@@ -45,6 +45,8 @@ import {
 } from './web-sessions'
 import {
   canDecideElevation,
+  canDecideElevationRequest,
+  deciderMemberIdOf,
   decideElevationRequest,
   listActiveElevationGrants,
   listElevationUsage,
@@ -1389,7 +1391,7 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
   const all = await listPendingElevationRequests(c.env, c.env.TENANT_SLUG)
   const visible: Array<Record<string, unknown>> = []
   for (const r of all) {
-    if (!(await scopeAuthorityOk(c.env, auth, capabilities, r.requested_scope_type as CapabilityScopeType, r.requested_scope_id))) continue
+    if (!(await canDecideElevationRequest(c.env, auth, capabilities, r, deciderMemberIdOf(auth)))) continue
     visible.push({
       id: r.id,
       agent_session_id: r.agent_session_id,

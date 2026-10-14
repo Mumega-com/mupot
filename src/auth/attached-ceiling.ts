@@ -17,6 +17,8 @@
 //   - src/operators/chokepoint.ts       authorizeStructuralWrite (only the attaching human's delegations, max_grant clamped)
 //   - src/mcp/index.ts                  the delegation floor bypass; task_verdict human_origin (refused for ANY seat session)
 // Elevation grants are bound to the exact agent session (the attachment's own token), so they never carry across threads.
+//   - "sudo for attached chats": the ONE exception to "an attached thread cannot elevate" is ATTACHED_SUDO_ACTIONS below;
+//     see docs/architecture/delegated-operators.md ("sudo for attached chats").
 
 import type { AuthContext, Capability } from '../types'
 
@@ -33,6 +35,7 @@ export function ceilingCapability(c: AttachCeiling): Capability | null {
 }
 
 export interface AttachedAuthority {
+  attachmentId: string
   humanMemberId: string
   agentId: string
   ceiling: AttachCeiling
@@ -42,5 +45,19 @@ export interface AttachedAuthority {
 export function attachedAuthority(auth: Pick<AuthContext, 'seatBinding'>): AttachedAuthority | null {
   const b = auth.seatBinding
   if (!b?.attached) return null
-  return { humanMemberId: b.humanMemberId, agentId: b.attached.agentId, ceiling: b.attached.ceiling }
+  return { attachmentId: b.attached.attachmentId, humanMemberId: b.humanMemberId, agentId: b.attached.agentId, ceiling: b.attached.ceiling }
+}
+
+/**
+ * "sudo" for an ATTACHED chat: the ONLY elevation actions an attached thread may request (request_elevation) and use.
+ * Everything else stays refused (attached_seat_cannot_elevate): minting, access, deploy, secrets, keys, irreversible
+ * acts (org_department_create, routine_archive), home access and every gate power. Adding a key here is a reviewed
+ * one-line change: it must be (a) enforced by a tool that is safe for an attached thread to call with a live grant,
+ * (b) reversible, and (c) never an act that mints or widens authority. The set is consulted at THREE points (the request,
+ * the decision, every use in hasElevatedAction), so a row forged past one of them is still refused by the others.
+ */
+export const ATTACHED_SUDO_ACTIONS: readonly string[] = ['action:org_structure']
+
+export function isAttachedSudoAction(action: string): boolean {
+  return ATTACHED_SUDO_ACTIONS.includes(action)
 }

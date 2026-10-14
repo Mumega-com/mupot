@@ -45,6 +45,7 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
+import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
 
@@ -439,6 +440,76 @@ async function decidedByHasElevationAuthority(
   )
 }
 
+// ── "sudo for attached chats": the attachment a session belongs to ──────────────────────────────────────────────────
+// An ATTACHED chat (W2 seat_attach) acts with its OWN credential, a member_tokens row created for exactly that one
+// attachment (agent_seat_attachments.seat_token_id; its raw secret is discarded at attach time, nothing can present it
+// except the server building the attached AuthContext). An agent session is keyed on that credential, so the session
+// itself names its attachment, and through it the ONE human who attached. That is DERIVED on every read (never a stored
+// claim on the request row, so there is nothing to forge and no migration): the decision rules below read it, never
+// request text. A session whose credential is not an attachment token has no origin (null) and every rule is a no-op.
+export interface SessionAttachmentOrigin {
+  attachmentId: string
+  /** The human who attached the chat: the ONLY member who may decide a request from it. */
+  humanMemberId: string
+  agentId: string
+  /** The attachment is not detached AND its admission is still live. A dead one decides nothing and uses nothing. */
+  live: boolean
+}
+
+export async function loadAttachmentOriginOfSession(env: Env, tenant: string, credentialId: string): Promise<SessionAttachmentOrigin | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT att.id AS attachment_id, att.human_member_id AS human_member_id, att.agent_id AS agent_id,
+              CASE WHEN att.detached_at IS NULL AND adm.status = 'live' THEN 1 ELSE 0 END AS live
+         FROM agent_seat_attachments att
+         LEFT JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
+        WHERE att.tenant = ?1 AND att.seat_token_id = ?2
+        LIMIT 1`,
+    ).bind(tenant, credentialId).first<{ attachment_id: string; human_member_id: string; agent_id: string; live: number }>()
+    return row ? { attachmentId: row.attachment_id, humanMemberId: row.human_member_id, agentId: row.agent_id, live: row.live === 1 } : null
+  } catch (err) {
+    // A pot that never applied the seat-attach migration has no attachments, so no session can have an origin.
+    if (/no such table:\s*agent_seat_(attachments|admissions)\b/i.test(err instanceof Error ? err.message : String(err))) return null
+    throw err
+  }
+}
+
+/** May this member decide (approve OR deny) this request, as far as ATTACHMENT ORIGIN goes? A request from an attached
+ *  chat is the attaching human's alone: another org admin may not approve it, and the list/review surfaces do not offer
+ *  it to them (the same predicate backs both, Security Invariant 12). Requests with no attachment origin: always true. */
+export async function attachedOriginAllowsDecider(env: Env, request: ElevationRequestRecord, deciderMemberId: string | null | undefined): Promise<boolean> {
+  const session = await loadAgentSessionById(env, request.tenant, request.agent_session_id)
+  if (!session) return true // no session row: the decide transaction refuses it as agent_session_ended
+  const origin = await loadAttachmentOriginOfSession(env, request.tenant, session.credential_id)
+  if (!origin) return true
+  return origin.live && deciderMemberId != null && origin.humanMemberId === deciderMemberId
+}
+
+/** The member a decision surface would record as the decider: the web session's member, else the principal's own. */
+export function deciderMemberIdOf(auth: Pick<AuthContext, 'webSessionMemberId' | 'memberId'> | null | undefined): string | null {
+  return auth?.webSessionMemberId ?? auth?.memberId ?? null
+}
+
+/** Is this request from an ATTACHED chat? (Display + step-up copy only; the decision rules read the origin themselves.) */
+export async function requestIsFromAttachedChat(env: Env, request: ElevationRequestRecord): Promise<boolean> {
+  const session = await loadAgentSessionById(env, request.tenant, request.agent_session_id)
+  return session ? (await loadAttachmentOriginOfSession(env, request.tenant, session.credential_id)) !== null : false
+}
+
+/** canDecideElevation PLUS the attachment-origin rule for one concrete request. The list/review surfaces call this. */
+export async function canDecideElevationRequest(
+  env: Env,
+  auth: AuthContext | null | undefined,
+  capabilities: CapabilityGrant[] | undefined,
+  request: ElevationRequestRecord,
+  deciderMemberId: string | null | undefined,
+): Promise<boolean> {
+  return (
+    (await canDecideElevation(env, auth, capabilities, request.requested_scope_type, request.requested_scope_id)) &&
+    (await attachedOriginAllowsDecider(env, request, deciderMemberId))
+  )
+}
+
 /** canDecideElevation (#1673) — may this caller decide (approve/deny) an
  *  elevation request on this scope? Every list/visibility surface (API
  *  pending + active lists, dashboard list + "Outside your authority" panel,
@@ -479,6 +550,23 @@ export async function findElevationDecisionRefusal(
   const agentSession = await loadAgentSessionById(env, input.tenant, request.agent_session_id)
   if (!agentSession || !evaluateAgentSession(agentSession, nowMs).ok) {
     return { ok: false, reason: 'agent_session_ended' }
+  }
+
+  // ── "sudo for attached chats": a request from an ATTACHED chat is decided by the human who attached it, and no one else.
+  // Derived from the session's own credential (see loadAttachmentOriginOfSession), so it holds for every channel that
+  // reaches a decision (dashboard, Access page, secure moment, Telegram mini-app): they all end in this function.
+  // A detached / admission-revoked / retired attachment is a dead session: nothing to approve, and nothing is granted.
+  const attachmentOrigin = await loadAttachmentOriginOfSession(env, input.tenant, agentSession.credential_id)
+  if (attachmentOrigin) {
+    if (!attachmentOrigin.live) return { ok: false, reason: 'agent_session_ended' }
+    // Same refusal shape as "not an admin": the other admin learns nothing about whose chat this is.
+    if (input.decidedByMemberId !== attachmentOrigin.humanMemberId) {
+      return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id } }
+    }
+    // The request itself may only name sudo-able actions (a row forged past request_elevation is refused here too).
+    for (const a of JSON.parse(request.requested_actions_json) as string[]) {
+      if (!isAttachedSudoAction(a)) return { ok: false, reason: 'invalid_elevation_request', detail: `"${a}" cannot be granted to an attached chat` }
+    }
   }
 
   // ── authority, checked BEFORE either terminal decision ────────────────
@@ -558,7 +646,9 @@ export async function findElevationDecisionRefusal(
       return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
     }
 
-    const needsStepUp = selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
+    // An attached chat's request is ALWAYS a step-up decision (a fresh passkey / reauth), whatever the action's own
+    // sensitivity: it is the human lending their own admin to a chat, the one thing a stale session must not do.
+    const needsStepUp = attachmentOrigin !== null || selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
     if (needsStepUp && !input.recentReauthOk) {
       return { ok: false, reason: 'reauth_required' }
     }
@@ -868,6 +958,9 @@ export type ElevatedActionDenyReason =
   | 'no_matching_grant'
   | 'approver_authority_lost'
   | 'approver_session_ended'
+  | 'attached_action_not_sudoable'
+  | 'approver_not_attaching_human'
+  | 'attachment_ended'
 
 export type HasElevatedActionResult =
   | { granted: true; grant: ElevationGrantRecord }
@@ -968,9 +1061,27 @@ export async function hasElevatedAction(
   // a covered-by-nothing squad, so existence is not an oracle.
   if (scopeType === 'squad' && scopeId && !targetSquadScope) return { granted: false, reason: 'no_matching_grant' }
 
+  // "sudo for attached chats": an ATTACHED caller (the server built this AuthContext from a live attachment on THIS request,
+  // so detach / admission revoke / idle sweep / seat retire have already ended it) may use a grant only for an allow-listed
+  // action, only one bound to ITS OWN attachment session (liveSession above is keyed on the attachment's own token), and
+  // only one the attaching human approved. The same rules are enforced at request and decision time; this is the use-time copy.
+  const attached = attachedAuthority(auth)
+  if (attached && !isAttachedSudoAction(action)) return { granted: false, reason: 'attached_action_not_sudoable' }
+  if (attached) {
+    // Re-read the attachment at USE time through THE admission chokepoint (not only when this request's AuthContext was
+    // built): a detach, an admission revoke, an idle sweep or a seat retire ends sudo immediately, whatever ctx a caller holds.
+    const b = auth.seatBinding
+    const { findLiveAttachment } = await import('../members/seat-attach') // dynamic: seat-attach pulls in the wider members graph
+    const live = b ? await findLiveAttachment(env, { memberId: b.humanMemberId, tokenId: b.grantTokenId }, b.seatId) : null
+    if (!live || live.attachment_id !== attached.attachmentId || live.seat_token_id !== sessionCtx.context.credentialId) {
+      return { granted: false, reason: 'attachment_ended' }
+    }
+  }
+
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
   const match = grants.find((g) => {
     if (g.action !== action) return false
+    if (attached && g.approved_by_member_id !== attached.humanMemberId) return false
     if (g.scope_type === 'org') return inheritancePlaneCovers('org')
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
     if (
@@ -983,7 +1094,10 @@ export async function hasElevatedAction(
     }
     return false
   })
-  if (!match) return { granted: false, reason: 'no_matching_grant' }
+  if (!match) {
+    const notTheAttachingHuman = attached !== null && grants.some((g) => g.action === action && g.approved_by_member_id !== attached.humanMemberId)
+    return { granted: false, reason: notTheAttachingHuman ? 'approver_not_attaching_human' : 'no_matching_grant' }
+  }
 
   // Re-derive the APPROVER's authority live — never trust that they still
   // hold what they granted just because the grant row exists. For a
@@ -1061,6 +1175,13 @@ async function loadLiveSessionForBoundAgent(
   return liveSession
 }
 
+/** Does this live grant count for THIS caller at all? Always for an ordinary bound agent. For an ATTACHED chat only an
+ *  allow-listed action the attaching human approved counts (existence probes must not let a stray row open a door). */
+function grantCountsForCaller(auth: AuthContext, g: ElevationGrantRecord): boolean {
+  const attached = attachedAuthority(auth)
+  return !attached || (isAttachedSudoAction(g.action) && g.approved_by_member_id === attached.humanMemberId)
+}
+
 export async function boundAgentHasAnyLiveGrantForAction(
   env: Env,
   auth: AuthContext,
@@ -1070,7 +1191,7 @@ export async function boundAgentHasAnyLiveGrantForAction(
   const liveSession = await loadLiveSessionForBoundAgent(env, auth, nowMs)
   if (!liveSession) return false
   const grants = await loadLiveElevationGrantsForSession(env, auth.tenant, liveSession.id, nowMs)
-  return grants.some((g) => g.action === action)
+  return grants.filter((g) => grantCountsForCaller(auth, g)).some((g) => g.action === action)
 }
 
 /**
@@ -1097,7 +1218,7 @@ export async function boundAgentHasAnyLiveElevationGrant(
   const liveSession = await loadLiveSessionForBoundAgent(env, auth, nowMs)
   if (!liveSession) return false
   const grants = await loadLiveElevationGrantsForSession(env, auth.tenant, liveSession.id, nowMs)
-  return grants.length > 0
+  return grants.some((g) => grantCountsForCaller(auth, g))
 }
 
 /** elevationRemedyMessage — a refusal must name the remedy (step-4 task rule
@@ -1113,6 +1234,9 @@ const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
   no_matching_grant: 'no live elevation grant covers this action and scope for this exact session — ask an org/department/squad admin to approve request_elevation for it',
   approver_authority_lost: 'the human who approved this grant no longer holds the required capability on this scope — ask a current admin to approve a fresh elevation',
   approver_session_ended: 'the human who approved this grant is no longer signed in — ask a current admin to approve a fresh elevation',
+  attached_action_not_sudoable: 'an attached chat may only use the sudo-able actions; this one is not on that list',
+  attachment_ended: 'this chat is no longer attached (detached, admission revoked, or the seat retired): any sudo it held ended with the attachment',
+  approver_not_attaching_human: 'a grant for an attached chat counts only when the human who attached the chat approved it; ask them to approve a fresh request with their passkey',
 }
 
 /** Tools that consult an elevation action, and the action key each consults.

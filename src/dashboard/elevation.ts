@@ -81,6 +81,8 @@ import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../
 import { resolveCapabilities } from '../auth/capability'
 import {
   canDecideElevation,
+  attachedOriginAllowsDecider,
+  requestIsFromAttachedChat,
   listPendingElevationRequests,
   loadElevationRequestById,
   listActiveElevationGrants,
@@ -265,13 +267,17 @@ async function splitByOperatorScope<T>(
   ctx: OperatorContext,
   rows: T[],
   scopeOf: (row: T) => { scopeType: CapabilityScopeType; scopeId: string },
+  /** Extra per-row visibility (a request from an attached chat is its attaching human's alone). */
+  alsoOk?: (row: T) => Promise<boolean>,
 ): Promise<{ visible: T[]; outOfScope: OutOfScopeGroup[] }> {
   const visible: T[] = []
   const outOfScope: OutOfScopeGroup[] = []
   const indexByKey = new Map<string, number>()
   for (const row of rows) {
     const { scopeType, scopeId } = scopeOf(row)
-    const ok = ctx.memberId ? await operatorIsAdminOnScope(env, auth, ctx.capabilities, scopeType, scopeId) : false
+    const ok = ctx.memberId
+      ? (await operatorIsAdminOnScope(env, auth, ctx.capabilities, scopeType, scopeId)) && (alsoOk ? await alsoOk(row) : true)
+      : false
     if (ok) {
       visible.push(row)
       continue
@@ -292,10 +298,11 @@ async function splitByOperatorScope<T>(
 // ── Screen 1: GET /elevation — pending requests ─────────────────────────────
 
 async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Promise<Html> {
-  const [agent, scopeLabel, session] = await Promise.all([
+  const [agent, scopeLabel, session, fromChat] = await Promise.all([
     loadAgentLabel(env, r.agent_id),
     loadScopeLabel(env, r.requested_scope_type, r.requested_scope_id),
     loadAgentSessionById(env, env.TENANT_SLUG, r.agent_session_id),
+    requestIsFromAttachedChat(env, r),
   ])
   const sessionLive = session ? evaluateAgentSession(session).ok : false
   const actions: string[] = JSON.parse(r.requested_actions_json)
@@ -308,6 +315,7 @@ async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Pr
       <div style="display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--text2);margin-bottom:10px;">
         <span>${statusDot(sessionLive ? 'ok' : 'dim', sessionLive ? 'session live' : 'session not live')}</span>
         <span>Scope: ${scopeLabel}</span>
+        ${fromChat ? html`<span><strong>Requested from a CHAT attached to ${agent?.name ?? r.agent_id}</strong> (sudo: only you, who attached it, can approve)</span>` : ''}
         <span>Asked ${formatWhen(r.created_at)}</span>
         <span>Decision window ends ${formatWhen(r.decision_expires_at)}</span>
       </div>
@@ -331,7 +339,7 @@ export async function pendingRequestsBody(env: Env, auth: AuthContext): Promise<
   const { visible, outOfScope } = await splitByOperatorScope(env, auth, ctx, all, (r) => ({
     scopeType: r.requested_scope_type,
     scopeId: r.requested_scope_id,
-  }))
+  }), (r) => attachedOriginAllowsDecider(env, r, ctx.memberId))
   const cards = await Promise.all(visible.map((r) => renderPendingRequestCard(env, r)))
 
   return html`
@@ -463,7 +471,9 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       <p><a href="/elevation">← Back to pending requests</a></p>`
   }
 
-  const eligible = await operatorIsAdminOnScope(env, auth, ctx.capabilities, request.requested_scope_type, request.requested_scope_id)
+  const eligible =
+    (await operatorIsAdminOnScope(env, auth, ctx.capabilities, request.requested_scope_type, request.requested_scope_id)) &&
+    (await attachedOriginAllowsDecider(env, request, ctx.memberId))
   const scopeLabel = await loadScopeLabel(env, request.requested_scope_type, request.requested_scope_id)
 
   if (!eligible) {
@@ -490,13 +500,14 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       <p><a href="/elevation">← Back to pending requests</a> · <a href="/elevation/grants">Active elevations →</a></p>`
   }
 
-  const [agent, session] = await Promise.all([
+  const [agent, session, fromChat] = await Promise.all([
     loadAgentLabel(env, request.agent_id),
     loadAgentSessionById(env, env.TENANT_SLUG, request.agent_session_id),
+    requestIsFromAttachedChat(env, request),
   ])
   const actions: string[] = JSON.parse(request.requested_actions_json)
   const hasIrreversible = actions.some((a) => ELEVATION_ACTIONS[a]?.effect === 'irreversible')
-  const needsStepUp = actions.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
+  const needsStepUp = fromChat || actions.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
   const durationOptions = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= request.requested_duration_minutes)
 
   let reauthOk = false
@@ -518,6 +529,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       body: html`
         <p style="margin:4px 0;font-size:13px;color:var(--text2);">Tenant: <strong>${env.TENANT_SLUG}</strong></p>
         <p style="margin:4px 0;">Agent: <strong>${agent?.name ?? request.agent_id}</strong>${agent?.slug ? html` <span style="color:var(--dim);">(${agent.slug})</span>` : ''}</p>
+        ${fromChat ? html`<p style="margin:4px 0;"><strong>Requested from a CHAT attached to ${agent?.name ?? request.agent_id}</strong> (sudo). You attached it, so only you can approve; it lends this chat your own admin on the scope below, for this chat only, until it expires or you detach.</p>` : ''}
         ${agentSessionSummary(session)}
       `,
     })}

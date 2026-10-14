@@ -189,6 +189,9 @@ async function emitProvisioned(
     reason?: string
     // Set when the act ran under a bounded elevation rather than standing admin.
     elevation_grant_id?: string
+    // "sudo for attached chats": the attachment (and the human who attached it) the act ran under.
+    attachment_id?: string
+    attached_human_member_id?: string
     // A profile correction keeps no history on the row (agents has no
     // updated_at), so the field-level before/after must ride on the event or
     // the change is unreversible from the trail.
@@ -210,6 +213,8 @@ async function emitProvisioned(
     receipt_id?: string
     reason?: string
     elevation_grant_id?: string
+    attachment_id?: string
+    attached_human_member_id?: string
     changed?: Record<string, { from: unknown; to: unknown }>
     self_report?: boolean
   }> = {
@@ -227,6 +232,8 @@ async function emitProvisioned(
       ...(extra.receipt_id ? { receipt_id: extra.receipt_id } : {}),
       ...(extra.reason ? { reason: extra.reason } : {}),
       ...(extra.elevation_grant_id ? { elevation_grant_id: extra.elevation_grant_id } : {}),
+      ...(extra.attachment_id ? { attachment_id: extra.attachment_id } : {}),
+      ...(extra.attached_human_member_id ? { attached_human_member_id: extra.attached_human_member_id } : {}),
       ...(extra.changed ? { changed: extra.changed } : {}),
       ...(extra.self_report ? { self_report: extra.self_report } : {}),
     },
@@ -367,9 +374,11 @@ export function callerCanGrantAgentCapability(
 
 // ── action:org_structure consumer ─────────────────────────────────────────────
 // ONE call site for the elevation lane that create_department / update_department / update_squad share, so the
-// attached-seat refusal below cannot be forgotten on one of them. An ATTACHED thread acts for the attaching human
-// under an admission ceiling and is already refused request_elevation (attached_seat_cannot_elevate); a grant row
-// bound to its credential must not open org structure either, whatever put it there.
+// attached-seat rule below cannot be forgotten on one of them. An ATTACHED thread acts for the attaching human under an
+// admission ceiling. "sudo for attached chats": it may request action:org_structure (and only the actions in
+// ATTACHED_SUDO_ACTIONS), the attaching human approves it with their passkey, and update_department / update_squad then
+// accept it ONLY with a live grant bound to THAT attachment's own session that matches the exact target (hasElevatedAction
+// re-checks the attachment is live on every request). create_department is never sudo-able for an attached thread.
 const ORG_STRUCTURE_ACTION = 'action:org_structure'
 const ORG_DEPARTMENT_CREATE_ACTION = 'action:org_department_create'
 
@@ -380,7 +389,9 @@ async function orgStructureElevation(
   scopeId: string | null,
   opts: { toolName: string; detail: unknown; squadDepartmentId?: string | null; action?: string },
 ) {
-  if (attachedAuthority(auth)) return { granted: false as const, reason: 'not_agent_session' as const }
+  // An attached thread consults ONLY the sudo-able action (create_department's action is not on the allow-list, and
+  // hasElevatedAction refuses it for an attached caller as well: two independent refusals).
+  if (attachedAuthority(auth) && opts.action === ORG_DEPARTMENT_CREATE_ACTION) return { granted: false as const, reason: 'not_agent_session' as const }
   const { action, ...rest } = opts
   // recordUsage:false: authorization alone writes NO elevation_usage_log row. The caller logs ONE itemized row AFTER the write
   // succeeds (recordOrgStructureUsage), so a refused or failed attempt never appears as an applied use (bot P1, Opus P1-2).
@@ -389,6 +400,64 @@ async function orgStructureElevation(
     return hasElevatedAction(env, auth, 'action:org_department_create', scopeType, scopeId, { ...rest, recordUsage: false })
   }
   return hasElevatedAction(env, auth, 'action:org_structure', scopeType, scopeId, { ...rest, recordUsage: false })
+}
+
+/** The refusal an ATTACHED thread gets for update_squad / update_department without a matching sudo grant. It names the exact
+ *  request_elevation call (action + scope + the RESOLVED id) and who approves it. `ref` is the caller's own argument. */
+export async function attachedSudoRefusal(env: Env, tool: 'update_squad' | 'update_department', ref: unknown, elevationDenied?: string) {
+  const isSquad = tool === 'update_squad'
+  const refStr = str(ref)
+  let resolvedId: string | null = null
+  if (refStr) {
+    const r = isSquad ? await resolveSquadRef(env, refStr) : await resolveDepartmentRef(env, refStr)
+    if (r.ok) resolvedId = r.value.id
+  }
+  const scopeType = isSquad ? 'squad' : 'department'
+  const request = {
+    actions: [ORG_STRUCTURE_ACTION],
+    scope_type: scopeType,
+    scope_id: resolvedId ?? `<the ${scopeType} id>`,
+    duration_minutes: 15,
+    reason: `<why this chat needs to ${isSquad ? 'update the squad' : 'rename the department'}>`,
+  }
+  return fail(403, 'forbidden', {
+    reason: 'attached_thread_without_matching_sudo_grant',
+    need: 'admin',
+    scope: scopeType,
+    ...(elevationDenied ? { elevation_denied: elevationDenied } : {}),
+    sudo: `sudo: this chat is attached to an agent and holds no admin of its own. Call request_elevation with ${JSON.stringify(request)}; your human approves with their passkey (they get the link in the result), then retry ${tool}. The grant is for this chat only, ends when you detach, and covers only this scope.`,
+    request_elevation: request,
+  })
+}
+
+/** Attached-thread preflight for update_squad / update_department: resolve the target and require a matching live sudo grant
+ *  BEFORE the structural gate would answer with its generic (no-target) refusal. null = carry on to the ordinary checks. */
+async function attachedSudoPreflight(
+  env: Env,
+  auth: AuthContext,
+  tool: 'update_squad' | 'update_department',
+  ref: unknown,
+): Promise<ReturnType<typeof fail> | null> {
+  const refStr = str(ref)
+  if (!refStr) return fail(400, 'invalid_args', tool === 'update_squad' ? 'squad required' : 'department required')
+  if (tool === 'update_squad') {
+    const r = await resolveSquadRef(env, refStr)
+    if (!r.ok) return resolveFail(r.reason, 'squad_not_found')
+    if (r.value.kind !== 'work') return fail(403, 'forbidden', { need: 'admin', scope: 'squad', reason: 'home_squad' })
+    const e = await orgStructureElevation(env, auth, 'squad', r.value.id, { toolName: tool, detail: { squad_id: r.value.id }, squadDepartmentId: r.value.department_id })
+    return e.granted ? null : attachedSudoRefusal(env, tool, r.value.id, e.reason)
+  }
+  const r = await resolveDepartmentRef(env, refStr)
+  if (!r.ok) return resolveFail(r.reason, 'department_not_found')
+  if (r.value.kind !== 'work') return fail(403, 'forbidden', { reason: 'home_department' })
+  const e = await orgStructureElevation(env, auth, 'department', r.value.id, { toolName: tool, detail: { department_id: r.value.id } })
+  return e.granted ? null : attachedSudoRefusal(env, tool, r.value.id, e.reason)
+}
+
+/** Audit context for an act done under an attached chat's sudo: the attachment (and the human) ride on the usage row and the event. */
+function attachedAuditFields(auth: AuthContext): { attachment_id?: string; attached_human_member_id?: string } {
+  const a = auth.seatBinding?.attached
+  return a ? { attachment_id: a.attachmentId, attached_human_member_id: auth.seatBinding?.humanMemberId } : {}
 }
 
 async function recordOrgStructureUsage(
@@ -481,7 +550,10 @@ const toolUpdateDepartment: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (attachedAuthority(auth)) return fail(403, 'forbidden', { reason: 'attached_seat_no_org_structure' })
+    if (attachedAuthority(auth)) {
+      const pre = await attachedSudoPreflight(env, auth, 'update_department', args.department)
+      if (pre) return pre
+    }
     const gate = await structuralGate(env, auth, 'update_department')
     if (gate.kind === 'refused') return structuralFail(gate)
     const deptRef = str(args.department)
@@ -522,11 +594,12 @@ const toolUpdateDepartment: ToolSpec = {
       if (result.error === 'home_department') return fail(403, 'forbidden', { reason: 'home_department' })
       return fail(400, 'invalid_args', { reason: result.error })
     }
-    await recordOrgStructureUsage(env, elevatedGrant, ORG_STRUCTURE_ACTION, 'update_department', { department_id: dept.id, name: { from: result.before.name, to: result.after.name } })
+    await recordOrgStructureUsage(env, elevatedGrant, ORG_STRUCTURE_ACTION, 'update_department', { department_id: dept.id, name: { from: result.before.name, to: result.after.name }, ...attachedAuditFields(auth) })
     await emitProvisioned(env, auth.memberId as string, 'department_updated', dept.id, {
       changed: { name: { from: result.before.name, to: result.after.name } },
       reason: str(args.reason) || undefined,
       elevation_grant_id: elevationGrantId,
+      ...attachedAuditFields(auth),
     })
     return done({ department: { id: dept.id, name: result.after.name }, changed: { name: { from: result.before.name, to: result.after.name } } })
   },
@@ -2679,7 +2752,10 @@ const toolUpdateSquad: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (attachedAuthority(auth)) return fail(403, 'forbidden', { reason: 'attached_seat_no_org_structure' })
+    if (attachedAuthority(auth)) {
+      const pre = await attachedSudoPreflight(env, auth, 'update_squad', args.squad)
+      if (pre) return pre
+    }
     const gate = await structuralGate(env, auth, 'update_squad')
     if (gate.kind === 'refused') return structuralFail(gate)
     const squadRef = str(args.squad)
@@ -2830,12 +2906,13 @@ const toolUpdateSquad: ToolSpec = {
 
     // Best-effort by design — a bus failure loses a notification, not the write
     // (the UPDATE above already committed).
-    await recordOrgStructureUsage(env, elevatedGrant, ORG_STRUCTURE_ACTION, 'update_squad', { squad_id: squad.id, changed })
+    await recordOrgStructureUsage(env, elevatedGrant, ORG_STRUCTURE_ACTION, 'update_squad', { squad_id: squad.id, changed, ...attachedAuditFields(auth) })
     await emitProvisioned(env, auth.memberId as string, 'squad_updated', squad.id, {
       squad_id: squad.id,
       changed,
       reason: str(args.reason) || undefined,
       elevation_grant_id: elevationGrantId,
+      ...attachedAuditFields(auth),
     })
 
     return done({ squad: after, changed })

@@ -50,7 +50,7 @@ import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, seatAttachEnabled } from '../members/seat-attach'
-import { attachedAuthority } from '../auth/attached-ceiling'
+import { ATTACHED_SUDO_ACTIONS, attachedAuthority, isAttachedSudoAction } from '../auth/attached-ceiling'
 import {
   decideHarnessBearer, HARNESS_SESSION_ALLOWED_TOOLS, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE,
   isHarnessCredentialSession,
@@ -194,7 +194,7 @@ import {
 } from '../fleet/registry'
 import { hasRegisteredDeliverySurface, resolveDispatchDeliveryMode } from '../bus/consumer'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
-import { PROVISION_TOOLS } from './provision'
+import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
 import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
@@ -5954,9 +5954,16 @@ const toolRequestElevation: ToolSpec = {
   },
   shouldTouchPresence: () => false,
   async run(auth, env, args, ctx) {
-    // W2: elevation grants are not clamped to an admission ceiling, so an attached thread must not request one (it would
-    // mint agent-level authority that outlives the attachment). A human elevates the agent from its own seat.
-    if (attachedAuthority(auth)) return fail(403, 'attached_seat_cannot_elevate')
+    // W2: elevation grants are not clamped to an admission ceiling, so an attached thread must not request just any one (it
+    // would mint agent-level authority that outlives the attachment). "sudo for attached chats": the ONE exception is an
+    // allow-listed, reversible act (ATTACHED_SUDO_ACTIONS). The request binds to the attachment's OWN session (below, same
+    // resolution as every elevation), and only the attaching human can decide it (findElevationDecisionRefusal).
+    if (attachedAuthority(auth)) {
+      const asked = Array.isArray(args.actions) ? args.actions.filter((a): a is string => typeof a === 'string') : []
+      if (asked.length === 0 || !asked.every(isAttachedSudoAction)) {
+        return fail(403, 'attached_seat_cannot_elevate', { sudoable_actions: ATTACHED_SUDO_ACTIONS, note: 'an attached chat may request only the listed actions; anything else is requested from the agent\'s own seat by a human' })
+      }
+    }
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
@@ -7461,6 +7468,11 @@ export async function invokeTool(
       delegatedOperatorsEnabled(env) &&
       (await agentHasLiveDelegation(env, auth.boundAgentId, attachedAuthority(auth)?.humanMemberId))
     if (!mayBeElevated && !mayBeDelegated) {
+      // "sudo for attached chats": an attached thread without a live sudo grant is told the exact call to make, not the
+      // generic agent hint (the human, not an admin elsewhere, approves it with their passkey).
+      if (attachedAuthority(auth) && (spec.name === 'update_squad' || spec.name === 'update_department')) {
+        return { ...(await attachedSudoRefusal(env, spec.name, spec.name === 'update_squad' ? args.squad : args.department)), tool: spec.name }
+      }
       const hint = elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }
