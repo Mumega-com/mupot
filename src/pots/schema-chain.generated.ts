@@ -4004,9 +4004,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0222_attachment_inbox_handled.sql",
+    sha256: "e43219f80b4c471b327b7fd7fe0ec211fae70064d08ab204d4559815fe6f9792",
+    statements: [
+      "-- 0222: per-ATTACHMENT \"handled\" receipts for the agent inbox (mupot#1937).\n--\n-- An ATTACHED chat (W2, agent_seat_attachments) is peek-only on the agent inbox by design: it can never consume, lease,\n-- ack or dead-letter, so a chat tab is never treated as the agent's host. That left an attached-only agent unable to\n-- say \"I handled this\". This table is that statement, and nothing more: one row per (attachment, message) written by\n-- the `inbox_mark_handled` tool. It is read ONLY by that attachment's own peek (which hides what it handled).\n--\n-- It deliberately does NOT touch agent_messages.read_at, lease columns, delivery_attempts, dead letters, the consumer\n-- fence, presence or fleet heartbeat: the host's cursor and queue are not this table's business. The attachment FK is\n-- RESTRICT like its siblings; message_id has no FK (a purged message must not block, or be blocked by, a receipt).\nCREATE TABLE IF NOT EXISTS agent_attachment_handled (\n  attachment_id TEXT NOT NULL REFERENCES agent_seat_attachments(id) ON DELETE RESTRICT,\n  tenant        TEXT NOT NULL,\n  message_id    TEXT NOT NULL,\n  handled_at    TEXT NOT NULL,\n  PRIMARY KEY (attachment_id, message_id)\n);",
+    ],
+    objects: [
+      { type: "table", name: "agent_attachment_handled" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f30fa3c25a0f18c0674492cc611c7c5cdc2813bc8f153df0b32c84224906e076"
+export const SCHEMA_CHAIN_DIGEST: string = "65702d5633e3d0a80e782d3b0f747e973831c3d36a82fe476fb8c87ef3c46d02"

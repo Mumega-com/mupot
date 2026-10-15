@@ -159,6 +159,7 @@ import { classify, humanAge } from '../dashboard/fleet'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
 import {
   sendToRef, readAgentInbox, sendAgentMessage, getSenderMessage,
+  agentUnreadTotal, MAX_UNREAD_PER_RECIPIENT, INBOX_NEAR_CAP_RATIO,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
@@ -4975,6 +4976,8 @@ const toolInbox: ToolSpec = {
       peek: args.peek === true,
       sinceSeq,
       seat: seatArg.seat,
+      // #1937: an attached chat's peek hides what THAT attachment marked handled (inbox_mark_handled).
+      handledByAttachment: attachedAuthority(auth)?.attachmentId,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -4989,11 +4992,21 @@ const toolInbox: ToolSpec = {
     if (!attachedAuthority(auth)) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat
     // `complete` is surfaced deliberately: a caller must be able to know it was
     // handed everything WITHOUT comparing a length against a cap it has to know.
+    // #1937: an attached chat's peek hides what it handled, but handled rows still count toward the sender-side unread
+    // cap (inbox_full). Warn when the agent-level total nears the cap. Attached callers only; host reads unchanged.
+    let warning: string | undefined
+    if (attachedAuthority(auth)) {
+      const total = await agentUnreadTotal(env, agent)
+      if (total !== null && total >= MAX_UNREAD_PER_RECIPIENT * INBOX_NEAR_CAP_RATIO) {
+        warning = `agent inbox is at ${total}/${MAX_UNREAD_PER_RECIPIENT} unread (handled-by-chat messages still count until the host consumes them); at the cap senders are refused with inbox_full`
+      }
+    }
     return done({
       messages: res.messages,
       remaining: res.remaining,
       complete: res.complete,
       consumed: args.peek !== true,
+      ...(warning ? { warning } : {}),
     })
   },
 }
@@ -5390,6 +5403,33 @@ const toolInboxFenceStatus: ToolSpec = {
       ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
       : null
     if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
+    // #1937: an attached chat is never the consumer, so the host fence mode (bearer_only/gen0) would be a lie for it.
+    // Say what it CAN do instead; the host's fence/key details are not an attached chat's business.
+    if (attachedAuthority(auth)) {
+      // Read the host's fence FIRST: under signed_only the bearer peek (and so mark_handled) is refused, so claiming
+      // can_peek would be a lie. Only the mode is surfaced, never the generation or key fingerprint.
+      const fenceRow = await env.DB.prepare(
+        `SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+      ).bind(env.TENANT_SLUG, agent).first<{ mode: string }>()
+      const fenced = (fenceRow?.mode ?? 'bearer_only') !== 'bearer_only'
+      // Agent-level unread (the send-side cap counts these, handled-by-attachment rows included, seat-blind).
+      const unreadTotal = await agentUnreadTotal(env, agent)
+      return done({
+        agent_id: agent,
+        mode: 'peek_only',
+        attached: true,
+        can_peek: !fenced,
+        can_consume: false,
+        can_mark_handled: !fenced && seatAttachEnabled(env),
+        ...(fenced ? { reason: 'consumer_fenced_signed_only' } : {}),
+        mark_handled_tool: 'inbox_mark_handled',
+        unread_total: unreadTotal,
+        unread_cap: MAX_UNREAD_PER_RECIPIENT,
+        near_cap: unreadTotal !== null && unreadTotal >= MAX_UNREAD_PER_RECIPIENT * INBOX_NEAR_CAP_RATIO,
+        note: 'This is an attached chat: read with inbox {peek:true}, then record what you handled with inbox_mark_handled {ids}. Consuming, leasing and acking belong to the agent host. unread_total counts messages the host has not consumed, including ones this chat marked handled; at unread_cap senders are refused (inbox_full).',
+        ...(strictSeat?.ok ? { strict_scope: true, tenant: env.TENANT_SLUG, effective_inbox_seat: strictSeat.seat } : {}),
+      })
+    }
     const row = await env.DB.prepare(
       `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
         WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,

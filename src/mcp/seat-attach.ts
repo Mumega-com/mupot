@@ -16,6 +16,9 @@
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { attachSeatToAgent, seatAttachEnabled } from '../members/seat-attach'
+import { attachedAuthority } from '../auth/attached-ceiling'
+import { resolveBoundSeat } from '../agents/inbox-seat'
+import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
 
 const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
@@ -101,4 +104,37 @@ const toolSeatAttach: ToolSpec = {
   },
 }
 
-export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach]
+// inbox_mark_handled (mupot#1937) — the attached chat's ONLY inbox write. See members/attached-handled.ts.
+const toolInboxMarkHandled: ToolSpec = {
+  name: 'inbox_mark_handled',
+  scope: 'self (an ATTACHED thread records which of the agent\'s peeked messages it handled; per-attachment receipt only)',
+  min: 'authenticated',
+  args: `{ ids: string[] }  // 1..${MAX_MARK_HANDLED_IDS} message ids from your own peek. Attached threads only: it never consumes, leases, acks or moves the host's cursor`,
+  inputSchema: {
+    type: 'object',
+    properties: { ids: { type: 'array', items: { type: 'string' }, description: 'Message ids (from inbox {peek:true}) this chat handled.' } },
+    required: ['ids'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    // (the SEAT_ATTACH flag is refused by invokeTool's SEAT_ATTACH_FLAG_TOOLS gate before this runs)
+    // Server-derived: only a thread the SERVER bound to a LIVE attachment. A host / agent-bound token consumes with inbox_ack.
+    const att = attachedAuthority(auth)
+    if (!att) {
+      return fail(403, 'not_attached_seat', 'inbox_mark_handled is for an attached chat. An agent host clears mail with inbox_ack.')
+    }
+    const ids = normalizeHandledIds(args.ids)
+    if (!ids) return fail(400, 'invalid_args', { field: 'ids', detail: `1..${MAX_MARK_HANDLED_IDS} non-empty message ids` })
+    // The seat partition is the attachment token's OWN label (never a client claim): the same value its peek uses.
+    const seat = await resolveBoundSeat(env, auth.tokenId ?? null)
+    const r = await markMessagesHandledByAttachment(env, { attachmentId: att.attachmentId, agentId: att.agentId, seat, ids })
+    if (!r.ok) return r.error === 'invalid_ids' ? fail(400, 'invalid_args', { field: 'ids' }) : fail(500, r.error)
+    return done({
+      handled: r.handled,
+      not_visible: r.not_visible,
+      note: 'Recorded for THIS chat only: your own peek now hides these. The host and other chats still see them; nothing was consumed.',
+    })
+  },
+}
+
+export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach, toolInboxMarkHandled]

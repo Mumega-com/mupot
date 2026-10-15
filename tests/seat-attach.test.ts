@@ -2037,3 +2037,211 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     expect(await subscriberAccessLive(env, row as never)).toMatchObject({ live: false })
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// mupot#1937: an attached chat can record "handled" per ATTACHMENT without ever becoming the host.
+// MUTATIONS proven (see PR body): the m.to_agent / target_seat / read_at / fence / live-attachment predicates in
+// markMessagesHandledByAttachment, the attachedAuthority guard in inbox_mark_handled, the NOT EXISTS hide in the peek
+// (handledHideSql, and its use in the remaining count), the attachment-id scoping of that hide, and the peek_only branch.
+describe('inbox_mark_handled (attached chat per-attachment handled receipt, #1937)', () => {
+  const HOST_BOUND = (): AuthContext => ({ userId: 'mem-agent-rava', email: null, role: 'member', tenant: TENANT, memberId: 'mem-agent-rava', boundAgentId: 'agent-rava', capabilities: [], channel: 'workspace', tokenId: 'tok-host-rava' } as unknown as AuthContext)
+  const msg = (id: string, to = 'agent-rava', seat: string | null = null, extra = ''): void => {
+    h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, target_seat ${extra ? ', ' + extra.split('=')[0] : ''}) VALUES ('${id}', '${TENANT}', '${to}', 'agent-x', 'mem-x', 'message', 'body ${id}', ${seat === null ? 'NULL' : `'${seat}'`} ${extra ? ', ' + extra.split('=')[1] : ''})`)
+  }
+  const idsOf = (r: unknown): string[] => ((r as { result?: { messages?: Array<{ id: string }> } }).result?.messages ?? []).map((m) => m.id)
+  const handledOf = (r: unknown): { handled: string[]; not_visible: string[] } => (r as { result: { handled: string[]; not_visible: string[] } }).result
+  const receipts = (): number => n(`SELECT COUNT(*) AS n FROM agent_attachment_handled`)
+
+  async function setup() {
+    const env = envFor(h)
+    const { invokeTool } = await import('../src/mcp/index')
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(att.seatBinding?.attached).toBeTruthy()
+    const label = one<{ label: string }>(`SELECT t.label AS label FROM agent_seat_attachments a JOIN member_tokens t ON t.id = a.seat_token_id WHERE a.detached_at IS NULL`)!.label
+    const call = (auth: AuthContext, tool: string, a: Record<string, unknown> = {}) => invokeTool(auth, env, tool, a, 'https://pot.test') as Promise<unknown>
+    const host = HOST_BOUND()
+    return { env, g, att, label, call, host, invokeTool }
+  }
+
+  it('happy path: marks the messages its own peek sees; its peek then hides them (and remaining drops), others still see them', async () => {
+    const { env, g, att, label, call, host } = await setup()
+    msg('m-null'); msg('m-own', 'agent-rava', label); msg('m-keep')
+    expect(idsOf(await call(att, 'inbox', { peek: true })).sort()).toEqual(['m-keep', 'm-null', 'm-own'])
+    const r = handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-null', 'm-own'] }))
+    expect(r.handled.sort()).toEqual(['m-null', 'm-own'])
+    expect(r.not_visible).toEqual([])
+    expect(receipts()).toBe(2)
+    const peek = await call(att, 'inbox', { peek: true, limit: 1 })
+    expect(idsOf(peek)).toEqual(['m-keep'])
+    expect((peek as { result: { remaining: number; complete: boolean } }).result).toMatchObject({ remaining: 0, complete: true })
+    // handled is PER ATTACHMENT: a second attachment of the same agent and the host still see the mail
+    await attach(env, g, 'conv-b', 'rava')
+    const att2 = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
+    expect(idsOf(await call(att2, 'inbox', { peek: true })).sort()).toEqual(['m-keep', 'm-null'])
+    expect(idsOf(await call(host, 'inbox', { peek: true })).sort()).toEqual(['m-keep', 'm-null'])
+  })
+
+  it('refuses a message addressed to a FOREIGN agent (indistinguishable from an unknown id)', async () => {
+    const { att, call } = await setup()
+    msg('m-foreign', 'agent-other')
+    const r = handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-foreign', 'm-nope'] }))
+    expect(r).toMatchObject({ handled: [], not_visible: ['m-foreign', 'm-nope'] })
+    expect(receipts()).toBe(0)
+  })
+
+  it('refuses another seat\'s mail (target_seat that is not this attachment\'s label)', async () => {
+    const { att, call } = await setup()
+    msg('m-other-seat', 'agent-rava', 'some-other-seat')
+    expect(idsOf(await call(att, 'inbox', { peek: true }))).toEqual([]) // its own peek cannot see it either
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-other-seat'] })).not_visible).toEqual(['m-other-seat'])
+    expect(receipts()).toBe(0)
+  })
+
+  it('refuses an already-consumed row and a signed_only-fenced agent (what its peek cannot see)', async () => {
+    const { att, call } = await setup()
+    msg('m-read'); h.sqlite.exec(`UPDATE agent_messages SET read_at = '2026-10-15T00:00:00.000Z' WHERE id = 'm-read'`)
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-read'] })).not_visible).toEqual(['m-read'])
+    msg('m-fenced')
+    h.sqlite.exec(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason) VALUES ('${TENANT}', 'agent-rava', 'signed_only', 1, '${'a'.repeat(64)}', '${HUMAN}', '2026-10-15T00:00:00.000Z', 'test')`)
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-fenced'] })).not_visible).toEqual(['m-fenced'])
+    expect(receipts()).toBe(0)
+  })
+
+  it('NEVER moves the host: read_at, lease, attempts, dead letters, fence, presence, fleet heartbeat, module registry unchanged; the host still consumes the message', async () => {
+    const { att, call, host } = await setup()
+    msg('m-1'); msg('m-2')
+    h.sqlite.exec(`INSERT OR REPLACE INTO fleet_agents (agent_id, tenant, runtime, status, reported_by, presence_mode, presence_ttl_sec, last_reported_at, updated_at)
+      VALUES ('agent-rava', '${TENANT}', 'claude-code', 'running', 'agent-rava', 'poll', 90, '2026-01-01 00:00:00', '2026-01-01 00:00:00')`)
+    const snap = (): string => JSON.stringify({
+      msgs: h.sqlite.prepare(`SELECT * FROM agent_messages ORDER BY seq`).all(),
+      fleet: h.sqlite.prepare(`SELECT * FROM fleet_agents`).all(),
+      presence: h.sqlite.prepare(`SELECT COUNT(*) AS n FROM presence`).get(),
+      modules: h.sqlite.prepare(`SELECT COUNT(*) AS n FROM module_registry`).get(),
+      fences: h.sqlite.prepare(`SELECT COUNT(*) AS n FROM agent_inbox_fences`).get(),
+    })
+    const before = snap()
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-1', 'm-2'] })).handled).toHaveLength(2)
+    expect(snap()).toBe(before)
+    // the host's own view and consume are unaffected
+    expect(idsOf(await call(host, 'inbox', { peek: true })).sort()).toEqual(['m-1', 'm-2'])
+    expect(idsOf(await call(host, 'inbox', { limit: 10 })).sort()).toEqual(['m-1', 'm-2'])
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE read_at IS NOT NULL`)).toBe(2)
+    // and the attached chat is still refused every consume path
+    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_lease', {}], ['inbox_ack', { ids: ['m-1'] }]] as Array<[string, Record<string, unknown>]>) {
+      expect(JSON.stringify(await call(att, tool, a))).toContain('attached_seat_peek_only')
+    }
+  })
+
+  it('a non-attached caller (host-bound token) is refused; bad ids are a 400', async () => {
+    const { att, call, host } = await setup()
+    msg('m-1')
+    expect(JSON.stringify(await call(host, 'inbox_mark_handled', { ids: ['m-1'] }))).toContain('not_attached_seat')
+    expect(receipts()).toBe(0)
+    for (const ids of [[], 'm-1', [1], [''], Array.from({ length: 51 }, (_, i) => `x${i}`)]) {
+      expect(JSON.stringify(await call(att, 'inbox_mark_handled', { ids }))).toContain('invalid_args')
+    }
+  })
+
+  it('a DETACHED attachment is refused (tool path, and the write itself when called directly)', async () => {
+    const { env, g, call } = await setup()
+    msg('m-1')
+    const attachmentId = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
+    expect(await detachAttachment(env, { attachmentId, humanMemberId: HUMAN })).toEqual({ ok: true })
+    const after = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(after.seatBinding?.attached).toBeFalsy()
+    expect(JSON.stringify(await call(after, 'inbox_mark_handled', { ids: ['m-1'] }))).toContain('not_attached_seat')
+    const { markMessagesHandledByAttachment } = await import('../src/members/attached-handled')
+    const direct = await markMessagesHandledByAttachment(env, { attachmentId, agentId: 'agent-rava', seat: null, ids: ['m-1'] })
+    expect(direct).toEqual({ ok: true, handled: [], not_visible: ['m-1'] })
+    expect(receipts()).toBe(0)
+  })
+
+  it('idempotent: a repeat succeeds, writes no second row and keeps the first handled_at', async () => {
+    const { att, call } = await setup()
+    msg('m-1')
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-1', 'm-1'] })).handled).toEqual(['m-1'])
+    const first = one<{ handled_at: string }>(`SELECT handled_at FROM agent_attachment_handled`)!.handled_at
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-1'] })).handled).toEqual(['m-1'])
+    expect(receipts()).toBe(1)
+    expect(one<{ handled_at: string }>(`SELECT handled_at FROM agent_attachment_handled`)!.handled_at).toBe(first)
+  })
+
+  it('inbox_consumer_status is truthful: peek_only + the mark_handled path for an attached chat; the host keeps bearer_only', async () => {
+    const { att, call, host } = await setup()
+    const a = (await call(att, 'inbox_consumer_status')) as { result: Record<string, unknown> }
+    expect(a.result).toMatchObject({ mode: 'peek_only', attached: true, can_consume: false, can_peek: true, can_mark_handled: true, mark_handled_tool: 'inbox_mark_handled' })
+    expect(JSON.stringify(a)).not.toContain('bearer_only')
+    const hh = (await call(host, 'inbox_consumer_status')) as { result: Record<string, unknown> }
+    expect(hh.result).toMatchObject({ mode: 'bearer_only', generation: 0 })
+    expect(hh.result.attached).toBeUndefined()
+  })
+
+  it('consumer status reads the fence first: signed_only => can_peek false, can_mark_handled false, with a reason (and no host fence details)', async () => {
+    const { att, call } = await setup()
+    h.sqlite.exec(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason) VALUES ('${TENANT}', 'agent-rava', 'signed_only', 7, '${'a'.repeat(64)}', '${HUMAN}', '2026-10-15T00:00:00.000Z', 'test')`)
+    const r = (await call(att, 'inbox_consumer_status')) as { result: Record<string, unknown> }
+    expect(r.result).toMatchObject({ mode: 'peek_only', can_peek: false, can_mark_handled: false, can_consume: false, reason: 'consumer_fenced_signed_only' })
+    expect(JSON.stringify(r)).not.toContain('a'.repeat(64))
+    expect(r.result.generation).toBeUndefined()
+  })
+
+  it('unread_total / unread_cap / near_cap on consumer status and a warning on peek at >=80% of the cap; handled rows still count; cap semantics unchanged', async () => {
+    const { att, call } = await setup()
+    const bulk = (count: number, prefix: string): void => h.sqlite.exec(`WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ${count})
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) SELECT '${prefix}' || i, '${TENANT}', 'agent-rava', 'agent-x', 'mem-x', 'message', 'b' FROM c`)
+    bulk(10, 'lo-')
+    const status = async (): Promise<Record<string, unknown>> => ((await call(att, 'inbox_consumer_status')) as { result: Record<string, unknown> }).result
+    expect(await status()).toMatchObject({ unread_total: 10, unread_cap: 1000, near_cap: false })
+    expect((await call(att, 'inbox', { peek: true, limit: 1 }) as { result: Record<string, unknown> }).result.warning).toBeUndefined()
+    bulk(790, 'hi-') // 800 = exactly 80%
+    expect(await status()).toMatchObject({ unread_total: 800, unread_cap: 1000, near_cap: true })
+    // the chat handles everything it can see in one go: its peek goes quiet, the agent-level total does NOT drop
+    await call(att, 'inbox_mark_handled', { ids: Array.from({ length: 50 }, (_, i) => `hi-${i + 1}`) })
+    const peek = (await call(att, 'inbox', { peek: true, limit: 1 })) as { result: { warning?: string } }
+    expect(peek.result.warning).toContain('800/1000')
+    expect(await status()).toMatchObject({ unread_total: 800, near_cap: true })
+    // 799 unread (just under 80%): no warning, near_cap false
+    h.sqlite.exec(`UPDATE agent_messages SET read_at = '2026-10-15T00:00:00.000Z' WHERE id = 'hi-790'`)
+    expect(await status()).toMatchObject({ unread_total: 799, near_cap: false })
+    expect(((await call(att, 'inbox', { peek: true, limit: 1 })) as { result: { warning?: string } }).result.warning).toBeUndefined()
+  })
+
+  it('handled readback is scoped to the CALLER\'s attachment: a second attachment cannot claim a message only the first could mark', async () => {
+    const { env, g, att, label, call } = await setup()
+    msg('m-seat1', 'agent-rava', label) // visible to attachment 1 only
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-seat1'] })).handled).toEqual(['m-seat1'])
+    await attach(env, g, 'conv-b', 'rava')
+    const att2 = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
+    expect(handledOf(await call(att2, 'inbox_mark_handled', { ids: ['m-seat1'] })).not_visible).toEqual(['m-seat1'])
+    expect(receipts()).toBe(1)
+  })
+
+  it('id length cap: 128 chars is accepted (not_visible), 129 is invalid_args', async () => {
+    const { att, call } = await setup()
+    expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['x'.repeat(128)] })).not_visible).toHaveLength(1)
+    expect(JSON.stringify(await call(att, 'inbox_mark_handled', { ids: ['x'.repeat(129)] }))).toContain('invalid_args')
+  })
+
+  it('the write itself is bound to the CALLER\'s attachment row: a detached attachment cannot write while a second live attachment of the same agent exists', async () => {
+    const { env, g, call } = await setup()
+    await attach(env, g, 'conv-b', 'rava')
+    msg('m-1')
+    const [first, second] = (h.sqlite.prepare(`SELECT id FROM agent_seat_attachments ORDER BY created_at, rowid`).all() as Array<{ id: string }>).map((r) => r.id)
+    expect(await detachAttachment(env, { attachmentId: first, humanMemberId: HUMAN })).toEqual({ ok: true })
+    expect(one<{ detached_at: string | null }>(`SELECT detached_at FROM agent_seat_attachments WHERE id = ?`, second)?.detached_at ?? null).toBeNull()
+    const { markMessagesHandledByAttachment } = await import('../src/members/attached-handled')
+    expect(await markMessagesHandledByAttachment(env, { attachmentId: first, agentId: 'agent-rava', seat: null, ids: ['m-1'] })).toEqual({ ok: true, handled: [], not_visible: ['m-1'] })
+    expect(receipts()).toBe(0)
+    void call
+  })
+
+  it('flag off: inbox_mark_handled is not advertised and refuses', async () => {
+    const off = envFor(h, { SEAT_ATTACH: undefined })
+    expect(advertisedTools(off).some((t) => t.name === 'inbox_mark_handled')).toBe(false)
+    expect(advertisedTools(envFor(h)).some((t) => t.name === 'inbox_mark_handled')).toBe(true)
+    const { invokeTool } = await import('../src/mcp/index')
+    expect(JSON.stringify(await invokeTool(HOST_BOUND(), off, 'inbox_mark_handled', {}, 'https://pot.test'))).toContain('seat_attach_disabled')
+  })
+})
