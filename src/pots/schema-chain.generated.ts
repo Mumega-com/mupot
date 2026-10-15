@@ -4015,10 +4015,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0223_capability_lifecycle.sql",
-    sha256: "f98f081728c4e3191e7c8282b5edd4485c6c612a6be0a3f6cde9fb00d12b0e17",
+    file: "0224_engrams_agent_created_index.sql",
+    sha256: "06cd5a21eaff838bc8b8ed56abc1c5937f8117ccd80c06a05bb41b5f78e66d0c",
     statements: [
-      "-- 0223_capability_lifecycle.sql — a standing capability grant has a lifecycle.\n--\n-- Controls: ISO 27001 A.5.18 (access rights: provisioning, review, removal),\n-- SOC 2 CC6.2 / CC6.3 (grant, modify, remove access; periodic review).\n--\n-- WHY\n--\n-- `capabilities` had no expiry, no reason, no granter and no history. Every\n-- grant was permanent, and a revoke is a hard DELETE that leaves nothing behind:\n-- \"who held admin on this squad in September, who gave it to them, and why\" was\n-- unanswerable. Only elevation_grants (0148) had a lifecycle.\n--\n-- This migration is the schema half of that. It is ADDITIVE and CHANGES NO\n-- EXISTING ROW'S AUTHORITY:\n--\n--   expires_at   NULL = non-expiring (every legacy grant). The liveness predicate\n--                CAPABILITY_LIVE_PREDICATE (src/auth/capability.ts) reads NULL as\n--                live; SQL three-valued logic would otherwise drop every NULL row\n--                from a comparison and lock the whole pot out at once.\n--   reason       free text the granter gave, or NULL.\n--   granted_by   member or agent id that made the grant, or NULL (legacy).\n--   granted_via  the surface: dashboard | mcp | elevation | delegated_operator |\n--                squad_join | invite | bootstrap | migration ... NULL (legacy).\n--\n-- Nothing is auto-expired and nothing is backfilled.\n--\n-- grant_events is the append-only history sidecar. The live table keeps its\n-- DELETE-on-revoke semantics (every revocation read is unchanged); history lives\n-- here, and is written BY TRIGGER in the same transaction as the change:\n--\n--   AFTER INSERT                       -> 'granted'\n--   AFTER UPDATE of capability, expiry,\n--     scope or provenance              -> 'granted' (re-grant, upgrade, horizon change)\n--   AFTER DELETE                       -> 'revoked' (or 'expired' for the sweeper)\n--\n-- A trigger cannot be forgotten by a writer, fires for the members ON DELETE\n-- CASCADE and for a console DELETE, writes nothing for an INSERT OR IGNORE / ON\n-- CONFLICT DO NOTHING that wrote no row, and a no-op re-grant is silent. The\n-- 'granted' event takes granted_by / reason from the row itself. A DELETE carries\n-- no actor, so a revoke that knows who is revoking sets grant_event_context in\n-- the same batch right before the DELETE and clears it right after; a context\n-- older than 60 seconds is ignored, so one that outlived its batch cannot\n-- mis-attribute a later revoke. `grant_table` also admits 'gate_grants' so the\n-- next step needs no change here.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
+      "-- recall's D1 read-your-writes leg (src/memory/index.ts) and memory_recent order a scope's engrams by\n-- created_at DESC. The old idx_engrams_agent (agent_id) forced a sort of the whole scope per query.\nCREATE INDEX IF NOT EXISTS idx_engrams_agent_created ON engrams(agent_id, created_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_engrams_agent_created" },
+    ],
+  },
+  {
+    file: "0225_capability_lifecycle.sql",
+    sha256: "86fb7e3a085293e9c42eda4df5120ba0222c9b9afe47f599b780f44b49c51362",
+    statements: [
+      "-- 0225_capability_lifecycle.sql — a standing capability grant has a lifecycle.\n--\n-- Controls: ISO 27001 A.5.18 (access rights: provisioning, review, removal),\n-- SOC 2 CC6.2 / CC6.3 (grant, modify, remove access; periodic review).\n--\n-- WHY\n--\n-- `capabilities` had no expiry, no reason, no granter and no history. Every\n-- grant was permanent, and a revoke is a hard DELETE that leaves nothing behind:\n-- \"who held admin on this squad in September, who gave it to them, and why\" was\n-- unanswerable. Only elevation_grants (0148) had a lifecycle.\n--\n-- This migration is the schema half of that. It is ADDITIVE and CHANGES NO\n-- EXISTING ROW'S AUTHORITY:\n--\n--   expires_at   NULL = non-expiring (every legacy grant). The liveness predicate\n--                CAPABILITY_LIVE_PREDICATE (src/auth/capability.ts) reads NULL as\n--                live; SQL three-valued logic would otherwise drop every NULL row\n--                from a comparison and lock the whole pot out at once.\n--   reason       free text the granter gave, or NULL.\n--   granted_by   member or agent id that made the grant, or NULL (legacy).\n--   granted_via  the surface: dashboard | mcp | elevation | delegated_operator |\n--                squad_join | invite | bootstrap | migration ... NULL (legacy).\n--\n-- Nothing is auto-expired and nothing is backfilled.\n--\n-- grant_events is the append-only history sidecar. The live table keeps its\n-- DELETE-on-revoke semantics (every revocation read is unchanged); history lives\n-- here, and is written BY TRIGGER in the same transaction as the change:\n--\n--   AFTER INSERT                       -> 'granted'\n--   AFTER UPDATE of capability, expiry,\n--     scope or provenance              -> 'granted' (re-grant, upgrade, horizon change)\n--   AFTER DELETE                       -> 'revoked' (or 'expired' for the sweeper)\n--\n-- A trigger cannot be forgotten by a writer, fires for the members ON DELETE\n-- CASCADE and for a console DELETE, writes nothing for an INSERT OR IGNORE / ON\n-- CONFLICT DO NOTHING that wrote no row, and a no-op re-grant is silent. The\n-- 'granted' event takes granted_by / reason from the row itself. A DELETE carries\n-- no actor, so a revoke that knows who is revoking sets grant_event_context in\n-- the same batch right before the DELETE and clears it right after; a context\n-- older than 60 seconds is ignored, so one that outlived its batch cannot\n-- mis-attribute a later revoke. `grant_table` also admits 'gate_grants' so the\n-- next step needs no change here.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN reason TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN granted_by TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN granted_via TEXT;",
@@ -4044,16 +4054,6 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "capabilities_grant_event_insert" },
       { type: "trigger", name: "capabilities_grant_event_update" },
       { type: "trigger", name: "capabilities_grant_event_delete" },
-    ],
-  },
-  {
-    file: "0224_engrams_agent_created_index.sql",
-    sha256: "06cd5a21eaff838bc8b8ed56abc1c5937f8117ccd80c06a05bb41b5f78e66d0c",
-    statements: [
-      "-- recall's D1 read-your-writes leg (src/memory/index.ts) and memory_recent order a scope's engrams by\n-- created_at DESC. The old idx_engrams_agent (agent_id) forced a sort of the whole scope per query.\nCREATE INDEX IF NOT EXISTS idx_engrams_agent_created ON engrams(agent_id, created_at);",
-    ],
-    objects: [
-      { type: "index", name: "idx_engrams_agent_created" },
     ],
   },
   {
@@ -4122,4 +4122,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a494d16f574ef4e9f42fd578796662b5949c3efd3fd6e9f015850137df635fd5"
+export const SCHEMA_CHAIN_DIGEST: string = "14f16514816c95d92ce17405deb67d581117569812bbc6fe3a667f08035e83fa"

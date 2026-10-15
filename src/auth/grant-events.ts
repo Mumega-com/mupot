@@ -1,6 +1,6 @@
 // src/auth/grant-events.ts — append-only history for standing access grants.
 //
-// Controls: ISO 27001 A.5.18, SOC 2 CC6.2 / CC6.3. Migration 0223.
+// Controls: ISO 27001 A.5.18, SOC 2 CC6.2 / CC6.3. Migration 0225.
 //
 // `capabilities` revoke is a hard DELETE; the live table keeps that (every read
 // of "is this still granted" is unchanged). History lives in `grant_events`, so
