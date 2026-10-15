@@ -7,8 +7,8 @@ except the one approval tap.
 **Method.** Read-only trace of the code on `origin/main` @ `32a8f146`, plus three live reads of
 `https://mupot.mumega.com` (the unauthenticated edge). Ground truth beats docs: every claim cites
 `file:line` at that commit unless it says "live". Line numbers in this document are pre-fix numbers for
-`src/mcp/index.ts`; the fixes in this PR shift later lines by a few. Prod flag state is read from the
-deploy checkout's gitignored `wrangler.toml` (flags below); it is local config, not code.
+`src/mcp/index.ts`; the fixes in this PR shift later lines by a few. Flag state is deployment config and is
+deliberately not recorded here.
 
 **Not in scope, planned (do not read these as done):**
 
@@ -17,10 +17,7 @@ deploy checkout's gitignored `wrangler.toml` (flags below); it is local config, 
 - S2, planned: a "Make this the agent's home" choice on the passkey approval page that turns an
   attachment into the agent's host seat. Funnel step A9 is a placeholder for it.
 
-**Prod flags that decide which funnel a human gets** (deploy checkout `wrangler.toml`): `SEAT_AUTO_ENROLL=1`
-(line 48), `SEAT_ATTACH=1` (49), `SECURE_MOMENTS=1` (23), `ACCESS_APPROVE_ENABLED=1` (17),
-`WEBHOOK_DOORBELL=1` (27), `EVENTS_ENABLED=true` (51), `SHARED_CREDENTIAL_DETECT=1` (50). `WORKSPACES` is not
-set (so `worktree_open` is not advertised).
+**Flags that decide which funnel a human gets** (per deploy config; names only, values are deployment-specific): `SEAT_AUTO_ENROLL`, `SEAT_ATTACH`, `SECURE_MOMENTS`, `ACCESS_APPROVE_ENABLED`, `WEBHOOK_DOORBELL`, `EVENTS_ENABLED`, `SHARED_CREDENTIAL_DETECT`, `WORKSPACES`. Check a pot's own `tools/list` and consent screen to see which are on.
 
 ---
 
@@ -34,7 +31,7 @@ A brand-new agent given only a URL finds nothing machine-readable. Live, 2026-10
 - `GET /llms.txt` and `GET /.well-known/mcp.json` answer `302` to sign-in.
 - `POST /mcp` unauthenticated answers `401`, `www-authenticate: Bearer ... resource_metadata=".../.well-known/oauth-protected-resource/mcp"`, body `{"error":"invalid_token"}`. The resource metadata lists scopes only; nothing says "to onboard, read X".
 - `GET /openapi.json` answers a public subset of tools (`src/mcp/openapi-public-allowlist.ts`), no onboarding text.
-- The initialize `instructions` are the real first-contact text, but initialize is itself behind the OAuth layer (`401` when unauthenticated, live), so a cold agent never reaches them. The comment at `src/mcp/instructions.ts:3` called the payload "unauthenticated"; corrected in this PR.
+- The initialize `instructions` are the real first-contact text, but the public endpoint answered an unauthenticated initialize with `401` (live; deployment behaviour of the OAuth front layer, not a handler guarantee, since the handler treats initialize as bearerless), so a cold agent did not reach them. The comment at `src/mcp/instructions.ts:3` is reworded in this PR to say both and to keep the static-payload rule explicit.
 
 So the first guidance any agent can read is delivered only after a human has already connected it.
 There is no door where an agent can read "start here" without credentials.
@@ -107,10 +104,10 @@ State ids are stable names so `boot_context` can adopt them as a `funnel.state` 
 | A0 `no_connector` | Human adds the `/mcp` URL as a connector | chat app settings | OAuth consent screen opens | client enters `/authorize` loop or `401` | URL must be the pot's `/mcp`; Troubleshooting table in `connect-mcp-client.md` |
 | A1 `consent` | Human picks **Many chats** (or **One agent** for a single bot) | consent screen | redirect back; connector shows tools | no "Many chats" choice shown | pot lacks `SEAT_AUTO_ENROLL=1`: owner sets it (`wrangler.example.toml` now documents it) and redeploys |
 | A2 `first_boot` | `boot_context` | MCP | `onboarding_state`, `available_doors` | none (always answers) | read `next_step` |
-| A3a `harness_no_seat` (Claude web) | `seat_select { project }`, then send the handle | MCP | `seat_handle` (`mseat_...`) | `seat_auto_enroll_disabled` / `rate_limited` / `seat_cap_reached` | re-boot; `next_step` now on every refusal; owner raises caps or retires seats |
+| A3a `harness_no_seat` (Claude web) | `seat_select { project }`, then send the handle | MCP | `seat_handle` (`mseat_...`) | `seat_auto_enroll_disabled` / `rate_limited` / `seat_cap_reached` | re-boot; `rate_limited` and `seat_auto_enroll_disabled` now carry a `next_step` (`seat_cap_reached` is NOT covered: its detail is the only text); owner raises caps or retires seats |
 | A3b `auto_seat` (ChatGPT) | none: already a seat | server | `identity_receipt.binding_source: auto_seat` | `auto_seat_refused` on the receipt | retry; refusals are cached 30 s |
 | A4 `seat_agent` | `orient` | MCP | brief; open tasks listed | empty list | brief now names `task_board` / `task_list`; else ask the supervisor |
-| A5 `want_existing_agent` | `seat_attach { agent }` | MCP | `pending_admission` + `approve_url` | `agent_not_found` (not one the human administers) | human picks an agent they administer; `seat_required` -> do A3a first |
+| A5 `want_existing_agent` | `seat_attach { agent }` | MCP | `pending_admission` + `approve_url` (no link when `SECURE_MOMENTS` is off: the note sends the human to the Connections page) | `agent_not_found` (not one the human administers) | human picks an agent they administer; `seat_required` -> do A3a first |
 | A6 `awaiting_tap` | give `approve_url` to the human | secure-moment page | "Admitted" page | human has no passkey / no prompt | human adds a passkey at My Account (`/account`) then reopens the link; link expires in 24 h -> call `seat_attach` again |
 | A7 `admitted` | `seat_attach` again | MCP | `attached`; next request acts as the agent | `already_pending` (human has not decided) | human decides on the Connections page; a lost link cannot be re-issued while one is live (proposal P5) |
 | A8 `attached` | `boot_context` then `orient` | MCP | `identity_receipt.binding_source: attached_seat` | `attached_seat_peek_only` on mail | **planned (#1937)**: attached chat marks its own read mail handled; until then peek only |
@@ -176,7 +173,7 @@ State ids are stable names so `boot_context` can adopt them as a `funnel.state` 
 | F4 `boot_context` lists `seat_attach` as a door for a seat session that is not yet attached (position 1, after `orient`) | `src/mcp/index.ts` | same |
 | F5 `bootstrap_self` and `seat_select` refusals from a seat session name `seat_attach` / `orient` / `boot_context` | `src/mcp/bootstrap.ts`, `src/mcp/seat-select.ts` | same |
 | F6 `orient` empty state names `task_board` / `task_list` | `src/orient/service.ts` | same + `tests/orient-service.test.ts` |
-| F7 MCP refusal envelope carries `next_step` for `forbidden {need}`, `not_agent_bound`, `seat_required`, flag-off and `rate_limited` (static text, never overwrites a refusal that already teaches; REST unchanged) | `src/mcp/refusal-next-step.ts`, `src/mcp/index.ts` | same |
+| F7 MCP refusal envelope carries `next_step` for exactly five refusal types: (1) `forbidden {need}`, (2) `not_agent_bound` / `agent_bound_credential_required`, (3) `seat_required`, (4) `seat_attach_disabled` / `seat_auto_enroll_disabled`, (5) `rate_limited`. Not covered: `seat_cap_reached`, `agent_not_found`, every other code (their own detail is the text) (static text, never overwrites a refusal that already teaches; REST unchanged) | `src/mcp/refusal-next-step.ts`, `src/mcp/index.ts` | same |
 | F8 Doc corrections | `docs/connect-mcp-client.md`, `docs/onboarding/add-an-agent.md`, `src/mcp/instructions.ts` comment | n/a |
 
 ## 5. Proposals not built here (sized)

@@ -189,6 +189,9 @@ describe('initialize instructions name the attach door only while it exists', ()
     expect(t).toMatch(/passkey/)
     expect(t).toMatch(/Do NOT call bootstrap_self from a seat session/)
     expect(t).toMatch(/never registered a passkey/)
+    // covers the pot with no approval links too: the link is conditional, the Connections page is the fallback
+    expect(t).toMatch(/If it includes an approve_url/)
+    expect(t).toMatch(/Connections page/)
   })
 })
 
@@ -251,6 +254,18 @@ describe('a chat with a seat is shown the attach door, and told what to do when 
     expect(r.sc).toMatchObject({ ok: false, error: 'not_unbound_directory_session', status: 403 })
     expect(String(r.sc.detail)).toContain('seat_attach')
     expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()).toEqual(before) // nothing was created
+  })
+
+  it('bootstrap_self from an ATTACHED chat does not tell it to seat_attach (that would 409 already_attached)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await rpc(env, g.ctx, 'boot_context')
+    const seat = h.sqlite.prepare('SELECT id FROM agent_seats').get() as { id: string }
+    expect((await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'rava', via: 'dashboard' })).ok).toBe(true)
+    const r = await rpc(env, g.ctx, 'bootstrap_self', { agent_name: 'second-agent' })
+    expect(r.sc).toMatchObject({ ok: false, error: 'not_unbound_directory_session', status: 403 })
+    expect(String(r.sc.detail)).not.toContain('call seat_attach')
+    expect(String(r.sc.detail)).toContain('already attached')
   })
 
   it('bootstrap_self from a seat session with the attach flag off does not advertise seat_attach', async () => {

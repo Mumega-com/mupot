@@ -1,9 +1,10 @@
 // src/mcp/instructions.ts — Canonical onboarding and runtime instructions for MCP initialize
 
 // SECURITY POSTURE INVARIANT (Athena Gate condition):
-// This payload is served in the MCP initialize handshake (an authenticated call: an unauthenticated
-// initialize answers 401 from the OAuth layer, checked live 2026-10-15, so a cold agent never sees it).
-// It MUST remain strictly static and tenant-neutral (never interpolate tenant slugs,
+// This payload is served in the MCP initialize handshake. The handler does not require a bearer (initialize and
+// tools/list are bearerless in src/mcp/index.ts), so treat it as readable by anyone who reaches it; the deployed OAuth
+// front layer happens to answer an unauthenticated public initialize with 401 (checked live 2026-10-15), which is
+// deployment behaviour, not a guarantee. It MUST remain strictly static and tenant-neutral (never interpolate tenant slugs,
 // request parameters, or untrusted user input) to prevent control-plane injection.
 
 /**
@@ -92,8 +93,8 @@ SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "M
 export const MUPOT_MCP_ATTACH_INSTRUCTIONS = `
 
 ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when boot_context shows a seat)
-   - If your agent already exists, call 'seat_attach' { agent: "<its id, slug or exact name>" }. Do NOT call bootstrap_self from a seat session: it refuses, and it would create a second agent.
-   - First time, it returns status "pending_admission" and an approve_url. Give that URL to your human: they tap their passkey once. Nothing attaches before that, and you cannot approve it yourself.
+   - If your agent already exists, call 'seat_attach' { agent: "<its id, slug or exact name>" }. Do NOT call bootstrap_self from a seat session: it refuses (and would otherwise create a second agent).
+   - First time, it returns status "pending_admission". If it includes an approve_url, give that URL to your human: they tap their passkey once. If it has none (the pot has no approval links), your human approves on their Connections page instead; the note in the result says which. Nothing attaches before that, and you cannot approve it yourself.
    - If your human has never registered a passkey, they must first add one in My Account (the dashboard /account page, while signed in). The approve link cannot enrol one for them.
    - After they approve, call 'seat_attach' again. It attaches immediately; your NEXT request acts as that agent (boot_context shows the identity_receipt).
    - A session with no seat yet (a harness session before seat_select) can call only seat_select and boot_context. Call seat_select first, then seat_attach.

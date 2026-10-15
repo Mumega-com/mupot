@@ -6643,7 +6643,7 @@ const toolBootContext: ToolSpec = {
       // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
       availableDoors.splice(1, 0, {
         tool: 'seat_attach',
-        does: 'act as an agent you already have: your human approves once with their passkey (you get an approve_url to hand them), then call seat_attach again and your NEXT request acts as that agent',
+        does: 'act as an agent you already have: your human approves once with their passkey (you get an approve_url to hand them, or are told to send them to their Connections page), then call seat_attach again and your NEXT request acts as that agent',
         requires: 'the agent must be one your human administers; nothing is attached until they tap',
       })
     }

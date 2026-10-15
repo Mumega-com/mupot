@@ -87,9 +87,11 @@ const toolBootstrapSelf: ToolSpec = {
           'bootstrap_self only runs for an unbound directory-channel session. An agent-bound token, or any '
             + 'other connection channel, already has a voice and does not need this tool.'
             // A chat with a seat is agent-bound (its seat agent), so it lands here. Say what it can do instead.
-            + (auth.seatBinding && seatAttachEnabled(env)
+            + (auth.seatBinding && !auth.seatBinding.attached && seatAttachEnabled(env)
               ? ' This chat already acts as a seat agent. To act as an agent you already have, call seat_attach { agent: "<its id, slug or name>" } (your human approves once with their passkey). To work as this seat agent, call orient.'
-              : ' Call boot_context: its next_step names what this session can do.'),
+              : auth.seatBinding?.attached
+                ? ' This chat is already attached to an existing agent; call boot_context and orient.'
+                : ' Call boot_context: its next_step names what this session can do.'),
         )
       case 'rate_limited':
         return fail(403, result.error, result.detail)
