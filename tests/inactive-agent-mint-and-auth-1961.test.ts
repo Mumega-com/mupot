@@ -130,8 +130,11 @@ describe('#1961 mint refuses a non-active agent', () => {
       return realBatch(stmts)
     }) as typeof env.DB.batch
     const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
-    await expect(mintAgentBoundToken(env, agent, 'x')).rejects.toBeInstanceOf(AgentInactiveError)
+    await expect(mintAgentBoundToken(env, agent, 'x', {
+      issuedBy: { memberId: 'm-admin', principal: 'admin@pot.test', surface: 'enroll' },
+    })).rejects.toBeInstanceOf(AgentInactiveError)
     expect(countFor(q, 'ag-live')).toEqual({ tokens: 0, bindings: 0, grants: 0, members: 0 })
+    expect(q(`SELECT COUNT(*) n FROM agent_token_issuance_audit`)[0].n).toBe(0)
   })
 
   it('a LATER mint (binding already exists) for an agent deactivated afterwards is refused with no new token', async () => {
