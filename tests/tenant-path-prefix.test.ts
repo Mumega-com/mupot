@@ -351,7 +351,7 @@ describe('user content is never rewritten', () => {
   const PROBE = `url=/docs fetch('/api/x') href='/y' location='/z' action="/w"`
   it('textarea body, text nodes and attribute VALUES containing url-like text stay byte-identical', () => {
     const html = `<!doctype html><html><head></head><body>
-<textarea name="goal">${PROBE}</textarea>
+<textarea name="goal">${PROBE} <a href="/z">raw</a><script>fetch('/api/x')</script></textarea>
 <p>${PROBE}</p>
 <input value="${PROBE.replace(/"/g, '&quot;')}">
 <input value='x href="/y" src="/z"'>
@@ -522,6 +522,21 @@ describe('wiring: credential-bearing URLs come from pinned PUBLIC_ORIGIN only', 
   it('routine MCP endpoint', () => {
     expect(publicMcpEndpoint({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf' } as unknown as Env)).toBe('https://mupot.mumega.com/t/gaf/mcp')
     expect(publicMcpEndpoint({ PUBLIC_ORIGIN: 'https://pot.example.com' } as unknown as Env)).toBe('https://pot.example.com/mcp')
+  })
+})
+
+describe('copilot full-page detection under a prefix (executed)', () => {
+  it('compares the pathname with the /t/<slug> prefix removed', () => {
+    const src = readFileSync(new URL('../src/dashboard/copilot.ts', import.meta.url), 'utf8')
+    const snippet = /const __base[\s\S]*?const onFullPage[^\n]*\n/.exec(src)?.[0] ?? ''
+    expect(snippet).not.toBe('')
+    const run = (pathname: string, base?: string): boolean =>
+      vm.runInNewContext(`(function(){${snippet}; return onFullPage })()`, { window: base ? { __MUPOT_BASE: base } : {}, location: { pathname } }) as boolean
+    expect(run('/t/local/copilot', '/t/local')).toBe(true)
+    expect(run('/t/local/chat', '/t/local')).toBe(true)
+    expect(run('/copilot')).toBe(true)
+    expect(run('/t/local/agents', '/t/local')).toBe(false)
+    expect(run('/t/local/copilot')).toBe(false)
   })
 })
 
