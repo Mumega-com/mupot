@@ -569,19 +569,19 @@ async function reachConsentScreen(
   )
   const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
   const setCookie = authorizeRes.headers.get('Set-Cookie') ?? ''
-  const nonceMatch = /mupot_oauth_nonce=([^;]+)/.exec(setCookie)
+  const nonceMatch = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(setCookie)
   const nonce = nonceMatch![1]
 
   stubGoogleFetch(email)
   const callbackReq = new Request(
     `https://pot.test/oauth/google-callback?code=abc&state=${nonce}`,
-    { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+    { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
   )
   const res = await handleOAuthAuthorize(callbackReq, env)
   const html = await res.clone().text()
   const cookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('Set-Cookie') ?? '']
-  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? ''
-  const consentNonceMatch = /mupot_oauth_consent=([^;]+)/.exec(consentCookieLine)
+  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? ''
+  const consentNonceMatch = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(consentCookieLine)
   return { res, html, consentCookie: consentNonceMatch ? consentNonceMatch[1] : '' }
 }
 
@@ -657,7 +657,7 @@ describe('C2. POST /oauth/consent — decline yields no token at all', () => {
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'decline', agent_id: AGENT_A.id })
     const declineReq = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(declineReq, env)
@@ -678,7 +678,7 @@ describe('C3. POST /oauth/consent — continue without an agent preserves today\
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: '' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -707,7 +707,7 @@ describe('C4. POST /oauth/consent — a valid agent_id mints an agent-bound toke
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -739,7 +739,7 @@ describe('C4. POST /oauth/consent — a valid agent_id mints an agent-bound toke
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     await handleOAuthAuthorize(req, env)
@@ -765,7 +765,7 @@ describe('C4. POST /oauth/consent — a valid agent_id mints an agent-bound toke
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     await handleOAuthAuthorize(req, env)
@@ -787,7 +787,7 @@ describe('C4b. POST /oauth/consent — continuing UNBOUND writes no consent rece
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: '' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     await handleOAuthAuthorize(req, env)
@@ -833,7 +833,7 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -885,7 +885,7 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -906,7 +906,7 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -926,7 +926,7 @@ describe('C5. POST /oauth/consent — a tampered/ineligible agent_id is rejected
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_B.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -948,7 +948,7 @@ describe('C5. POST /oauth/consent — a tampered/ineligible agent_id is rejected
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -969,7 +969,7 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: '' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent=some-other-nonce' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent_some-other-nonce=1' },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -985,7 +985,7 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: '' })
     const makeReq = () => new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
 
@@ -1001,10 +1001,10 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
 
-    const form = new URLSearchParams({ consent_nonce: 'never-issued', action: 'continue', agent_id: '' })
+    const form = new URLSearchParams({ consent_nonce: '00000000-0000-4000-8000-000000000000', action: 'continue', agent_id: '' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent=never-issued' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent_00000000-0000-4000-8000-000000000000=1' },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -1023,7 +1023,7 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -1093,7 +1093,7 @@ describe('D0. P0-3 — the weld floor is admin, not member', () => {
     const form = new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
@@ -1738,7 +1738,7 @@ describe('H. GET /oauth/consent is refused even with a valid consent cookie', ()
 
     const req = new Request(`https://pot.test/oauth/consent?agent_id=${AGENT_A.id}&action=continue`, {
       method: 'GET',
-      headers: { Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { Cookie: `mupot_oauth_consent_${consentCookie}=1` },
     })
     const res = await handleOAuthAuthorize(req, env)
 
@@ -1804,7 +1804,7 @@ describe('C10. a brand-new customer with no capabilities', () => {
     })
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: form.toString(),
     }), env)
 
@@ -1829,7 +1829,7 @@ describe('C10. a brand-new customer with no capabilities', () => {
 
     await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: new URLSearchParams({
         consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
       }).toString(),
@@ -1855,7 +1855,7 @@ describe('C10. a brand-new customer with no capabilities', () => {
 
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: new URLSearchParams({
         consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: '   ',
       }).toString(),
@@ -1878,7 +1878,7 @@ describe('C10. a brand-new customer with no capabilities', () => {
     const first = await reachConsentScreen(env, oauthProvider, NEWCOMER)
     await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${first.consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${first.consentCookie}=1` },
       body: new URLSearchParams({
         consent_nonce: first.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
       }).toString(),
@@ -1888,7 +1888,7 @@ describe('C10. a brand-new customer with no capabilities', () => {
     const second = await reachConsentScreen(env, oauthProvider, NEWCOMER)
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${second.consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${second.consentCookie}=1` },
       body: new URLSearchParams({
         consent_nonce: second.consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Bob',
       }).toString(),
@@ -1932,7 +1932,7 @@ describe('C11. the agent was created but this session could not be bound', () =>
 
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: new URLSearchParams({
         consent_nonce: consentCookie, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada',
       }).toString(),

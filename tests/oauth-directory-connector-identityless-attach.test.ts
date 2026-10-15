@@ -116,12 +116,12 @@ async function connectUnbound(
   )
   const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
   const setCookie = authorizeRes.headers.get('Set-Cookie') ?? ''
-  const nonce = /mupot_oauth_nonce=([^;]+)/.exec(setCookie)![1]
+  const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(setCookie)![1]
 
   stubGoogleFetch(email, googleId)
   const callbackReq = new Request(
     `${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`,
-    { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+    { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
   )
   const callbackRes = await handleOAuthAuthorize(callbackReq, env)
   if (callbackRes.status !== 200) {
@@ -130,13 +130,13 @@ async function connectUnbound(
   const cookies = callbackRes.headers.getSetCookie
     ? callbackRes.headers.getSetCookie()
     : [callbackRes.headers.get('Set-Cookie') ?? '']
-  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? ''
-  const consentNonce = /mupot_oauth_consent=([^;]+)/.exec(consentCookieLine)?.[1] ?? ''
+  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? ''
+  const consentNonce = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(consentCookieLine)?.[1] ?? ''
 
   const form = new URLSearchParams({ consent_nonce: consentNonce, action: 'continue', agent_id: '' })
   const consentReq = new Request(`${ORIGIN}/oauth/consent`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentNonce}` },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentNonce}=1` },
     body: form.toString(),
   })
   const res = await handleOAuthAuthorize(consentReq, env)
@@ -265,11 +265,11 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
       `${ORIGIN}/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256`,
     )
     const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
-    const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+    const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
     stubGoogleFetch('dup@example.com', 'google-sub-dup')
     const callbackReq = new Request(
       `${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`,
-      { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+      { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
     )
     const res = await handleOAuthAuthorize(callbackReq, env)
 
@@ -311,19 +311,19 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
       `${ORIGIN}/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256`,
     )
     const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
-    const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+    const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
     stubGoogleFetch('racewindow@example.com', 'google-sub-racewindow')
     const callbackReq = new Request(
       `${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`,
-      { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+      { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
     )
     const callbackRes = await handleOAuthAuthorize(callbackReq, env)
     expect(callbackRes.status).toBe(200)
     const cookies = callbackRes.headers.getSetCookie
       ? callbackRes.headers.getSetCookie()
       : [callbackRes.headers.get('Set-Cookie') ?? '']
-    const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? ''
-    const consentNonce = /mupot_oauth_consent=([^;]+)/.exec(consentCookieLine)?.[1] ?? ''
+    const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? ''
+    const consentNonce = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(consentCookieLine)?.[1] ?? ''
 
     // Read the freshly-created member id straight out of the pending-consent
     // KV record the callback just wrote — the human is now sitting on the
@@ -347,7 +347,7 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
     const form = new URLSearchParams({ consent_nonce: consentNonce, action: 'continue', agent_id: '' })
     const consentReq = new Request(`${ORIGIN}/oauth/consent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentNonce}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentNonce}=1` },
       body: form.toString(),
     })
     const consentRes = await handleOAuthAuthorize(consentReq, env)
