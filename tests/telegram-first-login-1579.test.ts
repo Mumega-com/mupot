@@ -3,7 +3,10 @@
 // through the real `/login` command, confirmed through the real authApp routes with real cookie sessions.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { Hono } from 'hono'
 import { authApp } from '../src/auth'
+import { resolveApexPathTenant } from '../src/dispatcher'
+import { withTenantPrefix } from '../src/platform/tenant-path'
 import { handleImMessage } from '../src/im'
 import { mintTelegramLoginLink } from '../src/auth/telegram-login-link'
 import { createProjectInvite } from '../src/members/project-invites'
@@ -469,6 +472,50 @@ describe('#1579 Telegram-first member web login', () => {
     expect(h.sqlite.prepare(`SELECT 1 FROM telegram_login_links`).all()).toEqual([])
   })
 
+  it('/login fence: each condition on its own refuses and writes no link row', async () => {
+    await bornViaTelegram()
+    const rows = () => h.sqlite.prepare(`SELECT COUNT(*) AS n FROM telegram_login_links`).get() as { n: number }
+    // no webhook envelope at all
+    expect(await handleImMessage(env, CHAT, '/login')).toMatch(/direct Telegram conversation/)
+    expect(rows().n).toBe(0)
+    // an envelope for a different Telegram user than the chat
+    expect(await handleImMessage(env, CHAT, '/login', telegramOptions('7777'))).toMatch(/direct Telegram conversation/)
+    expect(rows().n).toBe(0)
+    // forwarded
+    expect(await handleImMessage(env, CHAT, '/login', { ...telegramOptions(CHAT), forwarded: true })).not.toContain('/auth/telegram-link')
+    expect(rows().n).toBe(0)
+    // no pinned origin: refuses rather than emitting a relative link
+    const saved = env
+    env = { ...env, PUBLIC_ORIGIN: undefined } as unknown as Env
+    expect(await handleImMessage(env, CHAT, '/login', telegramOptions(CHAT))).toMatch(/not configured/)
+    expect(rows().n).toBe(0)
+    env = saved
+    // and the happy envelope does mint
+    expect((await mintLink()).token).not.toBeNull()
+    expect(rows().n).toBe(1)
+  })
+
+  it('a member that backs an agent gets no link, and the claim refuses it too', async () => {
+    const memberId = await bornViaTelegram()
+    const { token } = await mintLink()
+    h.sqlite.exec(`
+      INSERT OR IGNORE INTO departments (id, slug, name) VALUES ('dept-x', 'dept-x', 'Dept X');
+      INSERT OR IGNORE INTO squads (id, department_id, slug, name) VALUES ('squad-x', 'dept-x', 'squad-x', 'Squad X');
+      INSERT INTO agents (id, squad_id, slug, name, role, status, created_at) VALUES ('agent-1', 'squad-x', 'a1', 'A1', 'lead', 'active', datetime('now'));
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-1', '${memberId}', datetime('now'));
+    `)
+    // a link minted BEFORE the binding appeared cannot be confirmed
+    expect((await linkAndConfirm(token!)).res.status).toBe(403)
+    expect(identities()).toEqual([])
+    expect(linkRow()).toEqual({ consumed_at: null })
+    // and no new one is minted
+    h.sqlite.prepare(`DELETE FROM telegram_login_links`).run()
+    const again = await mintLink()
+    expect(again.token).toBeNull()
+    expect(again.reply).toMatch(/cannot use a web sign-in link/)
+    expect(await mintTelegramLoginLink(env, { memberId, chatId: CHAT })).toEqual({ ok: false, error: 'agent_backed' })
+  })
+
   it('/login on a member that already has a web sign-in mints nothing', async () => {
     const memberId = await bornViaTelegram()
     h.sqlite.prepare(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id) VALUES ('id-existing', ?, 'google', 'sub-first', NULL, ?)`).run(TENANT, memberId)
@@ -608,6 +655,43 @@ describe('#1579 Telegram-first member web login', () => {
       const jar: Jar = new Map()
       await visit(jar, `/auth/telegram-link?t=${token}`)
       expect(jar.get('mupot_tg_link')?.path).toBe('/t/local/auth')
+    })
+  })
+
+  describe('through the apex strip (resolveApexPathTenant + withTenantPrefix), not the tenant handler directly', () => {
+    const root = new Hono().route('/auth', authApp)
+    async function viaApex(jar: Jar, path: string, init: RequestInit = {}): Promise<Response> {
+      const original = new Request(`${ORIGIN}/t/local${path}`, {
+        ...init,
+        headers: { ...(init.headers as Record<string, string> | undefined), ...(cookieHeader(jar, `/t/local${path.split('?')[0]}`) ? { cookie: cookieHeader(jar, `/t/local${path.split('?')[0]}`) } : {}) },
+      })
+      const route = resolveApexPathTenant(original, 'local')
+      if (route?.kind !== 'home') throw new Error('home route expected')
+      const res = await withTenantPrefix(original, { TENANT_SLUG: 'local' }, () => root.fetch(route.request, env))
+      absorb(jar, res)
+      return res
+    }
+    it('a pinned path-tenant pot: state cookie Path is the browser-visible /t/local/auth/callback, Location is re-rooted, and the callback receives the cookie', async () => {
+      env = { ...env, PUBLIC_ORIGIN: `${ORIGIN}/t/local` } as unknown as Env
+      const jar: Jar = new Map()
+      const login = await viaApex(jar, '/auth/login?return=/auth/telegram-link/confirm')
+      expect(login.status).toBe(302)
+      const state = new URL(login.headers.get('location')!).searchParams.get('state')!
+      expect(jar.get(`mupot_login_state_${state}`)?.path).toBe('/t/local/auth/callback')
+      const cb = await withGoogle('sub-x', 'x@example.test', () => viaApex(jar, `/auth/callback?code=c&state=${state}`))
+      expect(cb.status).toBe(302)
+      expect(cb.headers.get('location')).toBe('/t/local/auth/telegram-link/confirm')
+      expect(jarGet(jar, 'mupot_session')).toBeTruthy()
+    })
+    it('the Telegram link open sets the nonce cookie at the browser-visible /t/local/auth and redirects under the prefix', async () => {
+      env = { ...env, PUBLIC_ORIGIN: `${ORIGIN}/t/local` } as unknown as Env
+      await bornViaTelegram()
+      const { token } = await mintLink()
+      const jar: Jar = new Map()
+      const open = await viaApex(jar, `/auth/telegram-link?t=${token}`)
+      expect(open.status).toBe(302)
+      expect(jar.get('mupot_tg_link')?.path).toBe('/t/local/auth')
+      expect(open.headers.get('location')).toBe('/t/local/auth/login?tg=1&return=/auth/telegram-link/confirm')
     })
   })
 

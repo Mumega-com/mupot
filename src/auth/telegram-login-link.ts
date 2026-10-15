@@ -46,7 +46,7 @@ function mintSecret(): string {
 
 export type MintTelegramLoginLinkResult =
   | { ok: true; token: string; expiresAt: string }
-  | { ok: false; error: 'not_bound' | 'already_has_login' | 'no_email' }
+  | { ok: false; error: 'not_bound' | 'already_has_login' | 'no_email' | 'agent_backed' }
 
 /** Mint a link for the member whose bound chat is `chatId`. The caller must have authenticated the chat (the webhook). */
 export async function mintTelegramLoginLink(
@@ -61,6 +61,11 @@ export async function mintTelegramLoginLink(
   // The claim requires the confirming session's verified email to equal the member's, so a member with no email could
   // never confirm; refuse at mint instead of handing out a link that cannot work (and a bearer with no email bound).
   if (!member.email || member.email.trim() === '') return { ok: false, error: 'no_email' }
+  // A member that backs an agent must never gain a human web login through this flow.
+  const backing = await env.DB.prepare(
+    `SELECT 1 AS present FROM agent_member_bindings WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, input.memberId).first<{ present: number }>()
+  if (backing) return { ok: false, error: 'agent_backed' }
   const identity = await env.DB.prepare(
     `SELECT 1 AS present FROM human_login_identities WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL LIMIT 1`,
   ).bind(env.TENANT_SLUG, input.memberId).first<{ present: number }>()
@@ -153,6 +158,10 @@ export async function redeemTelegramLoginLink(
              -- session's IdP-verified email must equal the member's email, always. A member with no email gets no
              -- link at all (mintTelegramLoginLink 'no_email'), and a NULL here matches nothing.
              AND lower(m.email) = lower(?11)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_member_bindings b
+           WHERE b.tenant = ?5 AND b.member_id = telegram_login_links.member_id
         )
         AND NOT EXISTS (
           SELECT 1 FROM human_login_identities h
