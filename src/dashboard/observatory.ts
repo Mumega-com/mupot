@@ -57,6 +57,7 @@ export async function loadAgentStats(env: Env): Promise<Map<string, AgentStat>> 
      LEFT JOIN tasks t
             ON t.assignee_agent_id = a.id
            AND t.created_at >= ?1
+           AND ${TASK_NOT_ARCHIVED_SQL('t')}
      GROUP BY a.id`,
   )
     .bind(since)

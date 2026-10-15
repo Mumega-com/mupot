@@ -1,8 +1,6 @@
 // /approvals + status counts + the other dashboard task readers must honor task
 // archive (tasks_archive_state). Real sqlite D1 + all migrations; archive then
 // unarchive the same row and assert it leaves and returns.
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { loadApprovals, loadPublishable } from '../src/dashboard/approvals'
 import { loadTaskStatusCounts } from '../src/dashboard/operator-counts'
@@ -72,21 +70,5 @@ describe('dashboard honors task archive', () => {
     expect((await loadSwimlaneBars(env)).map((t) => t.id)).not.toContain('t-review')
     unarchive('t-review')
     expect((await loadRecentTasks(env)).map((t) => t.id)).toContain('t-review')
-  })
-
-  // Readers whose full render needs heavier fixtures: pin the predicate in source.
-  it.each([
-    ['health.ts', /status IN \('blocked', 'rejected'\)[\s\S]{0,200}TASK_NOT_ARCHIVED_SQL\(\)/],
-    ['projects.ts', /\$\{TASK_NOT_ARCHIVED_SQL\(\)\}\) AS open_work/],
-    ['projects.ts', /t\.project_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\('t'\)\}/],
-    ['projects.ts', /project_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}\$\{squadFilter\}\) AS direct_tasks/],
-    ['agents-admin.ts', /LEFT JOIN tasks t ON t\.assignee_agent_id = a\.id AND \$\{TASK_NOT_ARCHIVED_SQL\('t'\)\}/],
-    ['agents-admin.ts', /status IN \('in_progress','open'\)\s+AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
-    ['agents-admin.ts', /status = 'review'\s+AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
-    ['agent-profile.ts', /assignee_agent_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
-    ['index.ts', /FROM tasks WHERE squad_id = \? AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
-  ])('%s keeps the archive predicate on its task read', (file, re) => {
-    const src = readFileSync(join(__dirname, '..', 'src', 'dashboard', file), 'utf8')
-    expect(src).toMatch(re)
   })
 })

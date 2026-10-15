@@ -14,6 +14,7 @@
 // The pure renderers + derivations are exported for tests; the DB reads are thin.
 
 import type { Env } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const STALE_MS = 60 * 60 * 1000 // field older than 1h → flag "mind may be asleep"
 const INDUCTION_RATE_MS = 2000 // min gap between orientation writes (write-amplification cap, #88)
@@ -303,7 +304,7 @@ export async function buildOrient(
   const squadmates = members.filter((m) => m.agent_id !== agent.id && m.agent_id !== supervisor?.agent_id)
 
   const tasksRes = await env.DB.prepare(
-    `SELECT id, title, status FROM tasks WHERE assignee_agent_id = ?1 AND status IN ('open','in_progress','blocked') ORDER BY created_at ASC LIMIT 50`,
+    `SELECT id, title, status FROM tasks WHERE assignee_agent_id = ?1 AND status IN ('open','in_progress','blocked') AND ${TASK_NOT_ARCHIVED_SQL()} ORDER BY created_at ASC LIMIT 50`,
   )
     .bind(agent.id)
     .all<OrientTask>()
