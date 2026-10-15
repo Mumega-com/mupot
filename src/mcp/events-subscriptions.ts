@@ -410,6 +410,11 @@ export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Prom
   if (!row) return { live: false, reason: 'token_not_live' }
   if (row.member_status !== 'active') return { live: false, reason: 'member_inactive' }
   if (row.agent_status !== 'active') return { live: false, reason: 'agent_inactive' }
+  // A subscription made through a W2 ATTACHMENT stores the attachment's own token: it is live only while that attachment, its admission
+  // and its seat are. The token's cleanup trigger already revokes it on detach/revoke; this is the explicit re-check (as findLiveAttachment
+  // does per request) so a missed trigger can never keep a wake alive.
+  const att = await attachmentLiveness(env, sub.token_id)
+  if (att && !att.live) return { live: false, reason: att.reason }
   const grants = row.channel === 'directory'
     ? await resolveConsentedAgentCapabilities(env, sub.agent_id, sub.consented_by_member_id)
     : await resolveCapabilities(env, sub.member_id)
@@ -417,6 +422,28 @@ export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Prom
     return { live: false, reason: 'no_capability' }
   }
   return { live: true }
+}
+
+/** null = this token is not an attachment's seat token (nothing to check). Tolerates a pot without the attach tables. */
+async function attachmentLiveness(env: Env, tokenId: string): Promise<{ live: true } | { live: false; reason: string } | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT att.detached_at AS detached_at, adm.status AS adm_status, s.retired_at AS retired_at
+         FROM agent_seat_attachments att
+         LEFT JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
+         LEFT JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant
+        WHERE att.tenant = ?1 AND att.seat_token_id = ?2
+        LIMIT 1`,
+    ).bind(env.TENANT_SLUG, tokenId).first<{ detached_at: string | null; adm_status: string | null; retired_at: string | null }>()
+    if (!row) return null
+    if (row.detached_at !== null) return { live: false, reason: 'attachment_detached' }
+    if (row.adm_status !== 'live') return { live: false, reason: 'admission_not_live' }
+    if (row.retired_at !== null) return { live: false, reason: 'seat_retired' }
+    return { live: true }
+  } catch (err) {
+    if (/no such table:\s*agent_seat_(attachments|admissions|seats)\b/i.test(err instanceof Error ? err.message : String(err))) return null
+    throw err
+  }
 }
 
 /** Decrypt the current (+ unexpired previous) signing secrets. Throws on any failure. */
