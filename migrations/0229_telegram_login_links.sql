@@ -1,4 +1,4 @@
--- 0227_telegram_login_links.sql — mupot#1579: a Telegram-first member gets a web login by PROOF OF CONTROL.
+-- 0229_telegram_login_links.sql — mupot#1579: a Telegram-first member gets a web login by PROOF OF CONTROL.
 --
 -- WHY. A member born through the Telegram door (redeemTelegramProjectInvite) holds a bound chat, an email and no
 -- human_login_identities row. Under the exclusive-control rule (#1551/#1963) a bound chat is a competing controller, so

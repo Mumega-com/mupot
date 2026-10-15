@@ -401,6 +401,10 @@ export async function handleImMessage(
         ? 'You already have a web sign-in. Open the workspace in your browser and sign in.'
         : 'Could not create a sign-in link.'
     }
+    // The reply carries the plaintext link and is persisted in telegram_webhook_receipts.response_text. That is NOT
+    // redactable: a duplicate Telegram delivery of this update is answered from the stored reply (reservation.duplicate
+    // above), so the receipt must hold the exact reply for idempotent resend. Bounded exposure: the link is single use,
+    // expires in TELEGRAM_LOGIN_LINK_TTL_SECONDS, is superseded by the next /login, and is only usable with a session.
     return `Open this link in your browser to connect your web sign-in (valid 10 minutes, one use): ${origin}/auth/telegram-link?t=${minted.token}`
   }
 
