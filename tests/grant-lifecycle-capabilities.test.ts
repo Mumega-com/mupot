@@ -270,6 +270,20 @@ describe('migration 0228 — capability grant lifecycle', () => {
       ])
     })
 
+    it('an UPDATE inside a fresh context is attributed to the context actor, not the row’s old granted_by', async () => {
+      insertGrant('g1', { grantedBy: ADMIN, grantedVia: 'mcp' })
+      const [setCtx, clearCtx] = revokeContextStatements(env, { grantedBy: 'system:sweeper', reason: 'renewed by sweeper' })
+      await env.DB.batch([
+        setCtx,
+        env.DB.prepare("UPDATE capabilities SET expires_at = '2099-01-01 00:00:00' WHERE id = 'g1'"),
+        clearCtx,
+      ])
+      expect(events().filter((e) => e.event === 'granted').at(-1)).toMatchObject({ actor: 'system:sweeper', reason: 'renewed by sweeper' })
+      // outside a context the row's own granted_by speaks
+      h.sqlite.exec("UPDATE capabilities SET capability = 'admin' WHERE id = 'g1'")
+      expect(events().filter((e) => e.event === 'granted').at(-1)).toMatchObject({ actor: ADMIN })
+    })
+
     it('a stale context does not supply the TENANT either (60s window applies to every field)', () => {
       insertGrant('g1')
       h.sqlite
