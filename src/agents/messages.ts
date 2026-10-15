@@ -36,6 +36,24 @@ const MAX_INBOX_LIMIT = 100
 // is refused (inbox_full) past the cap so a compromised agent-bound token cannot spam a
 // recipient's inbox into unbounded storage growth. Reads (consume) free the budget.
 export const MAX_UNREAD_PER_RECIPIENT = 1000
+/** #1937: fraction of the unread cap at which an attached chat is warned (handled-by-attachment rows still count). */
+export const INBOX_NEAR_CAP_RATIO = 0.8
+
+/**
+ * #1937: the agent-level unread total, counted with the SAME predicate the send-side cap uses (tenant, to_agent,
+ * read_at IS NULL; seat-blind, handled-by-attachment rows included). An attached chat's peek hides what it handled, so
+ * this is the number that tells it whether senders are about to be refused with inbox_full. null on a DB error.
+ */
+export async function agentUnreadTotal(env: Env, agent: string): Promise<number | null> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL`,
+    ).bind(env.TENANT_SLUG, agent).first<{ n: number }>()
+    return Number(row?.n ?? 0)
+  } catch {
+    return null
+  }
+}
 const KINDS = ['message', 'request', 'ack'] as const
 type MessageKind = (typeof KINDS)[number]
 // ACK-protocol rid shape: a uuid or a slug-ish token. Linear, bounded — no ReDoS.

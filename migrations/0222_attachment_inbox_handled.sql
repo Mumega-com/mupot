@@ -15,5 +15,5 @@ CREATE TABLE IF NOT EXISTS agent_attachment_handled (
   handled_at    TEXT NOT NULL,
   PRIMARY KEY (attachment_id, message_id)
 );
-CREATE INDEX IF NOT EXISTS idx_agent_attachment_handled_msg
-  ON agent_attachment_handled(tenant, message_id);
+-- No secondary index: every read is by the PK prefix (attachment_id). Receipts are keyed to the attachment, so they do not
+-- survive a thread change (a new attachment starts clean); pruning rows of detached attachments is a follow-up.
