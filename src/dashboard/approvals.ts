@@ -30,6 +30,7 @@ import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache, primeVerdictIndependence } from '../tasks/index'
 import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export interface ApprovalItem {
   id: string
@@ -144,7 +145,8 @@ const BASE_SELECT = `
     LEFT JOIN squads s ON s.id = t.squad_id
     LEFT JOIN agents a ON a.id = t.assignee_agent_id
    WHERE t.status = 'review'
-     AND t.gate_owner IS NOT NULL`
+     AND t.gate_owner IS NOT NULL
+     AND ${TASK_NOT_ARCHIVED_SQL('t')}`
 
 // Tasks that cleared their gate (status='approved') and are content-publish work —
 // awaiting the SEPARATE admin "Publish" action (flight-1 gap fix). Deliberately
@@ -159,7 +161,8 @@ const PUBLISHABLE_SELECT = `
     FROM tasks t
     LEFT JOIN squads s ON s.id = t.squad_id
     LEFT JOIN agents a ON a.id = t.assignee_agent_id
-   WHERE t.status = 'approved' AND t.gate_owner = ?1`
+   WHERE t.status = 'approved' AND t.gate_owner = ?1
+     AND ${TASK_NOT_ARCHIVED_SQL('t')}`
 
 // Compute can_approve/can_reject per row via the SAME predicate the write
 // route calls (evaluateVerdictGates), PLUS the squad-scope check the write

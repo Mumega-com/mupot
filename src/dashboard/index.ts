@@ -81,7 +81,7 @@ import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
-import { SQUAD_ACTIVE_SQL } from '../hygiene/filters'
+import { SQUAD_ACTIVE_SQL, TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
@@ -1925,7 +1925,7 @@ dashboardApp.get('/squads/:id', async (c) => {
       // ranked correctly. The board is the surface an operator opens to answer "what is
       // next"; answering it with recency is a silent wrong answer.
       `SELECT ${TASK_SELECT_COLUMNS}
-         FROM tasks WHERE squad_id = ?
+         FROM tasks WHERE squad_id = ? AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, updated_at DESC`,
     )
       .bind(squadId)

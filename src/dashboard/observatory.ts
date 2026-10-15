@@ -16,6 +16,7 @@
 
 import type { Env, Agent } from '../types'
 import { derivePresence, resolveFleetPresenceTtlSec } from '../fleet/registry'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // ── Time window ───────────────────────────────────────────────────────────────
 
@@ -125,6 +126,7 @@ export async function loadSwimlaneBars(env: Env): Promise<SwimlaneBar[]> {
        FROM tasks
       WHERE assignee_agent_id IS NOT NULL
         AND created_at >= ?1
+        AND ${TASK_NOT_ARCHIVED_SQL()}
       ORDER BY created_at ASC`,
   )
     .bind(since)
@@ -225,6 +227,7 @@ export async function loadRecentTasks(env: Env): Promise<RecentTask[]> {
        FROM tasks t
        LEFT JOIN agents a ON a.id = t.assignee_agent_id
        LEFT JOIN squads s ON s.id = t.squad_id
+      WHERE ${TASK_NOT_ARCHIVED_SQL('t')}
       ORDER BY t.updated_at DESC
       LIMIT 10`,
   ).all<RecentTask>()

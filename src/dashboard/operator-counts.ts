@@ -45,6 +45,7 @@ import type { Agent, AuthContext, Env } from '../types'
 import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
 import { loadApprovals, type ApprovalsQueue } from './approvals'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export interface OperatorCounts {
   generatedAtMs: number
@@ -145,6 +146,7 @@ export async function loadTaskStatusCounts(env: Env): Promise<Map<string, number
   const rs = await env.DB.prepare(
     `SELECT status, COUNT(*) AS count FROM tasks
       WHERE ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
+        AND ${TASK_NOT_ARCHIVED_SQL()}
       GROUP BY status`,
   ).bind(env.TENANT_SLUG).all<TaskStatusRow>()
   const map = new Map<string, number>()

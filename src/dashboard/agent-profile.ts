@@ -1,6 +1,7 @@
 import type { Env } from '../types'
 import { cancelledColumnSql, flightOutcome, isBookkeepingClosed, isCancelledFlight, isCancelUnconfirmed, isRealFailure } from '../flight/cancelled'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 /**
  * Agent profile panels.
@@ -229,7 +230,7 @@ export async function loadWorkPanel(env: Env, agentId: string): Promise<PanelRes
     const res = await env.DB.prepare(
       `SELECT id, title, status, github_issue_url
          FROM tasks
-        WHERE assignee_agent_id = ?1
+        WHERE assignee_agent_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY updated_at DESC
         LIMIT ${PANEL_ROW_CAP}`,
     ).bind(agentId).all<{
