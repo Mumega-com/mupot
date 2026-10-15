@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { mcpApp, TOOLS } from '../src/mcp'
+import { mcpApp, TOOLS, wireName } from '../src/mcp'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { NEEDS_YOU_PROFILE, NEEDS_YOU_PROFILE_PATH, profileEntry } from '../src/mcp/profile-needs-you'
@@ -117,7 +117,7 @@ describe('/mcp is unchanged (regression guard)', () => {
     const { json } = await rpc('/', 'tools/list', undefined, {}, makeEnv())
     const tools = json!.result.tools as Array<{ name: string; annotations?: unknown }>
     // SEAT_AUTO_ENROLL is unset in this env: the flag-gated seat_select (mupot#1794) is not advertised.
-    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => t.name))
+    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => wireName(t.name)))
     expect(tools.length).toBeGreaterThan(NEEDS_YOU_PROFILE.length * 5)
     // mupot#1709: every /mcp entry now ALSO carries `annotations` (tests/mcp-tool-annotations.test.ts pins
     // their values). Deliberate update: the pre-#1709 shape had none. Everything else is unchanged.
