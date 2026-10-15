@@ -24,6 +24,7 @@ const { loadListMetrics, loadProjectDetail } = await import('../src/dashboard/pr
 const { loadAllAgents } = await import('../src/dashboard/agents-admin')
 const { loadWorkPanel } = await import('../src/dashboard/agent-profile')
 const { loadAgentStats } = await import('../src/dashboard/observatory')
+const { dashboardApp } = await import('../src/dashboard')
 const { projectsApp } = await import('../src/projects')
 const { buildOrient } = await import('../src/orient/service')
 const { listOfficePendingApprovals } = await import('../src/addons/office/service')
@@ -171,6 +172,14 @@ describe('archive honored by error-swallowing dashboard readers (behavioural)', 
     await cycle('t-office', async () => {
       const r = await listOfficePendingApprovals(env, owner)
       return r.ok && r.value.some((a) => a.id === 't-office')
+    })
+  })
+
+  it('GET /squads/:id board task list', async () => {
+    await cycle('t-blocked', async () => {
+      const r = await dashboardApp.fetch(new Request('https://pot.test/squads/s1'), env)
+      expect(r.status).toBe(200)
+      return (await r.text()).includes('Blocked work')
     })
   })
 })
