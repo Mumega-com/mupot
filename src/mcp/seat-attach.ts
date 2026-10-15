@@ -86,7 +86,7 @@ const toolSeatAttach: ToolSpec = {
       case 'agent_ambiguous':
         return fail(409, r.error, 'More than one agent matches; use the agent id.')
       case 'agent_identity_unminted':
-        return fail(409, r.error, 'That agent has no identity yet (no minted credential), so a thread cannot act as it.')
+        return fail(409, r.error, 'That agent\'s identity is not usable right now (for example its identity member is suspended), so a thread cannot act as it. An admin must restore it first.')
       case 'already_attached':
         return fail(409, r.error)
       case 'too_many_pending_admissions':
