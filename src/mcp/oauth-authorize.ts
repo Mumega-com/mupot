@@ -1959,6 +1959,15 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
       tokenId = minted.tokenId
     } catch (err) {
+      // mupot#1961: the agent was deactivated after the eligibility check; no credential exists.
+      if (err instanceof AgentInactiveError) {
+        const rejected = new Response(
+          'The selected agent is no longer active, so no connection key was issued. Please sign in again.',
+          { status: 409, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
+      }
       console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Token mint failed', { status: 500 })
     }
