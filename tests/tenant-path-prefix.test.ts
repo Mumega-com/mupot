@@ -240,6 +240,12 @@ describe('rewriter narrowing (P2)', () => {
     expect(out.indexOf('__MUPOT_BASE')).toBeLessThan(out.indexOf('<header>'))
   })
 
+  it('no <head>: the shim is never injected inside <header>', () => {
+    const out = rewriteHtmlForPrefix('<html><body><header class="h">x</header></body></html>', PREFIX)
+    expect(out.indexOf('__MUPOT_BASE')).toBeLessThan(out.indexOf('<header'))
+    expect(out).toContain('<header class="h">x</header>')
+  })
+
   it('a fragment gets no shim', () => {
     const out = rewriteHtmlForPrefix('<div><a href="/x">x</a></div>', PREFIX)
     expect(out).toBe('<div><a href="/t/local/x">x</a></div>')
