@@ -87,13 +87,18 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
 
 /** The agent's most recent message.created subscription that LAPSED (its lease ran out without a renewal). A subscription the human or
  *  server REVOKED is not a lapse and is never reported as one. */
-async function lastLapsedSubscription(env: Env, tenant: string, agentId: string, nowIso: string): Promise<{ id: string; refresh_before: string } | null> {
-  return env.DB.prepare(
-    `SELECT id, refresh_before FROM event_subscriptions
+async function lastLapsedSubscription(env: Env, tenant: string, agentId: string, nowIso: string): Promise<{ id: string; refresh_before: string; last_refreshed_at: string } | null> {
+  // Only the agent's MOST RECENT message.created subscription can be "the lapsed wake": if the newest one was deliberately revoked/unsubscribed,
+  // an older expired row is history, not a lapse (the agent chose to stop).
+  const newest = await env.DB.prepare(
+    `SELECT id, status, refresh_before, last_refreshed_at FROM event_subscriptions
       WHERE tenant = ?1 AND agent_id = ?2 AND event_name = 'message.created'
-        AND status IN ('active', 'expired') AND refresh_before <= ?3
-      ORDER BY refresh_before DESC LIMIT 1`,
-  ).bind(tenant, agentId, nowIso).first<{ id: string; refresh_before: string }>()
+      ORDER BY last_refreshed_at DESC, created_at DESC LIMIT 1`,
+  ).bind(tenant, agentId).first<{ id: string; status: string; refresh_before: string; last_refreshed_at: string }>()
+  if (!newest) return null
+  if (newest.status !== 'active' && newest.status !== 'expired') return null
+  if (newest.refresh_before > nowIso) return null
+  return { id: newest.id, refresh_before: newest.refresh_before, last_refreshed_at: newest.last_refreshed_at }
 }
 
 /** No live lease for this message's recipient: if a lease LAPSED, make that true and visible. Marks the row expired (it is not "active"
@@ -106,12 +111,18 @@ async function recordLapsedWake(env: Env, tenant: string, agentId: string, messa
     `UPDATE event_subscriptions SET status = 'expired', revoke_reason = COALESCE(revoke_reason, 'lapsed')
       WHERE id = ?1 AND status = 'active' AND refresh_before <= ?2`,
   ).bind(lapsed.id, nowIso).run()
-  const eventId = await eventIdFor(lapsed.id, messageId)
+  // A DISTINCT event id from the one delivery uses: a lapse receipt must never become the 'final receipt' that makes a later real delivery of
+  // the same (subscription, message) skip after the platform re-subscribes and the source message is retried.
+  const eventId = await eventIdFor(`lapse:${lapsed.id}`, messageId)
+  // The queue is not a trust boundary (a forged message.created can name any message id): count a missed wake ONLY for a real message in this
+  // tenant addressed to this agent and not sent by it, exactly what delivery verifies, and only while the lease is still lapsed.
   await env.DB.prepare(
     `INSERT INTO event_delivery_receipts (id, subscription_id, event_id, attempt, outcome, http_status, error_class, signed_at, created_at)
      SELECT ?1, ?2, ?3, 1, 'refused', NULL, 'subscription_lapsed', NULL, ?4
-      WHERE NOT EXISTS (SELECT 1 FROM event_delivery_receipts WHERE subscription_id = ?2 AND event_id = ?3)`,
-  ).bind(crypto.randomUUID(), lapsed.id, eventId, nowIso).run()
+      WHERE EXISTS (SELECT 1 FROM agent_messages WHERE id = ?5 AND tenant = ?6 AND to_agent = ?7 AND from_agent <> to_agent)
+        AND EXISTS (SELECT 1 FROM event_subscriptions WHERE id = ?2 AND refresh_before <= ?4 AND status IN ('active', 'expired'))
+        AND NOT EXISTS (SELECT 1 FROM event_delivery_receipts WHERE subscription_id = ?2 AND event_id = ?3)`,
+  ).bind(crypto.randomUUID(), lapsed.id, eventId, nowIso, messageId, tenant, agentId).run()
 }
 
 export type NativeWakeState =
@@ -130,18 +141,17 @@ export async function nativeWakeState(env: Env, tenant: string, agentId: string,
   if (live) return { state: 'live', refresh_before: live.refresh_before, last_refreshed_at: live.last_refreshed_at }
   const lapsed = await lastLapsedSubscription(env, tenant, agentId, nowIso)
   if (!lapsed) return { state: 'none' }
-  const row = await env.DB.prepare(
-    `SELECT last_refreshed_at FROM event_subscriptions WHERE id = ?1`,
-  ).bind(lapsed.id).first<{ last_refreshed_at: string }>()
+  // Only pushes missed SINCE the last renewal count: a subscription id is stable across re-subscribes, so earlier lapses are history.
   const missed = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM event_delivery_receipts WHERE subscription_id = ?1 AND outcome = 'refused' AND error_class = 'subscription_lapsed'`,
-  ).bind(lapsed.id).first<{ n: number }>()
+    `SELECT COUNT(*) AS n FROM event_delivery_receipts
+      WHERE subscription_id = ?1 AND outcome = 'refused' AND error_class = 'subscription_lapsed' AND created_at > ?2`,
+  ).bind(lapsed.id, lapsed.last_refreshed_at).first<{ n: number }>()
   return {
     state: 'lapsed',
     lapsed_at: lapsed.refresh_before,
-    last_refreshed_at: row?.last_refreshed_at ?? lapsed.refresh_before,
+    last_refreshed_at: lapsed.last_refreshed_at,
     missed_wakes: Number(missed?.n ?? 0),
-    action: 'The platform stopped renewing this agent\'s native wake subscription, so new messages do not wake its chat. Open this agent\'s conversation (or reconnect the mupot connector) so the platform subscribes again; Mupot cannot renew it.',
+    action: 'The platform stopped renewing this agent\'s native wake subscription, so new messages do not wake it. Reconnect the mupot connector (or re-open the connection) so the platform subscribes again; Mupot cannot renew it. Messages missed meanwhile stay unread in the inbox.',
   }
 }
 
