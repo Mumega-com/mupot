@@ -122,6 +122,18 @@ describe('memory read-your-writes', () => {
       expect(hits.map((x) => x.id)).not.toContain(unindexed)
     })
 
+    it('the fallback query is skipped (no extra D1 read) when the vector leg is full and the query is a sentence', async () => {
+      for (let i = 0; i < 3; i++) await remember(ALICE, `indexed ${i}`)
+      const seen: string[] = []
+      const realPrepare = h.db.prepare.bind(h.db)
+      h.db.prepare = ((sql: string) => { seen.push(sql); return realPrepare(sql) }) as typeof h.db.prepare
+      await recall(ALICE, 'some semantic question', 3)
+      expect(seen.some((q) => q.includes('created_at >= ?'))).toBe(false)
+      seen.length = 0
+      await recall(ALICE, 'single-token', 3) // exact token: always consults D1
+      expect(seen.some((q) => q.includes('created_at >= ?'))).toBe(true)
+    })
+
     it('dedupes an engram found by several legs and respects the limit', async () => {
       const id = await remember(ALICE, 'dedupe-me-123')
       const hits = await recall(ALICE, 'dedupe-me-123')
