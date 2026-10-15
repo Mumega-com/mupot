@@ -577,8 +577,8 @@ export async function acceptInvite(
         if (!existingGrant) {
           writes.push(
             env.DB.prepare(
-              `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-               SELECT ?8, ?1, ?9, ?10, ?11
+              `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_by, granted_via, reason)
+               SELECT ?8, ?1, ?9, ?10, ?11, ?12, 'invite', 'invite accepted by existing member'
                 WHERE EXISTS (SELECT 1 FROM members m WHERE ${PROVEN_INVITEE_MEMBER_SQL})
                   AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?12', '?2')})
                   AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?10 AND ?9 = 'department' AND kind = 'home')
@@ -587,10 +587,12 @@ export async function acceptInvite(
                     inviterIdParam: '?12',
                     scopeIdParam: '?10',
                     requiredRankParam: '?13',
+                    nowParam: '?14',
                   })}`,
             ).bind(
               targetId, env.TENANT_SLUG, invite.email, ...proofBinds, nowSqlUtc(),
               crypto.randomUUID(), scopeType, scopeId, invite.capability, inviterId, requiredRank,
+              nowCapabilitySql(),
             ),
           )
         }
