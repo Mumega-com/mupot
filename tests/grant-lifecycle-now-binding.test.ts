@@ -176,6 +176,18 @@ describe('elevation-conferred memberships carry the horizon (project messaging)'
     expect(await validateMessageProjectAccess(env, 'p-1', 'a-1', 'a-2')).toBe('project_access_denied')
   })
 
+  it('the project-scoped recipient pre-check also drops a LAPSED membership (sender and recipient)', async () => {
+    const { projectScopedRecipientVisible } = await import('../src/agents/messages')
+    await grant('a-1', 'm-1', FUTURE)
+    await grant('a-2', 'm-2', FUTURE)
+    expect(await projectScopedRecipientVisible(env, 'p-1', 'a-1', 'a-2')).toBe(true)
+    h.sqlite.exec(`UPDATE memberships SET expires_at = '${PAST}' WHERE agent_id = 'a-2' AND squad_id = 'sq-a'`)
+    expect(await projectScopedRecipientVisible(env, 'p-1', 'a-1', 'a-2')).toBe(false)
+    h.sqlite.exec(`UPDATE memberships SET expires_at = NULL WHERE agent_id = 'a-2' AND squad_id = 'sq-a'`)
+    h.sqlite.exec(`UPDATE memberships SET expires_at = '${PAST}' WHERE agent_id = 'a-1' AND squad_id = 'sq-a'`)
+    expect(await projectScopedRecipientVisible(env, 'p-1', 'a-1', 'a-2')).toBe(false)
+  })
+
   it('a permanent membership is unaffected (NULL horizon stays live)', async () => {
     await grant('a-1', 'm-1', null)
     await grant('a-2', 'm-2', null)

@@ -2517,7 +2517,7 @@ async function nonAdminRefCandidates(env: Env, ref: string): Promise<SendAgentRo
 // (both squads reach the project, project not archived) so this pre-check and the eventual
 // write-time authority agree. Deliberately its own predicate, consulted only as the LAST
 // resort in resolveNonAdminSendTarget (see its doc comment for why order matters).
-async function projectScopedRecipientVisible(
+export async function projectScopedRecipientVisible(
   env: Env,
   projectId: string,
   fromAgent: string,
