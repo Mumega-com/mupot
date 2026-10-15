@@ -71,7 +71,14 @@ import { createProjectInvite, type CreateProjectInviteError } from './project-in
 // this codebase already shares (see that module's header) — reused here so
 // "does this member hold a live token" can never drift into a second,
 // differently-worded copy of what "live" means.
-import { TOKEN_LIVE_PREDICATE, resolveAgentTokenExpiry } from '../auth/token-lifecycle'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc, resolveAgentTokenExpiry } from '../auth/token-lifecycle'
+import {
+  liveCompetingBearerSql,
+  PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
+  PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+  PROVISIONING_EXEMPT_TOKEN_LABEL,
+  UNVERIFIED_LOGIN_PROVIDERS,
+} from './exclusive-control'
 import { seatAutoEnrollEnabled, isHarnessTokenKind, HARNESS_TOKEN_KINDS } from './harness'
 import { mintHarnessToken } from './harness-token'
 // mupot#1551 (case-insensitivity gate finding on #1557): the SAME normalizer
@@ -329,10 +336,17 @@ export type AcceptInviteError =
   // see the creation-time refusal in parseInvite (same error name) for the
   // primitive this closes.
   | 'home_scope_not_invitable'
+  // mupot#1457: login-first redemption refused because the member already
+  // holds a LOWER grant on this exact scope. The invite is left UNSPENT (an
+  // admin can revoke the old grant or re-issue) and `held` names what the
+  // member already has — never silently consumed as if it upgraded them.
+  | 'existing_grant_not_upgraded'
+  // mupot#1457: a concurrent redemption landed the same scope grant first.
+  | 'member_already_holds_grant'
 
 export type AcceptInviteResult =
   | { ok: true; value: AcceptInviteSuccess }
-  | { ok: false; error: AcceptInviteError }
+  | { ok: false; error: AcceptInviteError; held?: Capability }
 
 /**
  * Redeem a web invite: mint the member, capability grant and (optionally)
@@ -372,14 +386,26 @@ export interface AcceptInviteOptions {
   verifiedMemberId?: string
 }
 
-/** Active, tenant-exact member holding a live login identity whose
- *  IdP-verified email is the invite's email. Params: ?1 member id, ?2 tenant,
- *  ?3 invite email. Shared by the pre-check and the write-time re-check. */
+/** Eligibility of a login-first redeemer's member row. ONE fragment, used
+ *  verbatim by the pre-check SELECT and the write-time capability INSERT.
+ *  Fixed params: ?1 member id, ?2 tenant, ?3 invite email, ?4/?5/?6 the
+ *  provisioning-exempt token label/channel + directory channel, ?7 now.
+ *  The member must be: active, not archived, tenant-exact, not agent-bound;
+ *  hold a LIVE login identity from an IdP-VERIFIED provider (not
+ *  bootstrap/local-test) whose verified email equals the invite email; and
+ *  have NO competing live unbound bearer (the #1550/#1551 rule: proving who
+ *  is CLAIMING a row says nothing about who ELSE holds a credential on it —
+ *  same clause requireExclusiveControl uses, via liveCompetingBearerSql). */
 const PROVEN_INVITEE_MEMBER_SQL = `
-  m.id = ?1 AND m.tenant = ?2 AND m.status = 'active'
+  m.id = ?1 AND m.tenant = ?2 AND m.status = 'active' AND m.archived_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.tenant = ?2 AND b.member_id = m.id)
   AND EXISTS (SELECT 1 FROM human_login_identities h
                WHERE h.member_id = m.id AND h.tenant = ?2 AND h.revoked_at IS NULL
-                 AND lower(h.verified_email) = lower(?3))`
+                 AND h.provider NOT IN (${UNVERIFIED_LOGIN_PROVIDERS.map((x) => `'${x}'`).join(', ')})
+                 AND lower(h.verified_email) = lower(?3))
+  AND NOT EXISTS (${liveCompetingBearerSql({
+    tenant: '?2', member: 'm.id', exemptLabel: '?4', exemptChannel: '?5', directoryChannel: '?6', now: '?7',
+  })})`
 
 export async function acceptInvite(
   env: Env,
@@ -511,14 +537,17 @@ export async function acceptInvite(
   // the caller). Never resolved by an email guess — an unproven match falls
   // through to the fresh path, which refuses with member_already_exists.
   if (options?.verifiedMemberId) {
+    const proofBinds = [
+      PROVISIONING_EXEMPT_TOKEN_LABEL,
+      PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+      PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
+    ] as const
     const proven = await env.DB.prepare(
       `SELECT m.id FROM members m WHERE ${PROVEN_INVITEE_MEMBER_SQL} LIMIT 1`,
     )
-      .bind(options.verifiedMemberId, env.TENANT_SLUG, invite.email)
+      .bind(options.verifiedMemberId, env.TENANT_SLUG, invite.email, ...proofBinds, nowSqlUtc())
       .first<{ id: string }>()
-    // An agent-bound member row is governed by the agent grant route, not
-    // by an invite link.
-    if (proven && !(await resolveBoundAgentForMember(env, proven.id))) {
+    if (proven) {
       const targetId = proven.id
       const existingGrant = await env.DB.prepare(
         `SELECT capability FROM capabilities
@@ -526,6 +555,12 @@ export async function acceptInvite(
       )
         .bind(targetId, scopeType, scopeId)
         .first<{ capability: Capability }>()
+      // A lower existing grant is NOT upgraded by this path: refuse by name,
+      // leave the invite unspent, say what they hold. Equal-or-higher is
+      // already satisfied and the invite is consumed without changing it.
+      if (existingGrant && capabilityRank(existingGrant.capability) < capabilityRank(invite.capability)) {
+        return { ok: false, error: 'existing_grant_not_upgraded', held: existingGrant.capability }
+      }
       const acceptedAtExisting = new Date().toISOString()
       const claimExisting = await env.DB.prepare(
         'UPDATE invites SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL',
@@ -537,28 +572,23 @@ export async function acceptInvite(
       }
       try {
         const writes = []
-        // A re-invite onto a scope the member already holds never widens or
-        // narrows it: only ADD a missing grant.
         if (!existingGrant) {
           writes.push(
             env.DB.prepare(
               `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-               SELECT ?1, ?2, ?3, ?4, ?5
-                WHERE EXISTS (SELECT 1 FROM members m WHERE m.id = ?2 AND m.tenant = ?7 AND m.status = 'active'
-                                AND EXISTS (SELECT 1 FROM human_login_identities h
-                                             WHERE h.member_id = m.id AND h.tenant = ?7 AND h.revoked_at IS NULL
-                                               AND lower(h.verified_email) = lower(?9)))
-                  AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?6', '?7')})
-                  AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?4 AND ?3 = 'department' AND kind = 'home')
-                  AND NOT EXISTS (SELECT 1 FROM capabilities WHERE member_id = ?2 AND scope_type = ?3 AND scope_id IS ?4)
+               SELECT ?8, ?1, ?9, ?10, ?11
+                WHERE EXISTS (SELECT 1 FROM members m WHERE ${PROVEN_INVITEE_MEMBER_SQL})
+                  AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?12', '?2')})
+                  AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?10 AND ?9 = 'department' AND kind = 'home')
+                  AND NOT EXISTS (SELECT 1 FROM capabilities WHERE member_id = ?1 AND scope_type = ?9 AND scope_id IS ?10)
                   AND ${currentMemberRankAtLeastSql(scopeType, {
-                    inviterIdParam: '?6',
-                    scopeIdParam: '?4',
-                    requiredRankParam: '?8',
+                    inviterIdParam: '?12',
+                    scopeIdParam: '?10',
+                    requiredRankParam: '?13',
                   })}`,
             ).bind(
-              crypto.randomUUID(), targetId, scopeType, scopeId, invite.capability,
-              inviterId, env.TENANT_SLUG, requiredRank, invite.email,
+              targetId, env.TENANT_SLUG, invite.email, ...proofBinds, nowSqlUtc(),
+              crypto.randomUUID(), scopeType, scopeId, invite.capability, inviterId, requiredRank,
             ),
           )
         }
@@ -576,6 +606,14 @@ export async function acceptInvite(
           .bind(inviteId)
           .run()
         if (err instanceof Error && err.message.includes('invite_accept_existing')) {
+          // 0 rows: either a concurrent redemption landed this exact scope
+          // grant first, or proof/inviter standing evaporated in the window.
+          const raced = await env.DB.prepare(
+            'SELECT capability FROM capabilities WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 LIMIT 1',
+          )
+            .bind(targetId, scopeType, scopeId)
+            .first<{ capability: Capability }>()
+          if (raced) return { ok: false, error: 'member_already_holds_grant', held: raced.capability }
           return { ok: false, error: 'invite_inviter_no_longer_authorized' }
         }
         throw err

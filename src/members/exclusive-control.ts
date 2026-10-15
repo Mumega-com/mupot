@@ -110,6 +110,37 @@ export const PROVISIONING_EXEMPT_TOKEN_LABEL = 'admin'
 export const PROVISIONING_EXEMPT_TOKEN_CHANNEL = 'dashboard'
 export const PROVISIONING_EXEMPT_DIRECTORY_CHANNEL = 'directory'
 
+/**
+ * The ONE copy of the "competing bearer" clause: a live, UNBOUND member bearer
+ * (agent_id IS NULL) other than the documented provisioning-seed and
+ * directory-connector exemptions. Returned as a bare `SELECT 1 FROM
+ * member_tokens t WHERE ...` body for the caller to wrap in EXISTS /
+ * NOT EXISTS. Every consumer (decideIdentitylessAttach below,
+ * linkLoginIdentity's requireExclusiveControl INSERT, acceptInvite's
+ * login-first grant) interpolates this — none re-derives it. Callers bind the
+ * six parameters under whatever names they number them.
+ */
+export function liveCompetingBearerSql(p: {
+  tenant: string
+  member: string
+  exemptLabel: string
+  exemptChannel: string
+  directoryChannel: string
+  now: string
+}): string {
+  return `SELECT 1 FROM member_tokens t
+           WHERE t.tenant = ${p.tenant} AND t.member_id = ${p.member} AND t.agent_id IS NULL
+             AND NOT (t.label = ${p.exemptLabel} AND t.channel = ${p.exemptChannel})
+             AND t.channel != ${p.directoryChannel}
+             AND ${TOKEN_LIVE_PREDICATE(p.now)}`
+}
+
+/** Login providers whose `verified_email` is NOT an IdP-verified claim:
+ *  src/auth/index.ts mints 'bootstrap' (owner-token form, subject = typed
+ *  email) and 'local-test' (dev login) identities from an unverified email.
+ *  They must never count as proof of control of an email. */
+export const UNVERIFIED_LOGIN_PROVIDERS = ['bootstrap', 'local-test'] as const
+
 export interface DecideIdentitylessAttachInput {
   tenant: string
   /** Already lower-cased + trimmed by the caller — this module never
@@ -245,11 +276,9 @@ export async function decideIdentitylessAttach(
   //    provenance). Shared liveness predicate (revocation + expiry) — never
   //    `revoked_at IS NULL` alone.
   const liveBearer = await env.DB.prepare(
-    `SELECT 1 AS present FROM member_tokens t
-      WHERE t.tenant = ?1 AND t.member_id = ?2 AND t.agent_id IS NULL
-        AND NOT (t.label = ?3 AND t.channel = ?4)
-        AND t.channel != ?5
-        AND ${TOKEN_LIVE_PREDICATE('?6')}
+    `${liveCompetingBearerSql({
+      tenant: '?1', member: '?2', exemptLabel: '?3', exemptChannel: '?4', directoryChannel: '?5', now: '?6',
+    })}
       LIMIT 1`,
   )
     .bind(

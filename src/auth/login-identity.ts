@@ -22,8 +22,9 @@ import type { Env } from '../types'
 import { revokeMemberPasskeys } from '../secure-moments/store'
 import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 import { revokeWebSessionsForLoginIdentity } from './web-sessions'
-import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
+import { nowSqlUtc } from './token-lifecycle'
 import {
+  liveCompetingBearerSql,
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_LABEL,
@@ -160,11 +161,9 @@ export async function linkLoginIdentity(
           -- pot_provision_receipts) is reachable from the tenant's own D1,
           -- and why the directory-channel exemption exists at all (mupot#1551
           -- round 2 P0: mintDirectoryToken's own unbound connector token).
-          SELECT 1 FROM member_tokens t
-           WHERE t.tenant = ?2 AND t.member_id = ?6 AND t.agent_id IS NULL
-             AND NOT (t.label = ?9 AND t.channel = ?10)
-             AND t.channel != ?11
-             AND ${TOKEN_LIVE_PREDICATE('?12')}
+          ${liveCompetingBearerSql({
+            tenant: '?2', member: '?6', exemptLabel: '?9', exemptChannel: '?10', directoryChannel: '?11', now: '?12',
+          })}
         )
         AND NOT EXISTS (
           SELECT 1 FROM members m

@@ -94,6 +94,7 @@ describe('#1457 login-first invite accept (real route)', () => {
     session.auth = null
     const res = await post(h, 'inv-ceo')
     expect(res.status).toBe(409)
+    expect((await res.text()).replace(/\s+/g, ' ')).toContain('Sign in with the account')
     expect(grants(h, 'member-ceo')).toEqual([])
     expect(inviteRow(h, 'inv-ceo').accepted_at).toBeNull()
     expect(memberCount(h)).toBe(3)
@@ -109,6 +110,10 @@ describe('#1457 login-first invite accept (real route)', () => {
     expect(grants(h, 'member-ceo')).toEqual([{ scope_type: 'department', scope_id: 'dept-a', capability: 'member' }])
     expect(inviteRow(h, 'inv-ceo').member_id).toBe('member-ceo')
     expect(memberCount(h)).toBe(3) // no new row minted
+    // provisionHomeForMember ran on the linked branch: the member got a home squad grant
+    const home = h.sqlite.prepare(`SELECT COUNT(*) AS n FROM capabilities c JOIN squads s ON s.id = c.scope_id
+      WHERE c.member_id = 'member-ceo' AND c.scope_type = 'squad' AND s.kind = 'home'`).get() as { n: number }
+    expect(home.n).toBe(1)
     const tokens = h.sqlite.prepare(`SELECT COUNT(*) AS n FROM member_tokens`).get() as { n: number }
     expect(tokens.n).toBe(0)
   })
@@ -118,6 +123,10 @@ describe('#1457 login-first invite accept (real route)', () => {
     session.auth = authFor('member-evil', 'evil@x.test')
     const res = await post(h, 'inv-ceo')
     expect(res.status).toBe(409)
+    // already signed in: must NOT tell them to sign in
+    const txt = (await res.text()).replace(/\s+/g, ' ')
+    expect(txt).toContain('could not be linked')
+    expect(txt).not.toContain('Sign in with the account')
     expect(grants(h, 'member-evil')).toEqual([])
     expect(grants(h, 'member-ceo')).toEqual([])
     expect(inviteRow(h, 'inv-ceo').accepted_at).toBeNull()
@@ -174,41 +183,155 @@ describe('#1457 login-first invite accept (real route)', () => {
     expect(grants(h, 'member-ceo')).toHaveLength(1)
   })
 
-  it('a different invite onto a scope the member already holds never widens or narrows it', async () => {
+  it('a higher/equal existing grant is left untouched, invite consumed, held capability returned', async () => {
+    h = makeHarness()
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-ceo', 'member-ceo', 'department', 'dept-a', 'admin');
+    `)
+    const r = await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+    expect(r.ok && r.value.capability).toEqual({ scope_type: 'department', scope_id: 'dept-a', capability: 'admin' })
+    expect(r.ok && r.value.linked_existing).toBe(true)
+    expect(grants(h, 'member-ceo')).toEqual([{ scope_type: 'department', scope_id: 'dept-a', capability: 'admin' }])
+    expect(inviteRow(h, 'inv-ceo').accepted_at).not.toBeNull()
+  })
+
+  it('a LOWER existing grant is not upgraded: refused by name, says what is held, invite left UNSPENT', async () => {
     h = makeHarness()
     h.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-ceo', 'member-ceo', 'department', 'dept-a', 'observer');
     `)
-    const env = envFor(h)
-    const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
-    expect(r.ok).toBe(true)
+    const r = await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+    expect(r).toEqual({ ok: false, error: 'existing_grant_not_upgraded', held: 'observer' })
     expect(grants(h, 'member-ceo')).toEqual([{ scope_type: 'department', scope_id: 'dept-a', capability: 'observer' }])
+    expect(inviteRow(h, 'inv-ceo')).toEqual({ accepted_at: null, member_id: null })
+    session.auth = authFor('member-ceo', 'ceo@corp.test')
+    const res = await post(h, 'inv-ceo')
+    expect(res.status).toBe(409)
+    expect(await res.text()).toContain('already hold observer')
   })
 
-  it('write-time re-check: proof or inviter standing lost between pre-check and write lands NO grant and un-spends the invite', async () => {
-    for (const lose of [
-      `UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = 'hli-ceo'`,
-      `UPDATE human_login_identities SET verified_email = 'other@corp.test' WHERE id = 'hli-ceo'`,
-      `UPDATE members SET status = 'suspended' WHERE id = 'member-ceo'`,
-      `UPDATE members SET tenant = 'other-pot' WHERE id = 'member-ceo'`,
-      `DELETE FROM capabilities WHERE id = 'cap-admin'`,
-      `UPDATE members SET status = 'suspended' WHERE id = 'member-admin'`,
-    ]) {
+  it('a concurrent identical grant landing first returns member_already_holds_grant and un-spends the invite', async () => {
+    h = makeHarness()
+    const harness = h
+    const env = envFor(h)
+    const realBatch = harness.db.batch.bind(harness.db)
+    env.DB = Object.assign(Object.create(harness.db), {
+      batch: async (stmts: Parameters<typeof realBatch>[0]) => {
+        harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+          VALUES ('cap-race', 'member-ceo', 'department', 'dept-a', 'member')`)
+        return realBatch(stmts)
+      },
+    }) as Env['DB']
+    const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+    expect(r).toEqual({ ok: false, error: 'member_already_holds_grant', held: 'member' })
+    expect(inviteRow(h, 'inv-ceo')).toEqual({ accepted_at: null, member_id: null })
+  })
+
+  it('concurrent double accept: exactly one redeems, the other is invite_already_accepted, one grant', async () => {
+    h = makeHarness()
+    const env = envFor(h)
+    const rs = await Promise.all([
+      acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }),
+      acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }),
+      acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }),
+    ])
+    expect(rs.filter((r) => r.ok)).toHaveLength(1)
+    expect(rs.filter((r) => !r.ok).every((r) => !r.ok && r.error === 'invite_already_accepted')).toBe(true)
+    expect(grants(h, 'member-ceo')).toHaveLength(1)
+  })
+
+  it('P1 exclusive control: a live unbound bearer on the row blocks the grant (pre-check by name, and at write time)', async () => {
+    h = makeHarness()
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, tenant, token_hash, label, channel)
+      VALUES ('tok-squat', 'member-ceo', '${TENANT}', 'hash-squat', 'workspace', 'workspace')`)
+    expect(await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }))
+      .toEqual({ ok: false, error: 'member_already_exists' })
+    expect(grants(h, 'member-ceo')).toEqual([])
+    h.close()
+
+    // appears between the pre-check and the write
+    h = makeHarness()
+    const harness = h
+    const env = envFor(h)
+    const realBatch = harness.db.batch.bind(harness.db)
+    env.DB = Object.assign(Object.create(harness.db), {
+      batch: async (stmts: Parameters<typeof realBatch>[0]) => {
+        harness.sqlite.exec(`INSERT INTO member_tokens (id, member_id, tenant, token_hash, label, channel)
+          VALUES ('tok-squat', 'member-ceo', '${TENANT}', 'hash-squat', 'workspace', 'workspace')`)
+        return realBatch(stmts)
+      },
+    }) as Env['DB']
+    expect(await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }))
+      .toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
+    expect(grants(h, 'member-ceo')).toEqual([])
+    expect(inviteRow(h, 'inv-ceo').accepted_at).toBeNull()
+  })
+
+  it('the documented provisioning-seed bearer (admin/dashboard) and a revoked bearer do NOT block', async () => {
+    h = makeHarness()
+    h.sqlite.exec(`
+      INSERT INTO member_tokens (id, member_id, tenant, token_hash, label, channel)
+        VALUES ('tok-seed', 'member-ceo', '${TENANT}', 'hash-seed', 'admin', 'dashboard');
+      INSERT INTO member_tokens (id, member_id, tenant, token_hash, label, channel, revoked_at)
+        VALUES ('tok-old', 'member-ceo', '${TENANT}', 'hash-old', 'workspace', 'workspace', datetime('now'));
+    `)
+    const r = await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+    expect(r.ok).toBe(true)
+  })
+
+  it('identities from unverified providers (bootstrap, local-test) never prove control', async () => {
+    for (const provider of ['bootstrap', 'local-test']) {
       h = makeHarness()
-      const harness = h
-      const env = envFor(h)
-      const realBatch = harness.db.batch.bind(harness.db)
-      // Race: the world changes after the pre-checks, right before the batch.
-      env.DB = Object.assign(Object.create(harness.db), {
-        batch: async (stmts: Parameters<typeof realBatch>[0]) => { harness.sqlite.exec(lose); return realBatch(stmts) },
-      }) as Env['DB']
-      const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
-      expect(r, lose).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
-      expect(grants(h, 'member-ceo'), lose).toEqual([])
-      expect(inviteRow(h, 'inv-ceo'), lose).toEqual({ accepted_at: null, member_id: null })
+      h.sqlite.exec(`UPDATE human_login_identities SET provider = '${provider}' WHERE id = 'hli-ceo'`)
+      expect(await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }), provider)
+        .toEqual({ ok: false, error: 'member_already_exists' })
       h.close(); h = undefined
     }
+  })
+
+  it('an archived member is refused (pre-check by name, and write-time race)', async () => {
+    h = makeHarness()
+    h.sqlite.exec(`UPDATE members SET archived_at = datetime('now') WHERE id = 'member-ceo'`)
+    expect(await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }))
+      .toEqual({ ok: false, error: 'member_already_exists' })
+    h.close()
+    h = makeHarness()
+    const harness = h
+    const env = envFor(h)
+    const realBatch = harness.db.batch.bind(harness.db)
+    env.DB = Object.assign(Object.create(harness.db), {
+      batch: async (stmts: Parameters<typeof realBatch>[0]) => {
+        harness.sqlite.exec(`UPDATE members SET archived_at = datetime('now') WHERE id = 'member-ceo'`)
+        return realBatch(stmts)
+      },
+    }) as Env['DB']
+    expect(await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }))
+      .toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
+    expect(grants(h, 'member-ceo')).toEqual([])
+  })
+
+  it('agent-bound at write time (bound between pre-check and write) lands no grant', async () => {
+    h = makeHarness()
+    const harness = h
+    const env = envFor(h)
+    const realBatch = harness.db.batch.bind(harness.db)
+    env.DB = Object.assign(Object.create(harness.db), {
+      batch: async (stmts: Parameters<typeof realBatch>[0]) => {
+        harness.sqlite.exec(`
+          INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
+          INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+            VALUES ('ag-1', 'squad-a', 'bot', 'Bot', 'operator', 'test', 'active');
+          INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+            VALUES ('${TENANT}', 'ag-1', 'member-ceo', datetime('now'));`)
+        return realBatch(stmts)
+      },
+    }) as Env['DB']
+    const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+    expect(r.ok).toBe(false)
+    expect(grants(h, 'member-ceo')).toEqual([])
+    expect(inviteRow(h, 'inv-ceo').accepted_at).toBeNull()
   })
 
   it('fresh email regression: a new person still gets a fresh member (unchanged public path)', async () => {
@@ -217,6 +340,7 @@ describe('#1457 login-first invite accept (real route)', () => {
       VALUES ('inv-new', 'new@corp.test', 'dept-a', 'member', 'member-admin')`)
     const r = await acceptInvite(envFor(h), 'inv-new', 'New')
     expect(r.ok && r.value.linked_existing).toBe(false)
+    expect(r.ok && r.value.capability).toEqual({ scope_type: 'department', scope_id: 'dept-a', capability: 'member' })
     expect(memberCount(h)).toBe(4)
   })
 

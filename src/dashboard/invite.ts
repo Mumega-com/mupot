@@ -354,12 +354,33 @@ inviteApp.post('/:id', async (c) => {
         403,
       )
     }
-    // member_already_exists
+    // mupot#1457: login-first refusals that name what happened.
+    if (result.error === 'existing_grant_not_upgraded') {
+      return c.html(
+        invitePageBody(
+          c.env.BRAND,
+          view.ctx,
+          `You already hold ${result.held ?? 'a role'} here; this invite did not change it. Ask an admin if you need a different role.`,
+        ),
+        409,
+      )
+    }
+    if (result.error === 'member_already_holds_grant') {
+      return c.html(
+        invitePageBody(c.env.BRAND, view.ctx, 'You already hold access here; this invite did not change it. Try again if it still does not show.'),
+        409,
+      )
+    }
+    // member_already_exists. A visitor who is ALREADY signed in has done what
+    // "sign in" asks, so say the truth: this account could not be linked to
+    // the invite automatically.
     return c.html(
       invitePageBody(
         c.env.BRAND,
         view.ctx,
-        'An account already exists for this email. Sign in with the account that received this invite, then open this link again.',
+        session
+          ? 'This account could not be linked to this invite automatically. Ask an admin to add you.'
+          : 'An account already exists for this email. Sign in with the account that received this invite, then open this link again.',
       ),
       409,
     )
