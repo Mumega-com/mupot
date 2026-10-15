@@ -6700,8 +6700,9 @@ const toolBootContext: ToolSpec = {
             ],
             to_get_write_access:
               'if you have no agent yet, call bootstrap_self { agent_name } — it creates your agent, mints its credential and makes you admin of its squad in one atomic act, with no other human involved. '
-              + (seatAttachEnabled(env)
-                // The advertised journey for a CHAT: attach to the existing agent with one passkey approval, no token. The bearer is for a
+              + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached
+                // Only for a session that HAS a seat and is not yet attached: seat_attach refuses a seatless caller (seat_required), so a seatless
+                // directory session keeps the old text rather than a dead end. The advertised journey for a CHAT: attach with one passkey approval, no token. The bearer is for a
                 // fixed CLI/daemon agent with no human in the chat. (Athena's native onboarding, 2026-10-15: this text still said "bearer".)
                 ? 'If your agent already exists and you are a chat with a human present, call seat_attach { agent: "<its name or id>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
                   + 'Only a fixed CLI/daemon agent with no human in the chat needs an org-admin to mint a WORKSPACE-channel token for it (mint_agent_token), connecting with that bearer. '
