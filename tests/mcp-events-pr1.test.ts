@@ -275,8 +275,8 @@ describe('discovery observability (shape-only logs)', () => {
     expect(await lines('[mcp:initialize]', () => init(42))).toEqual([
       { door: 'mcp', requested: 'number', negotiated: '2025-06-18', events_advertised: false },
     ])
-    expect(await lines('[mcp:initialize]', () => init('x'.repeat(41)))).toEqual([
-      { door: 'mcp', requested: 'string', negotiated: '2025-06-18', events_advertised: false },
+    expect(await lines('[mcp:initialize]', () => init('attacker-controlled free text'))).toEqual([
+      { door: 'mcp', requested: 'other', negotiated: '2025-06-18', events_advertised: false },
     ])
     const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
     try {

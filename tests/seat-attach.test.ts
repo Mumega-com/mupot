@@ -1975,6 +1975,18 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     expect((await ev(env, g.ctx, 'events/list', {})).body.result?.events).toEqual([]) // nobody eligible: empty, not a lie
   })
 
+  it('two live attachments but only ONE eligible: required:[agent] is still present (subscribe counts every live candidate, not only the eligible)', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin')
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-agent-hadi-admin'`)
+    const list = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Array<{ inputSchema: { required?: string[] }; description: string }>
+    expect(list[0].description).not.toContain('hadi-admin') // really only one eligible
+    expect(list[0].inputSchema.required).toEqual(['agent'])
+    expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error?.message).toBe('agent_required') // and subscribe really does refuse without it
+  })
+
   it('two CONNECTORS of one human attached to the same agent with the same callback keep separate subscriptions (the salt is human + harness)', async () => {
     const env = evEnv()
     const gA = await grant(env, HUMAN, 'client-chatgpt', 'ChatGPT')

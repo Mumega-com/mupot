@@ -7579,10 +7579,14 @@ function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>
   }
 }
 
-/** Shape-only description of the client's requested protocolVersion for the discovery log: the string itself when it is short, else its typeof. Never logs anything else from params. */
+const KNOWN_PROTOCOL_VERSIONS_FOR_LOG: ReadonlySet<string> = new Set(['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26'])
+
+/** Shape-only description of the client's requested protocolVersion for the discovery log. initialize is UNAUTHENTICATED, so free text is
+ *  never logged: a known version string is logged as is, any other string is 'other', a non-string is its typeof. */
 function requestedProtocolVersionForLog(params: unknown): string {
   const v = typeof params === 'object' && params !== null ? (params as { protocolVersion?: unknown }).protocolVersion : undefined // narrowed to an object just above; only protocolVersion is read
-  return typeof v === 'string' && v.length <= 40 ? v : typeof v
+  if (typeof v !== 'string') return typeof v
+  return KNOWN_PROTOCOL_VERSIONS_FOR_LOG.has(v) ? v : 'other'
 }
 
 async function handleJsonRpc(
