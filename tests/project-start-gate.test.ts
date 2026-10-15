@@ -45,6 +45,7 @@ import {
 } from '../src/projects/start-gate'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { AgentInactiveError } from '../src/members/service'
 
 const TENANT = 'pot-a'
 const NOW = '2026-07-23T12:00:00.000Z'
@@ -356,6 +357,28 @@ describe('startProject happy path', () => {
         resource: 'minted',
       })
       expect(await hasStartProvisionAttempt(env, 'proj-happy')).toBe(true)
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('startProject: agent deactivated between selection and the mint batch (mupot#1961)', () => {
+  it('blocks with the accurate no_squad_agent (not resource_commit_failed), stays planned, seeds no task', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      insertPlannedProject(harness, { id: 'proj-inactive', goal: 'Never activate' })
+      grantSquadAccess(harness, 'proj-inactive', 'write')
+      insertAgent(harness, 'agent-inactive')
+      const deps = makeDeps({
+        resolveActiveAgentMember: vi.fn(async () => 'unminted' as const),
+        mintAgentBoundToken: vi.fn(async () => { throw new AgentInactiveError() }),
+      })
+      const result = await startProject(env, 'proj-inactive', deps)
+      expect(result).toMatchObject({ ok: false, error: 'no_squad_agent' })
+      expect((await getProject(env, 'proj-inactive'))?.status).toBe('planned')
+      expect(deps.createTask).not.toHaveBeenCalled()
     } finally {
       harness.close()
     }

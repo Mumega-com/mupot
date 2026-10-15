@@ -7,6 +7,9 @@
 //      inactive agent lands zero rows (no member, binding, capability, token, gate grant, audit row).
 //   2. src/auth/token-lifecycle.ts TOKEN_LIVE_PREDICATE: a token welded to an inactive agent is not live,
 //      on every door that executes the predicate. Reactivating the agent revives the credential.
+//   3. Rotation and paused: a paused agent keeps its EXISTING tokens but gets no NEW credential (mint or rotate).
+//   4. migrations/0226 (receipt requires token) makes provisionAgentConnection's shared batch all-or-nothing
+//      (tests/agent-connection-service.test.ts).
 // Real schema (createSqliteD1 + applyAllMigrations); production functions only, no transcribed SQL.
 
 import { createHash } from 'node:crypto'
@@ -15,7 +18,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
-import { AgentInactiveError, mintAgentBoundToken, prepareAgentBoundTokenMint } from '../src/members/service'
+import { AgentInactiveError, mintAgentBoundToken, prepareAgentBoundTokenMint, prepareDirectoryTokenInsert } from '../src/members/service'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import { resolveExternalToken } from '../src/mcp/oauth-authorize'
 import type { Env } from '../src/types'
@@ -40,7 +43,8 @@ function setup(): { env: Env; q: (sql: string) => Array<Record<string, unknown>>
       ('m-op', 'op@pot.test', 'Operator', 'active', '${TENANT}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
       ('c-admin', 'm-admin', 'squad', 'sq-a', 'admin'),
-      ('c-op', 'm-op', 'squad', 'sq-a', 'admin');
+      ('c-op', 'm-op', 'squad', 'sq-a', 'admin'),
+      ('c-op-org', 'm-op', 'org', NULL, 'admin');
     -- the MCP caller is a separate human with its own bearer; the dashboard caller (m-admin) uses a cookie session.
     INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
       VALUES ('t-op', 'm-op', '${sha(ADMIN_TOKEN)}', 'op', 'workspace', datetime('now'), NULL, '${TENANT}');
@@ -49,7 +53,10 @@ function setup(): { env: Env; q: (sql: string) => Array<Record<string, unknown>>
       ('ag-dead', 'sq-a', 'dead', 'Dead', 'member', 'test', 'inactive'),
       ('ag-paused', 'sq-a', 'paused', 'Paused', 'member', 'test', 'paused');
   `)
-  const store = new Map<string, string>([['sess:s-admin', JSON.stringify({ userId: 'u-admin', email: 'admin@pot.test', role: 'member', createdAt: '2026-01-01T00:00:00Z' })]])
+  const store = new Map<string, string>([
+    ['sess:s-admin', JSON.stringify({ userId: 'u-admin', email: 'admin@pot.test', role: 'member', createdAt: '2026-01-01T00:00:00Z' })],
+    ['sess:s-owner', JSON.stringify({ userId: 'u-owner', email: 'owner@pot.test', role: 'owner', createdAt: '2026-01-01T00:00:00Z' })],
+  ])
   const kv = new Map<string, string>()
   const env = {
     DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'T', PUBLIC_ORIGIN: ORIGIN,
@@ -119,10 +126,10 @@ describe('#1961 mint refuses a non-active agent', () => {
     expect(countFor(q, 'ag-live').tokens).toBe(1)
   })
 
-  it('the in-batch guard is authoritative: a deactivate landing AFTER the preflight read still mints nothing', async () => {
+  it('the in-batch guard is authoritative: a deactivate landing AFTER the service reads still mints nothing', async () => {
     const { env, q } = setup()
-    // Preflight reads status=active; the agent flips inactive before the batch runs (the race a
-    // pre-read alone loses). Simulate by flipping on the first member_tokens-batch boundary.
+    // The service reads see status=active; the agent flips inactive immediately before the batch runs
+    // (the race a pre-read alone loses). Simulated by flipping at the batch boundary.
     const realBatch = env.DB.batch.bind(env.DB)
     let flipped = false
     env.DB.batch = (async (stmts: Parameters<typeof realBatch>[0]) => {
@@ -144,6 +151,89 @@ describe('#1961 mint refuses a non-active agent', () => {
     harness!.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = 'ag-live'`)
     await expect(mintAgentBoundToken(env, agent, 'second')).rejects.toBeInstanceOf(AgentInactiveError)
     expect(countFor(q, 'ag-live').tokens).toBe(1)
+  })
+})
+
+const adminTokenMint = (env: Env, agent: string) => dashboardApp.fetch(new Request(`${ORIGIN}/admin/agent-token/mint`, {
+  method: 'POST',
+  headers: { Cookie: 'mupot_session=s-owner', Origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({ agent_id: agent, label: 'seat', capability: 'member' }),
+}), env)
+
+describe('#1961 POST /admin/agent-token/mint refuses a non-active agent', () => {
+  it('POSITIVE CONTROL: an ACTIVE agent mints (200, one token, one weld)', async () => {
+    const { env, q } = setup()
+    expect((await adminTokenMint(env, 'ag-live')).status).toBe(200)
+    expect(countFor(q, 'ag-live')).toEqual({ tokens: 1, bindings: 1, grants: 1, members: 1 })
+  })
+  it.each(['ag-dead', 'ag-paused'])('%s: 409 agent_inactive, no token, no weld, no member, no grant', async (agent) => {
+    const { env, q } = setup()
+    const res = await adminTokenMint(env, agent)
+    expect(res.status).toBe(409)
+    expect(await res.text()).toContain('agent_inactive')
+    expect(countFor(q, agent)).toEqual({ tokens: 0, bindings: 0, grants: 0, members: 0 })
+  })
+})
+
+describe('#1961 paused rule: no NEW credentials (mint or rotate), existing tokens keep working', () => {
+  it('mintAgentBoundToken for a paused agent is refused (first mint and later mint)', async () => {
+    const { env, q } = setup()
+    const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
+    await expect(mintAgentBoundToken(env, { ...agent, id: 'ag-paused', slug: 'paused', name: 'Paused' }, 'x')).rejects.toBeInstanceOf(AgentInactiveError)
+    expect(countFor(q, 'ag-paused').tokens).toBe(0)
+    await mintAgentBoundToken(env, agent, 'first')
+    harness!.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'ag-live'`)
+    await expect(mintAgentBoundToken(env, agent, 'second')).rejects.toBeInstanceOf(AgentInactiveError)
+    expect(countFor(q, 'ag-live').tokens).toBe(1)
+  })
+
+  it('rotation batch for a paused agent lands no replacement and does NOT revoke the prior token', async () => {
+    const { env, q } = setup()
+    const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
+    const first = await mintAgentBoundToken(env, agent, 'prior')
+    const prepared = await prepareAgentBoundTokenMint(env, agent, 'next', { revokePriorTokenId: first.tokenId })
+    harness!.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'ag-live'`)
+    await env.DB.batch(prepared.statements)
+    expect(q(`SELECT COUNT(*) n FROM member_tokens WHERE agent_id = 'ag-live'`)[0].n).toBe(1)
+    expect(q(`SELECT revoked_at FROM member_tokens WHERE id = '${first.tokenId}'`)[0].revoked_at).toBeNull()
+  })
+
+  it('MCP mint_agent_token rotate_prior_token_id: paused and inactive agents are refused agent_inactive; the prior token keeps working', async () => {
+    const { env, q } = setup()
+    const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
+    const first = await mintAgentBoundToken(env, agent, 'prior')
+    for (const status of ['paused', 'inactive']) {
+      harness!.sqlite.exec(`UPDATE agents SET status = '${status}' WHERE id = 'ag-live'`)
+      const out = await callToolOutcome(await mcpCall(env, ADMIN_TOKEN, 'mint_agent_token', { agent: 'ag-live', rotate_prior_token_id: first.tokenId }))
+      expect({ status, outcome: [out.status, out.error] }).toEqual({ status, outcome: [409, 'agent_inactive'] })
+      expect(q(`SELECT revoked_at FROM member_tokens WHERE id = '${first.tokenId}'`)[0].revoked_at).toBeNull()
+    }
+    harness!.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'ag-live'`)
+    expect(await resolveMemberByToken(env, first.raw)).not.toBeNull()
+  })
+
+  it('POSITIVE CONTROL: the same MCP rotation for an ACTIVE agent is not refused as inactive', async () => {
+    const { env } = setup()
+    const first = await mintAgentBoundToken(env, { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }, 'prior')
+    const out = await callToolOutcome(await mcpCall(env, ADMIN_TOKEN, 'mint_agent_token', { agent: 'ag-live', rotate_prior_token_id: first.tokenId }))
+    expect(out.error).not.toBe('agent_inactive')
+    expect(out.status, JSON.stringify(out)).toBe(200)
+  })
+})
+
+describe('#1961 directory (OAuth consent) token insert is guarded for an existing agent', () => {
+  it('requireActiveAgent: lands for an active agent, writes ZERO rows for inactive and paused, ungated when unbound', async () => {
+    const { env, q } = setup()
+    const welded = await mintAgentBoundToken(env, { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }, 'workspace')
+    const run = async (agentId: string | null, opts?: { requireActiveAgent?: boolean }) => {
+      const { statement } = await prepareDirectoryTokenInsert(env, agentId === 'ag-live' ? welded.memberId : 'm-op', 'oauth:x', agentId, opts)
+      return (await statement.run()).meta?.changes ?? 0
+    }
+    expect(await run('ag-live', { requireActiveAgent: true })).toBe(1)
+    expect(await run('ag-dead', { requireActiveAgent: true })).toBe(0)
+    expect(await run('ag-paused', { requireActiveAgent: true })).toBe(0)
+    expect(await run(null, { requireActiveAgent: true })).toBe(1)
+    expect(q(`SELECT COUNT(*) n FROM member_tokens WHERE channel = 'directory'`)[0].n).toBe(2)
   })
 })
 

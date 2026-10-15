@@ -391,6 +391,62 @@ describe('agent connection provisioning', () => {
     ).get()).toEqual({ status: 'failed', error_code: 'replace_token_not_found' })
   })
 
+  // mupot#1961: the guarded token statements land only while the agent is active, but the access, receipt and
+  // request-flip statements share their batch. Migration 0226's receipt trigger turns a missing token into an
+  // error, which rolls the WHOLE batch back (D1 rolls back on error, never on a zero-row write).
+  describe('agent deactivated between the service reads and the provisioning batch (mupot#1961)', () => {
+    function deactivateBeforeBatch(): void {
+      const committedDb = harness.db
+      let raced = false
+      env = {
+        ...env,
+        DB: {
+          prepare: committedDb.prepare.bind(committedDb),
+          async batch(statements) {
+            if (!raced) {
+              harness.sqlite.exec("UPDATE agents SET status = 'inactive' WHERE id = 'agent-existing'")
+              raced = true
+            }
+            return committedDb.batch(statements)
+          },
+        } as Env['DB'],
+      }
+    }
+    const snapshot = () => ({
+      tokens: harness.sqlite.prepare('SELECT id, revoked_at FROM member_tokens ORDER BY id').all(),
+      memberships: count(harness.sqlite, 'memberships'),
+      capabilities: count(harness.sqlite, 'capabilities'),
+      receipts: count(harness.sqlite, 'agent_connection_receipts'),
+    })
+    const withExtraAccess = (action: 'add' | 'replace', requestId: string) => ({
+      ...existingInput(requestId, action),
+      additionalAccess: [{ squadId: 'squad-extra', capability: 'lead' as const }],
+    })
+
+    it.each(['add', 'replace'] as const)('%s: commits NOTHING (no receipt, no access rows, no token, prior token not revoked)', async (action) => {
+      seedExisting(harness.sqlite, { bound: true, token: true })
+      const before = snapshot()
+      deactivateBeforeBatch()
+
+      const out = await provisionAgentConnection(env, OWNER, withExtraAccess(action, `deact-${action}`), NOW)
+
+      expect(out).toMatchObject({ status: 'error' })
+      expect(snapshot()).toEqual(before)
+      expect(harness.sqlite.prepare(
+        `SELECT status FROM agent_connection_requests WHERE request_id = 'deact-${action}'`,
+      ).get()).toEqual({ status: 'failed' })
+    })
+
+    it('POSITIVE CONTROL: the same add with the agent still active commits access, receipt and token', async () => {
+      seedExisting(harness.sqlite, { bound: true, token: true })
+      const out = await provisionAgentConnection(env, OWNER, withExtraAccess('add', 'ok-add'), NOW)
+      expect(out).toMatchObject({ status: 'credential_issued' })
+      expect(count(harness.sqlite, 'agent_connection_receipts')).toBe(1)
+      expect(count(harness.sqlite, 'member_tokens')).toBe(2)
+      expect(count(harness.sqlite, 'memberships')).toBeGreaterThan(1)
+    })
+  })
+
   it('does not unassign tasks when a canonical binding prevents agent deletion', async () => {
     seedExisting(harness.sqlite, { bound: true, token: true })
     harness.sqlite.exec(`

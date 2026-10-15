@@ -227,7 +227,7 @@ describe('mintAgentBoundToken', () => {
         args,
         bind(...values: unknown[]) { return makeStmt(values) },
         async first(): Promise<unknown> {
-          // mupot#1961 preflight: the agent is active.
+          // mupot#1961: the rotation-prepare agent-status read (prepareAgentTokenReplacement) sees an active agent.
           if (sql.includes('FROM agents WHERE id = ? AND status')) return { ok: 1 }
           if (sql.includes('FROM agent_member_bindings')) {
             bindingRead += 1

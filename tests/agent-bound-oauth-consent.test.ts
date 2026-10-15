@@ -437,10 +437,23 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
     expect(after).toBeNull()
   })
 
-  it('(b) defence in depth: even if the token were somehow NOT revoked, an inactive agent grants no authority (refused at the token door, or zero capabilities)', async () => {
-    // Isolates the resolveConsentedAgentCapabilities status guard from the
-    // token-revocation side effect above — flips agents.status directly, leaves
-    // member_tokens untouched.
+  it('(b) defence in depth, PAUSED agent: the token still authenticates (pause keeps credentials) but resolveConsentedAgentCapabilities grants ZERO capabilities', async () => {
+    // Isolates the resolveConsentedAgentCapabilities status guard from both the token-revocation side effect
+    // and the token door: a paused agent's token IS live (TOKEN_LIVE_PREDICATE admits 'paused'), so the
+    // capability layer is the only thing standing between the session and the agent's authority.
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-status-only', MEMBER_AGENT_A, AGENT_A.id)
+    harness.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = '${AGENT_A.id}'`)
+
+    const auth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(auth).not.toBeNull() // token itself still live
+    expect(auth!.capabilities).toEqual([]) // but the agent's grant is gone
+  })
+
+  it('(b2) INACTIVE agent whose token was NOT revoked (status flipped without the sweep): refused at the token door (mupot#1961)', async () => {
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-status-only', MEMBER_AGENT_A, AGENT_A.id)
     harness.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${AGENT_A.id}'`)
@@ -449,11 +462,14 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
       memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    // mupot#1961: the token door (TOKEN_LIVE_PREDICATE) now refuses a token welded to a retired agent
-    // outright, so the flow never reaches the capability layer. Either outcome is fail-closed; a
-    // non-null context must still carry ZERO capabilities (the capability-layer guard stays).
-    if (auth !== null) expect(auth.capabilities).toEqual([])
-    else expect(auth).toBeNull()
+    expect(auth).toBeNull()
+
+    // Reactivation revives the (never-revoked) credential: nothing was destroyed, only gated.
+    harness.sqlite.exec(`UPDATE agents SET status = 'active' WHERE id = '${AGENT_A.id}'`)
+    expect(await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })).not.toBeNull()
   })
 
   it('the DB schema itself refuses to mint a member_tokens row pointing at an unminted agent — the strongest form of "unminted grants zero"', () => {

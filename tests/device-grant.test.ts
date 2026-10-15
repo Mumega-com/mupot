@@ -147,6 +147,22 @@ describe('device grant type-then-click', () => {
     expect(second.access_token).toBeUndefined()
   })
 
+  it('agent deactivated between the status read and the mint batch: Allow is refused, nothing minted, poll stays pending (mupot#1961)', async () => {
+    const env = envFor(harness)
+    const created = await createDeviceGrant(env, { agent: AGENT_A.slug, origin: 'https://pot.test' })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const realBatch = env.DB.batch.bind(env.DB)
+    env.DB.batch = (async (stmts: Parameters<typeof realBatch>[0]) => {
+      harness.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${AGENT_A.id}'`)
+      return realBatch(stmts)
+    }) as typeof env.DB.batch
+    const decided = await decideDeviceGrant(env, { user_code: created.value.user_code, action: 'allow', auth: adminAuth() })
+    expect(decided).toEqual({ ok: false, error: 'forbidden' })
+    expect((harness.sqlite.prepare(`SELECT COUNT(*) n FROM member_tokens WHERE agent_id = '${AGENT_A.id}'`).get() as { n: number }).n).toBe(0)
+    expect((await pollDeviceGrant(env, created.value.device_code)).status).toBe('authorization_pending')
+  })
+
   it('Deny does not mint; poll collapses to expired_token', async () => {
     const env = envFor(harness)
     const created = await createDeviceGrant(env, { agent: AGENT_A.slug, origin: 'https://pot.test' })
