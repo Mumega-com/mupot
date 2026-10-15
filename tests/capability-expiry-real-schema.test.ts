@@ -1,4 +1,4 @@
-// tests/capability-expiry-real-schema.test.ts — migration 0225.
+// tests/capability-expiry-real-schema.test.ts — migration 0226.
 //
 // A STANDING CAPABILITY GRANT THAT ENDS ON ITS OWN.
 //
@@ -29,7 +29,7 @@ const MEMBER = 'member-lead'
 const SQUAD = 'squad-mcpwp'
 const SCOPE = brandSquadScope({ id: SQUAD, department_id: 'dept-1', kind: 'work' })
 
-describe('migration 0225 — capability grants may expire', () => {
+describe('migration 0226 — capability grants may expire', () => {
   let h: SqliteD1Harness
   let env: Env
 

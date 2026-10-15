@@ -67,7 +67,7 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
     async batch(batch: StatementRecord[]) {
       batches.push(batch)
       return options.batchResults ?? [
-        { meta: { changes: 1 }, results: [] }, // revoke-context set (migration 0225)
+        { meta: { changes: 1 }, results: [] }, // revoke-context set (migration 0226)
         {
           meta: { changes: options.existingCapabilities?.length ?? 0 },
           results: (options.existingCapabilities ?? []).map((capability) => ({ capability })),

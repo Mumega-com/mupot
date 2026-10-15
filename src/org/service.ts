@@ -1914,7 +1914,7 @@ export async function moveAgentSquad(
     env.DB.prepare(
       `DELETE FROM memberships WHERE agent_id = ? AND squad_id = ?`,
     ).bind(input.agentId, input.fromSquadId),
-    // Who is revoking the source-squad grant: the grant_events trigger reads this (migration 0225).
+    // Who is revoking the source-squad grant: the grant_events trigger reads this (migration 0226).
     moveRevokeContext[0],
     env.DB.prepare(
       `DELETE FROM capabilities

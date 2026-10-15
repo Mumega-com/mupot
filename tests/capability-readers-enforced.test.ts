@@ -232,7 +232,7 @@ describe('every capabilities reader consumes the liveness predicate', () => {
 // ── writers ────────────────────────────────────────────────────────────────────
 //
 // The reader census keeps an expired grant dead everywhere it is read. This is its
-// twin for the audit half (migration 0225): every statement that CREATES a grant
+// twin for the audit half (migration 0226): every statement that CREATES a grant
 // must say who granted it and through which surface, and every DELETE must be
 // attributable. History itself is written by trigger, so a writer cannot forget the
 // EVENT — but it can still forget the PROVENANCE the event is built from.
