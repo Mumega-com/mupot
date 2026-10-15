@@ -433,7 +433,7 @@ export async function decideSeatAdmission(
           WHERE id = ?1 AND tenant = ?4 AND human_member_id = ?3 AND status = 'pending'`,
       ).bind(adm.id, nowIso, proof.memberId, env.TENANT_SLUG).run()
       return r.meta.changes === 1
-        ? { status: 200, title: 'Denied', message: 'The thread was not admitted. Nothing was attached.', tone: 'ok' }
+        ? { status: 200, title: 'Denied', message: 'Nothing was admitted and nothing was attached.', tone: 'ok' }
         : CLOSED
     }
     const refusal = await admissionRefusal(env, adm)
@@ -442,9 +442,9 @@ export async function decideSeatAdmission(
     }
     if (!(await input.gate())) return CLOSED
     const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member')
-    return landed
-      ? { status: 200, title: 'Admitted', message: `Threads from this app can now attach to that agent (ceiling: ${input.ceiling ?? 'member'}). Ask the thread to call seat_attach again: it attaches immediately.`, tone: 'ok' }
-      : CLOSED
+    if (!landed) return CLOSED
+    const who = (await admissionView(env, adm)).agentName
+    return { status: 200, title: 'Admitted', message: `Chats from this app can now act as ${who} (ceiling: ${input.ceiling ?? 'member'}). Paste the message below into the chat that asked: it attaches to ${who} by name, immediately.`, tone: 'ok' }
   })
 }
 

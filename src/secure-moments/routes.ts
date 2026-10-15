@@ -418,19 +418,21 @@ momentsApp.get('/m/:id/:token', async (c) => {
   let inner: string
   let title: string
   let approveLabel: string
+  let promptBlock = ''
   if (subject.kind === 'seat_admit') {
     const v = await admissionView(c.env, subject.adm)
     inner = `<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
 <dt>App</dt><dd>${untrustedBox('Connected app', `${v.harnessName} (${v.harnessKind})`)}</dd>
-<dt>Asked by thread</dt><dd>${escapeHtml(v.seatLabel ?? 'a thread')}</dd>
+<dt>Asked from chat</dt><dd>${escapeHtml(v.seatLabel ?? 'a chat')}</dd>
 <dt>Expires</dt><dd>${escapeHtml(subject.adm.expires_at ?? '')}</dd></dl>
-<h2>How much may those threads do as this agent?</h2>
+<h2>How much may ${escapeHtml(v.agentName)} do in your chats?</h2>
 <label class="row"><input type="radio" name="ceiling" value="member" checked> <strong>Member</strong>: everyday work (the default)</label>
 <label class="row"><input type="radio" name="ceiling" value="lead"> <strong>Lead</strong>: also lead-level work on what the agent leads</label>
 <label class="row"><input type="radio" name="ceiling" value="full"> <strong>Full</strong>: everything this agent itself may do, never more than you may</label>
-<h2>What approving does</h2><p>Lets threads from <strong>this connected app</strong> act as <strong>${escapeHtml(v.agentName)}</strong>, now and for later threads, until you revoke it on your Connections page. Whatever you choose, they never hold this agent's approval gates, and never more than you yourself may do. To change the level later you revoke and approve again.</p>`
-    title = 'Let a thread act as an agent'
+<h2>What approving does</h2><p>Lets chats from <strong>this connected app</strong> act as <strong>${escapeHtml(v.agentName)}</strong>, now and for later chats, until you revoke it on your Connections page. Whatever you choose, they never hold this agent's approval gates, and never more than you yourself may do. To change the level later you revoke and approve again.</p>`
+    title = `Let ${v.agentName} work in your chat`
     approveLabel = 'Admit'
+    promptBlock = agentPromptBlock({ agentName: v.agentName, agentSlug: v.agentSlug, agentId: subject.adm.agent_id })
   } else if (subject.kind === 'seed_attach') {
     const view = await seedViewInner(c.env, subject.row)
     if (!view.ok) return page(c, view.outcome.status, view.outcome.title, view.outcome.message, view.outcome.tone)
@@ -451,6 +453,7 @@ momentsApp.get('/m/:id/:token', async (c) => {
 <div class="row"><button class="primary" type="button" data-act="approve">${escapeHtml(approveLabel)} with passkey</button>
 <button class="danger" type="button" data-act="deny">Deny with passkey</button></div></form>
 <div id="status" role="status"></div>
+${promptBlock}
 ${decideHelpBlock(c.env)}`
   secure(c, true)
   return c.html(renderPage(title, body, { nonce: c.get('nonce'), code: DECIDE_SCRIPT }))
@@ -486,6 +489,27 @@ momentsApp.post('/m/:id/:token/challenge', async (c) => {
     publicKey: { challenge, rpId: c.get('host'), timeout: 120000, userVerification: 'required', allowCredentials: allow },
   })
 })
+
+/** After approving an admission the human pastes this into the chat that asked, so the chat attaches to THE AGENT BY NAME and
+ *  introduces itself. Plain text, no secret and no authority (the agent id is not a credential: seat_attach still needs the
+ *  admission just approved). Name/slug are admin-set text: escaped here, written to a textarea. */
+function agentPromptBlock(raw: { agentName: string; agentSlug: string; agentId: string }): string {
+  // The pasted text goes to an LLM: keep the admin-set name to ONE short plain line so it can neither carry instructions on extra
+  // lines nor grow the message (the page-level escaping below protects the HTML; this protects the model).
+  const oneLine = (v: string, max: number): string => v.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
+  const a = { agentName: oneLine(raw.agentName, 60) || 'there', agentSlug: oneLine(raw.agentSlug, 60), agentId: raw.agentId }
+  const who = a.agentSlug ? `${a.agentName} (${a.agentSlug})` : a.agentName
+  const text = [
+    `Hi ${a.agentName}. I have just approved you to work with me in this chat on mupot.`,
+    `Please attach to your identity now: call seat_attach { agent: "${a.agentId}" }.`,
+    `- If it says attached: call boot_context, then orient, and tell me in two or three lines who you are, which squad you are in, and what you can do for me.`,
+    `- If it says pending_admission or returns an error: stop and show me the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
+  ].join('\n')
+  return `<section id="agent-prompt-box"><h2>Then tell ${escapeHtml(who)}</h2>
+<p class="muted">Approve above, then copy this message and paste it into the chat that asked. It speaks to ${escapeHtml(a.agentName)} by name and holds no secret.</p>
+<textarea id="agent-prompt" readonly rows="7" style="width:100%">${escapeHtml(text)}</textarea>
+<div class="row"><button type="button" id="copy-prompt">Copy message</button></div></section>`
+}
 
 /** "No passkey prompt on this device?" help under the decide buttons. The link goes to the signed-in dashboard My Account (never to an
  *  enrolment from THIS page: the approve link is a bearer link, and adding a passkey from it would let whoever holds the link plant their own

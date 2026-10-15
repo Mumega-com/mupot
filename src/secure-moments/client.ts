@@ -13,6 +13,8 @@ function explain(e){return e&&e.name==='NotAllowedError'?'The passkey prompt was
 
 export const DECIDE_SCRIPT = `${COMMON}
 (function(){
+var cb=document.getElementById('copy-prompt');
+if(cb){cb.addEventListener('click',function(){var t=document.getElementById('agent-prompt');if(!t)return;var done=function(){cb.textContent='Copied'};var fall=function(){try{t.focus();t.select();t.setSelectionRange(0,t.value.length);document.execCommand('copy');done()}catch(e){cb.textContent='Select the text and copy it'}};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t.value).then(done,fall)}else{fall()}})}
 if(!window.PublicKeyCredential){show('Passkeys not available','This browser cannot use passkeys. Open the link in a browser that can.',false);lock(true);return}
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
