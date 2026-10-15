@@ -1456,7 +1456,7 @@ describe('a lapsed native-wake lease is recorded, not silent', () => {
     await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'to-someone-else', seq: 30 }))
     expect(lapsedReceipts()).toHaveLength(0) // the row exists but is addressed to another agent
     insertMsg('self-sent', { to: agent, from: agent })
-    await runQueue(makeEnv(), messageCreated({ to_agent: agent, from_agent: agent, message_id: 'self-sent', seq: 31 }))
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'self-sent', seq: 31 })) // the EVENT claims another sender; the ROW says self-sent: the row wins
     expect(lapsedReceipts()).toHaveLength(0)
   })
 
