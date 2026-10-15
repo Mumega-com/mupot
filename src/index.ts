@@ -80,6 +80,7 @@ import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
+import { applyTenantPrefix, responsePrefixFor } from './platform/tenant-path'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
@@ -367,8 +368,19 @@ function reportUnmatchedCron(scheduledAt: Date): void {
   })
 }
 
-export default {
-  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+/**
+ * mupot#1928 choke point: a path-routed tenant (`/t/<slug>`) is served behind a prefix the
+ * handlers never see, so every root-relative URL in its responses is re-rooted here, once.
+ * The prefix is server-resolved (apex route match, or the header the apex stamped on a
+ * dispatched request) and re-validated by parseTenantPrefix; it never comes from a URL.
+ */
+async function handleWithTenantPrefix(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const response = await handleRequest(req, env, ctx)
+  const prefix = responsePrefixFor(req, env.TENANT_SLUG || 'mumega')
+  return prefix === null || response.status === 101 ? response : applyTenantPrefix(response, prefix)
+}
+
+async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
     // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
@@ -428,7 +440,10 @@ export default {
     const hosted = await maybeHandleHostnameDispatch(req, env)
     if (hosted) return hosted
     return oauthProvider.fetch(req, env, ctx)
-  },
+}
+
+export default {
+  fetch: handleWithTenantPrefix,
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,

@@ -1,6 +1,7 @@
 // src/billing/routes.ts — Customer Billing, Checkout, and Stripe Webhook Endpoints.
 
 import { Hono } from 'hono'
+import { requestBase } from '../platform/tenant-path'
 import type { Env, AuthContext } from '../types'
 import { resolveTier } from './entitlement'
 import { PLAN_LIMITS, POT_FEATURES, type PotTier } from './plans'
@@ -61,7 +62,7 @@ billingRoutesApp.post('/checkout', csrf(), requireAuth, requireOrgCapability('ad
   const tier = typeof body.tier === 'string' ? (body.tier as PotTier) : 'starter'
   const interval = body.interval === 'year' ? 'year' : 'month'
   const customerEmail = typeof body.customer_email === 'string' ? body.customer_email.trim() : undefined
-  const origin = new URL(c.req.url).origin
+  const origin = requestBase(c.env, c.req.raw)
 
   const result = await createStripeCheckout(c.env, {
     tier,
@@ -90,7 +91,7 @@ billingRoutesApp.post('/portal', csrf(), requireAuth, requireOrgCapability('admi
     return c.json({ error: 'no_active_stripe_customer', detail: 'No billing record exists yet. Upgrade to a paid plan first.' }, 404)
   }
 
-  const origin = new URL(c.req.url).origin
+  const origin = requestBase(c.env, c.req.raw)
   const result = await createStripePortal(c.env, customerId, origin)
 
   if (!result.ok) {

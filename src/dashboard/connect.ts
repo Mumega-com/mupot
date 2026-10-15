@@ -9,6 +9,7 @@
 // page, never woven into a reusable config snippet.
 
 import type { WakeContract } from '../types'
+import { pinnedBase } from '../platform/tenant-path'
 
 /** The pot's MCP endpoint, derived from the request origin (never hardcoded). */
 export function mcpEndpoint(origin: string): string {
@@ -29,7 +30,9 @@ export function canonicalOrigin(env: { PUBLIC_ORIGIN?: string }, requestOrigin: 
       // Only an http(s) origin is valid here. A non-special scheme (e.g. javascript:)
       // parses without throwing and serializes .origin to the literal "null" — reject
       // it and fall back rather than render "null/mcp" into the brief.
-      if (u.protocol === 'https:' || u.protocol === 'http:') return u.origin
+      // mupot#1928: a path-routed tenant's PUBLIC_ORIGIN is `https://<root>/t/<slug>`; every
+      // consumer appends a path to this value, so the validated prefix must survive.
+      if (u.protocol === 'https:' || u.protocol === 'http:') return pinnedBase(pinned) ?? u.origin
     } catch {
       // misconfigured PUBLIC_ORIGIN → fall back to the request origin (never throw)
     }
@@ -65,7 +68,8 @@ export function requiredCanonicalOrigin(
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
     return { ok: false, error: 'public_origin_unconfigured' }
   }
-  return { ok: true, origin: url.origin }
+  // `origin` is the base URL consumers append to; it keeps a path tenant's /t/<slug> (mupot#1928).
+  return { ok: true, origin: pinnedBase(origin) ?? url.origin }
 }
 
 /** Claude Code `.mcp.json` snippet — streamable-HTTP, Bearer placeholder.

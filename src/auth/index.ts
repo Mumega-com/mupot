@@ -14,6 +14,7 @@
 //   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
 import { Hono } from 'hono'
+import { requestBase } from '../platform/tenant-path'
 import { csrf } from 'hono/csrf'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -221,9 +222,8 @@ function provider(env: Env): string {
 }
 
 /** Absolute redirect URI back to /auth/callback for this request's origin. */
-function callbackUrl(reqUrl: string): string {
-  const u = new URL(reqUrl)
-  return `${u.origin}/auth/callback`
+function callbackUrl(env: Env, req: Request): string {
+  return `${requestBase(env, req)}/auth/callback`
 }
 
 function bootstrapOwnerEnabled(env: Env): boolean {
@@ -541,7 +541,7 @@ authApp.get('/login', async (c) => {
 
   const params = new URLSearchParams({
     client_id: env.OAUTH_CLIENT_ID,
-    redirect_uri: callbackUrl(c.req.url),
+    redirect_uri: callbackUrl(c.env, c.req.raw),
     response_type: 'code',
     scope: 'openid email',
     state,
@@ -632,7 +632,7 @@ authApp.get('/callback', async (c) => {
       code,
       client_id: env.OAUTH_CLIENT_ID,
       client_secret: env.OAUTH_CLIENT_SECRET,
-      redirect_uri: callbackUrl(c.req.url),
+      redirect_uri: callbackUrl(c.env, c.req.raw),
       grant_type: 'authorization_code',
     }).toString(),
   })
@@ -768,7 +768,7 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
 
   const params = new URLSearchParams({
     client_id: env.OAUTH_CLIENT_ID,
-    redirect_uri: callbackUrl(c.req.url),
+    redirect_uri: callbackUrl(c.env, c.req.raw),
     response_type: 'code',
     scope: 'openid email',
     state,
@@ -1115,7 +1115,7 @@ authApp.post('/email/start', async (c) => {
     email,
     ip: resolveClientIp(c),
     pendingInviteId,
-    origin: new URL(c.req.url).origin,
+    origin: requestBase(c.env, c.req.raw),
     waitUntil: (p) => c.executionCtx.waitUntil(p),
   })
 
