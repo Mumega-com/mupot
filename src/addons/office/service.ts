@@ -294,7 +294,7 @@ export async function listOfficePendingApprovals(
            f.payload_json as payload_json, f.payload_sha256 as payload_sha256
       FROM tasks t
       LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL
-     WHERE t.gate_owner = ?1 AND t.status = 'review'
+     WHERE t.gate_owner = ?1 AND t.status = 'review' AND ${TASK_NOT_ARCHIVED_SQL('t')}
      ORDER BY t.created_at ASC
      LIMIT ?2
   `).bind(OFFICE_GATE_OWNER, bounded).all<OfficePendingApprovalRow>()

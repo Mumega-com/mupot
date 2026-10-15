@@ -33,6 +33,7 @@ import {
   recommitPrincipalFromAuth,
 } from './circuit-breaker'
 import { prepareProjectWorkerProvision } from './provisioner'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
@@ -227,7 +228,7 @@ async function projectAggregates(
 ): Promise<{ direct_tasks: number; direct_squads: number; direct_flights: number }> {
   if (unrestrictedProjectRead(access)) {
     const [tasks, squads, flights] = await Promise.all([
-      env.DB.prepare('SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
+      env.DB.prepare(`SELECT COUNT(*) AS count FROM tasks WHERE project_id = ? AND ${TASK_NOT_ARCHIVED_SQL()}`).bind(projectId).first<{ count: number }>(),
       env.DB.prepare('SELECT COUNT(*) AS count FROM project_squad_access WHERE project_id = ?').bind(projectId).first<{ count: number }>(),
       env.DB.prepare('SELECT COUNT(*) AS count FROM flights WHERE project_id = ? AND tenant = ?').bind(projectId, env.TENANT_SLUG).first<{ count: number }>(),
     ])
@@ -246,7 +247,7 @@ async function projectAggregates(
       `SELECT COUNT(*) AS count
          FROM tasks t
          JOIN squads s ON s.id = t.squad_id
-        WHERE t.project_id = ?1
+        WHERE t.project_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL('t')}
           AND (s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
             OR s.department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))`,
     ).bind(projectId, squadIds, departmentIds).first<{ count: number }>(),

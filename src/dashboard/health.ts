@@ -9,6 +9,7 @@ import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRunti
 import { loadApprovals, type ApprovalsQueue } from './approvals'
 import { computeOperatorCounts, loadTaskStatusCounts, type OperatorCounts } from './operator-counts'
 import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export type HealthTone = 'ok' | 'warn' | 'danger' | 'dim'
 
@@ -387,6 +388,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
          FROM tasks
         WHERE status IN ('blocked', 'rejected')
           AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
+          AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY updated_at DESC
         LIMIT 5`,
       [tenant],

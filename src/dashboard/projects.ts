@@ -51,6 +51,7 @@ import {
 } from '../projects/provisioner'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
@@ -445,7 +446,8 @@ export async function loadListMetrics(
             (SELECT COUNT(*) FROM tasks
               WHERE project_id = p.id${squadFilter}
                 AND status IN ('open', 'in_progress', 'blocked', 'review')
-                AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', tenantParam, 'tasks.status')}) AS open_work,
+                AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', tenantParam, 'tasks.status')}
+                AND ${TASK_NOT_ARCHIVED_SQL()}) AS open_work,
             (SELECT COUNT(*) FROM flights f
               WHERE f.project_id = p.id
                 AND f.tenant = ${tenantParam}
@@ -623,7 +625,7 @@ async function loadReadableTasks(
     `SELECT t.id, t.title, t.status, t.squad_id, s.name AS squad_name, s.department_id
       FROM tasks t
        JOIN squads s ON s.id = t.squad_id
-      WHERE t.project_id = ?1${filter}
+      WHERE t.project_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL('t')}${filter}
       ORDER BY CASE t.status
         WHEN 'review' THEN 1
         WHEN 'blocked' THEN 2
@@ -731,7 +733,7 @@ async function loadProjectAggregates(
   const tenantParam = unrestricted ? '?2' : '?3'
   const row = await env.DB.prepare(
     `SELECT
-       (SELECT COUNT(*) FROM tasks WHERE project_id = ?1${squadFilter}) AS direct_tasks,
+       (SELECT COUNT(*) FROM tasks WHERE project_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL()}${squadFilter}) AS direct_tasks,
        (SELECT COUNT(*) FROM project_squad_access WHERE project_id = ?1${squadFilter}) AS direct_squads,
        (SELECT COUNT(*) FROM flights f
          WHERE f.project_id = ?1 AND f.tenant = ${tenantParam}${flightFilter}) AS direct_flights`,

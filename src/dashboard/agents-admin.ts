@@ -16,6 +16,7 @@
 
 import type { AuthContext, Env } from '../types'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // ── Row shapes (what D1 returns; narrower than the full Agent type) ───────────
 
@@ -121,17 +122,19 @@ export async function loadAllAgents(env: Env, auth: AuthContext): Promise<AgentA
        (SELECT title FROM tasks
           WHERE assignee_agent_id = a.id
             AND status IN ('in_progress','open')
+            AND ${TASK_NOT_ARCHIVED_SQL()}
           ORDER BY updated_at DESC
           LIMIT 1) AS current_task_title,
        (SELECT title FROM tasks
           WHERE assignee_agent_id = a.id
             AND status = 'review'
+            AND ${TASK_NOT_ARCHIVED_SQL()}
           ORDER BY updated_at DESC
           LIMIT 1) AS review_task_title
      FROM agents a
      JOIN squads s ON s.id = a.squad_id
      LEFT JOIN departments d ON d.id = s.department_id
-     LEFT JOIN tasks t ON t.assignee_agent_id = a.id
+     LEFT JOIN tasks t ON t.assignee_agent_id = a.id AND ${TASK_NOT_ARCHIVED_SQL('t')}
      -- G-FP1b point 2/3: resolveAccessibleSquadIds returns null (no extra
      -- query) for an unrestricted caller, same as before this PR — so the
      -- home exclusion is pushed into this query directly rather than
