@@ -117,10 +117,10 @@ const toolInboxMarkHandled: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (!seatAttachEnabled(env)) return fail(403, 'seat_attach_disabled', 'Attaching a thread to an existing agent is not enabled on this pot.')
+    // (the SEAT_ATTACH flag is refused by invokeTool's SEAT_ATTACH_FLAG_TOOLS gate before this runs)
     // Server-derived: only a thread the SERVER bound to a LIVE attachment. A host / agent-bound token consumes with inbox_ack.
     const att = attachedAuthority(auth)
-    if (!att || !auth.boundAgentId || auth.boundAgentId !== att.agentId) {
+    if (!att) {
       return fail(403, 'not_attached_seat', 'inbox_mark_handled is for an attached chat. An agent host clears mail with inbox_ack.')
     }
     const ids = normalizeHandledIds(args.ids)

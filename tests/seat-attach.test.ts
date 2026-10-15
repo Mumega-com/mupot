@@ -2156,5 +2156,7 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     const off = envFor(h, { SEAT_ATTACH: undefined })
     expect(advertisedTools(off).some((t) => t.name === 'inbox_mark_handled')).toBe(false)
     expect(advertisedTools(envFor(h)).some((t) => t.name === 'inbox_mark_handled')).toBe(true)
+    const { invokeTool } = await import('../src/mcp/index')
+    expect(JSON.stringify(await invokeTool(HOST_BOUND(), off, 'inbox_mark_handled', {}, 'https://pot.test'))).toContain('seat_attach_disabled')
   })
 })
