@@ -29,6 +29,7 @@ import {
 } from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
+import { previewTelegramLoginLink, redeemTelegramLoginLink } from './telegram-login-link'
 import {
   createWebSession,
   evaluateWebSession,
@@ -778,6 +779,68 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
     prompt: 'select_account consent',
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
+})
+
+// mupot#1579 — Telegram-first member web login by PROOF OF CONTROL (src/auth/telegram-login-link.ts).
+// The link is minted only inside the authenticated private chat (`/login`). Opening it shows who it is for and
+// what login it will attach; the POST consumes it. The identity linked is the one THIS session carries (server-side
+// session record) — never one named in the request, never one inferred from an email.
+authApp.use('/telegram-link', csrf())
+
+function telegramLinkPage(brand: string, inner: string): string {
+  const esc = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Connect your sign-in · ${esc(brand)}</title></head><body><main>${inner}</main></body></html>`
+}
+
+async function sessionLoginIdentity(c: Context<AppEnv>): Promise<{ provider: string; subject: string; email: string | null } | null> {
+  const sessionId = getCookie(c, COOKIE_NAME)
+  if (!sessionId) return null
+  const raw = await c.env.SESSIONS.get(sessionKey(sessionId))
+  if (!raw) return null
+  try {
+    const record = JSON.parse(raw) as Partial<SessionRecord>
+    if (!record.loginIdentity) return null
+    return { provider: record.loginIdentity.provider, subject: record.loginIdentity.subject, email: record.email ?? null }
+  } catch {
+    return null
+  }
+}
+
+authApp.get('/telegram-link', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+  const brand = c.env.BRAND || c.env.TENANT_SLUG
+  const token = c.req.query('t') ?? ''
+  const preview = await previewTelegramLoginLink(c.env, token)
+  if (!preview) {
+    return c.html(telegramLinkPage(brand, '<h1>This link is not valid</h1><p>It may have expired or already been used. Send /login to the bot again for a new one.</p>'), 404)
+  }
+  const identity = await sessionLoginIdentity(c)
+  if (!identity) {
+    return c.html(telegramLinkPage(brand, '<h1>Sign in first</h1><p><a href="/auth/login">Sign in</a>, then open this link again to connect that sign-in to your Telegram account.</p>'))
+  }
+  const safe = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return c.html(telegramLinkPage(brand, `<h1>Connect this sign-in to your Telegram account</h1><p>Telegram account: ${safe(preview.displayName)}. Sign-in: ${safe(identity.provider)}${identity.email ? ` (${safe(identity.email)})` : ''}.</p><form method="post" action="/auth/telegram-link"><input type="hidden" name="t" value="${safe(token)}"><button type="submit">Connect</button></form>`))
+})
+
+authApp.post('/telegram-link', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+  const brand = c.env.BRAND || c.env.TENANT_SLUG
+  const refuse = (): Response =>
+    c.html(telegramLinkPage(brand, '<h1>This link could not be used</h1><p>It may have expired, been used, or this sign-in cannot be connected. Send /login to the bot for a new link.</p>'), 403)
+  const identity = await sessionLoginIdentity(c)
+  if (!identity) return refuse()
+  const form = await c.req.parseBody()
+  const token = typeof form.t === 'string' ? form.t : ''
+  const result = await redeemTelegramLoginLink(c.env, {
+    token,
+    provider: identity.provider,
+    subject: identity.subject,
+    verifiedEmail: identity.email,
+  })
+  if (!result.ok) return refuse()
+  return c.redirect('/')
 })
 
 // GET /auth/handoff?token= → accept a mumega-signed verified-email claim (#262).
