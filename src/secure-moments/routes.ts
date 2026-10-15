@@ -500,13 +500,13 @@ function agentPromptBlock(raw: { agentName: string; agentSlug: string; agentId: 
   const a = { agentName: oneLine(raw.agentName, 60) || 'there', agentSlug: oneLine(raw.agentSlug, 60), agentId: raw.agentId }
   const who = a.agentSlug ? `${a.agentName} (${a.agentSlug})` : a.agentName
   const text = [
-    `Hi ${a.agentName}. I have just approved you to work with me in this chat on mupot.`,
-    `Please attach to your identity now: call seat_attach { agent: "${a.agentId}" }.`,
-    `- If it says attached: call boot_context, then orient, and tell me in two or three lines who you are, which squad you are in, and what you can do for me.`,
-    `- If it says pending_admission, already_pending or returns an error: stop and show me the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
+    `Message from mupot for ${a.agentName}. Your user approved your request to act as ${a.agentName} in this chat.`,
+    `Attach now: call seat_attach { agent: "${a.agentId}" }.`,
+    `- If it says attached: call boot_context, then orient, and tell your user in two or three lines who you are, which squad you are in, and what you can do for them.`,
+    `- If it says pending_admission, already_pending or returns an error: stop and show your user the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
   ].join('\n')
   return `<section id="agent-prompt-box" data-agent="${escapeHtml(a.agentName)}"><h2>Then tell ${escapeHtml(who)}</h2>
-<p class="muted">Approve above, then copy this message and paste it into the chat that asked. It speaks to ${escapeHtml(a.agentName)} by name and holds no secret.</p>
+<p class="muted">Approve above, then copy this message and paste it into the chat that asked. It is a message from mupot to ${escapeHtml(a.agentName)}, addressed by name, and holds no secret.</p>
 <textarea id="agent-prompt" readonly rows="7" style="width:100%;box-sizing:border-box">${escapeHtml(text)}</textarea>
 <div class="row"><button type="button" id="copy-prompt">Copy message</button></div></section>`
 }

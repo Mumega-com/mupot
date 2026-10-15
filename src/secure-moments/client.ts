@@ -23,8 +23,9 @@ function setAgentPrompt(kind,title,message){
  var box=document.getElementById('agent-prompt-box'),t=document.getElementById('agent-prompt');if(!box||!t)return;
  var who=box.getAttribute('data-agent')||'there';
  var line=function(v){return String(v==null?'':v).replace(/[\\u0000-\\u001f\\u007f]+/g,' ').replace(/\\s+/g,' ').trim().slice(0,300)};
- if(kind==='denied'){t.value='Hi '+who+'. I reviewed your request to act as '+who+' and DENIED it. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell me in two lines what you needed access for, and I will decide whether to set it up another way.'}
- else{t.value='Hi '+who+'. I tried to approve your request but mupot did not record it: "'+line(title)+': '+line(message)+'". Nothing was changed.\\nDo not retry other routes and do not ask for tokens or extra access.\\nShow me what you were trying to do and wait for my instruction.'}
+ var hdr='Message from mupot for '+who+'. ';
+ if(kind==='denied'){t.value=hdr+'Your user DENIED your request to act as '+who+'. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell your user in two lines what you needed access for; they will decide whether to set it up another way.'}
+ else{t.value=hdr+'Your user tried to approve your request but mupot did not record it: "'+line(title)+': '+line(message)+'". Nothing was changed.\\nDo not retry other routes and do not ask for tokens or extra access.\\nTell your user what you were trying to do and wait for their instruction.'}
  var h=box.querySelector('h2');if(h)h.textContent=kind==='denied'?'Tell '+who+' it was denied':'Tell '+who+' what happened';
  var cb=document.getElementById('copy-prompt');if(cb)cb.textContent='Copy message';
 }

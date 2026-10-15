@@ -629,7 +629,8 @@ describe('who may be attached, and who may call', () => {
     const path = new URL(String(pend.sc.approve_url)).pathname
     const page = await (await hit(path, env)).text()
     expect(page).toContain('id="agent-prompt"')
-    expect(page).toContain('Hi Rava.')
+    expect(page).toContain('Message from mupot for Rava. Your user approved your request')
+    expect(page).not.toMatch(/textarea[^>]*>[^<]*\bI have\b/)
     expect(page).toContain('seat_attach { agent: &quot;agent-rava&quot; }') // the id, escaped inside the textarea
     expect(page).toContain('id="copy-prompt"')
     expect(page).toContain('already_pending') // the message covers every non-attached answer
