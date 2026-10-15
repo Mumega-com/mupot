@@ -1,4 +1,4 @@
-// tests/grant-lifecycle-capabilities.test.ts — migration 0226.
+// tests/grant-lifecycle-capabilities.test.ts — migration 0228.
 //
 // ISO 27001 A.5.18 / SOC 2 CC6.2-6.3: a standing capability grant has a lifecycle —
 // it can expire, it records who granted it / through what / why, and its history
@@ -46,7 +46,7 @@ interface EventRow {
   snapshot_json: string
 }
 
-describe('migration 0226 — capability grant lifecycle', () => {
+describe('migration 0228 — capability grant lifecycle', () => {
   let h: SqliteD1Harness
   let env: Env
 

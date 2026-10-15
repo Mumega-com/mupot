@@ -115,7 +115,7 @@ export async function confirmJoin(
   squad: Squad,
   agentId: string,
   capability: string,
-  /** The member who confirmed the join (recorded as granted_by, migration 0226). */
+  /** The member who confirmed the join (recorded as granted_by, migration 0228). */
   actorMemberId: string | null = null,
 ): Promise<{ ok: true; result: 'created' | 'updated' | 'unchanged'; membership: Membership; grant: unknown }
   | { ok: false; error: string }> {
