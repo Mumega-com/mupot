@@ -466,6 +466,9 @@ describe('who may be attached, and who may call', () => {
     const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.id
     h.sqlite.exec(`INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
       VALUES ('adm-live', '${TENANT}', 'agent-bare', '${HUMAN}', '${g.harnessId}', 'live', 0, 'member', 'dashboard', '${seat}', '${nowIso}', '${nowIso}', '${HUMAN}', 'dashboard')`)
+    // a live admission decided at ANOTHER moment (not this batch) does not satisfy the guard: it is not the row this batch inserted
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, '2026-10-15T02:00:00.000Z', 'direct'))
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
     await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
     // and a second run welds nothing more (binding exists)
