@@ -230,7 +230,10 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
     const loginRes = await authApp.request(`${ORIGIN}/login`, {}, webEnv)
     const state = new URL(loginRes.headers.get('location') ?? '').searchParams.get('state')!
     const callbackRes = await authApp.fetch(
-      new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`),
+      // the browser that ran /login holds the per-state binding cookie (login-CSRF fix, #1579)
+      new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`, {
+        headers: { cookie: `mupot_login_state_${state}=1` },
+      }),
       webEnv,
     )
     expect(callbackRes.status).toBe(302)
