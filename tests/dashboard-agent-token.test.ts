@@ -25,6 +25,9 @@ import {
   stageAgentTokenReplacement,
 } from '../src/members/service'
 import { loadAgentTokenView } from '../src/dashboard/agent-token'
+import { enrollPageBody, enrollMintedBody, enrollClientSnippet } from '../src/dashboard/enroll'
+import { tokenSurfaceLinks } from '../src/dashboard/token-surfaces'
+import { withTenantPrefix } from '../src/platform/tenant-path'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
 import { revealCredentialClaim } from '../src/auth/credential-claim'
@@ -1584,5 +1587,67 @@ describe('POST /admin/agent-token/mint', () => {
       expect(typeof hash).toBe('string')
       expect((hash as string).length).toBe(64)
     }
+  })
+})
+
+// ── mupot#1566: one path across the three token surfaces ─────────────────────
+
+describe('token surfaces are one path (#1566)', () => {
+  const SNIPPET_MARKER = 'Paste-ready MCP config'
+
+  it('GET /admin/agent-token shows the client snippet, no server path, links to the other two', async () => {
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token', 'GET'), makeRouteEnv('admin'))
+    const body = await res.text()
+    expect(body).toContain(SNIPPET_MARKER)
+    expect(body).toContain('x-mupot-seat')
+    expect(body).not.toContain('~/.fleet')
+    expect(body).toContain('href="/enroll"')
+    expect(body).toContain('href="/admin/keys"')
+    expect(body).not.toContain('href="/admin/agent-token"')
+  })
+
+  it('the minted page shows the snippet with the real slug, the raw once, and no server path', async () => {
+    const env = makeRouteEnv('admin')
+    const form = new URLSearchParams({ agent_id: AGENT.id, label: 'my-seat' })
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+    const body = await res.text()
+    expect(res.status).toBe(200)
+    expect(body).toContain(SNIPPET_MARKER)
+    expect(body).toContain('Bearer &lt;MEMBER_TOKEN&gt;')
+    expect(body).toContain('my-seat')
+    expect(body).not.toContain('~/.fleet')
+    expect(body.match(/mupot_[0-9a-f]{64}/g)?.length).toBe(1)
+    expect(body).toContain('href="/enroll"')
+    expect(body).toContain('href="/admin/keys"')
+  })
+
+  it('/enroll page and minted page carry the cross-links and no server path', () => {
+    const page = enrollPageBody({ principal: 'a@b.test', memberId: null, seat: 's', preselectedAgent: null, agents: [] }).toString()
+    expect(page).toContain('href="/admin/agent-token"')
+    expect(page).toContain('href="/admin/keys"')
+    expect(page).not.toContain('~/.fleet')
+    const minted = enrollMintedBody('A', 'a', null, 'raw', 'tid', 'member', 's', enrollClientSnippet('a', 'https://p.test', 's')).toString()
+    expect(minted).toContain('Paste-ready MCP config')
+    expect(minted).toContain('href="/admin/agent-token"')
+    expect(minted).not.toContain('~/.fleet')
+  })
+
+  it('/admin/keys links to the two agent surfaces and says which is for agents', () => {
+    const links = tokenSurfaceLinks('keys')
+    expect(links).toContain('href="/enroll"')
+    expect(links).toContain('href="/admin/agent-token"')
+    expect(links).not.toContain('href="/admin/keys"')
+    expect(links).toContain('Connect an agent')
+  })
+
+  it('links are re-rooted under /t/<slug> by the tenant-path choke point', async () => {
+    const res = await withTenantPrefix(
+      new Request('https://root.test/t/acme/admin/agent-token', { headers: { 'x-mupot-path-prefix': '/t/acme' } }),
+      { TENANT_SLUG: 'acme' },
+      async () => new Response(tokenSurfaceLinks('keys'), { headers: { 'content-type': 'text/html' } }),
+    )
+    const body = await res.text()
+    expect(body).toContain('href="/t/acme/enroll"')
+    expect(body).toContain('href="/t/acme/admin/agent-token"')
   })
 })

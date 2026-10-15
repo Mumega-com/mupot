@@ -7,7 +7,7 @@ describe('#981 stored XSS in agent-token minted page', () => {
   const malicious = '<script>alert(1)</script>'
 
   it('escapes scopeLabel in the minted body', () => {
-    const html = agentTokenMintedBody('good-name', 'good-slug', 'good-squad', 'raw-token', 'good-id', 'member')
+    const html = agentTokenMintedBody('good-name', 'good-slug', 'good-squad', 'raw-token', 'good-id', 'member', 'https://pot.test', 'seat')
       .toString()
     // Baseline: safe values render unchanged.
     expect(html).toContain('good-squad / good-name')
@@ -17,38 +17,38 @@ describe('#981 stored XSS in agent-token minted page', () => {
   })
 
   it('escapes scopeLabel when injected through squadName', () => {
-    const html = agentTokenMintedBody('Agent', 'good-slug', malicious, 'raw-token', 'good-id', 'member').toString()
+    const html = agentTokenMintedBody('Agent', 'good-slug', malicious, 'raw-token', 'good-id', 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
   })
 
   it('escapes scopeLabel when injected through agentName', () => {
-    const html = agentTokenMintedBody(malicious, 'good-slug', null, 'raw-token', 'good-id', 'member').toString()
+    const html = agentTokenMintedBody(malicious, 'good-slug', null, 'raw-token', 'good-id', 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
   })
 
   it('escapes agentSlug everywhere it appears', () => {
-    const html = agentTokenMintedBody('Good', malicious, null, 'raw-token', 'good-id', 'member').toString()
+    const html = agentTokenMintedBody('Good', malicious, null, 'raw-token', 'good-id', 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('(slug: <code class="inline">&lt;script&gt;alert(1)&lt;/script&gt;</code>)')
-    expect(html).toContain('~/.fleet/agents/&lt;script&gt;alert(1)&lt;/script&gt;.token')
+    expect(html).not.toContain('~/.fleet')
   })
 
   it('escapes tokenId at output', () => {
-    const html = agentTokenMintedBody('Good', 'good-slug', null, 'raw-token', malicious, 'member').toString()
+    const html = agentTokenMintedBody('Good', 'good-slug', null, 'raw-token', malicious, 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('<code class="inline">&lt;script&gt;alert(1)&lt;/script&gt;</code>')
   })
 
   it('escapes capability at output', () => {
-    const html = agentTokenMintedBody('Good', 'good-slug', null, 'raw-token', 'good-id', malicious).toString()
+    const html = agentTokenMintedBody('Good', 'good-slug', null, 'raw-token', 'good-id', malicious, 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('<code class="inline">&lt;script&gt;alert(1)&lt;/script&gt;</code>')
   })
 
   it('escapes the raw token placeholder in the code block if it contains HTML characters', () => {
-    const html = agentTokenMintedBody('Good', 'good-slug', null, malicious, 'good-id', 'member').toString()
+    const html = agentTokenMintedBody('Good', 'good-slug', null, malicious, 'good-id', 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)
     expect(html).toContain('<code class="token" id="rawToken">&lt;script&gt;alert(1)&lt;/script&gt;</code>')
   })

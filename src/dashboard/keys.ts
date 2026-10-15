@@ -36,6 +36,7 @@
 //      this, an org admin (rank 4) could mint an 'observer' preset key for a
 //      member who separately holds org→owner and authenticate as owner.
 
+import { tokenSurfaceLinks } from './token-surfaces'
 import { html, raw as honoRaw } from 'hono/html'
 import type { Env } from '../types'
 import { mintMemberToken } from '../members/service'
@@ -394,6 +395,7 @@ export function keysPageBody(
   and never stored in plain text. Pick the preset — the guide shows what it allows and denies — then pick a person
   and (for team/department presets) the target scope.
 </p>
+${honoRaw(tokenSurfaceLinks('keys'))}
 
 ${honoRaw(errorHtml)}
 

@@ -23,6 +23,7 @@
 // active agent, agent_member_bindings row, human holds admin on its squad.
 // Do not invent a looser list.
 
+import { connectSnippetCard, tokenSurfaceLinks } from './token-surfaces'
 import { html, raw as honoRaw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
 import { canOnSquadAuth, isOrgAdmin } from '../auth/capability'
@@ -426,7 +427,8 @@ ${honoRaw(errorHtml)}
       <a href="/members" class="btn secondary sm" style="margin-left:10px">Cancel</a>
     </div>`)}
   </form>
-</div>`
+</div>
+${honoRaw(tokenSurfaceLinks('enroll'))}`
 }
 
 /**
@@ -496,8 +498,7 @@ export function enrollMintedBody(
   </p>
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Shown once only.</strong> Copy this token now — it cannot be retrieved again.
-    Place it at <code class="inline">~/.fleet/agents/${honoRaw(esc(agentSlug))}.token</code> on the host.
-    Never paste it in chat, bus messages, or version control.
+    Paste it into the config below. Never paste it in chat, bus messages, or version control.
   </div>
   <code class="token" id="rawToken">${honoRaw(esc(raw))}</code>
   <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
@@ -508,15 +509,13 @@ export function enrollMintedBody(
   </div>
 </div>
 
-<div class="card" style="margin-top:18px">
-  <h2 style="margin-top:0">Paste-ready MCP config</h2>
-  <p style="font-size:14px;color:var(--muted);margin:0 0 12px">
-    Replace <code class="inline">&lt;MEMBER_TOKEN&gt;</code> with the token above.
+${connectSnippetCard(
+  snippet,
+  `Replace <code class="inline">&lt;MEMBER_TOKEN&gt;</code> with the token above.
     The <code class="inline">x-mupot-seat</code> header is already set to this seat
-    so the harness declares it from the first call.
-  </p>
-  <pre style="overflow:auto;font-size:13px" id="enrollSnippet">${honoRaw(esc(snippet))}</pre>
-</div>
+    so the harness declares it from the first call.`,
+)}
+${honoRaw(tokenSurfaceLinks('enroll'))}
 <script>
   function copyToken() {
     const text = document.getElementById('rawToken').textContent.trim();
