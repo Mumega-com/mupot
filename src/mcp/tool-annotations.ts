@@ -94,6 +94,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // ── memory ─────────────────────────────────────────────────────────────────────────────────
   remember: ADD('INSERT engrams + Vectorize upsert (memory/index.ts:39,47)'),
   recall: RO('Vectorize query + SELECT engrams (memory/index.ts:60-90); embeddings via Workers AI binding, pot-internal'),
+  memory_recent: RO('SELECT engrams WHERE agent_id=member:<id> ORDER BY created_at (memory/index.ts recent); D1 only, no Vectorize'),
+  memory_get: RO('SELECT engrams WHERE id AND agent_id=member:<id> (memory/index.ts get); missing and foreign ids answer identically'),
   squad_remember: ADD('createMemory.remember INSERT engrams + Vectorize upsert (memory/index.ts:39,47)'),
   squad_recall: RO('createMemory.recall read path (memory/index.ts:60)'),
   project_remember: ADD('createMemory.remember INSERT engrams + Vectorize upsert (memory/index.ts:39,47)'),
