@@ -11,7 +11,8 @@
 -- tool reply are deliberately identical either way (no existence oracle for squads the caller cannot see). The human's
 -- approval page shows what the ref really resolved to; an unresolved request can only be denied.
 -- squad_key is the dedupe key: the resolved squad id, else 'ref:' || lower(ref). One pending request per (agent, key).
--- Identity columns never change; a closed request never reopens (status only moves out of 'pending').
+-- Identity columns never change; a closed request never reopens. status moves pending -> approving (the approver CLAIMS the row
+-- with one guarded UPDATE before any grant) -> approved|failed; or pending -> denied|expired|superseded.
 CREATE TABLE IF NOT EXISTS squad_join_requests (
   id                    TEXT PRIMARY KEY,
   tenant                TEXT NOT NULL,
@@ -22,7 +23,7 @@ CREATE TABLE IF NOT EXISTS squad_join_requests (
   capability            TEXT NOT NULL CHECK (capability IN ('member', 'observer')),
   reason                TEXT CHECK (reason IS NULL OR length(reason) <= 500),
   requested_via         TEXT NOT NULL CHECK (requested_via IN ('agent', 'attached_chat')),
-  status                TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'superseded', 'failed')),
+  status                TEXT NOT NULL CHECK (status IN ('pending', 'approving', 'approved', 'denied', 'expired', 'superseded', 'failed')),
   created_at            TEXT NOT NULL,
   expires_at            TEXT NOT NULL,
   decided_at            TEXT,
@@ -46,7 +47,8 @@ WHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.agent_id IS NOT
   OR NEW.squad_ref IS NOT OLD.squad_ref OR NEW.squad_id IS NOT OLD.squad_id OR NEW.squad_key IS NOT OLD.squad_key
   OR NEW.capability IS NOT OLD.capability OR NEW.reason IS NOT OLD.reason OR NEW.requested_via IS NOT OLD.requested_via
   OR NEW.created_at IS NOT OLD.created_at OR NEW.expires_at IS NOT OLD.expires_at
-  OR OLD.status <> 'pending'
+  OR OLD.status NOT IN ('pending', 'approving')
+  OR (OLD.status = 'approving' AND NEW.status NOT IN ('approving', 'approved', 'failed'))
 BEGIN
   SELECT RAISE(ABORT, 'squad_join_request_immutable');
 END;

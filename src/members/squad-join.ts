@@ -14,11 +14,14 @@
 //     inherited plane; on top of that a home target is refused outright (G-FP1b: the only writer of a home capability
 //     row is createHomeForMember).
 //   * The write is addSquadMember, the SAME function squad_member_add runs (memberships + capability row +
-//     membership_receipts), called with the APPROVER's auth: its own rank ceiling, self-grant refusal, archived/home
-//     refusals and receipts all apply unchanged. The request can only ever carry 'member' or 'observer' (column CHECK
-//     plus a code check), so nothing it does can reach lead/admin or a gate capability (gates live in gate_grants,
-//     which this module never touches). It never LOWERS an existing rank: an agent already at or above the asked level
-//     is reported 'unchanged' and nothing is written.
+//     membership_receipts), called with the APPROVER's auth: its own rank ceiling, self-grant refusal, the home
+//     refusal and receipts apply unchanged. addSquadMember does NOT refuse an archived squad, so this module does (before the
+//     gate, and again inside the claim). The request can only ever carry 'member' or 'observer' (column CHECK plus a code
+//     check), so nothing it does can reach lead/admin or a gate capability (gates live in gate_grants, which this module
+//     never touches). CHECK-THEN-WRITE IS CLOSED BY A CLAIM: the decider first flips the row pending -> approving with ONE guarded
+//     UPDATE (still pending, unexpired, squad not archived/home); only the call that changed exactly one row may grant, so a
+//     supersede or expiry inside the window can no longer be granted. The grant is raise-only IN ITS SQL (neverLower): a
+//     concurrent promotion is never demoted. The row then closes approved|failed in one batch with its audit row.
 //   * Segregation of duties: the requesting agent's own welded credential never decides its request. An owner deciding for their
 //     own agent is allowed.
 //   * Telegram never carries this decision (the Mini App allowlist is seed_attach and elevation only).
@@ -63,7 +66,7 @@ export interface SquadJoinRow {
   capability: JoinCapability
   reason: string | null
   requested_via: 'agent' | 'attached_chat'
-  status: 'pending' | 'approved' | 'denied' | 'expired' | 'superseded' | 'failed'
+  status: 'pending' | 'approving' | 'approved' | 'denied' | 'expired' | 'superseded' | 'failed'
   created_at: string
   expires_at: string
   decided_at: string | null
@@ -127,7 +130,7 @@ async function findPending(env: Env, agentId: string, squadKey: string, nowIso: 
  */
 export async function fileSquadJoinRequest(
   env: Env,
-  p: { agentId: string; squadRef: string; capability: JoinCapability; reason: string | null; via: 'agent' | 'attached_chat' },
+  p: { agentId: string; squadRef: string; capability: JoinCapability; reason: string | null; via: 'agent' | 'attached_chat'; waitUntil?: WaitUntil },
   nowMs: number = Date.now(),
 ): Promise<FileJoinResult> {
   if (secureMomentsStatus(env).state !== 'on') return { ok: false, error: 'secure_moments_unavailable' }
@@ -140,7 +143,9 @@ export async function fileSquadJoinRequest(
   const nowIso = new Date(nowMs).toISOString()
   const resolved = await resolveSquadRef(env, p.squadRef)
   const squadId = resolved.ok ? resolved.value.id : null
-  const squadKey = squadId ?? `ref:${p.squadRef.toLowerCase()}`
+  // The dedupe key is the normalized ref the CALLER sent, never the resolved id: it must not differ between a squad that exists
+  // and one that does not (that difference was an existence oracle through the pending cap and the re-ask path).
+  const squadKey = `ref:${p.squadRef.trim().toLowerCase()}`
   // A pending row past its expiry must not hold the unique slot.
   await env.DB.prepare(
     `UPDATE squad_join_requests SET status = 'expired' WHERE tenant = ?1 AND agent_id = ?2 AND squad_key = ?3 AND status = 'pending' AND expires_at <= ?4`,
@@ -173,28 +178,53 @@ export async function fileSquadJoinRequest(
   // A re-ask rotates the link (only a hash is stored; a lost link must be replaceable; the old one dies).
   const link = await issueMomentLink(env, { kind: 'squad_join', subjectId: row.id, requesterAgentId: p.agentId, subjectExpiresAtIso: row.expires_at })
   if (!link) return { ok: false, error: 'link_unavailable' }
-  await notifyApprovers(env, row, link.url, agent.name)
+  // Off the response path: whether anyone is notified (and how many Telegram calls that takes) must not show in the latency.
+  // Without a hosting waitUntil (a bare test call) it runs inline.
+  const notice = notifyApprovers(env, row, link.url, agent.name)
+  if (p.waitUntil) p.waitUntil(notice)
+  else await notice
   return { ok: true, link: link.url, expiresAt: link.expiresAt, agentName: agent.name, squadRef: p.squadRef, capability: p.capability }
 }
 
 // ── who may approve (ONE derivation: the approval check, the notice and any future Ask/Telegram surface use it) ──
 
-/** The approver cap: a notice goes to at most this many of them (the check itself is not capped). */
+/** At most this many approvers are NOTIFIED. The approval CHECK is never capped (it asks about one member directly), so a
+ *  member beyond the cap can still approve with a link passed to them; the cap only fails closed on who gets a Telegram message. */
 const APPROVER_SCAN_LIMIT = 200
 const NOTIFY_MAX_APPROVERS = 10
 
+interface ApproverTarget { id: string; department_id: string }
+
+/** The squad an approver could decide for: null for an unresolved, home or archived target (nobody could ever approve it). */
+async function approverTarget(env: Env, squadId: string | null): Promise<ApproverTarget | null> {
+  if (!squadId) return null
+  const sq = await env.DB.prepare(`SELECT id, department_id, kind, status FROM squads WHERE id = ?1 LIMIT 1`)
+    .bind(squadId).first<{ id: string; department_id: string; kind: OrgKind; status: string }>()
+  return !sq || sq.kind === 'home' || sq.status === 'archived' ? null : { id: sq.id, department_id: sq.department_id }
+}
+
+/** THE eligibility predicate for one member: an ACTIVE HUMAN (never an agent's welded member) who is admin on the target by canOnSquad. */
+async function eligibleApprover(env: Env, sq: ApproverTarget, memberId: string): Promise<boolean> {
+  if (!(await memberIsActiveHuman(env, memberId))) return false
+  return canOnSquad(env, await resolveCapabilities(env, memberId), sq.id, 'admin')
+}
+
+/** Is this one member an eligible approver right now (uncapped)? The approval check. */
+export async function memberMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'>, memberId: string): Promise<boolean> {
+  const sq = await approverTarget(env, req.squad_id)
+  return sq !== null && (await eligibleApprover(env, sq, memberId))
+}
+
 /**
- * The ACTIVE HUMAN members who may approve this request RIGHT NOW: admin on the TARGET squad by canOnSquad over each
- * member's own grants. That is squad admins of that squad, plus department/org admin or owner only where canOnSquad already
- * counts them for this squad kind. A closed target (unresolved ref, home squad, archived squad) has NO approvers: nothing
- * could ever be approved. An agent's own welded member is never a human, so it is never in the set.
+ * The ACTIVE HUMAN members who may approve this request RIGHT NOW (up to APPROVER_SCAN_LIMIT candidates): admin on the TARGET
+ * squad by canOnSquad over each member's own grants. That is squad admins of that squad, plus department/org admin or owner only
+ * where canOnSquad already counts them for this squad kind. A closed target has NO approvers. Used for the notice; the approval
+ * check uses the same per-member predicate (memberMayApprove).
  */
 export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'>): Promise<string[]> {
-  if (!req.squad_id) return []
-  const sq = await env.DB.prepare(`SELECT id, department_id, kind, status FROM squads WHERE id = ?1 LIMIT 1`)
-    .bind(req.squad_id).first<{ id: string; department_id: string; kind: OrgKind; status: string }>()
-  if (!sq || sq.kind === 'home' || sq.status === 'archived') return []
-  // Candidates: anyone holding an admin-or-better row on a scope that could reach this squad. canOnSquad below is the authority.
+  const sq = await approverTarget(env, req.squad_id)
+  if (!sq) return []
+  // Candidates: anyone holding an admin-or-better row on a scope that could reach this squad. eligibleApprover is the authority.
   const rows = await env.DB.prepare(
     `SELECT DISTINCT c.member_id AS member_id
        FROM capabilities c JOIN members m ON m.id = c.member_id AND m.tenant = ?1 AND m.status = 'active'
@@ -203,10 +233,7 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
       ORDER BY c.member_id LIMIT ?4`,
   ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT).all<{ member_id: string }>()
   const out: string[] = []
-  for (const r of rows.results ?? []) {
-    if (!(await memberIsActiveHuman(env, r.member_id))) continue
-    if (await canOnSquad(env, await resolveCapabilities(env, r.member_id), sq.id, 'admin')) out.push(r.member_id)
-  }
+  for (const r of rows.results ?? []) if (await eligibleApprover(env, sq, r.member_id)) out.push(r.member_id)
   return out
 }
 
@@ -305,7 +332,7 @@ async function notifyAgent(env: Env, req: SquadJoinRow, deciderId: string, body:
 
 /** Standing is re-derived NOW from the one approver derivation (a passkey proves who, never what). */
 async function mayApprove(env: Env, req: SquadJoinRow, memberId: string): Promise<boolean> {
-  return (await whoMayApprove(env, req)).includes(memberId)
+  return memberMayApprove(env, req, memberId)
 }
 
 /** Segregation of duties: the request's own agent (its welded member credential) never decides its own request. An owner deciding
@@ -340,7 +367,7 @@ export async function decideSquadJoin(
       const out = await env.DB.batch([
         env.DB.prepare(
           `UPDATE squad_join_requests SET status = 'denied', decided_at = ?2, decided_by_member_id = ?3, decided_via = 'webauthn'
-            WHERE id = ?1 AND tenant = ?4 AND status = 'pending'`,
+            WHERE id = ?1 AND tenant = ?4 AND status = 'pending' AND expires_at > ?2`,
         ).bind(req.id, nowIso, proof.memberId, env.TENANT_SLUG),
         auditInsert(env, req.agent_id, proof.memberId, 'squad_join_deny', { request_id: req.id, squad_ref: req.squad_ref, squad_id: req.squad_id, capability: req.capability },
           `EXISTS (SELECT 1 FROM squad_join_requests WHERE id = ?6 AND status = 'denied' AND decided_at = ?7)`, [req.id, nowIso]),
@@ -366,10 +393,19 @@ export async function decideSquadJoin(
 
   return durablyLocal(input.waitUntil, async (): Promise<Outcome> => {
     if (!(await input.gate())) return CLOSED
+    // CLAIM the request before any grant: one guarded UPDATE, and only the call that changed exactly one row may write. A
+    // supersede, an expiry, a deny or an archive that landed after the checks above makes this change nothing, so nothing is granted.
+    const claim = await env.DB.prepare(
+      `UPDATE squad_join_requests SET status = 'approving', decided_at = ?2, decided_by_member_id = ?3, decided_via = 'webauthn'
+        WHERE id = ?1 AND tenant = ?4 AND status = 'pending' AND expires_at > ?2
+          AND EXISTS (SELECT 1 FROM squads sq WHERE sq.id = squad_join_requests.squad_id AND sq.status <> 'archived' AND sq.kind <> 'home')`,
+    ).bind(req.id, nowIso, proof.memberId, env.TENANT_SLUG).run()
+    if (claim.meta.changes !== 1) return CLOSED
     let result: 'created' | 'updated' | 'unchanged' = 'unchanged'
     let failure: string | null = null
     if (!already) {
-      // The approver's own auth: addSquadMember re-applies its rank ceiling, self-grant and home/archive refusals.
+      // The approver's own auth: addSquadMember re-applies its rank ceiling, self-grant and home refusals. neverLower puts the
+      // rank predicate in the write itself.
       const auth = await buildAuth(env, proof.memberId)
       const out = await addSquadMember({
         env,
@@ -377,15 +413,22 @@ export async function decideSquadJoin(
         agentId: req.agent_id,
         squad: { id: squad.id, department_id: squad.department_id, kind: squad.kind },
         capability: req.capability,
+        neverLower: true,
       })
       if (out.ok) result = out.result
-      else failure = out.error
+      else {
+        // A raise-only upsert that found the agent already at/above the asked level (a concurrent promotion) writes nothing and
+        // reads as receipt_failed: that is success-unchanged, not a failure.
+        const now = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`).bind(req.agent_id, squad.id).first<{ capability: string }>()
+        if (out.error === 'receipt_failed' && now && capabilityRank(now.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)) result = 'unchanged'
+        else failure = out.error
+      }
     }
     const status = failure ? 'failed' : 'approved'
     const out = await env.DB.batch([
       env.DB.prepare(
-        `UPDATE squad_join_requests SET status = ?5, decided_at = ?2, decided_by_member_id = ?3, decided_via = 'webauthn', result = ?6, decision_error = ?7
-          WHERE id = ?1 AND tenant = ?4 AND status = 'pending'`,
+        `UPDATE squad_join_requests SET status = ?5, result = ?6, decision_error = ?7
+          WHERE id = ?1 AND tenant = ?4 AND status = 'approving' AND decided_by_member_id = ?3`,
       ).bind(req.id, nowIso, proof.memberId, env.TENANT_SLUG, status, failure ? null : result, failure),
       auditInsert(env, req.agent_id, proof.memberId, failure ? 'squad_join_failed' : 'squad_join_approve',
         { request_id: req.id, squad_id: squad.id, capability: req.capability, result, ...(failure ? { error: failure } : {}) },

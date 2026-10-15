@@ -22,7 +22,7 @@ import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
 import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { linkLoginIdentity } from '../src/auth/login-identity'
-import { SQUAD_JOIN_MAX_PENDING_PER_AGENT, SQUAD_JOIN_MAX_PER_HOUR, decideSquadJoin, loadSquadJoin, whoMayApprove } from '../src/members/squad-join'
+import { SQUAD_JOIN_MAX_PENDING_PER_AGENT, SQUAD_JOIN_MAX_PER_HOUR, decideSquadJoin, loadSquadJoin, memberMayApprove, whoMayApprove } from '../src/members/squad-join'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -344,11 +344,17 @@ describe('dedupe', () => {
     expect((await hit(new URL(b.link).pathname, env)).status).toBe(200)
   })
 
-  it('the same squad by id and by slug is the same (agent, squad)', async () => {
+  it('the dedupe key is the normalized ref the caller SENT, identical for a real and a nonexistent squad (no oracle)', async () => {
     await askOk('agent-rava', { squad: 'squad-target' })
+    await askOk('agent-rava', { squad: '  SQUAD-TARGET ' })
+    await askOk('agent-rava', { squad: 'nowhere' })
+    await askOk('agent-rava', { squad: 'NOWHERE' })
+    const keys = reqRows().filter((r) => r.status === 'pending').map((r) => r.squad_key).sort()
+    expect(keys).toEqual(['ref:nowhere', 'ref:squad-target'])
+    // the cap counts both kinds the same way: real and nonexistent refs consume the same pending slots
     const id = one<{ id: string }>(`SELECT id FROM squads WHERE slug = 'squad-target'`)!.id
     await askOk('agent-rava', { squad: id })
-    expect(reqRows().filter((r) => r.status === 'pending')).toHaveLength(1)
+    expect(reqRows().filter((r) => r.status === 'pending').map((r) => r.squad_key)).toContain(`ref:${id}`)
   })
 
   it('a CHANGED ask supersedes the old request: the old link can never approve what was asked then', async () => {
@@ -632,5 +638,112 @@ describe('delivery: the approvers are told, nobody has to paste', () => {
     vi.stubGlobal('fetch', async () => { throw new Error('boom') })
     expect((await ask('agent-rava', { squad: 'squad-target' }, envFor(h, { TELEGRAM_BOT_TOKEN: 'tg-test-token' }))).ok).toBe(true)
     expect((await ask('agent-hadi-admin', { squad: 'squad-target' })).ok).toBe(true) // no token at all
+  })
+})
+
+// ── check-then-write: the claim closes the window between the checks and the grant ─────────────────
+describe('the claim: nothing is granted unless the request is still pending, unexpired and open at the write', () => {
+  const proofOf = (memberId: string) => ({ memberId, via: 'webauthn' as const, evidence: {} })
+  async function approveWith(onGate: () => void | Promise<void>, agent = 'agent-rava', squad = 'squad-target'): Promise<{ status: number; message: string }> {
+    await askOk(agent, { squad })
+    const req = (await loadSquadJoin(env, one<{ id: string }>(`SELECT id FROM squad_join_requests ORDER BY created_at DESC LIMIT 1`)!.id))!
+    const gate = async (): Promise<boolean> => { await onGate(); return true }
+    const out = await decideSquadJoin(env, { req, decision: 'approve', proof: proofOf(ADMIN), gate }, Date.now())
+    return { status: out.status, message: out.message }
+  }
+  const approveAudits = (): number => n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'squad_join_approve'`)
+
+  it('F1: superseded between the checks and the grant -> no membership, no approve audit, request stays superseded', async () => {
+    const out = await approveWith(() => { h.sqlite.exec(`UPDATE squad_join_requests SET status = 'superseded'`) })
+    expect(out.status).toBe(409)
+    expect(member('agent-rava', 'squad-target')).toBeUndefined()
+    expect(n(`SELECT COUNT(*) AS n FROM membership_receipts WHERE squad_id = 'squad-target'`)).toBe(0)
+    expect(approveAudits()).toBe(0)
+    expect(reqRows()[0]!.status).toBe('superseded')
+  })
+
+  it('F4: expired between the checks and the grant -> no membership', async () => {
+    const out = await approveWith(() => { h.sqlite.exec(`DROP TRIGGER squad_join_requests_immutable`); h.sqlite.exec(`UPDATE squad_join_requests SET expires_at = '2020-01-01T00:00:00.000Z'`) })
+    expect(out.status).toBe(409)
+    expect(member('agent-rava', 'squad-target')).toBeUndefined()
+    expect(approveAudits()).toBe(0)
+  })
+
+  it('F2: archived between the checks and the grant -> no membership (addSquadMember does not refuse archived itself)', async () => {
+    const out = await approveWith(() => { h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-target'`) })
+    expect(out.status).toBe(409)
+    expect(member('agent-rava', 'squad-target')).toBeUndefined()
+    expect(approveAudits()).toBe(0)
+  })
+
+  it('F3: promoted to lead between the checks and the grant -> stays lead (the rank predicate is in the write), reported unchanged', async () => {
+    const out = await approveWith(() => {
+      h.sqlite.exec(`INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('m-lead', 'agent-rava', 'squad-target', 'lead')`)
+      cap('mem-agent-rava', 'squad', 'squad-target', 'lead')
+    })
+    expect(out.status, out.message).toBe(200)
+    expect(member('agent-rava', 'squad-target')).toEqual({ capability: 'lead' })
+    expect(one<{ capability: string }>(`SELECT capability FROM capabilities WHERE member_id = 'mem-agent-rava' AND scope_type = 'squad' AND scope_id = 'squad-target'`)).toEqual({ capability: 'lead' })
+    expect(reqRows()[0]).toMatchObject({ status: 'approved', result: 'unchanged' })
+  })
+
+  it('a grant that fails after the claim closes the request as failed, with a failure audit and a notice', async () => {
+    const out = await approveWith(() => { h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`) })
+    expect(out.status).toBe(409)
+    expect(member('agent-rava', 'squad-target')).toBeUndefined()
+    expect(reqRows()[0]!.status).toBe('failed')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'squad_join_failed'`)).toBe(1)
+  })
+
+  it('the table forbids reopening or skipping the claim: approving only goes to approved|failed, closed rows never move', async () => {
+    await askOk('agent-rava', { squad: 'squad-target' })
+    h.sqlite.exec(`UPDATE squad_join_requests SET status = 'approving'`)
+    expect(() => h.sqlite.exec(`UPDATE squad_join_requests SET status = 'pending'`)).toThrow()
+    expect(() => h.sqlite.exec(`UPDATE squad_join_requests SET status = 'denied'`)).toThrow()
+    h.sqlite.exec(`UPDATE squad_join_requests SET status = 'approved'`)
+    expect(() => h.sqlite.exec(`UPDATE squad_join_requests SET status = 'approving'`)).toThrow()
+  })
+
+  it('P2-4: the requesting agent credential is refused on the DENY path of an unresolved or home request (no other guard reaches it)', async () => {
+    for (const ref of ['nowhere', 'squad-home-x']) {
+      await askOk('agent-rava', { squad: ref })
+      const req = (await loadSquadJoin(env, one<{ id: string }>(`SELECT id FROM squad_join_requests WHERE squad_ref = ?`, ref)!.id))!
+      let gateCalls = 0
+      const out = await decideSquadJoin(env, { req, decision: 'deny', proof: proofOf('mem-agent-rava'), gate: async () => { gateCalls++; return true } }, Date.now())
+      expect(out.status, ref).toBe(403)
+      expect(gateCalls).toBe(0)
+    }
+    expect(reqRows().every((r) => r.status === 'pending')).toBe(true)
+  })
+
+  it('the approval check is uncapped: an approver past the 200-candidate notice scan can still approve', async () => {
+    for (let i = 0; i < 205; i++) {
+      const id = `a-${String(i).padStart(3, '0')}`
+      seedHuman(id)
+      cap(id, 'org', null, 'admin')
+    }
+    const r = await askOk('agent-rava', { squad: 'squad-target' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    expect(await whoMayApprove(env, row)).not.toContain(ADMIN) // beyond the notice scan
+    expect(await memberMayApprove(env, row, ADMIN)).toBe(true)
+    expect((await decide(r.link, adminKey, 'approve')).status).toBe(200)
+  })
+})
+
+describe('notices are off the response path', () => {
+  it('with a hosting waitUntil the tool returns while the Telegram send is still blocked; releasing it delivers', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = '1001' WHERE id = '${ADMIN}'`)
+    const calls: string[] = []
+    let release: () => void = () => undefined
+    const blocked = new Promise<void>((res) => { release = res })
+    vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => { await blocked; calls.push((JSON.parse(String(init.body)) as { chat_id: string }).chat_id); return new Response('{"ok":true}') })
+    const pending: Promise<unknown>[] = []
+    const r = await invokeTool(agentCtx('agent-rava'), envFor(h, { TELEGRAM_BOT_TOKEN: 't' }), 'squad_join_request', { squad: 'squad-target' }, { origin: 'https://pot.test', waitUntil: (p: Promise<unknown>) => { pending.push(p) } })
+    expect(r.ok).toBe(true) // returned although the send has not completed
+    expect(calls).toEqual([])
+    release()
+    await Promise.all(pending)
+    expect(calls).toEqual(['1001'])
+    vi.unstubAllGlobals()
   })
 })

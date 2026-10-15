@@ -17,6 +17,8 @@ export interface SetAgentSquadAccessInput {
   memberId: string
   squadId: string
   capability: AgentAccessCapability
+  /** Raise-only: the upsert's DO UPDATE carries a rank predicate IN THE WRITE, so a concurrent promotion is never demoted. */
+  neverLower?: boolean
 }
 
 export interface RemoveAgentSquadAccessInput {
@@ -226,6 +228,8 @@ export async function prepareAgentSquadAccess(
   }
 
   const bindingGuard = bindingProof.disposition === 'creating'
+  const rk = (t: string): string => `(CASE ${t}.capability WHEN 'observer' THEN 1 WHEN 'member' THEN 2 WHEN 'lead' THEN 3 WHEN 'admin' THEN 4 WHEN 'owner' THEN 5 ELSE 0 END)`
+  const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')}` : '')
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
@@ -238,7 +242,7 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability`,
+         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
       ).bind(
         membership.id,
         input.agentId,
@@ -252,7 +256,7 @@ export async function prepareAgentSquadAccess(
         `INSERT INTO memberships (id, agent_id, squad_id, capability)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability`,
+         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
       ).bind(membership.id, input.agentId, input.squadId, input.capability)
 
   const grantId = crypto.randomUUID()
@@ -268,7 +272,7 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability`,
+         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
       ).bind(
         grantId,
         input.memberId,
@@ -282,7 +286,7 @@ export async function prepareAgentSquadAccess(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
          VALUES (?, ?, 'squad', ?, ?)
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability`,
+         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
       ).bind(grantId, input.memberId, input.squadId, input.capability)
 
   return {

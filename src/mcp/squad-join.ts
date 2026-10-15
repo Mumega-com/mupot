@@ -44,7 +44,7 @@ const toolSquadJoinRequest: ToolSpec = {
     required: ['squad'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     // Server-derived identity: the agent behind this session (the bound agent, or the agent an attached chat acts as).
     const agentId = auth.boundAgentId
     if (!agentId) {
@@ -82,7 +82,7 @@ const toolSquadJoinRequest: ToolSpec = {
       return fail(503, 'secure_moments_unavailable', 'Approval links are not enabled on this pot, so a join request cannot be made. Ask a squad admin to add you with squad_member_add.')
     }
 
-    const r = await fileSquadJoinRequest(env, { agentId, squadRef, capability, reason, via: attached ? 'attached_chat' : 'agent' })
+    const r = await fileSquadJoinRequest(env, { agentId, squadRef, capability, reason, via: attached ? 'attached_chat' : 'agent', waitUntil: ctx?.waitUntil })
     if (r.ok) {
       return done({
         link: r.link,
