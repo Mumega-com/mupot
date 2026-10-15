@@ -5476,6 +5476,10 @@ const toolInboxFenceStatus: ToolSpec = {
         can_mark_handled: !fenced && seatAttachEnabled(env),
         ...(fenced ? { reason: 'consumer_fenced_signed_only' } : {}),
         mark_handled_tool: 'inbox_mark_handled',
+        // mupot#1956: tools/list is the SAME for every authenticated caller (flag-gated only), so a connector that
+        // lacks this tool cached its catalog before the tool shipped. The server cannot push a change (stateless
+        // HTTP, no list_changed channel): the client must re-list.
+        ...(seatAttachEnabled(env) ? { if_tool_missing: 'If inbox_mark_handled is not in your tool list, your connector cached its tool catalog before this tool was deployed. Refresh or reconnect the connector (or open a new chat) so it re-lists tools; the server advertises the tool to every authenticated caller while seat attach is on.' } : {}),
         unread_total: unreadTotal,
         unread_cap: MAX_UNREAD_PER_RECIPIENT,
         near_cap: unreadTotal !== null && unreadTotal >= MAX_UNREAD_PER_RECIPIENT * INBOX_NEAR_CAP_RATIO,
@@ -7275,6 +7279,34 @@ export const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+/** mupot#1910: tool names on the wire are BARE (`boot_context`). MCP clients namespace them
+ *  (`mupot.boot_context`, `mupot_boot_context`, `mcp__mupot__boot_context`) and a wrapper that forwards its
+ *  own exported name gets an unknown_tool refusal that names only the string it sent. This returns the detail
+ *  for that refusal: the name, plus a did-you-mean when stripping a client namespace (or case) lands on a
+ *  registered tool. It is a HINT only: the name is never resolved or executed, so what a caller can call is
+ *  unchanged. */
+export function unknownToolDetail(toolName: string): string {
+  const trimmed = toolName.trim()
+  const lower = trimmed.toLowerCase()
+  const noServer = lower.replace(/^mcp__.+?__/, '')
+  const bare = noServer.replace(/^mupot[._:/-]/, '')
+  for (const cand of [trimmed, lower, noServer, bare]) {
+    if (cand !== toolName && TOOL_BY_NAME.has(cand)) {
+      return `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${cand}"?)`
+    }
+  }
+  // A connector-style namespace (`mcp__codex_apps__mupot_w2__boot_context`): only for a name that visibly carries a
+  // client or mupot namespace, take the longest registered tool the name ends with after a separator.
+  if (/^mcp__|mupot/.test(lower)) {
+    let best: string | undefined
+    for (const name of TOOL_BY_NAME.keys()) {
+      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length)) best = name
+    }
+    if (best) return `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${best}"?)`
+  }
+  return toolName
+}
+
 // mupot#1794 W1: tools that exist only while a feature flag is on. With the flag off they are
 // not ADVERTISED (tools/list, GET /mcp/tools, openapi.full.json); a direct call still reaches the
 // tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
@@ -7511,7 +7543,7 @@ export async function invokeTool(
   }
 
   const spec = TOOL_BY_NAME.get(toolName)
-  if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
+  if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName)), tool: toolName }
 
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
