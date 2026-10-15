@@ -134,8 +134,10 @@ as success: check `result.isError`.
 ### MCP events (off by default)
 
 `server/discover` and `events/list|subscribe|unsubscribe` (protocol `2026-07-28`) are served
-only when the pot sets `EVENTS_ENABLED=true`. The flag is currently off, so a normal pot
-answers `method_not_found` for them. Do not build against them yet.
+only when the pot sets `EVENTS_ENABLED=true` (off by default; on for the mumega pot since
+2026-10-06, so a pot you did not configure yourself may answer either way). Probe it: with the
+flag off a pot answers `method_not_found` for them. Do not build against them unless that probe
+succeeds on your pot.
 
 ## Custom GPT / OpenAPI Actions
 
@@ -309,7 +311,12 @@ Until a request carries a seat handle, a connection on it can do exactly this an
 |---|---|
 | `seat_select` | find or create the seat agent for a workspace key and receive a seat handle |
 | `boot_context` | read-only identity: who you are, the harness, the identity receipt, hints |
+| `worktree_open` | find or create a project workspace record (only advertised while `WORKSPACES=1`) |
 | `initialize`, `tools/list` | protocol handshake and the tool listing (no tool runs) |
+
+`orient` is NOT on this list: a harness session that calls it is refused with
+`harness_session_seat_required` until it carries a seat handle. `seat_attach` is not on it either; get
+a seat with `seat_select` first (`src/members/harness-credential.ts:28`).
 
 Every other tool (`connect`, `bootstrap_self`, `recall`, `remember`, `reveal_credential_claim`, ...),
 `/actions/:tool`, the legacy `{tool,args}` body, `events/*` and the profile door answer

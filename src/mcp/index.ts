@@ -303,6 +303,7 @@ import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { mcpInitializeInstructions } from './instructions'
+import { refusalNextStep } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
@@ -6635,6 +6636,17 @@ const toolBootContext: ToolSpec = {
         requires: 'nothing beyond this connection — the seat agent is capped at member and your own access is the ceiling',
       })
     }
+    // A chat that HAS a seat (a ChatGPT conversation's auto seat, or a seat_select handle) and is not yet attached has one more
+    // door, and until now only channel_limits.to_get_write_access (read last) named it: this session is 'bound' (to its seat
+    // agent), so the doors above were just orient/status/boot_context. Same gate as that text and as seat_attach itself.
+    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory') {
+      // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
+      availableDoors.splice(1, 0, {
+        tool: 'seat_attach',
+        does: 'act as an agent you already have: your human approves once with their passkey (you get an approve_url to hand them), then call seat_attach again and your NEXT request acts as that agent',
+        requires: 'the agent must be one your human administers; nothing is attached until they tap',
+      })
+    }
     const enrollHref = enrollUrl(
       canonicalOrigin(env, ctx.origin),
       (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
@@ -7287,7 +7299,9 @@ function mcpToolRefusalResult(tool: string, status: number, error: string, detai
   const need = typeof detail === 'object' && detail !== null && 'need' in detail
     ? (detail as { need?: unknown }).need // narrowed by the 'in' check above
     : undefined
-  const body = { ok: false, tool, error, status, ...(need !== undefined ? { need } : {}), detail }
+  // A teaching line for the generic refusals (src/mcp/refusal-next-step.ts); absent when the tool's own detail already teaches.
+  const nextStep = refusalNextStep(error, status, detail)
+  const body = { ok: false, tool, error, status, ...(need !== undefined ? { need } : {}), ...(nextStep !== undefined ? { next_step: nextStep } : {}), detail }
   return { isError: true, content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body }
 }
 

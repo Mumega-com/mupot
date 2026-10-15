@@ -40,6 +40,16 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
                                   # off = byte-identical to before (server/discover + events/* are method_not_found). Full /mcp door only; also gates the PR 2 delivery hook.
 # EVENTS_CALLBACK_HOSTS = "hooks.example.com"  # exact-hostname allowlist (comma list) of webhook callback hosts. DEFAULT EMPTY =
                                   # every callback URL is refused. Needs the CONNECTOR_MASTER_KEY secret (signing secrets are stored encrypted).
+# ── Agent onboarding doors (all OFF unless set; docs/architecture/agent-onboarding-funnel.md) ──────────────────────────
+# A pot deployed from this file with none of these set has NO chat door: the consent screen offers no "Many chats" choice,
+# seat_select / seat_attach are not advertised, and a chat cannot be admitted to an agent. Set them in this order.
+# SEAT_AUTO_ENROLL = "1"          # chat/CLI threads get their own seat agent (seat_select, ChatGPT per-conversation auto seat).
+#                                 # Needs the harness migrations applied. Off = the consent screen has no "Many chats" option.
+# SECURE_MOMENTS = "1"            # /m/* passkey approval pages (dedicated host below). Needed for the seat_attach approve_url.
+# SECURE_MOMENTS_HOST = "secure.example.com"  # dedicated host for those pages; also needs the CONNECTOR_MASTER_KEY secret.
+# SEAT_ATTACH = "1"               # a seat thread attaches to an EXISTING agent after one passkey tap (seat_attach). Needs
+#                                 # SEAT_AUTO_ENROLL=1 AND SECURE_MOMENTS (without it the human decides on the Connections page).
+# WEBHOOK_DOORBELL = "1"          # outbound per-agent wake webhook for bot endpoints (/doorbells, set_agent_webhook_doorbell).
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
                                   # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
                                   # buttons. ONLY the exact string "true" enables; anything else = 503

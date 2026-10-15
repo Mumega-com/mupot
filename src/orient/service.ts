@@ -139,7 +139,7 @@ export function railsShipLine(autonomy: string | null | undefined): string {
 // indistinguishable here. Cheap error: never tell an empty-open-list
 // agent to rest.
 function emptyWorkLine(): string {
-  return '  (none assigned yet — ask your supervisor or check the project board)'
+  return '  (none assigned yet — check the project board with task_board or task_list for open work, or ask your supervisor)'
 }
 
 // ── the packet ───────────────────────────────────────────────────────────────────
