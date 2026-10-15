@@ -760,8 +760,10 @@ describe('notices are off the response path', () => {
     const blocked = new Promise<void>((res) => { release = res })
     vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => { await blocked; calls.push((JSON.parse(String(init.body)) as { chat_id: string }).chat_id); return new Response('{"ok":true}') })
     const pending: Promise<unknown>[] = []
+    const t0 = Date.now()
     const r = await invokeTool(agentCtx('agent-rava'), envFor(h, { TELEGRAM_BOT_TOKEN: 't' }), 'squad_join_request', { squad: 'squad-target' }, { origin: 'https://pot.test', waitUntil: (p: Promise<unknown>) => { pending.push(p) } })
     expect(r.ok).toBe(true) // returned although the send has not completed
+    expect(Date.now() - t0).toBeLessThan(2500) // inline, the blocked send would hold the reply for the 4s notice timeout
     expect(calls).toEqual([])
     release()
     await Promise.all(pending)
