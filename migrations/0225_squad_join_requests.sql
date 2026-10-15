@@ -1,4 +1,4 @@
--- 0223_squad_join_requests.sql — an agent ASKS to join a squad; a human admin of THAT squad taps once (passkey).
+-- 0225_squad_join_requests.sql — an agent ASKS to join a squad; a human admin of THAT squad taps once (passkey).
 --
 -- WHY. A human wants an agent in a squad, but there was no door between them: the agent could only say "an admin on
 -- that squad can add me by agent id". squad_member_add needs an admin's own session and the agent cannot see other
