@@ -146,6 +146,20 @@ describe('elevation-conferred memberships carry the horizon (project messaging)'
       .toEqual({ expires_at: FUTURE })
   })
 
+  it('the GUARDED (identity-creating) membership path writes the horizon too', async () => {
+    const { prepareAgentSquadAccess } = await import('../src/members/agent-access')
+    const prepared = await prepareAgentSquadAccess(
+      env,
+      { agentId: 'a-1', memberId: 'm-1', squadId: 'sq-a', capability: 'member', expiresAt: FUTURE },
+      { agentId: 'a-1', memberId: 'm-1', homeSquadId: 'sq-b', disposition: 'creating' },
+    )
+    expect(prepared.ok).toBe(true)
+    if (!prepared.ok) return
+    await env.DB.batch(prepared.value.statements)
+    expect(h.sqlite.prepare("SELECT expires_at FROM memberships WHERE agent_id = 'a-1' AND squad_id = 'sq-a'").get())
+      .toEqual({ expires_at: FUTURE })
+  })
+
   it('live elevation membership: project messaging is allowed', async () => {
     await grant('a-1', 'm-1', FUTURE)
     await grant('a-2', 'm-2', FUTURE)

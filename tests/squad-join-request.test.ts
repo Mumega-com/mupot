@@ -582,6 +582,17 @@ describe('who may approve: ONE derivation', () => {
     expect(await by('squad-target')).toEqual([ADMIN])
   })
 
+  it('LAPSED admins cannot starve the approver scan: 200 lapsed candidates sorted first do not hide the live approver', async () => {
+    await askOk('agent-rava', { squad: 'squad-target' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    for (let i = 0; i < 205; i += 1) {
+      const id = `aaa-lapsed-${String(i).padStart(3, '0')}`
+      h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('${id}', '${id}@example.test', '${id}', 'active', '2026-10-09T00:00:00.000Z', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES ('cap-${id}', '${id}', 'squad', 'squad-target', 'admin', '2020-01-01 00:00:00')`)
+    }
+    expect(await whoMayApprove(env, row)).toContain(ADMIN)
+  })
+
   it('an approver whose admin grant EXPIRES: live => still an approver (kills a misbound now), lapsed => not (migration 0228)', async () => {
     await askOk('agent-rava', { squad: 'squad-target' })
     const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
