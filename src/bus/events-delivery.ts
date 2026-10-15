@@ -225,6 +225,7 @@ interface MessageRow {
   kind: string
   request_id: string | null
   created_at: string
+  target_seat?: string | null
 }
 
 export interface DeliverOptions {
@@ -287,12 +288,22 @@ export async function deliverSubscriptionEvent(env: Env, payload: unknown, opts:
 
   // Facts of the message come from the row, never from the job or the queue event.
   const msg = await env.DB.prepare(
-    `SELECT seq, to_agent, from_agent, kind, request_id, created_at FROM agent_messages WHERE id = ?1 AND tenant = ?2`,
+    `SELECT seq, to_agent, from_agent, kind, request_id, created_at, target_seat FROM agent_messages WHERE id = ?1 AND tenant = ?2`,
   ).bind(job.message_id, env.TENANT_SLUG).first<MessageRow>()
   if (!msg) return refuse('message_not_found')
   if (msg.to_agent !== sub.agent_id) return refuse('message_not_addressed_to_subscriber')
   // Feedback-loop guard, from the row's real sender.
   if (msg.from_agent === sub.agent_id) return refuse('self_event')
+  // Seat partition: push ONLY what the subscribing token's own inbox read can return (src/agents/messages.ts: a token reads
+  // target_seat IS NULL, plus its own bound label). A message addressed to ANOTHER seat of the same agent must not wake (or reveal
+  // its id/kind/request_id to) this subscription. A lookup fault throws so the queue retries; it never fails open or drops the wake.
+  if (msg.target_seat != null && msg.target_seat !== '') {
+    const tok = await env.DB.prepare(
+      `SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`,
+    ).bind(sub.token_id, env.TENANT_SLUG).first<{ label: string | null }>()
+    const bound = tok?.label?.trim() || null
+    if (bound !== msg.target_seat) return refuse('message_not_for_seat')
+  }
   let readAfter: number
   try {
     readAfter = readAfterSeq(msg.seq)

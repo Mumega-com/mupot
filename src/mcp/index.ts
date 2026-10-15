@@ -7829,10 +7829,13 @@ async function handleJsonRpc(
       const catalogue = attachedCandidates.length > 0
         ? baseCatalogue.map((e) => ({
             ...e,
-            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. Pass arguments.agent to choose which one to wake (optional when only one).`,
+            // `agent` is REQUIRED exactly when subscribe would refuse without it: pickAttachment counts every live candidate, not only the
+            // eligible ones, so the schema must follow the same count (a client that trusts the schema must never get agent_required).
+            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. ${attachedCandidates.length > 1 ? 'Pass arguments.agent (required: this connection is attached to several agents) to choose which one to wake.' : 'arguments.agent is optional (one attached agent).'}`,
             inputSchema: {
               type: 'object',
               properties: { agent: { type: 'string', description: 'Id, slug or exact name of an agent this connection is attached to.' } },
+              ...(attachedCandidates.length > 1 ? { required: ['agent'] } : {}),
               additionalProperties: false,
             },
           }))

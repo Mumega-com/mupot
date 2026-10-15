@@ -600,7 +600,7 @@ describe('Standard Webhooks signing', () => {
 /** Insert a real inbox row (the ONLY source of a delivery's facts). Idempotent per id. */
 function insertMsg(
   mid: string,
-  o: { seq?: number; from?: string; to?: string; kind?: string; requestId?: string | null; createdAt?: string } = {},
+  o: { seq?: number; from?: string; to?: string; kind?: string; requestId?: string | null; createdAt?: string; targetSeat?: string | null } = {},
 ): void {
   const exists = harness.sqlite.prepare('SELECT 1 AS x FROM agent_messages WHERE id = ?').get(mid)
   if (exists) return
@@ -613,6 +613,7 @@ function insertMsg(
     mid, TENANT, o.to ?? 'agent-a', o.from ?? 'agent-b', 'member-agent-b', o.kind ?? 'message',
     'SECRET MESSAGE BODY MUST NEVER LEAVE', o.requestId ?? null, o.createdAt ?? '2026-08-01T12:00:00.000Z',
   )
+  if (o.targetSeat !== undefined) harness.sqlite.prepare('UPDATE agent_messages SET target_seat = ? WHERE id = ?').run(o.targetSeat, mid)
 }
 
 /** A job for message `mid` (row inserted on demand). */
@@ -815,6 +816,26 @@ describe('delivery', () => {
     expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-self', { from: 'agent-a' }))).toBe('refused')
     expect(sent).toHaveLength(0)
     expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'self_event' })
+  })
+
+  describe('seat partition: push only what the subscribing token\'s inbox can read', () => {
+    // The subscribing token (tok-ba) is seeded with label 't'. Inbox reads return target_seat IS NULL plus the token's own label.
+    it('a message addressed to ANOTHER seat of the same agent => refused message_not_for_seat, no POST', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-other-seat', { targetSeat: 'other-thread' }))).toBe('refused')
+      expect(sent).toHaveLength(0)
+      expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'message_not_for_seat' })
+      expect(subs()[0].status).toBe('active') // a seat mismatch is per-message, never a revocation
+    })
+    it('a message addressed to THIS token\'s own seat is delivered', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-own-seat', { targetSeat: 't' }))).toBe('delivered')
+      expect(sent).toHaveLength(1)
+    })
+    it('an unlabelled (empty label) token receives untargeted mail but not seat-targeted mail', async () => {
+      harness.sqlite.exec(`UPDATE member_tokens SET label = '' WHERE id = 'tok-ba'`)
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-targeted', { targetSeat: 't' }))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-broadcast'))).toBe('delivered')
+      expect(sent).toHaveLength(1)
+    })
   })
 
   it('caps new events per subscription per minute; the excess is refused with a receipt', async () => {
