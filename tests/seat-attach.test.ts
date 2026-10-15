@@ -1777,6 +1777,20 @@ describe('MCP Events for attached agents', () => {
     expect((row as unknown as { grant_token_id: string }).grant_token_id).toBe(g.tokenId) // the human's grant is recorded so ITS revocation stops the wake
   })
 
+  it('events/list inputSchema.required is [agent] exactly when several agents are attached (matches pickAttachment); absent with one', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    type Entry = { inputSchema: { required?: string[] }; description: string }
+    const one1 = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Entry[]
+    expect(one1[0].inputSchema).not.toHaveProperty('required')
+    expect(one1[0].description).toContain('optional')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin')
+    const two = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Entry[]
+    expect(two[0].inputSchema.required).toEqual(['agent'])
+    expect(two[0].description).toContain('required')
+  })
+
   it('several attached agents: no agent argument -> agent_required (lists them); a named agent works; an agent not attached is the same refusal whether or not it exists', async () => {
     const env = evEnv()
     const g = await grant(env, HUMAN)
