@@ -1,6 +1,7 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql } from './running-action'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
+import { pinnedBase } from '../platform/tenant-path'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { brandSquadScope, hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
@@ -164,13 +165,13 @@ function projectFrom(row: DispatchRunRow): Project {
   }
 }
 
-function publicMcpEndpoint(env: Env): string | null {
+export function publicMcpEndpoint(env: Env): string | null {
   const configured = env.PUBLIC_ORIGIN?.trim()
   if (!configured) return null
   try {
     const url = new URL(configured)
     if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
-    return mcpEndpoint(url.origin)
+    return mcpEndpoint(pinnedBase(configured) ?? url.origin)
   } catch {
     return null
   }

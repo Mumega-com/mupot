@@ -9,6 +9,7 @@
 //   3. Single billed request across the chain: Dispatch Worker -> User Worker.
 
 import { RESERVED_TENANT_SLUGS } from './pots/service'
+import { TENANT_PREFIX_HEADER, extractPathTenant } from './platform/tenant-path'
 import {
   buildForwardRequest,
   refuseServiceWorkerScript,
@@ -107,17 +108,7 @@ export function extractTenantSlug(
   return sanitizeSlug(cleanHost)
 }
 
-const PATH_TENANT_RE = /^\/t\/([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)(\/.*)?$/i
-
-/** Apex path ` /t/{tenant}/{interface} ` e.g. `/t/gaf/mcp`. */
-export function extractPathTenant(pathname: string): { slug: string; remainder: string } | null {
-  const match = pathname.match(PATH_TENANT_RE)
-  if (!match) return null
-  const slug = match[1].toLowerCase()
-  const rest = match[2]
-  const remainder = rest && rest.length > 0 ? rest : '/'
-  return { slug, remainder }
-}
+export { extractPathTenant } from './platform/tenant-path'
 
 export type ApexPathTenant =
   | { kind: 'home'; request: Request; slug: string }
@@ -137,6 +128,13 @@ const TENANT_OVERRIDE_HEADERS = ['x-mupot-tenant-slug', 'x-pot-tenant']
 // The path door is same-origin (`mupot.mumega.com`), so unlike subdomain
 // routing the browser/operator credentials arrive with the request — strip
 // them before dispatch. Tenant Workers authenticate through their own door.
+
+/** Stamp the server-resolved path-tenant prefix (mupot#1928). Overwrites any client-supplied value. */
+function withTenantPrefix(request: Request, slug: string): Request {
+  const headers = new Headers(request.headers)
+  headers.set(TENANT_PREFIX_HEADER, `/t/${slug}`)
+  return new Request(request, { headers })
+}
 
 function stripHeaders(request: Request, names: string[]): Request {
   const headers = new Headers(request.headers)
@@ -162,9 +160,9 @@ export function resolveApexPathTenant(
     // Home stays on this Worker (same isolate, colony credentials valid),
     // but the tenant-override headers must die here so the downstream
     // header dispatch in index.ts cannot retarget a resolved path.
-    const homeRequest = stripHeaders(
-      rewriteRequest(request, url.hostname, parsed.remainder),
-      TENANT_OVERRIDE_HEADERS,
+    const homeRequest = withTenantPrefix(
+      stripHeaders(rewriteRequest(request, url.hostname, parsed.remainder), TENANT_OVERRIDE_HEADERS),
+      parsed.slug,
     )
     return { kind: 'home', slug: parsed.slug, request: homeRequest }
   }
@@ -181,7 +179,9 @@ export function resolveApexPathTenant(
   const forwardUrl = new URL(request.url)
   forwardUrl.hostname = `${parsed.slug}.${rootDomain}`
   forwardUrl.pathname = parsed.remainder
-  const dispatchRequest = buildForwardRequest(request, forwardUrl, 'colony-origin')
+  // The tenant Worker rewrites its emitted URLs under this prefix (mupot#1928). `parsed.slug` is
+  // regex-validated (PATH_TENANT_RE), never raw client text.
+  const dispatchRequest = withTenantPrefix(buildForwardRequest(request, forwardUrl, 'colony-origin'), parsed.slug)
   return {
     kind: 'dispatch',
     slug: parsed.slug,

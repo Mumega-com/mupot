@@ -80,6 +80,7 @@ import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
+import { withTenantPrefix } from './platform/tenant-path'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
@@ -367,8 +368,7 @@ function reportUnmatchedCron(scheduledAt: Date): void {
   })
 }
 
-export default {
-  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
     // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
@@ -428,7 +428,11 @@ export default {
     const hosted = await maybeHandleHostnameDispatch(req, env)
     if (hosted) return hosted
     return oauthProvider.fetch(req, env, ctx)
-  },
+}
+
+export default {
+  // mupot#1928 choke point: strip a forged prefix header, then re-root a path-routed tenant's response.
+  fetch: (req: Request, env: Env, ctx: ExecutionContext) => withTenantPrefix(req, env, (r) => handleRequest(r, env, ctx)),
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,
