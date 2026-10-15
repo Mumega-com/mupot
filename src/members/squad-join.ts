@@ -37,7 +37,7 @@
 // shows what the ref really resolved to.
 
 import type { Env, OrgKind } from '../types'
-import { canOnSquad, capabilityRank, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, capabilityRank, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { resolveSquadRef } from '../org/resolve'
 import { issueMomentLink } from '../secure-moments/issue'
 import { secureMomentsStatus } from '../secure-moments/config'
@@ -235,6 +235,7 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
     `SELECT DISTINCT c.member_id AS member_id
        FROM capabilities c JOIN members m ON m.id = c.member_id AND m.tenant = ?1 AND m.status = 'active'
       WHERE c.capability IN ('admin', 'owner')
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?5')}
         AND (c.scope_type = 'org' OR (c.scope_type = 'department' AND c.scope_id = ?2) OR (c.scope_type = 'squad' AND c.scope_id = ?3))
       UNION
      -- channel-derived squad grants count exactly as resolveCapabilities counts them
@@ -242,7 +243,7 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
        FROM channel_capability_grants ccg JOIN members m ON m.id = ccg.member_id AND m.tenant = ?1 AND m.status = 'active'
       WHERE ccg.squad_id = ?3 AND ccg.capability IN ('admin', 'owner')
       ORDER BY member_id LIMIT ?4`,
-  ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT).all<{ member_id: string }>()
+  ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT, nowCapabilitySql()).all<{ member_id: string }>()
   const out: string[] = []
   for (const r of rows.results ?? []) if (await eligibleApprover(env, sq, r.member_id)) out.push(r.member_id)
   return out
