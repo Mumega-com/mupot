@@ -19,6 +19,15 @@ if(!window.PublicKeyCredential){show('Passkeys not available','This browser cann
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
 function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),csrf:form.getAttribute('data-csrf')}}
+function setAgentPrompt(kind,title,message){
+ var box=document.getElementById('agent-prompt-box'),t=document.getElementById('agent-prompt');if(!box||!t)return;
+ var who=box.getAttribute('data-agent')||'there';
+ var line=function(v){return String(v==null?'':v).replace(/[\\u0000-\\u001f\\u007f]+/g,' ').replace(/\\s+/g,' ').trim().slice(0,300)};
+ if(kind==='denied'){t.value='Hi '+who+'. I reviewed your request to act as '+who+' and DENIED it. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell me in two lines what you needed access for, and I will decide whether to set it up another way.'}
+ else{t.value='Hi '+who+'. I tried to approve your request but mupot did not record it: "'+line(title)+': '+line(message)+'". Nothing was changed.\\nDo not retry other routes and do not ask for tokens or extra access.\\nShow me what you were trying to do and wait for my instruction.'}
+ var h=box.querySelector('h2');if(h)h.textContent=kind==='denied'?'Tell '+who+' it was denied':'Tell '+who+' what happened';
+ var cb=document.getElementById('copy-prompt');if(cb)cb.textContent='Copy message';
+}
 async function decide(decision){
  var slow=null;
  lock(true);show('Waiting for your passkey','Confirm on this device. Nothing has been decided yet.',true);
@@ -34,8 +43,8 @@ async function decide(decision){
   clearTimeout(slow);
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
-  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;if(decision==='deny'){var pb=document.getElementById('agent-prompt-box');if(pb)pb.style.display='none'}}else{lock(false)}
- }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false)}
+  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;if(decision==='deny'){setAgentPrompt('denied')}}else{lock(false);setAgentPrompt('refused',res.json.title,res.json.message)}
+ }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false);setAgentPrompt('refused','Not decided',explain(e))}
 }
 var bs=form.querySelectorAll('button[data-act]');
 for(var i=0;i<bs.length;i++){bs[i].addEventListener('click',function(ev){decide(ev.currentTarget.getAttribute('data-act'))})}
