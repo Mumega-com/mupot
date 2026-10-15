@@ -27,7 +27,7 @@ import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import {
-  attachSeatToAgent, decideAdmissionDirect, detachAttachment, ensureAdmission, listAttachableAgents, revokeAdmission,
+  attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
   seatAttachEnabled, findLiveAttachment,
 } from '../src/members/seat-attach'
 import type { AuthContext, Env } from '../src/types'
@@ -379,10 +379,76 @@ describe('who may be attached, and who may call', () => {
     expect(errOf(await attach(env, g, 'conv-a', String(other.sc.bound_agent_id)))).toBe('agent_not_found')
   })
 
-  it('an unwelded agent (no member binding) cannot be attached', async () => {
+  it('an identity-only agent (no member binding yet) IS attachable: admitting it welds the identity, with no token', async () => {
     const env = envFor(h)
     h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
-    expect((await listAttachableAgents(env, HUMAN)).map((a) => a.slug)).not.toContain('bare')
+    expect((await listAttachableAgents(env, HUMAN)).map((a) => a.slug)).toContain('bare')
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'agent-bare')
+    expect(pend.sc).toMatchObject({ status: 'pending_admission' })
+    // asking welds NOTHING: only the human's approval does
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(pend.sc.approve_url), key, 'approve')).body).toMatchObject({ ok: true, title: 'Admitted' })
+    const welded = one<{ member_id: string }>(`SELECT member_id FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)!
+    expect(n(`SELECT COUNT(*) AS n FROM members WHERE id = ? AND status = 'active' AND email IS NULL`, welded.member_id)).toBe(1)
+    expect(one<{ capability: string; scope_id: string }>(`SELECT capability, scope_id FROM capabilities WHERE member_id = ?`, welded.member_id)).toMatchObject({ capability: 'member', scope_id: 'squad-core' })
+    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ? AND agent_id = 'agent-bare' AND channel != 'directory'`, welded.member_id)).toBe(0) // no standing credential
+    expect(JSON.parse(one<{ after_state: string }>(`SELECT after_state FROM agent_audit WHERE action = 'seat_admit' AND agent_id = 'agent-bare'`)!.after_state)).toMatchObject({ welded_identity: true })
+    const done = await attach(env, g, 'conv-a', 'agent-bare')
+    expect(done.sc).toMatchObject({ status: 'attached', agent: { id: 'agent-bare' } })
+    expect((await boot(env, g, 'conv-a')).sc.member_id).toBe(welded.member_id)
+  })
+
+  it('a deny welds nothing, and an expired/closed admission welds nothing', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'bare')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    await decideMoment(env, String(pend.sc.approve_url), key, 'deny')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    // the admission stops being pending BETWEEN the refusal check and the write (the gate runs in that window): the weld
+    // statements are conditional on it still being pending, so a lost race welds nothing.
+    const p2 = await attach(env, g, 'conv-a', 'bare')
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'pending'`)!
+    const out = await decideSeatAdmission(env, {
+      adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} },
+      gate: async () => { h.sqlite.exec(`UPDATE agent_seat_admissions SET status = 'denied' WHERE id = '${adm.id}'`); return true },
+    }, Date.now())
+    expect(out.status).toBe(409) // CLOSED: the admission write did not land
+    void p2
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(0)
+  })
+
+  it('an agent whose welded member was SUSPENDED is not attachable (and nothing is re-welded); an identity-only agent on a squad the human does not administer is not found', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`)
+    expect((await listAttachableAgents(env, HUMAN)).map((a) => a.slug)).not.toContain('rava')
+    seedAgent({ id: 'agent-far', slug: 'far', name: 'Far', squad: 'squad-far', admins: [] })
+    h.sqlite.exec(`DELETE FROM agent_member_bindings WHERE agent_id = 'agent-far'`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    expect(errOf(await attach(env, g, 'conv-a', 'far'))).toBe('agent_not_found')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-far'`)).toBe(0)
+  })
+
+  it('the dashboard direct-live path welds an identity-only agent in the same batch, and a second attach does not weld twice', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.id
+    const r1 = await ensureAdmission(env, { agentId: 'agent-bare', humanMemberId: HUMAN, harnessId: g.harnessId, seatId: seat, via: 'dashboard' })
+    expect(r1).toMatchObject({ ok: true, state: 'live' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
+    const r2 = await ensureAdmission(env, { agentId: 'agent-bare', humanMemberId: HUMAN, harnessId: g.harnessId, seatId: seat, via: 'dashboard' })
+    expect(r2).toMatchObject({ ok: true, state: 'live' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(1)
   })
 
   it('an ambiguous name needs the id', async () => {
