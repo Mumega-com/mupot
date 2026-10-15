@@ -13,7 +13,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { advertisedTools, mcpApp, unknownToolDetail, resolveToolSpec, wireName, TOOL_WIRE_ALIASES, TOOLS } from '../src/mcp/index'
+import { advertisedTools, mcpApp, unknownToolDetail, longestSuffixTool, resolveToolSpec, wireName, TOOL_WIRE_ALIASES, TOOLS } from '../src/mcp/index'
 import { toolAnnotations } from '../src/mcp/tool-annotations'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { HARNESS_SESSION_ALLOWED_TOOLS } from '../src/members/harness-credential'
@@ -138,6 +138,19 @@ describe('a call through the name a Codex client sends (#1910)', () => {
     expect(unknownToolDetail('mupot_inbox_mark_handled', envFor({ SEAT_ATTACH: undefined }))).toBe('mupot_inbox_mark_handled')
     expect(unknownToolDetail('mcp__codex_apps__mupot_w2__inbox_mark_handled', envFor({ SEAT_ATTACH: undefined }))).not.toContain('did you mean')
     expect(unknownToolDetail('mupot_inbox_mark_handled', envFor())).toContain('did you mean')
+  })
+
+  it('suffix scan: a hidden longer tool neither shadows an advertised shorter one nor is surfaced', () => {
+    const names = ['recall', 'secret_recall', 'status']
+    const advertised = (n: string): boolean => n !== 'secret_recall'
+    // the hidden longest match is skipped INSIDE the scan, so the advertised shorter one wins
+    expect(longestSuffixTool('mupot_x_secret_recall', names, advertised)).toBe('recall')
+    // everything hidden: nothing is returned (never the hidden name)
+    expect(longestSuffixTool('mupot_x_secret_recall', ['secret_recall'], () => false)).toBeUndefined()
+    // all advertised: still the longest
+    expect(longestSuffixTool('mupot_x_secret_recall', names, () => true)).toBe('secret_recall')
+    // needs a separator before the name
+    expect(longestSuffixTool('mupotrecall', names, () => true)).toBeUndefined()
   })
 
   it('the hint names the ADVERTISED wire name: an office tool is suggested as office_*, never as the dotted name', () => {

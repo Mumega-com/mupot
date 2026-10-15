@@ -108,7 +108,7 @@ test('wiring: real src/mcp/index.ts passes', () => {
 
 test('wiring: removing the allowlist refusal or the route mode is detected', () => {
   const real = readFileSync(new URL('../src/mcp/index.ts', import.meta.url), 'utf8')
-  const noEntry = real.replace('!profileEntry(params.name)', 'false')
+  const noEntry = real.replace('!profileEntry(canonicalName)', 'false')
   assert.equal(checkProfileWiring(noEntry).callsProfileEntry, false)
   const noSef = real.replace('sideEffectFree: true', 'sideEffectFree: false')
   assert.equal(checkProfileWiring(noSef).setsSideEffectFree, false)

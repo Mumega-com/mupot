@@ -7309,6 +7309,16 @@ export function wireName(canonical: string): string {
  *  for that refusal: the name, plus a did-you-mean when stripping a client namespace (or case) lands on a
  *  registered tool. It is a HINT only: the name is never resolved or executed, so what a caller can call is
  *  unchanged. */
+/** Longest `names` entry that `lower` ends with after a separator AND that `allowed` accepts. The filter sits INSIDE
+ *  the scan: filtering the longest match afterwards would let a hidden longer tool shadow an advertised shorter one,
+ *  or (with the filter dropped) surface the hidden tool's name. Pure, so it is tested with a synthetic registry. */
+export function longestSuffixTool(lower: string, names: Iterable<string>, allowed: (name: string) => boolean): string | undefined {
+  let best: string | undefined
+  for (const name of names) {
+    if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length) && allowed(name)) best = name
+  }
+  return best
+}
 export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): string {
   // Only a tool this pot ADVERTISES is ever suggested (a flag-gated tool that is off stays undisclosed), and it is
   // suggested under its ADVERTISED wire name (an office.* tool is suggested as office_*).
@@ -7330,10 +7340,7 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
   // A connector-style namespace (`mcp__codex_apps__mupot_w2__boot_context`): only for a name that visibly carries a
   // client or mupot namespace, take the longest tool the name ends with after a separator.
   if (/^mcp__|mupot/.test(lower)) {
-    let best: string | undefined
-    for (const name of TOOL_BY_NAME.keys()) {
-      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length)) best = name
-    }
+    const best = longestSuffixTool(lower, TOOL_BY_NAME.keys(), (n) => suggest(n) !== undefined)
     const s = best === undefined ? undefined : suggest(best)
     if (s) return hint(s)
   }
