@@ -82,11 +82,20 @@ describe('archive honored by error-swallowing dashboard readers (behavioural)', 
     expect((await loadListMetrics(env, ['p1'], access)).get('p1')?.openWork).toBe(1)
   })
 
-  it('loadProjectDetail: task list and directTasks aggregate', async () => {
+  it('loadProjectDetail: task list', async () => {
     await cycle('t-blocked', async () => {
       const d = await loadProjectDetail(env, owner, 'p1')
-      return !!d && d.tasks.some((t) => t.id === 't-blocked') && d.aggregates.directTasks === 2
+      return !!d && d.tasks.some((t) => t.id === 't-blocked')
     })
+  })
+
+  it('loadProjectDetail: directTasks aggregate', async () => {
+    const n = async () => (await loadProjectDetail(env, owner, 'p1'))?.aggregates.directTasks
+    expect(await n()).toBe(2)
+    archive('t-blocked')
+    expect(await n()).toBe(1)
+    unarchive('t-blocked')
+    expect(await n()).toBe(2)
   })
 
   it('GET /projects/:id direct_tasks (src/projects projectAggregates, unrestricted)', async () => {
