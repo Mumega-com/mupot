@@ -1424,7 +1424,7 @@ const CONSENT_NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 
 function cookieNonceList(cookieHeader: string, cookieName: string): string[] {
   const raw = parseCookieValue(cookieHeader, cookieName)
-  return raw ? raw.split('.').filter((n) => CONSENT_NONCE_RE.test(n)) : []
+  return raw ? raw.split('.').slice(-CONSENT_COOKIE_MAX_NONCES).filter((n) => CONSENT_NONCE_RE.test(n)) : [] // cap BEFORE any KV read: an unauthenticated cookie must not buy N reads
 }
 
 function consentCookieNonces(cookieHeader: string): string[] {
@@ -1727,7 +1727,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // Consume only THIS nonce from the cookie; sibling tabs' nonces stay bound.
     const remainingNonces = cookieNonces.filter((n) => n !== consentNonce)
     const clearConsentCookie = remainingNonces.length > 0
-      ? `${CONSENT_COOKIE_NAME}=${remainingNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=${CONSENT_TTL_SECONDS}`
+      ? `${CONSENT_COOKIE_NAME}=${remainingNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=${CONSENT_TTL_SECONDS}${url.protocol === 'https:' ? '; Secure' : ''}`
       : `${CONSENT_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=0`
 
     // Decline → NO mint, NO token, NO completeAuthorization. Ever. A declined

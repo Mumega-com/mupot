@@ -207,3 +207,39 @@ describe('mupot#1441 flow-nonce cookie (/authorize -> callback), same class', ()
     expect(b.jar.get('mupot_oauth_nonce')!.split('.')).toEqual(all.slice(-5))
   })
 })
+
+describe('mupot#1441 gate follow-ups', () => {
+  it('P2-1: the consent POST re-sets surviving sibling nonces WITH Secure on https', async () => {
+    const env = makeEnv(); const b = new Browser()
+    const n1 = await renderConsent(b, env)
+    await renderConsent(b, env)
+    const res = await decline(b, env, n1)
+    const sc = res.headers.getSetCookie().find((c) => c.startsWith('mupot_oauth_consent=') && !/Max-Age=0/.test(c))!
+    expect(sc).toBeDefined()
+    expect(sc).toContain('; Secure')
+    expect(sc).toContain('HttpOnly')
+  })
+
+  it('P2-2: a cookie stuffed with hundreds of UUIDs costs at most 5 KV reads (callback and authorize)', async () => {
+    const env = makeEnv(); const b = new Browser()
+    const stuffed = Array.from({ length: 800 }, () => crypto.randomUUID())
+    const kv = env.SESSIONS as unknown as { get: (k: string, t?: string) => Promise<unknown> }
+    const realGet = kv.get.bind(kv)
+    let reads = 0
+    kv.get = async (k, t) => { reads++; return realGet(k, t) }
+    env.DB = h.db
+    await callback(b, env, stuffed[799], `mupot_oauth_nonce=${stuffed.join('.')}`)
+    expect(reads).toBeLessThanOrEqual(5)
+    reads = 0
+    await handleOAuthAuthorize(new Request('https://pot.test/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256', { headers: { Cookie: `mupot_oauth_nonce=${stuffed.join('.')}` } }), env)
+    expect(reads).toBeLessThanOrEqual(5)
+  })
+
+  it('P2-4: replaying a consumed callback with the old cookie is refused 400 (KV single-use delete)', async () => {
+    const env = makeEnv(); const b = new Browser()
+    const s = await startAuthorize(b, env)
+    const oldCookie = `mupot_oauth_nonce=${s}`
+    expect((await callback(b, env, s)).status).toBe(200)
+    expect((await callback(b, env, s, oldCookie)).status).toBe(400)
+  })
+})
