@@ -74,7 +74,10 @@ async function startLogin(env: Env): Promise<string> {
 }
 
 function callbackReq(state: string) {
-  return new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`)
+  // The browser that ran /auth/login holds the per-state binding cookie (login-CSRF fix, #1579).
+  return new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`, {
+    headers: { cookie: `mupot_login_state_${state}=1` },
+  })
 }
 
 async function googleLogin(env: Env, email: string, sub: string) {

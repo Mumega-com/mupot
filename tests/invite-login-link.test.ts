@@ -139,7 +139,7 @@ async function startLogin(env: Env, pendingId?: string): Promise<string> {
 
 function callbackReq(state: string, pendingId?: string) {
   return new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`, {
-    headers: pendingId ? { cookie: `${PENDING_INVITE_COOKIE}=${pendingId}` } : {},
+    headers: { cookie: [`mupot_login_state_${state}=1`, ...(pendingId ? [`${PENDING_INVITE_COOKIE}=${pendingId}`] : [])].join('; ') },
   })
 }
 

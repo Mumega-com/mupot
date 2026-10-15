@@ -403,9 +403,12 @@ export async function handleImMessage(
     }
     // The reply carries the plaintext link and is persisted in telegram_webhook_receipts.response_text. That is NOT
     // redactable: a duplicate Telegram delivery of this update is answered from the stored reply (reservation.duplicate
-    // above), so the receipt must hold the exact reply for idempotent resend. Bounded exposure: the link is single use,
-    // expires in TELEGRAM_LOGIN_LINK_TTL_SECONDS, is superseded by the next /login, and is only usable with a session.
-    return `Open this link in your browser to connect your web sign-in (valid 10 minutes, one use): ${origin}/auth/telegram-link?t=${minted.token}`
+    // above), so the receipt must hold the exact reply for idempotent resend. The link is a BEARER that the chat relay
+    // (the Hermes gateway) and this stored receipt can both see, so it is not a secret from them. What bounds it: it
+    // expires in TELEGRAM_LOGIN_LINK_TTL_SECONDS, is single use, is superseded by the next /login, and confirming it
+    // needs a fresh browser-bound sign-in whose verified email equals the member's email (telegram-login-link.ts claim).
+    // A member with NO email is bounded only by the fresh-sign-in nonce, expiry and single use.
+    return `Open this link in your browser to connect your web sign-in (valid 10 minutes, one use). Do not share this link with anyone: ${origin}/auth/telegram-link?t=${minted.token}`
   }
 
   // 2) Capabilities for this member (the real RBAC).

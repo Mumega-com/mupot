@@ -32,6 +32,11 @@ async function sha256Hex(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+/** sha256 of a link token as it appears in the URL, or null when the shape is not a token we mint. */
+export async function telegramLoginTokenHash(token: string): Promise<string | null> {
+  return /^[0-9a-f]{64}$/.test(token) ? sha256Hex(token) : null
+}
+
 function mintSecret(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32))
   let s = ''
@@ -74,25 +79,40 @@ export async function mintTelegramLoginLink(
   return { ok: true, token, expiresAt }
 }
 
+/** Server-known facts about who a link is for, for the confirm page. Never anything the Telegram user typed. */
+export interface TelegramLoginLinkPreview {
+  /** Member email with the local part masked (a.***@domain), or null when the member has none. */
+  maskedEmail: string | null
+  /** Last four characters of the bound Telegram chat id. */
+  chatSuffix: string
+}
+
+function maskEmail(email: string): string {
+  const at = email.lastIndexOf('@')
+  if (at < 1) return '***'
+  return `${email.slice(0, 1)}***${email.slice(at)}`
+}
+
 /** Read-only preview for the confirm page. Writes nothing; null for any link that could not be redeemed right now. */
 export async function previewTelegramLoginLink(
   env: Env,
-  token: string,
-): Promise<{ displayName: string } | null> {
-  if (!/^[0-9a-f]{64}$/.test(token)) return null
+  tokenHash: string,
+): Promise<TelegramLoginLinkPreview | null> {
+  if (!/^[0-9a-f]{64}$/.test(tokenHash)) return null
   const row = await env.DB.prepare(
-    `SELECT m.display_name AS display_name
+    `SELECT m.email AS email, l.telegram_chat_id AS chat_id
        FROM telegram_login_links l
        JOIN members m ON m.id = l.member_id AND m.tenant = l.tenant
       WHERE l.token_hash = ?1 AND l.tenant = ?2 AND l.consumed_at IS NULL AND l.revoked_at IS NULL
         AND l.expires_at > ?3 AND m.status = 'active' AND m.telegram_chat_id = l.telegram_chat_id`,
-  ).bind(await sha256Hex(token), env.TENANT_SLUG, new Date().toISOString()).first<{ display_name: string | null }>()
-  return row ? { displayName: row.display_name ?? '' } : null
+  ).bind(tokenHash, env.TENANT_SLUG, new Date().toISOString()).first<{ email: string | null; chat_id: string }>()
+  if (!row) return null
+  return { maskedEmail: row.email ? maskEmail(row.email) : null, chatSuffix: row.chat_id.slice(-4) }
 }
 
 export type RedeemTelegramLoginLinkResult =
   | { ok: true; memberId: string }
-  | { ok: false; error: 'invalid_link' | 'unverified_provider' | 'identity_unavailable' }
+  | { ok: false; error: 'invalid_link' | 'unverified_provider' | 'identity_unavailable' | 'service_error' }
 
 /**
  * Consume the link and link the CONFIRMING session's identity to the link's member, atomically.
@@ -101,14 +121,14 @@ export type RedeemTelegramLoginLinkResult =
  */
 export async function redeemTelegramLoginLink(
   env: Env,
-  input: { token: string; provider: string; subject: string; verifiedEmail: string | null },
+  input: { tokenHash: string; provider: string; subject: string; verifiedEmail: string | null },
 ): Promise<RedeemTelegramLoginLinkResult> {
-  if (!/^[0-9a-f]{64}$/.test(input.token)) return { ok: false, error: 'invalid_link' }
+  if (!/^[0-9a-f]{64}$/.test(input.tokenHash)) return { ok: false, error: 'invalid_link' }
   if ((UNVERIFIED_LOGIN_PROVIDERS as readonly string[]).includes(input.provider)) {
     return { ok: false, error: 'unverified_provider' }
   }
   const tenant = env.TENANT_SLUG
-  const tokenHash = await sha256Hex(input.token)
+  const tokenHash = input.tokenHash
 
   // An identity row for this join key (live OR revoked) is never re-pointed at a Telegram member.
   const taken = await env.DB.prepare(
@@ -126,6 +146,11 @@ export async function redeemTelegramLoginLink(
           SELECT 1 FROM members m
            WHERE m.id = telegram_login_links.member_id AND m.tenant = ?5 AND m.status = 'active'
              AND m.archived_at IS NULL AND m.telegram_chat_id = telegram_login_links.telegram_chat_id
+             -- The link is a bearer the chat relay can see, so the chat proof alone is not enough: when the member
+             -- has an email (every Telegram-born member carries the invite email), the confirming session's
+             -- IdP-verified email must be the same address. NULL member email: the fresh-sign-in nonce plus single
+             -- use are the only bound (documented, not silently relaxed).
+             AND (m.email IS NULL OR lower(m.email) = lower(?11))
         )
         AND NOT EXISTS (
           SELECT 1 FROM human_login_identities h
@@ -139,7 +164,7 @@ export async function redeemTelegramLoginLink(
         )`,
   ).bind(
     stamp, input.provider, input.subject, tokenHash, tenant, now,
-    PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSqlUtc(),
+    PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSqlUtc(), input.verifiedEmail,
   )
   const link = env.DB.prepare(
     `INSERT INTO human_login_identities
@@ -153,9 +178,12 @@ export async function redeemTelegramLoginLink(
   )
   try {
     await env.DB.batch([claim, link])
-  } catch {
-    // UNIQUE(tenant, provider, subject) lost a race: the batch rolled back, so the link is NOT consumed.
-    return { ok: false, error: 'identity_unavailable' }
+  } catch (err) {
+    // Only a UNIQUE(tenant, provider, subject) conflict is "identity unavailable" (the batch rolled back, so the link
+    // is NOT consumed). Anything else (D1 down, schema drift) is a service fault the caller must surface as 503, never
+    // fold into a refusal the member would read as "this link is bad".
+    const msg = err instanceof Error ? err.message : String(err)
+    return { ok: false, error: /UNIQUE constraint failed/i.test(msg) ? 'identity_unavailable' : 'service_error' }
   }
   const landed = await env.DB.prepare(
     `SELECT l.member_id AS member_id FROM telegram_login_links l

@@ -29,7 +29,7 @@ import {
 } from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
-import { previewTelegramLoginLink, redeemTelegramLoginLink } from './telegram-login-link'
+import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
 import {
   createWebSession,
   evaluateWebSession,
@@ -124,6 +124,12 @@ interface SessionRecord {
    * (decideIdentitylessAttach), never the old unconditional email lookup.
    */
   loginIdentity?: { provider: string; subject: string }
+  /**
+   * mupot#1579: set ONLY when this login was started from a Telegram login link opened in this very browser (the
+   * state carried the link nonce AND the browser held the matching nonce cookie). The Telegram confirm page accepts
+   * no session without it, so a session minted before the link was opened, or by any other login, never confirms.
+   */
+  tgLinkNonce?: string
 }
 
 // Role precedence for the minimum-role gate: owner > admin > member.
@@ -163,6 +169,40 @@ function sessionKey(id: string): string {
 function stateKey(state: string): string {
   return `${STATE_PREFIX}${state}`
 }
+
+// Browser binding for the OAuth state (login-CSRF). The state alone lives only in server-side KV, so an attacker could
+// finish consent in THEIR browser and hand the callback URL to a victim: the victim's browser would then hold the
+// attacker's session. Each state therefore also rides in a per-state HttpOnly cookie scoped to the callback path
+// (one cookie per state, so two tabs never overwrite each other, same shape as the MCP flow's #1441 nonce cookies);
+// the callback demands it and clears it (single use).
+const STATE_COOKIE_PREFIX = 'mupot_login_state_'
+const STATE_VALUE_RE = /^[0-9a-f]{48}$/
+
+function stateCookieName(state: string): string | null {
+  return STATE_VALUE_RE.test(state) ? `${STATE_COOKIE_PREFIX}${state}` : null
+}
+
+function callbackPath(reqUrl: string): string {
+  return new URL(callbackUrl(reqUrl)).pathname
+}
+
+function cookieSecure(reqUrl: string): boolean {
+  return new URL(reqUrl).protocol === 'https:'
+}
+
+/** Same-origin relative path only: never a scheme, host, protocol-relative or backslash form. */
+function safeReturnPath(raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 256) return null
+  if (!/^\/[A-Za-z0-9/_.~%?=&-]*$/.test(raw)) return null
+  if (raw.startsWith('//') || raw.includes('..')) return null
+  return raw
+}
+
+// mupot#1579: Telegram login link round trip.
+const TG_LINK_COOKIE = 'mupot_tg_link'
+const TG_LINK_KV_PREFIX = 'tglink:'
+const TG_LINK_NONCE_RE = /^[0-9a-f]{48}$/
+const TG_LINK_CONFIRM_PATH = '/auth/telegram-link/confirm'
 
 // ── presence (pot check-in marker, #162 B2 Option P) ──────────────────────────
 // An email-keyed marker so the Control Tower's SIGNED presence probe can answer
@@ -392,7 +432,7 @@ async function mintSession(
   userId: string,
   email: string | null,
   role: OrgRole,
-  opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string } } = {},
+  opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string }; tgLinkNonce?: string } = {},
 ): Promise<void> {
   const sessionId = randomId(32)
   const registration = await registerWebSession(c.env, sessionId, email, opts.loginIdentity)
@@ -405,6 +445,7 @@ async function mintSession(
     // Persisted regardless of registration success — see the field's own
     // doc comment (mupot#1551 round 2, P1-a).
     ...(opts.loginIdentity ? { loginIdentity: opts.loginIdentity } : {}),
+    ...(opts.tgLinkNonce ? { tgLinkNonce: opts.tgLinkNonce } : {}),
   }
   await c.env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
     expirationTtl: SESSION_TTL_SECONDS,
@@ -535,10 +576,30 @@ authApp.get('/login', async (c) => {
   // a foreign/replayed state with a leftover cookie links nothing.
   const state = randomId(24)
   const pendingInviteId = getCookie(c, PENDING_INVITE_COOKIE)
-  const statePayload = pendingInviteId
-    ? JSON.stringify({ pending_invite: pendingInviteId })
+  const returnPath = safeReturnPath(c.req.query('return'))
+  // mupot#1579: a login that carries the Telegram link nonce. The nonce must be the one THIS browser holds in its
+  // cookie AND still be live server-side; anything else is an ordinary login that carries nothing.
+  let tgLinkNonce: string | null = null
+  if (c.req.query('tg') === '1') {
+    const cookieNonce = getCookie(c, TG_LINK_COOKIE)
+    if (cookieNonce && TG_LINK_NONCE_RE.test(cookieNonce) && (await env.SESSIONS.get(`${TG_LINK_KV_PREFIX}${cookieNonce}`))) {
+      tgLinkNonce = cookieNonce
+    }
+  }
+  const statePayload = pendingInviteId || returnPath || tgLinkNonce
+    ? JSON.stringify({
+        ...(pendingInviteId ? { pending_invite: pendingInviteId } : {}),
+        ...(returnPath ? { return: returnPath } : {}),
+        ...(tgLinkNonce ? { tg_link: tgLinkNonce } : {}),
+      })
     : '1'
   await env.SESSIONS.put(stateKey(state), statePayload, { expirationTtl: STATE_TTL_SECONDS })
+  const stateCookie = stateCookieName(state)
+  if (stateCookie) {
+    setCookie(c, stateCookie, '1', {
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.req.url), maxAge: STATE_TTL_SECONDS,
+    })
+  }
 
   const params = new URLSearchParams({
     client_id: env.OAUTH_CLIENT_ID,
@@ -600,6 +661,14 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'missing_code_or_state' }, 400)
   }
 
+  // Browser binding first: this browser must hold the cookie /auth/login (or /auth/reauth) set for THIS state, and it
+  // is consumed here. A callback URL forwarded to another browser has no such cookie and is refused (login-CSRF).
+  const bindingCookie = stateCookieName(state)
+  if (!bindingCookie || getCookie(c, bindingCookie) !== '1') {
+    return c.json({ error: 'invalid_state' }, 400)
+  }
+  deleteCookie(c, bindingCookie, { path: callbackPath(c.req.url) })
+
   // Validate + consume the CSRF state (single-use).
   const seen = await env.SESSIONS.get(stateKey(state))
   if (!seen) {
@@ -622,6 +691,23 @@ authApp.get('/callback', async (c) => {
     } catch {
       // Not a reauth marker — an ordinary (if unrecognised) state value.
       // Falls through to the normal mint path below, same as today.
+    }
+  }
+
+  let returnPath: string | null = null
+  let tgLinkNonce: string | null = null
+  if (seen !== '1') {
+    try {
+      const parsed = JSON.parse(seen) as { return?: unknown; tg_link?: unknown }
+      returnPath = safeReturnPath(parsed.return)
+      const claimed = typeof parsed.tg_link === 'string' ? parsed.tg_link : null
+      // The nonce only counts when this browser still holds the same cookie and the link record is still live.
+      if (claimed && TG_LINK_NONCE_RE.test(claimed) && getCookie(c, TG_LINK_COOKIE) === claimed
+        && (await env.SESSIONS.get(`${TG_LINK_KV_PREFIX}${claimed}`))) {
+        tgLinkNonce = claimed
+      }
+    } catch {
+      // Not our payload shape: ordinary login.
     }
   }
 
@@ -736,8 +822,9 @@ authApp.get('/callback', async (c) => {
   // Mint the session: random opaque id → server-side record in KV.
   await mintSession(c, userId, email, role, {
     loginIdentity: { provider: 'google', subject: info.sub },
+    ...(tgLinkNonce ? { tgLinkNonce } : {}),
   })
-  return c.redirect('/')
+  return c.redirect(returnPath ?? '/')
 })
 
 // GET /auth/reauth → step-up: prove a FRESH round-trip through the identity
@@ -766,6 +853,12 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
     JSON.stringify({ reauth: true, webSessionIdHash: auth.webSessionIdHash }),
     { expirationTtl: STATE_TTL_SECONDS },
   )
+  const reauthCookie = stateCookieName(state)
+  if (reauthCookie) {
+    setCookie(c, reauthCookie, '1', {
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.req.url), maxAge: STATE_TTL_SECONDS,
+    })
+  }
 
   const params = new URLSearchParams({
     client_id: env.OAUTH_CLIENT_ID,
@@ -782,25 +875,54 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
 })
 
 // mupot#1579 — Telegram-first member web login by PROOF OF CONTROL (src/auth/telegram-login-link.ts).
-// The link is minted only inside the authenticated private chat (`/login`). Opening it shows who it is for and
-// what login it will attach; the POST consumes it. The identity linked is the one THIS session carries (server-side
-// session record) — never one named in the request, never one inferred from an email.
-authApp.use('/telegram-link', csrf())
+//
+// Round trip, every hop bound to the browser that opened the link:
+//   1. GET  /auth/telegram-link?t=      validates the link, sets the nonce cookie, stores {tokenHash, openedAt} in KV
+//                                       under the nonce, and sends the browser through a FRESH /auth/login that carries
+//                                       the nonce (the login's own state is bound to this browser by the state cookie).
+//   2. GET  /auth/callback              mints a session stamped with the nonce (tgLinkNonce) and returns here:
+//   3. GET  /auth/telegram-link/confirm shows the EXACT provider account and the server-known Telegram member.
+//   4. POST /auth/telegram-link/confirm consumes the link. Needs the nonce cookie, a session stamped with the SAME
+//                                       nonce and minted after the link was opened (an older session is never enough),
+//                                       and the session's verified email must equal the member's email (module claim).
+// Path note: callbackUrl() hardcodes '/auth/callback' and no tenant-prefix helper has merged (#1975 pending), so these
+// paths are literal '/auth/...' like every other route in this file; switch them with callbackUrl when it lands.
+authApp.use('/telegram-link/confirm', csrf())
 
 function telegramLinkPage(brand: string, inner: string): string {
   const esc = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Connect your sign-in · ${esc(brand)}</title></head><body><main>${inner}</main></body></html>`
 }
 
-async function sessionLoginIdentity(c: Context<AppEnv>): Promise<{ provider: string; subject: string; email: string | null } | null> {
+function htmlEscape(v: string): string {
+  return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+interface TgLinkContext {
+  tokenHash: string
+  provider: string
+  email: string | null
+  nonce: string
+}
+
+/** Everything the confirm step needs, or null: nonce cookie + live KV record + a session stamped with that nonce and minted after the link opened. */
+async function loadTgLinkContext(c: Context<AppEnv>): Promise<TgLinkContext | null> {
+  const nonce = getCookie(c, TG_LINK_COOKIE)
+  if (!nonce || !TG_LINK_NONCE_RE.test(nonce)) return null
+  const rawLink = await c.env.SESSIONS.get(`${TG_LINK_KV_PREFIX}${nonce}`)
   const sessionId = getCookie(c, COOKIE_NAME)
-  if (!sessionId) return null
-  const raw = await c.env.SESSIONS.get(sessionKey(sessionId))
-  if (!raw) return null
+  if (!rawLink || !sessionId) return null
+  const rawSession = await c.env.SESSIONS.get(sessionKey(sessionId))
+  if (!rawSession) return null
   try {
-    const record = JSON.parse(raw) as Partial<SessionRecord>
-    if (!record.loginIdentity) return null
-    return { provider: record.loginIdentity.provider, subject: record.loginIdentity.subject, email: record.email ?? null }
+    const link = JSON.parse(rawLink) as { tokenHash?: unknown; openedAt?: unknown }
+    const record = JSON.parse(rawSession) as Partial<SessionRecord>
+    if (typeof link.tokenHash !== 'string' || typeof link.openedAt !== 'string') return null
+    if (record.tgLinkNonce !== nonce || !record.loginIdentity) return null
+    const minted = Date.parse(record.createdAt ?? '')
+    const opened = Date.parse(link.openedAt)
+    if (!Number.isFinite(minted) || !Number.isFinite(opened) || minted < opened) return null
+    return { tokenHash: link.tokenHash, provider: record.loginIdentity.provider, email: record.email ?? null, nonce }
   } catch {
     return null
   }
@@ -809,37 +931,78 @@ async function sessionLoginIdentity(c: Context<AppEnv>): Promise<{ provider: str
 authApp.get('/telegram-link', async (c) => {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
+  const env = c.env
+  const brand = env.BRAND || env.TENANT_SLUG
+  const tokenHash = await telegramLoginTokenHash(c.req.query('t') ?? '')
+  if (!tokenHash || !(await previewTelegramLoginLink(env, tokenHash))) {
+    return c.html(telegramLinkPage(brand, '<h1>This link is not valid</h1><p>It may have expired or already been used. Send /login to the bot again for a new one.</p>'), 404)
+  }
+  if (provider(env) !== 'google' || !env.OAUTH_CLIENT_ID) {
+    return c.html(telegramLinkPage(brand, '<h1>Google sign-in is not available</h1><p>Connecting a Telegram account needs Google sign-in on this workspace. Ask an admin.</p>'), 503)
+  }
+  const nonce = randomId(24)
+  await env.SESSIONS.put(
+    `${TG_LINK_KV_PREFIX}${nonce}`,
+    JSON.stringify({ tokenHash, openedAt: new Date().toISOString() }),
+    { expirationTtl: STATE_TTL_SECONDS },
+  )
+  setCookie(c, TG_LINK_COOKIE, nonce, {
+    httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: '/auth', maxAge: STATE_TTL_SECONDS,
+  })
+  // A FRESH sign-in, never an existing session: the nonce rides through the login's browser-bound state.
+  return c.redirect(`/auth/login?tg=1&return=${TG_LINK_CONFIRM_PATH}`)
+})
+
+authApp.get('/telegram-link/confirm', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
   const brand = c.env.BRAND || c.env.TENANT_SLUG
-  const token = c.req.query('t') ?? ''
-  const preview = await previewTelegramLoginLink(c.env, token)
+  const ctx = await loadTgLinkContext(c)
+  if (!ctx) {
+    return c.html(telegramLinkPage(brand, '<h1>Start again from Telegram</h1><p>Send /login to the bot and open the new link in this browser.</p>'), 403)
+  }
+  const preview = await previewTelegramLoginLink(c.env, ctx.tokenHash)
   if (!preview) {
     return c.html(telegramLinkPage(brand, '<h1>This link is not valid</h1><p>It may have expired or already been used. Send /login to the bot again for a new one.</p>'), 404)
   }
-  const identity = await sessionLoginIdentity(c)
-  if (!identity) {
-    return c.html(telegramLinkPage(brand, '<h1>Sign in first</h1><p><a href="/auth/login">Sign in</a>, then open this link again to connect that sign-in to your Telegram account.</p>'))
-  }
-  const safe = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-  return c.html(telegramLinkPage(brand, `<h1>Connect this sign-in to your Telegram account</h1><p>Telegram account: ${safe(preview.displayName)}. Sign-in: ${safe(identity.provider)}${identity.email ? ` (${safe(identity.email)})` : ''}.</p><form method="post" action="/auth/telegram-link"><input type="hidden" name="t" value="${safe(token)}"><button type="submit">Connect</button></form>`))
+  const e = htmlEscape
+  const member = preview.maskedEmail
+    ? `${e(preview.maskedEmail)} (Telegram account ending ${e(preview.chatSuffix)})`
+    : `Telegram account ending ${e(preview.chatSuffix)}`
+  return c.html(telegramLinkPage(brand, `<h1>Connect this sign-in to your Telegram account</h1>
+<p>You are signed in as: <strong>${e(ctx.provider)} account ${ctx.email ? e(ctx.email) : '(no email)'}</strong></p>
+<p>This will give that account access to: <strong>${member}</strong></p>
+<p><strong>Only continue if you just sent /login to the bot yourself and that account is yours.</strong> If someone sent you this link, do not continue.</p>
+<form method="post" action="${TG_LINK_CONFIRM_PATH}"><button type="submit">Connect</button></form>
+<p><a href="/auth/logout">Not you? Sign out</a></p>`))
 })
 
-authApp.post('/telegram-link', async (c) => {
+authApp.post('/telegram-link/confirm', async (c) => {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
   const brand = c.env.BRAND || c.env.TENANT_SLUG
   const refuse = (): Response =>
     c.html(telegramLinkPage(brand, '<h1>This link could not be used</h1><p>It may have expired, been used, or this sign-in cannot be connected. Send /login to the bot for a new link.</p>'), 403)
-  const identity = await sessionLoginIdentity(c)
-  if (!identity) return refuse()
-  const form = await c.req.parseBody()
-  const token = typeof form.t === 'string' ? form.t : ''
+  const ctx = await loadTgLinkContext(c)
+  if (!ctx) return refuse()
+  const sessionId = getCookie(c, COOKIE_NAME)
+  const raw = sessionId ? await c.env.SESSIONS.get(sessionKey(sessionId)) : null
+  const record = raw ? (JSON.parse(raw) as Partial<SessionRecord>) : null
+  if (!record?.loginIdentity) return refuse()
   const result = await redeemTelegramLoginLink(c.env, {
-    token,
-    provider: identity.provider,
-    subject: identity.subject,
-    verifiedEmail: identity.email,
+    tokenHash: ctx.tokenHash,
+    provider: record.loginIdentity.provider,
+    subject: record.loginIdentity.subject,
+    verifiedEmail: ctx.email,
   })
-  if (!result.ok) return refuse()
+  if (!result.ok) {
+    if (result.error === 'service_error') {
+      return c.html(telegramLinkPage(brand, '<h1>Temporarily unavailable</h1><p>Please try again in a moment.</p>'), 503)
+    }
+    return refuse()
+  }
+  await c.env.SESSIONS.delete(`${TG_LINK_KV_PREFIX}${ctx.nonce}`)
+  deleteCookie(c, TG_LINK_COOKIE, { path: '/auth' })
   return c.redirect('/')
 })
 
