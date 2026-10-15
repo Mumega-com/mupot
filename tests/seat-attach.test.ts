@@ -2243,7 +2243,10 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     expect(advertisedTools(envFor(h)).some((t) => t.name === 'inbox_mark_handled')).toBe(true)
     const { invokeTool } = await import('../src/mcp/index')
     expect(JSON.stringify(await invokeTool(HOST_BOUND(), off, 'inbox_mark_handled', {}, 'https://pot.test'))).toContain('seat_attach_disabled')
+  })
+})
 
+// ════════════════════════════════════════════════════════════════════════════
 // Memory keying for an ATTACHED seat (the read-your-writes incident asked: could an attached chat write
 // under a different scope key than it reads?). An attached seat's auth.memberId is the ATTACHED agent's own
 // welded member (buildSeatContext), and remember/recall both key on `member:<auth.memberId>`, so write and
