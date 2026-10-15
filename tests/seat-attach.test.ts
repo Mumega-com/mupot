@@ -252,6 +252,8 @@ describe('the flow: ask -> passkey admission -> attach -> act AS the agent', () 
     })
     expect((r.attachment as { admission_id: string }).admission_id).toBe(one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)?.id)
     expect(String(after.sc.next_step)).toContain('ATTACHED')
+    expect(String(after.sc.next_step)).toContain('the ceiling your human approved (member)') // the real approved ceiling, not a stale 'clamped to member level'
+    expect(String(after.sc.next_step)).not.toContain('clamped to member level')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_attach' AND agent_id = 'agent-rava'`)).toBe(1)
   })
 
@@ -652,6 +654,19 @@ describe('who may be attached, and who may call', () => {
     const res = await decideMoment(env, String(pend.sc.approve_url), key, 'approve')
     expect(res.body).toMatchObject({ ok: true, title: 'Admitted' })
     expect(String((res.body as { message?: string }).message)).toContain('act as Rava')
+  })
+
+  it('the attached boot note prints the ceiling the human actually approved (full), never a stale member clamp', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'rava')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(pend.sc.approve_url), key, 'approve', 'full')).body).toMatchObject({ ok: true, title: 'Admitted' })
+    await attach(env, g, 'conv-a', 'rava')
+    const step = String((await boot(env, g, 'conv-a')).sc.next_step)
+    expect(step).toContain('the ceiling your human approved (full)')
+    expect(step).not.toContain('clamped to member level')
   })
 
   it('a moment of kind seat_admit is closed once SEAT_ATTACH is switched off', async () => {
