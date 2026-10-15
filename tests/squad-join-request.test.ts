@@ -295,6 +295,15 @@ describe('home squads and other closed targets', () => {
     expect((await decide(r.link, plainKey, 'deny')).status).toBe(200)
   })
 
+  it('an agent whose identity is no longer usable is refused BEFORE the link is burned', async () => {
+    const r = await askOk('agent-rava', { squad: 'squad-target' })
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`)
+    const res = await decide(r.link, adminKey, 'approve')
+    expect(res.status).toBe(409)
+    expect(member('agent-rava', 'squad-target')).toBeUndefined()
+    expect(momentStatuses()).toEqual(['pending'])
+  })
+
   it('an archived squad is refused at approve', async () => {
     const r = await askOk('agent-rava', { squad: 'squad-target' })
     h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-target'`)
@@ -542,6 +551,13 @@ describe('who may approve: ONE derivation', () => {
     h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${ORGADM}'`)
     cap('mem-agent-hadi-admin', 'squad', 'squad-target', 'admin')
     expect(await by('squad-target')).toEqual([ADMIN])
+  })
+
+  it('a home squad has NO approvers even for a member holding an exact squad-scope admin grant on it (G-FP1b)', async () => {
+    cap(ADMIN, 'squad', 'squad-home-x', 'admin')
+    await askOk('agent-rava', { squad: 'squad-home-x' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    expect(await whoMayApprove(env, row)).toEqual([])
   })
 
   it('the approval check uses it: a member dropped from the set cannot approve a link they already hold', async () => {
