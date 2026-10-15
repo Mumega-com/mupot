@@ -1448,6 +1448,18 @@ describe('a lapsed native-wake lease is recorded, not silent', () => {
     expect((await nativeWakeState(env, TENANT, agent)).state).toBe('none')
   })
 
+  it('the message check is exact: a real message addressed to ANOTHER agent, and a self-sent one, write no lapse receipt', async () => {
+    const a = await subscribeOk('bound-admin')
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    lapse(a)
+    insertMsg('to-someone-else', { to: 'agent-zzz-not-subject', from: 'agent-b' })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'to-someone-else', seq: 30 }))
+    expect(lapsedReceipts()).toHaveLength(0) // the row exists but is addressed to another agent
+    insertMsg('self-sent', { to: agent, from: agent })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, from_agent: agent, message_id: 'self-sent', seq: 31 }))
+    expect(lapsedReceipts()).toHaveLength(0)
+  })
+
   it('a LIVE lease beside a lapsed one records no lapse (and still delivers); a lapse receipt never blocks the real delivery after a renewal', async () => {
     const a = await subscribeOk('bound-admin')
     const b = await subscribeOk('bound-admin', subParams({}, { url: 'https://hooks.example.com/mcp/events/second' }))

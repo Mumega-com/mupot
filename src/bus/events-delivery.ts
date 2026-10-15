@@ -67,7 +67,14 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
   // A message for an agent with NO live lease used to vanish without a trace (the lease row kept saying 'active' and no job, receipt or
   // log was written). Record it: the wake did not happen because the subscription lapsed, and say so in the receipts. (2026-10-15: Rava's
   // ChatGPT subscription stopped renewing on 10-10 and eight messages disappeared silently.)
-  if ((subs.results ?? []).length === 0) await recordLapsedWake(env, event.tenant, p.to_agent, p.message_id, nowIso)
+  // Best-effort bookkeeping: a failure here must never make the source message.created retry (it would re-run the seat and Hermes legs).
+  if ((subs.results ?? []).length === 0) {
+    try {
+      await recordLapsedWake(env, event.tenant, p.to_agent, p.message_id, nowIso)
+    } catch (err) {
+      console.error('[events] lapsed-wake bookkeeping failed', err instanceof Error ? err.message : String(err))
+    }
+  }
   for (const s of subs.results ?? []) {
     // NO pre-send marker, NO compensating write: nothing may suppress a retry. A failed send
     // rejects out of here (the consumer then does not ack the source message). If the source is
