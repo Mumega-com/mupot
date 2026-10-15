@@ -96,10 +96,10 @@ BEGIN
   VALUES (
     lower(hex(randomblob(16))),
     COALESCE((SELECT tenant FROM members WHERE id = NEW.member_id), ''),
-    'capabilities', NEW.id, 'granted', NEW.granted_by, NEW.reason,
+    'capabilities', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'granted', NEW.granted_by, NEW.reason,
     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     json_object(
-      'id', NEW.id, 'member_id', NEW.member_id, 'scope_type', NEW.scope_type, 'scope_id', NEW.scope_id,
+      'id', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'member_id', NEW.member_id, 'scope_type', NEW.scope_type, 'scope_id', NEW.scope_id,
       'capability', NEW.capability, 'expires_at', NEW.expires_at, 'reason', NEW.reason,
       'granted_by', NEW.granted_by, 'granted_via', NEW.granted_via, 'created_at', NEW.created_at)
   );
@@ -120,10 +120,10 @@ BEGIN
   VALUES (
     lower(hex(randomblob(16))),
     COALESCE((SELECT tenant FROM members WHERE id = NEW.member_id), ''),
-    'capabilities', NEW.id, 'granted', NEW.granted_by, NEW.reason,
+    'capabilities', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'granted', NEW.granted_by, NEW.reason,
     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     json_object(
-      'id', NEW.id, 'member_id', NEW.member_id, 'scope_type', NEW.scope_type, 'scope_id', NEW.scope_id,
+      'id', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'member_id', NEW.member_id, 'scope_type', NEW.scope_type, 'scope_id', NEW.scope_id,
       'capability', NEW.capability, 'expires_at', NEW.expires_at, 'reason', NEW.reason,
       'granted_by', NEW.granted_by, 'granted_via', NEW.granted_via, 'created_at', NEW.created_at,
       'previous_capability', OLD.capability, 'previous_expires_at', OLD.expires_at)
@@ -141,10 +141,10 @@ BEGIN
       (SELECT tenant FROM members WHERE id = OLD.member_id),
       -- a members ON DELETE CASCADE has already removed the member row by now: the
       -- grant's own first event remembers the tenant.
-      (SELECT tenant FROM grant_events WHERE grant_table = 'capabilities' AND grant_id = OLD.id
+      (SELECT tenant FROM grant_events WHERE grant_table = 'capabilities' AND grant_id = COALESCE(OLD.id, 'rowid:' || OLD.rowid)
         ORDER BY at ASC, rowid ASC LIMIT 1),
       ''),
-    'capabilities', OLD.id,
+    'capabilities', COALESCE(OLD.id, 'rowid:' || OLD.rowid),
     COALESCE((SELECT event FROM grant_event_context
                WHERE id = 1 AND julianday(at) >= julianday('now') - (60.0 / 86400.0)), 'revoked'),
     (SELECT actor FROM grant_event_context
@@ -153,7 +153,7 @@ BEGIN
       WHERE id = 1 AND julianday(at) >= julianday('now') - (60.0 / 86400.0)),
     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     json_object(
-      'id', OLD.id, 'member_id', OLD.member_id, 'scope_type', OLD.scope_type, 'scope_id', OLD.scope_id,
+      'id', COALESCE(OLD.id, 'rowid:' || OLD.rowid), 'member_id', OLD.member_id, 'scope_type', OLD.scope_type, 'scope_id', OLD.scope_id,
       'capability', OLD.capability, 'expires_at', OLD.expires_at, 'reason', OLD.reason,
       'granted_by', OLD.granted_by, 'granted_via', OLD.granted_via, 'created_at', OLD.created_at)
   );

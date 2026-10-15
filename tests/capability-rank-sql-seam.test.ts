@@ -24,7 +24,7 @@
 //        refusing.
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { currentMemberRankOnScope, currentMemberRankAtLeastSql } from '../src/auth/capability'
+import { currentMemberRankOnScope, currentMemberRankAtLeastSql, nowCapabilitySql } from '../src/auth/capability'
 import type { Env, CapabilityScopeType } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -49,9 +49,10 @@ async function sqlSaysAtLeast(
     inviterIdParam: '?1',
     scopeIdParam: '?2',
     requiredRankParam: '?3',
+    nowParam: '?4',
   })
   const row = await env.DB.prepare(`SELECT (${fragment}) AS ok`)
-    .bind(memberId, scopeId, requiredRank)
+    .bind(memberId, scopeId, requiredRank, nowCapabilitySql())
     .first<{ ok: number }>()
   return row?.ok === 1
 }
