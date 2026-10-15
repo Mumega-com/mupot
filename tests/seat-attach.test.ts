@@ -656,6 +656,19 @@ describe('who may be attached, and who may call', () => {
     expect(String((res.body as { message?: string }).message)).toContain('act as Rava')
   })
 
+  it('the attached boot note prints the ceiling the human actually approved (full), never a stale member clamp', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'rava')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(pend.sc.approve_url), key, 'approve', 'full')).body).toMatchObject({ ok: true, title: 'Admitted' })
+    await attach(env, g, 'conv-a', 'rava')
+    const step = String((await boot(env, g, 'conv-a')).sc.next_step)
+    expect(step).toContain('the ceiling your human approved (full)')
+    expect(step).not.toContain('clamped to member level')
+  })
+
   it('a moment of kind seat_admit is closed once SEAT_ATTACH is switched off', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
