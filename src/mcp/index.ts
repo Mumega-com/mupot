@@ -3534,13 +3534,22 @@ const toolFlightDispatch: ToolSpec = {
   name: 'flight_dispatch',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, goal: string, meta_json: string, '
+  args: '{ squad_id: string, project_id?: string|null, goal: string, '
+    + 'meta_json: string (a JSON STRING, <=16KB, unknown keys refused; minimal valid example: '
+    + '{"schema":"mupot.flight.meta/v1","goal_id":"<stable label>","objective_id":"<objective id or label>","squad_ids":["<this squad id>"],'
+    + '"task_ids":["<existing task id>"],"done_when":["<one observable acceptance sentence>"],"artifact_refs":[],"receipt_refs":[],'
+    + '"confidentiality":"internal","publication_target":"none","parent_flight_id":null}; squad_ids must include the dispatch squad AND the executor\'s squad; '
+    + 'every task must exist, be unarchived and match the project; confidentiality private|internal|public-projection; publication_target none|inkwell-draft|mumega.com), '
     + 'signals_json: string (JSON object — camelCase or snake_case, both accepted; ALL 8 fields '
     + 'required, unknown keys refused: contextComplete/context_complete: boolean, '
     + 'toolsReachable/tools_reachable: boolean, budgetRemainingMicroUsd/budget_remaining_micro_usd: number, '
     + 'budgetEstimateMicroUsd/budget_estimate_micro_usd: number, recentProgress/recent_progress: number 0..1, '
     + 'progressPerStep/progress_per_step: number 0..1, wastePerStep/waste_per_step: number 0..1, '
-    + 'stepSeconds/step_seconds: number), budget_micro_usd?: number, '
+    + 'stepSeconds/step_seconds: number; example: {"contextComplete":true,"toolsReachable":true,"budgetRemainingMicroUsd":0,"budgetEstimateMicroUsd":0,'
+    + '"recentProgress":0.5,"progressPerStep":0.5,"wastePerStep":0.5,"stepSeconds":60}; the two budget fields are overwritten by the server, send 0. '
+    + 'There is NO "unknown": the gate is fail-closed (go needs score>=0.5 and no failed check). Set contextComplete/toolsReachable true only if you verified them (false = a recorded no-go and nothing is sent). '
+    + 'With no progress history, 0/0/0 scores ~0.13 (no-go low_readiness) while a declared neutral prior 0.5/0.5/0.5 scores ~0.82: that prior is an assumption, not a measurement, so say so in the goal text), '
+    + 'budget_micro_usd?: number, '
     + 'executor_agent_id?: string (who FLIES the flight, if not the caller — requires lead on the executor\'s squad), '
     + 'client_request_id?: string (idempotency key, <=200 chars, unique per dispatching agent — a retry with the '
     + 'same key returns the ORIGINAL flight with idempotent_replay:true; the same key with a different request is '
@@ -6738,7 +6747,7 @@ const toolBootContext: ToolSpec = {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
       nextStepOut = auth.seatBinding.attached
-        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority is the human's, clamped to member level and to this agent's own grants, and you hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) to receive your basin-drop packet.`
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) to receive your basin-drop packet.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
         : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`

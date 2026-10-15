@@ -252,6 +252,8 @@ describe('the flow: ask -> passkey admission -> attach -> act AS the agent', () 
     })
     expect((r.attachment as { admission_id: string }).admission_id).toBe(one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)?.id)
     expect(String(after.sc.next_step)).toContain('ATTACHED')
+    expect(String(after.sc.next_step)).toContain('the ceiling your human approved (member)') // the real approved ceiling, not a stale 'clamped to member level'
+    expect(String(after.sc.next_step)).not.toContain('clamped to member level')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_attach' AND agent_id = 'agent-rava'`)).toBe(1)
   })
 
