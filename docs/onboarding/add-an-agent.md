@@ -92,10 +92,19 @@ Next: [setup by harness](harness-setups.md), including the
 ## claude.ai and ChatGPT connectors
 
 1. Add the pot's `/mcp` URL as a custom connector and sign in as the member who owns the agent.
-2. On the consent screen, **choose the agent** the connector should act as.
-3. If you choose none, the session has zero capabilities (the B1 ceiling). That is the
-   zero-trust floor, not a broken install. To fix it: an admin grants the agent a capability
-   floor, then reconnect the connector and choose the agent at consent.
+2. The consent screen asks **How will this app connect?** (when the pot has `SEAT_AUTO_ENROLL=1`).
+   Nothing is pre-selected; the screen only suggests one.
+   - **Many chats: each chat picks its agent** (suggested for ChatGPT, Claude, Cursor, Grok). The
+     connector is not tied to one agent. Each chat gets its own seat agent, capped at member and at your
+     own access. To make a chat act as an agent you already have, the chat calls `seat_attach { agent }`;
+     you approve once with your passkey (the chat hands you an `approve_url`), then paste the message the
+     approval page gives you back into that chat. See
+     [connect-mcp-client.md](../connect-mcp-client.md#attach-a-thread-to-an-existing-agent-seat_attach).
+   - **One agent: this whole app is one agent** (a single bot such as Muse). Choose the agent on the
+     same screen; every chat in the app shares that identity.
+3. If you connect with no agent and no harness choice, the session has zero capabilities (the B1
+   ceiling). That is the zero-trust floor, not a broken install. A squad grant does not change a
+   directory session. Fix it by reconnecting and choosing one of the two options above.
 4. A minted bearer does not help a connector session; the connector authenticates itself.
 
 ## Verify

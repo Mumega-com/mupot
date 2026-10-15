@@ -9,6 +9,7 @@
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { seatSelect } from '../members/seat-select'
+import { seatAttachEnabled } from '../members/seat-attach'
 
 const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
@@ -49,12 +50,13 @@ const toolSeatSelect: ToolSpec = {
 
     switch (result.error) {
       case 'seat_auto_enroll_disabled':
-        return fail(403, result.error, 'Zero-touch seat enrolment is not enabled on this pot.')
+        return fail(403, result.error, 'Zero-touch seat enrolment is not enabled on this pot. Call boot_context: its available_doors lists what this session can do instead.')
       case 'not_unbound_directory_session':
         return fail(
           403,
           result.error,
-          'seat_select only runs for an unbound directory-channel session. This session is already bound to an agent identity (an agent-bound connection, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat. To pick a seat explicitly, call seat_select from an unbound session: send no seat handle on that call.',
+          'seat_select only runs for an unbound directory-channel session. This session is already bound to an agent identity (an agent-bound connection, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat. To pick a seat explicitly, call seat_select from an unbound session: send no seat handle on that call.'
+            + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached ? ' To act as an agent you already have instead, call seat_attach { agent } from this session.' : ''),
         )
       case 'harness_required':
         return fail(

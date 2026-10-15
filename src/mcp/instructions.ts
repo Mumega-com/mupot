@@ -1,8 +1,10 @@
 // src/mcp/instructions.ts — Canonical onboarding and runtime instructions for MCP initialize
 
 // SECURITY POSTURE INVARIANT (Athena Gate condition):
-// This payload is served in the unauthenticated MCP initialize handshake.
-// It MUST remain strictly static and tenant-neutral (never interpolate tenant slugs,
+// This payload is served in the MCP initialize handshake. The handler does not require a bearer (initialize and
+// tools/list are bearerless in src/mcp/index.ts), so treat it as readable by anyone who reaches it; the deployed OAuth
+// front layer happens to answer an unauthenticated public initialize with 401 (checked live 2026-10-15), which is
+// deployment behaviour, not a guarantee. It MUST remain strictly static and tenant-neutral (never interpolate tenant slugs,
 // request parameters, or untrusted user input) to prevent control-plane injection.
 
 /**
@@ -14,7 +16,7 @@
 export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & RUNTIME INSTRUCTIONS ===
 
 1. FIRST ACTION: ORIENTATION & BOOT CONTEXT
-   - Always invoke 'boot_context' or 'orient' as your first MCP tool call.
+   - Always invoke 'boot_context' or 'orient' as your first MCP tool call. 'boot_context' always answers; 'orient' with no argument answers only once you act as an agent (orient { agent } also works for an agent you can observe), so a session with no agent yet should start with 'boot_context' and follow its next_step.
    - This returns your authenticated identity, assigned squad, active capability floor, and any unread high-priority inbox messages.
 
 2. ZERO-CAPABILITY DIRECTORY SESSIONS (B1 CEILING)
@@ -67,7 +69,12 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
          effort: "<effort>",                // "low" | "medium" | "high" | "extended-thinking-64k"
          flight_id: "<uuid>"                // optional — active leased flight UUID
        })
-   - Distinct seats on the same member persist independently. Do not reuse another harness's seat id.`
+   - Distinct seats on the same member persist independently. Do not reuse another harness's seat id.
+
+10. FINDING WORK (AFTER BOOT)
+   - Mail: 'inbox' { peek: true } shows what was sent to you without consuming it. Assigned work: 'task_list' { assignee_agent_id: <bound_agent_id from boot_context>, status: "open" }. The squad board: 'task_board'.
+   - If all three are empty you are caught up. Say so to your supervisor or your human instead of inventing work.
+   - A refusal that carries 'next_step' names the single next call. Read it before retrying.`
 
 
 // mupot#1794 W3 — appended to the initialize instructions ONLY while SEAT_AUTO_ENROLL === '1'.
@@ -80,8 +87,22 @@ SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "M
    - It returns a seat handle (prefix "mseat_"). Send it on every later request as the X-Mupot-Seat header, or as _meta["mupot/seat"] when your client cannot set headers. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
    - Once a request carries a valid handle, boot_context shows an identity_receipt naming the agent you act as and how it was bound.`
 
-export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string }): string {
-  return env.SEAT_AUTO_ENROLL === '1'
-    ? MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS
-    : MUPOT_MCP_INITIALIZE_INSTRUCTIONS
+// mupot W2 (seat_attach) — appended ONLY while SEAT_AUTO_ENROLL and SEAT_ATTACH are both '1'. Same invariant: strictly
+// static and tenant-neutral. Before this block nothing in the handshake named seat_attach, and item 3 above sends a
+// brand-new chat to bootstrap_self, which a seat session cannot run (not_unbound_directory_session).
+export const MUPOT_MCP_ATTACH_INSTRUCTIONS = `
+
+ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when boot_context shows a seat)
+   - If your agent already exists, call 'seat_attach' { agent: "<its id, slug or exact name>" }. Do NOT call bootstrap_self from a seat session: it refuses (and would otherwise create a second agent).
+   - First time, it returns status "pending_admission". If it includes an approve_url, give that URL to your human: they tap their passkey once. If it has none (the pot has no approval links), your human approves on their Connections page instead; the note in the result says which. Nothing attaches before that, and you cannot approve it yourself.
+   - If your human has never registered a passkey, they must first add one in My Account (the dashboard /account page, while signed in). The approve link cannot enrol one for them.
+   - After they approve, call 'seat_attach' again. It attaches immediately; your NEXT request acts as that agent (boot_context shows the identity_receipt).
+   - A session with no seat yet (a harness session before seat_select) can call only seat_select and boot_context. Call seat_select first, then seat_attach.
+   - A fixed CLI or daemon agent with no human in the chat does not use this: it connects with a workspace token an org admin mints for it.`
+
+export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string }): string {
+  if (env.SEAT_AUTO_ENROLL !== '1') return MUPOT_MCP_INITIALIZE_INSTRUCTIONS
+  return env.SEAT_ATTACH === '1'
+    ? MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS + MUPOT_MCP_ATTACH_INSTRUCTIONS
+    : MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS
 }
