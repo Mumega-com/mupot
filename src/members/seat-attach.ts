@@ -183,11 +183,12 @@ function auditInsert(env: Env, agentId: string, actorId: string, action: string,
 }
 
 /** The audit row for an identity weld, written ONLY if the binding this batch created exists (a weld that was skipped by its guards
- *  leaves no row, so the trail never claims a weld that did not happen). Keyed on created_at = this batch's timestamp. */
-function weldAudit(env: Env, agentId: string, actorId: string, admissionId: string, nowIso: string): D1PreparedStatement {
+ *  leaves no row, so the trail never claims a weld that did not happen). Keyed on the member id THIS batch generated: unique per
+ *  batch, so a losing weld that no-ops cannot borrow a winner's binding (a timestamp key could, in the same millisecond). */
+export function weldAudit(env: Env, agentId: string, actorId: string, admissionId: string, memberId: string): D1PreparedStatement {
   return auditInsert(env, agentId, actorId, 'identity_weld',
     { admission_id: admissionId, via: 'seat_admission', member: 'new dedicated agent member, home-squad capability member, no token' },
-    'EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?6 AND agent_id = ?2 AND created_at = ?7)', [env.TENANT_SLUG, nowIso])
+    'EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?6 AND agent_id = ?2 AND member_id = ?7)', [env.TENANT_SLUG, memberId])
 }
 
 export type EnsureAdmissionResult =
@@ -225,20 +226,21 @@ export async function ensureAdmission(
       const id = crypto.randomUUID()
       const agentRow = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
         .bind(p.agentId).first<{ name: string; squad_id: string }>()
-      const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? prepareConditionalIdentityWeld(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : []
+      const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? prepareConditionalIdentityWeld(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : null
       await env.DB.batch([
         env.DB.prepare(
           `INSERT INTO agent_seat_admissions
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
-           VALUES (?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard')
+           SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
+            WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND status = 'active')
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
-        ...weld,
+        ...(weld ? weld.statements : []),
         auditInsert(env, p.agentId, p.humanMemberId, 'seat_admit',
           { admission_id: id, harness_id: p.harnessId, human_member_id: p.humanMemberId, via: 'dashboard' },
           'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\')', [id]),
-        ...(weld.length ? [weldAudit(env, p.agentId, p.humanMemberId, id, nowIso)] : []),
+        ...(weld ? [weldAudit(env, p.agentId, p.humanMemberId, id, weld.memberId)] : []),
       ])
     }
     const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
@@ -335,19 +337,20 @@ async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: stri
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string }>()
-  const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : []
+  const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : null
   const out = await env.DB.batch([
-    ...weld,
+    ...(weld ? weld.statements : []),
     env.DB.prepare(
       `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6
-        WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2`,
+        WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
+          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active')`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
       'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\' AND decided_at = ?7)', [adm.id, nowIso]),
-    ...(weld.length ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, nowIso)] : []),
+    ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
-  return out[weld.length].meta.changes === 1
+  return out[weld ? weld.statements.length : 0].meta.changes === 1
 }
 
 /** Revoke a live admission (or deny a pending one). Live -> revoked cascades to every live attachment (trigger). */
