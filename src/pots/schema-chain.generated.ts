@@ -4053,9 +4053,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_secure_moments_subject" },
     ],
   },
+  {
+    file: "0226_agent_connection_receipt_requires_token.sql",
+    sha256: "e5d641da949889f934449771371579f16ebb6d906847c16425acefaa6f82f057",
+    statements: [
+      "-- 0226 — an agent-connection receipt may not exist without the token it names (mupot#1961).\n--\n-- provisionAgentConnection commits access rows, an immutable receipt and the request's\n-- credential_issued flip in ONE batch with the guarded token statements. Those token statements\n-- are conditional (they land only while the agent is active); the receipt, access and request\n-- statements are not. Deactivating the agent between the service's read and the batch left a\n-- receipt that names a token_id that does not exist, access rows for an agent that never got a\n-- credential, and (on replace) a revoked prior token with no successor.\n--\n-- D1 rolls a batch back only on ERROR, never on a zero-row write. This trigger turns \"the guarded\n-- token did not land\" into an error at the receipt insert, which aborts and rolls back the whole\n-- batch (membership, capability, weld, request flip, and the replace trigger's revocation).\n-- The existing agent_connection_receipt_replaces_live_token trigger fires in the same statement; any\n-- abort undoes its UPDATE too.\nCREATE TRIGGER IF NOT EXISTS agent_connection_receipt_requires_token\nBEFORE INSERT ON agent_connection_receipts\nWHEN NOT EXISTS (\n  SELECT 1 FROM member_tokens\n   WHERE id = NEW.token_id\n     AND tenant = NEW.tenant\n     AND agent_id = NEW.agent_id\n)\nBEGIN\n  SELECT RAISE(ABORT, 'receipt_token_missing');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_connection_receipt_requires_token" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0219ba62e11ed48c7a2fe528547e37179ca8549914fc9bc03a0eb27e96f761ba"
+export const SCHEMA_CHAIN_DIGEST: string = "6140636f860c62fb43b207dff16bc6cc4f9155fb4a20cfaff3b2ac08815103af"

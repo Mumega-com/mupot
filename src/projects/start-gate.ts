@@ -12,6 +12,7 @@
 
 import type { BusEvent, Env, Project, ProjectAccessLevel, Task } from '../types'
 import {
+  AgentInactiveError,
   mintAgentBoundToken,
   resolveActiveAgentMember,
   revokeMemberToken,
@@ -776,7 +777,10 @@ export async function startProject(
     if (committed.kind === 'minted' && committed.tokenId !== null) {
       mintedCredential = { tokenId: committed.tokenId, memberId: committed.memberId }
     }
-  } catch {
+  } catch (err) {
+    // mupot#1961: the chosen agent was deactivated between selection and the mint batch. The squad
+    // has no usable agent right now; that is the accurate refusal, not a generic commit failure.
+    if (err instanceof AgentInactiveError) return fail('no_squad_agent')
     return fail('resource_commit_failed')
   }
 

@@ -109,6 +109,9 @@ function insertRetentionReceipt(
   suffix: string,
   createdAt: string,
 ): void {
+  // Retention-boundary fixture: these rows exist only to be purged by age, never issued. Migration 0226's
+  // receipt-requires-token trigger (mupot#1961) guards ISSUANCE, so it is dropped for this synthetic seed.
+  sqlite.exec('DROP TRIGGER IF EXISTS agent_connection_receipt_requires_token')
   const fingerprint = suffix.padEnd(64, 'a').slice(0, 64).replace(/[^0-9a-f]/g, 'a')
   sqlite.prepare(
     `INSERT INTO agent_connection_requests

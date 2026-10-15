@@ -1014,6 +1014,7 @@ export const toolMintAgentToken: ToolSpec = {
             mintedByMemberId: auth.memberId as string,
           })
         } catch (err) {
+          // Live: prepareAgentTokenReplacement refuses a paused/inactive agent with AgentInactiveError.
           if (err instanceof AgentInactiveError) return fail(409, 'agent_inactive', { agent_id: agent.id })
           if (err instanceof AgentTokenReplacementError) return fail(409, 'replacement_token_unavailable')
           return fail(503, 'replacement_handoff_unavailable')

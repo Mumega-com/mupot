@@ -7,7 +7,7 @@
 
 import type { AuthContext, Env } from '../types'
 import { memberMayConsentToAgent } from '../mcp/oauth-authorize'
-import { mintAgentBoundToken, sha256Hex, type AgentForMint } from '../members/service'
+import { AgentInactiveError, mintAgentBoundToken, sha256Hex, type AgentForMint } from '../members/service'
 
 export const DEVICE_GRANT_TTL_SECONDS = 600
 export const DEVICE_TOKEN_TTL_SECONDS = 3600
@@ -278,12 +278,20 @@ export async function decideDeviceGrant(
   }
 
   const expiresAt = new Date(Date.now() + DEVICE_TOKEN_TTL_SECONDS * 1000).toISOString()
-  const minted = await mintAgentBoundToken(
-    env,
-    { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
-    `device:${grant.user_code}`,
-    { grantCapability: 'member', expiresAt },
-  )
+  let minted: Awaited<ReturnType<typeof mintAgentBoundToken>>
+  try {
+    minted = await mintAgentBoundToken(
+      env,
+      { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
+      `device:${grant.user_code}`,
+      { grantCapability: 'member', expiresAt },
+    )
+  } catch (err) {
+    // mupot#1961: the agent was deactivated between the status read above and the mint batch.
+    // Same refusal as the status check; the grant stays pending and no credential exists.
+    if (err instanceof AgentInactiveError) return { ok: false, error: 'forbidden' }
+    throw err
+  }
 
   grant.status = 'approved'
   grant.approved_by_member_id = input.auth.memberId ?? input.auth.userId

@@ -480,13 +480,23 @@ export async function prepareDirectoryTokenInsert(
   memberId: string,
   label: string,
   agentId: string | null,
+  opts: { requireActiveAgent?: boolean } = {},
 ): Promise<{ tokenId: string; tokenHash: string; statement: D1PreparedStatement }> {
   const raw = mintRawToken()
   const tokenHash = await sha256Hex(raw)
   const tokenId = crypto.randomUUID()
+  // mupot#1961: with requireActiveAgent (an EXISTING agent, e.g. OAuth consent) the row lands only while
+  // the agent is active, so reactivation cannot revive a token nobody intended to issue. Off for the seat
+  // path, which creates the agent in the same batch.
+  const guard = opts.requireActiveAgent && agentId !== null
+    ? ` WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?5 AND status = 'active')`
+    : ''
   const statement = env.DB.prepare(
-    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-     VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), ?5, ?6)`,
+    guard
+      ? `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+         SELECT ?1, ?2, ?3, ?4, 'directory', datetime('now'), ?5, ?6${guard}`
+      : `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+         VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), ?5, ?6)`,
   ).bind(tokenId, memberId, tokenHash, label, agentId, env.TENANT_SLUG)
   return { tokenId, tokenHash, statement }
 }
@@ -571,10 +581,10 @@ export async function prepareAgentBoundTokenMintForBinding(
   // the database transaction (not merely the preflight above): after one batch
   // revokes the prior token, every concurrent loser inserts zero rows and commits
   // no replacement credential or claim.
-  // mupot#1961: the rotation's agent-active guard IS replacementLivePredicate('prior'|'member_tokens'), which
-  // embeds TOKEN_LIVE_PREDICATE's agent clause (a token welded to a retired agent is not live): the INSERT and
-  // the revoking UPDATE both land only while the agent is not retired, so a rotation can neither mint a
-  // replacement nor revoke the prior for a deactivated agent.
+  // mupot#1961 rotation rule: a paused agent may NOT receive a replacement credential (its existing
+  // tokens keep working). The shared liveness predicate admits 'paused' (so those tokens keep
+  // authenticating), therefore the rotation INSERT and the revoking UPDATE carry the explicit strict
+  // ACTIVE_AGENT_GUARD as well: no replacement lands and the prior token is NOT revoked.
   if (revokePriorTokenId) {
     statements.push(
       env.DB.prepare(
@@ -584,7 +594,8 @@ export async function prepareAgentBoundTokenMintForBinding(
             SELECT 1 FROM member_tokens prior
              WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
                AND ${replacementLivePredicate('prior', '?')}
-          )`,
+          )
+            AND ${ACTIVE_AGENT_GUARD}`,
       ).bind(
         tokenId,
         memberId,
@@ -599,11 +610,13 @@ export async function prepareAgentBoundTokenMintForBinding(
         agent.id,
         env.TENANT_SLUG,
         nowSqlUtc(),
+        agent.id,
       ),
       env.DB.prepare(
         `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ?
-          AND ${replacementLivePredicate('member_tokens', '?')}`,
-      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc()),
+          AND ${replacementLivePredicate('member_tokens', '?')}
+          AND ${ACTIVE_AGENT_GUARD}`,
+      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc(), agent.id),
     )
   } else {
     statements.push(
@@ -707,8 +720,10 @@ async function commitPreparedAgentTokenMint(
     assertBatchWritten(writes, 'mint_agent_bound_token', 1)
   } catch (error) {
     // mupot#1961: a zero-row guarded batch because the agent is not active is a clear refusal,
-    // not a generic write failure. Re-read to tell the two apart. Nothing landed (every
-    // statement carries the same guard), so there is no token and no weld to undo.
+    // not a generic write failure. Re-read to tell the two apart. Nothing landed: the mint batch is
+    // built only from guarded statements (weld, token, gate grant, issuance audit), so there is
+    // no token and no weld to undo. (Callers that COMPOSE these statements into a larger batch,
+    // e.g. provisionAgentConnection, rely on the receipt trigger of migration 0226 instead.)
     const agentId = prepared.bindingProof.agentId
     const live = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
       .bind(agentId)
@@ -794,6 +809,12 @@ export async function prepareAgentTokenReplacement(
   if (opts.revokePriorTokenId.trim().length === 0) throw new AgentTokenReplacementError()
   const grantCapability = opts.grantCapability ?? 'member'
   if (!isAgentTokenCapability(grantCapability)) throw new Error('invalid agent token capability')
+  // A paused or inactive agent gets no replacement credential (precise refusal, not
+  // replacement_token_unavailable). The in-batch guards in the prepared statements are authoritative.
+  const live = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
+    .bind(agent.id)
+    .first<{ ok: number }>()
+  if (!live) throw new AgentInactiveError()
   const binding = await resolveAgentMemberBinding(env, agent.id)
   if (binding.kind === 'unminted') throw new AgentTokenReplacementError()
   await assertLiveReplacementToken(env, agent.id, binding.memberId, opts.revokePriorTokenId)

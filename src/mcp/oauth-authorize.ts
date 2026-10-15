@@ -37,7 +37,7 @@ import {
   summarizeGrants,
   type ScopeNames,
 } from './consent-view'
-import { sha256Hex, resolveAgentMemberBinding, mintAgentBoundToken, prepareDirectoryTokenInsert } from '../members/service'
+import { sha256Hex, resolveAgentMemberBinding, mintAgentBoundToken, AgentInactiveError, prepareDirectoryTokenInsert } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
@@ -197,8 +197,10 @@ async function mintDirectoryToken(
   // mupot#1794 W1: the statement is built by the shared prepareDirectoryTokenInsert (same SQL,
   // same binds) so the seat path mints the identical token shape; this caller still runs it
   // immediately, exactly as before.
-  const { tokenId, tokenHash, statement } = await prepareDirectoryTokenInsert(env, memberId, label, agentId)
-  await statement.run()
+  const { tokenId, tokenHash, statement } = await prepareDirectoryTokenInsert(env, memberId, label, agentId, { requireActiveAgent: true })
+  const written = await statement.run()
+  // mupot#1961: a zero-row insert for a bound agent means it is not active; no credential exists.
+  if (agentId !== null && (written.meta?.changes ?? 0) < 1) throw new AgentInactiveError()
   // Raw is intentionally discarded here — the OAuth access token IS the credential;
   // the member_tokens row exists purely for capability resolution and revocation.
   // The raw token is never returned to the caller (it is not the OAuth access token).
@@ -1860,9 +1862,21 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
 
       const newAgent = createRes.value
-      const minted = await mintAgentBoundToken(env, newAgent, `oauth-consent:${pending.email}`, {
-        grantCapability: 'member',
-      })
+      let minted: Awaited<ReturnType<typeof mintAgentBoundToken>>
+      try {
+        minted = await mintAgentBoundToken(env, newAgent, `oauth-consent:${pending.email}`, {
+          grantCapability: 'member',
+        })
+      } catch (err) {
+        // mupot#1961: the agent was deactivated between creation and the mint batch; nothing landed.
+        if (!(err instanceof AgentInactiveError)) throw err
+        const rejected = new Response(
+          'The new agent is no longer active, so no connection key was issued. Please sign in again.',
+          { status: 409, headers: { 'Content-Type': 'text/plain' } },
+        )
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
+      }
 
       boundAgentId = newAgent.id
       mintMemberId = minted.memberId

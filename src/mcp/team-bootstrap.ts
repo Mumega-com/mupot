@@ -247,6 +247,8 @@ export const toolTeamBootstrap: ToolSpec = {
         )
         credentialClaim = await createCredentialClaim(env, minted.raw, auth.memberId as string)
       } catch {
+        // mupot#1961: includes AgentInactiveError (bot deactivated mid-bootstrap): no credential exists
+        // and the operator mints separately once the agent is active.
         // Non-fatal: project/squad/edge/bot/invites are already committed by
         // teamBootstrap's batch. The operator can mint separately via
         // mint_agent_token — never fail the whole call for this step alone.
