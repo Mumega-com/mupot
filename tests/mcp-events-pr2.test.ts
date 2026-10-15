@@ -1435,6 +1435,9 @@ describe('a lapsed native-wake lease is recorded, not silent', () => {
     await runQueue(env, messageCreated({ to_agent: agent, message_id: 'real-1', seq: 91 }))
     expect(lapsedReceipts()).toHaveLength(1)
     expect(await nativeWakeState(env, TENANT, agent)).toMatchObject({ state: 'lapsed', missed_wakes: 1 })
+    // a different refusal on the same row (a delivery-time refusal, not a lapse) is NOT a missed wake
+    harness.sqlite.prepare(`INSERT INTO event_delivery_receipts (id, subscription_id, event_id, attempt, outcome, http_status, error_class, signed_at, created_at) VALUES ('r-x', ?, 'evt_other', 1, 'refused', NULL, 'message_not_found', NULL, ?)`).run(a, new Date().toISOString())
+    expect(await nativeWakeState(env, TENANT, agent)).toMatchObject({ state: 'lapsed', missed_wakes: 1 })
     // 2) renew (same id) then lapse again: the count restarts
     harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'active', refresh_before = '2999-01-01T00:00:00.000Z', last_refreshed_at = ? WHERE id = ?`).run(new Date(Date.now() + 60_000).toISOString(), a) // renewed just after the missed push
     expect((await nativeWakeState(env, TENANT, agent)).state).toBe('live')
