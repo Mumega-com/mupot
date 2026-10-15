@@ -126,11 +126,26 @@ describe('a call through the name a Codex client sends (#1910)', () => {
   })
 
   it('the hint never resolves: unknownToolDetail only suggests registered names and returns the bare input for strangers', () => {
-    expect(unknownToolDetail('no_such_tool')).toBe('no_such_tool')
-    expect(unknownToolDetail('mupot.no_such_tool')).toBe('mupot.no_such_tool')
-    expect(unknownToolDetail('my_status')).toBe('my_status') // an unrelated suffix is not a namespace: no suggestion
-    expect(unknownToolDetail('mupot_inbox_mark_handled')).toContain('"inbox_mark_handled"')
-    expect(unknownToolDetail('boot_context')).toBe('boot_context') // an exact name is not "unknown": nothing to suggest
+    const e = envFor()
+    expect(unknownToolDetail('no_such_tool', e)).toBe('no_such_tool')
+    expect(unknownToolDetail('mupot.no_such_tool', e)).toBe('mupot.no_such_tool')
+    expect(unknownToolDetail('my_status', e)).toBe('my_status') // an unrelated suffix is not a namespace: no suggestion
+    expect(unknownToolDetail('mupot_inbox_mark_handled', e)).toContain('"inbox_mark_handled"')
+    expect(unknownToolDetail('boot_context', e)).toBe('boot_context') // an exact name is not "unknown": nothing to suggest
+  })
+
+  it('the hint suggests only what this pot ADVERTISES (a flag-gated tool that is off stays undisclosed)', () => {
+    expect(unknownToolDetail('mupot_inbox_mark_handled', envFor({ SEAT_ATTACH: undefined }))).toBe('mupot_inbox_mark_handled')
+    expect(unknownToolDetail('mcp__codex_apps__mupot_w2__inbox_mark_handled', envFor({ SEAT_ATTACH: undefined }))).not.toContain('did you mean')
+    expect(unknownToolDetail('mupot_inbox_mark_handled', envFor())).toContain('did you mean')
+  })
+
+  it('the hint names the ADVERTISED wire name: an office tool is suggested as office_*, never as the dotted name', () => {
+    for (const wire of ['mupot.office.health', 'mcp__mupot__office.health', 'mcp__codex_apps__mupot_w2__office_health', 'OFFICE.HEALTH']) {
+      const d = unknownToolDetail(wire, envFor())
+      expect(d, wire).toContain('did you mean "office_health"')
+      expect(d, wire).not.toContain('"office.health"')
+    }
   })
 
   it('an unauthenticated tools/call is -32001 unauthenticated BEFORE tool lookup (the only source of -32001)', async () => {

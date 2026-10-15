@@ -7309,24 +7309,33 @@ export function wireName(canonical: string): string {
  *  for that refusal: the name, plus a did-you-mean when stripping a client namespace (or case) lands on a
  *  registered tool. It is a HINT only: the name is never resolved or executed, so what a caller can call is
  *  unchanged. */
-export function unknownToolDetail(toolName: string): string {
+export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): string {
+  // Only a tool this pot ADVERTISES is ever suggested (a flag-gated tool that is off stays undisclosed), and it is
+  // suggested under its ADVERTISED wire name (an office.* tool is suggested as office_*).
+  const advertised = new Set(advertisedTools(env).map((t) => t.name))
+  const suggest = (cand: string): string | undefined => {
+    const spec = TOOL_BY_NAME.get(cand)
+    return spec && advertised.has(spec.name) ? wireName(spec.name) : undefined
+  }
+  const hint = (name: string): string => `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${name}"?)`
   const trimmed = toolName.trim()
   const lower = trimmed.toLowerCase()
   const noServer = lower.replace(/^mcp__.+?__/, '')
   const bare = noServer.replace(/^mupot[._:/-]/, '')
   for (const cand of [trimmed, lower, noServer, bare]) {
-    if (cand !== toolName && TOOL_BY_NAME.has(cand)) {
-      return `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${cand}"?)`
-    }
+    if (cand === toolName) continue
+    const s = suggest(cand)
+    if (s) return hint(s)
   }
   // A connector-style namespace (`mcp__codex_apps__mupot_w2__boot_context`): only for a name that visibly carries a
-  // client or mupot namespace, take the longest registered tool the name ends with after a separator.
+  // client or mupot namespace, take the longest tool the name ends with after a separator.
   if (/^mcp__|mupot/.test(lower)) {
     let best: string | undefined
     for (const name of TOOL_BY_NAME.keys()) {
-      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length)) best = name
+      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length) && suggest(name)) best = name
     }
-    if (best) return `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${best}"?)`
+    const s = best === undefined ? undefined : suggest(best)
+    if (s) return hint(s)
   }
   return toolName
 }
@@ -7567,7 +7576,7 @@ export async function invokeTool(
   }
 
   const spec = TOOL_BY_NAME.get(toolName)
-  if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName)), tool: toolName }
+  if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName, env)), tool: toolName }
 
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
@@ -7835,11 +7844,14 @@ async function handleJsonRpc(
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     // mupot#1794 W2: `_meta` on the call (params._meta, or a `_meta` argument) can carry a seat handle
     // and harness hints. Read-only here; resolveAuth decides (flag-gated) what, if anything, it means.
+    // mupot#1910: every pre-invoke check below keys on the CANONICAL name, so an alias (office_x) cannot slip past a
+    // deny/trigger/profile list that names the dotted tool (or the reverse). invokeTool still gets the raw name.
+    const canonicalName: unknown = typeof params.name === 'string' ? (resolveToolSpec(params.name)?.name ?? params.name) : params.name
     const argsObject = typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof params.name === 'string' ? params.name : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -7869,12 +7881,12 @@ async function handleJsonRpc(
     // Profile allowlist: refuse BEFORE invokeTool, regardless of the caller's capabilities.
     // Authentication above still comes first (401 for an anonymous caller, never a probe of
     // which names are allowlisted).
-    if (profile === 'needs-you' && !profileEntry(params.name)) {
+    if (profile === 'needs-you' && !profileEntry(canonicalName)) {
       return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403)
     }
     // Profile arg refusal (e.g. boot_context runtime/model, which would reach selfReportAtBoot
     // and WRITE the fleet row). Refused, not stripped: a silent strip is a success-shaped no-op.
-    const rejectArgs = profile === 'needs-you' ? profileEntry(params.name)?.rejectArgs : undefined
+    const rejectArgs = profile === 'needs-you' ? profileEntry(canonicalName)?.rejectArgs : undefined
     if (rejectArgs && typeof params.arguments === 'object' && params.arguments !== null) {
       const supplied = rejectArgs.filter((k) => Object.prototype.hasOwnProperty.call(params.arguments, k))
       if (supplied.length > 0) {
@@ -7892,9 +7904,9 @@ async function handleJsonRpc(
     }
     // W3 (MCP_URL_ELICITATION): only the two request tools, only with the flag, secure moments and signing key on.
     let elicitPrep: ElicitationPrep | null = null
-    if (urlElicitOn && typeof params.name === 'string' && URL_ELICITATION_TOOLS.has(params.name)) {
+    if (urlElicitOn && typeof canonicalName === 'string' && URL_ELICITATION_TOOLS.has(canonicalName)) {
       elicitPrep = await prepareUrlElicitation(c.env, auth, {
-        toolName: params.name, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
+        toolName: canonicalName, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
       })
       // A refusal of a bad requestState happens INSIDE invokeTool (after its authz gates), via this hook.
       if (elicitPrep) ctx.shortCircuit = elicitPrep.shortCircuit
