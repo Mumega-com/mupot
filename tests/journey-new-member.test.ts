@@ -607,11 +607,11 @@ describe('Step 8 — MCP OAuth consent, single-render happy path', () => {
       `${ORIGIN}/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256`,
     )
     const authorizeRes = await handleOAuthAuthorize(authorizeReq, oauthEnv)
-    const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+    const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
 
     stubGoogleFetch('consent-human@uc1.test')
     const callbackReq = new Request(`${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`, {
-      headers: { Cookie: `mupot_oauth_nonce=${nonce}` },
+      headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` },
     })
     const callbackRes = await handleOAuthAuthorize(callbackReq, oauthEnv)
     expect(callbackRes.status).toBe(200)
@@ -620,11 +620,11 @@ describe('Step 8 — MCP OAuth consent, single-render happy path', () => {
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled() // not yet — no consent given
 
     const cookies = callbackRes.headers.getSetCookie ? callbackRes.headers.getSetCookie() : [callbackRes.headers.get('Set-Cookie') ?? '']
-    const consentCookie = /mupot_oauth_consent=([^;]+)/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? '')![1]
+    const consentCookie = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? '')![1]
 
     const consentReq = new Request(`${ORIGIN}/oauth/consent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentCookie}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
       body: new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: CONSENT_AGENT.id }).toString(),
     })
     const consentRes = await handleOAuthAuthorize(consentReq, oauthEnv)

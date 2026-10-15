@@ -579,18 +579,18 @@ async function consent(env: Env, agentId: string): Promise<Response> {
     new Request('https://pot.test/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256'),
     env,
   )
-  const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+  const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
   stubGoogleFetch(`${HUMAN}@example.test`)
   const cb = await handleOAuthAuthorize(
-    new Request(`https://pot.test/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } }),
+    new Request(`https://pot.test/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } }),
     env,
   )
   const cookies = cb.headers.getSetCookie ? cb.headers.getSetCookie() : [cb.headers.get('Set-Cookie') ?? '']
-  const consentNonce = /mupot_oauth_consent=([^;]+)/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? '')![1]
+  const consentNonce = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? '')![1]
   return handleOAuthAuthorize(
     new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentNonce}` },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentNonce}=1` },
       body: new URLSearchParams({ consent_nonce: consentNonce, action: 'continue', agent_id: agentId }).toString(),
     }),
     env,

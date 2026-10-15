@@ -110,19 +110,19 @@ async function reachConsentScreen(
   )
   const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
   const authSetCookie = authorizeRes.headers.get('Set-Cookie') ?? ''
-  const nonceMatch = /mupot_oauth_nonce=([^;]+)/.exec(authSetCookie)
+  const nonceMatch = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authSetCookie)
   const nonce = nonceMatch![1]
 
   stubGoogleFetch(email)
   const callbackReq = new Request(
     `https://pot.test/oauth/google-callback?code=abc&state=${nonce}`,
-    { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+    { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
   )
   const res = await handleOAuthAuthorize(callbackReq, env)
   const html = await res.clone().text()
   const cookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('Set-Cookie') ?? '']
-  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? ''
-  const consentNonceMatch = /mupot_oauth_consent=([^;]+)/.exec(consentCookieLine)
+  const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? ''
+  const consentNonceMatch = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(consentCookieLine)
   return { res, html, consentCookie: consentNonceMatch ? consentNonceMatch[1] : '' }
 }
 
@@ -282,7 +282,7 @@ describe('#901 — the first-run deadlock, reproduced and then closed end-to-end
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        Cookie: `mupot_oauth_consent=${second.consentCookie}`,
+        Cookie: `mupot_oauth_consent_${second.consentCookie}=1`,
       },
       body: form.toString(),
     })

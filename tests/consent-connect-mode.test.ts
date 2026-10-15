@@ -59,7 +59,7 @@ async function reachConsent(env: Env): Promise<{ html: string; nonce: string }> 
   const authorizeRes = await handleOAuthAuthorize(new Request(
     'https://pot.test/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256',
   ), env)
-  const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+  const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
@@ -70,10 +70,10 @@ async function reachConsent(env: Env): Promise<{ html: string; nonce: string }> 
   }))
   const res = await handleOAuthAuthorize(new Request(
     `https://pot.test/oauth/google-callback?code=abc&state=${nonce}`,
-    { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+    { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } },
   ), env)
   const cookies = res.headers.getSetCookie()
-  const consent = /mupot_oauth_consent=([^;]+)/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? '')![1]
+  const consent = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(cookies.find((c) => c.startsWith('mupot_oauth_consent_')) ?? '')![1]
   return { html: await res.text(), nonce: consent }
 }
 

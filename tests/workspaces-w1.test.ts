@@ -600,17 +600,17 @@ describe('4.0 harness identity is one GRANT', () => {
         SESSIONS: kv(), OAUTH_PROVIDER: provider, BUS: { send: async () => {} }, SEAT_AUTO_ENROLL: '1', ...(flagOn ? { WORKSPACES: '1' } : {}),
       } as unknown as Env
       const authorize = await handleOAuthAuthorize(new Request(`${ORIGIN}/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256`), env)
-      const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorize.headers.get('Set-Cookie') ?? '')![1]
+      const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorize.headers.get('Set-Cookie') ?? '')![1]
       vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input)
         if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
         if (url.includes('googleapis.com/oauth2/v2/userinfo')) return new Response(JSON.stringify({ id: 'google-sub-w', name: 'W', email: `${W}@example.test`, verified_email: true }), { status: 200 })
         throw new Error(`unexpected fetch: ${url}`)
       }))
-      const cb = await handleOAuthAuthorize(new Request(`${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } }), env)
-      const cn = /mupot_oauth_consent=([^;]+)/.exec(cb.headers.getSetCookie().find((c) => c.startsWith('mupot_oauth_consent=')) ?? '')![1]
+      const cb = await handleOAuthAuthorize(new Request(`${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } }), env)
+      const cn = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(cb.headers.getSetCookie().find((c) => c.startsWith('mupot_oauth_consent_')) ?? '')![1]
       const res = await handleOAuthAuthorize(new Request(`${ORIGIN}/oauth/consent`, {
-        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${cn}` },
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${cn}=1` },
         body: new URLSearchParams({ consent_nonce: cn, action: 'continue', agent_id: '__harness__' }).toString(),
       }), env)
       expect(res.status).toBe(302)
