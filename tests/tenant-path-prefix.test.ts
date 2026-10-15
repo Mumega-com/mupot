@@ -345,6 +345,25 @@ describe('sweep: dashboard pages under a /t/<slug> request emit no unprefixed UR
   })
 })
 
+// No regex HTML parsing in tests: locate the injected shim by plain string search.
+const SHIM_OPEN = '<script>(function(){var P='
+function shimBounds(html: string): { start: number; bodyStart: number; end: number; after: number } | null {
+  const start = html.indexOf(SHIM_OPEN)
+  if (start < 0) return null
+  const end = html.toLowerCase().indexOf('</script', start)
+  const close = html.indexOf('>', end)
+  if (end < 0 || close < 0) return null
+  return { start, bodyStart: start + '<script>'.length, end, after: close + 1 }
+}
+function firstScriptBody(html: string): string {
+  const b = shimBounds(html)
+  return b === null ? '' : html.slice(b.bodyStart, b.end)
+}
+function removeShim(html: string): string {
+  const b = shimBounds(html)
+  return b === null ? html : html.slice(0, b.start) + html.slice(b.after)
+}
+
 // ---- tokenizer: user content must round-trip ------------------------------------------------
 
 describe('user content is never rewritten', () => {
@@ -359,7 +378,7 @@ describe('user content is never rewritten', () => {
 <code>${PROBE}</code><pre>${PROBE}</pre>
 </body></html>`
     const out = rewriteHtmlForPrefix(html, PREFIX)
-    const strip = (x: string) => x.replace(/<script>\(function\(\)\{var P=.*?<\/script>/s, '')
+    const strip = (x: string) => removeShim(x)
     const expected = html.replace('<a href="/real">', '<a href="/t/local/real">')
     expect(strip(out)).toBe(expected)
   })
@@ -370,7 +389,7 @@ describe('user content is never rewritten', () => {
 describe('client shim (executed in a vm)', () => {
   function runShim() {
     const html = rewriteHtmlForPrefix('<html><head></head><body></body></html>', PREFIX)
-    const src = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/i.exec(html)?.[1] ?? ''
+    const src = firstScriptBody(html)
     const calls: Record<string, unknown[]> = { fetch: [], xhr: [], es: [], beacon: [], open: [] }
     class XHR { open(...a: unknown[]) { calls.xhr.push(a) } }
     class ES { constructor(...a: unknown[]) { calls.es.push(a) } }
