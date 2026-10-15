@@ -82,11 +82,21 @@ export async function subscriptionId(
   /** ATTACHED-agent subscriptions only: the consenting human. Several humans can be attached to one agent, and two of them must never share
    *  (or take over, or unsubscribe) one row. Absent for every other subscription, so every pre-existing id is byte-identical. */
   humanSalt?: string,
+  /** UNATTACHED subscriptions only: the subscribing token's trimmed seat label ('' when it has none). Two seats of one agent that name the
+   *  same callback URL must get two rows, because delivery partitions mail by the row's token label. Empty => id byte-identical to before. */
+  seatLabel?: string,
 ): Promise<string> {
-  const material = ['mcp-events-sub:v1', agentId, callbackUrl, eventName, canonicalJson(args), ...(humanSalt ? [`human:${humanSalt}`] : [])].join('\n')
+  const material = ['mcp-events-sub:v1', agentId, callbackUrl, eventName, canonicalJson(args), ...(humanSalt ? [`human:${humanSalt}`] : []), ...(seatLabel ? [`seat:${seatLabel}`] : [])].join('\n')
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material))
   const hex = Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('')
   return `sub_${hex.slice(0, 32)}`
+}
+
+/** The token's seat label exactly as the inbox read normalises it (trimmed; '' when absent). A lookup fault propagates (never defaults). */
+export async function tokenSeatLabel(env: Env, tokenId: string): Promise<string> {
+  const row = await env.DB.prepare(`SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2`)
+    .bind(tokenId, env.TENANT_SLUG).first<{ label: string | null }>()
+  return row?.label?.trim() ?? ''
 }
 
 function asObject(v: unknown): Record<string, unknown> | null {
@@ -222,7 +232,7 @@ export async function eventsSubscribe(
     return fail(-32003, 'forbidden', { reason: 'agent_inactive' }, 403)
   }
 
-  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId)
+  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId, attached ? undefined : await tokenSeatLabel(env, principal.tokenId))
   const now = new Date(nowMs).toISOString()
   const fingerprint = await secretFingerprint(secret)
 
@@ -390,7 +400,7 @@ export async function eventsUnsubscribe(
   const { name, args, url } = parsed.t
   // The id is derived from the CALLER's own agent id, so a caller can only ever address its own
   // subscriptions; revokeSubscriptionForAgent re-asserts ownership in the write's WHERE.
-  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId)
+  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId, attached ? undefined : await tokenSeatLabel(env, principal.tokenId))
   await revokeSubscriptionForAgent(env, principal.agentId, id, 'unsubscribed')
   return { ok: true, result: {} } // idempotent: same result whether or not a live row existed
 }

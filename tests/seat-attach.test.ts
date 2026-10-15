@@ -1777,6 +1777,20 @@ describe('MCP Events for attached agents', () => {
     expect((row as unknown as { grant_token_id: string }).grant_token_id).toBe(g.tokenId) // the human's grant is recorded so ITS revocation stops the wake
   })
 
+  it('events/list inputSchema.required is [agent] exactly when several agents are attached (matches pickAttachment); absent with one', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    type Entry = { inputSchema: { required?: string[] }; description: string }
+    const one1 = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Entry[]
+    expect(one1[0].inputSchema).not.toHaveProperty('required')
+    expect(one1[0].description).toContain('optional')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin')
+    const two = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Entry[]
+    expect(two[0].inputSchema.required).toEqual(['agent'])
+    expect(two[0].description).toContain('required')
+  })
+
   it('several attached agents: no agent argument -> agent_required (lists them); a named agent works; an agent not attached is the same refusal whether or not it exists', async () => {
     const env = evEnv()
     const g = await grant(env, HUMAN)
@@ -1959,6 +1973,18 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     expect(list[0].description).not.toContain('hadi-admin')
     h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-agent-rava'`)
     expect((await ev(env, g.ctx, 'events/list', {})).body.result?.events).toEqual([]) // nobody eligible: empty, not a lie
+  })
+
+  it('two live attachments but only ONE eligible: required:[agent] is still present (subscribe counts every live candidate, not only the eligible)', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin')
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-agent-hadi-admin'`)
+    const list = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Array<{ inputSchema: { required?: string[] }; description: string }>
+    expect(list[0].description).not.toContain('hadi-admin') // really only one eligible
+    expect(list[0].inputSchema.required).toEqual(['agent'])
+    expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error?.message).toBe('agent_required') // and subscribe really does refuse without it
   })
 
   it('two CONNECTORS of one human attached to the same agent with the same callback keep separate subscriptions (the salt is human + harness)', async () => {

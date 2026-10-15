@@ -7579,6 +7579,16 @@ function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>
   }
 }
 
+const KNOWN_PROTOCOL_VERSIONS_FOR_LOG: ReadonlySet<string> = new Set(['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26'])
+
+/** Shape-only description of the client's requested protocolVersion for the discovery log. initialize is UNAUTHENTICATED, so free text is
+ *  never logged: a known version string is logged as is, any other string is 'other', a non-string is its typeof. */
+function requestedProtocolVersionForLog(params: unknown): string {
+  const v = typeof params === 'object' && params !== null ? (params as { protocolVersion?: unknown }).protocolVersion : undefined // narrowed to an object just above; only protocolVersion is read
+  if (typeof v !== 'string') return typeof v
+  return KNOWN_PROTOCOL_VERSIONS_FOR_LOG.has(v) ? v : 'other'
+}
+
 async function handleJsonRpc(
   c: import('hono').Context<AppEnv>,
   body: JsonRpcRequest,
@@ -7608,6 +7618,7 @@ async function handleJsonRpc(
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
+      console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
       return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
@@ -7621,6 +7632,7 @@ async function handleJsonRpc(
     // tools/call path above) and the Origin/GET clarifications (GET and DELETE answer 405 below while the flag is on).
     const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
     const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
+    console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
     const legacyInit = ok(id, {
       protocolVersion: initVersion,
       capabilities: { tools: {} },
@@ -7762,6 +7774,7 @@ async function handleJsonRpc(
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
+    console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
     return ok(id, serverDiscoverResult())
   }
 
@@ -7829,10 +7842,13 @@ async function handleJsonRpc(
       const catalogue = attachedCandidates.length > 0
         ? baseCatalogue.map((e) => ({
             ...e,
-            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. Pass arguments.agent to choose which one to wake (optional when only one).`,
+            // `agent` is REQUIRED exactly when subscribe would refuse without it: pickAttachment counts every live candidate, not only the
+            // eligible ones, so the schema must follow the same count (a client that trusts the schema must never get agent_required).
+            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. ${attachedCandidates.length > 1 ? 'Pass arguments.agent (required: this connection is attached to several agents) to choose which one to wake.' : 'arguments.agent is optional (one attached agent).'}`,
             inputSchema: {
               type: 'object',
               properties: { agent: { type: 'string', description: 'Id, slug or exact name of an agent this connection is attached to.' } },
+              ...(attachedCandidates.length > 1 ? { required: ['agent'] } : {}),
               additionalProperties: false,
             },
           }))

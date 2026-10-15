@@ -32,7 +32,7 @@ const MASTER_KEY = 'ab'.repeat(32)
 const SECRET_A = 'whsec_' + Buffer.alloc(32, 7).toString('base64')
 const SECRET_B = 'whsec_' + Buffer.alloc(32, 9).toString('base64')
 
-type Bearer = 'bound-admin' | 'bound-nogrants' | 'bound-c' | 'unbound-admin' | 'dir-zero'
+type Bearer = 'bound-seat-b' | 'bound-admin' | 'bound-nogrants' | 'bound-c' | 'unbound-admin' | 'dir-zero'
 
 let harness: SqliteD1Harness
 let busSend: ReturnType<typeof vi.fn>
@@ -600,7 +600,7 @@ describe('Standard Webhooks signing', () => {
 /** Insert a real inbox row (the ONLY source of a delivery's facts). Idempotent per id. */
 function insertMsg(
   mid: string,
-  o: { seq?: number; from?: string; to?: string; kind?: string; requestId?: string | null; createdAt?: string } = {},
+  o: { seq?: number; from?: string; to?: string; kind?: string; requestId?: string | null; createdAt?: string; targetSeat?: string | null } = {},
 ): void {
   const exists = harness.sqlite.prepare('SELECT 1 AS x FROM agent_messages WHERE id = ?').get(mid)
   if (exists) return
@@ -613,6 +613,7 @@ function insertMsg(
     mid, TENANT, o.to ?? 'agent-a', o.from ?? 'agent-b', 'member-agent-b', o.kind ?? 'message',
     'SECRET MESSAGE BODY MUST NEVER LEAVE', o.requestId ?? null, o.createdAt ?? '2026-08-01T12:00:00.000Z',
   )
+  if (o.targetSeat !== undefined) harness.sqlite.prepare('UPDATE agent_messages SET target_seat = ? WHERE id = ?').run(o.targetSeat, mid)
 }
 
 /** A job for message `mid` (row inserted on demand). */
@@ -815,6 +816,85 @@ describe('delivery', () => {
     expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-self', { from: 'agent-a' }))).toBe('refused')
     expect(sent).toHaveLength(0)
     expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'self_event' })
+  })
+
+  describe('seat partition: push only what the subscribing token\'s inbox can read', () => {
+    // The subscribing token (tok-ba) is seeded with label 't'. Inbox reads return target_seat IS NULL plus the token's own label.
+    it('a message addressed to ANOTHER seat of the same agent => refused message_not_for_seat, no POST', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-other-seat', { targetSeat: 'other-thread' }))).toBe('refused')
+      expect(sent).toHaveLength(0)
+      expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'message_not_for_seat' })
+      expect(subs()[0].status).toBe('active') // a seat mismatch is per-message, never a revocation
+    })
+    it('a message addressed to THIS token\'s own seat is delivered', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-own-seat', { targetSeat: 't' }))).toBe('delivered')
+      expect(sent).toHaveLength(1)
+    })
+    // A SECOND live agent-a token labelled 'other-thread': the state the send path really creates (one agent, several seats).
+    const seatB = async (): Promise<void> => {
+      harness.sqlite.prepare(
+        `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('tok-seat-b', 'member-agent-a', ?, 'other-thread', 'workspace', ?, 'agent-a', ?)`,
+      ).run(await sha256Hex('bound-seat-b'), T0, TENANT)
+    }
+    const deliveredTo = (): string[] => receipts().filter((r) => r.outcome === 'delivered').map((r) => r.subscription_id)
+    it('two seats of one agent subscribing to the SAME url get two rows; each seat\'s targeted mail is delivered once, to its own row only', async () => {
+      await seatB()
+      const idB = await subscribeOk('bound-seat-b')
+      expect(idB).not.toBe(id)
+      expect(subs().filter((x) => x.status === 'active')).toHaveLength(2)
+      expect(subs().find((x) => x.id === id)).toMatchObject({ token_id: 'tok-ba' })
+      expect(subs().find((x) => x.id === idB)).toMatchObject({ token_id: 'tok-seat-b' })
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-t', { targetSeat: 't' }))).toBe('delivered')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(idB, 'm-t', { targetSeat: 't' }))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(idB, 'm-b', { targetSeat: 'other-thread' }))).toBe('delivered')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-b', { targetSeat: 'other-thread' }))).toBe('refused')
+      expect(eventReq()).toHaveLength(2)
+      expect(deliveredTo().sort()).toEqual([id, idB].sort())
+    })
+    it('the same seat refreshing upserts its OWN row (no duplicate); unsubscribe by one seat revokes only that seat\'s row', async () => {
+      await seatB()
+      const idB = await subscribeOk('bound-seat-b')
+      expect(await subscribeOk('bound-admin')).toBe(id)
+      expect(await subscribeOk('bound-seat-b')).toBe(idB)
+      expect(subs()).toHaveLength(2)
+      expect((await rpc('events/unsubscribe', subParams(), 'bound-seat-b')).body.error).toBeUndefined()
+      expect(subs().find((x) => x.id === idB)!.status).toBe('revoked')
+      expect(subs().find((x) => x.id === id)!.status).toBe('active')
+    })
+    it('a label with surrounding whitespace receives mail targeted at the trimmed seat (matches the inbox trim)', async () => {
+      harness.sqlite.exec(`UPDATE member_tokens SET label = ' t ' WHERE id = 'tok-ba'`)
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-pad', { targetSeat: 't' }))).toBe('delivered')
+    })
+    it('an EMPTY target_seat is never deliverable (as in the inbox), even to an unlabelled token', async () => {
+      harness.sqlite.exec(`UPDATE member_tokens SET label = '' WHERE id = 'tok-ba'`)
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-empty', { targetSeat: '' }))).toBe('refused')
+      expect(receipts()[0]).toMatchObject({ error_class: 'message_not_for_seat' })
+      expect(sent).toHaveLength(0)
+    })
+    it('a DB fault in the label lookup rejects (queue retry); it never fails open and never writes a refusal', async () => {
+      const env = makeEnv()
+      const real = env.DB.prepare.bind(env.DB)
+      env.DB.prepare = ((sql: string) => {
+        if (/FROM member_tokens WHERE id = \?1 AND tenant = \?2/.test(sql) && !/SELECT 1/.test(sql)) throw new Error('d1 down')
+        return real(sql)
+      }) as typeof env.DB.prepare
+      insertMsg('m-fault', { targetSeat: 'other-thread' })
+      await expect(deliverSubscriptionEvent(env, { subscription_id: id, message_id: 'm-fault' })).rejects.toThrow('d1 down')
+      expect(sent).toHaveLength(0)
+      expect(receipts()).toHaveLength(0)
+    })
+    it('a dead token is REVOKED (access_*) even for other-seat mail, not misclassified as message_not_for_seat', async () => {
+      harness.sqlite.exec(`UPDATE member_tokens SET revoked_at = '${T0}' WHERE id = 'tok-ba'`)
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-dead', { targetSeat: 'other-thread' }))).toBe('refused')
+      expect(subs()[0]).toMatchObject({ status: 'revoked', revoke_reason: 'access_token_not_live' })
+      expect(receipts()[0].error_class).toBe('access_token_not_live')
+    })
+    it('an unlabelled (empty label) token receives untargeted mail but not seat-targeted mail', async () => {
+      harness.sqlite.exec(`UPDATE member_tokens SET label = '' WHERE id = 'tok-ba'`)
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-targeted', { targetSeat: 't' }))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-broadcast'))).toBe('delivered')
+      expect(sent).toHaveLength(1)
+    })
   })
 
   it('caps new events per subscription per minute; the excess is refused with a receipt', async () => {
@@ -1337,7 +1417,7 @@ describe('further guards pinned', () => {
   })
 
   it('the upsert never overwrites a row owned by a different agent (ownership is in the statement)', async () => {
-    const id = await subscriptionId('agent-a', URL_A, 'message.created', {})
+    const id = await subscriptionId('agent-a', URL_A, 'message.created', {}, undefined, 't') // tok-ba carries seat label 't'
     harness.sqlite.exec(`INSERT INTO event_subscriptions (id, tenant, agent_id, member_id, token_id, event_name, callback_url, secret_ciphertext, secret_fingerprint, status, refresh_before, created_at, last_refreshed_at)
       VALUES ('${id}', '${TENANT}', 'agent-x', 'member-x', 'tok-x', 'message.created', '${URL_A}', 'untouched', 'deadbeef', 'active', '2099-01-01T00:00:00.000Z', '${T0}', '${T0}')`)
     const r = await rpc('events/subscribe', subParams())
