@@ -68,6 +68,46 @@ function markBootstrapped(memberId: string): void {
   `)
 }
 
+describe('an existing agent is pointed at seat_attach only when the session can actually call it', () => {
+  const withSeat = (attached = false): AuthContext => ({
+    ...seat('directory'),
+    seatBinding: { seatId: 'seat-1', label: 'chat', harnessId: 'h-1', grantTokenId: 'g-1', humanMemberId: 'mem-newcomer', source: 'auto:openai_session',
+      ...(attached ? { attached: { attachmentId: 'a', admissionId: 'adm', agentId: 'ag', seatAgentId: 'sa', ceiling: 'member' as const } } : {}) },
+  }) as AuthContext
+  const note = async (auth: AuthContext): Promise<string> => {
+    const out = await invokeTool(auth, env, 'boot_context', {}, ORIGIN)
+    return ((out as { result?: BootResult }).result?.channel_limits?.to_get_write_access) ?? ''
+  }
+  const on = (): void => { ;(env as unknown as Record<string, string>).SEAT_ATTACH = '1'; (env as unknown as Record<string, string>).SEAT_AUTO_ENROLL = '1' }
+  it('SEAT_ATTACH on + a seat that is not attached: names seat_attach (after bootstrap_self, before the token route) and keeps the bearer for a daemon agent', async () => {
+    on()
+    const fix = await note(withSeat())
+    expect(fix).toContain('seat_attach { agent:')
+    expect(fix.toLowerCase()).toContain('passkey')
+    expect(fix.toLowerCase()).toContain('will not help')
+    expect(fix.indexOf('bootstrap_self')).toBeLessThan(fix.indexOf('seat_attach'))
+    expect(fix.indexOf('seat_attach')).toBeLessThan(fix.indexOf('mint_agent_token'))
+    expect(fix).toContain('fixed CLI/daemon agent')
+  })
+  it('a SEATLESS directory session (seat_attach would answer seat_required) keeps the old text: no dead end', async () => {
+    on()
+    const fix = await note(seat('directory'))
+    expect(fix).not.toContain('seat_attach')
+    expect(fix).toContain('mint_agent_token')
+  })
+  it('a session already attached is not told to attach again', async () => {
+    on()
+    const fix = await note(withSeat(true))
+    expect(fix).not.toContain('seat_attach')
+  })
+  it('SEAT_ATTACH off: the old text is unchanged', async () => {
+    delete (env as unknown as Record<string, string | undefined>).SEAT_ATTACH
+    const fix = await note(withSeat())
+    expect(fix).not.toContain('seat_attach')
+    expect(fix).toContain('mint_agent_token')
+  })
+})
+
 describe('a newcomer is shown the self-serve door', () => {
   it('an unbound directory session with no agent is told to bootstrap_self FIRST', async () => {
     const r = await boot('directory')
