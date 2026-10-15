@@ -4064,10 +4064,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0226_capability_lifecycle.sql",
-    sha256: "24415cc917812bdacb8e521fb1a6ce4fcbe0e14a8d8784267e9b483160babc01",
+    file: "0227_page_versions.sql",
+    sha256: "196fc8417da051950f1c77512f611614254db9aac04b6cc101cebd07b4fa19b2",
     statements: [
-      "-- 0226_capability_lifecycle.sql — a standing capability grant has a lifecycle.\n--\n-- Controls: ISO 27001 A.5.18 (access rights: provisioning, review, removal),\n-- SOC 2 CC6.2 / CC6.3 (grant, modify, remove access; periodic review).\n--\n-- WHY\n--\n-- `capabilities` had no expiry, no reason, no granter and no history. Every\n-- grant was permanent, and a revoke is a hard DELETE that leaves nothing behind:\n-- \"who held admin on this squad in September, who gave it to them, and why\" was\n-- unanswerable. Only elevation_grants (0148) had a lifecycle.\n--\n-- This migration is the schema half of that. It is ADDITIVE and CHANGES NO\n-- EXISTING ROW'S AUTHORITY:\n--\n--   expires_at   NULL = non-expiring (every legacy grant). The liveness predicate\n--                CAPABILITY_LIVE_PREDICATE (src/auth/capability.ts) reads NULL as\n--                live; SQL three-valued logic would otherwise drop every NULL row\n--                from a comparison and lock the whole pot out at once.\n--   reason       free text the granter gave, or NULL.\n--   granted_by   member or agent id that made the grant, or NULL (legacy).\n--   granted_via  the surface: dashboard | mcp | elevation | delegated_operator |\n--                squad_join | invite | bootstrap | migration ... NULL (legacy).\n--\n-- Nothing is auto-expired and nothing is backfilled.\n--\n-- grant_events is the append-only history sidecar. The live table keeps its\n-- DELETE-on-revoke semantics (every revocation read is unchanged); history lives\n-- here, and is written BY TRIGGER in the same transaction as the change:\n--\n--   AFTER INSERT                       -> 'granted'\n--   AFTER UPDATE of capability, expiry,\n--     scope or provenance              -> 'granted' (re-grant, upgrade, horizon change)\n--   AFTER DELETE                       -> 'revoked' (or 'expired' for the sweeper)\n--\n-- A trigger cannot be forgotten by a writer, fires for the members ON DELETE\n-- CASCADE and for a console DELETE, writes nothing for an INSERT OR IGNORE / ON\n-- CONFLICT DO NOTHING that wrote no row, and a no-op re-grant is silent. The\n-- 'granted' event takes granted_by / reason from the row itself. A DELETE carries\n-- no actor, so a revoke that knows who is revoking sets grant_event_context in\n-- the same batch right before the DELETE and clears it right after; a context\n-- older than 60 seconds is ignored, so one that outlived its batch cannot\n-- mis-attribute a later revoke. `grant_table` also admits 'gate_grants' so the\n-- next step needs no change here.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
+      "-- 0227_page_versions — a monotonic version COUNTER for agent-written wiki pages (PagesPort, src/pages/).\n-- It carries NO ownership meaning. Owner, writer and tier live ONLY in the stamped envelope inside the\n-- text record (the store of record); this table is rebuildable from that text: next version =\n-- MAX(counter, text version) + 1, so a lost row costs nothing but a re-count. A row is committed only\n-- AFTER a successful put, so a refused or failed write leaves nothing behind. Its one other use is a\n-- refuse-only hint: a counter row whose page the store can no longer show means \"we wrote here before\",\n-- so the slug is not re-put (an update would silently republish an unpublished topic).\nCREATE TABLE IF NOT EXISTS page_versions (\n  project_id  TEXT NOT NULL,\n  slug        TEXT NOT NULL,\n  version     INTEGER NOT NULL,\n  PRIMARY KEY (project_id, slug)\n);",
+    ],
+    objects: [
+      { type: "table", name: "page_versions" },
+    ],
+  },
+  {
+    file: "0228_capability_lifecycle.sql",
+    sha256: "57cdced0fdbf44e821ba8a1e740a80964212052bbea68ad99444f7adc34a6618",
+    statements: [
+      "-- 0228_capability_lifecycle.sql — a standing capability grant has a lifecycle.\n--\n-- Controls: ISO 27001 A.5.18 (access rights: provisioning, review, removal),\n-- SOC 2 CC6.2 / CC6.3 (grant, modify, remove access; periodic review).\n--\n-- WHY\n--\n-- `capabilities` had no expiry, no reason, no granter and no history. Every\n-- grant was permanent, and a revoke is a hard DELETE that leaves nothing behind:\n-- \"who held admin on this squad in September, who gave it to them, and why\" was\n-- unanswerable. Only elevation_grants (0148) had a lifecycle.\n--\n-- This migration is the schema half of that. It is ADDITIVE and CHANGES NO\n-- EXISTING ROW'S AUTHORITY:\n--\n--   expires_at   NULL = non-expiring (every legacy grant). The liveness predicate\n--                CAPABILITY_LIVE_PREDICATE (src/auth/capability.ts) reads NULL as\n--                live; SQL three-valued logic would otherwise drop every NULL row\n--                from a comparison and lock the whole pot out at once.\n--   reason       free text the granter gave, or NULL.\n--   granted_by   member or agent id that made the grant, or NULL (legacy).\n--   granted_via  the surface: dashboard | mcp | elevation | delegated_operator |\n--                squad_join | invite | bootstrap | migration ... NULL (legacy).\n--\n-- Nothing is auto-expired and nothing is backfilled.\n--\n-- grant_events is the append-only history sidecar. The live table keeps its\n-- DELETE-on-revoke semantics (every revocation read is unchanged); history lives\n-- here, and is written BY TRIGGER in the same transaction as the change:\n--\n--   AFTER INSERT                       -> 'granted'\n--   AFTER UPDATE of capability, expiry,\n--     scope or provenance              -> 'granted' (re-grant, upgrade, horizon change)\n--   AFTER DELETE                       -> 'revoked' (or 'expired' for the sweeper)\n--\n-- A trigger cannot be forgotten by a writer, fires for the members ON DELETE\n-- CASCADE and for a console DELETE, writes nothing for an INSERT OR IGNORE / ON\n-- CONFLICT DO NOTHING that wrote no row, and a no-op re-grant is silent. The\n-- 'granted' event takes granted_by / reason from the row itself. A DELETE carries\n-- no actor, so a revoke that knows who is revoking sets grant_event_context in\n-- the same batch right before the DELETE and clears it right after; a context\n-- older than 60 seconds is ignored, so one that outlived its batch cannot\n-- mis-attribute a later revoke. `grant_table` also admits 'gate_grants' so the\n-- next step needs no change here.\nALTER TABLE capabilities ADD COLUMN expires_at TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN reason TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN granted_by TEXT;",
       "\nALTER TABLE capabilities ADD COLUMN granted_via TEXT;",
@@ -4096,16 +4106,6 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0227_page_versions.sql",
-    sha256: "196fc8417da051950f1c77512f611614254db9aac04b6cc101cebd07b4fa19b2",
-    statements: [
-      "-- 0227_page_versions — a monotonic version COUNTER for agent-written wiki pages (PagesPort, src/pages/).\n-- It carries NO ownership meaning. Owner, writer and tier live ONLY in the stamped envelope inside the\n-- text record (the store of record); this table is rebuildable from that text: next version =\n-- MAX(counter, text version) + 1, so a lost row costs nothing but a re-count. A row is committed only\n-- AFTER a successful put, so a refused or failed write leaves nothing behind. Its one other use is a\n-- refuse-only hint: a counter row whose page the store can no longer show means \"we wrote here before\",\n-- so the slug is not re-put (an update would silently republish an unpublished topic).\nCREATE TABLE IF NOT EXISTS page_versions (\n  project_id  TEXT NOT NULL,\n  slug        TEXT NOT NULL,\n  version     INTEGER NOT NULL,\n  PRIMARY KEY (project_id, slug)\n);",
-    ],
-    objects: [
-      { type: "table", name: "page_versions" },
-    ],
-  },
-  {
     file: "0229_telegram_login_links.sql",
     sha256: "c138bc053b9bf73b0add031665bdd2678139cdc17916108427e776865a08ff04",
     statements: [
@@ -4122,4 +4122,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "28b24dec7dbf3bebfafd76e1de4546fafe8d88b9cd8b31894eb8328fd0eee580"
+export const SCHEMA_CHAIN_DIGEST: string = "87682c86f33f777e0fd4d69826855ea33715c2666fb54580f6e96cfa19fcaef2"
