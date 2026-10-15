@@ -44,5 +44,11 @@ describe('flight_dispatch description examples are real', () => {
   it('the description states there is no "unknown" and that the neutral prior is an assumption', () => {
     expect(args()).toMatch(/NO "unknown"/)
     expect(args()).toMatch(/assumption, not a measurement/)
+    expect(args()).toContain('no live-flight collision') // flight_clearance_hold also forces a no-go
+    expect(args()).toContain('belong to a listed squad') // flight_task_scope_mismatch
+    expect(args()).toContain('lead if budget_micro_usd>0')
+  })
+  it('the description stays inside a size budget (every tool description ships in tools/list; this one is the largest, do not let it grow)', () => {
+    expect(args().length).toBeLessThan(2400)
   })
 })
