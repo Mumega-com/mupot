@@ -276,7 +276,13 @@ describe('every capabilities writer records provenance', () => {
   it('every INSERT and re-attributing UPDATE names granted_via', () => {
     const exempt = new Set(PROVENANCE_EXEMPT.map((e) => e.fingerprint))
     const offenders = writes()
-      .filter((w) => w.kind !== 'delete' && !/\bgranted_via\b/.test(w.text) && !exempt.has(w.fp))
+      .filter((w) => {
+        if (w.kind === 'delete' || exempt.has(w.fp)) return false
+        // An INSERT must name the column in ITS COLUMN LIST — a mention in the
+        // ON CONFLICT clause alone would leave a fresh row unattributed.
+        const scoped = w.kind === 'insert' ? w.text.split(/\b(?:VALUES|SELECT)\b/i)[0] ?? '' : w.text
+        return !/\bgranted_via\b/.test(scoped)
+      })
       .map((w) => `${w.file}:${w.line} [${w.fp}] ${w.kind}`)
     expect(offenders).toEqual([])
   })
