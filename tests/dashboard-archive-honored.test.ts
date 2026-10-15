@@ -81,6 +81,8 @@ describe('dashboard honors task archive', () => {
     ['projects.ts', /t\.project_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\('t'\)\}/],
     ['projects.ts', /project_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}\$\{squadFilter\}\) AS direct_tasks/],
     ['agents-admin.ts', /LEFT JOIN tasks t ON t\.assignee_agent_id = a\.id AND \$\{TASK_NOT_ARCHIVED_SQL\('t'\)\}/],
+    ['agents-admin.ts', /status IN \('in_progress','open'\)\s+AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
+    ['agents-admin.ts', /status = 'review'\s+AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
     ['agent-profile.ts', /assignee_agent_id = \?1 AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
     ['index.ts', /FROM tasks WHERE squad_id = \? AND \$\{TASK_NOT_ARCHIVED_SQL\(\)\}/],
   ])('%s keeps the archive predicate on its task read', (file, re) => {
