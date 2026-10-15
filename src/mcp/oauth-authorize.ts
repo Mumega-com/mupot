@@ -484,15 +484,25 @@ export async function listConsentableAgents(
    * unchanged: that flow has no AuthContext and must not silently widen.
    */
   orgWideAdmin = false,
+  /**
+   * mupot#1565. An agent's identity weld (member + agent_member_bindings row) is created
+   * lazily by the FIRST credential mint, so a freshly created agent has no binding and the
+   * inner JOIN hid it: /enroll told its owner "You may not act as any agent yet" about the
+   * agent they had just made. The /enroll page (which mints through the same weld-creating
+   * helper, behind the same squad-admin bar) opts in to list such agents. Default false:
+   * the OAuth consent flow must keep refusing an agent with no identity to consent to.
+   */
+  includeUnbound = false,
 ): Promise<ConsentableAgent[]> {
   const humanGrants = await resolveCapabilities(env, memberId)
+  const bindingJoin = includeUnbound ? 'LEFT JOIN' : 'JOIN'
   const rows = await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
             sq.name AS squad_name, a.autonomy AS autonomy,
             a.budget_cap_cents AS budget_cap_cents, a.budget_window AS budget_window
        FROM agents a
        JOIN squads sq ON sq.id = a.squad_id
-       JOIN agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
+       ${bindingJoin} agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
       WHERE a.status = 'active'
       ORDER BY sq.name ASC, a.name ASC`,
   ).bind(env.TENANT_SLUG).all<ConsentAgentRow>()
