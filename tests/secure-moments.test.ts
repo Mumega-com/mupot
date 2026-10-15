@@ -1323,6 +1323,24 @@ describe('round 2 P2/P3', () => {
     expect(html).toContain('<form id="decision-form"')
     expect(html).toContain("form.addEventListener('submit',function(ev){ev.preventDefault()})")
   })
+  it('the decision page tells a stuck phone what to do: Safari/Chrome itself, and a link to My Account to add this phone as a passkey (never an enrolment from the bearer link)', async () => {
+    const m = await fileSeed()
+    const html = await (await hit(m.path)).text()
+    expect(html).toContain('id="decide-help"')
+    expect(html).toContain('Open in Safari')
+    expect(html).toContain(`href="https://${COLONY}/account"`) // the signed-in dashboard, which requires a fresh re-auth to mint an enrolment
+    expect(html).not.toMatch(/\/m\/enrol\//) // the page itself never offers an enrolment
+    // a non-https dashboard origin: the advice stays, the link goes (never a plain-http link to the account page)
+    const plain = await (await hit(m.path, {}, { ...env, PUBLIC_ORIGIN: `http://${COLONY}` } as Env)).text()
+    expect(plain).toContain('id="decide-help"')
+    expect(plain).not.toContain('add this phone as a passkey')
+  })
+  it('the decide script warns after 25 seconds of no passkey response and stops its timer on every exit', async () => {
+    const m = await fileSeed()
+    const html = await (await hit(m.path)).text()
+    expect(html).toContain('Still waiting for your passkey')
+    expect((html.match(/clearTimeout\(slow\)/g) ?? []).length).toBeGreaterThanOrEqual(3) // not-started, success path, catch
+  })
 })
 
 describe('round 2 (#1853 P1): a dedicated host may not be a PARENT of a colony or pot host, nor of/under the other dedicated host', () => {

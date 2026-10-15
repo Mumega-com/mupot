@@ -18,19 +18,22 @@ var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
 function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),csrf:form.getAttribute('data-csrf')}}
 async function decide(decision){
+ var slow=null;
  lock(true);show('Waiting for your passkey','Confirm on this device. Nothing has been decided yet.',true);
  try{
   var p=params(decision);
+  slow=setTimeout(function(){if(document.querySelector('button[data-act]:disabled')){show('Still waiting for your passkey','Nothing has come back yet. If no passkey prompt appeared on this device, reload this page and tap once, from Safari or Chrome itself (not an in-app browser), or use a device that has your passkey. Nothing has been decided.',false)}},25000);
   var ch=await post('/challenge',p);
-  if(!ch.json.ok){show('Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
+  if(!ch.json.ok){clearTimeout(slow);show('Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
   var o=ch.json.publicKey;o.challenge=b64uToBuf(o.challenge);
   o.allowCredentials=(o.allowCredentials||[]).map(function(c){return{type:c.type,id:b64uToBuf(c.id)}});
   var cred=await navigator.credentials.get({publicKey:o});
   p.credential={id:cred.id,rawId:bufToB64u(cred.rawId),type:cred.type,response:{clientDataJSON:bufToB64u(cred.response.clientDataJSON),authenticatorData:bufToB64u(cred.response.authenticatorData),signature:bufToB64u(cred.response.signature)}};
+  clearTimeout(slow);
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
   if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true}else{lock(false)}
- }catch(e){show('Not decided',explain(e),false);lock(false)}
+ }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false)}
 }
 var bs=form.querySelectorAll('button[data-act]');
 for(var i=0;i<bs.length;i++){bs[i].addEventListener('click',function(ev){decide(ev.currentTarget.getAttribute('data-act'))})}

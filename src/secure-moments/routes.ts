@@ -450,7 +450,8 @@ momentsApp.get('/m/:id/:token', async (c) => {
 <p class="muted">Deciding needs your passkey. Opening this page decided nothing.</p>
 <div class="row"><button class="primary" type="button" data-act="approve">${escapeHtml(approveLabel)} with passkey</button>
 <button class="danger" type="button" data-act="deny">Deny with passkey</button></div></form>
-<div id="status" role="status"></div>`
+<div id="status" role="status"></div>
+${decideHelpBlock(c.env)}`
   secure(c, true)
   return c.html(renderPage(title, body, { nonce: c.get('nonce'), code: DECIDE_SCRIPT }))
 })
@@ -485,6 +486,19 @@ momentsApp.post('/m/:id/:token/challenge', async (c) => {
     publicKey: { challenge, rpId: c.get('host'), timeout: 120000, userVerification: 'required', allowCredentials: allow },
   })
 })
+
+/** "No passkey prompt on this device?" help under the decide buttons. The link goes to the signed-in dashboard My Account (never to an
+ *  enrolment from THIS page: the approve link is a bearer link, and adding a passkey from it would let whoever holds the link plant their own
+ *  proof method; the account page requires a real, freshly re-authenticated web session). Null-safe when PUBLIC_ORIGIN is unset. */
+function decideHelpBlock(env: Env): string {
+  let account = ''
+  try {
+    const u = new URL('/account', env.PUBLIC_ORIGIN ?? '')
+    if (u.protocol === 'https:') account = u.toString()
+  } catch { /* no usable dashboard origin: leave the link out */ }
+  const addPhone = account ? ` Or <a href="${escapeHtml(account)}" rel="noopener">add this phone as a passkey</a> in My Account (you sign in there first), then come back to this link.` : ''
+  return `<p class="muted" id="decide-help">No passkey prompt on this phone, or it did not come back? Open this link in Safari or Chrome itself, not inside another app's built-in browser (in the corner menu choose Open in Safari), and tap once.${addPhone}</p>`
+}
 
 momentsApp.post('/m/:id/:token/decide', async (c) => {
   const g = await jsonGuard(c, MAX_DROP_BODY_BYTES)
