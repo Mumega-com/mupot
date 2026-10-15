@@ -128,7 +128,7 @@ import {
   applyAgentAccessChange,
   loadAgentAccessView,
 } from './agent-access-panel'
-import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
+import { mintAgentBoundToken, isAgentTokenCapability, AgentInactiveError } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
 // Connect-config builders (pure) for the Connect card.
@@ -2357,10 +2357,21 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.
   // This is the same path the MCP mint_agent_token tool uses.
-  const minted = await mintAgentBoundToken(c.env, agent, labelRaw, {
-    grantCapability: capabilityRaw,
-    expiresAt,
-  })
+  let minted: Awaited<ReturnType<typeof mintAgentBoundToken>>
+  try {
+    minted = await mintAgentBoundToken(c.env, agent, labelRaw, {
+      grantCapability: capabilityRaw,
+      expiresAt,
+    })
+  } catch (err) {
+    // mupot#1961: a non-active agent gets no credential and no weld.
+    if (!(err instanceof AgentInactiveError)) throw err
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'agent_inactive: this agent is not active. Reactivate it before minting a key.')),
+      409,
+    )
+  }
 
   // Look up the squad name for the show-once page.
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
@@ -2482,13 +2493,24 @@ dashboardApp.post('/enroll/mint', async (c) => {
 
   // issuedBy puts the issuance row in the same batch as the token (0139), so
   // this page cannot hand out a credential nobody can attribute.
-  const minted = await mintAgentBoundToken(c.env, agent, seat, {
-    issuedBy: {
-      memberId: actorMemberId,
-      principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
-      surface: 'enroll',
-    },
-  })
+  let minted: Awaited<ReturnType<typeof mintAgentBoundToken>>
+  try {
+    minted = await mintAgentBoundToken(c.env, agent, seat, {
+      issuedBy: {
+        memberId: actorMemberId,
+        principal: (auth.email && auth.email.trim().length > 0) ? auth.email.trim() : actorMemberId,
+        surface: 'enroll',
+      },
+    })
+  } catch (err) {
+    // mupot#1961: a non-active agent gets no credential and no weld.
+    if (!(err instanceof AgentInactiveError)) throw err
+    const view = await loadEnrollView(c.env, auth, { seat, agent: agentIdRaw })
+    return c.html(
+      shell(c.env, 'Enroll seat', enrollPageBody(view, 'agent_inactive: this agent is not active. Reactivate it before minting a key.')),
+      409,
+    )
+  }
   const squadRow = await c.env.DB.prepare('SELECT name FROM squads WHERE id = ?1 LIMIT 1')
     .bind(agent.squad_id)
     .first<{ name: string }>()

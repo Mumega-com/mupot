@@ -372,13 +372,44 @@ export async function prepareAgentBoundTokenMint(
  * path composes the SAME weld statements instead of forking a second provisioner; the
  * existing mint callers get byte-identical statements, binds and order.
  */
+/** mupot#1961: the agent must be active at the moment the batch runs (positional `?` = agent id). */
+const ACTIVE_AGENT_GUARD = `EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`
+
+/** Thrown when a mint targets an agent that is not status='active' (deactivated/paused). */
+export class AgentInactiveError extends Error {
+  constructor() {
+    super('agent_inactive')
+    this.name = 'AgentInactiveError'
+  }
+}
+
 export function prepareAgentIdentityWeldStatements(
   env: Env,
   agent: AgentForMint,
   memberId: string,
   createdAt: string,
   grantCapability: AgentTokenCapability,
+  opts: { requireActiveAgent?: boolean } = {},
 ): D1PreparedStatement[] {
+  if (opts.requireActiveAgent) {
+    // mupot#1961: every row lands only while the agent is STILL active, evaluated inside the
+    // batch (a pre-read alone loses to a concurrent deactivate_agent). Inactive => 0 rows on
+    // each statement => commitPreparedAgentTokenMint refuses with AgentInactiveError.
+    return [
+      env.DB.prepare(
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG, agent.id),
+      env.DB.prepare(
+        `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+         SELECT ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+      ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt, agent.id),
+      env.DB.prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         SELECT ?, ?, 'squad', ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+      ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability, agent.id),
+    ]
+  }
   return [
     env.DB.prepare(
       `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
@@ -470,6 +501,14 @@ export async function prepareAgentBoundTokenMintForBinding(
   revokePriorTokenId: string | null = null,
   issuedBy?: TokenIssuanceActor,
 ): Promise<PreparedAgentTokenMint> {
+  // mupot#1961 preflight: refuse a non-active agent before generating any secret. The in-batch
+  // ACTIVE_AGENT_GUARD on every statement is the authoritative check (a concurrent
+  // deactivate_agent between this read and the batch still lands nothing).
+  const liveAgent = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
+    .bind(agent.id)
+    .first<{ ok: number }>()
+  if (!liveAgent) throw new AgentInactiveError()
+
   const creating = binding.kind === 'unminted'
   const memberId = creating ? crypto.randomUUID() : binding.memberId
   let grantCapability = requestedCapability
@@ -532,7 +571,7 @@ export async function prepareAgentBoundTokenMintForBinding(
   const statements: D1PreparedStatement[] = []
 
   if (creating) {
-    statements.push(...prepareAgentIdentityWeldStatements(env, agent, memberId, createdAt, grantCapability))
+    statements.push(...prepareAgentIdentityWeldStatements(env, agent, memberId, createdAt, grantCapability, { requireActiveAgent: true }))
   }
 
   // A rotation inserts the replacement only while the named prior token remains
@@ -549,7 +588,8 @@ export async function prepareAgentBoundTokenMintForBinding(
             SELECT 1 FROM member_tokens prior
              WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
                AND ${replacementLivePredicate('prior', '?')}
-          )`,
+          )
+            AND ${ACTIVE_AGENT_GUARD}`,
       ).bind(
         tokenId,
         memberId,
@@ -564,18 +604,20 @@ export async function prepareAgentBoundTokenMintForBinding(
         agent.id,
         env.TENANT_SLUG,
         nowSqlUtc(),
+        agent.id,
       ),
       env.DB.prepare(
         `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ?
-          AND ${replacementLivePredicate('member_tokens', '?')}`,
-      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc()),
+          AND ${replacementLivePredicate('member_tokens', '?')}
+          AND ${ACTIVE_AGENT_GUARD}`,
+      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc(), agent.id),
     )
   } else {
     statements.push(
       env.DB.prepare(
         `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
-         VALUES (?, ?, ?, ?, 'workspace', ?, ?, ?, ?)`,
-      ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG, expiresAt ?? null),
+         SELECT ?, ?, ?, ?, 'workspace', ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+      ).bind(tokenId, memberId, tokenHash, safeLabel, createdAt, agent.id, env.TENANT_SLUG, expiresAt ?? null, agent.id),
     )
   }
 
@@ -594,9 +636,9 @@ export async function prepareAgentBoundTokenMintForBinding(
     statements.push(
       env.DB.prepare(
       `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
-       VALUES (?, ?, 'agent', ?, 'system:mint', ?)
+       SELECT ?, ?, 'agent', ?, 'system:mint', ? WHERE ${ACTIVE_AGENT_GUARD}
        ON CONFLICT (capability, principal_type, principal_id) DO UPDATE SET created_at = created_at`,
-      ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt),
+      ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt, agent.id),
     )
   }
 
@@ -616,7 +658,7 @@ export async function prepareAgentBoundTokenMintForBinding(
         `INSERT INTO agent_token_issuance_audit
            (id, tenant, token_id, agent_id, member_id, actor_member_id, actor_principal,
             surface, seat_label, grant_capability, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
       ).bind(
         crypto.randomUUID(),
         env.TENANT_SLUG,
@@ -629,6 +671,7 @@ export async function prepareAgentBoundTokenMintForBinding(
         safeLabel,
         grantCapability,
         createdAt,
+        agent.id,
       ),
     )
   }
@@ -670,6 +713,14 @@ async function commitPreparedAgentTokenMint(
   try {
     assertBatchWritten(writes, 'mint_agent_bound_token', 1)
   } catch (error) {
+    // mupot#1961: a zero-row guarded batch because the agent is not active is a clear refusal,
+    // not a generic write failure. Re-read to tell the two apart. Nothing landed (every
+    // statement carries the same guard), so there is no token and no weld to undo.
+    const agentId = prepared.bindingProof.agentId
+    const live = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
+      .bind(agentId)
+      .first<{ ok: number }>()
+    if (!live) throw new AgentInactiveError()
     if (prepared.replacementTokenId) throw new AgentTokenReplacementError()
     throw error
   }

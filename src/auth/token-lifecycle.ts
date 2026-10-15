@@ -31,9 +31,19 @@ import type { Env } from '../types'
  *     answer for the same instant — and it fails OPEN or CLOSED depending purely on
  *     which format each row happens to carry. julianday() parses both and compares the
  *     actual instants. Do not "simplify" this to a string comparison.
+ *
+ *  3. mupot#1961: a token WELDED to an agent (`agent_id` NOT NULL) is live only while that
+ *     agent is not retired (status 'active' or 'paused'; 'inactive' = deactivate_agent's
+ *     retirement. 'paused' is the operator's reversible wake toggle and keeps its credentials,
+ *     the same convention seat-attach's connection listing uses). deactivate_agent revokes tokens, but a status flip that does
+ *     not (the dashboard toggle, a later mint) must not leave a live credential for a
+ *     non-active agent, and re-activating the agent makes the same credential work again.
+ *     Unbound tokens (agent_id NULL) are untouched. The subquery uses its own alias so the
+ *     callers' `t.` -> `<alias>.` rewrites stay valid; a missing agent row fails CLOSED.
  */
 export const TOKEN_LIVE_PREDICATE = (nowParam: string): string =>
-  `t.revoked_at IS NULL AND (t.expires_at IS NULL OR julianday(t.expires_at) > julianday(${nowParam}))`
+  `t.revoked_at IS NULL AND (t.expires_at IS NULL OR julianday(t.expires_at) > julianday(${nowParam}))
+   AND (t.agent_id IS NULL OR EXISTS (SELECT 1 FROM agents ag_live WHERE ag_live.id = t.agent_id AND ag_live.status IN ('active', 'paused')))`
 
 /** Canonical `now` for the predicate above. Emitted in the same shape SQLite's own
  *  `datetime('now')` produces, so a value written by a migration and a value written by
