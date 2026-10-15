@@ -3537,6 +3537,7 @@ const toolFlightDispatch: ToolSpec = {
   args: '{ squad_id: string, project_id?: string|null, goal: string, '
     + 'meta_json: string (a JSON string, unknown keys refused; example {"schema":"mupot.flight.meta/v1","goal_id":"g","objective_id":"o","squad_ids":["<dispatch squad>"],'
     + '"task_ids":["<task>"],"done_when":["<observable acceptance>"],"artifact_refs":[],"receipt_refs":[],"confidentiality":"internal","publication_target":"none","parent_flight_id":null}; '
+    + 'objective_id is a free label (objective_accept needs a workspace credential and is refused to attached chats); '
     + 'squad_ids must include the dispatch AND executor squads; each task must exist, be unarchived and belong to a listed squad and the project; you need member on every listed squad, lead if budget_micro_usd>0), '
     + 'signals_json: string (JSON object, camelCase or snake_case, ALL 8 required, unknown keys refused: contextComplete, toolsReachable (booleans), '
     + 'budgetRemainingMicroUsd, budgetEstimateMicroUsd (numbers, overwritten by the server: send 0), recentProgress, progressPerStep, wastePerStep (0..1), stepSeconds; '

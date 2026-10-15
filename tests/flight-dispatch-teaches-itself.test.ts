@@ -47,6 +47,7 @@ describe('flight_dispatch description examples are real', () => {
     expect(args()).toContain('no live-flight collision') // flight_clearance_hold also forces a no-go
     expect(args()).toContain('belong to a listed squad') // flight_task_scope_mismatch
     expect(args()).toContain('lead if budget_micro_usd>0')
+    expect(args()).toContain('objective_id is a free label') // an attached chat cannot objective_accept (agent_bound_workspace_credential_required)
   })
   it('the description stays inside a size budget (every tool description ships in tools/list; this one is the largest, do not let it grow)', () => {
     expect(args().length).toBeLessThan(2400)
