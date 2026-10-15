@@ -56,6 +56,7 @@ import { routeAgentWake } from '../agents/wake-routing'
 import { waitUntilFromContext, type DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { redeemTelegramProjectInvite } from '../members/project-invites'
+import { mintTelegramLoginLink } from '../auth/telegram-login-link'
 import { provisionHomeForMember } from '../members/service'
 import { listNeedsYou } from '../attention/service'
 import { answerRoutineRun, getRoutinePendingQuestion, getRoutineProjectAccessRequest } from '../routines/actions'
@@ -189,6 +190,7 @@ export async function soleSquadGrant(env: Env, grants: CapabilityGrant[]): Promi
 type Intent =
   | { kind: 'help' }
   | { kind: 'join'; code: string }
+  | { kind: 'weblogin' }
   | { kind: 'needs'; projectId: string | null }
   | { kind: 'answer'; runId: string; choice: string }
   | { kind: 'status'; ref: string | null }
@@ -223,6 +225,7 @@ function parseIntent(text: string): Intent {
   const lower = trimmed.toLowerCase()
 
   if (lower === 'help' || lower === '/help' || lower === '?') return { kind: 'help' }
+  if (lower === '/login') return { kind: 'weblogin' }
   const join = trimmed.match(/^\/start\s+(\S{1,512})$/i)
   if (join) return { kind: 'join', code: join[1] }
   const needs = trimmed.match(/^\/needs(?:\s+([A-Za-z0-9_-]{1,255}))?$/i)
@@ -289,7 +292,7 @@ function parseIntent(text: string): Intent {
 
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
-  'I can: "/start <invite-code>", "/needs [project-id]", "/answer <run-id> <choice>", ' +
+  'I can: "/start <invite-code>", "/login", "/needs [project-id]", "/answer <run-id> <choice>", ' +
   '"task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
   '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
   '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
@@ -382,6 +385,31 @@ export async function handleImMessage(
   const member = await memberForChat(env, chat)
   if (!member) {
     return "You're not registered with this workspace yet. Ask an admin to invite you, then connect Telegram."
+  }
+
+  // mupot#1579: web login by proof of control. The link is minted for the member whose bound chat is THIS chat, only
+  // from the authenticated private webhook envelope (same fence as join), and only ever reaches that chat.
+  if (intent.kind === 'weblogin') {
+    if (!options.telegram || options.telegram.telegram_user_id !== chat) {
+      return 'Send /login from your direct Telegram conversation with me.'
+    }
+    const origin = (env.PUBLIC_ORIGIN ?? '').trim().replace(/\/+$/, '')
+    if (!origin) return 'Web sign-in is not configured for this workspace. Ask an admin.'
+    const minted = await mintTelegramLoginLink(env, { memberId: member.id, chatId: chat })
+    if (!minted.ok) {
+      if (minted.error === 'already_has_login') return 'You already have a web sign-in. Open the workspace in your browser and sign in.'
+      if (minted.error === 'no_email') return 'Your account has no email on file, so I cannot create a sign-in link. Ask an admin to add your email, or use a new invitation.'
+      if (minted.error === 'agent_backed') return 'This account cannot use a web sign-in link.'
+      return 'Could not create a sign-in link.'
+    }
+    // The reply carries the plaintext link and is persisted in telegram_webhook_receipts.response_text. That is NOT
+    // redactable: a duplicate Telegram delivery of this update is answered from the stored reply (reservation.duplicate
+    // above), so the receipt must hold the exact reply for idempotent resend. The link is a BEARER that the chat relay
+    // (the Hermes gateway) and this stored receipt can both see, so it is not a secret from them. What bounds it: it
+    // expires in TELEGRAM_LOGIN_LINK_TTL_SECONDS, is single use, is superseded by the next /login, and confirming it
+    // needs a fresh browser-bound sign-in whose verified email equals the member's email (telegram-login-link.ts claim).
+    // A member with NO email is bounded only by the fresh-sign-in nonce, expiry and single use.
+    return `Open this link in your browser to connect your web sign-in (valid 10 minutes, one use). Do not share this link with anyone: ${origin}/auth/telegram-link?t=${minted.token}`
   }
 
   // 2) Capabilities for this member (the real RBAC).

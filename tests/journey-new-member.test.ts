@@ -168,7 +168,7 @@ async function startGoogleLogin(pendingId: string): Promise<string> {
 
 function googleCallbackReq(state: string, pendingId: string): Request {
   return new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`, {
-    headers: { cookie: `${PENDING_INVITE_COOKIE}=${pendingId}` },
+    headers: { cookie: `mupot_login_state_${state}=1; ${PENDING_INVITE_COOKIE}=${pendingId}` },
   })
 }
 

@@ -501,9 +501,10 @@ describe('wiring: credential-bearing URLs come from pinned PUBLIC_ORIGIN only', 
   const FORGED = { [TENANT_PREFIX_HEADER]: '/t/attackerpot' }
 
   it('OAuth redirect_uri: path-routed pot gets /t/<slug>/auth/callback; home alias and forged header keep the pinned value', async () => {
+    // The request host is the pinned host: a login on any other host is first moved to it (state cookie is host-scoped, #1579).
     const redirectUri = async (publicOrigin: string, headers: Record<string, string>, slug: string): Promise<string> => {
       const env = { DB: h.db, TENANT_SLUG: slug, BRAND: 'B', PUBLIC_ORIGIN: publicOrigin, SESSIONS: kv(), IDP_PROVIDER: 'google', OAUTH_CLIENT_ID: 'id', OAUTH_CLIENT_SECRET: 's' } as unknown as Env
-      const res = await authApp.fetch(new Request('https://pot.example.com/login', { headers }), env, { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext)
+      const res = await authApp.fetch(new Request(`${new URL(publicOrigin).origin}/login`, { headers }), env, { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext)
       expect(res.status).toBe(302)
       return new URL(res.headers.get('location') ?? '').searchParams.get('redirect_uri') ?? ''
     }
