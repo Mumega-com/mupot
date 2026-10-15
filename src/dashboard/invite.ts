@@ -22,8 +22,9 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw as honoRaw } from 'hono/html'
 import { setCookie } from 'hono/cookie'
-import type { Env, Capability } from '../types'
+import type { AuthContext, Env, Capability } from '../types'
 import { acceptInvite, protectRawTokenResponse } from '../members'
+import { peekSessionAuth } from '../auth'
 import { provisionHomeForMember } from '../members/service'
 import {
   PENDING_INVITE_COOKIE,
@@ -31,7 +32,8 @@ import {
   PENDING_INVITE_TTL_SECONDS,
 } from '../auth/pending-invite-link'
 
-type AppEnv = { Bindings: Env }
+// Variables.auth mirrors auth/index.ts's AppEnv so peekSessionAuth(c) accepts this context.
+type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export { PENDING_INVITE_COOKIE, PENDING_INVITE_KV_PREFIX, PENDING_INVITE_TTL_SECONDS }
 
@@ -308,7 +310,15 @@ inviteApp.post('/:id', async (c) => {
   // way could link a JSON-minted, unverified-email member to a victim's
   // Google identity). Both callers now get `token: null` unconditionally, so
   // that asymmetry no longer exists to get wrong.
-  const result = await acceptInvite(c.env, inviteId, displayName)
+  //
+  // mupot#1457: a login-first visitor (signed in before opening the link)
+  // carries a real session. Hand its member id to acceptInvite as a HINT
+  // only — acceptInvite re-proves it from D1 (live login identity whose
+  // IdP-verified email equals the invite's) and ignores it otherwise, so a
+  // session for a different identity can never receive this invite's grant.
+  const session = await peekSessionAuth(c)
+  const sessionMemberId = session?.webSessionMemberId
+  const result = await acceptInvite(c.env, inviteId, displayName, sessionMemberId ? { verifiedMemberId: sessionMemberId } : undefined)
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
     if (result.error === 'invite_already_accepted') return c.html(inviteAlreadyAcceptedBody(c.env.BRAND), 409)
@@ -344,11 +354,49 @@ inviteApp.post('/:id', async (c) => {
         403,
       )
     }
-    // member_already_exists
+    // mupot#1457: login-first refusals that name what happened.
+    if (result.error === 'existing_grant_not_upgraded') {
+      return c.html(
+        invitePageBody(
+          c.env.BRAND,
+          view.ctx,
+          `You already hold ${result.held ?? 'a role'} here; this invite did not change it. Ask an admin if you need a different role.`,
+        ),
+        409,
+      )
+    }
+    if (result.error === 'member_already_holds_grant') {
+      return c.html(
+        invitePageBody(c.env.BRAND, view.ctx, 'You already hold access here; this invite did not change it. Try again if it still does not show.'),
+        409,
+      )
+    }
+    // member_already_exists. A visitor who is ALREADY signed in has done what
+    // "sign in" asks, so say the truth: this account could not be linked to
+    // the invite automatically.
     return c.html(
-      invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),
+      invitePageBody(
+        c.env.BRAND,
+        view.ctx,
+        session
+          ? 'This account could not be linked to this invite automatically. Ask an admin to add you.'
+          : 'An account already exists for this email. Sign in with the account that received this invite, then open this link again.',
+      ),
       409,
     )
+  }
+
+  // mupot#1457: the grant landed on the redeemer's own, already-signed-in
+  // member. There is nothing to link at login (no pending marker, no cookie)
+  // — they are authenticated; send them to the dashboard.
+  if (result.value.linked_existing) {
+    await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
+      console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+        member_id: result.value.member_id, channel: 'web',
+        error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+    })
+    return c.redirect('/')
   }
 
   // mupot#1436 A2 (gated, not built here): stash a short-lived pointer to the
