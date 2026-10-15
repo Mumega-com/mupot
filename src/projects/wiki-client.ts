@@ -372,3 +372,37 @@ export async function upsertProjectWikiTopic(
     edges_upserted: typeof json.edges_upserted === 'number' ? json.edges_upserted : 0,
   }
 }
+
+/**
+ * Read ONE topic (+ its visible edges) from a project's wiki. Returns null exactly when the upstream
+ * answers 404 (absent, wrong project, unpublished or not service-readable all collapse to the same
+ * 404 upstream — no oracle). Same error discipline as getProjectWikiGraph. `projectKey` MUST be the
+ * project's `id`.
+ */
+export async function getProjectWikiTopic(
+  env: Env,
+  projectKey: string,
+  slug: string,
+  fetchImpl?: typeof fetch,
+): Promise<{ topic: WikiTopic; edges: WikiEdge[] } | null> {
+  const project = projectKey.toLowerCase()
+  if (!isWikiSlug(project) || !isWikiSlug(slug)) throw new WikiClientError('wiki_unavailable')
+  const cfg = await resolveWikiConfig(env)
+  if (!cfg) throw new WikiClientError('wiki_unavailable')
+
+  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project })
+  const res = await wikiRequest(
+    cfg,
+    `/api/internal/wiki/topics/${encodeURIComponent(slug)}?${qs.toString()}`,
+    { method: 'GET' },
+    fetchImpl,
+  )
+  if (res.status === 404) return null
+  if (!res.ok) return throwForErrorResponse(res)
+
+  const json = (await res.json().catch(() => null)) as { topic?: unknown; edges?: unknown } | null
+  if (!json || !json.topic || typeof json.topic !== 'object' || !Array.isArray(json.edges)) {
+    throw new WikiClientError('wiki_unavailable')
+  }
+  return { topic: json.topic as WikiTopic, edges: json.edges as WikiEdge[] }
+}

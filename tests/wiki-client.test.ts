@@ -110,24 +110,18 @@ describe('getProjectWikiGraph', () => {
     expect(graph.nodes).toEqual([])
   })
 
-  it('round-2 contract: an edge to a keychain-gated (but published) topic is writable, then dropped from reads', async () => {
+  it('round-5 contract: an edge to a keychain-gated OR keyless-public topic is refused (target must be service-owned) and nothing is written', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
-    // Edge-target gating is NOT checked at write time (only published is) —
-    // so this edge write succeeds, exercising the READ-side drop, not a
-    // write refusal.
     fake.seed({ tenantSlug: TENANT, project: 'stemminds', slug: 'hidden-b', title: 'Hidden B', requiredKeys: ['x'] })
+    fake.seed({ tenantSlug: TENANT, project: 'stemminds', slug: 'public-c', title: 'Public C' })
     const env = await makeEnv(makeHarness())
-    const result = await upsertProjectWikiTopic(
-      env,
-      'stemminds',
-      { slug: 'visible-a', title: 'Visible A', edges: [{ to_slug: 'hidden-b' }] },
-      fake.fetch.bind(fake),
-    )
-    expect(result.edges_upserted).toBe(1)
-
+    for (const target of ['hidden-b', 'public-c']) {
+      await expect(
+        upsertProjectWikiTopic(env, 'stemminds', { slug: 'visible-a', title: 'Visible A', edges: [{ to_slug: target }] }, fake.fetch.bind(fake)),
+      ).rejects.toMatchObject({ status: 400, code: 'edge_target_invalid' })
+    }
     const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
-    expect(graph.nodes.map((n) => n.slug)).toEqual(['visible-a']) // hidden-b itself absent
-    expect(graph.edges).toEqual([]) // and the edge naming it is dropped too
+    expect(graph.nodes.map((n) => n.slug)).toEqual(['public-c']) // visible-a was never created
   })
 
   it('P0: a service-written topic carries the reserved required_keys marker and stays visible via the service GET', async () => {
@@ -295,7 +289,7 @@ describe('upsertProjectWikiTopic', () => {
     }
     expect(caught).toBeInstanceOf(WikiRequestError)
     expect((caught as WikiRequestError).status).toBe(400)
-    expect((caught as WikiRequestError).code).toBe('edge_target_unpublished')
+    expect((caught as WikiRequestError).code).toBe('edge_target_invalid')
 
     // The all-or-nothing write never created new-topic at all.
     const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))

@@ -103,7 +103,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
   })
 
   const KNOWN_EXTERNAL = [
-    'task_create', 'task_update', 'task_submit_result', 'project_wiki', 'office.publish_post', 'office.health', 'cursor_dispatch',
+    'task_create', 'task_update', 'task_submit_result', 'project_wiki', 'project_wiki_get', 'project_wiki_upsert', 'office.publish_post', 'office.health', 'cursor_dispatch',
     'cursor_run_status', 'pot_provision', 'pot_list', 'supabase_connect', 'supabase_schema', 'supabase_query', 'supabase_mutate',
     'agent_lifecycle', 'addon_setup', 'wake_agent',
   ]
@@ -136,7 +136,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
     'memory_get', 'memory_recent', 'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'operator_list', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
-    'project_wiki', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
+    'project_wiki', 'project_wiki_get', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
     'routine_run_list', 'runner_list', 'secret_env_status', 'seed_draft', 'squad_member_list', 'squad_recall', 'status',
     'supabase_query', 'supabase_schema', 'task_board', 'task_get', 'task_intake_audit', 'worktree_list',
   ]
@@ -146,7 +146,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'host_key_register', 'loop_control', 'loop_set_status', 'mint_agent_token',
     'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
     'operator_revoke', 'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
-    'project_update', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
+    'project_update', 'project_wiki_upsert', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
     'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
     'set_agent_webhook_doorbell', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
@@ -155,7 +155,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   ]
   const ALL_OPEN_WORLD = [
     'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',
-    'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki', 'request_elevation', 'seed_attach_request',
+    'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki', 'project_wiki_get', 'project_wiki_upsert', 'request_elevation', 'seed_attach_request',
     'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
     'task_submit_result', 'task_update', 'wake_agent',
   ]

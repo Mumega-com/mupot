@@ -143,6 +143,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   project_list: RO('SELECT only (mcp/projects.ts:275)'),
   project_get: RO('loadProjectSituation SELECT only (projects/situation.ts:460)'),
   project_context: RO('loadProjectSituation + listPresence + listProjectBindings SELECT only (mcp/projects.ts:432)'),
+  project_wiki_get: ROX('PagesPort.get -> getProjectWikiTopic GET to Inkwell wiki service (pages/inkwell-adapter.ts)'),
+  project_wiki_upsert: MUTX('page_versions counter upsert + PagesPort.put -> PUT Inkwell wiki topic; overwrites an existing page of this port (pages/service.ts)'),
   project_wiki: ROX('getProjectWikiGraph GET to Inkwell wiki service (projects/wiki-client.ts:299)'),
   project_update: MUT('updateProject UPDATE projects (projects/service.ts:511) + start-gate receipts'),
   project_recommit: MUT('proposeProjectRecommit recordRecommitOrKill can kill the project (projects/circuit-breaker.ts:317)'),

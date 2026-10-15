@@ -221,7 +221,7 @@ import { dispatchBrakesClearSql, diagnoseDispatchBrake } from '../agents/executi
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from '../tasks/pagination'
-import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
+import { hasProjectWriteForSquads, callerCanWriteProject } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
@@ -246,6 +246,7 @@ import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
+import { PAGES_TOOLS } from './pages'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { ROUTINE_TOOLS } from './routines'
 import {
@@ -4479,7 +4480,7 @@ const toolProjectRemember: ToolSpec = {
     // Write tier: org-admin bypasses; otherwise the caller needs write/admin on the
     // project via at least one of their squads. Read-only participants can recall but
     // never write — a read-linked squad must not poison what others recall.
-    if (!access.workspaceAdmin && !(await anySquadHasProjectWrite(env, projectId, access.squadIds))) {
+    if (!(await callerCanWriteProject(env, auth, projectId))) {
       return fail(403, 'forbidden', { need: 'project_write', scope: 'project' })
     }
 
@@ -7264,6 +7265,7 @@ export const TOOLS: ToolSpec[] = [
   ...WORKTREE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
+  ...PAGES_TOOLS,
   ...ROUTINE_TOOLS,
   ...RUNNER_TOOLS,
   ...HARNESS_CAPACITY_TOOLS,
