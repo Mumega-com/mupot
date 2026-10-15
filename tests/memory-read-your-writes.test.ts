@@ -8,6 +8,7 @@
 // production lag window: upsert accepted, nothing searchable).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
+import { LEXICAL_SCAN_ROWS, LEXICAL_SCORE, LEXICAL_TERM_MAX, LEXICAL_TEXT_CHARS, exactTokenOf } from '../src/memory'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -23,6 +24,7 @@ describe('memory read-your-writes', () => {
   let env: Env
   let vectors: Vec[]
   let vecMode: 'indexed' | 'empty'
+  let fixedScores: Map<string, number> | null
 
   const ctx = (memberId: string): AuthContext => ({
     userId: memberId, memberId, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: null,
@@ -48,6 +50,7 @@ describe('memory read-your-writes', () => {
     applyAllMigrations(h.sqlite)
     vectors = []
     vecMode = 'indexed'
+    fixedScores = null
     env = {
       TENANT_SLUG: TENANT,
       DB: h.db,
@@ -60,7 +63,7 @@ describe('memory read-your-writes', () => {
             : vectors
               .filter((v) => Object.entries(opts.filter).every(([k, val]) => v.metadata[k] === val))
               .slice(0, opts.topK)
-              .map((v, i) => ({ id: v.id, score: 0.9 - i / 10 })),
+              .map((v, i) => ({ id: v.id, score: fixedScores?.get(v.id) ?? 0.9 - i / 10 })),
         }),
       },
     } as unknown as Env
@@ -102,14 +105,35 @@ describe('memory read-your-writes', () => {
       expect(ids).not.toContain(stale)
     })
 
-    it('an exact token outranks a crowd of weak vector hits (the five-unrelated-records failure)', async () => {
+    it('an exact token is found even when a crowd of weak vector hits fills the limit (the five-unrelated-records failure)', async () => {
       for (let i = 0; i < 5; i++) backdate(await remember(ALICE, `old unrelated record ${i}`), 600)
       const fresh = await remember(ALICE, 'needle-token-777 fresh')
-      // simulate the lag: the fresh vector is not searchable yet, the five old ones are
-      vectors = vectors.filter((v) => v.id !== fresh)
+      vectors = vectors.filter((v) => v.id !== fresh) // lag: the fresh vector is not searchable yet
       const hits = await recall(ALICE, 'needle-token-777', 5)
       expect(hits).toHaveLength(5)
-      expect(hits[0]).toMatchObject({ id: fresh, source: 'lexical' })
+      expect(hits.find((x) => x.id === fresh)).toMatchObject({ source: 'lexical', score: LEXICAL_SCORE })
+    })
+
+    it('P3-1: a strong vector hit outranks a lexical hit; a lexical hit outranks a weak vector hit', async () => {
+      const strong = await remember(ALICE, 'strong semantic neighbour')
+      const weak = await remember(ALICE, 'weak semantic neighbour')
+      const lex = await remember(ALICE, 'lexmarker-55 text')
+      vectors = vectors.filter((v) => v.id !== lex)
+      fixedScores = new Map([[strong, 0.95], [weak, 0.4]])
+      const hits = await recall(ALICE, 'lexmarker-55', 5)
+      const order = hits.map((x) => x.id)
+      expect(order.indexOf(strong)).toBeLessThan(order.indexOf(lex))
+      expect(order.indexOf(lex)).toBeLessThan(order.indexOf(weak))
+    })
+
+    it('P3-2: recent non-matching rows cannot hide an older exact match (limit smaller than the recent set)', async () => {
+      vecMode = 'empty'
+      const old = await remember(ALICE, 'old-needle-31 buried')
+      backdate(old, 60)
+      for (let i = 0; i < 8; i++) await remember(ALICE, `recent filler ${i}`)
+      const hits = await recall(ALICE, 'old-needle-31', 3)
+      expect(hits.map((x) => x.id)).toContain(old)
+      expect(hits.find((x) => x.id === old)?.source).toBe('lexical')
     })
 
     it('when the vector leg is full and the query is a sentence, D1 is not consulted (no recent noise)', async () => {
@@ -157,6 +181,56 @@ describe('memory read-your-writes', () => {
       expect(await recall(ALICE, 'secret-marker')).toEqual([])
       // sanity: bob does find it
       expect((await recall(BOB, 'bob-secret-marker-42')).map((x) => x.id)).toEqual([bobId])
+    })
+  })
+
+  describe('lexical DoS bounds (gate round 1 P1)', () => {
+    const bulk = (n: number, text: (i: number) => string): string[] => {
+      // insert oldest-first with strictly increasing created_at so recency order is deterministic
+      const ids: string[] = []
+      const ins = h.sqlite.prepare(`INSERT INTO engrams (id, agent_id, text, created_at) VALUES (?, ?, ?, datetime('now', ?))`)
+      for (let i = 0; i < n; i++) {
+        const id = `bulk-${String(i).padStart(4, '0')}`
+        ins.run(id, `member:${ALICE}`, text(i), `-${(n - i) * 60 + 3600} seconds`) // i=n-1 newest, all older than the recency window
+        ids.push(id)
+      }
+      return ids
+    }
+
+    it('the term is capped at LEXICAL_TERM_MAX characters', () => {
+      expect(LEXICAL_TERM_MAX).toBeLessThanOrEqual(64)
+      expect(exactTokenOf('x'.repeat(500))?.length).toBe(LEXICAL_TERM_MAX)
+      expect(exactTokenOf(`"${'y'.repeat(500)} z"`)?.length).toBe(LEXICAL_TERM_MAX)
+    })
+
+    it('only the newest LEXICAL_SCAN_ROWS rows of the scope are scanned', async () => {
+      vecMode = 'empty'
+      const n = LEXICAL_SCAN_ROWS + 50
+      // a row far older than the scan window and one just inside it carry the same marker
+      const ids = bulk(n, (i) => (i === 0 || i === n - LEXICAL_SCAN_ROWS ? `scan-cap-marker row${i}` : `filler ${i}`))
+      const hits = (await recall(ALICE, 'scan-cap-marker', 20)).map((x) => x.id)
+      expect(hits).toContain(ids[n - LEXICAL_SCAN_ROWS]) // oldest row still inside the cap
+      expect(hits).not.toContain(ids[0]) // beyond the cap: never examined
+    })
+
+    it('only the first LEXICAL_TEXT_CHARS of each row are compared', async () => {
+      vecMode = 'empty'
+      const ids = bulk(3, (i) => (i === 0 ? `${'a'.repeat(LEXICAL_TEXT_CHARS + 100)}tail-marker-9` : i === 1 ? `head-marker-9 ${'a'.repeat(LEXICAL_TEXT_CHARS + 100)}` : 'x'))
+      expect((await recall(ALICE, 'tail-marker-9')).map((x) => x.id)).not.toContain(ids[0])
+      expect((await recall(ALICE, 'head-marker-9')).map((x) => x.id)).toContain(ids[1])
+    })
+
+    it('the lexical SQL carries the scan-cap subquery, the text bound, and the scope pin (bounded work by construction)', async () => {
+      vecMode = 'empty'
+      const seen: string[] = []
+      const realPrepare = h.db.prepare.bind(h.db)
+      h.db.prepare = ((sql: string) => { seen.push(sql); return realPrepare(sql) }) as typeof h.db.prepare
+      await recall(ALICE, 'pathological-aaaaaaaaaaaaaaaab')
+      const like = seen.filter((q) => q.includes('LIKE'))
+      expect(like).toHaveLength(1)
+      expect(like[0]).toContain(`LIMIT ${LEXICAL_SCAN_ROWS})`)
+      expect(like[0]).toContain(`substr(text, 1, ${LEXICAL_TEXT_CHARS})`)
+      expect(like[0].match(/agent_id = \?/g)?.length).toBe(2)
     })
   })
 

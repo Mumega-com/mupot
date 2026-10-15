@@ -34,7 +34,16 @@ async function embed(env: Env, text: string): Promise<number[]> {
 // and exact substring matches. Every D1 read is scoped by the same agent_id (scope key) as
 // the vector leg. (engrams has no tenant column: D1 is one database per pot/tenant.)
 export const RECENT_WINDOW_MS = 15 * 60 * 1000
-const LEXICAL_TERM_MAX = 200
+// DoS bounds for the lexical leg (gate round 1, P1): SQLite's LIKE '%t%' backtracks, so cost is
+// rows x text-length x term-length on the pot's single D1. Bound all three: a short term, only the
+// newest LEXICAL_SCAN_ROWS rows of the scope, and only the first LEXICAL_TEXT_CHARS of each text.
+// No generic per-member limiter exists in the repo (rate-limit code is agent-meter specific), so
+// there is deliberately none here; the three caps bound ONE query's work.
+export const LEXICAL_TERM_MAX = 64
+export const LEXICAL_SCAN_ROWS = 200
+export const LEXICAL_TEXT_CHARS = 4096
+// A lexical hit outranks weak semantic hits but not a strong one (vector cosine > this wins).
+export const LEXICAL_SCORE = 0.75
 
 /** SQLite datetime('now') text format, UTC: 'YYYY-MM-DD HH:MM:SS'. */
 function sqliteTimestamp(ms: number): string {
@@ -150,34 +159,36 @@ export function createMemory(env: Env): MemoryPort {
       if (hits.length >= limit && term === null) return hits
 
       const cutoff = sqliteTimestamp(Date.now() - RECENT_WINDOW_MS)
-      const likeClause = term === null ? '' : " OR text LIKE ? ESCAPE '\\'"
-      const binds: unknown[] = [agentId, cutoff]
-      if (term !== null) binds.push(`%${escapeLike(term)}%`)
-      binds.push(limit)
-      const d1 = await env.DB.prepare(
-        `SELECT id, text, created_at FROM engrams WHERE agent_id = ? AND (created_at >= ?${likeClause}) ORDER BY created_at DESC, id DESC LIMIT ?`,
+      // Two bounded queries, so recent non-matching rows can never hide an older exact match.
+      const recentRows = await env.DB.prepare(
+        'SELECT id, text FROM engrams WHERE agent_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?',
       )
-        .bind(...binds)
-        .all<{ id: string; text: string; created_at: string }>()
+        .bind(agentId, cutoff, limit)
+        .all<{ id: string; text: string }>()
 
-      const lowerTerm = term === null ? null : term.toLowerCase()
-      const lexical: MemoryHit[] = []
-      const recent: MemoryHit[] = []
-      for (const row of d1.results ?? []) {
-        // A row older than the recency window can only have matched the LIKE leg.
-        const isLexical = lowerTerm !== null && (row.text.toLowerCase().includes(lowerTerm) || row.created_at < cutoff)
-        if (isLexical) lexical.push({ id: row.id, text: row.text, score: 1, source: 'lexical' })
-        else recent.push({ id: row.id, text: row.text, score: 0, source: 'recent' })
+      let lexicalRows: Array<{ id: string; text: string }> = []
+      if (term !== null) {
+        // LIKE only inside the newest LEXICAL_SCAN_ROWS rows of THIS scope, over a bounded text prefix.
+        const res = await env.DB.prepare(
+          `SELECT id, text FROM engrams WHERE id IN (SELECT id FROM engrams WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ${LEXICAL_SCAN_ROWS}) AND agent_id = ? AND substr(text, 1, ${LEXICAL_TEXT_CHARS}) LIKE ? ESCAPE '\\' ORDER BY created_at DESC, id DESC LIMIT ?`,
+        )
+          .bind(agentId, agentId, `%${escapeLike(term)}%`, limit)
+          .all<{ id: string; text: string }>()
+        lexicalRows = res.results ?? []
       }
 
-      // Exact substring matches outrank weak semantic hits (precision), then vector, then recent.
-      const merged: MemoryHit[] = []
-      const seen = new Set<string>()
-      for (const h of [...lexical, ...hits, ...recent]) {
-        if (seen.has(h.id)) continue
-        seen.add(h.id)
-        merged.push(h)
+      // Rank by score; on a duplicate id keep the higher-scoring leg. Stable for ties.
+      const candidates: MemoryHit[] = [
+        ...lexicalRows.map((r): MemoryHit => ({ id: r.id, text: r.text, score: LEXICAL_SCORE, source: 'lexical' })),
+        ...hits,
+        ...(recentRows.results ?? []).map((r): MemoryHit => ({ id: r.id, text: r.text, score: 0, source: 'recent' })),
+      ]
+      const best = new Map<string, MemoryHit>()
+      for (const h of candidates) {
+        const prior = best.get(h.id)
+        if (!prior || h.score > prior.score) best.set(h.id, h)
       }
+      const merged = [...best.values()].sort((x, y) => y.score - x.score)
       return merged.slice(0, limit)
     },
 
