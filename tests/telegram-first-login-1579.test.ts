@@ -378,6 +378,23 @@ describe('#1579 Telegram-first member web login', () => {
       const cookieAgain = new Map([[`mupot_login_state_${state}`, '1']])
       expect((await withGoogle('s', EMAIL, () => visit(cookieAgain, `/auth/callback?code=c&state=${state}`))).status).toBe(400)
     })
+    it('a state value that is not one we mint is refused even with a matching cookie', async () => {
+      await env.SESSIONS.put('oauthstate:abc', '1')
+      const res = await withGoogle('s', EMAIL, () => visit(new Map([['mupot_login_state_abc', '1']]), '/auth/callback?code=c&state=abc'))
+      expect(res.status).toBe(400)
+    })
+    it('a nonce whose server-side link record expired between login and callback is not stamped on the session', async () => {
+      await bornViaTelegram()
+      const { token } = await mintLink()
+      const jar: Jar = new Map()
+      const open = await visit(jar, `/auth/telegram-link?t=${token}`)
+      const login = await visit(jar, open.headers.get('location')!)
+      const state = new URL(login.headers.get('location')!).searchParams.get('state')!
+      await env.SESSIONS.delete(`tglink:${jar.get('mupot_tg_link')}`)
+      await withGoogle('sub-pat', EMAIL, () => visit(jar, `/auth/callback?code=c&state=${state}`))
+      const sid = jar.get('mupot_session')!
+      expect(JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!).tgLinkNonce).toBeUndefined()
+    })
     it('the reauth round trip is bound the same way', async () => {
       await bornViaTelegram()
       const { token } = await mintLink()
@@ -471,6 +488,7 @@ describe('#1579 Telegram-first member web login', () => {
       h.sqlite.prepare(`UPDATE telegram_login_links SET tenant = 'elsewhere'`).run()
       expect((await post(a.jar)).status).toBe(403)
       expect(identities()).toEqual([])
+      expect(linkRow()).toEqual({ consumed_at: null })
     })
     it('refuses a live competing unbound bearer (liveCompetingBearerSql) without burning the link; a revoked one does not compete', async () => {
       const a = await armed()
