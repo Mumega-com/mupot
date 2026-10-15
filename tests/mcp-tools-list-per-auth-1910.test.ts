@@ -13,7 +13,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { advertisedTools, mcpApp, unknownToolDetail, TOOLS } from '../src/mcp/index'
+import { advertisedTools, mcpApp, unknownToolDetail, resolveToolSpec, wireName, TOOL_WIRE_ALIASES, TOOLS } from '../src/mcp/index'
+import { toolAnnotations } from '../src/mcp/tool-annotations'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { HARNESS_SESSION_ALLOWED_TOOLS } from '../src/members/harness-credential'
 import type { AuthContext, Env } from '../src/types'
@@ -59,7 +60,7 @@ const namesOf = async (env: Env, auth: AuthContext): Promise<string[]> =>
 describe('tools/list snapshot per auth shape (#1910, #1956)', () => {
   it('every auth shape sees the identical catalog = advertisedTools(env), including boot_context and inbox_mark_handled', async () => {
     const env = envFor()
-    const expected = advertisedTools(env).map((t) => t.name)
+    const expected = advertisedTools(env).map((t) => wireName(t.name))
     expect(expected).toContain('inbox_mark_handled')
     expect(expected).toContain('boot_context')
     for (const [shape, auth] of Object.entries(SHAPES)) {
@@ -72,7 +73,7 @@ describe('tools/list snapshot per auth shape (#1910, #1956)', () => {
     const registered = new Set(TOOLS.map((t) => t.name))
     expect(new Set(names).size).toBe(names.length)
     for (const n of names) {
-      expect(registered.has(n), n).toBe(true)
+      expect(registered.has(n) || resolveToolSpec(n) !== undefined, n).toBe(true)
       expect(n.startsWith('mupot'), n).toBe(false)
       expect(n.length, n).toBeLessThanOrEqual(48) // room for Codex's `mcp__<server>__` prefix inside the 64-char limit
     }
@@ -147,5 +148,60 @@ describe('inbox_consumer_status tells an attached chat how to refresh a stale ca
     expect(String(on.result?.if_tool_missing)).toMatch(/Refresh or reconnect the connector/)
     const off = (await invokeTool(SHAPES.attached, envFor({ SEAT_ATTACH: undefined }), 'inbox_consumer_status', {}, 'https://pot.test')) as { result?: Record<string, unknown> }
     expect(off.result?.if_tool_missing).toBeUndefined()
+  })
+})
+
+const OFFICE = ['publish_post', 'list_pending_approvals', 'health', 'review_approval', 'reconcile_stalled_publish']
+
+describe('wire-safe tool names: office.* underscore aliases (#1910)', () => {
+  const ALL_ON = { SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', ACCESS_APPROVE_ENABLED: '1', SECURE_MOMENTS: '1', SECURE_DROP: '1', TELEGRAM_MINIAPP: '1', WORKSPACES: '1' }
+
+  it('CI gate: EVERY name advertised by tools/list (all flags on, every shape) matches ^[A-Za-z0-9_-]{1,64}$', async () => {
+    const env = envFor(ALL_ON)
+    for (const [shape, auth] of Object.entries(SHAPES)) {
+      for (const n of await namesOf(env, auth)) expect(n, `${shape}:${n}`).toMatch(/^[A-Za-z0-9_-]{1,64}$/)
+    }
+  })
+
+  it('GET /mcp/tools advertises the same wire-safe names', async () => {
+    const res = await mcpApp.fetch(new Request('https://pot.test/tools'), envFor(ALL_ON))
+    const names = ((await res.json()) as { tools: Array<{ name: string }> }).tools.map((t) => t.name)
+    expect(names.length).toBeGreaterThan(100)
+    for (const n of names) expect(n).toMatch(/^[A-Za-z0-9_-]{1,64}$/)
+  })
+
+  it('the five office aliases are advertised, the dotted names are not', async () => {
+    const names = await namesOf(envFor(ALL_ON), SHAPES.workspace)
+    for (const o of OFFICE) { expect(names).toContain(`office_${o}`); expect(names).not.toContain(`office.${o}`) }
+    expect([...TOOL_WIRE_ALIASES.keys()].sort()).toEqual(OFFICE.map((o) => `office_${o}`).sort())
+  })
+
+  it('alias and dotted name resolve to the IDENTICAL spec object; the advertised entry carries the dotted tool\'s annotations', async () => {
+    const list = (await rpc(envFor(ALL_ON), SHAPES.workspace, 'tools/list')).body.result?.tools as Array<{ name: string; annotations?: unknown; inputSchema: unknown }>
+    for (const o of OFFICE) {
+      const spec = resolveToolSpec(`office.${o}`)
+      expect(spec).toBeDefined()
+      expect(resolveToolSpec(`office_${o}`)).toBe(spec)
+      expect(wireName(`office.${o}`)).toBe(`office_${o}`)
+      const entry = list.find((t) => t.name === `office_${o}`)
+      expect(entry?.annotations).toEqual(toolAnnotations(`office.${o}`))
+      expect(JSON.stringify(entry?.inputSchema)).toBe(JSON.stringify(spec?.inputSchema))
+    }
+  })
+
+  it('both names are callable and refuse identically through the same floor (an observer-less caller cannot use either)', async () => {
+    const env = envFor(ALL_ON)
+    for (const o of OFFICE) {
+      const a = await rpc(env, SHAPES.directory, 'tools/call', { name: `office_${o}`, arguments: {} })
+      const d = await rpc(env, SHAPES.directory, 'tools/call', { name: `office.${o}`, arguments: {} })
+      expect(a.body.error?.message, o).not.toBe('unknown_tool')
+      expect(d.body.error?.message, o).not.toBe('unknown_tool')
+      expect(JSON.stringify(a.body)).toBe(JSON.stringify(d.body))
+    }
+  })
+
+  it('an alias that is not a derived underscore twin is still unknown (no wildcard resolution)', async () => {
+    expect(resolveToolSpec('office_nope')).toBeUndefined()
+    expect(resolveToolSpec('office.nope')).toBeUndefined()
   })
 })

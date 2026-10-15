@@ -7279,6 +7279,30 @@ export const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+/** mupot#1910: OpenAI-style function names (Codex, ChatGPT apps/Actions) allow only [A-Za-z0-9_-]{1,64}. The office
+ *  tools are registered dotted (`office.review_approval`). Each dotted name gets an EXACT alias with the dots turned
+ *  into underscores: the alias key points at the SAME ToolSpec object in TOOL_BY_NAME, so the capability floor,
+ *  annotations and run cannot drift. Only the alias is ADVERTISED (wireName); the dotted name stays callable for
+ *  existing callers. Registry, annotations and the allowlist ratchets keep the canonical dotted name. */
+const WIRE_SAFE_NAME = /^[A-Za-z0-9_-]{1,64}$/
+export const TOOL_WIRE_ALIASES: ReadonlyMap<string, string> = new Map(
+  TOOLS.filter((t) => !WIRE_SAFE_NAME.test(t.name)).map((t) => [t.name.replace(/[^A-Za-z0-9_-]/g, '_'), t.name]),
+)
+for (const [alias, canonical] of TOOL_WIRE_ALIASES) {
+  const spec = TOOL_BY_NAME.get(canonical)
+  if (!spec || TOOL_BY_NAME.has(alias) || !WIRE_SAFE_NAME.test(alias)) throw new Error(`tool alias ${alias} -> ${canonical} collides or is not wire-safe`)
+  TOOL_BY_NAME.set(alias, spec)
+}
+const WIRE_NAME_OF: ReadonlyMap<string, string> = new Map([...TOOL_WIRE_ALIASES].map(([alias, canonical]) => [canonical, alias]))
+/** Registry lookup by canonical OR alias name (tests pin that an alias is the identical spec object). */
+export function resolveToolSpec(name: string): ToolSpec | undefined {
+  return TOOL_BY_NAME.get(name)
+}
+/** The name a discovery surface advertises for a registered tool. */
+export function wireName(canonical: string): string {
+  return WIRE_NAME_OF.get(canonical) ?? canonical
+}
+
 /** mupot#1910: tool names on the wire are BARE (`boot_context`). MCP clients namespace them
  *  (`mupot.boot_context`, `mupot_boot_context`, `mcp__mupot__boot_context`) and a wrapper that forwards its
  *  own exported name gets an unknown_tool refusal that names only the string it sent. This returns the detail
@@ -7375,7 +7399,7 @@ function mcpTool(spec: ToolSpec): Record<string, unknown> {
   // tool-annotations.ts; tests/mcp-tool-annotations.test.ts fails if a registered tool lacks a row.
   const annotations = toolAnnotations(spec.name)
   return {
-    name: spec.name,
+    name: wireName(spec.name),
     description: `${spec.scope}; minimum capability: ${spec.min}. Args: ${spec.args}`,
     inputSchema: spec.inputSchema,
     ...(annotations ? { annotations } : {}),
@@ -8060,7 +8084,7 @@ mcpApp.get('/tools', (c) =>
   c.json({
     contract: 'POST /mcp {tool, args} — bearer member token in Authorization header',
     tools: advertisedTools(c.env).map((t) => ({
-      name: t.name,
+      name: wireName(t.name),
       scope: t.scope,
       min_capability: t.min,
       args: t.args,
@@ -8237,7 +8261,7 @@ const FULL_OPENAPI_DESCRIPTION =
 // scripts/check-openapi-public-allowlist.mjs, which fails the build on exactly that
 // regression.
 function publicOpenApiSpec(origin: string): Record<string, unknown> {
-  return openApiSpec(origin, publicToolSpecs(), PUBLIC_OPENAPI_DESCRIPTION)
+  return openApiSpec(origin, publicToolSpecs().map((t) => ({ ...t, name: wireName(t.name) })), PUBLIC_OPENAPI_DESCRIPTION)
 }
 
 mcpActionsApp.get('/openapi.json', (c) => {
@@ -8256,7 +8280,7 @@ mcpActionsApp.get('/openapi.full.json', async (c) => {
   }
   if (!hasWorkspaceAdmin(auth)) return c.json({ error: 'forbidden', need: 'org:admin' }, 403)
   const url = new URL(c.req.url)
-  return c.json(openApiSpec(url.origin, advertisedTools(c.env), FULL_OPENAPI_DESCRIPTION))
+  return c.json(openApiSpec(url.origin, advertisedTools(c.env).map((t) => ({ ...t, name: wireName(t.name) })), FULL_OPENAPI_DESCRIPTION))
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {
