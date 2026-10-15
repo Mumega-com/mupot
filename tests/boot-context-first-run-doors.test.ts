@@ -68,6 +68,26 @@ function markBootstrapped(memberId: string): void {
   `)
 }
 
+describe('an existing agent is pointed at seat_attach when the journey is on, and at the bearer when it is off', () => {
+  it('SEAT_ATTACH on: the directory note names seat_attach (after bootstrap_self, before the token route) and keeps the bearer for a daemon agent', async () => {
+    ;(env as unknown as Record<string, string>).SEAT_ATTACH = '1'
+    ;(env as unknown as Record<string, string>).SEAT_AUTO_ENROLL = '1'
+    const fix = (await boot('directory')).channel_limits?.to_get_write_access ?? ''
+    expect(fix).toContain('seat_attach { agent:')
+    expect(fix.toLowerCase()).toContain('passkey')
+    expect(fix.toLowerCase()).toContain('will not help')
+    expect(fix.indexOf('bootstrap_self')).toBeLessThan(fix.indexOf('seat_attach'))
+    expect(fix.indexOf('seat_attach')).toBeLessThan(fix.indexOf('mint_agent_token'))
+    expect(fix).toContain('fixed CLI/daemon agent')
+  })
+  it('SEAT_ATTACH off: the old text is unchanged (no mention of seat_attach)', async () => {
+    delete (env as unknown as Record<string, string | undefined>).SEAT_ATTACH
+    const fix = (await boot('directory')).channel_limits?.to_get_write_access ?? ''
+    expect(fix).not.toContain('seat_attach')
+    expect(fix).toContain('mint_agent_token')
+  })
+})
+
 describe('a newcomer is shown the self-serve door', () => {
   it('an unbound directory session with no agent is told to bootstrap_self FIRST', async () => {
     const r = await boot('directory')
