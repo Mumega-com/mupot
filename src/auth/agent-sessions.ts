@@ -358,6 +358,39 @@ export async function getOrCreateAgentSession(
   }
 }
 
+/**
+ * resolveCallerLiveAgentSession — the session an elevation tool binds to for THIS authenticated credential.
+ *
+ * loadLiveAgentSessionByCredential only filters `revoked_at IS NULL`; it never looks at the idle/absolute
+ * ceilings. A credential that stopped calling check_in (a harness that connects once and never re-checks in)
+ * keeps an unrevoked row long after it expired, so request_elevation bound the request to a DEAD session and
+ * the human's decide then refused it as agent_session_ended (and burnt the request). Here a tracked-but-dead
+ * row is evaluated and rotated exactly the way check_in does (the same getOrCreateAgentSession), so the request
+ * is filed on a session that is live at filing time. A credential with NO tracked row (never checked in) and one
+ * whose session was explicitly revoked stay refused: this never creates a session from nothing and never
+ * resurrects an ended one. A grant already bound to the retired session stays on it (it does not move).
+ * Same credential, same agent, same member as the authenticated request: nothing is derived from args.
+ */
+export async function resolveCallerLiveAgentSession(
+  env: Env,
+  context: AgentSessionContext,
+  nowMs: number = Date.now(),
+): Promise<AgentSessionRecord | null> {
+  const tracked = await loadLiveAgentSessionByCredential(env, env.TENANT_SLUG, context.authKind, context.credentialId)
+  if (!tracked) return null
+  const evaluated = evaluateAgentSession(tracked, nowMs)
+  if (evaluated.ok) {
+    await touchAgentSession(env, tracked.id, nowMs, context.seat)
+    return (await loadAgentSessionById(env, env.TENANT_SLUG, tracked.id)) ?? tracked
+  }
+  const resolved = await getOrCreateAgentSession(
+    env,
+    { tenant: env.TENANT_SLUG, agentId: context.agentId, memberId: context.memberId, authKind: context.authKind, credentialId: context.credentialId, seat: context.seat },
+    nowMs,
+  )
+  return resolved?.session ?? null
+}
+
 // ── list ──────────────────────────────────────────────────────────────────
 
 /** listAgentSessions — every session (live or not) for an agent, newest
