@@ -38,6 +38,7 @@ import { HPKE_BUNDLE_JS } from '../secure-drop/hpke-bundle.generated'
 import { groupFingerprint } from '../secure-drop/keys'
 import { mountTelegramMiniapp } from './telegram-miniapp'
 import { isAttachCeiling, type AttachCeiling } from '../auth/attached-ceiling'
+import { loadSquadJoin, squadJoinIsPendingLive, squadJoinView, decideSquadJoin, type SquadJoinRow } from '../members/squad-join'
 import { admissionIsPendingLive, admissionView, decideSeatAdmission, loadAdmission, seatAttachEnabled, type AdmissionRow } from '../members/seat-attach'
 
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
@@ -160,6 +161,7 @@ type Subject =
   | { kind: 'elevation'; req: ElevationRequestRecord }
   | { kind: 'credential'; drop: DropRow }
   | { kind: 'seat_admit'; adm: AdmissionRow }
+  | { kind: 'squad_join'; req: SquadJoinRow }
 
 /** The request this moment stands for, only while IT is still live (a closed request is not decidable here). */
 async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<Subject | null> {
@@ -174,6 +176,10 @@ async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<S
     if (!seatAttachEnabled(env)) return null
     const adm = await loadAdmission(env, m.subject_id)
     return adm && admissionIsPendingLive(adm, nowMs) ? { kind: 'seat_admit', adm } : null
+  }
+  if (m.kind === 'squad_join') {
+    const req = await loadSquadJoin(env, m.subject_id)
+    return req && squadJoinIsPendingLive(req, nowMs) ? { kind: 'squad_join', req } : null
   }
   if (m.kind === 'seed_attach') {
     const row = await loadSeedRequest(env, m.subject_id)
@@ -433,6 +439,18 @@ momentsApp.get('/m/:id/:token', async (c) => {
     title = `Let ${v.agentName} work in your chat`
     approveLabel = 'Admit'
     promptBlock = agentPromptBlock({ agentName: v.agentName, agentSlug: v.agentSlug, agentId: subject.adm.agent_id })
+  } else if (subject.kind === 'squad_join') {
+    const v = await squadJoinView(c.env, subject.req)
+    const sq = v.squad
+    const where = sq
+      ? `<strong>${escapeHtml(sq.name)}</strong> <code>${escapeHtml(sq.slug)}</code>${sq.kind === 'home' ? ' <em>(a home squad: it cannot be joined by request)</em>' : ''}${sq.archived ? ' <em>(archived)</em>' : ''}`
+      : `<em>no squad matches</em> ${untrustedBox('Squad name the agent typed', subject.req.squad_ref)}`
+    inner = `<p><strong>${escapeHtml(v.agentName)}</strong> <code>${escapeHtml(v.agentSlug)}</code> wants to join ${where} as <strong>${escapeHtml(subject.req.capability)}</strong>.</p>
+<dl><dt>Reason</dt><dd>${untrustedBox('Reason', subject.req.reason ?? '(none given)')}</dd>
+<dt>Expires</dt><dd>${escapeHtml(subject.req.expires_at)}</dd></dl>
+<h2>What approving does</h2><p>Adds this agent to the squad as ${escapeHtml(subject.req.capability)}, the same as an admin running squad_member_add. It never grants more than member, never an approval gate, and it never lowers access the agent already has. You must be an admin of that squad to approve. Deny, or close this page, to refuse.</p>`
+    title = `${v.agentName} wants to join a squad`
+    approveLabel = 'Approve'
   } else if (subject.kind === 'seed_attach') {
     const view = await seedViewInner(c.env, subject.row)
     if (!view.ok) return page(c, view.outcome.status, view.outcome.title, view.outcome.message, view.outcome.tone)
@@ -590,6 +608,9 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   if (p.decision === 'provide') return fail(c, 400, 'Invalid decision parameters.', 'Bad request') // provide exists only for credential moments
   if (subject.kind === 'seat_admit') {
     return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling }, now))
+  }
+  if (subject.kind === 'squad_join') {
+    return outcomeJson(c, await decideSquadJoin(c.env, { req: subject.req, decision: p.decision, proof, gate, waitUntil }, now))
   }
   if (subject.kind === 'seed_attach') {
     if (!mayDecideSeed(auth)) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')

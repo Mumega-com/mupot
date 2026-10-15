@@ -137,6 +137,8 @@ export async function addSquadMember(input: {
   agentId: string
   squad: SquadMembershipTarget
   capability: AgentAccessCapability
+  /** Raise-only write (squad_join_request): the rank predicate lives in the upsert SQL itself. */
+  neverLower?: boolean
   /**
    * Set ONLY from an `authorizeStructuralWrite` verdict of kind 'delegated' (src/operators/chokepoint.ts). That verdict
    * already decided standing, scope, self/human targets and the rank ceiling for a delegated agent, so the
@@ -191,6 +193,7 @@ export async function addSquadMember(input: {
         memberId: binding.memberId,
         squadId: input.squad.id,
         capability: input.capability,
+        ...(input.neverLower ? { neverLower: true } : {}),
       },
       (prepared) => [
         receiptInsert(input.env, {
