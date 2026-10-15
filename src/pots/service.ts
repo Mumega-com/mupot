@@ -741,7 +741,7 @@ export async function seedPotIdentities(
     `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES (${lit(departmentId)}, 'core', ${lit(brandName)}, 'work', 1, ${lit(now)});`,
     `INSERT INTO squads (id, department_id, slug, name, kind, created_at) VALUES (${lit(squadId)}, ${lit(departmentId)}, 'core', 'Core', 'work', ${lit(now)});`,
     `INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (${lit(adminMemberId)}, ${lit(normalizedEmail)}, ${lit(adminName)}, 'active', ${lit(input.slug)}, ${lit(now)});`,
-    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(adminMemberId)}, 'org', NULL, 'owner', ${lit(now)});`,
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason) VALUES (${lit(crypto.randomUUID())}, ${lit(adminMemberId)}, 'org', NULL, 'owner', ${lit(now)}, 'pot_provision', 'pot owner at provision');`,
     `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(adminMemberId)}, ${lit(adminTokenHash)}, 'admin', 'dashboard', ${lit(now)}, ${lit(input.slug)});`,
     // The seed-seat agent's own "home" identity — see the function doc comment for why an
     // agent still needs a member row to hold a token.
@@ -752,7 +752,7 @@ export async function seedPotIdentities(
     `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (${lit(input.slug)}, ${lit(leadAgentId)}, ${lit(leadAgentMemberId)}, ${lit(now)});`,
     // 'lead', matching the agent's own role — the home-capability ceiling that used to cap
     // this at observer/member was dropped in migration 0087. See the function doc comment.
-    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'lead', ${lit(now)});`,
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'lead', ${lit(now)}, 'pot_provision', 'lead agent at provision');`,
     `INSERT INTO member_tokens (id, member_id, agent_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, ${lit(leadAgentId)}, ${lit(leadAgentTokenHash)}, 'seed-seat', 'workspace', ${lit(now)}, ${lit(input.slug)});`,
   ].join('\n')
 

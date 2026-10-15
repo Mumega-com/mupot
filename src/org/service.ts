@@ -12,6 +12,7 @@ import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, Org
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
 import { assertWritten, assertBatchWritten } from '../lib/receipt'
+import { revokeContextStatements } from '../auth/grant-events'
 import { prepareAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 // Reused, not duplicated (mupot#1288, Kasra's gate) — src/fleet/boot-self-report.ts's
 // bearer-authenticated boot self-report already validates a claimed model against
@@ -669,8 +670,8 @@ export async function createHomeForMember(
        VALUES (?1, ?2, ?3, ?4, 'home', ?5)`,
     ).bind(squadId, departmentId, squadSlug, homeName, createdAt),
     env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?1, ?2, 'squad', ?3, 'admin')`,
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_by, granted_via, reason)
+       VALUES (?1, ?2, 'squad', ?3, 'admin', ?2, 'home_provision', 'home squad provisioned for member')`,
     ).bind(capabilityId, memberId, squadId),
   ]
 
@@ -1851,6 +1852,7 @@ export async function moveAgentSquad(
     memberId: input.memberId,
     squadId: input.toSquadId,
     capability: input.capability,
+    provenance: { grantedBy: input.actor.id, grantedVia: 'squad_move', reason: input.reason ?? null },
   }, {
     agentId: input.agentId,
     memberId: input.memberId,
@@ -1883,6 +1885,7 @@ export async function moveAgentSquad(
   // first statement and raises (malformed JSON) unless the agent still sits in `fromSquadId`, which aborts and rolls back
   // the whole batch, so a move that landed after the caller's own checks writes NOTHING (the per-statement WHERE clauses
   // alone were not enough: the DELETE and destination-grant statements are not conditional on the UPDATE's row count).
+  const [moveSetContext, moveClearContext] = revokeContextStatements(env, { grantedBy: input.actor.id, reason: input.reason ?? null })
   let writes: D1Result[]
   try {
     writes = (await env.DB.batch([
@@ -1911,10 +1914,13 @@ export async function moveAgentSquad(
     env.DB.prepare(
       `DELETE FROM memberships WHERE agent_id = ? AND squad_id = ?`,
     ).bind(input.agentId, input.fromSquadId),
+    // Who is revoking the source-squad grant: the grant_events trigger reads this (migration 0230).
+    moveSetContext,
     env.DB.prepare(
       `DELETE FROM capabilities
         WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
     ).bind(input.memberId, input.fromSquadId),
+    moveClearContext,
     ...prepared.value.statements,
     env.DB.prepare(
       `UPDATE agent_audit

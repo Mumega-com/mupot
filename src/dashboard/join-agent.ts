@@ -115,6 +115,8 @@ export async function confirmJoin(
   squad: Squad,
   agentId: string,
   capability: string,
+  /** The member who confirmed the join (recorded as granted_by, migration 0230). */
+  actorMemberId: string | null = null,
 ): Promise<{ ok: true; result: 'created' | 'updated' | 'unchanged'; membership: Membership; grant: unknown }
   | { ok: false; error: string }> {
   const cap = (capability || 'member') as AgentAccessCapability
@@ -128,6 +130,7 @@ export async function confirmJoin(
     memberId: binding.memberId,
     squadId: squad.id,
     capability: cap,
+    provenance: { grantedBy: actorMemberId, grantedVia: 'squad_join', reason: null },
   })
   if (!outcome.ok) return { ok: false, error: outcome.error }
   // setAgentSquadAccess can return 'removed' in general, but a join never removes —

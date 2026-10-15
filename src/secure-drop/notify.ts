@@ -8,6 +8,7 @@
 // whose owner_member_id is that member. Best effort by design: the key is already registered and receipted, and a
 // delivery failure must not undo it (the result reports how many governors were reached, including zero).
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { sendAgentMessage } from '../agents/messages'
 import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { createBus } from '../bus'
@@ -28,13 +29,14 @@ async function governorInboxes(env: Env, agent: AgentRow): Promise<{ members: st
       WHERE m.tenant = ?1 AND m.status = 'active' AND m.archived_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.tenant = ?1 AND b.member_id = m.id)
         AND c.capability IN ('owner', 'admin')
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}
         AND (
           (c.scope_type = 'org')
           OR (c.scope_type = 'squad' AND c.scope_id = ?2)
           OR (c.scope_type = 'department' AND c.scope_id = (SELECT department_id FROM squads WHERE id = ?2))
         )
       ORDER BY c.member_id ASC LIMIT 25`,
-  ).bind(tenant, agent.squad_id).all<{ member_id: string }>()
+  ).bind(tenant, agent.squad_id, nowCapabilitySql()).all<{ member_id: string }>()
   const ids = (members.results ?? []).map((r) => r.member_id)
   if (ids.length === 0) return { members: [], agents: [] }
   const marks = ids.map((_, i) => `?${i + 2}`).join(', ')

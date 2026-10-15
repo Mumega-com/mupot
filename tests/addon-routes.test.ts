@@ -53,6 +53,11 @@ const migrations = [
   '../migrations/0099_member_token_lifecycle.sql',
   // mupot#1783: createFlight's INSERT carries the archive guard, so tasks_archive_state must exist (as in prod).
   '../migrations/0173_archive_columns.sql',
+  // 0230 adds capabilities.expires_at (resolveCapabilities references it) AND ALTERs door_receipts and
+  // memberships, so it needs 0107 (door_receipts, capabilities.provisional_door_id) before it. A curated
+  // list that omits a table 0230 alters fails at schema build, not at runtime.
+  '../migrations/0107_onboarding_doors.sql',
+  '../migrations/0230_capability_lifecycle.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {

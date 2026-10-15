@@ -11,6 +11,8 @@
 // attempt escalates to org owners (ghost-start alarm).
 
 import type { BusEvent, Env, Project, ProjectAccessLevel, Task } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import type { GrantProvenance } from '../auth/grant-events'
 import {
   AgentInactiveError,
   mintAgentBoundToken,
@@ -175,6 +177,7 @@ export type SetAgentSquadAccessFn = (
     memberId: string
     squadId: string
     capability: typeof START_RESOURCE_CAPABILITY
+    provenance?: GrantProvenance
   },
 ) => Promise<
   | { ok: true; result: 'created' | 'updated' | 'unchanged' | 'removed' }
@@ -498,7 +501,7 @@ export async function commitSquadResource(
   agent: AgentForMint,
   deps: Pick<
     StartGateDeps,
-    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'setAgentSquadAccess'
+    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'setAgentSquadAccess' | 'actorMemberId'
   >,
 ): Promise<{ kind: ResourceCommitKind; memberId: string; tokenId: string | null } | null> {
   const identity = await deps.resolveActiveAgentMember(env, agent.id)
@@ -519,6 +522,7 @@ export async function commitSquadResource(
     memberId: identity,
     squadId: agent.squad_id,
     capability: START_RESOURCE_CAPABILITY,
+    provenance: { grantedBy: deps.actorMemberId, grantedVia: 'project_start', reason: 'project start-gate resource access' },
   })
   if (!outcome.ok) return null
   return { kind: 'confirmed', memberId: identity, tokenId: null }
@@ -666,11 +670,12 @@ export async function listOrgOwnerMemberIds(env: Env): Promise<string[]> {
       WHERE c.scope_type = 'org'
         AND c.scope_id IS NULL
         AND c.capability = 'owner'
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}
         AND m.tenant = ?1
         AND m.status = 'active'
       ORDER BY c.member_id ASC`,
   )
-    .bind(env.TENANT_SLUG)
+    .bind(env.TENANT_SLUG, nowCapabilitySql())
     .all<{ member_id: string }>()
   return (result.results ?? []).map((row) => row.member_id)
 }

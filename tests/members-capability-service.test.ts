@@ -67,10 +67,12 @@ function makeServiceDb(options: ServiceDbOptions = {}) {
     async batch(batch: StatementRecord[]) {
       batches.push(batch)
       return options.batchResults ?? [
+        { meta: { changes: 1 }, results: [] }, // revoke-context set (migration 0230)
         {
           meta: { changes: options.existingCapabilities?.length ?? 0 },
           results: (options.existingCapabilities ?? []).map((capability) => ({ capability })),
         },
+        { meta: { changes: 1 }, results: [] }, // revoke-context clear
         { meta: { changes: 1 }, results: [] },
       ]
     },
@@ -153,10 +155,12 @@ function makeGrantRouteEnv(
     },
     async batch(_statements: unknown[]) {
       return [
+        { meta: { changes: 1 }, results: [] }, // revoke-context set
         {
           meta: { changes: existingCapabilities.length },
           results: existingCapabilities.map((capability) => ({ capability })),
         },
+        { meta: { changes: 1 }, results: [] }, // revoke-context clear
         { meta: { changes: 1 }, results: [] },
       ]
     },
@@ -224,11 +228,12 @@ describe('upsertCapabilityGrant', () => {
     })
 
     expect(batches).toHaveLength(1)
-    expect(batches[0]).toHaveLength(2)
-    expect(batches[0][0].sql).toContain('DELETE FROM capabilities')
-    expect(batches[0][0].values).toEqual(['member-1', 'squad', 'squad-1'])
-    expect(batches[0][1].sql).toContain('INSERT INTO capabilities')
-    expect(batches[0][1].values.slice(1)).toEqual([
+    expect(batches[0]).toHaveLength(4)
+    expect(batches[0][0].sql).toContain('grant_event_context')
+    expect(batches[0][1].sql).toContain('DELETE FROM capabilities')
+    expect(batches[0][1].values).toEqual(['member-1', 'squad', 'squad-1'])
+    expect(batches[0][3].sql).toContain('INSERT INTO capabilities')
+    expect(batches[0][3].values.slice(1, 5)).toEqual([
       'member-1',
       'squad',
       'squad-1',
@@ -256,7 +261,7 @@ describe('upsertCapabilityGrant', () => {
 
   it('checks the inserted grant receipt without requiring the delete to remove a row', async () => {
     const { env } = makeServiceDb({
-      batchResults: [{ meta: { changes: 0 } }, { meta: { changes: 0 } }],
+      batchResults: [{ meta: { changes: 1 } }, { meta: { changes: 0 } }, { meta: { changes: 1 } }, { meta: { changes: 0 } }],
     })
 
     await expect(upsertCapabilityGrant(env, squadGrant)).rejects.toThrow(
@@ -281,9 +286,9 @@ describe('upsertCapabilityGrant', () => {
     })
 
     expect(batches).toHaveLength(1)
-    expect(batches[0][0].sql).toContain('scope_id IS NULL')
-    expect(batches[0][0].sql).toContain('RETURNING capability')
-    expect(batches[0][0].values).toEqual(['member-1', 'org'])
+    expect(batches[0][1].sql).toContain('scope_id IS NULL')
+    expect(batches[0][1].sql).toContain('RETURNING capability')
+    expect(batches[0][1].values).toEqual(['member-1', 'org'])
   })
 
   it('refuses a high inherited grant that would exceed a bound agent home ceiling', async () => {

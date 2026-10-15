@@ -36,7 +36,12 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       scope_id TEXT,
       capability TEXT NOT NULL CHECK (capability IN ('owner', 'admin', 'lead', 'member', 'observer')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT, reason TEXT, granted_by TEXT, granted_via TEXT,
       UNIQUE (member_id, scope_type, scope_id)
+    );
+    CREATE TABLE grant_event_context (
+      id INTEGER PRIMARY KEY CHECK (id = 1), tenant TEXT, actor TEXT, reason TEXT,
+      event TEXT NOT NULL, at TEXT NOT NULL
     );
     CREATE TABLE agent_member_bindings (
       tenant TEXT NOT NULL,

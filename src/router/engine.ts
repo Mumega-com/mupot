@@ -1,5 +1,6 @@
 import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { createBus } from '../bus'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../tasks/runtime-receipts'
@@ -184,6 +185,7 @@ export async function runRouterTick(
                    SELECT 1
                      FROM capabilities actor_grant
                     WHERE actor_grant.member_id = ?6
+                      AND ${CAPABILITY_LIVE_PREDICATE('actor_grant', '?7')}
                       AND actor_grant.capability IN ('lead', 'admin', 'owner')
                       AND (
                         actor_grant.scope_type = 'org'
@@ -229,7 +231,7 @@ export async function runRouterTick(
             )
           )
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId).run()
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId, nowCapabilitySql()).run()
 
     if (claim.meta.changes !== 1) {
       decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })

@@ -623,6 +623,7 @@ async function commitPreparedConnectionAttempt(
       memberId: token.memberId,
       squadId: access.squadId,
       capability: access.capability,
+      provenance: { grantedBy: actor.id, grantedVia: 'agent_connection', reason: null },
     }, token.bindingProof)
     if (!prepared.ok) {
       await failReservation(env, actor, normalized, prepared.error, now)

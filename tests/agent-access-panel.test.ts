@@ -941,3 +941,27 @@ describe('receipts', () => {
     expect(rava(harness)).toEqual(only.action === 'revoke' ? { cap: null, mem: null } : { cap: only.new_capability, mem: only.new_capability })
   })
 })
+
+// ── expiring authority through the in-batch guard (migration 0230) ──────────────
+//
+// The guard's rank facts take `now` as a bound parameter. A positional-bind slip that
+// hands it an INTEGER (?15 -> ?12, the org-admin floor) used to make every expiring
+// grant look live; the predicate now fails CLOSED on a non-date now, so the same slip
+// refuses a LIVE expiring grant instead — which these tests catch.
+describe('actor authority from an EXPIRING grant', () => {
+  it('a live expiring org-admin grant still authorises the change (kills a misbound now)', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec(`UPDATE capabilities SET expires_at = '2099-01-01 00:00:00' WHERE id = 'cap-hadi'`)
+    const result = await applyAgentAccessChange(env, hadi(), change({ capability: 'lead' }))
+    expect(result.ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'lead' })
+  })
+
+  it('an EXPIRED org-admin grant authorises nothing at write time, even though the session carried it', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00' WHERE id = 'cap-hadi'`)
+    const result = await applyAgentAccessChange(env, hadi(), change({ capability: 'lead' }))
+    expect(result.ok).toBe(false)
+    expect(rava(harness)).toEqual({ cap: null, mem: null })
+  })
+})

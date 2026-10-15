@@ -1,5 +1,5 @@
 import type { AuthContext, Env, OrgKind } from '../types'
-import { brandSquadScope, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities } from '../auth/capability'
+import { brandSquadScope, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { MemberTokenFingerprintEnv } from '../members/service'
@@ -358,6 +358,7 @@ async function requirePendingSeatRegistrationAuthority(
       JOIN squads squad ON squad.id = agent.squad_id
       JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = token.tenant
        AND binding.agent_id = token.agent_id
@@ -458,6 +459,7 @@ export async function registerPendingRuntimeSeat(
           JOIN squads squad ON squad.id = agent.squad_id
           JOIN memberships membership
             ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+            AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
           JOIN agent_member_bindings binding
             ON binding.tenant = token.tenant
            AND binding.agent_id = token.agent_id
@@ -482,6 +484,7 @@ export async function registerPendingRuntimeSeat(
              EXISTS (
                SELECT 1 FROM capabilities capability
                 WHERE capability.member_id = member.id
+                  AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                   AND (
                     capability.scope_type = 'org'
                     OR (capability.scope_type = 'department'
@@ -645,6 +648,7 @@ async function readSeatForActor(
       JOIN squads squad ON squad.id = agent.squad_id
       LEFT JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
      WHERE seat.id = ?1 AND seat.tenant = ?2 AND seat.agent_id = ?3
      LIMIT 1
   `).bind(runtimeSeatId, env.TENANT_SLUG, actor.agentId).first<RuntimeSeatRow>()
@@ -772,6 +776,7 @@ export async function acquireRuntimeSeatLease(
       JOIN squads squad ON squad.id = agent.squad_id
       JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = seat.tenant
        AND binding.agent_id = seat.agent_id
@@ -797,6 +802,7 @@ export async function acquireRuntimeSeatLease(
          OR EXISTS (
            SELECT 1 FROM capabilities capability
             WHERE capability.member_id = member.id
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'
@@ -915,6 +921,7 @@ export async function renewRuntimeSeatLease(
            JOIN squads squad ON squad.id = agent.squad_id
            JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
            JOIN agent_member_bindings binding
              ON binding.tenant = seat.tenant
             AND binding.agent_id = seat.agent_id
@@ -940,6 +947,7 @@ export async function renewRuntimeSeatLease(
               OR EXISTS (
                 SELECT 1 FROM capabilities capability
                  WHERE capability.member_id = member.id
+                   AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                    AND (
                      capability.scope_type = 'org'
                      OR (capability.scope_type = 'department'
@@ -1014,6 +1022,7 @@ export async function releaseRuntimeSeatLease(
              JOIN squads squad ON squad.id = agent.squad_id
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
              JOIN agent_member_bindings binding
                ON binding.tenant = seat.tenant
               AND binding.agent_id = seat.agent_id
@@ -1039,6 +1048,7 @@ export async function releaseRuntimeSeatLease(
                 OR EXISTS (
                   SELECT 1 FROM capabilities capability
                    WHERE capability.member_id = member.id
+                     AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                      AND (
                        capability.scope_type = 'org'
                        OR (capability.scope_type = 'department'

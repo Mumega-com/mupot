@@ -1,5 +1,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { assertBatchWritten } from '../lib/receipt'
+import { CAPABILITY_LAPSED_PREDICATE, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { revokeContextStatements, type GrantProvenance, type RevokeProvenance } from '../auth/grant-events'
 import type { CapabilityGrant, Env, Membership } from '../types'
 import type { AgentBindingProof } from './service'
 
@@ -19,12 +21,31 @@ export interface SetAgentSquadAccessInput {
   capability: AgentAccessCapability
   /** Raise-only: the upsert's DO UPDATE carries a rank predicate IN THE WRITE, so a concurrent promotion is never demoted. */
   neverLower?: boolean
+  /** ISO/SQL timestamp after which this grant stops resolving, or null/undefined
+   *  for a permanent one (migration 0230).
+   *
+   *  THIS IS THE POINT OF 0230. grant_agent_capability writes here, and before
+   *  the column existed the write was necessarily PERMANENT — which is why an
+   *  elevated session was capped at 'member': a time-boxed approval could not be
+   *  allowed to confer standing lead/admin that outlived its own window.
+   *
+   *  With an expiry the constraint inverts. An elevated caller passes the
+   *  ELEVATION GRANT'S OWN expires_at, so the conferred capability cannot outlive
+   *  the approval that authorized it, and conferring 'lead' becomes safe because
+   *  it lapses on the same clock. See mupot#1360. */
+  expiresAt?: string | null
+  /** Who granted this, through which surface, and why (migration 0230). */
+  provenance?: GrantProvenance
 }
+
+const REMOVE_WHERE = `member_id = ? AND scope_type = 'squad' AND scope_id = ?`
 
 export interface RemoveAgentSquadAccessInput {
   agentId: string
   memberId: string
   squadId: string
+  /** Who revoked and why; recorded on the grant_events row (migration 0230). */
+  provenance?: RevokeProvenance
 }
 
 export type AgentSquadAccessError =
@@ -142,11 +163,12 @@ async function priorAccess(
     env.DB.prepare(
       `SELECT capability
          FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<{ capability: AgentAccessCapability }>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<{ capability: AgentAccessCapability }>(),
   ])
   return {
     membership,
@@ -229,11 +251,21 @@ export async function prepareAgentSquadAccess(
 
   const bindingGuard = bindingProof.disposition === 'creating'
   const rk = (t: string): string => `(CASE ${t}.capability WHEN 'observer' THEN 1 WHEN 'member' THEN 2 WHEN 'lead' THEN 3 WHEN 'admin' THEN 4 WHEN 'owner' THEN 5 ELSE 0 END)`
-  const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')}` : '')
+  // THE HORIZON FOLLOWS THE RANK (see the capabilities upsert below for the full rule).
+  const horizon = (t: string): string => `expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk(t)} OR ${lapsed(t)} THEN excluded.expires_at
+                         WHEN excluded.expires_at IS NULL OR ${t}.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(${t}.expires_at)
+                           THEN excluded.expires_at
+                         ELSE ${t}.expires_at
+                       END`
+  // A LAPSED row confers nothing, so it never blocks a re-grant: it is replaced like an absent one.
+  const lapsed = (t: string): string => CAPABILITY_LAPSED_PREDICATE(t, "datetime('now')")
+  const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')} OR ${lapsed(t)}` : '')
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
-        `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         SELECT ?, ?, ?, ?
+        `INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at)
+         SELECT ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -242,28 +274,29 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
+         DO UPDATE SET capability = excluded.capability, ${horizon('memberships')}${raiseOnly('memberships')}`,
       ).bind(
         membership.id,
         input.agentId,
         input.squadId,
         input.capability,
+        input.expiresAt ?? null,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
-        `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
-      ).bind(membership.id, input.agentId, input.squadId, input.capability)
+         DO UPDATE SET capability = excluded.capability, ${horizon('memberships')}${raiseOnly('memberships')}`,
+      ).bind(membership.id, input.agentId, input.squadId, input.capability, input.expiresAt ?? null)
 
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
     ? env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ?
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at, reason, granted_by, granted_via)
+         SELECT ?, ?, 'squad', ?, ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -272,22 +305,85 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
+         DO UPDATE SET capability = excluded.capability,
+                       reason = excluded.reason,
+                       granted_by = excluded.granted_by,
+                       granted_via = excluded.granted_via,
+                       -- THE HORIZON FOLLOWS THE RANK.
+                       --
+                       --  * A RAISE carries the NEW grant's own horizon (excluded.expires_at,
+                       --    NULL included). Otherwise a 60-minute elevation raising a
+                       --    permanent observer to member would leave a PERMANENT member:
+                       --    the time-boxed approval would have conferred standing authority
+                       --    that outlives it.
+                       --  * A same-rank or lower re-grant never SHORTENS what is there:
+                       --    NULL means permanent, i.e. the longest horizon, so either side
+                       --    being NULL keeps it permanent; otherwise the LATER of the two
+                       --    survives (julianday(), because the columns hold two timestamp
+                       --    shapes and a text compare is wrong for the same instant). A
+                       --    short elevation therefore cannot cut a longer or permanent
+                       --    grant at the rank it already had.
+                       -- Note that a caller supplying NO expiry (standing operator, HTTP
+                       -- route) on a same-rank or lower re-grant MAKES the row permanent;
+                       -- that is a standing grant by definition, and the event row records
+                       -- who did it.
+                       expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} OR ${lapsed('capabilities')} THEN excluded.expires_at
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END${raiseOnly('capabilities')}`,
       ).bind(
         grantId,
         input.memberId,
         input.squadId,
         input.capability,
+        input.expiresAt ?? null,
+        input.provenance?.reason ?? null,
+        input.provenance?.grantedBy ?? null,
+        input.provenance?.grantedVia ?? null,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, ?)
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at, reason, granted_by, granted_via)
+         VALUES (?, ?, 'squad', ?, ?, ?, ?, ?, ?)
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
-      ).bind(grantId, input.memberId, input.squadId, input.capability)
+         DO UPDATE SET capability = excluded.capability,
+                       reason = excluded.reason,
+                       granted_by = excluded.granted_by,
+                       granted_via = excluded.granted_via,
+                       -- THE HORIZON FOLLOWS THE RANK.
+                       --
+                       --  * A RAISE carries the NEW grant's own horizon (excluded.expires_at,
+                       --    NULL included). Otherwise a 60-minute elevation raising a
+                       --    permanent observer to member would leave a PERMANENT member:
+                       --    the time-boxed approval would have conferred standing authority
+                       --    that outlives it.
+                       --  * A same-rank or lower re-grant never SHORTENS what is there:
+                       --    NULL means permanent, i.e. the longest horizon, so either side
+                       --    being NULL keeps it permanent; otherwise the LATER of the two
+                       --    survives (julianday(), because the columns hold two timestamp
+                       --    shapes and a text compare is wrong for the same instant). A
+                       --    short elevation therefore cannot cut a longer or permanent
+                       --    grant at the rank it already had.
+                       -- Note that a caller supplying NO expiry (standing operator, HTTP
+                       -- route) on a same-rank or lower re-grant MAKES the row permanent;
+                       -- that is a standing grant by definition, and the event row records
+                       -- who did it.
+                       expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} OR ${lapsed('capabilities')} THEN excluded.expires_at
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END${raiseOnly('capabilities')}`,
+      ).bind(
+        grantId, input.memberId, input.squadId, input.capability, input.expiresAt ?? null,
+        input.provenance?.reason ?? null, input.provenance?.grantedBy ?? null, input.provenance?.grantedVia ?? null,
+      )
 
   return {
     ok: true,
@@ -325,11 +421,12 @@ async function readCommittedAccess(
     env.DB.prepare(
       `SELECT member_id, scope_type, scope_id, capability
          FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<CapabilityGrant>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<CapabilityGrant>(),
   ])
   if (
     !membership
@@ -415,30 +512,31 @@ export async function commitRemoveAgentSquadAccess(
   }
 
   const prior = await priorAccess(env, {
-    ...input,
+    agentId: input.agentId,
+    memberId: input.memberId,
+    squadId: input.squadId,
     capability: 'member',
   })
   const removing = prior.membership !== null || prior.capability !== null
   const extras = removing || options.evaluateExtrasWhenAbsent
     ? extraStatementsFor(prior.capability)
     : []
+  const [setRevokeContext, clearRevokeContext] = revokeContextStatements(env, input.provenance ?? { grantedBy: null })
   const writes = await env.DB.batch([
     ...extras,
+    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0230).
+    setRevokeContext,
     env.DB.prepare(
       `DELETE FROM memberships
         WHERE agent_id = ?
           AND squad_id = ?`,
     ).bind(input.agentId, input.squadId),
-    env.DB.prepare(
-      `DELETE FROM capabilities
-        WHERE member_id = ?
-          AND scope_type = 'squad'
-          AND scope_id = ?`,
-    ).bind(input.memberId, input.squadId),
+    env.DB.prepare(`DELETE FROM capabilities WHERE ${REMOVE_WHERE}`).bind(input.memberId, input.squadId),
+    clearRevokeContext,
   ])
 
-  const membershipWrite = writes[extras.length]
-  const capabilityWrite = writes[extras.length + 1]
+  const membershipWrite = writes[extras.length + 1]
+  const capabilityWrite = writes[extras.length + 2]
   if (!membershipWrite || !capabilityWrite) {
     return { ok: false, error: 'receipt_failed' }
   }
@@ -463,7 +561,9 @@ export async function commitRemoveAgentSquadAccess(
   }
 
   const committed = await priorAccess(env, {
-    ...input,
+    agentId: input.agentId,
+    memberId: input.memberId,
+    squadId: input.squadId,
     capability: 'member',
   })
   if (committed.membership || committed.capability) {

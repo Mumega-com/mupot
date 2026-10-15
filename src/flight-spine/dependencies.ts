@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
   executePreparedExecutionReceiptBatch,
@@ -296,6 +297,7 @@ export async function linkChildFlight(
          OR EXISTS (
            SELECT 1 FROM capabilities capability JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))
@@ -319,6 +321,7 @@ export async function linkChildFlight(
                ON binding.agent_id = agent.id AND binding.tenant = ? AND binding.member_id = ?
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = ?
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
             WHERE agent.id = ? AND agent.status = 'active'
               AND CASE membership.capability
                 WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
@@ -582,6 +585,7 @@ export async function recordConsumedChildArtifact(
          JOIN agents agent ON agent.id = assignment.agent_id AND agent.status = 'active'
          JOIN memberships membership
            ON membership.agent_id = agent.id AND membership.squad_id = objective.squad_id
+           AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
          JOIN agent_member_bindings binding
            ON binding.tenant = dependency.tenant AND binding.agent_id = agent.id
           AND binding.member_id = ?
@@ -606,6 +610,7 @@ export async function recordConsumedChildArtifact(
              JOIN objectives objective ON objective.id = ? AND objective.tenant = ?
              JOIN squads squad ON squad.id = objective.squad_id
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))

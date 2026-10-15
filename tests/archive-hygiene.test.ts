@@ -308,6 +308,27 @@ describe('archive substrate (mupot#1496)', () => {
     expect(result.ok).toBe(true) // mem-2 remains an owner
   })
 
+  it('a survivor whose owner grant EXPIRES: live => archive allowed (kills a misbound now in the write guard), lapsed => last_org_owner', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES
+        ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner', NULL),
+        ('cap-owner-mem2', 'mem-2', 'org', NULL, 'owner', '2099-01-01 00:00:00');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const live = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(live.ok).toBe(true)
+
+    harness.sqlite.exec(`
+      UPDATE members SET status = 'active', archived_at = NULL WHERE id = 'mem-1';
+      UPDATE capabilities SET expires_at = '2020-01-01 00:00:00' WHERE id = 'cap-owner-mem2';
+    `)
+    const lapsed = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(lapsed.ok).toBe(false)
+    if (!lapsed.ok) expect(lapsed.error).toBe('last_org_owner')
+  })
+
   it('mupot#1496 Round 4 (Athena confirmation-pass BLOCK): two owners archiving each other CONCURRENTLY — exactly one succeeds, one is refused last_org_owner, never both', async () => {
     // mem-1 and mem-2 are the ONLY two org owners. Firing both archive calls
     // concurrently (Promise.all) lets their JS-side pre-checks (checkMemberArchivable)

@@ -37,7 +37,7 @@
 // shows what the ref really resolved to.
 
 import type { Env, OrgKind } from '../types'
-import { canOnSquad, capabilityRank, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, capabilityRank, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { resolveSquadRef } from '../org/resolve'
 import { issueMomentLink } from '../secure-moments/issue'
 import { secureMomentsStatus } from '../secure-moments/config'
@@ -235,6 +235,7 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
     `SELECT DISTINCT c.member_id AS member_id
        FROM capabilities c JOIN members m ON m.id = c.member_id AND m.tenant = ?1 AND m.status = 'active'
       WHERE c.capability IN ('admin', 'owner')
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?5')}
         AND (c.scope_type = 'org' OR (c.scope_type = 'department' AND c.scope_id = ?2) OR (c.scope_type = 'squad' AND c.scope_id = ?3))
       UNION
      -- channel-derived squad grants count exactly as resolveCapabilities counts them
@@ -242,7 +243,7 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
        FROM channel_capability_grants ccg JOIN members m ON m.id = ccg.member_id AND m.tenant = ?1 AND m.status = 'active'
       WHERE ccg.squad_id = ?3 AND ccg.capability IN ('admin', 'owner')
       ORDER BY member_id LIMIT ?4`,
-  ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT).all<{ member_id: string }>()
+  ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT, nowCapabilitySql()).all<{ member_id: string }>()
   const out: string[] = []
   for (const r of rows.results ?? []) if (await eligibleApprover(env, sq, r.member_id)) out.push(r.member_id)
   return out
@@ -400,7 +401,16 @@ export async function decideSquadJoin(
   if (binding.kind !== 'bound') return { status: 409, title: 'Cannot approve', message: "The agent's identity is not usable right now, so it cannot be added to a squad.", tone: 'warn' }
   const current = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`)
     .bind(req.agent_id, squad.id).first<{ capability: string }>()
-  const already = current !== null && capabilityRank(current.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
+  // `already` needs BOTH planes: the membership AND a LIVE capability row for the bound seat on this squad. A lapsed
+  // capability (an expired elevation) must not make the approval a no-op that reports success while granting nothing.
+  const liveCap = await env.DB.prepare(
+    `SELECT capability FROM capabilities
+      WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('', '?3')} LIMIT 1`,
+  ).bind(binding.memberId, squad.id, nowCapabilitySql()).first<{ capability: string }>()
+  const already = current !== null
+    && capabilityRank(current.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
+    && liveCap !== null
+    && capabilityRank(liveCap.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
 
   return durablyLocal(input.waitUntil, async (): Promise<Outcome> => {
     if (!(await input.gate())) return CLOSED
@@ -425,6 +435,7 @@ export async function decideSquadJoin(
         squad: { id: squad.id, department_id: squad.department_id, kind: squad.kind },
         capability: req.capability,
         neverLower: true,
+        via: 'squad_join',
       })
       if (out.ok) result = out.result
       else {

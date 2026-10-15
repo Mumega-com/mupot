@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
@@ -661,6 +662,7 @@ export async function recordHostControlFact(
             AND binding.member_id = ?
            JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = ?
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
           WHERE seat.id = ? AND seat.tenant = ? AND seat.agent_id = ?
             AND seat.host_id = ? AND seat.state = 'active'
             AND seat.current_generation = ?
@@ -672,6 +674,7 @@ export async function recordHostControlFact(
          EXISTS (
            SELECT 1 FROM capabilities capability
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = ?)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = ?))

@@ -18,7 +18,7 @@
 import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
-import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability'
+import { canOnSquad, loadSquadScope, planeCoversScope, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
@@ -309,7 +309,7 @@ async function receiverNotStopped(env: Env, agentId: string): Promise<boolean> {
   return row !== null
 }
 
-async function activeRecipientProjectAccessAllowed(
+export async function activeRecipientProjectAccessAllowed(
   env: Env,
   projectId: string,
   recipientAgentId: string,
@@ -322,6 +322,7 @@ async function activeRecipientProjectAccessAllowed(
        JOIN projects project ON project.id = access.project_id
       WHERE recipient.id = ? AND recipient.status = 'active'
         AND project.id = ? AND project.status = 'active'
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       LIMIT 1`,
   ).bind(recipientAgentId, projectId).first()
   return row !== null
@@ -493,6 +494,7 @@ export async function sendAgentMessage(
         guestVisibilityFence.scopeType,
         guestVisibilityFence.scopeId,
         guestVisibilityFence.capability,
+        nowCapabilitySql(),
       )
     }
     const activeRecipientProjectAccessSql = opts.requireActiveRecipientProjectAccess
@@ -504,6 +506,7 @@ export async function sendAgentMessage(
              JOIN projects project ON project.id = access.project_id
             WHERE recipient.id = ?3 AND recipient.status = 'active'
               AND project.id = ?12 AND project.status = 'active'
+              AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
          )`
       : ''
     let receiverFenceSql = ''
@@ -2276,6 +2279,7 @@ async function recipientVisibilityOnSenderSquads(
                AND a.scope_id IS c.scope_id
                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('a.capability')}
              WHERE c.member_id = ?1
+               AND ${CAPABILITY_LIVE_PREDICATE('c', '?5')}
             UNION ALL
             SELECT 'squad', cg.squad_id, a.capability
               FROM channel_capability_grants cg
@@ -2295,7 +2299,7 @@ async function recipientVisibilityOnSenderSquads(
       WHERE m.agent_id = ?2
         AND m.squad_id <> ?3
       LIMIT 1`,
-  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson).first<{
+  ).bind(memberId, recipient.id, recipient.squad_id, ambientJson, nowCapabilitySql()).first<{
     squad_id: string
     scope_type: CapabilityGrant['scope_type']
     scope_id: string | null
@@ -2318,6 +2322,9 @@ function guestVisibilityWriteFenceSql(first: number): string {
   const scopeType = `?${first + 1}`
   const scopeId = `?${first + 2}`
   const capability = `?${first + 3}`
+  // 0230: the durable capability plane must be LIVE, not merely present. The
+  // caller pushes nowCapabilitySql() as the fifth value of this block.
+  const now = `?${first + 4}`
   return `AND (
     EXISTS (
       SELECT 1
@@ -2336,6 +2343,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
               WHERE c.member_id = ?5
                 AND c.scope_type = ${scopeType}
                 AND c.scope_id IS ${scopeId}
+                AND ${CAPABILITY_LIVE_PREDICATE('c', now)}
                 AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql(capability)}
            )
            OR (
@@ -2361,6 +2369,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
                ON sender_access.squad_id = sender_membership.squad_id
               AND sender_access.project_id = p.id
               WHERE sender_membership.agent_id = ?4
+                AND ${CAPABILITY_LIVE_PREDICATE('sender_membership', "datetime('now')")}
            )
            AND EXISTS (
              SELECT 1 FROM memberships recipient_membership
@@ -2368,6 +2377,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
                ON recipient_access.squad_id = recipient_membership.squad_id
               AND recipient_access.project_id = p.id
               WHERE recipient_membership.agent_id = ?3
+                AND ${CAPABILITY_LIVE_PREDICATE('recipient_membership', "datetime('now')")}
            )
       )
     )
@@ -2395,6 +2405,7 @@ async function guestVisibilityFenceIsCurrent(
           EXISTS (
             SELECT 1 FROM capabilities c
              WHERE c.member_id = ?3
+               AND ${CAPABILITY_LIVE_PREDICATE('c', '?7')}
                AND c.scope_type = ?4
                AND c.scope_id IS ?5
                AND ${capabilityRankSql('c.capability')} >= ${capabilityRankSql('?6')}
@@ -2417,6 +2428,7 @@ async function guestVisibilityFenceIsCurrent(
     fence.scopeType,
     fence.scopeId,
     fence.capability,
+    nowCapabilitySql(),
   ).first()
   return row !== null
 }
@@ -2507,7 +2519,7 @@ async function nonAdminRefCandidates(env: Env, ref: string): Promise<SendAgentRo
 // (both squads reach the project, project not archived) so this pre-check and the eventual
 // write-time authority agree. Deliberately its own predicate, consulted only as the LAST
 // resort in resolveNonAdminSendTarget (see its doc comment for why order matters).
-async function projectScopedRecipientVisible(
+export async function projectScopedRecipientVisible(
   env: Env,
   projectId: string,
   fromAgent: string,
@@ -2523,6 +2535,7 @@ async function projectScopedRecipientVisible(
             ON sender_access.squad_id = sender_membership.squad_id
            AND sender_access.project_id = p.id
            WHERE sender_membership.agent_id = ?2
+             AND ${CAPABILITY_LIVE_PREDICATE('sender_membership', "datetime('now')")}
         )
         AND EXISTS (
           SELECT 1 FROM memberships recipient_membership
@@ -2530,6 +2543,7 @@ async function projectScopedRecipientVisible(
             ON recipient_access.squad_id = recipient_membership.squad_id
            AND recipient_access.project_id = p.id
            WHERE recipient_membership.agent_id = ?3
+             AND ${CAPABILITY_LIVE_PREDICATE('recipient_membership', "datetime('now')")}
         )
       LIMIT 1`,
   ).bind(projectId, fromAgent, toAgentId).first()
@@ -2887,11 +2901,13 @@ export async function validateMessageProjectAccess(
               SELECT 1 FROM memberships m
               JOIN project_squad_access psa ON psa.squad_id = m.squad_id
               WHERE psa.project_id = ?1 AND m.agent_id = ?2
+              AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")}
             ) AS sender_allowed,
             EXISTS (
               SELECT 1 FROM memberships m
               JOIN project_squad_access psa ON psa.squad_id = m.squad_id
               WHERE psa.project_id = ?1 AND m.agent_id = ?3
+              AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")}
             ) AS recipient_allowed
        FROM projects WHERE id = ?1 LIMIT 1`,
   ).bind(projectId, fromAgent, toAgent).first<{

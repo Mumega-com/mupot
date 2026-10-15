@@ -1,4 +1,5 @@
 import type { CreateTaskInput } from '../tasks/service'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import {
   isValidGateOwnerForm,
   prepareGuardedTaskInsert,
@@ -201,7 +202,7 @@ function assertRoleShape(lanes: readonly NormalizedLane[]): void {
   }
 }
 
-async function requireAssignableAgent(
+export async function requireAssignableAgent(
   env: Env,
   agentId: string,
   squadId: string,
@@ -211,6 +212,7 @@ async function requireAssignableAgent(
       FROM agents agent
       LEFT JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = ?2
+       AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
      WHERE agent.id = ?1
   `).bind(agentId, squadId).first<{ status: string; capability: Capability | null }>()
   if (
@@ -430,6 +432,7 @@ export async function materializeComposition(
              FROM capabilities capability
              JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'
@@ -458,6 +461,7 @@ export async function materializeComposition(
                 AND binding.member_id = ?
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = ?
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
             WHERE agent.id = ? AND agent.status = 'active'
               AND CASE membership.capability
                 WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
@@ -483,6 +487,7 @@ export async function materializeComposition(
             AND agent.status = 'active'
            LEFT JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = ?
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
            LEFT JOIN runtime_seats seat
              ON seat.id = json_extract(lane.value, '$.runtimeSeatId')
             AND seat.tenant = ? AND seat.agent_id = agent.id AND seat.state = 'pending'
@@ -619,6 +624,7 @@ export async function materializeComposition(
              FROM agents agent
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = ?
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
             WHERE agent.id = ? AND agent.status = 'active'
               AND CASE membership.capability
                 WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3

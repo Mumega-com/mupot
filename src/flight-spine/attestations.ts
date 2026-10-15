@@ -1,5 +1,5 @@
 import type { AuthContext, OrgKind } from '../types'
-import { brandSquadScope, hasCapability, resolveCapabilities } from '../auth/capability'
+import { brandSquadScope, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import {
   deriveSafeMemberTokenFingerprint,
@@ -113,6 +113,7 @@ async function readLiveTokenBinding(
       JOIN memberships membership
         ON membership.agent_id = agent.id
        AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = token.tenant
        AND binding.agent_id = token.agent_id
@@ -188,6 +189,7 @@ async function readExistingWithCurrentAuthority(
                  JOIN memberships membership
                    ON membership.agent_id = agent.id
                   AND membership.squad_id = squad.id
+                   AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
                  JOIN agent_member_bindings binding
                    ON binding.tenant = token.tenant
                   AND binding.agent_id = token.agent_id
@@ -217,6 +219,7 @@ async function readExistingWithCurrentAuthority(
                     EXISTS (
                       SELECT 1 FROM capabilities capability
                        WHERE capability.member_id = member.id
+                         AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                          AND (
                            capability.scope_type = 'org'
                            OR (capability.scope_type = 'department'
@@ -312,6 +315,7 @@ export async function issueTokenBindingAttestation(
         JOIN memberships membership
           ON membership.agent_id = agent.id
          AND membership.squad_id = squad.id
+          AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
         JOIN agent_member_bindings binding
           ON binding.tenant = token.tenant
          AND binding.agent_id = token.agent_id
@@ -332,6 +336,7 @@ export async function issueTokenBindingAttestation(
            EXISTS (
              SELECT 1 FROM capabilities capability
               WHERE capability.member_id = member.id
+                AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                 AND (
                   capability.scope_type = 'org'
                   OR (capability.scope_type = 'department'

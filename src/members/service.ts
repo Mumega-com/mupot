@@ -14,6 +14,8 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten, assertWritten, rowsWritten } from '../lib/receipt'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { revokeContextStatements, type GrantProvenance } from '../auth/grant-events'
 import {
   calculateExpiryTimestamp,
   DEFAULT_TOKEN_EXPIRY_DAYS,
@@ -405,8 +407,8 @@ export function prepareAgentIdentityWeldStatements(
          SELECT ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
       ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt, agent.id),
       env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via, reason)
+         SELECT ?, ?, 'squad', ?, ?, 'token_mint', 'agent identity weld: home-squad access' WHERE ${ACTIVE_AGENT_GUARD}`,
       ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability, agent.id),
     ]
   }
@@ -420,8 +422,8 @@ export function prepareAgentIdentityWeldStatements(
        VALUES (?, ?, ?, ?)`,
     ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt),
     env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       VALUES (?, ?, 'squad', ?, ?)`,
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via, reason)
+       VALUES (?, ?, 'squad', ?, ?, 'token_mint', 'agent identity weld: home-squad access')`,
     ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
   ]
 }
@@ -459,8 +461,8 @@ export function prepareConditionalIdentityWeld(
        SELECT ?2, ?4, ?5, ?3 WHERE EXISTS (SELECT 1 FROM members WHERE id = ?5 AND tenant = ?2) AND ${pending}`,
     ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId),
     env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       SELECT ?6, ?5, 'squad', ?7, 'member'
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via, reason)
+       SELECT ?6, ?5, 'squad', ?7, 'member', 'token_mint', 'agent identity weld: home-squad access'
         WHERE EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4 AND member_id = ?5)`,
     ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId, crypto.randomUUID(), agent.squad_id),
   ]
@@ -537,12 +539,13 @@ export async function prepareAgentBoundTokenMintForBinding(
     // (Athena, gate on #891.)
     const committed = await env.DB.prepare(
       `SELECT capability FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
     )
-      .bind(memberId, agent.squad_id)
+      .bind(memberId, agent.squad_id, nowCapabilitySql())
       .first<{ capability: string }>()
     if (!committed) {
       throw new Error(
@@ -1280,6 +1283,8 @@ export interface CapabilityGrantUpsertOutcome {
 export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
+  /** Who granted this, through which surface, and why (migration 0230). */
+  provenance: GrantProvenance = { grantedBy: null, grantedVia: 'http' },
 ): Promise<CapabilityGrantUpsertOutcome> {
   const deleteStmt = grant.scope_id === null
     ? env.DB.prepare(
@@ -1293,15 +1298,27 @@ export async function upsertCapabilityGrant(
         RETURNING capability`,
       ).bind(grant.member_id, grant.scope_type, grant.scope_id)
 
+  // The DELETE half of a replace is recorded as a revoke attributed to the same
+  // actor (grant_events trigger, migration 0230); the INSERT is the new grant.
+  const [setContext, clearContext] = revokeContextStatements(env, {
+    grantedBy: provenance.grantedBy,
+    reason: 'replaced by a new grant on the same scope',
+  })
   const writes = await env.DB.batch<{ capability: Capability }>([
+    setContext,
     deleteStmt,
+    clearContext,
     env.DB.prepare(
-      'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
-    ).bind(crypto.randomUUID(), grant.member_id, grant.scope_type, grant.scope_id, grant.capability),
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, reason, granted_by, granted_via)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(), grant.member_id, grant.scope_type, grant.scope_id, grant.capability,
+      provenance.reason ?? null, provenance.grantedBy, provenance.grantedVia,
+    ),
   ])
-  assertBatchWritten([writes[1]], 'upsert_capability_grant', 1)
+  assertBatchWritten([writes[3]], 'upsert_capability_grant', 1)
 
-  const existing = writes[0].results ?? []
+  const existing = writes[1].results ?? []
   const result = existing.length === 0
     ? 'created'
     : existing.length === 1 && existing[0].capability === grant.capability

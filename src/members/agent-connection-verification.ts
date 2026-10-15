@@ -3,6 +3,7 @@ import {
   readAgentInbox,
   sendAgentMessage,
 } from '../agents/messages'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { mcpEndpoint, requiredCanonicalOrigin } from '../dashboard/connect'
 import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { rowsWritten } from '../lib/receipt'
@@ -479,13 +480,14 @@ export async function verifyAgentConnection(
   try {
     const memberCapability = await env.DB.prepare(
       `SELECT capability FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
+          AND scope_id = ?2
           AND capability IN ('observer', 'member')
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
     )
-      .bind(receipt.member_id, receipt.home_squad_id)
+      .bind(receipt.member_id, receipt.home_squad_id, nowCapabilitySql())
       .first<{ capability: string }>()
     currentCapability = memberCapability?.capability ?? null
   } catch {

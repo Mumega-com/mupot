@@ -1,4 +1,5 @@
 import type { AuthContext, Capability, Env, OrgKind } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { brandSquadScope, hasCapability, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { isEnforceableCap } from '../agents/meter'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
@@ -251,6 +252,7 @@ export async function requireFlightSpineSquadAuthority(
     const membership = await env.DB.prepare(`
       SELECT capability FROM memberships
        WHERE agent_id = ?1 AND squad_id = ?2
+         AND ${CAPABILITY_LIVE_PREDICATE('', "datetime('now')")}
     `).bind(principal.agentId, squad.id).first<{ capability: Capability }>()
     if (!membership || !hasCapability([{
       member_id: principal.memberId,
@@ -496,6 +498,7 @@ export async function acceptObjective(
              FROM capabilities capability
              JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'
@@ -536,6 +539,7 @@ export async function acceptObjective(
                 AND binding.member_id = ?
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = ?
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
             WHERE agent.id = ? AND agent.status = 'active'
               AND CASE membership.capability
                 WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3

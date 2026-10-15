@@ -1,4 +1,5 @@
-import { brandSquadScope, canOnSquad, hasCapability } from '../auth/capability'
+import { brandSquadScope, canOnSquad, hasCapability, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import type { GrantVia } from '../auth/grant-events'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
   commitAgentSquadAccess,
@@ -139,6 +140,8 @@ export async function addSquadMember(input: {
   capability: AgentAccessCapability
   /** Raise-only write (squad_join_request): the rank predicate lives in the upsert SQL itself. */
   neverLower?: boolean
+  /** The surface this grant came through, recorded as granted_via (default 'mcp'; squad_join_request passes 'squad_join'). */
+  via?: GrantVia
   /**
    * Set ONLY from an `authorizeStructuralWrite` verdict of kind 'delegated' (src/operators/chokepoint.ts). That verdict
    * already decided standing, scope, self/human targets and the rank ceiling for a delegated agent, so the
@@ -194,6 +197,7 @@ export async function addSquadMember(input: {
         squadId: input.squad.id,
         capability: input.capability,
         ...(input.neverLower ? { neverLower: true } : {}),
+        provenance: { grantedBy: input.auth.memberId ?? null, grantedVia: input.via ?? 'mcp', reason: null },
       },
       (prepared) => [
         receiptInsert(input.env, {
@@ -273,6 +277,7 @@ export async function removeSquadMember(input: {
         agentId: input.agentId,
         memberId: binding.memberId,
         squadId: input.squad.id,
+        provenance: { grantedBy: input.auth.memberId ?? null, reason: null },
       },
       (_priorCapability) => [
         receiptInsert(input.env, {
@@ -329,10 +334,11 @@ export async function listSquadMembers(input: {
          ON c.member_id = b.member_id
         AND c.scope_type = 'squad'
         AND c.scope_id = m.squad_id
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}
       WHERE m.squad_id = ?2
       ORDER BY a.slug ASC`,
   )
-    .bind(input.env.TENANT_SLUG, input.squadId)
+    .bind(input.env.TENANT_SLUG, input.squadId, nowCapabilitySql())
     .all<SquadMembershipListRow>()
   return { ok: true, members: rows.results ?? [] }
 }

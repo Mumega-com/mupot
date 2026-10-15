@@ -37,6 +37,8 @@ function makeDb() {
       .run(id, `${id}@example.test`, id, TENANT)
   }
   return {
+    exec: (sql: string) => harness.sqlite.exec(sql),
+    get: (sql: string) => harness.sqlite.prepare(sql).get(),
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     cap: (memberId: string, scopeId: string) =>
       harness.sqlite
@@ -169,6 +171,48 @@ describe('ceilings — self-service is bounded, by allowlist not by prefix', () 
       scopeType: 'department', scopeId: 'dept-1', capability: 'lead',
     })
     expect(r.ok).toBe(true)
+  })
+})
+
+describe('lifecycle (migration 0230)', () => {
+  it('a self-grant onto a LAPSED row refreshes it instead of being swallowed, and is attributed', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    db.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00'`)
+    const r = await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    expect(r.ok).toBe(true)
+    expect(db.get(`SELECT capability, expires_at, granted_by, granted_via FROM capabilities WHERE member_id = '${SUBJECT}'`))
+      .toEqual({ capability: 'member', expires_at: null, granted_by: SUBJECT, granted_via: 'door' })
+  })
+
+  it('a self-grant over a LIVE expiring row leaves its horizon alone', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    db.exec(`UPDATE capabilities SET expires_at = '2099-01-01 00:00:00'`)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    expect(db.get(`SELECT expires_at FROM capabilities WHERE member_id = '${SUBJECT}'`)).toEqual({ expires_at: '2099-01-01 00:00:00' })
+  })
+
+  it('a door REVOKE records who ruled, in the history, and leaves no context behind', async () => {
+    const db = makeDb()
+    await open(db)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT event, actor, reason FROM grant_events WHERE event = 'revoked'`))
+      .toEqual({ event: 'revoked', actor: 'agent:athena', reason: 'over-reach' })
+    expect(db.get('SELECT COUNT(*) AS n FROM grant_event_context')).toEqual({ n: 0 })
   })
 })
 
@@ -354,5 +398,54 @@ describe('signup default — the half of OAuth onboarding that was missing', () 
 
     // capability_before was NULL, so revoking removes it entirely — baseline restored.
     expect(db.orgCap(SUBJECT)).toBeUndefined()
+  })
+})
+
+describe('a rejected self-grant never resurrects a lapsed grant (P0, round-2 gate)', () => {
+  it('REPRO: lapsed admin + self-grant member + reject => the row is DELETED, not {admin, permanent}', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'admin')
+    db.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00'`)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    // the lapsed prior counts as ABSENT in the receipt
+    expect(receipt).toMatchObject({ capability_before: null })
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT COUNT(*) AS n FROM capabilities WHERE member_id = '${SUBJECT}'`)).toEqual({ n: 0 })
+  })
+
+  it('RESTORE puts back rank AND horizon of a LIVE expiring prior', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    db.exec(`UPDATE capabilities SET expires_at = '2099-06-01 00:00:00'`)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    // something else changed the horizon after the door grant: the restore must still put back the SNAPSHOT
+    db.exec(`UPDATE capabilities SET expires_at = NULL WHERE member_id = '${SUBJECT}'`)
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT capability, expires_at FROM capabilities WHERE member_id = '${SUBJECT}'`))
+      .toEqual({ capability: 'observer', expires_at: '2099-06-01 00:00:00' })
+  })
+
+  it('RESTORE of a LIVE permanent prior stays permanent', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT capability, expires_at FROM capabilities WHERE member_id = '${SUBJECT}'`))
+      .toEqual({ capability: 'observer', expires_at: null })
   })
 })
