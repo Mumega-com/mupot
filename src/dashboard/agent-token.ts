@@ -25,6 +25,8 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { Env } from '../types'
+import { enrollClientSnippet } from './enroll'
+import { connectSnippetCard, tokenSurfaceLinks } from './token-surfaces'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -68,7 +70,7 @@ function esc(s: string): string {
 }
 
 /** GET /admin/agent-token — the agent picker form. */
-export function agentTokenPageBody(view: AgentTokenView, error?: string) {
+export function agentTokenPageBody(view: AgentTokenView, error?: string, origin?: string) {
   const { agents } = view
 
   const agentOptions =
@@ -104,8 +106,7 @@ ${honoRaw(errorHtml)}
 <div class="card">
   <div class="warn-box" style="margin-bottom:16px">
     <strong>Show once only.</strong> Copy the token immediately after minting — it cannot be retrieved again.
-    Place it at <code class="inline">~/.fleet/agents/&lt;agent&gt;.token</code> on the host.
-    Never paste it in chat or logs.
+    Paste it into the client config shown after minting. Never paste it in chat or logs.
   </div>
   <form method="post" action="/admin/agent-token/mint" autocomplete="off">
     <div class="adminform" style="flex-direction:column;align-items:stretch">
@@ -144,13 +145,11 @@ ${honoRaw(errorHtml)}
   </form>
 </div>
 
-<h2 style="margin-top:32px">See also</h2>
-<div class="card" style="padding:14px 18px">
-  <p style="margin:0;font-size:14px;color:var(--muted)">
-    <strong>Operator tokens</strong> (NULL-bound, for humans) are provisioned under
-    <a href="/members">Access Tokens</a>. Use this page only for agent runtimes.
-  </p>
-</div>`
+${origin ? connectSnippetCard(
+  enrollClientSnippet('your-agent', origin, 'your-seat'),
+  'This is the config you will paste after minting (the real agent name and token appear on the next page).',
+) : ''}
+${honoRaw(tokenSurfaceLinks('agent-token'))}`
 }
 
 /** Show-once page after a successful agent-bound mint. */
@@ -161,6 +160,8 @@ export function agentTokenMintedBody(
   raw: string,
   tokenId: string,
   capability: string,
+  origin: string,
+  seat: string,
 ) {
   const scopeLabel = squadName ? `${esc(squadName)} / ${esc(agentName)}` : esc(agentName)
   return html`
@@ -174,8 +175,7 @@ export function agentTokenMintedBody(
   </p>
   <div class="warn-box" style="margin-bottom:14px">
     <strong>Shown once only.</strong> Copy this token now — it cannot be retrieved again.
-    Place it at <code class="inline">~/.fleet/agents/${honoRaw(esc(agentSlug))}.token</code> on the host.
-    Never paste it in chat, bus messages, or version control.
+    Paste it into the config below. Never paste it in chat, bus messages, or version control.
   </div>
   <code class="token" id="rawToken">${honoRaw(esc(raw))}</code>
   <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
@@ -185,6 +185,11 @@ export function agentTokenMintedBody(
     <span id="copyFeedback" style="font-size:13px;color:var(--ok);display:none">Copied!</span>
   </div>
 </div>
+${connectSnippetCard(
+  enrollClientSnippet(agentSlug, origin, seat),
+  'Replace <code class="inline">&lt;MEMBER_TOKEN&gt;</code> with the token above.',
+)}
+${honoRaw(tokenSurfaceLinks('agent-token'))}
 <script>
   function copyToken() {
     const text = document.getElementById('rawToken').textContent.trim();

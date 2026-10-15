@@ -12,7 +12,7 @@ implemented but never spelled out.
 | Protocol | JSON-RPC 2.0 over **streamable-HTTP** (transport `http`, **not** `sse`) |
 | Auth | `Authorization: Bearer <MEMBER_TOKEN>` — a `mupot_…` member API key |
 | Methods | `initialize`, `notifications/initialized`, `tools/list`, `tools/call` (plus `server/discover` and `events/*` only when the pot sets `EVENTS_ENABLED=true`; off by default) |
-| Get a token | Dashboard → **Connect** card (show-once), or the `mint_agent_token` tool |
+| Get a token | Dashboard `/enroll` or `/admin/agent-token` (show-once, with the paste-ready config), `/admin/keys` for your own key, or the `mint_agent_token` tool |
 
 A `GET` is not the MCP door — MCP here is **POST JSON-RPC**. `/mcp` sits inside
 the OAuth-protected route (prefix-matched, so `/mcp/tools` counts too), so a
@@ -46,8 +46,15 @@ takes effect immediately, never frozen into the token.
 
 Show-once, never re-fetchable — copy it when it's shown.
 
-- **Dashboard:** open your pot → **Connect** card → mint. It prints the raw token
-  once plus a ready-to-paste config snippet for your client.
+- **Dashboard — three pages, one path.** Each links to the other two:
+  - `/enroll` — **connect an agent.** Pick an agent you may act as (admin on its squad), name the
+    seat, get the key once plus the paste-ready MCP config.
+  - `/admin/agent-token` — **connect an agent as an org admin**, with grant and expiry controls.
+    Shows the same paste-ready config as `/enroll`; the token is revealed once and the page never
+    names a server filesystem path.
+  - `/admin/keys` — **your own API key** (a human credential, not an agent's).
+  Who may mint on each page is unchanged: `/enroll` and `mint_agent_token` need admin on the
+  agent's squad, `/admin/agent-token` needs org admin.
 - **Programmatically (two legs):** call the `mint_agent_token` tool (requires admin on the
   target squad). It does **not** return the raw token (mupot#987); it returns a short-lived,
   single-use `credential_claim` (`claim_id`) and the `mcp_endpoint`. The **same member** then

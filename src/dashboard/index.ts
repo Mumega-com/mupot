@@ -2264,7 +2264,8 @@ dashboardApp.get('/admin/agent-token', async (c) => {
     )
   }
   const view = await loadAgentTokenView(c.env)
-  return c.html(shell(c.env, 'Mint agent token', agentTokenPageBody(view)))
+  const canonical = requiredCanonicalOrigin(c.env)
+  return c.html(shell(c.env, 'Mint agent token', agentTokenPageBody(view, undefined, canonical.ok ? canonical.origin : undefined)))
 })
 
 // POST /admin/agent-token/mint
@@ -2392,6 +2393,8 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
         minted.raw,
         minted.tokenId,
         minted.grantCapability,
+        canonical.origin,
+        labelRaw || agent.slug,
       ),
     ),
   )
