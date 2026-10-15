@@ -1348,18 +1348,19 @@ describe('round 2 P2/P3', () => {
     const run = async (steps: Array<{ decision: 'approve' | 'deny'; answer: Answer }>, o: { box?: boolean } = {}) => {
       const els: Record<string, Record<string, unknown>> = {
         'agent-prompt': { value: 'ORIGINAL ATTACH MESSAGE' }, 'copy-prompt': { textContent: 'Copy message', addEventListener() {} },
-        'decision-form': { hidden: false, addEventListener() {}, getAttribute: () => 'csrf', querySelectorAll: () => [] }, status: { textContent: '', appendChild() {}, className: '' },
+        'decision-form': { hidden: false, addEventListener() {}, getAttribute: () => 'csrf', querySelectorAll: () => [] }, status: { textContent: '', appendChild(ch: { tag?: string; textContent?: string }) { if (ch.tag === 'strong') lastTitle = String(ch.textContent) }, className: '' },
         h2: { textContent: 'Then tell Rava' },
       }
       if (o.box !== false) els['agent-prompt-box'] = { getAttribute: (k: string) => (k === 'data-agent' ? 'Rava' : null), querySelector: () => els['h2'] }
       let click: ((ev: unknown) => void) | undefined
+      let lastTitle = ''
       let current: 'approve' | 'deny' = 'approve'
       const btn = { getAttribute: () => current, addEventListener: (_e: string, f: (ev: unknown) => void) => { click = f }, disabled: false }
       els['decision-form'].querySelectorAll = () => [btn]
       let n = 0
       let credThrows = false
       const ctx = {
-        document: { getElementById: (id: string) => els[id] ?? null, querySelectorAll: () => [], querySelector: () => null, createElement: () => ({ appendChild() {}, textContent: '' }) },
+        document: { getElementById: (id: string) => els[id] ?? null, querySelectorAll: () => [], querySelector: () => null, createElement: (tag: string) => ({ tag, appendChild() {}, textContent: '' }) },
         window: { PublicKeyCredential: function () {} }, location: { pathname: '/m/x/y' }, FormData: class { getAll() { return [] } get() { return null } }, setTimeout, clearTimeout,
         atob: (s: string) => Buffer.from(s, 'base64').toString('binary'), btoa: (s: string) => Buffer.from(s, 'binary').toString('base64'), Uint8Array, console,
         navigator: { credentials: { get: async () => { if (credThrows) { const e = new Error('x'); e.name = 'NotAllowedError'; throw e } return { id: 'i', rawId: new ArrayBuffer(1), type: 'public-key', response: { clientDataJSON: new ArrayBuffer(1), authenticatorData: new ArrayBuffer(1), signature: new ArrayBuffer(1) } } } } },
@@ -1370,14 +1371,14 @@ describe('round 2 P2/P3', () => {
         },
       }
       vm.runInNewContext(DECIDE_SCRIPT, ctx)
-      const seen: Array<{ prompt: string; heading: string }> = []
+      const seen: Array<{ prompt: string; heading: string; title: string }> = []
       for (const st of steps) {
         n += 1
         current = st.decision
         credThrows = st.answer === 'throw'
         click?.({ currentTarget: btn })
         await new Promise((r) => setTimeout(r, 30))
-        seen.push({ prompt: String((els['agent-prompt'] as { value: string }).value), heading: String((els['h2'] as { textContent: string }).textContent) })
+        seen.push({ prompt: String((els['agent-prompt'] as { value: string }).value), heading: String((els['h2'] as { textContent: string }).textContent), title: lastTitle })
       }
       return seen
     }
@@ -1420,6 +1421,7 @@ describe('round 2 P2/P3', () => {
     // pages without the box (elevation, seed): a successful decision must stay a success, never fall into "Not decided"
     const noBox = await run([{ decision: 'deny', answer: { status: 200, json: { title: 'Denied', message: 'x' } } }], { box: false })
     expect(noBox[0].prompt).toBe('ORIGINAL ATTACH MESSAGE')
+    expect(noBox[0].title).toBe('Denied') // still reported as the success it was, not turned into 'Not decided' by a missing box
   })
   it('the decide script warns after 25 seconds of no passkey response and stops its timer on every exit', async () => {
     const m = await fileSeed()
