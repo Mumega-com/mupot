@@ -1413,6 +1413,19 @@ const CSRF_COOKIE_NAME = 'mupot_oauth_nonce'
 // cross-satisfying each other.
 const CONSENT_COOKIE_NAME = 'mupot_oauth_consent'
 const CONSENT_TTL_SECONDS = 600
+// mupot#1441: the consent cookie carries a '.'-joined LIST of live consent nonces, not one.
+// Clients (Claude Desktop) start /authorize twice, so two consent pages render for one browser;
+// a single-valued cookie let the second render overwrite the first tab's binding and the
+// first tab then failed 'consent nonce mismatch'. A nonce is only honoured if it is an exact
+// element of the list the browser sent, so a nonce minted for another browser (absent from
+// this cookie) is still refused. Bounded so it cannot grow without limit.
+const CONSENT_COOKIE_MAX_NONCES = 5
+const CONSENT_NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function consentCookieNonces(cookieHeader: string): string[] {
+  const raw = parseCookieValue(cookieHeader, CONSENT_COOKIE_NAME)
+  return raw ? raw.split('.').filter((n) => CONSENT_NONCE_RE.test(n)) : []
+}
 
 interface PendingConsent {
   stored: Record<string, unknown>
@@ -1644,9 +1657,17 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       'Set-Cookie',
       `${CSRF_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=0`,
     )
+    // Keep this browser's other still-live consent nonces (multi-tab / double-/authorize); drop
+    // any whose KV record is gone so the list self-prunes.
+    const priorNonces = consentCookieNonces(request.headers.get('Cookie') ?? '')
+    const liveNonces: string[] = []
+    for (const n of priorNonces) {
+      if (await env.SESSIONS.get(`oauth-consent:${n}`)) liveNonces.push(n)
+    }
+    const cookieNonces = [...liveNonces, consentNonce].slice(-CONSENT_COOKIE_MAX_NONCES)
     page.headers.append(
       'Set-Cookie',
-      `${CONSENT_COOKIE_NAME}=${consentNonce}; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=${CONSENT_TTL_SECONDS}${secure ? '; Secure' : ''}`,
+      `${CONSENT_COOKIE_NAME}=${cookieNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=${CONSENT_TTL_SECONDS}${secure ? '; Secure' : ''}`,
     )
     return page
   }
@@ -1675,8 +1696,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // CSRF: the cookie set when the consent page was rendered must match the
     // nonce the form posted back. Same defence as B3 above, second instance.
     const cookieHeader = request.headers.get('Cookie') ?? ''
-    const cookieNonce = parseCookieValue(cookieHeader, CONSENT_COOKIE_NAME)
-    if (!cookieNonce || cookieNonce !== consentNonce) {
+    const cookieNonces = consentCookieNonces(cookieHeader)
+    if (!cookieNonces.includes(consentNonce)) {
       return new Response('CSRF check failed: consent nonce mismatch', { status: 403 })
     }
 
@@ -1688,7 +1709,11 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // rejected agent_id) so a replayed POST can never re-run this step.
     await env.SESSIONS.delete(`oauth-consent:${consentNonce}`)
 
-    const clearConsentCookie = `${CONSENT_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=0`
+    // Consume only THIS nonce from the cookie; sibling tabs' nonces stay bound.
+    const remainingNonces = cookieNonces.filter((n) => n !== consentNonce)
+    const clearConsentCookie = remainingNonces.length > 0
+      ? `${CONSENT_COOKIE_NAME}=${remainingNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=${CONSENT_TTL_SECONDS}`
+      : `${CONSENT_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/consent; Max-Age=0`
 
     // Decline → NO mint, NO token, NO completeAuthorization. Ever. A declined
     // connection must never fall through to the unbound-default mint path below —
