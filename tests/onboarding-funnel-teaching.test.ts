@@ -116,8 +116,10 @@ describe('refusalNextStep (pure)', () => {
   })
 
   it('covers the not-bound, seat and flag-off refusals and the rate limit', () => {
-    expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('seat_attach')
-    expect(refusalNextStep('seat_required', 403, undefined)).toContain('seat_select')
+    expect(refusalNextStep('not_agent_bound', 403, 'x')).not.toContain('seat_attach')
+    expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('org admin')
+    expect(refusalNextStep('seat_required', 403, undefined)).toContain('workspace bearer')
+    expect(refusalNextStep('seat_required', 403, undefined)).toContain('Do not call seat_select')
     expect(refusalNextStep('seat_attach_disabled', 403, undefined)).toMatch(/not enabled/)
     expect(refusalNextStep('rate_limited', 429, undefined)).toMatch(/wait/)
   })
@@ -168,7 +170,7 @@ describe('initialize instructions name the attach door only while it exists', ()
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('task_board')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).not.toContain('seat_attach')
     // item 1 no longer sends an agent-less session to a tool that refuses it
-    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/'orient' answers only once you act as an agent/)
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toMatch(/'orient' with no argument answers only once you act as an agent/)
   })
 
   it('SEAT_AUTO_ENROLL alone: seat section, no attach section', () => {
@@ -288,6 +290,16 @@ describe('a chat with a seat is shown the attach door, and told what to do when 
     const r = await rpc(env, g.ctx, 'seat_select', { project: 'p' }, null, { 'x-mupot-seat': handle })
     expect(r.sc).toMatchObject({ ok: false, error: 'not_unbound_directory_session', status: 403 })
     expect(String(r.sc.detail)).toContain('seat_attach')
+  })
+
+  it('a workspace agent-bound bearer calling seat_select is not told to seat_attach (it would loop back via seat_required)', async () => {
+    const env = envFor(h)
+    const hash = await sha256Hex('agent-bearer')
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('tok-ag', 'mem-agent-rava', '${hash}', 't', 'workspace', '2026-10-09T00:00:00.000Z', 'agent-rava', '${TENANT}')`)
+    const res = await mcpApp.request('https://pot.example/', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer agent-bearer' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'seat_select', arguments: { project: 'p' } } }) }, env)
+    const sc = ((await res.json()) as { result: { structuredContent: Record<string, unknown> } }).result.structuredContent
+    expect(sc).toMatchObject({ ok: false, status: 403 })
+    expect(JSON.stringify(sc)).not.toContain('seat_attach')
   })
 
   it('seat_select with the attach flag off does not advertise seat_attach', async () => {

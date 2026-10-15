@@ -56,7 +56,7 @@ const toolSeatSelect: ToolSpec = {
           403,
           result.error,
           'seat_select only runs for an unbound directory-channel session. This session is already bound to an agent identity (an agent-bound connection, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat. To pick a seat explicitly, call seat_select from an unbound session: send no seat handle on that call.'
-            + (seatAttachEnabled(env) ? ' To act as an agent you already have instead, call seat_attach { agent } from this session.' : ''),
+            + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached ? ' To act as an agent you already have instead, call seat_attach { agent } from this session.' : ''),
         )
       case 'harness_required':
         return fail(

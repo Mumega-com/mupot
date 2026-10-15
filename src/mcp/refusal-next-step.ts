@@ -27,13 +27,13 @@ function alreadyTeaches(detail: unknown): boolean {
 export function refusalNextStep(error: string, status: number, detail: unknown): string | undefined {
   if (alreadyTeaches(detail)) return undefined
   if (status === 403 && error === 'forbidden' && typeof detail === 'object' && detail !== null && 'need' in detail) {
-    return `This session does not hold the capability this tool needs (need). ${BOOT_MAP} Getting a capability is a human act: an org admin for a workspace token, your human's passkey tap for an attached chat. A squad grant does not help a directory (chat connector) session.`
+    return `This session does not hold the capability this needs on that target (need). ${BOOT_MAP} Getting a capability is a human act: an org admin for a workspace token, your human's passkey tap for an attached chat. A squad grant does not help a directory (chat connector) session.`
   }
   if (status === 403 && (error === 'not_agent_bound' || error === 'agent_bound_credential_required')) {
-    return `This tool needs an agent-bound credential and this session is not one. ${BOOT_MAP} A chat with a seat attaches to an agent with seat_attach; a CLI or daemon agent needs an org admin to mint it a workspace token.`
+    return `This tool needs an agent-bound credential and this session is not one. ${BOOT_MAP} A CLI or daemon agent needs an org admin to mint it an agent-bound workspace token.`
   }
   if (status === 403 && error === 'seat_required') {
-    return `seat_attach needs a seat session. ${BOOT_MAP} A seatless session calls seat_select first (Claude web), or uses a workspace token (Claude Code, CLI).`
+    return `seat_attach is only for a chat thread that has a seat, and this session has none. ${BOOT_MAP} A workspace bearer (CLI or daemon) does not attach: it acts as the agent its token is bound to, or an org admin must mint it one. A connector chat consented to ONE agent already is that agent. Do not call seat_select to get around this.`
   }
   if (status === 403 && (error === 'seat_attach_disabled' || error === 'seat_auto_enroll_disabled')) {
     return `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP}`

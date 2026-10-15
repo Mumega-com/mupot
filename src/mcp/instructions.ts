@@ -16,7 +16,7 @@
 export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & RUNTIME INSTRUCTIONS ===
 
 1. FIRST ACTION: ORIENTATION & BOOT CONTEXT
-   - Always invoke 'boot_context' or 'orient' as your first MCP tool call. 'boot_context' always answers; 'orient' answers only once you act as an agent, so a session with no agent yet should start with 'boot_context' and follow its next_step.
+   - Always invoke 'boot_context' or 'orient' as your first MCP tool call. 'boot_context' always answers; 'orient' with no argument answers only once you act as an agent (orient { agent } also works for an agent you can observe), so a session with no agent yet should start with 'boot_context' and follow its next_step.
    - This returns your authenticated identity, assigned squad, active capability floor, and any unread high-priority inbox messages.
 
 2. ZERO-CAPABILITY DIRECTORY SESSIONS (B1 CEILING)
