@@ -131,6 +131,8 @@ describe('#1457 login-first invite accept (real route)', () => {
     const res = await post(h, 'inv-ceo')
     expect(res.status).toBe(409)
     expect(grants(h, 'member-ceo')).toEqual([])
+    expect(await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' }))
+      .toEqual({ ok: false, error: 'member_already_exists' })
   })
 
   it('SECURITY: a revoked identity, suspended member, or other-tenant row does not prove control', async () => {
@@ -146,6 +148,10 @@ describe('#1457 login-first invite accept (real route)', () => {
       const res = await post(h, 'inv-ceo')
       expect(res.status, mutate).toBe(409)
       expect(grants(h, 'member-ceo'), mutate).toEqual([])
+      // The PRE-check must refuse by name (not merely be caught later by the
+      // write-time re-check, which would surface as a different error).
+      const direct = await acceptInvite(envFor(h), 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+      expect(direct, mutate).toEqual({ ok: false, error: 'member_already_exists' })
       h.close(); h = undefined
     }
   })
@@ -178,6 +184,31 @@ describe('#1457 login-first invite accept (real route)', () => {
     const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
     expect(r.ok).toBe(true)
     expect(grants(h, 'member-ceo')).toEqual([{ scope_type: 'department', scope_id: 'dept-a', capability: 'observer' }])
+  })
+
+  it('write-time re-check: proof or inviter standing lost between pre-check and write lands NO grant and un-spends the invite', async () => {
+    for (const lose of [
+      `UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = 'hli-ceo'`,
+      `UPDATE human_login_identities SET verified_email = 'other@corp.test' WHERE id = 'hli-ceo'`,
+      `UPDATE members SET status = 'suspended' WHERE id = 'member-ceo'`,
+      `UPDATE members SET tenant = 'other-pot' WHERE id = 'member-ceo'`,
+      `DELETE FROM capabilities WHERE id = 'cap-admin'`,
+      `UPDATE members SET status = 'suspended' WHERE id = 'member-admin'`,
+    ]) {
+      h = makeHarness()
+      const harness = h
+      const env = envFor(h)
+      const realBatch = harness.db.batch.bind(harness.db)
+      // Race: the world changes after the pre-checks, right before the batch.
+      env.DB = Object.assign(Object.create(harness.db), {
+        batch: async (stmts: Parameters<typeof realBatch>[0]) => { harness.sqlite.exec(lose); return realBatch(stmts) },
+      }) as Env['DB']
+      const r = await acceptInvite(env, 'inv-ceo', 'Cee', { verifiedMemberId: 'member-ceo' })
+      expect(r, lose).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
+      expect(grants(h, 'member-ceo'), lose).toEqual([])
+      expect(inviteRow(h, 'inv-ceo'), lose).toEqual({ accepted_at: null, member_id: null })
+      h.close(); h = undefined
+    }
   })
 
   it('fresh email regression: a new person still gets a fresh member (unchanged public path)', async () => {
