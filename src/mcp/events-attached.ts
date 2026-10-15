@@ -65,7 +65,7 @@ export async function listLiveAttachmentsForEvents(
                        WHERE g.id = ?4 AND g.member_id = ?2 AND g.tenant = ?1 AND g.channel = 'directory' AND g.agent_id IS NULL
                          AND ${TOKEN_LIVE_PREDICATE('?5').replace(/\bt\./g, 'g.')})
         ORDER BY att.created_at DESC
-        LIMIT 50`,
+        LIMIT 400`, // same ceiling as the attachable-agent list: the per-agent dedupe and the admin floor run AFTER this, so a small cap could hide a real agent
     ).bind(env.TENANT_SLUG, human.memberId, human.harnessId, human.grantTokenId, nowSqlUtc()).all<Row>()).results ?? []
   } catch (err) {
     if (/no such table:\s*agent_seat_(attachments|admissions|seats)\b/i.test(err instanceof Error ? err.message : String(err))) return []
