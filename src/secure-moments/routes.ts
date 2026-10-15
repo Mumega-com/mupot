@@ -517,8 +517,10 @@ function agentPromptBlock(raw: { agentName: string; agentSlug: string; agentId: 
 function decideHelpBlock(env: Env): string {
   let account = ''
   try {
-    const u = new URL('/account', env.PUBLIC_ORIGIN ?? '')
-    if (u.protocol === 'https:') account = u.toString()
+    // Path-routed tenant pots carry a prefix in PUBLIC_ORIGIN (https://host/t/<tenant>): keep it, or the link lands on the colony's
+    // account and a passkey added there belongs to the wrong tenant database.
+    const u = new URL(env.PUBLIC_ORIGIN ?? '')
+    if (u.protocol === 'https:') account = `${u.origin}${u.pathname.replace(/\/+$/, '')}/account`
   } catch { /* no usable dashboard origin: leave the link out */ }
   const addPhone = account ? ` Or <a href="${escapeHtml(account)}" target="_blank" rel="noopener">add this phone as a passkey</a> in My Account (you sign in there first), then come back to this link.` : ''
   return `<p class="muted" id="decide-help">No passkey prompt on this phone, or it did not come back? Open this link in Safari or Chrome itself, not inside another app's built-in browser (in the corner menu choose Open in Safari), and tap once.${addPhone}</p>`

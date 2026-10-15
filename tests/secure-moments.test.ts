@@ -1331,6 +1331,11 @@ describe('round 2 P2/P3', () => {
     expect(html).toMatch(/href="https:\/\/[^"]+\/account" target="_blank" rel="noopener"/)
     expect(html).toContain(`href="https://${COLONY}/account"`) // the signed-in dashboard, which requires a fresh re-auth to mint an enrolment
     expect(html).not.toMatch(/\/m\/enrol\//) // the page itself never offers an enrolment
+    // a path-routed tenant pot keeps its /t/<tenant> prefix, with or without a trailing slash
+    for (const origin of [`https://${COLONY}/t/neuraya`, `https://${COLONY}/t/neuraya/`]) {
+      const pref = await (await hit(m.path, {}, { ...env, PUBLIC_ORIGIN: origin } as Env)).text()
+      expect(pref).toContain(`href="https://${COLONY}/t/neuraya/account"`)
+    }
     // a non-https dashboard origin: the advice stays, the link goes (never a plain-http link to the account page)
     const plain = await (await hit(m.path, {}, { ...env, PUBLIC_ORIGIN: `http://${COLONY}` } as Env)).text()
     expect(plain).toContain('id="decide-help"')
