@@ -49,6 +49,8 @@ export interface SubscriptionRow {
   status: 'active' | 'revoked' | 'expired'
   refresh_before: string
   verified_at: string | null
+  /** The human's connector grant that authorised an ATTACHED-agent subscribe (migration 0221); NULL for every other kind. */
+  grant_token_id?: string | null
 }
 
 export type EventsFailure = {
@@ -77,8 +79,11 @@ export async function subscriptionId(
   callbackUrl: string,
   eventName: string,
   args: unknown,
+  /** ATTACHED-agent subscriptions only: the consenting human. Several humans can be attached to one agent, and two of them must never share
+   *  (or take over, or unsubscribe) one row. Absent for every other subscription, so every pre-existing id is byte-identical. */
+  humanSalt?: string,
 ): Promise<string> {
-  const material = ['mcp-events-sub:v1', agentId, callbackUrl, eventName, canonicalJson(args)].join('\n')
+  const material = ['mcp-events-sub:v1', agentId, callbackUrl, eventName, canonicalJson(args), ...(humanSalt ? [`human:${humanSalt}`] : [])].join('\n')
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material))
   const hex = Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('')
   return `sub_${hex.slice(0, 32)}`
@@ -185,6 +190,8 @@ export async function eventsSubscribe(
   floorOk: boolean,
   paramsRaw: unknown,
   nowMs: number = Date.now(),
+  /** Set ONLY by the attached-agent path (events-attached.ts): the human whose connector grant authorised this subscribe. */
+  attached?: { humanMemberId: string; grantTokenId: string },
 ): Promise<EventsSuccess | EventsFailure> {
   const principal = eventsPrincipal(auth, floorOk)
   if (!principal.ok) return principal
@@ -215,7 +222,7 @@ export async function eventsSubscribe(
     return fail(-32003, 'forbidden', { reason: 'agent_inactive' }, 403)
   }
 
-  const id = await subscriptionId(principal.agentId, url, name, args)
+  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId)
   const now = new Date(nowMs).toISOString()
   const fingerprint = await secretFingerprint(secret)
 
@@ -294,8 +301,8 @@ export async function eventsSubscribe(
     `INSERT INTO event_subscriptions
        (id, tenant, agent_id, member_id, token_id, consented_by_member_id, event_name, arguments_json,
         callback_url, secret_ciphertext, secret_fingerprint, status, refresh_before, verified_at,
-        created_at, last_refreshed_at)
-     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?13, ?14, ?14
+        created_at, last_refreshed_at, grant_token_id)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?13, ?14, ?14, ?17
       WHERE EXISTS (SELECT 1 FROM event_subscriptions WHERE id = ?1 AND agent_id = ?3 AND status = 'active')
          OR (SELECT COUNT(*) FROM event_subscriptions
               WHERE tenant = ?2 AND agent_id = ?3 AND status = 'active') < ?16
@@ -303,6 +310,7 @@ export async function eventsSubscribe(
        member_id = excluded.member_id,
        token_id = excluded.token_id,
        consented_by_member_id = excluded.consented_by_member_id,
+       grant_token_id = excluded.grant_token_id,
        prev_secret_ciphertext = CASE WHEN event_subscriptions.secret_fingerprint != excluded.secret_fingerprint
                                      THEN event_subscriptions.secret_ciphertext
                                      ELSE event_subscriptions.prev_secret_ciphertext END,
@@ -336,6 +344,7 @@ export async function eventsSubscribe(
       now,
       rotationExpiry,
       MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT,
+      attached?.grantTokenId ?? null,
     )
     .run()
   if ((res.meta?.changes ?? 0) === 0) {
@@ -370,6 +379,7 @@ export async function eventsUnsubscribe(
   auth: AuthContext,
   floorOk: boolean,
   paramsRaw: unknown,
+  attached?: { humanMemberId: string },
 ): Promise<EventsSuccess | EventsFailure> {
   const principal = eventsPrincipal(auth, floorOk)
   if (!principal.ok) return principal
@@ -380,7 +390,7 @@ export async function eventsUnsubscribe(
   const { name, args, url } = parsed.t
   // The id is derived from the CALLER's own agent id, so a caller can only ever address its own
   // subscriptions; revokeSubscriptionForAgent re-asserts ownership in the write's WHERE.
-  const id = await subscriptionId(principal.agentId, url, name, args)
+  const id = await subscriptionId(principal.agentId, url, name, args, attached?.humanMemberId)
   await revokeSubscriptionForAgent(env, principal.agentId, id, 'unsubscribed')
   return { ok: true, result: {} } // idempotent: same result whether or not a live row existed
 }
@@ -415,6 +425,18 @@ export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Prom
   // does per request) so a missed trigger can never keep a wake alive.
   const att = await attachmentLiveness(env, sub.token_id)
   if (att && !att.live) return { live: false, reason: att.reason }
+  // ...and the HUMAN's connector grant that authorised it must still be live (revoking the grant stops the wake). An attachment subscription
+  // with no recorded grant fails closed.
+  if (att) {
+    const g = sub.grant_token_id && sub.consented_by_member_id
+      ? await env.DB.prepare(
+          `SELECT 1 AS ok FROM member_tokens g
+            WHERE g.id = ?1 AND g.member_id = ?2 AND g.tenant = ?3 AND g.channel = 'directory' AND g.agent_id IS NULL
+              AND ${TOKEN_LIVE_PREDICATE('?4').replace(/\bt\./g, 'g.')}`,
+        ).bind(sub.grant_token_id, sub.consented_by_member_id, env.TENANT_SLUG, nowSqlUtc()).first<{ ok: number }>()
+      : null
+    if (!g) return { live: false, reason: 'grant_token_not_live' }
+  }
   const grants = row.channel === 'directory'
     ? await resolveConsentedAgentCapabilities(env, sub.agent_id, sub.consented_by_member_id)
     : await resolveCapabilities(env, sub.member_id)

@@ -1774,6 +1774,7 @@ describe('MCP Events for attached agents', () => {
     const att = one<{ seat_token_id: string }>(`SELECT seat_token_id FROM agent_seat_attachments WHERE detached_at IS NULL`)!
     expect(row).toMatchObject({ agent_id: 'agent-rava', token_id: att.seat_token_id, consented_by_member_id: HUMAN, member_id: 'mem-agent-rava', status: 'active', arguments_json: '{}' })
     expect(row.token_id).not.toBe(g.tokenId) // never the human's grant
+    expect((row as unknown as { grant_token_id: string }).grant_token_id).toBe(g.tokenId) // the human's grant is recorded so ITS revocation stops the wake
   })
 
   it('several attached agents: no agent argument -> agent_required (lists them); a named agent works; an agent not attached is the same refusal whether or not it exists', async () => {
@@ -1852,5 +1853,112 @@ describe('MCP Events for attached agents', () => {
     expect(pickAttachment(twins, undefined)).toMatchObject({ ok: false, code: 'agent_required' })
     expect(pickAttachment([twins[0]], undefined)).toMatchObject({ ok: true })
     expect(pickAttachment(twins, 42)).toMatchObject({ ok: false, code: 'invalid_arguments' })
+  })
+})
+
+describe('MCP Events for attached agents: revocation and isolation (gate round)', () => {
+  const CB = 'https://hooks.example.com/mcp/events'
+  const SECRET = `whsec_${Buffer.from('a'.repeat(32)).toString('base64')}`
+  const evEnv = (): Env => envFor(h, { EVENTS_ENABLED: 'true', EVENTS_CALLBACK_HOSTS: 'hooks.example.com', BUS: { send: vi.fn().mockResolvedValue(undefined) } })
+  const ev = async (env: Env, ctx: AuthContext, method: string, params: unknown): Promise<{ body: { result?: Record<string, unknown>; error?: { message: string } } }> => {
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    return { body: (await (await mcpApp.fetch(mcpInternalRequest(req, ctx), env)).json()) as never }
+  }
+  const sub = (agent?: string): Record<string, unknown> => ({ name: 'message.created', arguments: agent ? { agent } : {}, delivery: { mode: 'webhook', url: CB, secret: SECRET }, ttlMs: 3_600_000 })
+  const dropAttachmentTriggers = (): void => {
+    for (const tbl of ['agent_seat_attachments', 'agent_seat_admissions', 'agent_seats', 'member_tokens']) {
+      for (const tr of h.sqlite.prepare(`SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='${tbl}'`).all() as Array<{ name: string }>) h.sqlite.exec(`DROP TRIGGER IF EXISTS "${tr.name}"`)
+    }
+  }
+  beforeEach(() => {
+    vi.stubGlobal('fetch', async (_u: unknown, init?: RequestInit) => {
+      const b = JSON.parse(String(init?.body ?? '{}')) as { type?: string; challenge?: string }
+      return new Response(JSON.stringify(b.type === 'verification' ? { challenge: b.challenge } : {}), { status: 200 })
+    })
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('REVOKING the human\'s connector grant stops the wake at the next delivery (the attachment alone staying live is not enough)', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    expect((await ev(env, g.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const { subscriberAccessLive } = await import('../src/mcp/events-subscriptions')
+    const row = one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)!
+    expect(await subscriberAccessLive(env, row as never)).toEqual({ live: true })
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-10-15 00:00:00' WHERE id = '${g.tokenId}'`)
+    expect(await subscriberAccessLive(env, row as never)).toEqual({ live: false, reason: 'grant_token_not_live' })
+    // an attachment subscription with NO recorded grant fails closed
+    expect(await subscriberAccessLive(env, { ...row, grant_token_id: null } as never)).toMatchObject({ live: false })
+  })
+
+  it('two humans attached to the SAME agent with the SAME callback keep two separate subscriptions: neither can take over, refresh or unsubscribe the other\'s', async () => {
+    const env = evEnv()
+    h.sqlite.exec(`INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h2-core', '${HUMAN2}', 'squad', 'squad-core', 'admin')`)
+    const g1 = await grant(env, HUMAN)
+    const g2 = await grant(env, HUMAN2)
+    await admitAndAttach(env, g1, 'conv-a', 'rava')
+    await admitAndAttach(env, g2, 'conv-b', 'rava')
+    expect((await ev(env, g1.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    expect((await ev(env, g2.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const rows = h.sqlite.prepare(`SELECT id, consented_by_member_id, token_id, grant_token_id, status, secret_fingerprint FROM event_subscriptions ORDER BY consented_by_member_id`).all() as Array<Record<string, string>>
+    expect(rows).toHaveLength(2)
+    expect(rows[0].id).not.toBe(rows[1].id)
+    expect(rows.map((r) => r.consented_by_member_id)).toEqual([HUMAN, HUMAN2])
+    expect(rows.map((r) => r.grant_token_id)).toEqual([g1.tokenId, g2.tokenId])
+    // H2 unsubscribes: H1's row is untouched
+    await ev(env, g2.ctx, 'events/unsubscribe', sub('rava'))
+    const after = h.sqlite.prepare(`SELECT consented_by_member_id, status FROM event_subscriptions ORDER BY consented_by_member_id`).all() as Array<Record<string, string>>
+    expect(after).toEqual([{ consented_by_member_id: HUMAN, status: 'active' }, { consented_by_member_id: HUMAN2, status: 'revoked' }])
+  })
+
+  it('parameter errors are JSON-RPC errors on HTTP 200 (a client must not read them as an auth failure), and arguments stay as strict as an unattached subscribe', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin')
+    const post = async (params: unknown): Promise<{ status: number; error?: { message: string } }> => {
+      const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events/subscribe', params }) })
+      const res = await mcpApp.fetch(mcpInternalRequest(req, g.ctx), env)
+      return { status: res.status, ...((await res.json()) as { error?: { message: string } }) }
+    }
+    expect(await post(sub())).toMatchObject({ status: 200, error: { message: 'agent_required' } })
+    expect(await post(sub('nobody'))).toMatchObject({ status: 200, error: { message: 'agent_not_attached' } })
+    expect(await post({ ...sub('rava'), arguments: 'rava' })).toMatchObject({ status: 200, error: { message: 'invalid_arguments' } })
+    expect(await post({ ...sub('rava'), arguments: ['rava'] })).toMatchObject({ status: 200, error: { message: 'invalid_arguments' } })
+    expect(await post({ ...sub('rava'), arguments: { agent: 'rava', extra: 1 } })).toMatchObject({ error: { message: 'invalid_arguments' } }) // leftover keys refused downstream
+    expect((await post(sub('rava'))).error).toBeUndefined()
+  })
+
+  it('every liveness predicate is pinned: a non-live admission, a retired seat, a revoked attachment token, or the human losing squad admin removes the candidate AND (at delivery) ends the wake', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    expect((await ev(env, g.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const { listLiveAttachmentsForEvents } = await import('../src/mcp/events-attached')
+    const { subscriberAccessLive } = await import('../src/mcp/events-subscriptions')
+    const row = one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)!
+    const ids = (): Promise<string[]> => listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId }).then((l) => l.map((a) => a.agentId))
+    expect(await ids()).toEqual(['agent-rava'])
+    dropAttachmentTriggers()
+    const breaks: Array<[string, string, string, string, string | null]> = [
+      // [name, break SQL, restore SQL, expected delivery reason, expected list-empty (null = delivery-only break)]
+      ['admission not live', `UPDATE agent_seat_admissions SET status = 'revoked'`, `UPDATE agent_seat_admissions SET status = 'live'`, 'admission_not_live', 'x'],
+      ['seat retired', `UPDATE agent_seats SET retired_at = '2026-10-15 00:00:00'`, `UPDATE agent_seats SET retired_at = NULL`, 'seat_retired', 'x'],
+      ['attachment token revoked', `UPDATE member_tokens SET revoked_at = '2026-10-15 00:00:00' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`, `UPDATE member_tokens SET revoked_at = NULL WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`, 'token_not_live', 'x'],
+    ]
+    for (const [name, brk, restore, reason] of breaks) {
+      h.sqlite.exec(brk)
+      expect(await ids(), `${name}: list`).toEqual([])
+      const live = await subscriberAccessLive(env, row as never)
+      expect(live, `${name}: delivery`).toMatchObject({ live: false })
+      if (name !== 'attachment token revoked') expect((live as { reason: string }).reason, name).toBe(reason)
+      h.sqlite.exec(restore)
+      expect(await ids(), `${name}: restored`).toEqual(['agent-rava'])
+    }
+    // the human loses admin on the agent's squad: no candidate, and delivery ends (consent-clamped capabilities re-derived)
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${HUMAN}'`)
+    expect(await ids()).toEqual([])
+    expect(await subscriberAccessLive(env, row as never)).toMatchObject({ live: false })
   })
 })

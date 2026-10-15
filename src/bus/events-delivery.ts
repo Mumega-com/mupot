@@ -250,7 +250,7 @@ export async function deliverSubscriptionEvent(env: Env, payload: unknown, opts:
   const sub = await env.DB.prepare(
     `SELECT id, tenant, agent_id, member_id, token_id, consented_by_member_id, event_name, arguments_json,
             callback_url, secret_ciphertext, secret_fingerprint, prev_secret_ciphertext,
-            prev_secret_expires_at, status, refresh_before, verified_at
+            prev_secret_expires_at, status, refresh_before, verified_at, grant_token_id
        FROM event_subscriptions WHERE id = ?1 AND tenant = ?2`,
   ).bind(job.subscription_id, env.TENANT_SLUG).first<SubscriptionRow>()
   if (!sub) return 'skipped'

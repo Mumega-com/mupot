@@ -7784,7 +7784,11 @@ async function handleJsonRpc(
     // neither discover nor subscribe to message.created. The principal is the live ATTACHMENT found from server-held facts (see
     // events-attached.ts); no seat handle is read or minted here, and the stored subscription uses the attachment's own token.
     const attachedCandidates = seatAttachEnabled(c.env) && auth.channel === 'directory' && !auth.boundAgentId && auth.harnessId && auth.memberId && auth.tokenId
-      ? await listLiveAttachmentsForEvents(c.env, { memberId: auth.memberId, harnessId: auth.harnessId, grantTokenId: auth.tokenId }).catch(() => [])
+      ? await listLiveAttachmentsForEvents(c.env, { memberId: auth.memberId, harnessId: auth.harnessId, grantTokenId: auth.tokenId }).catch((e: unknown) => {
+        // Fails closed (the caller is treated as unattached) but never silently: a DB fault must be visible in the logs.
+        console.error('[mcp:events] attached candidate lookup failed', e instanceof Error ? e.message : String(e))
+        return []
+      })
       : []
 
     if (method === 'events/list') {
@@ -7837,20 +7841,27 @@ async function handleJsonRpc(
     }
     let evAuth = auth
     let evParams: unknown = body.params
+    let evAttached: { humanMemberId: string; grantTokenId: string } | undefined
     if (attachedCandidates.length > 0 && (method === 'events/subscribe' || method === 'events/unsubscribe')) {
       const p = typeof body.params === 'object' && body.params !== null ? { ...(body.params as Record<string, unknown>) } : {}
       const rawArgs = p.arguments
-      const argObj = typeof rawArgs === 'object' && rawArgs !== null && !Array.isArray(rawArgs) ? rawArgs as Record<string, unknown> : {}
+      // Same strictness as an unattached subscribe: arguments must be absent, null, or a plain object (a string or array is invalid).
+      if (rawArgs !== undefined && rawArgs !== null && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+        return rpcError(id, -32602, 'invalid_arguments', { reason: 'arguments must be an object' })
+      }
+      const argObj = rawArgs !== undefined && rawArgs !== null ? rawArgs as Record<string, unknown> : {}
       const { agent: agentRef, ...restArgs } = argObj
       const picked = pickAttachment(attachedCandidates, agentRef)
-      if (!picked.ok) return rpcError(id, -32602, picked.code, picked.data, 403)
+      // A fixable PARAMETER error (name the agent / it is not attached): a JSON-RPC error on HTTP 200, never a 403 that a client would read as an auth failure.
+      if (!picked.ok) return rpcError(id, -32602, picked.code, picked.data)
       evAuth = await eventsAuthForAttachment(c.env, auth, picked.attachment)
+      evAttached = { humanMemberId: auth.memberId as string, grantTokenId: auth.tokenId as string }
       evParams = { ...p, arguments: restArgs } // message.created takes no other arguments: anything left over is refused downstream
     }
     const floorOk = callerFloorOk(evAuth, hasWorkspaceAdmin(evAuth))
     const out = method === 'events/subscribe'
-      ? await eventsSubscribe(c.env, evAuth, floorOk, evParams)
-      : await eventsUnsubscribe(c.env, evAuth, floorOk, evParams)
+      ? await eventsSubscribe(c.env, evAuth, floorOk, evParams, undefined, evAttached)
+      : await eventsUnsubscribe(c.env, evAuth, floorOk, evParams, evAttached)
     return out.ok ? ok(id, out.result) : rpcError(id, out.code, out.message, out.data, out.status)
   }
 
