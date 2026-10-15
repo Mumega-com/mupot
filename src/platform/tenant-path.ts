@@ -38,9 +38,23 @@ export function parseTenantPrefix(value: string | null | undefined): string | nu
   return PREFIX_RE.test(v) ? v : null
 }
 
-/** The validated prefix for a request, or null for an unprefixed (root / subdomain) tenant. */
-export function tenantPrefixOf(request: Request): string | null {
-  return parseTenantPrefix(request.headers.get(TENANT_PREFIX_HEADER))
+/**
+ * The validated prefix for a request, or null. The header is client-reachable on any direct
+ * request, so it is honoured ONLY when it names THIS Worker's own tenant slug (server config):
+ * a forged `/t/<other-pot>` can never aim a link at another tenant's isolate. A forged
+ * `/t/<own-slug>` re-roots only onto this same tenant's legitimate apex address.
+ */
+export function tenantPrefixOf(request: Request, ownSlug: string): string | null {
+  const prefix = parseTenantPrefix(request.headers.get(TENANT_PREFIX_HEADER))
+  return prefix !== null && prefix === `/t/${ownSlug.toLowerCase()}` ? prefix : null
+}
+
+/** Drop a header that does not name this tenant, so no downstream reader can see a forged value. */
+export function stripUntrustedPrefix(request: Request, ownSlug: string): Request {
+  if (!request.headers.has(TENANT_PREFIX_HEADER) || tenantPrefixOf(request, ownSlug) !== null) return request
+  const headers = new Headers(request.headers)
+  headers.delete(TENANT_PREFIX_HEADER)
+  return new Request(request, { headers })
 }
 
 /** True for `/x`, false for `//x`, `/\x`, schemes, relative paths and control characters. */
@@ -58,8 +72,10 @@ export function tenantPath(prefix: string | null, path: string): string {
 }
 
 /** Does `path` already live under `prefix` (so it must not be prefixed twice)? */
-function alreadyPrefixed(path: string, prefix: string): boolean {
-  return path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}?`) || path.startsWith(`${prefix}#`)
+const ANY_PREFIXED_RE = /^\/t\/[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?(?:[/?#]|$)/i
+function alreadyPrefixed(path: string, _prefix: string): boolean {
+  // Any valid /t/<slug> start is already an addressed path: never stack a second prefix on it.
+  return ANY_PREFIXED_RE.test(path)
 }
 
 /** Truly global paths that must NOT gain the tenant prefix. Empty by design: even OAuth and
@@ -84,7 +100,8 @@ export function prefixLocation(location: string, prefix: string): string {
 
 // `href="/x"`, `action='/x'`, and the backslash-escaped form `href=\"/x\"` that appears when
 // markup sits inside a JS string in an inline script. The attribute must be preceded by
-// whitespace or a quote so `data-href=` style names are still caught but `xhref=` is not.
+// whitespace, so `data-href=` and `xhref=` are NOT matched. `srcset`/`xlink:href` are not rewritten
+// (the dashboard emits neither; add here if that changes).
 const ATTR_RE = /(\s(?:href|src|action|formaction)\s*=\s*)(\\?)(["'])(\/(?!\/)[^"'\\]*)/gi
 // `location.href = '/x'`, `window.location = "/x"`, `location.assign('/x')`, `location.replace('/x')`.
 const NAV_ASSIGN_RE = /(\blocation(?:\.href)?\s*=\s*)(["'`])(\/(?!\/)[^"'`\\]*)/g
@@ -112,22 +129,47 @@ function clientShim(prefix: string): string {
     `})();</script>`
 }
 
+const JS_SCRIPT_TYPE_RE = /^(?:|text\/javascript|application\/javascript|module)$/i
+
+function rewriteJs(js: string, prefix: string): string {
+  const navFix = (_m: string, lead: string, q: string, path: string): string => `${lead}${q}${prefixUrlValue(path, prefix)}`
+  return js
+    .replace(ATTR_RE, (_m, lead: string, esc: string, q: string, path: string) => `${lead}${esc}${q}${prefixUrlValue(path, prefix)}`)
+    .replace(NAV_ASSIGN_RE, navFix).replace(NAV_CALL_RE, navFix).replace(CALL_RE, navFix).replace(XHR_RE, navFix).replace(ORIGIN_JOIN_RE, navFix)
+}
+
+function rewriteTag(tag: string, prefix: string): string {
+  let out = tag.replace(ATTR_RE, (_m, lead: string, esc: string, q: string, path: string) =>
+    `${lead}${esc}${q}${prefixUrlValue(path, prefix)}`)
+  if (/^<meta\b/i.test(tag) && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tag)) {
+    out = out.replace(META_REFRESH_RE, (_m, lead: string, path: string) => `${lead}${prefixUrlValue(path, prefix)}`)
+  }
+  return out
+}
+
+// One pass over the markup: <pre>/<code>/<textarea> bodies are left alone; <script> bodies get the
+// JS rules (JSON/other types are skipped); every other TAG gets attribute rewriting; text content
+// between tags is never touched.
+const SEGMENT_RE = /(<(pre|code|textarea)\b[^>]*>[\s\S]*?<\/\2\s*>)|(<script\b([^>]*)>)([\s\S]*?)(<\/script\s*>)|(<[a-zA-Z][^<>]*>)/gi
+
 /** Rewrite an HTML document for a prefixed tenant. Pure string transform on the emitted markup. */
 export function rewriteHtmlForPrefix(html: string, prefix: string, injectShim = true): string {
-  let out = html.replace(ATTR_RE, (_m, lead: string, esc: string, q: string, path: string) =>
-    `${lead}${esc}${q}${prefixUrlValue(path, prefix)}`)
-  const navFix = (_m: string, lead: string, q: string, path: string): string => `${lead}${q}${prefixUrlValue(path, prefix)}`
-  out = out.replace(NAV_ASSIGN_RE, navFix).replace(NAV_CALL_RE, navFix).replace(CALL_RE, navFix).replace(XHR_RE, navFix).replace(ORIGIN_JOIN_RE, navFix)
-  out = out.replace(META_REFRESH_RE, (_m, lead: string, path: string) => `${lead}${prefixUrlValue(path, prefix)}`)
-  if (!injectShim) return out
+  const out = html.replace(SEGMENT_RE, (...m: string[]) => {
+    if (m[1] !== undefined) return m[1]
+    if (m[3] !== undefined) {
+      const type = /\btype\s*=\s*["']?([^"'\s>]*)/i.exec(m[4] ?? '')?.[1] ?? ''
+      const open = rewriteTag(m[3], prefix)
+      return `${open}${JS_SCRIPT_TYPE_RE.test(type) ? rewriteJs(m[5], prefix) : m[5]}${m[6]}`
+    }
+    return rewriteTag(m[7], prefix)
+  })
+  // Fragments (no document structure) get no shim: the host page owns the document.
+  if (!injectShim || !/<!doctype|<html\b|<head\b/i.test(out)) return out
   const shim = clientShim(prefix)
-  const head = /<head[^>]*>/i.exec(html)
-  if (head !== null) {
-    // Insert after the (already rewritten) opening <head> tag.
-    const idx = out.search(/<head[^>]*>/i)
-    const tag = /<head[^>]*>/i.exec(out)
-    if (idx >= 0 && tag !== null) return out.slice(0, idx + tag[0].length) + shim + out.slice(idx + tag[0].length)
-  }
+  const tag = /<head(?:\s[^>]*)?>/i.exec(out)
+  if (tag !== null) return out.slice(0, tag.index + tag[0].length) + shim + out.slice(tag.index + tag[0].length)
+  const html1 = /<html(?:\s[^>]*)?>/i.exec(out)
+  if (html1 !== null) return out.slice(0, html1.index + html1[0].length) + shim + out.slice(html1.index + html1[0].length)
   return shim + out
 }
 
@@ -140,6 +182,8 @@ export async function applyTenantPrefix(response: Response, prefix: string): Pro
   const isHtml = type.includes('text/html')
   if (location === null && !isHtml) return response
   const headers = new Headers(response.headers)
+  // Cache belt-and-braces: the body/Location depends on the prefix header.
+  headers.append('vary', TENANT_PREFIX_HEADER)
   if (location !== null) headers.set('location', prefixLocation(location, prefix))
   if (!isHtml || response.body === null) {
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
@@ -157,19 +201,21 @@ export async function applyTenantPrefix(response: Response, prefix: string): Pro
  * PUBLIC_ORIGIN host (the request host of a dispatched tenant is the internal `<slug>.<root>`
  * dispatch address, not a URL a human can open) plus the validated prefix.
  */
-export function requestBase(env: { PUBLIC_ORIGIN?: string }, request: Request): string {
+export function requestBase(env: { PUBLIC_ORIGIN?: string; TENANT_SLUG?: string }, request: Request): string {
   const reqOrigin = new URL(request.url).origin
-  const prefix = tenantPrefixOf(request)
+  const prefix = tenantPrefixOf(request, env.TENANT_SLUG || 'mumega')
   if (prefix === null) return reqOrigin
-  let origin = reqOrigin
   const pinned = env.PUBLIC_ORIGIN?.trim()
-  if (pinned) {
-    try {
-      const u = new URL(pinned)
-      if (u.protocol === 'https:' || u.protocol === 'http:') origin = u.origin
-    } catch { /* fall back to the request origin */ }
+  const base = pinned ? pinnedBase(pinned) : null
+  if (base !== null) {
+    // The operator-pinned base wins when it carries no path (the home tenant reached through its
+    // /t/<home> alias keeps the ROOT URLs, e.g. the registered OAuth /auth/callback) or the same
+    // prefix (a path-routed pot). A pinned base naming a different prefix is misconfiguration.
+    const pinnedPrefix = base.slice(new URL(base).origin.length)
+    if (pinnedPrefix === '' || pinnedPrefix === prefix) return base
+    return `${new URL(base).origin}${prefix}`
   }
-  return `${origin}${prefix}`
+  return `${reqOrigin}${prefix}`
 }
 
 /** Operator-pinned PUBLIC_ORIGIN as a base URL: origin plus its validated `/t/<slug>` path, if any. */
@@ -195,5 +241,5 @@ export function pinnedBase(pinned: string): string | null {
 export function responsePrefixFor(original: Request, homeSlug: string): string | null {
   const path = extractPathTenant(new URL(original.url).pathname)
   if (path !== null) return path.slug === homeSlug.toLowerCase() ? `/t/${path.slug}` : null
-  return tenantPrefixOf(original)
+  return tenantPrefixOf(original, homeSlug)
 }

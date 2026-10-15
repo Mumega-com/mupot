@@ -80,7 +80,7 @@ import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
-import { applyTenantPrefix, responsePrefixFor } from './platform/tenant-path'
+import { applyTenantPrefix, responsePrefixFor, stripUntrustedPrefix } from './platform/tenant-path'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
@@ -375,8 +375,13 @@ function reportUnmatchedCron(scheduledAt: Date): void {
  * dispatched request) and re-validated by parseTenantPrefix; it never comes from a URL.
  */
 async function handleWithTenantPrefix(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  // The prefix header is client-reachable on direct requests: drop anything that does not name this
+  // Worker's own tenant before any handler can read it (an unstripped forgery put a bearer verify
+  // link into the sign-in email pointing at another tenant).
+  const ownSlug = env.TENANT_SLUG || 'mumega'
+  req = stripUntrustedPrefix(req, ownSlug)
   const response = await handleRequest(req, env, ctx)
-  const prefix = responsePrefixFor(req, env.TENANT_SLUG || 'mumega')
+  const prefix = responsePrefixFor(req, ownSlug)
   return prefix === null || response.status === 101 ? response : applyTenantPrefix(response, prefix)
 }
 

@@ -2,7 +2,7 @@
 // prefix. Exercises the real dashboardApp on the real migration chain, then the same choke point
 // the Worker entry applies (responsePrefixFor + applyTenantPrefix).
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { requiredCanonicalOrigin, canonicalOrigin } from '../src/dashboard/connect'
@@ -16,7 +16,9 @@ import {
   requestBase,
   responsePrefixFor,
   rewriteHtmlForPrefix,
+  stripUntrustedPrefix,
   tenantPath,
+  tenantPrefixOf,
 } from '../src/platform/tenant-path'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -81,6 +83,8 @@ describe('redirects (Location header)', () => {
     expect(responsePrefixFor(new Request('https://h.test/t/mumega/x', { headers: forged }), 'mumega')).toBe('/t/mumega')
     expect(responsePrefixFor(new Request('https://h.test/t/other/x', { headers: forged }), 'mumega')).toBeNull()
     expect(responsePrefixFor(new Request('https://h.test/t/other/x'), 'mumega')).toBeNull()
+    expect(responsePrefixFor(new Request('https://h.test/x', { headers: forged }), 'mumega')).toBeNull()
+    expect(responsePrefixFor(new Request('https://h.test/x', { headers: { [TENANT_PREFIX_HEADER]: '/t/mumega' } }), 'mumega')).toBe('/t/mumega')
   })
 
   it('the apex stamps the SERVER-resolved prefix on home and dispatched requests, overwriting a client value', () => {
@@ -143,11 +147,109 @@ describe('absolute links built outside the response (email / Stripe / OAuth / MC
     expect(canonicalOrigin({ PUBLIC_ORIGIN: 'https://pot.example.com/%2e%2e//evil' }, 'x')).toBe('https://pot.example.com')
   })
 
-  it('requestBase: dispatched tenant uses the pinned public host + prefix, not the internal dispatch host', () => {
+  it('requestBase: a path-routed pot uses the pinned public host + prefix, not the internal dispatch host', () => {
     const req = new Request('https://gaf.mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/gaf' } })
-    expect(requestBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf' }, req)).toBe('https://mupot.mumega.com/t/gaf')
+    expect(requestBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf', TENANT_SLUG: 'gaf' }, req)).toBe('https://mupot.mumega.com/t/gaf')
     const plain = new Request('https://pot.example.com/auth/login')
-    expect(requestBase({ PUBLIC_ORIGIN: 'https://other.test' }, plain)).toBe('https://pot.example.com')
+    expect(requestBase({ PUBLIC_ORIGIN: 'https://other.test', TENANT_SLUG: 'gaf' }, plain)).toBe('https://pot.example.com')
+  })
+
+  it('home tenant on its /t/<home> alias keeps ROOT urls (OAuth callback stays the registered /auth/callback)', () => {
+    const req = new Request('https://mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/mumega' } })
+    expect(requestBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com', TENANT_SLUG: 'mumega' }, req)).toBe('https://mupot.mumega.com')
+  })
+
+  it('FORGED HEADER (direct request, no /t/ path): no reader honours a prefix naming another tenant', () => {
+    const forged = { [TENANT_PREFIX_HEADER]: '/t/attackerpot' }
+    const env = { PUBLIC_ORIGIN: 'https://pot.example.com', TENANT_SLUG: 'victim' }
+    const req = new Request('https://pot.example.com/auth/email/start', { method: 'POST', headers: forged })
+    expect(tenantPrefixOf(req, 'victim')).toBeNull()
+    expect(requestBase(env, req)).toBe('https://pot.example.com')
+    expect(responsePrefixFor(req, 'victim')).toBeNull()
+    expect(stripUntrustedPrefix(req, 'victim').headers.has(TENANT_PREFIX_HEADER)).toBe(false)
+    // the tenant's own slug is the only value honoured
+    const own = new Request('https://x.test/', { headers: { [TENANT_PREFIX_HEADER]: '/t/victim' } })
+    expect(stripUntrustedPrefix(own, 'victim')).toBe(own)
+  })
+})
+
+describe('forged prefix header on the real sign-in route (end to end)', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+  })
+  afterEach(() => {
+    harness.close()
+    vi.restoreAllMocks()
+  })
+
+  async function startSignIn(headers: Record<string, string>, publicOrigin: string): Promise<string> {
+    const calls: string[] = []
+    vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => void calls.push(a.map(String).join(' ')))
+    const env = {
+      DB: harness.db, TENANT_SLUG: 'victim', BRAND: 'V', PUBLIC_ORIGIN: publicOrigin, SESSIONS: kv(),
+      OAUTH_CLIENT_ID: 'id', OAUTH_CLIENT_SECRET: 'sec', EMAIL_LOGIN_ENABLED: 'true', EMAIL_PROVIDER: 'console',
+    } as unknown as Env
+    const deferred: Promise<unknown>[] = []
+    const ctx = { waitUntil: (p: Promise<unknown>) => deferred.push(p), passThroughOnException: () => {} } as unknown as ExecutionContext
+    const res = await authApp.fetch(new Request('https://pot.example.com/email/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Origin: 'https://pot.example.com', ...headers },
+      body: JSON.stringify({ email: 'someone@example.com' }),
+    }), env, ctx)
+    expect(res.status).toBe(200)
+    await Promise.all(deferred)
+    const sent = calls.find((c) => /Sign in: /.test(c))
+    return /Sign in: (\S+)/.exec(sent ?? '')?.[1] ?? ''
+  }
+
+  it('a forged /t/attackerpot yields a sign-in link with NO prefix, same as no header', async () => {
+    const forged = await startSignIn({ [TENANT_PREFIX_HEADER]: '/t/attackerpot' }, 'https://pot.example.com')
+    expect(forged).toMatch(/^https:\/\/pot\.example\.com\/auth\/email\/verify\?/)
+    expect(forged).not.toContain('/t/')
+  })
+
+  it('the legitimate stamp for this tenant still yields the prefixed link', async () => {
+    const ok = await startSignIn({ [TENANT_PREFIX_HEADER]: '/t/victim' }, 'https://mupot.mumega.com/t/victim')
+    expect(ok).toMatch(/^https:\/\/mupot\.mumega\.com\/t\/victim\/auth\/email\/verify\?/)
+  })
+})
+
+describe('rewriter narrowing (P2)', () => {
+  it('never stacks a second prefix on any /t/<slug> path', () => {
+    expect(prefixLocation('/t/other/x', '/t/local')).toBe('/t/other/x')
+    expect(prefixLocation('/t/other', '/t/local')).toBe('/t/other')
+    expect(prefixLocation('/t/other?x=1', '/t/local')).toBe('/t/other?x=1')
+    expect(prefixLocation('/team/x', '/t/local')).toBe('/t/local/team/x')
+  })
+
+  it('leaves pre/code/textarea bodies, JSON scripts and text content alone; meta refresh only in a refresh meta', () => {
+    const html = '<!doctype html><html><head><meta name="x" content="a;url=/n"><meta http-equiv="refresh" content="0;url=/g">'
+      + '<script type="application/json">{"u":"fetch(\'/j\')","h":" href=\"/j2\""}</script></head><body>'
+      + '<header><a href="/h">h</a></header><pre>href="/p" fetch(\'/p2\')</pre><code>action="/c"</code>'
+      + '<p>text href="/t1" and url=/t2</p><textarea>href="/ta"</textarea></body></html>'
+    const out = rewriteHtmlForPrefix(html, PREFIX)
+    for (const keep of ['content="a;url=/n"', `{"u":"fetch('/j')","h":" href=\"/j2\""}`, '<pre>href="/p" fetch(\'/p2\')</pre>',
+      '<code>action="/c"</code>', '<p>text href="/t1" and url=/t2</p>', '<textarea>href="/ta"</textarea>']) {
+      expect(out, keep).toContain(keep)
+    }
+    expect(out).toContain('content="0;url=/t/local/g"')
+    expect(out).toContain('<header><a href="/t/local/h">')
+    // shim lands in <head>, not inside <header>
+    expect(out.indexOf('__MUPOT_BASE')).toBeLessThan(out.indexOf('<header>'))
+  })
+
+  it('a fragment gets no shim', () => {
+    const out = rewriteHtmlForPrefix('<div><a href="/x">x</a></div>', PREFIX)
+    expect(out).toBe('<div><a href="/t/local/x">x</a></div>')
+  })
+
+  it('rewritten responses carry Vary: x-mupot-path-prefix', async () => {
+    const html = await applyTenantPrefix(new Response('<html><head></head></html>', { headers: { 'content-type': 'text/html' } }), PREFIX)
+    expect(html.headers.get('vary')).toContain(TENANT_PREFIX_HEADER)
+    const redir = await applyTenantPrefix(new Response(null, { status: 302, headers: { location: '/x' } }), PREFIX)
+    expect(redir.headers.get('vary')).toContain(TENANT_PREFIX_HEADER)
   })
 })
 
