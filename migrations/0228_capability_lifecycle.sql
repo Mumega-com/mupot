@@ -54,6 +54,11 @@ ALTER TABLE capabilities ADD COLUMN granted_via TEXT;
 -- elevation. NULL = non-expiring, exactly as on capabilities.
 ALTER TABLE memberships ADD COLUMN expires_at TEXT;
 
+-- door_receipts snapshots the prior grant so a rejected self-grant can restore it. The prior's
+-- HORIZON is part of that snapshot: restoring the rank alone would resurrect an expiring grant
+-- as permanent.
+ALTER TABLE door_receipts ADD COLUMN capability_before_expires_at TEXT;
+
 -- Sweep support: only the expiring subset is ever visited.
 CREATE INDEX IF NOT EXISTS idx_capabilities_expiry
     ON capabilities (expires_at)

@@ -146,6 +146,37 @@ describe('elevation-conferred memberships carry the horizon (project messaging)'
       .toEqual({ expires_at: FUTURE })
   })
 
+  it('activeRecipientProjectAccessAllowed ignores a LAPSED recipient membership', async () => {
+    const { activeRecipientProjectAccessAllowed } = await import('../src/agents/messages')
+    await grant('a-2', 'm-2', FUTURE)
+    expect(await activeRecipientProjectAccessAllowed(env, 'p-1', 'a-2')).toBe(true)
+    h.sqlite.exec(`UPDATE memberships SET expires_at = '${PAST}' WHERE agent_id = 'a-2' AND squad_id = 'sq-a'`)
+    expect(await activeRecipientProjectAccessAllowed(env, 'p-1', 'a-2')).toBe(false)
+  })
+
+  it('sendAgentMessage (routine path: requireActiveRecipientProjectAccess) refuses a LAPSED recipient membership', async () => {
+    const { sendAgentMessage } = await import('../src/agents/messages')
+    await grant('a-1', 'm-1', FUTURE)
+    await grant('a-2', 'm-2', FUTURE)
+    const send = () => sendAgentMessage(
+      env,
+      { fromAgent: 'a-1', fromMember: 'm-1', toAgent: 'a-2', body: 'hello', projectId: 'p-1' },
+      { system: true, reason: 'test' },
+      { requireActiveRecipientProjectAccess: true, systemProjectAttribution: true },
+    )
+    expect((await send()).ok).toBe(true)
+    h.sqlite.exec(`UPDATE memberships SET expires_at = '${PAST}' WHERE agent_id = 'a-2' AND squad_id = 'sq-a'`)
+    expect(await send()).toMatchObject({ ok: false, reason: 'project_access_denied' })
+  })
+
+  it('requireAssignableAgent refuses an agent whose squad membership LAPSED', async () => {
+    const { requireAssignableAgent } = await import('../src/flight-spine/assignments')
+    await grant('a-1', 'm-1', FUTURE)
+    await expect(requireAssignableAgent(env, 'a-1', 'sq-a')).resolves.toBeUndefined()
+    h.sqlite.exec(`UPDATE memberships SET expires_at = '${PAST}' WHERE agent_id = 'a-1' AND squad_id = 'sq-a'`)
+    await expect(requireAssignableAgent(env, 'a-1', 'sq-a')).rejects.toThrow(/agent_not_assignable/)
+  })
+
   it('the GUARDED (identity-creating) membership path writes the horizon too', async () => {
     const { prepareAgentSquadAccess } = await import('../src/members/agent-access')
     const prepared = await prepareAgentSquadAccess(

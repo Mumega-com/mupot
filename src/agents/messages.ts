@@ -309,7 +309,7 @@ async function receiverNotStopped(env: Env, agentId: string): Promise<boolean> {
   return row !== null
 }
 
-async function activeRecipientProjectAccessAllowed(
+export async function activeRecipientProjectAccessAllowed(
   env: Env,
   projectId: string,
   recipientAgentId: string,
@@ -322,6 +322,7 @@ async function activeRecipientProjectAccessAllowed(
        JOIN projects project ON project.id = access.project_id
       WHERE recipient.id = ? AND recipient.status = 'active'
         AND project.id = ? AND project.status = 'active'
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       LIMIT 1`,
   ).bind(recipientAgentId, projectId).first()
   return row !== null
@@ -505,6 +506,7 @@ export async function sendAgentMessage(
              JOIN projects project ON project.id = access.project_id
             WHERE recipient.id = ?3 AND recipient.status = 'active'
               AND project.id = ?12 AND project.status = 'active'
+              AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
          )`
       : ''
     let receiverFenceSql = ''

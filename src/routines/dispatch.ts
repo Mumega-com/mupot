@@ -260,6 +260,7 @@ export async function loadCandidates(
           OR EXISTS (
             SELECT 1 FROM memberships mm
              WHERE mm.agent_id = a.id AND mm.squad_id = ?1
+               AND ${CAPABILITY_LIVE_PREDICATE('mm', "datetime('now')")}
           )
         )
       ORDER BY a.id ASC LIMIT ?3`,

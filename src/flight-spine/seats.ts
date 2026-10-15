@@ -358,6 +358,7 @@ async function requirePendingSeatRegistrationAuthority(
       JOIN squads squad ON squad.id = agent.squad_id
       JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = token.tenant
        AND binding.agent_id = token.agent_id
@@ -458,6 +459,7 @@ export async function registerPendingRuntimeSeat(
           JOIN squads squad ON squad.id = agent.squad_id
           JOIN memberships membership
             ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+            AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
           JOIN agent_member_bindings binding
             ON binding.tenant = token.tenant
            AND binding.agent_id = token.agent_id
@@ -646,6 +648,7 @@ async function readSeatForActor(
       JOIN squads squad ON squad.id = agent.squad_id
       LEFT JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
      WHERE seat.id = ?1 AND seat.tenant = ?2 AND seat.agent_id = ?3
      LIMIT 1
   `).bind(runtimeSeatId, env.TENANT_SLUG, actor.agentId).first<RuntimeSeatRow>()
@@ -773,6 +776,7 @@ export async function acquireRuntimeSeatLease(
       JOIN squads squad ON squad.id = agent.squad_id
       JOIN memberships membership
         ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = seat.tenant
        AND binding.agent_id = seat.agent_id
@@ -917,6 +921,7 @@ export async function renewRuntimeSeatLease(
            JOIN squads squad ON squad.id = agent.squad_id
            JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
            JOIN agent_member_bindings binding
              ON binding.tenant = seat.tenant
             AND binding.agent_id = seat.agent_id
@@ -1017,6 +1022,7 @@ export async function releaseRuntimeSeatLease(
              JOIN squads squad ON squad.id = agent.squad_id
              JOIN memberships membership
                ON membership.agent_id = agent.id AND membership.squad_id = squad.id
+               AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
              JOIN agent_member_bindings binding
                ON binding.tenant = seat.tenant
               AND binding.agent_id = seat.agent_id

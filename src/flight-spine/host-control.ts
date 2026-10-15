@@ -662,6 +662,7 @@ export async function recordHostControlFact(
             AND binding.member_id = ?
            JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = ?
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
           WHERE seat.id = ? AND seat.tenant = ? AND seat.agent_id = ?
             AND seat.host_id = ? AND seat.state = 'active'
             AND seat.current_generation = ?

@@ -400,3 +400,52 @@ describe('signup default — the half of OAuth onboarding that was missing', () 
     expect(db.orgCap(SUBJECT)).toBeUndefined()
   })
 })
+
+describe('a rejected self-grant never resurrects a lapsed grant (P0, round-2 gate)', () => {
+  it('REPRO: lapsed admin + self-grant member + reject => the row is DELETED, not {admin, permanent}', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'admin')
+    db.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00'`)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    // the lapsed prior counts as ABSENT in the receipt
+    expect(receipt).toMatchObject({ capability_before: null })
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT COUNT(*) AS n FROM capabilities WHERE member_id = '${SUBJECT}'`)).toEqual({ n: 0 })
+  })
+
+  it('RESTORE puts back rank AND horizon of a LIVE expiring prior', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    db.exec(`UPDATE capabilities SET expires_at = '2099-06-01 00:00:00'`)
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    // something else changed the horizon after the door grant: the restore must still put back the SNAPSHOT
+    db.exec(`UPDATE capabilities SET expires_at = NULL WHERE member_id = '${SUBJECT}'`)
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT capability, expires_at FROM capabilities WHERE member_id = '${SUBJECT}'`))
+      .toEqual({ capability: 'observer', expires_at: '2099-06-01 00:00:00' })
+  })
+
+  it('RESTORE of a LIVE permanent prior stays permanent', async () => {
+    const db = makeDb()
+    await open(db)
+    db.seedCap(SUBJECT, SQUAD, 'observer')
+    await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: SQUAD, capability: 'member',
+    })
+    const [receipt] = await listPendingReceipts(db.env, (await getOpenDoor(db.env))!.id)
+    await applyDisposition(db.env, receipt!.id, 'revoked', 'agent:athena', 'over-reach')
+    expect(db.get(`SELECT capability, expires_at FROM capabilities WHERE member_id = '${SUBJECT}'`))
+      .toEqual({ capability: 'observer', expires_at: null })
+  })
+})

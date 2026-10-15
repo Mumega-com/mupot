@@ -113,6 +113,7 @@ async function readLiveTokenBinding(
       JOIN memberships membership
         ON membership.agent_id = agent.id
        AND membership.squad_id = squad.id
+        AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
       JOIN agent_member_bindings binding
         ON binding.tenant = token.tenant
        AND binding.agent_id = token.agent_id
@@ -188,6 +189,7 @@ async function readExistingWithCurrentAuthority(
                  JOIN memberships membership
                    ON membership.agent_id = agent.id
                   AND membership.squad_id = squad.id
+                   AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
                  JOIN agent_member_bindings binding
                    ON binding.tenant = token.tenant
                   AND binding.agent_id = token.agent_id
@@ -313,6 +315,7 @@ export async function issueTokenBindingAttestation(
         JOIN memberships membership
           ON membership.agent_id = agent.id
          AND membership.squad_id = squad.id
+          AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
         JOIN agent_member_bindings binding
           ON binding.tenant = token.tenant
          AND binding.agent_id = token.agent_id

@@ -137,10 +137,6 @@ const NON_AUTHORIZING_READS: ReadonlyArray<{ fingerprint: string; why: string }>
     why: "members/service loadAgentTokenReplacementMetadata — reads binding_capability to describe a completed token rotation in a receipt. A historical description of a past act, not an authorization decision about a present one.",
   },
   {
-    fingerprint: 'a3f8d2b395f7',
-    why: "onboarding/doors selfGrant prior-row read — reads the PRIOR grant before writing, to reuse its id and record capability_before. Its own comment: 'This is the only moment it is knowable.' Filtering would MISS an expired row and insert a duplicate, violating UNIQUE(member_id, scope_type, scope_id). Row identity, not authority.",
-  },
-  {
     fingerprint: 'ad047cbef9cb',
     why: "onboarding/doors grantSignupDefault — refuses to clobber ANY existing org row, expired or not ('Never clobber access someone already has, however they got it'). Filtering would silently overwrite a lapsed grant's row and its provenance.",
   },
@@ -343,5 +339,108 @@ describe('every capabilities writer records provenance', () => {
       }
     }
     expect(offenders).toEqual([])
+  })
+})
+
+
+// ── memberships readers ─────────────────────────────────────────────────────────
+//
+// `memberships` carries the same horizon as `capabilities` (migration 0228) for agent grants
+// written under an elevation. A reader that treats a membership as "the agent is on this squad"
+// for an AUTHORITY decision must ignore a lapsed one. Same census, same discipline: every read
+// consumes the predicate once per read, or is exempted BY FINGERPRINT with a reason.
+
+const MEMBERSHIP_READ_RE = /(?:FROM|JOIN)\s+(?:\w+\.)?memberships\b/gi
+
+const NON_AUTHORIZING_MEMBERSHIP_READS: ReadonlyArray<{ fingerprint: string; why: string }> = [
+  {
+    fingerprint: '1a0c7a2d263a',
+    why: "dashboard/agent-access-panel memRow() \u2014 compare-and-swap leaf of the Access receipt guard: 'this table still holds the level the admin SAW'. Must compare stored state (the panel lists lapsed rows on purpose); filtering would make a lapsed row impossible to revoke from the panel.",
+  },
+  {
+    fingerprint: 'fb9e314e0f69',
+    why: "dashboard/agent-access-panel currentMembership() \u2014 the same CAS read in JS (stored state the admin saw).",
+  },
+  {
+    fingerprint: '72f827764f3b',
+    why: "dashboard/agent-access-panel list read \u2014 renders the per-squad access table, lapsed rows included on purpose. Display only.",
+  },
+  {
+    fingerprint: '05c8fd8664f2',
+    why: "control-center / org list reads of every membership row \u2014 admin listing for display, not an authority decision.",
+  },
+  {
+    fingerprint: 'e516cf451015',
+    why: "dashboard/join-agent preview \u2014 shows the agent's current memberships to the approver, display only; the write goes through setAgentSquadAccess.",
+  },
+  {
+    fingerprint: 'd760d8bd8611',
+    why: "prior-membership read feeding a RECEIPT / never-lower / `already` comparison (provision.ts, squad-join.ts, squad-membership.ts). It records or compares STORED state; the authority decision for the same operation is the live-capability check beside it (squad-join `already` requires a live capability row).",
+  },
+  {
+    fingerprint: '4a9eafa17698',
+    why: "members/agent-access priorAccess() \u2014 reads the stored prior level for the receipt and the monotonic upsert; a lapsed row is still the row the upsert replaces.",
+  },
+  {
+    fingerprint: '5bc6dae54383',
+    why: "post-write read-back of the membership row just written (agent-access readCommittedAccess, org/service move). A write receipt must see the row it wrote.",
+  },
+  {
+    fingerprint: 'bba397cbb56b',
+    why: "members/agent-connection-status \u2014 status panel, display only.",
+  },
+  {
+    fingerprint: '846b5ce9cf1f',
+    why: "operators/chokepoint target-standing read \u2014 computes the TARGET's rank to enforce a CEILING; counting a lapsed membership only makes the ceiling stricter (fail-safe direction).",
+  },
+  {
+    fingerprint: 'c40039991494',
+    why: "org/service listMoveGrantImpact \u2014 lists what a squad move REMOVES for the receipt; the move deletes the stored row whether or not it lapsed.",
+  },
+  {
+    fingerprint: '3a38211ecb1f',
+    why: "orient/service squad roster \u2014 informational 'who is on your squad' list in the boot packet; grants nothing.",
+  },
+]
+
+function membershipReads(): Read[] {
+  const out: Read[] = []
+  for (const file of tsFiles(SRC_DIR)) {
+    const src = readFileSync(file, 'utf8')
+    if (!src.includes('memberships')) continue
+    for (const lit of literalsOf(file, src)) {
+      if (/^[`'"]\s*DELETE\s+FROM\s+memberships\b/i.test(lit.text)) continue
+      const reads = (lit.text.match(MEMBERSHIP_READ_RE) ?? []).length
+      if (reads === 0) continue
+      out.push({
+        file: file.slice(file.indexOf('src/')),
+        line: lit.line,
+        fp: fingerprint(lit.text),
+        sql: lit.text.split(/\s+/).filter(Boolean).join(' ').slice(0, 120),
+        reads,
+        live: (lit.text.match(/CAPABILITY_LIVE_PREDICATE\(/g) ?? []).length,
+        orJoined: /\bOR\s*\$\{CAPABILITY_LIVE_PREDICATE\(/i.test(lit.text),
+      })
+    }
+  }
+  return out
+}
+
+describe('every memberships reader consumes the liveness predicate', () => {
+  it('the walker finds the readers (anti-vacuity)', () => {
+    expect(membershipReads().length).toBeGreaterThanOrEqual(30)
+  })
+
+  it('EVERY memberships read consumes the predicate (once per read, AND-joined) or is fingerprint-exempt', () => {
+    const exempt = new Map(NON_AUTHORIZING_MEMBERSHIP_READS.map((e) => [e.fingerprint, e.why]))
+    const offenders = membershipReads()
+      .filter((r) => (r.live < r.reads || r.orJoined) && !exempt.has(r.fp))
+      .map((r) => `${r.file}:${r.line} [${r.fp}] reads=${r.reads} live=${r.live} :: ${r.sql.slice(0, 70)}`)
+    expect(offenders, `${offenders.length} memberships reads do not gate on expiry`).toEqual([])
+  })
+
+  it('every membership exemption still matches a real read', () => {
+    const seen = new Set(membershipReads().map((r) => r.fp))
+    expect(NON_AUTHORIZING_MEMBERSHIP_READS.filter((e) => !seen.has(e.fingerprint)).map((e) => e.fingerprint)).toEqual([])
   })
 })

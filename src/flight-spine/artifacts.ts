@@ -784,6 +784,7 @@ export async function recordArtifactMetadata(
             AND generation.generation = seat.current_generation
            JOIN memberships membership
              ON membership.agent_id = agent.id AND membership.squad_id = task.squad_id
+             AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
            JOIN agent_member_bindings binding
              ON binding.tenant = assignment.tenant AND binding.agent_id = agent.id
             AND binding.member_id = ?25
@@ -1174,6 +1175,7 @@ export async function recordArtifactRetrieval(
           AND generation.generation = seat.current_generation
          JOIN memberships membership
            ON membership.agent_id = agent.id AND membership.squad_id = task.squad_id
+           AND ${CAPABILITY_LIVE_PREDICATE('membership', "datetime('now')")}
          JOIN agent_member_bindings binding
            ON binding.tenant = assignment.tenant AND binding.agent_id = agent.id
           AND binding.member_id = ?16

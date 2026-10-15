@@ -34,7 +34,7 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
-import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
@@ -307,7 +307,8 @@ async function agentHasProject(env: Env, agentId: string, projectId: string): Pr
     `SELECT 1 AS x FROM memberships ms
        JOIN project_squad_access psa ON psa.squad_id = ms.squad_id
        JOIN projects p ON p.id = psa.project_id
-      WHERE ms.agent_id = ?1 AND p.id = ?2 AND p.status = 'active' LIMIT 1`,
+      WHERE ms.agent_id = ?1 AND p.id = ?2 AND p.status = 'active'
+        AND ${CAPABILITY_LIVE_PREDICATE('ms', "datetime('now')")} LIMIT 1`,
   ).bind(agentId, projectId).first()
   return row !== null
 }
@@ -355,7 +356,8 @@ export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agent
                 SELECT 1 FROM memberships ms
                   JOIN project_squad_access psa ON psa.squad_id = ms.squad_id
                   JOIN projects p ON p.id = psa.project_id
-                 WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'))
+                 WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'
+                   AND ${CAPABILITY_LIVE_PREDICATE('ms', "datetime('now')")}))
           AND ${HOST_STANDING_SQL}
         LIMIT 1`,
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()

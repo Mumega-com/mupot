@@ -16,7 +16,7 @@
 
 import type { Env } from '../types'
 import { capabilityReviewedEvents, revokeContextStatements } from '../auth/grant-events'
-import { CAPABILITY_LAPSED_PREDICATE } from '../auth/capability'
+import { CAPABILITY_LAPSED_PREDICATE, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 
 export type DoorStatus = 'open' | 'closed' | 'crystallized'
 export type Disposition = 'pending' | 'crystallized' | 'revoked'
@@ -183,10 +183,17 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
   }
 
   // Read the prior grant BEFORE writing. This is the only moment it is knowable.
+  //
+  // LIVE rows only: a LAPSED prior grant confers nothing, so it is NOT something a reject may
+  // restore. Snapshotting it would let a rejected self-grant resurrect an expired admin as a
+  // PERMANENT one (the refresh below clears the horizon). With no live prior, a reject DELETES.
+  // The prior's horizon is snapshotted with its rank: a restore puts back BOTH.
   const prior = await env.DB.prepare(
-    `SELECT id, capability FROM capabilities
-      WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 LIMIT 1`,
-  ).bind(input.subjectMemberId, input.scopeType, input.scopeId).first<{ id: string; capability: string }>()
+    `SELECT id, capability, expires_at FROM capabilities
+      WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3
+        AND ${CAPABILITY_LIVE_PREDICATE('', '?4')} LIMIT 1`,
+  ).bind(input.subjectMemberId, input.scopeType, input.scopeId, nowCapabilitySql())
+    .first<{ id: string; capability: string; expires_at: string | null }>()
 
   const receiptId = crypto.randomUUID()
   const grantId = prior?.id ?? crypto.randomUUID()
@@ -222,12 +229,12 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
     env.DB.prepare(
       `INSERT INTO door_receipts
          (id, tenant, door_id, actor_member_id, actor_agent_id, subject_member_id,
-          scope_type, scope_id, action, capability_before, capability_after)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'self_grant', ?9, ?10)`,
+          scope_type, scope_id, action, capability_before, capability_after, capability_before_expires_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'self_grant', ?9, ?10, ?11)`,
     ).bind(
       receiptId, env.TENANT_SLUG, door.id, input.actorMemberId, input.actorAgentId ?? null,
       input.subjectMemberId, input.scopeType, input.scopeId,
-      prior?.capability ?? null, input.capability,
+      prior?.capability ?? null, input.capability, prior?.expires_at ?? null,
     ),
   ])
 
@@ -376,11 +383,11 @@ export async function applyDisposition(
   note?: string,
 ): Promise<DoorResult<{ applied: 'crystallized' | 'revoked' }>> {
   const r = await env.DB.prepare(
-    `SELECT id, door_id, subject_member_id, scope_type, scope_id, capability_before, disposition
+    `SELECT id, door_id, subject_member_id, scope_type, scope_id, capability_before, capability_before_expires_at, disposition
        FROM door_receipts WHERE id = ?1 AND tenant = ?2 LIMIT 1`,
   ).bind(receiptId, env.TENANT_SLUG).first<{
     id: string; door_id: string; subject_member_id: string; scope_type: string
-    scope_id: string | null; capability_before: string | null; disposition: string
+    scope_id: string | null; capability_before: string | null; capability_before_expires_at: string | null; disposition: string
   }>()
   if (!r) return { ok: false, error: 'receipt_not_found' }
   if (r.disposition !== 'pending') return { ok: false, error: 'already_disposed', detail: r.disposition }
@@ -430,11 +437,15 @@ export async function applyDisposition(
       env.DB.prepare(
         `UPDATE capabilities
             SET capability = ?5, provisional_door_id = NULL,
+                -- rank AND horizon come back together: restoring one without the other either
+                -- resurrects an expiring grant as permanent or strands a permanent one.
+                expires_at = ?8,
                 granted_by = ?6, granted_via = 'door', reason = ?7
           WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 AND provisional_door_id = ?4`,
       ).bind(
         r.subject_member_id, r.scope_type, r.scope_id, r.door_id, r.capability_before,
         reviewedBy, note ?? `onboarding door review: restored prior capability ${r.capability_before}`,
+        r.capability_before_expires_at,
       ),
       stamp,
     ])
