@@ -4014,9 +4014,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "agent_attachment_handled" },
     ],
   },
+  {
+    file: "0224_engrams_agent_created_index.sql",
+    sha256: "06cd5a21eaff838bc8b8ed56abc1c5937f8117ccd80c06a05bb41b5f78e66d0c",
+    statements: [
+      "-- recall's D1 read-your-writes leg (src/memory/index.ts) and memory_recent order a scope's engrams by\n-- created_at DESC. The old idx_engrams_agent (agent_id) forced a sort of the whole scope per query.\nCREATE INDEX IF NOT EXISTS idx_engrams_agent_created ON engrams(agent_id, created_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_engrams_agent_created" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "65702d5633e3d0a80e782d3b0f747e973831c3d36a82fe476fb8c87ef3c46d02"
+export const SCHEMA_CHAIN_DIGEST: string = "6ea463c6cc08e437eb158dfa664ed3b237fe95fc792d3bdec27aee005dc05873"

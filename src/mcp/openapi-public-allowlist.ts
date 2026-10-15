@@ -82,6 +82,8 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'inbox_lease_ack',
   'inbox_lease_reconcile',
   'kanban_board',
+  'memory_get',
+  'memory_recent',
   'message_get',
   'needs_you_list',
   'objective_accept',

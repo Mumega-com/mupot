@@ -958,12 +958,27 @@ export interface WakeContract {
 export interface MemoryPort {
   remember(agentId: string, text: string, concepts?: string[]): Promise<string> // returns engram id
   recall(agentId: string, query: string, limit?: number): Promise<MemoryHit[]>
+  /** Newest engrams in ONE scope (read-your-writes; does not depend on the vector index). */
+  recent?(agentId: string, limit?: number): Promise<MemoryEngram[]>
+  /** One engram by id, ONLY if it lives in `agentId`'s scope; null for missing and foreign alike. */
+  get?(agentId: string, id: string): Promise<MemoryEngram | null>
 }
+
+export type MemoryHitSource = 'vector' | 'recent' | 'lexical'
 
 export interface MemoryHit {
   id: string
   text: string
   score: number
+  /** Which retrieval leg produced the hit (vector index, D1 exact substring, D1 recently written). */
+  source?: MemoryHitSource
+}
+
+export interface MemoryEngram {
+  id: string
+  text: string
+  concepts: string[] | null
+  created_at: string
 }
 
 export interface BusPort {

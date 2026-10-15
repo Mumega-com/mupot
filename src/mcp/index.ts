@@ -4325,6 +4325,55 @@ const toolRecall: ToolSpec = {
   },
 }
 
+// memory_recent — the caller's OWN newest engrams, straight from D1 (no vector index, so a
+// write is visible immediately). Same member scope as remember/recall. cap: authenticated.
+const toolMemoryRecent: ToolSpec = {
+  name: 'memory_recent',
+  scope: 'self',
+  min: 'authenticated',
+  args: '{ limit?: number (1..20) }',
+  inputSchema: {
+    type: 'object',
+    properties: { limit: OPTIONAL_NUMBER_SCHEMA },
+    required: [],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    let limit = 5
+    if (typeof args.limit === 'number' && Number.isFinite(args.limit)) {
+      limit = Math.min(20, Math.max(1, Math.floor(args.limit)))
+    } else if (args.limit !== undefined && args.limit !== null) {
+      return fail(400, 'invalid_args', 'limit must be a number')
+    }
+    const mem = createMemory(env)
+    const engrams = (await mem.recent?.(memberMemoryScope(auth.memberId as string), limit)) ?? []
+    return done({ engrams })
+  },
+}
+
+// memory_get — ONE engram by id from the caller's OWN member scope. An id that exists in
+// another scope answers byte-for-byte like an id that does not exist (no existence oracle).
+const toolMemoryGet: ToolSpec = {
+  name: 'memory_get',
+  scope: 'self',
+  min: 'authenticated',
+  args: '{ id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { id: STRING_SCHEMA },
+    required: ['id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const id = str(args.id)
+    if (!id || id.length > 64) return fail(400, 'invalid_args', 'id required')
+    const mem = createMemory(env)
+    const engram = (await mem.get?.(memberMemoryScope(auth.memberId as string), id)) ?? null
+    if (!engram) return fail(404, 'not_found', 'no such engram in your memory')
+    return done({ engram })
+  },
+}
+
 // squad_remember — write to the squad's shared memory scope. cap: member+ on squad.
 // Agent-bound tokens may omit squad_id and default to their own squad.
 const toolSquadRemember: ToolSpec = {
@@ -7150,6 +7199,8 @@ export const TOOLS: ToolSpec[] = [
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
+  toolMemoryRecent,
+  toolMemoryGet,
   toolSquadRemember,
   toolSquadRecall,
   toolProjectRemember,

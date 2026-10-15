@@ -2245,3 +2245,62 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     expect(JSON.stringify(await invokeTool(HOST_BOUND(), off, 'inbox_mark_handled', {}, 'https://pot.test'))).toContain('seat_attach_disabled')
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// Memory keying for an ATTACHED seat (the read-your-writes incident asked: could an attached chat write
+// under a different scope key than it reads?). An attached seat's auth.memberId is the ATTACHED agent's own
+// welded member (buildSeatContext), and remember/recall both key on `member:<auth.memberId>`, so write and
+// read land on the same key, and it is the agent's key, not the human's and not the throwaway seat agent's.
+describe('attached seat memory keying (write scope == read scope == the welded member)', () => {
+  function memEnv(): { env: Env; lag: { on: boolean } } {
+    const lag = { on: false }
+    const vectors: Array<{ id: string; metadata: Record<string, unknown> }> = []
+    const env = {
+      ...envFor(h),
+      AI: { run: async () => ({ data: [[0.1, 0.2, 0.3]] }) },
+      VEC: {
+        upsert: async (rows: Array<{ id: string; metadata: Record<string, unknown> }>) => { vectors.push(...rows) },
+        query: async (_v: number[], o: { topK: number; filter: Record<string, unknown> }) => ({
+          matches: lag.on ? [] : vectors.filter((v) => Object.entries(o.filter).every(([k, val]) => v.metadata[k] === val)).slice(0, o.topK).map((v, i) => ({ id: v.id, score: 0.9 - i / 10 })),
+        }),
+      },
+    } as unknown as Env
+    return { env, lag }
+  }
+  const hitsOf = (r: Rpc): Array<{ id: string; text: string; source?: string }> => (r.sc.hits ?? []) as Array<{ id: string; text: string; source?: string }>
+
+  it('remember-as-attached then recall-as-attached finds it, under member:<agent welded member>', async () => {
+    const { env, lag } = memEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-mem')
+    const w = await rpc(env, g.ctx, 'remember', { text: 'attached-keying-marker-9 hello' }, { meta: thread('conv-mem') })
+    const id = String(w.sc.engram_id)
+    expect(id, JSON.stringify(w.body)).not.toBe('undefined')
+    // keyed on the attached agent's welded member, NOT the human and NOT the throwaway seat agent
+    const row = one<{ agent_id: string }>(`SELECT agent_id FROM engrams WHERE id = ?`, id)!
+    expect(row.agent_id).toBe('member:mem-agent-rava')
+    expect(row.agent_id).not.toContain(HUMAN)
+    // read back through the vector leg
+    expect(hitsOf(await rpc(env, g.ctx, 'recall', { query: 'attached-keying-marker-9' }, { meta: thread('conv-mem') })).map((x) => x.id)).toContain(id)
+    // and through the D1 leg while Vectorize lags
+    lag.on = true
+    const lagged = hitsOf(await rpc(env, g.ctx, 'recall', { query: 'attached-keying-marker-9' }, { meta: thread('conv-mem') }))
+    expect(lagged.map((x) => x.id)).toContain(id)
+    expect(lagged[0].source).toBe('lexical')
+    const rec = await rpc(env, g.ctx, 'memory_recent', {}, { meta: thread('conv-mem') })
+    expect((rec.sc.engrams as Array<{ id: string }>).map((e) => e.id)).toContain(id)
+    expect(((await rpc(env, g.ctx, 'memory_get', { id }, { meta: thread('conv-mem') })).sc.engram as { id: string }).id).toBe(id)
+  })
+
+  it('the human\'s own unattached thread does NOT see the attached agent\'s memory (different key)', async () => {
+    const { env } = memEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-mem')
+    const id = String((await rpc(env, g.ctx, 'remember', { text: 'agent-private-marker-5' }, { meta: thread('conv-mem') })).sc.engram_id)
+    await boot(env, g, 'conv-other') // a second, unattached thread of the same human
+    const other = await rpc(env, g.ctx, 'recall', { query: 'agent-private-marker-5' }, { meta: thread('conv-other') })
+    expect(hitsOf(other).map((x) => x.id)).not.toContain(id)
+    const get = await rpc(env, g.ctx, 'memory_get', { id }, { meta: thread('conv-other') })
+    expect(get.sc.engram).toBeUndefined()
+  })
+})
