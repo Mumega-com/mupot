@@ -632,6 +632,8 @@ describe('who may be attached, and who may call', () => {
     expect(page).toContain('Hi Rava.')
     expect(page).toContain('seat_attach { agent: &quot;agent-rava&quot; }') // the id, escaped inside the textarea
     expect(page).toContain('id="copy-prompt"')
+    expect(page).toContain('already_pending') // the message covers every non-attached answer
+    expect(page).toContain('box-sizing:border-box')
     expect(page).not.toMatch(/Asked by thread|those threads/)
     // a hostile admin-set name cannot break out of the page or the textarea
     h.sqlite.exec(`UPDATE agents SET name = 'Ra</textarea><img src=x onerror=alert(1)>' WHERE id = 'agent-rava'`)

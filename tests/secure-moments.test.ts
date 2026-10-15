@@ -1328,6 +1328,7 @@ describe('round 2 P2/P3', () => {
     const html = await (await hit(m.path)).text()
     expect(html).toContain('id="decide-help"')
     expect(html).toContain('Open in Safari')
+    expect(html).toMatch(/href="https:\/\/[^"]+\/account" target="_blank" rel="noopener"/)
     expect(html).toContain(`href="https://${COLONY}/account"`) // the signed-in dashboard, which requires a fresh re-auth to mint an enrolment
     expect(html).not.toMatch(/\/m\/enrol\//) // the page itself never offers an enrolment
     // a non-https dashboard origin: the advice stays, the link goes (never a plain-http link to the account page)
@@ -1335,11 +1336,24 @@ describe('round 2 P2/P3', () => {
     expect(plain).toContain('id="decide-help"')
     expect(plain).not.toContain('add this phone as a passkey')
   })
+  it('the generated decide script is valid JavaScript (a quoting slip inside the TS template would otherwise ship a dead page)', async () => {
+    const { DECIDE_SCRIPT } = await import('../src/secure-moments/client')
+    const vm = await import('node:vm')
+    expect(() => new vm.Script(DECIDE_SCRIPT)).not.toThrow()
+  })
   it('the decide script warns after 25 seconds of no passkey response and stops its timer on every exit', async () => {
     const m = await fileSeed()
     const html = await (await hit(m.path)).text()
     expect(html).toContain('Still waiting for your passkey')
     expect((html.match(/clearTimeout\(slow\)/g) ?? []).length).toBeGreaterThanOrEqual(3) // not-started, success path, catch
+    // pin the behaviour, not just the words: the delay, that the timer only ever shows text, that it is armed after the challenge,
+    // that it is cleared BEFORE /decide is posted, and that the copy handler is wired before the no-passkey early return
+    const timer = html.slice(html.indexOf('slow=setTimeout('), html.indexOf(',25000);'))
+    expect(html).toContain(',25000);')
+    expect(timer).not.toContain('lock(false)')
+    expect(html.indexOf("post('/challenge',p)")).toBeLessThan(html.indexOf('slow=setTimeout('))
+    expect(html.indexOf('clearTimeout(slow);\n  var res=await post(\'/decide\'')).toBeGreaterThan(-1)
+    expect(html.indexOf("getElementById('copy-prompt')")).toBeLessThan(html.indexOf('if(!window.PublicKeyCredential)'))
   })
 })
 

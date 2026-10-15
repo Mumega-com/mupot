@@ -503,11 +503,11 @@ function agentPromptBlock(raw: { agentName: string; agentSlug: string; agentId: 
     `Hi ${a.agentName}. I have just approved you to work with me in this chat on mupot.`,
     `Please attach to your identity now: call seat_attach { agent: "${a.agentId}" }.`,
     `- If it says attached: call boot_context, then orient, and tell me in two or three lines who you are, which squad you are in, and what you can do for me.`,
-    `- If it says pending_admission or returns an error: stop and show me the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
+    `- If it says pending_admission, already_pending or returns an error: stop and show me the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
   ].join('\n')
   return `<section id="agent-prompt-box"><h2>Then tell ${escapeHtml(who)}</h2>
 <p class="muted">Approve above, then copy this message and paste it into the chat that asked. It speaks to ${escapeHtml(a.agentName)} by name and holds no secret.</p>
-<textarea id="agent-prompt" readonly rows="7" style="width:100%">${escapeHtml(text)}</textarea>
+<textarea id="agent-prompt" readonly rows="7" style="width:100%;box-sizing:border-box">${escapeHtml(text)}</textarea>
 <div class="row"><button type="button" id="copy-prompt">Copy message</button></div></section>`
 }
 
@@ -520,7 +520,7 @@ function decideHelpBlock(env: Env): string {
     const u = new URL('/account', env.PUBLIC_ORIGIN ?? '')
     if (u.protocol === 'https:') account = u.toString()
   } catch { /* no usable dashboard origin: leave the link out */ }
-  const addPhone = account ? ` Or <a href="${escapeHtml(account)}" rel="noopener">add this phone as a passkey</a> in My Account (you sign in there first), then come back to this link.` : ''
+  const addPhone = account ? ` Or <a href="${escapeHtml(account)}" target="_blank" rel="noopener">add this phone as a passkey</a> in My Account (you sign in there first), then come back to this link.` : ''
   return `<p class="muted" id="decide-help">No passkey prompt on this phone, or it did not come back? Open this link in Safari or Chrome itself, not inside another app's built-in browser (in the corner menu choose Open in Safari), and tap once.${addPhone}</p>`
 }
 

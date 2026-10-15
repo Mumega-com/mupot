@@ -14,7 +14,7 @@ function explain(e){return e&&e.name==='NotAllowedError'?'The passkey prompt was
 export const DECIDE_SCRIPT = `${COMMON}
 (function(){
 var cb=document.getElementById('copy-prompt');
-if(cb){cb.addEventListener('click',function(){var t=document.getElementById('agent-prompt');if(!t)return;var done=function(){cb.textContent='Copied'};var fall=function(){try{t.focus();t.select();t.setSelectionRange(0,t.value.length);document.execCommand('copy');done()}catch(e){cb.textContent='Select the text and copy it'}};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t.value).then(done,fall)}else{fall()}})}
+if(cb){cb.addEventListener('click',function(){var t=document.getElementById('agent-prompt');if(!t)return;var done=function(){cb.textContent='Copied'};var fall=function(){try{t.removeAttribute('readonly');t.focus();t.select();t.setSelectionRange(0,t.value.length);var ok=document.execCommand('copy');t.setAttribute('readonly','');if(ok){done()}else{cb.textContent='Select the text and copy it'}}catch(e){t.setAttribute('readonly','');cb.textContent='Select the text and copy it'}};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t.value).then(done,fall)}else{fall()}})}
 if(!window.PublicKeyCredential){show('Passkeys not available','This browser cannot use passkeys. Open the link in a browser that can.',false);lock(true);return}
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
@@ -24,9 +24,9 @@ async function decide(decision){
  lock(true);show('Waiting for your passkey','Confirm on this device. Nothing has been decided yet.',true);
  try{
   var p=params(decision);
-  slow=setTimeout(function(){if(document.querySelector('button[data-act]:disabled')){show('Still waiting for your passkey','Nothing has come back yet. If no passkey prompt appeared on this device, reload this page and tap once, from Safari or Chrome itself (not an in-app browser), or use a device that has your passkey. Nothing has been decided.',false)}},25000);
   var ch=await post('/challenge',p);
   if(!ch.json.ok){clearTimeout(slow);show('Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
+  slow=setTimeout(function(){if(document.querySelector('button[data-act]:disabled')){show('Still waiting for your passkey','Nothing has come back yet. If no passkey prompt appeared on this device, reload this page and tap once, from Safari or Chrome itself (not an in-app browser), or use a device that has your passkey. Nothing has been decided.',false)}},25000);
   var o=ch.json.publicKey;o.challenge=b64uToBuf(o.challenge);
   o.allowCredentials=(o.allowCredentials||[]).map(function(c){return{type:c.type,id:b64uToBuf(c.id)}});
   var cred=await navigator.credentials.get({publicKey:o});

@@ -74,7 +74,7 @@ const toolSeatAttach: ToolSpec = {
         approve_url: r.approve_url,
         expires_at: r.expires_at,
         note: r.approve_url
-          ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let threads from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
+          ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let chats from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
           : 'Pending. Your human can approve this on their Connections page (no secure-moment link is available on this pot). Nothing is attached until then; after they approve, call seat_attach again.',
       })
     }

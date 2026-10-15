@@ -443,7 +443,8 @@ export async function decideSeatAdmission(
     if (!(await input.gate())) return CLOSED
     const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member')
     if (!landed) return CLOSED
-    const who = (await admissionView(env, adm)).agentName
+    // The write already landed: a failed name lookup must not turn a successful approval into an error page.
+    const who = (await admissionView(env, adm).then((v) => v.agentName, () => null)) ?? 'this agent'
     return { status: 200, title: 'Admitted', message: `Chats from this app can now act as ${who} (ceiling: ${input.ceiling ?? 'member'}). Paste the message below into the chat that asked: it attaches to ${who} by name, immediately.`, tone: 'ok' }
   })
 }
