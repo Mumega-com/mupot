@@ -46,7 +46,7 @@ function mintSecret(): string {
 
 export type MintTelegramLoginLinkResult =
   | { ok: true; token: string; expiresAt: string }
-  | { ok: false; error: 'not_bound' | 'already_has_login' }
+  | { ok: false; error: 'not_bound' | 'already_has_login' | 'no_email' }
 
 /** Mint a link for the member whose bound chat is `chatId`. The caller must have authenticated the chat (the webhook). */
 export async function mintTelegramLoginLink(
@@ -54,10 +54,13 @@ export async function mintTelegramLoginLink(
   input: { memberId: string; chatId: string },
 ): Promise<MintTelegramLoginLinkResult> {
   const member = await env.DB.prepare(
-    `SELECT id FROM members
+    `SELECT id, email FROM members
       WHERE id = ?1 AND tenant = ?2 AND status = 'active' AND archived_at IS NULL AND telegram_chat_id = ?3`,
-  ).bind(input.memberId, env.TENANT_SLUG, input.chatId).first<{ id: string }>()
+  ).bind(input.memberId, env.TENANT_SLUG, input.chatId).first<{ id: string; email: string | null }>()
   if (!member) return { ok: false, error: 'not_bound' }
+  // The claim requires the confirming session's verified email to equal the member's, so a member with no email could
+  // never confirm; refuse at mint instead of handing out a link that cannot work (and a bearer with no email bound).
+  if (!member.email || member.email.trim() === '') return { ok: false, error: 'no_email' }
   const identity = await env.DB.prepare(
     `SELECT 1 AS present FROM human_login_identities WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL LIMIT 1`,
   ).bind(env.TENANT_SLUG, input.memberId).first<{ present: number }>()
@@ -146,11 +149,10 @@ export async function redeemTelegramLoginLink(
           SELECT 1 FROM members m
            WHERE m.id = telegram_login_links.member_id AND m.tenant = ?5 AND m.status = 'active'
              AND m.archived_at IS NULL AND m.telegram_chat_id = telegram_login_links.telegram_chat_id
-             -- The link is a bearer the chat relay can see, so the chat proof alone is not enough: when the member
-             -- has an email (every Telegram-born member carries the invite email), the confirming session's
-             -- IdP-verified email must be the same address. NULL member email: the fresh-sign-in nonce plus single
-             -- use are the only bound (documented, not silently relaxed).
-             AND (m.email IS NULL OR lower(m.email) = lower(?11))
+             -- The link is a bearer the chat relay can see, so the chat proof alone is not enough: the confirming
+             -- session's IdP-verified email must equal the member's email, always. A member with no email gets no
+             -- link at all (mintTelegramLoginLink 'no_email'), and a NULL here matches nothing.
+             AND lower(m.email) = lower(?11)
         )
         AND NOT EXISTS (
           SELECT 1 FROM human_login_identities h

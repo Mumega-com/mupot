@@ -93,23 +93,42 @@ describe('#1579 Telegram-first member web login', () => {
     return id
   }
 
-  // ── a tiny browser: cookie jar + the real routes ──────────────────────────────
-  type Jar = Map<string, string>
-  const cookieHeader = (jar: Jar) => [...jar].map(([k, v]) => `${k}=${v}`).join('; ')
+  // ── a tiny browser: a Path-respecting cookie jar (RFC 6265) + the real routes ─────────────────
+  // PFX emulates the apex's /t/<slug> path routing: the browser sees PFX + path, authApp sees the stripped path plus the
+  // apex header, and (like applyTenantPrefix in production) Location is re-rooted but Set-Cookie Path is NOT.
+  let PFX = ''
+  type Jar = Map<string, { value: string; path: string }>
+  const pathMatches = (cookiePath: string, requestPath: string) =>
+    requestPath === cookiePath || (requestPath.startsWith(cookiePath) && (cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/'))
+  const cookieHeader = (jar: Jar, visiblePath: string) =>
+    [...jar].filter(([, c]) => pathMatches(c.path, visiblePath)).map(([k, c]) => `${k}=${c.value}`).join('; ')
   function absorb(jar: Jar, res: Response): void {
     for (const line of res.headers.getSetCookie()) {
-      const [pair] = line.split(';')
+      const [pair, ...attrs] = line.split(';')
       const eq = pair.indexOf('=')
       const name = pair.slice(0, eq)
       const value = pair.slice(eq + 1)
+      const path = attrs.map((a) => a.trim()).find((a) => /^path=/i.test(a))?.slice(5) ?? '/'
       if (value === '' || /Max-Age=0/i.test(line)) jar.delete(name)
-      else jar.set(name, value)
+      else jar.set(name, { value, path })
     }
   }
-  async function visit(jar: Jar, path: string, init: RequestInit = {}): Promise<Response> {
-    const res = await authApp.request(`${ORIGIN}${path.replace(/^\/auth/, '')}`, {
+  const jarGet = (jar: Jar, name: string) => jar.get(name)?.value
+  /** Browser-visible Location, re-rooted the way applyTenantPrefix does for root-relative targets. */
+  const loc = (res: Response) => {
+    const l = res.headers.get('location')!
+    return PFX && l.startsWith('/') && !l.startsWith('/t/') ? `${PFX}${l}` : l
+  }
+  async function visit(jar: Jar, path: string, init: RequestInit = {}, host = 'pot.test'): Promise<Response> {
+    const visible = `${PFX}${path}`
+    const cookie = cookieHeader(jar, visible.split('?')[0])
+    const res = await authApp.request(`https://${host}${path.replace(/^\/auth/, '')}`, {
       ...init,
-      headers: { ...(init.headers as Record<string, string> | undefined), ...(jar.size ? { cookie: cookieHeader(jar) } : {}) },
+      headers: {
+        ...(init.headers as Record<string, string> | undefined),
+        ...(cookie ? { cookie } : {}),
+        ...(PFX ? { 'x-mupot-path-prefix': PFX } : {}),
+      },
     }, env)
     absorb(jar, res)
     return res
@@ -252,11 +271,32 @@ describe('#1579 Telegram-first member web login', () => {
     expect(identities()).toHaveLength(1)
   })
 
-  it('a member with NO email is bounded by the fresh-sign-in nonce, expiry and single use only (documented)', async () => {
+  it('a member with NO email gets no link (mint refuses, bot says why) and a NULL email can never satisfy the claim', async () => {
     const memberId = await bornViaTelegram()
-    h.sqlite.prepare(`UPDATE members SET email = NULL WHERE id = ?`).run(memberId)
     const { token } = await mintLink()
-    expect((await linkAndConfirm(token!, 'sub-any', 'whoever@x.test')).res.status).toBe(302)
+    // email removed after mint: the claim must not treat NULL as a match
+    h.sqlite.prepare(`UPDATE members SET email = NULL WHERE id = ?`).run(memberId)
+    expect((await linkAndConfirm(token!, 'sub-any', 'whoever@x.test')).res.status).toBe(403)
+    expect(identities()).toEqual([])
+    h.sqlite.prepare(`DELETE FROM telegram_login_links`).run()
+    const noEmail = await mintLink()
+    expect(noEmail.token).toBeNull()
+    expect(noEmail.reply).toMatch(/no email on file/i)
+    expect(await mintTelegramLoginLink(env, { memberId, chatId: CHAT })).toEqual({ ok: false, error: 'no_email' })
+    expect(h.sqlite.prepare(`SELECT 1 FROM telegram_login_links`).all()).toEqual([])
+  })
+
+  it('the identity INSERT is anchored on THIS claim: a consumed link cannot be replayed into a link even if the identity row is gone', async () => {
+    const memberId = await bornViaTelegram()
+    const { token } = await mintLink()
+    expect((await linkAndConfirm(token!)).res.status).toBe(302)
+    h.sqlite.prepare(`DELETE FROM human_login_identities`).run()
+    const again = await redeemTelegramLoginLink(env, {
+      tokenHash: (await telegramLoginTokenHash(token!))!, provider: 'google', subject: 'sub-pat', verifiedEmail: EMAIL,
+    })
+    expect(again).toEqual({ ok: false, error: 'invalid_link' })
+    expect(identities()).toEqual([])
+    expect(memberId).toBeTruthy()
   })
 
   it('replay of the link is refused (same browser, another browser, and after the identity is revoked)', async () => {
@@ -298,8 +338,8 @@ describe('#1579 Telegram-first member web login', () => {
     }
     it('refuses a session minted BEFORE the link was opened', async () => {
       const r = await ready()
-      const nonce = r.jar.get('mupot_tg_link')!
-      const sid = r.jar.get('mupot_session')!
+      const nonce = jarGet(r.jar, 'mupot_tg_link')!
+      const sid = jarGet(r.jar, 'mupot_session')!
       const raw = JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!)
       raw.createdAt = new Date(Date.now() - 3600_000).toISOString()
       await env.SESSIONS.put(`sess:${sid}`, JSON.stringify(raw))
@@ -309,7 +349,7 @@ describe('#1579 Telegram-first member web login', () => {
     })
     it('refuses a session whose nonce differs from the cookie nonce', async () => {
       const r = await ready()
-      const sid = r.jar.get('mupot_session')!
+      const sid = jarGet(r.jar, 'mupot_session')!
       const raw = JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!)
       raw.tgLinkNonce = 'a'.repeat(48)
       await env.SESSIONS.put(`sess:${sid}`, JSON.stringify(raw))
@@ -319,7 +359,7 @@ describe('#1579 Telegram-first member web login', () => {
       const r = await ready()
       const jar2 = new Map(r.jar); jar2.delete('mupot_tg_link')
       expect((await post(jar2)).status).toBe(403)
-      await env.SESSIONS.delete(`tglink:${r.jar.get('mupot_tg_link')}`)
+      await env.SESSIONS.delete(`tglink:${jarGet(r.jar, 'mupot_tg_link')}`)
       expect((await post(r.jar)).status).toBe(403)
       expect(identities()).toEqual([])
     })
@@ -329,7 +369,7 @@ describe('#1579 Telegram-first member web login', () => {
       const login = await visit(jar, '/auth/login?tg=1&return=/auth/telegram-link/confirm')
       const state = new URL(login.headers.get('location')!).searchParams.get('state')!
       await withGoogle('sub-pat', EMAIL, () => visit(jar, `/auth/callback?code=c&state=${state}`))
-      const sid = jar.get('mupot_session')!
+      const sid = jarGet(jar, 'mupot_session')!
       expect(JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!).tgLinkNonce).toBeUndefined()
     })
     it('a callback whose browser lost the nonce cookie mints a session without the nonce', async () => {
@@ -341,7 +381,7 @@ describe('#1579 Telegram-first member web login', () => {
       const state = new URL(login.headers.get('location')!).searchParams.get('state')!
       jar.delete('mupot_tg_link')
       await withGoogle('sub-pat', EMAIL, () => visit(jar, `/auth/callback?code=c&state=${state}`))
-      const sid = jar.get('mupot_session')!
+      const sid = jarGet(jar, 'mupot_session')!
       expect(JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!).tgLinkNonce).toBeUndefined()
       expect((await post(jar)).status).toBe(403)
     })
@@ -371,16 +411,16 @@ describe('#1579 Telegram-first member web login', () => {
       const login = await visit(jar, '/auth/login')
       const state = new URL(login.headers.get('location')!).searchParams.get('state')!
       expect((await withGoogle('s', EMAIL, () => visit(new Map(), `/auth/callback?code=c&state=${state}`))).status).toBe(400)
-      expect((await withGoogle('s', EMAIL, () => visit(new Map([[`mupot_login_state_${'0'.repeat(48)}`, '1']]), `/auth/callback?code=c&state=${state}`))).status).toBe(400)
+      expect((await withGoogle('s', EMAIL, () => visit(new Map([[`mupot_login_state_${'0'.repeat(48)}`, { value: '1', path: '/' }]]), `/auth/callback?code=c&state=${state}`))).status).toBe(400)
       const ok = await withGoogle('s', EMAIL, () => visit(jar, `/auth/callback?code=c&state=${state}`))
       expect(ok.status).toBe(302)
       expect(jar.has(`mupot_login_state_${state}`)).toBe(false)
-      const cookieAgain = new Map([[`mupot_login_state_${state}`, '1']])
+      const cookieAgain = new Map([[`mupot_login_state_${state}`, { value: '1', path: '/' }]])
       expect((await withGoogle('s', EMAIL, () => visit(cookieAgain, `/auth/callback?code=c&state=${state}`))).status).toBe(400)
     })
     it('a state value that is not one we mint is refused even with a matching cookie', async () => {
       await env.SESSIONS.put('oauthstate:abc', '1')
-      const res = await withGoogle('s', EMAIL, () => visit(new Map([['mupot_login_state_abc', '1']]), '/auth/callback?code=c&state=abc'))
+      const res = await withGoogle('s', EMAIL, () => visit(new Map([['mupot_login_state_abc', { value: '1', path: '/' }]]), '/auth/callback?code=c&state=abc'))
       expect(res.status).toBe(400)
     })
     it('a nonce whose server-side link record expired between login and callback is not stamped on the session', async () => {
@@ -390,9 +430,9 @@ describe('#1579 Telegram-first member web login', () => {
       const open = await visit(jar, `/auth/telegram-link?t=${token}`)
       const login = await visit(jar, open.headers.get('location')!)
       const state = new URL(login.headers.get('location')!).searchParams.get('state')!
-      await env.SESSIONS.delete(`tglink:${jar.get('mupot_tg_link')}`)
+      await env.SESSIONS.delete(`tglink:${jarGet(jar, 'mupot_tg_link')}`)
       await withGoogle('sub-pat', EMAIL, () => visit(jar, `/auth/callback?code=c&state=${state}`))
-      const sid = jar.get('mupot_session')!
+      const sid = jarGet(jar, 'mupot_session')!
       expect(JSON.parse((await env.SESSIONS.get(`sess:${sid}`))!).tgLinkNonce).toBeUndefined()
     })
     it('the reauth round trip is bound the same way', async () => {
@@ -403,7 +443,7 @@ describe('#1579 Telegram-first member web login', () => {
       const reauth = await visit(r.jar, '/auth/reauth')
       expect(reauth.status).toBe(302)
       const state = new URL(reauth.headers.get('location')!).searchParams.get('state')!
-      expect(r.jar.get(`mupot_login_state_${state}`)).toBe('1')
+      expect(jarGet(r.jar, `mupot_login_state_${state}`)).toBe('1')
     })
     it('return= accepts only a same-origin path', async () => {
       for (const bad of ['//evil.test/x', 'https://evil.test', '/a/../b', '/\\evil.test', 'javascript:1']) {
@@ -519,6 +559,88 @@ describe('#1579 Telegram-first member web login', () => {
       expect((await post(a.jar)).status).toBe(403)
       env.DB.batch = realBatch
       expect((await post(a.jar)).status).toBe(302)
+    })
+  })
+
+  describe('under a path-routed tenant (/t/local)', () => {
+    beforeEach(() => {
+      PFX = '/t/local'
+      env = { ...env, PUBLIC_ORIGIN: `${ORIGIN}${PFX}` } as unknown as Env
+    })
+    afterEach(() => { PFX = '' })
+
+    it('the state cookie is scoped to the PREFIXED callback path, and a full login -> callback round trip works with a Path-respecting jar', async () => {
+      const jar: Jar = new Map()
+      const login = await visit(jar, '/auth/login')
+      expect(login.status).toBe(302)
+      const state = new URL(login.headers.get('location')!).searchParams.get('state')!
+      expect(login.headers.get('location')).toContain(encodeURIComponent(`${ORIGIN}/t/local/auth/callback`))
+      expect(jar.get(`mupot_login_state_${state}`)?.path).toBe('/t/local/auth/callback')
+      const cb = await withGoogle('sub-x', 'someone@example.test', () => visit(jar, `/auth/callback?code=c&state=${state}`))
+      expect(cb.status).toBe(302)
+      expect(jarGet(jar, 'mupot_session')).toBeTruthy()
+      expect(jar.has(`mupot_login_state_${state}`)).toBe(false)
+    })
+
+    it('a callback for a forwarded state is still refused under the prefix (no bypass)', async () => {
+      const attacker: Jar = new Map()
+      const login = await visit(attacker, '/auth/login')
+      const state = new URL(login.headers.get('location')!).searchParams.get('state')!
+      const victim: Jar = new Map()
+      expect((await withGoogle('s', EMAIL, () => visit(victim, `/auth/callback?code=c&state=${state}`))).status).toBe(400)
+      expect(victim.has('mupot_session')).toBe(false)
+    })
+
+    it('the whole Telegram link round trip works under the prefix (nonce cookie reaches every /auth route)', async () => {
+      const memberId = await bornViaTelegram()
+      const { reply, token } = await mintLink()
+      expect(reply).toContain(`${ORIGIN}/t/local/auth/telegram-link?t=`)
+      const { jar, landed } = await signInViaLink(token!, 'sub-pat', EMAIL)
+      expect(jar.get('mupot_tg_link')?.path ?? null).not.toBeNull()
+      expect(landed).toBe('/auth/telegram-link/confirm')
+      expect((await post(jar)).status).toBe(302)
+      expect(identities()).toEqual([{ provider: 'google', provider_subject: 'sub-pat', member_id: memberId }])
+    })
+
+    it('the nonce cookie Path is the prefixed /auth base (not the bare /auth the browser would never send)', async () => {
+      await bornViaTelegram()
+      const { token } = await mintLink()
+      const jar: Jar = new Map()
+      await visit(jar, `/auth/telegram-link?t=${token}`)
+      expect(jar.get('mupot_tg_link')?.path).toBe('/t/local/auth')
+    })
+  })
+
+  describe('login started on a host other than the pinned PUBLIC_ORIGIN host', () => {
+    it('/login, /reauth-less entry points and the link open move the browser to the pinned host first (same path and query), setting no cookie', async () => {
+      const jar: Jar = new Map()
+      const res = await visit(jar, '/auth/login?return=/auth/telegram-link/confirm', {}, 'alias.workers.dev')
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toBe(`${ORIGIN}/login?return=/auth/telegram-link/confirm`)  // authApp is mounted at /auth in prod; the harness sees the stripped path
+      expect(jar.size).toBe(0)
+      await bornViaTelegram()
+      const { token } = await mintLink()
+      const open = await visit(jar, `/auth/telegram-link?t=${token}`, {}, 'alias.workers.dev')
+      expect(open.status).toBe(302)
+      expect(open.headers.get('location')).toBe(`${ORIGIN}/telegram-link?t=${token}`)
+      expect(jar.size).toBe(0)
+    })
+    it('/reauth on another host also moves to the pinned host', async () => {
+      await bornViaTelegram()
+      const { token } = await mintLink()
+      const r = await linkAndConfirm(token!)
+      expect(r.res.status).toBe(302)
+      const res = await visit(r.jar, '/auth/reauth', {}, 'alias.workers.dev')
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toBe(`${ORIGIN}/reauth`)
+    })
+    it('a path-tenant pinned origin keeps its prefix on the redirect', async () => {
+      env = { ...env, PUBLIC_ORIGIN: `${ORIGIN}/t/local` } as unknown as Env
+      const res = await visit(new Map(), '/auth/login', {}, 'alias.workers.dev')
+      expect(res.headers.get('location')).toBe(`${ORIGIN}/t/local/login`)
+    })
+    it('on the pinned host there is no redirect', async () => {
+      expect((await visit(new Map(), '/auth/login')).headers.get('location')).toContain('accounts.google.com')
     })
   })
 })

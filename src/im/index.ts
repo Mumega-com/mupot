@@ -397,9 +397,9 @@ export async function handleImMessage(
     if (!origin) return 'Web sign-in is not configured for this workspace. Ask an admin.'
     const minted = await mintTelegramLoginLink(env, { memberId: member.id, chatId: chat })
     if (!minted.ok) {
-      return minted.error === 'already_has_login'
-        ? 'You already have a web sign-in. Open the workspace in your browser and sign in.'
-        : 'Could not create a sign-in link.'
+      if (minted.error === 'already_has_login') return 'You already have a web sign-in. Open the workspace in your browser and sign in.'
+      if (minted.error === 'no_email') return 'Your account has no email on file, so I cannot create a sign-in link. Ask an admin to add your email, or use a new invitation.'
+      return 'Could not create a sign-in link.'
     }
     // The reply carries the plaintext link and is persisted in telegram_webhook_receipts.response_text. That is NOT
     // redactable: a duplicate Telegram delivery of this update is answered from the stored reply (reservation.duplicate

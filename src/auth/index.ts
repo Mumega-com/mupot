@@ -14,7 +14,7 @@
 //   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
 import { Hono } from 'hono'
-import { credentialBase } from '../platform/tenant-path'
+import { credentialBase, pinnedBase, parseTenantPrefix, prefixUrlValue } from '../platform/tenant-path'
 import { csrf } from 'hono/csrf'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -182,8 +182,36 @@ function stateCookieName(state: string): string | null {
   return STATE_VALUE_RE.test(state) ? `${STATE_COOKIE_PREFIX}${state}` : null
 }
 
-function callbackPath(reqUrl: string): string {
-  return new URL(callbackUrl(reqUrl)).pathname
+/**
+ * Browser-visible callback path, derived from the SAME URL used as the OAuth redirect_uri (the operator-pinned
+ * PUBLIC_ORIGIN, which carries `/t/<slug>` for a path-routed pot). A cookie scoped to a different path is never sent
+ * to the callback, which would lock every login out, so the two must come from one source.
+ */
+function callbackPath(env: Env, req: Request): string {
+  return new URL(callbackUrl(env, req)).pathname
+}
+
+/** Browser-visible `/auth` base path (for cookies that must reach every /auth route under the tenant prefix). */
+function authBasePath(env: Env, req: Request): string {
+  return callbackPath(env, req).replace(/\/callback$/, '')
+}
+
+/**
+ * The state cookie is scoped to the host that served /auth/login, but redirect_uri is the pinned PUBLIC_ORIGIN host.
+ * A login started on any other host (workers.dev, an alias) would come back to a host that never received the cookie.
+ * So /auth/login and /auth/reauth first move the browser to the pinned host, same path and query. The target host is
+ * operator config only, never request input.
+ */
+function pinnedHostRedirect(c: Context<AppEnv>): Response | null {
+  const pinned = c.env.PUBLIC_ORIGIN?.trim()
+  const base = pinned ? pinnedBase(pinned) : null
+  if (!base) return null
+  const want = new URL(base)
+  const got = new URL(c.req.url)
+  if (want.host === got.host) return null
+  const prefix = parseTenantPrefix(want.pathname)
+  const path = prefix ? prefixUrlValue(got.pathname, prefix) : got.pathname
+  return c.redirect(`${want.origin}${path}${got.search}`)
 }
 
 function cookieSecure(reqUrl: string): boolean {
@@ -569,6 +597,8 @@ authApp.get('/login', async (c) => {
   if (!env.OAUTH_CLIENT_ID) {
     return c.json({ error: 'oauth_not_configured' }, 500)
   }
+  const wrongHost = pinnedHostRedirect(c)
+  if (wrongHost) return wrongHost
 
   // CSRF state — random, single-use, stored server-side (KV) with short TTL.
   // A2: if the invite-landing page planted mupot_pending_invite, bind that
@@ -597,7 +627,7 @@ authApp.get('/login', async (c) => {
   const stateCookie = stateCookieName(state)
   if (stateCookie) {
     setCookie(c, stateCookie, '1', {
-      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.req.url), maxAge: STATE_TTL_SECONDS,
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.env, c.req.raw), maxAge: STATE_TTL_SECONDS,
     })
   }
 
@@ -667,7 +697,7 @@ authApp.get('/callback', async (c) => {
   if (!bindingCookie || getCookie(c, bindingCookie) !== '1') {
     return c.json({ error: 'invalid_state' }, 400)
   }
-  deleteCookie(c, bindingCookie, { path: callbackPath(c.req.url) })
+  deleteCookie(c, bindingCookie, { path: callbackPath(c.env, c.req.raw) })
 
   // Validate + consume the CSRF state (single-use).
   const seen = await env.SESSIONS.get(stateKey(state))
@@ -846,6 +876,8 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
   if (!auth.webSessionIdHash) {
     return c.json({ error: 'session_not_registered' }, 409)
   }
+  const wrongHost = pinnedHostRedirect(c)
+  if (wrongHost) return wrongHost
 
   const state = randomId(24)
   await env.SESSIONS.put(
@@ -856,7 +888,7 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
   const reauthCookie = stateCookieName(state)
   if (reauthCookie) {
     setCookie(c, reauthCookie, '1', {
-      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.req.url), maxAge: STATE_TTL_SECONDS,
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(c.env, c.req.raw), maxAge: STATE_TTL_SECONDS,
     })
   }
 
@@ -885,8 +917,9 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
 //   4. POST /auth/telegram-link/confirm consumes the link. Needs the nonce cookie, a session stamped with the SAME
 //                                       nonce and minted after the link was opened (an older session is never enough),
 //                                       and the session's verified email must equal the member's email (module claim).
-// Path note: callbackUrl() hardcodes '/auth/callback' and no tenant-prefix helper has merged (#1975 pending), so these
-// paths are literal '/auth/...' like every other route in this file; switch them with callbackUrl when it lands.
+// Path note: URLs in responses (Location, href, form action) are re-rooted under /t/<slug> by the Worker entry's
+// applyTenantPrefix choke point (#1975), so they stay literal '/auth/...'. COOKIE paths are not rewritten by it, so
+// every cookie Path here comes from callbackPath()/authBasePath(), i.e. from the pinned redirect_uri.
 authApp.use('/telegram-link/confirm', csrf())
 
 function telegramLinkPage(brand: string, inner: string): string {
@@ -940,6 +973,8 @@ authApp.get('/telegram-link', async (c) => {
   if (provider(env) !== 'google' || !env.OAUTH_CLIENT_ID) {
     return c.html(telegramLinkPage(brand, '<h1>Google sign-in is not available</h1><p>Connecting a Telegram account needs Google sign-in on this workspace. Ask an admin.</p>'), 503)
   }
+  const wrongHost = pinnedHostRedirect(c)
+  if (wrongHost) return wrongHost
   const nonce = randomId(24)
   await env.SESSIONS.put(
     `${TG_LINK_KV_PREFIX}${nonce}`,
@@ -947,7 +982,7 @@ authApp.get('/telegram-link', async (c) => {
     { expirationTtl: STATE_TTL_SECONDS },
   )
   setCookie(c, TG_LINK_COOKIE, nonce, {
-    httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: '/auth', maxAge: STATE_TTL_SECONDS,
+    httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: authBasePath(c.env, c.req.raw), maxAge: STATE_TTL_SECONDS,
   })
   // A FRESH sign-in, never an existing session: the nonce rides through the login's browser-bound state.
   return c.redirect(`/auth/login?tg=1&return=${TG_LINK_CONFIRM_PATH}`)
@@ -1002,7 +1037,7 @@ authApp.post('/telegram-link/confirm', async (c) => {
     return refuse()
   }
   await c.env.SESSIONS.delete(`${TG_LINK_KV_PREFIX}${ctx.nonce}`)
-  deleteCookie(c, TG_LINK_COOKIE, { path: '/auth' })
+  deleteCookie(c, TG_LINK_COOKIE, { path: authBasePath(c.env, c.req.raw) })
   return c.redirect('/')
 })
 
