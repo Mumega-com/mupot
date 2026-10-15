@@ -1422,9 +1422,13 @@ const CONSENT_TTL_SECONDS = 600
 const CONSENT_COOKIE_MAX_NONCES = 5
 const CONSENT_NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
-function consentCookieNonces(cookieHeader: string): string[] {
-  const raw = parseCookieValue(cookieHeader, CONSENT_COOKIE_NAME)
+function cookieNonceList(cookieHeader: string, cookieName: string): string[] {
+  const raw = parseCookieValue(cookieHeader, cookieName)
   return raw ? raw.split('.').filter((n) => CONSENT_NONCE_RE.test(n)) : []
+}
+
+function consentCookieNonces(cookieHeader: string): string[] {
+  return cookieNonceList(cookieHeader, CONSENT_COOKIE_NAME)
 }
 
 interface PendingConsent {
@@ -1497,9 +1501,16 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const responseWithCookie = new Response(redirectResponse.body, redirectResponse)
     // The `secure` flag is omitted for localhost (http:) but applied for https:.
     const secure = url.protocol === 'https:'
+    // mupot#1441 (same class): a double /authorize must not overwrite flow 1's binding. Keep this
+    // browser's other still-live flow nonces, append this one (bounded, self-pruning).
+    const liveFlowNonces: string[] = []
+    for (const n of cookieNonceList(request.headers.get('Cookie') ?? '', CSRF_COOKIE_NAME)) {
+      if (await env.SESSIONS.get(`oauth-req:${n}`)) liveFlowNonces.push(n)
+    }
+    const flowNonces = [...liveFlowNonces, nonce].slice(-CONSENT_COOKIE_MAX_NONCES)
     responseWithCookie.headers.set(
       'Set-Cookie',
-      `${CSRF_COOKIE_NAME}=${nonce}; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=600${secure ? '; Secure' : ''}`,
+      `${CSRF_COOKIE_NAME}=${flowNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=600${secure ? '; Secure' : ''}`,
     )
     return responseWithCookie
   }
@@ -1521,8 +1532,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // If the cookie is absent or mismatched, reject with 403 — the callback did
     // not originate from the browser that initiated /authorize.
     const cookieHeader = request.headers.get('Cookie') ?? ''
-    const cookieNonce = parseCookieValue(cookieHeader, CSRF_COOKIE_NAME)
-    if (!cookieNonce || cookieNonce !== state) {
+    const flowCookieNonces = cookieNonceList(cookieHeader, CSRF_COOKIE_NAME)
+    if (!flowCookieNonces.includes(state)) {
       return new Response('CSRF check failed: nonce mismatch', { status: 403 })
     }
 
@@ -1653,9 +1664,13 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
     const secure = url.protocol === 'https:'
+    // Consume only THIS flow's nonce; a sibling flow's callback is still bound.
+    const remainingFlowNonces = flowCookieNonces.filter((n) => n !== state)
     page.headers.append(
       'Set-Cookie',
-      `${CSRF_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=0`,
+      remainingFlowNonces.length > 0
+        ? `${CSRF_COOKIE_NAME}=${remainingFlowNonces.join('.')}; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=600${secure ? '; Secure' : ''}`
+        : `${CSRF_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/oauth/google-callback; Max-Age=0`,
     )
     // Keep this browser's other still-live consent nonces (multi-tab / double-/authorize); drop
     // any whose KV record is gone so the list self-prunes.

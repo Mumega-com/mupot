@@ -151,3 +151,59 @@ describe('mupot#1441 consent nonce binding across tabs', () => {
     expect((await decline(b, env, ns[0])).status).toBe(403) // fell off the cookie
   })
 })
+
+// Same class, earlier hop: /authorize -> google-callback binding cookie (mupot_oauth_nonce).
+async function startAuthorize(b: Browser, env: Env): Promise<string> {
+  env.DB = h.db
+  const a = await b.send(env, new Request('https://pot.test/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256'))
+  const state = new URL(a.headers.get('Location')!).searchParams.get('state')!
+  expect(b.jar.get('mupot_oauth_nonce')!.split('.')).toContain(state)
+  return state
+}
+function callback(b: Browser, env: Env, state: string, cookieOverride?: string): Promise<Response> {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'g' }), { status: 200 })
+    if (url.includes('googleapis.com/oauth2/v2/userinfo')) return new Response(JSON.stringify({ id: 'gs1', name: 'Human', email: 'human@example.test', verified_email: true }), { status: 200 })
+    throw new Error(`unexpected fetch ${url}`)
+  }))
+  const headers: Record<string, string> = { 'CF-Connecting-IP': `10.1.0.${ipSeq++}` }
+  if (cookieOverride !== undefined) headers.Cookie = cookieOverride
+  const req = new Request(`https://pot.test/oauth/google-callback?code=c&state=${state}`, { headers })
+  return cookieOverride !== undefined ? handleOAuthAuthorize(req, env) : b.send(env, req)
+}
+
+describe('mupot#1441 flow-nonce cookie (/authorize -> callback), same class', () => {
+  it('two interleaved /authorize flows in one browser: BOTH callbacks succeed, in either order', async () => {
+    for (const order of [[0, 1], [1, 0]]) {
+      const env = makeEnv(); const b = new Browser()
+      const states = [await startAuthorize(b, env), await startAuthorize(b, env)]
+      expect(states[0]).not.toBe(states[1])
+      for (const i of order) expect((await callback(b, env, states[i])).status).toBe(200)
+    }
+  })
+
+  it('cross-browser state is refused; replay of a consumed state is refused', async () => {
+    const env = makeEnv(); const a = new Browser(); const evil = new Browser()
+    const sA = await startAuthorize(a, env)
+    const sE = await startAuthorize(evil, env)
+    expect((await callback(evil, env, sA)).status).toBe(403)
+    expect((await callback(a, env, sE)).status).toBe(403)
+    expect((await callback(a, env, sA)).status).toBe(200)
+    expect((await callback(a, env, sA)).status).toBe(403) // cookie entry consumed
+    const sA2 = await startAuthorize(a, env)
+    expect((await callback(a, env, sA2, `mupot_oauth_nonce=${sA}`)).status).toBe(403) // listed-nonce missing for sA2
+  })
+
+  it('a non-UUID / forged cookie never binds; dead flows are pruned; list is capped at 5', async () => {
+    const env = makeEnv(); const b = new Browser()
+    expect((await callback(b, env, 'x', 'mupot_oauth_nonce=x')).status).toBe(403)
+    const s1 = await startAuthorize(b, env)
+    await env.SESSIONS.delete(`oauth-req:${s1}`) // expired
+    const s2 = await startAuthorize(b, env)
+    expect(b.jar.get('mupot_oauth_nonce')).toBe(s2)
+    const all = [s2]
+    for (let i = 0; i < 6; i++) all.push(await startAuthorize(b, env))
+    expect(b.jar.get('mupot_oauth_nonce')!.split('.')).toEqual(all.slice(-5))
+  })
+})
