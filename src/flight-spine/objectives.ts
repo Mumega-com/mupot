@@ -1,4 +1,5 @@
 import type { AuthContext, Capability, Env, OrgKind } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { brandSquadScope, hasCapability, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { isEnforceableCap } from '../agents/meter'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
@@ -496,6 +497,7 @@ export async function acceptObjective(
              FROM capabilities capability
              JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'

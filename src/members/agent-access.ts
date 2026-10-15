@@ -163,10 +163,10 @@ async function priorAccess(
     env.DB.prepare(
       `SELECT capability
          FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
-          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
     ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<{ capability: AgentAccessCapability }>(),
   ])
@@ -251,11 +251,19 @@ export async function prepareAgentSquadAccess(
 
   const bindingGuard = bindingProof.disposition === 'creating'
   const rk = (t: string): string => `(CASE ${t}.capability WHEN 'observer' THEN 1 WHEN 'member' THEN 2 WHEN 'lead' THEN 3 WHEN 'admin' THEN 4 WHEN 'owner' THEN 5 ELSE 0 END)`
+  // THE HORIZON FOLLOWS THE RANK (see the capabilities upsert below for the full rule).
+  const horizon = (t: string): string => `expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk(t)} THEN excluded.expires_at
+                         WHEN excluded.expires_at IS NULL OR ${t}.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(${t}.expires_at)
+                           THEN excluded.expires_at
+                         ELSE ${t}.expires_at
+                       END`
   const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')}` : '')
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
-        `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         SELECT ?, ?, ?, ?
+        `INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at)
+         SELECT ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -264,22 +272,23 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
+         DO UPDATE SET capability = excluded.capability, ${horizon('memberships')}${raiseOnly('memberships')}`,
       ).bind(
         membership.id,
         input.agentId,
         input.squadId,
         input.capability,
+        input.expiresAt ?? null,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
-        `INSERT INTO memberships (id, agent_id, squad_id, capability)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(agent_id, squad_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('memberships')}`,
-      ).bind(membership.id, input.agentId, input.squadId, input.capability)
+         DO UPDATE SET capability = excluded.capability, ${horizon('memberships')}${raiseOnly('memberships')}`,
+      ).bind(membership.id, input.agentId, input.squadId, input.capability, input.expiresAt ?? null)
 
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
@@ -298,25 +307,26 @@ export async function prepareAgentSquadAccess(
                        reason = excluded.reason,
                        granted_by = excluded.granted_by,
                        granted_via = excluded.granted_via,
-                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       -- THE HORIZON FOLLOWS THE RANK.
                        --
-                       -- NULL means permanent, i.e. the longest horizon there is,
-                       -- so either side being NULL wins. Otherwise the LATER of the
-                       -- two survives, compared with julianday() because these
-                       -- columns hold two timestamp shapes and a text compare is
-                       -- wrong for the same instant.
-                       --
-                       -- This closes two findings at the write instead of with a
-                       -- refusal, which is why there is no guard above it:
-                       --  * a caller supplying NO expiry (standing operator, or the
-                       --    HTTP route) cannot ERASE a horizon a human set — that
-                       --    would turn a deliberately time-limited grant permanent
-                       --    with no receipt distinguishing it from a real grant.
-                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
-                       --    grant to its own 60-minute horizon. An equal-rank
-                       --    re-grant is still a demotion when it cuts the duration,
-                       --    and a rank-only guard is blind to it.
+                       --  * A RAISE carries the NEW grant's own horizon (excluded.expires_at,
+                       --    NULL included). Otherwise a 60-minute elevation raising a
+                       --    permanent observer to member would leave a PERMANENT member:
+                       --    the time-boxed approval would have conferred standing authority
+                       --    that outlives it.
+                       --  * A same-rank or lower re-grant never SHORTENS what is there:
+                       --    NULL means permanent, i.e. the longest horizon, so either side
+                       --    being NULL keeps it permanent; otherwise the LATER of the two
+                       --    survives (julianday(), because the columns hold two timestamp
+                       --    shapes and a text compare is wrong for the same instant). A
+                       --    short elevation therefore cannot cut a longer or permanent
+                       --    grant at the rank it already had.
+                       -- Note that a caller supplying NO expiry (standing operator, HTTP
+                       -- route) on a same-rank or lower re-grant MAKES the row permanent;
+                       -- that is a standing grant by definition, and the event row records
+                       -- who did it.
                        expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} THEN excluded.expires_at
                          WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
                          WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
                            THEN excluded.expires_at
@@ -343,25 +353,26 @@ export async function prepareAgentSquadAccess(
                        reason = excluded.reason,
                        granted_by = excluded.granted_by,
                        granted_via = excluded.granted_via,
-                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       -- THE HORIZON FOLLOWS THE RANK.
                        --
-                       -- NULL means permanent, i.e. the longest horizon there is,
-                       -- so either side being NULL wins. Otherwise the LATER of the
-                       -- two survives, compared with julianday() because these
-                       -- columns hold two timestamp shapes and a text compare is
-                       -- wrong for the same instant.
-                       --
-                       -- This closes two findings at the write instead of with a
-                       -- refusal, which is why there is no guard above it:
-                       --  * a caller supplying NO expiry (standing operator, or the
-                       --    HTTP route) cannot ERASE a horizon a human set — that
-                       --    would turn a deliberately time-limited grant permanent
-                       --    with no receipt distinguishing it from a real grant.
-                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
-                       --    grant to its own 60-minute horizon. An equal-rank
-                       --    re-grant is still a demotion when it cuts the duration,
-                       --    and a rank-only guard is blind to it.
+                       --  * A RAISE carries the NEW grant's own horizon (excluded.expires_at,
+                       --    NULL included). Otherwise a 60-minute elevation raising a
+                       --    permanent observer to member would leave a PERMANENT member:
+                       --    the time-boxed approval would have conferred standing authority
+                       --    that outlives it.
+                       --  * A same-rank or lower re-grant never SHORTENS what is there:
+                       --    NULL means permanent, i.e. the longest horizon, so either side
+                       --    being NULL keeps it permanent; otherwise the LATER of the two
+                       --    survives (julianday(), because the columns hold two timestamp
+                       --    shapes and a text compare is wrong for the same instant). A
+                       --    short elevation therefore cannot cut a longer or permanent
+                       --    grant at the rank it already had.
+                       -- Note that a caller supplying NO expiry (standing operator, HTTP
+                       -- route) on a same-rank or lower re-grant MAKES the row permanent;
+                       -- that is a standing grant by definition, and the event row records
+                       -- who did it.
                        expires_at = CASE
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} THEN excluded.expires_at
                          WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
                          WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
                            THEN excluded.expires_at
@@ -408,10 +419,10 @@ async function readCommittedAccess(
     env.DB.prepare(
       `SELECT member_id, scope_type, scope_id, capability
          FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
-          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
     ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<CapabilityGrant>(),
   ])

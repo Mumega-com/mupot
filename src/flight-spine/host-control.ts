@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
@@ -672,6 +673,7 @@ export async function recordHostControlFact(
          EXISTS (
            SELECT 1 FROM capabilities capability
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = ?)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = ?))

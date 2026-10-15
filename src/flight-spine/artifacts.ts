@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
   executeAuditedProjectionMutations,
@@ -819,6 +820,7 @@ export async function recordArtifactMetadata(
            SELECT 1 FROM capabilities capability
              JOIN squads squad ON squad.id = ?26
             WHERE capability.member_id = ?27
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))
@@ -1198,6 +1200,7 @@ export async function recordArtifactRetrieval(
            SELECT 1 FROM capabilities capability
              JOIN squads squad ON squad.id = ?17
             WHERE capability.member_id = ?18
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))

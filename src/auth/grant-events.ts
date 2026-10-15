@@ -13,7 +13,7 @@
 //   AFTER INSERT                       -> 'granted'
 //   AFTER UPDATE (capability/expiry/   -> 'granted'  (a re-grant, an upgrade, a
 //     provenance changed)                              widened or shortened horizon)
-//   BEFORE DELETE                      -> 'revoked' (or 'expired' for the sweeper)
+//   AFTER DELETE                       -> 'revoked' (or 'expired' for the sweeper)
 //
 // Why a trigger instead of a statement every writer must remember to append:
 //

@@ -407,8 +407,8 @@ export function prepareAgentIdentityWeldStatements(
          SELECT ?, ?, ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
       ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt, agent.id),
       env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ? WHERE ${ACTIVE_AGENT_GUARD}`,
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via, reason)
+         SELECT ?, ?, 'squad', ?, ?, 'token_mint', 'agent identity weld: home-squad access' WHERE ${ACTIVE_AGENT_GUARD}`,
       ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability, agent.id),
     ]
   }
@@ -539,10 +539,10 @@ export async function prepareAgentBoundTokenMintForBinding(
     // (Athena, gate on #891.)
     const committed = await env.DB.prepare(
       `SELECT capability FROM capabilities
-        WHERE member_id = ?
+        WHERE member_id = ?1
           AND scope_type = 'squad'
-          AND scope_id = ?
-          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
+          AND scope_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
         LIMIT 1`,
     )
       .bind(memberId, agent.squad_id, nowCapabilitySql())

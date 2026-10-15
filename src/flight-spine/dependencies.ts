@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
   executePreparedExecutionReceiptBatch,
@@ -296,6 +297,7 @@ export async function linkChildFlight(
          OR EXISTS (
            SELECT 1 FROM capabilities capability JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))
@@ -606,6 +608,7 @@ export async function recordConsumedChildArtifact(
              JOIN objectives objective ON objective.id = ? AND objective.tenant = ?
              JOIN squads squad ON squad.id = objective.squad_id
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (capability.scope_type = 'org'
                 OR (capability.scope_type = 'department' AND capability.scope_id = squad.department_id)
                 OR (capability.scope_type = 'squad' AND capability.scope_id = squad.id))

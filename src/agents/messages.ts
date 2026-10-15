@@ -2367,6 +2367,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
                ON sender_access.squad_id = sender_membership.squad_id
               AND sender_access.project_id = p.id
               WHERE sender_membership.agent_id = ?4
+                AND ${CAPABILITY_LIVE_PREDICATE('sender_membership', "datetime('now')")}
            )
            AND EXISTS (
              SELECT 1 FROM memberships recipient_membership
@@ -2374,6 +2375,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
                ON recipient_access.squad_id = recipient_membership.squad_id
               AND recipient_access.project_id = p.id
               WHERE recipient_membership.agent_id = ?3
+                AND ${CAPABILITY_LIVE_PREDICATE('recipient_membership', "datetime('now')")}
            )
       )
     )
@@ -2531,6 +2533,7 @@ async function projectScopedRecipientVisible(
             ON sender_access.squad_id = sender_membership.squad_id
            AND sender_access.project_id = p.id
            WHERE sender_membership.agent_id = ?2
+             AND ${CAPABILITY_LIVE_PREDICATE('sender_membership', "datetime('now')")}
         )
         AND EXISTS (
           SELECT 1 FROM memberships recipient_membership
@@ -2538,6 +2541,7 @@ async function projectScopedRecipientVisible(
             ON recipient_access.squad_id = recipient_membership.squad_id
            AND recipient_access.project_id = p.id
            WHERE recipient_membership.agent_id = ?3
+             AND ${CAPABILITY_LIVE_PREDICATE('recipient_membership', "datetime('now')")}
         )
       LIMIT 1`,
   ).bind(projectId, fromAgent, toAgentId).first()
@@ -2895,11 +2899,13 @@ export async function validateMessageProjectAccess(
               SELECT 1 FROM memberships m
               JOIN project_squad_access psa ON psa.squad_id = m.squad_id
               WHERE psa.project_id = ?1 AND m.agent_id = ?2
+              AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")}
             ) AS sender_allowed,
             EXISTS (
               SELECT 1 FROM memberships m
               JOIN project_squad_access psa ON psa.squad_id = m.squad_id
               WHERE psa.project_id = ?1 AND m.agent_id = ?3
+              AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")}
             ) AS recipient_allowed
        FROM projects WHERE id = ?1 LIMIT 1`,
   ).bind(projectId, fromAgent, toAgent).first<{

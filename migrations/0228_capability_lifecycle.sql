@@ -47,6 +47,13 @@ ALTER TABLE capabilities ADD COLUMN reason TEXT;
 ALTER TABLE capabilities ADD COLUMN granted_by TEXT;
 ALTER TABLE capabilities ADD COLUMN granted_via TEXT;
 
+-- memberships carries the same horizon for the agent grants written through
+-- prepareAgentSquadAccess (the memberships row and the capabilities row are two
+-- planes written together). Without it a time-boxed elevation leaves a standing
+-- membership behind, and project messaging (which reads memberships) outlives the
+-- elevation. NULL = non-expiring, exactly as on capabilities.
+ALTER TABLE memberships ADD COLUMN expires_at TEXT;
+
 -- Sweep support: only the expiring subset is ever visited.
 CREATE INDEX IF NOT EXISTS idx_capabilities_expiry
     ON capabilities (expires_at)
@@ -137,7 +144,8 @@ BEGIN
   VALUES (
     lower(hex(randomblob(16))),
     COALESCE(
-      (SELECT tenant FROM grant_event_context WHERE id = 1),
+      (SELECT tenant FROM grant_event_context
+        WHERE id = 1 AND julianday(at) >= julianday('now') - (60.0 / 86400.0)),
       (SELECT tenant FROM members WHERE id = OLD.member_id),
       -- a members ON DELETE CASCADE has already removed the member row by now: the
       -- grant's own first event remembers the tenant.

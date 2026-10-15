@@ -77,6 +77,18 @@ function fingerprint(sql: string): string {
  *  query, never the file — a file is not the unit of authority, a query is. */
 const NON_AUTHORIZING_READS: ReadonlyArray<{ fingerprint: string; why: string }> = [
   {
+    fingerprint: 'aa4c890eaf7d',
+    why: "auth/grant-events capabilityReviewedEvents — snapshots the row being reviewed into grant_events. A history write must record the stored row whether or not it has lapsed.",
+  },
+  {
+    fingerprint: 'fb3ba028cbd1',
+    why: "hygiene/archive archive-squad UPDATE guard — refuses to archive a squad that still has grant rows on it. A lapsed row is still a row the archive would orphan; counting it only makes the refusal more conservative until the sweeper removes it. Not an access decision.",
+  },
+  {
+    fingerprint: 'b3f8b54f22cf',
+    why: "members/index acceptInvite existing-member INSERT — the `NOT EXISTS (SELECT … FROM capabilities …)` is the UNIQUE(member_id, scope_type, scope_id) guard of the INSERT it sits in. Filtering it would hide a lapsed row and the INSERT would collide. The AUTHORITY check in the same statement (inviter rank) goes through currentMemberRankAtLeastSql, which is predicate-filtered and pinned by tests.",
+  },
+  {
     fingerprint: 'f5623e35078b',
     why: "members/index acceptInvite (existing-member path) prior-grant read — ROW EXISTENCE for a UNIQUE(member_id, scope_type, scope_id) insert that follows. Filtering would hide a lapsed row and the INSERT would collide. Follow-up: a lapsed row currently blocks redemption of an invite on that scope until the sweeper (next PR) removes it.",
   },
@@ -160,8 +172,13 @@ function reads(): Read[] {
     const src = readFileSync(file, 'utf8')
     if (!src.includes('capabilities')) continue
     for (const lit of literalsOf(file, src)) {
-      // DELETE/INSERT/UPDATE are writes, not authorization reads — they have their own census below.
-      if (/^[`'"]\s*(DELETE|INSERT|UPDATE)\b/i.test(lit.text)) continue
+      // Writes are classified too. A guarded write (`UPDATE tasks ... WHERE EXISTS
+      // (SELECT 1 FROM capabilities ...)`, `INSERT ... SELECT ... WHERE EXISTS (...)`)
+      // re-asserts AUTHORITY at write time, which is exactly where an expired grant
+      // must not count. Only the write's own target (`INSERT INTO capabilities`,
+      // `DELETE FROM capabilities`) is not a read; READ_RE below matches FROM/JOIN, and
+      // `DELETE FROM capabilities` is filtered here.
+      if (/^[`'"]\s*DELETE\s+FROM\s+capabilities\b/i.test(lit.text)) continue
       const reads = (lit.text.match(READ_RE) ?? []).length
       if (reads === 0) continue
       out.push({
@@ -190,6 +207,12 @@ describe('every capabilities reader consumes the liveness predicate', () => {
     // The files the regex tokeniser went blind in must be seen.
     const capabilityTs = all.filter((r) => r.file === 'src/auth/capability.ts')
     expect(capabilityTs.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('the predicate refuses an anonymous `?` now (it names now twice and would misalign binds)', () => {
+    expect(() => CAPABILITY_LIVE_PREDICATE('c', '?')).toThrow(/numbered/)
+    expect(CAPABILITY_LIVE_PREDICATE('c', '?7')).toContain('?7')
+    expect(CAPABILITY_LIVE_PREDICATE('c', "datetime('now')")).toContain("datetime('now')")
   })
 
   it('the predicate keeps both load-bearing halves', () => {

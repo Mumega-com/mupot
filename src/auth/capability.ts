@@ -644,8 +644,16 @@ export async function canOnSquadAuth(
  *  @param nowParam the bound `now` parameter, e.g. '?2'.
  */
 export const CAPABILITY_LIVE_PREDICATE = (alias: string, nowParam: string): string => {
+  // The predicate names `now` twice. An ANONYMOUS `?` would bind two different positions
+  // and silently misalign every later parameter: demand a numbered placeholder or an expression.
+  if (nowParam.trim() === '?') throw new Error('CAPABILITY_LIVE_PREDICATE needs a numbered now (?N) or an SQL expression')
   const col = alias ? `${alias}.expires_at` : 'expires_at'
-  return `(${col} IS NULL OR julianday(${col}) > julianday(${nowParam}))`
+  // FAIL CLOSED ON A MISBOUND `now`. julianday(4) is a valid (ancient) Julian day, so a
+  // positional-bind slip that hands this predicate an INTEGER (a rank, a count) made
+  // every expiring grant look live. A real `now` is ~2.46 million; anything at or below
+  // 2.4 million (an integer, NULL, non-date text -> NULL) fails the guard and the
+  // expiring row is dead. NULL expires_at is unaffected: it never consults `now`.
+  return `(${col} IS NULL OR (julianday(${nowParam}) > 2400000 AND julianday(${col}) > julianday(${nowParam})))`
 }
 
 /** Canonical `now` for the predicate above — SQLite's own datetime('now') shape,

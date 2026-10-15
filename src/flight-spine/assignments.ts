@@ -1,4 +1,5 @@
 import type { CreateTaskInput } from '../tasks/service'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import {
   isValidGateOwnerForm,
   prepareGuardedTaskInsert,
@@ -430,6 +431,7 @@ export async function materializeComposition(
              FROM capabilities capability
              JOIN squads squad ON squad.id = ?
             WHERE capability.member_id = ?
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'

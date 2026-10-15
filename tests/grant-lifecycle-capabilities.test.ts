@@ -106,6 +106,16 @@ describe('migration 0228 — capability grant lifecycle', () => {
     }
   })
 
+  it('the history triggers exist at head (a future table rebuild would silently drop them)', () => {
+    const names = (h.sqlite.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'").all() as Array<{ name: string; tbl_name: string }>)
+    const has = (name: string, table: string): boolean => names.some((t) => t.name === name && t.tbl_name === table)
+    expect(has('capabilities_grant_event_insert', 'capabilities')).toBe(true)
+    expect(has('capabilities_grant_event_update', 'capabilities')).toBe(true)
+    expect(has('capabilities_grant_event_delete', 'capabilities')).toBe(true)
+    expect(has('grant_events_no_update', 'grant_events')).toBe(true)
+    expect(has('grant_events_no_delete', 'grant_events')).toBe(true)
+  })
+
   // ── an expired grant has no authority, before any sweeper ───────────────────
 
   describe('an expired grant gives no authority (no sweeper involved)', () => {
@@ -260,6 +270,18 @@ describe('migration 0228 — capability grant lifecycle', () => {
       ])
     })
 
+    it('a stale context does not supply the TENANT either (60s window applies to every field)', () => {
+      insertGrant('g1')
+      h.sqlite
+        .prepare(
+          `INSERT INTO grant_event_context (id, tenant, actor, reason, event, at)
+           VALUES (1, 'forged-tenant', 'a', 'r', 'revoked', ?)`,
+        )
+        .run(new Date(Date.now() - 10 * 60_000).toISOString())
+      h.sqlite.exec("DELETE FROM capabilities WHERE id = 'g1'")
+      expect(events().filter((e) => e.event === 'revoked')).toMatchObject([{ tenant: TENANT }])
+    })
+
     it('a fresh context can mark the end as expired (the sweeper’s path)', async () => {
       insertGrant('g1')
       const [setCtx, clearCtx] = revokeContextStatements(env, { grantedBy: 'system:sweeper', reason: 'expired' }, 'expired')
@@ -372,6 +394,52 @@ describe('migration 0228 — capability grant lifecycle', () => {
       expect(agentGrant()).toMatchObject({ capability: 'lead', granted_by: 'second-admin', granted_via: 'dashboard', reason: 'promoted' })
       const ev = events().filter((e) => JSON.parse(e.snapshot_json).scope_id === SQUAD)
       expect(ev.map((e) => [e.event, e.actor])).toEqual([['granted', ADMIN], ['granted', 'second-admin']])
+    })
+
+    describe('horizon follows the rank (a time-boxed elevation never makes a RAISE permanent)', () => {
+      const SOON = '2099-01-01 01:00:00'
+      const LATER = '2099-06-01 00:00:00'
+      const regrant = async (capability: 'observer' | 'member' | 'lead', expiresAt: string | null): Promise<void> => {
+        const out = await setAgentSquadAccess(env, {
+          agentId: AGENT, memberId: AGENT_MEMBER, squadId: SQUAD, capability, expiresAt,
+          provenance: { grantedBy: ADMIN, grantedVia: 'elevation' },
+        })
+        expect(out.ok).toBe(true)
+      }
+      const horizon = (): { capability: string; expires_at: string | null } =>
+        agentGrant() as { capability: string; expires_at: string | null }
+
+      it('RAISE from a permanent row carries the elevation horizon, not NULL', async () => {
+        seedAgent()
+        await regrant('observer', null)
+        await regrant('member', SOON)
+        expect(horizon()).toMatchObject({ capability: 'member', expires_at: SOON })
+      })
+
+      it('RAISE from a long-dated row carries the elevation horizon, not the longer one', async () => {
+        seedAgent()
+        await regrant('observer', LATER)
+        await regrant('member', SOON)
+        expect(horizon()).toMatchObject({ capability: 'member', expires_at: SOON })
+      })
+
+      it('SAME-RANK re-grant never shortens: permanent stays permanent, long stays long', async () => {
+        seedAgent()
+        await regrant('member', null)
+        await regrant('member', SOON)
+        expect(horizon()).toMatchObject({ capability: 'member', expires_at: null })
+        h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${AGENT_MEMBER}' AND scope_id = '${SQUAD}'`)
+        await regrant('member', LATER)
+        await regrant('member', SOON)
+        expect(horizon()).toMatchObject({ capability: 'member', expires_at: LATER })
+      })
+
+      it('LOWER re-grant never shortens the horizon either', async () => {
+        seedAgent()
+        await regrant('lead', null)
+        await regrant('member', SOON)
+        expect(horizon()).toMatchObject({ capability: 'member', expires_at: null })
+      })
     })
 
     it('removeAgentSquadAccess records WHO revoked, in the same batch as the DELETE', async () => {
