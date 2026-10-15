@@ -415,7 +415,7 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
     expect(row?.capability).toBe('member')
   })
 
-  // THE KEYSTONE (migration 0149).
+  // THE KEYSTONE (migration 0228).
   //
   // grant_agent_capability writes the STANDING capabilities table, so before an
   // expiry column existed the write was necessarily PERMANENT. That is the only
@@ -423,7 +423,7 @@ describe('grant_agent_capability — elevation substitutes for operator_principa
   // not confer authority that outlives it, and with no expiry the only way to
   // bound the damage was to bound the RANK.
   //
-  // With 0149 the conferred grant carries the ELEVATION's own expires_at, so it
+  // With 0228 the conferred grant carries the ELEVATION's own expires_at, so it
   // lapses on exactly the clock the human approved. That is what makes lifting
   // the rank cap safe (mupot#1360) — tracked separately; the cap stays until the
   // expiry is proven in production.

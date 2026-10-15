@@ -418,6 +418,8 @@ describe('guards on the ask', () => {
   it('never lowers access the agent already has: an agent that is already lead is left a lead', async () => {
     h.sqlite.exec(`INSERT INTO memberships (agent_id, squad_id, capability) VALUES ('agent-rava', 'squad-target', 'lead')`)
     h.sqlite.exec(`UPDATE capabilities SET capability = 'lead' WHERE id = 'cap-agent-rava'`)
+    // `already` needs BOTH planes now (a live capability row as well as the membership).
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-target', 'mem-agent-rava', 'squad', 'squad-target', 'lead')`)
     const r = await askOk('agent-rava', { squad: 'squad-target', capability: 'member' })
     const res = await decide(r.link, adminKey, 'approve')
     expect(res.status, JSON.stringify(res.body)).toBe(200)
@@ -425,6 +427,17 @@ describe('guards on the ask', () => {
     expect(member('agent-rava', 'squad-target')).toEqual({ capability: 'lead' })
     expect(n(`SELECT COUNT(*) AS n FROM membership_receipts WHERE squad_id = 'squad-target'`)).toBe(0)
     expect(reqRows()[0]).toMatchObject({ status: 'approved', result: 'unchanged' })
+  })
+
+  it('a LAPSED capability does not make the approval a no-op: the membership alone is not "already"', async () => {
+    h.sqlite.exec(`INSERT INTO memberships (agent_id, squad_id, capability, expires_at) VALUES ('agent-rava', 'squad-target', 'member', '2020-01-01 00:00:00')`)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES ('cap-rava-target', 'mem-agent-rava', 'squad', 'squad-target', 'member', '2020-01-01 00:00:00')`)
+    const r = await askOk('agent-rava', { squad: 'squad-target', capability: 'member' })
+    expect((await decide(r.link, adminKey, 'approve')).status).toBe(200)
+    expect(reqRows()[0]).toMatchObject({ status: 'approved' })
+    // the approval REFRESHED the lapsed rows instead of being swallowed by them: permanent again, via squad_join
+    expect(one(`SELECT expires_at, granted_via FROM capabilities WHERE id = 'cap-rava-target'`)).toEqual({ expires_at: null, granted_via: 'squad_join' })
+    expect(one(`SELECT expires_at FROM memberships WHERE agent_id = 'agent-rava' AND squad_id = 'squad-target'`)).toEqual({ expires_at: null })
   })
 
   it('an observer can be raised to member by an approved request, never past what was asked', async () => {
@@ -567,6 +580,17 @@ describe('who may approve: ONE derivation', () => {
     h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${ORGADM}'`)
     cap('mem-agent-hadi-admin', 'squad', 'squad-target', 'admin')
     expect(await by('squad-target')).toEqual([ADMIN])
+  })
+
+  it('an approver whose admin grant EXPIRES: live => still an approver (kills a misbound now), lapsed => not (migration 0228)', async () => {
+    await askOk('agent-rava', { squad: 'squad-target' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    h.sqlite.exec(`UPDATE capabilities SET expires_at = '2099-01-01 00:00:00' WHERE member_id = '${ADMIN}' AND scope_id = 'squad-target'`)
+    expect(await whoMayApprove(env, row)).toContain(ADMIN)
+    expect(await memberMayApprove(env, row, ADMIN)).toBe(true)
+    h.sqlite.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00' WHERE member_id = '${ADMIN}' AND scope_id = 'squad-target'`)
+    expect(await whoMayApprove(env, row)).not.toContain(ADMIN)
+    expect(await memberMayApprove(env, row, ADMIN)).toBe(false)
   })
 
   it('a home squad has NO approvers even for a member holding an exact squad-scope admin grant on it (G-FP1b)', async () => {

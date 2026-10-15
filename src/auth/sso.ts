@@ -243,8 +243,8 @@ export async function autoEnrollSsoMember(
     `).bind(memberId, env.TENANT_SLUG, email, profile.name?.trim() || email, nowIso),
     env.DB.prepare(`
       INSERT INTO capabilities (
-        id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason
-      ) VALUES (?1, ?2, 'org', NULL, ?3, ?4, 'sso', 'SSO auto-enrolment default role')
+        id, member_id, scope_type, scope_id, capability, created_at, granted_by, granted_via, reason
+      ) VALUES (?1, ?2, 'org', NULL, ?3, ?4, ?2, 'sso', 'SSO auto-enrolment default role')
     `).bind(crypto.randomUUID(), memberId, role, nowIso),
   ])
 

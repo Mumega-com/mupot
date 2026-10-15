@@ -2,7 +2,7 @@
 //
 // A STANDING CAPABILITY GRANT THAT ENDS ON ITS OWN.
 //
-// Until 0149 `capabilities` had no expiry. Every grant was permanent, and the
+// Until 0228 `capabilities` had no expiry. Every grant was permanent, and the
 // only way to narrow one was for a human to remember to revoke it. That single
 // fact is why "let this agent run its own squad" kept collapsing into "make it
 // an admin", and why operator_principal_required pushes people toward browser
@@ -72,7 +72,7 @@ describe('migration 0228 — capability grants may expire', () => {
   })
 
   it('MECHANISM ONLY — applying it expires nothing that already existed', async () => {
-    // Every pre-0149 row is NULL. If the NULL arm regresses, every standing grant
+    // Every pre-0228 row is NULL. If the NULL arm regresses, every standing grant
     // in the pot stops resolving at once — a total authorization outage.
     const preExisting = h.sqlite
       .prepare('SELECT COUNT(*) n FROM capabilities WHERE expires_at IS NOT NULL')

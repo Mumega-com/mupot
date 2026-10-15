@@ -29,6 +29,7 @@
 // useful without a squad pre-existing.
 
 import type { Env, CapabilityScopeType, Capability } from '../types'
+import { CAPABILITY_LAPSED_PREDICATE } from '../auth/capability'
 
 // ── seed definitions ──────────────────────────────────────────────────────────
 
@@ -248,8 +249,15 @@ export async function seedSquadMembers(
       // preserved; the existing capability level is NOT overwritten on re-seed.
       const grantId = await deterministicGrantId(effectiveMemberId, def.scope_type, def.scope_id)
       const grantResult = await env.DB.prepare(
-        `INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'squad_seed', 'squad seed definition')`,
+        // DO NOTHING on a live row (a re-seed never overwrites an existing level), but a LAPSED row is
+        // replaced: it confers nothing, so it must not swallow the seed definition.
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'squad_seed', 'squad seed definition')
+         -- no conflict target: the row can collide on its deterministic id AND on the (member, scope) triple.
+         ON CONFLICT DO UPDATE SET
+           capability = excluded.capability, expires_at = NULL,
+           granted_via = excluded.granted_via, reason = excluded.reason, granted_by = NULL
+         WHERE ${CAPABILITY_LAPSED_PREDICATE('capabilities', "datetime('now')")}`,
       )
         .bind(grantId, effectiveMemberId, def.scope_type, def.scope_id, def.capability, now)
         .run()

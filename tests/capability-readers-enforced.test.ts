@@ -1,8 +1,8 @@
-// tests/capability-readers-enforced.test.ts — migration 0149.
+// tests/capability-readers-enforced.test.ts — migration 0228.
 //
 // THE PREDICATE IS NOT THE HARD PART. THE CENSUS IS.
 //
-// `capabilities` is read 43 times across 25 files. A first cut of 0149 applied
+// `capabilities` is read 43 times across 25 files. A first cut of 0228 applied
 // the liveness predicate to exactly ONE of them (resolveCapabilities) and an
 // adversarial pass blocked it, correctly: the moment a writer existed, an
 // expired grant would be dead in one reader and fully alive in forty-two — and
@@ -40,7 +40,7 @@ function tsFiles(dir: string): string[] {
   return out
 }
 
-interface Literal { text: string; line: number }
+interface Literal { text: string; line: number; fnText: string }
 
 /** Every string / template literal in a file, taken from the TypeScript AST.
  *
@@ -57,9 +57,17 @@ function literalsOf(file: string, src: string): Literal[] {
   const out: Literal[] = []
   const visit = (node: ts.Node): void => {
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node)) {
+      // The nearest enclosing function-like body (or the whole file): the unit a write's
+      // revoke context must live in. A per-FILE check passes when ANY writer in the file
+      // has one, which is how a dropped or swapped context survived.
+      let fn: ts.Node = sf
+      for (let up: ts.Node | undefined = node.parent; up; up = up.parent) {
+        if (ts.isFunctionLike(up)) { fn = up; break }
+      }
       out.push({
         text: node.getText(sf),
         line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+        fnText: fn.getText(sf),
       })
       return
     }
@@ -268,7 +276,7 @@ describe('every capabilities reader consumes the liveness predicate', () => {
 // attributable. History itself is written by trigger, so a writer cannot forget the
 // EVENT — but it can still forget the PROVENANCE the event is built from.
 
-interface Write { file: string; line: number; kind: 'insert' | 'update' | 'delete'; text: string; fp: string }
+interface Write { file: string; line: number; kind: 'insert' | 'update' | 'delete'; text: string; fp: string; fnText: string }
 
 function writes(): Write[] {
   const out: Write[] = []
@@ -285,6 +293,7 @@ function writes(): Write[] {
         kind: head.startsWith('INSERT') ? 'insert' : head.startsWith('UPDATE') ? 'update' : 'delete',
         text: lit.text,
         fp: fingerprint(lit.text),
+        fnText: lit.fnText,
       })
     }
   }
@@ -318,12 +327,21 @@ describe('every capabilities writer records provenance', () => {
     expect(offenders).toEqual([])
   })
 
-  it('every DELETE is bracketed by a revoke context in its file, or is exempt', () => {
+  it('every DELETE is bracketed by a revoke context in its OWN function: set before, clear after', () => {
     const exempt = new Set(PROVENANCE_EXEMPT.map((e) => e.fingerprint))
-    const offenders = writes()
-      .filter((w) => w.kind === 'delete' && !exempt.has(w.fp))
-      .filter((w) => !readFileSync(join(__dirname, '..', w.file), 'utf8').includes('revokeContextStatements'))
-      .map((w) => `${w.file}:${w.line} [${w.fp}]`)
+    const offenders: string[] = []
+    for (const w of writes()) {
+      if (w.kind !== 'delete' || exempt.has(w.fp)) continue
+      const m = /const \[(\w+), (\w+)\] = revokeContextStatements\(/.exec(w.fnText)
+      if (!m) { offenders.push(`${w.file}:${w.line} [${w.fp}] no revokeContextStatements destructure in the enclosing function`); continue }
+      const setName = m[1] ?? ''
+      const clearName = m[2] ?? ''
+      const uses = (name: string): number => (w.fnText.match(new RegExp(`\\b${name}\\b`, 'g')) ?? []).length
+      // declaration + at least one use each, and the clear is placed AFTER the set in the batch
+      if (uses(setName) < 2 || uses(clearName) < 2 || w.fnText.lastIndexOf(setName) > w.fnText.lastIndexOf(clearName)) {
+        offenders.push(`${w.file}:${w.line} [${w.fp}] revoke context not placed set->clear around the DELETE`)
+      }
+    }
     expect(offenders).toEqual([])
   })
 })

@@ -615,12 +615,12 @@ export async function canOnSquadAuth(
   return false
 }
 
-/** SQL fragment gating a `capabilities` row on liveness (migration 0149).
+/** SQL fragment gating a `capabilities` row on liveness (migration 0228).
  *
  *  Two things are load-bearing, and they are the same two src/auth/token-lifecycle.ts
  *  spells out for member_tokens — the reasoning transfers because the failure modes do:
  *
- *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0149 is
+ *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0228 is
  *     NULL, and SQL three-valued logic drops NULL from any comparison, so a
  *     predicate without this arm would stop resolving EVERY grant in the pot at
  *     once — a total authorization outage, self-inflicted.
@@ -631,7 +631,7 @@ export async function canOnSquadAuth(
  *     fails open or closed depending purely on which shape the row carries.
  *
  *  THE PREDICATE IS NOT THE HARD PART. `capabilities` has 43 readers across 25
- *  files. A first cut of 0149 applied this to ONE of them (resolveCapabilities)
+ *  files. A first cut of 0228 applied this to ONE of them (resolveCapabilities)
  *  and an adversarial pass blocked it: an expired grant would have been dead in
  *  one reader and alive in forty-two, so the surface that DISPLAYS "expired"
  *  would disagree with every surface that ENFORCES. Worse than no expiry at all.
@@ -643,17 +643,27 @@ export async function canOnSquadAuth(
  *  @param alias table alias used in the query ('' for an unaliased FROM).
  *  @param nowParam the bound `now` parameter, e.g. '?2'.
  */
+/** Any `now` earlier than this is a bug, not a time: the predicate fails closed on it. */
+export const CAPABILITY_CLOCK_FLOOR = '2026-01-01'
+
+/** True (1) for a row whose horizon HAS lapsed: expires_at is set and not live. Used where a write
+ *  must treat a lapsed row as absent (a re-grant refreshes it instead of being swallowed by it). */
+export const CAPABILITY_LAPSED_PREDICATE = (alias: string, nowParam: string): string => {
+  const col = alias ? `${alias}.expires_at` : 'expires_at'
+  return `(${col} IS NOT NULL AND COALESCE(${CAPABILITY_LIVE_PREDICATE(alias, nowParam)}, 0) = 0)`
+}
+
 export const CAPABILITY_LIVE_PREDICATE = (alias: string, nowParam: string): string => {
   // The predicate names `now` twice. An ANONYMOUS `?` would bind two different positions
   // and silently misalign every later parameter: demand a numbered placeholder or an expression.
   if (nowParam.trim() === '?') throw new Error('CAPABILITY_LIVE_PREDICATE needs a numbered now (?N) or an SQL expression')
   const col = alias ? `${alias}.expires_at` : 'expires_at'
-  // FAIL CLOSED ON A MISBOUND `now`. julianday(4) is a valid (ancient) Julian day, so a
-  // positional-bind slip that hands this predicate an INTEGER (a rank, a count) made
-  // every expiring grant look live. A real `now` is ~2.46 million; anything at or below
-  // 2.4 million (an integer, NULL, non-date text -> NULL) fails the guard and the
-  // expiring row is dead. NULL expires_at is unaffected: it never consults `now`.
-  return `(${col} IS NULL OR (julianday(${nowParam}) > 2400000 AND julianday(${col}) > julianday(${nowParam})))`
+  // FAIL CLOSED ON A MISBOUND OR FROZEN `now`. julianday(4) is a valid (ancient) Julian
+  // day, so a positional-bind slip that hands this predicate an INTEGER (a rank, a count)
+  // made every expiring grant look live; so does a clock frozen in the past. `now` must be
+  // later than CAPABILITY_CLOCK_FLOOR (an integer, NULL, non-date text, a stale constant
+  // all fail), else the expiring row is dead. NULL expires_at never consults `now`.
+  return `(${col} IS NULL OR (julianday(${nowParam}) > julianday('${CAPABILITY_CLOCK_FLOOR}') AND julianday(${col}) > julianday(${nowParam})))`
 }
 
 /** Canonical `now` for the predicate above — SQLite's own datetime('now') shape,

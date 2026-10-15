@@ -401,7 +401,16 @@ export async function decideSquadJoin(
   if (binding.kind !== 'bound') return { status: 409, title: 'Cannot approve', message: "The agent's identity is not usable right now, so it cannot be added to a squad.", tone: 'warn' }
   const current = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`)
     .bind(req.agent_id, squad.id).first<{ capability: string }>()
-  const already = current !== null && capabilityRank(current.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
+  // `already` needs BOTH planes: the membership AND a LIVE capability row for the bound seat on this squad. A lapsed
+  // capability (an expired elevation) must not make the approval a no-op that reports success while granting nothing.
+  const liveCap = await env.DB.prepare(
+    `SELECT capability FROM capabilities
+      WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('', '?3')} LIMIT 1`,
+  ).bind(binding.memberId, squad.id, nowCapabilitySql()).first<{ capability: string }>()
+  const already = current !== null
+    && capabilityRank(current.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
+    && liveCap !== null
+    && capabilityRank(liveCap.capability as Parameters<typeof capabilityRank>[0]) >= capabilityRank(req.capability)
 
   return durablyLocal(input.waitUntil, async (): Promise<Outcome> => {
     if (!(await input.gate())) return CLOSED
@@ -426,6 +435,7 @@ export async function decideSquadJoin(
         squad: { id: squad.id, department_id: squad.department_id, kind: squad.kind },
         capability: req.capability,
         neverLower: true,
+        via: 'squad_join',
       })
       if (out.ok) result = out.result
       else {

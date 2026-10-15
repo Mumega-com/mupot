@@ -1308,7 +1308,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         );
         CREATE TABLE memberships (
           id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
-          capability TEXT NOT NULL, UNIQUE (agent_id, squad_id)
+          capability TEXT NOT NULL, expires_at TEXT, UNIQUE (agent_id, squad_id)
         );
         CREATE TABLE capabilities (
           id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,

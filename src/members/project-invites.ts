@@ -2,6 +2,7 @@ import type { AuthContext, Capability, CapabilityGrant, Env, OrgKind } from '../
 import {
   actorRankOnScopeFor,
   brandSquadScope,
+  CAPABILITY_LAPSED_PREDICATE,
   capabilityRank,
   exceedsTargetRankCeiling,
   hasCapability,
@@ -995,6 +996,8 @@ export async function redeemTelegramProjectInvite(
     : ''
   const netNewMemberExistsParams = invite.member_id === null ? [memberId] : []
 
+  // `?` = the invite's rank, bound once per use below. LAPSED reads the clock in SQL.
+  const UP = `(? > ${RANK_SQL_CASE('capabilities.capability')} OR ${CAPABILITY_LAPSED_PREDICATE('capabilities', "datetime('now')")})`
   try {
     const results = await env.DB.batch([
       env.DB.prepare(CLAIM_INVITE_SQL).bind(
@@ -1037,24 +1040,22 @@ export async function redeemTelegramProjectInvite(
             SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
           )${memberBindLandedGuard}${netNewMemberExistsGuard}
          ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET
-           -- provenance moves with the capability: only an UPGRADE re-attributes the row.
-           reason = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
-                         THEN excluded.reason ELSE capabilities.reason END,
-           granted_by = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
-                             THEN excluded.granted_by ELSE capabilities.granted_by END,
-           granted_via = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
-                              THEN excluded.granted_via ELSE capabilities.granted_via END,
-           capability =
-           CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
-                THEN excluded.capability
-                ELSE capabilities.capability
-           END`,
+           -- A redemption takes over the row on an UPGRADE, or when the existing grant has
+           -- LAPSED: a lapsed row confers nothing, so it must not swallow the new grant (the
+           -- invite would report success while conferring nothing). Provenance, capability and
+           -- horizon all move together; a raise carries the invite's own (permanent) horizon.
+           reason = CASE WHEN ${UP} THEN excluded.reason ELSE capabilities.reason END,
+           granted_by = CASE WHEN ${UP} THEN excluded.granted_by ELSE capabilities.granted_by END,
+           granted_via = CASE WHEN ${UP} THEN excluded.granted_via ELSE capabilities.granted_via END,
+           expires_at = CASE WHEN ${UP} THEN NULL ELSE capabilities.expires_at END,
+           capability = CASE WHEN ${UP} THEN excluded.capability ELSE capabilities.capability END`,
       ).bind(
         grantId, memberId, invite.squad_id, invite.capability,
         `project invite ${invite.id}`, invite.minted_by_member_id ?? null,
         invite.id, claimedAt,
         ...memberBindLandedParams,
         ...netNewMemberExistsParams,
+        capabilityRank(invite.capability),
         capabilityRank(invite.capability),
         capabilityRank(invite.capability),
         capabilityRank(invite.capability),

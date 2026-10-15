@@ -168,3 +168,72 @@ describe('elevation-conferred memberships carry the horizon (project messaging)'
     expect(await validateMessageProjectAccess(env, 'p-1', 'a-1', 'a-2')).toBeNull()
   })
 })
+
+describe('frozen or stale clocks fail closed', () => {
+  it('a now earlier than the clock floor kills an expiring grant (a test clock frozen in 1900 cannot revive it)', () => {
+    const h = createSqliteD1()
+    const probe = (now: string): number | null =>
+      (h.sqlite.prepare(`SELECT ${CAPABILITY_LIVE_PREDICATE('t', '?2')} AS ok FROM (SELECT ?1 AS expires_at) t`).get(FUTURE, now) as { ok: number | null }).ok
+    expect(probe('1900-01-01 00:00:00')).toBe(0)
+    expect(probe('2025-12-31 23:59:59')).toBe(0)
+    expect(probe(nowCapabilitySql())).toBe(1)
+    h.sqlite.close()
+  })
+})
+
+describe('a LAPSED row never swallows a re-grant (seed)', () => {
+  it('squad-seed replaces a lapsed seed row but never overwrites a live one', async () => {
+    const { seedSquadMembers, deterministicMemberId } = await import('../src/members/squad-seed')
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('d', 'd', 'D');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-seed', 'd', 's', 'S');
+    `)
+    const env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
+    expect((await seedSquadMembers(env, 'sq-seed')).ok).toBe(true)
+    const before = h.sqlite.prepare("SELECT COUNT(*) n FROM capabilities WHERE granted_via = 'squad_seed'").get() as { n: number }
+    expect(before.n).toBeGreaterThan(0)
+    // a LIVE expiring row is left alone on re-seed
+    h.sqlite.exec(`UPDATE capabilities SET expires_at = '2099-01-01 00:00:00', capability = 'observer' WHERE granted_via = 'squad_seed'`)
+    await seedSquadMembers(env, 'sq-seed')
+    expect(h.sqlite.prepare("SELECT DISTINCT capability, expires_at FROM capabilities WHERE granted_via = 'squad_seed' AND capability = 'observer'").all())
+      .toEqual([{ capability: 'observer', expires_at: '2099-01-01 00:00:00' }])
+    // a LAPSED one is replaced by the seed definition and is permanent again
+    h.sqlite.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00' WHERE granted_via = 'squad_seed'`)
+    const again = await seedSquadMembers(env, 'sq-seed')
+    expect(again, JSON.stringify(again)).toMatchObject({ ok: true })
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM capabilities WHERE granted_via = 'squad_seed' AND expires_at IS NOT NULL").get()).toEqual({ n: 0 })
+    expect(typeof deterministicMemberId).toBe('function')
+    h.sqlite.close()
+  })
+})
+
+describe('squad move records WHO revoked the source grant and attributes the destination grant', () => {
+  it('revoke context brackets the source DELETE (set before, clear after)', async () => {
+    const { moveAgentSquad } = await import('../src/org/service')
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('d', 'd', 'D');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-a', 'd', 'a', 'A'), ('sq-b', 'd', 'b', 'B');
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('m-1', 'M1', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('a-1', 'sq-a', 'a1', 'A1', 'member', 't', 'active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'a-1', 'm-1', datetime('now'));
+      INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('ms-1', 'a-1', 'sq-a', 'member');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-1', 'm-1', 'squad', 'sq-a', 'member');
+    `)
+    const env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
+    const out = await moveAgentSquad(env, {
+      agentId: 'a-1', fromSquadId: 'sq-a', toSquadId: 'sq-b', memberId: 'm-1', capability: 'member',
+      actor: { id: 'mover-1', type: 'user' }, reason: 'reorg',
+    })
+    expect(out, JSON.stringify(out)).toMatchObject({ ok: true })
+    const rev = h.sqlite.prepare("SELECT actor, reason FROM grant_events WHERE event = 'revoked'").all()
+    expect(rev).toEqual([{ actor: 'mover-1', reason: 'reorg' }])
+    const dest = h.sqlite.prepare("SELECT granted_by, granted_via FROM capabilities WHERE scope_id = 'sq-b'").get()
+    expect(dest).toEqual({ granted_by: 'mover-1', granted_via: 'squad_move' })
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM grant_event_context').get()).toEqual({ n: 0 })
+    h.sqlite.close()
+  })
+})

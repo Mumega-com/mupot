@@ -127,7 +127,17 @@ BEGIN
   VALUES (
     lower(hex(randomblob(16))),
     COALESCE((SELECT tenant FROM members WHERE id = NEW.member_id), ''),
-    'capabilities', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'granted', NEW.granted_by, NEW.reason,
+    'capabilities', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'granted',
+    -- a context-bracketed UPDATE (the sweeper) is attributed to the context's actor, fresh
+    -- within 60s; an ordinary re-grant to the actor stamped on the row itself.
+    COALESCE(
+      (SELECT actor FROM grant_event_context
+        WHERE id = 1 AND julianday(at) >= julianday('now') - (60.0 / 86400.0)),
+      NEW.granted_by),
+    COALESCE(
+      (SELECT reason FROM grant_event_context
+        WHERE id = 1 AND julianday(at) >= julianday('now') - (60.0 / 86400.0)),
+      NEW.reason),
     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     json_object(
       'id', COALESCE(NEW.id, 'rowid:' || NEW.rowid), 'member_id', NEW.member_id, 'scope_type', NEW.scope_type, 'scope_id', NEW.scope_id,

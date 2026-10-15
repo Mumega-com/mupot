@@ -101,7 +101,7 @@ function makeDb(squadKinds: Map<string, string> = new Map()) {
         }
 
         // INSERT OR IGNORE INTO capabilities
-        if (/INSERT OR IGNORE INTO capabilities/i.test(s)) {
+        if (/INSERT (?:OR IGNORE )?INTO capabilities/i.test(s)) {
           const [id, member_id, scope_type, scope_id, capability, created_at] = binds as [
             string, string, string, string | null, string, string,
           ]

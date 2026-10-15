@@ -501,7 +501,7 @@ export async function commitSquadResource(
   agent: AgentForMint,
   deps: Pick<
     StartGateDeps,
-    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'setAgentSquadAccess'
+    'mintAgentBoundToken' | 'resolveActiveAgentMember' | 'setAgentSquadAccess' | 'actorMemberId'
   >,
 ): Promise<{ kind: ResourceCommitKind; memberId: string; tokenId: string | null } | null> {
   const identity = await deps.resolveActiveAgentMember(env, agent.id)
@@ -522,7 +522,7 @@ export async function commitSquadResource(
     memberId: identity,
     squadId: agent.squad_id,
     capability: START_RESOURCE_CAPABILITY,
-    provenance: { grantedBy: null, grantedVia: 'project_start', reason: 'project start-gate resource access' },
+    provenance: { grantedBy: deps.actorMemberId, grantedVia: 'project_start', reason: 'project start-gate resource access' },
   })
   if (!outcome.ok) return null
   return { kind: 'confirmed', memberId: identity, tokenId: null }

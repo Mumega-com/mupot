@@ -1,6 +1,6 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { assertBatchWritten } from '../lib/receipt'
-import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { CAPABILITY_LAPSED_PREDICATE, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { revokeContextStatements, type GrantProvenance, type RevokeProvenance } from '../auth/grant-events'
 import type { CapabilityGrant, Env, Membership } from '../types'
 import type { AgentBindingProof } from './service'
@@ -22,9 +22,9 @@ export interface SetAgentSquadAccessInput {
   /** Raise-only: the upsert's DO UPDATE carries a rank predicate IN THE WRITE, so a concurrent promotion is never demoted. */
   neverLower?: boolean
   /** ISO/SQL timestamp after which this grant stops resolving, or null/undefined
-   *  for a permanent one (migration 0149).
+   *  for a permanent one (migration 0228).
    *
-   *  THIS IS THE POINT OF 0149. grant_agent_capability writes here, and before
+   *  THIS IS THE POINT OF 0228. grant_agent_capability writes here, and before
    *  the column existed the write was necessarily PERMANENT — which is why an
    *  elevated session was capped at 'member': a time-boxed approval could not be
    *  allowed to confer standing lead/admin that outlived its own window.
@@ -253,13 +253,15 @@ export async function prepareAgentSquadAccess(
   const rk = (t: string): string => `(CASE ${t}.capability WHEN 'observer' THEN 1 WHEN 'member' THEN 2 WHEN 'lead' THEN 3 WHEN 'admin' THEN 4 WHEN 'owner' THEN 5 ELSE 0 END)`
   // THE HORIZON FOLLOWS THE RANK (see the capabilities upsert below for the full rule).
   const horizon = (t: string): string => `expires_at = CASE
-                         WHEN ${rk('excluded')} > ${rk(t)} THEN excluded.expires_at
+                         WHEN ${rk('excluded')} > ${rk(t)} OR ${lapsed(t)} THEN excluded.expires_at
                          WHEN excluded.expires_at IS NULL OR ${t}.expires_at IS NULL THEN NULL
                          WHEN julianday(excluded.expires_at) > julianday(${t}.expires_at)
                            THEN excluded.expires_at
                          ELSE ${t}.expires_at
                        END`
-  const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')}` : '')
+  // A LAPSED row confers nothing, so it never blocks a re-grant: it is replaced like an absent one.
+  const lapsed = (t: string): string => CAPABILITY_LAPSED_PREDICATE(t, "datetime('now')")
+  const raiseOnly = (t: string): string => (input.neverLower ? ` WHERE ${rk(t)} < ${rk('excluded')} OR ${lapsed(t)}` : '')
   const membershipStatement = bindingGuard
     ? env.DB.prepare(
         `INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at)
@@ -326,7 +328,7 @@ export async function prepareAgentSquadAccess(
                        -- that is a standing grant by definition, and the event row records
                        -- who did it.
                        expires_at = CASE
-                         WHEN ${rk('excluded')} > ${rk('capabilities')} THEN excluded.expires_at
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} OR ${lapsed('capabilities')} THEN excluded.expires_at
                          WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
                          WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
                            THEN excluded.expires_at
@@ -372,7 +374,7 @@ export async function prepareAgentSquadAccess(
                        -- that is a standing grant by definition, and the event row records
                        -- who did it.
                        expires_at = CASE
-                         WHEN ${rk('excluded')} > ${rk('capabilities')} THEN excluded.expires_at
+                         WHEN ${rk('excluded')} > ${rk('capabilities')} OR ${lapsed('capabilities')} THEN excluded.expires_at
                          WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
                          WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
                            THEN excluded.expires_at

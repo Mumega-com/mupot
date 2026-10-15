@@ -1,4 +1,5 @@
 import { brandSquadScope, canOnSquad, hasCapability, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import type { GrantVia } from '../auth/grant-events'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
   commitAgentSquadAccess,
@@ -139,6 +140,8 @@ export async function addSquadMember(input: {
   capability: AgentAccessCapability
   /** Raise-only write (squad_join_request): the rank predicate lives in the upsert SQL itself. */
   neverLower?: boolean
+  /** The surface this grant came through, recorded as granted_via (default 'mcp'; squad_join_request passes 'squad_join'). */
+  via?: GrantVia
   /**
    * Set ONLY from an `authorizeStructuralWrite` verdict of kind 'delegated' (src/operators/chokepoint.ts). That verdict
    * already decided standing, scope, self/human targets and the rank ceiling for a delegated agent, so the
@@ -194,7 +197,7 @@ export async function addSquadMember(input: {
         squadId: input.squad.id,
         capability: input.capability,
         ...(input.neverLower ? { neverLower: true } : {}),
-        provenance: { grantedBy: input.auth.memberId ?? null, grantedVia: 'mcp', reason: null },
+        provenance: { grantedBy: input.auth.memberId ?? null, grantedVia: input.via ?? 'mcp', reason: null },
       },
       (prepared) => [
         receiptInsert(input.env, {

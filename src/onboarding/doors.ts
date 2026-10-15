@@ -16,6 +16,7 @@
 
 import type { Env } from '../types'
 import { capabilityReviewedEvents, revokeContextStatements } from '../auth/grant-events'
+import { CAPABILITY_LAPSED_PREDICATE } from '../auth/capability'
 
 export type DoorStatus = 'open' | 'closed' | 'crystallized'
 export type Disposition = 'pending' | 'crystallized' | 'revoked'
@@ -209,7 +210,11 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
                      provisional_door_id = excluded.provisional_door_id,
                      granted_by = excluded.granted_by,
                      granted_via = excluded.granted_via,
-                     reason = excluded.reason`,
+                     reason = excluded.reason,
+                     -- a LAPSED row must not swallow the new grant: refresh its horizon (to the
+                     -- door's own, i.e. none); a live horizon is left exactly as it was.
+                     expires_at = CASE WHEN ${CAPABILITY_LAPSED_PREDICATE('capabilities', "datetime('now')")}
+                                       THEN excluded.expires_at ELSE capabilities.expires_at END`,
     ).bind(
       grantId, input.subjectMemberId, input.scopeType, input.scopeId, input.capability, door.id,
       input.actorMemberId, `onboarding door ${door.id} self-grant`,
