@@ -4975,6 +4975,8 @@ const toolInbox: ToolSpec = {
       peek: args.peek === true,
       sinceSeq,
       seat: seatArg.seat,
+      // #1937: an attached chat's peek hides what THAT attachment marked handled (inbox_mark_handled).
+      handledByAttachment: attachedAuthority(auth)?.attachmentId,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -5390,6 +5392,21 @@ const toolInboxFenceStatus: ToolSpec = {
       ? await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
       : null
     if (strictSeat && !strictSeat.ok) return fail(500, strictSeat.error)
+    // #1937: an attached chat is never the consumer, so the host fence mode (bearer_only/gen0) would be a lie for it.
+    // Say what it CAN do instead; the host's fence/key details are not an attached chat's business.
+    if (attachedAuthority(auth)) {
+      return done({
+        agent_id: agent,
+        mode: 'peek_only',
+        attached: true,
+        can_peek: true,
+        can_consume: false,
+        can_mark_handled: seatAttachEnabled(env),
+        mark_handled_tool: 'inbox_mark_handled',
+        note: 'This is an attached chat: read with inbox {peek:true}, then record what you handled with inbox_mark_handled {ids}. Consuming, leasing and acking belong to the agent host.',
+        ...(strictSeat?.ok ? { strict_scope: true, tenant: env.TENANT_SLUG, effective_inbox_seat: strictSeat.seat } : {}),
+      })
+    }
     const row = await env.DB.prepare(
       `SELECT mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences
         WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,

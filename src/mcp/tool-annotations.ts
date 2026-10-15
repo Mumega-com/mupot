@@ -188,6 +188,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   agent_lifecycle: MUTX('delegates to deactivate/move/grant/mint, and free-text intent calls Jev at api.typesafe.ai (mcp/agent-lifecycle.ts:156,258)'),
   bootstrap_self: ADD('bootstrapSelf INSERT department/squad/agent/capabilities + agent_audit + credential claim (members/bootstrap-self.ts:809-852)'),
   seat_attach: ADD('attachSeatToAgent INSERT agent_seat_attachments + member_tokens (server-held, raw discarded) + agent_audit; or files a PENDING agent_seat_admissions row + secure_moments link (members/seat-attach.ts); flag-gated SEAT_ATTACH'),
+  inbox_mark_handled: ADD('markMessagesHandledByAttachment INSERT OR IGNORE agent_attachment_handled only (members/attached-handled.ts); never agent_messages.read_at / lease / dead letters / fence / presence; attached threads only; flag-gated SEAT_ATTACH'),
   seat_select: ADD('seatSelect INSERT agent/member/binding/capability/token/audit/seat (members/seat-select.ts); flag-gated SEAT_AUTO_ENROLL'),
   worktree_open: ADD('openWorktree find-or-create INSERT worktrees ON CONFLICT DO NOTHING + display-only UPDATE last_seen_at/last_head_sha (workspaces/service.ts); flag-gated WORKSPACES'),
   worktree_list: RO('listWorktrees SELECT only (workspaces/service.ts); flag-gated WORKSPACES'),

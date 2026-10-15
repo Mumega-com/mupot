@@ -824,9 +824,20 @@ function readerCanRead(
   return mode === (reader === 'signed' ? 'signed_only' : 'bearer_only')
 }
 
+/**
+ * #1937 - an ATTACHED chat's peek hides the rows THAT attachment marked handled (inbox_mark_handled). Pushes the
+ * attachment id onto `binds` and returns the predicate; '' when the caller is not an attached chat (host reads are
+ * byte-for-byte unchanged). Only the bearer reader uses it: an attachment is never a signed consumer.
+ */
+function handledHideSql(attachmentId: string | undefined, binds: (string | number | null)[]): string {
+  if (!attachmentId) return ''
+  binds.push(attachmentId)
+  return `AND NOT EXISTS (SELECT 1 FROM agent_attachment_handled hh WHERE hh.attachment_id = ?${binds.length} AND hh.message_id = agent_messages.id)`
+}
+
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; handledByAttachment?: string },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -875,13 +886,15 @@ async function readAgentInboxForReader(
         messages = rows.results ?? []
       } else {
         const seatSql = targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-        const binds = targetSeat
+        const binds: (string | number | null)[] = targetSeat
           ? [tenant, input.agent, sinceSeq, limit, targetSeat]
           : [tenant, input.agent, sinceSeq, limit]
+        const handledSql = handledHideSql(input.handledByAttachment, binds)
         const rows = await env.DB.prepare(
           `SELECT ${cols} FROM agent_messages
             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
               ${seatSql}
+              ${handledSql}
               AND COALESCE((SELECT mode FROM agent_inbox_fences
                              WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
             ORDER BY seq ASC LIMIT ?4`,
@@ -993,11 +1006,13 @@ async function readAgentInboxForReader(
         : [tenant, input.agent]
       const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
       if (sinceSeq > 0) binds.push(sinceSeq)
+      const handledSql = handledHideSql(input.handledByAttachment, binds)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
             ${sinceSql}
+            ${handledSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences
                            WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'`,
       ).bind(...binds).first<{ n: number }>()
@@ -1022,7 +1037,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; handledByAttachment?: string },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)
