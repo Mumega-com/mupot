@@ -1354,6 +1354,8 @@ describe('round 2 P2/P3', () => {
     expect(html.indexOf("post('/challenge',p)")).toBeLessThan(html.indexOf('slow=setTimeout('))
     expect(html.indexOf('clearTimeout(slow);\n  var res=await post(\'/decide\'')).toBeGreaterThan(-1)
     expect(html.indexOf("getElementById('copy-prompt')")).toBeLessThan(html.indexOf('if(!window.PublicKeyCredential)'))
+    // a DENY hides the 'I approved you' message box (display, not the hidden attribute: stylesheets can override it)
+    expect(html).toContain("if(decision==='deny'){var pb=document.getElementById('agent-prompt-box');if(pb)pb.style.display='none'}")
   })
 })
 

@@ -34,7 +34,7 @@ async function decide(decision){
   clearTimeout(slow);
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
-  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true}else{lock(false)}
+  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;if(decision==='deny'){var pb=document.getElementById('agent-prompt-box');if(pb)pb.style.display='none'}}else{lock(false)}
  }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false)}
 }
 var bs=form.querySelectorAll('button[data-act]');
