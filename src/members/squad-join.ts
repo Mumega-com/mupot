@@ -26,6 +26,12 @@
 //     own agent is allowed.
 //   * Telegram never carries this decision (the Mini App allowlist is seed_attach and elevation only).
 //
+// THE LINK NEVER GOES TO THE ASKING AGENT. The approval link is a bearer link whose page shows the real squad (name, home or
+// archived flags, or "no squad matches"); handing it to the agent would let it read squad names it cannot see. So the link is minted
+// here and delivered ONLY to the eligible approvers (notifyApprovers); the agent gets a link-free acknowledgement and learns the
+// outcome from its inbox. (The page itself is still a bearer page: whoever holds the link can read it, so the notice goes only to
+// approvers and the link is single-use and expires.)
+//
 // NO EXISTENCE ORACLE. The caller learns nothing about squads it cannot see: the request row, the link and the tool
 // reply have the same shape whether the ref names a real squad, a hidden one or nothing. Only the approver's page
 // shows what the ref really resolved to.
@@ -103,7 +109,7 @@ export type FileJoinFailure =
   | 'link_unavailable'
 
 export type FileJoinResult =
-  | { ok: true; link: string; expiresAt: string; agentName: string; squadRef: string; capability: JoinCapability }
+  | { ok: true; expiresAt: string; agentName: string; squadRef: string; capability: JoinCapability }
   | { ok: false; error: FileJoinFailure }
 
 /** One atomic guarded UPSERT per (agent, hour): true iff this call was inside the cap. */
@@ -183,7 +189,7 @@ export async function fileSquadJoinRequest(
   const notice = notifyApprovers(env, row, link.url, agent.name)
   if (p.waitUntil) p.waitUntil(notice)
   else await notice
-  return { ok: true, link: link.url, expiresAt: link.expiresAt, agentName: agent.name, squadRef: p.squadRef, capability: p.capability }
+  return { ok: true, expiresAt: link.expiresAt, agentName: agent.name, squadRef: p.squadRef, capability: p.capability }
 }
 
 // ── who may approve (ONE derivation: the approval check, the notice and any future Ask/Telegram surface use it) ──
@@ -230,7 +236,12 @@ export async function whoMayApprove(env: Env, req: Pick<SquadJoinRow, 'squad_id'
        FROM capabilities c JOIN members m ON m.id = c.member_id AND m.tenant = ?1 AND m.status = 'active'
       WHERE c.capability IN ('admin', 'owner')
         AND (c.scope_type = 'org' OR (c.scope_type = 'department' AND c.scope_id = ?2) OR (c.scope_type = 'squad' AND c.scope_id = ?3))
-      ORDER BY c.member_id LIMIT ?4`,
+      UNION
+     -- channel-derived squad grants count exactly as resolveCapabilities counts them
+     SELECT ccg.member_id AS member_id
+       FROM channel_capability_grants ccg JOIN members m ON m.id = ccg.member_id AND m.tenant = ?1 AND m.status = 'active'
+      WHERE ccg.squad_id = ?3 AND ccg.capability IN ('admin', 'owner')
+      ORDER BY member_id LIMIT ?4`,
   ).bind(env.TENANT_SLUG, sq.department_id, sq.id, APPROVER_SCAN_LIMIT).all<{ member_id: string }>()
   const out: string[] = []
   for (const r of rows.results ?? []) if (await eligibleApprover(env, sq, r.member_id)) out.push(r.member_id)

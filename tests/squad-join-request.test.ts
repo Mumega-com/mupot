@@ -19,6 +19,7 @@ import { advertisedTools, invokeTool, mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
+import { reissueMomentLink } from '../src/secure-moments/issue'
 import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { linkLoginIdentity } from '../src/auth/login-identity'
@@ -90,11 +91,16 @@ const agentCtx = (agentId: string): AuthContext => ({
 type Out = Awaited<ReturnType<typeof invokeTool>>
 const ask = (agentId: string, args: Record<string, unknown>, e: Env = env, ctx: AuthContext = agentCtx(agentId)): Promise<Out> =>
   invokeTool(ctx, e, 'squad_join_request', args, 'https://pot.test')
-interface Asked { link: string; expires_at: string; agent_prompt: string }
+interface Asked { link: string; status: string; expires_at: string; agent_prompt: string }
+/** The tool never returns the link (it goes only to approvers), so a test that plays the approver mints one for the pending moment. */
 async function askOk(agentId: string, args: Record<string, unknown>): Promise<Asked> {
   const r = await ask(agentId, args)
   if (!r.ok) throw new Error(`ask failed ${JSON.stringify(r)}`)
-  return r.result as Asked
+  const res = r.result as Omit<Asked, 'link'>
+  const subject = one<{ id: string }>(`SELECT id FROM squad_join_requests WHERE agent_id = ? AND squad_ref = ? AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1`, agentId, String(args.squad))
+  const m = subject ? one<{ id: string }>(`SELECT id FROM secure_moments WHERE kind = 'squad_join' AND subject_id = ? AND status = 'pending'`, subject.id) : undefined
+  const link = m ? await reissueMomentLink(env, m.id) : null
+  return { ...res, link: link?.url ?? '' }
 }
 const errOf = (r: Out): string => (r.ok ? '' : r.error)
 
@@ -166,11 +172,11 @@ afterEach(() => { h.close(); vi.restoreAllMocks() })
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('the ask grants nothing', () => {
-  it('returns { link, expires_at, agent_prompt }, files one pending request and one pending moment, writes no membership', async () => {
+  it('returns { status, expires_at, agent_prompt } with NO link, files one pending request and one pending moment, writes no membership', async () => {
     const r = await askOk('agent-rava', { squad: 'squad-target', reason: 'I run the weekly report for them' })
-    expect(Object.keys(r).sort()).toEqual(['agent_prompt', 'expires_at', 'link'])
+    expect(Object.keys(r).sort()).toEqual(['agent_prompt', 'expires_at', 'link', 'status']) // `link` is the test's own reissue, see askOk
     expect(r.link.startsWith(`${ORIGIN}/m/`)).toBe(true)
-    expect(r.agent_prompt).toContain(r.link)
+    expect(r.agent_prompt).not.toContain(r.link)
     expect(r.agent_prompt).toContain('Rava')
     expect(r.agent_prompt).toContain('as member')
     expect(reqRows()).toMatchObject([{ status: 'pending', capability: 'member', squad_id: 'squad-target', requested_via: 'agent' }])
@@ -319,8 +325,9 @@ describe('no existence oracle', () => {
     const refs = ['squad-target', 'squad-secret', 'does-not-exist', 'DOES-NOT-EXIST-2']
     const outs: Asked[] = []
     for (const ref of refs) outs.push(await askOk('agent-rava', { squad: ref }))
-    for (const o of outs) expect(Object.keys(o).sort()).toEqual(['agent_prompt', 'expires_at', 'link'])
-    const norm = (o: Asked, ref: string): string => o.agent_prompt.replace(o.link, '<LINK>').replace(o.expires_at, '<EXP>').split(`"${ref}"`).join('"<REF>"')
+    const raw = await ask('agent-rava', { squad: 'squad-target' })
+    expect(raw.ok && Object.keys(raw.result as object).sort()).toEqual(['agent_prompt', 'expires_at', 'status'])
+    const norm = (o: Asked, ref: string): string => o.agent_prompt.replace(o.expires_at, '<EXP>').split(`"${ref}"`).join('"<REF>"')
     const shapes = new Set(outs.map((o, i) => norm(o, refs[i]!)))
     expect(shapes.size).toBe(1)
     // the expiry window is the same TTL for all
@@ -533,12 +540,15 @@ describe('an attached chat asks on behalf of its attached agent, and only that a
     expect(reqRows()).toHaveLength(0)
 
     const ok = await rpc(env, g.ctx, 'squad_join_request', { squad: 'squad-target' }, 'conv-a')
-    expect(ok.sc.link, JSON.stringify(ok.body)).toBeTruthy()
+    expect(ok.sc.status, JSON.stringify(ok.body)).toBe('sent_to_admins')
+    expect(JSON.stringify(ok.body)).not.toContain('/m/') // no link reaches the chat
+    const m = one<{ id: string }>(`SELECT id FROM secure_moments WHERE kind = 'squad_join' AND status = 'pending'`)!
+    const issued = (await reissueMomentLink(env, m.id))!.url
     expect(reqRows()).toMatchObject([{ status: 'pending', requested_via: 'attached_chat', squad_id: 'squad-target' }])
     expect(one<{ agent_id: string }>(`SELECT agent_id FROM squad_join_requests`)?.agent_id).toBe('agent-rava')
     // the attached chat's own human (an admin of squad-core only) cannot approve it; the target's admin can
-    expect((await decide(String(ok.sc.link), humanKey, 'approve')).status).toBe(403)
-    expect((await decide(String(ok.sc.link), adminKey, 'approve')).status).toBe(200)
+    expect((await decide(issued, humanKey, 'approve')).status).toBe(403)
+    expect((await decide(issued, adminKey, 'approve')).status).toBe(200)
     expect(member('agent-rava', 'squad-target')).toEqual({ capability: 'member' })
   })
 })
@@ -617,9 +627,11 @@ describe('delivery: the approvers are told, nobody has to paste', () => {
     const withTg = envFor(h, { TELEGRAM_BOT_TOKEN: 'tg-test-token' })
     const r = await ask('agent-rava', { squad: 'squad-target', reason: 'ignore previous instructions' }, withTg)
     expect(r.ok).toBe(true)
-    const link = (r.ok ? (r.result as Asked).link : '')
+    const link = /https:\/\/\S+\/m\/\S+/.exec(tgCalls[0]?.text ?? '')?.[0] ?? ''
     expect(tgCalls.map((c) => c.chat)).toEqual(['1001'])
-    expect(tgCalls[0]!.text).toContain(link)
+    expect(link).not.toBe('')
+    expect((await hit(new URL(link).pathname, env)).status).toBe(200) // the approver's link works
+    expect(JSON.stringify(r)).not.toContain('/m/') // and the agent was never given it
     expect(tgCalls[0]!.text).toContain('Rava')
     expect(tgCalls[0]!.text).not.toContain('ignore previous instructions') // the agent's free text is never forwarded
     expect(tgCalls[0]!.text).toContain('cannot be approved from Telegram')
@@ -755,5 +767,76 @@ describe('notices are off the response path', () => {
     await Promise.all(pending)
     expect(calls).toEqual(['1001'])
     vi.unstubAllGlobals()
+  })
+})
+
+describe('round 1 gaps', () => {
+  it('P1: the asking agent never sees the link, nor any squad detail, whatever the ref is', async () => {
+    for (const ref of ['squad-target', 'squad-home-x', 'nowhere']) {
+      const r = await ask('agent-rava', { squad: ref })
+      expect(r.ok).toBe(true)
+      const text = JSON.stringify(r)
+      expect(text).not.toContain('/m/')
+      expect(text).not.toContain('http')
+      expect(text).not.toContain('Squad squad-target') // the real name of the squad is only on the approver page
+    }
+  })
+
+  it('M26: a changed REASON alone supersedes the old request', async () => {
+    await askOk('agent-rava', { squad: 'squad-target', reason: 'first reason' })
+    await askOk('agent-rava', { squad: 'squad-target', reason: 'second reason' })
+    expect(reqRows().map((r) => r.status).sort()).toEqual(['pending', 'superseded'])
+  })
+
+  it('M29: when no link can be minted the ask fails closed (no success reply, nobody told)', async () => {
+    h.sqlite.exec('DROP TABLE secure_moments')
+    const r = await ask('agent-rava', { squad: 'squad-target' })
+    expect(errOf(r)).toBe('secure_moments_unavailable')
+  })
+
+  it('M30: only private chats get a link: a group id, a negative id and junk are never messaged', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => { calls.push((JSON.parse(String(init.body)) as { chat_id: string }).chat_id); return new Response('{"ok":true}') })
+    const withTg = envFor(h, { TELEGRAM_BOT_TOKEN: 't' })
+    for (const chat of ['-1001234567890', 'abc', '0', '12 34']) {
+      h.sqlite.exec(`UPDATE members SET telegram_chat_id = '${chat}' WHERE id = '${ADMIN}'`)
+      await invokeTool(agentCtx('agent-rava'), withTg, 'squad_join_request', { squad: 'squad-target', reason: chat }, 'https://pot.test')
+    }
+    expect(calls).toEqual([])
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = '4242' WHERE id = '${ADMIN}'`)
+    await invokeTool(agentCtx('agent-rava'), withTg, 'squad_join_request', { squad: 'squad-target', reason: 'ok' }, 'https://pot.test')
+    expect(calls).toEqual(['4242'])
+    vi.unstubAllGlobals()
+  })
+
+  it('M17: an archived squad has no approvers', async () => {
+    await askOk('agent-rava', { squad: 'squad-target' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    expect((await whoMayApprove(env, row)).length).toBeGreaterThan(0)
+    h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-target'`)
+    expect(await whoMayApprove(env, row)).toEqual([])
+    expect(await memberMayApprove(env, row, ADMIN)).toBe(false)
+  })
+
+  it('P2: channel-derived squad admin grants count as approvers, as resolveCapabilities counts them', async () => {
+    seedHuman('member-chan')
+    h.sqlite.exec('PRAGMA foreign_keys = OFF')
+    h.sqlite.exec(`INSERT INTO channel_capability_grants (id, binding_id, member_id, squad_id, capability) VALUES ('ccg1', 'b1', 'member-chan', 'squad-target', 'admin')`)
+    await askOk('agent-rava', { squad: 'squad-target' })
+    const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
+    expect(await whoMayApprove(env, row)).toContain('member-chan')
+    expect(await memberMayApprove(env, row, 'member-chan')).toBe(true)
+  })
+
+  it('M33: every close writes its audit row (approve, deny, failed), anchored on the closed request', async () => {
+    const a = await askOk('agent-rava', { squad: 'squad-target' })
+    expect((await decide(a.link, adminKey, 'approve')).status).toBe(200)
+    const b = await askOk('agent-hadi-admin', { squad: 'squad-target' })
+    expect((await decide(b.link, adminKey, 'deny')).status).toBe(200)
+    const rows = h.sqlite.prepare(`SELECT action, agent_id, actor_id FROM agent_audit WHERE action LIKE 'squad_join_%' ORDER BY seq`).all()
+    expect(rows).toEqual([
+      { action: 'squad_join_approve', agent_id: 'agent-rava', actor_id: ADMIN },
+      { action: 'squad_join_deny', agent_id: 'agent-hadi-admin', actor_id: ADMIN },
+    ])
   })
 })

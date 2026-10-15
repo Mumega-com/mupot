@@ -7,8 +7,8 @@
 // a caller that names ANOTHER agent is refused outright (own_agent_only): it is compared to the caller's own id/slug,
 // never resolved, so it can neither widen the request nor probe for other agents.
 //
-// WHAT IT DOES. Files a pending request and a one-time secure-moment link. Nothing is granted. The reply is
-// { link, expires_at, agent_prompt } and has the same shape whether or not the squad exists or is visible to the caller.
+// WHAT IT DOES. Files a pending request and a one-time secure-moment link that goes ONLY to the eligible approvers. Nothing is
+// granted. The reply is { status, expires_at, agent_prompt } (no link) and is identical whether or not the squad exists or is visible.
 
 import type { ToolSpec } from './index'
 import { fail, done, str } from './index'
@@ -16,15 +16,15 @@ import { secureMomentsStatus } from '../secure-moments/config'
 import { SQUAD_JOIN_REASON_MAX, fileSquadJoinRequest, isJoinCapability, oneLine, type JoinCapability } from '../members/squad-join'
 import { attachedAuthority } from '../auth/attached-ceiling'
 
-/** The copyable text the agent shows its human, in mupot's voice. The same words for every squad ref (no oracle). */
-export function squadJoinAgentPrompt(i: { agentName: string; squadRef: string; capability: JoinCapability; link: string; expiresAt: string }): string {
+/** The copyable text the agent shows its human, in mupot's voice. The same words for every squad ref and NO link: the approval link
+ *  goes only to the squad's admins (a link in the agent's hands would let it read squad names it cannot see). */
+export function squadJoinAgentPrompt(i: { agentName: string; squadRef: string; capability: JoinCapability; expiresAt: string }): string {
   const agent = oneLine(i.agentName, 60) || 'An agent'
   const squad = oneLine(i.squadRef, 64)
   return [
     `Message from mupot. ${agent} asked to join the squad "${squad}" as ${i.capability}.`,
-    `To decide, open this link and tap your passkey. You must be an admin of that squad to approve; if you are not, pass the link to someone who is:`,
-    i.link,
-    `The link works once and expires ${i.expiresAt}. Nothing changes until an admin approves, and you can deny it on the same page.`,
+    `The request was sent to that squad's admins, who can approve it with their passkey. Nothing changes until one of them does.`,
+    `It expires ${i.expiresAt}. ${agent} will be told the outcome in its inbox. If you are an admin of that squad and have heard nothing, ask the agent to request again.`,
   ].join('\n')
 }
 
@@ -85,9 +85,9 @@ const toolSquadJoinRequest: ToolSpec = {
     const r = await fileSquadJoinRequest(env, { agentId, squadRef, capability, reason, via: attached ? 'attached_chat' : 'agent', waitUntil: ctx?.waitUntil })
     if (r.ok) {
       return done({
-        link: r.link,
+        status: 'sent_to_admins',
         expires_at: r.expiresAt,
-        agent_prompt: squadJoinAgentPrompt({ agentName: r.agentName, squadRef: r.squadRef, capability: r.capability, link: r.link, expiresAt: r.expiresAt }),
+        agent_prompt: squadJoinAgentPrompt({ agentName: r.agentName, squadRef: r.squadRef, capability: r.capability, expiresAt: r.expiresAt }),
       })
     }
     switch (r.error) {
