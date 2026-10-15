@@ -49,6 +49,15 @@ button.primary{background:var(--accent);color:var(--accent-text);border-color:va
 select{font:inherit;padding:.4rem;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px}
 .muted{color:var(--muted)}label{display:block}
 input[type=password],input[type=text]{font:inherit;width:100%;box-sizing:border-box;padding:.5rem;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px}
+.choices{list-style:none;padding:0;margin:.25rem 0}.choices li{margin:.5rem 0}
+label.choice{display:flex;gap:.75rem;align-items:flex-start;box-sizing:border-box;min-height:44px;padding:.65rem .75rem;margin:.5rem 0;border:1px solid var(--border);border-radius:8px;background:var(--surface);cursor:pointer;touch-action:manipulation}
+.choices label.choice{margin:0}
+label.choice>input{flex:none;width:1.5rem;height:1.5rem;min-width:24px;min-height:24px;margin:.1rem 0 0;accent-color:var(--accent)}
+label.choice>span{flex:1;min-width:0;word-break:break-word}
+label.choice:has(>input:checked){border-color:var(--accent);box-shadow:inset 0 0 0 2px var(--accent);background:var(--bg)}
+label.choice:has(>input:disabled){border-style:dashed;cursor:not-allowed;opacity:.8}
+label.choice .lock-tag{font-weight:600}
+label.choice:focus-within{outline:3px solid var(--accent);outline-offset:2px}
 .fp{font:1.05rem/1.6 ui-monospace,monospace;letter-spacing:.04em;word-break:break-word}
 </style></head><body><main>${body}</main>${script ? `${(script.srcs ?? []).map((f) => `<script nonce="${escapeHtml(script.nonce)}" src="${escapeHtml(f.src)}" integrity="${escapeHtml(f.integrity)}" crossorigin="anonymous"></script>`).join('')}<script nonce="${escapeHtml(script.nonce)}">${script.code}</script>` : ''}</body></html>`
 }

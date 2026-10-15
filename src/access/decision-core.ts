@@ -220,14 +220,14 @@ export async function elevationViewInner(env: Env, req: ElevationRequestRecord):
     const def = ELEVATION_ACTIONS[a]
     const label = def?.label ?? a
     const note = def ? `${escapeHtml(def.description)} <span class="muted">(effect: ${escapeHtml(def.effect)}. ${escapeHtml(def.effectNote)})</span>` : ''
-    return `<li><label><input type="checkbox" name="actions" value="${escapeHtml(a)}" checked> <strong>${escapeHtml(label)}</strong>${SENSITIVE_STEP_UP_ACTIONS.has(a) ? ' (sensitive)' : ''}<br>${note}</label></li>`
+    return `<li><label class="choice"><input type="checkbox" name="actions" value="${escapeHtml(a)}" checked><span><strong>${escapeHtml(label)}</strong>${SENSITIVE_STEP_UP_ACTIONS.has(a) ? ' (sensitive)' : ''}<br>${note}</span></label></li>`
   }).join('')
   const durations = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= req.requested_duration_minutes)
     .map((m) => `<option value="${m}"${m === req.requested_duration_minutes ? ' selected' : ''}>${m} minutes</option>`).join('')
   return `<dl><dt>Agent</dt><dd>${agent ? escapeHtml(agent) : '<span class="muted">unknown</span>'} (<code>${escapeHtml(req.agent_id)}</code>)</dd>
 ${fromChat ? `<dt>Requested from</dt><dd><strong>a CHAT attached to ${agent ? escapeHtml(agent) : 'this agent'}</strong> (sudo: only you, who attached it, can approve)</dd>` : ''}<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
 <dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
-<h2>Actions (untick to narrow)</h2><ul style="list-style:none;padding-left:0">${boxes}</ul>
+<h2>Actions (untick to narrow)</h2><ul class="choices">${boxes}</ul>
 <h2>Duration (you can only shorten)</h2><select name="duration_minutes">${durations}</select>
 <h2>Why the agent says it needs this</h2>${untrustedBox('Reason', req.reason)}`
 }
