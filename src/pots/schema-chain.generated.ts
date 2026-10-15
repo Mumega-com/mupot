@@ -3996,9 +3996,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_secure_moments_subject" },
     ],
   },
+  {
+    file: "0221_event_subscription_grant_token.sql",
+    sha256: "37a5c48306a01021be7126a54b02c84ae2e56ab3d629a85a710e9c6308a3682e",
+    statements: [
+      "-- 0221_event_subscription_grant_token.sql — MCP Events for ATTACHED agents (mupot W2): a subscription made through an attachment stores the\n-- attachment's own token (so its liveness follows the attachment), but the HUMAN's connector grant that authorised the subscribe must also stay\n-- live for the subscription's whole life: revoking the grant has to stop the wake. NULL for every pre-existing subscription (agent-bound\n-- consent / workspace tokens), which never use it.\nALTER TABLE event_subscriptions ADD COLUMN grant_token_id TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f9be807c7517f25db9f76d67babef3f0df2ad1ef6c42e976d6ed0d2f4d2feba6"
+export const SCHEMA_CHAIN_DIGEST: string = "f30fa3c25a0f18c0674492cc611c7c5cdc2813bc8f153df0b32c84224906e076"

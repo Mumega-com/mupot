@@ -52,6 +52,7 @@ import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, seatAttachEnabled } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, isAttachedSudoAction } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
+import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
 import {
   decideHarnessBearer, HARNESS_SESSION_ALLOWED_TOOLS, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE,
   isHarnessCredentialSession,
@@ -7779,26 +7780,67 @@ async function handleJsonRpc(
       return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403)
     }
 
+    // W2 attached agents: the human's grant is an UNBOUND directory token, so without this a chat attached to an existing agent could
+    // neither discover nor subscribe to message.created. The principal is the live ATTACHMENT found from server-held facts (see
+    // events-attached.ts); no seat handle is read or minted here, and the stored subscription uses the attachment's own token.
+    const attachedCandidates = seatAttachEnabled(c.env) && auth.channel === 'directory' && !auth.boundAgentId && auth.harnessId && auth.memberId && auth.tokenId
+      ? await listLiveAttachmentsForEvents(c.env, { memberId: auth.memberId, harnessId: auth.harnessId, grantTokenId: auth.tokenId }).catch((e: unknown) => {
+        // Fails closed (the caller is treated as unattached) but never silently: a DB fault must be visible in the logs.
+        console.error('[mcp:events] attached candidate lookup failed', e instanceof Error ? e.message : String(e))
+        return []
+      })
+      : []
+
     if (method === 'events/list') {
       const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
       // No cursor is ever issued (single page), so any non-empty cursor is not one of ours.
       if (params.cursor !== undefined && params.cursor !== null && params.cursor !== '') {
         return rpcError(id, -32602, 'invalid_cursor')
       }
-      const catalogue = eventCatalogue({
-        bound: auth.boundAgentId != null,
-        // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
-        // request time; unknown tool => not advertised).
-        mayCallTool: (toolName) => {
-          const spec = TOOL_BY_NAME.get(toolName)
-          if (!spec) return false
-          return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
-        },
-      })
+      // An attached grant is listed per ELIGIBLE candidate: each attached agent is tested against the read tool's own floor with its own
+      // consent-clamped capabilities, and only the ones that pass are advertised (and named in the description).
+      const eligible: typeof attachedCandidates = []
+      let listAuth = auth
+      for (const cand of attachedCandidates) {
+        const candAuth = await eventsAuthForAttachment(c.env, auth, cand)
+        const ok = eventCatalogue({
+          bound: true,
+          mayCallTool: (toolName) => {
+            const spec = TOOL_BY_NAME.get(toolName)
+            if (!spec) return false
+            return spec.min === 'authenticated' || hasWorkspaceAdmin(candAuth) || holdsCapabilityFloor(candAuth, spec.min)
+          },
+        }).length > 0
+        // The SAME floor events/subscribe applies (a candidate that cannot subscribe must not be advertised).
+        if (ok && callerFloorOk(candAuth, hasWorkspaceAdmin(candAuth))) { eligible.push(cand); if (eligible.length === 1) listAuth = candAuth }
+      }
+      const baseCatalogue = attachedCandidates.length > 0
+        ? (eligible.length > 0 ? eventCatalogue({ bound: true, mayCallTool: () => true }) : [])
+        : eventCatalogue({
+            bound: auth.boundAgentId != null,
+            // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
+            // request time; unknown tool => not advertised).
+            mayCallTool: (toolName) => {
+              const spec = TOOL_BY_NAME.get(toolName)
+              if (!spec) return false
+              return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
+            },
+          })
+      const catalogue = attachedCandidates.length > 0
+        ? baseCatalogue.map((e) => ({
+            ...e,
+            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. Pass arguments.agent to choose which one to wake (optional when only one).`,
+            inputSchema: {
+              type: 'object',
+              properties: { agent: { type: 'string', description: 'Id, slug or exact name of an agent this connection is attached to.' } },
+              additionalProperties: false,
+            },
+          }))
+        : baseCatalogue
       // mupot#1709: what a client was actually shown, so a client canary observes the catalogue instead
       // of inferring it. Shape only — never a token, principal id, or message body.
       console.info('[mcp:events/list]', {
-        bound: auth.boundAgentId != null,
+        bound: listAuth.boundAgentId != null,
         count: catalogue.length,
         names: catalogue.map((e) => e.name),
       })
@@ -7813,10 +7855,30 @@ async function handleJsonRpc(
         reason: 'events subscriptions are not available to a seat-handle session; call events/subscribe without the seat handle',
       }, 403)
     }
-    const floorOk = callerFloorOk(auth, hasWorkspaceAdmin(auth))
+    let evAuth = auth
+    let evParams: unknown = body.params
+    let evAttached: { humanMemberId: string; grantTokenId: string } | undefined
+    if (attachedCandidates.length > 0 && (method === 'events/subscribe' || method === 'events/unsubscribe')) {
+      const p = typeof body.params === 'object' && body.params !== null ? { ...(body.params as Record<string, unknown>) } : {}
+      const rawArgs = p.arguments
+      // Same strictness as an unattached subscribe: arguments must be absent, null, or a plain object (a string or array is invalid).
+      if (rawArgs !== undefined && rawArgs !== null && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+        return rpcError(id, -32602, 'invalid_arguments', { reason: 'arguments must be an object' })
+      }
+      const argObj = rawArgs !== undefined && rawArgs !== null ? rawArgs as Record<string, unknown> : {}
+      const { agent: agentRef, ...restArgs } = argObj
+      const picked = pickAttachment(attachedCandidates, agentRef)
+      // A fixable PARAMETER error (name the agent / it is not attached): a JSON-RPC error on HTTP 200, never a 403 that a client would read as an auth failure.
+      if (!picked.ok) return rpcError(id, -32602, picked.code, picked.data)
+      evAuth = await eventsAuthForAttachment(c.env, auth, picked.attachment)
+      // The salt is the human AND the harness (the connector): two connectors of one human attached to one agent must not share a row either.
+      evAttached = { humanMemberId: `${auth.memberId as string}:${auth.harnessId as string}`, grantTokenId: auth.tokenId as string }
+      evParams = { ...p, arguments: restArgs } // message.created takes no other arguments: anything left over is refused downstream
+    }
+    const floorOk = callerFloorOk(evAuth, hasWorkspaceAdmin(evAuth))
     const out = method === 'events/subscribe'
-      ? await eventsSubscribe(c.env, auth, floorOk, body.params)
-      : await eventsUnsubscribe(c.env, auth, floorOk, body.params)
+      ? await eventsSubscribe(c.env, evAuth, floorOk, evParams, undefined, evAttached)
+      : await eventsUnsubscribe(c.env, evAuth, floorOk, evParams, evAttached)
     return out.ok ? ok(id, out.result) : rpcError(id, out.code, out.message, out.data, out.status)
   }
 
