@@ -6,6 +6,7 @@ import { applyD1Migrations, env as cfEnv } from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
 import worker from '../../src/index'
 import { toolAnnotations } from '../../src/mcp/tool-annotations'
+import { resolveToolSpec } from '../../src/mcp/index'
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
 
@@ -226,7 +227,7 @@ describe('with a real minted token (/mcp-audience), through the wrapper', () => 
     const fullTools = ((await full.json()) as { result: { tools: Array<{ name: string; annotations?: unknown }> } }).result.tools
     expect(fullTools.length).toBeGreaterThan(100)
     // mupot#1718: every full-surface tool now carries its table annotations (through the real worker).
-    for (const t of fullTools) expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
+    for (const t of fullTools) expect(t.annotations, t.name).toEqual(toolAnnotations(resolveToolSpec(t.name)?.name ?? t.name))
     const prof = await rpcAt('/mcp/profile/needs-you', e, token)
     expect(prof.status).toBe(200)
     expect(((await prof.json()) as { result: { tools: unknown[] } }).result.tools).toHaveLength(8)

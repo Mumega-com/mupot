@@ -5476,6 +5476,10 @@ const toolInboxFenceStatus: ToolSpec = {
         can_mark_handled: !fenced && seatAttachEnabled(env),
         ...(fenced ? { reason: 'consumer_fenced_signed_only' } : {}),
         mark_handled_tool: 'inbox_mark_handled',
+        // mupot#1956: tools/list is the SAME for every authenticated caller (flag-gated only), so a connector that
+        // lacks this tool cached its catalog before the tool shipped. The server cannot push a change (stateless
+        // HTTP, no list_changed channel): the client must re-list.
+        ...(seatAttachEnabled(env) ? { if_tool_missing: 'If inbox_mark_handled is not in your tool list, your connector cached its tool catalog before this tool was deployed. Refresh or reconnect the connector (or open a new chat) so it re-lists tools; the server advertises the tool to every authenticated caller while seat attach is on.' } : {}),
         unread_total: unreadTotal,
         unread_cap: MAX_UNREAD_PER_RECIPIENT,
         near_cap: unreadTotal !== null && unreadTotal >= MAX_UNREAD_PER_RECIPIENT * INBOX_NEAR_CAP_RATIO,
@@ -7275,6 +7279,74 @@ export const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+/** mupot#1910: OpenAI-style function names (Codex, ChatGPT apps/Actions) allow only [A-Za-z0-9_-]{1,64}. The office
+ *  tools are registered dotted (`office.review_approval`). Each dotted name gets an EXACT alias with the dots turned
+ *  into underscores: the alias key points at the SAME ToolSpec object in TOOL_BY_NAME, so the capability floor,
+ *  annotations and run cannot drift. Only the alias is ADVERTISED (wireName); the dotted name stays callable for
+ *  existing callers. Registry, annotations and the allowlist ratchets keep the canonical dotted name. */
+const WIRE_SAFE_NAME = /^[A-Za-z0-9_-]{1,64}$/
+export const TOOL_WIRE_ALIASES: ReadonlyMap<string, string> = new Map(
+  TOOLS.filter((t) => !WIRE_SAFE_NAME.test(t.name)).map((t) => [t.name.replace(/[^A-Za-z0-9_-]/g, '_'), t.name]),
+)
+for (const [alias, canonical] of TOOL_WIRE_ALIASES) {
+  const spec = TOOL_BY_NAME.get(canonical)
+  if (!spec || TOOL_BY_NAME.has(alias) || !WIRE_SAFE_NAME.test(alias)) throw new Error(`tool alias ${alias} -> ${canonical} collides or is not wire-safe`)
+  TOOL_BY_NAME.set(alias, spec)
+}
+const WIRE_NAME_OF: ReadonlyMap<string, string> = new Map([...TOOL_WIRE_ALIASES].map(([alias, canonical]) => [canonical, alias]))
+/** Registry lookup by canonical OR alias name (tests pin that an alias is the identical spec object). */
+export function resolveToolSpec(name: string): ToolSpec | undefined {
+  return TOOL_BY_NAME.get(name)
+}
+/** The name a discovery surface advertises for a registered tool. */
+export function wireName(canonical: string): string {
+  return WIRE_NAME_OF.get(canonical) ?? canonical
+}
+
+/** mupot#1910: tool names on the wire are BARE (`boot_context`). MCP clients namespace them
+ *  (`mupot.boot_context`, `mupot_boot_context`, `mcp__mupot__boot_context`) and a wrapper that forwards its
+ *  own exported name gets an unknown_tool refusal that names only the string it sent. This returns the detail
+ *  for that refusal: the name, plus a did-you-mean when stripping a client namespace (or case) lands on a
+ *  registered tool. It is a HINT only: the name is never resolved or executed, so what a caller can call is
+ *  unchanged. */
+/** Longest `names` entry that `lower` ends with after a separator AND that `allowed` accepts. The filter sits INSIDE
+ *  the scan: filtering the longest match afterwards would let a hidden longer tool shadow an advertised shorter one,
+ *  or (with the filter dropped) surface the hidden tool's name. Pure, so it is tested with a synthetic registry. */
+export function longestSuffixTool(lower: string, names: Iterable<string>, allowed: (name: string) => boolean): string | undefined {
+  let best: string | undefined
+  for (const name of names) {
+    if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length) && allowed(name)) best = name
+  }
+  return best
+}
+export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): string {
+  // Only a tool this pot ADVERTISES is ever suggested (a flag-gated tool that is off stays undisclosed), and it is
+  // suggested under its ADVERTISED wire name (an office.* tool is suggested as office_*).
+  const advertised = new Set(advertisedTools(env).map((t) => t.name))
+  const suggest = (cand: string): string | undefined => {
+    const spec = TOOL_BY_NAME.get(cand)
+    return spec && advertised.has(spec.name) ? wireName(spec.name) : undefined
+  }
+  const hint = (name: string): string => `${toolName} (mupot tool names are bare, with no client namespace or prefix; did you mean "${name}"?)`
+  const trimmed = toolName.trim()
+  const lower = trimmed.toLowerCase()
+  const noServer = lower.replace(/^mcp__.+?__/, '')
+  const bare = noServer.replace(/^mupot[._:/-]/, '')
+  for (const cand of [trimmed, lower, noServer, bare]) {
+    if (cand === toolName) continue
+    const s = suggest(cand)
+    if (s) return hint(s)
+  }
+  // A connector-style namespace (`mcp__codex_apps__mupot_w2__boot_context`): only for a name that visibly carries a
+  // client or mupot namespace, take the longest tool the name ends with after a separator.
+  if (/^mcp__|mupot/.test(lower)) {
+    const best = longestSuffixTool(lower, TOOL_BY_NAME.keys(), (n) => suggest(n) !== undefined)
+    const s = best === undefined ? undefined : suggest(best)
+    if (s) return hint(s)
+  }
+  return toolName
+}
+
 // mupot#1794 W1: tools that exist only while a feature flag is on. With the flag off they are
 // not ADVERTISED (tools/list, GET /mcp/tools, openapi.full.json); a direct call still reaches the
 // tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
@@ -7343,7 +7415,7 @@ function mcpTool(spec: ToolSpec): Record<string, unknown> {
   // tool-annotations.ts; tests/mcp-tool-annotations.test.ts fails if a registered tool lacks a row.
   const annotations = toolAnnotations(spec.name)
   return {
-    name: spec.name,
+    name: wireName(spec.name),
     description: `${spec.scope}; minimum capability: ${spec.min}. Args: ${spec.args}`,
     inputSchema: spec.inputSchema,
     ...(annotations ? { annotations } : {}),
@@ -7511,7 +7583,7 @@ export async function invokeTool(
   }
 
   const spec = TOOL_BY_NAME.get(toolName)
-  if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
+  if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName, env)), tool: toolName }
 
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
@@ -7779,11 +7851,14 @@ async function handleJsonRpc(
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
     // mupot#1794 W2: `_meta` on the call (params._meta, or a `_meta` argument) can carry a seat handle
     // and harness hints. Read-only here; resolveAuth decides (flag-gated) what, if anything, it means.
+    // mupot#1910: every pre-invoke check below keys on the CANONICAL name, so an alias (office_x) cannot slip past a
+    // deny/trigger/profile list that names the dotted tool (or the reverse). invokeTool still gets the raw name.
+    const canonicalName: unknown = typeof params.name === 'string' ? (resolveToolSpec(params.name)?.name ?? params.name) : params.name
     const argsObject = typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof params.name === 'string' ? params.name : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -7813,12 +7888,12 @@ async function handleJsonRpc(
     // Profile allowlist: refuse BEFORE invokeTool, regardless of the caller's capabilities.
     // Authentication above still comes first (401 for an anonymous caller, never a probe of
     // which names are allowlisted).
-    if (profile === 'needs-you' && !profileEntry(params.name)) {
+    if (profile === 'needs-you' && !profileEntry(canonicalName)) {
       return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403)
     }
     // Profile arg refusal (e.g. boot_context runtime/model, which would reach selfReportAtBoot
     // and WRITE the fleet row). Refused, not stripped: a silent strip is a success-shaped no-op.
-    const rejectArgs = profile === 'needs-you' ? profileEntry(params.name)?.rejectArgs : undefined
+    const rejectArgs = profile === 'needs-you' ? profileEntry(canonicalName)?.rejectArgs : undefined
     if (rejectArgs && typeof params.arguments === 'object' && params.arguments !== null) {
       const supplied = rejectArgs.filter((k) => Object.prototype.hasOwnProperty.call(params.arguments, k))
       if (supplied.length > 0) {
@@ -7836,9 +7911,9 @@ async function handleJsonRpc(
     }
     // W3 (MCP_URL_ELICITATION): only the two request tools, only with the flag, secure moments and signing key on.
     let elicitPrep: ElicitationPrep | null = null
-    if (urlElicitOn && typeof params.name === 'string' && URL_ELICITATION_TOOLS.has(params.name)) {
+    if (urlElicitOn && typeof canonicalName === 'string' && URL_ELICITATION_TOOLS.has(canonicalName)) {
       elicitPrep = await prepareUrlElicitation(c.env, auth, {
-        toolName: params.name, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
+        toolName: canonicalName, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
       })
       // A refusal of a bad requestState happens INSIDE invokeTool (after its authz gates), via this hook.
       if (elicitPrep) ctx.shortCircuit = elicitPrep.shortCircuit
@@ -8028,7 +8103,7 @@ mcpApp.get('/tools', (c) =>
   c.json({
     contract: 'POST /mcp {tool, args} — bearer member token in Authorization header',
     tools: advertisedTools(c.env).map((t) => ({
-      name: t.name,
+      name: wireName(t.name),
       scope: t.scope,
       min_capability: t.min,
       args: t.args,
@@ -8205,7 +8280,7 @@ const FULL_OPENAPI_DESCRIPTION =
 // scripts/check-openapi-public-allowlist.mjs, which fails the build on exactly that
 // regression.
 function publicOpenApiSpec(origin: string): Record<string, unknown> {
-  return openApiSpec(origin, publicToolSpecs(), PUBLIC_OPENAPI_DESCRIPTION)
+  return openApiSpec(origin, publicToolSpecs().map((t) => ({ ...t, name: wireName(t.name) })), PUBLIC_OPENAPI_DESCRIPTION)
 }
 
 mcpActionsApp.get('/openapi.json', (c) => {
@@ -8224,7 +8299,7 @@ mcpActionsApp.get('/openapi.full.json', async (c) => {
   }
   if (!hasWorkspaceAdmin(auth)) return c.json({ error: 'forbidden', need: 'org:admin' }, 403)
   const url = new URL(c.req.url)
-  return c.json(openApiSpec(url.origin, advertisedTools(c.env), FULL_OPENAPI_DESCRIPTION))
+  return c.json(openApiSpec(url.origin, advertisedTools(c.env).map((t) => ({ ...t, name: wireName(t.name) })), FULL_OPENAPI_DESCRIPTION))
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {

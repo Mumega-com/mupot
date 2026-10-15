@@ -8,7 +8,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { TOOLS } from '../src/mcp'
+import { TOOLS, resolveToolSpec } from '../src/mcp'
 import { NEEDS_YOU_PROFILE } from '../src/mcp/profile-needs-you'
 import { TOOL_ANNOTATION_ROWS, toolAnnotations } from '../src/mcp/tool-annotations'
 import type { Env } from '../src/types'
@@ -68,7 +68,9 @@ describe('the full /mcp tools/list response includes them', () => {
     const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
     expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
-      expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
+      // #1910: an office_* wire alias carries its dotted tool's row (same ToolSpec object).
+      const canonical = resolveToolSpec(t.name)?.name ?? t.name
+      expect(t.annotations, t.name).toEqual(toolAnnotations(canonical))
       expect(Object.keys(t.annotations ?? {}).sort(), t.name).toEqual(['destructiveHint', 'openWorldHint', 'readOnlyHint'])
     }
   })
