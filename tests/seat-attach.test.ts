@@ -1892,6 +1892,23 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     expect(await subscriberAccessLive(env, { ...row, grant_token_id: null } as never)).toMatchObject({ live: false })
   })
 
+  it('RE-GRANT: after the connector grant is replaced, re-subscribing refreshes grant_token_id and delivery is live again (the old grant stays dead)', async () => {
+    const env = evEnv()
+    const g1 = await grant(env, HUMAN)
+    await admitAndAttach(env, g1, 'conv-a', 'rava')
+    expect((await ev(env, g1.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const { subscriberAccessLive } = await import('../src/mcp/events-subscriptions')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-10-15 00:00:00' WHERE id = '${g1.tokenId}'`)
+    expect((await subscriberAccessLive(env, one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)! as never)).live).toBe(false)
+    const g2 = await grant(env, HUMAN) // the same app reconnects: same harness, a NEW grant token
+    expect(g2.harnessId).toBe(g1.harnessId)
+    expect((await ev(env, g2.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const row = one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)!
+    expect(row.grant_token_id).toBe(g2.tokenId) // the upsert refreshed it (not left on the dead grant)
+    expect(await subscriberAccessLive(env, row as never)).toEqual({ live: true })
+    expect(n(`SELECT COUNT(*) AS n FROM event_subscriptions`)).toBe(1) // same subscription, refreshed
+  })
+
   it('two humans attached to the SAME agent with the SAME callback keep two separate subscriptions: neither can take over, refresh or unsubscribe the other\'s', async () => {
     const env = evEnv()
     h.sqlite.exec(`INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h2-core', '${HUMAN2}', 'squad', 'squad-core', 'admin')`)
