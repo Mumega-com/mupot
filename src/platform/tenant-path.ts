@@ -9,7 +9,12 @@
 //  * `tenantPath`         — prefix a root-relative path (throws on anything that is not one).
 //  * `applyTenantPrefix`  — response choke point: Location header + HTML attributes + inline-script
 //    navigation + a fetch/XHR/EventSource shim. Applied once, in the Worker entry.
-//  * `requestBase`        — absolute base for emails / Stripe / OAuth redirect URIs.
+//  * `credentialBase`     — absolute base for emails / Stripe / OAuth redirect URIs (pinned only).
+//
+// NOT COVERED (documented gaps): absolute-origin URLs built outside PUBLIC_ORIGIN (device grant,
+// pot checkout, pricing, MCP ctx.origin fallback), `fetch(new Request(...))`, `history.pushState`,
+// `srcset`/`xlink:href`, and URLs assembled at runtime that never pass through fetch/XHR/
+// EventSource/sendBeacon/window.open or an `href`/`action` attribute.
 //
 // The prefix is resolved SERVER-SIDE from the matched route (index.ts) and carried in a header the
 // apex sets after its own allow-list; it is re-validated by `parseTenantPrefix` on every read.
@@ -120,7 +125,7 @@ const META_REFRESH_RE = /(\burl\s*=\s*)(\/(?!\/)[^"'\s>]*)/gi
 function clientShim(prefix: string): string {
   const p = JSON.stringify(prefix)
   return `<script>(function(){var P=${p};window.__MUPOT_BASE=P;` +
-    `function f(u){return typeof u==='string'&&u.charAt(0)==='/'&&u.charAt(1)!=='/'&&u.indexOf('\\\\')<0&&u!==P&&u.indexOf(P+'/')!==0&&u.indexOf(P+'?')!==0?P+u:u}` +
+    `function f(u){return typeof u==='string'&&u.charAt(0)==='/'&&u.charAt(1)!=='/'&&u.indexOf('\\\\')<0&&!/^\\/t\\/[a-z0-9][a-z0-9-]*([\\/?#]|$)/i.test(u)?P+u:u}` +
     `var F=window.fetch;if(F)window.fetch=function(i,o){return F.call(this,typeof i==='string'?f(i):i,o)};` +
     `var X=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;if(X)XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=f(String(u));return X.apply(this,a)};` +
     `var E=window.EventSource;if(E){window.EventSource=function(u,c){return new E(f(String(u)),c)};window.EventSource.prototype=E.prototype}` +
@@ -138,19 +143,29 @@ function rewriteJs(js: string, prefix: string): string {
     .replace(NAV_ASSIGN_RE, navFix).replace(NAV_CALL_RE, navFix).replace(CALL_RE, navFix).replace(XHR_RE, navFix).replace(ORIGIN_JOIN_RE, navFix)
 }
 
+// One attribute: name, optional value (double-quoted, single-quoted or bare). Parsed left to right
+// so a quoted VALUE that merely contains text like ` href='/y'` is consumed whole and never matched.
+const ATTR_PAIR_RE = /([^\s"'<>\/=]+)(\s*=\s*)("[^"]*"|'[^']*'|[^\s"'=<>`]+)?/g
+const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction'])
+
 function rewriteTag(tag: string, prefix: string): string {
-  let out = tag.replace(ATTR_RE, (_m, lead: string, esc: string, q: string, path: string) =>
-    `${lead}${esc}${q}${prefixUrlValue(path, prefix)}`)
-  if (/^<meta\b/i.test(tag) && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tag)) {
-    out = out.replace(META_REFRESH_RE, (_m, lead: string, path: string) => `${lead}${prefixUrlValue(path, prefix)}`)
-  }
-  return out
+  const isRefresh = /^<meta\b/i.test(tag) && /\bhttp-equiv\s*=\s*["']?refresh/i.test(tag)
+  return tag.replace(ATTR_PAIR_RE, (m: string, name: string, eq: string, raw: string | undefined) => {
+    if (raw === undefined) return m
+    const lower = name.toLowerCase()
+    const quote = raw[0] === '"' || raw[0] === "'" ? raw[0] : ''
+    const value = quote ? raw.slice(1, -1) : raw
+    let next = value
+    if (URL_ATTRS.has(lower)) next = prefixUrlValue(value, prefix)
+    else if (isRefresh && lower === 'content') next = value.replace(META_REFRESH_RE, (_x, lead: string, path: string) => `${lead}${prefixUrlValue(path, prefix)}`)
+    return next === value ? m : `${name}${eq}${quote}${next}${quote}`
+  })
 }
 
 // One pass over the markup: <pre>/<code>/<textarea> bodies are left alone; <script> bodies get the
 // JS rules (JSON/other types are skipped); every other TAG gets attribute rewriting; text content
 // between tags is never touched.
-const SEGMENT_RE = /(<(pre|code|textarea)\b[^>]*>[\s\S]*?<\/\2\s*>)|(<script\b([^>]*)>)([\s\S]*?)(<\/script\s*>)|(<[a-zA-Z][^<>]*>)/gi
+const SEGMENT_RE = /(<(pre|code|textarea)\b[^>]*>[\s\S]*?<\/\2\s*>)|(<script\b([^>]*)>)([\s\S]*?)(<\/script\s*>)|(<[a-zA-Z](?:"[^"]*"|'[^']*'|[^<>"'])*>)/gi
 
 /** Rewrite an HTML document for a prefixed tenant. Pure string transform on the emitted markup. */
 export function rewriteHtmlForPrefix(html: string, prefix: string, injectShim = true): string {
@@ -196,26 +211,17 @@ export async function applyTenantPrefix(response: Response, prefix: string): Pro
 }
 
 /**
- * Absolute base URL for links that leave the response (emails, Stripe return URLs, OAuth redirect
- * URIs). Unprefixed tenant: the request origin, as before. Prefixed tenant: the operator-pinned
- * PUBLIC_ORIGIN host (the request host of a dispatched tenant is the internal `<slug>.<root>`
- * dispatch address, not a URL a human can open) plus the validated prefix.
+ * Base URL for CREDENTIAL-BEARING links that leave the response (sign-in verify link, OAuth
+ * redirect URI, Stripe return URLs, invite/enroll/MCP endpoints). It comes ONLY from the
+ * operator-pinned PUBLIC_ORIGIN (via `pinnedBase`; a path-routed pot's PUBLIC_ORIGIN already
+ * carries `/t/<slug>`) and NEVER from any request header or request path, so no client-controlled
+ * value can steer a bearer link. With no PUBLIC_ORIGIN configured it falls back to the request
+ * origin, as it did before #1928.
  */
-export function requestBase(env: { PUBLIC_ORIGIN?: string; TENANT_SLUG?: string }, request: Request): string {
-  const reqOrigin = new URL(request.url).origin
-  const prefix = tenantPrefixOf(request, env.TENANT_SLUG || 'mumega')
-  if (prefix === null) return reqOrigin
+export function credentialBase(env: { PUBLIC_ORIGIN?: string }, request: Request): string {
   const pinned = env.PUBLIC_ORIGIN?.trim()
   const base = pinned ? pinnedBase(pinned) : null
-  if (base !== null) {
-    // The operator-pinned base wins when it carries no path (the home tenant reached through its
-    // /t/<home> alias keeps the ROOT URLs, e.g. the registered OAuth /auth/callback) or the same
-    // prefix (a path-routed pot). A pinned base naming a different prefix is misconfiguration.
-    const pinnedPrefix = base.slice(new URL(base).origin.length)
-    if (pinnedPrefix === '' || pinnedPrefix === prefix) return base
-    return `${new URL(base).origin}${prefix}`
-  }
-  return `${reqOrigin}${prefix}`
+  return base ?? new URL(request.url).origin
 }
 
 /** Operator-pinned PUBLIC_ORIGIN as a base URL: origin plus its validated `/t/<slug>` path, if any. */
@@ -242,4 +248,20 @@ export function responsePrefixFor(original: Request, homeSlug: string): string |
   const path = extractPathTenant(new URL(original.url).pathname)
   if (path !== null) return path.slug === homeSlug.toLowerCase() ? `/t/${path.slug}` : null
   return tenantPrefixOf(original, homeSlug)
+}
+
+/**
+ * The entry wrapper (extracted from src/index.ts so it is importable in the Node test pool):
+ * drop any prefix header that is not this tenant's own, run the handler, then re-root the response.
+ */
+export async function withTenantPrefix(
+  req: Request,
+  env: { TENANT_SLUG?: string },
+  handler: (req: Request) => Promise<Response>,
+): Promise<Response> {
+  const ownSlug = env.TENANT_SLUG || 'mumega'
+  const clean = stripUntrustedPrefix(req, ownSlug)
+  const response = await handler(clean)
+  const prefix = responsePrefixFor(clean, ownSlug)
+  return prefix === null || response.status === 101 ? response : applyTenantPrefix(response, prefix)
 }

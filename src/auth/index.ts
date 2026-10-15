@@ -14,7 +14,7 @@
 //   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
 import { Hono } from 'hono'
-import { requestBase } from '../platform/tenant-path'
+import { credentialBase } from '../platform/tenant-path'
 import { csrf } from 'hono/csrf'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -223,7 +223,7 @@ function provider(env: Env): string {
 
 /** Absolute redirect URI back to /auth/callback for this request's origin. */
 function callbackUrl(env: Env, req: Request): string {
-  return `${requestBase(env, req)}/auth/callback`
+  return `${credentialBase(env, req)}/auth/callback`
 }
 
 function bootstrapOwnerEnabled(env: Env): boolean {
@@ -1115,7 +1115,7 @@ authApp.post('/email/start', async (c) => {
     email,
     ip: resolveClientIp(c),
     pendingInviteId,
-    origin: requestBase(c.env, c.req.raw),
+    origin: credentialBase(c.env, c.req.raw),
     waitUntil: (p) => c.executionCtx.waitUntil(p),
   })
 

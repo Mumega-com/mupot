@@ -80,7 +80,7 @@ import { routinesApp } from './routines/routes'
 import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
-import { applyTenantPrefix, responsePrefixFor, stripUntrustedPrefix } from './platform/tenant-path'
+import { withTenantPrefix } from './platform/tenant-path'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
@@ -368,23 +368,6 @@ function reportUnmatchedCron(scheduledAt: Date): void {
   })
 }
 
-/**
- * mupot#1928 choke point: a path-routed tenant (`/t/<slug>`) is served behind a prefix the
- * handlers never see, so every root-relative URL in its responses is re-rooted here, once.
- * The prefix is server-resolved (apex route match, or the header the apex stamped on a
- * dispatched request) and re-validated by parseTenantPrefix; it never comes from a URL.
- */
-async function handleWithTenantPrefix(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  // The prefix header is client-reachable on direct requests: drop anything that does not name this
-  // Worker's own tenant before any handler can read it (an unstripped forgery put a bearer verify
-  // link into the sign-in email pointing at another tenant).
-  const ownSlug = env.TENANT_SLUG || 'mumega'
-  req = stripUntrustedPrefix(req, ownSlug)
-  const response = await handleRequest(req, env, ctx)
-  const prefix = responsePrefixFor(req, ownSlug)
-  return prefix === null || response.status === 101 ? response : applyTenantPrefix(response, prefix)
-}
-
 async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
@@ -448,7 +431,8 @@ async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Pro
 }
 
 export default {
-  fetch: handleWithTenantPrefix,
+  // mupot#1928 choke point: strip a forged prefix header, then re-root a path-routed tenant's response.
+  fetch: (req: Request, env: Env, ctx: ExecutionContext) => withTenantPrefix(req, env, (r) => handleRequest(r, env, ctx)),
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,

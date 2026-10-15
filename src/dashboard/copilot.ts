@@ -823,7 +823,10 @@ document.querySelectorAll('[data-copilot-open]').forEach(function (btn) {
   });
 });
 
-const onFullPage = location.pathname === '/copilot' || location.pathname === '/chat';
+// Path-routed tenant (#1928): compare the pathname with the /t/<slug> prefix removed.
+const __base = window.__MUPOT_BASE || '';
+const __path = __base && location.pathname.indexOf(__base) === 0 ? location.pathname.slice(__base.length) : location.pathname;
+const onFullPage = __path === '/copilot' || __path === '/chat';
 if (onFullPage) document.body.classList.add('copilot-fullpage');
 
 document.querySelectorAll('.mupot-copilot-recipient-select').forEach(function (sel) {

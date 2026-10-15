@@ -2,7 +2,11 @@
 // prefix. Exercises the real dashboardApp on the real migration chain, then the same choke point
 // the Worker entry applies (responsePrefixFor + applyTenantPrefix).
 
+import { readFileSync } from 'node:fs'
+import vm from 'node:vm'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { billingRoutesApp } from '../src/billing/routes'
+import { publicMcpEndpoint } from '../src/routines/dispatch'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { requiredCanonicalOrigin, canonicalOrigin } from '../src/dashboard/connect'
@@ -13,7 +17,8 @@ import {
   applyTenantPrefix,
   parseTenantPrefix,
   prefixLocation,
-  requestBase,
+  credentialBase,
+  withTenantPrefix,
   responsePrefixFor,
   rewriteHtmlForPrefix,
   stripUntrustedPrefix,
@@ -147,27 +152,26 @@ describe('absolute links built outside the response (email / Stripe / OAuth / MC
     expect(canonicalOrigin({ PUBLIC_ORIGIN: 'https://pot.example.com/%2e%2e//evil' }, 'x')).toBe('https://pot.example.com')
   })
 
-  it('requestBase: a path-routed pot uses the pinned public host + prefix, not the internal dispatch host', () => {
-    const req = new Request('https://gaf.mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/gaf' } })
-    expect(requestBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf', TENANT_SLUG: 'gaf' }, req)).toBe('https://mupot.mumega.com/t/gaf')
-    const plain = new Request('https://pot.example.com/auth/login')
-    expect(requestBase({ PUBLIC_ORIGIN: 'https://other.test', TENANT_SLUG: 'gaf' }, plain)).toBe('https://pot.example.com')
-  })
-
-  it('home tenant on its /t/<home> alias keeps ROOT urls (OAuth callback stays the registered /auth/callback)', () => {
-    const req = new Request('https://mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/mumega' } })
-    expect(requestBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com', TENANT_SLUG: 'mumega' }, req)).toBe('https://mupot.mumega.com')
+  it('credentialBase comes ONLY from pinned PUBLIC_ORIGIN: header, path and request host are irrelevant', () => {
+    const stamped = new Request('https://gaf.mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/gaf' } })
+    expect(credentialBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf' }, stamped)).toBe('https://mupot.mumega.com/t/gaf')
+    // forged header cannot add OR change a prefix
+    const forged = new Request('https://pot.example.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/attackerpot' } })
+    expect(credentialBase({ PUBLIC_ORIGIN: 'https://pot.example.com' }, forged)).toBe('https://pot.example.com')
+    expect(credentialBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/victim' }, forged)).toBe('https://mupot.mumega.com/t/victim')
+    // home tenant on its /t/<home> alias keeps ROOT urls (registered OAuth /auth/callback)
+    const alias = new Request('https://mupot.mumega.com/auth/login', { headers: { [TENANT_PREFIX_HEADER]: '/t/mumega' } })
+    expect(credentialBase({ PUBLIC_ORIGIN: 'https://mupot.mumega.com' }, alias)).toBe('https://mupot.mumega.com')
+    // no PUBLIC_ORIGIN: request origin (pre-#1928 behaviour), never a header
+    expect(credentialBase({}, forged)).toBe('https://pot.example.com')
   })
 
   it('FORGED HEADER (direct request, no /t/ path): no reader honours a prefix naming another tenant', () => {
     const forged = { [TENANT_PREFIX_HEADER]: '/t/attackerpot' }
-    const env = { PUBLIC_ORIGIN: 'https://pot.example.com', TENANT_SLUG: 'victim' }
     const req = new Request('https://pot.example.com/auth/email/start', { method: 'POST', headers: forged })
     expect(tenantPrefixOf(req, 'victim')).toBeNull()
-    expect(requestBase(env, req)).toBe('https://pot.example.com')
     expect(responsePrefixFor(req, 'victim')).toBeNull()
     expect(stripUntrustedPrefix(req, 'victim').headers.has(TENANT_PREFIX_HEADER)).toBe(false)
-    // the tenant's own slug is the only value honoured
     const own = new Request('https://x.test/', { headers: { [TENANT_PREFIX_HEADER]: '/t/victim' } })
     expect(stripUntrustedPrefix(own, 'victim')).toBe(own)
   })
@@ -338,5 +342,202 @@ describe('sweep: dashboard pages under a /t/<slug> request emit no unprefixed UR
     expect(raw.status).toBe(302)
     const out = await applyTenantPrefix(raw, PREFIX)
     expect(out.headers.get('location')).toBe('/t/local/auth/login')
+  })
+})
+
+// ---- tokenizer: user content must round-trip ------------------------------------------------
+
+describe('user content is never rewritten', () => {
+  const PROBE = `url=/docs fetch('/api/x') href='/y' location='/z' action="/w"`
+  it('textarea body, text nodes and attribute VALUES containing url-like text stay byte-identical', () => {
+    const html = `<!doctype html><html><head></head><body>
+<textarea name="goal">${PROBE}</textarea>
+<p>${PROBE}</p>
+<input value="${PROBE.replace(/"/g, '&quot;')}">
+<input value='x href="/y" src="/z"'>
+<div title="a href='/q' b" data-href="/d" data-src="/e"><a href="/real">r</a></div>
+<code>${PROBE}</code><pre>${PROBE}</pre>
+</body></html>`
+    const out = rewriteHtmlForPrefix(html, PREFIX)
+    const strip = (x: string) => x.replace(/<script>\(function\(\)\{var P=.*?<\/script>/s, '')
+    const expected = html.replace('<a href="/real">', '<a href="/t/local/real">')
+    expect(strip(out)).toBe(expected)
+  })
+})
+
+// ---- the client shim, executed ---------------------------------------------------------------
+
+describe('client shim (executed in a vm)', () => {
+  function runShim() {
+    const html = rewriteHtmlForPrefix('<html><head></head><body></body></html>', PREFIX)
+    const src = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? ''
+    const calls: Record<string, unknown[]> = { fetch: [], xhr: [], es: [], beacon: [], open: [] }
+    class XHR { open(...a: unknown[]) { calls.xhr.push(a) } }
+    class ES { constructor(...a: unknown[]) { calls.es.push(a) } }
+    const win: Record<string, unknown> = {
+      fetch: (...a: unknown[]) => { calls.fetch.push(a); return Promise.resolve() },
+      XMLHttpRequest: XHR,
+      EventSource: ES,
+      open: (...a: unknown[]) => { calls.open.push(a) },
+    }
+    const ctx: Record<string, unknown> = { window: win, XMLHttpRequest: XHR, navigator: { sendBeacon: (...a: unknown[]) => { calls.beacon.push(a); return true } } }
+    ctx.globalThis = ctx
+    vm.runInNewContext(src, ctx)
+    return { win, calls, nav: ctx.navigator as { sendBeacon: (u: string, d?: string) => boolean }, XHR }
+  }
+
+  it('prefixes root-relative fetch / XHR / EventSource / sendBeacon / window.open and exposes __MUPOT_BASE', async () => {
+    const { win, calls, nav, XHR } = runShim()
+    expect(win.__MUPOT_BASE).toBe(PREFIX)
+    await (win.fetch as (u: unknown) => Promise<void>)('/api/x')
+    expect(calls.fetch[0]).toEqual(['/t/local/api/x', undefined])
+    new XHR().open('POST', '/api/y')
+    expect(calls.xhr[0]).toEqual(['POST', '/t/local/api/y'])
+    new (win.EventSource as new (u: string) => unknown)('/api/sse')
+    expect(calls.es[0]).toEqual(['/t/local/api/sse', undefined])
+    nav.sendBeacon('/api/b', 'd')
+    expect(calls.beacon[0]).toEqual(['/t/local/api/b', 'd'])
+    ;(win.open as (u: string) => void)('/page')
+    expect(calls.open[0]).toEqual(['/t/local/page'])
+  })
+
+  it('leaves protocol-relative, absolute, backslash, already-prefixed (ANY /t/<slug>) and non-string values alone', async () => {
+    const { win, calls } = runShim()
+    const f = win.fetch as (u: unknown) => Promise<void>
+    const same = ['//cdn.example/x', 'https://e.test/x', '/\\evil.com', '/t/local/x', '/t/local', '/t/other/x', '/t/other?x=1', 'relative/x']
+    for (const u of same) await f(u)
+    expect(calls.fetch.map((c) => c[0])).toEqual(same)
+    const req = { url: '/x' }
+    await f(req)
+    expect(calls.fetch[same.length][0]).toBe(req)
+    await f('/team/x')
+    expect(calls.fetch[same.length + 1][0]).toBe('/t/local/team/x')
+  })
+})
+
+// ---- wiring: the real entry wrapper + the real routes ------------------------------------------
+
+describe('wiring through withTenantPrefix (the entry wrapper index.ts delegates to)', () => {
+  const origin = 'https://mupot.mumega.com'
+  const handler = (req: Request) => dashboardApp.fetch(req, wiringEnv())
+  function wiringEnv(): Env {
+    return { TENANT_SLUG: 'mumega', BRAND: 'Pot', SESSIONS: kv(), DB: wiringDb } as unknown as Env
+  }
+  let wiringDb: D1Database
+  let h: SqliteD1Harness
+  beforeEach(() => {
+    h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    wiringDb = h.db
+  })
+  afterEach(() => h.close())
+
+  async function viaApex(path: string): Promise<Response> {
+    const original = new Request(`${origin}/t/mumega${path}`)
+    const route = resolveApexPathTenant(original, 'mumega')
+    if (route?.kind !== 'home') throw new Error('home route expected')
+    return withTenantPrefix(original, { TENANT_SLUG: 'mumega' }, () => handler(route.request))
+  }
+
+  it('redirect: unauthenticated /t/mumega/account -> Location under the prefix', async () => {
+    const res = await viaApex('/account')
+    expect(res.status).toBe(302)
+    expect(res.headers.get('location')).toBe('/t/mumega/auth/login')
+    expect(res.headers.get('vary')).toContain(TENANT_PREFIX_HEADER)
+  })
+
+  it('page: a signed-out HTML landing is re-rooted and carries the shim', async () => {
+    const res = await viaApex('/')
+    if (res.status !== 200) throw new Error(`landing page not rendered: ${res.status}`)
+    const text = await res.text()
+    expect(text).toContain('window.__MUPOT_BASE=P')
+    const hrefs = [...text.matchAll(/\s(?:href|action|src)="(\/(?!\/)[^"]*)"/g)].map((m) => m[1])
+    expect(hrefs.length).toBeGreaterThan(0)
+    expect(hrefs.filter((u) => !u.startsWith('/t/mumega'))).toEqual([])
+  })
+
+  it('a direct request with a forged header is NOT re-rooted and the handler never sees it', async () => {
+    let seen: string | null = 'unset'
+    const res = await withTenantPrefix(
+      new Request(`${origin}/account`, { headers: { [TENANT_PREFIX_HEADER]: '/t/attackerpot' } }),
+      { TENANT_SLUG: 'mumega' },
+      async (r) => { seen = r.headers.get(TENANT_PREFIX_HEADER); return new Response(null, { status: 302, headers: { location: '/auth/login' } }) },
+    )
+    expect(seen).toBeNull()
+    expect(res.headers.get('location')).toBe('/auth/login')
+  })
+})
+
+describe('wiring: credential-bearing URLs come from pinned PUBLIC_ORIGIN only', () => {
+  let h: SqliteD1Harness
+  beforeEach(() => {
+    h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+  })
+  afterEach(() => {
+    h.close()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+  const FORGED = { [TENANT_PREFIX_HEADER]: '/t/attackerpot' }
+
+  it('OAuth redirect_uri: path-routed pot gets /t/<slug>/auth/callback; home alias and forged header keep the pinned value', async () => {
+    const redirectUri = async (publicOrigin: string, headers: Record<string, string>, slug: string): Promise<string> => {
+      const env = { DB: h.db, TENANT_SLUG: slug, BRAND: 'B', PUBLIC_ORIGIN: publicOrigin, SESSIONS: kv(), IDP_PROVIDER: 'google', OAUTH_CLIENT_ID: 'id', OAUTH_CLIENT_SECRET: 's' } as unknown as Env
+      const res = await authApp.fetch(new Request('https://pot.example.com/login', { headers }), env, { waitUntil() {}, passThroughOnException() {} } as unknown as ExecutionContext)
+      expect(res.status).toBe(302)
+      return new URL(res.headers.get('location') ?? '').searchParams.get('redirect_uri') ?? ''
+    }
+    expect(await redirectUri('https://mupot.mumega.com/t/gaf', { [TENANT_PREFIX_HEADER]: '/t/gaf' }, 'gaf')).toBe('https://mupot.mumega.com/t/gaf/auth/callback')
+    expect(await redirectUri('https://mupot.mumega.com', { [TENANT_PREFIX_HEADER]: '/t/mumega' }, 'mumega')).toBe('https://mupot.mumega.com/auth/callback')
+    expect(await redirectUri('https://pot.example.com', FORGED, 'victim')).toBe('https://pot.example.com/auth/callback')
+  })
+
+  it('Stripe checkout success/cancel URLs', async () => {
+    const OWNER = 'mupot_session=owner-s'
+    const sessions: Record<string, string> = { 'sess:owner-s': JSON.stringify({ userId: 'u', email: 'o@x.test', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' }) }
+    const bodies: string[] = []
+    vi.stubGlobal('fetch', async (_u: unknown, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ''))
+      return new Response(JSON.stringify({ id: 'cs_1', url: 'https://stripe.test/c' }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    const run = async (publicOrigin: string, headers: Record<string, string>): Promise<string> => {
+      bodies.length = 0
+      const env = {
+        TENANT_SLUG: 'local', DB: h.db, STRIPE_SECRET_KEY: 'sk_test', PUBLIC_ORIGIN: publicOrigin,
+        SESSIONS: { get: async (k: string) => sessions[k] ?? null, put: async () => undefined, delete: async () => undefined },
+      } as unknown as Env
+      const res = await billingRoutesApp.request('/checkout', {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: OWNER, ...headers }, body: JSON.stringify({ tier: 'pro' }),
+      }, env)
+      expect(res.status).toBe(200)
+      return decodeURIComponent(bodies[0] ?? '')
+    }
+    expect(await run('https://mupot.mumega.com/t/local', { [TENANT_PREFIX_HEADER]: '/t/local' })).toContain('success_url=https://mupot.mumega.com/t/local/billing?')
+    const forged = await run('https://pot.example.com', FORGED)
+    expect(forged).toContain('success_url=https://pot.example.com/billing?')
+    expect(forged).not.toContain('/t/')
+  })
+
+  it('routine MCP endpoint', () => {
+    expect(publicMcpEndpoint({ PUBLIC_ORIGIN: 'https://mupot.mumega.com/t/gaf' } as unknown as Env)).toBe('https://mupot.mumega.com/t/gaf/mcp')
+    expect(publicMcpEndpoint({ PUBLIC_ORIGIN: 'https://pot.example.com' } as unknown as Env)).toBe('https://pot.example.com/mcp')
+  })
+})
+
+describe('source ratchets', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
+  it('index.ts routes its default fetch through withTenantPrefix', () => {
+    const src = read('../src/index.ts')
+    expect(src).toMatch(/fetch:[^\n]*withTenantPrefix\(req, env,/)
+  })
+  it('credential sites use credentialBase and nothing derives them from a header', () => {
+    expect(read('../src/auth/index.ts').match(/credentialBase\(/g)?.length).toBeGreaterThanOrEqual(2)
+    expect(read('../src/billing/routes.ts').match(/credentialBase\(/g)?.length).toBe(2)
+    expect(read('../src/platform/tenant-path.ts')).not.toMatch(/export function requestBase/)
+  })
+  it('copilot and nav compare the pathname with the prefix removed', () => {
+    expect(read('../src/dashboard/copilot.ts')).toContain('__MUPOT_BASE')
+    expect(read('../src/dashboard/index.ts')).toContain('window.__MUPOT_BASE')
   })
 })

@@ -4828,7 +4828,10 @@ export function shell(
         document.querySelectorAll('#app-nav a.nav-link, #app-nav a.nav-child').forEach(function (a) {
           var href = a.getAttribute('href');
           if (!href) return;
-          var match = href === '/' ? p === '/' : p.indexOf(href) === 0;
+          // Path-routed tenant (#1928): the rewritten Home href is the bare /t/<slug> prefix.
+          var base = window.__MUPOT_BASE || '';
+          var isHome = href === '/' || (base !== '' && href === base);
+          var match = isHome ? (p === '/' || (base !== '' && (p === base || p === base + '/'))) : p.indexOf(href) === 0;
           if (match && href.length > bestLen) { best = a; bestLen = href.length; }
         });
         if (best) best.classList.add('active');

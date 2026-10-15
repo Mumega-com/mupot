@@ -165,7 +165,7 @@ function projectFrom(row: DispatchRunRow): Project {
   }
 }
 
-function publicMcpEndpoint(env: Env): string | null {
+export function publicMcpEndpoint(env: Env): string | null {
   const configured = env.PUBLIC_ORIGIN?.trim()
   if (!configured) return null
   try {
