@@ -1363,3 +1363,146 @@ describe('further guards pinned', () => {
     }
   })
 })
+
+// ── a LAPSED lease must be visible (2026-10-15: Rava's ChatGPT subscription stopped renewing on 10-10 and 8 messages vanished silently) ──
+
+describe('a lapsed native-wake lease is recorded, not silent', () => {
+  const lapse = (id: string): void => {
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET refresh_before = '2020-01-01T00:00:00.000Z', last_refreshed_at = '2020-01-01T00:00:00.000Z' WHERE id = ?`).run(id)
+  }
+  const lapsedReceipts = (): Array<{ subscription_id: string; event_id: string; outcome: string; error_class: string }> =>
+    harness.sqlite.prepare(`SELECT subscription_id, event_id, outcome, error_class FROM event_delivery_receipts WHERE error_class = 'subscription_lapsed'`).all() as never
+
+  it('a message to an agent whose lease lapsed enqueues NO job, marks the subscription expired, and writes one refused/subscription_lapsed receipt per message (idempotent on a retried queue message)', async () => {
+    const a = await subscribeOk('bound-admin')
+    lapse(a)
+    busSend.mockClear()
+    insertMsg('msg-9')
+    insertMsg('msg-10')
+    await runQueue(makeEnv(), messageCreated())
+    expect(busSend).not.toHaveBeenCalled()
+    expect(subs().find((s) => s.id === a)).toMatchObject({ status: 'expired', revoke_reason: 'lapsed' })
+    expect(lapsedReceipts()).toHaveLength(1)
+    expect(lapsedReceipts()[0]).toMatchObject({ subscription_id: a, outcome: 'refused', event_id: await eventIdFor(`lapse:${a}`, 'msg-9') })
+    await runQueue(makeEnv(), messageCreated()) // the same message retried: no second receipt
+    expect(lapsedReceipts()).toHaveLength(1)
+    await runQueue(makeEnv(), messageCreated({ message_id: 'msg-10', seq: 10 })) // a later message is still counted though the row is now 'expired'
+    expect(lapsedReceipts()).toHaveLength(2)
+    expect(JSON.stringify(lapsedReceipts())).not.toContain('SECRET MESSAGE BODY')
+  })
+
+  it('a REVOKED subscription is not reported as a lapse, and a LIVE one still enqueues normally with no lapse receipt', async () => {
+    const a = await subscribeOk('bound-admin')
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'revoked', refresh_before = '2020-01-01T00:00:00.000Z' WHERE id = ?`).run(a)
+    await runQueue(makeEnv(), messageCreated())
+    expect(lapsedReceipts()).toHaveLength(0)
+    const b = await subscribeOk('bound-c')
+    busSend.mockClear()
+    await runQueue(makeEnv(), messageCreated({ to_agent: subs().find((s) => s.id === b)!.agent_id, message_id: 'msg-11', seq: 11 }))
+    expect(lapsedReceipts()).toHaveLength(0)
+  })
+
+  it('boot_context shows the agent its own native_wake: live, then lapsed with the missed count (self-scoped; absent while Events is off)', async () => {
+    const boot = async (env: Env) => {
+      const r = await rpc('tools/call', { name: 'boot_context', arguments: {} }, 'bound-admin', env)
+      const text = (r.body as unknown as { result?: { content?: Array<{ text?: string }> } }).result?.content?.[0]?.text ?? '{}'
+      return (JSON.parse(text) as { result?: { native_wake?: { state: string; missed_wakes?: number; action?: string } } }).result ?? {}
+    }
+    const a = await subscribeOk('bound-admin')
+    expect((await boot(makeEnv())).native_wake?.state).toBe('live')
+    lapse(a)
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    insertMsg('msg-9', { to: agent })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent }))
+    const lapsed = (await boot(makeEnv())).native_wake
+    expect(lapsed).toMatchObject({ state: 'lapsed', missed_wakes: 1 })
+    expect(String(lapsed?.action)).toContain('Mupot cannot renew it')
+    expect((await boot(makeEnv({ events: 'false' }))).native_wake).toBeUndefined()
+  })
+
+  it('review fixes: forged events record nothing; only the NEWEST subscription can be the lapse; the missed count restarts at each renewal; a lapse receipt never blocks a later real delivery; a live lease beside a lapsed one records nothing', async () => {
+    const { nativeWakeState } = await import('../src/bus/events-delivery')
+    const env = makeEnv()
+    const a = await subscribeOk('bound-admin')
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    lapse(a)
+    // 1) a forged message.created naming a message id that does not exist / is not addressed to this agent writes NO receipt and does not inflate the count
+    await runQueue(env, messageCreated({ to_agent: agent, message_id: 'forged-1', seq: 90 }))
+    expect(lapsedReceipts()).toHaveLength(0)
+    expect((await nativeWakeState(env, TENANT, agent)).state).toBe('lapsed')
+    // real messages count (insertMsg creates a real agent_messages row addressed to the agent)
+    insertMsg('real-1', { to: agent })
+    await runQueue(env, messageCreated({ to_agent: agent, message_id: 'real-1', seq: 91 }))
+    expect(lapsedReceipts()).toHaveLength(1)
+    expect(await nativeWakeState(env, TENANT, agent)).toMatchObject({ state: 'lapsed', missed_wakes: 1 })
+    // a different refusal on the same row (a delivery-time refusal, not a lapse) is NOT a missed wake
+    harness.sqlite.prepare(`INSERT INTO event_delivery_receipts (id, subscription_id, event_id, attempt, outcome, http_status, error_class, signed_at, created_at) VALUES ('r-x', ?, 'evt_other', 1, 'refused', NULL, 'message_not_found', NULL, ?)`).run(a, new Date().toISOString())
+    expect(await nativeWakeState(env, TENANT, agent)).toMatchObject({ state: 'lapsed', missed_wakes: 1 })
+    // 2) renew (same id) then lapse again: the count restarts
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'active', refresh_before = '2999-01-01T00:00:00.000Z', last_refreshed_at = ? WHERE id = ?`).run(new Date(Date.now() + 60_000).toISOString(), a) // renewed just after the missed push
+    expect((await nativeWakeState(env, TENANT, agent)).state).toBe('live')
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET refresh_before = '2020-06-01T00:00:00.000Z' WHERE id = ?`).run(a)
+    expect(await nativeWakeState(env, TENANT, agent)).toMatchObject({ state: 'lapsed', missed_wakes: 0 })
+    // 3) an older lapsed row is not 'the lapse' once the NEWEST subscription was deliberately revoked
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'revoked', revoke_reason = 'unsubscribed' WHERE id = ?`).run(a)
+    expect((await nativeWakeState(env, TENANT, agent)).state).toBe('none')
+  })
+
+  it('the message check is exact: a real message addressed to ANOTHER agent, and a self-sent one, write no lapse receipt', async () => {
+    const a = await subscribeOk('bound-admin')
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    lapse(a)
+    insertMsg('to-someone-else', { to: 'agent-zzz-not-subject', from: 'agent-b' })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'to-someone-else', seq: 30 }))
+    expect(lapsedReceipts()).toHaveLength(0) // the row exists but is addressed to another agent
+    insertMsg('self-sent', { to: agent, from: agent })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'self-sent', seq: 31 })) // the EVENT claims another sender; the ROW says self-sent: the row wins
+    expect(lapsedReceipts()).toHaveLength(0)
+  })
+
+  it('a LIVE lease beside a lapsed one records no lapse (and still delivers); a lapse receipt never blocks the real delivery after a renewal', async () => {
+    const a = await subscribeOk('bound-admin')
+    const b = await subscribeOk('bound-admin', subParams({}, { url: 'https://hooks.example.com/mcp/events/second' }))
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    lapse(a)
+    insertMsg('msg-live', { to: agent })
+    busSend.mockClear()
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'msg-live', seq: 20 }))
+    expect(lapsedReceipts()).toHaveLength(0) // a wake DID go out (to b): the lapsed row is not a missed wake
+    const jobs = busSend.mock.calls.map((c) => (c[0] as BusEvent<DeliveryJob>).payload.subscription_id)
+    expect(jobs).toEqual([b])
+    // now ONLY a is lapsed (b revoked): the message is recorded as missed...
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'revoked' WHERE id = ?`).run(b)
+    insertMsg('msg-missed', { to: agent })
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'msg-missed', seq: 21 }))
+    expect(lapsedReceipts()).toHaveLength(0) // ...except the newest subscription (b) was deliberately revoked, so a's lapse is history
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET status = 'active', revoke_reason = NULL WHERE id = ?`).run(b)
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET refresh_before = '2020-01-01T00:00:00.000Z', last_refreshed_at = '2019-01-01T00:00:00.000Z' WHERE id = ?`).run(b)
+    await runQueue(makeEnv(), messageCreated({ to_agent: agent, message_id: 'msg-missed', seq: 21 }))
+    expect(lapsedReceipts()).toHaveLength(1) // b (newest) lapsed: recorded
+    // the platform renews b and the SAME source message is retried: the real delivery must not be skipped by the lapse receipt
+    harness.sqlite.prepare(`UPDATE event_subscriptions SET refresh_before = '2999-01-01T00:00:00.000Z' WHERE id = ?`).run(b)
+    sent.length = 0
+    const out = await deliverSubscriptionEvent(makeEnv(), { subscription_id: b, message_id: 'msg-missed' })
+    expect(out).not.toBe('skipped')
+    expect(eventReq()).toHaveLength(1)
+  })
+
+  it('nativeWakeState: none -> live -> lapsed (with the count of missed pushes and the human action)', async () => {
+    const { nativeWakeState } = await import('../src/bus/events-delivery')
+    const env = makeEnv()
+    expect(await nativeWakeState(env, TENANT, 'agent-a')).toEqual({ state: 'none' })
+    const a = await subscribeOk('bound-admin')
+    const agent = subs().find((s) => s.id === a)!.agent_id
+    expect((await nativeWakeState(env, TENANT, agent)).state).toBe('live')
+    lapse(a)
+    expect((await nativeWakeState(env, TENANT, agent)).state).toBe('lapsed') // lapsed even before any message has arrived
+    insertMsg('msg-9', { to: agent })
+    insertMsg('msg-12', { to: agent })
+    await runQueue(env, messageCreated({ to_agent: agent }))
+    await runQueue(env, messageCreated({ to_agent: agent, message_id: 'msg-12', seq: 12 }))
+    const s = await nativeWakeState(env, TENANT, agent)
+    expect(s).toMatchObject({ state: 'lapsed', missed_wakes: 2, lapsed_at: '2020-01-01T00:00:00.000Z' })
+    expect(JSON.stringify(s)).toMatch(/Reconnect the mupot connector/)
+  })
+})
