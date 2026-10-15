@@ -70,6 +70,7 @@ import {
   revokeAgentSessionByCredential,
   loadLiveAgentSessionByCredential,
   resolveCallerLiveAgentSession,
+  loadCallerLiveAgentSession,
 } from '../auth/agent-sessions'
 import {
   createElevationRequest,
@@ -6093,7 +6094,7 @@ const toolElevationStatus: ToolSpec = {
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
-    const liveSession = await resolveCallerLiveAgentSession(env, sessionContext.context)
+    const liveSession = await loadCallerLiveAgentSession(env, sessionContext.context)
     if (!liveSession) return fail(409, 'not_agent_session', 'No tracked runtime session for this credential.')
 
     const requestId = str(args.request_id)

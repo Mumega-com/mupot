@@ -11,6 +11,8 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { decideElevationRequest, loadElevationRequestById } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
+import { elicitationPrincipal } from '../src/mcp/url-elicitation'
+import { resolveAgentSessionContext, resolveCallerLiveAgentSession } from '../src/auth/agent-sessions'
 import { elevationViewInner } from '../src/access/decision-core'
 import { renderPage } from '../src/access/page'
 import { TG_LOCK_ROWS } from '../src/secure-moments/telegram-miniapp-client'
@@ -191,5 +193,99 @@ describe('elevation binds to a LIVE agent session, never an idle-expired row tha
     // gray styling exists only behind :disabled; nothing in the plain page script touches the inputs
     expect(page).toContain('label.choice:has(>input:disabled)')
     expect(TG_LOCK_ROWS).toContain('disabled=true')
+  })
+
+  const sessCount = async (): Promise<number> => (await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_sessions WHERE credential_id = ?1`).bind(TOKEN_ID).first<{ n: number }>())?.n ?? 0
+  const sessionOf = async (): Promise<string> => {
+    const c = await invokeTool(agentAuth(), env, 'check_in', {}, 'https://pot.example')
+    return (c.result as { agent_session: { id: string } }).agent_session.id
+  }
+
+  it('RACE: a revoke landing between the read and the rotation creates NO session (refuse)', async () => {
+    const id = await sessionOf()
+    await expireSession(id)
+    const real = env.DB.prepare.bind(env.DB)
+    let injected = false
+    env.DB.prepare = ((sql: string) => {
+      if (!injected && /^\s*UPDATE agent_sessions SET revoked_at/.test(sql)) {
+        injected = true
+        harness.sqlite.prepare(`UPDATE agent_sessions SET revoked_at = ?1, revoke_reason = 'human_revoke' WHERE id = ?2`).run(new Date().toISOString(), id)
+      }
+      return real(sql)
+    }) as typeof env.DB.prepare
+    const sc = resolveAgentSessionContext(agentAuth())
+    if (!sc.ok) throw new Error('ctx')
+    const got = await resolveCallerLiveAgentSession(env, sc.context)
+    expect(injected).toBe(true)
+    expect(got).toBeNull()
+    expect(await sessCount()).toBe(1)
+    const row = await env.DB.prepare(`SELECT revoke_reason FROM agent_sessions WHERE id = ?1`).bind(id).first<{ revoke_reason: string }>()
+    expect(row?.revoke_reason).toBe('human_revoke')
+  })
+
+  it('live path touches: a live row past the coalesce window gets its idle clock bumped by request_elevation', async () => {
+    const id = await sessionOf()
+    const old = new Date(Date.now() - 10 * 60_000).toISOString()
+    await env.DB.prepare(`UPDATE agent_sessions SET last_seen_at = ?1 WHERE id = ?2`).bind(old, id).run()
+    const res = await invokeTool(agentAuth(), env, 'request_elevation', ASK, 'https://pot.example')
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare(`SELECT last_seen_at FROM agent_sessions WHERE id = ?1`).bind(id).first<{ last_seen_at: string }>()
+    expect(Date.parse(row?.last_seen_at ?? '')).toBeGreaterThan(Date.parse(old))
+    expect(await sessCount()).toBe(1)
+  })
+
+  it('elevation_status ALONE on a dead row refuses and never rotates or touches (read-only)', async () => {
+    const id = await sessionOf()
+    await expireSession(id)
+    const before = await env.DB.prepare(`SELECT last_seen_at, revoked_at FROM agent_sessions WHERE id = ?1`).bind(id).first<{ last_seen_at: string; revoked_at: string | null }>()
+    const st = await invokeTool(agentAuth(), env, 'elevation_status', {}, 'https://pot.example')
+    expect(st.ok).toBe(false)
+    expect(await sessCount()).toBe(1)
+    const after = await env.DB.prepare(`SELECT last_seen_at, revoked_at FROM agent_sessions WHERE id = ?1`).bind(id).first<{ last_seen_at: string; revoked_at: string | null }>()
+    expect(after).toEqual(before)
+  })
+
+  it('url-elicitation principal never treats a dead row as the principal session (and never rotates)', async () => {
+    const id = await sessionOf()
+    expect(await elicitationPrincipal(env, agentAuth(), 'elevation')).toMatchObject({ sessionId: id })
+    await expireSession(id)
+    expect(await elicitationPrincipal(env, agentAuth(), 'elevation')).toBeNull()
+    expect(await sessCount()).toBe(1)
+  })
+
+  it('rotation does not re-point grants: an approved grant stays on the retired session, the new session holds none', async () => {
+    const oldId = await sessionOf()
+    const req = await invokeTool(agentAuth(), env, 'request_elevation', ASK, 'https://pot.example')
+    const requestId = (req.result as { request: { id: string } }).request.id
+    expect(await approve(requestId)).toMatchObject({ ok: true })
+    await expireSession(oldId)
+    const again = await invokeTool(agentAuth(), env, 'request_elevation', { ...ASK, reason: 'again' }, 'https://pot.example')
+    expect(again.ok).toBe(true)
+    const grants = await env.DB.prepare(`SELECT agent_session_id FROM elevation_grants WHERE elevation_request_id = ?1`).bind(requestId).all<{ agent_session_id: string }>()
+    expect(grants.results.length).toBeGreaterThan(0)
+    for (const g of grants.results) expect(g.agent_session_id).toBe(oldId)
+    const st = await invokeTool(agentAuth(), env, 'elevation_status', {}, 'https://pot.example')
+    expect((st.result as { active_elevations: unknown[] }).active_elevations).toHaveLength(0)
+  })
+
+  it('rotates on ABSOLUTE expiry too, with its own reason', async () => {
+    const id = await sessionOf()
+    const past = new Date(Date.now() - 60_000).toISOString()
+    await env.DB.prepare(`UPDATE agent_sessions SET absolute_expires_at = ?1 WHERE id = ?2`).bind(past, id).run()
+    const res = await invokeTool(agentAuth(), env, 'request_elevation', ASK, 'https://pot.example')
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare(`SELECT revoke_reason FROM agent_sessions WHERE id = ?1`).bind(id).first<{ revoke_reason: string }>()
+    expect(row?.revoke_reason).toBe('auto_expired_absolute')
+  })
+
+  it('rotation carries the tracked seat label to the new row', async () => {
+    const id = await sessionOf()
+    await env.DB.prepare(`UPDATE agent_sessions SET seat = 'muvps_kasra' WHERE id = ?1`).bind(id).run()
+    await expireSession(id)
+    const res = await invokeTool(agentAuth(), env, 'request_elevation', ASK, 'https://pot.example')
+    const requestId = (res.result as { request: { id: string } }).request.id
+    const req = await loadElevationRequestById(env, TENANT, requestId)
+    const fresh = await env.DB.prepare(`SELECT seat FROM agent_sessions WHERE id = ?1`).bind(req?.agent_session_id ?? '').first<{ seat: string | null }>()
+    expect(fresh?.seat).toBe('muvps_kasra')
   })
 })

@@ -359,36 +359,56 @@ export async function getOrCreateAgentSession(
 }
 
 /**
- * resolveCallerLiveAgentSession — the session an elevation tool binds to for THIS authenticated credential.
- *
- * loadLiveAgentSessionByCredential only filters `revoked_at IS NULL`; it never looks at the idle/absolute
- * ceilings. A credential that stopped calling check_in (a harness that connects once and never re-checks in)
- * keeps an unrevoked row long after it expired, so request_elevation bound the request to a DEAD session and
- * the human's decide then refused it as agent_session_ended (and burnt the request). Here a tracked-but-dead
- * row is evaluated and rotated exactly the way check_in does (the same getOrCreateAgentSession), so the request
- * is filed on a session that is live at filing time. A credential with NO tracked row (never checked in) and one
- * whose session was explicitly revoked stay refused: this never creates a session from nothing and never
- * resurrects an ended one. A grant already bound to the retired session stays on it (it does not move).
- * Same credential, same agent, same member as the authenticated request: nothing is derived from args.
+ * loadCallerLiveAgentSession — READ-ONLY: the caller credential's tracked session iff it is live NOW (not revoked,
+ * inside both the idle and absolute ceilings). loadLiveAgentSessionByCredential alone only filters `revoked_at IS NULL`,
+ * so a credential that stopped calling check_in kept an unrevoked-but-expired row that read as current. No writes, no
+ * rotation: for elevation_status and the URL-elicitation principal, which must never mint or retire a session.
  */
-export async function resolveCallerLiveAgentSession(
+export async function loadCallerLiveAgentSession(
   env: Env,
   context: AgentSessionContext,
   nowMs: number = Date.now(),
 ): Promise<AgentSessionRecord | null> {
   const tracked = await loadLiveAgentSessionByCredential(env, env.TENANT_SLUG, context.authKind, context.credentialId)
   if (!tracked) return null
-  const evaluated = evaluateAgentSession(tracked, nowMs)
-  if (evaluated.ok) {
-    await touchAgentSession(env, tracked.id, nowMs, context.seat)
-    return (await loadAgentSessionById(env, env.TENANT_SLUG, tracked.id)) ?? tracked
+  return evaluateAgentSession(tracked, nowMs).ok ? tracked : null
+}
+
+/**
+ * resolveCallerLiveAgentSession — the session request_elevation binds to for THIS authenticated credential.
+ *
+ * A live tracked row is touched and returned. A tracked-but-DEAD row (idle or absolute ceiling passed, never revoked)
+ * is rotated: the dead row is retired with ONE guarded `UPDATE .. WHERE revoked_at IS NULL`, and a fresh row is
+ * created ONLY if that UPDATE changed exactly one row. If anything else got there first (an explicit revoke such as
+ * end_agent_session / revoke_agent_token / deactivate_agent, or a concurrent rotation) it changes zero and this
+ * REFUSES (null): a revoke racing the rotation must never be turned into a new live session. No tracked row (never
+ * checked in) is refused too: this never creates a session from nothing. A grant bound to the retired row stays on it.
+ * The new row keeps the credential, agent, member and seat of the tracked row; nothing is read from request args.
+ */
+export async function resolveCallerLiveAgentSession(
+  env: Env,
+  context: AgentSessionContext,
+  nowMs: number = Date.now(),
+): Promise<AgentSessionRecord | null> {
+  try {
+    const tracked = await loadLiveAgentSessionByCredential(env, env.TENANT_SLUG, context.authKind, context.credentialId)
+    if (!tracked) return null
+    const evaluated = evaluateAgentSession(tracked, nowMs)
+    if (evaluated.ok) {
+      await touchAgentSession(env, tracked.id, nowMs, context.seat)
+      return (await loadAgentSessionById(env, env.TENANT_SLUG, tracked.id)) ?? tracked
+    }
+    const { revoked } = await markAgentSessionRevoked(env, tracked.id, `auto_${evaluated.reason}`, nowMs)
+    if (!revoked) return null
+    return await createAgentSession(
+      env,
+      { tenant: env.TENANT_SLUG, agentId: tracked.agent_id, memberId: tracked.member_id, authKind: context.authKind, credentialId: context.credentialId, seat: context.seat ?? tracked.seat },
+      nowMs,
+    )
+  } catch (err) {
+    if (isMissingTableError(err)) return null
+    throw err
   }
-  const resolved = await getOrCreateAgentSession(
-    env,
-    { tenant: env.TENANT_SLUG, agentId: context.agentId, memberId: context.memberId, authKind: context.authKind, credentialId: context.credentialId, seat: context.seat },
-    nowMs,
-  )
-  return resolved?.session ?? null
 }
 
 // ── list ──────────────────────────────────────────────────────────────────

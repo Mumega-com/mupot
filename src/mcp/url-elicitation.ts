@@ -29,7 +29,7 @@ import { reserveRotation } from '../secure-moments/rotate'
 import { approveUrl } from '../access/config'
 import { loadElevationRequestById, REQUEST_DECISION_WINDOW_MS } from '../auth/elevation'
 import { loadSeedRequest } from '../access/seed-request'
-import { resolveAgentSessionContext, resolveCallerLiveAgentSession } from '../auth/agent-sessions'
+import { resolveAgentSessionContext, loadCallerLiveAgentSession } from '../auth/agent-sessions'
 import { validateSeed } from '../seeds/validate'
 
 /** Per-request client capabilities (2026-07-28, SEP-2575). Also accepted as a per-request fallback on older requests. */
@@ -114,7 +114,7 @@ export async function elicitationPrincipal(env: Env, auth: AuthContext, kind: Mo
   if (kind === 'seed_attach') return { key: principalKey(auth), sessionId: null }
   const sc = resolveAgentSessionContext(auth)
   if (!sc.ok) return null
-  const live = await resolveCallerLiveAgentSession(env, sc.context)
+  const live = await loadCallerLiveAgentSession(env, sc.context)
   return live ? { key: principalKey(auth, live.id), sessionId: live.id } : null
 }
 
