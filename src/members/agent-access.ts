@@ -34,7 +34,7 @@ export interface SetAgentSquadAccessInput {
    *  the approval that authorized it, and conferring 'lead' becomes safe because
    *  it lapses on the same clock. See mupot#1360. */
   expiresAt?: string | null
-  /** Who granted this, through which surface, and why (migration 0223). */
+  /** Who granted this, through which surface, and why (migration 0225). */
   provenance?: GrantProvenance
 }
 
@@ -44,7 +44,7 @@ export interface RemoveAgentSquadAccessInput {
   agentId: string
   memberId: string
   squadId: string
-  /** Who revoked and why; recorded on the grant_events row (migration 0223). */
+  /** Who revoked and why; recorded on the grant_events row (migration 0225). */
   provenance?: RevokeProvenance
 }
 
@@ -511,7 +511,7 @@ export async function commitRemoveAgentSquadAccess(
   const [setRevokeContext, clearRevokeContext] = revokeContextStatements(env, input.provenance ?? { grantedBy: null })
   const writes = await env.DB.batch([
     ...extras,
-    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0223).
+    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0225).
     setRevokeContext,
     env.DB.prepare(
       `DELETE FROM memberships

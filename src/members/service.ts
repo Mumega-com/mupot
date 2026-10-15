@@ -1283,7 +1283,7 @@ export interface CapabilityGrantUpsertOutcome {
 export async function upsertCapabilityGrant(
   env: Env,
   grant: CapabilityGrant,
-  /** Who granted this, through which surface, and why (migration 0223). */
+  /** Who granted this, through which surface, and why (migration 0225). */
   provenance: GrantProvenance = { grantedBy: null, grantedVia: 'http' },
 ): Promise<CapabilityGrantUpsertOutcome> {
   const deleteStmt = grant.scope_id === null
@@ -1299,7 +1299,7 @@ export async function upsertCapabilityGrant(
       ).bind(grant.member_id, grant.scope_type, grant.scope_id)
 
   // The DELETE half of a replace is recorded as a revoke attributed to the same
-  // actor (grant_events trigger, migration 0223); the INSERT is the new grant.
+  // actor (grant_events trigger, migration 0225); the INSERT is the new grant.
   const [setContext, clearContext] = revokeContextStatements(env, {
     grantedBy: provenance.grantedBy,
     reason: 'replaced by a new grant on the same scope',

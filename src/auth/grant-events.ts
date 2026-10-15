@@ -8,7 +8,7 @@
 // when did it end".
 //
 // HOW THE EVENTS GET WRITTEN — by trigger, in the same transaction as the change
-// (migration 0223):
+// (migration 0225):
 //
 //   AFTER INSERT                       -> 'granted'
 //   AFTER UPDATE (capability/expiry/   -> 'granted'  (a re-grant, an upgrade, a
