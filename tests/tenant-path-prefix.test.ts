@@ -370,7 +370,7 @@ describe('user content is never rewritten', () => {
 describe('client shim (executed in a vm)', () => {
   function runShim() {
     const html = rewriteHtmlForPrefix('<html><head></head><body></body></html>', PREFIX)
-    const src = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? ''
+    const src = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/i.exec(html)?.[1] ?? ''
     const calls: Record<string, unknown[]> = { fetch: [], xhr: [], es: [], beacon: [], open: [] }
     class XHR { open(...a: unknown[]) { calls.xhr.push(a) } }
     class ES { constructor(...a: unknown[]) { calls.es.push(a) } }
