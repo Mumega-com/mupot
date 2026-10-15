@@ -501,14 +501,6 @@ export async function prepareAgentBoundTokenMintForBinding(
   revokePriorTokenId: string | null = null,
   issuedBy?: TokenIssuanceActor,
 ): Promise<PreparedAgentTokenMint> {
-  // mupot#1961 preflight: refuse a non-active agent before generating any secret. The in-batch
-  // ACTIVE_AGENT_GUARD on every statement is the authoritative check (a concurrent
-  // deactivate_agent between this read and the batch still lands nothing).
-  const liveAgent = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
-    .bind(agent.id)
-    .first<{ ok: number }>()
-  if (!liveAgent) throw new AgentInactiveError()
-
   const creating = binding.kind === 'unminted'
   const memberId = creating ? crypto.randomUUID() : binding.memberId
   let grantCapability = requestedCapability
@@ -735,6 +727,17 @@ async function commitPreparedAgentTokenMint(
   }
 }
 
+/** mupot#1961 preflight: refuse a non-active agent before generating any secret. The in-batch
+ *  ACTIVE_AGENT_GUARD on every statement is the authoritative check (a concurrent deactivate_agent
+ *  between this read and the batch still lands nothing). NOT in prepareAgentBoundTokenMintForBinding:
+ *  provisioning composes that function into a batch that creates the agent row itself. */
+async function assertAgentActive(env: Env, agentId: string): Promise<void> {
+  const live = await env.DB.prepare(`SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active' LIMIT 1`)
+    .bind(agentId)
+    .first<{ ok: number }>()
+  if (!live) throw new AgentInactiveError()
+}
+
 /**
  * Atomically mint a dedicated member envelope, immutable agent/member binding,
  * home-squad capability, and agent-weld token for `agent`.
@@ -762,6 +765,7 @@ export async function mintAgentBoundToken(
     : { grantCapability: (grantCapabilityOrOpts as AgentTokenCapability) ?? 'member' }
 
   const grantCapability = opts.grantCapability ?? 'member'
+  await assertAgentActive(env, agent.id)
   const first = await prepareAgentBoundTokenMint(env, agent, label, opts)
   try {
     return await commitPreparedAgentTokenMint(env, first)
@@ -801,6 +805,7 @@ export async function prepareAgentTokenReplacement(
   if (opts.revokePriorTokenId.trim().length === 0) throw new AgentTokenReplacementError()
   const grantCapability = opts.grantCapability ?? 'member'
   if (!isAgentTokenCapability(grantCapability)) throw new Error('invalid agent token capability')
+  await assertAgentActive(env, agent.id)
   const binding = await resolveAgentMemberBinding(env, agent.id)
   if (binding.kind === 'unminted') throw new AgentTokenReplacementError()
   await assertLiveReplacementToken(env, agent.id, binding.memberId, opts.revokePriorTokenId)

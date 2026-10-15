@@ -437,7 +437,7 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
     expect(after).toBeNull()
   })
 
-  it('(b) defence in depth: even if the token were somehow NOT revoked, an inactive agent grants ZERO capabilities', async () => {
+  it('(b) defence in depth: even if the token were somehow NOT revoked, an inactive agent grants no authority (refused at the token door, or zero capabilities)', async () => {
     // Isolates the resolveConsentedAgentCapabilities status guard from the
     // token-revocation side effect above — flips agents.status directly, leaves
     // member_tokens untouched.
@@ -449,8 +449,11 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
       memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    expect(auth).not.toBeNull() // token itself still live (member row untouched)
-    expect(auth!.capabilities).toEqual([]) // but the agent's grant is gone
+    // mupot#1961: the token door (TOKEN_LIVE_PREDICATE) now refuses a token welded to a retired agent
+    // outright, so the flow never reaches the capability layer. Either outcome is fail-closed; a
+    // non-null context must still carry ZERO capabilities (the capability-layer guard stays).
+    if (auth !== null) expect(auth.capabilities).toEqual([])
+    else expect(auth).toBeNull()
   })
 
   it('the DB schema itself refuses to mint a member_tokens row pointing at an unminted agent — the strongest form of "unminted grants zero"', () => {

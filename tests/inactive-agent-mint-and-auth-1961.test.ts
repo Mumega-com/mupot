@@ -15,7 +15,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { dashboardApp } from '../src/dashboard/index'
 import { mcpApp } from '../src/mcp'
-import { AgentInactiveError, mintAgentBoundToken } from '../src/members/service'
+import { AgentInactiveError, mintAgentBoundToken, prepareAgentBoundTokenMint } from '../src/members/service'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import { resolveExternalToken } from '../src/mcp/oauth-authorize'
 import type { Env } from '../src/types'
@@ -141,6 +141,29 @@ describe('#1961 mint refuses a non-active agent', () => {
     harness!.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = 'ag-live'`)
     await expect(mintAgentBoundToken(env, agent, 'second')).rejects.toBeInstanceOf(AgentInactiveError)
     expect(countFor(q, 'ag-live').tokens).toBe(1)
+  })
+})
+
+describe('#1961 a rotation batch is guarded too', () => {
+  it('agent deactivated between prepare and batch: no replacement token lands AND the prior token is NOT revoked', async () => {
+    const { env, q } = setup()
+    const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
+    const first = await mintAgentBoundToken(env, agent, 'prior')
+    const prepared = await prepareAgentBoundTokenMint(env, agent, 'next', { revokePriorTokenId: first.tokenId })
+    harness!.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = 'ag-live'`)
+    await env.DB.batch(prepared.statements)
+    expect(q(`SELECT COUNT(*) n FROM member_tokens WHERE agent_id = 'ag-live'`)[0].n).toBe(1)
+    expect(q(`SELECT revoked_at FROM member_tokens WHERE id = '${first.tokenId}'`)[0].revoked_at).toBeNull()
+  })
+
+  it('POSITIVE CONTROL: same sequence with the agent still active rotates (replacement lands, prior revoked)', async () => {
+    const { env, q } = setup()
+    const agent = { id: 'ag-live', squad_id: 'sq-a', slug: 'live', name: 'Live' }
+    const first = await mintAgentBoundToken(env, agent, 'prior')
+    const prepared = await prepareAgentBoundTokenMint(env, agent, 'next', { revokePriorTokenId: first.tokenId })
+    await env.DB.batch(prepared.statements)
+    expect(q(`SELECT COUNT(*) n FROM member_tokens WHERE agent_id = 'ag-live'`)[0].n).toBe(2)
+    expect(q(`SELECT revoked_at FROM member_tokens WHERE id = '${first.tokenId}'`)[0].revoked_at).not.toBeNull()
   })
 })
 
