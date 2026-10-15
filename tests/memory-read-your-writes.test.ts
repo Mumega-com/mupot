@@ -257,6 +257,62 @@ describe('memory read-your-writes', () => {
     })
   })
 
+  describe('guard pins (gate delta)', () => {
+    it('matching is case-insensitive (mixed-case term finds lower-case text and vice versa)', async () => {
+      vecMode = 'empty'
+      const a = await remember(ALICE, 'lowercase marker casey-77')
+      const b = await remember(ALICE, 'UPPER MARKER CASEY-88')
+      backdate(a, 600); backdate(b, 600)
+      expect((await recall(ALICE, 'CaSeY-77')).map((x) => x.id)).toEqual([a])
+      expect((await recall(ALICE, 'casey-88')).map((x) => x.id)).toEqual([b])
+    })
+
+    it('an empty or empty-quoted query never becomes LIKE %% (no table enumeration)', async () => {
+      expect(exactTokenOf('')).toBeNull()
+      expect(exactTokenOf('   ')).toBeNull()
+      expect(exactTokenOf('""')).toBeNull()
+      expect(exactTokenOf("''")).toBeNull()
+      expect(exactTokenOf('" "')).toBeNull()
+      vecMode = 'empty'
+      backdate(await remember(ALICE, 'secret old row'), 600)
+      const seen: string[] = []
+      const realPrepare = h.db.prepare.bind(h.db)
+      h.db.prepare = ((sql: string) => { seen.push(sql); return realPrepare(sql) }) as typeof h.db.prepare
+      expect(await invokeTool(ctx(ALICE), env, 'recall', { query: '""' })).toMatchObject({ ok: true })
+      expect(seen.some((q) => q.includes('LIKE'))).toBe(false)
+    })
+
+    it('memory_get refuses an id longer than 64 characters (400, no lookup)', async () => {
+      const seen: string[] = []
+      const realPrepare = h.db.prepare.bind(h.db)
+      h.db.prepare = ((sql: string) => { seen.push(sql); return realPrepare(sql) }) as typeof h.db.prepare
+      const out = await invokeTool(ctx(ALICE), env, 'memory_get', { id: 'a'.repeat(65) })
+      expect(out).toMatchObject({ ok: false, status: 400 })
+      expect(seen.some((q) => q.includes('FROM engrams'))).toBe(false)
+      expect((await invokeTool(ctx(ALICE), env, 'memory_get', { id: 'a'.repeat(64) })).ok).toBe(false) // 64 passes the length gate (404)
+      expect(await invokeTool(ctx(ALICE), env, 'memory_get', { id: 'a'.repeat(64) })).toMatchObject({ status: 404 })
+    })
+
+    it('memory_recent clamps limit to 20 even with more rows (and a huge limit)', async () => {
+      for (let i = 0; i < 25; i++) await remember(ALICE, `row ${i}`)
+      const out = await invokeTool(ctx(ALICE), env, 'memory_recent', { limit: 1000 })
+      expect(out.ok && (out.result as { engrams: unknown[] }).engrams.length).toBe(20)
+      const dflt = await invokeTool(ctx(ALICE), env, 'memory_recent', {})
+      expect(dflt.ok && (dflt.result as { engrams: unknown[] }).engrams.length).toBe(5)
+    })
+  })
+
+  describe('index (migration 0224)', () => {
+    it('the per-scope newest-first read is served by idx_engrams_agent_created (no whole-scope sort)', () => {
+      const plan = h.sqlite
+        .prepare(`EXPLAIN QUERY PLAN SELECT id FROM engrams WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT 200`)
+        .all('member:x') as Array<{ detail: string }>
+      const detail = plan.map((r) => r.detail).join(' | ')
+      expect(detail).toContain('idx_engrams_agent_created')
+      expect(detail).not.toContain('USE TEMP B-TREE FOR ORDER BY')
+    })
+  })
+
   describe('memory_recent', () => {
     it('returns only the caller\'s own engrams, newest first, clamped to 1..20', async () => {
       const a1 = await remember(ALICE, 'first')
