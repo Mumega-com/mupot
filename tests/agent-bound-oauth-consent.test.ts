@@ -437,10 +437,23 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
     expect(after).toBeNull()
   })
 
-  it('(b) defence in depth: even if the token were somehow NOT revoked, an inactive agent grants ZERO capabilities', async () => {
-    // Isolates the resolveConsentedAgentCapabilities status guard from the
-    // token-revocation side effect above — flips agents.status directly, leaves
-    // member_tokens untouched.
+  it('(b) defence in depth, PAUSED agent: the token still authenticates (pause keeps credentials) but resolveConsentedAgentCapabilities grants ZERO capabilities', async () => {
+    // Isolates the resolveConsentedAgentCapabilities status guard from both the token-revocation side effect
+    // and the token door: a paused agent's token IS live (TOKEN_LIVE_PREDICATE admits 'paused'), so the
+    // capability layer is the only thing standing between the session and the agent's authority.
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-status-only', MEMBER_AGENT_A, AGENT_A.id)
+    harness.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = '${AGENT_A.id}'`)
+
+    const auth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })
+    expect(auth).not.toBeNull() // token itself still live
+    expect(auth!.capabilities).toEqual([]) // but the agent's grant is gone
+  })
+
+  it('(b2) INACTIVE agent whose token was NOT revoked (status flipped without the sweep): refused at the token door (mupot#1961)', async () => {
     const env = envFor(harness)
     insertDirectoryToken(harness.sqlite, 'tok-status-only', MEMBER_AGENT_A, AGENT_A.id)
     harness.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${AGENT_A.id}'`)
@@ -449,8 +462,14 @@ describe('B3. deactivating the agent kills the session\'s authority', () => {
       memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
       consentedByMemberId: HUMAN,
     })
-    expect(auth).not.toBeNull() // token itself still live (member row untouched)
-    expect(auth!.capabilities).toEqual([]) // but the agent's grant is gone
+    expect(auth).toBeNull()
+
+    // Reactivation revives the (never-revoked) credential: nothing was destroyed, only gated.
+    harness.sqlite.exec(`UPDATE agents SET status = 'active' WHERE id = '${AGENT_A.id}'`)
+    expect(await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-status-only', email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+    })).not.toBeNull()
   })
 
   it('the DB schema itself refuses to mint a member_tokens row pointing at an unminted agent — the strongest form of "unminted grants zero"', () => {
@@ -699,6 +718,31 @@ describe('C3. POST /oauth/consent — continue without an agent preserves today\
 })
 
 describe('C4. POST /oauth/consent — a valid agent_id mints an agent-bound token', () => {
+  it('the agent deactivated after the eligibility check but before the directory-token insert: 409, no token row, session NOT completed (mupot#1961)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0].n
+    const realPrepare = env.DB.prepare.bind(env.DB)
+    env.DB.prepare = ((sql: string) => {
+      if (/INSERT INTO member_tokens/.test(sql) && /'directory'/.test(sql)) {
+        harness.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${AGENT_A.id}'`)
+      }
+      return realPrepare(sql)
+    }) as typeof env.DB.prepare
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
+      body: new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id }).toString(),
+    }), env)
+
+    expect(res.status).toBe(409)
+    expect(await res.text()).toContain('no longer active')
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM member_tokens').all()[0].n).toBe(before)
+  })
+
   it('mints with agent_id set AND member_id = the AGENT\'s own dedicated member, never the human\'s', async () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
@@ -817,6 +861,32 @@ describe('C4b. POST /oauth/consent — continuing UNBOUND writes no consent rece
 })
 
 describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
+  it('the new agent deactivated between its creation and the mint batch: 409, no credential, no token row, session NOT completed (mupot#1961)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    const realBatch = env.DB.batch.bind(env.DB)
+    env.DB.batch = (async (stmts: Parameters<typeof realBatch>[0]) => {
+      // Before every batch: retire the just-created agent (a no-op until the agent row exists).
+      harness.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE slug = 'cursor-kasra'`)
+      return realBatch(stmts)
+    }) as typeof env.DB.batch
+
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
+      body: new URLSearchParams({
+        consent_nonce: consentCookie, action: 'continue', agent_id: '__mint_new__',
+        new_agent_name: 'Cursor Kasra', new_agent_slug: 'cursor-kasra', new_agent_squad_id: 'squad-a',
+      }).toString(),
+    }), env)
+
+    expect(res.status).toBe(409)
+    expect(await res.text()).toContain('no longer active')
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    expect((harness.sqlite.prepare(`SELECT COUNT(*) n FROM member_tokens t JOIN agents a ON a.id = t.agent_id WHERE a.slug = 'cursor-kasra'`).get() as { n: number }).n).toBe(0)
+  })
+
   it('creates and binds a brand new agent seat when __mint_new__ is posted with valid squad admin grants', async () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)

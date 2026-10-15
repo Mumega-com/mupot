@@ -1505,7 +1505,7 @@ describe('claimUnleasedForPairSettlement — is not a pre-authorization write (m
     }
   })
 
-  it('the ASSIGNEE\'s own token still refuses the claim (and changes zero rows) once the agent is deactivated', async () => {
+  it('the ASSIGNEE\'s own token still refuses the claim (and changes zero rows) once the agent is deactivated (mupot#1961: refused earlier, at the credential door, because a token welded to a retired agent is no longer a bound workspace credential)', async () => {
     const fixture = runtimeFixture({ unleased: true })
     try {
       fixture.harness.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(AGENT_ID)
@@ -1518,7 +1518,7 @@ describe('claimUnleasedForPairSettlement — is not a pre-authorization write (m
         stage: 'runtime_consumed',
         runtimeReceiptHash: RUNTIME_HASH,
         attempt: 1,
-      })).rejects.toMatchObject({ code: 'runtime_receipt_forbidden' })
+      })).rejects.toMatchObject({ code: 'agent_bound_workspace_credential_required' })
 
       expect(unchangedMessageRow(fixture.harness.sqlite)).toEqual(before)
     } finally {
