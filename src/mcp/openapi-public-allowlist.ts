@@ -107,6 +107,8 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'project_remember',
   'project_squad_list',
   'project_wiki',
+  'project_wiki_get',
+  'project_wiki_upsert',
   'recall',
   'remember',
   'report_run_usage',

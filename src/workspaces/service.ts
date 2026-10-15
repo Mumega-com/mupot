@@ -22,9 +22,9 @@
 //
 // last_head_sha / last_seen_at are DISPLAY ONLY: written on open, read by nothing that decides.
 
+import { resolveCapabilities } from '../auth/capability'
 import type { AuthContext, Env, Project } from '../types'
-import { capabilityRank, resolveCapabilities } from '../auth/capability'
-import { anySquadHasProjectWrite } from '../projects/access'
+import { callerCanWriteProject } from '../projects/access'
 import { loadHarness } from '../members/harness'
 import { isHarnessCredentialSession } from '../members/harness-credential'
 import { readAccess, readableProject } from '../mcp/projects'
@@ -168,14 +168,9 @@ async function findProject(env: Env, ref: string, authz: AuthContext): Promise<P
   return bySlug ? readableProject(env, bySlug.id, access) : null
 }
 
-/** The write predicate project_remember uses (org admin, or a directly granted squad with write/admin on
- *  the project), at member rank: an observer-rank grant never writes. */
+/** The write predicate project_remember uses: the shared chokepoint (member rank on a write squad, or org admin). */
 async function principalCanWriteProject(env: Env, authz: AuthContext, projectId: string): Promise<boolean> {
-  const floored = authz.capabilities === undefined
-    ? undefined
-    : authz.capabilities.filter((g) => capabilityRank(g.capability) >= capabilityRank('member'))
-  const access = readAccess({ ...authz, capabilities: floored })
-  return access.workspaceAdmin || anySquadHasProjectWrite(env, projectId, access.squadIds)
+  return callerCanWriteProject(env, authz, projectId)
 }
 
 // ── worktree_open ───────────────────────────────────────────────────────────────────────

@@ -90,6 +90,23 @@ export async function hasProjectWriteForSquads(
   return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }
 
+// THE caller-write chokepoint (adversarial gate #1974 P1-B): "can THIS CALLER write to the project".
+// The caller must hold at least MEMBER rank on a squad that itself has write/admin on the project.
+// anySquadHasProjectWrite below answers only "does any of these squads have write on the project";
+// fed squadIds built from read access (which includes OBSERVER grants) it let an observer on a write
+// squad write whenever they held member somewhere else (the tool floor passes on the other grant).
+// Rank is filtered on the GRANTS before squads are collected, so the squad list can only contain
+// squads where the caller's own grant is member or above. Legacy (capabilities undefined) callers
+// keep the role path. Every caller-write check (project_remember, project_wiki_upsert, workspaces)
+// goes through here.
+export async function callerCanWriteProject(env: Env, auth: AuthContext, projectId: string): Promise<boolean> {
+  const floored = auth.capabilities === undefined
+    ? undefined
+    : auth.capabilities.filter((g) => capabilityRank(g.capability) >= capabilityRank('member'))
+  const access = projectReadAccessFromGrants({ ...auth, capabilities: floored }, floored ?? [])
+  return access.workspaceAdmin || anySquadHasProjectWrite(env, projectId, access.squadIds)
+}
+
 // The ANY-of variant of hasProjectWriteForSquads: true when AT LEAST ONE of `squadIds`
 // holds 'write'/'admin' on the project. This is the correct "can THIS CALLER write to
 // the project" test — a caller typically holds several squad grants (write on one,

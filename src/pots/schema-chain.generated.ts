@@ -4063,9 +4063,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_connection_receipt_requires_token" },
     ],
   },
+  {
+    file: "0227_page_versions.sql",
+    sha256: "196fc8417da051950f1c77512f611614254db9aac04b6cc101cebd07b4fa19b2",
+    statements: [
+      "-- 0227_page_versions — a monotonic version COUNTER for agent-written wiki pages (PagesPort, src/pages/).\n-- It carries NO ownership meaning. Owner, writer and tier live ONLY in the stamped envelope inside the\n-- text record (the store of record); this table is rebuildable from that text: next version =\n-- MAX(counter, text version) + 1, so a lost row costs nothing but a re-count. A row is committed only\n-- AFTER a successful put, so a refused or failed write leaves nothing behind. Its one other use is a\n-- refuse-only hint: a counter row whose page the store can no longer show means \"we wrote here before\",\n-- so the slug is not re-put (an update would silently republish an unpublished topic).\nCREATE TABLE IF NOT EXISTS page_versions (\n  project_id  TEXT NOT NULL,\n  slug        TEXT NOT NULL,\n  version     INTEGER NOT NULL,\n  PRIMARY KEY (project_id, slug)\n);",
+    ],
+    objects: [
+      { type: "table", name: "page_versions" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "6140636f860c62fb43b207dff16bc6cc4f9155fb4a20cfaff3b2ac08815103af"
+export const SCHEMA_CHAIN_DIGEST: string = "feda760dbc53ed9cac85217a28efba5007d5809bd492f677f59366a1785819f9"

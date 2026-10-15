@@ -33,14 +33,20 @@
 //     service marker on write, exactly mirroring the real route's "this path
 //     cannot create keychain-gated content"; a REAL gated row can only enter
 //     the store via `seed()`, standing in for the admin-only wiki.ts path)
-//   - UPDATE does NOT reset `published` — only CREATE forces published=1;
-//     an existing row's published flag survives an update untouched (round-2
-//     parity: the real route's UPDATE statement never SETs published)
-//   - PUT with an edge naming a to_slug in a different project or that does
-//     not exist -> 400 cross_project_edge_refused
-//   - PUT with an edge naming an UNPUBLISHED to_slug -> 400
-//     edge_target_unpublished — validated, like every edge, BEFORE any write
-//     (all-or-nothing; the topic itself is left untouched on refusal)
+//   - UPDATE sets published=1 (it REPUBLISHES an unpublished row) and matches
+//     unpublished rows too — wiki-store.ts prepareUpdateWikiTopic's SET list
+//     has `published = 1` and its WHERE has no published term (corrected after
+//     adversarial gate #1974 P2-1; an earlier revision of this fake said the
+//     opposite and hid the defect)
+//   - PUT with an edge whose target is missing, in a different project, UNPUBLISHED,
+//     or not service-OWNED (a keyless public topic is readable but not owned) -> the
+//     SAME 400 edge_target_invalid (real route, round-3 P3 / round-5 P0), validated
+//     BEFORE any write (all-or-nothing; the topic is left untouched on refusal)
+//   - edges are ADD-ONLY and identified by (from, to, relation): re-putting the same
+//     triple updates its weight, a changed relation adds a SECOND link, a link that is
+//     omitted from a later PUT persists (real prepareEdgeUpsert ON CONFLICT clause)
+//   - title/description/topic_type are whitespace-collapsed and capped (120/500/32);
+//     tags are trimmed, cut at 48, deduped, first 12 (real cleanText/parseTags)
 //   - `topic_write_conflict` (409, a TOCTOU race) is a concurrency outcome
 //     this single-threaded fake cannot naturally reproduce —
 //     wiki-client.test.ts exercises that mapping with a raw fetchImpl
@@ -104,6 +110,28 @@ interface StoredEdge {
   weight: number
 }
 
+/** Real route's cleanText: collapse whitespace runs, trim, cap. */
+function cleanText(value: string, max: number): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+/** Real route's parseTags: strings only, trimmed, cut at 48, deduped, first 12. */
+function parseTags(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) continue
+    const tag = item.trim().slice(0, 48)
+    if (!out.includes(tag)) out.push(tag)
+  }
+  return out.slice(0, 12)
+}
+
+/** Real isServiceOwned: required_keys is EXACTLY [SERVICE_WRITE_KEY] (a keyless public topic is readable but not owned). */
+function isServiceOwned(requiredKeys: string[]): boolean {
+  return requiredKeys.length === 1 && requiredKeys[0] === SERVICE_WRITE_KEY
+}
+
 function isServiceOnlyGate(requiredKeys: string[]): boolean {
   return requiredKeys.length === 0 || (requiredKeys.length === 1 && requiredKeys[0] === SERVICE_WRITE_KEY)
 }
@@ -119,6 +147,11 @@ export class FakeInternalWiki {
 
   constructor(secretsByTenant: Record<string, string>) {
     this.secretsByTenant = new Map(Object.entries(secretsByTenant))
+  }
+
+  /** Test hook: an admin unpublishes a topic (the real GET then 404s it, while a service PUT would still match and republish it). */
+  unpublish(slug: string): void {
+    for (const t of this.topics) if (t.slug === slug) t.published = false
   }
 
   /** Stand-in for the admin-only wiki.ts create path — the ONLY way a REAL (non-service) gated topic enters the store. */
@@ -237,7 +270,9 @@ export class FakeInternalWiki {
       if (!project) return Response.json({ error: 'project required' }, { status: 400 })
       const row = this.readableByTenantSlug(tenantSlug, slug)
       if (!row || row.project !== project) return Response.json({ error: 'not_found' }, { status: 404 })
-      return Response.json({ tenant_slug: tenantSlug, project, topic: this.serialize(row), edges: [] })
+      const projectVisible = (sl: string): boolean => { const t = this.readableByTenantSlug(tenantSlug, sl); return !!t && t.project === project }
+      const visibleEdges = this.edges.filter((e) => e.tenant_id === tenantSlug && (e.from_slug === slug || e.to_slug === slug) && projectVisible(e.from_slug) && projectVisible(e.to_slug))
+      return Response.json({ tenant_slug: tenantSlug, project, topic: this.serialize(row), edges: visibleEdges.map((e) => ({ from_slug: e.from_slug, to_slug: e.to_slug, relation_type: e.relation_type, weight: e.weight })) })
     }
 
     if (req.method === 'PUT' && topicMatch) {
@@ -246,10 +281,9 @@ export class FakeInternalWiki {
       const project = typeof body.project === 'string' ? body.project : null
       if (!project) return Response.json({ error: 'project required' }, { status: 400 })
 
-      const titleRaw = typeof body.title === 'string' ? body.title.trim() : ''
-      if (!titleRaw) return Response.json({ error: 'title required' }, { status: 400 })
-      if (titleRaw.length < 2) return Response.json({ error: 'title too short' }, { status: 400 })
-      const title = titleRaw.slice(0, 120)
+      if (typeof body.title !== 'string' || !body.title.trim()) return Response.json({ error: 'title required' }, { status: 400 })
+      const title = cleanText(body.title, 120)
+      if (title.length < 2) return Response.json({ error: 'title too short' }, { status: 400 })
 
       const existing = this.findByTenantSlug(tenantSlug, slug)
       if (existing && existing.project !== project) {
@@ -284,17 +318,14 @@ export class FakeInternalWiki {
         const toSlug = typeof e.to_slug === 'string' ? e.to_slug : null
         if (!toSlug) return Response.json({ error: 'invalid_edge_to_slug' }, { status: 400 })
         const target = this.findByTenantSlug(tenantSlug, toSlug)
-        if (!target || target.project !== project) {
-          return Response.json({ error: 'cross_project_edge_refused', to_slug: toSlug }, { status: 400 })
-        }
-        // An edge to an unpublished (draft) target is refused — an edge is
-        // itself a read-side signal the target exists.
-        if (!target.published) {
-          return Response.json({ error: 'edge_target_unpublished', to_slug: toSlug }, { status: 400 })
+        // Real route (round-3 P3 + round-5 P0): missing, wrong project, unpublished and not-service-OWNED
+        // all collapse to the SAME 400 edge_target_invalid.
+        if (!target || target.project !== project || !target.published || !isServiceOwned(target.required_keys)) {
+          return Response.json({ error: 'edge_target_invalid', to_slug: toSlug }, { status: 400 })
         }
         pendingEdges.push({
           toSlug,
-          relationType: typeof e.relation_type === 'string' ? e.relation_type : 'related',
+          relationType: typeof e.relation_type === 'string' && e.relation_type.trim() ? cleanText(e.relation_type, 32) : 'related',
           weight: typeof e.weight === 'number' ? e.weight : 1,
         })
       }
@@ -307,13 +338,13 @@ export class FakeInternalWiki {
         project,
         slug,
         title,
-        description: typeof body.description === 'string' ? body.description.replace(/\s+/g, ' ').trim().slice(0, 500) : '',
-        topic_type: typeof body.topic_type === 'string' ? body.topic_type : 'general',
+        description: typeof body.description === 'string' && body.description.trim() ? cleanText(body.description, 500) : '',
+        topic_type: typeof body.topic_type === 'string' && body.topic_type.trim() ? cleanText(body.topic_type, 32) : 'general',
         required_keys: [SERVICE_WRITE_KEY], // ALWAYS forced to the service marker on write
-        tags: Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === 'string') : [],
+        tags: parseTags(body.tags),
         // CREATE forces published=1; UPDATE never touches it (round-2 parity —
         // "update does NOT force published").
-        published: existing ? existing.published : true,
+        published: true, // the REAL route's UPDATE sets published = 1 and matches unpublished rows too (wiki-store.ts prepareUpdateWikiTopic)
         created_at: existing?.created_at ?? now,
         updated_at: now,
       }
@@ -325,6 +356,10 @@ export class FakeInternalWiki {
       }
 
       for (const edge of pendingEdges) {
+        for (let i = this.edges.length - 1; i >= 0; i--) {
+          const x = this.edges[i]
+          if (x.tenant_id === tenantSlug && x.from_slug === slug && x.to_slug === edge.toSlug && x.relation_type === edge.relationType) this.edges.splice(i, 1) // identity = (from,to,relation): same triple updates weight; a new relation ADDS a link; nothing is ever removed
+        }
         this.edges.push({
           tenant_id: tenantSlug,
           from_slug: slug,
