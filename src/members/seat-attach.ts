@@ -38,7 +38,7 @@ import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { seatAutoEnrollEnabled } from './harness'
-import { mintRawToken, resolveAgentMemberBinding, sha256Hex } from './service'
+import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding, sha256Hex } from './service'
 import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
@@ -217,7 +217,7 @@ export async function ensureAdmission(
       const id = crypto.randomUUID()
       const agentRow = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
         .bind(p.agentId).first<{ name: string; squad_id: string }>()
-      const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? conditionalWeldStatements(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : []
+      const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? prepareConditionalIdentityWeld(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : []
       await env.DB.batch([
         ...weld,
         env.DB.prepare(
@@ -321,47 +321,11 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
   return !!row
 }
 
-/** The identity weld for an agent that has NONE, as conditional statements: each lands only if the admission is still pending and
- *  unexpired, the agent still has no binding, and the previous statement landed. Same three rows as prepareAgentIdentityWeldStatements
- *  (the agent's dedicated member, the binding, a home-squad capability clamped to member) and NO token: attaching mints the
- *  attachment's own token later, exactly as for an already-welded agent. */
-function conditionalWeldStatements(
-  env: Env,
-  adm: { id: string; agent_id: string },
-  agent: { name: string; squad_id: string },
-  nowIso: string,
-  // 'promote': the admission exists and must still be pending. 'direct': the dashboard inserts the admission live in the SAME batch,
-  // right after these statements, so its id must not exist yet (a replay of the batch welds nothing).
-  mode: 'promote' | 'direct' = 'promote',
-): D1PreparedStatement[] {
-  const memberId = crypto.randomUUID()
-  const admissionGuard = mode === 'promote'
-    ? `EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3)`
-    : `NOT EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1) AND ?3 IS NOT NULL`
-  const pending = `${admissionGuard}
-                   AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4)`
-  return [
-    env.DB.prepare(
-      `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-       SELECT ?5, NULL, ?6, NULL, 'active', ?3, ?2 WHERE ${pending}`,
-    ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId, agent.name),
-    env.DB.prepare(
-      `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-       SELECT ?2, ?4, ?5, ?3 WHERE EXISTS (SELECT 1 FROM members WHERE id = ?5 AND tenant = ?2) AND ${pending}`,
-    ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId),
-    env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-       SELECT ?6, ?5, 'squad', ?7, 'member'
-        WHERE EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4 AND member_id = ?5)`,
-    ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId, crypto.randomUUID(), agent.squad_id),
-  ]
-}
-
 async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling): Promise<boolean> {
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string }>()
-  const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? conditionalWeldStatements(env, adm, agent, nowIso) : []
+  const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : []
   const out = await env.DB.batch([
     ...weld,
     env.DB.prepare(
