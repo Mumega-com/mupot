@@ -571,6 +571,10 @@ export async function prepareAgentBoundTokenMintForBinding(
   // the database transaction (not merely the preflight above): after one batch
   // revokes the prior token, every concurrent loser inserts zero rows and commits
   // no replacement credential or claim.
+  // mupot#1961: the rotation's agent-active guard IS replacementLivePredicate('prior'|'member_tokens'), which
+  // embeds TOKEN_LIVE_PREDICATE's agent clause (a token welded to a retired agent is not live): the INSERT and
+  // the revoking UPDATE both land only while the agent is not retired, so a rotation can neither mint a
+  // replacement nor revoke the prior for a deactivated agent.
   if (revokePriorTokenId) {
     statements.push(
       env.DB.prepare(
@@ -580,8 +584,7 @@ export async function prepareAgentBoundTokenMintForBinding(
             SELECT 1 FROM member_tokens prior
              WHERE prior.id = ? AND prior.member_id = ? AND prior.agent_id = ? AND prior.tenant = ?
                AND ${replacementLivePredicate('prior', '?')}
-          )
-            AND ${ACTIVE_AGENT_GUARD}`,
+          )`,
       ).bind(
         tokenId,
         memberId,
@@ -596,13 +599,11 @@ export async function prepareAgentBoundTokenMintForBinding(
         agent.id,
         env.TENANT_SLUG,
         nowSqlUtc(),
-        agent.id,
       ),
       env.DB.prepare(
         `UPDATE member_tokens SET revoked_at = ? WHERE id = ? AND member_id = ? AND agent_id = ? AND tenant = ?
-          AND ${replacementLivePredicate('member_tokens', '?')}
-          AND ${ACTIVE_AGENT_GUARD}`,
-      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc(), agent.id),
+          AND ${replacementLivePredicate('member_tokens', '?')}`,
+      ).bind(createdAt, revokePriorTokenId, memberId, agent.id, env.TENANT_SLUG, nowSqlUtc()),
     )
   } else {
     statements.push(
