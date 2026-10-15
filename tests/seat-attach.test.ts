@@ -17,6 +17,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { SoftAuthenticator } from './helpers/webauthn-authenticator'
 import { upsertHarness } from '../src/members/harness'
 import { prepareConditionalIdentityWeld } from '../src/members/service'
+import { weldAudit } from '../src/members/seat-attach'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { advertisedTools, mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
@@ -457,7 +458,7 @@ describe('who may be attached, and who may call', () => {
     h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
     const nowIso = '2026-10-15T01:00:00.000Z'
     // no admission 'adm-lost' exists (its INSERT lost a conflict): the three weld statements are all no-ops
-    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-lost', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-lost', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct').statements)
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
     expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(0)
     // the same statements after a LIVE admission row with this decided_at exists do weld, once
@@ -467,13 +468,75 @@ describe('who may be attached, and who may call', () => {
     h.sqlite.exec(`INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
       VALUES ('adm-live', '${TENANT}', 'agent-bare', '${HUMAN}', '${g.harnessId}', 'live', 0, 'member', 'dashboard', '${seat}', '${nowIso}', '${nowIso}', '${HUMAN}', 'dashboard')`)
     // a live admission decided at ANOTHER moment (not this batch) does not satisfy the guard: it is not the row this batch inserted
-    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, '2026-10-15T02:00:00.000Z', 'direct'))
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, '2026-10-15T02:00:00.000Z', 'direct').statements)
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
-    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct').statements)
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
     // and a second run welds nothing more (binding exists)
-    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct').statements)
     expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(1)
+  })
+
+  it('two same-millisecond weld batches for ONE agent: exactly one binding and exactly ONE identity_weld audit, naming the WINNING admission (the skipped batch borrows nothing)', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    const g1 = await grant(env, HUMAN)
+    await boot(env, g1, 'conv-a')
+    const g2 = await grant(env, HUMAN, 'client-other', 'Other')
+    await boot(env, g2, 'conv-b')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.id
+    const nowIso = '2026-10-15T03:00:00.000Z'
+    for (const [id, harness] of [['adm-a', g1.harnessId], ['adm-b', g2.harnessId]]) {
+      h.sqlite.exec(`INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, gates, requested_via, requested_seat_id, created_at, expires_at)
+        VALUES ('${id}', '${TENANT}', 'agent-bare', '${HUMAN}', '${harness}', 'pending', 0, 'tool', '${seat}', '2026-10-15T00:00:00.000Z', '2999-01-01T00:00:00.000Z')`)
+    }
+    const agent = { name: 'Bare', squad_id: 'squad-core' }
+    // BOTH batches are prepared before either runs (the read-then-write window), with the SAME timestamp
+    const wa = prepareConditionalIdentityWeld(env, { id: 'adm-a', agent_id: 'agent-bare' }, agent, nowIso)
+    const wb = prepareConditionalIdentityWeld(env, { id: 'adm-b', agent_id: 'agent-bare' }, agent, nowIso)
+    await env.DB.batch([...wb.statements, weldAudit(env, 'agent-bare', HUMAN, 'adm-b', wb.memberId)]) // B wins
+    await env.DB.batch([...wa.statements, weldAudit(env, 'agent-bare', HUMAN, 'adm-a', wa.memberId)]) // A's weld no-ops: it must leave NO audit
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
+    const audits = h.sqlite.prepare(`SELECT after_state FROM agent_audit WHERE action = 'identity_weld' AND agent_id = 'agent-bare'`).all() as Array<{ after_state: string }>
+    expect(audits).toHaveLength(1)
+    expect(JSON.parse(audits[0].after_state)).toMatchObject({ admission_id: 'adm-b' })
+  })
+
+  it('an agent deactivated inside the approval window: the approval closes, NOTHING is welded or made live, and reactivating later does not revive it (bare AND already-bound)', async () => {
+    for (const [slug, bound] of [['bare', false], ['rava', true]] as const) {
+      const env = envFor(h)
+      if (!bound) h.sqlite.exec(`INSERT OR IGNORE INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+      const g = await grant(env, HUMAN, `client-${slug}`, slug)
+      await boot(env, g, `conv-${slug}`)
+      const pend = await attach(env, g, `conv-${slug}`, slug)
+      void pend
+      const agentId = bound ? 'agent-rava' : 'agent-bare'
+      const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE agent_id = ? AND status = 'pending'`, agentId)!
+      const out = await decideSeatAdmission(env, {
+        adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} },
+        gate: async () => { h.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${agentId}'`); return true },
+      }, Date.now())
+      expect(out.status, slug).toBe(409)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm.id)!.status, slug).toBe('pending')
+      if (!bound) {
+        expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+        expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(0)
+      }
+      h.sqlite.exec(`UPDATE agents SET status = 'active' WHERE id = '${agentId}'`)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm.id)!.status, slug).toBe('pending') // still needs a fresh decision
+    }
+  })
+
+  it('the dashboard direct path for an INACTIVE agent writes no live admission and no identity', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'inactive')`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.id
+    const r = await ensureAdmission(env, { agentId: 'agent-bare', humanMemberId: HUMAN, harnessId: g.harnessId, seatId: seat, via: 'dashboard' })
+    expect(r).toMatchObject({ ok: false, error: 'attach_refused' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE agent_id = 'agent-bare'`)).toBe(0)
   })
 
   it('a suspended identity makes the admission refuse to go live (it is not welded again, and the refusal is tested)', async () => {

@@ -408,14 +408,17 @@ export function prepareConditionalIdentityWeld(
   // 'direct':  place these AFTER the INSERT of a live admission in the SAME batch; the guard is that exact row existing live
   //            with this decided_at, so an INSERT that lost a conflict (ON CONFLICT DO NOTHING) leaves no row and welds nothing.
   mode: 'promote' | 'direct' = 'promote',
-): D1PreparedStatement[] {
+): { statements: D1PreparedStatement[]; memberId: string } {
   const memberId = crypto.randomUUID()
   const admissionGuard = mode === 'promote'
     ? `EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3)`
     : `EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 AND status = 'live' AND decided_at = ?3)`
+  // The agent must STILL be active inside the batch: a deactivate_agent that lands between the caller's read and this batch
+  // provisions nothing (the admission UPDATE carries the same clause, so the approval closes rather than going live).
   const pending = `${admissionGuard}
-                   AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4)`
-  return [
+                   AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4)
+                   AND EXISTS (SELECT 1 FROM agents WHERE id = ?4 AND status = 'active')`
+  const statements = [
     env.DB.prepare(
       `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
        SELECT ?5, NULL, ?6, NULL, 'active', ?3, ?2 WHERE ${pending}`,
@@ -430,6 +433,7 @@ export function prepareConditionalIdentityWeld(
         WHERE EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4 AND member_id = ?5)`,
     ).bind(adm.id, env.TENANT_SLUG, nowIso, adm.agent_id, memberId, crypto.randomUUID(), agent.squad_id),
   ]
+  return { statements, memberId }
 }
 
 /**
