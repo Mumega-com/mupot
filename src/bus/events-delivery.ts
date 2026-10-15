@@ -64,6 +64,10 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
         AND status = 'active' AND refresh_before > ?3`,
   ).bind(event.tenant, p.to_agent, nowIso).all<{ id: string }>()
   let n = 0
+  // A message for an agent with NO live lease used to vanish without a trace (the lease row kept saying 'active' and no job, receipt or
+  // log was written). Record it: the wake did not happen because the subscription lapsed, and say so in the receipts. (2026-10-15: Rava's
+  // ChatGPT subscription stopped renewing on 10-10 and eight messages disappeared silently.)
+  if ((subs.results ?? []).length === 0) await recordLapsedWake(env, event.tenant, p.to_agent, p.message_id, nowIso)
   for (const s of subs.results ?? []) {
     // NO pre-send marker, NO compensating write: nothing may suppress a retry. A failed send
     // rejects out of here (the consumer then does not ack the source message). If the source is
@@ -79,6 +83,66 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
     n++
   }
   return n
+}
+
+/** The agent's most recent message.created subscription that LAPSED (its lease ran out without a renewal). A subscription the human or
+ *  server REVOKED is not a lapse and is never reported as one. */
+async function lastLapsedSubscription(env: Env, tenant: string, agentId: string, nowIso: string): Promise<{ id: string; refresh_before: string } | null> {
+  return env.DB.prepare(
+    `SELECT id, refresh_before FROM event_subscriptions
+      WHERE tenant = ?1 AND agent_id = ?2 AND event_name = 'message.created'
+        AND status IN ('active', 'expired') AND refresh_before <= ?3
+      ORDER BY refresh_before DESC LIMIT 1`,
+  ).bind(tenant, agentId, nowIso).first<{ id: string; refresh_before: string }>()
+}
+
+/** No live lease for this message's recipient: if a lease LAPSED, make that true and visible. Marks the row expired (it is not "active"
+ *  any more) and writes ONE `refused / subscription_lapsed` receipt for (subscription, message) so each missed wake is auditable and
+ *  countable. Idempotent per message (a retried queue message writes no second receipt). Writes no body, no secret. */
+async function recordLapsedWake(env: Env, tenant: string, agentId: string, messageId: string, nowIso: string): Promise<void> {
+  const lapsed = await lastLapsedSubscription(env, tenant, agentId, nowIso)
+  if (!lapsed) return
+  await env.DB.prepare(
+    `UPDATE event_subscriptions SET status = 'expired', revoke_reason = COALESCE(revoke_reason, 'lapsed')
+      WHERE id = ?1 AND status = 'active' AND refresh_before <= ?2`,
+  ).bind(lapsed.id, nowIso).run()
+  const eventId = await eventIdFor(lapsed.id, messageId)
+  await env.DB.prepare(
+    `INSERT INTO event_delivery_receipts (id, subscription_id, event_id, attempt, outcome, http_status, error_class, signed_at, created_at)
+     SELECT ?1, ?2, ?3, 1, 'refused', NULL, 'subscription_lapsed', NULL, ?4
+      WHERE NOT EXISTS (SELECT 1 FROM event_delivery_receipts WHERE subscription_id = ?2 AND event_id = ?3)`,
+  ).bind(crypto.randomUUID(), lapsed.id, eventId, nowIso).run()
+}
+
+export type NativeWakeState =
+  | { state: 'live'; refresh_before: string; last_refreshed_at: string }
+  | { state: 'lapsed'; lapsed_at: string; last_refreshed_at: string; missed_wakes: number; action: string }
+  | { state: 'none' }
+
+/** What the agent's OWN boot reports about its native wake: live, lapsed (with how many pushes were missed), or never subscribed.
+ *  Self-scoped, metadata only. */
+export async function nativeWakeState(env: Env, tenant: string, agentId: string, nowIso: string = new Date().toISOString()): Promise<NativeWakeState> {
+  const live = await env.DB.prepare(
+    `SELECT refresh_before, last_refreshed_at FROM event_subscriptions
+      WHERE tenant = ?1 AND agent_id = ?2 AND event_name = 'message.created' AND status = 'active' AND refresh_before > ?3
+      ORDER BY refresh_before DESC LIMIT 1`,
+  ).bind(tenant, agentId, nowIso).first<{ refresh_before: string; last_refreshed_at: string }>()
+  if (live) return { state: 'live', refresh_before: live.refresh_before, last_refreshed_at: live.last_refreshed_at }
+  const lapsed = await lastLapsedSubscription(env, tenant, agentId, nowIso)
+  if (!lapsed) return { state: 'none' }
+  const row = await env.DB.prepare(
+    `SELECT last_refreshed_at FROM event_subscriptions WHERE id = ?1`,
+  ).bind(lapsed.id).first<{ last_refreshed_at: string }>()
+  const missed = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM event_delivery_receipts WHERE subscription_id = ?1 AND outcome = 'refused' AND error_class = 'subscription_lapsed'`,
+  ).bind(lapsed.id).first<{ n: number }>()
+  return {
+    state: 'lapsed',
+    lapsed_at: lapsed.refresh_before,
+    last_refreshed_at: row?.last_refreshed_at ?? lapsed.refresh_before,
+    missed_wakes: Number(missed?.n ?? 0),
+    action: 'The platform stopped renewing this agent\'s native wake subscription, so new messages do not wake its chat. Open this agent\'s conversation (or reconnect the mupot connector) so the platform subscribes again; Mupot cannot renew it.',
+  }
 }
 
 type Outcome = 'delivered' | 'retry' | 'failed' | 'gone' | 'refused'

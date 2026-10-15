@@ -51,6 +51,7 @@ import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, seatAttachEnabled } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, isAttachedSudoAction } from '../auth/attached-ceiling'
+import { nativeWakeState } from '../bus/events-delivery'
 import {
   decideHarnessBearer, HARNESS_SESSION_ALLOWED_TOOLS, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE,
   isHarnessCredentialSession,
@@ -6678,6 +6679,10 @@ const toolBootContext: ToolSpec = {
     // named `channel` is a fact; a field explaining what that fact COSTS is a map. QA-1
     // ("every refusal/unminted signal must carry the full map out — no dead ends") applied
     // to refusals but never to the successful boot that precedes them.
+    // Native wake state for THIS agent (self-scoped, metadata only, only while MCP Events is on): live / lapsed (+ missed pushes) / none.
+    const nativeWake = isEventsEnabled(env) && auth.boundAgentId
+      ? await nativeWakeState(env, auth.tenant ?? env.TENANT_SLUG, auth.boundAgentId).catch(() => null)
+      : null
     const directoryNote =
       auth.channel === 'directory'
         ? {
@@ -6762,6 +6767,7 @@ const toolBootContext: ToolSpec = {
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
+      ...(nativeWake ? { native_wake: nativeWake } : {}),
       ...(identityReceipt ? { identity_receipt: identityReceipt } : {}),
       // Emitted ONCE, top level (the receipt exists only with SEAT_AUTO_ENROLL; detection has its own flag).
       ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
