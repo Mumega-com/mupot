@@ -7332,7 +7332,7 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
   if (/^mcp__|mupot/.test(lower)) {
     let best: string | undefined
     for (const name of TOOL_BY_NAME.keys()) {
-      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length) && suggest(name)) best = name
+      if (lower.length > name.length && /[._:/-]/.test(lower[lower.length - name.length - 1]) && lower.endsWith(name) && (best === undefined || name.length > best.length)) best = name
     }
     const s = best === undefined ? undefined : suggest(best)
     if (s) return hint(s)
