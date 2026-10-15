@@ -7821,7 +7821,6 @@ async function handleJsonRpc(
       // of inferring it. Shape only — never a token, principal id, or message body.
       console.info('[mcp:events/list]', {
         bound: listAuth.boundAgentId != null,
-        attached: attachedCandidates.length,
         count: catalogue.length,
         names: catalogue.map((e) => e.name),
       })
