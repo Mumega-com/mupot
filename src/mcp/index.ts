@@ -7797,23 +7797,39 @@ async function handleJsonRpc(
       if (params.cursor !== undefined && params.cursor !== null && params.cursor !== '') {
         return rpcError(id, -32602, 'invalid_cursor')
       }
-      // An attached grant is listed AS the (first) attached agent for the floor check: the catalogue is the same event, with an
-      // optional `agent` argument naming which attached agent to wake.
-      const listAuth = attachedCandidates.length > 0 ? await eventsAuthForAttachment(c.env, auth, attachedCandidates[0]) : auth
-      const baseCatalogue = eventCatalogue({
-        bound: listAuth.boundAgentId != null,
-        // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
-        // request time; unknown tool => not advertised).
-        mayCallTool: (toolName) => {
-          const spec = TOOL_BY_NAME.get(toolName)
-          if (!spec) return false
-          return spec.min === 'authenticated' || hasWorkspaceAdmin(listAuth) || holdsCapabilityFloor(listAuth, spec.min)
-        },
-      })
+      // An attached grant is listed per ELIGIBLE candidate: each attached agent is tested against the read tool's own floor with its own
+      // consent-clamped capabilities, and only the ones that pass are advertised (and named in the description).
+      const eligible: typeof attachedCandidates = []
+      let listAuth = auth
+      for (const cand of attachedCandidates) {
+        const candAuth = await eventsAuthForAttachment(c.env, auth, cand)
+        const ok = eventCatalogue({
+          bound: true,
+          mayCallTool: (toolName) => {
+            const spec = TOOL_BY_NAME.get(toolName)
+            if (!spec) return false
+            return spec.min === 'authenticated' || hasWorkspaceAdmin(candAuth) || holdsCapabilityFloor(candAuth, spec.min)
+          },
+        }).length > 0
+        // The SAME floor events/subscribe applies (a candidate that cannot subscribe must not be advertised).
+        if (ok && callerFloorOk(candAuth, hasWorkspaceAdmin(candAuth))) { eligible.push(cand); if (eligible.length === 1) listAuth = candAuth }
+      }
+      const baseCatalogue = attachedCandidates.length > 0
+        ? (eligible.length > 0 ? eventCatalogue({ bound: true, mayCallTool: () => true }) : [])
+        : eventCatalogue({
+            bound: auth.boundAgentId != null,
+            // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
+            // request time; unknown tool => not advertised).
+            mayCallTool: (toolName) => {
+              const spec = TOOL_BY_NAME.get(toolName)
+              if (!spec) return false
+              return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
+            },
+          })
       const catalogue = attachedCandidates.length > 0
         ? baseCatalogue.map((e) => ({
             ...e,
-            description: `${e.description} This connection is attached to: ${attachedCandidates.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. Pass arguments.agent to choose which one to wake (optional when only one).`,
+            description: `${e.description} This connection is attached to: ${eligible.map((x) => `${x.slug} (${x.agentId})`).join(', ')}. Pass arguments.agent to choose which one to wake (optional when only one).`,
             inputSchema: {
               type: 'object',
               properties: { agent: { type: 'string', description: 'Id, slug or exact name of an agent this connection is attached to.' } },
@@ -7855,7 +7871,8 @@ async function handleJsonRpc(
       // A fixable PARAMETER error (name the agent / it is not attached): a JSON-RPC error on HTTP 200, never a 403 that a client would read as an auth failure.
       if (!picked.ok) return rpcError(id, -32602, picked.code, picked.data)
       evAuth = await eventsAuthForAttachment(c.env, auth, picked.attachment)
-      evAttached = { humanMemberId: auth.memberId as string, grantTokenId: auth.tokenId as string }
+      // The salt is the human AND the harness (the connector): two connectors of one human attached to one agent must not share a row either.
+      evAttached = { humanMemberId: `${auth.memberId as string}:${auth.harnessId as string}`, grantTokenId: auth.tokenId as string }
       evParams = { ...p, arguments: restArgs } // message.created takes no other arguments: anything left over is refused downstream
     }
     const floorOk = callerFloorOk(evAuth, hasWorkspaceAdmin(evAuth))

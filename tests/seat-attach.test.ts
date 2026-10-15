@@ -1947,6 +1947,38 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     expect((await post(sub('rava'))).error).toBeUndefined()
   })
 
+  it('the catalogue is evaluated PER attached agent: the newest one losing its capability does not hide the others, and an ineligible agent is not advertised', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    await admitAndAttach(env, g, 'conv-b', 'hadi-admin') // the NEWEST attachment
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-agent-hadi-admin'`) // its effective floor is gone
+    const list = (await ev(env, g.ctx, 'events/list', {})).body.result?.events as Array<{ name: string; description: string }>
+    expect(list.map((e) => e.name)).toEqual(['message.created'])
+    expect(list[0].description).toContain('rava')
+    expect(list[0].description).not.toContain('hadi-admin')
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-agent-rava'`)
+    expect((await ev(env, g.ctx, 'events/list', {})).body.result?.events).toEqual([]) // nobody eligible: empty, not a lie
+  })
+
+  it('two CONNECTORS of one human attached to the same agent with the same callback keep separate subscriptions (the salt is human + harness)', async () => {
+    const env = evEnv()
+    const gA = await grant(env, HUMAN, 'client-chatgpt', 'ChatGPT')
+    const gB = await grant(env, HUMAN, 'client-claude', 'Claude')
+    expect(gA.harnessId).not.toBe(gB.harnessId)
+    await admitAndAttach(env, gA, 'conv-a', 'rava')
+    await admitAndAttach(env, gB, 'conv-b', 'rava')
+    expect((await ev(env, gA.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    expect((await ev(env, gB.ctx, 'events/subscribe', sub('rava'))).body.error).toBeUndefined()
+    const rows = h.sqlite.prepare(`SELECT id, grant_token_id, status FROM event_subscriptions ORDER BY grant_token_id`).all() as Array<Record<string, string>>
+    expect(rows).toHaveLength(2)
+    expect(rows[0].id).not.toBe(rows[1].id)
+    await ev(env, gB.ctx, 'events/unsubscribe', sub('rava'))
+    const after = h.sqlite.prepare(`SELECT grant_token_id, status FROM event_subscriptions ORDER BY grant_token_id`).all() as Array<Record<string, string>>
+    expect(after.find((r) => r.grant_token_id === gA.tokenId)?.status).toBe('active') // A's wake is untouched by B's unsubscribe
+    expect(after.find((r) => r.grant_token_id === gB.tokenId)?.status).toBe('revoked')
+  })
+
   it('every liveness predicate is pinned: a non-live admission, a retired seat, a revoked attachment token, or the human losing squad admin removes the candidate AND (at delivery) ends the wake', async () => {
     const env = evEnv()
     const g = await grant(env, HUMAN)
