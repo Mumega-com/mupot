@@ -77,6 +77,14 @@ function fingerprint(sql: string): string {
  *  query, never the file — a file is not the unit of authority, a query is. */
 const NON_AUTHORIZING_READS: ReadonlyArray<{ fingerprint: string; why: string }> = [
   {
+    fingerprint: 'f5623e35078b',
+    why: "members/index acceptInvite (existing-member path) prior-grant read — ROW EXISTENCE for a UNIQUE(member_id, scope_type, scope_id) insert that follows. Filtering would hide a lapsed row and the INSERT would collide. Follow-up: a lapsed row currently blocks redemption of an invite on that scope until the sweeper (next PR) removes it.",
+  },
+  {
+    fingerprint: '0a38e13368bb',
+    why: "members/index acceptInvite race read — after a 0-row batch, asks whether a grant row exists to name the refusal (member_already_holds_grant). Existence for an error message, not an authority decision.",
+  },
+  {
     fingerprint: 'ad9b6465d248',
     why: "dashboard/agent-access-panel capRow() — the compare-and-swap leaf of the Access receipt guard: 'this table still holds the level the admin SAW'. The admin saw stored rows (the panel lists lapsed grants on purpose), so the CAS must compare stored state. Filtering it would make a lapsed grant impossible to revoke from the panel (stale_state forever).",
   },
