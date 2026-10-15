@@ -1837,7 +1837,20 @@ describe('MCP Events for attached agents', () => {
     expect(await listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId })).toEqual([]) // detached: no candidate
     await attach(env, g, 'conv-a', 'rava') // re-attach (admission still live)
     expect((await listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId })).length).toBe(1)
+    // the SAME human holds another live unbound directory token: the candidates are pinned to the grant token that made THIS request
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('tok-extra', '${HUMAN}', 'hash-extra', 'oauth:other', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
     h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-10-15 00:00:00' WHERE id = '${g.tokenId}'`)
     expect(await listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId })).toEqual([]) // a revoked grant is dead
+  })
+
+  it('pickAttachment: two live agents with the same name are never silently resolved to the first; a unique one is', async () => {
+    const { pickAttachment } = await import('../src/mcp/events-attached')
+    const mk = (agentId: string, slug: string, name: string) => ({ attachmentId: `att-${agentId}`, agentId, slug, name, squadId: 's', agentMemberId: 'm', seatTokenId: 't' })
+    const twins = [mk('a1', 'twin-1', 'Twin'), mk('a2', 'twin-2', 'Twin')]
+    expect(pickAttachment(twins, 'Twin')).toMatchObject({ ok: false, code: 'agent_not_attached' })
+    expect(pickAttachment(twins, 'a2')).toMatchObject({ ok: true, attachment: { agentId: 'a2' } })
+    expect(pickAttachment(twins, undefined)).toMatchObject({ ok: false, code: 'agent_required' })
+    expect(pickAttachment([twins[0]], undefined)).toMatchObject({ ok: true })
+    expect(pickAttachment(twins, 42)).toMatchObject({ ok: false, code: 'invalid_arguments' })
   })
 })
