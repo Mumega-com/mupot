@@ -404,14 +404,15 @@ export function prepareConditionalIdentityWeld(
   adm: { id: string; agent_id: string },
   agent: { name: string; squad_id: string },
   nowIso: string,
-  // 'promote': the admission exists and must still be pending. 'direct': the dashboard inserts the admission live in the SAME batch,
-  // right after these statements, so its id must not exist yet (a replay of the batch welds nothing).
+  // 'promote': place these BEFORE the UPDATE that takes the admission live; the admission must still be pending and unexpired.
+  // 'direct':  place these AFTER the INSERT of a live admission in the SAME batch; the guard is that exact row existing live
+  //            with this decided_at, so an INSERT that lost a conflict (ON CONFLICT DO NOTHING) leaves no row and welds nothing.
   mode: 'promote' | 'direct' = 'promote',
 ): D1PreparedStatement[] {
   const memberId = crypto.randomUUID()
   const admissionGuard = mode === 'promote'
     ? `EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3)`
-    : `NOT EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1) AND ?3 IS NOT NULL`
+    : `EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 AND status = 'live' AND decided_at = ?3)`
   const pending = `${admissionGuard}
                    AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4)`
   return [

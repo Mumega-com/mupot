@@ -182,6 +182,14 @@ function auditInsert(env: Env, agentId: string, actorId: string, action: string,
   ).bind(crypto.randomUUID(), agentId, actorId, action, JSON.stringify(after), ...guardBinds)
 }
 
+/** The audit row for an identity weld, written ONLY if the binding this batch created exists (a weld that was skipped by its guards
+ *  leaves no row, so the trail never claims a weld that did not happen). Keyed on created_at = this batch's timestamp. */
+function weldAudit(env: Env, agentId: string, actorId: string, admissionId: string, nowIso: string): D1PreparedStatement {
+  return auditInsert(env, agentId, actorId, 'identity_weld',
+    { admission_id: admissionId, via: 'seat_admission', member: 'new dedicated agent member, home-squad capability member, no token' },
+    'EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?6 AND agent_id = ?2 AND created_at = ?7)', [env.TENANT_SLUG, nowIso])
+}
+
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
   | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean }
@@ -219,16 +227,18 @@ export async function ensureAdmission(
         .bind(p.agentId).first<{ name: string; squad_id: string }>()
       const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? prepareConditionalIdentityWeld(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : []
       await env.DB.batch([
-        ...weld,
         env.DB.prepare(
           `INSERT INTO agent_seat_admissions
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
            VALUES (?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard')
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
+        // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
+        ...weld,
         auditInsert(env, p.agentId, p.humanMemberId, 'seat_admit',
           { admission_id: id, harness_id: p.harnessId, human_member_id: p.humanMemberId, via: 'dashboard' },
           'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\')', [id]),
+        ...(weld.length ? [weldAudit(env, p.agentId, p.humanMemberId, id, nowIso)] : []),
       ])
     }
     const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
@@ -333,8 +343,9 @@ async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: stri
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
-      { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, ...(weld.length ? { welded_identity: true } : {}) },
+      { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
       'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\' AND decided_at = ?7)', [adm.id, nowIso]),
+    ...(weld.length ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, nowIso)] : []),
   ])
   return out[weld.length].meta.changes === 1
 }

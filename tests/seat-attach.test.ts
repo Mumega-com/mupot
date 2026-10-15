@@ -16,6 +16,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { SoftAuthenticator } from './helpers/webauthn-authenticator'
 import { upsertHarness } from '../src/members/harness'
+import { prepareConditionalIdentityWeld } from '../src/members/service'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { advertisedTools, mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
@@ -395,7 +396,7 @@ describe('who may be attached, and who may call', () => {
     expect(n(`SELECT COUNT(*) AS n FROM members WHERE id = ? AND status = 'active' AND email IS NULL`, welded.member_id)).toBe(1)
     expect(one<{ capability: string; scope_id: string }>(`SELECT capability, scope_id FROM capabilities WHERE member_id = ?`, welded.member_id)).toMatchObject({ capability: 'member', scope_id: 'squad-core' })
     expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ? AND agent_id = 'agent-bare' AND channel != 'directory'`, welded.member_id)).toBe(0) // no standing credential
-    expect(JSON.parse(one<{ after_state: string }>(`SELECT after_state FROM agent_audit WHERE action = 'seat_admit' AND agent_id = 'agent-bare'`)!.after_state)).toMatchObject({ welded_identity: true })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'identity_weld' AND agent_id = 'agent-bare'`)).toBe(1) // the weld is audited, once
     const done = await attach(env, g, 'conv-a', 'agent-bare')
     expect(done.sc).toMatchObject({ status: 'attached', agent: { id: 'agent-bare' } })
     expect((await boot(env, g, 'conv-a')).sc.member_id).toBe(welded.member_id)
@@ -449,6 +450,39 @@ describe('who may be attached, and who may call', () => {
     expect(r2).toMatchObject({ ok: true, state: 'live' })
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
     expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(1)
+  })
+
+  it('direct-mode weld is guarded on THE admission row existing live in the same batch: a lost insert (no such row) welds nothing and writes no audit', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    const nowIso = '2026-10-15T01:00:00.000Z'
+    // no admission 'adm-lost' exists (its INSERT lost a conflict): the three weld statements are all no-ops
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-lost', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(0)
+    // the same statements after a LIVE admission row with this decided_at exists do weld, once
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.id
+    h.sqlite.exec(`INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
+      VALUES ('adm-live', '${TENANT}', 'agent-bare', '${HUMAN}', '${g.harnessId}', 'live', 0, 'member', 'dashboard', '${seat}', '${nowIso}', '${nowIso}', '${HUMAN}', 'dashboard')`)
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(1)
+    // and a second run welds nothing more (binding exists)
+    await env.DB.batch(prepareConditionalIdentityWeld(env, { id: 'adm-live', agent_id: 'agent-bare' }, { name: 'Bare', squad_id: 'squad-core' }, nowIso, 'direct'))
+    expect(n(`SELECT COUNT(*) AS n FROM members WHERE display_name = 'Bare'`)).toBe(1)
+  })
+
+  it('a suspended identity makes the admission refuse to go live (it is not welded again, and the refusal is tested)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'rava')
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`)
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'pending'`)!
+    void pend
+    expect(await decideAdmissionDirect(env, { admissionId: adm.id, humanMemberId: HUMAN, decision: 'approve' })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-rava'`)).toBe(1) // not re-welded
   })
 
   it('an ambiguous name needs the id', async () => {
