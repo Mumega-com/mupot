@@ -1001,10 +1001,10 @@ describe('C6. POST /oauth/consent — CSRF and replay protection', () => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
 
-    const form = new URLSearchParams({ consent_nonce: 'never-issued', action: 'continue', agent_id: '' })
+    const form = new URLSearchParams({ consent_nonce: '00000000-0000-4000-8000-000000000000', action: 'continue', agent_id: '' })
     const req = new Request('https://pot.test/oauth/consent', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent=never-issued' },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: 'mupot_oauth_consent=00000000-0000-4000-8000-000000000000' },
       body: form.toString(),
     })
     const res = await handleOAuthAuthorize(req, env)
