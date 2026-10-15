@@ -415,7 +415,7 @@ export async function applyDisposition(
   }
 
   // Revoked: restore the prior value, or remove the row if there was nothing before.
-  // History is written by the capabilities triggers (migration 0228): a removal is a
+  // History is written by the capabilities triggers (migration 0230): a removal is a
   // 'revoked' event attributed through the revoke context, a restore is a 'granted'
   // event for the restored level attributed through the provenance stamped on the row.
   if (r.capability_before === null) {

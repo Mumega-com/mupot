@@ -2322,7 +2322,7 @@ function guestVisibilityWriteFenceSql(first: number): string {
   const scopeType = `?${first + 1}`
   const scopeId = `?${first + 2}`
   const capability = `?${first + 3}`
-  // 0228: the durable capability plane must be LIVE, not merely present. The
+  // 0230: the durable capability plane must be LIVE, not merely present. The
   // caller pushes nowCapabilitySql() as the fifth value of this block.
   const now = `?${first + 4}`
   return `AND (

@@ -1,8 +1,8 @@
-// tests/capability-expiry-real-schema.test.ts — migration 0228.
+// tests/capability-expiry-real-schema.test.ts — migration 0230.
 //
 // A STANDING CAPABILITY GRANT THAT ENDS ON ITS OWN.
 //
-// Until 0228 `capabilities` had no expiry. Every grant was permanent, and the
+// Until 0230 `capabilities` had no expiry. Every grant was permanent, and the
 // only way to narrow one was for a human to remember to revoke it. That single
 // fact is why "let this agent run its own squad" kept collapsing into "make it
 // an admin", and why operator_principal_required pushes people toward browser
@@ -29,7 +29,7 @@ const MEMBER = 'member-lead'
 const SQUAD = 'squad-mcpwp'
 const SCOPE = brandSquadScope({ id: SQUAD, department_id: 'dept-1', kind: 'work' })
 
-describe('migration 0228 — capability grants may expire', () => {
+describe('migration 0230 — capability grants may expire', () => {
   let h: SqliteD1Harness
   let env: Env
 
@@ -72,7 +72,7 @@ describe('migration 0228 — capability grants may expire', () => {
   })
 
   it('MECHANISM ONLY — applying it expires nothing that already existed', async () => {
-    // Every pre-0228 row is NULL. If the NULL arm regresses, every standing grant
+    // Every pre-0230 row is NULL. If the NULL arm regresses, every standing grant
     // in the pot stops resolving at once — a total authorization outage.
     const preExisting = h.sqlite
       .prepare('SELECT COUNT(*) n FROM capabilities WHERE expires_at IS NOT NULL')

@@ -593,7 +593,7 @@ describe('who may approve: ONE derivation', () => {
     expect(await whoMayApprove(env, row)).toContain(ADMIN)
   })
 
-  it('an approver whose admin grant EXPIRES: live => still an approver (kills a misbound now), lapsed => not (migration 0228)', async () => {
+  it('an approver whose admin grant EXPIRES: live => still an approver (kills a misbound now), lapsed => not (migration 0230)', async () => {
     await askOk('agent-rava', { squad: 'squad-target' })
     const row = one<{ id: string; squad_id: string }>(`SELECT id, squad_id FROM squad_join_requests`)!
     h.sqlite.exec(`UPDATE capabilities SET expires_at = '2099-01-01 00:00:00' WHERE member_id = '${ADMIN}' AND scope_id = 'squad-target'`)

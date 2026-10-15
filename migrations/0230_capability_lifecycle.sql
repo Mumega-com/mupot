@@ -1,4 +1,4 @@
--- 0228_capability_lifecycle.sql — a standing capability grant has a lifecycle.
+-- 0230_capability_lifecycle.sql — a standing capability grant has a lifecycle.
 --
 -- Controls: ISO 27001 A.5.18 (access rights: provisioning, review, removal),
 -- SOC 2 CC6.2 / CC6.3 (grant, modify, remove access; periodic review).

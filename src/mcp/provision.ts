@@ -1842,7 +1842,7 @@ export const toolGrantAgentCapability: ToolSpec = {
     if (elevatedGrant) {
       const [existingCap, existingMembership] = await Promise.all([
         env.DB.prepare(
-          // 0228: an EXPIRED grant is not authority, so it must not block a
+          // 0230: an EXPIRED grant is not authority, so it must not block a
           // demotion either. Filtering here keeps "what the target currently
           // holds" meaning the same thing in the guard as it does in every
           // authorization check.
@@ -1875,7 +1875,7 @@ export const toolGrantAgentCapability: ToolSpec = {
       }
     }
 
-    // 0228 — THE CONFERRED CAPABILITY CANNOT OUTLIVE THE APPROVAL THAT AUTHORIZED IT.
+    // 0230 — THE CONFERRED CAPABILITY CANNOT OUTLIVE THE APPROVAL THAT AUTHORIZED IT.
     //
     // An elevated caller writes the grant with the ELEVATION's own expires_at, so
     // the standing row lapses on exactly the clock the human approved. A standing

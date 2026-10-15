@@ -1,4 +1,4 @@
-// tests/grant-lifecycle-now-binding.test.ts — migration 0228.
+// tests/grant-lifecycle-now-binding.test.ts — migration 0230.
 //
 // (1) The liveness predicate fails CLOSED on a misbound `now`.
 // (2) acceptInvite's rank checks honour an EXPIRING inviter grant (live = ok, lapsed = refused),

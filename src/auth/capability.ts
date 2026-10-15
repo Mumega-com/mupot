@@ -615,12 +615,12 @@ export async function canOnSquadAuth(
   return false
 }
 
-/** SQL fragment gating a `capabilities` row on liveness (migration 0228).
+/** SQL fragment gating a `capabilities` row on liveness (migration 0230).
  *
  *  Two things are load-bearing, and they are the same two src/auth/token-lifecycle.ts
  *  spells out for member_tokens — the reasoning transfers because the failure modes do:
  *
- *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0228 is
+ *  1. `expires_at IS NULL` means NON-EXPIRING. Every grant written before 0230 is
  *     NULL, and SQL three-valued logic drops NULL from any comparison, so a
  *     predicate without this arm would stop resolving EVERY grant in the pot at
  *     once — a total authorization outage, self-inflicted.
@@ -631,7 +631,7 @@ export async function canOnSquadAuth(
  *     fails open or closed depending purely on which shape the row carries.
  *
  *  THE PREDICATE IS NOT THE HARD PART. `capabilities` has 43 readers across 25
- *  files. A first cut of 0228 applied this to ONE of them (resolveCapabilities)
+ *  files. A first cut of 0230 applied this to ONE of them (resolveCapabilities)
  *  and an adversarial pass blocked it: an expired grant would have been dead in
  *  one reader and alive in forty-two, so the surface that DISPLAYS "expired"
  *  would disagree with every surface that ENFORCES. Worse than no expiry at all.

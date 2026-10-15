@@ -1,8 +1,8 @@
-// tests/capability-readers-enforced.test.ts — migration 0228.
+// tests/capability-readers-enforced.test.ts — migration 0230.
 //
 // THE PREDICATE IS NOT THE HARD PART. THE CENSUS IS.
 //
-// `capabilities` is read 43 times across 25 files. A first cut of 0228 applied
+// `capabilities` is read 43 times across 25 files. A first cut of 0230 applied
 // the liveness predicate to exactly ONE of them (resolveCapabilities) and an
 // adversarial pass blocked it, correctly: the moment a writer existed, an
 // expired grant would be dead in one reader and fully alive in forty-two — and
@@ -267,7 +267,7 @@ describe('every capabilities reader consumes the liveness predicate', () => {
 // ── writers ────────────────────────────────────────────────────────────────────
 //
 // The reader census keeps an expired grant dead everywhere it is read. This is its
-// twin for the audit half (migration 0228): every statement that CREATES a grant
+// twin for the audit half (migration 0230): every statement that CREATES a grant
 // must say who granted it and through which surface, and every DELETE must be
 // attributable. History itself is written by trigger, so a writer cannot forget the
 // EVENT — but it can still forget the PROVENANCE the event is built from.
@@ -345,7 +345,7 @@ describe('every capabilities writer records provenance', () => {
 
 // ── memberships readers ─────────────────────────────────────────────────────────
 //
-// `memberships` carries the same horizon as `capabilities` (migration 0228) for agent grants
+// `memberships` carries the same horizon as `capabilities` (migration 0230) for agent grants
 // written under an elevation. A reader that treats a membership as "the agent is on this squad"
 // for an AUTHORITY decision must ignore a lapsed one. Same census, same discipline: every read
 // consumes the predicate once per read, or is exempted BY FINGERPRINT with a reason.

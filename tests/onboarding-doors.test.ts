@@ -174,7 +174,7 @@ describe('ceilings — self-service is bounded, by allowlist not by prefix', () 
   })
 })
 
-describe('lifecycle (migration 0228)', () => {
+describe('lifecycle (migration 0230)', () => {
   it('a self-grant onto a LAPSED row refreshes it instead of being swallowed, and is attributed', async () => {
     const db = makeDb()
     await open(db)

@@ -942,7 +942,7 @@ describe('receipts', () => {
   })
 })
 
-// ── expiring authority through the in-batch guard (migration 0228) ──────────────
+// ── expiring authority through the in-batch guard (migration 0230) ──────────────
 //
 // The guard's rank facts take `now` as a bound parameter. A positional-bind slip that
 // hands it an INTEGER (?15 -> ?12, the org-admin floor) used to make every expiring

@@ -22,9 +22,9 @@ export interface SetAgentSquadAccessInput {
   /** Raise-only: the upsert's DO UPDATE carries a rank predicate IN THE WRITE, so a concurrent promotion is never demoted. */
   neverLower?: boolean
   /** ISO/SQL timestamp after which this grant stops resolving, or null/undefined
-   *  for a permanent one (migration 0228).
+   *  for a permanent one (migration 0230).
    *
-   *  THIS IS THE POINT OF 0228. grant_agent_capability writes here, and before
+   *  THIS IS THE POINT OF 0230. grant_agent_capability writes here, and before
    *  the column existed the write was necessarily PERMANENT — which is why an
    *  elevated session was capped at 'member': a time-boxed approval could not be
    *  allowed to confer standing lead/admin that outlived its own window.
@@ -34,7 +34,7 @@ export interface SetAgentSquadAccessInput {
    *  the approval that authorized it, and conferring 'lead' becomes safe because
    *  it lapses on the same clock. See mupot#1360. */
   expiresAt?: string | null
-  /** Who granted this, through which surface, and why (migration 0228). */
+  /** Who granted this, through which surface, and why (migration 0230). */
   provenance?: GrantProvenance
 }
 
@@ -44,7 +44,7 @@ export interface RemoveAgentSquadAccessInput {
   agentId: string
   memberId: string
   squadId: string
-  /** Who revoked and why; recorded on the grant_events row (migration 0228). */
+  /** Who revoked and why; recorded on the grant_events row (migration 0230). */
   provenance?: RevokeProvenance
 }
 
@@ -524,7 +524,7 @@ export async function commitRemoveAgentSquadAccess(
   const [setRevokeContext, clearRevokeContext] = revokeContextStatements(env, input.provenance ?? { grantedBy: null })
   const writes = await env.DB.batch([
     ...extras,
-    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0228).
+    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0230).
     setRevokeContext,
     env.DB.prepare(
       `DELETE FROM memberships

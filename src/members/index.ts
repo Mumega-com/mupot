@@ -1927,7 +1927,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
 
     // scope_id comparison must treat null correctly (IS NULL vs = ?).
     // set-context / DELETE / clear-context in one batch: the grant_events trigger
-    // (migration 0228) records who revoked.
+    // (migration 0230) records who revoked.
     const [setRevokeContext, clearRevokeContext] = revokeContextStatements(c.env, {
       grantedBy: c.get('auth').memberId ?? null,
       reason: null,
