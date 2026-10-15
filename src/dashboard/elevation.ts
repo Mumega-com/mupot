@@ -379,6 +379,12 @@ function agentSessionSummary(session: AgentSessionRecord | null): Html {
 
 function actionChecklist(actions: string[]): Html {
   return html`
+    <style>
+      .action-choice { display:flex; gap:12px; align-items:flex-start; box-sizing:border-box; min-height:44px; padding:10px 12px; margin:10px 0; border:1px solid var(--border); border-radius:10px; cursor:pointer; touch-action:manipulation; }
+      .action-choice input { flex:none; width:24px; height:24px; margin:0; accent-color:var(--accent); }
+      .action-choice:has(input:checked) { border-color:var(--accent); box-shadow:inset 0 0 0 2px var(--accent); }
+      .action-choice:focus-within { outline:3px solid var(--accent); outline-offset:2px; }
+    </style>
     <fieldset style="border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin:10px 0;">
       <legend style="padding:0 6px;font-size:12.5px;color:var(--dim);">
         Tick which of the REQUESTED actions to allow. You may remove any; you cannot add anything the agent
@@ -387,8 +393,8 @@ function actionChecklist(actions: string[]): Html {
       ${actions.map((a) => {
         const def = ELEVATION_ACTIONS[a]
         return html`
-          <label style="display:flex;gap:10px;align-items:flex-start;margin:10px 0;">
-            <input type="checkbox" name="actions" form="decide-form" value="${a}" checked style="margin-top:3px;" />
+          <label class="action-choice">
+            <input type="checkbox" name="actions" form="decide-form" value="${a}" checked />
             <span>
               <strong>${def?.label ?? a}</strong> ${def ? effectBadge(def.effect) : ''}
               <div style="font-size:12.5px;color:var(--dim);">${def?.description ?? ''}</div>

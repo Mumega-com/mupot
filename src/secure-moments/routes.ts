@@ -426,9 +426,9 @@ momentsApp.get('/m/:id/:token', async (c) => {
 <dt>Asked from chat</dt><dd>${escapeHtml(v.seatLabel ?? 'a chat')}</dd>
 <dt>Expires</dt><dd>${escapeHtml(subject.adm.expires_at ?? '')}</dd></dl>
 <h2>How much may ${escapeHtml(v.agentName)} do in your chats?</h2>
-<label class="row"><input type="radio" name="ceiling" value="member" checked> <strong>Member</strong>: everyday work (the default)</label>
-<label class="row"><input type="radio" name="ceiling" value="lead"> <strong>Lead</strong>: also lead-level work on what the agent leads</label>
-<label class="row"><input type="radio" name="ceiling" value="full"> <strong>Full</strong>: everything this agent itself may do, never more than you may</label>
+<label class="choice"><input type="radio" name="ceiling" value="member" checked><span><strong>Member</strong>: everyday work (the default)</span></label>
+<label class="choice"><input type="radio" name="ceiling" value="lead"><span><strong>Lead</strong>: also lead-level work on what the agent leads</span></label>
+<label class="choice"><input type="radio" name="ceiling" value="full"><span><strong>Full</strong>: everything this agent itself may do, never more than you may</span></label>
 <h2>What approving does</h2><p>Lets chats from <strong>this connected app</strong> act as <strong>${escapeHtml(v.agentName)}</strong>, now and for later chats, until you revoke it on your Connections page. Whatever you choose, they never hold this agent's approval gates, and never more than you yourself may do. To change the level later you revoke and approve again.</p>`
     title = `Let ${v.agentName} work in your chat`
     approveLabel = 'Admit'

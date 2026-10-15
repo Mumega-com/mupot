@@ -6,6 +6,8 @@
 //   - after a won decision the server may return a trust secret + trusted_until: it is cached outside BiometricManager for
 //     the window only, and used for routine decisions with no prompt. Every refusal falls back to the full prompt.
 // It holds no mupot secret of its own. Server text is written with textContent; view_html is HTML the SERVER escaped.
+import { TG_LOCK_ROWS } from './telegram-miniapp-client'
+
 export const TG_SCRIPT_PIN_WINDOW = `
 (function(){
 var app=document.getElementById('app'),out=document.getElementById('status');
@@ -80,13 +82,14 @@ async function moment(id){
  f.innerHTML=v.json.view_html;
  var blocked=v.json.passkey_only_actions||[];
  var boxes=f.querySelectorAll('input[name=actions]');
- for(var i=0;i<boxes.length;i++){if(blocked.indexOf(boxes[i].value)>=0){boxes[i].checked=false;boxes[i].disabled=true}}
+${TG_LOCK_ROWS}
  var row=document.createElement('div');row.className='row';
  var note=document.createElement('p');note.className='muted';note.textContent='Deciding asks for your fingerprint, face or PIN (unless you chose to trust this phone for a while). Opening this page decided nothing.';
  var ok=document.createElement('button');ok.className='primary';ok.type='button';ok.setAttribute('data-act','approve');ok.textContent=v.json.approve_label;
  var no=document.createElement('button');no.className='danger';no.type='button';no.setAttribute('data-act','deny');no.textContent='Deny';
  row.appendChild(ok);row.appendChild(no);f.appendChild(note);f.appendChild(row);
  var row2=document.createElement('div');row2.className='row';passkeyButton(row2);f.appendChild(row2);
+ if(allLocked){ok.hidden=true;note.textContent='Every action in this request needs a passkey, which Telegram cannot give. Deny here, or approve with your passkey in your browser.';var pb=row2.querySelector('button');if(pb)pb.className='primary'}
  function params(decision){var acts=[];var cs=f.querySelectorAll('input[name=actions]');for(var i=0;i<cs.length;i++){if(cs[i].checked&&!cs[i].disabled)acts.push(cs[i].value)}var d=f.querySelector('select[name=duration_minutes]');return{moment_id:momentId,decision:decision,actions:acts,duration_minutes:d?d.value:undefined}}
  function finish(res,extra){
   show(res.json.title||'Result',(res.json.message||'No message.')+(extra||''),res.status===200&&!extra);

@@ -19,6 +19,8 @@ import { requestMomentDelivery } from '../src/secure-moments/telegram-miniapp-la
 import { requestEnrolDelivery } from '../src/secure-moments/telegram-miniapp-enrol-delivery'
 import { sendMiniappButton } from '../src/secure-moments/telegram-miniapp-send'
 import { telegramMiniappStatus } from '../src/secure-moments/telegram-miniapp-config'
+import { renderPage } from '../src/access/page'
+import { TG_LOCK_ROWS } from '../src/secure-moments/telegram-miniapp-client'
 import { PASSKEY_REQUIRED_MESSAGE, TELEGRAM_PASSKEY_ONLY_EXTRA, telegramPolicyRefusal } from '../src/secure-moments/telegram-miniapp'
 import { ELEVATION_ACTIONS, isRequestableElevationAction, SENSITIVE_STEP_UP_ACTIONS } from '../src/auth/elevation-actions'
 import { linkLoginIdentity, revokeLoginIdentity } from '../src/auth/login-identity'
@@ -1230,5 +1232,49 @@ describe('the Mini App uses the real decision core, not a copy', () => {
     await decide(m, TG.owner, dev, { decision: 'approve' })
     expect(count('member_passkeys')).toBe(before.p)
     expect(await SoftAuthenticator.create()).toBeTruthy()
+  })
+})
+
+describe('touch-friendly approval rows (presentation only)', () => {
+  it('every selectable input in the elevation view sits inside a label.choice, pre-ticked and enabled', async () => {
+    const m = await fileElevation()
+    const html = (await jbody(await post('/m/tg/view', { init_data: init(TG.sqadmin), moment_id: m.id }))).view_html ?? ''
+    const inputs = html.match(/<input\b[^>]*>/g) ?? []
+    expect(inputs.length).toBe(2)
+    const labels = html.match(/<label\b[^>]*>[\s\S]*?<\/label>/g) ?? []
+    expect(labels.length).toBe(inputs.length)
+    for (const l of labels) {
+      expect(l).toMatch(/^<label class="choice">/)
+      expect((l.match(/<input\b/g) ?? []).length).toBe(1)
+    }
+    for (const i of inputs) {
+      expect(i).toContain('type="checkbox"')
+      expect(i).toContain(' checked')
+      expect(i).not.toMatch(/disabled|readonly|hidden/)
+    }
+  })
+  it('the page CSS gives the row a 44px minimum height, a visible selected state and a focus ring', () => {
+    const css = renderPage('t', '').match(/<style>([\s\S]*?)<\/style>/)?.[1] ?? ''
+    expect(css).toMatch(/label\.choice\{[^}]*min-height:44px/)
+    expect(css).toMatch(/label\.choice:has\(>input:checked\)\{[^}]*box-shadow/)
+    expect(css).toMatch(/label\.choice:focus-within\{[^}]*outline/)
+  })
+  it('ROOT CAUSE pin: Telegram unticks+disables passkey-only rows; the page now says why and leaves no dead-end', () => {
+    type Box = { value: string; checked: boolean; disabled: boolean; parentNode: { querySelector: () => { appended: string[]; appendChild: (n: unknown) => void } } }
+    const mk = (value: string): Box => {
+      const sp = { appended: [] as string[], appendChild(n: unknown) { this.appended.push(JSON.stringify(n)) } }
+      return { value, checked: true, disabled: false, parentNode: { querySelector: () => sp } }
+    }
+    const doc = { createElement: (t: string) => ({ t, className: '', textContent: '' }) }
+    const run = (boxes: Box[], blocked: string[]) => new Function('boxes', 'blocked', 'document', `${TG_LOCK_ROWS}; return allLocked`)(boxes, blocked, doc) as boolean
+    const a = mk('action:manage_access')
+    const b = mk('action:mint_token')
+    expect(run([a, b], ['action:manage_access', 'action:mint_token'])).toBe(true)
+    expect([a.checked, a.disabled]).toEqual([false, true])
+    expect(JSON.stringify(a.parentNode.querySelector().appended)).toContain('Passkey only')
+    const c = mk('action:project_status')
+    const d = mk('action:manage_access')
+    expect(run([c, d], ['action:manage_access'])).toBe(false)
+    expect([c.checked, c.disabled]).toEqual([true, false])
   })
 })
