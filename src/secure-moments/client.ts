@@ -19,14 +19,17 @@ if(!window.PublicKeyCredential){show('Passkeys not available','This browser cann
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
 function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),csrf:form.getAttribute('data-csrf')}}
-function setAgentPrompt(kind,title,message){
+var promptOrig=null;
+function setAgentPrompt(kind,title,message,verb){
  var box=document.getElementById('agent-prompt-box'),t=document.getElementById('agent-prompt');if(!box||!t)return;
+ var h=box.querySelector('h2');
+ if(promptOrig===null){promptOrig={v:t.value,h:h?h.textContent:''}}
  var who=box.getAttribute('data-agent')||'there';
- var line=function(v){return String(v==null?'':v).replace(/[\\u0000-\\u001f\\u007f]+/g,' ').replace(/\\s+/g,' ').trim().slice(0,300)};
+ var line=function(v){var s=String(v==null?'':v).replace(/[\\u0000-\\u001f\\u007f]+/g,' ').replace(/\\s+/g,' ').trim().slice(0,300);return s||'no response'};
  var hdr='Message from mupot for '+who+'. ';
- if(kind==='denied'){t.value=hdr+'Your user DENIED your request to act as '+who+'. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell your user in two lines what you needed access for; they will decide whether to set it up another way.'}
- else{t.value=hdr+'Your user tried to approve your request but mupot did not record it: "'+line(title)+': '+line(message)+'". Nothing was changed.\\nDo not retry other routes and do not ask for tokens or extra access.\\nTell your user what you were trying to do and wait for their instruction.'}
- var h=box.querySelector('h2');if(h)h.textContent=kind==='denied'?'Tell '+who+' it was denied':'Tell '+who+' what happened';
+ if(kind==='attach'){t.value=promptOrig.v;if(h)h.textContent=promptOrig.h}
+ else if(kind==='denied'){t.value=hdr+'Your user DENIED your request to act as '+who+'. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell your user in two lines what you needed access for; they will decide whether to set it up another way.';if(h)h.textContent='Tell '+who+' it was denied'}
+ else{t.value=hdr+'Your user tried to '+(verb==='deny'?'deny':'approve')+' your request but it did not complete: "'+line(title)+': '+line(message)+'". Mupot has not confirmed any change, so assume nothing was attached or changed until you are told otherwise.\\nDo not retry other routes and do not ask for tokens or extra access.\\nTell your user what you were trying to do and wait for their instruction.';if(h)h.textContent='Tell '+who+' what happened'}
  var cb=document.getElementById('copy-prompt');if(cb)cb.textContent='Copy message';
 }
 async function decide(decision){
@@ -44,8 +47,8 @@ async function decide(decision){
   clearTimeout(slow);
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
-  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;if(decision==='deny'){setAgentPrompt('denied')}}else{lock(false);setAgentPrompt('refused',res.json.title,res.json.message)}
- }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false);setAgentPrompt('refused','Not decided',explain(e))}
+  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;setAgentPrompt(decision==='deny'?'denied':'attach')}else{lock(false);setAgentPrompt('refused',res.json.title,res.json.message,decision)}
+ }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false);setAgentPrompt('refused','Not decided',explain(e),decision)}
 }
 var bs=form.querySelectorAll('button[data-act]');
 for(var i=0;i<bs.length;i++){bs[i].addEventListener('click',function(ev){decide(ev.currentTarget.getAttribute('data-act'))})}
