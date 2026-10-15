@@ -128,6 +128,19 @@ describe('mupot#1441 consent nonce binding across tabs', () => {
     expect((await decline(b, env, n1, `mupot_oauth_consent=${n1.replace(/.$/, 'x')}`)).status).toBe(403)
   })
 
+  it('a nonce whose KV record is gone is pruned from the cookie on the next render', async () => {
+    const env = makeEnv(); const b = new Browser()
+    const n1 = await renderConsent(b, env)
+    await env.SESSIONS.delete(`oauth-consent:${n1}`) // expired
+    const n2 = await renderConsent(b, env)
+    expect(b.jar.get('mupot_oauth_consent')).toBe(n2)
+  })
+
+  it('a non-UUID element in the cookie is never honoured (shape check before the list check)', async () => {
+    const env = makeEnv(); const b = new Browser()
+    expect((await decline(b, env, 'x', 'mupot_oauth_consent=x')).status).toBe(403)
+  })
+
   it('cookie list is bounded and stale nonces are pruned', async () => {
     const env = makeEnv(); const b = new Browser()
     const ns: string[] = []
