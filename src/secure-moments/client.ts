@@ -13,24 +13,42 @@ function explain(e){return e&&e.name==='NotAllowedError'?'The passkey prompt was
 
 export const DECIDE_SCRIPT = `${COMMON}
 (function(){
+var cb=document.getElementById('copy-prompt');
+if(cb){cb.addEventListener('click',function(){var t=document.getElementById('agent-prompt');if(!t)return;var done=function(){cb.textContent='Copied'};var fall=function(){try{t.removeAttribute('readonly');t.focus();t.select();t.setSelectionRange(0,t.value.length);var ok=document.execCommand('copy');t.setAttribute('readonly','');if(ok){done()}else{cb.textContent='Select the text and copy it'}}catch(e){t.setAttribute('readonly','');cb.textContent='Select the text and copy it'}};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t.value).then(done,fall)}else{fall()}})}
 if(!window.PublicKeyCredential){show('Passkeys not available','This browser cannot use passkeys. Open the link in a browser that can.',false);lock(true);return}
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
 function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),csrf:form.getAttribute('data-csrf')}}
+var promptOrig=null;
+function setAgentPrompt(kind,title,message,verb){
+ var box=document.getElementById('agent-prompt-box'),t=document.getElementById('agent-prompt');if(!box||!t)return;
+ var h=box.querySelector('h2');
+ if(promptOrig===null){promptOrig={v:t.value,h:h?h.textContent:''}}
+ var who=box.getAttribute('data-agent')||'there';
+ var line=function(v){var s=String(v==null?'':v).replace(/[\\u0000-\\u001f\\u007f]+/g,' ').replace(/\\s+/g,' ').trim().slice(0,300);return s||'no response'};
+ var hdr='Message from mupot for '+who+'. ';
+ if(kind==='attach'){t.value=promptOrig.v;if(h)h.textContent=promptOrig.h}
+ else if(kind==='denied'){t.value=hdr+'Your user DENIED your request to act as '+who+'. Nothing was attached and nothing was changed.\\nDo not retry seat_attach and do not try another route.\\nTell your user in two lines what you needed access for; they will decide whether to set it up another way.';if(h)h.textContent='Tell '+who+' it was denied'}
+ else{t.value=hdr+'Your user tried to '+(verb==='deny'?'deny':'approve')+' your request but it did not complete: "'+line(title)+': '+line(message)+'". Mupot has not confirmed any change, so assume nothing was attached or changed until you are told otherwise.\\nDo not retry other routes and do not ask for tokens or extra access.\\nTell your user what you were trying to do and wait for their instruction.';if(h)h.textContent='Tell '+who+' what happened'}
+ var cb=document.getElementById('copy-prompt');if(cb)cb.textContent='Copy message';
+}
 async function decide(decision){
+ var slow=null;
  lock(true);show('Waiting for your passkey','Confirm on this device. Nothing has been decided yet.',true);
  try{
   var p=params(decision);
   var ch=await post('/challenge',p);
-  if(!ch.json.ok){show('Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
+  if(!ch.json.ok){clearTimeout(slow);show('Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
+  slow=setTimeout(function(){if(document.querySelector('button[data-act]:disabled')){show('Still waiting for your passkey','Nothing has come back yet. If no passkey prompt appeared on this device, reload this page and tap once, from Safari or Chrome itself (not an in-app browser), or use a device that has your passkey. Nothing has been decided.',false)}},25000);
   var o=ch.json.publicKey;o.challenge=b64uToBuf(o.challenge);
   o.allowCredentials=(o.allowCredentials||[]).map(function(c){return{type:c.type,id:b64uToBuf(c.id)}});
   var cred=await navigator.credentials.get({publicKey:o});
   p.credential={id:cred.id,rawId:bufToB64u(cred.rawId),type:cred.type,response:{clientDataJSON:bufToB64u(cred.response.clientDataJSON),authenticatorData:bufToB64u(cred.response.authenticatorData),signature:bufToB64u(cred.response.signature)}};
+  clearTimeout(slow);
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
-  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true}else{lock(false)}
- }catch(e){show('Not decided',explain(e),false);lock(false)}
+  if(res.status===200){var f=document.getElementById('decision-form');if(f)f.hidden=true;setAgentPrompt(decision==='deny'?'denied':'attach')}else{lock(false);setAgentPrompt('refused',res.json.title,res.json.message,decision)}
+ }catch(e){clearTimeout(slow);show('Not decided',explain(e),false);lock(false);setAgentPrompt('refused','Not decided',explain(e),decision)}
 }
 var bs=form.querySelectorAll('button[data-act]');
 for(var i=0;i<bs.length;i++){bs[i].addEventListener('click',function(ev){decide(ev.currentTarget.getAttribute('data-act'))})}
