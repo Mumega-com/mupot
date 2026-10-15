@@ -69,6 +69,8 @@ import {
   resolveAgentSessionContext,
   revokeAgentSessionByCredential,
   loadLiveAgentSessionByCredential,
+  resolveCallerLiveAgentSession,
+  loadCallerLiveAgentSession,
 } from '../auth/agent-sessions'
 import {
   createElevationRequest,
@@ -6014,12 +6016,7 @@ const toolRequestElevation: ToolSpec = {
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
-    const liveSession = await loadLiveAgentSessionByCredential(
-      env,
-      env.TENANT_SLUG,
-      sessionContext.context.authKind,
-      sessionContext.context.credentialId,
-    )
+    const liveSession = await resolveCallerLiveAgentSession(env, sessionContext.context)
     if (!liveSession) {
       return fail(409, 'not_agent_session', 'No tracked runtime session for this credential (migration not applied yet, or none created — call check_in first).')
     }
@@ -6097,12 +6094,7 @@ const toolElevationStatus: ToolSpec = {
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
-    const liveSession = await loadLiveAgentSessionByCredential(
-      env,
-      env.TENANT_SLUG,
-      sessionContext.context.authKind,
-      sessionContext.context.credentialId,
-    )
+    const liveSession = await loadCallerLiveAgentSession(env, sessionContext.context)
     if (!liveSession) return fail(409, 'not_agent_session', 'No tracked runtime session for this credential.')
 
     const requestId = str(args.request_id)
