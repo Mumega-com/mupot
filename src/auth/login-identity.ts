@@ -161,7 +161,7 @@ export async function linkLoginIdentity(
           -- pot_provision_receipts) is reachable from the tenant's own D1,
           -- and why the directory-channel exemption exists at all (mupot#1551
           -- round 2 P0: mintDirectoryToken's own unbound connector token).
-          ${liveCompetingBearerSql({
+          SELECT 1 ${liveCompetingBearerSql({
             tenant: '?2', member: '?6', exemptLabel: '?9', exemptChannel: '?10', directoryChannel: '?11', now: '?12',
           })}
         )

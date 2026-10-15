@@ -113,8 +113,8 @@ export const PROVISIONING_EXEMPT_DIRECTORY_CHANNEL = 'directory'
 /**
  * The ONE copy of the "competing bearer" clause: a live, UNBOUND member bearer
  * (agent_id IS NULL) other than the documented provisioning-seed and
- * directory-connector exemptions. Returned as a bare `SELECT 1 FROM
- * member_tokens t WHERE ...` body for the caller to wrap in EXISTS /
+ * directory-connector exemptions. Returned as a `FROM member_tokens t WHERE ...`
+ * tail; the caller supplies its own `SELECT ...` head and wraps in EXISTS /
  * NOT EXISTS. Every consumer (decideIdentitylessAttach below,
  * linkLoginIdentity's requireExclusiveControl INSERT, acceptInvite's
  * login-first grant) interpolates this — none re-derives it. Callers bind the
@@ -128,7 +128,7 @@ export function liveCompetingBearerSql(p: {
   directoryChannel: string
   now: string
 }): string {
-  return `SELECT 1 FROM member_tokens t
+  return `FROM member_tokens t
            WHERE t.tenant = ${p.tenant} AND t.member_id = ${p.member} AND t.agent_id IS NULL
              AND NOT (t.label = ${p.exemptLabel} AND t.channel = ${p.exemptChannel})
              AND t.channel != ${p.directoryChannel}
@@ -276,7 +276,7 @@ export async function decideIdentitylessAttach(
   //    provenance). Shared liveness predicate (revocation + expiry) — never
   //    `revoked_at IS NULL` alone.
   const liveBearer = await env.DB.prepare(
-    `${liveCompetingBearerSql({
+    `SELECT 1 AS present ${liveCompetingBearerSql({
       tenant: '?1', member: '?2', exemptLabel: '?3', exemptChannel: '?4', directoryChannel: '?5', now: '?6',
     })}
       LIMIT 1`,

@@ -403,7 +403,7 @@ const PROVEN_INVITEE_MEMBER_SQL = `
                WHERE h.member_id = m.id AND h.tenant = ?2 AND h.revoked_at IS NULL
                  AND h.provider NOT IN (${UNVERIFIED_LOGIN_PROVIDERS.map((x) => `'${x}'`).join(', ')})
                  AND lower(h.verified_email) = lower(?3))
-  AND NOT EXISTS (${liveCompetingBearerSql({
+  AND NOT EXISTS (SELECT 1 ${liveCompetingBearerSql({
     tenant: '?2', member: 'm.id', exemptLabel: '?4', exemptChannel: '?5', directoryChannel: '?6', now: '?7',
   })})`
 

@@ -317,7 +317,7 @@ inviteApp.post('/:id', async (c) => {
   // IdP-verified email equals the invite's) and ignores it otherwise, so a
   // session for a different identity can never receive this invite's grant.
   const session = await peekSessionAuth(c)
-  const sessionMemberId = session?.webSessionMemberId ?? session?.memberId
+  const sessionMemberId = session?.webSessionMemberId
   const result = await acceptInvite(c.env, inviteId, displayName, sessionMemberId ? { verifiedMemberId: sessionMemberId } : undefined)
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
