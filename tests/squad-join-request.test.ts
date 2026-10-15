@@ -695,6 +695,16 @@ describe('the claim: nothing is granted unless the request is still pending, une
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'squad_join_failed'`)).toBe(1)
   })
 
+  it('a deny that races the expiry changes nothing (the deny UPDATE carries the expiry guard)', async () => {
+    await askOk('agent-rava', { squad: 'squad-target' })
+    const req = (await loadSquadJoin(env, one<{ id: string }>(`SELECT id FROM squad_join_requests`)!.id))!
+    const gate = async (): Promise<boolean> => { h.sqlite.exec(`DROP TRIGGER squad_join_requests_immutable`); h.sqlite.exec(`UPDATE squad_join_requests SET expires_at = '2020-01-01T00:00:00.000Z'`); return true }
+    const out = await decideSquadJoin(env, { req, decision: 'deny', proof: proofOf(ADMIN), gate }, Date.now())
+    expect(out.status).toBe(409)
+    expect(reqRows()[0]!.status).toBe('pending')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'squad_join_deny'`)).toBe(0)
+  })
+
   it('the table forbids reopening or skipping the claim: approving only goes to approved|failed, closed rows never move', async () => {
     await askOk('agent-rava', { squad: 'squad-target' })
     h.sqlite.exec(`UPDATE squad_join_requests SET status = 'approving'`)
