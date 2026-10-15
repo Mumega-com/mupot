@@ -191,6 +191,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   bootstrap_self: ADD('bootstrapSelf INSERT department/squad/agent/capabilities + agent_audit + credential claim (members/bootstrap-self.ts:809-852)'),
   seat_attach: ADD('attachSeatToAgent INSERT agent_seat_attachments + member_tokens (server-held, raw discarded) + agent_audit; or files a PENDING agent_seat_admissions row + secure_moments link (members/seat-attach.ts); flag-gated SEAT_ATTACH'),
   inbox_mark_handled: ADD('markMessagesHandledByAttachment INSERT OR IGNORE agent_attachment_handled only (members/attached-handled.ts); never agent_messages.read_at / lease / dead letters / fence / presence; attached threads only; flag-gated SEAT_ATTACH'),
+  squad_join_request: ADD('fileSquadJoinRequest INSERT squad_join_requests (pending, supersedes a changed ask) + squad_join_rate_limits + secure_moments link (members/squad-join.ts); grants nothing, a human admin decides on /m/*; flag-gated SECURE_MOMENTS'),
   seat_select: ADD('seatSelect INSERT agent/member/binding/capability/token/audit/seat (members/seat-select.ts); flag-gated SEAT_AUTO_ENROLL'),
   worktree_open: ADD('openWorktree find-or-create INSERT worktrees ON CONFLICT DO NOTHING + display-only UPDATE last_seen_at/last_head_sha (workspaces/service.ts); flag-gated WORKSPACES'),
   worktree_list: RO('listWorktrees SELECT only (workspaces/service.ts); flag-gated WORKSPACES'),

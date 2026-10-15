@@ -207,6 +207,7 @@ import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
@@ -7245,6 +7246,7 @@ export const TOOLS: ToolSpec[] = [
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
   ...SEAT_ATTACH_TOOLS,
+  ...SQUAD_JOIN_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
@@ -7283,6 +7285,8 @@ const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.ma
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
 // (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
+// squad_join_request needs the passkey-class decision page, so it is advertised only while SECURE_MOMENTS is usable (flag off => tools/list unchanged).
+const SQUAD_JOIN_FLAG_TOOLS: ReadonlySet<string> = new Set(SQUAD_JOIN_TOOLS.map((t) => t.name))
 // Secure drops (W2): the five drop tools are not advertised while SECURE_DROP is off, and a direct call refuses
 // in invokeTool before argument handling (so a flag-off pot never reveals their schemas).
 const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.map((t) => t.name))
@@ -7297,8 +7301,9 @@ export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH
   const tgMiniapp = telegramMiniappFlag(env)
   const workspaces = workspacesEnabled(env)
   const attach = seatAttachEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces && attach) return TOOLS
-  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
+  const moments = secureMomentsEnabled(env)
+  if (seat && access && drop && tgMiniapp && workspaces && attach && moments) return TOOLS
+  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -7521,6 +7526,10 @@ export async function invokeTool(
   // pot never reveals the tool's argument schema through an invalid_args response.
   if (SEAT_FLAG_TOOLS.has(spec.name) && !seatAutoEnrollEnabled(env)) {
     return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
+  }
+
+  if (SQUAD_JOIN_FLAG_TOOLS.has(spec.name) && !secureMomentsEnabled(env)) {
+    return { ...fail(503, 'secure_moments_unavailable', 'Approval links are not enabled on this pot, so a join request cannot be made.'), tool: spec.name }
   }
 
   if (SEAT_ATTACH_FLAG_TOOLS.has(spec.name) && !seatAttachEnabled(env)) {

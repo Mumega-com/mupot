@@ -4015,6 +4015,35 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
+    file: "0223_squad_join_requests.sql",
+    sha256: "d49f81c8c18b5f5490c250692d06cd74ed53d5cc958b31419cac5d37a82ae3f3",
+    statements: [
+      "-- 0223_squad_join_requests.sql — an agent ASKS to join a squad; a human admin of THAT squad taps once (passkey).\n--\n-- WHY. A human wants an agent in a squad, but there was no door between them: the agent could only say \"an admin on\n-- that squad can add me by agent id\". squad_member_add needs an admin's own session and the agent cannot see other\n-- squads, let alone ask. This table is the ask. It stands for one pending request; the decision runs on a secure\n-- moment (kind 'squad_join', passkey-class proof, src/secure-moments/routes.ts) and, on approve, performs the SAME\n-- write squad_member_add performs (addSquadMember: memberships + capability row + membership_receipts), never above\n-- member and never a gate capability.\n--\n-- squad_id is NULL when the ref the agent typed did not resolve at request time: the request row, the link and the\n-- tool reply are deliberately identical either way (no existence oracle for squads the caller cannot see). The human's\n-- approval page shows what the ref really resolved to; an unresolved request can only be denied.\n-- squad_key is the dedupe key: the resolved squad id, else 'ref:' || lower(ref). One pending request per (agent, key).\n-- Identity columns never change; a closed request never reopens (status only moves out of 'pending').\nCREATE TABLE IF NOT EXISTS squad_join_requests (\n  id                    TEXT PRIMARY KEY,\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  squad_ref             TEXT NOT NULL CHECK (length(squad_ref) BETWEEN 1 AND 128),\n  squad_id              TEXT,\n  squad_key             TEXT NOT NULL,\n  capability            TEXT NOT NULL CHECK (capability IN ('member', 'observer')),\n  reason                TEXT CHECK (reason IS NULL OR length(reason) <= 500),\n  requested_via         TEXT NOT NULL CHECK (requested_via IN ('agent', 'attached_chat')),\n  status                TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'superseded', 'failed')),\n  created_at            TEXT NOT NULL,\n  expires_at            TEXT NOT NULL,\n  decided_at            TEXT,\n  decided_by_member_id  TEXT,\n  decided_via           TEXT CHECK (decided_via IS NULL OR decided_via IN ('webauthn')),\n  result                TEXT CHECK (result IS NULL OR result IN ('created', 'updated', 'unchanged')),\n  decision_error        TEXT\n);",
+      "\n\n-- One pending request per (agent, squad): a repeat ask reuses it (or supersedes it when what was asked changed).\nCREATE UNIQUE INDEX IF NOT EXISTS uq_squad_join_requests_pending\n  ON squad_join_requests(tenant, agent_id, squad_key)\n  WHERE status = 'pending';",
+      "\nCREATE INDEX IF NOT EXISTS idx_squad_join_requests_agent\n  ON squad_join_requests(tenant, agent_id, status);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS squad_join_requests_immutable\nBEFORE UPDATE ON squad_join_requests\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.squad_ref IS NOT OLD.squad_ref OR NEW.squad_id IS NOT OLD.squad_id OR NEW.squad_key IS NOT OLD.squad_key\n  OR NEW.capability IS NOT OLD.capability OR NEW.reason IS NOT OLD.reason OR NEW.requested_via IS NOT OLD.requested_via\n  OR NEW.created_at IS NOT OLD.created_at OR NEW.expires_at IS NOT OLD.expires_at\n  OR OLD.status <> 'pending'\nBEGIN\n  SELECT RAISE(ABORT, 'squad_join_request_immutable');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS squad_join_requests_no_delete\nBEFORE DELETE ON squad_join_requests\nFOR EACH ROW\nBEGIN\n  SELECT RAISE(ABORT, 'squad_join_request_immutable');\nEND;",
+      "\n\n-- Per-agent request flood cap: one counter row per (agent, hour bucket), bumped by an atomic guarded UPSERT.\nCREATE TABLE IF NOT EXISTS squad_join_rate_limits (\n  tenant    TEXT NOT NULL,\n  agent_id  TEXT NOT NULL,\n  bucket    TEXT NOT NULL,\n  count     INTEGER NOT NULL,\n  PRIMARY KEY (tenant, agent_id, bucket)\n);",
+      "\n\n-- secure_moments gains kind 'squad_join'. SQLite cannot alter a CHECK, so the table is rebuilt exactly as 0220 did\n-- (same columns/constraints, one more kind; rows and both indexes preserved). Nothing references secure_moments by\n-- foreign key, trigger or view.\nCREATE TABLE secure_moments_new (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  kind TEXT NOT NULL CHECK (kind IN ('seed_attach', 'elevation', 'credential', 'seat_admit', 'squad_join')),\n  subject_id TEXT NOT NULL,\n  requester_agent_id TEXT,\n  decider_member_id TEXT,\n  link_token_sha256 TEXT NOT NULL CHECK (\n    length(link_token_sha256) = 64 AND link_token_sha256 = lower(link_token_sha256) AND link_token_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consumed', 'expired', 'denied')),\n  step_up_required INTEGER NOT NULL DEFAULT 1 CHECK (step_up_required = 1),\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  decided_at TEXT,\n  decision TEXT CHECK (decision IS NULL OR decision IN ('approve', 'deny', 'provide')),\n  decided_via TEXT CHECK (decided_via IS NULL OR decided_via IN ('webauthn')),\n  decided_by_member_id TEXT,\n  decided_passkey_id TEXT\n);",
+      "\n\nINSERT INTO secure_moments_new\n  (id, tenant, kind, subject_id, requester_agent_id, decider_member_id, link_token_sha256, status, step_up_required,\n   created_at, expires_at, decided_at, decision, decided_via, decided_by_member_id, decided_passkey_id)\nSELECT id, tenant, kind, subject_id, requester_agent_id, decider_member_id, link_token_sha256, status, step_up_required,\n       created_at, expires_at, decided_at, decision, decided_via, decided_by_member_id, decided_passkey_id\n  FROM secure_moments;",
+      "\n\nDROP TABLE secure_moments;",
+      "\n\nALTER TABLE secure_moments_new RENAME TO secure_moments;",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_secure_moments_pending_subject\n  ON secure_moments(tenant, kind, subject_id)\n  WHERE status = 'pending';",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_secure_moments_subject\n  ON secure_moments(tenant, kind, subject_id, status);",
+    ],
+    objects: [
+      { type: "table", name: "squad_join_requests" },
+      { type: "index", name: "uq_squad_join_requests_pending" },
+      { type: "index", name: "idx_squad_join_requests_agent" },
+      { type: "trigger", name: "squad_join_requests_immutable" },
+      { type: "trigger", name: "squad_join_requests_no_delete" },
+      { type: "table", name: "squad_join_rate_limits" },
+      { type: "table", name: "secure_moments_new" },
+      { type: "index", name: "uq_secure_moments_pending_subject" },
+      { type: "index", name: "idx_secure_moments_subject" },
+    ],
+  },
+  {
     file: "0224_engrams_agent_created_index.sql",
     sha256: "06cd5a21eaff838bc8b8ed56abc1c5937f8117ccd80c06a05bb41b5f78e66d0c",
     statements: [
@@ -4029,4 +4058,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "6ea463c6cc08e437eb158dfa664ed3b237fe95fc792d3bdec27aee005dc05873"
+export const SCHEMA_CHAIN_DIGEST: string = "465a4ccb7215d2eba8ac7bb348838247cab1aa581ce751adc2b956183b64a74c"
