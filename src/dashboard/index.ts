@@ -69,6 +69,8 @@ import {
   exceedsTargetRankCeiling,
   loadSquadScope,
   planeCoversScope,
+  CAPABILITY_LIVE_PREDICATE,
+  nowCapabilitySql,
 } from '../auth/capability'
 // Legible refusals (#530 follow-on): a 403 that names the signed-in principal and
 // their actual standing, not just the requirement they failed. See src/auth/refusal.ts.
@@ -3200,7 +3202,7 @@ dashboardApp.post('/squads/:id/agents/join', async (c) => {
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody('Agent not found.')), 404)
 
-  const outcome = await confirmJoin(c.env, squad, agentId, capability)
+  const outcome = await confirmJoin(c.env, squad, agentId, capability, c.get('auth').memberId ?? null)
   if (!outcome.ok) {
     const msg =
       outcome.error === 'agent_identity_unminted'
@@ -3377,12 +3379,17 @@ async function loadMembers(env: Env): Promise<Member[]> {
 
 async function loadGrants(env: Env): Promise<CapabilityGrant[]> {
   const rows = await env.DB.prepare(
+    // A lapsed grant is not shown as standing access: People & Access and the
+    // division heads read this as "who can do what", the same question
+    // resolveCapabilities answers. (The agent Access panel is the surface that
+    // lists lapsed rows on purpose.)
     `SELECT member_id, scope_type, scope_id, capability
        FROM capabilities
+      WHERE ${CAPABILITY_LIVE_PREDICATE('', '?1')}
      UNION ALL
      SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
        FROM channel_capability_grants`,
-  ).all<CapabilityGrant>()
+  ).bind(nowCapabilitySql()).all<CapabilityGrant>()
   return rows.results ?? []
 }
 

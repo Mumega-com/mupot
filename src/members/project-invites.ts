@@ -1031,20 +1031,33 @@ export async function redeemTelegramProjectInvite(
       // source rows means the INSERT never fires and ON CONFLICT never
       // triggers either — a failed claim touches no pre-existing row.
       env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ?
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, reason, granted_by, granted_via)
+         SELECT ?, ?, 'squad', ?, ?, ?, ?, 'project_invite'
           WHERE EXISTS (
             SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
           )${memberBindLandedGuard}${netNewMemberExistsGuard}
-         ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET capability =
+         ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET
+           -- provenance moves with the capability: only an UPGRADE re-attributes the row.
+           reason = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
+                         THEN excluded.reason ELSE capabilities.reason END,
+           granted_by = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
+                             THEN excluded.granted_by ELSE capabilities.granted_by END,
+           granted_via = CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
+                              THEN excluded.granted_via ELSE capabilities.granted_via END,
+           capability =
            CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
                 THEN excluded.capability
                 ELSE capabilities.capability
            END`,
       ).bind(
-        grantId, memberId, invite.squad_id, invite.capability, invite.id, claimedAt,
+        grantId, memberId, invite.squad_id, invite.capability,
+        `project invite ${invite.id}`, invite.minted_by_member_id ?? null,
+        invite.id, claimedAt,
         ...memberBindLandedParams,
         ...netNewMemberExistsParams,
+        capabilityRank(invite.capability),
+        capabilityRank(invite.capability),
+        capabilityRank(invite.capability),
         capabilityRank(invite.capability),
       ),
       env.DB.prepare(

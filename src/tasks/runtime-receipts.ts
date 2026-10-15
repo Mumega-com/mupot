@@ -1,4 +1,4 @@
-import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
@@ -547,12 +547,13 @@ const STAGES = new Set<TaskDispatchRuntimeStage>(['runtime_consumed', 'completed
  * the agent-holder branch and the human-holder branch (mupot#1663 P3) so an
  * independent gate holder of either kind needs the same standing.
  */
-function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): string {
+function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string, nowParam: string): string {
   return `(
     EXISTS (
       SELECT 1
         FROM capabilities capability
        WHERE capability.member_id = ${memberExpr}
+         AND ${CAPABILITY_LIVE_PREDICATE('capability', nowParam)}
          AND capability.capability IN ('member', 'lead', 'admin', 'owner')
          AND (
            capability.scope_type = 'org'
@@ -624,7 +625,7 @@ export function independentGateHolderExistsSql(p: {
             WHERE t.agent_id = gate_agent.id
               AND t.tenant = ${p.tenantParam}
               AND ${TOKEN_LIVE_PREDICATE(p.nowParam)}
-              AND ${memberStandingOnSquadSql('t.member_id', p.squadIdExpr)}
+              AND ${memberStandingOnSquadSql('t.member_id', p.squadIdExpr, p.nowParam)}
          )
     )`
   const memberHolder = p.allowMemberHolders ? `
@@ -665,6 +666,8 @@ export function humanGateHolderExistsSql(p: {
   assigneeIdExpr: string
   squadIdExpr: string
   tenantParam: string
+  /** Bound or quoted `now`; the holder's standing is read through CAPABILITY_LIVE_PREDICATE. */
+  nowParam: string
 }): string {
   return `EXISTS (
       SELECT 1
@@ -679,7 +682,7 @@ export function humanGateHolderExistsSql(p: {
            SELECT 1 FROM agent_member_bindings bound WHERE bound.member_id = gate_human.id
          )
          AND NOT ${memberAffiliatedWithAssigneeSql({ memberExpr: 'gate_human.id', assigneeIdExpr: p.assigneeIdExpr })}
-         AND ${memberStandingOnSquadSql('gate_human.id', p.squadIdExpr)}
+         AND ${memberStandingOnSquadSql('gate_human.id', p.squadIdExpr, p.nowParam)}
     )`
 }
 

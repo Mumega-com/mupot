@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { hasCapability } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
@@ -311,6 +312,7 @@ const LIVE_AUTHORITY_SQL = `
       EXISTS (
         SELECT 1 FROM capabilities capability
          WHERE capability.member_id = ?
+           AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
            AND (capability.scope_type = 'org'
              OR (capability.scope_type = 'department' AND capability.scope_id = ?)
              OR (capability.scope_type = 'squad' AND capability.scope_id = ?))
@@ -336,6 +338,7 @@ const LIVE_AUTHORITY_SQL = `
     OR (? IS NULL AND EXISTS (
       SELECT 1 FROM capabilities capability
        WHERE capability.member_id = ? AND capability.scope_type = 'org'
+         AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
          AND CASE capability.capability
            WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3
            WHEN 'member' THEN 2 WHEN 'observer' THEN 1 ELSE 0 END >= ?

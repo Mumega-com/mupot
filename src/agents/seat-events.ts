@@ -335,6 +335,7 @@ const HOST_STANDING_SQL = `(
     inviterIdParam: 'k.member_id',
     scopeIdParam: 'a.squad_id',
     requiredRankParam: String(capabilityRank('member')),
+    nowParam: "datetime('now')",
   })}
 )`
 

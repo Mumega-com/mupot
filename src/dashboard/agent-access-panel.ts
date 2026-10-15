@@ -23,11 +23,13 @@ import { html } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import {
   actorRankOnScopeFor,
+  CAPABILITY_LIVE_PREDICATE,
   capabilityRank,
   currentMemberRankAtLeastSql,
   exceedsTargetRankCeiling,
   isOrgAdmin,
   legacyRoleAboveSql,
+  nowCapabilitySql,
   RANK_SQL_CASE,
   sessionMemberId,
   targetMaxRankAcrossScopes,
@@ -148,16 +150,19 @@ export interface ReceiptPlan {
 //   ?12 org-admin floor / target-rank ceiling floor
 //   ?13 the agent's home squad as planned
 //   ?14 prior membership level
+//   ?15 now (an expired grant confers no rank, here as in resolveCapabilities)
 function guardSql(plan: ReceiptPlan): string {
   const orgAdmin = currentMemberRankAtLeastSql('org', {
     inviterIdParam: '?2',
     scopeIdParam: '?4',
     requiredRankParam: '?12',
+    nowParam: '?15',
   })
   const squadRank = currentMemberRankAtLeastSql('squad', {
     inviterIdParam: '?2',
     scopeIdParam: '?4',
     requiredRankParam: '?10',
+    nowParam: '?15',
   })
   const capRow = (cap: string | null): string =>
     `EXISTS (SELECT 1 FROM capabilities WHERE member_id = ?11 AND scope_type = 'squad' AND scope_id = ?4${cap ? ` AND capability = ${cap}` : ''})`
@@ -194,7 +199,7 @@ function guardSql(plan: ReceiptPlan): string {
     //   - the legacy role plane, via legacyRoleAboveSql (src/auth/capability.ts): the
     //     same members.email -> users.role bridge legacyRoleRankSql / targetLegacyRoleRank
     //     use, as an EXISTS over every bridged users row, which is global.
-    `NOT EXISTS (SELECT 1 FROM capabilities t WHERE t.member_id = ?11 AND ${RANK_SQL_CASE('t.capability')} > ?12
+    `NOT EXISTS (SELECT 1 FROM capabilities t WHERE t.member_id = ?11 AND ${CAPABILITY_LIVE_PREDICATE('t', '?15')} AND ${RANK_SQL_CASE('t.capability')} > ?12
         AND NOT (t.scope_type = 'squad' AND EXISTS (SELECT 1 FROM squads hs WHERE hs.id = t.scope_id AND hs.kind = 'home')))`,
     `NOT EXISTS (SELECT 1 FROM channel_capability_grants ccg JOIN squads cs ON cs.id = ccg.squad_id
         WHERE ccg.member_id = ?11 AND cs.kind <> 'home' AND ${RANK_SQL_CASE('ccg.capability')} > ?12)`,
@@ -234,6 +239,7 @@ export function receiptStatement(env: Env, plan: ReceiptPlan) {
     ACTOR_RANK_FLOOR,
     plan.homeSquadId,
     plan.priorMembership,
+    nowCapabilitySql(),
   )
 }
 
@@ -372,14 +378,17 @@ export async function applyAgentAccessChange(
     if (input.action === 'set' && next) {
       const outcome = await commitAgentSquadAccess(
         env,
-        { agentId: agent.id, memberId: binding.memberId, squadId: squad.id, capability: next },
+        {
+          agentId: agent.id, memberId: binding.memberId, squadId: squad.id, capability: next,
+          provenance: { grantedBy: actorMemberId, grantedVia: 'dashboard', reason: plan.reason },
+        },
         (_prepared) => [receiptStatement(env, plan)],
       )
       if (!outcome.ok) refusal = outcome.error === 'home_squad_immutable' ? 'home_squad_immutable' : 'refused_at_write'
     } else {
       const outcome = await commitRemoveAgentSquadAccess(
         env,
-        { agentId: agent.id, memberId: binding.memberId, squadId: squad.id },
+        { agentId: agent.id, memberId: binding.memberId, squadId: squad.id, provenance: { grantedBy: actorMemberId, reason: plan.reason } },
         (_prior) => [receiptStatement(env, plan)],
         { evaluateExtrasWhenAbsent: true },
       )

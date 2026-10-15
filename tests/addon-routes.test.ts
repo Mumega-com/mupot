@@ -53,6 +53,8 @@ const migrations = [
   '../migrations/0099_member_token_lifecycle.sql',
   // mupot#1783: createFlight's INSERT carries the archive guard, so tasks_archive_state must exist (as in prod).
   '../migrations/0173_archive_columns.sql',
+  // capabilities.expires_at (resolveCapabilities references it).
+  '../migrations/0223_capability_lifecycle.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 function envForRole(harness: SqliteD1Harness, role: 'owner' | 'admin' | 'member', tenant = 'tenant-a'): Env {

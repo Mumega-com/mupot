@@ -23,6 +23,7 @@
 //   resolveSecretEnvBinding()      — only public resolve path: D1 status=bound, then read env
 
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { assertBindingName } from './names'
 import { getSecretEnvCfConfig, putScriptSecrets } from './cf-secrets'
 import { rowsWritten } from '../lib/receipt'
@@ -379,9 +380,10 @@ export async function listPendingSecretEnvRequests(env: Env): Promise<PublicSecr
           WHERE m.id != ?3 AND (
                 m.id = ?1
              OR m.id IN (SELECT c.member_id FROM capabilities c
-                          WHERE c.scope_type = 'squad' AND c.scope_id = ?2 AND c.capability IN ('admin', 'owner')))
+                          WHERE c.scope_type = 'squad' AND c.scope_id = ?2 AND c.capability IN ('admin', 'owner')
+                            AND ${CAPABILITY_LIVE_PREDICATE('c', '?4')}))
           LIMIT 5`,
-      ).bind(agent.owner_member_id, agent.squad_id, row.requested_by)
+      ).bind(agent.owner_member_id, agent.squad_id, row.requested_by, nowCapabilitySql())
         .all<{ member_id: string; email: string | null; display_name: string }>()
       base.requester_agent_name = agent.name
       base.requester_owners = (owners.results ?? []).map((o) => ({

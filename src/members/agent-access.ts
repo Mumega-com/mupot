@@ -1,5 +1,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { assertBatchWritten } from '../lib/receipt'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { revokeContextStatements, type GrantProvenance, type RevokeProvenance } from '../auth/grant-events'
 import type { CapabilityGrant, Env, Membership } from '../types'
 import type { AgentBindingProof } from './service'
 
@@ -19,12 +21,31 @@ export interface SetAgentSquadAccessInput {
   capability: AgentAccessCapability
   /** Raise-only: the upsert's DO UPDATE carries a rank predicate IN THE WRITE, so a concurrent promotion is never demoted. */
   neverLower?: boolean
+  /** ISO/SQL timestamp after which this grant stops resolving, or null/undefined
+   *  for a permanent one (migration 0149).
+   *
+   *  THIS IS THE POINT OF 0149. grant_agent_capability writes here, and before
+   *  the column existed the write was necessarily PERMANENT — which is why an
+   *  elevated session was capped at 'member': a time-boxed approval could not be
+   *  allowed to confer standing lead/admin that outlived its own window.
+   *
+   *  With an expiry the constraint inverts. An elevated caller passes the
+   *  ELEVATION GRANT'S OWN expires_at, so the conferred capability cannot outlive
+   *  the approval that authorized it, and conferring 'lead' becomes safe because
+   *  it lapses on the same clock. See mupot#1360. */
+  expiresAt?: string | null
+  /** Who granted this, through which surface, and why (migration 0223). */
+  provenance?: GrantProvenance
 }
+
+const REMOVE_WHERE = `member_id = ? AND scope_type = 'squad' AND scope_id = ?`
 
 export interface RemoveAgentSquadAccessInput {
   agentId: string
   memberId: string
   squadId: string
+  /** Who revoked and why; recorded on the grant_events row (migration 0223). */
+  provenance?: RevokeProvenance
 }
 
 export type AgentSquadAccessError =
@@ -145,8 +166,9 @@ async function priorAccess(
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<{ capability: AgentAccessCapability }>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<{ capability: AgentAccessCapability }>(),
   ])
   return {
     membership,
@@ -262,8 +284,8 @@ export async function prepareAgentSquadAccess(
   const grantId = crypto.randomUUID()
   const capabilityStatement = bindingGuard
     ? env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, 'squad', ?, ?
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at, reason, granted_by, granted_via)
+         SELECT ?, ?, 'squad', ?, ?, ?, ?, ?, ?
           WHERE EXISTS (
             SELECT 1
               FROM agent_member_bindings
@@ -272,22 +294,83 @@ export async function prepareAgentSquadAccess(
                AND member_id = ?
           )
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
+         DO UPDATE SET capability = excluded.capability,
+                       reason = excluded.reason,
+                       granted_by = excluded.granted_by,
+                       granted_via = excluded.granted_via,
+                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       --
+                       -- NULL means permanent, i.e. the longest horizon there is,
+                       -- so either side being NULL wins. Otherwise the LATER of the
+                       -- two survives, compared with julianday() because these
+                       -- columns hold two timestamp shapes and a text compare is
+                       -- wrong for the same instant.
+                       --
+                       -- This closes two findings at the write instead of with a
+                       -- refusal, which is why there is no guard above it:
+                       --  * a caller supplying NO expiry (standing operator, or the
+                       --    HTTP route) cannot ERASE a horizon a human set — that
+                       --    would turn a deliberately time-limited grant permanent
+                       --    with no receipt distinguishing it from a real grant.
+                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
+                       --    grant to its own 60-minute horizon. An equal-rank
+                       --    re-grant is still a demotion when it cuts the duration,
+                       --    and a rank-only guard is blind to it.
+                       expires_at = CASE
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END${raiseOnly('capabilities')}`,
       ).bind(
         grantId,
         input.memberId,
         input.squadId,
         input.capability,
+        input.expiresAt ?? null,
+        input.provenance?.reason ?? null,
+        input.provenance?.grantedBy ?? null,
+        input.provenance?.grantedVia ?? null,
         env.TENANT_SLUG,
         input.agentId,
         input.memberId,
       )
     : env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, ?)
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at, reason, granted_by, granted_via)
+         VALUES (?, ?, 'squad', ?, ?, ?, ?, ?, ?)
          ON CONFLICT(member_id, scope_type, scope_id)
-         DO UPDATE SET capability = excluded.capability${raiseOnly('capabilities')}`,
-      ).bind(grantId, input.memberId, input.squadId, input.capability)
+         DO UPDATE SET capability = excluded.capability,
+                       reason = excluded.reason,
+                       granted_by = excluded.granted_by,
+                       granted_via = excluded.granted_via,
+                       -- THE HORIZON IS MONOTONIC. It can be extended, never cut.
+                       --
+                       -- NULL means permanent, i.e. the longest horizon there is,
+                       -- so either side being NULL wins. Otherwise the LATER of the
+                       -- two survives, compared with julianday() because these
+                       -- columns hold two timestamp shapes and a text compare is
+                       -- wrong for the same instant.
+                       --
+                       -- This closes two findings at the write instead of with a
+                       -- refusal, which is why there is no guard above it:
+                       --  * a caller supplying NO expiry (standing operator, or the
+                       --    HTTP route) cannot ERASE a horizon a human set — that
+                       --    would turn a deliberately time-limited grant permanent
+                       --    with no receipt distinguishing it from a real grant.
+                       --  * an ELEVATED caller cannot SHORTEN a longer or permanent
+                       --    grant to its own 60-minute horizon. An equal-rank
+                       --    re-grant is still a demotion when it cuts the duration,
+                       --    and a rank-only guard is blind to it.
+                       expires_at = CASE
+                         WHEN excluded.expires_at IS NULL OR capabilities.expires_at IS NULL THEN NULL
+                         WHEN julianday(excluded.expires_at) > julianday(capabilities.expires_at)
+                           THEN excluded.expires_at
+                         ELSE capabilities.expires_at
+                       END${raiseOnly('capabilities')}`,
+      ).bind(
+        grantId, input.memberId, input.squadId, input.capability, input.expiresAt ?? null,
+        input.provenance?.reason ?? null, input.provenance?.grantedBy ?? null, input.provenance?.grantedVia ?? null,
+      )
 
   return {
     ok: true,
@@ -328,8 +411,9 @@ async function readCommittedAccess(
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
-    ).bind(input.memberId, input.squadId).first<CapabilityGrant>(),
+    ).bind(input.memberId, input.squadId, nowCapabilitySql()).first<CapabilityGrant>(),
   ])
   if (
     !membership
@@ -415,30 +499,31 @@ export async function commitRemoveAgentSquadAccess(
   }
 
   const prior = await priorAccess(env, {
-    ...input,
+    agentId: input.agentId,
+    memberId: input.memberId,
+    squadId: input.squadId,
     capability: 'member',
   })
   const removing = prior.membership !== null || prior.capability !== null
   const extras = removing || options.evaluateExtrasWhenAbsent
     ? extraStatementsFor(prior.capability)
     : []
+  const [setRevokeContext, clearRevokeContext] = revokeContextStatements(env, input.provenance ?? { grantedBy: null })
   const writes = await env.DB.batch([
     ...extras,
+    // Who is revoking: the grant_events trigger reads this for the DELETE below (migration 0223).
+    setRevokeContext,
     env.DB.prepare(
       `DELETE FROM memberships
         WHERE agent_id = ?
           AND squad_id = ?`,
     ).bind(input.agentId, input.squadId),
-    env.DB.prepare(
-      `DELETE FROM capabilities
-        WHERE member_id = ?
-          AND scope_type = 'squad'
-          AND scope_id = ?`,
-    ).bind(input.memberId, input.squadId),
+    env.DB.prepare(`DELETE FROM capabilities WHERE ${REMOVE_WHERE}`).bind(input.memberId, input.squadId),
+    clearRevokeContext,
   ])
 
-  const membershipWrite = writes[extras.length]
-  const capabilityWrite = writes[extras.length + 1]
+  const membershipWrite = writes[extras.length + 1]
+  const capabilityWrite = writes[extras.length + 2]
   if (!membershipWrite || !capabilityWrite) {
     return { ok: false, error: 'receipt_failed' }
   }
@@ -463,7 +548,9 @@ export async function commitRemoveAgentSquadAccess(
   }
 
   const committed = await priorAccess(env, {
-    ...input,
+    agentId: input.agentId,
+    memberId: input.memberId,
+    squadId: input.squadId,
     capability: 'member',
   })
   if (committed.membership || committed.capability) {

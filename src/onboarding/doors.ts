@@ -15,6 +15,7 @@
 // that can fail independently of the mutation is not provenance.
 
 import type { Env } from '../types'
+import { capabilityReviewedEvents, revokeContextStatements } from '../auth/grant-events'
 
 export type DoorStatus = 'open' | 'closed' | 'crystallized'
 export type Disposition = 'pending' | 'crystallized' | 'revoked'
@@ -200,12 +201,19 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
       // by the restore test failing on a FOREIGN KEY/constraint error rather than by
       // reading — the upsert would have thrown on precisely the overwrite case the whole
       // receipt mechanism exists to make reversible.
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, provisional_door_id)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, provisional_door_id,
+                                 granted_by, granted_via, reason)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'door', ?8)
        ON CONFLICT (member_id, scope_type, scope_id)
        DO UPDATE SET capability = excluded.capability,
-                     provisional_door_id = excluded.provisional_door_id`,
-    ).bind(grantId, input.subjectMemberId, input.scopeType, input.scopeId, input.capability, door.id),
+                     provisional_door_id = excluded.provisional_door_id,
+                     granted_by = excluded.granted_by,
+                     granted_via = excluded.granted_via,
+                     reason = excluded.reason`,
+    ).bind(
+      grantId, input.subjectMemberId, input.scopeType, input.scopeId, input.capability, door.id,
+      input.actorMemberId, `onboarding door ${door.id} self-grant`,
+    ),
     env.DB.prepare(
       `INSERT INTO door_receipts
          (id, tenant, door_id, actor_member_id, actor_agent_id, subject_member_id,
@@ -268,10 +276,11 @@ export async function grantSignupDefault(
   // uncloseable, and this one runs on the busiest path in the product.
   await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, provisional_door_id)
-       VALUES (?1, ?2, 'org', NULL, ?3, ?4)
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, provisional_door_id,
+                                 granted_via, reason)
+       VALUES (?1, ?2, 'org', NULL, ?3, ?4, 'door', ?5)
        ON CONFLICT (member_id, scope_type, scope_id) DO NOTHING`,
-    ).bind(grantId, memberId, row.signup_capability, row.id),
+    ).bind(grantId, memberId, row.signup_capability, row.id, `onboarding door ${row.id} signup default`),
     env.DB.prepare(
       `INSERT INTO door_receipts
          (id, tenant, door_id, actor_member_id, subject_member_id, scope_type, scope_id,
@@ -334,6 +343,12 @@ export async function listPendingReceipts(env: Env, doorId: string): Promise<Pen
   return res.results ?? []
 }
 
+/** The provisional grant a door receipt points at (anonymous `?` — shared with the history event). */
+const DOOR_ROW_WHERE = 'member_id = ? AND scope_type = ? AND scope_id IS ? AND provisional_door_id = ?'
+function doorRowBinds(r: { subject_member_id: string; scope_type: string; scope_id: string | null; door_id: string }) {
+  return [r.subject_member_id, r.scope_type, r.scope_id, r.door_id] as const
+}
+
 /**
  * Apply Athena's ruling to one receipt.
  *
@@ -373,6 +388,11 @@ export async function applyDisposition(
 
   if (disposition === 'crystallized') {
     await env.DB.batch([
+      // 'reviewed' event first (pre-change snapshot), anchored on the same WHERE.
+      capabilityReviewedEvents(env, DOOR_ROW_WHERE, doorRowBinds(r), {
+        grantedBy: reviewedBy,
+        reason: note ?? 'onboarding door review: crystallized',
+      }),
       env.DB.prepare(
         `UPDATE capabilities SET provisional_door_id = NULL
           WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 AND provisional_door_id = ?4`,
@@ -383,17 +403,37 @@ export async function applyDisposition(
   }
 
   // Revoked: restore the prior value, or remove the row if there was nothing before.
-  const restore = r.capability_before === null
-    ? env.DB.prepare(
+  // History is written by the capabilities triggers (migration 0223): a removal is a
+  // 'revoked' event attributed through the revoke context, a restore is a 'granted'
+  // event for the restored level attributed through the provenance stamped on the row.
+  if (r.capability_before === null) {
+    const [setContext, clearContext] = revokeContextStatements(env, {
+      grantedBy: reviewedBy,
+      reason: note ?? 'onboarding door review: revoked',
+    })
+    await env.DB.batch([
+      setContext,
+      env.DB.prepare(
         `DELETE FROM capabilities
           WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 AND provisional_door_id = ?4`,
-      ).bind(r.subject_member_id, r.scope_type, r.scope_id, r.door_id)
-    : env.DB.prepare(
-        `UPDATE capabilities SET capability = ?5, provisional_door_id = NULL
+      ).bind(r.subject_member_id, r.scope_type, r.scope_id, r.door_id),
+      clearContext,
+      stamp,
+    ])
+  } else {
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE capabilities
+            SET capability = ?5, provisional_door_id = NULL,
+                granted_by = ?6, granted_via = 'door', reason = ?7
           WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS ?3 AND provisional_door_id = ?4`,
-      ).bind(r.subject_member_id, r.scope_type, r.scope_id, r.door_id, r.capability_before)
-
-  await env.DB.batch([restore, stamp])
+      ).bind(
+        r.subject_member_id, r.scope_type, r.scope_id, r.door_id, r.capability_before,
+        reviewedBy, note ?? `onboarding door review: restored prior capability ${r.capability_before}`,
+      ),
+      stamp,
+    ])
+  }
   return { ok: true, value: { applied: 'revoked' } }
 }
 

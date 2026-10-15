@@ -17,6 +17,7 @@ import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { createVerdictGateCache, evaluateVerdictGates, primeVerdictIndependence, type VerdictGateCache } from '../tasks/index'
 import { canReadSquadTasks } from '../tasks/visibility'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -425,6 +426,7 @@ async function sourceRows(
     assigneeIdExpr: 't.assignee_agent_id',
     squadIdExpr: 't.squad_id',
     tenantParam: sqlQuote(env.TENANT_SLUG),
+    nowParam: sqlQuote(nowSqlUtc()),
   })} OR NOT EXISTS (
     SELECT 1 FROM gate_grants agent_lane
      WHERE agent_lane.capability = t.gate_owner AND agent_lane.principal_type = 'agent'

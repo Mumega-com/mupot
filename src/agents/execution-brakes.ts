@@ -93,6 +93,7 @@ export async function escalateRefusedTask(env: Env, agentId: string, taskId: str
     assigneeIdExpr: '?1',
     squadIdExpr: 'tasks.squad_id',
     tenantParam: '?5',
+    nowParam: '?3',
   })
   const results = await env.DB.batch([
     // 1. The transition row: place the hold once, only at/over the ceiling AND while the task is

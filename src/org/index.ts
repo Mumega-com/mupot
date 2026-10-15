@@ -410,6 +410,11 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     memberId: binding.memberId,
     squadId: squad.id,
     capability,
+    provenance: {
+      grantedBy: c.get('auth').memberId ?? null,
+      grantedVia: gate.kind === 'delegated' ? 'delegated_operator' : 'http',
+      reason: gate.kind === 'delegated' ? `delegation ${gate.delegation.id}` : null,
+    },
   })
   await finishDelegatedReceipt(c.env, gate, result.ok && result.result !== 'unchanged')
   if (!result.ok) {

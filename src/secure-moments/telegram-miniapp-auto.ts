@@ -11,6 +11,7 @@
 // the human who filed it, else the org setting approvals_member_id, else the tenant's single REACHABLE human org owner/admin.
 // Nobody resolvable = nobody is addressed = 'not_bound' (a reported gap, not a fan-out).
 import type { Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { buildAuth } from '../access/identity'
 import { mayDecideElevation, mayDecideSeed } from '../access/decision-core'
 import { loadAgentSessionById } from '../auth/agent-sessions'
@@ -58,9 +59,10 @@ async function decidingHuman(env: Env, requesterAgentId: string | null, requeste
   const admins = await env.DB.prepare(
     `SELECT DISTINCT c.member_id AS id FROM capabilities c
       WHERE c.scope_type = 'org' AND c.capability IN ('owner', 'admin')
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?1')}
         AND NOT EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.member_id = c.member_id)
       LIMIT 20`,
-  ).all<{ id: string }>()
+  ).bind(nowCapabilitySql()).all<{ id: string }>()
   const reachable: string[] = []
   for (const a of admins.results ?? []) if (await privateChatOf(env, a.id)) reachable.push(a.id)
   return reachable.length === 1 ? reachable[0] : null

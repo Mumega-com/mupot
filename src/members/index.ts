@@ -54,7 +54,9 @@ import {
   currentMemberRankOnScope,
   currentMemberRankAtLeastSql,
   isOrgAdmin,
+  nowCapabilitySql,
 } from '../auth/capability'
+import { revokeContextStatements } from '../auth/grant-events'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
 // mupot#1551: acceptInvite() no longer mints (Athena's ruling — that is a
 // function-boundary invariant now, not a per-caller option), so sha256Hex
@@ -707,6 +709,7 @@ export async function acceptInvite(
               inviterIdParam: '?8',
               scopeIdParam: '?9',
               requiredRankParam: '?10',
+              nowParam: '?11',
             })}`,
       ).bind(
         member.id,
@@ -719,6 +722,7 @@ export async function acceptInvite(
         inviterId,
         scopeId,
         requiredRank,
+        nowCapabilitySql(),
       ),
       // mupot#1551 slice 1: re-asserts INVITER_ACTIVE_MEMBER_SQL at write time
       // — the SAME fragment (and the SAME inviterId/env.TENANT_SLUG values,
@@ -752,8 +756,8 @@ export async function acceptInvite(
       // several params below repeat multiple times in the generated text —
       // see INVITER_ACTIVE_MEMBER_SQL's own comment for why.
       env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?1, ?2, ?3, ?4, ?5
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_by, granted_via, reason)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'invite', 'invite accepted'
           WHERE EXISTS (SELECT 1 FROM members WHERE id = ?2)
             AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?6', '?7')})
             AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?4 AND ?3 = 'department' AND kind = 'home')
@@ -761,8 +765,9 @@ export async function acceptInvite(
               inviterIdParam: '?6',
               scopeIdParam: '?4',
               requiredRankParam: '?8',
+              nowParam: '?9',
             })}`,
-      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, inviterId, env.TENANT_SLUG, requiredRank),
+      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, inviterId, env.TENANT_SLUG, requiredRank, nowCapabilitySql()),
     ]
     // mupot#1551 (#1557, option A): acceptInvite never inserts into
     // member_tokens — there is no conditional branch left to gate; this
@@ -1907,6 +1912,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
         agentId: boundAgent.agentId,
         memberId,
         squadId: scopeId as string,
+        provenance: { grantedBy: c.get('auth').memberId ?? null, reason: null },
       })
       await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok && outcome.result !== 'unchanged')
       if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
@@ -1918,18 +1924,21 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
     }
 
     // scope_id comparison must treat null correctly (IS NULL vs = ?).
-    const res = scopeId === null
-      ? await c.env.DB.prepare(
+    // set-context / DELETE / clear-context in one batch: the grant_events trigger
+    // (migration 0223) records who revoked.
+    const [setRevokeContext, clearRevokeContext] = revokeContextStatements(c.env, {
+      grantedBy: c.get('auth').memberId ?? null,
+      reason: null,
+    })
+    const revokeStmt = scopeId === null
+      ? c.env.DB.prepare(
           'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id IS NULL',
-        )
-          .bind(memberId, scopeType)
-          .run()
-      : await c.env.DB.prepare(
+        ).bind(memberId, scopeType)
+      : c.env.DB.prepare(
           'DELETE FROM capabilities WHERE member_id = ? AND scope_type = ? AND scope_id = ?',
-        )
-          .bind(memberId, scopeType, scopeId)
-          .run()
-    const removed = res.meta ? res.meta.changes : 0
+        ).bind(memberId, scopeType, scopeId)
+    const res = (await c.env.DB.batch([setRevokeContext, revokeStmt, clearRevokeContext]))[1]
+    const removed = res?.meta ? res.meta.changes : 0
     return c.json({ member_id: memberId, action: 'revoke', removed })
   }
 
@@ -1959,6 +1968,11 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
       memberId,
       squadId: scopeId as string,
       capability: agentCapability,
+      provenance: {
+        grantedBy: c.get('auth').memberId ?? null,
+        grantedVia: delegatedWrite ? 'delegated_operator' : 'http',
+        reason: null,
+      },
     })
     await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok && outcome.result !== 'unchanged')
     if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
@@ -1976,6 +1990,10 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
     capability,
   }
 
-  const outcome = await upsertCapabilityGrant(c.env, grant)
+  const outcome = await upsertCapabilityGrant(c.env, grant, {
+      grantedBy: c.get('auth').memberId ?? null,
+      grantedVia: 'http',
+      reason: null,
+    })
   return c.json({ grant: outcome.grant, action: 'grant', result: outcome.result }, 201)
 })

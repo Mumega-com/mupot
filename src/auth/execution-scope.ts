@@ -1,4 +1,4 @@
-import { brandSquadScope, canOnSquad, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { brandSquadScope, canOnSquad, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from './capability'
 import { resolveAgentMemberBinding } from '../members/service'
 import type { AuthContext, Env, OrgKind } from '../types'
 
@@ -71,6 +71,7 @@ async function findAgentAuthorizedForLead(
        SELECT scope_type, scope_id, capability
          FROM capabilities
         WHERE member_id = ?2
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?3')}
        UNION ALL
        SELECT 'squad' AS scope_type, squad_id AS scope_id, capability
          FROM channel_capability_grants
@@ -95,7 +96,7 @@ async function findAgentAuthorizedForLead(
              )
         )
       LIMIT 1`,
-  ).bind(agentId, auth.memberId).first<AuthorizedAgentRow>()
+  ).bind(agentId, auth.memberId, nowCapabilitySql()).first<AuthorizedAgentRow>()
   if (!agent) return null
 
   const agentScope = brandSquadScope({ id: agent.squad_id, department_id: agent.department_id, kind: agent.kind })

@@ -248,8 +248,8 @@ export async function seedSquadMembers(
       // preserved; the existing capability level is NOT overwritten on re-seed.
       const grantId = await deterministicGrantId(effectiveMemberId, def.scope_type, def.scope_id)
       const grantResult = await env.DB.prepare(
-        `INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+        `INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at, granted_via, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'squad_seed', 'squad seed definition')`,
       )
         .bind(grantId, effectiveMemberId, def.scope_type, def.scope_id, def.capability, now)
         .run()

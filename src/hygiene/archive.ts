@@ -44,7 +44,7 @@ import type { AuthContext, Env } from '../types'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import { revokeAllWebSessions } from '../auth/web-sessions'
 import { revokeAllAgentSessionsForMember } from '../auth/agent-sessions'
-import { exceedsTargetRankCeiling, targetLegacyRoleRank, capabilityRank } from '../auth/capability'
+import { exceedsTargetRankCeiling, targetLegacyRoleRank, capabilityRank, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { TASK_NOT_ARCHIVED_SQL } from './filters'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
@@ -263,8 +263,11 @@ const OWNER_RANK = capabilityRank('owner')
  *  to avoid. */
 async function isOrgScopeOwner(env: Env, memberId: string): Promise<boolean> {
   const capRow = await env.DB.prepare(
-    `SELECT 1 FROM capabilities WHERE member_id = ?1 AND scope_type = 'org' AND scope_id IS NULL AND capability = 'owner'`,
-  ).bind(memberId).first()
+    // An EXPIRED owner grant is not an owner: counting it would let the last LIVE owner be archived
+    // because a lapsed row still "survives" them.
+    `SELECT 1 FROM capabilities WHERE member_id = ?1 AND scope_type = 'org' AND scope_id IS NULL AND capability = 'owner'
+        AND ${CAPABILITY_LIVE_PREDICATE('', '?2')}`,
+  ).bind(memberId, nowCapabilitySql()).first()
   if (capRow) return true
   return (await targetLegacyRoleRank(env, memberId)) >= OWNER_RANK
 }
@@ -289,7 +292,7 @@ async function isOrgScopeOwner(env: Env, memberId: string): Promise<boolean> {
  *  isOrgScopeOwner does (an org-scope capabilities row, or the legacy
  *  users.role='owner' plane bridged by lower(email)) — never a second,
  *  narrower copy of that logic. */
-function orgOwnerSurvivorGuardSQL(idParam: string, tenantParam: string): string {
+function orgOwnerSurvivorGuardSQL(idParam: string, tenantParam: string, nowParam: string): string {
   // NOTE: every leaf check below is an EXISTS, deliberately — never a scalar
   // `(SELECT role FROM users ...) = 'owner'` comparison. A scalar comparison
   // against a subquery that finds no matching row returns SQL NULL, and
@@ -301,7 +304,7 @@ function orgOwnerSurvivorGuardSQL(idParam: string, tenantParam: string): string 
   // whose NULL poisoned the surrounding OR. EXISTS never returns NULL.
   return `(
     NOT (
-      EXISTS (SELECT 1 FROM capabilities c WHERE c.member_id = ${idParam} AND c.scope_type = 'org' AND c.scope_id IS NULL AND c.capability = 'owner')
+      EXISTS (SELECT 1 FROM capabilities c WHERE c.member_id = ${idParam} AND c.scope_type = 'org' AND c.scope_id IS NULL AND c.capability = 'owner' AND ${CAPABILITY_LIVE_PREDICATE('c', nowParam)})
       OR EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = (SELECT lower(email) FROM members WHERE id = ${idParam}) AND u.role = 'owner')
     )
     OR EXISTS (
@@ -311,7 +314,7 @@ function orgOwnerSurvivorGuardSQL(idParam: string, tenantParam: string): string 
          AND m2.archived_at IS NULL
          AND (m2.tenant = ${tenantParam} OR m2.tenant IS NULL)
          AND (
-           EXISTS (SELECT 1 FROM capabilities c2 WHERE c2.member_id = m2.id AND c2.scope_type = 'org' AND c2.scope_id IS NULL AND c2.capability = 'owner')
+           EXISTS (SELECT 1 FROM capabilities c2 WHERE c2.member_id = m2.id AND c2.scope_type = 'org' AND c2.scope_id IS NULL AND c2.capability = 'owner' AND ${CAPABILITY_LIVE_PREDICATE('c2', nowParam)})
            OR EXISTS (SELECT 1 FROM users u2 WHERE lower(u2.email) = lower(m2.email) AND u2.role = 'owner')
          )
     )
@@ -431,7 +434,7 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
         WHERE id = ?5
           AND (tenant = ?1 OR tenant IS NULL)
           AND NOT (archived_at IS NOT NULL AND status = 'suspended')
-          AND ${orgOwnerSurvivorGuardSQL('?5', '?1')}
+          AND ${orgOwnerSurvivorGuardSQL('?5', '?1', '?6')}
           AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.owner_member_id = ?5 AND a.status IN ('active','paused'))
           AND NOT EXISTS (
             SELECT 1 FROM agent_member_bindings b JOIN agents a ON a.id = b.agent_id

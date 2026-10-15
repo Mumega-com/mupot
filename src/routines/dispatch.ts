@@ -3,7 +3,7 @@ import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql } from './running-actio
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { pinnedBase } from '../platform/tenant-path'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
-import { brandSquadScope, hasCapability } from '../auth/capability'
+import { brandSquadScope, hasCapability, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
 import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
@@ -287,12 +287,13 @@ async function loadCandidateGrants(env: Env, memberIds: string[]): Promise<Map<s
   if (!memberIds.length) return new Map()
   const result = await env.DB.prepare(
     `SELECT member_id, scope_type, scope_id, capability FROM capabilities
-      WHERE member_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+      WHERE member_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+        AND ${CAPABILITY_LIVE_PREDICATE('', '?2')}
      UNION ALL
      SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
        FROM channel_capability_grants
-      WHERE member_id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
-  ).bind(JSON.stringify(memberIds), JSON.stringify(memberIds)).all<CapabilityGrant>()
+      WHERE member_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))`,
+  ).bind(JSON.stringify(memberIds), nowCapabilitySql()).all<CapabilityGrant>()
   const byMember = new Map<string, CapabilityGrant[]>()
   for (const grant of result.results ?? []) {
     const grants = byMember.get(grant.member_id) ?? []
