@@ -587,6 +587,15 @@ export async function canOnSquadAuth(
   // with department inheritance intact, and zero standing on a home squad from
   // this plane either.
   if (await canOnSquad(env, auth?.capabilities ?? [], scope, min)) return true
+  // A member's OWN exact squad-scope grant on THEIR home squad, for a LEGACY owner/admin web login. The auth bridge deliberately leaves
+  // auth.capabilities UNDEFINED for such a login (assigning [] would downgrade them), so the line above sees no grants at all and the
+  // owner is refused on a home squad where a real, exact `admin` row exists for their own member (2026-10-15: hadi@mumega.com, "Home -
+  // Hadi", enrol page). Only the web-session member's rows are read, only for a HOME squad, through canOnSquad (so only an EXACT
+  // squad-scope grant counts: planeCoversScope still gives the org/department/role planes zero standing here). Never for a bound agent.
+  if (scope.kind === 'home' && auth && !auth.boundAgentId && auth.webSessionMemberId) {
+    const own = await resolveCapabilities(env, auth.webSessionMemberId)
+    if (await canOnSquad(env, own, scope, min)) return true
+  }
   // Elevation-to-home (G-FP1b point 4): a home squad grants no standing access
   // from org/department/role planes by design (planeCoversScope above). The
   // ONLY additional door is a time-boxed, human-approved elevation grant naming
