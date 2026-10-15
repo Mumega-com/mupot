@@ -7579,6 +7579,12 @@ function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>
   }
 }
 
+/** Shape-only description of the client's requested protocolVersion for the discovery log: the string itself when it is short, else its typeof. Never logs anything else from params. */
+function requestedProtocolVersionForLog(params: unknown): string {
+  const v = typeof params === 'object' && params !== null ? (params as { protocolVersion?: unknown }).protocolVersion : undefined // narrowed to an object just above; only protocolVersion is read
+  return typeof v === 'string' && v.length <= 40 ? v : typeof v
+}
+
 async function handleJsonRpc(
   c: import('hono').Context<AppEnv>,
   body: JsonRpcRequest,
@@ -7608,6 +7614,7 @@ async function handleJsonRpc(
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
+      console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
       return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
@@ -7621,6 +7628,7 @@ async function handleJsonRpc(
     // tools/call path above) and the Origin/GET clarifications (GET and DELETE answer 405 below while the flag is on).
     const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
     const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
+    console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
     const legacyInit = ok(id, {
       protocolVersion: initVersion,
       capabilities: { tools: {} },
@@ -7762,6 +7770,7 @@ async function handleJsonRpc(
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
+    console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
     return ok(id, serverDiscoverResult())
   }
 

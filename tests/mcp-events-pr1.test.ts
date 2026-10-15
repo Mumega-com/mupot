@@ -253,6 +253,45 @@ describe('server/discover', () => {
   })
 })
 
+describe('discovery observability (shape-only logs)', () => {
+  const lines = async (tag: string, run: () => Promise<unknown>): Promise<unknown[]> => {
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      await run()
+      return spy.mock.calls.filter((c) => c[0] === tag).map((c) => c[1])
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('initialize logs requested / negotiated / events_advertised for 2025-06-18 and 2026-07-28, and nothing else from the client', async () => {
+    const init = (v: unknown) => rawRpc('initialize', { protocolVersion: v, clientInfo: { name: 'secret-client-name', version: '9' } }, { events: 'true' })
+    expect(await lines('[mcp:initialize]', () => init('2025-06-18'))).toEqual([
+      { door: 'mcp', requested: '2025-06-18', negotiated: '2025-06-18', events_advertised: false },
+    ])
+    expect(await lines('[mcp:initialize]', () => init('2026-07-28'))).toEqual([
+      { door: 'mcp', requested: '2026-07-28', negotiated: '2026-07-28', events_advertised: true },
+    ])
+    expect(await lines('[mcp:initialize]', () => init(42))).toEqual([
+      { door: 'mcp', requested: 'number', negotiated: '2025-06-18', events_advertised: false },
+    ])
+    expect(await lines('[mcp:initialize]', () => init('x'.repeat(41)))).toEqual([
+      { door: 'mcp', requested: 'string', negotiated: '2025-06-18', events_advertised: false },
+    ])
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      await init('2026-07-28')
+      expect(JSON.stringify(spy.mock.calls)).not.toContain('secret-client-name')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('server/discover logs the door', async () => {
+    expect(await lines('[mcp:server/discover]', () => rawRpc('server/discover', undefined, { events: 'true' }))).toEqual([{ door: 'mcp' }])
+  })
+})
+
 const BOUND_ADMIN: EnvOpts = { events: 'true', bearer: 'bound-admin' }
 
 describe('events/* with the flag off', () => {
