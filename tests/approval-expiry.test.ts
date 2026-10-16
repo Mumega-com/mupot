@@ -491,6 +491,33 @@ describe('approval expiry', () => {
       expect(task('ci')).toMatchObject({ status: 'review', review_entered_at: original, review_clock_carry: null, expired_count: 1 })
     })
 
+    it('the carry window: re-entry within 24h of the bounce keeps the old clock, after 24h gets a fresh clock; the bounce counts either way', () => {
+      const hours = APPROVAL_EXPIRY.bounce_carry_hours
+      const original = ago(10)
+      const run = (id: string, bouncedHoursAgo: number): Record<string, unknown> => {
+        harness.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id)
+          VALUES ('${id}', '${SQUAD}', 'T', 'b', 'd', 'review', '${LANE}', '${BUILDER}')`)
+        harness.sqlite.prepare('UPDATE tasks SET review_entered_at = ? WHERE id = ?').run(original, id)
+        harness.sqlite.exec(`UPDATE tasks SET status = 'in_progress' WHERE id = '${id}'`)
+        harness.sqlite.prepare('UPDATE tasks SET review_bounced_at = ? WHERE id = ?').run(iso(Date.now() - bouncedHoursAgo * 3_600_000), id)
+        harness.sqlite.exec(`UPDATE tasks SET status = 'review' WHERE id = '${id}'`)
+        return task(id)
+      }
+      const within = run('w-in', hours - 1)
+      expect(within.review_entered_at).toBe(original)
+      expect(within.expired_count).toBe(1)
+      const after = run('w-out', hours + 1)
+      expect(Date.parse(String(after.review_entered_at))).toBeGreaterThan(Date.now() - 60_000) // fresh clock
+      expect(after.expired_count).toBe(1) // still counted toward the cap
+      expect(after.review_clock_carry).toBeNull()
+      expect(after.review_bounced_at).toBeNull()
+    })
+
+    it('the migration literal and APPROVAL_EXPIRY.bounce_carry_hours are the same number', () => {
+      const migration = readFileSync(join(__dirname, '..', 'migrations', '0232_approval_expiry.sql'), 'utf8')
+      expect(migration).toContain(`datetime(review_bounced_at, '+${APPROVAL_EXPIRY.bounce_carry_hours} hours')`)
+    })
+
     it('a bounce counts toward the resubmit cap like an expiry', async () => {
       seedReview('cap', 0)
       harness.sqlite.exec(`UPDATE tasks SET github_issue_url = 'https://github.com/o/r/pull/78', expired_count = 1 WHERE id = 'cap'`)

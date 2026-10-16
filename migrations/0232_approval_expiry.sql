@@ -19,8 +19,14 @@
 --   tasks.review_clock_carry  set when a task leaves review for in_progress without a verdict (a
 --                             CI-fail bounce); the next entry into review keeps that ORIGINAL
 --                             review_entered_at instead of restarting the 14-day clock, so a bounce
---                             cannot be used to dodge expiry. Cleared on the next entry into review,
---                             or when the task moves to any status other than review/in_progress.
+--                             cannot be used to dodge expiry. The carry holds ONLY if the task
+--                             re-enters review within 24h of the bounce (review_bounced_at); after
+--                             long rework it gets a fresh clock (an old clock would expire the
+--                             resubmission at once and burn the cap). The bounce is counted toward
+--                             the cap either way. Both columns are cleared on the next entry into
+--                             review, or when the task moves to any status other than
+--                             review/in_progress. The literal 24 below is
+--                             APPROVAL_EXPIRY.bounce_carry_hours (pinned by the test).
 --   approval_expiry_receipts  append-only receipt + audit row per sweeper transition (who, when,
 --                             why) and per human cap reset.
 --
@@ -37,14 +43,20 @@
 ALTER TABLE tasks ADD COLUMN review_entered_at TEXT;
 ALTER TABLE tasks ADD COLUMN expired_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN review_clock_carry TEXT;
+ALTER TABLE tasks ADD COLUMN review_bounced_at TEXT;
 
 CREATE TRIGGER IF NOT EXISTS tasks_review_entered_stamp_update
 AFTER UPDATE OF status ON tasks
 WHEN NEW.status = 'review' AND OLD.status <> 'review'
 BEGIN
   UPDATE tasks
-     SET review_entered_at = COALESCE(review_clock_carry, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-         review_clock_carry = NULL
+     SET review_entered_at = CASE
+           WHEN review_clock_carry IS NOT NULL AND review_bounced_at IS NOT NULL
+            AND datetime(review_bounced_at, '+24 hours') > datetime('now')
+           THEN review_clock_carry
+           ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END,
+         review_clock_carry = NULL,
+         review_bounced_at = NULL
    WHERE id = NEW.id;
 END;
 
@@ -57,6 +69,7 @@ WHEN OLD.status = 'review' AND NEW.status = 'in_progress'
 BEGIN
   UPDATE tasks
      SET review_clock_carry = OLD.review_entered_at,
+         review_bounced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
          expired_count = expired_count + 1
    WHERE id = NEW.id;
 END;
@@ -65,7 +78,7 @@ CREATE TRIGGER IF NOT EXISTS tasks_review_carry_clear
 AFTER UPDATE OF status ON tasks
 WHEN NEW.status NOT IN ('review', 'in_progress') AND NEW.review_clock_carry IS NOT NULL
 BEGIN
-  UPDATE tasks SET review_clock_carry = NULL WHERE id = NEW.id;
+  UPDATE tasks SET review_clock_carry = NULL, review_bounced_at = NULL WHERE id = NEW.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS tasks_review_entered_stamp_insert

@@ -38,6 +38,8 @@ export const APPROVAL_EXPIRY = {
    * pins the two together.
    */
   resubmit_cap: 2,
+  /** A CI-fail bounce keeps the old clock only if the task re-enters review within this many hours. MUST equal the literal in the tasks_review_entered_stamp_update trigger (migrations/0232). */
+  bounce_carry_hours: 24,
   /** Tasks transitioned per sweep invocation (bounded; the next tick takes the next batch). */
   sweep_batch: 50,
   sweep_batch_max: 200,
