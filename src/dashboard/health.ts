@@ -66,6 +66,8 @@ export interface OpsHealthData {
      *  consumer of this field must not treat needsDecision as exact when
      *  this is true. */
     needsDecisionIsLowerBound: boolean
+    allReviewersNeedsDecision: number
+    allReviewersNeedsDecisionIsLowerBound: boolean
     blockedOrRejected: number
     recentAudit: number
   }
@@ -306,12 +308,17 @@ function makeCheck(input: HealthCheck): HealthCheck {
 export function approvalsCheckPresentation(
   needsDecisionCount: number,
   isLowerBound: boolean,
+  allReviewers?: { count: number; isLowerBound: boolean },
 ): { tone: HealthTone; state: string; detail: string; nextAction: string } {
+  // The org-wide total is kept, but only as a labelled aside: the headline is the viewer's own count.
+  const acrossAll = allReviewers && allReviewers.count > needsDecisionCount
+    ? ` ${String(allReviewers.count)}${allReviewers.isLowerBound ? '+' : ''} across all reviewers.`
+    : ''
   if (needsDecisionCount > 0) {
     return {
       tone: 'warn',
       state: `${needsDecisionCount}${isLowerBound ? '+' : ''} waiting`,
-      detail: 'Gated work is waiting for an accountable verdict.',
+      detail: `Gated work is waiting for an accountable verdict.${acrossAll}`,
       nextAction: 'Approve, reject, or request changes.',
     }
   }
@@ -320,14 +327,14 @@ export function approvalsCheckPresentation(
       tone: 'warn',
       state: '0+ waiting',
       detail:
-        'The approval queue read was truncated, so this is a lower bound — an actionable task may exist beyond it.',
+        `The approval queue read was truncated, so this is a lower bound — an actionable task may exist beyond it.${acrossAll}`,
       nextAction: 'Open the approvals queue directly — the count cannot prove it is empty.',
     }
   }
   return {
     tone: 'ok',
     state: 'clear',
-    detail: 'No tasks are waiting in review.',
+    detail: acrossAll ? `Nothing is waiting on you.${acrossAll}` : 'No tasks are waiting in review.',
     nextAction: 'No action needed.',
   }
 }
@@ -450,7 +457,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     // failure here becomes a queryErrors entry + safe fallback, not a 500.
     safeCall(() => loadAgentStats(env), new Map<string, AgentStat>()),
     safeCall(() => loadAgentRuntimeStates(env, nowMs), new Map<string, AgentRuntimeState>()),
-    safeCall(() => loadApprovals(env, auth), { items: [], actionableCount: 0, actionableCountIsLowerBound: false } as ApprovalsQueue),
+    safeCall(() => loadApprovals(env, auth), { items: [], actionableCount: 0, actionableCountIsLowerBound: false, ownCount: 0, ownCountIsLowerBound: false } satisfies ApprovalsQueue),
     safeCall(() => loadTaskStatusCounts(env), new Map<string, number>()),
   ])
 
@@ -649,7 +656,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
     makeCheck({
       id: 'approvals',
       label: 'Approval gates',
-      ...approvalsCheckPresentation(counts.needsDecisionCount, counts.needsDecisionCountIsLowerBound),
+      ...approvalsCheckPresentation(counts.needsDecisionCount, counts.needsDecisionCountIsLowerBound, { count: counts.allReviewersCount, isLowerBound: counts.allReviewersCountIsLowerBound }),
       href: '/approvals',
     }),
     makeCheck({
@@ -753,6 +760,9 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       activePresence,
       needsDecision: counts.needsDecisionCount,
       needsDecisionIsLowerBound: counts.needsDecisionCountIsLowerBound,
+      /** Org-wide total across all reviewers (not "waiting on you"). */
+      allReviewersNeedsDecision: counts.allReviewersCount,
+      allReviewersNeedsDecisionIsLowerBound: counts.allReviewersCountIsLowerBound,
       blockedOrRejected,
       recentAudit: auditSignals.length,
     },

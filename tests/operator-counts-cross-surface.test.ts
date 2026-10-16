@@ -18,7 +18,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { loadObservatory } from '../src/dashboard/observatory'
-import { loadApprovals } from '../src/dashboard/approvals'
+import { loadApprovals, waitingOnYou } from '../src/dashboard/approvals'
 import { computeOperatorCounts, loadTaskStatusCounts } from '../src/dashboard/operator-counts'
 import { loadOpsHealth } from '../src/dashboard/health'
 import { loadFleetRadar } from '../src/dashboard/radar'
@@ -68,6 +68,10 @@ describe('operator-counts cross-surface parity (real D1, seeded fixture)', () =>
         ('t-review-2', 'squad1', 'Ship the other thing', 'review', 'a-kasra', 'gate:content', datetime('now'), datetime('now')),
         ('t-blocked-1', 'squad1', 'Blocked work', 'blocked', 'a-loom', NULL, datetime('now'), datetime('now')),
         ('t-done-1', 'squad1', 'Done work', 'done', 'a-loom', NULL, datetime('now'), datetime('now'));
+
+      -- The owner holds gate:content, so both review tasks are THEIR gate (the badge count).
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gg-owner', 'gate:content', 'agent', 'owner-1', 'test', datetime('now'));
     `)
     env = { TENANT_SLUG: 'flight008', DB: harness.db } as unknown as Env
   })
@@ -122,6 +126,9 @@ describe('operator-counts cross-surface parity (real D1, seeded fixture)', () =>
     // Sanity: exactly the two 'review' + gate_owner-set tasks, not the blocked one.
     expect(home.needsDecisionCount).toBe(2)
     expect(health.kpis.needsDecision).toBe(home.needsDecisionCount)
+    // Both equal the /approvals badge (the viewer's own-gate count), and the org-wide total is separate.
+    expect(home.needsDecisionCount).toBe(waitingOnYou(await loadApprovals(env, OWNER)).count)
+    expect(health.kpis.allReviewersNeedsDecision).toBe(home.allReviewersCount)
   })
 
   it('mutating the underlying signal (one agent goes stale) moves ALL three surfaces together — proves the helper is the source, not a copy', async () => {
