@@ -4184,9 +4184,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0235_boot_observed_facts.sql",
+    sha256: "761e05084d0328d38cae134aba132dcfbafbccbaa31e48de04ac90ecec61ac0f",
+    statements: [
+      "-- 0235_boot_observed_facts.sql — boot is the single writer of OBSERVED facts.\n--\n-- fleet_agents already carries runtime, model and host. Three observed facts had no\n-- column: HOW the caller connected (server-derived, never from args), WHEN it last\n-- booted, and the canonical hint for the raw runtime string the caller reported.\n-- presence gets the same canonical hint for the raw check_in harness.\n--\n-- Raw values stay as reported; *_canonical is a display/filter hint ('other' when the\n-- value matches no known harness), never a gate. Additive only: ADD COLUMN with a\n-- default, no backfill, no table recreate. Declared fields (owner, role, purpose, name)\n-- are untouched.\n\nALTER TABLE fleet_agents ADD COLUMN connection_kind TEXT NOT NULL DEFAULT '';",
+      "\nALTER TABLE fleet_agents ADD COLUMN last_boot_at TEXT;",
+      "\nALTER TABLE fleet_agents ADD COLUMN runtime_canonical TEXT NOT NULL DEFAULT '';",
+      "\nALTER TABLE presence ADD COLUMN harness_canonical TEXT NOT NULL DEFAULT '';",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "38fe46ead4e53b223734d4c1ccebf35e88e384379950915390fd901c627f413a"
+export const SCHEMA_CHAIN_DIGEST: string = "67258303099fe6e4cfec4dc1d81518062818990881749f74f8d89c68690ac79d"

@@ -203,7 +203,9 @@ import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 // module_registry) presence primitive src/routines/dispatch.ts#selectAgent already
 // uses for automated dispatch (mupot#732's either-surface fix). Do not invent a
 // second liveness notion here.
-import { getFleetAgentRuntimeStates, MAX_RUNTIME_STATE_BATCH } from '../fleet/registry'
+import { getFleetAgentRuntimeStates, MAX_RUNTIME_STATE_BATCH, readFleetAgentRow } from '../fleet/registry'
+import { readFleetBelief, type FleetBelief } from '../fleet/boot-self-report'
+import { canonicalHarness } from '../fleet/reported-values'
 import type { FleetAgentIdentity, FleetAgentRuntimeState } from '../fleet/registry'
 
 import type { ObservatoryData, SwimlaneBar, AgentRuntimeState, AgentStat } from './observatory'
@@ -2050,8 +2052,13 @@ dashboardApp.get('/agents/:id', async (c) => {
     ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id), null)
     : null
   const ownerView = await loadAgentOwnerView(c.env, auth, agent)
+  // Observed facts boot recorded (read-only on this page). A failed read renders "not reported yet",
+  // never an error: the registry is advisory here.
+  const liveRuntime = await readFleetAgentRow(c.env, agent.id)
+    .then((row) => (row ? readFleetBelief(c.env, row.agent_id) : null))
+    .catch(() => null)
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime)),
   )
 })
 
@@ -5898,6 +5905,23 @@ function renderPanel<T>(
   return body(result.data)
 }
 
+// Observed facts, written ONLY by the agent's own boot_context (never by a human, never from this page).
+// Kept visibly apart from the declared fields (role, owner, purpose), which a human sets.
+function liveRuntimeCard(b: FleetBelief | null) {
+  const v = (x: string | null | undefined) => (x ? html`<code>${x}</code>` : html`<span class="dim">not reported</span>`)
+  return html`<h2>Live runtime</h2>
+    <div class="card" data-live-runtime>
+      <p class="dim">Observed at boot by the agent itself. Declared fields above (role, owner, purpose) are set by a human; these are not.</p>
+      <dl class="kv">
+        <dt>Runtime</dt><dd>${v(b?.runtime)}${b?.runtime ? html` <span class="dim">(${b.runtime_canonical || canonicalHarness(b.runtime)})</span>` : ''}</dd>
+        <dt>Model</dt><dd>${v(b?.model)}</dd>
+        <dt>Host</dt><dd>${v(b?.host)}</dd>
+        <dt>Connection</dt><dd>${v(b?.connection_kind)}</dd>
+        <dt>Last boot</dt><dd>${v(b?.last_boot_at)}</dd>
+      </dl>
+    </div>`
+}
+
 function agentConsoleBody(
   agent: Agent,
   squad: Squad | null,
@@ -5907,6 +5931,7 @@ function agentConsoleBody(
   collaboration: PanelResult<CollaborationSummary>,
   accessPanel: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
   ownerView: AgentOwnerView | null = null,
+  liveRuntime: FleetBelief | null = null,
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -5962,6 +5987,7 @@ function agentConsoleBody(
       </dl>
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
     </div>
+    ${liveRuntimeCard(liveRuntime)}
     ${accessPanel ?? ''}
     <h2>Flights</h2>
     ${renderPanel('flights', flights, (d) => html`

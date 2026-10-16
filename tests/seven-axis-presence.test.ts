@@ -22,6 +22,7 @@ import {
 } from '../src/cursor/seat-identity'
 import { listPresence, normalizeHarness, normalizeEffort } from '../src/fleet/presence'
 import { parseSevenAxisCheckin } from '../src/presence/seven-axis'
+import { canonicalHarness } from '../src/fleet/reported-values'
 import { renderSevenAxisSeatRoster } from '../src/dashboard/mission-control-views'
 import type { AuthContext, Env } from '../src/types'
 import type { PresenceView } from '../src/fleet/presence'
@@ -307,26 +308,31 @@ describe('7-axis multi-harness seat onboarding (real SQLite D1)', () => {
 })
 
 describe('7-axis normalizers and Cursor Cloud seat injection', () => {
-  it('normalizes unknown harness/effort without storing raw client junk', () => {
+  it('keeps any harness as reported (cleaned, <=64) and tags a canonical hint', () => {
     expect(normalizeHarness('codex-cli')).toBe('codex-cli')
-    expect(normalizeHarness('codex')).toBe('unknown')
-    expect(normalizeHarness('Codex-CLI')).toBe('unknown')
-    expect(normalizeHarness(' codex-cli ')).toBe('unknown')
-    expect(normalizeHarness('unrecognized-harness')).toBe('unknown')
+    expect(normalizeHarness('codex')).toBe('codex')
+    expect(normalizeHarness(' codex-cli ')).toBe('codex-cli')
+    expect(normalizeHarness('my-new-harness')).toBe('my-new-harness')
     expect(normalizeHarness('cursor-cloud')).toBe('cursor-cloud')
-    expect(normalizeHarness('evil-runtime')).toBe('unknown')
+    expect(normalizeHarness('bad\u0007name\n')).toBe('badname')
+    expect(normalizeHarness('x'.repeat(200))).toHaveLength(64)
+    expect(normalizeHarness('   ')).toBe('unknown')
     expect(normalizeHarness(42)).toBe('unknown')
+    expect(canonicalHarness('Codex')).toBe('codex-cli')
+    expect(canonicalHarness('cursor-cloud')).toBe('cursor')
+    expect(canonicalHarness('grok-tui')).toBe('grok-cli')
+    expect(canonicalHarness('my-new-harness')).toBe('other')
+    expect(canonicalHarness('__proto__')).toBe('other')
+    expect(canonicalHarness('')).toBe('unknown')
     expect(normalizeEffort('high')).toBe('high')
     expect(normalizeEffort('extended-thinking-64k')).toBe('extended-thinking-64k')
     expect(normalizeEffort('ludicrous')).toBeNull()
   })
 
-  it('parses only the exact Codex CLI harness spelling', () => {
+  it('parseSevenAxisCheckin keeps an unknown harness raw instead of dropping it', () => {
     expect(parseSevenAxisCheckin({ harness: 'codex-cli' }).harness).toBe('codex-cli')
-    expect(parseSevenAxisCheckin({ harness: 'codex' }).harness).toBeNull()
-    expect(parseSevenAxisCheckin({ harness: 'Codex-CLI' }).harness).toBeNull()
-    expect(parseSevenAxisCheckin({ harness: ' codex-cli ' }).harness).toBeNull()
-    expect(parseSevenAxisCheckin({ harness: 'unrecognized-harness' }).harness).toBeNull()
+    expect(parseSevenAxisCheckin({ harness: ' my-new-harness ' }).harness).toBe('my-new-harness')
+    expect(parseSevenAxisCheckin({ harness: 42 }).harness).toBeNull()
   })
 
   it('injects the exact Cursor Cloud 7-axis check_in declaration', () => {

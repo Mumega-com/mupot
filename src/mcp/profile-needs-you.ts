@@ -69,12 +69,12 @@ export const NEEDS_YOU_PROFILE: readonly ProfileToolEntry[] = [
   {
     name: 'boot_context',
     annotations: { title: 'Who am I and what can I do', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    // runtime/model make boot_context call selfReportAtBoot, which WRITES the caller's
+    // runtime/model/host make boot_context call selfReportAtBoot, which WRITES the caller's
     // fleet_agents row (status -> 'running' even for an operator-stopped agent, runtime,
     // model). That is a state change under a readOnlyHint, and ChatGPT calls read-only-hinted
     // tools without confirmation — so the profile never forwards them (#1625 tracks the
     // stopped-row defect in selfReportAtBoot itself).
-    rejectArgs: ['model', 'runtime'],
+    rejectArgs: ['host', 'model', 'runtime'],
     args: '{ source?: string, seat?: string, label?: string }',
   },
   {

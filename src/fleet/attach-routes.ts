@@ -27,7 +27,7 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView, resolveFleetWriteAgentId } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
-import { isValidRuntime, runtimeVocabulary, RUNTIME_SET } from './runtimes'
+import { canonicalHarness, cleanReported, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
 import { hasRegisteredKey } from './agent-keys'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
@@ -39,9 +39,10 @@ import { hasRegisteredKey } from './agent-keys'
 // no re-signing-scheme change is needed on either side. Trim + cap; never reject the request
 // over it. Re-declared locally rather than imported from registry.ts — same "keeps
 // validation explicit, avoids coupling to the daemon-report path" rule as AGENT_ID_RE above.
+const NON_ADOPTED_RUNTIMES: ReadonlySet<string> = new Set(['goose', 'goosed'])
 const MAX_HOST = 64
 function cleanHost(v: unknown): string {
-  return typeof v === 'string' ? v.trim().slice(0, MAX_HOST) : ''
+  return typeof v === 'string' ? (cleanReported(v, MAX_HOST) ?? '') : ''
 }
 
 /** Upsert a fleet_agents row to status='running'. Shared by the bearer (/attach) and the
@@ -74,10 +75,11 @@ async function upsertRunning(
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
-           status, reported_by, agent_type, member_id, host, model, last_reported_at, updated_at)
-     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now'))
+           status, reported_by, agent_type, member_id, host, model, runtime_canonical, last_reported_at, updated_at)
+     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
           runtime          = excluded.runtime,
+          runtime_canonical = excluded.runtime_canonical,
           lifecycle        = excluded.lifecycle,
           status           = 'running',
           reported_by      = excluded.reported_by,
@@ -88,7 +90,7 @@ async function upsertRunning(
           last_reported_at = excluded.last_reported_at,
           updated_at       = excluded.updated_at`,
   )
-    .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model)
+    .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model, canonicalHarness(runtime))
     .run()
 
   // Runtime truth reaches the identity record too (harness-native-mupot lane A): the Fleet
@@ -226,21 +228,27 @@ fleetAttachApp.post('/attach', async (c) => {
   }
   const agentType = b.type
 
-  if (!isValidRuntime(b.runtime)) {
-    return c.json({ error: 'bad_request', detail: `runtime: must be one of ${runtimeVocabulary()}` }, 400)
+  // Any harness name is accepted as reported (trimmed, control chars stripped, truncated to 64);
+  // canonicalHarness is a hint written alongside, never a gate. Only a non-string/empty runtime is refused.
+  const runtime = typeof b.runtime === 'string' ? cleanReported(b.runtime, MAX_REPORTED) : null
+  // The ONE named refusal: goose/goosed were formally NOT adopted (docs/fleet/goose-non-adoption-2026-07-22.md),
+  // a recorded governance decision rather than an unknown-name gate. Everything else is accepted.
+  if (runtime !== null && NON_ADOPTED_RUNTIMES.has(runtime.toLowerCase())) {
+    return c.json({ error: 'bad_request', detail: 'runtime: not adopted (see docs/fleet/goose-non-adoption-2026-07-22.md)' }, 400)
+  }
+  if (runtime === null) {
+    return c.json({ error: 'bad_request', detail: 'runtime: a non-empty string is required (any harness name)' }, 400)
   }
   // Runtime-reported model (harness-native-mupot lane A): optional display metadata, never
   // an authority. Reported-truth discipline (gate-protocol v2, Appendix A): the runtime
   // reports what it ACTUALLY loaded; mupot labels it runtime-reported, never canonical.
   let model: string | null = null
   if (b.model !== undefined && b.model !== null) {
-    if (typeof b.model !== 'string' || !/^[A-Za-z0-9_./@-]{1,128}$/.test(b.model)) {
-      return c.json({ error: 'bad_request', detail: 'model: must be a 1-128 char string of [A-Za-z0-9_./@-]' }, 400)
+    if (typeof b.model !== 'string') {
+      return c.json({ error: 'bad_request', detail: 'model: must be a string' }, 400)
     }
-    model = b.model
+    model = cleanReported(b.model, MAX_REPORTED_MODEL)
   }
-
-  const runtime = b.runtime
 
   // lifecycle is optional; defaults to 'on_demand'.
   let lifecycle = 'on_demand'
@@ -318,7 +326,7 @@ fleetAttachApp.post('/attach-signed', async (c) => {
 
   // 2. Verify the signature. Does ALL field validation (incl. lifecycle, which is SIGNED),
   //    freshness, key lookup, and the single-use nonce burn.
-  const v = await verifySignedAttach(c.env, b, VALID_TYPES, RUNTIME_SET, VALID_LIFECYCLES)
+  const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_LIFECYCLES)
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
 
   // host: UNTRUSTED, agent-controlled, optional, display-only (#21 slice 2). Deliberately
@@ -337,7 +345,7 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   //    last wrote it. `upsertRunning` now resolves `v.agent_id` to the canonical `agents.id`
   //    INTERNALLY (v4 round 2, P1-1 — resolution centralized in the write function itself,
   //    never at an individual call site) and returns it for the boot-ack lookup below.
-  const writeAgentId = await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id, host)
+  const writeAgentId = await upsertRunning(c.env, v.agent_id, cleanReported(v.runtime, MAX_REPORTED) ?? 'unknown', v.lifecycle, v.type, v.member_id, host)
 
   // 4. Boot-ack.
   const views = await getAgentView(c.env)

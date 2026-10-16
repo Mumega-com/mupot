@@ -247,11 +247,13 @@ describe('POST /attach', () => {
     expect(db._fleet.size).toBe(0)
   })
 
-  it('400 on bad runtime', async () => {
+  it('400 on a non-string runtime; an unknown harness name is accepted as reported', async () => {
     const db = defaultDb()
-    const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'elixir' }, makeEnv(db))
-    expect(res.status).toBe(400)
+    const bad = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 42 }, makeEnv(db))
+    expect(bad.status).toBe(400)
     expect(db._fleet.size).toBe(0)
+    const ok = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime: 'elixir' }, makeEnv(db))
+    expect(ok.status).toBe(200)
   })
 
   // Goose formal gate 2026-07-22: ACP wrapper over native CLI subscriptions — not adopted.

@@ -126,15 +126,13 @@ describe('it cannot become a way around signed attach', () => {
   })
 })
 
-describe('refusals teach instead of silencing', () => {
-  it('an unknown runtime is refused WITH the vocabulary, and changes nothing', async () => {
+describe('intake is graceful', () => {
+  it('an unknown runtime is ACCEPTED as reported, canonical other', async () => {
     const r = await boot({ runtime: 'definitely-not-a-harness' })
-    expect(r.registry?.outcome).toBe('refused_unknown_runtime')
-    // Withholding the valid values is what made the agent give up and stay stale.
-    expect(r.registry?.detail).toContain('grok')
-    expect(r.registry?.detail).toContain('cursor-agent')
-    expect(r.registry?.detail).toContain('cursor-ide')
-    expect(storedRuntime().runtime).toBe('pi')
+    expect(r.registry?.outcome).toBe('recorded')
+    expect(storedRuntime().runtime).toBe('definitely-not-a-harness')
+    const row = harness.sqlite.prepare(`SELECT runtime_canonical c FROM fleet_agents WHERE agent_id = ?`).get(AGENT) as { c: string }
+    expect(row.c).toBe('other')
   })
 })
 

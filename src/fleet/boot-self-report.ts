@@ -25,7 +25,15 @@
 
 import type { Env } from '../types'
 import { hasRegisteredKey } from './agent-keys'
-import { isValidRuntime, runtimeVocabulary } from './runtimes'
+import { canonicalHarness, cleanReported, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
+
+// INTAKE IS GRACEFUL (Hadi 2026-10-16): an unknown runtime/model/host is never a reason to
+// refuse a boot. Any bounded string is kept as reported (trimmed, control chars stripped,
+// truncated); `runtime_canonical` is a hint ('other' when unrecognised), never a gate. The
+// only refusal is a non-string value. Authority never derives from these strings.
+
+/** How the caller connected — derived by the SERVER from authentication, never from args. */
+export type ConnectionKind = 'agent_bound' | 'attached' | 'member'
 
 export interface FleetBelief {
   runtime: string
@@ -33,57 +41,66 @@ export interface FleetBelief {
   status: string
   reported_by: string
   last_reported_at: string
+  /** Observed facts (migration 0235). Additive. */
+  runtime_canonical: string
+  host: string
+  connection_kind: string
+  last_boot_at: string | null
 }
 
 export type BootSelfReport =
-  /** Nothing was claimed, so nothing was written. */
+  /** Nothing was claimed, so no runtime/model/host was written (connection kind + boot time still are). */
   | { outcome: 'nothing_reported'; belief: FleetBelief | null }
   /** Written. `changed` names the fields whose value actually moved. */
   | { outcome: 'recorded'; belief: FleetBelief | null; changed: string[] }
   /** Keyed agent: must use /api/fleet/attach-signed. */
   | { outcome: 'refused_signed_attach_required'; belief: FleetBelief | null; detail: string }
-  /** Claimed a runtime outside the vocabulary — told which words exist. */
-  | { outcome: 'refused_unknown_runtime'; belief: FleetBelief | null; detail: string }
+  /** A reported value was not a string. Nothing written. */
+  | { outcome: 'refused_not_a_string'; belief: FleetBelief | null; detail: string }
 
 export const MODEL_RE = /^[A-Za-z0-9_./@-]{1,128}$/
 
 export async function readFleetBelief(env: Env, agentId: string): Promise<FleetBelief | null> {
   return env.DB.prepare(
-    `SELECT runtime, model, status, reported_by, last_reported_at
+    `SELECT runtime, model, status, reported_by, last_reported_at,
+            runtime_canonical, host, connection_kind, last_boot_at
        FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(env.TENANT_SLUG, agentId).first<FleetBelief>()
+}
+
+type Claimed = { present: boolean; value: string | null; bad: boolean }
+function claimed(v: unknown, max: number): Claimed {
+  if (v === undefined || v === null) return { present: false, value: null, bad: false }
+  if (typeof v !== 'string') return { present: true, value: null, bad: true }
+  const value = cleanReported(v, max)
+  return { present: value !== null, value, bad: false }
 }
 
 /** Record what a booting agent says it is. Own row only; keyed agents refused.
  *
  *  Only the fields actually claimed are written — an agent that reports a runtime but no
  *  model must not blank its model. A blanket upsert would make a partial report look like
- *  a complete one, which is the defect class this whole change is about. */
+ *  a complete one, which is the defect class this whole change is about.
+ *
+ *  `connectionKind` is passed by the caller from authentication (never from tool args). */
 export async function selfReportAtBoot(
   env: Env,
   agentId: string,
-  claim: { runtime?: unknown; model?: unknown },
+  claim: { runtime?: unknown; model?: unknown; host?: unknown },
+  connectionKind: ConnectionKind = 'agent_bound',
 ): Promise<BootSelfReport> {
   const belief = await readFleetBelief(env, agentId)
 
-  const wantsRuntime = claim.runtime !== undefined && claim.runtime !== null
-  const wantsModel = claim.model !== undefined && claim.model !== null
-  if (!wantsRuntime && !wantsModel) return { outcome: 'nothing_reported', belief }
-
-  if (wantsRuntime && !isValidRuntime(claim.runtime)) {
-    return {
-      outcome: 'refused_unknown_runtime',
-      belief,
-      // Name the whole vocabulary. A refusal that withholds the valid values is what
-      // makes an agent give up and stay stale instead of correcting itself.
-      detail: `runtime: must be one of ${runtimeVocabulary()}`,
-    }
-  }
-  if (wantsModel && (typeof claim.model !== 'string' || !MODEL_RE.test(claim.model))) {
-    return { outcome: 'refused_unknown_runtime', belief, detail: 'model: 1-128 chars of [A-Za-z0-9_./@-]' }
+  const rt = claimed(claim.runtime, MAX_REPORTED)
+  const md = claimed(claim.model, MAX_REPORTED_MODEL)
+  const hs = claimed(claim.host, MAX_REPORTED)
+  const badField = rt.bad ? 'runtime' : md.bad ? 'model' : hs.bad ? 'host' : null
+  if (badField) {
+    return { outcome: 'refused_not_a_string', belief, detail: `${badField}: must be a string` }
   }
 
   if (await hasRegisteredKey(env, agentId)) {
+    if (!rt.present && !md.present && !hs.present) return { outcome: 'nothing_reported', belief }
     return {
       outcome: 'refused_signed_attach_required',
       belief,
@@ -94,32 +111,53 @@ export async function selfReportAtBoot(
     }
   }
 
-  const runtime = wantsRuntime ? (claim.runtime as string) : null
-  const model = wantsModel ? (claim.model as string) : null
+  if (!rt.present && !md.present && !hs.present) {
+    // Nothing to claim: still stamp the two facts the SERVER observed (how it connected, when).
+    // Existing row only — boot alone never creates a registry row or flips status.
+    if (belief) {
+      await env.DB.prepare(
+        `UPDATE fleet_agents SET connection_kind = ?3, last_boot_at = datetime('now')
+          WHERE tenant = ?1 AND agent_id = ?2`,
+      ).bind(env.TENANT_SLUG, agentId, connectionKind).run()
+    }
+    return { outcome: 'nothing_reported', belief: belief ? await readFleetBelief(env, agentId) : null }
+  }
+
+  const runtime = rt.value
+  const model = md.value
+  const host = hs.value
+  const runtimeCanonical = runtime === null ? null : canonicalHarness(runtime)
 
   const changed: string[] = []
   if (runtime !== null && runtime !== (belief?.runtime ?? '')) changed.push('runtime')
   if (model !== null && model !== (belief?.model ?? null)) changed.push('model')
+  if (host !== null && host !== (belief?.host ?? '')) changed.push('host')
 
   if (belief === null) {
     await env.DB.prepare(
       `INSERT INTO fleet_agents
-             (agent_id, tenant, runtime, status, reported_by, model, last_reported_at, updated_at)
-       VALUES (?1, ?2, COALESCE(?3, ''), 'running', ?1, ?4, datetime('now'), datetime('now'))
+             (agent_id, tenant, runtime, runtime_canonical, status, reported_by, model, host,
+              connection_kind, last_boot_at, last_reported_at, updated_at)
+       VALUES (?1, ?2, COALESCE(?3, ''), COALESCE(?4, ''), 'running', ?1, ?5, COALESCE(?6, ''),
+               ?7, datetime('now'), datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO NOTHING`,
-    ).bind(agentId, env.TENANT_SLUG, runtime, model).run()
+    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind).run()
   } else {
     // COALESCE so an unclaimed field keeps its stored value rather than being blanked.
     await env.DB.prepare(
       `UPDATE fleet_agents
-          SET runtime          = COALESCE(?3, runtime),
-              model            = COALESCE(?4, model),
-              status           = 'running',
-              reported_by      = ?1,
-              last_reported_at = datetime('now'),
-              updated_at       = datetime('now')
+          SET runtime           = COALESCE(?3, runtime),
+              runtime_canonical = COALESCE(?4, runtime_canonical),
+              model             = COALESCE(?5, model),
+              host              = COALESCE(?6, host),
+              connection_kind   = ?7,
+              last_boot_at      = datetime('now'),
+              status            = 'running',
+              reported_by       = ?1,
+              last_reported_at  = datetime('now'),
+              updated_at        = datetime('now')
         WHERE tenant = ?2 AND agent_id = ?1`,
-    ).bind(agentId, env.TENANT_SLUG, runtime, model).run()
+    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind).run()
   }
 
   // The identity record is what the dashboard reads, so a truthful runtime report must

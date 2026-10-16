@@ -4,6 +4,7 @@
 // Cursor Cloud seat is `river-cursor`.
 
 import { RIVER_CURSOR_SEAT } from '../agents/river-lead'
+import { cleanReported } from '../fleet/reported-values'
 
 export const SEVEN_AXIS_KEYS = [
   'seat',
@@ -37,7 +38,8 @@ export type SevenAxisEffort = (typeof SEVEN_AXIS_EFFORTS)[number]
 
 export interface SevenAxisPresence {
   seat: string
-  harness: SevenAxisHarness | null
+  /** Raw harness as reported (any bounded string); never a gate. */
+  harness: string | null
   machine: string | null
   model: string | null
   provider: string | null
@@ -61,11 +63,6 @@ function optionalEnum<T extends string>(value: unknown, allowed: readonly T[]): 
   return (allowed as readonly string[]).includes(trimmed) ? (trimmed as T) : null
 }
 
-function optionalExactEnum<T extends string>(value: unknown, allowed: readonly T[]): T | null {
-  if (typeof value !== 'string') return null
-  return (allowed as readonly string[]).includes(value) ? (value as T) : null
-}
-
 export function parseSevenAxisCheckin(
   args: Record<string, unknown>,
   fallbackSeat = '',
@@ -73,7 +70,7 @@ export function parseSevenAxisCheckin(
   const seat = optionalString(args.seat) || optionalString(args.name) || optionalString(args.label) || fallbackSeat
   return {
     seat,
-    harness: optionalExactEnum(args.harness, SEVEN_AXIS_HARNESSES),
+    harness: typeof args.harness === 'string' ? cleanReported(args.harness) : null,
     machine: optionalString(args.machine),
     model: optionalString(args.model),
     provider: optionalString(args.provider),

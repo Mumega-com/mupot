@@ -181,7 +181,6 @@ import {
   refreshOwnAgentPresence,
   sqliteUtcToMs,
   normalizeSevenAxis,
-  SEVEN_AXIS_HARNESSES,
   SEVEN_AXIS_EFFORTS,
 } from '../fleet/presence'
 import {
@@ -316,7 +315,7 @@ import { refusalNextStep } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
-import { selfReportAtBoot } from '../fleet/boot-self-report'
+import { selfReportAtBoot, readFleetBelief, type ConnectionKind } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
@@ -5788,7 +5787,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
+  args: '{ seat?: string, harness?: string /* any harness name, kept as reported (<=64 chars); known ones also get a canonical hint, others are tagged other */, machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -5796,7 +5795,7 @@ const toolCheckIn: ToolSpec = {
       label: STRING_SCHEMA,
       name: STRING_SCHEMA,
       seat: STRING_SCHEMA,
-      harness: { type: 'string', enum: [...SEVEN_AXIS_HARNESSES] },
+      harness: STRING_SCHEMA,
       machine: STRING_SCHEMA,
       model: STRING_SCHEMA,
       provider: STRING_SCHEMA,
@@ -5947,6 +5946,7 @@ const toolCheckIn: ToolSpec = {
       agent: id.displayName,
       agent_id: id.boundAgentId,
       harness: axis.harness,
+      harness_canonical: axis.harness_canonical,
       machine: axis.machine,
       model: axis.model,
       provider: axis.provider,
@@ -6385,11 +6385,18 @@ const toolFleetAgentGet: ToolSpec = {
     const lastReportedAt = String(row?.last_reported_at ?? '')
     const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
 
+    // Observed facts boot recorded (migration 0235). Raw as reported; *_canonical is a hint, never a gate.
+    const observed = row ? await readFleetBelief(env, row.agent_id) : null
     return done({
       agent_id: targetAgent.id,
       agent_slug: targetAgent.slug,
       squad_id: targetAgent.squad_id,
       runtime: routeInfo.runtime,
+      runtime_canonical: observed?.runtime_canonical || null,
+      model: observed?.model ?? null,
+      host: observed?.host || null,
+      connection_kind: observed?.connection_kind || null,
+      last_boot_at: observed?.last_boot_at ?? null,
       status: row?.status ?? null,
       last_reported_at: row?.last_reported_at ?? null,
       // mupot#1494 round 3 (P3, adversarial round 2) — reads `routeInfo.presenceMode`
@@ -6415,12 +6422,48 @@ const toolFleetAgentGet: ToolSpec = {
 async function reportSelfAtBoot(
   env: Env,
   agentId: string,
-  claim: { runtime?: unknown; model?: unknown },
+  // null = READ-ONLY (attached thread / profile): never writes, not even connection_kind or boot time.
+  claim: { runtime?: unknown; model?: unknown; host?: unknown } | null,
 ): Promise<unknown> {
   try {
-    return await selfReportAtBoot(env, agentId, claim)
+    if (claim === null) {
+      return { outcome: 'nothing_reported', belief: await readFleetBelief(env, agentId) }
+    }
+    return await selfReportAtBoot(env, agentId, claim, 'agent_bound')
   } catch {
     return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
+  }
+}
+
+// What boot tells the caller about HOW it is connected. Tool/route names only — never a token.
+function buildBootOnboarding(
+  kind: ConnectionKind,
+  args: Record<string, unknown>,
+): { connection_kind: ConnectionKind; inbox?: 'peek_only' | 'none'; next_step?: string } {
+  if (kind === 'attached') {
+    return {
+      connection_kind: kind,
+      inbox: 'peek_only',
+      next_step:
+        'this thread is attached to the agent: it can read the agent inbox with inbox { peek: true } but cannot consume it, and boot records no runtime, model or host for it. '
+        + "The agent's own runtime should connect with the agent-bound connection (its minted agent token) and call boot_context with runtime, model and host.",
+    }
+  }
+  if (kind === 'member') {
+    return {
+      connection_kind: kind,
+      inbox: 'none',
+      next_step:
+        'this connection is a member token with no agent binding, so boot records no runtime, model or host. '
+        + "An agent's own runtime should connect with the agent-bound connection (see available_doors: bootstrap_self, or mint_agent_token by an org admin) and call boot_context with runtime, model and host.",
+    }
+  }
+  const missing = ['runtime', 'model', 'host'].filter((k) => args[k] === undefined || args[k] === null)
+  return {
+    connection_kind: kind,
+    ...(missing.length > 0
+      ? { next_step: `call boot_context again passing ${missing.join(', ')} (any short string: what you are actually running on) so the registry shows your real seat.` }
+      : {}),
   }
 }
 
@@ -6640,7 +6683,7 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string }  // runtime/model: what you are ACTUALLY running on — reported at boot',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6649,6 +6692,7 @@ const toolBootContext: ToolSpec = {
       label: STRING_SCHEMA,
       runtime: STRING_SCHEMA,
       model: STRING_SCHEMA,
+      host: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -6692,8 +6736,15 @@ const toolBootContext: ToolSpec = {
       // fleet_agents/agents.model rows; bot review P1 on #1887). It still READS the registry belief.
       // sideEffectFree (profile): never claim runtime/model — the profile refuses them, and
       // this drops them even if a caller reaches here another way. An empty claim only READS.
-      ? await reportSelfAtBoot(env, auth.boundAgentId as string, ctx?.sideEffectFree || attachedAuthority(auth) ? {} : { runtime: args.runtime, model: args.model })
+      ? await reportSelfAtBoot(
+          env,
+          auth.boundAgentId as string,
+          ctx?.sideEffectFree || attachedAuthority(auth) ? null : { runtime: args.runtime, model: args.model, host: args.host },
+        )
       : null
+    // Server-derived from authentication; NEVER from args. Attached beats bound (an attached thread also has a boundAgentId).
+    const connectionKind: ConnectionKind = attachedAuthority(auth) ? 'attached' : isMinted ? 'agent_bound' : 'member'
+    const bootOnboarding = ctx?.sideEffectFree ? null : buildBootOnboarding(connectionKind, args)
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
     // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
@@ -6883,6 +6934,9 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       ...(selfReport ? { registry: selfReport } : {}),
+      // Additive. Structured so a harness can act on it: what kind of connection this is, whether
+      // its inbox reads consume, and (only when something is wrong or missing) a plain next_step.
+      ...(bootOnboarding ? { onboarding: bootOnboarding } : {}),
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,

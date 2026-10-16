@@ -10,6 +10,7 @@ import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
+import { cleanReported, canonicalHarness } from './reported-values'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
@@ -44,15 +45,16 @@ export const SEVEN_AXIS_EFFORTS = ['low', 'medium', 'high', 'extended-thinking-6
 
 export type SevenAxisEffort = (typeof SEVEN_AXIS_EFFORTS)[number]
 
-const HARNESSES = new Set<string>(SEVEN_AXIS_HARNESSES)
 const EFFORTS = new Set<string>(SEVEN_AXIS_EFFORTS)
 
 export function normalizeSource(s: unknown): string {
   return typeof s === 'string' && SOURCES.has(s) ? s : 'unknown'
 }
 
-export function normalizeHarness(s: unknown): SevenAxisHarness {
-  return typeof s === 'string' && HARNESSES.has(s) ? (s as SevenAxisHarness) : 'unknown'
+/** The raw harness as reported (cleaned, <=64 chars); empty/non-string -> 'unknown'. Never a gate:
+ *  an unrecognised harness is accepted and carried as-is (canonical hint: canonicalHarness). */
+export function normalizeHarness(s: unknown): string {
+  return typeof s === 'string' ? (cleanReported(s) ?? 'unknown') : 'unknown'
 }
 
 export function normalizeEffort(s: unknown): SevenAxisEffort | null {
@@ -61,13 +63,14 @@ export function normalizeEffort(s: unknown): SevenAxisEffort | null {
 
 export function sanitizeAxisString(s: unknown, max = 120): string | null {
   if (typeof s !== 'string') return null
-  const trimmed = s.trim().slice(0, max)
-  return trimmed.length > 0 ? trimmed : null
+  return cleanReported(s, max)
 }
 
 export interface SevenAxisDeclaration {
   seat: string
-  harness: SevenAxisHarness
+  harness: string
+  /** Canonical hint for `harness` ('other' when unrecognised). Display/filter only. */
+  harness_canonical: string
   machine: string | null
   model: string | null
   provider: string | null
@@ -97,7 +100,8 @@ export function resolveSeatLabel(opts: CheckinOpts): string {
 export function normalizeSevenAxis(opts: CheckinOpts): SevenAxisDeclaration {
   return {
     seat: resolveSeatLabel(opts),
-    harness: opts.harness === undefined || opts.harness === null ? 'unknown' : normalizeHarness(opts.harness),
+    harness: normalizeHarness(opts.harness),
+    harness_canonical: canonicalHarness(normalizeHarness(opts.harness)),
     machine: sanitizeAxisString(opts.machine),
     model: sanitizeAxisString(opts.model),
     provider: sanitizeAxisString(opts.provider),
@@ -181,7 +185,8 @@ export function sqliteUtcToMs(s: string | null): number | null {
 }
 
 function bindSevenAxis(opts: CheckinOpts): {
-  harness: SevenAxisHarness | null
+  harness: string | null
+  harness_canonical: string | null
   machine: string | null
   model: string | null
   provider: string | null
@@ -189,9 +194,11 @@ function bindSevenAxis(opts: CheckinOpts): {
   flight_id: string | null
 } {
   // Omitted axes bind NULL so ON CONFLICT COALESCE keeps a previously declared value.
-  // An explicit empty / unknown-invalid harness still stores 'unknown'.
+  // An explicit empty harness stores 'unknown'; an unrecognised one is stored RAW (canonical 'other').
+  const harness = opts.harness === undefined || opts.harness === null ? null : normalizeHarness(opts.harness)
   return {
-    harness: opts.harness === undefined || opts.harness === null ? null : normalizeHarness(opts.harness),
+    harness,
+    harness_canonical: harness === null ? null : canonicalHarness(harness),
     machine: sanitizeAxisString(opts.machine),
     model: sanitizeAxisString(opts.model),
     provider: sanitizeAxisString(opts.provider),
@@ -214,15 +221,16 @@ export async function recordCheckin(
     `INSERT INTO presence (
         tenant, member_id, display_name, source, label, seat, agent_id,
         harness, machine, model, provider, effort, flight_id,
-        first_seen_at, last_seen_at
+        harness_canonical, first_seen_at, last_seen_at
       )
-      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
+      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, COALESCE(?7, 'unknown'), ?8, ?9, ?10, ?11, ?12, COALESCE(?13, 'unknown'), datetime('now'), datetime('now'))
       ON CONFLICT(tenant, member_id, label) DO UPDATE SET
         display_name = excluded.display_name,
         source       = excluded.source,
         seat         = excluded.seat,
         agent_id     = excluded.agent_id,
         harness      = CASE WHEN ?7 IS NULL THEN presence.harness ELSE excluded.harness END,
+        harness_canonical = CASE WHEN ?13 IS NULL THEN presence.harness_canonical ELSE excluded.harness_canonical END,
         machine      = COALESCE(?8, presence.machine),
         model        = COALESCE(?9, presence.model),
         provider     = COALESCE(?10, presence.provider),
@@ -243,11 +251,13 @@ export async function recordCheckin(
       axis.provider,
       axis.effort,
       axis.flight_id,
+      axis.harness_canonical,
     )
     .run()
   return {
     seat: label,
     harness: axis.harness ?? 'unknown',
+    harness_canonical: axis.harness_canonical ?? 'unknown',
     machine: axis.machine,
     model: axis.model,
     provider: axis.provider,

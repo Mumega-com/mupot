@@ -49,11 +49,11 @@ describe('lane A: runtime=pi + model on /attach (real D1)', () => {
     expect(ag.model).toBe('hetzner/Kimi-K2.7-Code')
   })
 
-  it('rejects an invalid model (bad chars)', async () => {
+  it('rejects a non-string model; odd characters are kept as reported (rendering escapes)', async () => {
     const res = await fleetAttachApp.request('/attach', {
       method: 'POST',
       headers: { Authorization: 'Bearer tok-loom', 'content-type': 'application/json' },
-      body: JSON.stringify({ agent_id: 'a-loom', runtime: 'pi', type: 'weaver', model: 'bad model " quote' }),
+      body: JSON.stringify({ agent_id: 'a-loom', runtime: 'pi', type: 'weaver', model: 42 }),
     }, env)
     expect(res.status).toBe(400)
   })
