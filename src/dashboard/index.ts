@@ -2457,21 +2457,30 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   if (!agentIdRaw) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Pick an agent.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Pick an agent.', canonical.origin)),
       400,
     )
   }
   if (labelRaw.length > 64) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Label too long (max 64 chars).', canonical.origin)),
+      400,
+    )
+  }
+  // mupot#1982: a label starting with the seat-handle prefix would trip
+  // requestPresentsSeatHandle on the minted credential's own label.
+  if (/^mseat_/i.test(labelRaw)) {
+    const view = await loadAgentTokenView(c.env)
+    return c.html(
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Label cannot start with mseat_ (reserved for seat handles).', canonical.origin)),
       400,
     )
   }
   if (!isAgentTokenCapability(capabilityRaw)) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Grant must be observer or member.', canonical.origin)),
       400,
     )
   }
@@ -2486,7 +2495,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
       : 'Agent not found in this pot.'
     const status = agentResult.reason === 'ambiguous' ? 409 : 404
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, msg)),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, msg, canonical.origin)),
       status,
     )
   }
@@ -2501,7 +2510,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   if (!expiry.ok) {
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Expiry must be a whole number from 1 to 365 days.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'Expiry must be a whole number from 1 to 365 days.', canonical.origin)),
       400,
     )
   }
@@ -2521,7 +2530,7 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
     if (!(err instanceof AgentInactiveError)) throw err
     const view = await loadAgentTokenView(c.env)
     return c.html(
-      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'agent_inactive: this agent is not active. Reactivate it before minting a key.')),
+      shell(c.env, 'Mint agent token', agentTokenPageBody(view, 'agent_inactive: this agent is not active. Reactivate it before minting a key.', canonical.origin)),
       409,
     )
   }

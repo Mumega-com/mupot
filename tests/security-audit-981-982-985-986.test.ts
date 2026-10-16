@@ -47,6 +47,13 @@ describe('#981 stored XSS in agent-token minted page', () => {
     expect(html).toContain('<code class="inline">&lt;script&gt;alert(1)&lt;/script&gt;</code>')
   })
 
+  it('escapes a hostile seat label (#1982)', () => {
+    const seat = '<img src=x onerror=alert(1)>'
+    const html = agentTokenMintedBody('Good', 'good-slug', null, 'raw-token', 'good-id', 'member', 'https://pot.test', seat).toString()
+    expect(html).not.toContain('<img')
+    expect(html).not.toContain(seat)
+  })
+
   it('escapes the raw token placeholder in the code block if it contains HTML characters', () => {
     const html = agentTokenMintedBody('Good', 'good-slug', null, malicious, 'good-id', 'member', 'https://pot.test', 'seat').toString()
     expect(html).not.toContain(malicious)

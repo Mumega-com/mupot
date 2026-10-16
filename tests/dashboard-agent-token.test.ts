@@ -1482,6 +1482,26 @@ describe('POST /admin/agent-token/mint', () => {
     expect(text).toContain('Pick an agent')
   })
 
+  it('400 + keeps the preview snippet on a validation-error re-render (#1982)', async () => {
+    const env = makeRouteEnv('admin')
+    const form = new URLSearchParams({ agent_id: '', label: '' })
+    const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('This is the config you will paste after minting')
+  })
+
+  it('400 when the label starts with the seat-handle prefix mseat_ (#1982)', async () => {
+    const captured: Captured[] = []
+    const env = makeRouteEnv('admin', { captured })
+    for (const label of ['mseat_abc', 'MSEAT_abc']) {
+      const form = new URLSearchParams({ agent_id: AGENT.id, label })
+      const res = await dashboardApp.fetch(makeReq('/admin/agent-token/mint', 'POST', form), env)
+      expect(res.status).toBe(400)
+      expect(await res.text()).toContain('reserved for seat handles')
+    }
+    expect(captured).toHaveLength(0)
+  })
+
   it('404 when agent does not exist in this pot', async () => {
     const env = makeRouteEnv('admin', { agentExists: false })
     const form = new URLSearchParams({ agent_id: 'ghost-id', label: '' })
