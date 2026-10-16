@@ -404,40 +404,16 @@ function mapPrincipalError(error: unknown): never {
   throw error
 }
 
-/**
- * Append one standalone mutation fact. Receipt/domain executors keep ownership of
- * their private guard rows and do not call this function, preventing recursive or
- * double audit insertion.
- */
-export async function auditMutation(
+function auditInsertStatement(
   env: Env,
-  auth: AuthContext,
-  rawInput: MutationAuditInput,
-): Promise<MutationAuditRecord> {
-  const input = await normalizeInput(rawInput)
-  let principal: FlightSpinePrincipal
-  try {
-    principal = await resolveFlightSpinePrincipal(env, auth)
-  } catch (error) {
-    mapPrincipalError(error)
-  }
-  const credentialId = safeOptionalId(auth.tokenId, 255)
-  const replay = await findReplay(env, input)
-  if (replay !== null) {
-    return exactReplay(replay, env.TENANT_SLUG, principal, credentialId, input)
-  }
-
-  const identityJson = canonicalJson({
-    tenant: env.TENANT_SLUG,
-    requestId: input.requestId,
-    handler: input.handler,
-    operation: input.operation,
-    targetKind: input.targetKind,
-    targetId: input.targetId,
-  })
-  const id = `audit:${(await sha256Hex(identityJson)).slice(0, 48)}`
-  const recordedAt = new Date().toISOString()
-  const result = await env.DB.prepare(`
+  id: string,
+  principal: FlightSpinePrincipal,
+  credentialId: string | null,
+  input: NormalizedMutationAuditInput,
+  recordedAt: string,
+  anchor?: { sql: string; binds: unknown[] },
+) {
+  return env.DB.prepare(`
     INSERT INTO mutation_audit_entries (
       id, tenant, principal_kind, principal_id, member_id, agent_id,
       credential_id, runtime_seat_id, runtime_generation, origin, handler,
@@ -482,6 +458,7 @@ export async function auditMutation(
               AND seat.state = 'active' AND seat.current_generation = ?9
          )
        )
+       ${anchor ? `AND (${anchor.sql})` : ''}
   `).bind(
     id,
     env.TENANT_SLUG,
@@ -507,7 +484,73 @@ export async function auditMutation(
     input.evidenceJson,
     recordedAt,
     nowSqlUtc(),
-  ).run()
+    ...(anchor ? anchor.binds : []),
+  )
+}
+
+/**
+ * Same append-only fact as auditMutation, returned as a statement for a caller's D1 batch. `anchor` is an extra predicate
+ * (numbered placeholders from ?25) the row only lands under, so an audit entry can be tied to the write it describes.
+ */
+export async function prepareMutationAudit(
+  env: Env,
+  auth: AuthContext,
+  rawInput: MutationAuditInput,
+  anchor?: { sql: string; binds: unknown[] },
+) {
+  const input = await normalizeInput(rawInput)
+  let principal: FlightSpinePrincipal
+  try {
+    principal = await resolveFlightSpinePrincipal(env, auth)
+  } catch (error) {
+    mapPrincipalError(error)
+  }
+  const identityJson = canonicalJson({
+    tenant: env.TENANT_SLUG,
+    requestId: input.requestId,
+    handler: input.handler,
+    operation: input.operation,
+    targetKind: input.targetKind,
+    targetId: input.targetId,
+  })
+  const id = `audit:${(await sha256Hex(identityJson)).slice(0, 48)}`
+  return auditInsertStatement(env, id, principal, safeOptionalId(auth.tokenId, 255), input, new Date().toISOString(), anchor)
+}
+
+/**
+ * Append one standalone mutation fact. Receipt/domain executors keep ownership of
+ * their private guard rows and do not call this function, preventing recursive or
+ * double audit insertion.
+ */
+export async function auditMutation(
+  env: Env,
+  auth: AuthContext,
+  rawInput: MutationAuditInput,
+): Promise<MutationAuditRecord> {
+  const input = await normalizeInput(rawInput)
+  let principal: FlightSpinePrincipal
+  try {
+    principal = await resolveFlightSpinePrincipal(env, auth)
+  } catch (error) {
+    mapPrincipalError(error)
+  }
+  const credentialId = safeOptionalId(auth.tokenId, 255)
+  const replay = await findReplay(env, input)
+  if (replay !== null) {
+    return exactReplay(replay, env.TENANT_SLUG, principal, credentialId, input)
+  }
+
+  const identityJson = canonicalJson({
+    tenant: env.TENANT_SLUG,
+    requestId: input.requestId,
+    handler: input.handler,
+    operation: input.operation,
+    targetKind: input.targetKind,
+    targetId: input.targetId,
+  })
+  const id = `audit:${(await sha256Hex(identityJson)).slice(0, 48)}`
+  const recordedAt = new Date().toISOString()
+  const result = await auditInsertStatement(env, id, principal, credentialId, input, recordedAt).run()
   if (rowsWritten(result) !== 1) {
     throw new MutationAuditError('audit_persistence_conflict')
   }

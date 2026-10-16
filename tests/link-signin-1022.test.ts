@@ -40,6 +40,7 @@ describe('#1022 linked sign-ins', () => {
     h = createSqliteD1()
     applyAllMigrations(h.sqlite)
     sessions = kv()
+    googleAuthTime = null
     env = {
       DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN, SESSIONS: sessions,
       OAUTH_PROVIDER: 'google', OAUTH_CLIENT_ID: 'cid', OAUTH_CLIENT_SECRET: 'sec',
@@ -86,10 +87,12 @@ describe('#1022 linked sign-ins', () => {
     absorb(jar, res)
     return res
   }
+  let googleAuthTime: number | null = null // seconds; null = Google returns no id_token
+  const idTokenFor = (authTime: number) => `x.${btoa(JSON.stringify({ auth_time: authTime })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}.y`
   async function withGoogle<T>(sub: string, email: string | null, fn: () => Promise<T>): Promise<T> {
     const realFetch = globalThis.fetch
     globalThis.fetch = (async (u: string) => {
-      if (String(u).includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer' }))
+      if (String(u).includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer', ...(googleAuthTime === null ? {} : { id_token: idTokenFor(googleAuthTime) }) }))
       return new Response(JSON.stringify({ sub, ...(email ? { email, email_verified: true } : {}) }))
     }) as typeof fetch
     try { return await fn() } finally { globalThis.fetch = realFetch }
@@ -321,6 +324,113 @@ describe('#1022 linked sign-ins', () => {
     const done = await post(jar, '/auth/link-signin/confirm')
     expect(done.headers.get('location')).toBe('/account?signin=changed')
     expect(identity('sub-dup')?.member_id).toBe('mem-dup2')
+  })
+
+  it('agent-backed duplicate is not movable: refused at plan and at confirm, row not moved', async () => {
+    h.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-1', 'squad-1', 'ag-1', 'Ag', 'active');
+    `)
+    const jar = await mainSession()
+    const { state } = await startLink(jar)
+    expect((await completeLink(jar, state!, 'sub-dup', 'dup@gmail.test')).status).toBe(200) // movable so far
+    // the duplicate becomes an agent's member between callback and confirm
+    h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'ag-1', 'mem-dup', datetime('now'))`)
+    const done = await post(jar, '/auth/link-signin/confirm')
+    expect(done.headers.get('location')).toBe('/account?signin=already_linked')
+    expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+  })
+
+  it('an old member suspended or archived between callback and confirm is refused, row not moved', async () => {
+    for (const change of [`status = 'suspended'`, `archived_at = datetime('now')`]) {
+      h.sqlite.exec(`UPDATE members SET status = 'active', archived_at = NULL WHERE id = 'mem-dup'`)
+      const { jar } = await reachMoveConfirm()
+      h.sqlite.exec(`UPDATE members SET ${change} WHERE id = 'mem-dup'`)
+      const done = await post(jar, '/auth/link-signin/confirm')
+      expect(done.headers.get('location')).toBe('/account?signin=already_linked')
+      expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+    }
+  })
+
+  it('a duplicate promoted above the actor during the confirm window is refused', async () => {
+    const { jar } = await reachMoveConfirm()
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dup-owner', 'mem-dup', 'org', NULL, 'owner')`)
+    const done = await post(jar, '/auth/link-signin/confirm')
+    expect(done.headers.get('location')).toBe('/account?signin=already_linked')
+    expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+  })
+
+  it('a move that changes zero rows revokes nothing and audits nothing (cutoff and audit are anchored on the move)', async () => {
+    const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
+    const { jar } = await reachMoveConfirm()
+    // a race loser: the row update is silently skipped (RAISE(IGNORE)), so the guarded move changes 0 rows
+    h.sqlite.exec(`CREATE TRIGGER skip_move BEFORE UPDATE ON human_login_identities WHEN NEW.member_id = 'mem-main' BEGIN SELECT RAISE(IGNORE); END`)
+    const done = await post(jar, '/auth/link-signin/confirm')
+    expect(done.headers.get('location')).toBe('/account?signin=already_linked')
+    expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+    expect(await memberOf(oldBrowser)).toBe('mem-dup') // old session untouched
+    expect(audits('move')).toHaveLength(0)
+  })
+
+  it('the move audit lands in the same batch as the move', async () => {
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    const rows = audits('move') as { evidence_json: string }[]
+    expect(rows).toHaveLength(1)
+    expect(rows[0].evidence_json).toContain('mem-dup')
+    expect(rows[0].evidence_json).not.toContain('dup@gmail.test')
+  })
+
+  it('the confirm page names the Google account being moved and the old member, masked', async () => {
+    const { page } = await reachMoveConfirm()
+    expect(page).toContain('Google account being moved: <strong>d***@gmail.test</strong>')
+    expect(page).toContain('Its current member: <strong>d***@gmail.test</strong>')
+    expect(page).not.toContain('dup@gmail.test')
+  })
+
+  it('the link flow forces a fresh Google sign-in; normal login does not', async () => {
+    const jar = await mainSession()
+    const { res } = await startLink(jar)
+    const q = new URL(res.headers.get('location')!).searchParams
+    expect(q.get('prompt')).toContain('login')
+    expect(q.get('max_age')).toBe('0')
+    const login = await visit(new Map(), '/auth/login')
+    const lq = new URL(login.headers.get('location')!).searchParams
+    expect(lq.get('prompt')).toBe('select_account')
+    expect(lq.get('max_age')).toBeNull()
+  })
+
+  it('a stale Google auth_time (shared-browser account) is refused; a recent one links', async () => {
+    const jar = await mainSession()
+    const first = await startLink(jar)
+    googleAuthTime = Math.floor(Date.now() / 1000) - 3600
+    const stale = await completeLink(jar, first.state!, 'sub-new', 'other@gmail.test')
+    expect(stale.headers.get('location')).toBe('/account?signin=stale_google_signin')
+    expect(identity('sub-new')).toBeUndefined()
+    const second = await startLink(jar)
+    googleAuthTime = Math.floor(Date.now() / 1000) - 5
+    const ok = await completeLink(jar, second.state!, 'sub-new', 'other@gmail.test')
+    expect(ok.headers.get('location')).toBe('/account?signin=linked')
+  })
+
+  it('redirects and form targets survive the /t/<slug> prefix choke point (#1975)', async () => {
+    const { applyTenantPrefix } = await import('../src/platform/tenant-path')
+    const prefix = '/t/local'
+    const stale = await signIn('sub-main', 'main@example.test')
+    freshen('mem-main', 10 * 60 * 1000)
+    const reauth = await applyTenantPrefix((await startLink(stale)).res, prefix)
+    expect(reauth.headers.get('location')).toBe('/t/local/auth/reauth?return=/account')
+    const jar = await mainSession()
+    const { state } = await startLink(jar)
+    const linked = await applyTenantPrefix(await completeLink(jar, state!, 'sub-new', 'other@gmail.test'), prefix)
+    expect(linked.headers.get('location')).toBe('/t/local/account?signin=linked')
+    const { page } = await (async () => {
+      const j = await mainSession()
+      const st = (await startLink(j)).state!
+      const r = await applyTenantPrefix(await completeLink(j, st, 'sub-dup', 'dup@gmail.test'), prefix)
+      return { page: await r.text() }
+    })()
+    expect(page).toContain('action="/t/local/auth/link-signin/confirm"')
+    expect(page).toContain('href="/t/local/account"')
   })
 
   // ── 5. unlink ──────────────────────────────────────────────────────────────────────────────────

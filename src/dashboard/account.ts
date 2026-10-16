@@ -596,6 +596,7 @@ const SIGNIN_NOTICES: Record<string, string> = {
   identity_revoked: 'That Google account was unlinked from another member before and is not linked again automatically. Ask an org admin.',
   last_identity: 'You cannot unlink your last sign-in: you would lose access.',
   not_found: 'That sign-in was not found.',
+  stale_google_signin: 'Google did not ask you to sign in again just now. Start again and complete the Google sign-in.',
   reauth_required: 'Please confirm it is you again, then start linking from here.',
   expired: 'That link request expired. Start again.',
   changed: 'That Google account changed while you were confirming. Start again.',

@@ -546,6 +546,25 @@ interface GoogleToken {
   access_token: string
   expires_in: number
   token_type: string
+  id_token?: string
+}
+
+/**
+ * auth_time (seconds) from the id_token Google returned on the code exchange, or null when absent/unreadable. The token came
+ * straight from Google's token endpoint over TLS in exchange for OUR code, so its payload needs no signature check here; it is
+ * only used to REFUSE a link whose Google sign-in was not just performed (shared-browser case).
+ */
+function googleAuthTime(idToken: string | undefined): number | null {
+  if (!idToken) return null
+  const part = idToken.split('.')[1]
+  if (!part) return null
+  try {
+    const json = atob(part.replace(/-/g, '+').replace(/_/g, '/'))
+    const claim = JSON.parse(json) as { auth_time?: unknown }
+    return typeof claim.auth_time === 'number' && Number.isFinite(claim.auth_time) ? claim.auth_time : null
+  } catch {
+    return null
+  }
 }
 
 interface GoogleUserInfo {
@@ -794,7 +813,7 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'email_unverified' }, 403)
   }
 
-  if (linkTarget) return finishLinkSignIn(c, linkTarget, info.sub, info.email ?? null)
+  if (linkTarget) return finishLinkSignIn(c, linkTarget, info.sub, info.email ?? null, googleAuthTime(token.id_token))
 
   // Reauth branch (GET /auth/reauth's round trip): this callback is proving
   // freshness for an EXISTING session, not minting a new one. The returned
@@ -1078,6 +1097,7 @@ authApp.post('/telegram-link/confirm', async (c) => {
 // unauthenticated login, and never an identity named in a request.
 authApp.use('/link-signin/*', csrf())
 
+const GOOGLE_AUTH_MAX_AGE_SECONDS = 5 * 60
 const LINK_MOVE_COOKIE = 'mupot_link_move'
 const LINK_MOVE_KV_PREFIX = 'linkmove:'
 const LINK_MOVE_CONFIRM_PATH = '/auth/link-signin/confirm'
@@ -1118,7 +1138,9 @@ authApp.post('/link-signin/start', async (c) => {
     scope: 'openid email',
     state,
     access_type: 'online',
-    prompt: 'select_account',
+    // Link flow ONLY: demand a fresh Google credential so a still-logged-in account on a shared browser cannot be picked.
+    prompt: 'login select_account',
+    max_age: '0',
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
@@ -1133,6 +1155,7 @@ async function finishLinkSignIn(
   target: { webSessionIdHash: string; memberId: string },
   subject: string,
   email: string | null,
+  googleAuthTimeSec: number | null,
 ): Promise<Response> {
   c.header('Cache-Control', 'no-store')
   const env = c.env
@@ -1144,6 +1167,11 @@ async function finishLinkSignIn(
   }
   const session = await checkWebSession(env, auth, { fresh: true })
   if (!session.ok) return linkSigninRedirect(c, 'reauth_required')
+  // The link flow forces a fresh Google sign-in (prompt=login, max_age=0). When Google says when the user last authenticated,
+  // a stale auth_time means a still-logged-in Google account was picked, not proven: refuse.
+  if (googleAuthTimeSec !== null && Date.now() / 1000 - googleAuthTimeSec > GOOGLE_AUTH_MAX_AGE_SECONDS) {
+    return linkSigninRedirect(c, 'stale_google_signin')
+  }
   const input = { provider: 'google', subject, verifiedEmail: email }
   const plan = await planLinkSignIn(env, auth, input)
   if (plan.kind === 'move') {
@@ -1166,6 +1194,7 @@ async function finishLinkSignIn(
     const e = htmlEscape
     const created = e(plan.duplicate.createdAt.slice(0, 10))
     return c.html(linkMovePage(env.BRAND || env.TENANT_SLUG, `<h1>This Google account already has its own member</h1>
+<p>Google account being moved: <strong>${e(plan.duplicate.identityMaskedEmail ?? 'no email')}</strong>. Its current member: <strong>${e(plan.duplicate.maskedEmail ?? 'no email')}</strong>.</p>
 <p>This Google account already has its own member (created ${created}, ${plan.duplicate.permissions} permissions). Linking moves sign-in to this account; the old member is left as-is for an admin to archive.</p>
 <form method="post" action="${LINK_MOVE_CONFIRM_PATH}"><button type="submit">Move this sign-in to my account</button></form>
 <p><a href="/account">Cancel</a></p>`))

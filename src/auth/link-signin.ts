@@ -19,14 +19,14 @@
 //   - Every link, move and unlink writes a mutation_audit_entries row.
 
 import type { AuthContext, Env } from '../types'
-import { exceedsTargetRankCeiling, resolveCapabilities } from './capability'
+import { actorRankOnScopeFor, exceedsTargetRankCeiling, resolveCapabilities } from './capability'
 import { linkLoginIdentity, resolveLoginIdentity, type LoginIdentityRecord } from './login-identity'
 import { maskEmail } from './telegram-login-link'
 import { nowSqlUtc } from './token-lifecycle'
 import { revokeWebSessionsForLoginIdentity } from './web-sessions'
 import { revokeMemberPasskeys } from '../secure-moments/store'
 import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
-import { auditMutation } from '../flight-spine/audit'
+import { auditMutation, prepareMutationAudit } from '../flight-spine/audit'
 import {
   liveCompetingBearerSql,
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
@@ -62,6 +62,10 @@ export interface DuplicateMemberInfo {
   memberId: string
   createdAt: string
   permissions: number
+  /** Old member's email, masked (a***@domain), or null. */
+  maskedEmail: string | null
+  /** The Google account being moved, masked. */
+  identityMaskedEmail: string | null
 }
 
 export type LinkSignInRefusal =
@@ -85,6 +89,7 @@ export interface LinkSignInInput {
 }
 
 interface MemberFacts {
+  email: string | null
   created_at: string
   status: string
   archived_at: string | null
@@ -92,7 +97,7 @@ interface MemberFacts {
 
 async function memberFacts(env: Env, memberId: string): Promise<MemberFacts | null> {
   return env.DB.prepare(
-    `SELECT created_at, status, archived_at FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1`,
+    `SELECT email, created_at, status, archived_at FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1`,
   ).bind(memberId, env.TENANT_SLUG).first<MemberFacts>()
 }
 
@@ -149,7 +154,17 @@ export async function planLinkSignIn(env: Env, auth: AuthContext, input: LinkSig
   if (await backsAgent(env, other)) return { kind: 'refuse', error: 'already_linked' }
   if (await hasLiveCompetingBearer(env, other)) return { kind: 'refuse', error: 'already_linked' }
   const permissions = (await resolveCapabilities(env, other)).length
-  return { kind: 'move', duplicate: { identityId: existing.id, memberId: other, createdAt: facts.created_at, permissions } }
+  return {
+    kind: 'move',
+    duplicate: {
+      identityId: existing.id,
+      memberId: other,
+      createdAt: facts.created_at,
+      permissions,
+      maskedEmail: facts.email ? maskEmail(facts.email) : null,
+      identityMaskedEmail: existing.verified_email ? maskEmail(existing.verified_email) : null,
+    },
+  }
 }
 
 export type LinkSignInResult =
@@ -242,6 +257,10 @@ export async function linkSignIn(
       const { identityId, memberId: oldMemberId } = plan.duplicate
       const nowIso = new Date().toISOString()
       const nowSql = nowSqlUtc()
+      const requestId = crypto.randomUUID()
+      // Re-read at write time and enforced INSIDE the statement too: a promotion of the old member between the plan and the
+      // batch must not slip a higher-ranked member's identity away. (capabilities table only; the plan covers every plane.)
+      const actorRank = await actorRankOnScopeFor(env, auth, 'org', null)
       const move = env.DB.prepare(
         `UPDATE human_login_identities
             SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2
@@ -259,35 +278,63 @@ export async function linkSignIn(
               SELECT 1 FROM agent_member_bindings b WHERE b.tenant = ?4 AND b.member_id = ?5
             )
             AND NOT EXISTS (
+              SELECT 1 FROM capabilities c
+               WHERE c.member_id = ?5
+                 AND CASE c.capability WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3 WHEN 'member' THEN 2 ELSE 1 END > ?12
+            )
+            AND NOT EXISTS (
               SELECT 1 ${liveCompetingBearerSql({
                 tenant: '?4', member: '?5', exemptLabel: '?8', exemptChannel: '?9', directoryChannel: '?10', now: '?11',
               })}
             )`,
       ).bind(
         me, input.verifiedEmail, identityId, env.TENANT_SLUG, oldMemberId, input.provider, input.subject,
-        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql,
+        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank,
       )
-      // Anchored on the move: it only revokes the old member's sessions for this identity if the row now belongs to `me`.
+      // Everything after the move lands only if THIS batch's move changed a row: the audit row is the anchor (changes() is the
+      // move's own count because the audit INSERT directly follows it), and the cutoffs are anchored on the audit row.
+      let audit
+      try {
+        audit = await prepareMutationAudit(env, auth, {
+          origin: 'admin_ui',
+          handler: 'auth.linked_signins',
+          operation: 'move',
+          targetKind: 'login_identity',
+          targetId: identityId,
+          requestId,
+          evidence: { provider: input.provider, masked_email: maskedEmail, from_member_id: oldMemberId },
+        }, {
+          sql: `(SELECT changes()) > 0 AND EXISTS (
+                  SELECT 1 FROM human_login_identities h
+                   WHERE h.id = ?25 AND h.tenant = ?26 AND h.member_id = ?27 AND h.linked_by_member_id = ?27 AND h.revoked_at IS NULL)`,
+          binds: [identityId, env.TENANT_SLUG, me],
+        })
+      } catch (err) {
+        console.error('linked-signins move audit prepare failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
+        return { ok: false, error: 'service_error' }
+      }
+      const anchored = `EXISTS (SELECT 1 FROM mutation_audit_entries a
+                         WHERE a.tenant = ?1 AND a.request_id = ?2 AND a.handler = 'auth.linked_signins' AND a.operation = 'move')`
       const cutoff = env.DB.prepare(
-        `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = 'identity_moved'
-          WHERE tenant = ?2 AND member_id = ?3 AND login_identity_id = ?4 AND revoked_at IS NULL
-            AND EXISTS (
-              SELECT 1 FROM human_login_identities h
-               WHERE h.id = ?4 AND h.tenant = ?2 AND h.member_id = ?5 AND h.linked_by_member_id = ?5 AND h.revoked_at IS NULL
-            )`,
-      ).bind(nowIso, env.TENANT_SLUG, oldMemberId, identityId, me)
+        `UPDATE web_sessions SET revoked_at = ?3, revoke_reason = 'identity_moved'
+          WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
+      // Passkeys / phones enrolled under the old owner stay with the old member and are cut off in the same batch.
+      const passkeys = env.DB.prepare(
+        `UPDATE member_passkeys SET revoked_at = ?3 WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
+      const phones = env.DB.prepare(
+        `UPDATE tg_miniapp_devices SET revoked_at = ?3, revoked_reason = 'login_identity_moved'
+          WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
       let results: Awaited<ReturnType<typeof env.DB.batch>>
       try {
-        results = await env.DB.batch([move, cutoff])
+        results = await env.DB.batch([move, audit, cutoff, passkeys, phones])
       } catch (err) {
         console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }
       }
       if (Number(results[0]?.meta?.changes ?? 0) === 0) return { ok: false, error: 'already_linked' }
-      // Passkeys / phones enrolled under the old owner stay with the old member and are cut off (idempotent; a retry finishes it).
-      await revokeMemberPasskeys(env, oldMemberId, 'login_identity_moved', { loginIdentityId: identityId })
-      await revokeMemberTgDevices(env, oldMemberId, 'login_identity_moved', { loginIdentityId: identityId })
-      await auditLink(env, auth, 'move', identityId, { provider: input.provider, maskedEmail, fromMemberId: oldMemberId })
       return { ok: true, outcome: 'moved', identityId }
     }
   }
