@@ -810,6 +810,8 @@ export interface Member {
   telegram_chat_id: string | null // IM-only members reach mupot through Hermes
   status: 'active' | 'suspended'
   created_at: string
+  /** mupot#1997: set when this member's login identity was moved to another member; archive is an admin's call. */
+  superseded_by_member_id?: string | null
 }
 
 // 'directory' is the OAuth 2.1 door — a seat that connected via the /authorize

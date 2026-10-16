@@ -19,6 +19,7 @@ import type { Env } from '../types'
 import { nowSqlUtc } from './token-lifecycle'
 import {
   liveCompetingBearerSql,
+  notSupersededSql,
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_LABEL,
@@ -158,6 +159,7 @@ export async function redeemTelegramLoginLink(
              -- session's IdP-verified email must equal the member's email, always. A member with no email gets no
              -- link at all (mintTelegramLoginLink 'no_email'), and a NULL here matches nothing.
              AND lower(m.email) = lower(?11)
+             AND ${notSupersededSql('m')}
         )
         AND NOT EXISTS (
           SELECT 1 FROM agent_member_bindings b

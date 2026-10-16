@@ -3520,7 +3520,7 @@ async function canOnSquadRead(env: Env, grants: CapabilityGrant[], squadId: stri
 async function loadMembers(env: Env): Promise<Member[]> {
   // #1330 F-B: tenant-scoped, same rationale as src/members/index.ts GET /members.
   const rows = await env.DB.prepare(
-    'SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE tenant = ?1 OR tenant IS NULL ORDER BY created_at ASC, display_name ASC',
+    'SELECT id, email, display_name, telegram_chat_id, status, created_at, superseded_by_member_id FROM members WHERE tenant = ?1 OR tenant IS NULL ORDER BY created_at ASC, display_name ASC',
   )
     .bind(env.TENANT_SLUG)
     .all<Member>()
@@ -7137,6 +7137,9 @@ function memberRow(
         <strong>${m.display_name}</strong>
         <div class="t-meta">${m.email ?? html`<span class="empty">no email</span>`}</div>
         <div class="t-meta"><code>${m.id}</code></div>
+        ${m.superseded_by_member_id
+          ? html`<div class="t-meta" data-superseded="${m.superseded_by_member_id}">Superseded: its sign-in moved to <code>${m.superseded_by_member_id}</code>. Archive it when you are ready.</div>`
+          : ''}
       </td>
       <td>${chChips}</td>
       <td>${capChips}</td>

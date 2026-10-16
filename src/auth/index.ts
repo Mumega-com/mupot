@@ -1195,7 +1195,7 @@ async function finishLinkSignIn(
     const created = e(plan.duplicate.createdAt.slice(0, 10))
     return c.html(linkMovePage(env.BRAND || env.TENANT_SLUG, `<h1>This Google account already has its own member</h1>
 <p>Google account being moved: <strong>${e(plan.duplicate.identityMaskedEmail ?? 'no email')}</strong>. Its current member: <strong>${e(plan.duplicate.maskedEmail ?? 'no email')}</strong>.</p>
-<p>This Google account already has its own member (created ${created}, ${plan.duplicate.permissions} permissions). Linking moves sign-in to this account; the old member is left as-is for an admin to archive.</p>
+<p>This Google account already has its own member (created ${created}, ${plan.duplicate.permissions} permissions). Linking moves sign-in to this account; the old member is left as-is for an admin to archive. Your old account's connector sessions will be signed out; reconnect them and they will open this account.</p>
 <form method="post" action="${LINK_MOVE_CONFIRM_PATH}"><button type="submit">Move this sign-in to my account</button></form>
 <p><a href="/account">Cancel</a></p>`))
   }

@@ -111,6 +111,19 @@ export const PROVISIONING_EXEMPT_TOKEN_CHANNEL = 'dashboard'
 export const PROVISIONING_EXEMPT_DIRECTORY_CHANNEL = 'directory'
 
 /**
+ * mupot#1997: the ONE "superseded member" predicate. A member whose identity was moved away by a confirmed duplicate
+ * move carries `superseded_by_member_id`; it is never attachable by email again. SQL consumers (the identity-link
+ * INSERT guard, the Telegram login-link claim) interpolate `notSupersededSql`; the JS decision uses `isSupersededMember`.
+ * Both read the same column and nothing else re-derives it.
+ */
+export function notSupersededSql(alias = ''): string {
+  return `${alias ? `${alias}.` : ''}superseded_by_member_id IS NULL`
+}
+export function isSupersededMember(row: { superseded_by_member_id: string | null }): boolean {
+  return typeof row.superseded_by_member_id === 'string' // not `!== null`: a row read without the column (undefined) is not superseded
+}
+
+/**
  * The ONE copy of the "competing bearer" clause: a live, UNBOUND member bearer
  * (agent_id IS NULL) other than the documented provisioning-seed and
  * directory-connector exemptions. Returned as a `FROM member_tokens t WHERE ...`
@@ -181,6 +194,7 @@ export type CompetingControlReason =
   | 'live_login_identity'
   | 'live_member_bearer'
   | 'telegram_bound'
+  | 'superseded'
 
 export type DecideIdentitylessAttachResult =
   | { kind: 'eligible'; memberId: string; status: string }
@@ -202,6 +216,7 @@ interface CandidateRow {
   id: string
   status: string
   telegram_chat_id: string | null
+  superseded_by_member_id: string | null
 }
 
 /**
@@ -227,7 +242,7 @@ export async function decideIdentitylessAttach(
   if (!normalizedEmail) return { kind: 'not_found' }
 
   const rows = await env.DB.prepare(
-    `SELECT id, status, telegram_chat_id FROM members
+    `SELECT id, status, telegram_chat_id, superseded_by_member_id FROM members
       WHERE lower(email) = ?1 AND tenant = ?2`,
   )
     .bind(normalizedEmail, tenant)
@@ -237,6 +252,11 @@ export async function decideIdentitylessAttach(
   if (candidates.length > 1) return { kind: 'ambiguous' }
 
   const candidate = candidates[0]
+
+  // 0. mupot#1997: a superseded member (its identity moved to another member) is never re-attached by email.
+  if (isSupersededMember(candidate)) {
+    return { kind: 'denied_competing_control', reason: 'superseded' }
+  }
 
   // 1. Telegram bind — already have the column, no extra query.
   if (candidate.telegram_chat_id !== null) {

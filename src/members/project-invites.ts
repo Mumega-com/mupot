@@ -1,4 +1,5 @@
 import type { AuthContext, Capability, CapabilityGrant, Env, OrgKind } from '../types'
+import { notSupersededSql } from './exclusive-control'
 import {
   actorRankOnScopeFor,
   brandSquadScope,
@@ -384,7 +385,7 @@ function uniqueConstraintColumn(error: unknown, column: string): boolean {
  * compiled statement strings contain this exact constant, so any future edit
  * that touches one copy without the other fails immediately.
  */
-export const MEMBER_BIND_ELIGIBLE_SQL = "id = ? AND tenant = ? AND status = 'active' AND (telegram_chat_id IS NULL OR telegram_chat_id = ?)"
+export const MEMBER_BIND_ELIGIBLE_SQL = `id = ? AND tenant = ? AND status = 'active' AND (telegram_chat_id IS NULL OR telegram_chat_id = ?) AND ${notSupersededSql()}`
 
 /**
  * The bind-landed PROOF used to gate the capability grant and receipt

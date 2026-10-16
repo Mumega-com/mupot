@@ -24,6 +24,7 @@
 //   - handleImMessage  : (env, chatId, text) => Promise<string>. The pure entry
 //                        Hermes can call directly (or the webhook calls for it).
 
+import { notSupersededSql } from '../members/exclusive-control'
 import { Hono } from 'hono'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import type {
@@ -99,6 +100,7 @@ export async function memberForChat(env: Env, chatId: string): Promise<Member | 
     `SELECT id, email, display_name, telegram_chat_id, status, created_at
        FROM members
       WHERE telegram_chat_id = ?1 AND tenant = ?2
+        AND ${notSupersededSql()}
       LIMIT 1`,
   )
     .bind(chatId, env.TENANT_SLUG)

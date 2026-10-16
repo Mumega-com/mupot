@@ -4176,9 +4176,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "login_identity_move_claims" },
     ],
   },
+  {
+    file: "0234_members_superseded_by.sql",
+    sha256: "d86b5681672426da50a02324b8f4ade3516e514cce457193c4e063b148ea3c05",
+    statements: [
+      "-- 0234_members_superseded_by.sql — mupot#1997: a member whose only login identity was moved away by a confirmed\n-- linked-sign-in duplicate move (#1022) is SUPERSEDED by the member that took the identity. Nullable, additive: members is\n-- created by 0002, so this ALTER is safe on every schema the chain builds. NULL = not superseded (every existing row).\n-- Set only inside the move batch (src/auth/link-signin.ts); read by the one shared predicate in\n-- src/members/exclusive-control.ts so no email attach ever re-binds a login to a superseded member.\nALTER TABLE members ADD COLUMN superseded_by_member_id TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "30bcda6ca606c4a18759d8502bbff2ce6ef02b1a4e0a9eb372d07ba808930f17"
+export const SCHEMA_CHAIN_DIGEST: string = "38fe46ead4e53b223734d4c1ccebf35e88e384379950915390fd901c627f413a"
