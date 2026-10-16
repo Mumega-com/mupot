@@ -153,7 +153,9 @@ export const APPROVALS_FETCH_CEILING = APPROVALS_QUEUE_LIMIT * 5
 // Staleness is a DISPLAY partition, never a filter: an item untouched for
 // APPROVAL_OLDER_DAYS moves into a collapsed "Older" section that KEEPS its
 // approve/reject buttons. Nothing is hidden or made read-only by age.
-export const APPROVAL_OLDER_DAYS = 14
+// 7d: strictly BELOW the 14d expiry window (APPROVAL_EXPIRY.gate_verdict_days), so "Older" is a live
+// warning state, not a section that can never populate (an ask older than 14d is expired and swept).
+export const APPROVAL_OLDER_DAYS = 7
 export const APPROVAL_HISTORY_PAGE_SIZE = 20
 export const APPROVAL_LIVE_LIST_CAP = 20
 
