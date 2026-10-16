@@ -336,7 +336,7 @@ describe('"You asked" tab (?tab=sent): the viewer own asks, read-only', () => {
     const f = parseFilters({ p: [], kind: [], tab: 'sent', asks }, [])
     const html = String(approvalsSentBody(asks, f))
     expect(html).toContain('Decided by hadi')
-    expect(html).toContain('via Agent')
+    expect(html).toContain('assigned to your agent Agent')
     expect(html).toContain('>P0<')
     expect(html).toContain('>waiting<')
     expect(html).toContain('>approved<')

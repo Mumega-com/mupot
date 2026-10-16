@@ -447,7 +447,7 @@ export async function loadApprovalsSummary(env: Env, auth: AuthContext): Promise
 // a verdict; reused as a read filter it matched bindings, agent_keys and past submitters/
 // runners and leaked titles across squads). The ask is the viewer's when:
 //   - the task is assigned to the viewer as a human (assignee_member_id), or
-//   - it is assigned to an agent whose agents.owner_member_id IS the viewer (shown "via <agent>").
+//   - it is assigned to an agent whose agents.owner_member_id IS the viewer (shown "assigned to your agent <agent>", since someone else may have created the task).
 // AND the viewer can read the task's squad (resolveVisibleTaskScope/visibleTaskClause, the
 // task-list read fence, which also hides archived tasks). Exactly one fragment, named here so
 // it is one mutation target. ?1 = viewer member id.
