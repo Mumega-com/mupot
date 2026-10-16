@@ -41,13 +41,13 @@ function data(needsDecision: number, isLowerBound: boolean): OpsHealthData {
 // rendered string keeps this honest about what an operator actually sees.
 function renderedNeedsDecision(d: OpsHealthData): string {
   const html = String(opsHealthBody(d))
-  const idx = html.indexOf('Needs decision')
+  const idx = html.indexOf('Waiting on you')
   expect(idx).toBeGreaterThan(-1)
   // The value sits in the same stat card as the label; take a window around it.
   return html.slice(Math.max(0, idx - 400), idx + 400)
 }
 
-describe('/ops "Needs decision" KPI tells the truth about a capped queue', () => {
+describe('/ops "Waiting on you" KPI tells the truth about a capped queue', () => {
   it('renders a bare count when the queue was NOT truncated', () => {
     const window = renderedNeedsDecision(data(2, false))
     expect(window).toContain('>2<')

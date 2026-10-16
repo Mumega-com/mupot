@@ -5196,7 +5196,7 @@ function agentChip(a: Agent) {
 // Read-only except the operator-queue verdict buttons (existing endpoint).
 // Cost column renders '—' until #15 (metered spend) lands.
 
-function observatoryBody(
+export function observatoryBody(
   brand: string,
   data: ObservatoryData,
   approvals: ApprovalItem[],
@@ -5529,7 +5529,7 @@ export function opsHealthBody(data: OpsHealthData) {
     ${kpiRow([
       statCard({ label: 'Active agents', value: String(data.kpis.activeAgents), subTone: data.kpis.activeAgents > 0 ? 'ok' : 'warn' }),
       statCard({ label: 'Runtime online', value: String(data.kpis.runtimeOnline), subTone: data.kpis.runtimeOnline > 0 ? 'ok' : 'warn' }),
-      statCard({ label: 'Needs decision', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, sub: data.kpis.allReviewersNeedsDecision > data.kpis.needsDecision ? `${String(data.kpis.allReviewersNeedsDecision)}${data.kpis.allReviewersNeedsDecisionIsLowerBound ? '+' : ''} across all reviewers` : undefined, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
+      statCard({ label: 'Waiting on you', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, sub: data.kpis.allReviewersNeedsDecision > data.kpis.needsDecision ? `${String(data.kpis.allReviewersNeedsDecision)}${data.kpis.allReviewersNeedsDecisionIsLowerBound ? '+' : ''} across all reviewers` : undefined, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
       statCard({ label: 'Failures', value: String(data.kpis.blockedOrRejected), subTone: data.kpis.blockedOrRejected > 0 ? 'danger' : 'dim' }),
     ])}
     ${sectionPanel({
@@ -6621,7 +6621,7 @@ export function approvalsSentBody(asks: AskItem[], filters: ApprovalFilters, sho
     const chip = a.priority
       ? `<span class="prio-chip prio-${a.priority.toLowerCase()}">${a.priority}</span>`
       : '<span class="prio-chip prio-none">no priority</span>'
-    const via = a.via_agent ? ` · via ${escHtml(a.via_agent)}` : ''
+    const via = a.via_agent ? ` · assigned to your agent ${escHtml(a.via_agent)}` : ''
     const decider = a.gate_owner ? escHtml(a.gate_owner.replace(/^gate:/, '')) : 'unassigned'
     const project = a.project_name ? ` · ${escHtml(a.project_name)}` : ''
     return `
