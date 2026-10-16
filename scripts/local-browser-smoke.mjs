@@ -724,7 +724,15 @@ async function runApprovalWorkflow() {
     fail('approval workflow task did not enter review', { status: reviewResponse.status(), reviewed })
   }
 
+  // The seeded local-owner holds no gate_grants row for gate:local, so the default
+  // "Waiting on you" view (own gates only) does not list it; an owner who CAN decide
+  // it reaches it in one click through the "Other gates ... view" link.
   await page.goto(`${baseUrl}/approvals`, { waitUntil: 'networkidle', timeout: 20_000 })
+  if (await page.locator(`[data-task="${taskId}"]`).count() !== 0) {
+    fail('default Waiting-on-you view listed a gate the viewer does not hold', { taskId })
+  }
+  await page.locator('.appr-other-line a', { hasText: 'view' }).click()
+  await page.waitForLoadState('networkidle', { timeout: 20_000 })
   const card = page.locator(`[data-task="${taskId}"]`).first()
   await card.waitFor({ state: 'visible', timeout: 10_000 })
 

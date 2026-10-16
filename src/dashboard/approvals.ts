@@ -31,6 +31,7 @@ import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache, primeVerdi
 import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { compileVerdictIndependenceSql } from '../tasks/verdict-independence'
 
 export interface ApprovalItem {
   id: string
@@ -44,6 +45,17 @@ export interface ApprovalItem {
   result: string | null
   completed_at: string | null
   created_at: string
+  /** Last touch — drives the "Older" display partition. Optional: only the live queue selects it. */
+  updated_at?: string
+  /** True when the VIEWER holds a gate_grants row for this task's gate (resolved
+   *  through gate_grants + resolveGatePrincipal, never a name match). */
+  own_gate?: boolean
+  /** REVIEW_ENTERED_AT_SQL — when the task entered review (drives age, Older, sort). */
+  review_entered_at?: string
+  /** tasks.priority: P0..P3, null = untriaged. */
+  priority?: 'P0' | 'P1' | 'P2' | 'P3' | null
+  project_id?: string | null
+  project_name?: string | null
   // mupot#1081 — see module header. can_verdict = can_approve || can_reject;
   // kept as its own field because the card/queue UI decides whether to render
   // ANY action affordance at all (vs. the specific Approve/Reject buttons)
@@ -137,13 +149,39 @@ function isOwnerAdmin(auth: AuthContext): boolean {
 export const APPROVALS_QUEUE_LIMIT = 200
 export const APPROVALS_FETCH_CEILING = APPROVALS_QUEUE_LIMIT * 5
 
+// Staleness is a DISPLAY partition, never a filter: an item untouched for
+// APPROVAL_OLDER_DAYS moves into a collapsed "Older" section that KEEPS its
+// approve/reject buttons. Nothing is hidden or made read-only by age.
+export const APPROVAL_OLDER_DAYS = 14
+export const APPROVAL_HISTORY_PAGE_SIZE = 20
+export const APPROVAL_LIVE_LIST_CAP = 20
+
+// When did this task ENTER review? No table stores a status->review event, so
+// this ONE fragment derives it: the latest verdict_reversals row (the only
+// receipt of a re-entry into review, exact for reversed tasks), else
+// tasks.updated_at (the status->review UPDATE stamps it; the stall watchdog's
+// re-wakes live in gate_stall_rewakes and do NOT bump it). Later edits can only
+// move it forward, so age is a floor, never an overstatement. Swap this single
+// fragment for expires_at/review-entry when a real column lands.
+export const REVIEW_ENTERED_AT_SQL = `COALESCE(
+  (SELECT MAX(vr.created_at) FROM verdict_reversals vr WHERE vr.task_id = t.id),
+  t.updated_at, t.created_at)`
+
+export function isOlderItem(t: Pick<ApprovalItem, 'review_entered_at' | 'updated_at' | 'created_at'>, nowMs = Date.now()): boolean {
+  const touched = Date.parse(t.review_entered_at ?? t.updated_at ?? t.created_at)
+  // Unparseable timestamp => treated as older (collapsed, still actionable).
+  return !Number.isFinite(touched) || nowMs - touched > APPROVAL_OLDER_DAYS * 86_400_000
+}
+
 const BASE_SELECT = `
   SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
          t.assignee_agent_id, a.name AS agent_name, t.result, t.completed_at,
-         t.created_at
+         t.created_at, t.updated_at, ${REVIEW_ENTERED_AT_SQL} AS review_entered_at,
+         t.priority, t.project_id, pr.name AS project_name
     FROM tasks t
     LEFT JOIN squads s ON s.id = t.squad_id
     LEFT JOIN agents a ON a.id = t.assignee_agent_id
+    LEFT JOIN projects pr ON pr.id = t.project_id
    WHERE t.status = 'review'
      AND t.gate_owner IS NOT NULL
      AND ${TASK_NOT_ARCHIVED_SQL('t')}`
@@ -232,6 +270,8 @@ export interface ApprovalsQueue {
    *  cannot express "at least N" must say so rather than print this count
    *  as if it were exact. */
   actionableCountIsLowerBound: boolean
+  /** can_verdict rows in `items` whose gate the VIEWER holds a grant for — the sidebar/page badge. */
+  ownCount?: number
 }
 
 // Select the displayed window from a fully-decorated CANDIDATE set (already
@@ -251,15 +291,24 @@ export function selectQueueWindow(decorated: ApprovalItem[]): ApprovalsQueue {
     items,
     actionableCount: Math.min(actionable.length, APPROVALS_QUEUE_LIMIT),
     actionableCountIsLowerBound,
+    ownCount: items.filter((t) => t.can_verdict && t.own_gate === true).length,
   }
 }
 
 export async function loadApprovals(env: Env, auth: AuthContext): Promise<ApprovalsQueue> {
   if (isOwnerAdmin(auth)) {
-    const rs = await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC LIMIT ?1`)
-      .bind(APPROVALS_FETCH_CEILING)
-      .all<ApprovalRow>()
-    const decorated = await decorateApprovals(env, auth, rs.results ?? [])
+    // own_gate: does the VIEWER hold a gate_grants row for this task's gate.
+    const ownPrincipal = resolveGatePrincipal(auth)
+    const rs = ownPrincipal
+      ? await env.DB.prepare(
+        `SELECT q.*, EXISTS (SELECT 1 FROM gate_grants g WHERE g.capability = q.gate_owner
+                               AND g.principal_type = ?2 AND g.principal_id = ?3) AS own_gate
+           FROM (${BASE_SELECT} ORDER BY t.created_at ASC LIMIT ?1) q`,
+      ).bind(APPROVALS_FETCH_CEILING, ownPrincipal.type, ownPrincipal.id).all<Omit<ApprovalRow, 'own_gate'> & { own_gate: number }>()
+      : await env.DB.prepare(`${BASE_SELECT} ORDER BY t.created_at ASC LIMIT ?1`)
+        .bind(APPROVALS_FETCH_CEILING)
+        .all<Omit<ApprovalRow, 'own_gate'> & { own_gate: number }>()
+    const decorated = await decorateApprovals(env, auth, (rs.results ?? []).map((r) => ({ ...r, own_gate: Boolean(r.own_gate) })))
     return selectQueueWindow(decorated)
   }
 
@@ -278,7 +327,8 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
   )
     .bind(principal.type, principal.id, APPROVALS_FETCH_CEILING)
     .all<ApprovalRow>()
-  const decorated = await decorateApprovals(env, auth, rs.results ?? [])
+  // Non-admin: the EXISTS above already means every row is a gate the viewer holds.
+  const decorated = await decorateApprovals(env, auth, (rs.results ?? []).map((r) => ({ ...r, own_gate: true })))
   return selectQueueWindow(decorated)
 }
 
@@ -301,4 +351,137 @@ export function resultPreview(task: Pick<Task, 'result'>, max = 600): string | n
   const text = task.result.trim()
   if (text.length <= max) return text
   return `${text.slice(0, max).trimEnd()}…`
+}
+
+
+// ── history (?view=history) ──────────────────────────────────────────────────
+// Expired-but-still-pending items and decided items, newest first, read-only.
+// Same RBAC scoping as the live queue (owner/admin: all; others: gate_grants).
+
+export interface ApprovalHistoryRow {
+  id: string
+  title: string
+  gate_owner: string | null
+  squad_name: string | null
+  agent_name: string | null
+  at: string
+  verdict: 'approved' | 'rejected' | null
+}
+
+export interface ApprovalHistoryPage {
+  rows: ApprovalHistoryRow[]
+  page: number
+  hasMore: boolean
+}
+
+export interface ApprovalsSummary {
+  decidedThisWeek: number
+}
+
+function scopeFor(auth: AuthContext): { sql: string; binds: unknown[]; next: number } | null {
+  if (isOwnerAdmin(auth)) return { sql: '', binds: [], next: 1 }
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return null
+  return {
+    sql: `AND EXISTS (SELECT 1 FROM gate_grants g WHERE g.capability = t.gate_owner AND g.principal_type = ?1 AND g.principal_id = ?2)`,
+    binds: [principal.type, principal.id],
+    next: 3,
+  }
+}
+
+/** Decided items, newest first, read-only. Same RBAC scoping as the live queue. */
+export async function loadApprovalsHistory(env: Env, auth: AuthContext, page = 1): Promise<ApprovalHistoryPage> {
+  const safePage = Number.isInteger(page) && page >= 1 && page <= 10_000 ? page : 1
+  const scope = scopeFor(auth)
+  if (!scope) return { rows: [], page: safePage, hasMore: false }
+  const rs = await env.DB.prepare(
+    `SELECT t.id, t.title, t.gate_owner, s.name AS squad_name, a.name AS agent_name,
+            v.decided_at AS at, v.verdict AS verdict
+       FROM task_verdicts v
+       JOIN tasks t ON t.id = v.task_id
+       LEFT JOIN squads s ON s.id = t.squad_id
+       LEFT JOIN agents a ON a.id = t.assignee_agent_id
+      WHERE t.gate_owner IS NOT NULL AND t.status <> 'review'
+        AND v.decided_at = (SELECT MAX(v2.decided_at) FROM task_verdicts v2 WHERE v2.task_id = v.task_id)
+        AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}
+      ORDER BY v.decided_at DESC, t.id LIMIT ?${scope.next} OFFSET ?${scope.next + 1}`,
+  )
+    .bind(...scope.binds, APPROVAL_HISTORY_PAGE_SIZE + 1, (safePage - 1) * APPROVAL_HISTORY_PAGE_SIZE)
+    .all<ApprovalHistoryRow>()
+  const all = rs.results ?? []
+  return { rows: all.slice(0, APPROVAL_HISTORY_PAGE_SIZE), page: safePage, hasMore: all.length > APPROVAL_HISTORY_PAGE_SIZE }
+}
+
+/** The one quiet line under the list: decided this week. */
+export async function loadApprovalsSummary(env: Env, auth: AuthContext): Promise<ApprovalsSummary> {
+  const scope = scopeFor(auth)
+  if (!scope) return { decidedThisWeek: 0 }
+  const decided = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT v.task_id) AS n
+       FROM task_verdicts v JOIN tasks t ON t.id = v.task_id
+      WHERE t.gate_owner IS NOT NULL AND t.status <> 'review'
+        AND COALESCE(julianday(v.decided_at) > julianday('now') - 7, 0) = 1
+        AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}`,
+  ).bind(...scope.binds).first<{ n: number }>()
+  return { decidedThisWeek: Number(decided?.n ?? 0) }
+}
+
+
+// ── "You asked" (?tab=sent): asks the VIEWER originated, read-only ───────────
+// ORIGINATOR = the verdict-independence rule (src/tasks/verdict-independence.ts)
+// run for the viewer's member id, in BOTH of its legs: 'direct' (the viewer is a
+// party: assignee member, submitter/runner member) and 'affiliated' (the viewer
+// owns / is bound to / holds the key of a party agent => shown "via <agent>").
+// It is the SAME predicate the verdict writer uses to refuse the viewer's own
+// verdict, so a row listed here can never carry an act button, and the server
+// refuses regardless. Exactly one fragment, named here so it is one mutation target.
+export const ASK_ORIGINATED_BY_VIEWER_SQL = (memberId: string): { sql: string; params: string[] } =>
+  compileVerdictIndependenceSql(['direct', 'affiliated'], memberId, { column: 't.id' })
+
+export type AskState = 'waiting' | 'approved' | 'rejected'
+
+export interface AskItem {
+  id: string
+  title: string
+  body: string
+  gate_owner: string | null
+  priority: 'P0' | 'P1' | 'P2' | 'P3' | null
+  project_id: string | null
+  project_name: string | null
+  assignee_agent_id: string | null
+  agent_name: string | null
+  review_entered_at: string
+  created_at: string
+  updated_at: string
+  state: AskState
+  /** Set when the ask is the viewer's via an agent they own (not directly theirs). */
+  via_agent: string | null
+}
+
+export const ASKS_LIMIT = 200
+
+export async function loadAsks(env: Env, auth: AuthContext): Promise<AskItem[]> {
+  // Only a real member id can originate; an agent/anonymous principal has no "my asks".
+  if (!auth.memberId) return []
+  const own = ASK_ORIGINATED_BY_VIEWER_SQL(auth.memberId)
+  const rs = await env.DB.prepare(
+    `SELECT t.id, t.title, t.body, t.gate_owner, t.priority, t.project_id, pr.name AS project_name,
+            t.assignee_agent_id, a.name AS agent_name, t.status, t.created_at, t.updated_at,
+            ${REVIEW_ENTERED_AT_SQL} AS review_entered_at, t.assignee_member_id
+       FROM tasks t
+       LEFT JOIN agents a ON a.id = t.assignee_agent_id
+       LEFT JOIN projects pr ON pr.id = t.project_id
+      WHERE t.status IN ('review', 'approved', 'rejected') AND t.gate_owner IS NOT NULL
+        AND ${TASK_NOT_ARCHIVED_SQL('t')}
+        AND ${own.sql}
+      ORDER BY CASE t.status WHEN 'review' THEN 0 ELSE 1 END, t.updated_at DESC, t.id
+      LIMIT ?`,
+  ).bind(...own.params, ASKS_LIMIT).all<Omit<AskItem, 'state' | 'via_agent'> & { status: string; assignee_member_id: string | null }>()
+  return (rs.results ?? []).map((r) => ({
+    id: r.id, title: r.title, body: r.body, gate_owner: r.gate_owner, priority: r.priority,
+    project_id: r.project_id, project_name: r.project_name, assignee_agent_id: r.assignee_agent_id,
+    agent_name: r.agent_name, review_entered_at: r.review_entered_at, created_at: r.created_at, updated_at: r.updated_at,
+    state: r.status === 'review' ? 'waiting' : r.status === 'approved' ? 'approved' : 'rejected',
+    via_agent: r.assignee_member_id === auth.memberId ? null : (r.agent_name ?? r.assignee_agent_id),
+  }))
 }

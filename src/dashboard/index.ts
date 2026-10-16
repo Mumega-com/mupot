@@ -142,7 +142,16 @@ import {
   cursorSnippet,
   requiredCanonicalOrigin,
 } from './connect'
-import { loadApprovals, loadPublishable, resultPreview } from './approvals'
+import {
+  loadApprovals, loadPublishable, resultPreview, loadApprovalsHistory, loadApprovalsSummary, loadAsks,
+  APPROVAL_LIVE_LIST_CAP, isOlderItem,
+} from './approvals'
+import type { ApprovalHistoryPage, ApprovalsSummary, AskItem } from './approvals'
+import {
+  parseFilters, applyFilters, sortApprovals, sortAsks, scopeItems, filterOptions, activeFilterCount, filterQuery,
+  PRIORITY_VALUES, KIND_VALUES,
+} from './approvals-view'
+import type { ApprovalFilters } from './approvals-view'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 // Secret-env approvals (Task 5): the paste-capable admin section on /approvals —
 // this is deliberately NOT the task_verdict queue above, since paste fields
@@ -1072,14 +1081,49 @@ dashboardApp.get('/send', async (c) => {
 // admin-gated POST /admin/departments/:dept/execute/:gateId, no new write path.
 dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
+  // Sidebar badge: the SAME own-gate count the page header shows, as JSON.
+  const accept = c.req.header('accept') ?? ''
+  if (accept.includes('application/json') && !accept.includes('text/html')) {
+    const q = await loadApprovals(c.env, auth)
+    c.header('Cache-Control', 'no-store')
+    return c.json({ pending: q.ownCount ?? 0 })
+  }
+  if (c.req.query('tab') === 'sent') {
+    const asks = await loadAsks(c.env, auth)
+    const sentFilters = parseFilters({
+      p: c.req.queries('p') ?? [], agent: c.req.query('agent'), project: c.req.query('project'),
+      kind: [], tab: 'sent', asks,
+    }, [])
+    return c.html(shell(c.env, 'You asked', approvalsSentBody(asks, sentFilters, c.req.query('all') === '1')))
+  }
+  const view = c.req.query('view')
+  if (view === 'history') {
+    const page = Number(c.req.query('page') ?? '1')
+    const history = await loadApprovalsHistory(c.env, auth, page)
+    return c.html(shell(c.env, 'Approvals history', approvalsHistoryBody(history)))
+  }
+  if (view === 'other') {
+    const q = await loadApprovals(c.env, auth)
+    return c.html(shell(c.env, 'Other gates', approvalsOtherBody(q)))
+  }
   // Secret-env pending requests: admin-only, like loadPublishable above — a
   // non-admin caller never even queries the table, not just doesn't see a button.
-  const [approvalsQueue, publishable, secretEnvRequests] = await Promise.all([
+  const [approvalsQueue, publishable, secretEnvRequests, summary] = await Promise.all([
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
     isOrgAdmin(auth) ? listPendingSecretEnvRequests(c.env) : Promise.resolve([]),
+    loadApprovalsSummary(c.env, auth),
   ])
-  return c.html(shell(c.env, 'Approvals', approvalsBody(approvalsQueue, publishable, secretEnvRequests)))
+  const filters = parseFilters({
+    p: c.req.queries('p') ?? [],
+    agent: c.req.query('agent'),
+    project: c.req.query('project'),
+    kind: c.req.queries('kind') ?? [],
+    gate: c.req.query('gate'),
+  }, approvalsQueue.items)
+  return c.html(shell(c.env, 'Approvals', approvalsBody(
+    approvalsQueue, publishable, secretEnvRequests, summary, c.req.query('all') === '1', filters,
+  )))
 })
 
 // POST /admin/secret-env/:requestId/bind — admin pastes values for a pending
@@ -4399,6 +4443,17 @@ export function shell(
       .queue-section .appr-title { font-weight: 600; }
       .queue-section .appr-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
       .queue-section .appr-when { color: var(--dim); font-size: 12px; white-space: nowrap; }
+      .prio-chip {
+        display: inline-block; border: 1px solid var(--border); border-radius: 999px;
+        padding: 1px 8px; font-size: 11px; font-weight: 600; margin-right: 6px; color: var(--muted);
+      }
+      .prio-p0 { color: var(--danger, var(--warn)); border-color: var(--danger, var(--warn)); }
+      .prio-p1 { color: var(--warn); border-color: var(--warn); }
+      .prio-p2 { color: var(--accent); border-color: var(--accent); }
+      .prio-p3 { color: var(--dim); }
+      .appr-filters { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; padding: 10px 12px; }
+      .appr-filters fieldset { border: 0; margin: 0; padding: 0; display: flex; gap: 10px; align-items: center; }
+      .appr-check { font-size: 13px; color: var(--text); }
       .gate-chip {
         border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
         font-size: 12px; color: var(--accent);
@@ -6366,30 +6421,73 @@ function sendScript(projectId?: string) {
 // The inline <style> block for .appr-* classes was moved into shell() to avoid
 // duplication across pages.
 
-function approvalsBody(
+export function approvalsBody(
   approvalsQueue: ApprovalsQueue,
   publishable: PublishableItem[] = [],
   secretEnvRequests: PublicSecretEnvRequest[] = [],
+  summary: ApprovalsSummary = { decidedThisWeek: 0 },
+  showAll = false,
+  filtersIn?: ApprovalFilters,
 ) {
-  const { items, actionableCount, actionableCountIsLowerBound } = approvalsQueue
-  // Re-use the shared card renderer. Wrap in a named container so the script can
-  // scope its querySelectorAll without touching #obs-queue on the home page.
-  // `items` mixes actionable rows (buttons render) and informational ones (no
-  // buttons; see approvalCardHtml) — actionable rows always come first, see
-  // selectQueueWindow (src/dashboard/approvals.ts).
-  const cards = items.map((t) => approvalCardHtml(t)).join('')
-  const n = items.length
-  // mupot#1319 round 2, Codex FINDING 4/2 (CORRECTED from round 1, which used
-  // items.length — that counted informational/unactionable rows as "awaiting
-  // your gate," which they are not by this page's own definition, AND
-  // understated the true total once truncated since it never distinguished
-  // "hit the cap" from "this is everything"). The badge now reflects
-  // actionableCount specifically, with an explicit "+" whenever that count is
-  // a LOWER BOUND (actionableCountIsLowerBound) — see ApprovalsQueue's own
-  // doc comment for exactly what can make it one.
-  const badgeText = actionableCountIsLowerBound
-    ? `${String(actionableCount)}+ awaiting your gate`
-    : `${String(actionableCount)} awaiting your gate`
+  const { items, actionableCountIsLowerBound } = approvalsQueue
+  const filters = filtersIn ?? parseFilters({ p: [], kind: [] }, items)
+  // "Mine" = gates the VIEWER holds (gate_grants). The badge and the sentence
+  // count that set UNFILTERED, so the badge never changes with a filter.
+  const own = items.filter((t) => t.can_verdict && t.own_gate === true)
+  const other = items.filter((t) => !(t.can_verdict && t.own_gate === true))
+  const actionableCount = own.length
+  const highCount = own.filter((t) => t.priority === 'P0' || t.priority === 'P1').length
+  const visible = scopeItems(items, filters.gate)
+  const options = filterOptions(visible)
+  const filtered = sortApprovals(applyFilters(visible, filters))
+  const filterCount = activeFilterCount(filters)
+  const fresh = filtered.filter((t) => !isOlderItem(t))
+  const older = filtered.filter((t) => isOlderItem(t))
+  const shownFresh = showAll ? fresh : fresh.slice(0, APPROVAL_LIVE_LIST_CAP)
+  const hidden = fresh.length - shownFresh.length
+  const rowsHtml = shownFresh.map((t) => approvalRowHtml(t, filters.gate === 'all')).join('')
+  const olderSection = older.length
+    ? `<details class="appr-older"><summary class="muted">Older (${String(older.length)})</summary>${older.map((t) => approvalRowHtml(t, filters.gate === 'all')).join('')}</details>`
+    : ''
+  const n = filtered.length
+  const moreLink = hidden > 0
+    ? `<p><a class="btn secondary sm" href="/approvals${escAttr(filterQuery(filters, { all: '1' }))}">Show ${String(hidden)} more</a></p>`
+    : ''
+  const showVerdicts = filters.kind.length === 0 || filters.kind.includes('verdict')
+  const showPublish = filters.kind.length === 0 || filters.kind.includes('publish')
+  const showSecret = filters.kind.length === 0 || filters.kind.includes('secret')
+  const otherCounts = new Map<string, number>()
+  for (const t of other) {
+    const g = t.gate_owner ?? 'ungated'
+    otherCounts.set(g, (otherCounts.get(g) ?? 0) + 1)
+  }
+  const otherLine = filters.gate === 'mine' && other.length
+    ? `<p class="muted appr-other-line">Other gates: ${[...otherCounts.entries()].sort((a, b) => b[1] - a[1]).map(([g, c]) => `${escHtml(g.replace(/^gate:/, ''))} ${String(c)}`).join(' · ')} → <a href="/approvals?view=other">view</a></p>`
+    : ''
+  const historyLine = summary.decidedThisWeek > 0
+    ? `<p class="muted appr-history-line">${String(summary.decidedThisWeek)} decided this week → <a href="/approvals?view=history">History</a></p>`
+    : ''
+  const countText = `${String(actionableCount)}${actionableCountIsLowerBound ? '+' : ''}`
+  const badgeText = `${countText} waiting on you`
+  const sentence = actionableCount
+    ? `You have ${countText} decision${actionableCount === 1 && !actionableCountIsLowerBound ? '' : 's'} waiting${highCount ? ` · ${String(highCount)} high priority` : ''}`
+    : 'Nothing is waiting on you.'
+
+  const opt = (value: string, label: string, selected: boolean) =>
+    `<option value="${escAttr(value)}"${selected ? ' selected' : ''}>${escHtml(label)}</option>`
+  const check = (name: string, value: string, label: string, on: boolean) =>
+    `<label class="appr-check"><input type="checkbox" name="${name}" value="${escAttr(value)}"${on ? ' checked' : ''}> ${escHtml(label)}</label>`
+  const filterBar = `
+    <form method="get" action="/approvals" class="card appr-filters">
+      <fieldset><legend class="muted">Priority</legend>${PRIORITY_VALUES.map((v) => check('p', v, v === 'none' ? 'No priority' : v, filters.priority.includes(v))).join('')}</fieldset>
+      <label class="muted">Sender <select name="agent">${opt('', 'Anyone', !filters.agent)}${options.agents.map((a) => opt(a.id, a.name, filters.agent === a.id)).join('')}</select></label>
+      <label class="muted">Project <select name="project">${opt('', 'All projects', !filters.project)}${options.projects.map((pr) => opt(pr.id, pr.name, filters.project === pr.id)).join('')}</select></label>
+      <fieldset><legend class="muted">Kind</legend>${KIND_VALUES.map((v) => check('kind', v, v === 'verdict' ? 'Decision' : v === 'publish' ? 'Publish' : 'Secret env', filters.kind.includes(v))).join('')}</fieldset>
+      <label class="muted">Show <select name="gate">${opt('mine', 'Mine only', filters.gate === 'mine')}${opt('all', 'Everything I can decide', filters.gate === 'all')}</select></label>
+      <button class="btn sm" type="submit">Apply</button>
+      <span class="muted appr-filter-count">${filterCount ? `${String(filterCount)} filter${filterCount === 1 ? '' : 's'} active · <a href="/approvals">clear</a>` : 'No filters'}</span>
+    </form>`
+  const showing = filterCount && showVerdicts ? `<p class="muted">Showing ${String(n)} of ${String(visible.length)}</p>` : ''
 
   // "Ready to publish" (flight-1 gap fix): tasks already past the gate
   // (status='approved', gate:content) with no operator control to fire the real
@@ -6397,7 +6495,7 @@ function approvalsBody(
   // always [] for a non-admin caller, so this whole section (and its button)
   // is simply absent from their HTML, not just disabled.
   const pubCards = publishable.map((t) => publishCardHtml(t)).join('')
-  const pn = publishable.length
+  const pn = showPublish ? publishable.length : 0
   const publishSection = pn
     ? html`
         ${pageHeader({
@@ -6411,24 +6509,175 @@ function approvalsBody(
         ${publishScript()}`
     : html``
 
-  // "Gate clear" means nothing NEEDS the caller's decision — that is
-  // actionableCount, not n (items.length also counts informational rows
-  // with no verdict action at all; a queue full of those is still clear).
-  const sub = actionableCountIsLowerBound
-    ? 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it. The queue is deep enough that this count is a floor, not a total — some waiting work may not be listed below yet.'
-    : 'Agents propose work; you authorize it. This is the only place human authority enters the loop — untrusted input can wake an agent, never steer it.'
   return html`
     ${pageHeader({
-      crumbs: 'Overview / The Gate',
-      title: 'The Gate',
-      sub,
-      badge: actionableCount ? badgeText : 'Gate clear',
+      crumbs: 'Overview / Waiting on you',
+      title: 'Waiting on you',
+      sub: 'Decisions agents need from you. Nothing here runs until you approve it.',
+      badge: actionableCount ? badgeText : 'All clear',
       badgeTone: actionableCount ? 'warn' : 'ok',
     })}
-    ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
-    ${n ? approvalsScript() : html``}
+    ${raw(approvalsTabsHtml('waiting'))}
+    <p class="appr-sentence"><strong>${sentence}</strong></p>
+    ${raw(filterBar)}
+    ${raw(showing)}
+    ${showVerdicts
+      ? (n
+        ? raw(`<div id="approvals-list">${rowsHtml}${moreLink}${olderSection}</div>`)
+        : html`<div class="card"><p class="empty">${filterCount ? 'No decisions match these filters.' : 'Nothing is waiting on you. Work lands here when an agent finishes it.'}</p></div>`)
+      : html``}
+    ${raw(otherLine)}
+    ${raw(historyLine)}
+    ${showVerdicts && n ? approvalsScript() : html``}
     ${publishSection}
-    ${secretEnvApprovalsSection(secretEnvRequests)}`
+    ${showSecret ? secretEnvApprovalsSection(secretEnvRequests) : html``}`
+}
+
+function groupedRows(rows: ApprovalItem[]): string {
+  const groups = new Map<string, ApprovalItem[]>()
+  for (const t of rows) {
+    const key = t.gate_owner ?? 'ungated'
+    const g = groups.get(key)
+    if (g) g.push(t)
+    else groups.set(key, [t])
+  }
+  return [...groups.entries()]
+    .map(([gate, rs]) => `<h3 class="appr-group">${escHtml(gate)} <span class="muted">${String(rs.length)}</span></h3>${rs.map((t) => approvalRowHtml(t)).join('')}`)
+    .join('')
+}
+
+/** Compact one-row approval: who, what, age, approve/reject. Same hooks as
+ *  approvalCardHtml (.approval / .appr-note / .appr-approve / .appr-reject), so
+ *  approvalsScript wires it unchanged. Buttons render only per can_approve /
+ *  can_reject — the same server-computed predicate as the write route. */
+function approvalRowHtml(t: ApprovalItem, showGate = false): string {
+  const sender = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
+  const project = t.project_name ? ` · ${escHtml(t.project_name)}` : ''
+  const entered = Date.parse(t.review_entered_at ?? t.updated_at ?? t.created_at)
+  const ageDays = Number.isFinite(entered) ? Math.max(0, Math.floor((Date.now() - entered) / 86_400_000)) : null
+  const age = ageDays === null ? 'age unknown' : ageDays === 0 ? 'in review today' : `${String(ageDays)}d in review`
+  const chip = t.priority
+    ? `<span class="prio-chip prio-${t.priority.toLowerCase()}">${t.priority}</span>`
+    : '<span class="prio-chip prio-none">no priority</span>'
+  const gate = showGate && t.gate_owner ? ` · <span class="gate-chip">${escHtml(t.gate_owner.replace(/^gate:/, ''))}</span>` : ''
+  const detail = t.body
+    ? `<details><summary class="muted">details</summary><div class="appr-body">${escHtml(t.body)}</div></details>`
+    : ''
+  const actions = t.can_verdict
+    ? `<input type="text" class="appr-note" placeholder="note (required to reject)" />
+          ${t.can_approve ? '<button class="btn appr-approve">Approve</button>' : ''}
+          ${t.can_reject ? '<button class="btn btn-reject appr-reject">Reject</button>' : ''}
+          <span class="appr-status"></span>`
+    : '<span class="appr-no-action muted">no action for you</span>'
+  return `
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}">
+      <div class="appr-head">
+        <div>
+          <div class="appr-title">${chip} ${escHtml(t.title)}</div>
+          <div class="appr-meta">From ${sender}${project} · ${age}${gate}</div>
+        </div>
+        <div class="appr-actions">${actions}</div>
+      </div>
+      ${detail}
+    </div>`
+}
+
+function approvalsTabsHtml(active: 'waiting' | 'sent'): string {
+  const tab = (href: string, label: string, on: boolean) =>
+    `<a class="btn ${on ? '' : 'secondary '}sm" href="${href}"${on ? ' aria-current="page"' : ''}>${label}</a>`
+  return `<nav class="appr-tabs" aria-label="Approvals">${tab('/approvals', 'Waiting on you', active === 'waiting')} ${tab('/approvals?tab=sent', 'You asked', active === 'sent')}</nav>`
+}
+
+/** ?tab=sent — asks the viewer originated. Read-only by construction: the
+ *  originator predicate IS the verdict-independence rule, so no act control is
+ *  ever emitted here and the verdict route refuses these rows anyway. */
+export function approvalsSentBody(asks: AskItem[], filters: ApprovalFilters, showAll = false) {
+  const options = filterOptions(asks)
+  const filtered = sortAsks(applyFilters(asks, filters))
+  const shown = showAll ? filtered : filtered.slice(0, APPROVAL_LIVE_LIST_CAP)
+  const hidden = filtered.length - shown.length
+  const waiting = asks.filter((a) => a.state === 'waiting').length
+  const filterCount = (filters.priority.length ? 1 : 0) + (filters.agent ? 1 : 0) + (filters.project ? 1 : 0)
+  const opt = (value: string, label: string, selected: boolean) =>
+    `<option value="${escAttr(value)}"${selected ? ' selected' : ''}>${escHtml(label)}</option>`
+  const bar = `
+    <form method="get" action="/approvals" class="card appr-filters">
+      <input type="hidden" name="tab" value="sent">
+      <fieldset><legend class="muted">Priority</legend>${PRIORITY_VALUES.map((v) => `<label class="appr-check"><input type="checkbox" name="p" value="${v}"${filters.priority.includes(v) ? ' checked' : ''}> ${v === 'none' ? 'No priority' : v}</label>`).join('')}</fieldset>
+      <label class="muted">Sender <select name="agent">${opt('', 'Anyone', !filters.agent)}${options.agents.map((a) => opt(a.id, a.name, filters.agent === a.id)).join('')}</select></label>
+      <label class="muted">Project <select name="project">${opt('', 'All projects', !filters.project)}${options.projects.map((pr) => opt(pr.id, pr.name, filters.project === pr.id)).join('')}</select></label>
+      <button class="btn sm" type="submit">Apply</button>
+      <span class="muted appr-filter-count">${filterCount ? `${String(filterCount)} filter${filterCount === 1 ? '' : 's'} active · <a href="/approvals?tab=sent">clear</a>` : 'No filters'}</span>
+    </form>`
+  const row = (a: AskItem): string => {
+    const entered = Date.parse(a.review_entered_at)
+    const days = Number.isFinite(entered) ? Math.max(0, Math.floor((Date.now() - entered) / 86_400_000)) : null
+    const age = days === null ? 'age unknown' : days === 0 ? 'today' : `${String(days)}d`
+    const chip = a.priority
+      ? `<span class="prio-chip prio-${a.priority.toLowerCase()}">${a.priority}</span>`
+      : '<span class="prio-chip prio-none">no priority</span>'
+    const via = a.via_agent ? ` · via ${escHtml(a.via_agent)}` : ''
+    const decider = a.gate_owner ? escHtml(a.gate_owner.replace(/^gate:/, '')) : 'unassigned'
+    const project = a.project_name ? ` · ${escHtml(a.project_name)}` : ''
+    return `
+    <div class="card ask" data-task="${escAttr(a.id)}" data-state="${a.state}">
+      <div class="appr-head">
+        <div>
+          <div class="appr-title">${chip} ${escHtml(a.title)}</div>
+          <div class="appr-meta">Decided by ${decider}${via}${project} · ${age}</div>
+        </div>
+        <div class="appr-when"><span class="gate-chip">${a.state}</span></div>
+      </div>
+    </div>`
+  }
+  const more = hidden > 0
+    ? `<p><a class="btn secondary sm" href="/approvals${escAttr(`?tab=sent${filterQuery({ ...filters, kind: [], gate: 'mine' }, { all: '1' }).replace(/^\?/, '&')}`)}">Show ${String(hidden)} more</a></p>`
+    : ''
+  return html`
+    ${pageHeader({
+      crumbs: 'Overview / You asked',
+      title: 'You asked',
+      sub: 'Work you or your agents sent for a decision. Read-only — you cannot approve your own asks.',
+      badge: waiting ? `${String(waiting)} waiting` : 'None waiting',
+      badgeTone: waiting ? 'warn' : 'ok',
+    })}
+    ${raw(approvalsTabsHtml('sent'))}
+    ${raw(bar)}
+    ${filtered.length
+      ? raw(`<div id="asks-list">${shown.map(row).join('')}${more}</div>`)
+      : html`<div class="card"><p class="empty">${filterCount ? 'No asks match these filters.' : 'You have not asked anything of a gate yet.'}</p></div>`}`
+}
+
+/** ?view=other — gates the viewer does not hold, grouped by gate, same compact
+ *  rows. An org owner keeps buttons wherever evaluateVerdictGates allows. */
+export function approvalsOtherBody(q: ApprovalsQueue) {
+  const other = q.items.filter((t) => !(t.can_verdict && t.own_gate === true))
+  const fresh = other.filter((t) => !isOlderItem(t))
+  const older = other.filter((t) => isOlderItem(t))
+  const olderSection = older.length
+    ? `<details class="appr-older"><summary class="muted">Older (${String(older.length)})</summary>${groupedRows(older)}</details>`
+    : ''
+  return html`
+    ${pageHeader({ crumbs: 'Overview / The Gate / Other gates', title: 'Other gates', sub: 'Work waiting on gates you do not hold.' })}
+    ${other.length
+      ? raw(`<div id="approvals-list">${groupedRows(fresh)}${olderSection}</div>`)
+      : html`<div class="card"><p class="empty">Nothing waiting on other gates.</p></div>`}
+    ${other.length ? approvalsScript() : html``}
+    <p><a href="/approvals">← Back to approvals</a></p>`
+}
+
+export function approvalsHistoryBody(h: ApprovalHistoryPage) {
+  const rows = h.rows.map((r) =>
+    `<tr><td>${escHtml(r.title)}</td><td>${escHtml(r.gate_owner ?? '')}</td><td>${escHtml(r.agent_name ?? r.squad_name ?? '')}</td><td>${escHtml(r.verdict ?? 'decided')}</td><td>${escHtml(r.at.slice(0, 16).replace('T', ' '))}</td></tr>`,
+  ).join('')
+  const prev = h.page > 1 ? `<a class="btn secondary sm" href="/approvals?view=history&amp;page=${String(h.page - 1)}">Newer</a> ` : ''
+  const next = h.hasMore ? `<a class="btn secondary sm" href="/approvals?view=history&amp;page=${String(h.page + 1)}">Older</a>` : ''
+  return html`
+    ${pageHeader({ crumbs: 'Overview / The Gate / History', title: 'Approvals history', sub: 'Decided items, read-only.' })}
+    ${rows
+      ? raw(`<div class="card"><table class="ui-table"><thead><tr><th>What</th><th>Gate</th><th>Who</th><th>Verdict</th><th>When</th></tr></thead><tbody>${rows}</tbody></table></div><p>${prev}${next}</p>`)
+      : html`<div class="card"><p class="empty">Nothing decided yet.</p></div>`}
+    <p><a href="/approvals">← Back to approvals</a></p>`
 }
 
 /**

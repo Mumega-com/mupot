@@ -57,7 +57,8 @@ describe('loadApprovals', () => {
     expect(out.items).toHaveLength(2)
     expect(out.actionableCount).toBe(0)
     expect(calls[0].sql).toContain("t.status = 'review'")
-    expect(calls[0].sql).not.toContain('gate_grants')
+    // gate_grants may appear ONLY as the own_gate projection (a flag), never as a row filter.
+    expect(calls[0].sql.replace(/EXISTS \(SELECT 1 FROM gate_grants[\s\S]*?\) AS own_gate/, '')).not.toContain('gate_grants')
     // ungated review tasks are unverdictable zombies — the queue must not offer
     // an Approve button that would 409 'no_gate'.
     expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
@@ -66,7 +67,8 @@ describe('loadApprovals', () => {
   it('admin gets the same query — unfiltered by grants, filtered to gated tasks', async () => {
     const { env, calls } = makeEnv([])
     await loadApprovals(env, auth({ role: 'admin' }))
-    expect(calls[0].sql).not.toContain('gate_grants')
+    // gate_grants may appear ONLY as the own_gate projection (a flag), never as a row filter.
+    expect(calls[0].sql.replace(/EXISTS \(SELECT 1 FROM gate_grants[\s\S]*?\) AS own_gate/, '')).not.toContain('gate_grants')
     expect(calls[0].sql).toContain('t.gate_owner IS NOT NULL')
   })
 

@@ -708,7 +708,7 @@ export async function createCollectorDependencies(config) {
 
     async approveTask({ taskId, runId }) {
       const active = await ensureBrowser()
-      await active.page.goto(`${baseUrl}/approvals`, { waitUntil: 'networkidle', timeout: 20_000 })
+      await active.page.goto(`${baseUrl}/approvals?gate=all&all=1`, { waitUntil: 'networkidle', timeout: 20_000 })
       const safeTaskId = taskId.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
       const card = active.page.locator(`[data-task="${safeTaskId}"]`)
       if (await card.count() !== 1) throw new Error('control task was not rendered in Approvals')
