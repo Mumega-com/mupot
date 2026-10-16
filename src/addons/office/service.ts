@@ -59,6 +59,7 @@
 // built around — see the PR body.
 
 import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../types'
+import { isGateAskExpired } from '../../gates/approval-expiry-rule'
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
@@ -67,6 +68,7 @@ import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
   TaskArchivedError,
+  ApprovalExpiredError,
   buildVerdictStatements,
   assertVerdictWritable,
   emitVerdictBusEvent,
@@ -468,6 +470,7 @@ export async function reviewOfficeApproval(
     return { ok: true, value: { task: written.task } }
   } catch (error) {
     if (error instanceof TaskArchivedError) return { ok: false, reason: 'task_archived' }
+    if (error instanceof ApprovalExpiredError) return { ok: false, reason: 'approval_expired' }
     if (error instanceof VerdictRaceError) return { ok: false, reason: 'verdict_race' }
     throw error
   }
@@ -593,6 +596,7 @@ async function writeOfficeVerdictAndBindFreeze(
     // freeze extraGuard no longer holds. The verdict INSERT and the freeze
     // bind/void statement are both, by construction, no-ops in this same
     // transaction (their EXISTS guards cannot be satisfied) — nothing to roll back.
+    if (await isGateAskExpired(env, task.id)) throw new ApprovalExpiredError(task.id)
     throw new VerdictRaceError(task.id)
   }
 

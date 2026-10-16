@@ -26,6 +26,8 @@ function addTask(id: string, opts: { ageDays?: number; status?: string; gate?: s
     `INSERT INTO tasks (id, squad_id, title, status, done_when, gate_owner, assignee_agent_id, priority, project_id, created_at, updated_at)
      VALUES (?, 's1', ?, ?, 'x', ?, ?, ?, ?, datetime('now', ?), datetime('now', ?))`,
   ).run(id, opts.title ?? `Task ${id}`, opts.status ?? 'review', opts.gate ?? 'gate:hadi', opts.agent ?? 'a1', opts.priority ?? null, opts.project ?? null, age, age)
+  // The review clock (tasks.review_entered_at, stamped by trigger at INSERT) follows the fixture's age.
+  h.sqlite.prepare(`UPDATE tasks SET review_entered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?) WHERE id = ?`).run(age, id)
 }
 const verdict = (taskId: string, ageDays = 0) =>
   h.sqlite.prepare(`INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at) VALUES (?, ?, 'approved', 'm-op', datetime('now', ?))`)
@@ -100,11 +102,13 @@ describe('approvals: own gate vs other gates', () => {
 
   it('older items collapse into Older (N) and KEEP approve/reject buttons', async () => {
     addTask('fresh', { ageDays: 1 })
-    addTask('old1', { ageDays: APPROVAL_OLDER_DAYS + 5 })
-    addTask('old2', { ageDays: APPROVAL_OLDER_DAYS + 50 })
+    // Older (display, 7d) sits BELOW the expiry window (14d): an older ask is still live and actionable.
+    addTask('old1', { ageDays: APPROVAL_OLDER_DAYS + 1 })
+    addTask('old2', { ageDays: APPROVAL_OLDER_DAYS + 3 })
+    addTask('expired', { ageDays: 40 }) // past the expiry window: not listed at all (swept to blocked)
     const q = await loadApprovals(env, owner)
     const html = String(approvalsBody(q))
-    expect(html).toContain('3 waiting on you') // age never drops the count
+    expect(html).toContain('3 waiting on you') // age never drops the count; an EXPIRED ask is not waiting
     expect(html).toContain('Older (2)')
     const olderStart = html.indexOf('appr-older')
     const olderPart = html.slice(olderStart).split('<script>')[0]
@@ -166,7 +170,7 @@ describe('sidebar badge: GET /approvals with Accept: application/json', () => {
     h.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-org', 'm-op', 'org', NULL, 'admin');
     `)
-    addTask('mine0', { ageDays: 1 }); addTask('mine1', { ageDays: 40 })
+    addTask('mine0', { ageDays: 1 }); addTask('mine1', { ageDays: 10 })
     addTask('kc', { gate: 'gate:kasra-core', ageDays: 1 })
     const routeEnv = {
       DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test',
@@ -276,16 +280,15 @@ describe('approvals page for humans: sort, filters, options', () => {
     }
   })
 
-  it('review entry = latest verdict reversal when one exists (a later touch does not rejuvenate it), else updated_at', async () => {
-    addTask('rev', { ageDays: 0 })
+  it('review entry = tasks.review_entered_at (a later updated_at touch does not rejuvenate it), the same column the expiry predicate reads', async () => {
+    addTask('late', { ageDays: 0 })
     addTask('plain', { ageDays: 3 })
-    h.sqlite.exec(`INSERT INTO verdict_reversals (id, tenant, task_id, squad_id, from_status, reason, actor_id, created_at)
-      VALUES ('vr1', '${TENANT}', 'rev', 's1', 'approved', 'redo', 'm-op', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 days'))`)
+    h.sqlite.exec(`UPDATE tasks SET review_entered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${APPROVAL_OLDER_DAYS + 2} days') WHERE id = 'late'`)
     const items = (await loadApprovals(env, owner)).items
-    const rev = items.find((t) => t.id === 'rev')
+    const late = items.find((t) => t.id === 'late')
     const plain = items.find((t) => t.id === 'plain')
-    expect(Date.now() - Date.parse(rev?.review_entered_at ?? '')).toBeGreaterThan(19 * 86_400_000)
-    expect(plain?.review_entered_at).toBe(plain?.updated_at)
+    expect(Date.now() - Date.parse(late?.review_entered_at ?? '')).toBeGreaterThan((APPROVAL_OLDER_DAYS + 1) * 86_400_000)
+    expect(Date.parse(plain?.review_entered_at ?? '')).toBeLessThan(Date.now() - 2 * 86_400_000)
     expect(String(approvalsBody({ items, actionableCount: 2, actionableCountIsLowerBound: false, ownCount: 2 }))).toContain('Older (1)')
   })
 })

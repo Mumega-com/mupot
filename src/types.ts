@@ -92,6 +92,9 @@ export interface Env {
   // gate wake is re-sent (default 30), and the max re-wakes per review episode (default 3).
   GATE_STALL_THRESHOLD_MINUTES?: string
   GATE_STALL_MAX_REWAKES?: string
+  // Approval expiry sweep (src/gates/approval-expiry.ts): the cron is a DRY RUN (logs counts, writes
+  // nothing) unless this is exactly '1'.
+  APPROVAL_EXPIRY_ENFORCE?: string
   // Which IdP the human web-login door uses. NAMED `IDP_PROVIDER`, NOT `OAUTH_PROVIDER` —
   // @cloudflare/workers-oauth-provider RESERVES the binding name `OAUTH_PROVIDER` and
   // injects its own OAuthHelpersImpl instance there at runtime. Declaring that name as a

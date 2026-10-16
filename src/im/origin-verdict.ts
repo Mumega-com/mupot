@@ -114,6 +114,7 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from './index'
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { evaluateVerdictGates } from '../tasks/index'
+import { isGateAskExpired } from '../gates/approval-expiry-rule'
 import {
   assertVerdictWritable,
   buildVerdictStatements,
@@ -121,6 +122,7 @@ import {
   resolveVerdictProposalId,
   TaskEvidenceFenceError,
   VerdictRaceError,
+  ApprovalExpiredError,
   type TaskActor,
 } from '../tasks/service'
 import type { TaskVerdict } from '../types'
@@ -572,6 +574,11 @@ async function commitOriginDecision(
     // Same shared outcome the non-origin path already surfaces — propagate
     // it identically rather than inventing a second race code, so the
     // caller (src/mcp/index.ts) handles both with the SAME catch block.
+    // An ask past its window is the one deliberate exception: say so (never a verdict).
+    if (await isGateAskExpired(env, task.id)) {
+      await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'approval_expired' }))
+      throw new ApprovalExpiredError(task.id)
+    }
     await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'verdict_race' }))
     throw new VerdictRaceError(task.id)
   }

@@ -18,6 +18,7 @@ import { createVerdictGateCache, evaluateVerdictGates, primeVerdictIndependence,
 import { canReadSquadTasks } from '../tasks/visibility'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
 import { nowSqlUtc } from '../auth/token-lifecycle'
+import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -454,6 +455,7 @@ async function sourceRows(
     WHERE t.status = 'review' AND t.gate_owner IS NOT NULL${projectClause}
       AND ${projectLive} ${holderClause}
       AND ${TASK_NOT_ARCHIVED_SQL('t')}
+      AND ${GATE_ASK_LIVE_PREDICATE('t', "datetime('now')")}
       AND ${visibility.sql}
   `, projectScope, cursor)
 

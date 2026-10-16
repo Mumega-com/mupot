@@ -107,6 +107,8 @@ export type OfficeRefusalReason =
   | 'verdict_race'
   // mupot#1571: the task is archived; archived = inert, so no publish/verdict/claim.
   | 'task_archived'
+  // The gate ask expired unanswered (src/gates/approval-expiry.ts): never approvable, resubmit.
+  | 'approval_expired'
 
 export type OfficeResult<T> =
   | { ok: true; value: T }

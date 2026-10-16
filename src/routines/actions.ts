@@ -919,7 +919,10 @@ async function waitForHuman(
       waitReceipt, now, action.id, run.tenant, run.id, run.tenant,
     ),
     ...(reason === 'review' ? [env.DB.prepare(
-      `UPDATE tasks SET status = 'review', gate_owner = ?, updated_at = ?
+      // review_entered_at is re-stamped explicitly for an ALREADY-review task: this is a NEW ask, and
+      // the entry trigger only fires on a real status change (OLD <> 'review').
+      `UPDATE tasks SET status = 'review', gate_owner = ?, updated_at = ?,
+              review_entered_at = CASE WHEN status = 'review' THEN ? ELSE review_entered_at END
         WHERE id = ? AND project_id = ? AND status IN ('in_progress','review')
           AND ${TASK_NOT_ARCHIVED_SQL()}
           AND (gate_owner IS NULL OR gate_owner = ?)
@@ -928,7 +931,7 @@ async function waitForHuman(
              WHERE id = ? AND tenant = ? AND status = 'waiting' AND receipt_id = ?
           )`,
     ).bind(
-      ROUTINE_GATE, now, run.task_id, run.project_id, ROUTINE_GATE,
+      ROUTINE_GATE, now, now, run.task_id, run.project_id, ROUTINE_GATE,
       action.id, run.tenant, waitReceipt,
     )] : []),
     env.DB.prepare(

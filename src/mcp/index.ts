@@ -109,6 +109,7 @@ import {
   writeVerdict,
   VerdictRaceError,
   TaskArchivedError,
+  ApprovalExpiredError,
   TaskEvidenceFenceError,
   NonHumanVerdictRefusedError,
   detectVerdictReversalRequest,
@@ -214,6 +215,8 @@ import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
+import { APPROVAL_EXPIRY_TOOLS } from './approval-expiry'
+import { isResubmitCapError } from '../gates/approval-expiry-rule'
 import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
@@ -2572,6 +2575,7 @@ const toolTaskVerdict: ToolSpec = {
         originFailure = originOutcome
       } catch (err) {
         if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
+        if (err instanceof ApprovalExpiredError) return fail(409, 'approval_expired', { detail: 'the gate ask expired unanswered; resubmit the task if it is still needed' })
         if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
         throw err
       }
@@ -2661,6 +2665,7 @@ const toolTaskVerdict: ToolSpec = {
       return done({ ...result, ...humanOriginField })
     } catch (err) {
       if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
+      if (err instanceof ApprovalExpiredError) return fail(409, 'approval_expired', { detail: 'the gate ask expired unanswered; resubmit the task if it is still needed' })
       if (err instanceof VerdictIndependenceError) {
         return fail(409, 'self_verdict', {
           reason: 'decider is a party to this task (assignee, submitter or runner) or acts for one; self-approval is forbidden',
@@ -3302,7 +3307,14 @@ const toolTaskSubmitResult: ToolSpec = {
       receiptId, env.TENANT_SLUG, next.id, next.squad_id, callerAgentId,
       artifactCheck.path, artifactCheck.sha256Claimed, resultDigest, next.updated_at, resultText,
     )
-    const results = await env.DB.batch([updateStmt, insertStmt])
+    let results: Awaited<ReturnType<typeof env.DB.batch>>
+    try {
+      results = await env.DB.batch([updateStmt, insertStmt])
+    } catch (error) {
+      // migrations/0232 tasks_resubmit_cap: a third resubmission after two expiries needs a human.
+      if (isResubmitCapError(error)) return fail(409, 'resubmit_cap_needs_human', { detail: 'this task\'s approval expired unanswered twice; an org admin must reset the cap (approval_resubmit_cap_reset)' })
+      throw error
+    }
     if (!results[0]?.meta?.changes) {
       if (await isTaskArchived(env, next.id)) return fail(409, 'task_archived')
       return fail(409, 'task_update_conflict')
@@ -7246,6 +7258,7 @@ export const TOOLS: ToolSpec[] = [
   toolTeamBootstrapRelease,
   ...ARCHIVE_TOOLS,
   ...INCIDENT_REVERT_TOOLS,
+  ...APPROVAL_EXPIRY_TOOLS,
   ...EXECUTION_PAUSE_TOOLS,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,

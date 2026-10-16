@@ -13,6 +13,7 @@ import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
+import { GATE_ASK_LIVE_PREDICATE, isGateAskExpired, isResubmitCapError } from '../gates/approval-expiry-rule'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
@@ -312,7 +313,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review' | 'assignee_change_with_reversal'
+export type TaskUpdateConflictCode = 'resubmit_cap_needs_human' | 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review' | 'assignee_change_with_reversal'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode, readonly detail?: string) {
@@ -437,6 +438,7 @@ function mapTaskProjectInsertError(error: unknown): never {
 
 function mapTaskProjectUpdateError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
+  if (isResubmitCapError(error)) throw new TaskUpdateConflictError('resubmit_cap_needs_human')
   if (message.includes('task project locked by flight')) {
     throw new TaskUpdateConflictError('task_project_locked')
   }
@@ -1732,6 +1734,16 @@ export class TaskArchivedError extends VerdictRaceError {
   }
 }
 
+/** The gate ask expired unanswered (src/gates/approval-expiry.ts). Subclasses VerdictRaceError so a
+ *  catch that predates it still answers 409; surfaces name it `approval_expired`. Expiry is never
+ *  approval: nothing is written. */
+export class ApprovalExpiredError extends VerdictRaceError {
+  constructor(taskId: string) {
+    super(taskId)
+    this.name = 'ApprovalExpiredError'
+  }
+}
+
 // NonHumanVerdictRefusedError — FP-01 Slice 2 v2 round 2 (P2-4, kasra-review
 // adversarial round 2 on PR #1490): P0-3's verdictIsHuman only refused the
 // GRANT once the (non-human) verdict already existed — the task itself had
@@ -1984,7 +1996,7 @@ export function buildVerdictStatements(
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
-      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()}${guardSql}`,
+      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()} AND ${GATE_ASK_LIVE_PREDICATE('tasks', "datetime('now')")}${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
       `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id)
@@ -2118,6 +2130,8 @@ export async function writeVerdict(
     // batch is, by construction, also a no-op here (its EXISTS guard cannot
     // be satisfied) — nothing to roll back.
     if (await isTaskArchived(env, input.task.id)) throw new TaskArchivedError(input.task.id)
+    // An unanswered ask past its window: refused, never approved (src/gates/approval-expiry.ts).
+    if (await isGateAskExpired(env, input.task.id)) throw new ApprovalExpiredError(input.task.id)
     // Distinguish a refused self-verdict from a lost race so the caller can say which it was.
     if (input.independenceWaiver !== 'owner_override' && !(await isCurrentSelfCompletionProducer(env, input))) {
       const conflict = await findVerdictIndependenceConflict(env, input.decidedBy, input.task.id)
