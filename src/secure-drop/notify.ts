@@ -15,7 +15,9 @@ import { createBus } from '../bus'
 import { groupFingerprint } from './keys'
 import type { AgentRow } from './authority'
 
-export const NOTIFY_SENDER = 'mupot-secure-drop'
+import { SECURE_DROP_NOTIFY_SENDER } from '../agents/system-senders'
+
+export const NOTIFY_SENDER = SECURE_DROP_NOTIFY_SENDER
 
 export interface GovernorNotice { governors: number; delivered: number }
 

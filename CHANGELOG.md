@@ -23,6 +23,8 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
    deployment, integrity and final-readiness verification before declaring completion.
 
 
+- **Messaging:** inbox rows from system-sender literals (mupot-review-gate, mupot-flights, mupot-dispatch, ...) report `reply_basis: system_sender` with `reply_via`, and a send to one is refused as `system_sender_not_addressable` (#2003).
+
 ### Release-scope highlights, 2026-10-12 → 2026-10-16 (merged to `main`; unreleased)
 
 Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.

@@ -173,6 +173,7 @@ import {
   ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
   MAX_DELIVERY_ATTEMPTS, DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS,
 } from '../agents/messages'
+import { FLIGHTS_SENDER, REVIEW_WAKE_SENDER } from '../agents/system-senders'
 import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from '../agents/inbox-seat'
 import {
   recordCheckin,
@@ -2213,7 +2214,6 @@ const toolTaskUpdate: ToolSpec = {
 // mirrors DISPATCH_BRIDGE_SENDER's convention (src/bus/fleet-bridge.ts): task_update is
 // invoked by a human/agent MEMBER token, not by the gate-owner agent itself, so there is
 // no honest agent principal to name as the sender of "you have a review waiting."
-const REVIEW_WAKE_SENDER = 'mupot-review-gate'
 
 // sendAgentMessage's request_id must match RID_RE ([A-Za-z0-9_.:-]{1,128}, src/agents/
 // messages.ts) — task.id (a uuid) + an ISO timestamp both fit that charset comfortably
@@ -3872,7 +3872,7 @@ const toolFlightDispatch: ToolSpec = {
       const delivery = await sendAgentMessage(
         env,
         {
-          fromAgent: 'mupot-flights',
+          fromAgent: FLIGHTS_SENDER,
           fromMember: auth.memberId as string,
           toAgent: flight.agent,
           kind: 'request',
@@ -7414,7 +7414,7 @@ function rpcResult(id: unknown, result: unknown): Response {
  *  for application refusals such as send_target_not_visible (HTTP 404). Harnesses treat
  *  -32602 as a schema error and retry the call shape instead of resolving the target. */
 export function jsonRpcCodeForToolFailure(status: number, error: string): number {
-  if (error === 'send_target_not_visible') return -32000
+  if (error === 'send_target_not_visible' || error === 'system_sender_not_addressable') return -32000
   return status === 404 ? -32602 : -32000
 }
 

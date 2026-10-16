@@ -27,6 +27,7 @@ import type { Env, Task } from '../types'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { claimTimestamp } from '../lib/claim-timestamp'
 import { sendAgentMessage } from '../agents/messages'
+import { SWEEPER_SENDER } from '../agents/system-senders'
 import { persistGateWakeNotice } from './grants'
 import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import {
@@ -39,7 +40,6 @@ import {
 export * from './approval-expiry-rule'
 
 export const SWEEPER_ACTOR = 'system:sweeper'
-const SWEEPER_SENDER = 'mupot-approval-sweeper'
 export const APPROVAL_EXPIRED_NOTICE = 'approval expired unanswered — resubmit if still needed'
 
 // "Dead" gate: nobody can answer it. Live holder = an ACTIVE principal behind a gate_grants row
