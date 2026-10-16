@@ -4166,9 +4166,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_tasks_review_entered" },
     ],
   },
+  {
+    file: "0233_login_identity_moved_stamp.sql",
+    sha256: "9fa685f5c437f9cfa29e9bfeaa79e240d1dc4fea87098f371318cd26d01ea1ad",
+    statements: [
+      "-- 0233_login_identity_moved_stamp.sql — mupot#1022: per-move claim stamp on human_login_identities.\n--\n-- A confirmed \"move this Google sign-in to my account\" re-points the existing identity row (UNIQUE(tenant, provider,\n-- provider_subject) covers revoked rows, so a second row is impossible). The move UPDATE writes a per-request unique\n-- stamp here, and the audit INSERT in the same D1 batch anchors on `moved_stamp = <this request's stamp>`, so a move that\n-- changed zero rows writes no audit and no session cutoff, and a real move always does. Same pattern as\n-- telegram_login_links.consumed_at (#1579). NULL for every identity that was never moved.\nALTER TABLE human_login_identities ADD COLUMN moved_stamp TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "c26fea459509a01bf6efb60814755b5c59d2b9c507b21dd34b005af79ed34973"
+export const SCHEMA_CHAIN_DIGEST: string = "75feeca614df142cf718c91e3f892575d2832ebe17c90a29793a48d052686f1e"

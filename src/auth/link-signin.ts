@@ -263,7 +263,7 @@ export async function linkSignIn(
       const actorRank = await actorRankOnScopeFor(env, auth, 'org', null)
       const move = env.DB.prepare(
         `UPDATE human_login_identities
-            SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2
+            SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2, moved_stamp = ?14
           WHERE id = ?3 AND tenant = ?4 AND member_id = ?5 AND revoked_at IS NULL
             AND provider = ?6 AND provider_subject = ?7
             AND EXISTS (
@@ -290,10 +290,10 @@ export async function linkSignIn(
             )`,
       ).bind(
         me, input.verifiedEmail, identityId, env.TENANT_SLUG, oldMemberId, input.provider, input.subject,
-        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(),
+        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(), requestId,
       )
-      // Everything after the move lands only if THIS batch's move changed a row: the audit row is the anchor (changes() is the
-      // move's own count because the audit INSERT directly follows it), and the cutoffs are anchored on the audit row.
+      // Everything after the move lands only if THIS request's move changed the row: the move stamps moved_stamp = requestId,
+      // the audit INSERT anchors on that stamp (the #1979 consumed_at pattern), and the cutoffs anchor on the audit row.
       let audit
       try {
         audit = await prepareMutationAudit(env, auth, {
@@ -305,10 +305,10 @@ export async function linkSignIn(
           requestId,
           evidence: { provider: input.provider, masked_email: maskedEmail, from_member_id: oldMemberId },
         }, {
-          sql: `(SELECT changes()) > 0 AND EXISTS (
+          sql: `EXISTS (
                   SELECT 1 FROM human_login_identities h
-                   WHERE h.id = ?25 AND h.tenant = ?26 AND h.member_id = ?27 AND h.linked_by_member_id = ?27 AND h.revoked_at IS NULL)`,
-          binds: [identityId, env.TENANT_SLUG, me],
+                   WHERE h.id = ?25 AND h.tenant = ?26 AND h.member_id = ?27 AND h.moved_stamp = ?28 AND h.revoked_at IS NULL)`,
+          binds: [identityId, env.TENANT_SLUG, me, requestId],
         })
       } catch (err) {
         console.error('linked-signins move audit prepare failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })

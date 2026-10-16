@@ -371,6 +371,27 @@ describe('#1022 linked sign-ins', () => {
     expect(audits('move')).toHaveLength(0)
   })
 
+  it('audit and cutoffs anchor on THIS request\'s moved_stamp, not on the row merely belonging to the actor', async () => {
+    const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
+    const { jar } = await reachMoveConfirm()
+    // the row ends up with the actor as owner but a stamp that is not this request's (a different writer's move)
+    h.sqlite.exec(`CREATE TRIGGER foreign_stamp AFTER UPDATE ON human_login_identities WHEN NEW.moved_stamp IS NOT NULL
+      BEGIN UPDATE human_login_identities SET moved_stamp = 'someone-else' WHERE id = NEW.id; END`)
+    await post(jar, '/auth/link-signin/confirm')
+    expect(audits('move')).toHaveLength(0)
+    expect(await memberOf(oldBrowser)).toBe('mem-dup')
+  })
+
+  it('a real move stamps the row and always writes its audit and cutoffs', async () => {
+    const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    const row = h.sqlite.prepare(`SELECT moved_stamp FROM human_login_identities WHERE id = 'hli-dup'`).get() as { moved_stamp: string | null }
+    expect(row.moved_stamp).toMatch(/^[0-9a-f-]{36}$/)
+    expect(audits('move')).toHaveLength(1)
+    expect(await memberOf(oldBrowser)).toBeUndefined()
+  })
+
   it('the move audit lands in the same batch as the move', async () => {
     const { jar } = await reachMoveConfirm()
     await post(jar, '/auth/link-signin/confirm')
