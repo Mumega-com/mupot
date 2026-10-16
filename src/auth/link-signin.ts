@@ -19,7 +19,7 @@
 //   - Every link, move and unlink writes a mutation_audit_entries row.
 
 import type { AuthContext, Env } from '../types'
-import { actorRankOnScopeFor, exceedsTargetRankCeiling, resolveCapabilities } from './capability'
+import { actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, exceedsTargetRankCeiling, nowCapabilitySql, resolveCapabilities } from './capability'
 import { linkLoginIdentity, resolveLoginIdentity, type LoginIdentityRecord } from './login-identity'
 import { maskEmail } from './telegram-login-link'
 import { nowSqlUtc } from './token-lifecycle'
@@ -280,6 +280,7 @@ export async function linkSignIn(
             AND NOT EXISTS (
               SELECT 1 FROM capabilities c
                WHERE c.member_id = ?5
+                 AND ${CAPABILITY_LIVE_PREDICATE('c', '?13')}
                  AND CASE c.capability WHEN 'owner' THEN 5 WHEN 'admin' THEN 4 WHEN 'lead' THEN 3 WHEN 'member' THEN 2 ELSE 1 END > ?12
             )
             AND NOT EXISTS (
@@ -289,7 +290,7 @@ export async function linkSignIn(
             )`,
       ).bind(
         me, input.verifiedEmail, identityId, env.TENANT_SLUG, oldMemberId, input.provider, input.subject,
-        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank,
+        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(),
       )
       // Everything after the move lands only if THIS batch's move changed a row: the audit row is the anchor (changes() is the
       // move's own count because the audit INSERT directly follows it), and the cutoffs are anchored on the audit row.
