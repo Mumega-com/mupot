@@ -3,6 +3,8 @@ import type { AuthContext, Env } from '../types'
 import { ROUTES } from '../types'
 import { listNeedsYou, type NeedsYouItem } from '../attention/service'
 import { routinePrincipal } from '../routines/access'
+import { hasWorkspaceAdmin } from '../auth/capability'
+import { countPendingProposals } from '../hygiene/archive-proposals'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
 
@@ -26,6 +28,8 @@ import type { Html } from './ui'
 const RECOMMIT_BUTTON_CLASS = 'needs-you-recommit-btn'
 
 export interface NeedsYouDashboardView {
+  /** Pending agent archive proposals (/board/cleanup); links the page when > 0. Absent = none. */
+  pendingArchiveProposals?: number
   items: NeedsYouItem[]
   nextCursor: string | null
   truncated: boolean
@@ -38,7 +42,9 @@ export async function loadNeedsYouDashboard(
   options: { limit?: number; after?: string } = {},
 ): Promise<NeedsYouDashboardView> {
   const page = await listNeedsYou(env, routinePrincipal(auth), { ...options, auth })
-  return { items: page.items, nextCursor: page.next_cursor, truncated: page.truncated, truncatedSources: page.truncated_sources }
+  // Only an org admin can act on proposals, so only they see the link (count is fail-soft).
+  const pendingArchiveProposals = hasWorkspaceAdmin(auth) ? await countPendingProposals(env) : 0
+  return { pendingArchiveProposals, items: page.items, nextCursor: page.next_cursor, truncated: page.truncated, truncatedSources: page.truncated_sources }
 }
 
 function urgencyTone(urgency: NeedsYouItem['urgency']): 'danger' | 'warn' | 'primary' | 'dim' {
@@ -146,9 +152,15 @@ function table(rows: Html[][]): Html {
  * proposeProjectRecommit's self_recommit refusal) as the project_recommit
  * MCP tool and the project detail page's own recommit control call.
  */
+function archiveProposalsLink(view: NeedsYouDashboardView): Html | '' {
+  const n = view.pendingArchiveProposals ?? 0
+  if (n <= 0) return ''
+  return html`<p class="ui-panel-sub" data-needs-you-archive-proposals><a class="ui-link" href="/board/cleanup">${n} agent archive proposal${n === 1 ? '' : 's'} waiting for your review</a></p>`
+}
+
 export function needsYouBody(view: NeedsYouDashboardView): Html {
   if (!view.items.length) {
-    return html`${pageHeader({ crumbs: 'Workspace', title: 'Needs You', sub: 'Accountable decisions across readable Projects.' })}${emptyState({ title: 'No attention items', detail: 'No unresolved work requires a response.' })}`
+    return html`${pageHeader({ crumbs: 'Workspace', title: 'Needs You', sub: 'Accountable decisions across readable Projects.' })}${archiveProposalsLink(view)}${emptyState({ title: 'No attention items', detail: 'No unresolved work requires a response.' })}`
   }
   const hasRecommit = view.items.some(item => item.allowed_actions.includes('recommit'))
   const rows = view.items.map(item => [
@@ -161,6 +173,7 @@ export function needsYouBody(view: NeedsYouDashboardView): Html {
   ])
   const continuation = view.nextCursor ? `/needs-you?cursor=${encodeURIComponent(view.nextCursor)}` : null
   return html`${pageHeader({ crumbs: 'Workspace', title: 'Needs You', sub: 'Accountable decisions across readable Projects.' })}
+    ${archiveProposalsLink(view)}
     ${sectionPanel({ title: 'Attention queue', body: html`${table(rows)}${continuation ? html`<p class="ui-panel-sub">${view.truncated ? `Source scan caps applied: ${view.truncatedSources.join(', ')}. ` : ''}<a class="ui-link" href="${continuation}">Continue queue</a></p>` : ''}` })}
     ${hasRecommit ? recommitScript() : ''}`
 }

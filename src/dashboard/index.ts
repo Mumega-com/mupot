@@ -297,6 +297,7 @@ import { makeMissionControlApp } from './mission-control-routes'
 import { makeElevationApp } from './elevation'
 import { makeAccountApp } from './account'
 import { makeOperatorsApp } from './operators'
+import { makeBoardCleanupApp } from './board-cleanup'
 import { makeDoorbellsApp } from './doorbells'
 import { makeConnectionsApp } from './connections'
 import { makeImSettingsApp } from './im-settings'
@@ -1641,6 +1642,8 @@ dashboardApp.route('/', makeElevationApp(shell))
 dashboardApp.route('/', makeAccountApp(shell))
 // Operators (W0.2): human UI over the existing delegated-operator writers; same-origin + real fresh web session.
 dashboardApp.route('/', makeOperatorsApp(shell))
+// Board cleanup: agents propose archives (archive_propose), a human org admin archives here through archiveRow.
+dashboardApp.route('/', makeBoardCleanupApp(shell))
 dashboardApp.route('/', makeDoorbellsApp(shell))
 dashboardApp.route('/', makeConnectionsApp(shell))
 
