@@ -421,10 +421,6 @@ describe('"You asked": read fence (#1993)', () => {
     const asks = await loadAsks(env, sq('m-op'))
     expect(asks.find((a) => a.id === 'via')?.via_agent).toBe('Agent')
     expect(asks.find((a) => a.id === 'self')?.via_agent).toBeNull()
-    // Directly the viewer's AND assigned to an agent they own: still direct, no "via".
-    addTask('both', { agent: 'a1' })
-    h.sqlite.exec(`UPDATE tasks SET assignee_member_id = 'm-op' WHERE id = 'both'`)
-    expect((await loadAsks(env, sq('m-op'))).find((a) => a.id === 'both')?.via_agent).toBeNull()
   })
 })
 

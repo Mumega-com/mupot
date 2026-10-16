@@ -498,8 +498,9 @@ export async function loadAsks(env: Env, auth: AuthContext): Promise<AskItem[]> 
     project_id: r.project_id, project_name: r.project_name, assignee_agent_id: r.assignee_agent_id,
     agent_name: r.agent_name, review_entered_at: r.review_entered_at, created_at: r.created_at, updated_at: r.updated_at,
     state: r.status === 'review' ? 'waiting' : r.status === 'approved' ? 'approved' : 'rejected',
-    // The only agent leg that includes a row is "assignee agent owned by the viewer", so the
-    // assignee IS the agent that matched.
-    via_agent: r.assignee_member_id === auth.memberId ? null : (r.agent_name ?? r.assignee_agent_id),
+    // tasks.task_single_assignee makes assignee_agent_id and assignee_member_id mutually
+    // exclusive, and the only agent leg that includes a row is "assignee agent owned by the
+    // viewer": a non-null assignee agent IS the agent that matched; a direct ask has none.
+    via_agent: r.assignee_agent_id === null ? null : (r.agent_name ?? r.assignee_agent_id),
   }))
 }
