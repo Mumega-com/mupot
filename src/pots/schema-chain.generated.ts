@@ -4119,9 +4119,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "capabilities_grant_event_delete" },
     ],
   },
+  {
+    file: "0231_archive_proposals.sql",
+    sha256: "75178d72243d2b98d66a95671be0ec3f04598574a2611f2ed0a8e95982be7176",
+    statements: [
+      "-- 0231_archive_proposals.sql: agents PROPOSE archiving a task; a human org admin decides at /board/cleanup.\n--\n-- WHY. archive_row on tasks accepts only an operator principal (a human, never an agent-bound caller) and the\n-- dashboard had no archive control, so agents could list obsolete tasks but nobody could approve them in one place.\n-- This table is the whole store: a proposal writes nothing to the task. Archiving still runs through archiveRow\n-- (src/hygiene/archive.ts), the one chokepoint, from the human page only.\n--\n-- task_status_at_proposal is the status the proposer saw; the page passes it as archiveRow's expectedStatus so a task\n-- that moved since is refused per row (status_drift) instead of archived on stale evidence.\n-- task_updated_at_proposal is tasks.updated_at when proposed; a task touched since is refused at decision (refused_task_changed).\n-- Proposals expire after 14 days (enforced in the readers and the decision).\n-- decision: NULL = pending. 'archived' | 'already_archived' | 'refused_status_drift' | 'refused_not_found' | 'refused_task_changed' are terminal.\n-- A transient refusal (live execution claim, in-air flight, in-flight dispatch) leaves the row pending.\nCREATE TABLE IF NOT EXISTS archive_proposals (\n  id                      TEXT PRIMARY KEY,\n  tenant                  TEXT NOT NULL,\n  task_id                 TEXT NOT NULL,\n  proposed_by_agent_id    TEXT NOT NULL,\n  reason                  TEXT NOT NULL,\n  evidence                TEXT NOT NULL DEFAULT '',\n  task_status_at_proposal TEXT NOT NULL,\n  task_updated_at_proposal TEXT,\n  created_at              TEXT NOT NULL,\n  decided_at              TEXT,\n  decision                TEXT,\n  decided_by_member_id    TEXT\n);",
+      "\n-- One pending proposal per task: a re-proposal while one is pending is a no-op, not a second row.\nCREATE UNIQUE INDEX IF NOT EXISTS idx_archive_proposals_pending_task\n  ON archive_proposals(tenant, task_id) WHERE decision IS NULL;",
+      "\nCREATE INDEX IF NOT EXISTS idx_archive_proposals_pending\n  ON archive_proposals(tenant, created_at) WHERE decision IS NULL;",
+    ],
+    objects: [
+      { type: "table", name: "archive_proposals" },
+      { type: "index", name: "idx_archive_proposals_pending_task" },
+      { type: "index", name: "idx_archive_proposals_pending" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "fc9b6731efafe07a8913d37d51bc3cfe89b28e161e78c012d2acad34290eb908"
+export const SCHEMA_CHAIN_DIGEST: string = "7c3d690079ddc29d5c7dfd40a0b3a8995b1cee55ec52705715018954e56ae45b"

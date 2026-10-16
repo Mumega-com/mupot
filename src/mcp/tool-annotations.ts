@@ -182,6 +182,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   team_bootstrap_release: MUT('releaseTeamBootstrapSlugBase DELETE FROM projects (org/team-bootstrap.ts:1089)'),
   archive_row: MUT('archiveRow archives members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   // unarchive restores a previously archived row (the inverse of archive_row): changes state, destroys nothing.
+  archive_propose: ADD('proposeArchives INSERT archive_proposals only; never touches a task (hygiene/archive-proposals.ts)'),
   unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   task_incident_revert: MUT('task_incident_revert INSERT task_incident_revert_receipts + guarded UPDATE tasks status/assignee/updated_at (tasks/incident-revert.ts); org-admin operator only'),
   // Loop brakes (migration 0203): additive state rows, no data destroyed; resume is the exact inverse.

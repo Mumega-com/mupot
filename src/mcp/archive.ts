@@ -21,6 +21,7 @@ import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
 import { type ToolSpec, type ToolOutcome, fail, done, str, hasWorkspaceAdmin } from './index'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import { memberOrElevatedAgent, withElevationReceipt, type ElevationTarget } from './elevated-principal'
+import { proposeArchives, MAX_PROPOSE_IDS } from '../hygiene/archive-proposals'
 import {
   archiveRow,
   unarchiveRow,
@@ -400,4 +401,43 @@ export const toolArchivePlanExpand: ToolSpec = {
   },
 }
 
-export const ARCHIVE_TOOLS: ToolSpec[] = [toolArchiveRow, toolUnarchiveRow, toolArchivePlanExpand]
+// archive_propose: the AGENT half of /board/cleanup. Writes archive_proposals rows and nothing else; it never
+// archives (archive_row stays operator-only, and the human page is the one place a proposal becomes an archive).
+export const toolArchivePropose: ToolSpec = {
+  name: 'archive_propose',
+  scope: 'org',
+  min: 'member',
+  args: `{ task_ids: string[] (1-${MAX_PROPOSE_IDS}), reason: string, evidence?: string }` +
+    ' -- agent-bound callers only. Proposes archiving tasks; NEVER archives. A human org admin reviews pending' +
+    ' proposals at /board/cleanup and archives them there. The task\'s current status is recorded and re-checked at' +
+    ' archive time (a task that moved is refused). Returns proposed / already_pending / not_proposable (missing, unreadable or archived: not told apart) / cap_reached (200 pending per agent). 409 not_supported when TASK_ARCHIVE_ENABLED is off.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_ids: { type: 'array', items: STRING_SCHEMA, minItems: 1, maxItems: MAX_PROPOSE_IDS },
+      reason: STRING_SCHEMA,
+      evidence: STRING_SCHEMA,
+    },
+    required: ['task_ids', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.boundAgentId) return fail(403, 'agent_principal_required')
+    if (!Array.isArray(args.task_ids) || args.task_ids.some((v) => typeof v !== 'string')) {
+      return fail(400, 'invalid_args', 'task_ids must be an array of strings')
+    }
+    const reason = str(args.reason)
+    if (!reason) return fail(400, 'invalid_args', 'reason required')
+    if (args.evidence !== undefined && typeof args.evidence !== 'string') return fail(400, 'invalid_args', 'evidence must be a string')
+    const result = await proposeArchives(env, auth, {
+      agentId: auth.boundAgentId,
+      taskIds: args.task_ids as string[], // as: every element was just checked to be a string
+      reason,
+      evidence: typeof args.evidence === 'string' ? args.evidence : '',
+    })
+    if (!result.ok) return fail(result.error === 'not_supported' ? 409 : 400, result.error, result.detail)
+    return done(result)
+  },
+}
+
+export const ARCHIVE_TOOLS: ToolSpec[] = [toolArchiveRow, toolUnarchiveRow, toolArchivePlanExpand, toolArchivePropose]
