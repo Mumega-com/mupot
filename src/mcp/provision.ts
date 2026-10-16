@@ -32,7 +32,7 @@
 //                        no authorization of its own.
 
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   createDepartment,
   updateDepartment,
@@ -78,7 +78,7 @@ import {
 } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, isAgentAccessCapability, type AgentAccessCapability } from '../members/agent-access'
-import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
+import { authorizeOwnerMemberChange } from '../org/agent-owner'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import {
   GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
@@ -2349,21 +2349,10 @@ const toolUpdateAgent: ToolSpec = {
     // the admin lane. Self-target (actor pointing an agent at their OWN
     // member id) is exempt from BOTH the floor and the ceiling — a principal
     // granting themselves nothing is not the mint this guards.
-    if (typeof patch.owner_member_id === 'string' && patch.owner_member_id.length > 0) {
-      if (/\s/.test(patch.owner_member_id)) {
-        return fail(400, 'invalid_args', 'owner_member_id must not contain whitespace')
-      }
-      const isSelfTarget = auth.memberId != null && auth.memberId === patch.owner_member_id
-      if (!isSelfTarget) {
-        const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-        if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
-          return fail(403, 'forbidden', { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' })
-        }
-        if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
-          return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })
-        }
-      }
-    }
+    // The predicate lives in src/org/agent-owner.ts (one chokepoint shared with the
+    // dashboard owner form, mupot#1987); the rationale above applies to it unchanged.
+    const ownerGate = await authorizeOwnerMemberChange(env, auth, agent.id, patch.owner_member_id)
+    if (!ownerGate.ok) return fail(ownerGate.status, ownerGate.error, ownerGate.detail)
 
     // Audit actor: a self-correction is attributed to the agent itself (0086's
     // CHECK already permits actor_type 'agent'), not to the human whose bearer

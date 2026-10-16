@@ -293,6 +293,55 @@ describe('update_agent — owner_member_id (mupot#1424, migration 0155)', () => 
     })
   })
 
+  describe('mupot#1987 gate P1/P2 — OUTGOING owner ceiling and inactive new owner', () => {
+    const adminGrant: CapabilityGrant[] = [{ member_id: 'member-org-admin', scope_type: 'org', scope_id: null, capability: 'admin' }]
+    const squadAdminGrant: CapabilityGrant[] = [
+      { member_id: 'member-sq', scope_type: 'squad', scope_id: squadId, capability: 'admin' },
+    ]
+    beforeEach(() => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES
+          ('member-org-owner', 'owner@test.com', 'Owner', 'active', '${TENANT}'),
+          ('member-org-admin', 'orgadmin@test.com', 'OrgAdmin', 'active', '${TENANT}'),
+          ('member-sq', 'sq@test.com', 'Sq', 'active', '${TENANT}'),
+          ('member-peer', 'peer@test.com', 'Peer', 'active', '${TENANT}'),
+          ('member-susp', 'susp@test.com', 'Susp', 'suspended', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+          ('cap-o', 'member-org-owner', 'org', NULL, 'owner'),
+          ('cap-a', 'member-org-admin', 'org', NULL, 'admin');
+        UPDATE agents SET owner_member_id = 'member-org-owner' WHERE id = '${agentId}';
+      `)
+    })
+    const ownerNow = async () =>
+      (await env.DB.prepare('SELECT owner_member_id AS o FROM agents WHERE id = ?').bind(agentId).first<{ o: string | null }>())?.o
+
+    it.each([
+      ['clear', null],
+      ['replace', 'member-peer'],
+      ['take over (self-target)', 'member-org-admin'],
+    ])('an org admin cannot %s an agent owned by a member who outranks them', async (_n, target) => {
+      const result = await invoke(auth({ memberId: 'member-org-admin', capabilities: adminGrant }), { agent: agentId, owner_member_id: target })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('target_rank_exceeds_ceiling')
+      expect(result.detail).toEqual({ owner_member_id: 'member-org-owner' })
+      expect(await ownerNow()).toBe('member-org-owner')
+    })
+
+    it('the squad-admin clear lane passes the same outgoing check', async () => {
+      const result = await invoke(auth({ memberId: 'member-sq', capabilities: squadAdminGrant }), { agent: agentId, owner_member_id: null })
+      expect(result.ok).toBe(false)
+      expect(await ownerNow()).toBe('member-org-owner')
+    })
+
+    it('a suspended member cannot become the owner', async () => {
+      harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL WHERE id = '${agentId}'`)
+      const result = await invoke(auth({ memberId: 'member-org-admin', capabilities: adminGrant }), { agent: agentId, owner_member_id: 'member-susp' })
+      expect(result.ok).toBe(false)
+      expect(await ownerNow()).toBeNull()
+    })
+  })
+
   it('partition invariant still holds with owner_member_id added', () => {
     const selfPatchable = new Set<string>(SELF_PATCHABLE_FIELDS)
     const selfForbidden = new Set<string>(SELF_FORBIDDEN_FIELDS)
