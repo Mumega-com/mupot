@@ -464,6 +464,7 @@ describe('#1022 linked sign-ins', () => {
   })
 
   it('a move that changes zero rows revokes nothing and audits nothing (cutoff and audit are anchored on the move)', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup'`)
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
     // a race loser: the row update is silently skipped (RAISE(IGNORE)), so the guarded move changes 0 rows
@@ -474,10 +475,11 @@ describe('#1022 linked sign-ins', () => {
     expect(await memberOf(oldBrowser)).toBe('mem-dup') // old session untouched
     expect(audits('move')).toHaveLength(0)
     expect(supersededBy('mem-dup')).toBeNull() // #1997: a 0-row move marks nothing and revokes no connector
-    expect(directoryTokenLive('tok-dir')).toBe(true)
+    expect((await memberForChat(env, 'chat-dup'))?.id).toBe('mem-dup') // chat not cleared by a move that did not land
   })
 
   it('audit and cutoffs anchor on THIS request\'s claim row, not on the identity merely belonging to the actor', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup'`)
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
     // the claim is lost (a race loser) while the row still ends up with the actor: nothing downstream may land
@@ -490,10 +492,11 @@ describe('#1022 linked sign-ins', () => {
     expect(audits('move')).toHaveLength(0)
     expect(await memberOf(oldBrowser)).toBe('mem-dup')
     expect(supersededBy('mem-dup')).toBeNull()
-    expect(directoryTokenLive('tok-dir')).toBe(true)
+    expect((await memberForChat(env, 'chat-dup'))?.id).toBe('mem-dup') // chat not cleared by a move that did not land
   })
 
   it('a real move writes its claim, audit and cutoffs', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup'`)
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
     await post(jar, '/auth/link-signin/confirm')
