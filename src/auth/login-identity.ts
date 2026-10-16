@@ -226,10 +226,12 @@ export async function linkLoginIdentity(
     }
   }
 
-  await env.DB.prepare(
+  // mupot#1997: even the non-exclusive link never attaches a login to a superseded member.
+  const plain = await env.DB.prepare(
     `INSERT INTO human_login_identities
        (id, tenant, provider, provider_subject, verified_email, member_id, linked_by_member_id, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+      WHERE NOT EXISTS (SELECT 1 FROM members sm WHERE sm.id = ?6 AND sm.tenant = ?2 AND NOT (${notSupersededSql('sm')}))`,
   )
     .bind(
       id,
@@ -242,6 +244,7 @@ export async function linkLoginIdentity(
       now,
     )
     .run()
+  if (Number(plain.meta?.changes ?? 0) === 0) return { ok: false, error: 'competing_control' }
 
   return {
     ok: true,

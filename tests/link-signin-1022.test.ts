@@ -9,6 +9,8 @@ import { listLinkedSignIns, linkSignIn } from '../src/auth/link-signin'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../src/auth/token-lifecycle'
 import { decideIdentitylessAttach } from '../src/members/exclusive-control'
+import { memberForChat } from '../src/im'
+import { MEMBER_BIND_ELIGIBLE_SQL } from '../src/members/project-invites'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -328,6 +330,60 @@ describe('#1022 linked sign-ins', () => {
     expect(r).toMatchObject({ ok: false, error: 'competing_control' })
     // a plain login with the same email does not land on the superseded member
     expect(await memberOf(await signIn('sub-new', 'dup@gmail.test'))).not.toBe('mem-dup')
+  })
+
+  const bindEligible = (id: string) =>
+    h.sqlite.prepare(`SELECT 1 AS x FROM members WHERE ${MEMBER_BIND_ELIGIBLE_SQL}`).get(id, TENANT, 'chat-dup') !== undefined
+
+  it('#1997 telegram: a move clears the old member chat, memberForChat and the bind-eligibility refuse a superseded member', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup'`)
+    expect((await memberForChat(env, 'chat-dup'))?.id).toBe('mem-dup')
+    expect(bindEligible('mem-dup')).toBe(true)
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect((h.sqlite.prepare(`SELECT telegram_chat_id AS t FROM members WHERE id = 'mem-dup'`).get() as { t: string | null }).t).toBeNull()
+    expect(bindEligible('mem-dup')).toBe(false)
+    // the read guards on their own, with the chat still bound (clear undone)
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup'`)
+    expect(await memberForChat(env, 'chat-dup')).toBeNull()
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-dup'`)
+    expect(bindEligible('mem-dup')).toBe(false)
+  })
+
+  it('#1997 a move that leaves another live identity keeps the connectors and the Telegram chat', async () => {
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id = 'chat-dup' WHERE id = 'mem-dup';
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id) VALUES ('hli-dup-2', '${TENANT}', 'google', 'sub-dup-2', 'dup2@gmail.test', 'mem-dup')`)
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect(identity('sub-dup')?.member_id).toBe('mem-main')
+    expect(directoryTokenLive('tok-dir')).toBe(true)
+    expect((await memberForChat(env, 'chat-dup'))?.id).toBe('mem-dup')
+  })
+
+  it('#1997 only directory tokens are revoked: the admin/dashboard seed token survives', async () => {
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
+      VALUES ('tok-seed', 'mem-dup', 'hash-seed', 'admin', 'dashboard', datetime('now'), NULL, '${TENANT}', NULL, NULL)`)
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect(supersededBy('mem-dup')).toBe('mem-main')
+    expect(directoryTokenLive('tok-dir')).toBe(false)
+    expect(directoryTokenLive('tok-seed')).toBe(true)
+  })
+
+  it('#1997 superseded_by is write-once: a later move never overwrites it', async () => {
+    h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'mem-earlier' WHERE id = 'mem-dup'`)
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect(identity('sub-dup')?.member_id).toBe('mem-main')
+    expect(supersededBy('mem-dup')).toBe('mem-earlier')
+  })
+
+  it('#1997 even the non-exclusive linkLoginIdentity refuses a superseded member', async () => {
+    h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'mem-main' WHERE id = 'mem-dup'; DELETE FROM human_login_identities WHERE id = 'hli-dup'`)
+    const r = await linkLoginIdentity(env, { tenant: TENANT, provider: 'google', providerSubject: 'sub-x', verifiedEmail: 'x@gmail.test', memberId: 'mem-dup' })
+    expect(r).toMatchObject({ ok: false, error: 'competing_control' })
+    const ok = await linkLoginIdentity(env, { tenant: TENANT, provider: 'google', providerSubject: 'sub-y', verifiedEmail: 'y@gmail.test', memberId: 'mem-main' })
+    expect(ok).toMatchObject({ ok: true })
   })
 
   it('the duplicate-move batch is all-or-nothing: a failure in the cutoff statement leaves the identity on the old member', async () => {

@@ -337,21 +337,30 @@ export async function linkSignIn(
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
       // mupot#1997: the old member is now identityless. Mark it superseded (only if it holds no other live identity) so no
       // email attach re-binds a login to it, and sign out its directory-channel connectors. Same audit anchor as the cutoffs.
+      // ONE condition for all three effects: the old member holds no other live identity (it is being superseded).
+      const beingSuperseded = `NOT EXISTS (
+              SELECT 1 FROM human_login_identities h
+               WHERE h.tenant = ?1 AND h.member_id = ?4 AND h.revoked_at IS NULL
+            )`
       const supersede = env.DB.prepare(
         `UPDATE members SET superseded_by_member_id = ?5
           WHERE id = ?4 AND tenant = ?1 AND superseded_by_member_id IS NULL AND ${anchored}
-            AND NOT EXISTS (
-              SELECT 1 FROM human_login_identities h
-               WHERE h.tenant = ?1 AND h.member_id = ?4 AND h.revoked_at IS NULL
-            )`,
+            AND ${beingSuperseded}`,
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, me)
       const connectors = env.DB.prepare(
         `UPDATE member_tokens SET revoked_at = ?3
-          WHERE tenant = ?1 AND member_id = ?4 AND channel = ?5 AND revoked_at IS NULL AND ${anchored}`,
+          WHERE tenant = ?1 AND member_id = ?4 AND channel = ?5 AND revoked_at IS NULL AND ${anchored}
+            AND ${beingSuperseded}`,
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL)
+      // A bound Telegram chat is a credential too: a superseded member must not keep deciding through it.
+      const telegram = env.DB.prepare(
+        `UPDATE members SET telegram_chat_id = NULL
+          WHERE id = ?4 AND tenant = ?1 AND telegram_chat_id IS NOT NULL AND ${anchored}
+            AND ${beingSuperseded}`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId)
       let results: Awaited<ReturnType<typeof env.DB.batch>>
       try {
-        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones, supersede, connectors])
+        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones, supersede, connectors, telegram])
       } catch (err) {
         console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }

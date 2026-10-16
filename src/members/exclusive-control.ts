@@ -116,8 +116,8 @@ export const PROVISIONING_EXEMPT_DIRECTORY_CHANNEL = 'directory'
  * INSERT guard, the Telegram login-link claim) interpolate `notSupersededSql`; the JS decision uses `isSupersededMember`.
  * Both read the same column and nothing else re-derives it.
  */
-export function notSupersededSql(alias: string): string {
-  return `${alias}.superseded_by_member_id IS NULL`
+export function notSupersededSql(alias = ''): string {
+  return `${alias ? `${alias}.` : ''}superseded_by_member_id IS NULL`
 }
 export function isSupersededMember(row: { superseded_by_member_id: string | null }): boolean {
   return typeof row.superseded_by_member_id === 'string' // not `!== null`: a row read without the column (undefined) is not superseded
