@@ -77,15 +77,15 @@ function seedReviewTask(sqlite: SqliteD1Harness['sqlite'], id: string, squadId: 
 // Explicit created_at — needed for the starvation test, which must prove an
 // ACTUALLY-NEWER row survives the candidate window ahead of many OLDER ones
 // (BASE_SELECT orders oldest-first at the SQL layer; selectQueueWindow then
-// reorders actionable-first; updated_at stays fresh so the row is not 'expired' — this helper exists so the fixture's age
+// reorders actionable-first — this helper exists so the fixture's age
 // ordering is real, not incidental insert order).
 function seedReviewTaskAt(sqlite: SqliteD1Harness['sqlite'], id: string, squadId: string, gateOwner: string, createdAt: string): void {
   sqlite
     .prepare(
       `INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, result, created_at, updated_at)
-       VALUES (?, ?, 'T', 'body', 'done', 'review', ?, NULL, NULL, ?, datetime('now'))`,
+       VALUES (?, ?, 'T', 'body', 'done', 'review', ?, NULL, NULL, ?, ?)`,
     )
-    .run(id, squadId, gateOwner, createdAt)
+    .run(id, squadId, gateOwner, createdAt, createdAt)
 }
 
 // Capabilities are set explicitly on the AuthContext, exactly as the real
