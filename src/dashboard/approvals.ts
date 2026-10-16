@@ -44,6 +44,8 @@ export interface ApprovalItem {
   result: string | null
   completed_at: string | null
   created_at: string
+  /** Last touch — the clock APPROVAL_LIVE_SQL runs on. Optional: only the live queue selects it. */
+  updated_at?: string
   // mupot#1081 — see module header. can_verdict = can_approve || can_reject;
   // kept as its own field because the card/queue UI decides whether to render
   // ANY action affordance at all (vs. the specific Approve/Reject buttons)
@@ -137,15 +139,31 @@ function isOwnerAdmin(auth: AuthContext): boolean {
 export const APPROVALS_QUEUE_LIMIT = 200
 export const APPROVALS_FETCH_CEILING = APPROVALS_QUEUE_LIMIT * 5
 
+// "Expiry" for a gate item. Review tasks carry NO expires_at column (nor does
+// any other source on /approvals), so the only honest freshness signal is the
+// last time the task was touched. An item untouched for APPROVAL_LIVE_DAYS is
+// "expired": it leaves the badge and the default list and lives under
+// ?view=history. This is a LIVE predicate evaluated in the read query (like
+// CAPABILITY_LIVE_PREDICATE) — no sweeper, no status flip; a NULL or
+// unparseable updated_at fails CLOSED to expired (history), never to live.
+export const APPROVAL_LIVE_DAYS = 14
+export const APPROVAL_HISTORY_PAGE_SIZE = 20
+export const APPROVAL_LIVE_LIST_CAP = 20
+
+export function APPROVAL_LIVE_SQL(tasksAlias: string = 't'): string {
+  return `COALESCE(julianday(${tasksAlias}.updated_at) > julianday('now') - ${APPROVAL_LIVE_DAYS}, 0) = 1`
+}
+
 const BASE_SELECT = `
   SELECT t.id, t.squad_id, s.name AS squad_name, t.title, t.body, t.gate_owner,
          t.assignee_agent_id, a.name AS agent_name, t.result, t.completed_at,
-         t.created_at
+         t.created_at, t.updated_at
     FROM tasks t
     LEFT JOIN squads s ON s.id = t.squad_id
     LEFT JOIN agents a ON a.id = t.assignee_agent_id
    WHERE t.status = 'review'
      AND t.gate_owner IS NOT NULL
+     AND ${APPROVAL_LIVE_SQL('t')}
      AND ${TASK_NOT_ARCHIVED_SQL('t')}`
 
 // Tasks that cleared their gate (status='approved') and are content-publish work —
@@ -301,4 +319,101 @@ export function resultPreview(task: Pick<Task, 'result'>, max = 600): string | n
   const text = task.result.trim()
   if (text.length <= max) return text
   return `${text.slice(0, max).trimEnd()}…`
+}
+
+
+// ── history (?view=history) ──────────────────────────────────────────────────
+// Expired-but-still-pending items and decided items, newest first, read-only.
+// Same RBAC scoping as the live queue (owner/admin: all; others: gate_grants).
+
+export type ApprovalHistoryState = 'expired' | 'decided'
+
+export interface ApprovalHistoryRow {
+  id: string
+  title: string
+  gate_owner: string | null
+  squad_name: string | null
+  agent_name: string | null
+  at: string
+  state: ApprovalHistoryState
+  verdict: 'approved' | 'rejected' | null
+}
+
+export interface ApprovalHistoryPage {
+  rows: ApprovalHistoryRow[]
+  page: number
+  hasMore: boolean
+}
+
+export interface ApprovalsSummary {
+  expired: number
+  decidedThisWeek: number
+}
+
+function scopeFor(auth: AuthContext): { sql: string; binds: unknown[]; next: number } | null {
+  if (isOwnerAdmin(auth)) return { sql: '', binds: [], next: 1 }
+  const principal = resolveGatePrincipal(auth)
+  if (!principal) return null
+  return {
+    sql: `AND EXISTS (SELECT 1 FROM gate_grants g WHERE g.capability = t.gate_owner AND g.principal_type = ?1 AND g.principal_id = ?2)`,
+    binds: [principal.type, principal.id],
+    next: 3,
+  }
+}
+
+const HISTORY_COMMON = `
+    FROM tasks t
+    LEFT JOIN squads s ON s.id = t.squad_id
+    LEFT JOIN agents a ON a.id = t.assignee_agent_id`
+
+export async function loadApprovalsHistory(env: Env, auth: AuthContext, page = 1): Promise<ApprovalHistoryPage> {
+  const safePage = Number.isInteger(page) && page >= 1 && page <= 10_000 ? page : 1
+  const scope = scopeFor(auth)
+  if (!scope) return { rows: [], page: safePage, hasMore: false }
+  const limitN = scope.next
+  const offsetN = scope.next + 1
+  const sql = `
+    SELECT * FROM (
+      SELECT t.id, t.title, t.gate_owner, s.name AS squad_name, a.name AS agent_name,
+             t.updated_at AS at, 'expired' AS state, NULL AS verdict
+        ${HISTORY_COMMON}
+       WHERE t.status = 'review' AND t.gate_owner IS NOT NULL
+         AND NOT ${APPROVAL_LIVE_SQL('t')}
+         AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}
+      UNION ALL
+      SELECT t.id, t.title, t.gate_owner, s.name AS squad_name, a.name AS agent_name,
+             v.decided_at AS at, 'decided' AS state, v.verdict AS verdict
+        FROM task_verdicts v
+        JOIN tasks t ON t.id = v.task_id
+        LEFT JOIN squads s ON s.id = t.squad_id
+        LEFT JOIN agents a ON a.id = t.assignee_agent_id
+       WHERE t.gate_owner IS NOT NULL AND t.status <> 'review'
+         AND v.decided_at = (SELECT MAX(v2.decided_at) FROM task_verdicts v2 WHERE v2.task_id = v.task_id)
+         AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}
+    ) ORDER BY at DESC, id LIMIT ?${limitN} OFFSET ?${offsetN}`
+  const rs = await env.DB.prepare(sql)
+    .bind(...scope.binds, APPROVAL_HISTORY_PAGE_SIZE + 1, (safePage - 1) * APPROVAL_HISTORY_PAGE_SIZE)
+    .all<ApprovalHistoryRow>()
+  const all = rs.results ?? []
+  return { rows: all.slice(0, APPROVAL_HISTORY_PAGE_SIZE), page: safePage, hasMore: all.length > APPROVAL_HISTORY_PAGE_SIZE }
+}
+
+/** The one quiet line under the live list: how much sits in History. */
+export async function loadApprovalsSummary(env: Env, auth: AuthContext): Promise<ApprovalsSummary> {
+  const scope = scopeFor(auth)
+  if (!scope) return { expired: 0, decidedThisWeek: 0 }
+  const expired = await env.DB.prepare(
+    `SELECT COUNT(*) AS n ${HISTORY_COMMON}
+      WHERE t.status = 'review' AND t.gate_owner IS NOT NULL
+        AND NOT ${APPROVAL_LIVE_SQL('t')}
+        AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}`,
+  ).bind(...scope.binds).first<{ n: number }>()
+  const decided = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT v.task_id) AS n
+       FROM task_verdicts v JOIN tasks t ON t.id = v.task_id
+      WHERE t.gate_owner IS NOT NULL AND t.status <> 'review'
+        AND COALESCE(julianday(v.decided_at) > julianday('now') - 7, 0) = 1
+        AND ${TASK_NOT_ARCHIVED_SQL('t')} ${scope.sql}`,
+  ).bind(...scope.binds).first<{ n: number }>()
+  return { expired: Number(expired?.n ?? 0), decidedThisWeek: Number(decided?.n ?? 0) }
 }

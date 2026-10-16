@@ -141,7 +141,11 @@ import {
   cursorSnippet,
   requiredCanonicalOrigin,
 } from './connect'
-import { loadApprovals, loadPublishable, resultPreview } from './approvals'
+import {
+  loadApprovals, loadPublishable, resultPreview, loadApprovalsHistory, loadApprovalsSummary,
+  APPROVAL_LIVE_DAYS, APPROVAL_LIVE_LIST_CAP,
+} from './approvals'
+import type { ApprovalHistoryPage, ApprovalsSummary } from './approvals'
 import { CONTENT_DEPARTMENT_KEY } from '../agents/execute'
 // Secret-env approvals (Task 5): the paste-capable admin section on /approvals —
 // this is deliberately NOT the task_verdict queue above, since paste fields
@@ -1070,14 +1074,22 @@ dashboardApp.get('/send', async (c) => {
 // admin-gated POST /admin/departments/:dept/execute/:gateId, no new write path.
 dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
+  if (c.req.query('view') === 'history') {
+    const page = Number(c.req.query('page') ?? '1')
+    const history = await loadApprovalsHistory(c.env, auth, page)
+    return c.html(shell(c.env, 'Approvals history', approvalsHistoryBody(history)))
+  }
   // Secret-env pending requests: admin-only, like loadPublishable above — a
   // non-admin caller never even queries the table, not just doesn't see a button.
-  const [approvalsQueue, publishable, secretEnvRequests] = await Promise.all([
+  const [approvalsQueue, publishable, secretEnvRequests, summary] = await Promise.all([
     loadApprovals(c.env, auth),
     loadPublishable(c.env, auth),
     isOrgAdmin(auth) ? listPendingSecretEnvRequests(c.env) : Promise.resolve([]),
+    loadApprovalsSummary(c.env, auth),
   ])
-  return c.html(shell(c.env, 'Approvals', approvalsBody(approvalsQueue, publishable, secretEnvRequests)))
+  return c.html(shell(c.env, 'Approvals', approvalsBody(
+    approvalsQueue, publishable, secretEnvRequests, summary, c.req.query('all') === '1',
+  )))
 })
 
 // POST /admin/secret-env/:requestId/bind — admin pastes values for a pending
@@ -6259,27 +6271,39 @@ function sendScript(projectId?: string) {
 // The inline <style> block for .appr-* classes was moved into shell() to avoid
 // duplication across pages.
 
-function approvalsBody(
+export function approvalsBody(
   approvalsQueue: ApprovalsQueue,
   publishable: PublishableItem[] = [],
   secretEnvRequests: PublicSecretEnvRequest[] = [],
+  summary: ApprovalsSummary = { expired: 0, decidedThisWeek: 0 },
+  showAll = false,
 ) {
   const { items, actionableCount, actionableCountIsLowerBound } = approvalsQueue
-  // Re-use the shared card renderer. Wrap in a named container so the script can
-  // scope its querySelectorAll without touching #obs-queue on the home page.
-  // `items` mixes actionable rows (buttons render) and informational ones (no
-  // buttons; see approvalCardHtml) — actionable rows always come first, see
-  // selectQueueWindow (src/dashboard/approvals.ts).
-  const cards = items.map((t) => approvalCardHtml(t)).join('')
-  const n = items.length
-  // mupot#1319 round 2, Codex FINDING 4/2 (CORRECTED from round 1, which used
-  // items.length — that counted informational/unactionable rows as "awaiting
-  // your gate," which they are not by this page's own definition, AND
-  // understated the true total once truncated since it never distinguished
-  // "hit the cap" from "this is everything"). The badge now reflects
-  // actionableCount specifically, with an explicit "+" whenever that count is
-  // a LOWER BOUND (actionableCountIsLowerBound) — see ApprovalsQueue's own
-  // doc comment for exactly what can make it one.
+  // Only what the caller can act on right now: informational rows (no verdict
+  // action for this caller) never render here, and the badge counts the same
+  // set (actionableCount === actionable.length).
+  const actionable = items.filter((t) => t.can_verdict)
+  const shown = showAll ? actionable : actionable.slice(0, APPROVAL_LIVE_LIST_CAP)
+  const hidden = actionable.length - shown.length
+  const groups = new Map<string, ApprovalItem[]>()
+  for (const t of shown) {
+    const key = t.gate_owner ?? 'ungated'
+    const g = groups.get(key)
+    if (g) g.push(t)
+    else groups.set(key, [t])
+  }
+  const cards = [...groups.entries()]
+    .map(([gate, rows]) => `<h3 class="appr-group">${escHtml(gate)} <span class="muted">${String(rows.length)}</span></h3>${rows.map((t) => approvalRowHtml(t)).join('')}`)
+    .join('')
+  const n = actionable.length
+  const moreLink = hidden > 0
+    ? `<p><a class="btn secondary sm" href="/approvals?all=1">Show ${String(hidden)} more</a></p>`
+    : ''
+  const historyLine = summary.expired + summary.decidedThisWeek > 0
+    ? `<p class="muted appr-history-line">${String(summary.expired)} expired, ${String(summary.decidedThisWeek)} decided this week → <a href="/approvals?view=history">History</a></p>`
+    : ''
+  // The badge reflects actionableCount, with an explicit "+" whenever that
+  // count is a LOWER BOUND (actionableCountIsLowerBound).
   const badgeText = actionableCountIsLowerBound
     ? `${String(actionableCount)}+ awaiting your gate`
     : `${String(actionableCount)} awaiting your gate`
@@ -6318,10 +6342,59 @@ function approvalsBody(
       badge: actionableCount ? badgeText : 'Gate clear',
       badgeTone: actionableCount ? 'warn' : 'ok',
     })}
-    ${n ? raw(`<div id="approvals-list">${cards}</div>`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${n ? raw(`<div id="approvals-list">${cards}</div>${moreLink}`) : html`<div class="card"><p class="empty">Nothing waiting at your gates. Gated work lands here when an agent finishes it.</p></div>`}
+    ${raw(historyLine)}
     ${n ? approvalsScript() : html``}
     ${publishSection}
     ${secretEnvApprovalsSection(secretEnvRequests)}`
+}
+
+/** Compact one-row approval: who, what, expiry, approve/reject. Same hooks as
+ *  approvalCardHtml (.approval / .appr-note / .appr-approve / .appr-reject), so
+ *  approvalsScript wires it unchanged. Buttons render only per can_approve /
+ *  can_reject — the same server-computed predicate as the write route. */
+function approvalRowHtml(t: ApprovalItem): string {
+  const who = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
+  const squad = escHtml(t.squad_name ?? t.squad_id)
+  const touched = Date.parse(t.updated_at ?? t.created_at)
+  const daysLeft = Number.isFinite(touched)
+    ? Math.max(0, Math.ceil(APPROVAL_LIVE_DAYS - (Date.now() - touched) / 86_400_000))
+    : 0
+  const expiry = `leaves queue in ${String(daysLeft)}d`
+  const detail = t.body
+    ? `<details><summary class="muted">details</summary><div class="appr-body">${escHtml(t.body)}</div></details>`
+    : ''
+  return `
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}">
+      <div class="appr-head">
+        <div>
+          <div class="appr-title">${escHtml(t.title)}</div>
+          <div class="appr-meta">${who} · ${squad} · ${expiry}</div>
+        </div>
+        <div class="appr-actions">
+          <input type="text" class="appr-note" placeholder="note (required to reject)" />
+          ${t.can_approve ? '<button class="btn appr-approve">Approve</button>' : ''}
+          ${t.can_reject ? '<button class="btn btn-reject appr-reject">Reject</button>' : ''}
+          <span class="appr-status"></span>
+        </div>
+      </div>
+      ${detail}
+    </div>`
+}
+
+export function approvalsHistoryBody(h: ApprovalHistoryPage) {
+  const rows = h.rows.map((r) => {
+    const state = r.state === 'decided' ? (r.verdict ?? 'decided') : 'expired'
+    return `<tr><td>${escHtml(r.title)}</td><td>${escHtml(r.gate_owner ?? '')}</td><td>${escHtml(r.agent_name ?? r.squad_name ?? '')}</td><td>${escHtml(state)}</td><td>${escHtml(r.at.slice(0, 16).replace('T', ' '))}</td></tr>`
+  }).join('')
+  const prev = h.page > 1 ? `<a class="btn secondary sm" href="/approvals?view=history&amp;page=${String(h.page - 1)}">Newer</a> ` : ''
+  const next = h.hasMore ? `<a class="btn secondary sm" href="/approvals?view=history&amp;page=${String(h.page + 1)}">Older</a>` : ''
+  return html`
+    ${pageHeader({ crumbs: 'Overview / The Gate / History', title: 'Approvals history', sub: 'Expired and decided items. Nothing here needs you right now.' })}
+    ${rows
+      ? raw(`<div class="card"><table class="ui-table"><thead><tr><th>What</th><th>Gate</th><th>Who</th><th>State</th><th>When</th></tr></thead><tbody>${rows}</tbody></table></div><p>${prev}${next}</p>`)
+      : html`<div class="card"><p class="empty">Nothing in history yet.</p></div>`}
+    <p><a href="/approvals">← Back to approvals</a></p>`
 }
 
 /**
