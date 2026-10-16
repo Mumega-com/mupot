@@ -25,6 +25,7 @@ import { revokeWebSessionsForLoginIdentity } from './web-sessions'
 import { nowSqlUtc } from './token-lifecycle'
 import {
   liveCompetingBearerSql,
+  notSupersededSql,
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_LABEL,
@@ -184,6 +185,7 @@ export async function linkLoginIdentity(
           SELECT 1 FROM members m2
            WHERE m2.id = ?6 AND m2.tenant = ?2
              AND m2.status = 'active' AND m2.archived_at IS NULL
+             AND ${notSupersededSql('m2')}
         )`,
     )
       .bind(

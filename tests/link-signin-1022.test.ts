@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
 import { listLinkedSignIns, linkSignIn } from '../src/auth/link-signin'
+import { linkLoginIdentity } from '../src/auth/login-identity'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../src/auth/token-lifecycle'
+import { decideIdentitylessAttach } from '../src/members/exclusive-control'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -59,6 +62,9 @@ describe('#1022 linked sign-ins', () => {
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dup-1', 'mem-dup', 'squad', 'squad-1', 'member');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dup-2', 'mem-dup', 'squad', 'squad-2', 'member');
       INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id) VALUES ('hli-dup', '${TENANT}', 'google', 'sub-dup', 'dup@gmail.test', 'mem-dup');
+      -- the duplicate's MCP connector (directory channel, unbound): exempt from the competing-bearer check, signed out on a move
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
+        VALUES ('tok-dir', 'mem-dup', 'hash-dir', 'oauth:x', 'directory', datetime('now'), NULL, '${TENANT}', NULL, NULL);
     `)
   })
   afterEach(() => {
@@ -126,6 +132,10 @@ describe('#1022 linked sign-ins', () => {
   const identity = (sub: string) =>
     h.sqlite.prepare(`SELECT member_id, revoked_at, linked_by_member_id FROM human_login_identities WHERE provider = 'google' AND provider_subject = ?`).get(sub) as
       { member_id: string; revoked_at: string | null; linked_by_member_id: string | null } | undefined
+  const supersededBy = (id: string) =>
+    (h.sqlite.prepare(`SELECT superseded_by_member_id AS s FROM members WHERE id = ?`).get(id) as { s: string | null }).s
+  const directoryTokenLive = (id: string) =>
+    h.sqlite.prepare(`SELECT 1 AS x FROM member_tokens t WHERE t.id = ? AND ${TOKEN_LIVE_PREDICATE("'" + nowSqlUtc() + "'")}`).get(id) !== undefined
   const audits = (op: string) =>
     h.sqlite.prepare(`SELECT operation, evidence_json FROM mutation_audit_entries WHERE handler = 'auth.linked_signins' AND operation = ?`).all(op)
 
@@ -282,6 +292,44 @@ describe('#1022 linked sign-ins', () => {
     expect(await memberOf(await signIn('sub-dup', 'dup@gmail.test'))).toBe('mem-main')
   })
 
+  it('#1997 a move marks the old member superseded and signs out its directory connectors (revoked tokens fail liveness)', async () => {
+    expect(directoryTokenLive('tok-dir')).toBe(true)
+    const { jar, page } = await reachMoveConfirm()
+    expect(page).toContain("Your old account&#39;s connector sessions will be signed out".replace('&#39;', "'")) // page promise
+    await post(jar, '/auth/link-signin/confirm')
+    expect(supersededBy('mem-dup')).toBe('mem-main')
+    expect(directoryTokenLive('tok-dir')).toBe(false)
+    expect(h.sqlite.prepare(`SELECT revoked_at FROM member_tokens WHERE id = 'tok-dir'`).get()).not.toEqual({ revoked_at: null })
+    // grants and status untouched
+    expect(h.sqlite.prepare(`SELECT status FROM members WHERE id = 'mem-dup'`).get()).toEqual({ status: 'active' })
+    expect((h.sqlite.prepare(`SELECT COUNT(*) AS n FROM capabilities WHERE member_id = 'mem-dup'`).get() as { n: number }).n).toBe(2)
+  })
+
+  it('#1997 a move that leaves the old member another live identity does NOT mark it superseded', async () => {
+    h.sqlite.exec(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id) VALUES ('hli-dup-2', '${TENANT}', 'google', 'sub-dup-2', 'dup2@gmail.test', 'mem-dup')`)
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect(identity('sub-dup')?.member_id).toBe('mem-main')
+    expect(supersededBy('mem-dup')).toBeNull()
+  })
+
+  it('#1997 email attach refuses a superseded member: decision and the atomic link write', async () => {
+    const { jar } = await reachMoveConfirm()
+    await post(jar, '/auth/link-signin/confirm')
+    expect(await decideIdentitylessAttach(env, { tenant: TENANT, normalizedEmail: 'dup@gmail.test' }))
+      .toEqual({ kind: 'denied_competing_control', reason: 'superseded' })
+    expect(await decideIdentitylessAttach(env, { tenant: TENANT, normalizedEmail: 'dup@gmail.test', ignoreLiveIdentity: true }))
+      .toEqual({ kind: 'denied_competing_control', reason: 'superseded' })
+    // the write-time guard refuses too, independently of the read
+    const r = await linkLoginIdentity(env, {
+      tenant: TENANT, provider: 'google', providerSubject: 'sub-new', verifiedEmail: 'dup@gmail.test',
+      memberId: 'mem-dup', requireExclusiveControl: true,
+    })
+    expect(r).toMatchObject({ ok: false, error: 'competing_control' })
+    // a plain login with the same email does not land on the superseded member
+    expect(await memberOf(await signIn('sub-new', 'dup@gmail.test'))).not.toBe('mem-dup')
+  })
+
   it('the duplicate-move batch is all-or-nothing: a failure in the cutoff statement leaves the identity on the old member', async () => {
     await signIn('sub-dup', 'dup@gmail.test') // a live old session so the cutoff UPDATE has a row to touch
     const { jar } = await reachMoveConfirm()
@@ -369,6 +417,8 @@ describe('#1022 linked sign-ins', () => {
     expect(identity('sub-dup')?.member_id).toBe('mem-dup')
     expect(await memberOf(oldBrowser)).toBe('mem-dup') // old session untouched
     expect(audits('move')).toHaveLength(0)
+    expect(supersededBy('mem-dup')).toBeNull() // #1997: a 0-row move marks nothing and revokes no connector
+    expect(directoryTokenLive('tok-dir')).toBe(true)
   })
 
   it('audit and cutoffs anchor on THIS request\'s claim row, not on the identity merely belonging to the actor', async () => {
@@ -383,6 +433,8 @@ describe('#1022 linked sign-ins', () => {
     expect(identity('sub-dup')?.member_id).toBe('mem-main')
     expect(audits('move')).toHaveLength(0)
     expect(await memberOf(oldBrowser)).toBe('mem-dup')
+    expect(supersededBy('mem-dup')).toBeNull()
+    expect(directoryTokenLive('tok-dir')).toBe(true)
   })
 
   it('a real move writes its claim, audit and cutoffs', async () => {

@@ -14,7 +14,8 @@
 //     check on the member losing the identity, and the old member must not back an agent. The move is ONE guarded UPDATE
 //     plus an anchored session cutoff in one D1 batch: a refusal changes nothing, and the cutoff only lands if the move did.
 //   - UNIQUE(tenant, provider, subject) covers revoked rows too, so a "move" re-points the existing row rather than
-//     inserting a second one; the old member keeps its row and its capabilities and is left for an admin to archive.
+//     inserting a second one; the old member keeps its row and its capabilities and is left for an admin to archive; it is marked superseded (#1997,
+//     never email-attachable again) and its directory-channel connector tokens are revoked in the same batch.
 //   - Unlink: self only, never the last live identity (guard is inside the UPDATE), cuts off the sessions/passkeys it issued.
 //   - Every link, move and unlink writes a mutation_audit_entries row.
 
@@ -334,9 +335,23 @@ export async function linkSignIn(
         `UPDATE tg_miniapp_devices SET revoked_at = ?3, revoked_reason = 'login_identity_moved'
           WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
+      // mupot#1997: the old member is now identityless. Mark it superseded (only if it holds no other live identity) so no
+      // email attach re-binds a login to it, and sign out its directory-channel connectors. Same audit anchor as the cutoffs.
+      const supersede = env.DB.prepare(
+        `UPDATE members SET superseded_by_member_id = ?5
+          WHERE id = ?4 AND tenant = ?1 AND superseded_by_member_id IS NULL AND ${anchored}
+            AND NOT EXISTS (
+              SELECT 1 FROM human_login_identities h
+               WHERE h.tenant = ?1 AND h.member_id = ?4 AND h.revoked_at IS NULL
+            )`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, me)
+      const connectors = env.DB.prepare(
+        `UPDATE member_tokens SET revoked_at = ?3
+          WHERE tenant = ?1 AND member_id = ?4 AND channel = ?5 AND revoked_at IS NULL AND ${anchored}`,
+      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL)
       let results: Awaited<ReturnType<typeof env.DB.batch>>
       try {
-        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones])
+        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones, supersede, connectors])
       } catch (err) {
         console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }

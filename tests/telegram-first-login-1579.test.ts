@@ -564,6 +564,12 @@ describe('#1579 Telegram-first member web login', () => {
       expect((await post(a.jar)).status).toBe(403)
       expect(identities()).toEqual([])
     })
+    it('#1997 refuses a member superseded after minting (never attaches a login to a moved-away duplicate)', async () => {
+      const a = await armed()
+      h.sqlite.prepare(`UPDATE members SET superseded_by_member_id = 'mem-other' WHERE id = ?`).run(a.memberId)
+      expect((await post(a.jar)).status).toBe(403)
+      expect(identities()).toEqual([])
+    })
     it('refuses a member that now lives in another tenant', async () => {
       const a = await armed()
       h.sqlite.prepare(`UPDATE members SET tenant = 'elsewhere' WHERE id = ?`).run(a.memberId)
