@@ -261,10 +261,8 @@ export async function linkSignIn(
       // Re-read at write time and enforced INSIDE the statement too: a promotion of the old member between the plan and the
       // batch must not slip a higher-ranked member's identity away. (capabilities table only; the plan covers every plane.)
       const actorRank = await actorRankOnScopeFor(env, auth, 'org', null)
-      const move = env.DB.prepare(
-        `UPDATE human_login_identities
-            SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2, moved_stamp = ?14
-          WHERE id = ?3 AND tenant = ?4 AND member_id = ?5 AND revoked_at IS NULL
+      // The move's guards, written once: the claim INSERT and the UPDATE evaluate the SAME predicate inside one transaction.
+      const guard = `id = ?3 AND tenant = ?4 AND member_id = ?5 AND revoked_at IS NULL
             AND provider = ?6 AND provider_subject = ?7
             AND EXISTS (
               SELECT 1 FROM members cur
@@ -287,13 +285,20 @@ export async function linkSignIn(
               SELECT 1 ${liveCompetingBearerSql({
                 tenant: '?4', member: '?5', exemptLabel: '?8', exemptChannel: '?9', directoryChannel: '?10', now: '?11',
               })}
-            )`,
-      ).bind(
+            )`
+      const baseBinds = [
         me, input.verifiedEmail, identityId, env.TENANT_SLUG, oldMemberId, input.provider, input.subject,
-        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(), requestId,
-      )
-      // Everything after the move lands only if THIS request's move changed the row: the move stamps moved_stamp = requestId,
-      // the audit INSERT anchors on that stamp (the #1979 consumed_at pattern), and the cutoffs anchor on the audit row.
+        PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(),
+      ]
+      const claim = env.DB.prepare(
+        `INSERT INTO login_identity_move_claims (stamp, tenant, identity_id, from_member_id, to_member_id, claimed_at)
+         SELECT ?14, ?4, ?3, ?5, ?1, ?15 FROM human_login_identities WHERE ${guard}`,
+      ).bind(...baseBinds, requestId, nowIso)
+      const move = env.DB.prepare(
+        `UPDATE human_login_identities SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2 WHERE ${guard}`,
+      ).bind(...baseBinds)
+      // Everything after the move lands only if THIS request's claim landed (stamp = requestId, the #1979 consumed_at pattern)
+      // AND the identity now belongs to the actor; the cutoffs anchor on the audit row.
       let audit
       try {
         audit = await prepareMutationAudit(env, auth, {
@@ -306,9 +311,10 @@ export async function linkSignIn(
           evidence: { provider: input.provider, masked_email: maskedEmail, from_member_id: oldMemberId },
         }, {
           sql: `EXISTS (
-                  SELECT 1 FROM human_login_identities h
-                   WHERE h.id = ?25 AND h.tenant = ?26 AND h.member_id = ?27 AND h.moved_stamp = ?28 AND h.revoked_at IS NULL)`,
-          binds: [identityId, env.TENANT_SLUG, me, requestId],
+                  SELECT 1 FROM login_identity_move_claims m
+                    JOIN human_login_identities h ON h.id = m.identity_id AND h.tenant = m.tenant
+                   WHERE m.stamp = ?25 AND m.tenant = ?26 AND h.member_id = ?27 AND h.revoked_at IS NULL)`,
+          binds: [requestId, env.TENANT_SLUG, me],
         })
       } catch (err) {
         console.error('linked-signins move audit prepare failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
@@ -330,12 +336,12 @@ export async function linkSignIn(
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
       let results: Awaited<ReturnType<typeof env.DB.batch>>
       try {
-        results = await env.DB.batch([move, audit, cutoff, passkeys, phones])
+        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones])
       } catch (err) {
         console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }
       }
-      if (Number(results[0]?.meta?.changes ?? 0) === 0) return { ok: false, error: 'already_linked' }
+      if (Number(results[1]?.meta?.changes ?? 0) === 0) return { ok: false, error: 'already_linked' }
       return { ok: true, outcome: 'moved', identityId }
     }
   }

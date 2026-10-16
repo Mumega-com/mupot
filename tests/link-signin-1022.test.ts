@@ -92,7 +92,7 @@ describe('#1022 linked sign-ins', () => {
   async function withGoogle<T>(sub: string, email: string | null, fn: () => Promise<T>): Promise<T> {
     const realFetch = globalThis.fetch
     globalThis.fetch = (async (u: string) => {
-      if (String(u).includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer', ...(googleAuthTime === null ? {} : { id_token: idTokenFor(googleAuthTime) }) }))
+      if (new URL(String(u)).pathname.includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer', ...(googleAuthTime === null ? {} : { id_token: idTokenFor(googleAuthTime) }) }))
       return new Response(JSON.stringify({ sub, ...(email ? { email, email_verified: true } : {}) }))
     }) as typeof fetch
     try { return await fn() } finally { globalThis.fetch = realFetch }
@@ -111,7 +111,7 @@ describe('#1022 linked sign-ins', () => {
   async function startLink(jar: Jar): Promise<{ res: Response; state: string | null }> {
     const res = await post(jar, '/auth/link-signin/start')
     const loc = res.headers.get('location') ?? ''
-    return { res, state: loc.includes('accounts.google.com') ? new URL(loc).searchParams.get('state') : null }
+    return { res, state: loc !== '' && new URL(loc, ORIGIN).host === 'accounts.google.com' ? new URL(loc).searchParams.get('state') : null }
   }
   async function completeLink(jar: Jar, state: string, sub: string, email: string | null = `${sub}@gmail.test`): Promise<Response> {
     return withGoogle(sub, email, () => visit(jar, `/auth/callback?code=c&state=${state}`))
@@ -371,23 +371,24 @@ describe('#1022 linked sign-ins', () => {
     expect(audits('move')).toHaveLength(0)
   })
 
-  it('audit and cutoffs anchor on THIS request\'s moved_stamp, not on the row merely belonging to the actor', async () => {
+  it('audit and cutoffs anchor on THIS request\'s claim row, not on the identity merely belonging to the actor', async () => {
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
-    // the row ends up with the actor as owner but a stamp that is not this request's (a different writer's move)
-    h.sqlite.exec(`CREATE TRIGGER foreign_stamp AFTER UPDATE ON human_login_identities WHEN NEW.moved_stamp IS NOT NULL
-      BEGIN UPDATE human_login_identities SET moved_stamp = 'someone-else' WHERE id = NEW.id; END`)
+    // the claim is lost (a race loser) while the row still ends up with the actor: nothing downstream may land
+    h.sqlite.exec(`CREATE TRIGGER lose_claim BEFORE INSERT ON login_identity_move_claims BEGIN SELECT RAISE(IGNORE); END`)
     await post(jar, '/auth/link-signin/confirm')
+    expect(identity('sub-dup')?.member_id).toBe('mem-main')
     expect(audits('move')).toHaveLength(0)
     expect(await memberOf(oldBrowser)).toBe('mem-dup')
   })
 
-  it('a real move stamps the row and always writes its audit and cutoffs', async () => {
+  it('a real move writes its claim, audit and cutoffs', async () => {
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
     await post(jar, '/auth/link-signin/confirm')
-    const row = h.sqlite.prepare(`SELECT moved_stamp FROM human_login_identities WHERE id = 'hli-dup'`).get() as { moved_stamp: string | null }
-    expect(row.moved_stamp).toMatch(/^[0-9a-f-]{36}$/)
+    const claim = h.sqlite.prepare(`SELECT stamp, from_member_id, to_member_id FROM login_identity_move_claims`).all() as { stamp: string; from_member_id: string; to_member_id: string }[]
+    expect(claim).toHaveLength(1)
+    expect(claim[0]).toMatchObject({ from_member_id: 'mem-dup', to_member_id: 'mem-main' })
     expect(audits('move')).toHaveLength(1)
     expect(await memberOf(oldBrowser)).toBeUndefined()
   })
@@ -538,7 +539,7 @@ describe('#1022 linked sign-ins', () => {
       const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(authorize.headers.get('Set-Cookie') ?? '')![1]
       vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input)
-        if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
+        if (new URL(url).host === 'oauth2.googleapis.com' && new URL(url).pathname === '/token') return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
         return new Response(JSON.stringify({ id: googleId, name: 'P', email, verified_email: true }), { status: 200 })
       }))
       const res = await handleOAuthAuthorize(new Request(
