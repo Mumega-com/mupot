@@ -42,17 +42,22 @@
 //   reply" signal is forgeable by anyone who repeats it. Only fields that a sender sets on the
 //   envelope — kind, request_id — are safe to treat as intent.
 
+import { systemSenderReplyVia, isSystemSender } from './system-senders'
+
 /** Kinds an agent message may carry. Mirrors KINDS in ./messages. */
 export type ReplyExpectationKind = 'message' | 'request' | 'ack'
 
 /**
  * Why the predicate answered the way it did. Ordered by strength of evidence, strongest first.
+ * - `system_sender`     — sent by a registered system literal (./system-senders). No message
+ *                         reply is owed; the real response is the tool named in reply_via.
  * - `ack_is_terminal`  — kind:"ack". An ack closes a chain; it never opens one.
  * - `request_id_field` — the sender set the structured field. Unambiguous intent.
  * - `body_token`       — a `[request_id:…]` token appears in prose only. WEAK: may be a quote.
  * - `no_signal`        — nothing in the message asks for anything.
  */
 export type ReplyBasis =
+  | 'system_sender'
   | 'ack_is_terminal'
   | 'request_id_field'
   | 'body_token'
@@ -75,6 +80,8 @@ export interface ReplyExpectationInput {
   kind: ReplyExpectationKind | string
   requestId?: string | null
   body?: string | null
+  /** Stored from_agent. A registered system-sender literal (never a real agent id) is never owed a reply. */
+  fromAgent?: string | null
 }
 
 /**
@@ -99,6 +106,10 @@ export interface ReplyExpectationInput {
  * kind:"ack": it already persists, it is already terminal here, and it needs no new column.
  */
 export function evaluateReplyExpectation(input: ReplyExpectationInput): ReplyExpectation {
+  // System senders are not agent rows and cannot receive a message; the structured intent on
+  // their rows (request_id) is a correlation key, not a request for an ACK.
+  if (isSystemSender(input.fromAgent)) return { expected: false, basis: 'system_sender' }
+
   if (input.kind === 'ack') return { expected: false, basis: 'ack_is_terminal' }
 
   const requestId = typeof input.requestId === 'string' ? input.requestId.trim() : ''
@@ -108,4 +119,9 @@ export function evaluateReplyExpectation(input: ReplyExpectationInput): ReplyExp
   if (BODY_REQUEST_ID_RE.test(body)) return { expected: true, basis: 'body_token' }
 
   return { expected: false, basis: 'no_signal' }
+}
+
+/** Tool that is the real response to a system-sender message, or null. */
+export function replyViaFor(fromAgent: unknown): string | null {
+  return systemSenderReplyVia(fromAgent)
 }

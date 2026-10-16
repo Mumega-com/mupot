@@ -29,7 +29,8 @@ import type { DispatchBrakeReason } from '../agents/execution-brake-sql'
 // (src/fleet/control.ts, emitControlRequest) for a system-originated send with no bound-agent
 // caller: a distinct, non-spoofable literal so a bridged message is visibly attributable in the
 // inbox (never invented as if some other real agent sent it).
-export const DISPATCH_BRIDGE_SENDER = 'mupot-dispatch'
+import { DISPATCH_BRIDGE_SENDER } from '../agents/system-senders'
+export { DISPATCH_BRIDGE_SENDER }
 
 /** Idempotency-key prefix for a bridged dispatch delivery. Exported so a caller that must
  *  validate a receiptId against sendAgentMessage's request_id charset/length limit (RID_RE,

@@ -24,7 +24,8 @@ import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
 import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedAtSql, executionPausedSql } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
-import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
+import { evaluateReplyExpectation, replyViaFor, type ReplyBasis } from './reply-expectation'
+import { isSystemSender, systemSenderReplyVia } from './system-senders'
 import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
@@ -100,6 +101,9 @@ export interface InboxMessage {
   /** Which input decided expects_reply. 'body_token' is the weak, quotable one — a consumer
    *  that acts only on structured intent should require 'request_id_field'. */
   reply_basis?: ReplyBasis
+  /** For system-sender messages (reply_basis 'system_sender'): the tool that is the real
+   *  response, or null when informational. Absent on ordinary messages. */
+  reply_via?: string | null
 }
 
 async function annotateMessages(messages: InboxMessage[]): Promise<void> {
@@ -128,9 +132,11 @@ async function annotateMessages(messages: InboxMessage[]): Promise<void> {
       kind: message.kind,
       requestId: message.request_id,
       body: message.body,
+      fromAgent: message.from_agent,
     })
     message.expects_reply = expectation.expected
     message.reply_basis = expectation.basis
+    if (expectation.basis === 'system_sender') message.reply_via = replyViaFor(message.from_agent)
   }
 }
 
@@ -195,6 +201,7 @@ export type SendFailure = {
     | 'task_held'
     | 'retry_ceiling_reached'
     | 'send_target_not_visible'
+    | 'system_sender_not_addressable'
     | 'inbox_full'
     | 'db_error'
   detail?: string
@@ -370,6 +377,7 @@ export async function sendAgentMessage(
     return { ok: false, reason: 'invalid_from', detail: 'fromMember required' }
   if (typeof input.toAgent !== 'string' || !isRef(input.toAgent))
     return { ok: false, reason: 'invalid_to', detail: 'toAgent required' }
+  if (isSystemSender(input.toAgent)) return systemSenderRefusal(input.toAgent)
   if (typeof input.body !== 'string' || input.body.length === 0)
     return { ok: false, reason: 'invalid_body', detail: 'body required' }
   if (input.body.length > MAX_BODY_CHARS)
@@ -2748,6 +2756,17 @@ async function resolveVisibleSendTargetOnce(
   return { ok: false, reason: 'send_target_not_visible' }
 }
 
+function systemSenderRefusal(ref: string): SendFailure {
+  const via = systemSenderReplyVia(ref)
+  return {
+    ok: false,
+    reason: 'system_sender_not_addressable',
+    detail: via
+      ? `${ref} is a system sender, not an agent; it takes no message replies. Respond with ${via}, then inbox_ack the message.`
+      : `${ref} is a system sender, not an agent; it takes no message replies. inbox_ack the message to consume it.`,
+  }
+}
+
 export async function sendToRef(
   env: Env,
   input: {
@@ -2770,6 +2789,12 @@ export async function sendToRef(
   // existence-oracle bit the old `invisible_resolved` defer used to leak; when the target
   // was already squad/guest-visible, the specific reason is legitimate feedback the sender
   // already had every right to (they could already see this recipient).
+  // System-sender literals are public constants and never agent rows: refuse with a distinct,
+  // actionable reason BEFORE any resolution. Exact-match only; every other ref keeps the
+  // collapsed send_target_not_visible behavior below (this is not an existence oracle).
+  const systemRef = input.toRef.trim()
+  if (isSystemSender(systemRef)) return systemSenderRefusal(systemRef)
+
   let resolved: { value: SendAgentRow }
   let squadViaProjectOnly = false
   let guestVisibilityFence: GuestVisibilityFence | undefined

@@ -2,10 +2,10 @@ import type { Agent, BusEvent, Env } from '../types'
 import { createBus } from '../bus'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { sendAgentMessage } from './messages'
+import { WAKE_ROUTER_SENDER } from './system-senders'
 import { isExecutionPaused } from './execution-brakes'
 import type { DoorbellWaitUntil } from './webhook-doorbell'
 
-const WAKE_ROUTER_SENDER = 'mupot-wake-router'
 const DO_ORIGIN = 'https://agent'
 
 export interface WakeRouteInput {
