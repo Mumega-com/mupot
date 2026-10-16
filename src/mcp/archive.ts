@@ -410,7 +410,7 @@ export const toolArchivePropose: ToolSpec = {
   args: `{ task_ids: string[] (1-${MAX_PROPOSE_IDS}), reason: string, evidence?: string }` +
     ' -- agent-bound callers only. Proposes archiving tasks; NEVER archives. A human org admin reviews pending' +
     ' proposals at /board/cleanup and archives them there. The task\'s current status is recorded and re-checked at' +
-    ' archive time (a task that moved is refused). Returns proposed / already_pending / not_found / already_archived.',
+    ' archive time (a task that moved is refused). Returns proposed / already_pending / not_proposable (missing, unreadable or archived: not told apart) / cap_reached (200 pending per agent). 409 not_supported when TASK_ARCHIVE_ENABLED is off.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -429,13 +429,13 @@ export const toolArchivePropose: ToolSpec = {
     const reason = str(args.reason)
     if (!reason) return fail(400, 'invalid_args', 'reason required')
     if (args.evidence !== undefined && typeof args.evidence !== 'string') return fail(400, 'invalid_args', 'evidence must be a string')
-    const result = await proposeArchives(env, {
+    const result = await proposeArchives(env, auth, {
       agentId: auth.boundAgentId,
       taskIds: args.task_ids as string[], // as: every element was just checked to be a string
       reason,
       evidence: typeof args.evidence === 'string' ? args.evidence : '',
     })
-    if (!result.ok) return fail(result.error === 'too_many_pending' ? 409 : 400, result.error, result.detail)
+    if (!result.ok) return fail(result.error === 'not_supported' ? 409 : 400, result.error, result.detail)
     return done(result)
   },
 }

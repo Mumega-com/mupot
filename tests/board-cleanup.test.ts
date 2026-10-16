@@ -4,9 +4,12 @@
 // Mutation (see PR body): removing the operator-only gate in the POST (the org-admin + not-agent check)
 // turns "a non-admin is refused" red.
 
+import { Hono } from 'hono'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
+import { makeBoardCleanupApp } from '../src/dashboard/board-cleanup'
+import { countPendingProposals, listPendingProposals, MAX_PENDING_PER_AGENT, PROPOSAL_TTL_MS } from '../src/hygiene/archive-proposals'
 import { invokeTool } from '../src/mcp/index'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -71,6 +74,9 @@ function form(env: Env, cookie: string, body: Record<string, string | string[]>,
   return dashboardApp.request('/board/cleanup/archive', { method: 'POST', headers, body: params.toString() }, env)
 }
 
+function renderedIds(html: string): string[] {
+  return Array.from(html.matchAll(/name="rendered_id" value="([^"]+)"/g)).map((m) => m[1] as string)
+}
 const rows = (sql: string) => harness.sqlite.prepare(sql).all() as Array<Record<string, unknown>>
 const archivedIds = () => rows('SELECT task_id FROM tasks_archive_state').map((r) => String(r.task_id))
 const pendingIds = () => rows('SELECT id, task_id FROM archive_proposals WHERE decision IS NULL ORDER BY task_id')
@@ -137,7 +143,9 @@ describe('/board/cleanup (human half)', () => {
     const res = await dashboardApp.request('/board/cleanup', { headers: { cookie } }, env)
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).toContain('obsolete spike (2)')
+    expect(body).toContain('Proposed by Agent A (2)')
+    expect(body).toMatch(/Agent.{1,6}s note: obsolete spike/)
+    expect(body).toContain('Squad One / Project One')
     expect(body).toContain('Obsolete spike one')
     expect(body).toContain('no activity 90d')
     expect(body).toContain('blocked')
@@ -169,7 +177,7 @@ describe('/board/cleanup (human half)', () => {
     await propose(['t-1', 't-2', 't-3'])
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
-    const res = await form(env, cookie, { mode: 'all' })
+    const res = await form(env, cookie, { mode: 'all', rendered_id: pendingIds().map((r) => String(r.id)) })
     expect(res.status).toBe(200)
     expect(archivedIds().sort()).toEqual(['t-1', 't-2', 't-3'])
     expect(pendingIds()).toHaveLength(0)
@@ -218,7 +226,7 @@ describe('/board/cleanup (human half)', () => {
     harness.sqlite.exec(`UPDATE tasks SET status = 'in_progress' WHERE id = 't-1'`)
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
-    const res = await form(env, cookie, { mode: 'all' })
+    const res = await form(env, cookie, { mode: 'all', rendered_id: pendingIds().map((r) => String(r.id)) })
     expect(res.status).toBe(200)
     expect(await res.text()).toContain('status_drift')
     expect(archivedIds()).toEqual(['t-2'])
@@ -232,9 +240,126 @@ describe('/board/cleanup (human half)', () => {
     harness.sqlite.exec(`UPDATE tasks SET execution_claim_expires_at = ${Date.now() + 3_600_000} WHERE id = 't-1'`)
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
-    const res = await form(env, cookie, { mode: 'all' })
+    const res = await form(env, cookie, { mode: 'all', rendered_id: pendingIds().map((r) => String(r.id)) })
     expect(await res.text()).toContain('live_execution_claim')
     expect(archivedIds()).toEqual(['t-2'])
     expect(pendingIds().map((r) => r.task_id)).toEqual(['t-1'])
+  })
+
+  it('Archive all archives ONLY the proposals the page rendered (a proposal that arrived after render is untouched)', async () => {
+    await propose(['t-1'])
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const page = await (await dashboardApp.request('/board/cleanup', { headers: { cookie } }, env)).text()
+    expect(page).toContain('Archive all (1)')
+    await propose(['t-3']) // arrives after the human loaded the page
+    const res = await form(env, cookie, { mode: 'all', rendered_id: renderedIds(page) })
+    expect(res.status).toBe(200)
+    expect(archivedIds()).toEqual(['t-1'])
+    expect(pendingIds().map((r) => r.task_id)).toEqual(['t-3'])
+  })
+
+  it('"Archive all" with no rendered ids archives nothing (never falls back to a fresh read)', async () => {
+    await propose(['t-1'])
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    await form(env, cookie, { mode: 'all' })
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('a decided proposal is never re-run (decision IS NULL is pinned)', async () => {
+    await propose(['t-1'])
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const id = String(pendingIds()[0]?.id)
+    await form(env, cookie, { mode: 'selected', proposal_id: [id] })
+    harness.sqlite.exec(`DELETE FROM tasks_archive_state WHERE task_id = 't-1'`) // restored by an operator since
+    const again = await form(env, cookie, { mode: 'selected', proposal_id: [id] })
+    expect(await again.text()).toContain('not_pending')
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('a retitled or touched task is refused (refused_task_changed), the untouched proposal proceeds', async () => {
+    await propose(['t-1', 't-2'])
+    harness.sqlite.exec(`UPDATE tasks SET title = 'Retitled', updated_at = '2099-01-01T00:00:00.000Z' WHERE id = 't-1'`)
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const res = await form(env, cookie, { mode: 'all', rendered_id: pendingIds().map((r) => String(r.id)) })
+    expect(await res.text()).toContain('task_changed')
+    expect(archivedIds()).toEqual(['t-2'])
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_task_changed' })
+  })
+
+  it('an expired proposal (older than 14 days) is not listed, not counted and not archivable', async () => {
+    await propose(['t-1'])
+    const old = new Date(Date.now() - PROPOSAL_TTL_MS - 60_000).toISOString()
+    harness.sqlite.exec(`UPDATE archive_proposals SET created_at = '${old}'`)
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    expect(await listPendingProposals(env)).toHaveLength(0)
+    expect(await countPendingProposals(env)).toBe(0)
+    const id = String(pendingIds()[0]?.id)
+    await form(env, cookie, { mode: 'selected', proposal_id: [id] })
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('the Needs You count and the page use the same rows, oldest first, regardless of the agent-written reason', async () => {
+    const env = makeEnv('admin@x.test')
+    await invokeTool(agentAuth(), env, 'archive_propose', { task_ids: ['t-1'], reason: 'zzz late' }, ORIGIN)
+    harness.sqlite.exec(`UPDATE archive_proposals SET created_at = '${new Date(Date.now() - 1000).toISOString()}'`)
+    await invokeTool(agentAuth(), env, 'archive_propose', { task_ids: ['t-2'], reason: '!!! jump the queue' }, ORIGIN)
+    const list = await listPendingProposals(env)
+    expect(list.map((p) => p.task_id)).toEqual(['t-1', 't-2'])
+    expect(await countPendingProposals(env)).toBe(list.length)
+  })
+})
+
+describe('archive_propose visibility, cap and flag', () => {
+  it('a hidden id and a missing id get the same undifferentiated answer; a visible id is proposed', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('S2', 'D1', 's2-sqd', 'Squad Two');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('P1', 'S2', 'admin');
+      INSERT INTO tasks (id, squad_id, title, status, done_when, project_id) VALUES ('t-hidden', 'S2', 'Hidden', 'open', 'n/a', 'P1');
+    `)
+    const res = await propose(['t-hidden', 'does-not-exist', 't-1'])
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    const body = JSON.stringify(res)
+    expect(body).toContain('"not_proposable":["t-hidden","does-not-exist"]')
+    expect(pendingIds().map((r) => r.task_id)).toEqual(['t-1'])
+  })
+
+  it('the per-agent pending cap is enforced inside the INSERT', async () => {
+    const stmt = harness.sqlite.prepare(`INSERT INTO archive_proposals (id, tenant, task_id, proposed_by_agent_id, reason, evidence, task_status_at_proposal, created_at)
+      VALUES (?, '${TENANT}', ?, 'agent-A', 'bulk', '', 'open', ?)`)
+    for (let i = 0; i < MAX_PENDING_PER_AGENT - 1; i++) stmt.run(`p-${i}`, `ghost-${i}`, new Date().toISOString())
+    const res = await propose(['t-1', 't-2'])
+    expect(JSON.stringify(res)).toContain('"proposed":["t-1"]')
+    expect(JSON.stringify(res)).toContain('"cap_reached":["t-2"]')
+    expect(rows(`SELECT COUNT(*) AS n FROM archive_proposals WHERE decision IS NULL`)[0]).toEqual({ n: MAX_PENDING_PER_AGENT })
+  })
+
+  it('refuses up front with not_supported when TASK_ARCHIVE_ENABLED is off', async () => {
+    const env = { ...makeEnv('admin@x.test'), TASK_ARCHIVE_ENABLED: undefined } as Env
+    const res = await invokeTool(agentAuth(), env, 'archive_propose', { task_ids: ['t-1'], reason: 'x' }, ORIGIN)
+    expect(res.ok).toBe(false)
+    expect(JSON.stringify(res)).toContain('not_supported')
+    expect(pendingIds()).toHaveLength(0)
+  })
+})
+
+describe('POST gate: agent-bound session', () => {
+  it('an agent-bound caller is refused on the POST and nothing is archived', async () => {
+    await propose(['t-1'])
+    const agent = agentAuth()
+    const app = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+    app.use('*', async (c, next) => { c.set('auth', agent); await next() })
+    app.route('/', makeBoardCleanupApp((_e, _t, body) => body))
+    const res = await app.request('/board/cleanup/archive', {
+      method: 'POST',
+      headers: { origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ mode: 'all', rendered_id: String(pendingIds()[0]?.id) }).toString(),
+    }, makeEnv('admin@x.test'))
+    expect(res.status).toBe(403)
+    expect(archivedIds()).toEqual([])
   })
 })

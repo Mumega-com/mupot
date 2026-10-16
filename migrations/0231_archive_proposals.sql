@@ -7,7 +7,9 @@
 --
 -- task_status_at_proposal is the status the proposer saw; the page passes it as archiveRow's expectedStatus so a task
 -- that moved since is refused per row (status_drift) instead of archived on stale evidence.
--- decision: NULL = pending. 'archived' | 'already_archived' | 'refused_status_drift' | 'refused_not_found' are terminal.
+-- task_updated_at_proposal is tasks.updated_at when proposed; a task touched since is refused at decision (refused_task_changed).
+-- Proposals expire after 14 days (enforced in the readers and the decision).
+-- decision: NULL = pending. 'archived' | 'already_archived' | 'refused_status_drift' | 'refused_not_found' | 'refused_task_changed' are terminal.
 -- A transient refusal (live execution claim, in-air flight, in-flight dispatch) leaves the row pending.
 CREATE TABLE IF NOT EXISTS archive_proposals (
   id                      TEXT PRIMARY KEY,
@@ -17,6 +19,7 @@ CREATE TABLE IF NOT EXISTS archive_proposals (
   reason                  TEXT NOT NULL,
   evidence                TEXT NOT NULL DEFAULT '',
   task_status_at_proposal TEXT NOT NULL,
+  task_updated_at_proposal TEXT,
   created_at              TEXT NOT NULL,
   decided_at              TEXT,
   decision                TEXT,

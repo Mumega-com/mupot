@@ -29,12 +29,13 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 const MAX_FORM_IDS = 500
 
-function groupByReason(rows: PendingProposal[]): Map<string, PendingProposal[]> {
+function groupByAgent(rows: PendingProposal[]): Map<string, PendingProposal[]> {
   const groups = new Map<string, PendingProposal[]>()
   for (const row of rows) {
-    const group = groups.get(row.reason)
+    const key = `${row.agent_id}\u0000${row.proposed_by}`
+    const group = groups.get(key)
     if (group) group.push(row)
-    else groups.set(row.reason, [row])
+    else groups.set(key, [row])
   }
   return groups
 }
@@ -63,7 +64,7 @@ export function boardCleanupBody(rows: PendingProposal[], extra: Html | '' = '')
       ${extra}
       ${emptyState({ title: 'Nothing to review', detail: 'No agent has proposed archiving a task, or every proposal is decided.' })}`
   }
-  const groups = Array.from(groupByReason(rows).entries())
+  const groups = Array.from(groupByAgent(rows).values())
   return html`${pageHeader({
       crumbs: 'Workspace / Board',
       title: 'Board cleanup',
@@ -71,14 +72,16 @@ export function boardCleanupBody(rows: PendingProposal[], extra: Html | '' = '')
     })}
     ${extra}
     <form method="post" action="/board/cleanup/archive" data-board-cleanup-form>
-      ${groups.map(([reason, items]) => sectionPanel({
-        title: `${reason} (${items.length})`,
+      ${rows.map((p) => html`<input type="hidden" name="rendered_id" value="${p.id}">`)}
+      ${groups.map((items) => sectionPanel({
+        title: `Proposed by ${items[0]?.proposed_by ?? ''} (${items.length})`,
         body: html`<div class="ui-table">
           ${items.map((p) => html`<div class="ui-tr ui-row" style="grid-template-columns:auto 1fr auto">
             <div class="ui-td"><input type="checkbox" name="proposal_id" value="${p.id}" aria-label="Select ${p.title ?? p.task_id}"></div>
             <div class="ui-td" style="overflow-wrap:anywhere">
               <strong>${p.title ?? p.task_id}</strong>
-              <span class="ui-panel-sub">${p.evidence || 'No evidence given.'} Proposed by ${p.proposed_by}.</span>
+              <span class="ui-panel-sub">${[p.squad, p.project].filter(Boolean).join(' / ') || 'No squad or project'}</span>
+              <span class="ui-panel-sub">Agent's note: ${p.reason}. Evidence: ${p.evidence || 'none given'}.</span>
             </div>
             <div class="ui-td">${pill(p.current_status ?? 'missing', p.current_status === p.status_at_proposal ? 'primary' : 'warn')}${p.current_status !== p.status_at_proposal ? html`<span class="ui-panel-sub">was ${p.status_at_proposal}</span>` : ''}</div>
           </div>`)}
@@ -121,8 +124,11 @@ export function makeBoardCleanupApp(shell: ShellFn) {
     const form = await c.req.formData()
     const mode = form.get('mode')
     let ids: string[]
+    // Only the ids the page RENDERED are ever archived: "all" means every rendered id, never a fresh read, so a
+    // proposal that arrived after the page loaded is not archived unseen. decideProposals also requires each to
+    // still be pending.
     if (mode === 'all') {
-      ids = (await listPendingProposals(c.env)).map((p) => p.id)
+      ids = form.getAll('rendered_id').filter((v): v is string => typeof v === 'string').slice(0, MAX_FORM_IDS)
     } else {
       ids = form.getAll('proposal_id').filter((v): v is string => typeof v === 'string').slice(0, MAX_FORM_IDS)
     }
