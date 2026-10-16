@@ -157,9 +157,9 @@ async function findOrCreateMember(
   email: string,
   displayName: string,
   loginIdentity?: { provider: string; subject: string },
-): Promise<string> { // returns member_id
-  const { findOrCreateHumanMember } = await import('../members/human-identity')
-  return findOrCreateHumanMember(env, email, displayName, loginIdentity)
+): Promise<{ id: string; created: boolean }> {
+  const { findOrCreateHumanMemberDetailed } = await import('../members/human-identity')
+  return findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)
 }
 
 // ── Token mint for OAuth seat ─────────────────────────────────────────────────
@@ -591,6 +591,23 @@ function formatBudgetCap(cents: number | null): string {
 // pure copy on the empty-state branch — it does not touch selection, minting,
 // or any of the P0-1/P0-2/P0-3 invariants proven in
 // tests/agent-bound-oauth-consent.test.ts.
+/**
+ * mupot#1022 consent empty state. A member with no consentable agent is very often the SECOND sign-in of someone whose
+ * real member lives behind another Google account (login resolves by (provider, subject), and an unlinked subject with a
+ * different email gets its own empty member). Say that plainly and point at the one fix: link it from My Account.
+ * Never offers the owner's agents here: linking is the fix, the B1 ceiling is unchanged.
+ */
+export function unlinkedSignInHint(maskedEmail: string, justCreated: boolean): string {
+  return `
+<p class="empty-hint">${justCreated ? 'This sign-in just created a new, empty member in this workspace. ' : ''}This sign-in (${escapeHtml(maskedEmail)}) isn't linked to your main account. Sign in to mupot with your main account, open My Account &rarr; Linked sign-ins, and link this Google account.</p>
+<p class="empty-hint">If this is a new account and you meant to start fresh, use the <strong>New agent</strong> option instead.</p>`
+}
+
+function maskConsentEmail(email: string): string {
+  const at = email.lastIndexOf('@')
+  return at < 1 ? '***' : `${email.slice(0, 1)}***${email.slice(at)}`
+}
+
 const EMPTY_STATE_HINT = `
 <p class="empty-hint">No agent is available to bind this connection to yet. If you are
 connecting an AI assistant (Claude Desktop, claude.ai, etc.), ask it to call the
@@ -707,6 +724,8 @@ function renderConsentPage(
   // True ONLY when SEAT_ATTACH is on (with the harness option): the 'How will this app connect?' wording, the suggested
   // tab and the plain-language panel. False renders the pre-W2 page byte-identically.
   connectChoice = false,
+  // mupot#1022: true when THIS login just created the member row (shown once, because the page is only rendered once).
+  memberJustCreated = false,
 ): Response {
   const choice = harnessOption && connectChoice
   const rows = agents.map((a) => {
@@ -935,6 +954,7 @@ ${choice ? `<h2 class="how">How will this app connect?</h2>
 
   <div class="panels" id="panels">${harnessPanel}
     <div class="panel" id="p-existing">
+      ${agentsListed && agents.length === 0 ? unlinkedSignInHint(maskConsentEmail(email), memberJustCreated) : ''}
       ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
       ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
       ${choice ? `<p class="panel-help"><strong>One agent: this whole app is one agent.</strong>${connectMode === 'one' ? ' <span class="suggested">Suggested for this app</span>' : ''} Every chat in this app will act as the agent you pick, so they all share one identity. Use it for a single-purpose app or bot.</p>` : ''}
@@ -1577,11 +1597,15 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
+    // mupot#1022: true only when THIS login created the member row, so the consent screen can say so once, in-band.
+    let memberJustCreated = false
     try {
-      memberId = await findOrCreateMember(env, googleUser.email, googleUser.name, {
+      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, {
         provider: 'google',
         subject: googleUser.id,
       })
+      memberId = found.id
+      memberJustCreated = found.created
     } catch (err) {
       // mupot#1551 round 2 (P0): a denial/ambiguity is NOT the same failure
       // as a D1 outage — it means this email's member row is legitimately
@@ -1654,7 +1678,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
     }
     const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames, seatAutoEnrollEnabled(env),
-      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env))
+      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env), memberJustCreated)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.

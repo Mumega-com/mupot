@@ -48,13 +48,24 @@ export async function findOrCreateHumanMember(
   displayName: string,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<string> {
+  return (await findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)).id
+}
+
+/** Same as findOrCreateHumanMember, and says whether THIS call created the row (mupot#1022: the consent screen tells a
+ *  member once, in-band, that this sign-in just made a new, empty member). */
+export async function findOrCreateHumanMemberDetailed(
+  env: Env,
+  email: string,
+  displayName: string,
+  loginIdentity?: { provider: string; subject: string },
+): Promise<{ id: string; created: boolean }> {
   const result = await resolveHumanMemberForAttach(env, {
     tenant: env.TENANT_SLUG,
     provider: loginIdentity?.provider,
     providerSubject: loginIdentity?.subject,
     email,
   })
-  if (result.kind === 'resolved') return result.member.id
+  if (result.kind === 'resolved') return { id: result.member.id, created: false }
   if (result.kind === 'denied') {
     console.error('findOrCreateHumanMember: attach denied — competing controller, refusing to insert', {
       reason: result.reason,
@@ -96,5 +107,5 @@ export async function findOrCreateHumanMember(
     })
   }
 
-  return memberId
+  return { id: memberId, created: true }
 }
