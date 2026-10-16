@@ -26,6 +26,8 @@ function data(needsDecision: number, isLowerBound: boolean): OpsHealthData {
       activePresence: 1,
       needsDecision,
       needsDecisionIsLowerBound: isLowerBound,
+      allReviewersNeedsDecision: needsDecision,
+      allReviewersNeedsDecisionIsLowerBound: isLowerBound,
       blockedOrRejected: 0,
       recentAudit: 0,
     },
@@ -96,5 +98,27 @@ describe('the Approval gates check does not call a TRUNCATED zero "clear"', () =
 
   it('an exact positive count carries no marker', () => {
     expect(approvalsCheckPresentation(3, false).state).toBe('3 waiting')
+  })
+})
+
+describe('org-wide total is labelled "across all reviewers" and never replaces the own count (#1993)', () => {
+  it('Health check: headline is the own count, the all-gate total is a labelled aside', () => {
+    const r = approvalsCheckPresentation(1, false, { count: 5, isLowerBound: true })
+    expect(r.state).toBe('1 waiting')
+    expect(r.detail).toContain('5+ across all reviewers')
+  })
+
+  it('Health check: own zero with others waiting says nothing is waiting on you', () => {
+    const r = approvalsCheckPresentation(0, false, { count: 4, isLowerBound: false })
+    expect(r.state).toBe('clear')
+    expect(r.detail).toContain('Nothing is waiting on you.')
+    expect(r.detail).toContain('4 across all reviewers')
+  })
+
+  it('/ops KPI card renders the aside only when the org total exceeds the own count', () => {
+    const d = data(1, false)
+    d.kpis.allReviewersNeedsDecision = 6
+    expect(String(opsHealthBody(d))).toContain('6 across all reviewers')
+    expect(String(opsHealthBody(data(1, false)))).not.toContain('across all reviewers')
   })
 })

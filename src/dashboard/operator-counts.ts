@@ -44,7 +44,7 @@
 import type { Agent, AuthContext, Env } from '../types'
 import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
-import { loadApprovals, type ApprovalsQueue } from './approvals'
+import { loadApprovals, waitingOnYou, type ApprovalsQueue } from './approvals'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export interface OperatorCounts {
@@ -61,8 +61,8 @@ export interface OperatorCounts {
   inFlightTotal: number
   /** Sum of AgentStat.spend_micro_usd over the 24h stats window. */
   spendMicroUsdTotal: number
-  /** loadApprovals(env, auth).actionableCount — the RBAC+gate_owner-scoped gate
-   *  queue's actionable rows. This IS "needs your decision": the only tasks a
+  /** waitingOnYou(loadApprovals(env, auth)) — the viewer's OWN-gate count, identical to the
+   *  /approvals badge. (Was the all-gate actionableCount, which disagreed with the badge.) This IS "needs your decision": the only tasks a
    *  verdict endpoint will actually accept (mupot#1319 round 2 FINDING 4/2:
    *  this used to be approvals.length, which counted informational/
    *  unactionable rows too — a caller who lost squad access but still holds
@@ -74,6 +74,10 @@ export interface OperatorCounts {
    *  A surface rendering this MUST show it as "N+" or otherwise signal
    *  incompleteness when true, never a bare exact-looking number. */
   needsDecisionCountIsLowerBound: boolean
+  /** The org-wide, all-gate total (ApprovalsQueue.actionableCount): rows ANY reviewer can act on.
+   *  Not "waiting on you" — every surface that shows it must label it "across all reviewers". */
+  allReviewersCount: number
+  allReviewersCountIsLowerBound: boolean
   /** tasks.status IN ('blocked', 'rejected'), from the shared grouped count. */
   blockedOrRejectedCount: number
 }
@@ -87,7 +91,7 @@ export interface OperatorCountsInputs {
   // only actionableCount/actionableCountIsLowerBound are read; `items` is
   // ignored (callers that also RENDER the queue, e.g. dashboard/index.ts's
   // two routes, pass approvals.items separately to their own card renderer).
-  approvals: Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound'>
+  approvals: Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound' | 'ownCount' | 'ownCountIsLowerBound'>
   /** status -> count, e.g. from loadTaskStatusCounts. Only 'blocked'/'rejected' are read. */
   taskStatusCounts: Map<string, number>
 }
@@ -127,8 +131,11 @@ export function computeOperatorCounts(inputs: OperatorCountsInputs): OperatorCou
     liveRuntimeCount,
     inFlightTotal,
     spendMicroUsdTotal,
-    needsDecisionCount: approvals.actionableCount,
-    needsDecisionCountIsLowerBound: approvals.actionableCountIsLowerBound,
+    // "Waiting on you" = the viewer's OWN-gate count, via the same function as the /approvals badge.
+    needsDecisionCount: waitingOnYou(approvals).count,
+    needsDecisionCountIsLowerBound: waitingOnYou(approvals).isLowerBound,
+    allReviewersCount: approvals.actionableCount,
+    allReviewersCountIsLowerBound: approvals.actionableCountIsLowerBound,
     blockedOrRejectedCount,
   }
 }

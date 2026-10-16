@@ -143,7 +143,7 @@ import {
   requiredCanonicalOrigin,
 } from './connect'
 import {
-  loadApprovals, loadPublishable, resultPreview, loadApprovalsHistory, loadApprovalsSummary, loadAsks,
+  loadApprovals, loadPublishable, resultPreview, loadApprovalsHistory, loadApprovalsSummary, loadAsks, waitingOnYou,
   APPROVAL_LIVE_LIST_CAP, isOlderItem,
 } from './approvals'
 import type { ApprovalHistoryPage, ApprovalsSummary, AskItem } from './approvals'
@@ -1081,12 +1081,14 @@ dashboardApp.get('/send', async (c) => {
 // admin-gated POST /admin/departments/:dept/execute/:gateId, no new write path.
 dashboardApp.get('/approvals', async (c) => {
   const auth = c.get('auth')
+  // This route negotiates JSON vs HTML on Accept: caches must key on it.
+  c.header('Vary', 'Accept')
   // Sidebar badge: the SAME own-gate count the page header shows, as JSON.
   const accept = c.req.header('accept') ?? ''
   if (accept.includes('application/json') && !accept.includes('text/html')) {
     const q = await loadApprovals(c.env, auth)
     c.header('Cache-Control', 'no-store')
-    return c.json({ pending: q.ownCount ?? 0 })
+    return c.json({ pending: waitingOnYou(q).count })
   }
   if (c.req.query('tab') === 'sent') {
     const asks = await loadAsks(c.env, auth)
@@ -5352,7 +5354,9 @@ function observatoryBody(
   </section>`
 
   // ── operator queue ────────────────────────────────────────────────────────
-  const queueCount = counts.needsDecisionCount
+  // Panel visibility follows the rows rendered (items can include other reviewers' gates);
+  // the KPI number is the viewer's own count (counts.needsDecisionCount).
+  const queueCount = approvals.length
   const queueCards = approvals.map((t) => approvalCardHtml(t)).join('')
 
   // ── fleet-level KPI strip (ui.ts) — every number here comes from the SAME
@@ -5363,7 +5367,7 @@ function observatoryBody(
     statCard({ label: 'Configured agents', value: String(counts.agentsTotal) }),
     statCard({ label: 'Live runtimes', value: String(counts.liveRuntimeCount), subTone: counts.liveRuntimeCount > 0 ? 'primary' : 'warn' }),
     statCard({ label: 'In flight', value: String(counts.inFlightTotal), subTone: counts.inFlightTotal > 0 ? 'primary' : 'dim' }),
-    statCard({ label: 'Needs decision', value: `${String(counts.needsDecisionCount)}${counts.needsDecisionCountIsLowerBound ? '+' : ''}`, subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
+    statCard({ label: 'Waiting on you', value: `${String(counts.needsDecisionCount)}${counts.needsDecisionCountIsLowerBound ? '+' : ''}`, sub: counts.allReviewersCount > counts.needsDecisionCount ? `${String(counts.allReviewersCount)}${counts.allReviewersCountIsLowerBound ? '+' : ''} across all reviewers` : undefined, subTone: counts.needsDecisionCount > 0 ? 'warn' : 'dim' }),
     statCard({ label: 'Spend · 24h', value: formatUsd(counts.spendMicroUsdTotal) }),
   ])
 
@@ -5525,7 +5529,7 @@ export function opsHealthBody(data: OpsHealthData) {
     ${kpiRow([
       statCard({ label: 'Active agents', value: String(data.kpis.activeAgents), subTone: data.kpis.activeAgents > 0 ? 'ok' : 'warn' }),
       statCard({ label: 'Runtime online', value: String(data.kpis.runtimeOnline), subTone: data.kpis.runtimeOnline > 0 ? 'ok' : 'warn' }),
-      statCard({ label: 'Needs decision', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
+      statCard({ label: 'Needs decision', value: `${String(data.kpis.needsDecision)}${data.kpis.needsDecisionIsLowerBound ? '+' : ''}`, sub: data.kpis.allReviewersNeedsDecision > data.kpis.needsDecision ? `${String(data.kpis.allReviewersNeedsDecision)}${data.kpis.allReviewersNeedsDecisionIsLowerBound ? '+' : ''} across all reviewers` : undefined, subTone: data.kpis.needsDecision > 0 ? 'warn' : 'dim' }),
       statCard({ label: 'Failures', value: String(data.kpis.blockedOrRejected), subTone: data.kpis.blockedOrRejected > 0 ? 'danger' : 'dim' }),
     ])}
     ${sectionPanel({
@@ -6429,13 +6433,14 @@ export function approvalsBody(
   showAll = false,
   filtersIn?: ApprovalFilters,
 ) {
-  const { items, actionableCountIsLowerBound } = approvalsQueue
+  const { items } = approvalsQueue
   const filters = filtersIn ?? parseFilters({ p: [], kind: [] }, items)
   // "Mine" = gates the VIEWER holds (gate_grants). The badge and the sentence
   // count that set UNFILTERED, so the badge never changes with a filter.
   const own = items.filter((t) => t.can_verdict && t.own_gate === true)
   const other = items.filter((t) => !(t.can_verdict && t.own_gate === true))
-  const actionableCount = own.length
+  // The badge number: waitingOnYou() (the one function), "+" from the OWN count's bound.
+  const { count: actionableCount, isLowerBound: actionableCountIsLowerBound } = waitingOnYou(approvalsQueue)
   const highCount = own.filter((t) => t.priority === 'P0' || t.priority === 'P1').length
   const visible = scopeItems(items, filters.gate)
   const options = filterOptions(visible)

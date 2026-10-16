@@ -105,7 +105,7 @@ describe('loadApprovals', () => {
   it('no principal id → empty queue, no query', async () => {
     const { env, calls } = makeEnv([{ id: 'should-not-appear' }])
     const out = await loadApprovals(env, auth({ role: 'member', memberId: undefined, userId: undefined }))
-    expect(out).toEqual({ items: [], actionableCount: 0, actionableCountIsLowerBound: false })
+    expect(out).toEqual({ items: [], actionableCount: 0, actionableCountIsLowerBound: false, ownCount: 0, ownCountIsLowerBound: false })
     expect(calls).toHaveLength(0)
   })
 })

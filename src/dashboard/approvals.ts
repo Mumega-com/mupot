@@ -31,7 +31,7 @@ import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache, primeVerdi
 import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { compileVerdictIndependenceSql } from '../tasks/verdict-independence'
+import { resolveVisibleTaskScope, visibleTaskClause } from '../tasks/visibility'
 import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
 
 export interface ApprovalItem {
@@ -269,8 +269,20 @@ export interface ApprovalsQueue {
    *  cannot express "at least N" must say so rather than print this count
    *  as if it were exact. */
   actionableCountIsLowerBound: boolean
-  /** can_verdict rows in `items` whose gate the VIEWER holds a grant for — the sidebar/page badge. */
-  ownCount?: number
+  /** can_verdict rows in `items` whose gate the VIEWER holds a grant for — the sidebar/page badge.
+   *  The ONE "waiting on you" number: read it through waitingOnYou(), never re-derive it. */
+  ownCount: number
+  /** True when ownCount is a LOWER BOUND (own rows filled the display window, or the candidate
+   *  fetch hit APPROVALS_FETCH_CEILING). Independent of the org-wide actionableCountIsLowerBound:
+   *  the "+" on the badge follows the OWN count, not the all-gate total. */
+  ownCountIsLowerBound: boolean
+}
+
+/** THE "waiting on you" number every member-facing surface (badge JSON, /approvals header,
+ *  Home KPI, Health) must use. The all-gate total (actionableCount) is an org-wide figure and
+ *  must be labelled "across all reviewers" wherever it is shown. */
+export function waitingOnYou(q: Pick<ApprovalsQueue, 'ownCount' | 'ownCountIsLowerBound'>): { count: number; isLowerBound: boolean } {
+  return { count: q.ownCount, isLowerBound: q.ownCountIsLowerBound }
 }
 
 // Select the displayed window from a fully-decorated CANDIDATE set (already
@@ -281,16 +293,20 @@ export interface ApprovalsQueue {
 // crowding-out was Codex FINDING 3. Informational rows fill any remaining
 // space, oldest first, for context only (no action renders on them).
 export function selectQueueWindow(decorated: ApprovalItem[]): ApprovalsQueue {
-  const actionable = decorated.filter((t) => t.can_verdict)
+  const isOwn = (t: ApprovalItem): boolean => t.can_verdict && t.own_gate === true
+  const own = decorated.filter(isOwn)
+  const otherActionable = decorated.filter((t) => t.can_verdict && !isOwn(t))
   const informational = decorated.filter((t) => !t.can_verdict)
-  const items = [...actionable, ...informational].slice(0, APPROVALS_QUEUE_LIMIT)
-  const actionableCountIsLowerBound =
-    actionable.length > APPROVALS_QUEUE_LIMIT || decorated.length >= APPROVALS_FETCH_CEILING
+  // Own-gate rows lead the window so the own count (the badge) is never crowded out by
+  // another reviewer's actionable rows; each group keeps its oldest-first order.
+  const items = [...own, ...otherActionable, ...informational].slice(0, APPROVALS_QUEUE_LIMIT)
+  const truncated = decorated.length >= APPROVALS_FETCH_CEILING
   return {
     items,
-    actionableCount: Math.min(actionable.length, APPROVALS_QUEUE_LIMIT),
-    actionableCountIsLowerBound,
-    ownCount: items.filter((t) => t.can_verdict && t.own_gate === true).length,
+    actionableCount: Math.min(own.length + otherActionable.length, APPROVALS_QUEUE_LIMIT),
+    actionableCountIsLowerBound: own.length + otherActionable.length > APPROVALS_QUEUE_LIMIT || truncated,
+    ownCount: Math.min(own.length, APPROVALS_QUEUE_LIMIT),
+    ownCountIsLowerBound: own.length > APPROVALS_QUEUE_LIMIT || truncated,
   }
 }
 
@@ -312,7 +328,7 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
   }
 
   const principal = resolveGatePrincipal(auth)
-  if (!principal) return { items: [], actionableCount: 0, actionableCountIsLowerBound: false }
+  if (!principal) return { items: [], actionableCount: 0, actionableCountIsLowerBound: false, ownCount: 0, ownCountIsLowerBound: false }
 
   const rs = await env.DB.prepare(
     `${BASE_SELECT}
@@ -427,15 +443,16 @@ export async function loadApprovalsSummary(env: Env, auth: AuthContext): Promise
 
 
 // ── "You asked" (?tab=sent): asks the VIEWER originated, read-only ───────────
-// ORIGINATOR = the verdict-independence rule (src/tasks/verdict-independence.ts)
-// run for the viewer's member id, in BOTH of its legs: 'direct' (the viewer is a
-// party: assignee member, submitter/runner member) and 'affiliated' (the viewer
-// owns / is bound to / holds the key of a party agent => shown "via <agent>").
-// It is the SAME predicate the verdict writer uses to refuse the viewer's own
-// verdict, so a row listed here can never carry an act button, and the server
-// refuses regardless. Exactly one fragment, named here so it is one mutation target.
-export const ASK_ORIGINATED_BY_VIEWER_SQL = (memberId: string): { sql: string; params: string[] } =>
-  compileVerdictIndependenceSql(['direct', 'affiliated'], memberId, { column: 't.id' })
+// A READ filter, deliberately NOT the verdict-independence rule (that rule is built to REFUSE
+// a verdict; reused as a read filter it matched bindings, agent_keys and past submitters/
+// runners and leaked titles across squads). The ask is the viewer's when:
+//   - the task is assigned to the viewer as a human (assignee_member_id), or
+//   - it is assigned to an agent whose agents.owner_member_id IS the viewer (shown "via <agent>").
+// AND the viewer can read the task's squad (resolveVisibleTaskScope/visibleTaskClause, the
+// task-list read fence, which also hides archived tasks). Exactly one fragment, named here so
+// it is one mutation target. ?1 = viewer member id.
+export const ASK_ORIGINATED_BY_VIEWER_SQL =
+  `(t.assignee_member_id = ?1 OR t.assignee_agent_id IN (SELECT oa.id FROM agents oa WHERE oa.owner_member_id = ?1))`
 
 export type AskState = 'waiting' | 'approved' | 'rejected'
 
@@ -462,7 +479,7 @@ export const ASKS_LIMIT = 200
 export async function loadAsks(env: Env, auth: AuthContext): Promise<AskItem[]> {
   // Only a real member id can originate; an agent/anonymous principal has no "my asks".
   if (!auth.memberId) return []
-  const own = ASK_ORIGINATED_BY_VIEWER_SQL(auth.memberId)
+  const visible = visibleTaskClause(await resolveVisibleTaskScope(env, auth), 2, 't')
   const rs = await env.DB.prepare(
     `SELECT t.id, t.title, t.body, t.gate_owner, t.priority, t.project_id, pr.name AS project_name,
             t.assignee_agent_id, a.name AS agent_name, t.status, t.created_at, t.updated_at,
@@ -471,16 +488,18 @@ export async function loadAsks(env: Env, auth: AuthContext): Promise<AskItem[]> 
        LEFT JOIN agents a ON a.id = t.assignee_agent_id
        LEFT JOIN projects pr ON pr.id = t.project_id
       WHERE t.status IN ('review', 'approved', 'rejected') AND t.gate_owner IS NOT NULL
-        AND ${TASK_NOT_ARCHIVED_SQL('t')}
-        AND ${own.sql}
+        AND ${visible.sql}
+        AND ${ASK_ORIGINATED_BY_VIEWER_SQL}
       ORDER BY CASE t.status WHEN 'review' THEN 0 ELSE 1 END, t.updated_at DESC, t.id
-      LIMIT ?`,
-  ).bind(...own.params, ASKS_LIMIT).all<Omit<AskItem, 'state' | 'via_agent'> & { status: string; assignee_member_id: string | null }>()
+      LIMIT ?${String(2 + visible.binds.length)}`,
+  ).bind(auth.memberId, ...visible.binds, ASKS_LIMIT).all<Omit<AskItem, 'state' | 'via_agent'> & { status: string; assignee_member_id: string | null }>()
   return (rs.results ?? []).map((r) => ({
     id: r.id, title: r.title, body: r.body, gate_owner: r.gate_owner, priority: r.priority,
     project_id: r.project_id, project_name: r.project_name, assignee_agent_id: r.assignee_agent_id,
     agent_name: r.agent_name, review_entered_at: r.review_entered_at, created_at: r.created_at, updated_at: r.updated_at,
     state: r.status === 'review' ? 'waiting' : r.status === 'approved' ? 'approved' : 'rejected',
+    // The only agent leg that includes a row is "assignee agent owned by the viewer", so the
+    // assignee IS the agent that matched.
     via_agent: r.assignee_member_id === auth.memberId ? null : (r.agent_name ?? r.assignee_agent_id),
   }))
 }

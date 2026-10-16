@@ -289,15 +289,18 @@ describe('approvals page for humans: sort, filters, options', () => {
     const plain = items.find((t) => t.id === 'plain')
     expect(Date.now() - Date.parse(late?.review_entered_at ?? '')).toBeGreaterThan((APPROVAL_OLDER_DAYS + 1) * 86_400_000)
     expect(Date.parse(plain?.review_entered_at ?? '')).toBeLessThan(Date.now() - 2 * 86_400_000)
-    expect(String(approvalsBody({ items, actionableCount: 2, actionableCountIsLowerBound: false, ownCount: 2 }))).toContain('Older (1)')
+    expect(String(approvalsBody({ items, actionableCount: 2, actionableCountIsLowerBound: false, ownCount: 2, ownCountIsLowerBound: false }))).toContain('Older (1)')
   })
 })
 
 describe('"You asked" tab (?tab=sent): the viewer own asks, read-only', () => {
-  const as = (memberId: string) => ({ userId: memberId, memberId, email: null, role: 'owner', tenant: TENANT, capabilities: [] }) as unknown as AuthContext
+  // A squad member of s1: the viewer must hold read standing on the task's squad (canReadSquadTasks fence).
+  const as = (memberId: string, squad = 's1') => ({ userId: memberId, memberId, email: null, role: 'member', tenant: TENANT,
+    capabilities: [{ member_id: memberId, scope_type: 'squad', scope_id: squad, capability: 'member' }] }) as unknown as AuthContext
   beforeEach(() => {
     h.sqlite.exec(`
       INSERT INTO members (id, tenant, email, display_name, status) VALUES ('m-x', '${TENANT}', 'x@example.com', 'X', 'active');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-op-s1', 'm-op', 'squad', 's1', 'member'), ('cap-x-s1', 'm-x', 'squad', 's1', 'member');
       UPDATE agents SET owner_member_id = 'm-op' WHERE id = 'a1';
       UPDATE agents SET owner_member_id = 'm-x' WHERE id = 'a2';
     `)
@@ -367,5 +370,147 @@ describe('"You asked" tab (?tab=sent): the viewer own asks, read-only', () => {
     const body = await res.text()
     expect(body).toContain('data-task="mine"')
     expect(body).not.toContain('appr-approve')
+  })
+})
+
+
+describe('"You asked": read fence (#1993)', () => {
+  const sq = (memberId: string, squad = 's1') => ({ userId: memberId, memberId, email: null, role: 'member', tenant: TENANT,
+    capabilities: [{ member_id: memberId, scope_type: 'squad', scope_id: squad, capability: 'member' }] }) as unknown as AuthContext
+  beforeEach(() => {
+    h.sqlite.exec(`
+      INSERT INTO members (id, tenant, email, display_name, status) VALUES ('m-x', '${TENANT}', 'x@example.com', 'X', 'active');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-op-s1', 'm-op', 'squad', 's1', 'member');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('s2', 'd1', 'sq-two', 'Squad Two');
+      UPDATE agents SET owner_member_id = 'm-op' WHERE id = 'a1';
+    `)
+  })
+
+  it('squad fence: an owned-agent ask on a squad the viewer cannot read is NOT listed', async () => {
+    addTask('ok', { agent: 'a1' })
+    addTask('foreign', { agent: 'a1' })
+    h.sqlite.exec(`UPDATE tasks SET squad_id = 's2' WHERE id = 'foreign'`)
+    expect((await loadAsks(env, sq('m-op'))).map((a) => a.id)).toEqual(['ok'])
+    // Standing on s2 admits it again: the fence is canReadSquadTasks, not a blanket drop.
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-op-s2', 'm-op', 'squad', 's2', 'member')`)
+    const both = { ...sq('m-op'), capabilities: [...sq('m-op').capabilities, { member_id: 'm-op', scope_type: 'squad', scope_id: 's2', capability: 'member' }] } as unknown as AuthContext
+    expect((await loadAsks(env, both)).map((a) => a.id).sort()).toEqual(['foreign', 'ok'])
+  })
+
+  it('inclusion is assignee-member or OWNED assignee agent only: bindings, agent_keys, submitters, runners do not include', async () => {
+    h.sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'a2', 'm-op', datetime('now'));
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES ('${TENANT}', 'a2', 'pk-a2', 'm-op', unixepoch());
+    `)
+    addTask('bound-only', { agent: 'a2' }) // a2 is bound to / keyed by m-op but owned by nobody
+    addTask('submitter', { agent: 'a2' })
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('a3', 's1', 'ag3', 'Third', 'inactive')`)
+    addTask('other-assignee', { agent: 'a3' })
+    h.sqlite.exec(`
+      INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+        VALUES ('sub1', '${TENANT}', 'other-assignee', 's1', 'a1', 'p', '${'a'.repeat(64)}', '${'b'.repeat(64)}');
+    `)
+    addTask('owned', { agent: 'a1' })
+    expect((await loadAsks(env, sq('m-op'))).map((a) => a.id)).toEqual(['owned'])
+  })
+
+  it('via names the agent that actually matched: the owned assignee, and no via when the viewer is the assignee', async () => {
+    addTask('via', { agent: 'a1' })
+    addTask('self', { agent: 'a2' })
+    h.sqlite.exec(`UPDATE tasks SET assignee_agent_id = NULL, assignee_member_id = 'm-op' WHERE id = 'self'`)
+    const asks = await loadAsks(env, sq('m-op'))
+    expect(asks.find((a) => a.id === 'via')?.via_agent).toBe('Agent')
+    expect(asks.find((a) => a.id === 'self')?.via_agent).toBeNull()
+  })
+})
+
+describe('non-admin gate_grants fence on history and summary (scopeFor)', () => {
+  const member = { userId: 'm-2', memberId: 'm-2', email: null, role: 'member', tenant: TENANT, capabilities: [] } as unknown as AuthContext
+  beforeEach(() => {
+    h.sqlite.exec(`
+      INSERT INTO members (id, tenant, email, display_name, status) VALUES ('m-2', '${TENANT}', 'm2@example.com', 'M2', 'active');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-m2', 'gate:hadi', 'member', 'm-2', 't', datetime('now'));
+    `)
+    addTask('mine', { status: 'approved', gate: 'gate:hadi' })
+    addTask('theirs', { status: 'approved', gate: 'gate:kasra-core' })
+    verdict('mine', 1)
+    verdict('theirs', 1)
+  })
+
+  it('history lists only the gates the member holds; the owner sees both', async () => {
+    expect((await loadApprovalsHistory(env, member)).rows.map((r) => r.id)).toEqual(['mine'])
+    expect(ids((await loadApprovalsHistory(env, owner)).rows)).toEqual(['mine', 'theirs'])
+  })
+
+  it('summary counts only the gates the member holds; the owner counts both', async () => {
+    expect((await loadApprovalsSummary(env, member)).decidedThisWeek).toBe(1)
+    expect((await loadApprovalsSummary(env, owner)).decidedThisWeek).toBe(2)
+  })
+
+  it('a member with no gate_grants sees empty history and zero summary', async () => {
+    h.sqlite.exec(`DELETE FROM gate_grants WHERE principal_id = 'm-2'`)
+    expect((await loadApprovalsHistory(env, member)).rows).toEqual([])
+    expect((await loadApprovalsSummary(env, member)).decidedThisWeek).toBe(0)
+  })
+})
+
+describe('escaping and visible-set filters (#1993)', () => {
+  it('the live row title is HTML-escaped', async () => {
+    addTask('x', { title: '<img src=x onerror=alert(1)>' })
+    const html = String(approvalsBody(await loadApprovals(env, owner)))
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;')
+    expect(html).not.toContain('<img src=x')
+  })
+
+  it('the "You asked" title is HTML-escaped', () => {
+    const ask = { id: 'k', title: '<script>alert(2)</script>', body: '', gate_owner: 'gate:hadi', priority: null, project_id: null, project_name: null,
+      assignee_agent_id: null, agent_name: null, review_entered_at: new Date().toISOString(), created_at: '', updated_at: '', state: 'waiting' as const, via_agent: null }
+    const html = String(approvalsSentBody([ask], parseFilters({ p: [], kind: [], tab: 'sent', asks: [ask] }, [])))
+    expect(html).toContain('&lt;script&gt;alert(2)&lt;/script&gt;')
+    expect(html).not.toContain('<script>alert(2)')
+  })
+
+  it('the rendered filter options come from the visible set: other-gate senders/projects are absent under "mine", present under "all"', async () => {
+    addTask('mine', { agent: 'a1', project: 'p1' })
+    addTask('theirs', { gate: 'gate:kasra-core', agent: 'a2', project: 'p2' })
+    const q = await loadApprovals(env, owner)
+    const mineHtml = String(approvalsBody(q, [], [], { decidedThisWeek: 0 }, false, parseFilters({ p: [], kind: [] }, q.items)))
+    expect(mineHtml).toContain('value="a1"')
+    expect(mineHtml).toContain('value="p1"')
+    expect(mineHtml).not.toContain('value="a2"')
+    expect(mineHtml).not.toContain('value="p2"')
+    const allHtml = String(approvalsBody(q, [], [], { decidedThisWeek: 0 }, false, parseFilters({ p: [], kind: [], gate: 'all' }, q.items)))
+    expect(allHtml).toContain('value="a2"')
+    expect(allHtml).toContain('value="p2"')
+  })
+})
+
+describe('badge "+" follows the OWN count; Vary: Accept (#1993)', () => {
+  it('own count exact => no "+" even when the all-gate total is a lower bound', () => {
+    const html = String(approvalsBody({ items: [], actionableCount: 200, actionableCountIsLowerBound: true, ownCount: 1, ownCountIsLowerBound: false }))
+    expect(html).toContain('1 waiting on you')
+    expect(html).not.toContain('1+ waiting on you')
+  })
+
+  it('own count a lower bound => "+"', () => {
+    const html = String(approvalsBody({ items: [], actionableCount: 3, actionableCountIsLowerBound: false, ownCount: 3, ownCountIsLowerBound: true }))
+    expect(html).toContain('3+ waiting on you')
+  })
+
+  it('badge JSON and page HTML both carry Vary: Accept; JSON pending = own count', async () => {
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-org', 'm-op', 'org', NULL, 'admin')`)
+    addTask('mine')
+    addTask('kc', { gate: 'gate:kasra-core' })
+    const routeEnv = {
+      DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test',
+      SESSIONS: { get: async (k: string) => (k === 'sess:s1' ? JSON.stringify({ userId: 'u-op', email: 'op@example.com', role: 'admin', createdAt: '2026-01-01T00:00:00Z' }) : null) },
+      OAUTH_KV: { get: async () => null, put: async () => undefined },
+    } as unknown as Env
+    const get = (accept: string) => dashboardApp.fetch(new Request('https://pot.test/approvals', { headers: { Cookie: 'mupot_session=s1', Accept: accept } }), routeEnv)
+    const json = await get('application/json')
+    expect(json.headers.get('Vary')).toContain('Accept')
+    expect(await json.json()).toEqual({ pending: 1 })
+    const page = await get('text/html')
+    expect(page.headers.get('Vary')).toContain('Accept')
   })
 })

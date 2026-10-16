@@ -37,8 +37,12 @@ function stat(over: Partial<AgentStat> = {}): AgentStat {
 // actionableCount/actionableCountIsLowerBound off the approvals queue now —
 // never the raw items — so the fixture is that summary shape directly, not
 // a list of ApprovalItem rows a count would have to re-derive from.
-function approvalsQueue(actionableCount: number, isLowerBound = false): Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound'> {
-  return { actionableCount, actionableCountIsLowerBound: isLowerBound }
+function approvalsQueue(
+  actionableCount: number,
+  isLowerBound = false,
+  own = { count: actionableCount, isLowerBound },
+): Pick<ApprovalsQueue, 'actionableCount' | 'actionableCountIsLowerBound' | 'ownCount' | 'ownCountIsLowerBound'> {
+  return { actionableCount, actionableCountIsLowerBound: isLowerBound, ownCount: own.count, ownCountIsLowerBound: own.isLowerBound }
 }
 
 function baseInputs(over: Partial<OperatorCountsInputs> = {}): OperatorCountsInputs {
@@ -86,6 +90,14 @@ describe('computeOperatorCounts — arithmetic', () => {
     const out = computeOperatorCounts(baseInputs({ approvals: approvalsQueue(200, true) }))
     expect(out.needsDecisionCount).toBe(200)
     expect(out.needsDecisionCountIsLowerBound).toBe(true)
+  })
+
+  it('needsDecisionCount is the viewer OWN count (the /approvals badge); the all-gate total is kept separately', () => {
+    const out = computeOperatorCounts(baseInputs({ approvals: approvalsQueue(5, true, { count: 1, isLowerBound: false }) }))
+    expect(out.needsDecisionCount).toBe(1)
+    expect(out.needsDecisionCountIsLowerBound).toBe(false) // "+" follows the own count
+    expect(out.allReviewersCount).toBe(5)
+    expect(out.allReviewersCountIsLowerBound).toBe(true)
   })
 
   it('blockedOrRejectedCount sums the blocked and rejected buckets of the shared map', () => {
@@ -202,6 +214,8 @@ describe('loadOperatorCounts — thin D1 wiring (real D1)', () => {
       INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id, gate_owner, created_at, updated_at) VALUES
         ('t-review-1', 'squad1', 'Ship it', 'review', 'a-live', 'gate:content', datetime('now'), datetime('now')),
         ('t-blocked-1', 'squad1', 'Blocked work', 'blocked', 'a-live', NULL, datetime('now'), datetime('now'));
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gg-owner', 'gate:content', 'agent', 'owner-1', 'test', datetime('now'));
     `)
     env = { TENANT_SLUG: 'wiring-test', DB: harness.db } as unknown as Env
   })
