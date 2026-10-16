@@ -69,6 +69,14 @@ CHANGELOG; this lists what the re-scope below builds on.
   bound to the shown payload (#1602), idempotent publish (#1653), `office_health` and
   `addon_setup` (#1679).
 
+- 2026-10-12 → 10-16 (see CHANGELOG `[Unreleased]`, "Release-scope highlights,
+  2026-10-12 → 2026-10-16"): secure moments and secure drop (flagged), delegated operators,
+  workspaces W1, seat attach W2 with its post-merge fixes, events/wake fixes, `org_structure`
+  elevation, `squad_join_request`, memory read-your-writes, `PagesPort`, capability grant
+  lifecycle PR-A, Telegram-first login, linked sign-ins, the human-shaped approvals page,
+  approval expiry (count-only unless enforced by deployment var), and board cleanup.
+  Migrations 0206–0234.
+
 ### After v0.31.0
 
 - Agent profiles, `agent_of_choice`, and steward design — #1564.
@@ -847,6 +855,33 @@ Release contract (done-when). `v0.32.0` is stable only when all seven hold:
 
 Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
 met by the frozen SHA, not by the existence of those PRs.
+
+**Proposed addendum, 2026-10-16 (Kasra; not yet accepted by Hadi — the contract above is
+unchanged until it is).** A one-day read-only review of the running system and its
+surface recorded that the pot limits agent authority well and tracks agent accountability
+poorly, and that the flow path for idle agents exists but is off. The proposal is to make
+`v0.32.0` the release that *accepts responsibility*, adding four acceptance tests to the
+seven above, each provable on Mumega's own fleet before the tag:
+
+8. no agent row with a null `owner_member_id`, `purpose`, `budget_cap_cents` or
+   `death_condition` holds a live token (refused at mint, not cleaned up after);
+9. liveness is derived from the last recorded act (verdict, receipt, landed change), never
+   from a heartbeat, and the roster shows its age;
+10. every result from every surface (chat reply, cloud-task artifact, shell commit) lands
+    as a receipt through one path; every failure writes a row (including
+    `POST /api/flights/:id/fail`); and "unknown" is a recorded outcome distinct from
+    "failed";
+11. every correction to an agent's or operator's own error is an append-only
+    nonconformity record with an owner and a close date.
+
+Measure proposed for the same release: flights landed per day by agents that received no
+human briefing, read from receipts; the bulk assign-and-wake path leaves dry-run only
+under a per-transition check that can pause and flag but never grant. Scope direction for
+`v0.32.0`/`v0.33.0`, recorded for the next scope decision: subtraction before addition —
+fold the duplicate presence, flight and wake paths, retire the still-routable endpoints of
+retired eras, and migrate the seat-link wake and connector registration off deprecated
+MCP transport/registration before the 2027-07-28 floor.
+
 
 ### v0.33.0: Compounding Project Knowledge (with the canonical receiver, realtime push, runtime receipts and Agent Computers rows) - planned
 

@@ -22,6 +22,91 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
   deployed SHA, collect fresh permission evidence, and require postpublication stable
    deployment, integrity and final-readiness verification before declaring completion.
 
+
+### Release-scope highlights, 2026-10-12 → 2026-10-16 (merged to `main`; unreleased)
+
+Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.
+Migrations named here must be applied before the code that reads them is deployed.
+Feature flags named here ship **off** unless stated. A merge is not a stable-release verdict.
+
+- **Secure moments and secure drop:** passkey-approved human decisions as a first-class
+  surface (#1862, migration 0212), HPKE-sealed credential delivery to agent hosts
+  (#1863, 0213), MCP URL-mode elicitation of moment links with plain-link fallback
+  (#1866, #1869), Telegram Mini App adapter with passkey and PIN fallbacks and a
+  trusted-device window (#1868, #1870, #1872, 0214–0215), approval requests reaching
+  the human's Telegram automatically (#1909), tappable approval rows and an explanation
+  of Telegram-locked sensitive actions (#1945), admission page help for a stuck phone
+  (#1920). All flagged off except where the PR says otherwise.
+- **Delegated operators (s1386 W0):** one structural chokepoint for human-only operator
+  tools, delegation rows, follow-ups and a human Operators dashboard page (#1876, #1879,
+  #1880, migration 0217).
+- **Workspaces W1:** `harnesses.grant_id`, worktrees, `worktree_open`/`worktree_list`
+  behind `WORKSPACES` (#1875, 0216).
+- **Seat attach (s1794 W2):** a harness thread acts as an existing admitted agent behind
+  `SEAT_ATTACH` (#1887, 0220); post-merge fixes for per-thread inbox labels, dead letters,
+  durable decisions and stranded admissions (#1900, #1901); admitting an identity-only
+  agent welds its identity without a token (#1917, #1919); boot and directory guidance
+  point at `seat_attach` instead of a bearer (#1922, #1911); `flight_dispatch` teaches the
+  goal-to-flight flow and boot prints the real attach ceiling (#1923); attached chats
+  record per-attachment handled receipts and `consumer_status` tells the truth (#1939,
+  0222). An attached seat never inherits gate authority (`gates = 0` by CHECK).
+- **Events and wake:** a lapsed native-wake lease is recorded and shown to the agent
+  (#1926 — the platform had stopped renewing on 10-10 and an attached agent did not wake);
+  attached agents can discover and subscribe to `message.created`, with the wake bound to
+  the live attachment and re-checked at every delivery (#1927, 0221); webhook follows the
+  inbox seat partition (#1936); Grok Bot webhook doorbell hardened with task wake and
+  dashboard registration (#1890, #1894, 0219).
+- **Elevation without standing admin:** `action:org_structure` elevation and
+  `update_department` — agents fix departments and squads with a passkey tap (#1905);
+  attached chats may request it, approved only by the attaching human with a passkey, not
+  Telegram (#1913, #1916); elevation binds to a live agent session (#1954);
+  `human_origin` accepted only from allowlisted harness runtimes (#1891).
+- **Squad membership by request:** `squad_join_request` — an agent asks, a squad admin
+  approves with a passkey (#1955, 0225).
+- **Memory and pages:** `recall` read-your-writes via a D1 fallback plus `memory_recent`
+  and `memory_get` (#1949, 0224); `PagesPort` with `project_wiki_upsert`/`project_wiki_get`
+  for agent wiki writes, Inkwell as the default adapter (#1974, 0227).
+- **Capability grant lifecycle (s1362a, PR-A of 3):** expiry, provenance and an
+  append-only grant history (#1976, 0230).
+- **Login and identity:** Telegram-first member web login by proof of control (#1979,
+  0229); a login-first invitee redeems onto their own proven member row (#1963); consent
+  cookie binds a list of nonces so a double `/authorize` no longer 403s (#1966); identity
+  revoke cuts sessions then passkeys, idempotently (#1864); a legacy owner login sees the
+  member's exact grant on their home squad (#1933); mint and bearer auth refused for a
+  non-active agent (#1969); linked sign-ins — a member links their other Google accounts
+  at `/account` and the moved-away duplicate member is superseded, its directory tokens
+  revoked and connectors signed out (#1996, #1998, 0233–0234).
+- **Onboarding:** one path across the three token surfaces (#1981); agent onboarding
+  funnel map and first-contact refusal fixes (#1941); a freshly created agent is listed on
+  `/enroll` (#1958); namespaced `unknown_tool` names the bare tool and hints a stale
+  attached catalog (#1971).
+- **Approvals, human-shaped:** "Waiting on you" shows your own decisions first, with
+  agent/project/type filters, priority, sender and a "You asked" tab (#1990, #1994, #1999);
+  `/approvals` and status counts honor task archive (#1959); unanswered gated asks expire
+  — `review` → `blocked(approval_expired)` through one shared predicate and a cron sweep
+  (#1992, 0232). **The sweep counts only unless `APPROVAL_EXPIRY_ENFORCE=1` is set in the
+  deployment's vars; enforcement is a deployment decision, not a merge.**
+- **Board cleanup:** agents propose, humans archive in one click at `/board/cleanup`
+  (#1991, 0231); set an agent's owner from its page (#1989).
+- **Dashboard and CI:** type-to-search on long dropdowns (#1881); path-routed tenant URLs
+  re-rooted at one chokepoint (#1975); Vitest sharded with reused migrated schemas
+  (#1898); deterministic order in the agent-access panel and agent-token P3s (#2001).
+
+### Observations recorded 2026-10-16 (not fixes)
+
+A read-only endpoint review of the tree at that date (178 MCP tools, 146 dashboard
+routes, 226 other HTTP routes) found: roughly a quarter of the surface duplicates another
+path for the same purpose (HTTP twins of MCP tools; two presence models, two flight
+spines, two wake paths) or belongs to retired eras still routable in production (SOS
+addon, Mirror API, ToRivers, Inkwell API, fleet control, brain KV); `router_tick` — the
+bulk assign-and-wake path for idle agents — exists and defaults to dry-run;
+`POST /api/flights/:id/fail` writes no receipt row where `land` does; five human
+decision surfaces (secret-env bind, seat admission, archive-proposal decision, scoped-key
+mint, connector revoke/rotate) have no MCP twin. Protocol note: MCP 2026-07-28 deprecates
+HTTP+SSE and dynamic client registration (removal no earlier than 2027-07-28); the
+seat-link wake path and connector registration use both. These are recorded here so the
+next scope decision starts from measurement; none is a change in this entry.
+
 > **Re-scope (2026-10-11):** `v0.32.0` is now "Agents as themselves and governed
 > autonomy": per-seat agent identity for Claude Code, Codex, and ChatGPT threads, plus
 > the loop brakes, with P0 #1565 and #1608 and #1609 (the #1596 phase-1b disclosure items) closed
