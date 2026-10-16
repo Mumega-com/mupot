@@ -4166,9 +4166,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_tasks_review_entered" },
     ],
   },
+  {
+    file: "0233_login_identity_move_claims.sql",
+    sha256: "5f2e2b52f70e15bd3fa2583ea7c3b8438a172b29dce1cc45865225884541c814",
+    statements: [
+      "-- 0233_login_identity_moved_stamp.sql — mupot#1022: per-request claim row for a confirmed sign-in move.\n--\n-- A confirmed \"move this Google sign-in to my account\" re-points the existing identity row (UNIQUE(tenant, provider,\n-- provider_subject) covers revoked rows, so a second row is impossible). In ONE D1 batch the move first INSERTs a claim\n-- row here, guarded by exactly the move's own predicates (INSERT ... SELECT ... FROM human_login_identities WHERE <guards>);\n-- the audit INSERT and the session/passkey/phone cutoffs anchor on `stamp = <this request>` (the telegram_login_links\n-- consumed_at pattern, #1579/#1979). A move whose guards fail writes no claim, so nothing downstream lands; a real move\n-- always writes its audit and cutoffs, with no reliance on changes(). stamp is a per-request uuid.\nCREATE TABLE IF NOT EXISTS login_identity_move_claims (\n  stamp          TEXT PRIMARY KEY,\n  tenant         TEXT NOT NULL,\n  identity_id    TEXT NOT NULL,\n  from_member_id TEXT NOT NULL,\n  to_member_id   TEXT NOT NULL,\n  claimed_at     TEXT NOT NULL\n);",
+    ],
+    objects: [
+      { type: "table", name: "login_identity_move_claims" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "c26fea459509a01bf6efb60814755b5c59d2b9c507b21dd34b005af79ed34973"
+export const SCHEMA_CHAIN_DIGEST: string = "30bcda6ca606c4a18759d8502bbff2ce6ef02b1a4e0a9eb372d07ba808930f17"

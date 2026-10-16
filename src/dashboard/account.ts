@@ -52,6 +52,7 @@ import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config
 import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
 import { changeTrustWindow, currentTrustWindow, listMemberTgDevicesPw, parseTrustWindow, pinWindowOn, TRUST_WINDOW_PRESETS } from '../secure-moments/telegram-miniapp-pin-window'
 import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
+import { listLinkedSignIns } from '../auth/link-signin'
 
 type ShellFn = (
   env: Env,
@@ -584,13 +585,56 @@ async function passkeyPanel(env: Env, auth: AuthContext): Promise<Html> {
   return body ? sectionPanel({ title: 'Passkeys', body }) : html``
 }
 
-async function accountPageBody(env: Env, auth: AuthContext): Promise<Html> {
+// mupot#1022: outcome codes the auth routes put in ?signin=. A fixed map: the query value is only ever a lookup key, never echoed.
+const SIGNIN_NOTICES: Record<string, string> = {
+  linked: 'Google account linked. You can now sign in with it and land here.',
+  moved: 'Google account linked. Sign-in for it now lands in this account; the old member was left as-is for an admin to archive.',
+  reactivated: 'Google account linked again.',
+  already_yours: 'That Google account is already linked to this account.',
+  unlinked: 'Sign-in unlinked.',
+  already_linked: 'That Google account belongs to another member and cannot be moved from here. Ask an org admin.',
+  identity_revoked: 'That Google account was unlinked from another member before and is not linked again automatically. Ask an org admin.',
+  last_identity: 'You cannot unlink your last sign-in: you would lose access.',
+  not_found: 'That sign-in was not found.',
+  stale_google_signin: 'Google did not ask you to sign in again just now. Start again and complete the Google sign-in.',
+  reauth_required: 'Please confirm it is you again, then start linking from here.',
+  expired: 'That link request expired. Start again.',
+  changed: 'That Google account changed while you were confirming. Start again.',
+  unverified: 'That Google account has no verified email, so it cannot be linked.',
+  competing_control: 'That sign-in could not be linked right now.',
+  service_error: 'Something went wrong. Try again in a moment.',
+  not_a_human_session: 'Only a signed-in person can link sign-ins.',
+}
+
+export async function linkedSignInsSectionBody(env: Env, auth: AuthContext, notice: string | null): Promise<Html> {
+  if (!auth.memberId || !auth.webSessionIdHash) {
+    return html`<p class="ui-sub">Linked sign-ins are available once you are signed in with a registered web session.</p>`
+  }
+  const identities = await listLinkedSignIns(env, auth.memberId)
+  const note = notice && SIGNIN_NOTICES[notice] ? html`<p class="notice" role="status">${SIGNIN_NOTICES[notice]}</p>` : html``
+  const rows = identities.map((i) => html`
+    <li>
+      <span>${i.provider}</span> <span class="ui-sub">${i.maskedEmail ?? 'no email'}</span>
+      ${identities.length > 1
+        ? html`<form method="post" action="/auth/link-signin/${i.id}/unlink"><button type="submit">Unlink</button></form>`
+        : html`<span class="ui-sub">(your only sign-in)</span>`}
+    </li>`)
+  return html`
+    ${note}
+    <p>The accounts that sign you in to this member. Link your other Google account so signing in with it lands here instead of creating a separate, empty member.</p>
+    ${identities.length === 0 ? html`<p class="ui-sub">No linked sign-ins.</p>` : html`<ul>${rows}</ul>`}
+    <form method="post" action="/auth/link-signin/start"><button type="submit">Link another Google account</button></form>
+    <p class="ui-sub">You will be asked to confirm it is you, then to pick the Google account to link.</p>`
+}
+
+async function accountPageBody(env: Env, auth: AuthContext, signinNotice: string | null = null): Promise<Html> {
   return html`
     ${pageHeader({
       crumbs: 'Overview / My Account',
       title: 'My Account',
       sub: 'Your identity in this pot and the channels connected to it.',
     })}
+    ${sectionPanel({ title: 'Linked sign-ins', body: await linkedSignInsSectionBody(env, auth, signinNotice) })}
     ${sectionPanel({ title: 'Telegram', body: await telegramSectionBody(env, auth) })}
     ${await passkeyPanel(env, auth)}
     ${await telegramDevicePanel(env, auth)}
@@ -603,7 +647,7 @@ export function makeAccountApp(shell: ShellFn) {
   const app = new Hono<AppEnv>()
 
   app.get('/account', async (c) => {
-    const body = await accountPageBody(c.env, c.get('auth'))
+    const body = await accountPageBody(c.env, c.get('auth'), c.req.query('signin') ?? null)
     return c.html(shell(c.env, 'My Account', body))
   })
 

@@ -30,6 +30,8 @@ import {
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
 import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
+import { linkSignIn, planLinkSignIn, unlinkSignIn } from './link-signin'
+import { checkWebSession } from '../secure-moments/enrol-mint'
 import {
   createWebSession,
   evaluateWebSession,
@@ -544,6 +546,25 @@ interface GoogleToken {
   access_token: string
   expires_in: number
   token_type: string
+  id_token?: string
+}
+
+/**
+ * auth_time (seconds) from the id_token Google returned on the code exchange, or null when absent/unreadable. The token came
+ * straight from Google's token endpoint over TLS in exchange for OUR code, so its payload needs no signature check here; it is
+ * only used to REFUSE a link whose Google sign-in was not just performed (shared-browser case).
+ */
+function googleAuthTime(idToken: string | undefined): number | null {
+  if (!idToken) return null
+  const part = idToken.split('.')[1]
+  if (!part) return null
+  try {
+    const json = atob(part.replace(/-/g, '+').replace(/_/g, '/'))
+    const claim = JSON.parse(json) as { auth_time?: unknown }
+    return typeof claim.auth_time === 'number' && Number.isFinite(claim.auth_time) ? claim.auth_time : null
+  } catch {
+    return null
+  }
 }
 
 interface GoogleUserInfo {
@@ -724,6 +745,21 @@ authApp.get('/callback', async (c) => {
     }
   }
 
+  // mupot#1022: POST /auth/link-signin/start encodes a link-intent into this same state value, bound to the session
+  // that started it. Like the reauth marker it can only come from a state WE wrote (the state is server-side KV behind
+  // a per-state browser cookie), and a link-intent state NEVER falls through to the login mint below.
+  let linkTarget: { webSessionIdHash: string; memberId: string } | null = null
+  if (seen !== '1') {
+    try {
+      const parsed = JSON.parse(seen) as { link_signin?: boolean; webSessionIdHash?: string; memberId?: string }
+      if (parsed.link_signin === true && typeof parsed.webSessionIdHash === 'string' && typeof parsed.memberId === 'string') {
+        linkTarget = { webSessionIdHash: parsed.webSessionIdHash, memberId: parsed.memberId }
+      }
+    } catch {
+      // Not a link-intent marker.
+    }
+  }
+
   let returnPath: string | null = null
   let tgLinkNonce: string | null = null
   if (seen !== '1') {
@@ -777,6 +813,8 @@ authApp.get('/callback', async (c) => {
     return c.json({ error: 'email_unverified' }, 403)
   }
 
+  if (linkTarget) return finishLinkSignIn(c, linkTarget, info.sub, info.email ?? null, googleAuthTime(token.id_token))
+
   // Reauth branch (GET /auth/reauth's round trip): this callback is proving
   // freshness for an EXISTING session, not minting a new one. The returned
   // provider identity must be the EXACT identity that session is already
@@ -792,7 +830,7 @@ authApp.get('/callback', async (c) => {
       return c.json({ error: 'reauth_identity_mismatch' }, 403)
     }
     await markRecentReauth(env, reauthTarget.webSessionIdHash)
-    return c.redirect('/')
+    return c.redirect(returnPath ?? '/')
   }
 
   const derivedId = await deriveUserId('google', info.sub)
@@ -882,7 +920,11 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
   const state = randomId(24)
   await env.SESSIONS.put(
     stateKey(state),
-    JSON.stringify({ reauth: true, webSessionIdHash: auth.webSessionIdHash }),
+    JSON.stringify({
+      reauth: true,
+      webSessionIdHash: auth.webSessionIdHash,
+      ...(safeReturnPath(c.req.query('return')) ? { return: safeReturnPath(c.req.query('return')) } : {}),
+    }),
     { expirationTtl: STATE_TTL_SECONDS },
   )
   const reauthCookie = stateCookieName(state)
@@ -1039,6 +1081,174 @@ authApp.post('/telegram-link/confirm', async (c) => {
   await c.env.SESSIONS.delete(`${TG_LINK_KV_PREFIX}${ctx.nonce}`)
   deleteCookie(c, TG_LINK_COOKIE, { path: authBasePath(c.env, c.req.raw) })
   return c.redirect('/')
+})
+
+
+// mupot#1022 — Linked sign-ins (src/auth/link-signin.ts). A SIGNED-IN member links another Google account to THIS member.
+//   POST /auth/link-signin/start        needs a live web session re-authenticated within five minutes (else it sends the
+//                                       member through /auth/reauth and back to /account). Writes a state bound to THAT
+//                                       session, behind the per-state browser cookie, and goes to Google.
+//   GET  /auth/callback                 (link-intent branch, finishLinkSignIn) the callback must arrive in the SAME session,
+//                                       still fresh. A free subject is linked; a subject that is a separate member's shows
+//                                       the confirm page; anything else is refused.
+//   POST /auth/link-signin/confirm      the duplicate move, needs its own nonce cookie + KV record + the same session.
+//   POST /auth/link-signin/:id/unlink   own identity, never the last live one.
+// The identity linked is the one the OAuth callback VERIFIED (subject + verified email). It is never an email match, never an
+// unauthenticated login, and never an identity named in a request.
+authApp.use('/link-signin/*', csrf())
+
+const GOOGLE_AUTH_MAX_AGE_SECONDS = 5 * 60
+const LINK_MOVE_COOKIE = 'mupot_link_move'
+const LINK_MOVE_KV_PREFIX = 'linkmove:'
+const LINK_MOVE_CONFIRM_PATH = '/auth/link-signin/confirm'
+
+function linkSigninRedirect(c: Context<AppEnv>, code: string): Response {
+  return c.redirect(`/account?signin=${code}`)
+}
+
+authApp.post('/link-signin/start', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  const env = c.env
+  if (provider(env) !== 'google' || !env.OAUTH_CLIENT_ID) return c.json({ error: 'oauth_not_configured' }, 503)
+  const auth = await peekSessionAuth(c)
+  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+  const session = await checkWebSession(env, auth, { fresh: true })
+  if (!session.ok) {
+    // Stale: re-authenticate this session, then come back to the account page to start again.
+    if (session.error === 'reauth_required') return c.redirect('/auth/reauth?return=/account')
+    return c.json({ error: session.error }, session.status)
+  }
+  if (pinnedHostRedirect(c)) return c.json({ error: 'wrong_host' }, 409)
+  const state = randomId(24)
+  await env.SESSIONS.put(
+    stateKey(state),
+    JSON.stringify({ link_signin: true, webSessionIdHash: session.session.id_hash, memberId: session.memberId, return: '/account' }),
+    { expirationTtl: STATE_TTL_SECONDS },
+  )
+  const stateCookie = stateCookieName(state)
+  if (stateCookie) {
+    setCookie(c, stateCookie, '1', {
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: callbackPath(env, c.req.raw), maxAge: STATE_TTL_SECONDS,
+    })
+  }
+  const params = new URLSearchParams({
+    client_id: env.OAUTH_CLIENT_ID,
+    redirect_uri: callbackUrl(env, c.req.raw),
+    response_type: 'code',
+    scope: 'openid email',
+    state,
+    access_type: 'online',
+    // Link flow ONLY: demand a fresh Google credential so a still-logged-in account on a shared browser cannot be picked.
+    prompt: 'login select_account',
+    max_age: '0',
+  })
+  return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
+})
+
+function linkMovePage(brand: string, inner: string): string {
+  return telegramLinkPage(brand, inner).replace('Connect your sign-in', 'Link your sign-in')
+}
+
+/** The link-intent branch of /auth/callback. Always returns a response; never mints a session. */
+async function finishLinkSignIn(
+  c: Context<AppEnv>,
+  target: { webSessionIdHash: string; memberId: string },
+  subject: string,
+  email: string | null,
+  googleAuthTimeSec: number | null,
+): Promise<Response> {
+  c.header('Cache-Control', 'no-store')
+  const env = c.env
+  const auth = await peekSessionAuth(c)
+  // The callback must arrive in the session that started the link: a state started by another session, or by nobody still
+  // signed in, links nothing.
+  if (!auth || auth.webSessionIdHash !== target.webSessionIdHash || auth.memberId !== target.memberId) {
+    return c.json({ error: 'link_session_mismatch' }, 403)
+  }
+  const session = await checkWebSession(env, auth, { fresh: true })
+  if (!session.ok) return linkSigninRedirect(c, 'reauth_required')
+  // The link flow forces a fresh Google sign-in (prompt=login, max_age=0). When Google says when the user last authenticated,
+  // a stale auth_time means a still-logged-in Google account was picked, not proven: refuse.
+  if (googleAuthTimeSec !== null && Date.now() / 1000 - googleAuthTimeSec > GOOGLE_AUTH_MAX_AGE_SECONDS) {
+    return linkSigninRedirect(c, 'stale_google_signin')
+  }
+  const input = { provider: 'google', subject, verifiedEmail: email }
+  const plan = await planLinkSignIn(env, auth, input)
+  if (plan.kind === 'move') {
+    const nonce = randomId(24)
+    await env.SESSIONS.put(
+      `${LINK_MOVE_KV_PREFIX}${nonce}`,
+      JSON.stringify({
+        webSessionIdHash: target.webSessionIdHash,
+        memberId: target.memberId,
+        subject,
+        email,
+        identityId: plan.duplicate.identityId,
+        oldMemberId: plan.duplicate.memberId,
+      }),
+      { expirationTtl: STATE_TTL_SECONDS },
+    )
+    setCookie(c, LINK_MOVE_COOKIE, nonce, {
+      httpOnly: true, secure: cookieSecure(c.req.url), sameSite: 'Lax', path: authBasePath(env, c.req.raw), maxAge: STATE_TTL_SECONDS,
+    })
+    const e = htmlEscape
+    const created = e(plan.duplicate.createdAt.slice(0, 10))
+    return c.html(linkMovePage(env.BRAND || env.TENANT_SLUG, `<h1>This Google account already has its own member</h1>
+<p>Google account being moved: <strong>${e(plan.duplicate.identityMaskedEmail ?? 'no email')}</strong>. Its current member: <strong>${e(plan.duplicate.maskedEmail ?? 'no email')}</strong>.</p>
+<p>This Google account already has its own member (created ${created}, ${plan.duplicate.permissions} permissions). Linking moves sign-in to this account; the old member is left as-is for an admin to archive.</p>
+<form method="post" action="${LINK_MOVE_CONFIRM_PATH}"><button type="submit">Move this sign-in to my account</button></form>
+<p><a href="/account">Cancel</a></p>`))
+  }
+  const result = await linkSignIn(env, auth, input)
+  if (!result.ok) return linkSigninRedirect(c, result.error)
+  return linkSigninRedirect(c, result.outcome)
+}
+
+authApp.post('/link-signin/confirm', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+  const env = c.env
+  const nonce = getCookie(c, LINK_MOVE_COOKIE)
+  const auth = await peekSessionAuth(c)
+  if (!nonce || !TG_LINK_NONCE_RE.test(nonce) || !auth) return linkSigninRedirect(c, 'expired')
+  const raw = await env.SESSIONS.get(`${LINK_MOVE_KV_PREFIX}${nonce}`)
+  if (!raw) return linkSigninRedirect(c, 'expired')
+  // Single use: consumed before it is honoured.
+  await env.SESSIONS.delete(`${LINK_MOVE_KV_PREFIX}${nonce}`)
+  deleteCookie(c, LINK_MOVE_COOKIE, { path: authBasePath(env, c.req.raw) })
+  let pending: { webSessionIdHash?: unknown; memberId?: unknown; subject?: unknown; email?: unknown; identityId?: unknown; oldMemberId?: unknown }
+  try {
+    pending = JSON.parse(raw) as typeof pending // as: shape-checked field by field below
+  } catch {
+    return linkSigninRedirect(c, 'expired')
+  }
+  if (
+    typeof pending.webSessionIdHash !== 'string' || typeof pending.memberId !== 'string' || typeof pending.subject !== 'string'
+    || typeof pending.identityId !== 'string' || typeof pending.oldMemberId !== 'string'
+    || (pending.email !== null && typeof pending.email !== 'string')
+  ) return linkSigninRedirect(c, 'expired')
+  if (auth.webSessionIdHash !== pending.webSessionIdHash || auth.memberId !== pending.memberId) {
+    return c.json({ error: 'link_session_mismatch' }, 403)
+  }
+  const session = await checkWebSession(env, auth, { fresh: true })
+  if (!session.ok) return linkSigninRedirect(c, 'reauth_required')
+  const result = await linkSignIn(
+    env, auth,
+    { provider: 'google', subject: pending.subject, verifiedEmail: pending.email },
+    { confirmMove: true, expectedDuplicate: { identityId: pending.identityId, memberId: pending.oldMemberId } },
+  )
+  return linkSigninRedirect(c, result.ok ? result.outcome : result.error)
+})
+
+authApp.post('/link-signin/:id/unlink', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  const auth = await peekSessionAuth(c)
+  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+  // Unlinking only reduces access, so a real web session is enough (the revoke-device bar), no fresh re-auth.
+  const session = await checkWebSession(c.env, auth, { fresh: false })
+  if (!session.ok) return c.json({ error: session.error }, session.status)
+  const result = await unlinkSignIn(c.env, auth, c.req.param('id'))
+  return linkSigninRedirect(c, result.ok ? 'unlinked' : result.error)
 })
 
 // GET /auth/handoff?token= → accept a mumega-signed verified-email claim (#262).
