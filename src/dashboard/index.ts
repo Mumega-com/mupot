@@ -82,7 +82,8 @@ import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
-import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
+import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig, updateAgentProfile } from '../org/service'
+import { authorizeOwnerMemberChange } from '../org/agent-owner'
 import { SQUAD_ACTIVE_SQL, TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
@@ -1999,9 +2000,102 @@ dashboardApp.get('/agents/:id', async (c) => {
   const accessPanel = isOrgAdmin(auth) && !auth.boundAgentId
     ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id), null)
     : null
+  const ownerView = await loadAgentOwnerView(c.env, auth, agent)
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView)),
   )
+})
+
+// ── Owner row (mupot#1987) ───────────────────────────────────────────────────
+// The control is org-admin only and never offered to an agent session. The select lists
+// only members the caller does not outrank-fail on (exceedsTargetRankCeiling, the same
+// predicate the write re-runs); POST /agents/:id/owner re-checks everything.
+interface AgentOwnerView {
+  ownerLabel: string | null
+  canSet: boolean
+  candidates: Array<{ id: string; label: string }>
+  callerMemberId: string | null
+}
+
+async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Promise<AgentOwnerView> {
+  let ownerLabel: string | null = null
+  if (agent.owner_member_id) {
+    const row = await env.DB.prepare('SELECT display_name, email FROM members WHERE id = ? AND tenant = ?')
+      .bind(agent.owner_member_id, env.TENANT_SLUG)
+      .first<{ display_name: string | null; email: string | null }>()
+    ownerLabel = row
+      ? [row.display_name, row.email].filter((v): v is string => !!v).join(' · ') || agent.owner_member_id
+      : `${agent.owner_member_id} (member not found)`
+  }
+  const canSet = isOrgAdmin(auth) && !auth.boundAgentId
+  const candidates: Array<{ id: string; label: string }> = []
+  if (canSet) {
+    const members = await env.DB.prepare(
+      "SELECT id, display_name, email FROM members WHERE tenant = ? AND status = 'active' ORDER BY display_name LIMIT 200",
+    )
+      .bind(env.TENANT_SLUG)
+      .all<{ id: string; display_name: string | null; email: string | null }>()
+    for (const m of members.results ?? []) {
+      if (m.id === auth.memberId) continue
+      if (await exceedsTargetRankCeiling(env, auth, m.id)) continue
+      candidates.push({ id: m.id, label: [m.display_name, m.email].filter((v): v is string => !!v).join(' · ') || m.id })
+    }
+  }
+  return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null }
+}
+
+function agentOwnerControl(agent: Agent, view: AgentOwnerView) {
+  return html`<form method="post" action="/agents/${agent.id}/owner" class="inline-form">
+      <label>Set owner
+        <select name="owner_member_id">
+          <option value="">Choose a member</option>
+          ${view.candidates.map((m) => html`<option value="${m.id}">${m.label}</option>`)}
+        </select>
+      </label>
+      <button type="submit" name="action" value="set" class="btn">Set owner</button>
+      ${view.callerMemberId ? html`<button type="submit" name="action" value="me" class="btn secondary">Make me the owner</button>` : ''}
+      ${agent.owner_member_id ? html`<button type="submit" name="action" value="clear" class="btn secondary">Clear owner</button>` : ''}
+    </form>`
+}
+
+// POST /agents/:id/owner — same-origin form post; the csrf() Origin check registered on
+// dashboardApp applies (as for /agents/:id/access). Authorization is the SAME predicate
+// update_agent uses (authorizeOwnerMemberChange); the write is the SAME updateAgentProfile,
+// which validates the member in this tenant and writes the agent_audit row.
+dashboardApp.post('/agents/:id/owner', async (c) => {
+  const auth = c.get('auth')
+  if (auth.boundAgentId || !isOrgAdmin(auth) || !auth.memberId) {
+    return c.html(shell(c.env, 'Agent owner', errorBody('Only an org admin can set an agent owner.')), 403)
+  }
+  const resolved = await resolveAgentRef(c.env, c.req.param('id'))
+  if (!resolved.ok) return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
+  if (!agent) return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
+  const form = await c.req.parseBody()
+  const field = (name: string): string => (typeof form[name] === 'string' ? form[name] : '')
+  const action = field('action')
+  const target: string | null =
+    action === 'clear' ? null : action === 'me' ? auth.memberId : field('owner_member_id')
+  if (target !== null && target.length === 0) {
+    return c.html(shell(c.env, 'Agent owner', errorBody('Choose a member to set as owner.')), 400)
+  }
+  const gate = await authorizeOwnerMemberChange(c.env, auth, target)
+  if (!gate.ok) {
+    const msg = gate.error === 'target_rank_exceeds_ceiling'
+      ? 'You cannot make a member who outranks you the owner.'
+      : gate.error === 'forbidden'
+        ? 'Only an org admin can set an agent owner.'
+        : 'That member id is not valid.'
+    return c.html(shell(c.env, 'Agent owner', errorBody(msg)), gate.status)
+  }
+  const result = await updateAgentProfile(c.env, agent.id, { owner_member_id: target }, { id: auth.memberId, type: 'user' })
+  if (!result.ok) {
+    if (result.error === 'owner_member_not_found') {
+      return c.html(shell(c.env, 'Agent owner', errorBody('owner_member_not_found: that member does not exist.')), 404)
+    }
+    return c.html(shell(c.env, 'Agent owner', errorBody('Could not set the owner.')), 400)
+  }
+  return c.redirect(`/agents/${agent.id}`, 303)
 })
 
 // POST /agents/:id/access — the org-admin Access panel write. Every authority rule
@@ -5734,6 +5828,7 @@ function agentConsoleBody(
   work: PanelResult<WorkSummary>,
   collaboration: PanelResult<CollaborationSummary>,
   accessPanel: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
+  ownerView: AgentOwnerView | null = null,
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -5783,9 +5878,11 @@ function agentConsoleBody(
         <dt>Model</dt><dd><code>${agent.model}</code></dd>
         <dt>Status</dt><dd>${agent.status}</dd>
         <dt>Squad</dt><dd>${squad ? html`<a href="/squads/${squad.id}">${squad.name}</a>` : html`—`}</dd>
+        <dt>Owner</dt><dd>${ownerView?.ownerLabel ?? 'No owner'}</dd>
         <dt>Agent id</dt><dd><code>${agent.id}</code></dd>
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
+      ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
     </div>
     ${accessPanel ?? ''}
     <h2>Flights</h2>
