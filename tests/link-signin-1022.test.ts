@@ -375,6 +375,9 @@ describe('#1022 linked sign-ins', () => {
     const oldBrowser = await signIn('sub-dup', 'dup@gmail.test')
     const { jar } = await reachMoveConfirm()
     // the claim is lost (a race loser) while the row still ends up with the actor: nothing downstream may land
+    // a claim for the same identity from some OTHER request exists: it must not satisfy this request's anchor
+    h.sqlite.exec(`INSERT INTO login_identity_move_claims (stamp, tenant, identity_id, from_member_id, to_member_id, claimed_at)
+      VALUES ('foreign-request', '${TENANT}', 'hli-dup', 'mem-dup', 'mem-main', datetime('now'))`)
     h.sqlite.exec(`CREATE TRIGGER lose_claim BEFORE INSERT ON login_identity_move_claims BEGIN SELECT RAISE(IGNORE); END`)
     await post(jar, '/auth/link-signin/confirm')
     expect(identity('sub-dup')?.member_id).toBe('mem-main')
