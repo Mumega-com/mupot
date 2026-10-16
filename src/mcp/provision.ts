@@ -2351,7 +2351,7 @@ const toolUpdateAgent: ToolSpec = {
     // granting themselves nothing is not the mint this guards.
     // The predicate lives in src/org/agent-owner.ts (one chokepoint shared with the
     // dashboard owner form, mupot#1987); the rationale above applies to it unchanged.
-    const ownerGate = await authorizeOwnerMemberChange(env, auth, patch.owner_member_id)
+    const ownerGate = await authorizeOwnerMemberChange(env, auth, agent.id, patch.owner_member_id)
     if (!ownerGate.ok) return fail(ownerGate.status, ownerGate.error, ownerGate.detail)
 
     // Audit actor: a self-correction is attributed to the agent itself (0086's

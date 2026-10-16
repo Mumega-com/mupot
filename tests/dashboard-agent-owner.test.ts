@@ -46,6 +46,7 @@ function setup(): { harness: SqliteD1Harness; env: Env } {
       ('m-boss', 'Boss Owner', 'boss@x.test', 'active', '${TENANT}'),
       ('m-peer', 'Peer Member', 'peer@x.test', 'active', '${TENANT}'),
       ('m-evil', '<script>alert(1)</script>', 'evil@x.test', 'active', '${TENANT}'),
+      ('m-susp', 'Susp Member', 'susp@x.test', 'suspended', '${TENANT}'),
       ('m-other', 'Other Tenant', 'o@x.test', 'active', 'someone-else');
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
       ('ag1', 'sq-core', 'ag1', 'Agent One', 'member', 'test', 'active');
@@ -166,5 +167,54 @@ describe('agent Owner row + POST /agents/:id/owner', () => {
     expect((await post(env, { action: 'me' }, 'https://evil.test')).status).toBe(403)
     expect((await post(env, { action: 'me' }, null)).status).toBe(403)
     expect(owner(harness)).toBeNull()
+  })
+
+  describe('gate P1/P2/P3', () => {
+    const ownedByBoss = (h: SqliteD1Harness) => h.sqlite.exec("UPDATE agents SET owner_member_id = 'm-boss' WHERE id = 'ag1'")
+
+    it.each([
+      ['clear', { action: 'clear' }],
+      ['replace', { action: 'set', owner_member_id: 'm-peer' }],
+      ['make me the owner', { action: 'me' }],
+    ])('refuses to %s an agent owned by a member who outranks the caller', async (_n, form) => {
+      const { harness, env } = setup()
+      ownedByBoss(harness)
+      authState.current = as('m-admin', 'admin')
+      expect((await post(env, form)).status).toBe(403)
+      expect(owner(harness)).toBe('m-boss')
+    })
+
+    it('hides the control when the current owner outranks the viewer, but still shows the owner', async () => {
+      const { harness, env } = setup()
+      ownedByBoss(harness)
+      authState.current = as('m-admin', 'admin')
+      const body = await (await dashboardApp.request(`${ORIGIN}/agents/ag1`, {}, env)).text()
+      expect(body).toContain('Boss Owner')
+      expect(body).not.toContain('Make me the owner')
+    })
+
+    it('refuses a suspended new owner', async () => {
+      const { harness, env } = setup()
+      authState.current = as('m-admin', 'admin')
+      const res = await post(env, { action: 'set', owner_member_id: 'm-susp' })
+      expect(res.status).toBe(409)
+      expect(owner(harness)).toBeNull()
+    })
+
+    it('refuses an agent-bound session even if it holds org admin', async () => {
+      const { harness, env } = setup()
+      authState.current = { ...as('m-admin', 'admin'), boundAgentId: 'ag1' } as AuthContext
+      expect((await post(env, { action: 'me' })).status).toBe(403)
+      expect(owner(harness)).toBeNull()
+    })
+
+    it('emits agent_updated on the bus', async () => {
+      const { env } = setup()
+      const sent: unknown[] = []
+      ;(env as unknown as { BUS: { send: (e: unknown) => Promise<void> } }).BUS.send = async (e) => { sent.push(e) }
+      authState.current = as('m-admin', 'admin')
+      await post(env, { action: 'me' })
+      expect(JSON.stringify(sent)).toContain('agent_updated')
+    })
   })
 })

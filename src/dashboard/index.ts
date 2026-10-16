@@ -83,7 +83,7 @@ import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig, updateAgentProfile } from '../org/service'
-import { authorizeOwnerMemberChange } from '../org/agent-owner'
+import { authorizeOwnerMemberChange, emitAgentOwnerUpdated } from '../org/agent-owner'
 import { SQUAD_ACTIVE_SQL, TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
@@ -2027,7 +2027,10 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
       ? [row.display_name, row.email].filter((v): v is string => !!v).join(' · ') || agent.owner_member_id
       : `${agent.owner_member_id} (member not found)`
   }
-  const canSet = isOrgAdmin(auth) && !auth.boundAgentId
+  const canSet =
+    isOrgAdmin(auth) &&
+    !auth.boundAgentId &&
+    !(agent.owner_member_id && (await exceedsTargetRankCeiling(env, auth, agent.owner_member_id)))
   const candidates: Array<{ id: string; label: string }> = []
   if (canSet) {
     const members = await env.DB.prepare(
@@ -2079,7 +2082,7 @@ dashboardApp.post('/agents/:id/owner', async (c) => {
   if (target !== null && target.length === 0) {
     return c.html(shell(c.env, 'Agent owner', errorBody('Choose a member to set as owner.')), 400)
   }
-  const gate = await authorizeOwnerMemberChange(c.env, auth, target)
+  const gate = await authorizeOwnerMemberChange(c.env, auth, agent.id, target)
   if (!gate.ok) {
     const msg = gate.error === 'target_rank_exceeds_ceiling'
       ? 'You cannot make a member who outranks you the owner.'
@@ -2090,11 +2093,15 @@ dashboardApp.post('/agents/:id/owner', async (c) => {
   }
   const result = await updateAgentProfile(c.env, agent.id, { owner_member_id: target }, { id: auth.memberId, type: 'user' })
   if (!result.ok) {
+    if (result.error === 'owner_member_inactive') {
+      return c.html(shell(c.env, 'Agent owner', errorBody('owner_member_inactive: that member is suspended or archived.')), 409)
+    }
     if (result.error === 'owner_member_not_found') {
       return c.html(shell(c.env, 'Agent owner', errorBody('owner_member_not_found: that member does not exist.')), 404)
     }
     return c.html(shell(c.env, 'Agent owner', errorBody('Could not set the owner.')), 400)
   }
+  await emitAgentOwnerUpdated(c.env, auth.memberId, agent, target)
   return c.redirect(`/agents/${agent.id}`, 303)
 })
 

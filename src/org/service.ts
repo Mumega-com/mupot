@@ -1349,7 +1349,7 @@ export async function setAgentStatus(
 
 export type UpdateAgentProfileResult =
   | { ok: true; value: AgentProfileSummary; auditId: string }
-  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' | 'owner_member_not_found' }
+  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' | 'owner_member_not_found' | 'owner_member_inactive' }
 
 /** Who made a correction. `actor_type` is constrained by 0086's CHECK; a member
  *  acting through the MCP tool is a 'user'. */
@@ -1580,10 +1580,12 @@ export async function updateAgentProfile(
         continue
       }
       if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid_field' }
-      const memberRow = await env.DB.prepare('SELECT 1 FROM members WHERE id = ? AND tenant = ?')
+      const memberRow = await env.DB.prepare('SELECT status FROM members WHERE id = ? AND tenant = ?')
         .bind(raw.trim(), env.TENANT_SLUG)
-        .first<{ 1: number }>()
+        .first<{ status: string }>()
       if (!memberRow) return { ok: false, error: 'owner_member_not_found' }
+      // A suspended/archived member cannot be an owner (mupot#1987 gate P2).
+      if (memberRow.status !== 'active') return { ok: false, error: 'owner_member_inactive' }
       sets.push(`${key} = ?`)
       binds.push(raw.trim())
       continue
