@@ -41,7 +41,8 @@ export const TASK_ROW_COLUMNS = [
   'updated_at', 'result', 'completed_at', 'gate_owner', 'cost_micro_usd', 'workflow_instance_id',
   'done_when', 'execution_receipt_id', 'execution_claim_expires_at', 'project_id', 'source_pot',
   'external_source', 'priority', 'parent_task_id', 'assignment_epoch', 'assignee_member_id',
-  'gate_wake_notice',
+  'gate_wake_notice', 'review_entered_at', 'expired_count',
+  'review_clock_carry',
 ] as const
 
 /** The only states the incident produced and no supported tool can leave: blocked (executor refused) and

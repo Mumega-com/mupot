@@ -1152,6 +1152,40 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(member?.telegram_chat_id).toBe('5551234') // binding untouched
   })
 
+  it('an ask that EXPIRES between the dry run and the commit batch is refused as approval_expired (not verdict_race), no verdict, no bind', async () => {
+    seedAgent(harness.sqlite, 'agent-exp')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-exp')
+    seedMember(harness.sqlite, 'member-exp', { telegramChatId: '5551234' })
+    setAgentOwner(harness.sqlite, 'agent-exp', 'member-exp')
+    seedSquadMemberCapability(harness.sqlite, 'member-exp')
+    seedGateGrant(harness.sqlite, 'member', 'member-exp')
+    seedReviewTask(harness.sqlite, 'task-exp')
+
+    const realBatch = env.DB.batch.bind(env.DB)
+    const raceEnv: Env = {
+      ...env,
+      DB: {
+        ...env.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          harness.sqlite.prepare("UPDATE tasks SET review_entered_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run('task-exp')
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+    const res = await invokeVerdict(raceEnv, harnessAuth('agent-exp'), {
+      task_id: 'task-exp', verdict: 'approved', human_origin: origin({ text: 'approve task-exp' }),
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.status).toBe(409)
+    expect(res.error).toBe('approval_expired')
+    const verdictCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM task_verdicts').first<{ n: number }>()
+    expect(verdictCount?.n).toBe(0)
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-exp').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBe('5551234')
+  })
+
   // ── mupot#1425 round 4 addendum (plugin gate P2-1): bind INTENT server-
   // side — the target task id must be NAMED in `text`, or refuse with
   // task_not_named. Three cases: named in full, absent entirely, and naming

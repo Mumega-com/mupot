@@ -35,6 +35,7 @@ import { mcpActionsApp, mcpApp } from './mcp'
 // Static (not await import): the watchdog imports ../mcp, and a dynamic edge into that graph makes
 // esbuild lazy-wrap it and emit `await init_*()` inside a sync initializer — Worker fails to start.
 import { sweepStalledGateReviews } from './gates/stall-watchdog'
+import { runApprovalExpiryTick } from './gates/approval-expiry'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 import { inviteApp } from './dashboard/invite'
@@ -469,7 +470,7 @@ export default {
       return
     }
 
-    // Twelve independent maintenance heartbeats, staggered across each 15-minute
+    // Fourteen independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -511,6 +512,9 @@ export default {
     // 13. Gate-stall watchdog (mupot#1705) — re-send the gate wake for a review task whose gate
     //     seat has not recorded a verdict past the threshold. Bounded + recorded durably; never
     //     changes status or verdicts. Requires migration 0191 (gate_stall_rewakes).
+    // 14. Approval expiry (migrations/0232) — a gate ask unanswered 14 days after review entry moves
+    //     review -> blocked (approval_expired | gate_owner_dead), receipted, assignee notified. Bounded
+    //     per run + idempotent; dry run (counts only) unless APPROVAL_EXPIRY_ENFORCE=1. Rides this cron: no new trigger.
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -525,6 +529,7 @@ export default {
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
       ['gate-stall-watchdog', () => sweepStalledGateReviews(env)],
+      ['approval-expiry', () => runApprovalExpiryTick(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

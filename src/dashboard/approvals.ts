@@ -32,6 +32,7 @@ import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { compileVerdictIndependenceSql } from '../tasks/verdict-independence'
+import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
 
 export interface ApprovalItem {
   id: string
@@ -156,16 +157,11 @@ export const APPROVAL_OLDER_DAYS = 14
 export const APPROVAL_HISTORY_PAGE_SIZE = 20
 export const APPROVAL_LIVE_LIST_CAP = 20
 
-// When did this task ENTER review? No table stores a status->review event, so
-// this ONE fragment derives it: the latest verdict_reversals row (the only
-// receipt of a re-entry into review, exact for reversed tasks), else
-// tasks.updated_at (the status->review UPDATE stamps it; the stall watchdog's
-// re-wakes live in gate_stall_rewakes and do NOT bump it). Later edits can only
-// move it forward, so age is a floor, never an overstatement. Swap this single
-// fragment for expires_at/review-entry when a real column lands.
-export const REVIEW_ENTERED_AT_SQL = `COALESCE(
-  (SELECT MAX(vr.created_at) FROM verdict_reversals vr WHERE vr.task_id = t.id),
-  t.updated_at, t.created_at)`
+// When did this task ENTER review? tasks.review_entered_at (migrations/0232), stamped by trigger on
+// every transition into review: the ONE review-entry fragment, shared with the expiry predicate
+// (src/gates/approval-expiry-rule.ts reads the same column). The fallbacks only cover a row that
+// predates the column and was never backfilled.
+export const REVIEW_ENTERED_AT_SQL = `COALESCE(t.review_entered_at, t.updated_at, t.created_at)`
 
 export function isOlderItem(t: Pick<ApprovalItem, 'review_entered_at' | 'updated_at' | 'created_at'>, nowMs = Date.now()): boolean {
   const touched = Date.parse(t.review_entered_at ?? t.updated_at ?? t.created_at)
@@ -184,7 +180,8 @@ const BASE_SELECT = `
     LEFT JOIN projects pr ON pr.id = t.project_id
    WHERE t.status = 'review'
      AND t.gate_owner IS NOT NULL
-     AND ${TASK_NOT_ARCHIVED_SQL('t')}`
+     AND ${TASK_NOT_ARCHIVED_SQL('t')}
+     AND ${GATE_ASK_LIVE_PREDICATE('t', "datetime('now')")}`
 
 // Tasks that cleared their gate (status='approved') and are content-publish work —
 // awaiting the SEPARATE admin "Publish" action (flight-1 gap fix). Deliberately

@@ -184,6 +184,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // unarchive restores a previously archived row (the inverse of archive_row): changes state, destroys nothing.
   archive_propose: ADD('proposeArchives INSERT archive_proposals only; never touches a task (hygiene/archive-proposals.ts)'),
   unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
+  approval_expiry_sweep: MUT('approval_expiry_sweep dry_run default; real run: guarded UPDATE tasks review->blocked + approval_expiry_receipts INSERT (gates/approval-expiry.ts); org-admin operator only'),
+  approval_resubmit_cap_reset: MUT('approval_resubmit_cap_reset UPDATE tasks expired_count=0 + approval_expiry_receipts INSERT; org-admin operator only'),
   task_incident_revert: MUT('task_incident_revert INSERT task_incident_revert_receipts + guarded UPDATE tasks status/assignee/updated_at (tasks/incident-revert.ts); org-admin operator only'),
   // Loop brakes (migration 0203): additive state rows, no data destroyed; resume is the exact inverse.
   execution_pause: ADD('toolExecutionPause INSERT execution_pauses ON CONFLICT DO NOTHING + INSERT mutation_audit_entries (mcp/execution-pause.ts); stops nothing already written, no task/agent row changes'),

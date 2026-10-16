@@ -353,6 +353,20 @@ describe('Routine proposal submission and governed actions', () => {
     }))).resolves.toEqual({ ok: false, error: 'budget_exceeded' })
   })
 
+  it('a propose-mode review on an ALREADY-review control task re-stamps review_entered_at (a new ask, new clock)', async () => {
+    fixture = await makeReadyRoutineFixture('propose')
+    fixture.harness.sqlite.exec(`
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-routines-agent2', 'gate:routines', 'agent', 'agent-2', 'test', datetime('now'));
+      UPDATE tasks SET status = 'review', gate_owner = NULL WHERE id = 'control-task';
+      UPDATE tasks SET review_entered_at = '2020-01-01T00:00:00.000Z' WHERE id = 'control-task';`)
+    await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
+      key: 'task-restamp', kind: 'create_task', input: { title: 'Task', description: 'Description' },
+    }))
+    const entered = String(row(fixture, "SELECT review_entered_at AS e FROM tasks WHERE id = 'control-task'")?.e)
+    expect(Date.parse(entered)).toBeGreaterThan(Date.now() - 60_000)
+  })
+
   it('routes propose mode through the existing Task review gate', async () => {
     fixture = await makeReadyRoutineFixture('propose')
     // FP-01 Slice 2 v2 (successor to PR #1488, P1-6): notifyHumanWait now
