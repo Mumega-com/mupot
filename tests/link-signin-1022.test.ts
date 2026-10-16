@@ -312,6 +312,17 @@ describe('#1022 linked sign-ins', () => {
     expect(identity('sub-dup')?.member_id).toBe('mem-dup')
   })
 
+  it('confirm refuses a different duplicate than the one that was shown', async () => {
+    const { jar } = await reachMoveConfirm()
+    h.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES ('mem-dup2', 'dup2@gmail.test', 'Dup2', 'active', '${TENANT}', '2026-10-01T00:00:00.000Z');
+      UPDATE human_login_identities SET member_id = 'mem-dup2' WHERE id = 'hli-dup';
+    `)
+    const done = await post(jar, '/auth/link-signin/confirm')
+    expect(done.headers.get('location')).toBe('/account?signin=changed')
+    expect(identity('sub-dup')?.member_id).toBe('mem-dup2')
+  })
+
   // ── 5. unlink ──────────────────────────────────────────────────────────────────────────────────
   it('unlinking the last identity is refused; with two it succeeds, audits, and ends that identity\'s sessions', async () => {
     const jar = await mainSession()
