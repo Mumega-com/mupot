@@ -4195,9 +4195,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0236_attached_attribution.sql",
+    sha256: "d65408565b5be3e852b578dae927acec461b3c2675f5444009569f82e2ef2eaa",
+    statements: [
+      "-- mupot#2006 — attribution for writes made through an ATTACHED thread (a seat attached to an existing agent X acts AS X).\n-- Nullable, additive: ADD COLUMN only, no backfill (rows written before this migration, and every non-attached write,\n-- stay NULL). Values are written from the server-resolved auth context only (auth.seatBinding.attached + the attaching\n-- human), never from tool args.\n--   attachment_id         = agent_seat_attachments.id the write was made through\n--   consenting_member_id  = the human who attached (members.id); counted as AFFILIATED with the submitting agent\n-- flight_event_outbox is the flight.landed receipt table (landGovernedFlight).\nALTER TABLE agent_messages ADD COLUMN attachment_id TEXT;",
+      "\nALTER TABLE agent_messages ADD COLUMN consenting_member_id TEXT;",
+      "\nALTER TABLE task_result_submissions ADD COLUMN attachment_id TEXT;",
+      "\nALTER TABLE task_result_submissions ADD COLUMN consenting_member_id TEXT;",
+      "\nALTER TABLE flight_event_outbox ADD COLUMN attachment_id TEXT;",
+      "\nALTER TABLE flight_event_outbox ADD COLUMN consenting_member_id TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "67258303099fe6e4cfec4dc1d81518062818990881749f74f8d89c68690ac79d"
+export const SCHEMA_CHAIN_DIGEST: string = "c11108641a34db3debf7af9eea05af886cc01ee7c8e476d11a9e2619a8d86c09"

@@ -29,6 +29,9 @@ import { chunkForD1InList } from '../lib/d1-in-list'
  * on the follow-up issue, to be closed by a canonical same-human relation, not
  * by email.
  */
+// mupot#2006: the human who ATTACHED a thread to the agent acted as it, so is affiliated with it. agent_seat_attachments
+// rows persist after detach; an admission that went live and was later revoked/expired counts too. Pending/denied
+// admissions never attached anything and do not count.
 export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigneeIdExpr: string }): string {
   return `EXISTS (
       SELECT 1
@@ -43,6 +46,15 @@ export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigne
            OR EXISTS (
              SELECT 1 FROM agent_keys assignee_key
               WHERE assignee_key.agent_id = assignee_agent.id AND assignee_key.member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_seat_attachments assignee_attach
+              WHERE assignee_attach.agent_id = assignee_agent.id AND assignee_attach.human_member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_seat_admissions assignee_admission
+              WHERE assignee_admission.agent_id = assignee_agent.id AND assignee_admission.human_member_id = ${p.memberExpr}
+                AND assignee_admission.status IN ('live', 'revoked', 'expired')
            )
          )
     )`
@@ -107,6 +119,9 @@ function affiliatedConflictSqlRaw(): string {
   for (const src of partyAgentSources()) {
     parts.push(`EXISTS (SELECT 1 FROM ${src.from} AND ${memberAffiliatedWithAssigneeSql({ memberExpr: '@D', assigneeIdExpr: src.agentCol })})`)
   }
+  // mupot#2006: the human who attached the thread that SUBMITTED this task's result is affiliated with the
+  // submitter (recorded on the submission row from auth at submit time, so it survives detach and admission change).
+  parts.push('EXISTS (SELECT 1 FROM task_result_submissions cs WHERE cs.task_id = @T AND cs.consenting_member_id = @D)')
   // An AGENT decider acting for the HUMAN who owns the task (tasks.assignee_member_id): the agent's
   // owner or bound member IS that member.
   parts.push(`EXISTS (SELECT 1 FROM tasks mt WHERE mt.id = @T AND mt.assignee_member_id IS NOT NULL AND (

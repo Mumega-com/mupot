@@ -470,6 +470,8 @@ export async function landGovernedFlight(
     agent_id: string
     meta: FlightMetaV1
     actor: { kind: 'member' | 'agent'; id: string }
+    /** mupot#2006: the attached thread's attribution (from auth only); omitted/null = NULL columns. */
+    attribution?: { attachmentId: string; consentingMemberId: string } | null
   },
 ): Promise<GovernedLandingResult> {
   const endedAt = Date.now()
@@ -640,10 +642,13 @@ export async function landGovernedFlight(
     // exist. A wrong `false` here is a permanent audit gap, not a retryable blip.
     await env.DB.prepare(
       `INSERT INTO flight_event_outbox
-         (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
-       VALUES (?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7)
+         (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at, attachment_id, consenting_member_id)
+       VALUES (?1, ?2, ?3, 'flight.landed', ?4, ?5, ?6, ?7, ?8, ?9)
        ON CONFLICT (tenant, flight_id, event_type) DO NOTHING`,
-    ).bind(eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, receiptPayload, createdAt).run()
+    ).bind(
+      eventId, env.TENANT_SLUG, id, opts.actor.kind, opts.actor.id, receiptPayload, createdAt,
+      opts.attribution?.attachmentId ?? null, opts.attribution?.consentingMemberId ?? null,
+    ).run()
     receipt = await flightReceiptExists(env, id)
   } catch (error) {
     // A receipt that fails to write must not un-land a landed flight — that is the whole

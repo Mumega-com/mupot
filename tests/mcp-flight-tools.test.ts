@@ -1370,7 +1370,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           created_at   TEXT NOT NULL DEFAULT (datetime('now')),
           read_at      TEXT,
           project_id   TEXT,
-          target_seat  TEXT
+          target_seat  TEXT,
+          attachment_id TEXT, consenting_member_id TEXT
         );
         CREATE TABLE agent_inbox_fences (
           tenant TEXT NOT NULL, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
@@ -1382,6 +1383,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           id TEXT PRIMARY KEY, tenant TEXT NOT NULL, flight_id TEXT NOT NULL, event_type TEXT NOT NULL,
           actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
           delivered_at TEXT, consumed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+          attachment_id TEXT, consenting_member_id TEXT,
           UNIQUE (tenant, flight_id, event_type)
         );
         -- mupot#1494 round 3 (P2-5) — task_update's reassignment guard
