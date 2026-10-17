@@ -315,7 +315,7 @@ import { refusalNextStep } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
-import { isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
+import { cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
 import { selfReportAtBoot, readFleetBelief, type ConnectionKind } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
@@ -6484,7 +6484,8 @@ async function buildBootOnboarding(
   }
 
   if (kind === 'attached') {
-    const canMark = !fenced && seatAttachEnabled(env)
+    // Inside the `kind === 'attached'` branch; the fenced case is handled separately below.
+    const canMark = seatAttachEnabled(env)
     return {
       connection_kind: kind,
       inbox: 'peek_only',
@@ -6527,7 +6528,11 @@ async function buildBootOnboarding(
   if (outcome === 'refused_not_a_string' || outcome === 'refused_not_adopted') {
     return { ...base, next_step: `boot_context did not record your report (${detail ?? outcome}). Call it again with runtime, model and host as plain strings.`, who_acts: 'self' }
   }
-  const missing = ['runtime', 'model', 'host'].filter((k) => args[k] === undefined || args[k] === null)
+  // Same predicate boot enforcement uses (cleanReported): whitespace/control-only counts as not reported.
+  const missing = ['runtime', 'model', 'host'].filter((k) => {
+    const v = args[k]
+    return typeof v !== 'string' || cleanReported(v) === null
+  })
   return {
     ...base,
     ...(missing.length > 0
