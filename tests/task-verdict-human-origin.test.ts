@@ -1248,6 +1248,59 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       const r = await attempt('look', 'approved', 'unapprove c0de1234 approved')
       expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
     })
+
+    // mupot#2015 — the grammar is anchored to the WHOLE message.
+    const REFUSED: Array<[string, string]> = [
+      ['neg1', "don't approve c0de1234"],
+      ['q1', 'should I approve c0de1234?'],
+      ['neg2', 'do NOT approve c0de1234 ever'],
+      ['unap', 'un-approve c0de1234'],
+      ['url', 'https://x.io/approve?id=c0de1234'],
+      ['lead', 'please approve c0de1234'],
+      ['trail', 'approve c0de1234 looks good'],
+      ['trailpunct', 'approve c0de1234.'],
+      ['card', 'Decision card\ntitle: T\nTask c0de1234-aaaa-bbbb-cccc-000000000003\n/muapprove c0de1234\n/mureject c0de1234 <reason>'],
+    ]
+    it.each(REFUSED)('refuses non-command text (%s)', async (tag, text) => {
+      const r = await attempt(`nc-${tag}`, 'approved', text)
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('refuses a wrong ref token even when the task id appears elsewhere in the text', async () => {
+      const r = await attempt('wrongref', 'approved', 'approve deadbeef0 c0de1234')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it.each([
+      ['a1', '/muapprove c0de1234'],
+      ['a2', 'approve c0de1234'],
+      ['a3', '/APPROVE@kayhermes_mubot c0de1234'],
+      ['a4', '  /MuApprove c0de1234-aaaa-bbbb-cccc-000000000003  '],
+    ])('accepts anchored approve (%s)', async (tag, text) => {
+      const r = await attempt(`ok-${tag}`, 'approved', text)
+      expect(r.human_origin).toEqual({ applied: true })
+    })
+    it.each([
+      ['r1', "/mureject c0de1234 can't approve this"],
+      ['r2', 'reject c0de1234'],
+      ['r3', 'REJECT c0de1234'],
+      ['r4', '/MUREJECT@kayhermes_mubot c0de1234 not ready\nsecond line'],
+    ])('accepts anchored reject, reason optional (%s)', async (tag, text) => {
+      const r = await attempt(`rj-${tag}`, 'rejected', text)
+      expect(r.human_origin).toEqual({ applied: true })
+    })
+    it('approve text spent as rejected is refused', async () => {
+      const r = await attempt('dir-ar', 'rejected', 'approve c0de1234')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('reject text spent as approved is refused', async () => {
+      const r = await attempt('dir-ra', 'approved', 'reject c0de1234')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('uppercase approve text spent as rejected is refused', async () => {
+      expect((await attempt('dir-up1', 'rejected', 'APPROVE c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('uppercase reject text spent as approved is refused', async () => {
+      expect((await attempt('dir-up2', 'approved', '/MUREJECT c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
   })
 
   it('addendum: text says only "approve" with no task reference — task_not_named, falls back to agent authority', async () => {

@@ -255,20 +255,38 @@ function taskNamedInText(text: string, taskId: string): boolean {
   return hexRuns.some((run) => idHexOnly.startsWith(run))
 }
 
-// mupot#2014 round 2: naming the task proves WHICH task, not WHAT the human decided. A message
-// like "/mureject <id>" must not be spendable as an approval (or vice versa) by a model relaying
-// the call. The text must carry exactly one decision verb and it must match the verdict:
-// approved <- approve | /approve | /muapprove ; rejected <- reject | /reject | /mureject.
-// Word-bounded and case-insensitive ("unapprove", "approved", "disapprove" do not count).
-// No verb, the wrong verb, or both verbs => origin_verb_mismatch.
-const APPROVE_VERB_RE = /(?:^|[^A-Za-z0-9_])\/?(?:mu)?approve(?![A-Za-z0-9_])/i
-const REJECT_VERB_RE = /(?:^|[^A-Za-z0-9_])\/?(?:mu)?reject(?![A-Za-z0-9_])/i
+// mupot#2015: naming the task proves WHICH task, and a verb somewhere in the text proves nothing
+// about WHAT the human decided ("should I approve X?", "don't approve X", a URL ending /approve).
+// A human_origin decision must therefore be an ANCHORED command spanning the WHOLE message:
+//   ^\s*/?(mu)?(approve|reject)(@botname)?\s+<task ref>( <reason> — reject only)?\s*$   (case-insensitive)
+// where <task ref> is the full task id or an 8+ hex-char prefix (hyphens allowed). Free text is
+// accepted only as a rejection reason after the ref; approve with trailing text is REFUSED.
+// Wrong/absent verb, extra text, leading text, or a verb/verdict direction mismatch =>
+// origin_verb_mismatch. Non-English decision words are refused (accepted limitation).
+const DECISION_COMMAND_RE = /^\s*\/?(?:mu)?(approve|reject)(?:@[A-Za-z0-9_]+)?\s+(\S+)(?:\s+([\s\S]*\S))?\s*$/i
 
-function verbMatchesVerdict(text: string, verdict: 'approved' | 'rejected'): boolean {
-  const approve = APPROVE_VERB_RE.test(text)
-  const reject = REJECT_VERB_RE.test(text)
-  if (approve === reject) return false
-  return verdict === 'approved' ? approve : reject
+function verbMatchesVerdict(text: string, verdict: 'approved' | 'rejected', taskId: string): boolean {
+  const m = DECISION_COMMAND_RE.exec(text)
+  if (!m) return false
+  const verb = (m[1] ?? '').toLowerCase()
+  const hasReason = m[3] !== undefined
+  if (verb === 'approve') {
+    if (verdict !== 'approved' || hasReason) return false
+  } else if (verdict !== 'rejected') {
+    return false
+  }
+  // The ref token itself (not any run elsewhere in the text) must resolve to this task.
+  return refResolvesToTask(m[2] ?? '', taskId)
+}
+
+// The ref token must BE the full task id (any shape) or an 8+ hex-char prefix of it (hyphens ignored).
+function refResolvesToTask(ref: string, taskId: string): boolean {
+  const lowerRef = ref.toLowerCase()
+  const lowerId = taskId.toLowerCase()
+  if (lowerRef === lowerId) return true
+  if (!/^[0-9a-f-]+$/.test(lowerRef)) return false
+  const hex = lowerRef.replace(/-/g, '')
+  return hex.length >= 8 && lowerId.replace(/-/g, '').startsWith(hex)
 }
 
 // The chat fence, as SQL. An origin NEVER binds a channel: binding a channel to
@@ -669,7 +687,7 @@ export async function resolveHarnessAttestedOrigin(
   if (!taskNamedInText(origin.text, task.id)) {
     return { replayed: false, applied: false, reason: 'task_not_named' }
   }
-  if (!verbMatchesVerdict(origin.text, verdict)) {
+  if (!verbMatchesVerdict(origin.text, verdict, task.id)) {
     return { replayed: false, applied: false, reason: 'origin_verb_mismatch' }
   }
 

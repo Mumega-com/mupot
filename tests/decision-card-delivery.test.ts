@@ -106,6 +106,35 @@ describe('wakeGateOwnerOnReview — member-held gate', () => {
     expect((JSON.parse(row.body) as { title: string }).title.length).toBe(300)
   })
 
+  // A 4-byte emoji straddling the cut must not leave a lone high surrogate: JSON.stringify would
+  // emit "\\ud83d" and crash the plugin validator.
+  it.each([
+    ['title', 300],
+    ['result', 400],
+  ])('truncating %s at %i units never leaves a lone surrogate', async (field, n) => {
+    seedAgent('kay', 'mem-hadi')
+    seedAttestor('kay', 'tok-kay')
+    seedGrant('gate:hadi', 'member', 'mem-hadi')
+    seedTask('gate:hadi')
+    run(`UPDATE tasks SET ${field} = ? WHERE id = ?`, `${'a'.repeat(n - 1)}\u{1F600}tail`, TASK_ID)
+    await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    const row = harness.sqlite.prepare('SELECT body FROM agent_messages').get() as { body: string }
+    expect(row.body).not.toMatch(/\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i)
+    const card = JSON.parse(row.body) as { title: string; result_excerpt: string }
+    const out = field === 'title' ? card.title : card.result_excerpt
+    expect(out).toBe('a'.repeat(n - 1))
+    expect(out.isWellFormed()).toBe(true)
+  })
+
+  it('reports new_sends: 1 on first wake, 0 on a duplicate re-wake', async () => {
+    seedAgent('kay', 'mem-hadi')
+    seedAttestor('kay', 'tok-kay')
+    seedGrant('gate:hadi', 'member', 'mem-hadi')
+    seedTask('gate:hadi')
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).new_sends).toBe(1)
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).new_sends).toBe(0)
+  })
+
   it('re-wake after the result changed reports queued, not failed (request_id_conflict)', async () => {
     seedAgent('kay', 'mem-hadi')
     seedAttestor('kay', 'tok-kay')
