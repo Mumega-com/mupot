@@ -25,7 +25,7 @@
 
 import type { Env } from '../types'
 import { hasRegisteredKey } from './agent-keys'
-import { canonicalHarness, cleanReported, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
+import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
 
 // INTAKE IS GRACEFUL (Hadi 2026-10-16): an unknown runtime/model/host is never a reason to
 // refuse a boot. Any bounded string is kept as reported (trimmed, control chars stripped,
@@ -33,7 +33,7 @@ import { canonicalHarness, cleanReported, MAX_REPORTED, MAX_REPORTED_MODEL } fro
 // only refusal is a non-string value. Authority never derives from these strings.
 
 /** How the caller connected — derived by the SERVER from authentication, never from args. */
-export type ConnectionKind = 'agent_bound' | 'attached' | 'member'
+export type ConnectionKind = 'agent_bound' | 'seat' | 'attached' | 'member'
 
 export interface FleetBelief {
   runtime: string
@@ -52,20 +52,25 @@ export type BootSelfReport =
   /** Nothing was claimed, so no runtime/model/host was written (connection kind + boot time still are). */
   | { outcome: 'nothing_reported'; belief: FleetBelief | null }
   /** Written. `changed` names the fields whose value actually moved. */
-  | { outcome: 'recorded'; belief: FleetBelief | null; changed: string[] }
+  | { outcome: 'recorded'; belief: FleetBelief | null; changed: string[]; notes?: string[] }
   /** Keyed agent: must use /api/fleet/attach-signed. */
   | { outcome: 'refused_signed_attach_required'; belief: FleetBelief | null; detail: string }
+  /** The runtime is a formally non-adopted one (shared check). Nothing written. */
+  | { outcome: 'refused_not_adopted'; belief: FleetBelief | null; detail: string }
   /** A reported value was not a string. Nothing written. */
   | { outcome: 'refused_not_a_string'; belief: FleetBelief | null; detail: string }
 
 export const MODEL_RE = /^[A-Za-z0-9_./@-]{1,128}$/
 
 export async function readFleetBelief(env: Env, agentId: string): Promise<FleetBelief | null> {
-  return env.DB.prepare(
+  const r = await env.DB.prepare(
     `SELECT runtime, model, status, reported_by, last_reported_at,
             runtime_canonical, host, connection_kind, last_boot_at
        FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(env.TENANT_SLUG, agentId).first<FleetBelief>()
+  // Canonical is a pure function of the raw runtime, so compute it at read: daemon /report and the
+  // harness backfill write runtime without it, and a stored hint could go stale.
+  return r ? { ...r, runtime_canonical: r.runtime ? canonicalHarness(r.runtime) : '' } : null
 }
 
 type Claimed = { present: boolean; value: string | null; bad: boolean }
@@ -97,6 +102,10 @@ export async function selfReportAtBoot(
   const badField = rt.bad ? 'runtime' : md.bad ? 'model' : hs.bad ? 'host' : null
   if (badField) {
     return { outcome: 'refused_not_a_string', belief, detail: `${badField}: must be a string` }
+  }
+
+  if (rt.value !== null && isNonAdoptedRuntime(rt.value)) {
+    return { outcome: 'refused_not_adopted', belief, detail: `runtime: ${NON_ADOPTED_DETAIL}` }
   }
 
   if (await hasRegisteredKey(env, agentId)) {
@@ -162,9 +171,16 @@ export async function selfReportAtBoot(
 
   // The identity record is what the dashboard reads, so a truthful runtime report must
   // reach it too — same rule attach-routes follows, labelled runtime-reported downstream.
+  // agents.model can reach an LLM URL, so it only takes the strict charset. The raw value is kept in
+  // fleet_agents.model; a value outside the charset leaves agents.model unchanged and says so.
+  const notes: string[] = []
   if (model !== null) {
-    await env.DB.prepare(`UPDATE agents SET model = ?1 WHERE id = ?2`).bind(model, agentId).run()
+    if (MODEL_RE.test(model)) {
+      await env.DB.prepare(`UPDATE agents SET model = ?1 WHERE id = ?2`).bind(model, agentId).run()
+    } else {
+      notes.push('model recorded in the fleet registry as reported; agents.model unchanged (it only accepts [A-Za-z0-9_./@-], 1-128 chars)')
+    }
   }
 
-  return { outcome: 'recorded', belief: await readFleetBelief(env, agentId), changed }
+  return { outcome: 'recorded', belief: await readFleetBelief(env, agentId), changed, ...(notes.length ? { notes } : {}) }
 }

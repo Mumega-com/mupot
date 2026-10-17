@@ -115,6 +115,16 @@ describe('reportFleetAgents / listFleetAgents', () => {
     expect(rows[0].status).toBe('stopped')
   })
 
+  it('skips a non-adopted runtime (goose, even with a zero-width char) without failing the batch', async () => {
+    const db = makeDb()
+    const r = await reportFleetAgents(env(db), 'fleet-consumer', [
+      GOOD,
+      { agent_id: 'gooser', status: 'running', runtime: 'goo\u200bse' },
+    ])
+    expect(r).toEqual({ ok: true, count: 1, skipped: 1 })
+    expect((await listFleetAgents(env(db))).map((x) => x.agent_id)).toEqual(['image-gen'])
+  })
+
   it('P2: skips keyed agents (signed-attach owns their row; daemon /report cannot forge it)', async () => {
     // 'kasra' has a registered signing key → the unsigned /report path must NOT write/rebind it.
     const db = makeDb({}, {}, ['kasra'])

@@ -24,7 +24,7 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
 
 
 - **Messaging:** inbox rows from system-sender literals (mupot-review-gate, mupot-flights, mupot-dispatch, ...) report `reply_basis: system_sender` with `reply_via`, and a send to one is refused as `system_sender_not_addressable` (#2003).
-- **Onboarding:** boot_context now records observed facts (runtime, model, host, server-derived connection kind, last boot; migration 0235) for agent-bound callers, returns an `onboarding.next_step` to attached threads and member tokens (which still write nothing), and the agent page shows a read-only Live runtime block; runtime/harness/model/host intake is graceful: any bounded string is kept as reported with a canonical hint (`other` when unknown), check_in `harness` is no longer an enum, only non-strings are refused (#2005).
+- **Onboarding:** boot_context now records observed facts (runtime, model, host, server-derived connection kind, last boot; migration 0235) for agent-bound callers, returns an `onboarding.next_step` to attached threads and member tokens (which still write nothing), and the agent page shows a read-only Live runtime block; runtime/harness/model/host intake is graceful: any bounded string is kept as reported with a canonical hint (`other` when unknown), check_in `harness` is no longer an enum, only non-strings are refused, except the formally non-adopted goose/goosed which one shared check refuses on every intake; boot also gives keyed agents and fenced attached threads a truthful `next_step` with `who_acts`, and seat-handle sessions record connection kind `seat` (#2005).
 
 ### Release-scope highlights, 2026-10-12 → 2026-10-16 (merged to `main`; unreleased)
 

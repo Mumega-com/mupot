@@ -7,7 +7,7 @@
 
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
-import { cleanReported, MAX_REPORTED } from './reported-values'
+import { cleanReported, isNonAdoptedRuntime, MAX_REPORTED } from './reported-values'
 import type { RuntimeValue } from './runtimes'
 import { hasRegisteredKey } from './agent-keys'
 
@@ -529,7 +529,8 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     .all<{ agent_id: string }>()
   for (const k of keyRows.results ?? []) keyed.add(k.agent_id)
 
-  const toWrite = valid.filter((v) => !keyed.has(v.agent_id))
+  // Non-adopted runtimes are skipped like keyed agents (one entry never fails the batch).
+  const toWrite = valid.filter((v) => !keyed.has(v.agent_id) && !isNonAdoptedRuntime(v.runtime))
   const skipped = valid.length - toWrite.length
 
   // Lazy backfill: stamp any NULL-tenant member rows before the tenant-scoped existence check.

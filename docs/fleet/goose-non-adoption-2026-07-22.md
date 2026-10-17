@@ -82,3 +82,12 @@ reaches those native CLIs via ACP. Adopting it would:
 A future model shift makes raw-API multi-provider aggregation the primary reach path
 **and** native CLI subscriptions are no longer the fleet substrate. Until then, treat
 Goose as out of scope for `runtime-adapter/v1` fleet hosts.
+
+## Enforcement note (2026-10-17, PR #2005)
+
+The refusal now lives in ONE shared check, `isNonAdoptedRuntime` in `src/fleet/reported-values.ts`
+(matching after invisible-character stripping and case folding), applied on every intake: bearer
+`/api/fleet/attach`, `/attach-signed` (after signature verify), `boot_context`, daemon `/report`
+(entry skipped), and `check_in` harness (MCP and `/api/fleet/checkin`). `attach-routes.ts` still
+contains no quoted goose literal, so the ratchet in `tests/runtime-adapter-contract.test.ts` is unchanged.
+Every other unknown harness name is accepted as reported.

@@ -5,6 +5,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { fleetAttachApp } from '../src/fleet/attach-routes'
+import { fleetCheckinApp } from '../src/fleet/checkin-routes'
 import type { Env } from '../src/types'
 
 const sha256 = async (s: string) => {
@@ -74,5 +75,28 @@ describe('lane A: runtime=pi + model on /attach (real D1)', () => {
       body: JSON.stringify({ agent_id: 'a-loom', runtime: 'pi', type: 'weaver' }),
     }, env)
     expect(res.status).toBe(200)
+  })
+
+  it('HTTP /checkin refuses a non-adopted harness (zero-width variant too) and accepts an unknown one', async () => {
+    const post = (harnessName: string) => fleetCheckinApp.request('/checkin', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-loom', 'content-type': 'application/json' },
+      body: JSON.stringify({ seat: 'hseat', harness: harnessName }),
+    }, { ...env, SESSIONS: { get: async () => null, put: async () => undefined } } as unknown as Env)
+    expect((await post('goose')).status).toBe(400)
+    expect((await post('goo\u200bsed')).status).toBe(400)
+    expect((await post('my-new-harness')).status).toBe(200)
+  })
+
+  it('agents.model keeps the strict charset: odd model stored raw in fleet_agents, agents.model unchanged', async () => {
+    const before = (harness.sqlite.prepare(`SELECT model FROM agents WHERE id = 'a-loom'`).get() as { model: string }).model
+    const res = await fleetAttachApp.request('/attach', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-loom', 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_id: 'a-loom', runtime: 'pi', type: 'weaver', model: 'bad model " quote' }),
+    }, env)
+    expect(res.status).toBe(200)
+    expect((harness.sqlite.prepare(`SELECT model FROM fleet_agents WHERE agent_id = 'a-loom'`).get() as { model: string }).model).toBe('bad model " quote')
+    expect((harness.sqlite.prepare(`SELECT model FROM agents WHERE id = 'a-loom'`).get() as { model: string }).model).toBe(before)
   })
 })

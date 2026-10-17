@@ -27,7 +27,8 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { getAgentView, resolveFleetWriteAgentId } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
-import { canonicalHarness, cleanReported, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
+import { MODEL_RE } from './boot-self-report'
+import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
 import { hasRegisteredKey } from './agent-keys'
 
 // ── shared upsert ───────────────────────────────────────────────────────────────────
@@ -39,7 +40,6 @@ import { hasRegisteredKey } from './agent-keys'
 // no re-signing-scheme change is needed on either side. Trim + cap; never reject the request
 // over it. Re-declared locally rather than imported from registry.ts — same "keeps
 // validation explicit, avoids coupling to the daemon-report path" rule as AGENT_ID_RE above.
-const NON_ADOPTED_RUNTIMES: ReadonlySet<string> = new Set(['goose', 'goosed'])
 const MAX_HOST = 64
 function cleanHost(v: unknown): string {
   return typeof v === 'string' ? (cleanReported(v, MAX_HOST) ?? '') : ''
@@ -97,7 +97,8 @@ async function upsertRunning(
   // Activity dashboard reads agents.model, so a stale identity model (the grok-4.5 class)
   // must not survive a truthful runtime checkin. Reported-truth discipline: agents.model is
   // updated from the runtime, labeled runtime-reported downstream.
-  if (model !== null) {
+  // agents.model can reach an LLM URL, so it only takes the old strict charset; the raw value stays in fleet_agents.
+  if (model !== null && MODEL_RE.test(model)) {
     await env.DB.prepare(
       `UPDATE agents
           SET model = ?1
@@ -231,10 +232,9 @@ fleetAttachApp.post('/attach', async (c) => {
   // Any harness name is accepted as reported (trimmed, control chars stripped, truncated to 64);
   // canonicalHarness is a hint written alongside, never a gate. Only a non-string/empty runtime is refused.
   const runtime = typeof b.runtime === 'string' ? cleanReported(b.runtime, MAX_REPORTED) : null
-  // The ONE named refusal: goose/goosed were formally NOT adopted (docs/fleet/goose-non-adoption-2026-07-22.md),
-  // a recorded governance decision rather than an unknown-name gate. Everything else is accepted.
-  if (runtime !== null && NON_ADOPTED_RUNTIMES.has(runtime.toLowerCase())) {
-    return c.json({ error: 'bad_request', detail: 'runtime: not adopted (see docs/fleet/goose-non-adoption-2026-07-22.md)' }, 400)
+  // The ONE named refusal: a recorded non-adoption decision (shared check, reported-values.ts).
+  if (runtime !== null && isNonAdoptedRuntime(runtime)) {
+    return c.json({ error: 'bad_request', detail: `runtime: ${NON_ADOPTED_DETAIL}` }, 400)
   }
   if (runtime === null) {
     return c.json({ error: 'bad_request', detail: 'runtime: a non-empty string is required (any harness name)' }, 400)
@@ -328,6 +328,10 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   //    freshness, key lookup, and the single-use nonce burn.
   const v = await verifySignedAttach(c.env, b, VALID_TYPES, VALID_LIFECYCLES)
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status as 400 | 401 | 409)
+  // After the signature (so a refusal needs a valid signer) and before anything is stored.
+  if (isNonAdoptedRuntime(v.runtime)) {
+    return c.json({ error: 'bad_request', detail: `runtime: ${NON_ADOPTED_DETAIL}` }, 400)
+  }
 
   // host: UNTRUSTED, agent-controlled, optional, display-only (#21 slice 2). Deliberately
   // read from the raw body, NOT from `v` — it is not part of the signed canonical message

@@ -5913,7 +5913,7 @@ function liveRuntimeCard(b: FleetBelief | null) {
     <div class="card" data-live-runtime>
       <p class="dim">Observed at boot by the agent itself. Declared fields above (role, owner, purpose) are set by a human; these are not.</p>
       <dl class="kv">
-        <dt>Runtime</dt><dd>${v(b?.runtime)}${b?.runtime ? html` <span class="dim">(${b.runtime_canonical || canonicalHarness(b.runtime)})</span>` : ''}</dd>
+        <dt>Runtime</dt><dd>${v(b?.runtime)}${b?.runtime ? html` <span class="dim">(${canonicalHarness(b.runtime)})</span>` : ''}</dd>
         <dt>Model</dt><dd>${v(b?.model)}</dd>
         <dt>Host</dt><dd>${v(b?.host)}</dd>
         <dt>Connection</dt><dd>${v(b?.connection_kind)}</dd>

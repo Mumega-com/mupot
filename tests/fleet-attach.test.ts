@@ -260,7 +260,7 @@ describe('POST /attach', () => {
   // docs/fleet/goose-non-adoption-2026-07-22.md (kasra-core ACCEPTS; replaces e89df2c2 process)
   it('400 on goose / goosed runtime (non-adoption)', async () => {
     const db = defaultDb()
-    for (const runtime of ['goose', 'goosed'] as const) {
+    for (const runtime of ['goose', 'goosed', 'Goose', ' goo\u200bse ', 'g\u202eoosed'] as const) {
       const res = await post('/attach', TOKEN_KASRA, { agent_id: 'kasra', type: 'builder', runtime }, makeEnv(db))
       expect(res.status).toBe(400)
     }
