@@ -114,6 +114,7 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from './index'
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { evaluateVerdictGates } from '../tasks/index'
+import { findVerdictIndependenceConflict } from '../tasks/verdict-independence'
 import { isGateAskExpired } from '../gates/approval-expiry-rule'
 import {
   assertVerdictWritable,
@@ -302,7 +303,13 @@ async function hasConflictOfInterest(
   boundAgentId: string,
   memberId: string,
   assigneeAgentId: string | null,
+  taskId: string,
 ): Promise<boolean> {
+  // mupot#2009: the verdict writer's own independence predicate (findVerdictIndependenceConflict — the SAME fragments
+  // evaluateVerdictGates enforces): the member who consented to a submission on this task, or who owns / is bound /
+  // keyed / attached / admitted (live or revoked) to a party agent, would be refused at write time as verdict_race;
+  // report it up front as assignee_conflict instead.
+  if ((await findVerdictIndependenceConflict(env, memberId, taskId)) !== null) return true
   if (!assigneeAgentId) return false
   if (assigneeAgentId === boundAgentId) return true
   const assignee = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?')
@@ -377,7 +384,7 @@ async function dryRunAuthorize(
   }
 
   // (3) conflict of interest — see hasConflictOfInterest's own doc comment.
-  if (await hasConflictOfInterest(env, boundAgentId, owner.id, task.assignee_agent_id)) {
+  if (await hasConflictOfInterest(env, boundAgentId, owner.id, task.assignee_agent_id, task.id)) {
     return { ok: false, reason: 'assignee_conflict' }
   }
 

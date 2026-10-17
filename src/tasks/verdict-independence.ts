@@ -103,17 +103,28 @@ function partyAgentSources(): Array<{ from: string; agentCol: string }> {
   ]
 }
 
+/**
+ * agentLinkedToMemberSql (mupot#2009) — TRUE iff the AGENT is owned by, bound to, or keyed to the member.
+ * ONE copy shared by the verdict check (directConflictSqlRaw: an agent decider linked to the submission's
+ * consenting member) and review entry (independentGateHolderExistsSql: a gate-holder agent linked to the
+ * consenting member is no eligible decider), so the two cannot drift. Raw SQL expressions only, never caller text.
+ */
+export function agentLinkedToMemberSql(p: { agentExpr: string; memberExpr: string }): string {
+  return `(
+        EXISTS (SELECT 1 FROM agents lk_owner WHERE lk_owner.id = ${p.agentExpr} AND lk_owner.owner_member_id = ${p.memberExpr})
+        OR EXISTS (SELECT 1 FROM agent_member_bindings lk_bind WHERE lk_bind.agent_id = ${p.agentExpr} AND lk_bind.member_id = ${p.memberExpr})
+        OR EXISTS (SELECT 1 FROM agent_keys lk_key WHERE lk_key.agent_id = ${p.agentExpr} AND lk_key.member_id = ${p.memberExpr})
+      )`
+}
+
 function directConflictSqlRaw(): string {
   return `(
     EXISTS (SELECT 1 FROM tasks dt WHERE dt.id = @T AND (dt.assignee_agent_id = @D OR dt.assignee_member_id = @D))
     OR EXISTS (SELECT 1 FROM task_result_submissions ds WHERE ds.task_id = @T AND ds.submitted_by_agent_id = @D)
     OR EXISTS (SELECT 1 FROM task_result_submissions cs WHERE cs.task_id = @T AND cs.consenting_member_id = @D)
     OR EXISTS (
-      SELECT 1 FROM task_result_submissions ca WHERE ca.task_id = @T AND ca.consenting_member_id IS NOT NULL AND (
-        EXISTS (SELECT 1 FROM agents cao WHERE cao.id = @D AND cao.owner_member_id = ca.consenting_member_id)
-        OR EXISTS (SELECT 1 FROM agent_member_bindings cab WHERE cab.agent_id = @D AND cab.member_id = ca.consenting_member_id)
-        OR EXISTS (SELECT 1 FROM agent_keys cak WHERE cak.agent_id = @D AND cak.member_id = ca.consenting_member_id)
-      )
+      SELECT 1 FROM task_result_submissions ca WHERE ca.task_id = @T AND ca.consenting_member_id IS NOT NULL
+        AND ${agentLinkedToMemberSql({ agentExpr: '@D', memberExpr: 'ca.consenting_member_id' })}
     )
     OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts dr WHERE dr.task_id = @T AND dr.stage IN ('runtime_consumed', 'completed', 'failed') AND (dr.agent_id = @D OR dr.member_id = @D))
   )`
