@@ -221,7 +221,29 @@ function extractSquadRef(raw: string): { title: string; squadRef: string | null 
   return { title: text, squadRef: null }
 }
 
-function parseIntent(text: string): Intent {
+// Hermes-hosted chats own the bare /approve, /reject, /needs and /answer commands, so mupot
+// also answers to namespaced aliases. Telegram appends "@botname" to a command in group chats
+// and in the command menu (/muapprove@kayhermes_mubot). Both are normalised to the canonical
+// bare command BEFORE parsing, so an alias reaches the exact same intent, handler and auth
+// checks as the original — there is no second code path.
+const MU_COMMAND_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  muneeds: 'needs',
+  muapprove: 'approve',
+  mureject: 'reject',
+  muanswer: 'answer',
+  mulogin: 'login',
+})
+
+export function normalizeImCommand(text: string): string {
+  const m = text.trim().match(/^\/([A-Za-z]+)(?:@[A-Za-z0-9_]{1,64})?(?=\s|$)([\s\S]*)$/)
+  if (!m) return text
+  const cmd = m[1].toLowerCase()
+  const alias = Object.hasOwn(MU_COMMAND_ALIASES, cmd) ? MU_COMMAND_ALIASES[cmd] : cmd
+  return `/${alias}${m[2]}`
+}
+
+function parseIntent(rawText: string): Intent {
+  const text = normalizeImCommand(rawText)
   const trimmed = text.trim()
   if (!trimmed) return { kind: 'unknown' }
   const lower = trimmed.toLowerCase()
@@ -477,8 +499,8 @@ async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], p
   let omitted = Boolean(page.next_cursor || page.truncated)
   for (const item of page.items) {
     const actions = item.allowed_actions.map(action => {
-      if (action === 'approve') return `/approve ${item.source_id}`
-      if (action === 'reject') return `/reject ${item.source_id} <reason>`
+      if (action === 'approve') return `/muapprove ${item.source_id}`
+      if (action === 'reject') return `/mureject ${item.source_id} <reason>`
       if (action === 'answer') return `/answer ${item.source_id} <choice>`
       if (action === 'view') return item.safe_url
       return action
@@ -717,7 +739,7 @@ async function verdictReply(
   note: string | null,
 ): Promise<string> {
   if (verdict === 'rejected' && !note) {
-    return `Add a rejection reason: reject ${ref} <reason>.`
+    return `Add a rejection reason: /mureject ${ref} <reason>.`
   }
 
   const task = await resolveTaskRef(env, ref)

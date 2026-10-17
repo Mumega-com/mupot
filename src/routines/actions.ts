@@ -453,6 +453,8 @@ export async function notifyHumanWait(
       // The expected steady state: a human holds gate:routines. There is no
       // agent-inbox channel to a member — the human finds this item via
       // /needs. Reporting 'delivered' here would be a fabricated signal.
+      // TODO(decision-card): reuse deliverDecisionCard (src/gates/decision-card.ts) here for the
+      // routine review wait; kept out of the first decision-card PR to stay small.
       return { delivered: false, reason: 'requires_human' }
     }
     try {

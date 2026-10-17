@@ -359,8 +359,8 @@ describe('authenticated Telegram receipts and human controls', () => {
       INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
       VALUES ('human-gate', 'gate:human', 'member', 'human-1', 'test', datetime('now'));`)
     const decider = (await (await post(envelope('/needs project-1', 11))).json() as { reply: string }).reply
-    expect(decider).toContain('/approve task-visible')
-    expect(decider).toContain('/reject task-visible')
+    expect(decider).toContain('/muapprove task-visible')
+    expect(decider).toContain('/mureject task-visible')
     const hidden = (await (await post(envelope('/needs project-2', 12))).json() as { reply: string }).reply
     expect(hidden).not.toContain('Private secret')
     harness.sqlite.exec('DELETE FROM capabilities')

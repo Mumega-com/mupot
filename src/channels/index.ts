@@ -622,11 +622,15 @@ export async function postAgentActivity(env: Env, event: BusEvent): Promise<void
   if (event.actor?.kind !== 'agent') return
   if (!event.squad_id) return
 
+  // 'task.updated' is far too noisy for a human channel. A review request is NOT rendered here:
+  // the decision card (src/gates/decision-card.ts) is the channel for that.
+  if (event.type === 'task.updated') return
+
   const bindings = await bindingsForSquad(env, event.squad_id)
   if (bindings.length === 0) return
 
+  const agentLabel = await agentDisplayLabel(env, event.agent_id ?? event.actor.id)
   const summary = summarizeAgentEvent(event)
-  const agentLabel = event.agent_id ?? event.actor.id
 
   // Fan out to every bound channel via its adapter. One failing platform must not
   // block the others — isolate each post.
@@ -645,6 +649,17 @@ export async function postAgentActivity(env: Env, event: BusEvent): Promise<void
       }
     }),
   )
+}
+
+// Humane agent label: slug/name instead of the raw UUID; falls back to the id.
+async function agentDisplayLabel(env: Env, agentId: string): Promise<string> {
+  try {
+    const row = await env.DB.prepare('SELECT COALESCE(slug, name) AS label FROM agents WHERE id = ?1')
+      .bind(agentId).first<{ label: string | null }>()
+    return row?.label ?? agentId
+  } catch {
+    return agentId
+  }
 }
 
 // Map a BusEvent to a one-line human summary. Platform-agnostic; the adapter owns

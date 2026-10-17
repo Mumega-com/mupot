@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
 import { isHumanOriginAttestorToken } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
 import {
@@ -2244,7 +2245,7 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
 export type GateWakeOutcome = {
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'resolution_failed' | 'task_archived'
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2337,6 +2338,26 @@ export async function wakeGateOwnerOnReview(
   }
 
   if (resolution.principal.type === 'member') {
+    // Notify (never decide): hand a decision card to the member's own harness agent(s).
+    const card = await deliverDecisionCard(env, task, resolution.principal.id, byId).catch(
+      (): DecisionCardOutcome => ({ status: 'delivery_failed', agent_ids: [] }),
+    )
+    if (card.status === 'delivered') {
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome,
+        status: 'queued_to_owner_agent',
+        principal: resolution.principal,
+        notice: `Decision card queued to ${card.agent_ids.join(', ')}'s inbox (not yet acknowledged): ${gateOwner} is held by member ${resolution.principal.id}${card.duplicates > 0 ? '; already queued for this review entry' : ''}. A verdict still needs the member's own decision.`,
+      })
+    }
+    if (card.status === 'delivery_failed') {
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome,
+        status: 'owner_agent_delivery_failed',
+        principal: resolution.principal,
+        notice: `Gate wake requires human: ${gateOwner} is held by active member ${resolution.principal.id}; decision card delivery to owned agent(s) failed.`,
+      })
+    }
     return surfaceGateWakeOutcome(env, task.id, {
       ...baseOutcome,
       status: 'requires_human',
@@ -2444,7 +2465,7 @@ const toolTaskVerdict: ToolSpec = {
   min: 'member',
   args:
     '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean,' +
-    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named) } }' +
+    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named; it must also carry exactly one decision verb matching the verdict — approve|/approve|/muapprove for approved, reject|/reject|/mureject for rejected — or origin_verb_mismatch) } }' +
     ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
     ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
     ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +

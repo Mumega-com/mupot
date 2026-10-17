@@ -1674,8 +1674,8 @@ describe('Telegram project invitation service', () => {
 
     const needs = await telegram('/needs project-active')
     expect(needs).toContain('/answer participant-run <choice>')
-    expect(needs).toContain('/approve participant-review')
-    expect(needs).toContain('/reject participant-review <reason>')
+    expect(needs).toContain('/muapprove participant-review')
+    expect(needs).toContain('/mureject participant-review <reason>')
     expect(needs).not.toContain('/answer other-run')
     expect(needs).not.toContain('/approve other-review')
     expect(needs).not.toContain('/reject other-review')

@@ -93,7 +93,7 @@ describe('FP-01 Slice 2 v2 — P1-6 (IM /needs shows the decision) and P2-8 (re-
     `)
 
     const reply = await handleImMessage(fixture.env, '555', '/needs')
-    expect(reply).toContain('/approve control-task')
+    expect(reply).toContain('/muapprove control-task')
     expect(reply).toContain('write')
     expect(reply).toContain('Project One')
     expect(reply).toContain('member-shadi')

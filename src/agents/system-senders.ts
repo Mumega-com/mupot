@@ -13,6 +13,9 @@
 // existence oracle. Registering a literal here never makes it addressable or impersonable.
 
 export const REVIEW_WAKE_SENDER = 'mupot-review-gate'
+// Informational only: a decision card tells a HUMAN something awaits them. It must not tell the
+// recipient model to act with a tool (reply_via null), unlike the review-wake delegation above.
+export const DECISION_CARD_SENDER = 'mupot-decision-card'
 export const FLIGHTS_SENDER = 'mupot-flights'
 export const DISPATCH_BRIDGE_SENDER = 'mupot-dispatch'
 export const SWEEPER_SENDER = 'mupot-approval-sweeper'
@@ -22,6 +25,7 @@ export const WAKE_ROUTER_SENDER = 'mupot-wake-router'
 /** Response tool per system sender; null = informational, nothing to answer. */
 export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.freeze({
   [REVIEW_WAKE_SENDER]: 'task_verdict',
+  [DECISION_CARD_SENDER]: null,
   [FLIGHTS_SENDER]: 'flight_land',
   // The dispatch envelope itself names this tool as the only thing that settles the dispatch.
   [DISPATCH_BRIDGE_SENDER]: 'task_dispatch_runtime_receipt',

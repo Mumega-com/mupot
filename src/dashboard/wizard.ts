@@ -965,8 +965,8 @@ function stepImPanel(p: Prefill) {
           <label class="fld">Bot @username members message for decisions (the gateway bot, e.g. kayhermes_mubot)
             <input name="bot_username" placeholder="kayhermes_mubot" value="${p.imBotUsername}" />
           </label>
-          <p class="hint">This is the bot a human actually talks to for <code>/needs</code> and
-            <code>/approve</code> — usually a different bot than the one above, which only sends
+          <p class="hint">This is the bot a human actually talks to for <code>/muneeds</code> and
+            <code>/muapprove</code> — usually a different bot than the one above, which only sends
             notifications. Display only; it grants no authority. You can set or change this later from
             <a href="/admin/im-settings">IM settings</a>.</p>
           <div class="actions">

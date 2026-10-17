@@ -290,7 +290,7 @@ function connectScript(): Html {
                   result.appendChild(a);
                   var then = document.createElement('p');
                   then.className = 'ui-sub';
-                  then.textContent = 'Tap Start in Telegram. Once the bot confirms the link, send /needs to see what is waiting for you, then /approve <task id> or /reject <task id>.';
+                  then.textContent = 'Tap Start in Telegram. Once the bot confirms the link, send /muneeds to see what is waiting for you, then /muapprove <task id> or /mureject <task id> <reason>.';
                   result.appendChild(then);
                 } else {
                   var manual = document.createElement('p');

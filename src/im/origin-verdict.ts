@@ -149,6 +149,7 @@ export type HumanOriginFailureReason =
   | 'text_required'
   | 'origin_stale'
   | 'task_not_named'
+  | 'origin_verb_mismatch'
   | 'agent_not_owned'
   | 'member_inactive'
   | 'origin_member_mismatch'
@@ -252,6 +253,22 @@ function taskNamedInText(text: string, taskId: string): boolean {
   const idHexOnly = lowerId.replace(/-/g, '')
   const hexRuns = lowerText.match(/[0-9a-f]{8,}/g) ?? []
   return hexRuns.some((run) => idHexOnly.startsWith(run))
+}
+
+// mupot#2014 round 2: naming the task proves WHICH task, not WHAT the human decided. A message
+// like "/mureject <id>" must not be spendable as an approval (or vice versa) by a model relaying
+// the call. The text must carry exactly one decision verb and it must match the verdict:
+// approved <- approve | /approve | /muapprove ; rejected <- reject | /reject | /mureject.
+// Word-bounded and case-insensitive ("unapprove", "approved", "disapprove" do not count).
+// No verb, the wrong verb, or both verbs => origin_verb_mismatch.
+const APPROVE_VERB_RE = /(?:^|[^A-Za-z0-9_])\/?(?:mu)?approve(?![A-Za-z0-9_])/i
+const REJECT_VERB_RE = /(?:^|[^A-Za-z0-9_])\/?(?:mu)?reject(?![A-Za-z0-9_])/i
+
+function verbMatchesVerdict(text: string, verdict: 'approved' | 'rejected'): boolean {
+  const approve = APPROVE_VERB_RE.test(text)
+  const reject = REJECT_VERB_RE.test(text)
+  if (approve === reject) return false
+  return verdict === 'approved' ? approve : reject
 }
 
 // The chat fence, as SQL. An origin NEVER binds a channel: binding a channel to
@@ -651,6 +668,9 @@ export async function resolveHarnessAttestedOrigin(
   // reason those are: a call that fails this can never reach a write.
   if (!taskNamedInText(origin.text, task.id)) {
     return { replayed: false, applied: false, reason: 'task_not_named' }
+  }
+  if (!verbMatchesVerdict(origin.text, verdict)) {
+    return { replayed: false, applied: false, reason: 'origin_verb_mismatch' }
   }
 
   const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task, gateOwner)
