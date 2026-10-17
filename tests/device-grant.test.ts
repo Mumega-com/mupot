@@ -206,6 +206,9 @@ describe('device grant type-then-click', () => {
     const created = await createDeviceGrant(env, { agent: 'agent-a', origin: 'http://pot.test' })
     expect(created.ok).toBe(true)
     if (!created.ok) return
+    expect(created.value.verification_uri_complete).toBe(
+      `http://pot.test/enroll?code=${encodeURIComponent(created.value.user_code)}&agent=agent-a`,
+    )
 
     const anon = await deviceApp.fetch(new Request('http://pot.test/'), env)
     expect(anon.status).toBe(302)
@@ -220,5 +223,14 @@ describe('device grant type-then-click', () => {
     expect(html).not.toContain(created.value.user_code)
     expect(html).not.toContain('mupot_')
     expect(html).not.toContain(created.value.device_code)
+
+    // Prefill via query param ?code=
+    const prefilled = await deviceApp.fetch(
+      new Request(`http://pot.test/?code=${created.value.user_code}`, { headers: { Cookie: cookie } }),
+      env,
+    )
+    expect(prefilled.status).toBe(200)
+    const prefilledHtml = await prefilled.text()
+    expect(prefilledHtml).toContain(`value="${created.value.user_code}"`)
   })
 })
