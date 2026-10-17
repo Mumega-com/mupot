@@ -3,7 +3,7 @@
 -- stay NULL). Values are written from the server-resolved auth context only (auth.seatBinding.attached + the attaching
 -- human), never from tool args.
 --   attachment_id         = agent_seat_attachments.id the write was made through
---   consenting_member_id  = the human who attached (members.id); counted as a DIRECT conflict (party) on the submission
+--   consenting_member_id  = the human who attached (members.id); counted as AFFILIATED with the submitting agent
 -- flight_event_outbox is the flight.landed receipt table (landGovernedFlight).
 ALTER TABLE agent_messages ADD COLUMN attachment_id TEXT;
 ALTER TABLE agent_messages ADD COLUMN consenting_member_id TEXT;
