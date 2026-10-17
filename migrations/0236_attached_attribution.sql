@@ -11,3 +11,7 @@ ALTER TABLE task_result_submissions ADD COLUMN attachment_id TEXT;
 ALTER TABLE task_result_submissions ADD COLUMN consenting_member_id TEXT;
 ALTER TABLE flight_event_outbox ADD COLUMN attachment_id TEXT;
 ALTER TABLE flight_event_outbox ADD COLUMN consenting_member_id TEXT;
+
+-- Lookup paths of the independence predicate (memberAffiliatedWithAssigneeSql): (agent, human).
+CREATE INDEX IF NOT EXISTS idx_agent_seat_attachments_agent_human ON agent_seat_attachments(agent_id, human_member_id);
+CREATE INDEX IF NOT EXISTS idx_agent_seat_admissions_agent_human ON agent_seat_admissions(agent_id, human_member_id);

@@ -3242,7 +3242,7 @@ const toolTaskSubmitResult: ToolSpec = {
       return fail(409, 'independent_gate_required', {
         gate_owner: existing.gate_owner,
         detail: existing.gate_owner
-          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee, or by an active human member who is neither the assignee nor the assignee agent\'s owner (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
+          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee, or by an active human member who is neither the assignee nor the assignee agent\'s owner nor a human who attached a thread to that agent (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
           : 'a task can only enter review through task_submit_result once it carries an independent gate_owner — ask the task\'s creator or an admin to set one via task_update; this tool never accepts gate_owner itself, so the assignee cannot choose its own reviewer',
       })
     }
@@ -3890,6 +3890,7 @@ const toolFlightDispatch: ToolSpec = {
             ...(flightOrigin.ok ? { mcp_endpoint: mcpEndpoint(flightOrigin.origin) } : {}),
             land_with: 'flight_land',
           }),
+          attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
           ...(projectId ? { projectId } : {}),
         },
         {
@@ -4948,6 +4949,7 @@ const toolBroadcast: ToolSpec = {
         body,
         kind,
         requestId: recipientRequestId,
+        attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
       }, {
         system: true,
         reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',

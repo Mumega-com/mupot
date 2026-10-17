@@ -4197,7 +4197,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0236_attached_attribution.sql",
-    sha256: "d65408565b5be3e852b578dae927acec461b3c2675f5444009569f82e2ef2eaa",
+    sha256: "ae4d078d0c1ee8e8c7c7b900e6db9efc1243ef06fd6e08c40ad4b613e01062a6",
     statements: [
       "-- mupot#2006 — attribution for writes made through an ATTACHED thread (a seat attached to an existing agent X acts AS X).\n-- Nullable, additive: ADD COLUMN only, no backfill (rows written before this migration, and every non-attached write,\n-- stay NULL). Values are written from the server-resolved auth context only (auth.seatBinding.attached + the attaching\n-- human), never from tool args.\n--   attachment_id         = agent_seat_attachments.id the write was made through\n--   consenting_member_id  = the human who attached (members.id); counted as AFFILIATED with the submitting agent\n-- flight_event_outbox is the flight.landed receipt table (landGovernedFlight).\nALTER TABLE agent_messages ADD COLUMN attachment_id TEXT;",
       "\nALTER TABLE agent_messages ADD COLUMN consenting_member_id TEXT;",
@@ -4205,12 +4205,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nALTER TABLE task_result_submissions ADD COLUMN consenting_member_id TEXT;",
       "\nALTER TABLE flight_event_outbox ADD COLUMN attachment_id TEXT;",
       "\nALTER TABLE flight_event_outbox ADD COLUMN consenting_member_id TEXT;",
+      "\n\n-- Lookup paths of the independence predicate (memberAffiliatedWithAssigneeSql): (agent, human).\nCREATE INDEX IF NOT EXISTS idx_agent_seat_attachments_agent_human ON agent_seat_attachments(agent_id, human_member_id);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_seat_admissions_agent_human ON agent_seat_admissions(agent_id, human_member_id);",
     ],
-    objects: [],
+    objects: [
+      { type: "index", name: "idx_agent_seat_attachments_agent_human" },
+      { type: "index", name: "idx_agent_seat_admissions_agent_human" },
+    ],
   },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "c11108641a34db3debf7af9eea05af886cc01ee7c8e476d11a9e2619a8d86c09"
+export const SCHEMA_CHAIN_DIGEST: string = "a59b4d8b0e0f9fed399df6b30e4dbab38c839b321d04b50c89ced314bea7c126"

@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
+import { evaluateVerdictGates } from '../src/tasks'
 import { landGovernedFlight } from '../src/flight/service'
 import { parseFlightMetaV1 } from '../src/flight/meta'
 import { findVerdictIndependenceConflict, isMemberAffiliatedWithAssigneeAgent } from '../src/tasks/verdict-independence'
@@ -105,14 +106,14 @@ function seedIndependentAgentGate(sqlite: SqliteD1Harness['sqlite']): void {
 type Row = { attachment_id: string | null; consenting_member_id: string | null }
 
 describe('independence: the attaching human is affiliated with the attached agent', () => {
-  it('issue scenario: H attached a chat to X (not owner), submitted via it, then holds the gate -> refused as affiliated', async () => {
+  it('issue scenario: H attached a chat to X (not owner), submitted via it, then holds the gate -> refused (direct party)', async () => {
     const { harness, env } = fresh()
     seedIndependentAgentGate(harness.sqlite)
     expect(await findVerdictIndependenceConflict(env, H, TASK)).toBeNull() // baseline: nothing links H to X yet
     const sub = await invokeTool(attachedAuth(), env, 'task_submit_result', { task_id: TASK, result: RESULT }, 'https://pot.test')
     expect(sub.ok, JSON.stringify(sub)).toBe(true)
     // no attachment/admission rows exist here: ONLY the submission row's consenting_member_id can make H affiliated
-    expect(await findVerdictIndependenceConflict(env, H, TASK)).toBe('affiliated')
+    expect(await findVerdictIndependenceConflict(env, H, TASK)).toBe('direct')
     expect(await findVerdictIndependenceConflict(env, INDEP, TASK)).toBeNull()
   })
 
@@ -140,6 +141,21 @@ describe('independence: the attaching human is affiliated with the attached agen
     expect(await isMemberAffiliatedWithAssigneeAgent(env, H, X)).toBe(true)
   })
 
+  it('an expired admission (a pending one that lapsed: never approved) does not count', async () => {
+    const { harness, env } = fresh()
+    seedAttachment(harness.sqlite, { admissionStatus: 'expired' })
+    expect(await isMemberAffiliatedWithAssigneeAgent(env, H, X)).toBe(false)
+  })
+
+  it('injected-thread scenario: a lapsed admission request cannot taint H; H stays an independent gate and X can still submit', async () => {
+    const { harness, env } = fresh()
+    seedAttachment(harness.sqlite, { admissionStatus: 'expired' })
+    expect(await hasIndependentRuntimeGate(env, 'gate:reviewer', X, SQUAD, { allowMemberHolders: true })).toBe(true)
+    const sub = await invokeTool(plainAuth(), env, 'task_submit_result', { task_id: TASK, result: RESULT }, 'https://pot.test')
+    expect(sub.ok, JSON.stringify(sub)).toBe(true)
+    expect(await findVerdictIndependenceConflict(env, H, TASK)).toBeNull()
+  })
+
   it('a pending admission never attached anything and does not count', async () => {
     const { harness, env } = fresh()
     seedAttachment(harness.sqlite, { admissionStatus: 'pending' })
@@ -157,7 +173,61 @@ describe('independence: the attaching human is affiliated with the attached agen
   })
 })
 
+function memberAuthRole(memberId: string, role: AuthContext['role']): AuthContext {
+  return {
+    userId: memberId, memberId, email: null, role, tenant: TENANT, channel: 'workspace', boundAgentId: null,
+    capabilities: [{ member_id: memberId, scope_type: 'squad', scope_id: SQUAD, capability: 'admin' }],
+  }
+}
+
+describe('consenting human is a DIRECT party of the submission', () => {
+  function submitted() {
+    const f = fresh()
+    seedIndependentAgentGate(f.harness.sqlite)
+    f.harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gg-h2', 'gate:agent-reviewer', 'member', '${H}', '${OWNER}', '${T0}')`)
+    return f
+  }
+
+  it('H (consenting) is direct, not affiliated; an org admin H gets self_verdict, not the admin_supervisory waiver', async () => {
+    const { harness, env } = submitted()
+    const sub = await invokeTool(attachedAuth(), env, 'task_submit_result', { task_id: TASK, result: RESULT }, 'https://pot.test')
+    expect(sub.ok, JSON.stringify(sub)).toBe(true)
+    expect(await findVerdictIndependenceConflict(env, H, TASK)).toBe('direct')
+    const task = { id: TASK, squad_id: SQUAD, gate_owner: 'gate:agent-reviewer', assignee_agent_id: X }
+    expect(await evaluateVerdictGates(env, memberAuthRole(H, 'admin'), task, 'approved'))
+      .toMatchObject({ allowed: false, code: 'self_verdict' })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get()).toEqual({ n: 0 })
+  })
+
+  it('an agent decider owned by / bound to / keyed to the consenting human conflicts; an unrelated agent does not', async () => {
+    const { harness, env } = submitted()
+    await invokeTool(attachedAuth(), env, 'task_submit_result', { task_id: TASK, result: RESULT }, 'https://pot.test')
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = '${H}' WHERE id = '${PEER}'`)
+    expect(await findVerdictIndependenceConflict(env, PEER, TASK)).toBe('direct')
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL WHERE id = '${PEER}';
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', '${PEER}', '${H}', '${T0}')`)
+    expect(await findVerdictIndependenceConflict(env, PEER, TASK)).toBe('direct')
+    harness.sqlite.exec(`DELETE FROM agent_member_bindings WHERE agent_id = '${PEER}'`)
+    expect(await findVerdictIndependenceConflict(env, PEER, TASK)).toBeNull()
+  })
+})
+
 describe('attribution columns', () => {
+  it('broadcast: attached caller stamps every delivery; non-attached stays NULL', async () => {
+    const { harness, env } = fresh()
+    const a = await invokeTool(attachedAuth(), env, 'broadcast', { squad_id: SQUAD, body: 'hello all' }, 'https://pot.test')
+    expect(a.ok, JSON.stringify(a)).toBe(true)
+    const p = await invokeTool(plainAuth(), env, 'broadcast', { squad_id: SQUAD, body: 'plain' }, 'https://pot.test')
+    expect(p.ok, JSON.stringify(p)).toBe(true)
+    const rows = harness.sqlite.prepare('SELECT body, attachment_id, consenting_member_id FROM agent_messages ORDER BY seq').all() as Array<Row & { body: string }>
+    expect(rows.filter((r) => r.body === 'hello all').length).toBeGreaterThan(0)
+    for (const r of rows) {
+      expect(r.attachment_id).toBe(r.body === 'hello all' ? ATT : null)
+      expect(r.consenting_member_id).toBe(r.body === 'hello all' ? H : null)
+    }
+  })
+
   it('task_submit_result: attached caller stamps attachment + consenting human', async () => {
     const { harness, env } = fresh()
     seedIndependentAgentGate(harness.sqlite)
