@@ -13,6 +13,7 @@ import type { Env } from '../src/types'
 const SYSTEM_AUTHZ: SendAuthzDecision = { system: true, reason: 'test' }
 const EXPECTED_VIA: Record<string, string | null> = {
   'mupot-review-gate': 'task_verdict',
+  'mupot-decision-card': null,
   'mupot-flights': 'flight_land',
   'mupot-dispatch': 'task_dispatch_runtime_receipt',
   'mupot-approval-sweeper': null,
@@ -21,7 +22,7 @@ const EXPECTED_VIA: Record<string, string | null> = {
 }
 
 describe('registry', () => {
-  it('registers exactly the six known literals with the right response tool', () => {
+  it('registers exactly the seven known literals with the right response tool', () => {
     expect({ ...SYSTEM_SENDERS }).toEqual(EXPECTED_VIA)
   })
   it('does not treat prototype keys or lookalikes as system senders', () => {
@@ -67,7 +68,7 @@ describe('inbox annotation', () => {
     }, SYSTEM_AUTHZ)
     const read = await readAgentInbox(env, { agent: 'agent-to', peek: true })
     if (!read.ok) throw new Error(read.reason)
-    expect(read.messages).toHaveLength(7)
+    expect(read.messages).toHaveLength(8)
     for (const m of read.messages) {
       if (m.from_agent in EXPECTED_VIA) {
         expect(m.expects_reply).toBe(false)

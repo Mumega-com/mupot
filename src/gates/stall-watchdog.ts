@@ -99,7 +99,7 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
       // Only a wake that reached a holder counts as a re-wake. requires_human / no_live_holder /
       // ambiguous / delivery_failed spend the attempt budget but are never reported as re-wakes —
       // a counter shown to humans must count deliveries, not attempts (#1706 adversarial P1).
-      const delivered = outcome.status === 'delivered' || outcome.status === 'partial'
+      const delivered = outcome.status === 'delivered' || outcome.status === 'partial' || outcome.status === 'queued_to_owner_agent'
       await env.DB.prepare(
         `UPDATE gate_stall_rewakes
             SET last_outcome = ?1,

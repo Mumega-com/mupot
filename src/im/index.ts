@@ -238,7 +238,8 @@ export function normalizeImCommand(text: string): string {
   const m = text.trim().match(/^\/([A-Za-z]+)(?:@[A-Za-z0-9_]{1,64})?(?=\s|$)([\s\S]*)$/)
   if (!m) return text
   const cmd = m[1].toLowerCase()
-  return `/${MU_COMMAND_ALIASES[cmd] ?? cmd}${m[2]}`
+  const alias = Object.hasOwn(MU_COMMAND_ALIASES, cmd) ? MU_COMMAND_ALIASES[cmd] : cmd
+  return `/${alias}${m[2]}`
 }
 
 function parseIntent(rawText: string): Intent {
@@ -738,7 +739,7 @@ async function verdictReply(
   note: string | null,
 ): Promise<string> {
   if (verdict === 'rejected' && !note) {
-    return `Add a rejection reason: reject ${ref} <reason>.`
+    return `Add a rejection reason: /mureject ${ref} <reason>.`
   }
 
   const task = await resolveTaskRef(env, ref)

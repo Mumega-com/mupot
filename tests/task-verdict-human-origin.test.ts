@@ -1208,6 +1208,48 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.verdict.decided_by).toBe('member-named-ok')
   })
 
+  // mupot#2014 round 2 — verb binding: naming the task is not deciding it. The text must carry
+  // exactly one decision verb and it must match the verdict being written.
+  describe('verb binding (origin_verb_mismatch)', () => {
+    const TID = 'c0de1234-aaaa-bbbb-cccc-000000000003'
+    async function attempt(tag: string, verdict: 'approved' | 'rejected', text: string) {
+      const agent = `agent-verb-${tag}`
+      const member = `member-verb-${tag}`
+      const chat = `55${Math.abs([...tag].reduce((a, c) => a * 31 + c.charCodeAt(0), 7)) % 100000}`
+      seedAgent(harness.sqlite, agent)
+      seedGateGrant(harness.sqlite, 'agent', agent)
+      seedMember(harness.sqlite, member, { telegramChatId: chat })
+      setAgentOwner(harness.sqlite, agent, member)
+      seedSquadMemberCapability(harness.sqlite, member)
+      seedGateGrant(harness.sqlite, 'member', member)
+      seedReviewTask(harness.sqlite, TID)
+      return expectApplied(await invokeVerdict(env, harnessAuth(agent), {
+        task_id: TID, verdict, note: verdict === 'rejected' ? 'because' : undefined,
+        human_origin: origin({ text, chat_id: chat, user_id: chat }),
+      }))
+    }
+    it('/muapprove <id> with approved is applied', async () => {
+      const r = await attempt('ok', 'approved', '/muapprove c0de1234')
+      expect(r.human_origin).toEqual({ applied: true })
+    })
+    it('/mureject <id> used for an approval is refused', async () => {
+      const r = await attempt('swap', 'approved', '/mureject c0de1234')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('text naming the task but no verb is refused', async () => {
+      const r = await attempt('noverb', 'approved', 'c0de1234 looks fine to me')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('both verbs present is refused', async () => {
+      const r = await attempt('both', 'approved', 'approve c0de1234 or reject it')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+    it('lookalikes (unapprove / approved) do not count as the verb', async () => {
+      const r = await attempt('look', 'approved', 'unapprove c0de1234 approved')
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch' })
+    })
+  })
+
   it('addendum: text says only "approve" with no task reference — task_not_named, falls back to agent authority', async () => {
     seedAgent(harness.sqlite, 'agent-named-absent')
     seedGateGrant(harness.sqlite, 'agent', 'agent-named-absent')

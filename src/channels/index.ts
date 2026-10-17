@@ -38,7 +38,6 @@ import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
-import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
 type AppEnv = { Bindings: Env }
 
@@ -623,18 +622,15 @@ export async function postAgentActivity(env: Env, event: BusEvent): Promise<void
   if (event.actor?.kind !== 'agent') return
   if (!event.squad_id) return
 
-  // 'task.updated' is far too noisy for a human channel — the one exception is the transition
-  // INTO review, which is rendered as a decision request below. Everything else is dropped.
-  const isReviewEntry = event.type === 'task.updated' && readField(event.payload, 'status') === 'review'
-  if (event.type === 'task.updated' && !isReviewEntry) return
+  // 'task.updated' is far too noisy for a human channel. A review request is NOT rendered here:
+  // the decision card (src/gates/decision-card.ts) is the channel for that.
+  if (event.type === 'task.updated') return
 
   const bindings = await bindingsForSquad(env, event.squad_id)
   if (bindings.length === 0) return
 
   const agentLabel = await agentDisplayLabel(env, event.agent_id ?? event.actor.id)
-  const summary = isReviewEntry
-    ? (await reviewDecisionSummary(env, event)) ?? summarizeAgentEvent(event)
-    : summarizeAgentEvent(event)
+  const summary = summarizeAgentEvent(event)
 
   // Fan out to every bound channel via its adapter. One failing platform must not
   // block the others — isolate each post.
@@ -663,26 +659,6 @@ async function agentDisplayLabel(env: Env, agentId: string): Promise<string> {
     return row?.label ?? agentId
   } catch {
     return agentId
-  }
-}
-
-// For a task that entered review under a gate held by an active MEMBER, say whose decision it
-// is and how to give it. Null when the gate is not member-held (caller falls back to the plain line).
-async function reviewDecisionSummary(env: Env, event: BusEvent): Promise<string | null> {
-  const taskId = readField(event.payload, 'task_id')
-  if (!taskId) return null
-  try {
-    const task = await env.DB.prepare('SELECT title, gate_owner FROM tasks WHERE id = ?1')
-      .bind(taskId).first<{ title: string; gate_owner: string | null }>()
-    if (!task?.gate_owner) return null
-    const res = await resolveSoleGateOwnerAgent(env, task.gate_owner)
-    if (res.status !== 'resolved' || res.principal.type !== 'member') return null
-    const m = await env.DB.prepare('SELECT display_name FROM members WHERE id = ?1')
-      .bind(res.principal.id).first<{ display_name: string | null }>()
-    const who = m?.display_name ?? 'a member'
-    return `needs ${who}'s decision: ${task.title} — /muapprove ${taskId.slice(0, 8)}`
-  } catch {
-    return null
   }
 }
 

@@ -97,7 +97,7 @@ export async function imSettingsBody(env: Env): Promise<Html> {
       body: html`
         <p class="ui-sub">
           The Telegram username of the DECISION-CHANNEL bot — the gateway bot a human messages for
-          <code>/needs</code>, <code>/approve</code>, and <code>/reject</code>. This is usually a
+          <code>/muneeds</code>, <code>/muapprove</code>, and <code>/mureject</code>. This is usually a
           DIFFERENT bot than the one <code>TELEGRAM_BOT_TOKEN</code> sends notifications through — mupot
           does not hold the decision bot's token, so its username cannot be looked up automatically and
           must be set here. Used only to build the "Open in Telegram" link on

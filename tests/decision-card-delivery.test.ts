@@ -26,6 +26,15 @@ function seedAgent(id: string, owner: string | null, status = 'active'): void {
 function seedMember(id: string, name: string, chat: string | null = null): void {
   run(`INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant) VALUES (?, ?, ?, ?, 'active', ?)`, id, `${id}@t.com`, name, chat, TENANT)
 }
+// Gives an owned agent a live token whose id is on the attestor allowlist (the decision channel).
+function seedAttestor(agentId: string, tokenId: string): void {
+  const mem = `mem-${agentId}`
+  run(`INSERT OR IGNORE INTO members (id, email, display_name, status, tenant) VALUES (?, ?, ?, 'active', ?)`, mem, `${mem}@t.com`, mem, TENANT)
+  run(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, ?, ?, datetime('now'))`, TENANT, agentId, mem)
+  run(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, agent_id, tenant) VALUES (?, ?, ?, 'l', 'workspace', ?, ?)`, tokenId, mem, `h-${tokenId}`, agentId, TENANT)
+  const prev = env.HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS ? `${env.HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS},` : ''
+  env = { ...env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: `${prev}${tokenId}` } as Env
+}
 function seedGrant(cap: string, type: 'agent' | 'member', id: string): void {
   run(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES (?, ?, ?, ?, 't', datetime('now'))`, `g-${cap}-${id}`, cap, type, id)
 }
@@ -50,81 +59,112 @@ beforeEach(() => {
 afterEach(() => { harness.close(); vi.restoreAllMocks() })
 
 describe('wakeGateOwnerOnReview — member-held gate', () => {
-  it('delivers ONE decision card to the member-owned active agent, idempotent on re-wake', async () => {
+  const actor = { kind: 'member' as const, id: 'mem-hadi' }
+
+  it('queues ONE informational card to the attestor-bearing owned agent, idempotent on re-wake', async () => {
     seedAgent('kay', 'mem-hadi')
+    seedAgent('coder', 'mem-hadi') // owned but no attestor token: never a recipient
     seedAgent('other-owner', null)
-    seedAgent('retired', 'mem-hadi', 'inactive')
+    seedAttestor('kay', 'tok-kay')
     seedGrant('gate:hadi', 'member', 'mem-hadi')
     seedTask('gate:hadi')
-    const actor = { kind: 'member' as const, id: 'mem-hadi' }
 
     const out = await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
-    expect(out.status).toBe('delivered_to_owner_agent')
-    expect(out.notice).toContain('kay')
+    expect(out.status).toBe('queued_to_owner_agent')
+    expect(out.notice).toContain('queued')
+    expect(out.notice).toContain('not yet acknowledged')
     expect(messageCount()).toBe(1)
-
-    const again = await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
-    expect(again.status).toBe('delivered_to_owner_agent')
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).status).toBe('queued_to_owner_agent')
     expect(messageCount()).toBe(1)
 
     const inbox = await readAgentInbox(env, { agent: 'kay', peek: true })
     if (!inbox.ok) throw new Error(inbox.reason)
-    expect(inbox.messages).toHaveLength(1)
     const m = inbox.messages[0]
-    expect(m.from_agent).toBe('mupot-review-gate')
+    expect(m.from_agent).toBe('mupot-decision-card')
     expect(m.kind).toBe('request')
     expect(m.expects_reply).toBe(false)
-    expect(m.reply_via).toBe('task_verdict')
+    expect(m.reply_via).toBeNull() // informational: no tool is named
     expect(m.request_id).toMatch(/^decision-card:abcdef12-0000-4000-8000-000000000001:/)
+    expect(m.request_id).toMatch(/^[A-Za-z0-9_.:-]{1,128}$/)
     const card = JSON.parse(m.body) as Record<string, unknown>
     expect(card).toMatchObject({
       type: 'decision_card', task_id: TASK_ID, short_id: 'abcdef12', title: 'Decide the thing', priority: 'P1',
-      approve: '/muapprove abcdef12', reject: '/mureject abcdef12',
+      approve: '/muapprove abcdef12', reject: '/mureject abcdef12', reject_hint: '/mureject abcdef12 <reason>',
     })
     expect((card.result_excerpt as string).length).toBe(400)
+    expect((card.title as string).length).toBeLessThanOrEqual(300)
   })
 
-  it('two owned agents each get their own card (request_id is per-sender unique)', async () => {
+  it('caps a very long title at 300 chars in the card', async () => {
     seedAgent('kay', 'mem-hadi')
-    seedAgent('muse', 'mem-hadi')
+    seedAttestor('kay', 'tok-kay')
     seedGrant('gate:hadi', 'member', 'mem-hadi')
     seedTask('gate:hadi')
-    const out = await wakeGateOwnerOnReview(env, task(), { kind: 'member', id: 'mem-hadi' }, 'mem-hadi')
-    expect(out.status).toBe('delivered_to_owner_agent')
-    expect(messageCount()).toBe(2)
+    run(`UPDATE tasks SET title = ? WHERE id = ?`, 'T'.repeat(900), TASK_ID)
+    await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    const row = harness.sqlite.prepare('SELECT body FROM agent_messages').get() as { body: string }
+    expect((JSON.parse(row.body) as { title: string }).title.length).toBe(300)
   })
 
-  it('prefers the agent holding an attestor token when the allowlist names one', async () => {
+  it('re-wake after the result changed reports queued, not failed (request_id_conflict)', async () => {
     seedAgent('kay', 'mem-hadi')
-    seedAgent('coder', 'mem-hadi')
-    seedMember('mem-kay', 'Kay')
-    run(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, 'kay', 'mem-kay', datetime('now'))`, TENANT)
-    run(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, agent_id, tenant) VALUES ('tok-kay', 'mem-kay', 'h1', 'l', 'workspace', 'kay', ?)`, TENANT)
+    seedAttestor('kay', 'tok-kay')
     seedGrant('gate:hadi', 'member', 'mem-hadi')
     seedTask('gate:hadi')
-    env = { ...env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: 'tok-kay' } as Env
-    const out = await wakeGateOwnerOnReview(env, task(), { kind: 'member', id: 'mem-hadi' }, 'mem-hadi')
-    expect(out.status).toBe('delivered_to_owner_agent')
+    await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    run(`UPDATE tasks SET result = 'edited result' WHERE id = ?`, TASK_ID)
+    const again = await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    expect(again.status).toBe('queued_to_owner_agent')
     expect(messageCount()).toBe(1)
-    const row = harness.sqlite.prepare('SELECT to_agent FROM agent_messages').get() as { to_agent: string }
-    expect(row.to_agent).toBe('kay')
   })
 
-  it('no owned active agent -> requires_human unchanged, nothing sent', async () => {
-    seedAgent('retired', 'mem-hadi', 'inactive')
+  it('an attestor that sorts after 5+ owned agents still gets the card (no LIMIT before the filter)', async () => {
+    for (const id of ['a1', 'a2', 'a3', 'a4', 'a5', 'a6']) seedAgent(id, 'mem-hadi')
+    seedAgent('zz-kay', 'mem-hadi')
+    seedAttestor('zz-kay', 'tok-zz')
     seedGrant('gate:hadi', 'member', 'mem-hadi')
     seedTask('gate:hadi')
-    const out = await wakeGateOwnerOnReview(env, task(), { kind: 'member', id: 'mem-hadi' }, 'mem-hadi')
-    expect(out.status).toBe('requires_human')
+    const out = await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    expect(out.status).toBe('queued_to_owner_agent')
+    const row = harness.sqlite.prepare('SELECT to_agent FROM agent_messages').get() as { to_agent: string }
+    expect(row.to_agent).toBe('zz-kay')
+  })
+
+  it('an archived owned attestor agent is excluded', async () => {
+    seedAgent('kay', 'mem-hadi')
+    seedAttestor('kay', 'tok-kay')
+    run(`UPDATE agents SET archived_at = datetime('now') WHERE id = 'kay'`)
+    seedGrant('gate:hadi', 'member', 'mem-hadi')
+    seedTask('gate:hadi')
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).status).toBe('requires_human')
     expect(messageCount()).toBe(0)
+  })
+
+  it('owned agents with NO attestor token (allowlist empty or not matching) get nothing: requires_human', async () => {
+    seedAgent('coder', 'mem-hadi')
+    seedGrant('gate:hadi', 'member', 'mem-hadi')
+    seedTask('gate:hadi')
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).status).toBe('requires_human')
+    env = { ...env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: 'tok-unrelated' } as Env
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).status).toBe('requires_human')
+    expect(messageCount()).toBe(0)
+  })
+
+  it('a revoked attestor token does not qualify', async () => {
+    seedAgent('kay', 'mem-hadi')
+    seedAttestor('kay', 'tok-kay')
+    run(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = 'tok-kay'`)
+    seedGrant('gate:hadi', 'member', 'mem-hadi')
+    seedTask('gate:hadi')
+    expect((await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')).status).toBe('requires_human')
   })
 
   it('agent-held gate is unchanged (task_review wake, not a decision card)', async () => {
     seedAgent('gatekeeper', null)
     seedGrant('gate:x', 'agent', 'gatekeeper')
     seedTask('gate:x')
-    const out = await wakeGateOwnerOnReview(env, task(), { kind: 'member', id: 'mem-hadi' }, 'mem-hadi')
-    expect(out.status).not.toBe('delivered_to_owner_agent')
+    const out = await wakeGateOwnerOnReview(env, task(), actor, 'mem-hadi')
+    expect(out.status).not.toBe('queued_to_owner_agent')
     const row = harness.sqlite.prepare('SELECT body FROM agent_messages').get() as { body: string }
     expect(JSON.parse(row.body)).toMatchObject({ type: 'task_review' })
   })
@@ -154,13 +194,12 @@ describe('postAgentActivity — humane feed', () => {
     expect(text).not.toMatch(/🤖 agent-uuid-1 /)
   })
 
-  it('review entry under a member gate says whose decision and how', async () => {
+  it('review entry is NOT rendered in the feed (the decision card is the channel)', async () => {
     seedGrant('gate:hadi', 'member', 'mem-hadi')
     seedTask('gate:hadi')
     const post = bind()
     await postAgentActivity(env, ev('task.updated', 'review'))
-    expect(post).toHaveBeenCalledTimes(1)
-    expect(post.mock.calls[0][2]).toContain("needs Hadi's decision: Decide the thing — /muapprove abcdef12")
+    expect(post).not.toHaveBeenCalled()
   })
 })
 
@@ -174,6 +213,11 @@ describe('/mu* IM aliases', () => {
     expect(normalizeImCommand('/login@b')).toBe('/login')
     expect(normalizeImCommand('/muapproveX t')).toBe('/muapprovex t')
     expect(normalizeImCommand('task: do @squad')).toBe('task: do @squad')
+    for (const proto of ['/constructor', '/toString', '/__proto__', '/hasOwnProperty x'])
+      expect(normalizeImCommand(proto)).toBe(proto.toLowerCase())
+    // lookahead: command must end at whitespace/end/@bot, not run into more letters or digits
+    expect(normalizeImCommand('/muapprove2 t')).toBe('/muapprove2 t')
+    expect(normalizeImCommand('/muapprove_x t')).toBe('/muapprove_x t')
   })
 
   it('/muapprove hits the same verdict handler + auth as /approve; /muneeds equals /needs', async () => {

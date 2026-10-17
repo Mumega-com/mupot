@@ -457,7 +457,7 @@ describe('Hermes IM control', () => {
 
     const reply = await handleImMessage(env, 123456789, 'reject task-review-local')
 
-    expect(reply).toBe('Add a rejection reason: reject task-review-local <reason>.')
+    expect(reply).toBe('Add a rejection reason: /mureject task-review-local <reason>.')
     expect(tasks[0].status).toBe('review')
     expect(verdicts).toHaveLength(0)
   })
