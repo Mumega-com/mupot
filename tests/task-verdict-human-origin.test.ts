@@ -1461,4 +1461,50 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       expect(n?.n).toBe(0)
     })
   })
+  // ── mupot#2009: the pre-check mirrors the verdict writer's independence predicate ──────────────
+  function seedAttachedConflictScene(task: string, memberId: string): void {
+    seedAgent(harness.sqlite, `h-${task}`)
+    seedGateGrant(harness.sqlite, 'agent', `h-${task}`)
+    seedAgent(harness.sqlite, `a-${task}`) // assignee: NOT owned by / keyed to the member
+    seedMember(harness.sqlite, memberId, { telegramChatId: '5551234' })
+    setAgentOwner(harness.sqlite, `h-${task}`, memberId)
+    seedSquadMemberCapability(harness.sqlite, memberId)
+    seedGateGrant(harness.sqlite, 'member', memberId)
+    seedReviewTask(harness.sqlite, task, `a-${task}`)
+  }
+  const attestTo = (task: string) => harnessAuth(`h-${task}`, [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
+
+  it('assignee_conflict (#2009) — the member is the consenting member of a submission on the task', async () => {
+    seedAttachedConflictScene('task-2009a', 'member-2009a')
+    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, consenting_member_id)
+      VALUES ('sub-a', ?, 'task-2009a', ?, 'someone-else', '/x', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'r', 'member-2009a')`).run(TENANT, SQUAD)
+    // The harness agent is owned by the member, so once the origin is refused the agent-authority fallback is ALSO a
+    // direct conflict (self_verdict): the observable proof is that the origin was NOT applied and nothing was written
+    // as the member. Without the pre-check the origin path would have been taken (and raced at write time).
+    const res = await invokeVerdict(env, attestTo('task-2009a'), { task_id: 'task-2009a', verdict: 'approved', human_origin: origin({ text: 'approve task-2009a' }) })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.error).toBe('self_verdict')
+    const n = await env.DB.prepare('SELECT COUNT(*) AS n FROM task_verdicts').first<{ n: number }>()
+    expect(n?.n).toBe(0)
+  })
+
+  it('assignee_conflict (#2009) — the member holds a REVOKED admission to the assignee agent', async () => {
+    seedAttachedConflictScene('task-2009b', 'member-2009b')
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(`INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, ceiling, requested_via, created_at)
+      VALUES ('adm-b', ?, 'a-task-2009b', 'member-2009b', 'h-1', 'revoked', 'member', 'tool', '2026-10-01T00:00:00.000Z')`).run(TENANT)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+    const result = expectApplied(await invokeVerdict(env, attestTo('task-2009b'), { task_id: 'task-2009b', verdict: 'approved', human_origin: origin({ text: 'approve task-2009b' }) }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'assignee_conflict' })
+  })
+
+  it('control (#2009) — a submission consented by a DIFFERENT member does not block this member', async () => {
+    seedAttachedConflictScene('task-2009c', 'member-2009c')
+    seedMember(harness.sqlite, 'member-2009c-other')
+    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, consenting_member_id)
+      VALUES ('sub-c', ?, 'task-2009c', ?, 'someone-else', '/x', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'r', 'member-2009c-other')`).run(TENANT, SQUAD)
+    const result = expectApplied(await invokeVerdict(env, attestTo('task-2009c'), { task_id: 'task-2009c', verdict: 'approved', human_origin: origin({ text: 'approve task-2009c' }) }))
+    expect(result.human_origin).toEqual({ applied: true })
+  })
 })

@@ -7,6 +7,7 @@
 These entries summarize selected merged work; exact heads, tests, deployments and
 residual findings remain on the cited PRs. A merge is not a stable-release verdict.
 
+- **Attached-submit follow-ups:** review entry now refuses a task whose only gate-holder agents are linked to the attaching human, and the IM pre-check reports `assignee_conflict` for attached/consenting members (#2011).
 - **Autonomy brakes and recovery:** dry-run-default router, execution pause and per-task
   retry ceiling (#1807); task-dispatch/envelope/custody fences and release policy
   (#1811); successive brake/routine fixes (#1813, #1815, #1823); audited incident

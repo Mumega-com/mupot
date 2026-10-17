@@ -3238,7 +3238,11 @@ const toolTaskSubmitResult: ToolSpec = {
     // task_update) before a completion can be submitted at all. Covers both
     // the no-gate case and 'gate:agent-self-completion' (hasIndependentRuntimeGate
     // returns false for both, and for a gate no live independent agent holds).
-    if (!(await hasIndependentRuntimeGate(env, existing.gate_owner, callerAgentId, existing.squad_id, { allowMemberHolders: true }))) {
+    // mupot#2009: an attached-thread submit records the consenting human; gate-holder agents linked to that human
+    // (owner / binding / key) are refused at the verdict, so they must not satisfy review entry either.
+    const submitAttribution = attachmentAttribution(auth)
+    const consentingMemberId = submitAttribution?.consentingMemberId ?? null
+    if (!(await hasIndependentRuntimeGate(env, existing.gate_owner, callerAgentId, existing.squad_id, { allowMemberHolders: true, excludeAgentsLinkedToMemberId: consentingMemberId }))) {
       return fail(409, 'independent_gate_required', {
         gate_owner: existing.gate_owner,
         detail: existing.gate_owner
@@ -3280,7 +3284,6 @@ const toolTaskSubmitResult: ToolSpec = {
     const now = nowSqlUtc()
     const resultDigest = await sha256Hex(resultText)
     const receiptId = crypto.randomUUID()
-    const submitAttribution = attachmentAttribution(auth)
     const updateStmt = env.DB.prepare(
       `UPDATE tasks
           SET status = 'review', result = ?1, updated_at = ?2
@@ -3292,12 +3295,12 @@ const toolTaskSubmitResult: ToolSpec = {
           AND ${independentGateHolderExistsSql({
             gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
             squadIdExpr: 'tasks.squad_id', tenantParam: '?7', nowParam: '?8',
-            allowMemberHolders: true,
+            allowMemberHolders: true, excludeAgentsLinkedToMemberExpr: '?9',
           })}
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(
       next.result, next.updated_at, next.id, existing.updated_at, existing.project_id,
-      callerAgentId, env.TENANT_SLUG, now,
+      callerAgentId, env.TENANT_SLUG, now, consentingMemberId,
     )
     const insertStmt = env.DB.prepare(
       `INSERT INTO task_result_submissions

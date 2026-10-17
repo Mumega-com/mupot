@@ -6,7 +6,7 @@ import type { AuthContext, Env } from '../types'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_ENVELOPE_OPTIONAL_KEYS, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
-import { memberAffiliatedWithAssigneeSql } from './verdict-independence'
+import { agentLinkedToMemberSql, memberAffiliatedWithAssigneeSql } from './verdict-independence'
 
 export { memberAffiliatedWithAssigneeSql, isMemberAffiliatedWithAssigneeAgent } from './verdict-independence'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -607,7 +607,17 @@ export function independentGateHolderExistsSql(p: {
    *  path and the dispatch pre-check keep the agent-holder-only rule; only the
    *  hand-worked review entry (task_submit_result) opts in. */
   allowMemberHolders?: boolean
+  /** mupot#2009 — bound param / expression for the submission's consenting member (an attached-thread submit). A
+   *  gate-holder AGENT owned by, bound to or keyed to that member is not counted: the verdict check refuses it
+   *  (directConflictSqlRaw), so counting it would let a task enter review with no eligible decider. Omit (or
+   *  bind NULL) for a non-attached submit: behavior unchanged. */
+  excludeAgentsLinkedToMemberExpr?: string
 }): string {
+  const linkedExclusion = p.excludeAgentsLinkedToMemberExpr
+    ? `
+         AND (${p.excludeAgentsLinkedToMemberExpr} IS NULL
+              OR NOT ${agentLinkedToMemberSql({ agentExpr: 'gate_agent.id', memberExpr: p.excludeAgentsLinkedToMemberExpr })})`
+    : ''
   const agentHolder = `EXISTS (
       SELECT 1
         FROM gate_grants grant_row
@@ -616,7 +626,7 @@ export function independentGateHolderExistsSql(p: {
          AND gate_agent.id = grant_row.principal_id
          AND gate_agent.status = 'active'
        WHERE grant_row.capability = ${p.gateOwnerExpr}
-         AND gate_agent.id <> ${p.assigneeIdExpr}
+         AND gate_agent.id <> ${p.assigneeIdExpr}${linkedExclusion}
          AND EXISTS (
            SELECT 1
              FROM member_tokens t
@@ -749,7 +759,7 @@ export async function hasIndependentRuntimeGate(
   gateOwner: string | null | undefined,
   assigneeAgentId: string,
   taskSquadId: string,
-  opts: { allowMemberHolders?: boolean } = {},
+  opts: { allowMemberHolders?: boolean; excludeAgentsLinkedToMemberId?: string | null } = {},
 ): Promise<boolean> {
   if (
     gateOwner === null || gateOwner === undefined
@@ -760,8 +770,9 @@ export async function hasIndependentRuntimeGate(
     SELECT 1 WHERE ${independentGateHolderExistsSql({
       gateOwnerExpr: '?1', assigneeIdExpr: '?2', tenantParam: '?3', squadIdExpr: '?4', nowParam: '?5',
       allowMemberHolders: opts.allowMemberHolders,
+      excludeAgentsLinkedToMemberExpr: '?6',
     })}
-  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
+  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc(), opts.excludeAgentsLinkedToMemberId ?? null)
     .first<{ 1: number }>()
   return row !== null
 }

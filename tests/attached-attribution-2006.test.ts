@@ -1,6 +1,6 @@
 // tests/attached-attribution-2006.test.ts — mupot#2006. A thread attached to an existing agent X acts AS X by design;
 // the writes it makes (send, task_submit_result, flight_land) must record the attachment + the attaching human, and that
-// human must count as AFFILIATED with X for verdict independence (verdict predicate AND the runtime-gate check).
+// human must count as DIRECTLY in conflict with X for verdict independence (verdict predicate AND the runtime-gate check).
 // Real sqlite D1 + every migration; entered through invokeTool.
 
 import { describe, expect, it } from 'vitest'
