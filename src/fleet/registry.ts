@@ -7,7 +7,8 @@
 
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
-import { isValidRuntimeOrUnset, type RuntimeValue } from './runtimes'
+import { cleanReported, isNonAdoptedRuntime, MAX_REPORTED } from './reported-values'
+import type { RuntimeValue } from './runtimes'
 import { hasRegisteredKey } from './agent-keys'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -452,7 +453,8 @@ function validReport(a: unknown, knownSquadSlugs: ReadonlySet<string>): FleetAge
   const r = a as Record<string, unknown>
   if (typeof r.agent_id !== 'string' || !AGENT_ID_RE.test(r.agent_id)) return null
   if (typeof r.status !== 'string' || !STATUSES.has(r.status)) return null
-  const runtime = isValidRuntimeOrUnset(r.runtime) ? r.runtime : ''
+  // Any harness name is kept as reported (cleaned, <=64); '' = not reported. Never a reason to drop a report.
+  const runtime = typeof r.runtime === 'string' ? (cleanReported(r.runtime, MAX_REPORTED) ?? '') : ''
   const lifecycle = typeof r.lifecycle === 'string' && LIFECYCLES.has(r.lifecycle) ? r.lifecycle : ''
   const squads = Array.isArray(r.squads)
     ? r.squads
@@ -527,7 +529,8 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     .all<{ agent_id: string }>()
   for (const k of keyRows.results ?? []) keyed.add(k.agent_id)
 
-  const toWrite = valid.filter((v) => !keyed.has(v.agent_id))
+  // Non-adopted runtimes are skipped like keyed agents (one entry never fails the batch).
+  const toWrite = valid.filter((v) => !keyed.has(v.agent_id) && !isNonAdoptedRuntime(v.runtime))
   const skipped = valid.length - toWrite.length
 
   // Lazy backfill: stamp any NULL-tenant member rows before the tenant-scoped existence check.

@@ -193,6 +193,26 @@ describe('signed attach', () => {
     expect(row.runtime).toBe('claude-code')
   })
 
+  it('non-adopted runtime (goose, zero-width variant) → 400 after a VALID signature, nothing stored', async () => {
+    for (const runtime of ['goose', 'goo\u200bse']) {
+      const { kp, pubX } = await genKey()
+      const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+      const body = freshBody('kasra', 'mumega', { runtime })
+      ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+      expect((await post(makeEnv(db), '/attach-signed', body)).status).toBe(400)
+      expect(db._fleet.size).toBe(0)
+    }
+  })
+
+  it('an unknown harness name is accepted and stored cleaned', async () => {
+    const { kp, pubX } = await genKey()
+    const db = makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } })
+    const body = freshBody('kasra', 'mumega', { runtime: 'my-new-harness' })
+    ;(body as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(body as Record<string, string | number>), tenant: 'mumega' })
+    expect((await post(makeEnv(db), '/attach-signed', body)).status).toBe(200)
+    expect(db._fleet.get('mumega:kasra')!.runtime).toBe('my-new-harness')
+  })
+
   it('replay (same nonce) → 409', async () => {
     const { kp, pubX } = await genKey()
     const env = makeEnv(makeDb({ keys: { 'mumega:kasra': { pubkey: pubX, algo: 'Ed25519', member_id: 'm-kasra' } } }))

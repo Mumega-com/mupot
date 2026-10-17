@@ -104,29 +104,21 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('extended-thinking-64k')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('flight_id')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('"codex-cli"')
-    expect(toolCheckIn?.inputSchema.properties.harness).toMatchObject({
-      enum: expect.arrayContaining(['codex-cli']),
-    })
+    // Open vocabulary: an unknown harness is never refused, so the schema carries no enum.
+    expect(toolCheckIn?.inputSchema.properties.harness).toEqual({ type: 'string' })
   })
 
-  it('keeps every check_in harness surface exactly aligned with the canonical enum', () => {
+  it('check_in harness is an open string: any name accepted, known names are only suggestions', () => {
     const toolCheckIn = TOOLS.find((tool) => tool.name === 'check_in')
     if (!toolCheckIn) throw new Error('check_in tool is missing from the public catalog')
-
-    const schemaHarnesses = (toolCheckIn.inputSchema.properties.harness as { enum: string[] }).enum
-    const catalogHarnesses = extractQuotedHarnesses(
-      toolCheckIn.args,
-      /harness\?:\s*((?:"[^"]+"\|?)+), machine\?:/,
-      'public check_in catalog args',
-    )
+    expect((toolCheckIn.inputSchema.properties.harness as { enum?: string[] }).enum).toBeUndefined()
+    expect(toolCheckIn.args).toMatch(/harness\?: string/)
+    // The instruction examples stay a subset of the known list (suggestions, never a gate).
     const instructionHarnesses = extractQuotedHarnesses(
       MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
       /harness:\s+"<harness>",\s+\/\/\s+(.+)\n/,
       'static initialize instructions',
     )
-
-    expect(schemaHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
-    expect(catalogHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
     expect(instructionHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
   })
 })

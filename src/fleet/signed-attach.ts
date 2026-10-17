@@ -114,13 +114,12 @@ export type SignedAttachResult = SignedAttachOk | SignedAttachErr
  *  the fleet_agents upsert. The caller MUST treat any {ok:false} as terminal (no upsert).
  *
  *  `body` is the already-parsed, byte-capped request object (untrusted). `validTypes`
- *  and `validRuntimes` are passed in so this module shares the route's allow-lists. */
+ *  and `validLifecycles` are passed in so this module shares the route's allow-lists. */
 export async function verifySignedAttach(
   env: Env,
   body: Record<string, unknown>,
   // ReadonlySet: a verifier validates against the vocabulary, it never edits it.
   validTypes: ReadonlySet<string>,
-  validRuntimes: ReadonlySet<string>,
   validLifecycles: ReadonlySet<string>,
 ): Promise<SignedAttachResult> {
   // 1. Shape + field validation (all from the UNTRUSTED body).
@@ -134,8 +133,11 @@ export async function verifySignedAttach(
   }
   const type = body.type
 
-  if (typeof body.runtime !== 'string' || !validRuntimes.has(body.runtime)) {
-    return { ok: false, status: 400, error: 'bad_request', detail: 'runtime: invalid' }
+  // Any non-empty string is accepted: an unknown harness is never turned away (Hadi 2026-10-16).
+  // The raw value is what the key signed, so it is verified as sent; the caller cleans/truncates
+  // it for storage. The cap only bounds the signed message.
+  if (typeof body.runtime !== 'string' || body.runtime.trim() === '' || body.runtime.length > 256) {
+    return { ok: false, status: 400, error: 'bad_request', detail: 'runtime: a non-empty string (<=256 chars) is required' }
   }
   const runtime = body.runtime
 

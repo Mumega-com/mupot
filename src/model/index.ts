@@ -217,7 +217,7 @@ async function callGoogle(
   if (system) body.systemInstruction = { parts: [{ text: system }] }
 
   const res = await fetch(
-    `${GATEWAY_BASE}/${gw.accountId}/${gw.gatewayId}/google-ai-studio/v1/models/${model}:generateContent`,
+    `${GATEWAY_BASE}/${gw.accountId}/${gw.gatewayId}/google-ai-studio/v1/models/${encodeURIComponent(model)}:generateContent`,
     {
       method: 'POST',
       headers: {

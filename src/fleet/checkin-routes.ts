@@ -9,6 +9,7 @@ import { Hono } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { recordCheckin } from './presence'
+import { isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from './reported-values'
 
 export const fleetCheckinApp = new Hono<{ Bindings: Env }>()
 
@@ -43,6 +44,9 @@ fleetCheckinApp.post('/checkin', async (c) => {
     // KV unavailable — prefer correctness (record) over the cost guard.
   }
 
+  if (isNonAdoptedRuntime(body.harness)) {
+    return c.json({ error: 'bad_request', detail: `harness: ${NON_ADOPTED_DETAIL}` }, 400)
+  }
   await recordCheckin(c.env, id, body)
   return c.json({ ok: true, agent: id.displayName })
 })

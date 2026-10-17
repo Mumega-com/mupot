@@ -181,7 +181,6 @@ import {
   refreshOwnAgentPresence,
   sqliteUtcToMs,
   normalizeSevenAxis,
-  SEVEN_AXIS_HARNESSES,
   SEVEN_AXIS_EFFORTS,
 } from '../fleet/presence'
 import {
@@ -200,7 +199,7 @@ import {
   RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
 import { hasRegisteredDeliverySurface, resolveDispatchDeliveryMode } from '../bus/consumer'
-import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
+import { agentKeyFingerprint, hasRegisteredKey, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
@@ -316,7 +315,8 @@ import { refusalNextStep } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
-import { selfReportAtBoot } from '../fleet/boot-self-report'
+import { isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
+import { selfReportAtBoot, readFleetBelief, type ConnectionKind } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
@@ -5447,6 +5447,15 @@ const toolInboxDeadLetters: ToolSpec = {
   },
 }
 
+// True when the agent's inbox consumer fence is not bearer_only (signed_only): every bearer/MCP inbox read,
+// attached peek included, is refused. ONE definition shared by inbox_consumer_status and boot_context's onboarding.
+async function inboxFencedToHost(env: Env, agentId: string): Promise<boolean> {
+  const fenceRow = await env.DB.prepare(
+    `SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, agentId).first<{ mode: string }>()
+  return (fenceRow?.mode ?? 'bearer_only') !== 'bearer_only'
+}
+
 // inbox_fence_status — redacted self-status for cutover evidence. The fence is
 // enforced in readAgentInbox, so this tool cannot bypass or consume the inbox.
 const toolInboxFenceStatus: ToolSpec = {
@@ -5474,10 +5483,7 @@ const toolInboxFenceStatus: ToolSpec = {
     if (attachedAuthority(auth)) {
       // Read the host's fence FIRST: under signed_only the bearer peek (and so mark_handled) is refused, so claiming
       // can_peek would be a lie. Only the mode is surfaced, never the generation or key fingerprint.
-      const fenceRow = await env.DB.prepare(
-        `SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
-      ).bind(env.TENANT_SLUG, agent).first<{ mode: string }>()
-      const fenced = (fenceRow?.mode ?? 'bearer_only') !== 'bearer_only'
+      const fenced = await inboxFencedToHost(env, agent)
       // Agent-level unread (the send-side cap counts these, handled-by-attachment rows included, seat-blind).
       const unreadTotal = await agentUnreadTotal(env, agent)
       return done({
@@ -5788,7 +5794,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
+  args: '{ seat?: string, harness?: string /* any harness name, kept as reported (<=64 chars); known ones also get a canonical hint, others are tagged other */, machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -5796,7 +5802,7 @@ const toolCheckIn: ToolSpec = {
       label: STRING_SCHEMA,
       name: STRING_SCHEMA,
       seat: STRING_SCHEMA,
-      harness: { type: 'string', enum: [...SEVEN_AXIS_HARNESSES] },
+      harness: STRING_SCHEMA,
       machine: STRING_SCHEMA,
       model: STRING_SCHEMA,
       provider: STRING_SCHEMA,
@@ -5829,6 +5835,8 @@ const toolCheckIn: ToolSpec = {
     ) {
       return fail(400, 'invalid_args', `presence_mode must be "${POLL_PRESENCE_MODE}" or "${RESIDENT_PRESENCE_MODE}"`)
     }
+
+    if (isNonAdoptedRuntime(args.harness)) return fail(400, 'invalid_args', `harness: ${NON_ADOPTED_DETAIL}`)
 
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
@@ -5947,6 +5955,7 @@ const toolCheckIn: ToolSpec = {
       agent: id.displayName,
       agent_id: id.boundAgentId,
       harness: axis.harness,
+      harness_canonical: axis.harness_canonical,
       machine: axis.machine,
       model: axis.model,
       provider: axis.provider,
@@ -6385,11 +6394,18 @@ const toolFleetAgentGet: ToolSpec = {
     const lastReportedAt = String(row?.last_reported_at ?? '')
     const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
 
+    // Observed facts boot recorded (migration 0235). Raw as reported; *_canonical is a hint, never a gate.
+    const observed = row ? await readFleetBelief(env, row.agent_id) : null
     return done({
       agent_id: targetAgent.id,
       agent_slug: targetAgent.slug,
       squad_id: targetAgent.squad_id,
       runtime: routeInfo.runtime,
+      runtime_canonical: observed?.runtime_canonical || null,
+      model: observed?.model ?? null,
+      host: observed?.host || null,
+      connection_kind: observed?.connection_kind || null,
+      last_boot_at: observed?.last_boot_at ?? null,
       status: row?.status ?? null,
       last_reported_at: row?.last_reported_at ?? null,
       // mupot#1494 round 3 (P3, adversarial round 2) — reads `routeInfo.presenceMode`
@@ -6415,12 +6431,99 @@ const toolFleetAgentGet: ToolSpec = {
 async function reportSelfAtBoot(
   env: Env,
   agentId: string,
-  claim: { runtime?: unknown; model?: unknown },
+  // null = READ-ONLY (attached thread / profile): never writes, not even connection_kind or boot time.
+  claim: { runtime?: unknown; model?: unknown; host?: unknown } | null,
+  connectionKind: ConnectionKind,
 ): Promise<unknown> {
   try {
-    return await selfReportAtBoot(env, agentId, claim)
+    if (claim === null) {
+      return { outcome: 'nothing_reported', belief: await readFleetBelief(env, agentId) }
+    }
+    return await selfReportAtBoot(env, agentId, claim, connectionKind)
   } catch {
     return { outcome: 'unavailable', belief: null, detail: 'registry unreachable at boot; identity below is unaffected' }
+  }
+}
+
+// What boot tells the caller about HOW it is connected. Tool/route names only, never a token.
+// `next_step` is the one thing the CALLER can do first; `who_acts` says who that is. Anything only a
+// human or the agent's host can do goes in `for_owner` (who_acts: 'owner'), as information.
+type WhoActs = 'self' | 'owner' | 'admin'
+interface BootOnboarding {
+  connection_kind: ConnectionKind
+  inbox?: 'peek_only' | 'none'
+  agent: { keyed: boolean; inbox: 'consume' | 'peek' | 'none' | 'fenced'; can_self_report: boolean }
+  next_step?: string
+  who_acts?: WhoActs
+  for_owner?: { next_step: string; who_acts: 'owner' }
+}
+
+async function buildBootOnboarding(
+  env: Env,
+  auth: AuthContext,
+  kind: ConnectionKind,
+  args: Record<string, unknown>,
+  selfReport: unknown,
+): Promise<BootOnboarding> {
+  const agentId = auth.boundAgentId
+  // Best-effort reads: onboarding is advisory and must never take boot down.
+  const keyed = agentId ? await hasRegisteredKey(env, agentId).catch(() => false) : false
+  const fenced = agentId ? await inboxFencedToHost(env, agentId).catch(() => false) : false
+  const ownerNote = {
+    next_step: "for your human: the agent's own runtime should connect with the agent-bound connection (its minted agent token) and call boot_context with runtime, model and host; this connection cannot record them.",
+    who_acts: 'owner' as const,
+  }
+
+  if (kind === 'attached') {
+    const canMark = !fenced && seatAttachEnabled(env)
+    return {
+      connection_kind: kind,
+      inbox: 'peek_only',
+      agent: { keyed, inbox: fenced ? 'fenced' : 'peek', can_self_report: false },
+      ...(fenced
+        ? {
+            next_step: "this agent's inbox is fenced to its signing host (signed_only): peek is refused for this thread, so there is nothing to read here. The agent host consumes it; an org admin can change the fence with set_agent_inbox_consumer. Boot records no runtime, model or host for an attached thread.",
+            who_acts: 'admin' as const,
+          }
+        : {
+            next_step: `read the agent inbox with inbox { peek: true }${canMark ? ', then record what you handled with inbox_mark_handled { ids } so this thread stops re-reading it' : ''}. This thread cannot consume, lease or ack the inbox, and boot records no runtime, model or host for it.`,
+            who_acts: 'self' as const,
+          }),
+      for_owner: ownerNote,
+    }
+  }
+  if (kind === 'member') {
+    return {
+      connection_kind: kind,
+      inbox: 'none',
+      agent: { keyed: false, inbox: 'none', can_self_report: false },
+      next_step: "this connection is a member token with no agent binding, so boot records no runtime, model or host. An agent's own runtime should connect with the agent-bound connection (see available_doors: bootstrap_self, or mint_agent_token by an org admin) and call boot_context with runtime, model and host.",
+      who_acts: 'owner',
+    }
+  }
+  // agent_bound or seat: the caller IS the agent's runtime.
+  const base = {
+    connection_kind: kind,
+    agent: { keyed, inbox: fenced ? ('fenced' as const) : ('consume' as const), can_self_report: !keyed },
+  }
+  if (keyed) {
+    return {
+      ...base,
+      next_step: 'this agent has a registered signing key, so its fleet row moves by signature only: report runtime, model and host from the agent host via POST /api/fleet/attach-signed. boot_context does not record them for a keyed agent.',
+      who_acts: 'self',
+    }
+  }
+  const outcome = (selfReport as { outcome?: string; detail?: string } | null)?.outcome
+  const detail = (selfReport as { detail?: string } | null)?.detail
+  if (outcome === 'refused_not_a_string' || outcome === 'refused_not_adopted') {
+    return { ...base, next_step: `boot_context did not record your report (${detail ?? outcome}). Call it again with runtime, model and host as plain strings.`, who_acts: 'self' }
+  }
+  const missing = ['runtime', 'model', 'host'].filter((k) => args[k] === undefined || args[k] === null)
+  return {
+    ...base,
+    ...(missing.length > 0
+      ? { next_step: `call boot_context again passing ${missing.join(', ')} (any short string: what you are actually running on) so the registry shows your real seat.`, who_acts: 'self' as const }
+      : {}),
   }
 }
 
@@ -6640,7 +6743,7 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string }  // runtime/model: what you are ACTUALLY running on — reported at boot',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6649,6 +6752,7 @@ const toolBootContext: ToolSpec = {
       label: STRING_SCHEMA,
       runtime: STRING_SCHEMA,
       model: STRING_SCHEMA,
+      host: STRING_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -6687,13 +6791,22 @@ const toolBootContext: ToolSpec = {
     // currently believes, so a booting agent SEES the drift instead of having to think
     // to ask. Same reasoning as available_doors — the response that always succeeds is
     // where a fact has to be said, or it is not said at all.
+    // Server-derived from authentication; NEVER from args. Attached beats bound (an attached thread also has a boundAgentId).
+    // A seat-handle / auto-seat session (bound through a seat, not attached) is its own kind.
+    const connectionKind: ConnectionKind = attachedAuthority(auth) ? 'attached' : !isMinted ? 'member' : auth.seatBinding ? 'seat' : 'agent_bound'
     const selfReport = isMinted
       // An ATTACHED thread is not the agent's runtime: it never claims runtime/model (it would overwrite the host's
       // fleet_agents/agents.model rows; bot review P1 on #1887). It still READS the registry belief.
       // sideEffectFree (profile): never claim runtime/model — the profile refuses them, and
       // this drops them even if a caller reaches here another way. An empty claim only READS.
-      ? await reportSelfAtBoot(env, auth.boundAgentId as string, ctx?.sideEffectFree || attachedAuthority(auth) ? {} : { runtime: args.runtime, model: args.model })
+      ? await reportSelfAtBoot(
+          env,
+          auth.boundAgentId as string,
+          ctx?.sideEffectFree || attachedAuthority(auth) ? null : { runtime: args.runtime, model: args.model, host: args.host },
+          connectionKind,
+        )
       : null
+    const bootOnboarding = ctx?.sideEffectFree ? null : await buildBootOnboarding(env, auth, connectionKind, args, selfReport)
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
     // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
@@ -6883,6 +6996,9 @@ const toolBootContext: ToolSpec = {
       identity_status: identityStatus,
       bound_agent_id: auth.boundAgentId ?? null,
       ...(selfReport ? { registry: selfReport } : {}),
+      // Additive. Structured so a harness can act on it: what kind of connection this is, whether
+      // its inbox reads consume, and (only when something is wrong or missing) a plain next_step.
+      ...(bootOnboarding ? { onboarding: bootOnboarding } : {}),
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,
