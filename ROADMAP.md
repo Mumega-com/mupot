@@ -50,6 +50,11 @@ Computers) — none of that shipped in it. The four ledger rows were relabelled 
 Merged to `main` after the tag; unreleased until `v0.32.0` is cut. Detail lives in the
 CHANGELOG; this lists what the re-scope below builds on.
 
+- Secure moments W1–W5 plus W3.1, W4.1 and W4.2 (#1859–#1872, migrations 0212–0215):
+  passkey decision links, sealed secret drops, MCP URL elicitation with a plain-link
+  fallback, and the Telegram Mini App (biometric, browser passkey, PIN/trusted window).
+  Production flag state is not recorded in this repo (deploy config is out of tree);
+  read live `/health` and the deploy record.
 - Loop brakes: dry-run-default `router_tick`, execution pause, per-task retry ceiling
   (#1807); task-dispatch, inbox-envelope and runtime-custody fences with one release
   policy (#1811); follow-up fixes (#1813, #1815, #1823). Audited incident recovery tool
@@ -78,6 +83,22 @@ CHANGELOG; this lists what the re-scope below builds on.
   Migrations 0206–0234.
 
 ### After v0.31.0
+
+**In flight (2026-10-13): Operators + Admission**, proposed for `v0.32.0` "Agents as
+themselves". The v0.32.0 release contract and its gates are unchanged until amended by
+PR. Design: harness seats and worktrees, private design PR; tracked privately.
+- W0 delegated operators: one structural-write chokepoint for MCP and HTTP. Designated
+  agents may organise squads and agents within a ceiling (≤ lead); anything above needs a
+  human secure-moment tap. Closes the MCP/HTTP inconsistency #1357.
+- W1 workspace records (repo branch, folder or thread) and harness identity per grant.
+- W2 explicit admission and attach to existing agents (seat key v2).
+- W3 smart proposals: rules first, then Jev on Workers AI through the existing decision
+  port, then a Cloudflare Workflow that waits for the human tap.
+- W4 `worktree_id` on tasks, flights and receipts.
+
+Next after that: a task-verdict secure-moment kind plus a `decision_status` tool (the
+ChatGPT-native front door, MCP Events), and a work queue for humans.
+
 
 - Agent profiles, `agent_of_choice`, and steward design — #1564.
 - Machines — #1572.
