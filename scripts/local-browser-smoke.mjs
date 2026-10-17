@@ -981,7 +981,7 @@ async function runAccountTelegramConnectWorkflow() {
   if (!deepLinkText.includes('Open in Telegram')) {
     fail('Connect Telegram deep link anchor did not render the expected label', { deepLinkText })
   }
-  if (!pairingText.includes('send /needs')) {
+  if (!pairingText.includes('send /muneeds')) {
     fail('Connect Telegram result did not tell the member what to type after tapping the link', { pairingText })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'account-pairing-code.png'), fullPage: true })
