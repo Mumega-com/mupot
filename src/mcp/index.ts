@@ -50,7 +50,7 @@ import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, seatAttachEnabled } from '../members/seat-attach'
-import { ATTACHED_SUDO_ACTIONS, attachedAuthority, isAttachedSudoAction } from '../auth/attached-ceiling'
+import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
 import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
 import {
@@ -3242,7 +3242,7 @@ const toolTaskSubmitResult: ToolSpec = {
       return fail(409, 'independent_gate_required', {
         gate_owner: existing.gate_owner,
         detail: existing.gate_owner
-          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee, or by an active human member who is neither the assignee nor the assignee agent\'s owner (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
+          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee, or by an active human member who is neither the assignee nor the assignee agent\'s owner nor a human who attached a thread to that agent (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
           : 'a task can only enter review through task_submit_result once it carries an independent gate_owner — ask the task\'s creator or an admin to set one via task_update; this tool never accepts gate_owner itself, so the assignee cannot choose its own reviewer',
       })
     }
@@ -3280,6 +3280,7 @@ const toolTaskSubmitResult: ToolSpec = {
     const now = nowSqlUtc()
     const resultDigest = await sha256Hex(resultText)
     const receiptId = crypto.randomUUID()
+    const submitAttribution = attachmentAttribution(auth)
     const updateStmt = env.DB.prepare(
       `UPDATE tasks
           SET status = 'review', result = ?1, updated_at = ?2
@@ -3300,12 +3301,13 @@ const toolTaskSubmitResult: ToolSpec = {
     )
     const insertStmt = env.DB.prepare(
       `INSERT INTO task_result_submissions
-         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10
+         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, attachment_id, consenting_member_id)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11, ?12
         WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND updated_at = ?9 AND status = 'review')`,
     ).bind(
       receiptId, env.TENANT_SLUG, next.id, next.squad_id, callerAgentId,
       artifactCheck.path, artifactCheck.sha256Claimed, resultDigest, next.updated_at, resultText,
+      submitAttribution?.attachmentId ?? null, submitAttribution?.consentingMemberId ?? null, // mupot#2006: from auth, never args
     )
     let results: Awaited<ReturnType<typeof env.DB.batch>>
     try {
@@ -3888,6 +3890,7 @@ const toolFlightDispatch: ToolSpec = {
             ...(flightOrigin.ok ? { mcp_endpoint: mcpEndpoint(flightOrigin.origin) } : {}),
             land_with: 'flight_land',
           }),
+          attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
           ...(projectId ? { projectId } : {}),
         },
         {
@@ -4028,6 +4031,7 @@ const toolFlightLand: ToolSpec = {
       agent_id: flight.agent,
       meta,
       actor: { kind: 'agent', id: auth.boundAgentId },
+      attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
     })
     // Only a refused TRANSITION is a failed land (#916). A missing receipt means the
     // flight is already landed; answering 409 there tells the agent to retry something
@@ -4831,6 +4835,7 @@ const toolSend: ToolSpec = {
         inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
         projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
         targetSeat: typeof args.seat === 'string' && args.seat.trim().length > 0 ? args.seat.trim() : undefined,
+        attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
       },
       { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
       { waitUntil: ctx.waitUntil },
@@ -4944,6 +4949,7 @@ const toolBroadcast: ToolSpec = {
         body,
         kind,
         requestId: recipientRequestId,
+        attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
       }, {
         system: true,
         reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',

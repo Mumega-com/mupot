@@ -29,6 +29,11 @@ import { chunkForD1InList } from '../lib/d1-in-list'
  * on the follow-up issue, to be closed by a canonical same-human relation, not
  * by email.
  */
+// mupot#2006: the human who ATTACHED a thread to the agent acted as it, so is affiliated with it. agent_seat_attachments
+// rows persist after detach; an admission that went live and was later revoked counts too. pending/denied/expired
+// admissions never attached anything ('expired' only comes from a pending admission lapsing in ensureAdmission; the
+// 0220 trigger forbids live -> expired) and do not count: otherwise anyone could taint an independent reviewer by
+// merely requesting an admission for the agent and letting it lapse.
 export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigneeIdExpr: string }): string {
   return `EXISTS (
       SELECT 1
@@ -43,6 +48,15 @@ export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigne
            OR EXISTS (
              SELECT 1 FROM agent_keys assignee_key
               WHERE assignee_key.agent_id = assignee_agent.id AND assignee_key.member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_seat_attachments assignee_attach
+              WHERE assignee_attach.agent_id = assignee_agent.id AND assignee_attach.human_member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_seat_admissions assignee_admission
+              WHERE assignee_admission.agent_id = assignee_agent.id AND assignee_admission.human_member_id = ${p.memberExpr}
+                AND assignee_admission.status IN ('live', 'revoked')
            )
          )
     )`
@@ -93,6 +107,14 @@ function directConflictSqlRaw(): string {
   return `(
     EXISTS (SELECT 1 FROM tasks dt WHERE dt.id = @T AND (dt.assignee_agent_id = @D OR dt.assignee_member_id = @D))
     OR EXISTS (SELECT 1 FROM task_result_submissions ds WHERE ds.task_id = @T AND ds.submitted_by_agent_id = @D)
+    OR EXISTS (SELECT 1 FROM task_result_submissions cs WHERE cs.task_id = @T AND cs.consenting_member_id = @D)
+    OR EXISTS (
+      SELECT 1 FROM task_result_submissions ca WHERE ca.task_id = @T AND ca.consenting_member_id IS NOT NULL AND (
+        EXISTS (SELECT 1 FROM agents cao WHERE cao.id = @D AND cao.owner_member_id = ca.consenting_member_id)
+        OR EXISTS (SELECT 1 FROM agent_member_bindings cab WHERE cab.agent_id = @D AND cab.member_id = ca.consenting_member_id)
+        OR EXISTS (SELECT 1 FROM agent_keys cak WHERE cak.agent_id = @D AND cak.member_id = ca.consenting_member_id)
+      )
+    )
     OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts dr WHERE dr.task_id = @T AND dr.stage IN ('runtime_consumed', 'completed', 'failed') AND (dr.agent_id = @D OR dr.member_id = @D))
   )`
 }

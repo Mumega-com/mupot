@@ -49,6 +49,20 @@ export function attachedAuthority(auth: Pick<AuthContext, 'seatBinding'>): Attac
 }
 
 /**
+ * mupot#2006 — the attribution an attached thread's writes carry (agent_messages / task_result_submissions /
+ * flight_event_outbox). Derived from the server-resolved auth ONLY, never from tool args; null for any non-attached caller.
+ */
+export interface AttachmentAttribution {
+  attachmentId: string
+  consentingMemberId: string
+}
+
+export function attachmentAttribution(auth: Pick<AuthContext, 'seatBinding'>): AttachmentAttribution | null {
+  const a = attachedAuthority(auth)
+  return a ? { attachmentId: a.attachmentId, consentingMemberId: a.humanMemberId } : null
+}
+
+/**
  * "sudo" for an ATTACHED chat: the ONLY elevation actions an attached thread may request (request_elevation) and use.
  * Everything else stays refused (attached_seat_cannot_elevate): minting, access, deploy, secrets, keys, irreversible
  * acts (org_department_create, routine_archive), home access and every gate power. Adding a key here is a reviewed

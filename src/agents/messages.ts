@@ -71,6 +71,8 @@ export interface SendInput {
   inReplyTo?: string
   projectId?: string
   targetSeat?: string
+  /** mupot#2006: set ONLY from attachmentAttribution(auth) (server-resolved); NULL columns otherwise. */
+  attribution?: { attachmentId: string; consentingMemberId: string } | null
 }
 
 export interface SendResult {
@@ -492,6 +494,8 @@ export async function sendAgentMessage(
       input.targetSeat ?? null,
       bodyLength,
       bodyChecksum,
+      input.attribution?.attachmentId ?? null,
+      input.attribution?.consentingMemberId ?? null,
     ]
     let guestVisibilitySql = ''
     const guestVisibilityFence = opts.guestVisibilityFence
@@ -534,8 +538,8 @@ export async function sendAgentMessage(
     const returningSql = fenced ? ' RETURNING seq' : ''
     const statement = routineFence
       ? env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
@@ -561,8 +565,8 @@ export async function sendAgentMessage(
                  )${returningSql}`,
       ).bind(...values, routineFence.runId, routineFence.agentId)
       : env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
@@ -2779,6 +2783,7 @@ export async function sendToRef(
     inReplyTo?: string
     projectId?: string
     targetSeat?: string
+    attribution?: { attachmentId: string; consentingMemberId: string } | null
   },
   authz: SendTargetAuthz,
   opts: Opts = {},
@@ -2886,6 +2891,7 @@ export async function sendToRef(
       inReplyTo: input.inReplyTo,
       projectId: input.projectId,
       targetSeat: input.targetSeat,
+      attribution: input.attribution,
     },
     authz,
     guestVisibilityFence ? { ...opts, guestVisibilityFence } : opts,
