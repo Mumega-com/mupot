@@ -5911,7 +5911,7 @@ function liveRuntimeCard(b: FleetBelief | null) {
   const v = (x: string | null | undefined) => (x ? html`<code>${x}</code>` : html`<span class="dim">not reported</span>`)
   return html`<h2>Live runtime</h2>
     <div class="card" data-live-runtime>
-      <p class="dim">Observed at boot by the agent itself. Declared fields above (role, owner, purpose) are set by a human; these are not.</p>
+      <p class="dim">Last reported by the agent itself (at boot, on attach, or by its daemon); the last boot time is shown separately. Declared fields above (role, owner, purpose) are set by a human; these are not.</p>
       <dl class="kv">
         <dt>Runtime</dt><dd>${v(b?.runtime)}${b?.runtime ? html` <span class="dim">(${canonicalHarness(b.runtime)})</span>` : ''}</dd>
         <dt>Model</dt><dd>${v(b?.model)}</dd>

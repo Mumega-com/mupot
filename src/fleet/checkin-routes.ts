@@ -18,7 +18,13 @@ fleetCheckinApp.post('/checkin', async (c) => {
   // Generic 401 — never distinguish missing vs bad token (no auth oracle).
   if (!id) return c.json({ error: 'unauthorized' }, 401)
 
-  const body = (await c.req.json().catch(() => ({}))) as {
+  const parsed: unknown = await c.req.json().catch(() => ({}))
+  // Shape: the body must be a JSON object (null, arrays and scalars are refused, not crashed on).
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return c.json({ error: 'bad_request', detail: 'body must be a JSON object' }, 400)
+  }
+  // Narrowed to a plain object just above; every field stays untrusted and is sanitized downstream.
+  const body = parsed as {
     source?: unknown
     label?: unknown
     seat?: unknown
@@ -30,6 +36,10 @@ fleetCheckinApp.post('/checkin', async (c) => {
     flight_id?: unknown
   }
 
+  // Validate BEFORE charging the debounce/cost guard: a refused check-in must not consume the slot.
+  if (isNonAdoptedRuntime(body.harness)) {
+    return c.json({ error: 'bad_request', detail: `harness: ${NON_ADOPTED_DETAIL}` }, 400)
+  }
   // Debounce (adversarial P2): bound D1 writes to ~1 per 30s per agent so a valid
   // token cannot thrash D1 by spamming check-ins. A rapid re-check-in within the
   // window is a cheap KV hit + no-op (presence is at most 30s stale; the active
@@ -44,9 +54,6 @@ fleetCheckinApp.post('/checkin', async (c) => {
     // KV unavailable — prefer correctness (record) over the cost guard.
   }
 
-  if (isNonAdoptedRuntime(body.harness)) {
-    return c.json({ error: 'bad_request', detail: `harness: ${NON_ADOPTED_DETAIL}` }, 400)
-  }
   await recordCheckin(c.env, id, body)
   return c.json({ ok: true, agent: id.displayName })
 })
