@@ -7,6 +7,7 @@
 These entries summarize selected merged work; exact heads, tests, deployments and
 residual findings remain on the cited PRs. A merge is not a stable-release verdict.
 
+- **Decision cards reach the human:** a task entering review under a member-held gate now sends a compact decision card (`/muapprove` / `/mureject <short_id>`) to the member's active owned agent instead of silently reporting `requires_human`; the channel activity feed labels agents by slug, drops `task.updated` noise and names whose decision a review needs; IM gains `/muneeds` `/muapprove` `/mureject` `/muanswer` aliases (and `@botname` suffixes) for chats where Hermes owns the bare commands (#PR).
 - **Attached-submit follow-ups:** review entry now refuses a task whose only gate-holder agents are linked to the attaching human, and the IM pre-check reports `assignee_conflict` for attached/consenting members (#2011).
 - **Autonomy brakes and recovery:** dry-run-default router, execution pause and per-task
   retry ceiling (#1807); task-dispatch/envelope/custody fences and release policy
