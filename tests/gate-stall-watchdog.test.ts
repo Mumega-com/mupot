@@ -352,3 +352,33 @@ describe('gate-stall watchdog: archive is an action boundary (mupot#1780)', () =
     harness.close()
   })
 })
+
+describe('gate-stall watchdog: member-held gate decision card (mupot#2015)', () => {
+  function memberSetup() {
+    const base = setup()
+    const { sqlite } = base
+    sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-h', 'h@t.com', 'H', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, status, owner_member_id) VALUES ('kay', '${SQUAD_ID}', 'kay', 'kay', 'active', 'mem-h');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'kay', 'mem-h', datetime('now'));
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, agent_id, tenant) VALUES ('tok-kay', 'mem-h', 'h', 'l', 'workspace', 'kay', '${TENANT}');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('g-m', 'gate:hm', 'member', 'mem-h', 'owner-1', '2026-08-15T00:00:00.000Z');
+    `)
+    const env = { ...base.env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: 'tok-kay' } as Env
+    return { ...base, env }
+  }
+
+  it('counts the first card as a re-wake, but a duplicate card (same review entry) is NOT counted delivered', async () => {
+    const { env, sqlite, harness } = memberSetup()
+    seedReviewTask(sqlite, 'tm1', { gateOwner: 'gate:hm' })
+    const first = await sweepAt(env, T0)
+    expect(first.rewoken).toBe(1)
+    const second = await sweepAt(env, minutes(31))
+    expect(second.rewoken).toBe(0)
+    expect(second.undelivered).toBe(1)
+    const row = sqlite.prepare(`SELECT delivered_count, last_outcome FROM gate_stall_rewakes WHERE task_id='tm1'`).get() as Record<string, unknown>
+    expect(row).toMatchObject({ delivered_count: 1, last_outcome: 'queued_to_owner_agent' })
+    harness.close()
+  })
+})

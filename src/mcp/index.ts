@@ -2253,6 +2253,8 @@ export type GateWakeOutcome = {
   grant_count: number
   notice: string
   notice_persisted: boolean
+  // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
+  new_sends?: number
 }
 
 async function surfaceGateWakeOutcome(
@@ -2347,6 +2349,7 @@ export async function wakeGateOwnerOnReview(
         ...baseOutcome,
         status: 'queued_to_owner_agent',
         principal: resolution.principal,
+        new_sends: Math.max(0, card.agent_ids.length - card.duplicates),
         notice: `Decision card queued to ${card.agent_ids.join(', ')}'s inbox (not yet acknowledged): ${gateOwner} is held by member ${resolution.principal.id}${card.duplicates > 0 ? '; already queued for this review entry' : ''}. A verdict still needs the member's own decision.`,
       })
     }
@@ -2465,7 +2468,7 @@ const toolTaskVerdict: ToolSpec = {
   min: 'member',
   args:
     '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean,' +
-    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named; it must also carry exactly one decision verb matching the verdict — approve|/approve|/muapprove for approved, reject|/reject|/mureject for rejected — or origin_verb_mismatch) } }' +
+    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named; the WHOLE message must be one anchored command, case-insensitive: [/][mu]approve|reject[@bot] <task ref> — approve takes nothing after the ref, reject may add a free-text reason; the verb must match the verdict; questions, negations, leading text, pasted cards and non-English words are refused with origin_verb_mismatch) } }' +
     ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
     ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
     ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +

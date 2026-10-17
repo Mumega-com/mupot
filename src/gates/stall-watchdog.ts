@@ -99,7 +99,10 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
       // Only a wake that reached a holder counts as a re-wake. requires_human / no_live_holder /
       // ambiguous / delivery_failed spend the attempt budget but are never reported as re-wakes —
       // a counter shown to humans must count deliveries, not attempts (#1706 adversarial P1).
-      const delivered = outcome.status === 'delivered' || outcome.status === 'partial' || outcome.status === 'queued_to_owner_agent'
+      // A decision-card re-wake (queued_to_owner_agent) counts only if it inserted a NEW message; a
+      // duplicate / request_id_conflict card is already queued and was not delivered again (#2015).
+      const delivered = outcome.status === 'delivered' || outcome.status === 'partial'
+        || (outcome.status === 'queued_to_owner_agent' && (outcome.new_sends ?? 1) > 0)
       await env.DB.prepare(
         `UPDATE gate_stall_rewakes
             SET last_outcome = ?1,

@@ -10,7 +10,10 @@
 //   - the "/muapprove <short_id>" lines are text for the HUMAN to type back. A /muapprove sent
 //     through /im/webhook is written directly AS the member via their telegram_chat_id binding (the
 //     IM verdict path, same gates as any member surface); an agent-relayed decision would instead
-//     need the harness-attested human_origin path (#1425, verb-bound). Nothing in the card body is
+//     need the harness-attested human_origin path (#1425). That path accepts ONLY an anchored
+//     whole-message command (#2015): `[/][mu]approve|reject[@bot] <task ref>`; reject may add a
+//     free-text reason, approve takes nothing after the ref. Questions, negations, leading text,
+//     a pasted card and non-English decision words are refused. Nothing in the card body is
 //     read back as approval by any server code.
 //
 // Recipient choice (documented, deliberately narrow): ONLY active, unarchived agents whose
@@ -30,7 +33,14 @@ const RESULT_EXCERPT_CHARS = 400
 // Field caps so a plugin-side validator never rejects a legitimate long title/project/name.
 const MAX_TITLE_CHARS = 300
 const MAX_LABEL_CHARS = 120
-const cap = (v: string | null, n: number): string | null => (v === null ? null : v.slice(0, n))
+// Truncate to at most n UTF-16 units (the plugin validator's cap), but never end on a lone high
+// surrogate: JSON.stringify would emit a bare "\ud83d" that crashes the plugin's validator.
+export function truncateSafe(v: string, n: number): string {
+  const cut = v.slice(0, n)
+  const last = cut.charCodeAt(cut.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut
+}
+const cap = (v: string | null, n: number): string | null => (v === null ? null : truncateSafe(v, n))
 const MAX_CARD_RECIPIENTS = 5
 // D1 caps bound parameters per statement; owned-agent lists are chunked to stay far below it.
 const ID_CHUNK = 50
@@ -117,11 +127,11 @@ export async function deliverDecisionCard(
     type: 'decision_card',
     task_id: task.id,
     short_id: shortId,
-    title: row.title.slice(0, MAX_TITLE_CHARS),
+    title: truncateSafe(row.title, MAX_TITLE_CHARS),
     priority: row.priority,
     project: cap(row.project_name, MAX_LABEL_CHARS),
     asked_by: cap(row.asked_by, MAX_LABEL_CHARS),
-    result_excerpt: (row.result ?? '').slice(0, RESULT_EXCERPT_CHARS),
+    result_excerpt: truncateSafe(row.result ?? '', RESULT_EXCERPT_CHARS),
     approve: `/muapprove ${shortId}`,
     reject: `/mureject ${shortId}`,
     // Optional: a rejection needs a reason; `reject` stays exactly '/mureject <short_id>' (plugins match it by equality).
