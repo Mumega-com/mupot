@@ -24,6 +24,10 @@ Event-driven Herdr plugin. Herdr subscriptions + Mupot inbox. No interval poller
 
 **Attribution:** `from_seat` comes from `pane_id → workspace label`. Self-declared `from_seat` is overwritten.
 
+**Resolve:** `byName` then workspace **label**. Inject uses `agent.prompt` with `name` or, if unnamed, `pane_id`. Unnamed + no label still drops. Rename after every `agent start`.
+
+See [herdr-on-mupot](herdr-on-mupot.md).
+
 ## Retrieve
 
 ```bash

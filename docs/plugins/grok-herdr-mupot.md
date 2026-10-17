@@ -1,6 +1,6 @@
 # grok-herdr-mupot
 
-How **Grok Build** sits on Herdr and talks to Mupot. Skill on hadi-mac; this page is the wiki copy.
+How **Grok Build** sits on Herdr and talks to Mupot. Skill on hadi-mac; this page is the wiki copy. Inherits [herdr-on-mupot](herdr-on-mupot.md).
 
 | | |
 |---|---|
