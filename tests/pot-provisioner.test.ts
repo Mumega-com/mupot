@@ -43,6 +43,7 @@ import {
   D1_MAX_STATEMENT_BYTES,
 } from './helpers/d1-rest-double'
 import { fakeSessionsKv, fakeDispatcher, createRealisticFakeCf } from './helpers/fake-cf-provisioner'
+import { withoutSeat } from './helpers/without-seat'
 
 const orgAdmin: AuthContext = {
   memberId: 'admin-mem-id',
@@ -1499,7 +1500,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     })
 
     it('MCP tool inputSchema properties are built from the SAME allow-list (parity by construction)', () => {
-      expect(Object.keys(toolPotProvision.inputSchema.properties as object).sort()).toEqual([...PROVISION_ALLOWED_FIELDS].sort())
+      expect(Object.keys(toolPotProvision.inputSchema.properties as object).filter((k) => k !== 'seat').sort()).toEqual([...PROVISION_ALLOWED_FIELDS].sort())
     })
 
     it('Athena condition iii: provisionSovereignPot ITSELF refuses forbidden keys via an `as any` bypass, independent of either surface validator', async () => {

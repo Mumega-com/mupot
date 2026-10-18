@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
+import { withoutSeat } from './helpers/without-seat'
 
 // deactivate_agent is the inverse of create_agent: a gated, auditable way to retire a
 // dead/junk agent (or a duplicate identity) without a raw-D1 hand-edit. These tests
@@ -165,7 +166,7 @@ describe('deactivate_agent — advertised', () => {
     const body = (await res.json()) as { result: { tools: { name: string; inputSchema: unknown }[] } }
     const tool = body.result.tools.find((t) => t.name === 'deactivate_agent')
     expect(tool).toBeDefined()
-    expect(tool?.inputSchema).toEqual({
+    expect(withoutSeat(tool?.inputSchema)).toEqual({
       type: 'object',
       properties: { agent: { type: 'string' }, reason: { type: 'string' } },
       required: ['agent'],

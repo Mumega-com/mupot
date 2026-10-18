@@ -211,8 +211,8 @@ interface SeatRow {
 }
 
 const W1_NOTE =
-  'Seat resolved. To act as this seat, send the seat_handle as header X-Mupot-Seat (or _meta["mupot/seat"]) '
-  + 'on later requests; the handle is shown once. Without it this session stays your own unbound identity. '
+  'Seat resolved. To act as this seat, pass the `seat` value below as the `seat` argument on every later call '
+  + '(a harness that can set headers may send X-Mupot-Seat instead); the handle is shown once. Without it this session stays your own unbound identity. '
   + 'The agent has member capability at most and no admin.'
 
 /** Issue a handle for an EXISTING seat (its own batch: evict-LRU-at-cap + insert). Any failure

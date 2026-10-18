@@ -5,6 +5,7 @@ import { invokeTool, mcpApp, TOOLS } from '../src/mcp'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { makeReadyRoutineFixture } from './helpers/routine-actions'
+import { withoutSeat } from './helpers/without-seat'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const NAMES = [
@@ -222,7 +223,7 @@ describe('routine MCP tools', () => {
     for (const tool of routines) {
       expect(tool.inputSchema).toMatchObject({ type: 'object', additionalProperties: false })
       expect((tool.inputSchema.required ?? [])).toEqual(shape[tool.name].required ?? [])
-      expect(Object.keys(tool.inputSchema.properties as Record<string, unknown>).sort()).toEqual(shape[tool.name].properties.sort())
+      expect(Object.keys(tool.inputSchema.properties as Record<string, unknown>).filter((k) => k !== 'seat').sort()).toEqual(shape[tool.name].properties.sort())
     }
     expect(TOOLS.find(tool => tool.name === 'routine_run_now')?.inputSchema).toMatchObject({
       required: ['routine_id', 'idempotency_key'],

@@ -197,7 +197,7 @@ describe('W3 boot_context doors', () => {
     expect(r.available_doors[0].tool).toBe('seat_select')
     expect(r.available_doors[0].does).toContain('mseat_')
     expect(r.available_doors[0].does).toContain('X-Mupot-Seat')
-    expect(r.available_doors[0].does).toContain('mupot/seat')
+    expect(r.available_doors[0].does).toContain('argument on every later call')
     expect(r.next_step).toMatch(/^this connection is a harness session.*seat_select/)
   })
 
@@ -223,7 +223,7 @@ describe('W3 boot_context doors', () => {
     expect(r.next_step).toContain('seat_handle')
     expect(r.next_step).toContain('identity_receipt')
     expect(r.next_step).toContain('seat-1')
-    expect(r.next_step).toMatch(/only while you keep sending the seat handle/)
+    expect(r.next_step).toMatch(/only while you keep passing your seat handle/)
     expect(r.next_step).not.toContain('token is agent-bound')
     expect(r.next_step).not.toContain('IGNORE PREVIOUS')
     expect(r.available_doors.map((d) => d.tool)).not.toContain('seat_select')
@@ -238,13 +238,13 @@ describe('W3 initialize instructions', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).not.toContain('seat_select')
   })
 
-  it('flag on appends the seat section: seat_select first, mseat_ prefix, header and _meta', () => {
+  it('flag on appends the seat section: seat_select first, mseat_ prefix, the seat argument', () => {
     const t = mcpInitializeInstructions({ SEAT_AUTO_ENROLL: '1' })
     expect(t.startsWith(MUPOT_MCP_INITIALIZE_INSTRUCTIONS)).toBe(true)
     expect(t).toContain('seat_select')
     expect(t).toContain('mseat_')
     expect(t).toContain('X-Mupot-Seat')
-    expect(t).toContain('_meta["mupot/seat"]')
+    expect(t).toContain('"seat" argument')
     expect(t).toContain('identity_receipt')
   })
 })

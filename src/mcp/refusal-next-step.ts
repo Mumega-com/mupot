@@ -49,6 +49,8 @@ export interface GuidanceEntry {
   error: string
   /** Only for this refused tool. */
   tool?: string
+  /** Never for these refused tools (connect has its own door text). */
+  notTools?: readonly string[]
   /** Only for these connection kinds. */
   kinds?: readonly ConnKind[]
   status?: number
@@ -79,7 +81,9 @@ export function consentChoiceLabels(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTAC
   return env.SEAT_AUTO_ENROLL === '1' && env.SEAT_ATTACH === '1'
 }
 
-export const SEAT_SELECT_STEP = 'Call seat_select { project: "<workspace name>" } (add folder and thread labels to key a seat per thread; every value is a label, none grants authority). Then send the returned seat_handle as the X-Mupot-Seat header, or as _meta["mupot/seat"] when your client cannot set headers, on every later request.'
+export const SEAT_SELECT_STEP = 'Call seat_select { project: "<workspace name>" } (add folder and thread labels to key a seat per thread; every value is a label, none grants authority). Then pass the returned `seat` value as the `seat` argument on every later call (a harness that can set headers may send X-Mupot-Seat instead).'
+
+export const LOST_SEAT_STEP = 'This session has a harness but is not presenting a seat. Pass `seat: <the seat value seat_select returned>` on every call; if you lost it, call seat_select again with the same project (it returns the same agent and a new handle). A harness that can set headers may send X-Mupot-Seat instead.'
 
 const MINT = 'an admin mints an agent-bound workspace token with mint_agent_token { agent }'
 const NEEDS_MINT = 'an admin to mint it an agent-bound workspace token with mint_agent_token { agent }'
@@ -174,6 +178,18 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'This tool is not on this limited endpoint, and a session cannot change its own endpoint. Whoever configured this connector points it at the full endpoint {full_mcp}. {reach}' },
   { error: 'profile_args_not_allowed', who_acts: 'self', next_step: 'Those arguments are not allowed on this limited endpoint. Call the tool again without them.' },
 
+  { error: 'seat_handle_rejected', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
+    next_step: 'That `seat` value was not accepted: it must be the mseat_ handle seat_select returned (not a seat id, label or agent id). Pass the mseat_ value on every call; if it is lost or stale, call seat_select again with the same project (it returns the same agent and a new handle).' },
+
+  // ── a harness session that is not presenting its seat (a forgotten `seat` argument looks like a missing grant) ──
+  { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, reasonIs: 'directory_channel_zero_capability', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
+    next_step: LOST_SEAT_STEP },
+  { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, needsNeed: true, who_acts: 'self', next_tool: 'seat_select', next_step: LOST_SEAT_STEP },
+
+  // ── send to an agent this session cannot see ──────────────────────────────────────────────────
+  { error: 'send_target_not_visible', who_acts: 'owner', next_tool: 'squad_join_request',
+    next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). {reach}' },
+
   // ── generic floors ────────────────────────────────────────────────────────────────────────────
   { error: 'forbidden', tool: 'orient', status: 403, needsNeed: true, who_acts: 'owner',
     next_step: 'This session cannot observe that agent. Ask the owner for the slug of an agent you can observe, then call orient with it. {reach}' },
@@ -207,6 +223,7 @@ function matchEntry(error: string, status: number, detail: unknown, tool: string
   for (const e of GUIDANCE_TABLE) {
     if (e.error !== error) continue
     if (e.tool !== undefined && e.tool !== tool) continue
+    if (e.notTools !== undefined && tool !== undefined && e.notTools.includes(tool)) continue
     if (e.kinds !== undefined && (kind === undefined || !e.kinds.includes(kind))) continue
     if (e.status !== undefined && e.status !== status) continue
     if (e.reasonIs !== undefined && !(typeof detail === 'object' && detail !== null && (detail as { reason?: unknown }).reason === e.reasonIs)) continue // narrowed by the typeof/null checks

@@ -188,6 +188,9 @@ export interface SeatRequestInputs {
   headerHandle?: string | null
   /** `_meta["mupot/seat"]` (call params or call arguments), if any. */
   metaHandle?: string | null
+  /** `arguments.seat` (lane C): the handle as an ordinary tool argument, the only carrier hosted chat clients
+   *  (claude.ai, Grok, Cursor and Codex web) can use. Lowest precedence; same verification as the header. */
+  argHandle?: string | null
   hints: HarnessHints
 }
 
@@ -201,7 +204,22 @@ export function pickHandle(inputs: SeatRequestInputs): string | null {
   if (typeof inputs.metaHandle === 'string' && inputs.metaHandle.length > 0) return inputs.metaHandle
   const header = typeof inputs.headerHandle === 'string' ? inputs.headerHandle.trim() : ''
   if (header.startsWith(SEAT_HANDLE_PREFIX)) return header
+  if (typeof inputs.argHandle === 'string' && inputs.argHandle.length > 0) return inputs.argHandle
   return null
+}
+
+/** The `seat` tool-argument carrier, ONE definition (lane C). Returns the value of `arguments.seat` that is a
+ *  seat-handle CANDIDATE, or null. On a tool with a native `seat` LABEL meaning (send, inbox, check_in,
+ *  boot_context...: `labelTool`) only an `mseat_`-prefixed value is a candidate, exactly the header path's
+ *  split, so a label is never read as, nor rejected as, a handle. On every other tool ANY non-empty string is
+ *  a candidate (so a model that passes the seat row uuid is refused with seat_handle_rejected, not ignored). */
+export function seatHandleFromArgs(args: Record<string, unknown> | null, labelTool = false): string | null {
+  if (args === null) return null
+  const raw = args.seat
+  if (typeof raw !== 'string') return null
+  const v = raw.trim()
+  if (v.startsWith(SEAT_HANDLE_PREFIX)) return v
+  return !labelTool && v.length > 0 ? v : null
 }
 
 interface MatchRow {

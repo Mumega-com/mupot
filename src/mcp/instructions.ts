@@ -86,7 +86,7 @@ export const MUPOT_MCP_SEAT_INSTRUCTIONS = `
 
 SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "Me — auto per workspace")
    - If boot_context reports a harness session with no bound agent, your FIRST step is 'seat_select' with { project: "<workspace name>", folder?: "<worktree path>", thread?: "<thread id>" }. Every value is a label that keys your seat; none of them grants authority.
-   - It returns a seat handle (prefix "mseat_"). Send it on every later request as the X-Mupot-Seat header, or as _meta["mupot/seat"] when your client cannot set headers. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
+   - It returns a seat handle (prefix "mseat_"). Pass it as the "seat" argument on every later call (seat: "<the seat value>"); a harness that can set headers may send X-Mupot-Seat instead. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
    - Once a request carries a valid handle, boot_context shows an identity_receipt naming the agent you act as and how it was bound.`
 
 // mupot W2 (seat_attach) — appended ONLY while SEAT_AUTO_ENROLL and SEAT_ATTACH are both '1'. Same invariant: strictly
