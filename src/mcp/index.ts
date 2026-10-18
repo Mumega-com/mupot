@@ -207,6 +207,7 @@ import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
 import { boundAgentMayBeInstalling, installerWindowView } from '../operators/installer-window'
+import { isInstallerAction } from '../operators/installer-tiers'
 import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
@@ -6134,6 +6135,14 @@ const toolRequestElevation: ToolSpec = {
       if (asked.length === 0 || !asked.every(isAttachedSudoAction)) {
         return fail(403, 'attached_seat_cannot_elevate', { sudoable_actions: ATTACHED_SUDO_ACTIONS, note: 'an attached chat may request only the listed actions; anything else is requested from the agent\'s own seat by a human' })
       }
+    }
+    // Installer windows are for bound agents only; a seat session (attached or not) cannot hold or use one.
+    if (auth.seatBinding && Array.isArray(args.actions) && args.actions.some((a) => typeof a === 'string' && isInstallerAction(a))) {
+      return fail(403, 'installer_window_needs_bound_agent', {
+        who_acts: 'owner',
+        needs: 'human_approval',
+        next_step: 'An installer window is not available to a seat session. Use a bound agent (a workspace token minted for the agent) to request it, or ask your human to make these changes directly.',
+      })
     }
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)

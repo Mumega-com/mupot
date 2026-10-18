@@ -101,9 +101,14 @@ const REQUEST_COLUMNS = `id, tenant, agent_session_id, agent_id, member_id, requ
   requested_scope_type, requested_scope_id, requested_duration_minutes, reason, status,
   created_at, decision_expires_at, decided_at, decided_by_member_id, decided_by_web_session_hash, decision_note`
 
-/** True when ACCESS_REQUIRED_AMR names at least one method (config.ts reads the same list). */
+/** AMR values that prove a passkey / hardware-key class login. ACCESS_REQUIRED_AMR must name ONLY these for action:install_high. */
+const PASSKEY_CLASS_AMR: ReadonlySet<string> = new Set(['hwk', 'swk', 'webauthn'])
+
+/** True when ACCESS_REQUIRED_AMR is non-empty and every value is passkey-class (config.ts reads the same list): one weaker value
+ *  (e.g. pwd) would let any fresh Access login satisfy "passkey only". */
 function accessAmrConfigured(env: Env): boolean {
-  return (env.ACCESS_REQUIRED_AMR ?? '').split(',').some((v) => v.trim().length > 0)
+  const vals = (env.ACCESS_REQUIRED_AMR ?? '').split(',').map((v) => v.trim().toLowerCase()).filter((v) => v.length > 0)
+  return vals.length > 0 && vals.every((v) => PASSKEY_CLASS_AMR.has(v))
 }
 
 const GRANT_COLUMNS = `id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id,
@@ -695,7 +700,7 @@ export async function findElevationDecisionRefusal(
     }
     // "Passkey only" must not silently degrade to any fresh Access login: without an AMR requirement configured it is unenforceable.
     if (selected.includes('action:install_high') && !accessAmrConfigured(env)) {
-      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high needs ACCESS_REQUIRED_AMR configured on this pot' }
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high needs ACCESS_REQUIRED_AMR configured with passkey-class methods only (hwk, swk, webauthn) on this pot' }
     }
     if (selected.includes('action:install_high') && input.decidedViaPasskey !== true) {
       return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high is approved with a passkey; open the approval link in your browser' }

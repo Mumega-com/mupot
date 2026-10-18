@@ -58,6 +58,10 @@ export interface LiveInstallerWindow {
  */
 export async function liveInstallerWindows(env: Env, auth: AuthContext, nowMs: number = Date.now()): Promise<LiveInstallerWindow[]> {
   if (!auth.boundAgentId) return []
+  // SCOPE CUT (PR #2039 round 3): a seat session (attached or not) never holds or uses a window. A seat's real authority is its effective
+  // auth.capabilities (the human's grants copied in), but the chokepoint's conferral bound reads the seat member's DB rows only.
+  // Seats regain windows only when every installer bound reads the seat's effective rank, with its own gate.
+  if (auth.seatBinding) return []
   const session = await loadLiveSessionForBoundAgent(env, auth, nowMs)
   if (!session) return []
   const grants = await loadLiveElevationGrantsForSession(env, auth.tenant, session.id, nowMs)

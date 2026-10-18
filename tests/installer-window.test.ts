@@ -464,11 +464,12 @@ describe('approval policy: standard via Telegram biometric, high passkey-only, n
         decidedByWebSessionHash: 'h', recentReauthOk: true, decidedViaPasskey: true,
       }, req)
     }
-    for (const amr of [undefined, '', ' , ']) {
+    for (const amr of [undefined, '', ' , ', 'pwd', 'hwk,pwd', 'mfa']) {
       const r = await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: amr } as Env)
       expect(r?.reason, `amr=${String(amr)}`).toBe('invalid_elevation_request')
     }
     expect(await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: 'hwk' } as Env)).toBeNull()
+    expect(await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: 'HWK, swk,webauthn' } as Env)).toBeNull()
     expect(await refusalFor(INSTALL_STANDARD_ACTION, { ...env, ACCESS_REQUIRED_AMR: undefined } as Env)).toBeNull()
   })
 
@@ -741,5 +742,35 @@ describe('shared decision core carries the passkey-class bit; envelope marker', 
     expect(plain.who_acts).toBe('admin')
     const installer = refusalGuidance('operator_principal_required', 403, { next_step: 'x', who_acts: 'owner', needs: 'human_approval' })
     expect(installer.who_acts).toBe('owner')
+  })
+})
+
+describe('SCOPE CUT: seat sessions cannot hold or use an installer window (Q2a regression)', () => {
+  // The seat's agent member holds DB lead on S1; its human holds nothing there. A second agent is added into S1 under the window.
+  const seatAuth = (): AuthContext => ({
+    ...agentAuth('agent-op', 'tok-op'),
+    seatBinding: { seatId: 'seat-1', label: 'l', harnessId: 'h', grantTokenId: 'g', humanMemberId: 'mem-human', source: 'handle' },
+  } as unknown as AuthContext) // fixture: a non-attached seat session
+
+  it.each([[INSTALL_STANDARD_ACTION], [INSTALL_HIGH_ACTION]])('%s: a window in the DB is unusable from a seat session: refused, no membership row, no receipt', async (action) => {
+    await openWindow(op(), action, 'department', 'D1') // granted to the same agent session, as the bound agent
+    expect(await liveInstallerWindows(env, seatAuth())).toEqual([])
+    expect((await installerDelegationsFor(env, seatAuth(), 'squad_member_add')).rows).toEqual([])
+    const r = refusal(await call(seatAuth(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' }))
+    expect(r.status).toBe(403)
+    expect(membership('agent-b', 'S1')).toBeNull()
+    expect(rows('SELECT 1 FROM operator_delegation_receipts')).toHaveLength(0)
+    // the same call from the bound agent still works (anti-vacuity)
+    expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
+  })
+
+  it('request_elevation for an install action from a seat session is refused with the bound-agent next step', async () => {
+    await checkIn(op())
+    for (const action of [INSTALL_STANDARD_ACTION, INSTALL_HIGH_ACTION]) {
+      const r = refusal(await call(seatAuth(), 'request_elevation', { actions: [action], scope_type: 'org', duration_minutes: 15, reason: 'x' }))
+      expect(r.error).toBe('installer_window_needs_bound_agent')
+      expect(String(r.detail.next_step)).toMatch(/bound agent/)
+    }
+    expect(rows('SELECT 1 FROM elevation_requests')).toHaveLength(0)
   })
 })
