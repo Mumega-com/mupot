@@ -4245,9 +4245,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agents_attach_designation_end" },
     ],
   },
+  {
+    file: "0239_agent_messages_reply_cap_index.sql",
+    sha256: "944cb29c18d4eccfc4bfe89f14c2eee5c6c6f71cca272b5daa067b72feb8c2e5",
+    statements: [
+      "-- Reply-exception cap (#2041): the atomic cap counts a replier's messages to one recipient keyed\n-- on in_reply_to. Without this the count scans the recipient's whole history.\nCREATE INDEX IF NOT EXISTS idx_agent_messages_reply_cap\n  ON agent_messages(tenant, from_agent, to_agent, in_reply_to)\n  WHERE in_reply_to IS NOT NULL;",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_messages_reply_cap" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "160e6c9daa54762a374d400446c1608cfeb4519054f604d3682d86a6fd82abba"
+export const SCHEMA_CHAIN_DIGEST: string = "daed280b2ee24fb3fce54ecd6fd2769dc0f53251439dded16a65403189153a23"
