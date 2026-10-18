@@ -41,13 +41,14 @@ export const INSTALLER_STANDING_GRANT_CAP = 'member' as const
 /** Failed (refused) usage rows kept per window; past this a refusal is still returned but no longer logged, so the log cannot be flooded. */
 export const INSTALLER_REFUSED_LOG_CAP = 100
 
+// project_squad_set / project_squad_remove are NOT in either tier (scope cut, PR #2039 round 2): a project edge outlives the window and
+// widens whoever already belongs to the squad; the fence cannot yet read a seat's EFFECTIVE grants (auth.capabilities incl. the human's).
+// They are named in INSTALLER_EXCLUDED_ACTS and refused `not_in_installer_window` while a window is live.
 const STANDARD_ACTS: readonly StructuralAction[] = [
   'squad_member_add',
   'squad_member_remove',
   'grant_agent_membership', // HTTP twin of squad_member_add: the same verdict on both doors (#1357 class)
   'move_agent_squad',
-  'project_squad_set',
-  'project_squad_remove',
   'create_agent',
   'create_squad',
 ]
@@ -70,6 +71,9 @@ export const INSTALLER_TIERS: Readonly<Record<InstallerTier, InstallerTierDef>> 
     writeCap: 200,
   },
 }
+
+/** Acts that may never ride a window: refused `not_in_installer_window` while one is live. */
+export const INSTALLER_EXCLUDED_ACTS: ReadonlySet<StructuralAction> = new Set<StructuralAction>(['project_squad_set', 'project_squad_remove'])
 
 export const INSTALLER_ACTION_KEYS: readonly string[] = [INSTALL_STANDARD_ACTION, INSTALL_HIGH_ACTION]
 

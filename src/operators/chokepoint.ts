@@ -46,7 +46,7 @@ import {
   liveInstallerWindows,
   type LiveInstallerWindow,
 } from './installer-window'
-import { INSTALLER_REFUSED_LOG_CAP, INSTALLER_STANDING_GRANT_CAP, INSTALLER_TIERS, installerWindowEnabled } from './installer-tiers'
+import { INSTALLER_EXCLUDED_ACTS, INSTALLER_REFUSED_LOG_CAP, INSTALLER_STANDING_GRANT_CAP, INSTALLER_TIERS, installerWindowEnabled } from './installer-tiers'
 
 /** Every act that writes org structure, standing authority or credentials. The registry is the ratchet's source. */
 export type StructuralAction =
@@ -824,8 +824,7 @@ export async function authorizeStructuralWrite(
       if (verdict.kind === 'delegated') {
         const w = installerWindowOf(installer.windows, verdict)
         if (w) {
-          // Window-only fences the delegation engine does not know (self-benefit through a container, destroying authority above the
-          // ceiling, the standing-grant cap, the per-window write cap). The receipt is already written: close it refused.
+          // Window-only fences the delegation engine does not know (the standing-grant cap and the per-window write cap). The receipt is already written: close it refused.
           const fenced = await installerFence(env, auth, action, verdict, w)
           if (fenced) {
             await finishDelegatedReceipt(env, verdict, false)
@@ -844,6 +843,15 @@ export async function authorizeStructuralWrite(
     }
   }
 
+  // Project edges never ride a window (INSTALLER_EXCLUDED_ACTS): while one is live, say so instead of falling to the legacy lane.
+  if (installerOn && INSTALLER_EXCLUDED_ACTS.has(action) && (await liveInstallerWindows(env, auth)).length > 0) {
+    return refuse(403, 'not_in_installer_window', {
+      act: action,
+      who_acts: 'owner',
+      next_step: 'Project edges are never part of an installer window: the edge outlives the window. Your human makes this edge directly.',
+      needs: 'human_approval',
+    })
+  }
   if (policy.elevationAction && (await boundAgentHasAnyLiveGrantForAction(env, auth, policy.elevationAction))) {
     return { kind: 'agent_legacy' }
   }
@@ -862,27 +870,6 @@ function installerWindowOf(windows: LiveInstallerWindow[], verdict: DelegatedAut
   return windows.find((w) => ids.includes(`elev:${w.grant.id}`))
 }
 
-/** Does the caller already belong to this squad, or to its department, by ANY route: its home squad (agents.squad_id), a
- *  membership row, or a live rank on it (seat capabilities incl. inheritance)? Used only for the window's self-benefit fence. */
-async function callerBelongsToSquadOrDepartment(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
-  const agentId = auth.boundAgentId as string // only reached for a bound-agent caller
-  const target = await loadSquad(env, squadId)
-  if (!target) return false
-  const mine = await env.DB.prepare(
-    `SELECT s.id AS id, s.department_id AS department_id
-       FROM squads s
-      WHERE s.id IN (SELECT squad_id FROM agents WHERE id = ?1 AND squad_id IS NOT NULL)
-         OR s.id IN (SELECT squad_id FROM memberships WHERE agent_id = ?1)`,
-  )
-    .bind(agentId)
-    .all<{ id: string; department_id: string }>()
-  for (const m of mine.results ?? []) {
-    if (m.id === squadId || m.department_id === target.department_id) return true
-  }
-  const rank = auth.memberId ? await currentMemberRankOnScope(env, auth.memberId, 'squad', squadId) : 0
-  return rank > 0
-}
-
 async function windowRowCount(env: Env, auth: AuthContext, grantId: string, failed: boolean): Promise<number> {
   const r = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM elevation_usage_log WHERE tenant = ?1 AND elevation_grant_id = ?2 AND ${failed ? "status = 'failed'" : "status <> 'failed'"}`,
@@ -896,8 +883,6 @@ async function windowRowCount(env: Env, auth: AuthContext, grantId: string, fail
  * Fences that only an installer window needs (the delegation engine judges what an act confers and whom it touches; it does
  * not know the caller is also a beneficiary of the container, nor what the act destroys). Returns a refusal or null.
  *  - write cap per window
- *  - project edge acts on a squad (or department) the caller itself belongs to: the edge outlives the window and widens the caller
- *  - project edge acts (set/downgrade/remove) over an existing edge ABOVE the tier ceiling
  *  - standing grants above MEMBER (INSTALLER_STANDING_GRANT_CAP), whatever the tier ceiling
  */
 async function installerFence(
@@ -915,26 +900,7 @@ async function installerFence(
     })
   }
   const t = verdict.target
-  if ((action === 'project_squad_set' || action === 'project_squad_remove') && t.squadId) {
-    if (await callerBelongsToSquadOrDepartment(env, auth, t.squadId)) {
-      return refuse(403, 'installer_self_benefit', {
-        act: action, reason: 'own_container', who_acts: 'owner', needs: 'human_approval',
-        next_step: 'A window cannot attach or detach a project on a squad (or department) this agent itself belongs to: the edge outlives the window and widens the agent. Ask your human to make that edge.',
-      })
-    }
-    if (t.projectId) {
-      const edge = await env.DB.prepare('SELECT access_level FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2 LIMIT 1')
-        .bind(t.projectId, t.squadId)
-        .first<{ access_level: ProjectAccessLevel }>()
-      if (edge && capabilityRank(LEVEL_TO_CAPABILITY[edge.access_level]) > capabilityRank(def.maxGrant)) {
-        return refuse(403, 'requires_human_approval', {
-          requires_human_approval: true, act: action, reason: 'existing_edge_above_ceiling', who_acts: 'owner', needs: 'human_approval',
-          next_step: 'That project edge is above what this window may touch (changing or removing it would destroy authority above the window). Ask your human.',
-        })
-      }
-    }
-  }
-  const confers: Capability | null = t.projectAccessLevel ? LEVEL_TO_CAPABILITY[t.projectAccessLevel] : (t.capability ?? null)
+  const confers: Capability | null = t.capability ?? null
   if (confers && capabilityRank(confers) > capabilityRank(INSTALLER_STANDING_GRANT_CAP)) {
     return refuse(403, 'requires_human_approval', {
       requires_human_approval: true, act: action, reason: 'installer_standing_grant_cap_member', who_acts: 'owner', needs: 'human_approval',

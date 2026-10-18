@@ -173,7 +173,7 @@ beforeEach(() => {
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
   seed()
-  env = { DB: harness.db, TENANT_SLUG: TENANT, SESSIONS: memoryKv(), PUBLIC_ORIGIN: ORIGIN, INSTALLER_WINDOW: '1' } as unknown as Env // fixture env
+  env = { DB: harness.db, TENANT_SLUG: TENANT, SESSIONS: memoryKv(), PUBLIC_ORIGIN: ORIGIN, INSTALLER_WINDOW: '1', ACCESS_REQUIRED_AMR: 'hwk' } as unknown as Env // fixture env
   authState.current = null
   sessionByToken.clear()
 })
@@ -222,10 +222,8 @@ describe('flag OFF: authority and refusals byte-identical (the request_elevation
 })
 
 describe('standard window: every act allowed in-window, receipted, usage-logged', () => {
-  it('squad_member_add / move_agent_squad / squad_member_remove / project_squad_set+remove / create_agent / create_squad / HTTP twin', async () => {
-    // squad acts are covered by a department window; project edge acts only by an ORG (or project) window, by design
+  it('squad_member_add / move_agent_squad / squad_member_remove / create_agent / create_squad / HTTP twin', async () => {
     const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
-    const wOrg = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
 
     expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
     expect(membership('agent-b', 'S1')).toBe('member')
@@ -233,8 +231,6 @@ describe('standard window: every act allowed in-window, receipted, usage-logged'
     expect(mv.ok, JSON.stringify(mv)).toBe(true)
     expect((await call(op(), 'squad_member_remove', { agent: 'agent-b', squad: 'S1' })).ok).toBe(true)
     expect(membership('agent-b', 'S1')).toBeNull()
-    expect((await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'write' })).ok).toBe(true)
-    expect((await call(op(), 'project_squad_remove', { project_id: 'P1', squad_id: 'S3' })).ok).toBe(true)
     expect((await call(op(), 'create_agent', { squad: 'S1', slug: 'made-agent', name: 'Made' })).ok).toBe(true)
     const cs = await call(op(), 'create_squad', { department: 'D1', slug: 'made-sqd', name: 'Made' })
     expect(cs.ok, JSON.stringify(cs)).toBe(true)
@@ -251,14 +247,14 @@ describe('standard window: every act allowed in-window, receipted, usage-logged'
 
     // one receipt per act, all closed, all under the synthesized id; one usage row per act, all applied
     const receipts = rows<{ delegation_id: string; outcome: string; action: string }>('SELECT delegation_id, outcome, action FROM operator_delegation_receipts')
-    expect(receipts.length).toBe(8)
+    expect(receipts.length).toBe(6)
     for (const r of receipts) {
-      expect([`elev:${w.grantId}`, `elev:${wOrg.grantId}`]).toContain(r.delegation_id)
+      expect(r.delegation_id).toBe(`elev:${w.grantId}`)
       expect(r.outcome).toBe('applied')
     }
-    const u = [...usage(w.grantId), ...usage(wOrg.grantId)]
+    const u = usage(w.grantId)
     expect(u.map((x) => x.tool_name).sort()).toEqual([
-      'create_agent', 'create_squad', 'grant_agent_membership', 'move_agent_squad', 'project_squad_remove', 'project_squad_set', 'squad_member_add', 'squad_member_remove',
+      'create_agent', 'create_squad', 'grant_agent_membership', 'move_agent_squad', 'squad_member_add', 'squad_member_remove',
     ])
     expect(new Set(u.map((x) => x.status))).toEqual(new Set(['applied']))
   })
@@ -355,12 +351,6 @@ describe('ceilings and tier membership', () => {
     expect(refusal(await call(op(), 'grant_agent_capability', { agent: 'agent-b', squad: 'S1', capability: 'lead' })).detail.reason).toBe('installer_standing_grant_cap_member')
   })
 
-  it('project access admin is above both tiers', async () => {
-    await openWindow(op(), INSTALL_HIGH_ACTION, 'org', '')
-    expect(refusal(await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'admin' })).error).toBe('requires_human_approval')
-    expect((await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'write' })).ok).toBe(true)
-  })
-
   it('a target above the ceiling is not the window\'s to touch (target standing is global)', async () => {
     await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
     const r = refusal(await call(op(), 'squad_member_add', { agent: 'agent-lead-target', squad: 'S1', capability: 'member' }))
@@ -377,7 +367,7 @@ describe('ceilings and tier membership', () => {
   })
 
   it('tier tables pinned OUTSIDE the registry, both directions', () => {
-    const std = ['create_agent', 'create_squad', 'grant_agent_membership', 'move_agent_squad', 'project_squad_remove', 'project_squad_set', 'squad_member_add', 'squad_member_remove']
+    const std = ['create_agent', 'create_squad', 'grant_agent_membership', 'move_agent_squad', 'squad_member_add', 'squad_member_remove']
     expect([...INSTALLER_TIERS.standard.acts].sort()).toEqual(std)
     expect([...INSTALLER_TIERS.high.acts].sort()).toEqual([...std, 'grant_agent_capability'].sort())
     expect(INSTALLER_TIERS.standard.maxGrant).toBe('member')
@@ -385,7 +375,7 @@ describe('ceilings and tier membership', () => {
     expect(INSTALLER_TIERS.standard.durationsMinutes).toEqual([15, 60, 240])
     expect(INSTALLER_TIERS.high.durationsMinutes).toEqual([15, 60, 240, 480])
     for (const t of [INSTALLER_TIERS.standard, INSTALLER_TIERS.high]) {
-      for (const bad of ['mint_agent_token', 'mint_member_token', 'register_agent_key', 'grant_gate_capability', 'member_capability_grant', 'manage_delegations', 'suspend_member', 'create_invite']) {
+      for (const bad of ['mint_agent_token', 'mint_member_token', 'register_agent_key', 'grant_gate_capability', 'member_capability_grant', 'manage_delegations', 'suspend_member', 'create_invite', 'project_squad_set', 'project_squad_remove']) {
         expect((t.acts as ReadonlySet<string>).has(bad), bad).toBe(false)
       }
     }
@@ -457,6 +447,29 @@ describe('approval policy: standard via Telegram biometric, high passkey-only, n
     expect(await decide(INSTALL_HIGH_ACTION, { recentReauthOk: true, decidedViaPasskey: true })).toBeNull()
     expect(SENSITIVE_STEP_UP_ACTIONS.has(INSTALL_HIGH_ACTION)).toBe(true)
     expect(SENSITIVE_STEP_UP_ACTIONS.has(INSTALL_STANDARD_ACTION)).toBe(false)
+  })
+
+  it('install_high is refused unless ACCESS_REQUIRED_AMR is configured (passkey-only cannot degrade to any fresh Access login); standard is unaffected', async () => {
+    const sessionId = await checkIn(op())
+    const refusalFor = async (action: string, e: Env) => {
+      const created = await createElevationRequest(env, {
+        tenant: TENANT, agentSessionId: sessionId, agentId: 'agent-op', memberId: 'seat-agent-op',
+        actions: [action], scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'x',
+      })
+      if (!created.ok) throw new Error('request refused')
+      const req = (await loadElevationRequestById(env, TENANT, created.request.id))!
+      return findElevationDecisionRefusal(e, {
+        tenant: TENANT, requestId: req.id, decision: 'approve', selectedActions: [action], decidedByMemberId: APPROVER,
+        decidedByCapabilities: [{ member_id: APPROVER, scope_type: 'org', scope_id: null, capability: 'admin' }],
+        decidedByWebSessionHash: 'h', recentReauthOk: true, decidedViaPasskey: true,
+      }, req)
+    }
+    for (const amr of [undefined, '', ' , ']) {
+      const r = await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: amr } as Env)
+      expect(r?.reason, `amr=${String(amr)}`).toBe('invalid_elevation_request')
+    }
+    expect(await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: 'hwk' } as Env)).toBeNull()
+    expect(await refusalFor(INSTALL_STANDARD_ACTION, { ...env, ACCESS_REQUIRED_AMR: undefined } as Env)).toBeNull()
   })
 
   it('flag off at DECISION time: a pending install request cannot be approved (either tier)', async () => {
@@ -577,46 +590,36 @@ describe('whoami', () => {
   })
 })
 
-describe('P0 class sweep: acts whose target is a container the caller belongs to', () => {
-  // op: home squad S1 (agents.squad_id), lead capability on S1 and S2. S4 is a squad in the same department D1 with no op standing; S3 is in D2.
-  it.each([
-    ['project_squad_set on its HOME squad', 'project_squad_set', { project_id: 'P1', squad_id: 'S1', access_level: 'write' }],
-    ['project_squad_set on a squad it holds capability on', 'project_squad_set', { project_id: 'P1', squad_id: 'S2', access_level: 'write' }],
-    ['project_squad_set on a SIBLING squad of its department', 'project_squad_set', { project_id: 'P1', squad_id: 'S4', access_level: 'write' }],
-    ['project_squad_remove on its HOME squad edge', 'project_squad_remove', { project_id: 'P1', squad_id: 'S1' }],
-  ] as const)('REFUSED under an org window: %s', async (_t, tool, args) => {
-    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
-    const r = refusal(await call(op(), tool, { ...args }))
-    expect(r.error).toBe('installer_self_benefit')
-    expect(rows("SELECT 1 FROM project_squad_access WHERE project_id = 'P1' AND squad_id = 'S1'")).toHaveLength(1)
-    expect(rows("SELECT 1 FROM project_squad_access WHERE project_id = 'P1' AND squad_id IN ('S2','S4')")).toHaveLength(0)
-    expect(rows<{ outcome: string }>('SELECT outcome FROM operator_delegation_receipts').every((x) => x.outcome === 'refused')).toBe(true)
-    expect(usage(w.grantId).at(-1)).toMatchObject({ status: 'failed', error_code: 'installer_self_benefit' })
-  })
+describe('SCOPE CUT: project edges never ride a window (P0 class, round 2 regression)', () => {
+  // A seat's REAL authority is auth.capabilities from resolveSeatCapabilities: it copies the human's squad/department grants.
+  // Here the seat-derived context carries a squad grant (S4) that the agent's own DB rows do not show.
+  const seatDerived = (): AuthContext => ({
+    ...agentAuth('agent-op', 'tok-op'),
+    capabilities: [
+      { member_id: 'seat-agent-op', scope_type: 'squad', scope_id: 'S1', capability: 'lead' },
+      { member_id: 'seat-agent-op', scope_type: 'squad', scope_id: 'S4', capability: 'member' },
+      { member_id: 'seat-agent-op', scope_type: 'department', scope_id: 'D1', capability: 'member' },
+    ],
+  } as AuthContext) // fixture: seat-derived capabilities (the human's grants copied, capped at member)
 
-  it('REFUSED by the capability route alone and the membership route alone (squads in ANOTHER department, so neither home nor department route applies)', async () => {
-    sql("INSERT INTO departments (id, slug, name) VALUES ('D5','d5','Dept Five')")
-    sql("INSERT INTO squads (id, department_id, slug, name) VALUES ('S5','D2','s5-sqd','Five'), ('S6','D5','s6-sqd','Six')")
-    addCap('seat-agent-op', 'member', 'squad', 'S5')
-    sql("INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('m-op-s6', 'agent-op', 'S6', 'observer')")
-    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
-    for (const sq of ['S5', 'S6']) {
-      expect(refusal(await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: sq, access_level: 'read' })).error, sq).toBe('installer_self_benefit')
+  it.each([[INSTALL_STANDARD_ACTION], [INSTALL_HIGH_ACTION]])('%s (org window): project_squad_set and project_squad_remove are refused not_in_installer_window for every squad, own or not', async (action) => {
+    const w = await openWindow(seatDerived(), action, 'org', '')
+    for (const sq of ['S1', 'S2', 'S3', 'S4']) {
+      const set = refusal(await call(seatDerived(), 'project_squad_set', { project_id: 'P1', squad_id: sq, access_level: 'write' }))
+      expect(set.error, `set ${sq}`).toBe('not_in_installer_window')
+      expect(set.detail.next_step).toMatch(/human makes this edge directly/)
+      const rem = refusal(await call(seatDerived(), 'project_squad_remove', { project_id: 'P1', squad_id: sq }))
+      expect(rem.error, `remove ${sq}`).toBe('not_in_installer_window')
     }
-    // the direct chokepoint verdict leaves the receipt CLOSED refused (not only via the dispatcher backstop)
-    const v = await authorizeStructuralWrite(env, op(), 'project_squad_set', { projectId: 'P1', squadId: 'S5', projectAccessLevel: 'read' })
-    expect(v.kind).toBe('refused')
-    expect(rows<{ outcome: string }>("SELECT outcome FROM operator_delegation_receipts WHERE delegation_id = ?", `elev:${w.grantId}`).every((x) => x.outcome === 'refused')).toBe(true)
+    expect(rows("SELECT squad_id FROM project_squad_access WHERE project_id = 'P1'")).toEqual([{ squad_id: 'S1' }])
+    expect(rows('SELECT 1 FROM operator_delegation_receipts')).toHaveLength(0)
+    expect(w.grantId).toBeTruthy()
   })
 
-  it('refused by the same fence for the HIGH tier too', async () => {
-    await openWindow(op(), INSTALL_HIGH_ACTION, 'org', '')
-    expect(refusal(await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S4', access_level: 'write' })).error).toBe('installer_self_benefit')
-  })
-
-  it('a squad OUTSIDE its department and holdings is attachable (anti-vacuity for the fence)', async () => {
-    await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
-    expect((await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'write' })).ok).toBe(true)
+  it('with NO window the pre-PR lane is untouched (the refusal is the window-specific one only while a window is live)', async () => {
+    await checkIn(op())
+    const r = await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S2', access_level: 'read' })
+    expect(r.ok || (!r.ok && r.error !== 'not_in_installer_window')).toBe(true)
   })
 
   it('ALLOWED, bounded by the caller\'s own rank and the member cap, and never widening the caller: adds/moves/creates inside its own squad', async () => {
@@ -632,24 +635,7 @@ describe('P0 class sweep: acts whose target is a container the caller belongs to
   })
 })
 
-describe('P1-1: a window cannot destroy authority above its ceiling', () => {
-  beforeEach(() => {
-    sql("INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('P1','S3','admin')")
-  })
-  it.each([[INSTALL_STANDARD_ACTION], [INSTALL_HIGH_ACTION]])('%s: set (downgrade) and remove of an admin edge are refused, the edge is intact', async (action) => {
-    await openWindow(op(), action, 'org', '')
-    const down = refusal(await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'read' }))
-    expect(down.error).toBe('requires_human_approval')
-    expect(down.detail.reason).toBe('existing_edge_above_ceiling')
-    const rem = refusal(await call(op(), 'project_squad_remove', { project_id: 'P1', squad_id: 'S3' }))
-    expect(rem.detail.reason).toBe('existing_edge_above_ceiling')
-    expect(rows<{ access_level: string }>("SELECT access_level FROM project_squad_access WHERE project_id = 'P1' AND squad_id = 'S3'")[0].access_level).toBe('admin')
-  })
-  it('an edge at or below the ceiling can still be changed (anti-vacuity)', async () => {
-    sql("UPDATE project_squad_access SET access_level = 'write' WHERE project_id = 'P1' AND squad_id = 'S3'")
-    await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
-    expect((await call(op(), 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'read' })).ok).toBe(true)
-  })
+describe('a window cannot destroy authority above its ceiling (agent targets)', () => {
   it('removing or downgrading an admin-standing AGENT is refused under a member window (target standing)', async () => {
     await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
     expect(refusal(await call(op(), 'squad_member_remove', { agent: 'agent-admin-target', squad: 'S3' })).error).toBe('requires_human_approval')

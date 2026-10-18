@@ -101,6 +101,11 @@ const REQUEST_COLUMNS = `id, tenant, agent_session_id, agent_id, member_id, requ
   requested_scope_type, requested_scope_id, requested_duration_minutes, reason, status,
   created_at, decision_expires_at, decided_at, decided_by_member_id, decided_by_web_session_hash, decision_note`
 
+/** True when ACCESS_REQUIRED_AMR names at least one method (config.ts reads the same list). */
+function accessAmrConfigured(env: Env): boolean {
+  return (env.ACCESS_REQUIRED_AMR ?? '').split(',').some((v) => v.trim().length > 0)
+}
+
 const GRANT_COLUMNS = `id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id,
   effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason`
 
@@ -687,6 +692,10 @@ export async function findElevationDecisionRefusal(
     const needsStepUp = attachmentOrigin !== null || installing.length > 0 || selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
     if (needsStepUp && !input.recentReauthOk) {
       return { ok: false, reason: 'reauth_required' }
+    }
+    // "Passkey only" must not silently degrade to any fresh Access login: without an AMR requirement configured it is unenforceable.
+    if (selected.includes('action:install_high') && !accessAmrConfigured(env)) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high needs ACCESS_REQUIRED_AMR configured on this pot' }
     }
     if (selected.includes('action:install_high') && input.decidedViaPasskey !== true) {
       return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high is approved with a passkey; open the approval link in your browser' }
