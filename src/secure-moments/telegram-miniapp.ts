@@ -26,6 +26,7 @@ import {
 } from '../access/decision-core'
 import { loadElevationRequestById, requestIsFromAttachedChat, type ElevationRequestRecord } from '../auth/elevation'
 import { ELEVATION_ACTIONS, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
+import { isInstallerAction } from '../operators/installer-tiers'
 import { reserveRotation } from './rotate'
 import { reissueMomentLink } from './issue'
 import { loadMoment, momentIsLive, type MomentRow } from './store'
@@ -240,6 +241,14 @@ export const PASSKEY_REQUIRED_MESSAGE = 'Granting a sensitive action needs a pas
  */
 export const TELEGRAM_PASSKEY_ONLY_EXTRA: ReadonlySet<string> = new Set(['action:home_access'])
 
+/**
+ * Whether a decision may ride the PIN-window trust token (no fresh biometric/PIN). A deny always may; an elevation approve may
+ * unless it names an installer window (a standing-authority grant needs a fresh proof, never a live trust token); a seed approve never.
+ */
+export function tgDecisionIsRoutine(kind: MomentRow['kind'], p: Params): boolean {
+  return p.decision === 'deny' || (kind === 'elevation' && !p.actions.some(isInstallerAction))
+}
+
 /** True when this action must NOT be granted through Telegram: sensitive, Telegram-extra, or not a known action at all. */
 function passkeyOnly(action: string): boolean {
   return !Object.prototype.hasOwnProperty.call(ELEVATION_ACTIONS, action) || SENSITIVE_STEP_UP_ACTIONS.has(action) || TELEGRAM_PASSKEY_ONLY_EXTRA.has(action)
@@ -402,7 +411,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     let presentedSha256 = ''
     let tgProof: 'trust' | 'pin' | 'biometric' | null = null
     if (pw) {
-      const au = await pwAuthorize(c.env, { body: g.body, who: { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId }, routine: m.kind === 'elevation' || p.decision === 'deny' }, Date.now())
+      const au = await pwAuthorize(c.env, { body: g.body, who: { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId }, routine: tgDecisionIsRoutine(m.kind, p) }, Date.now())
       if (!au.ok) return fail(c, au.status, au.message, au.title, au.extra)
       device = au.device
       identityId = au.device.login_identity_id

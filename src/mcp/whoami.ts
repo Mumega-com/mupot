@@ -25,6 +25,8 @@ import { attachedAuthority } from '../auth/attached-ceiling'
 import { mcpEndpoint } from '../dashboard/connect'
 import { consentChoiceLabels, consentLabels, refusalGuidance, SEAT_SELECT_STEP as TABLE_SEAT_SELECT_STEP, type WhoActs as TableWhoActs } from './refusal-next-step'
 
+import type { InstallerWindowView } from '../operators/installer-window'
+
 export type WhoamiState = 'no_agent' | 'own_seat' | 'acting_as' | 'host' | 'harness_unseated'
 export type WhoActs = TableWhoActs // one vocabulary with the refusal envelope (refusal-next-step.ts)
 
@@ -46,6 +48,8 @@ export interface Whoami {
   /** Present when the request is bound to a seat. Never carries an agent id: `acts_as` is a slug/name. */
   seat?: { seat_id: string; acts_as: string | null; presented: boolean }
   harness: 'present' | 'absent'
+  /** Installer window (flag INSTALLER_WINDOW): present only while this session holds a LIVE window. Never otherwise. */
+  installer_window?: InstallerWindowView
   /** ADMISSION_TAPE on AND the seat has a status only. Status band + reason class; the score is never exposed to the seat. */
   admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
 }

@@ -148,7 +148,7 @@ async function fileElevation(actions: string[]): Promise<Moment> {
   return { ...parseLink(res.approve_url), subject: res.request.id }
 }
 // One grant per (agent session, action, scope): every moment asks for a DIFFERENT non-sensitive action.
-const freeActions = Object.keys(ELEVATION_ACTIONS).filter((k) => !SENSITIVE_STEP_UP_ACTIONS.has(k) && !TELEGRAM_PASSKEY_ONLY_EXTRA.has(k) && isRequestableElevationAction(k))
+const freeActions = Object.keys(ELEVATION_ACTIONS).filter((k) => !SENSITIVE_STEP_UP_ACTIONS.has(k) && !TELEGRAM_PASSKEY_ONLY_EXTRA.has(k) && isRequestableElevationAction(k) && !k.startsWith('action:install_')) // installer windows are flag-gated and requested alone (tests/installer-window.test.ts)
 let nextAction = 0
 const act = (): string => freeActions[nextAction++ % freeActions.length]
 const momentStatus = (id: string): string => one<{ status: string }>('SELECT status FROM secure_moments WHERE id = ?', id)?.status ?? 'missing'

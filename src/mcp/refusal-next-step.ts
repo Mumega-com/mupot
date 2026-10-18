@@ -252,6 +252,11 @@ function linkFromDetail(detail: unknown): string | undefined {
 
 /** A squad-access miss is an org admin's to fix. */
 function reasonWho(detail: unknown): WhoActs | undefined {
+  // The installer-window refusals (chokepoint.ts) name who acts next in their own detail, beside their own next_step.
+  if (typeof detail === 'object' && detail !== null && 'next_step' in detail && 'needs' in detail && (detail as { needs?: unknown }).needs === 'human_approval') {
+    const w = (detail as { who_acts?: unknown }).who_acts // narrowed by the typeof/null/in checks
+    if (w === 'self' || w === 'owner' || w === 'admin' || w === 'org_admin') return w
+  }
   if (typeof detail !== 'object' || detail === null || !('reason' in detail)) return undefined
   const reason = (detail as { reason?: unknown }).reason // narrowed by the 'in' check above
   if (reason === 'no_squad_access') return 'org_admin'

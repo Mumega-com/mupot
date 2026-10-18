@@ -16,6 +16,7 @@
 // GUARD that the caller's AuthContext.tenant matches env.TENANT_SLUG so a token
 // minted for another tenant can never read or mutate this pot.
 
+import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import { Hono } from 'hono'
 import type {
   Env,
@@ -262,7 +263,11 @@ orgApp.post('/departments/:id/squads', async (c) => {
       name: body.name,
       charter: body.charter,
     },
-    { createdByMemberId: auth.memberId ?? undefined },
+    {
+      createdByMemberId: auth.memberId ?? undefined,
+      // an installer window authorised this create: stamp the grant, same as the MCP door
+      createdViaElevationGrant: gate.kind === 'delegated' && isInstallerDelegationId(gate.delegation.id) ? installerGrantIdOf(gate.delegation.id) : undefined,
+    },
   )
   await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) {

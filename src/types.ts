@@ -402,6 +402,8 @@ export interface Env {
   // On => a bound agent may ALSO act inside a live agent_operator_delegations row, through the single
   // chokepoint src/operators/chokepoint.ts. Read via delegatedOperatorsEnabled().
   DELEGATED_OPERATORS?: string
+  // Installer window (PR-C, design S1): opt-in flag, default OFF. Read via installerWindowEnabled() in src/operators/installer-window.ts.
+  INSTALLER_WINDOW?: string
   /** Opt-in ("1"/"true"): outbound Grok Bot webhook doorbell (src/agents/webhook-doorbell.ts). Default off. */
   WEBHOOK_DOORBELL?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.

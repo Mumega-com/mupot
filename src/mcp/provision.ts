@@ -31,6 +31,7 @@
 //                        through Jev with a decline-on-low-confidence gate. Adds
 //                        no authorization of its own.
 
+import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
@@ -661,6 +662,10 @@ const toolCreateSquad: ToolSpec = {
     // so a slug_taken refusal (or an adopt:true override) can report "created
     // by member X under elevation receipt Y" rather than just naming the actor.
     let createdViaElevationGrant: string | undefined
+    // An installer window authorised this create (synthesized delegation `elev:<grantId>`): stamp the grant, same as the legacy elevation lane.
+    if (squadGate.kind === 'delegated' && isInstallerDelegationId(squadGate.delegation.id)) {
+      createdViaElevationGrant = installerGrantIdOf(squadGate.delegation.id)
+    }
     if (!squadDelegated && !hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
