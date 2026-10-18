@@ -649,7 +649,8 @@ describe('round 2: seat_select exemption, audit clarity, member pin', () => {
     const text = JSON.stringify(again.body)
     expect(text).toContain('not_unbound_directory_session')
     expect(text).toContain('seat handle you sent')
-    expect(text).toContain('send no seat handle')
+    expect(text).toContain('already an agent')
+    expect(text).not.toContain('send no seat handle') // DE7: the old "retry unbound" advice is gone
   })
 
   it('audit: an auto seat is created as action seat_auto by a system actor naming the human; seat_select rows keep seat_select/user', async () => {
