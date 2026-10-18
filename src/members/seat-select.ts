@@ -212,7 +212,7 @@ interface SeatRow {
 
 const W1_NOTE =
   'Seat resolved. To act as this seat, pass the `seat` value below as the `seat` argument on every later call '
-  + '(a harness that can set headers may send X-Mupot-Seat instead); the handle is shown once. Without it this session stays your own unbound identity. '
+  + '(a harness that can set headers may send X-Mupot-Seat instead); Lost the handle? Call seat_select again with the same project/folder/thread labels: you get your existing seat and a new handle. Without it this session stays your own unbound identity. '
   + 'The agent has member capability at most and no admin.'
 
 /** Issue a handle for an EXISTING seat (its own batch: evict-LRU-at-cap + insert). Any failure

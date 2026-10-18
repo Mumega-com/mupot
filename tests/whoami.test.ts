@@ -16,6 +16,7 @@ import { hashMemberToken } from '../src/auth/member-bearer'
 import { mintHarnessToken } from '../src/members/harness-token'
 import { buildWhoami, bootstrapOffered, type Whoami, type WhoamiFacts } from '../src/mcp/whoami'
 import { mcpEndpoint } from '../src/dashboard/connect'
+import { invokeTool } from '../src/mcp/index'
 import type { AuthContext, Env } from '../src/types'
 
 afterEach(() => { vi.unstubAllGlobals() })
@@ -258,6 +259,61 @@ describe('real handler: each reachable state', () => {
     } finally { w.h.close() }
   })
 })
+
+describe('round 2', () => {
+  it('a lost handle: the harness_unseated step says to re-select with the SAME labels, and doing so returns the same agent, a new handle, and no new agents row', async () => {
+    const w = newWorld()
+    try {
+      const c = await oauthClient(w, 'claude', 'Claude', HARNESS_CHOICE)
+      const wh = whoamiOf((await call(w, c, 'boot_context')).body)
+      expect(wh.missing[0].next_step).toContain('Lost the handle? Call seat_select again with the same project/folder/thread labels')
+      const first = await call(w, c, 'seat_select', { project: 'lost-handle', folder: 'f', thread: 't' })
+      expect(first.refused).toBe(false)
+      const rows = w.agents()
+      const again = await call(w, c, 'seat_select', { project: 'lost-handle', folder: 'f', thread: 't' })
+      expect(again.refused, JSON.stringify(again.body)).toBe(false)
+      expect(obj(again.body.agent).slug).toBe(obj(first.body.agent).slug)
+      expect(again.body.seat_handle).not.toBe(first.body.seat_handle)
+      expect(typeof again.body.seat_handle).toBe('string')
+      expect(w.agents()).toBe(rows)
+      expect(String(again.body.note)).toContain('Lost the handle?')
+      expect(String(again.body.note)).not.toContain('shown once')
+    } finally { w.h.close() }
+  })
+
+  it('the curated profile door (sideEffectFree) does not attach whoami to the unbound orient refusal (it would name seat_select, tool_not_in_profile there)', async () => {
+    const w = newWorld()
+    try {
+      const auth = { userId: 'u', role: 'member', tenant: TENANT, channel: 'directory', memberId: 'mem-admin', capabilities: [], harnessId: 'h-1' } as unknown as AuthContext // fields the orient refusal reads
+      const full = await invokeTool(auth, w.env, 'orient', {}, { origin: ORIGIN_P, sideEffectFree: false })
+      const prof = await invokeTool(auth, w.env, 'orient', {}, { origin: ORIGIN_P, sideEffectFree: true })
+      expect((full as { whoami?: unknown }).whoami).toBeDefined()
+      expect(prof.ok).toBe(false)
+      expect((prof as { whoami?: unknown }).whoami).toBeUndefined()
+    } finally { w.h.close() }
+  })
+
+  it('K2: doors do not offer connect (it answers no_squad_access) and the prose is the plain "person, not an agent" step', async () => {
+    const w = newWorld()
+    try {
+      const boot = (await call(w, await memberTokenClient(w), 'boot_context')).body
+      expect(arr(boot.available_doors).map((d) => d.tool)).not.toContain('connect')
+      expect(arr(boot.available_doors).map((d) => d.tool)).toContain('mint_agent_token')
+      expect(whoamiOf(boot).missing[0].next_step).toBe('This token is a person, not an agent. Ask an org admin to run mint_agent_token for your agent, then reconnect with that token.')
+      expect(JSON.stringify(boot)).not.toContain('basin-drop')
+    } finally { w.h.close() }
+  })
+
+  it('onboarding carries whoami.state beside connection_kind', async () => {
+    const w = newWorld()
+    try {
+      const boot = (await call(w, await oauthClient(w, 'claude', 'Claude', HARNESS_CHOICE), 'boot_context')).body
+      expect(obj(boot.onboarding)).toMatchObject({ connection_kind: 'member', state: 'harness_unseated' })
+    } finally { w.h.close() }
+  })
+})
+
+const ORIGIN_P = 'https://pot.test'
 
 // ── pure layer ────────────────────────────────────────────────────────────────
 

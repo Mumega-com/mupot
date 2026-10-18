@@ -6493,6 +6493,8 @@ async function reportSelfAtBoot(
 type WhoActs = 'self' | 'owner' | 'admin' | 'org_admin'
 interface BootOnboarding {
   connection_kind: ConnectionKind
+  /** whoami.state, repeated so the two vocabularies are readable together: connection_kind member = a person (no_agent, harness_unseated); seat = own_seat; attached/agent_bound = acting_as/host. */
+  state: Whoami['state']
   inbox?: 'peek_only' | 'none'
   agent: { keyed: boolean; inbox: 'consume' | 'peek' | 'none' | 'fenced'; can_self_report: boolean }
   next_step?: string
@@ -6568,6 +6570,7 @@ function buildBootOnboarding(
     const canMark = seatAttachEnabled(env)
     return {
       connection_kind: kind,
+      state: whoami.state,
       inbox: 'peek_only',
       agent: whoami.agent,
       ...(fenced && first
@@ -6583,21 +6586,18 @@ function buildBootOnboarding(
     // Unbound: the next step IS whoami's first missing step (one derivation, so the fields cannot disagree).
     return {
       connection_kind: kind,
+      state: whoami.state,
       inbox: 'none',
       agent: whoami.agent,
       ...(first ? { next_step: first.next_step, who_acts: first.who_acts } : {}),
     }
   }
   // agent_bound or seat: the caller IS the agent's runtime (a seat is its own agent: no runtime/model/host nag, #door-map cut list).
-  const base = { connection_kind: kind, agent: whoami.agent }
+  const base = { connection_kind: kind, state: whoami.state, agent: whoami.agent }
   if (kind === 'seat') return base
-  if (keyed) {
-    return {
-      ...base,
-      next_step: 'this agent has a registered signing key, so its fleet row moves by signature only: report runtime, model and host from the agent host via POST /api/fleet/attach-signed. boot_context does not record them for a keyed agent.',
-      who_acts: 'self',
-    }
-  }
+  // A keyed agent's fleet row moves by signature only: registry.detail (refused_signed_attach_required) names POST /api/fleet/attach-signed.
+  // Whoami is the source of next steps and lists none for it (reporting is telemetry, not a requirement), so none is repeated here.
+  if (keyed) return base
   const report = whoami.missing.find((m) => m.code === 'report_refused' || m.code === 'report_runtime')
   return { ...base, ...(report ? { next_step: report.next_step, who_acts: report.who_acts } : {}) }
 }
@@ -6661,7 +6661,7 @@ function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
   switch (state) {
     case 'bound':
       return [
-        { tool: 'orient', does: 'your full basin-drop packet — squad, scope, tasks, field state', requires: 'nothing (your token is agent-bound)' },
+        { tool: 'orient', does: "your agent's briefing: squad, scope, tasks, inbox", requires: 'nothing (your token is agent-bound)' },
         ...alwaysOpen,
       ]
     case 'unbound_no_agent':
@@ -7001,7 +7001,7 @@ const toolBootContext: ToolSpec = {
     const firstStep = whoami.missing.find((m) => !m.code.startsWith('report_'))
     const nextStep = firstStep
       ? firstStep.next_step
-      : 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
+      : "call orient (no args) for your agent's briefing: squad, tasks, inbox"
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -7080,10 +7080,10 @@ const toolBootContext: ToolSpec = {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
       nextStepOut = auth.seatBinding.attached
-        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) to receive your basin-drop packet.`
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
-        ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
-        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
+        ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
+        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
 
       // A silent downgrade (attach refused, handle rejected, auto seat refused) is said out loud, after the acting-as line.
       if (firstStep) nextStepOut = `${nextStepOut} ${firstStep.next_step}`
@@ -7154,7 +7154,8 @@ const toolOrient: ToolSpec = {
           'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as ' + consentLabels(consentChoiceLabels(env)).many + '); a seated session then calls orient with no arguments.',
           'For an agent you can observe, pass orient { agent: "<id-or-slug>" }.',
         ].join(' ')),
-        whoami: await whoamiFor(env, auth, ctx?.origin),
+        // Not on the curated profile door: it cannot call the tools whoami's steps name (seat_select is tool_not_in_profile there).
+        ...(ctx?.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx?.origin) }),
       }
     }
 
@@ -7418,11 +7419,11 @@ const toolConnect: ToolSpec = {
       // DE2: a session-local claim does not bind the session, so `orient {}` would answer "agent required". Name the agent.
       next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
-            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your basin-drop call orient { agent: "${agentRef.slug}" }.`
-            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your basin-drop call orient { agent: "${agentRef.slug}" }.`)
+            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`
+            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`)
         : durable
-          ? 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.'
-          : `You are now hot (this claim is session-local). For your basin-drop call orient { agent: "${agentRef.slug}" }, or rely on this packet.`,
+          ? 'You are now hot. Call orient {} (or rely on this packet) for your full briefing.'
+          : `You are now hot (this claim is session-local). For your agent's briefing call orient { agent: "${agentRef.slug}" }, or rely on this packet.`,
       packet: data,
       brief: renderBrief(data),
     })

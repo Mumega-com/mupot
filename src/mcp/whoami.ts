@@ -97,7 +97,7 @@ export function bootstrapOffered(auth: AuthContext, facts: WhoamiFacts): boolean
 }
 
 // The seat_select instruction is the refusal table's own sentence (one text, so boot and a refusal cannot disagree).
-const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet. ${TABLE_SEAT_SELECT_STEP}`
+const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet. ${TABLE_SEAT_SELECT_STEP} Lost the handle? Call seat_select again with the same project/folder/thread labels: you get your existing seat and a new handle.`
 
 export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami {
   const { facts } = ctx
@@ -173,14 +173,14 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
         who_acts: 'owner',
         next_step: wasBootstrapped
           ? `you already bootstrapped an agent. Reconnect this connector and pick ${labels.one} on the consent screen to bind this connection to it.`
-          : `this connection has no agent and no harness. Reconnect this connector and pick ${labels.many} on the consent screen (each chat then gets its own seat), or ${labels.one} to act as an agent you already have.`,
+          : `You are connected as a person with no agent yet. Ask your human to remove and re-add this MCP server (URL in link) and on the consent screen choose ${labels.many} (each chat gets its own agent) or ${labels.one}.`,
         link: consentUrl,
       })
     } else {
       missing.push({
         code: 'agent_required',
         who_acts: 'org_admin',
-        next_step: "this is a member token with no agent binding, so boot records no runtime, model or host. An agent's own runtime should connect with the agent-bound connection: an org admin mints your agent a workspace token (mint_agent_token) and you reconnect with it; if you only need to read as an existing agent now, connect { agent_name: \"<its slug>\" } claims it for this session.",
+        next_step: 'This token is a person, not an agent. Ask an org admin to run mint_agent_token for your agent, then reconnect with that token.',
       })
     }
   } else if (state === 'acting_as' && basis === 'attached' && facts.fenced) {
@@ -249,6 +249,8 @@ export function whoamiDoorFilter(env: Env, auth: AuthContext, w: Whoami): (tool:
     if (tool === 'bootstrap_self') return offered.has('bootstrap_self')
     if (tool === 'seat_select') return offered.has('seat_select')
     if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat'
+    // K2 (member token, no agent): connect answers no_squad_access and the step is an org admin's mint_agent_token, so only that stays.
+    if (w.state === 'no_agent' && auth.channel !== 'directory') return tool === 'mint_agent_token' || tool === 'status' || tool === 'boot_context'
     return true
   }
 }
