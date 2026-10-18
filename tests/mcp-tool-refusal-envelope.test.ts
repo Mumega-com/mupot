@@ -103,12 +103,12 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
     expect(String(body.result.structuredContent.next_step)).toContain('grant_agent_capability')
   })
 
-  it('tool_not_in_profile keeps its JSON-RPC code and adds the envelope in data (DE5)', async () => {
+  it('tool_not_in_profile keeps its JSON-RPC code AND its data; the envelope rides beside data (DE5)', async () => {
     const res = await call(mcpApp, 'https://pot.example/profile/needs-you', { ...rpcCall, params: { name: 'send', arguments: {} } })
-    const body = await res.json() as { error?: { code: number; message: string; data: Record<string, unknown> } }
-    expect(body.error).toMatchObject({ code: -32601, message: 'tool_not_in_profile' })
-    expect(body.error?.data).toMatchObject({ profile: 'needs-you', who_acts: 'self' })
-    expect(String(body.error?.data.next_step)).toContain('full endpoint /mcp')
+    const body = await res.json() as { error?: { code: number; message: string; data: Record<string, unknown>; who_acts?: string; next_step?: string } }
+    expect(body.error).toMatchObject({ code: -32601, message: 'tool_not_in_profile', who_acts: 'owner' })
+    expect(body.error?.data).toEqual({ profile: 'needs-you' }) // unchanged shape: nothing added inside data
+    expect(String(body.error?.next_step)).toContain('https://pot.example/mcp') // the absolute full endpoint, not a relative path
   })
 
   it('REST /actions refusal body stays exactly as before: no who_acts, no next_step', async () => {

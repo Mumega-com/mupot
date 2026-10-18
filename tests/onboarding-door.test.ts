@@ -174,9 +174,10 @@ async function rpc(w: World, c: Client, method: string, params: Json): Promise<R
 
 async function call(w: World, c: Client, name: string, args: Json = {}): Promise<Reply> {
   const res = await rpc(w, c, 'tools/call', { name, arguments: args })
-  const env = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Json }; error?: { message?: string; data?: unknown } }
+  const env = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Json }; error?: { message?: string; data?: unknown; who_acts?: unknown; next_step?: unknown; next_tool?: unknown } }
   if (env.result?.isError) { w.refusals.push(env.result.structuredContent ?? {}); return { refused: true, body: env.result.structuredContent ?? {} } }
-  if (env.error) { const b = { error: env.error.message, detail: env.error.data }; w.refusals.push(b); return { refused: true, body: b } }
+  // Lane B: the refusal envelope rides as SIBLING members of the JSON-RPC error (beside `data`, which keeps its old shape).
+  if (env.error) { const b = { error: env.error.message, detail: env.error.data, who_acts: env.error.who_acts, next_step: env.error.next_step, next_tool: env.error.next_tool }; w.refusals.push(b); return { refused: true, body: b } }
   return { refused: res.status >= 400, body: env.result?.structuredContent ?? {} }
 }
 
@@ -322,7 +323,7 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
   })
 
   // dead end orient-refusal: bound -> a real packet about the bound agent; unbound -> an envelope naming a callable door
-  dead(DEAD.orientRefusal[kind])('orient answers a real packet when bound, or a who_acts + next_step envelope when not', () => {
+  dead(DEAD.orientRefusal[kind])('orient answers a real packet when bound, or a who_acts + next_step envelope when not', async () => {
     pre()
     const boundId = t.boot3.bound_agent_id ?? null
     if (boundId !== null) {
@@ -333,6 +334,16 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
       expect(['self', 'owner', 'admin', 'org_admin']).toContain(field(t.orient.body, 'who_acts'))
       const next = actionIn(String(field(t.orient.body, 'next_step') ?? ''), t.tools)
       expect(toolDoors(t.boot3)).toContain(next)
+      // Lane B round 2: a door that boot lists is not enough; the named tool must NOT be refused for this very session
+      // ("Call seat_attach", "Call boot_context", "Call connect" would each satisfy the line above and fail here).
+      expect(next).toBeDefined()
+      const again = await call(t.w, t.c, String(next), STATIC_ARGS[String(next)] ?? {})
+      expect(again.refused, `${String(next)}: ${JSON.stringify(again.body)}`).toBe(false)
+      if (kind === 'claude') {
+        // Pinned per connection kind: a Claude thread (harness, no seat) acts for itself; seat_select first.
+        expect(field(t.orient.body, 'who_acts')).toBe('self')
+        expect(next).toBe('seat_select')
+      }
     }
   })
 

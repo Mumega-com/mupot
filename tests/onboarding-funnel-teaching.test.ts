@@ -17,7 +17,7 @@ import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
 import { attachSeatToAgent } from '../src/members/seat-attach'
-import { GUIDANCE_TABLE, refusalGuidance, refusalNextStep, type WhoActs } from '../src/mcp/refusal-next-step'
+import { GUIDANCE_TABLE, refusalGuidance, refusalNextStep, renderStep, type ConnKind, type GuideCtx, type WhoActs } from '../src/mcp/refusal-next-step'
 import { hashMemberToken } from '../src/auth/member-bearer'
 import { checkBootstrapSelfRateLimit } from '../src/members/bootstrap-self'
 import {
@@ -121,11 +121,11 @@ describe('refusalNextStep (pure)', () => {
 
   it('covers the not-bound, seat and flag-off refusals and the rate limit', () => {
     expect(refusalNextStep('not_agent_bound', 403, 'x')).not.toContain('seat_attach')
-    expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('org admin')
+    expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('an admin to mint')
     expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('mint_agent_token')
     expect(refusalNextStep('seat_required', 403, undefined)).toContain('workspace bearer')
     // Agrees with connect DOOR A: seat_select only when a harness is present, otherwise re-consent with "Many chats".
-    expect(refusalNextStep('seat_required', 403, undefined)).toContain('Many chats')
+    expect(refusalNextStep('seat_required', 403, undefined, undefined, { choiceLabels: true })).toContain('Many chats')
     expect(refusalNextStep('seat_required', 403, undefined)).not.toContain('Do not call seat_select')
     expect(refusalNextStep('seat_attach_disabled', 403, undefined)).toMatch(/not enabled/)
     expect(refusalNextStep('rate_limited', 429, undefined)).toMatch(/wait/)
@@ -333,9 +333,11 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
       expect(row.next_step.trim().length, row.error).toBeGreaterThan(20)
       // A row must be reachable: feed it the detail it needs and expect its own text back.
       const detail = row.reasonIs ? { reason: row.reasonIs, need: 'x' } : row.needsNeed ? { need: 'x' } : row.detailMatch ? 'poll requires an agent-bound credential agent required' : undefined
-      const g = refusalGuidance(row.error, row.status ?? 403, detail, row.tool)
-      expect(g.who_acts, row.error).toBe(row.who_acts)
-      expect(g.next_step, `${row.tool ?? '*'}:${row.error}`).toBe(row.next_step)
+      const ctx: GuideCtx = { kind: row.kinds?.[0], choiceLabels: true, origin: 'https://pot.example' }
+      const g = refusalGuidance(row.error, row.status ?? 403, detail, row.tool, ctx)
+      expect(g.who_acts, `${row.tool ?? '*'}:${row.error}:${row.kinds?.join('|') ?? '*'}`).toBe(row.who_acts)
+      expect(g.next_step, `${row.tool ?? '*'}:${row.error}`).toBe(renderStep(row.next_step, ctx))
+      expect(g.next_step).not.toMatch(/\{(many|one|reach|full_mcp)\}/) // every token is rendered
     }
   })
 
@@ -343,7 +345,9 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     expect(refusalGuidance('forbidden', 403, { need: 'admin', hint: 'x' })).toEqual({ who_acts: 'admin' })
     const dir = refusalGuidance('forbidden', 403, { reason: 'directory_channel_zero_capability', need: 'workspace-channel token' })
     expect(dir.who_acts).toBe('owner') // connect-after-bootstrap: the human binds; the reason no longer suppresses the step
-    expect(dir.next_step).toMatch(/One agent.*Many chats/)
+    expect(dir.next_step).toMatch(/Existing agent.*Me \(auto\)/) // SEAT_ATTACH off (prod): the labels the consent page actually shows
+    expect(dir.next_step).not.toMatch(/Many chats|One agent/)
+    expect(refusalGuidance('forbidden', 403, { reason: 'directory_channel_zero_capability', need: 'x' }, undefined, { choiceLabels: true }).next_step).toMatch(/One agent.*Many chats/)
     expect(dir.next_step).toContain('mint_agent_token')
     expect(refusalGuidance('forbidden', 403, { reason: 'no_squad_access', need: 'member' }).who_acts).toBe('org_admin')
     expect(refusalGuidance('some_unknown_code', 409, undefined).who_acts).toBe('self')
@@ -351,31 +355,67 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
   })
 
   it('one case per code: who_acts + next_step on the door codes of map §3', () => {
-    const cases: Array<[string, number, unknown, string | undefined, WhoActs, RegExp]> = [
-      ['harness_session_seat_required', 403, 'msg', undefined, 'self', /seat_select \{ project/],
-      ['not_unbound_directory_session', 403, 'msg', 'seat_select', 'self', /already an agent/],
-      ['harness_required', 403, 'msg', 'seat_select', 'owner', /Many chats/],
-      ['member_not_active', 403, undefined, 'seat_select', 'org_admin', /reactivates/],
-      ['seat_cap_reached', 409, { cap: 3 }, 'seat_select', 'self', /same project/],
-      ['seat_agent_inactive', 409, { reason: 'seat_retired' }, 'seat_select', 'admin', /retired/],
-      ['seat_key_source_conflict', 409, 'x', 'seat_select', 'self', /different project or thread/],
-      ['provisioning_failed', 500, undefined, 'seat_select', 'self', /Retry seat_select once/],
-      ['rate_limited', 429, undefined, 'bootstrap_self', 'self', /bootstrap rate limit/],
-      ['agent_bound_credential_required', 403, undefined, 'verify_agent_connection', 'admin', /mint_agent_token/],
-      ['agent_bound_workspace_credential_required', 403, undefined, 'runtime_seat_register_pending', 'self', /token_binding_attest/],
-      ['consumer_fenced', 409, undefined, 'inbox', 'admin', /set_agent_inbox_consumer/],
-      ['not_member_bound', 403, 'check_in requires a member-token principal', 'check_in', 'self', /member/],
-      ['invalid_args', 400, 'presence_mode: poll requires an agent-bound credential', 'check_in', 'admin', /mint_agent_token/],
-      ['attached_seat_cannot_set_presence_mode', 403, undefined, 'check_in', 'self', /without presence_mode/],
-      ['tool_not_in_profile', 403, { profile: 'needs-you' }, 'send', 'self', /full endpoint \/mcp/],
-      ['invalid_args', 400, 'agent required: this session is not an agent yet.', 'orient', 'self', /orient \{ agent:/],
-      ['forbidden', 403, { need: 'admin' }, 'pot_list', 'admin', /grant_agent_capability/],
+    const FULL: GuideCtx = { choiceLabels: true, origin: 'https://pot.example' }
+    // [error, status, detail, tool, kind, who_acts, step]
+    const cases: Array<[string, number, unknown, string | undefined, ConnKind | undefined, WhoActs, RegExp]> = [
+      ['harness_session_seat_required', 403, 'msg', undefined, undefined, 'self', /seat_select \{ project/],
+      ['not_unbound_directory_session', 403, 'msg', 'seat_select', 'chat_bound', 'self', /already an agent/],
+      ['not_unbound_directory_session', 403, 'msg', 'seat_select', 'bearer_unbound', 'admin', /mint_agent_token/],
+      ['harness_required', 403, 'msg', 'seat_select', 'chat_plain', 'owner', /Many chats/],
+      ['member_not_active', 403, undefined, 'seat_select', undefined, 'org_admin', /reactivates/],
+      ['seat_cap_reached', 409, { cap: 3 }, 'seat_select', undefined, 'self', /same project/],
+      ['seat_agent_inactive', 409, { reason: 'seat_retired' }, 'seat_select', undefined, 'self', /different thread label/],
+      ['seat_key_source_conflict', 409, 'x', 'seat_select', undefined, 'self', /different project or thread/],
+      ['provisioning_failed', 500, undefined, 'seat_select', undefined, 'self', /Retry seat_select once/],
+      ['seat_required', 403, undefined, 'seat_attach', 'chat_harness', 'self', /seat_select \{ project/],
+      ['seat_required', 403, undefined, 'seat_attach', 'chat_plain', 'owner', /re-consents.*Many chats/],
+      ['seat_required', 403, undefined, 'seat_attach', 'chat_bound', 'self', /already that agent|already is that agent/],
+      ['seat_required', 403, undefined, 'seat_attach', 'bearer_unbound', 'admin', /mint_agent_token/],
+      ['rate_limited', 429, undefined, 'bootstrap_self', undefined, 'self', /bootstrap rate limit/],
+      ['not_unbound_directory_session', 403, 'x', 'bootstrap_self', 'bearer_unbound', 'admin', /mint_agent_token/],
+      ['not_unbound_directory_session', 403, 'x', 'bootstrap_self', 'chat_bound', 'self', /boot_context/],
+      ['agent_bound_credential_required', 403, undefined, 'verify_agent_connection', 'chat_bound', 'owner', /daemon/],
+      ['agent_bound_credential_required', 403, undefined, 'verify_agent_connection', 'bearer_unbound', 'admin', /mint_agent_token/],
+      ['not_agent_bound', 403, undefined, 'inbox', 'chat_bound', 'owner', /re-consents/],
+      ['not_agent_bound', 403, undefined, 'inbox', 'bearer_unbound', 'admin', /mint_agent_token/],
+      ['agent_bound_workspace_credential_required', 403, undefined, 'runtime_seat_register_pending', 'bearer_bound', 'self', /token_binding_attest/],
+      ['agent_bound_workspace_credential_required', 403, undefined, 'runtime_seat_register_pending', 'chat_bound', 'owner', /daemon/],
+      ['consumer_fenced', 409, undefined, 'inbox', undefined, 'self', /inbox \{ peek: true \}/],
+      ['not_member_bound', 403, 'check_in requires a member-token principal', 'check_in', undefined, 'org_admin', /org admin issues/],
+      ['invalid_args', 400, 'presence_mode: poll requires an agent-bound credential', 'check_in', undefined, 'self', /without presence_mode/],
+      ['attached_seat_cannot_set_presence_mode', 403, undefined, 'check_in', undefined, 'self', /without presence_mode/],
+      ['tool_not_in_profile', 403, { profile: 'needs-you' }, 'send', undefined, 'owner', /https:\/\/pot\.example\/mcp/],
+      ['invalid_args', 400, 'agent required: this session is not an agent yet.', 'orient', 'chat_harness', 'self', /seat_select/],
+      ['invalid_args', 400, 'agent required: this session is not an agent yet.', 'orient', 'chat_plain', 'owner', /re-consents/],
+      ['forbidden', 403, { need: 'admin' }, 'pot_list', undefined, 'admin', /grant_agent_capability/],
+      ['forbidden', 403, { need: 'observer' }, 'orient', undefined, 'owner', /slug of an agent you can observe/],
     ]
-    for (const [error, status, detail, tool, who, step] of cases) {
-      const g = refusalGuidance(error, status, detail, tool)
-      expect(g.who_acts, `${tool}:${error}`).toBe(who)
-      expect(g.next_step, `${tool}:${error}`).toMatch(step)
+    for (const [error, status, detail, tool, kind, who, step] of cases) {
+      const g = refusalGuidance(error, status, detail, tool, { ...FULL, kind })
+      const label = `${tool}:${error}:${kind ?? '*'}`
+      expect(g.who_acts, label).toBe(who)
+      expect(g.next_step, label).toMatch(step)
+      if (who !== 'self') expect(g.next_step, label).toContain('To reach them') // every admin/owner row says how to reach them
     }
+  })
+
+  it('P1-1: with SEAT_ATTACH off (prod) the labels are the ones the consent page shows, never "Many chats"/"One agent"', () => {
+    const off: GuideCtx = { choiceLabels: false, kind: 'chat_plain' }
+    for (const [error, detail, tool] of [
+      ['harness_required', 'x', 'seat_select'], ['seat_required', undefined, 'seat_attach'],
+      ['invalid_args', 'agent required: x', 'orient'], ['forbidden', { reason: 'directory_channel_zero_capability', need: 'x' }, undefined],
+      ['not_agent_bound', undefined, 'inbox'],
+    ] as Array<[string, unknown, string | undefined]>) {
+      const t = String(refusalGuidance(error, 403, detail, tool, off).next_step)
+      expect(t, `${tool}:${error}`).not.toMatch(/Many chats|One agent/)
+      expect(t, `${tool}:${error}`).toMatch(/Me \(auto\)|Existing agent/)
+    }
+  })
+
+  it('P2: link comes only from a dedicated detail field, never scraped from prose', () => {
+    expect(refusalGuidance('harness_required', 403, 'see https://evil.example/x for more', 'seat_select').link).toBeUndefined()
+    expect(refusalGuidance('harness_required', 403, { link: 'https://pot.example/connections' }, 'seat_select').link).toBe('https://pot.example/connections')
+    expect(refusalGuidance('harness_required', 403, { link: 'javascript:alert(1)' }, 'seat_select').link).toBeUndefined()
   })
 
   it('DE7: seat_select from an already-bound credential says it IS an agent, not "retry unbound" (real path)', async () => {
@@ -407,8 +447,11 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     const g = await grant(env, HUMAN)
     await rpc(env, g.ctx, 'boot_context') // auto seat
     const r = await rpc(env, g.ctx, 'verify_agent_connection', { receipt_id: 'r', challenge: 'c' })
-    expect(r.sc).toMatchObject({ ok: false, error: 'agent_bound_credential_required', status: 403, who_acts: 'admin', next_tool: 'mint_agent_token' })
-    expect(String(r.sc.next_step)).toContain('workspace token an admin mints')
+    // A seat session is a CHAT connector: it cannot use a minted bearer, so the step must not point it at mint_agent_token.
+    expect(r.sc).toMatchObject({ ok: false, error: 'agent_bound_credential_required', status: 403, who_acts: 'owner' })
+    expect(r.sc).not.toHaveProperty('next_tool')
+    expect(String(r.sc.next_step)).toContain('daemon')
+    expect(String(r.sc.next_step)).not.toContain('mint_agent_token')
     expect(String(r.sc.next_step)).not.toContain('this session is not one')
   })
 
@@ -416,12 +459,13 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     const env = envFor(h, { SEAT_AUTO_ENROLL: undefined, SEAT_ATTACH: undefined })
     const g = await grant(env, HUMAN)
     const res = await mcpApp.fetch(mcpInternalRequest(new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'orient', arguments: {} } }) }), g.ctx), env)
-    const body = (await res.json()) as { error: { message: string; data: { detail: string; who_acts: string; next_step: string } } }
+    const body = (await res.json()) as { error: { message: string; data: string; who_acts: string; next_step: string } }
     expect(body.error.message).toBe('invalid_args')
-    expect(body.error.data.who_acts).toBe('self')
-    expect(body.error.data.detail).toMatch(/orient \{ agent:/)
-    expect(body.error.data.detail).toMatch(/seat_select/)
-    expect(JSON.stringify(body.error.data)).not.toMatch(/call connect/)
+    expect(typeof body.error.data).toBe('string') // data keeps its old shape (P1-3); the envelope is a sibling of data
+    expect(body.error.who_acts).toBe('owner') // seat flags off in this env: a plain connector, its human re-consents
+    expect(body.error.data).toMatch(/orient \{ agent:/)
+    expect(body.error.data).toMatch(/seat_select/)
+    expect(JSON.stringify(body.error)).not.toMatch(/call connect/)
   })
 
   it('DE2 other half: connect on a session-local claim says orient {agent: <slug>}, not "orient {}"', async () => {
@@ -451,7 +495,8 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     const r = await rpc(env, g.ctx, 'connect', { agent_name: 'rava' }, null)
     expect(r.sc).toMatchObject({ ok: false, error: 'forbidden', status: 403, who_acts: 'owner' })
     expect((r.sc.detail as { reason?: string }).reason).toBe('directory_channel_zero_capability')
-    expect(String(r.sc.next_step)).toMatch(/One agent.*Many chats/)
+    expect(String(r.sc.next_step)).toMatch(/Existing agent.*Me \(auto\)/) // prod labels (SEAT_ATTACH off), P1-1
+    expect(String(r.sc.next_step)).not.toMatch(/Many chats|One agent/)
     expect(String(r.sc.next_step)).toContain('mint_agent_token')
     expect(JSON.stringify(r.sc)).not.toContain('seat_attach') // flag off: nothing may advertise it
   })

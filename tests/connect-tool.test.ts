@@ -411,14 +411,14 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
       env,
     )
     expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: { message: string; data: { detail: string; who_acts: string; next_step: string } } }
+    const body = (await res.json()) as { error: { message: string; data: string } } // mcpRequest rebuilds the legacy shape; the envelope siblings are asserted in onboarding-funnel-teaching
     expect(body.error.message).toBe('invalid_args')
+    // `data` keeps its old shape (a string); the envelope rides as sibling members of `error`.
+    expect(typeof body.error.data).toBe('string')
     // DE2: connect is session-local for an unbound token, so sending it there loops back to this refusal.
-    expect(body.error.data.detail).not.toMatch(/call connect/)
-    expect(body.error.data.detail).toMatch(/orient \{ agent:/)
-    expect(body.error.data.detail).toMatch(/seat_select/)
-    expect(body.error.data.who_acts).toBe('self')
-    expect(body.error.data.next_step).toMatch(/orient \{ agent:/)
+    expect(body.error.data).not.toMatch(/call connect/)
+    expect(body.error.data).toMatch(/orient \{ agent:/)
+    expect(body.error.data).toMatch(/seat_select/)
   })
 
   // ── QA finding 2 regression guard (D6 coverage) ─────────────────────────────

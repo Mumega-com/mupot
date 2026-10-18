@@ -312,7 +312,7 @@ import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { mcpInitializeInstructions } from './instructions'
-import { refusalGuidance, withRefusalGuidance } from './refusal-next-step'
+import { consentChoiceLabels, consentLabels, refusalEnvelope, refusalGuidance, type ConnKind, type GuideCtx } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
@@ -7079,7 +7079,7 @@ const toolOrient: ToolSpec = {
       // session to connect loops straight back here. The two paths that resolve it are an explicit agent and a seat.
       return fail(400, 'invalid_args', [
         'agent required: this session is not an agent yet.',
-        'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as "Many chats"); a seated session then calls orient with no arguments.',
+        'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as ' + consentLabels(consentChoiceLabels(env)).many + '); a seated session then calls orient with no arguments.',
         'For an agent you can observe, pass orient { agent: "<id-or-slug>" }.',
       ].join(' '))
     }
@@ -7259,7 +7259,7 @@ const toolConnect: ToolSpec = {
                   ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
                   : auth.harnessId
                     ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and send the handle in _meta["mupot/seat"] (or X-Mupot-Seat if your client can set headers). Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
-                    : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks "Many chats"; then call seat_select, then seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
+                    : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many}; then call seat_select, then seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
               : []),
             // Render the ID, never the slug. mint_agent_token resolves through the same
             // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
@@ -7345,7 +7345,7 @@ const toolConnect: ToolSpec = {
       next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
             ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your basin-drop call orient { agent: "${agentRef.slug}" }.`
-            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : 'Your human re-consents the connector choosing "Many chats" so it can get a seat (a ChatGPT conversation gets one automatically)'}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your basin-drop call orient { agent: "${agentRef.slug}" }.`)
+            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your basin-drop call orient { agent: "${agentRef.slug}" }.`)
         : durable
           ? 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.'
           : `You are now hot (this claim is session-local). For your basin-drop call orient { agent: "${agentRef.slug}" }, or rely on this packet.`,
@@ -7579,8 +7579,17 @@ export function jsonRpcCodeForToolFailure(status: number, error: string): number
   return status === 404 ? -32602 : -32000
 }
 
-function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200): Response {
-  return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data } }), {
+/** What kind of connection reads a refusal, so its who_acts / next_step can be honest per kind (refusal-next-step.ts). */
+function guideCtxFor(env: Env, auth: AuthContext, origin: string): GuideCtx {
+  let kind: ConnKind
+  if (auth.channel === 'directory') kind = auth.seatBinding || auth.boundAgentId ? 'chat_bound' : auth.harnessId ? 'chat_harness' : 'chat_plain'
+  else kind = auth.boundAgentId ? 'bearer_bound' : 'bearer_unbound'
+  return { kind, choiceLabels: consentChoiceLabels(env), origin: canonicalOrigin(env, origin) }
+}
+
+/** `envelope` rides as SIBLING members of `error` (beside `data`): `data` keeps the exact shape clients already read. */
+function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200, envelope?: object): Response {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data, ...(envelope ?? {}) } }), {
     status,
     headers: { 'content-type': 'application/json' },
   })
@@ -7631,12 +7640,12 @@ function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
 /** MCP tool execution error result (mupot#1667). `status` is the HTTP status REST would have used,
  *  kept in the body so agents can still tell 403/404/409 apart; `need` is lifted to the top level
  *  when the refusal detail carries one. */
-function mcpToolRefusalResult(tool: string, status: number, error: string, detail: unknown): Record<string, unknown> {
+function mcpToolRefusalResult(tool: string, status: number, error: string, detail: unknown, gctx: GuideCtx = {}): Record<string, unknown> {
   const need = typeof detail === 'object' && detail !== null && 'need' in detail
     ? (detail as { need?: unknown }).need // narrowed by the 'in' check above
     : undefined
   // The one refusal envelope (src/mcp/refusal-next-step.ts): who_acts always; next_step unless the tool's own detail already teaches.
-  const g = refusalGuidance(error, status, detail, tool)
+  const g = refusalGuidance(error, status, detail, tool, gctx)
   const body = {
     ok: false, tool, error, status, ...(need !== undefined ? { need } : {}),
     who_acts: g.who_acts,
@@ -8021,7 +8030,7 @@ async function handleJsonRpc(
       // mupot#1794 W4: the profile door never resolves a seat handle, so a harness session is by
       // definition seatless here: refused (its tools/call goes through invokeTool, which refuses too).
       if (isHarnessCredentialSession(profileAuth)) {
-        return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, withRefusalGuidance(HARNESS_SESSION_SEAT_REQUIRED, 403, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE), 403)
+        return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403, refusalEnvelope(HARNESS_SESSION_SEAT_REQUIRED, 403, undefined, undefined, guideCtxFor(c.env, profileAuth, new URL(c.req.url).origin)))
       }
       return ok(id, { tools: profileToolList() })
     }
@@ -8072,7 +8081,7 @@ async function handleJsonRpc(
     // Authentication above still comes first (401 for an anonymous caller, never a probe of
     // which names are allowlisted).
     if (profile === 'needs-you' && !profileEntry(canonicalName)) {
-      return rpcError(id, -32601, 'tool_not_in_profile', withRefusalGuidance('tool_not_in_profile', 403, { profile }, typeof canonicalName === 'string' ? canonicalName : undefined), 403)
+      return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403, refusalEnvelope('tool_not_in_profile', 403, { profile }, typeof canonicalName === 'string' ? canonicalName : undefined, guideCtxFor(c.env, auth, new URL(c.req.url).origin)))
     }
     // Profile arg refusal (e.g. boot_context runtime/model, which would reach selfReportAtBoot
     // and WRITE the fleet row). Refused, not stripped: a silent strip is a success-shaped no-op.
@@ -8080,7 +8089,7 @@ async function handleJsonRpc(
     if (rejectArgs && typeof params.arguments === 'object' && params.arguments !== null) {
       const supplied = rejectArgs.filter((k) => Object.prototype.hasOwnProperty.call(params.arguments, k))
       if (supplied.length > 0) {
-        return rpcError(id, -32602, 'profile_args_not_allowed', withRefusalGuidance('profile_args_not_allowed', 400, { tool: params.name, rejected: supplied }, typeof canonicalName === 'string' ? canonicalName : undefined), 400)
+        return rpcError(id, -32602, 'profile_args_not_allowed', { tool: params.name, rejected: supplied }, 400, refusalEnvelope('profile_args_not_allowed', 400, { tool: params.name, rejected: supplied }, typeof canonicalName === 'string' ? canonicalName : undefined, guideCtxFor(c.env, auth, new URL(c.req.url).origin)))
       }
     }
     const ctx: ToolCtx = {
@@ -8122,18 +8131,18 @@ async function handleJsonRpc(
     // 2025-11-25 (SEP-1303): input validation errors are Tool Execution Errors so the model can self-correct. Only
     // for a session that negotiated that version through the URL-elicitation path (flag on); everything else keeps -32602.
     if (outcome.error === 'invalid_args' && urlElicitOn && c.req.header('mcp-protocol-version') === URL_ELICITATION_PROTOCOL_VERSION) {
-      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
+      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       // Same -32602; the envelope rides in `data` only where the table has a specific entry (orient "agent required", check_in poll).
-      return rpcError(id, -32602, outcome.error, withRefusalGuidance(outcome.error, outcome.status, outcome.detail, outcome.tool))
+      return rpcError(id, -32602, outcome.error, outcome.detail, 200, refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)))
     }
     // 5xx (internal_error, receipt_failed, 503s) stay JSON-RPC errors carrying their HTTP status so
     // server-fault monitoring keeps working; only 4xx authz/business refusals become isError.
     if (outcome.status >= 500) {
-      return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, withRefusalGuidance(outcome.error, outcome.status, outcome.detail, outcome.tool), outcome.status)
+      return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, outcome.detail, outcome.status, refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)))
     }
-    return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
+    return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
   }
 
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
@@ -8155,7 +8164,7 @@ async function handleJsonRpc(
     }
     // mupot#1794 W4: events never resolve a seat handle; a harness session is seatless here: refused.
     if (isHarnessCredentialSession(auth)) {
-      return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, withRefusalGuidance(HARNESS_SESSION_SEAT_REQUIRED, 403, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE), 403)
+      return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403, refusalEnvelope(HARNESS_SESSION_SEAT_REQUIRED, 403, undefined, undefined, guideCtxFor(c.env, auth, new URL(c.req.url).origin)))
     }
 
     // W2 attached agents: the human's grant is an UNBOUND directory token, so without this a chat attached to an existing agent could

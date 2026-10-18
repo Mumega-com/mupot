@@ -10,6 +10,7 @@ import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { seatSelect } from '../members/seat-select'
 import { seatAttachEnabled } from '../members/seat-attach'
+import { consentChoiceLabels, consentLabels } from './refusal-next-step'
 
 const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
@@ -62,7 +63,7 @@ const toolSeatSelect: ToolSpec = {
         return fail(
           403,
           result.error,
-          'This connection carries no verified harness. Your human re-consents this connector (remove and add it again) and picks "Many chats" to register its harness; then call seat_select again.',
+          `This connection carries no verified harness. Your human re-consents this connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many} to register its harness; then call seat_select again.`,
         )
       case 'member_not_active':
         return fail(403, result.error)
