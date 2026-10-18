@@ -196,7 +196,11 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
 
   // ── send to an agent this session cannot see ──────────────────────────────────────────────────
   { error: 'send_target_not_visible', who_acts: 'owner', next_tool: 'squad_join_request',
-    next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). {reach}' },
+    next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). To answer an agent that messaged you, resend with in_reply_to set to that message\'s id and `to` set to the sender (its slug or name works with the message id); if you cite the sender\'s request_id instead, `to` must be the sender\'s agent id (the from_agent of that message). A reply to the sender of a message addressed to you is allowed even from outside its squad, for 7 days, at most 20 per message. {reach}' },
+
+  // ── a reply to one message hit its per-message limit: retrying the same in_reply_to cannot succeed ──
+  { error: 'reply_limit_reached', who_acts: 'self',
+    next_step: 'You have sent the maximum number of replies to that one message. Do not retry with the same in_reply_to: put anything further in a new message to a recipient you can already reach, or ask the other side to message you again.' },
 
   // ── generic floors ────────────────────────────────────────────────────────────────────────────
   { error: 'forbidden', tool: 'orient', status: 403, needsNeed: true, who_acts: 'owner',
