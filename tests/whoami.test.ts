@@ -358,16 +358,14 @@ describe('auto_seat_refused: the step names the actor who can clear the reason (
     expect(m.next_tool).toBeUndefined()
     expect(m.next_step).toContain('"Me (auto)"')
   })
-  it('seat_cap_reached: self, no seat_select', () => {
-    const m = only('seat_cap_reached')
-    expect(m.who_acts).toBe('self')
-    expect(m.next_tool).toBeUndefined()
-    expect(m.next_step).toMatch(/Retire a seat/)
-  })
-  it('rate_limited: self, wait then seat_select', () => {
-    const m = only('rate_limited')
-    expect(m).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })
-    expect(m.next_step).toMatch(/Wait about 5 minutes/)
+  it('seat_cap_reached and rate_limited (auto pool): self, seat_select with the same labels (the select pool has its own cap and window), text from the table row', () => {
+    for (const reason of ['seat_cap_reached', 'rate_limited']) {
+      const m = only(reason)
+      expect(m).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })
+      expect(m.next_step).toContain(reason)
+      expect(m.next_step).toContain('same project, folder and thread labels')
+      expect(m.next_step).not.toMatch(/same way|Wait about/)
+    }
   })
   it('reasons that clear on retry keep seat_select (self)', () => {
     for (const reason of ['seat_not_live', 'error']) expect(only(reason)).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })

@@ -132,18 +132,15 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
         next_step: `this chat's automatic seat was refused (${reason}). ${g.next_step ?? ''}`.trim(),
         ...(reason === 'harness_required' ? { link: consentUrl } : {}),
       })
-    } else if (reason === 'seat_cap_reached') {
+    } else if (reason === 'seat_cap_reached' || reason === 'rate_limited') {
+      // The auto pool has its own cap and window (migration 0205), separate from the select pool seat_select draws on, so seat_select
+      // is expected to work. The step is the refusal table's seat_cap_reached row ("call seat_select with the same labels").
+      const row = refusalGuidance('seat_cap_reached', 403, undefined, 'seat_select', { kind: 'chat_harness', choiceLabels: consentChoiceLabels(env), origin: ctx.origin })
       missing.push({
         code: 'auto_seat_refused',
-        who_acts: 'self',
-        next_step: "this chat's automatic seat was refused (seat_cap_reached): this connection holds the maximum number of seats. Retire a seat you no longer use or wait for a stale one to be reclaimed; an org admin can raise the cap. seat_select would be refused the same way.",
-      })
-    } else if (reason === 'rate_limited') {
-      missing.push({
-        code: 'auto_seat_refused',
-        who_acts: 'self',
-        next_step: `this chat's automatic seat was refused (rate_limited): seat creation is limited per connection. Wait about 5 minutes, then ${seatSelectCallable ? SEAT_SELECT_STEP : 'retry'}`,
-        ...(seatSelectCallable ? { next_tool: 'seat_select' } : {}),
+        who_acts: row.who_acts,
+        next_step: `this chat's automatic seat was refused (${reason}). ${row.next_step ?? ''}`.trim(),
+        ...(seatSelectCallable && row.next_tool ? { next_tool: row.next_tool } : {}),
       })
     } else {
       // Reasons that can clear on retry (seat_not_live, error, no_capabilities, ...) keep the seat_select step.
