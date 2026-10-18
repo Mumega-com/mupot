@@ -6939,7 +6939,10 @@ const toolBootContext: ToolSpec = {
       actsAs: typeof receiptAgent?.slug === 'string' ? receiptAgent.slug : typeof receiptAgent?.name === 'string' ? receiptAgent.name : null,
       report: attachedAuthority(auth) || ctx?.sideEffectFree ? undefined : reportFacts(args, selfReport),
     })
-    const whoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin) })
+    const baseWhoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin) })
+    // Installer window (flag off => no D1 read): boot is where the agent discovers its current authority, same as status/orient.
+    const bootWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: boot must always answer
+    const whoami: Whoami = bootWindow ? { ...baseWhoami, installer_window: bootWindow } : baseWhoami
     const bootOnboarding = ctx?.sideEffectFree ? null : buildBootOnboarding(env, connectionKind, whoami)
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 

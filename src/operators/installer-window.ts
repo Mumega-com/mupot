@@ -73,7 +73,7 @@ export async function liveInstallerWindows(env: Env, auth: AuthContext, nowMs: n
     if (seen.has(key)) continue
     seen.add(key)
     const scopeId = g.scope_type === 'org' ? null : g.scope_id
-    const opts = { nowMs, recordUsage: false, onlyGrantId: g.id } as const
+    const opts = { nowMs, recordUsage: false, onlyGrantId: g.id, approverRolePlane: true } as const
     const res = g.action === 'action:install_high'
       ? await hasElevatedAction(env, auth, 'action:install_high', g.scope_type, scopeId, opts)
       : await hasElevatedAction(env, auth, 'action:install_standard', g.scope_type, scopeId, opts)
@@ -119,16 +119,25 @@ export async function installerDelegationsFor(
   auth: AuthContext,
   action: StructuralAction,
   nowMs: number = Date.now(),
-): Promise<{ rows: DelegationRow[]; windows: LiveInstallerWindow[] }> {
-  if (!installerWindowEnabled(env) || !auth.boundAgentId) return { rows: [], windows: [] }
+): Promise<{ rows: DelegationRow[]; windows: LiveInstallerWindow[]; capped: LiveInstallerWindow[] }> {
+  if (!installerWindowEnabled(env) || !auth.boundAgentId) return { rows: [], windows: [], capped: [] }
   const windows = (await liveInstallerWindows(env, auth, nowMs)).filter((w) => {
     if (!INSTALLER_TIERS[w.tier].acts.has(action)) return false
     if (w.tier === 'standard' && action === 'create_squad' && w.grant.scope_type === 'org') return false
     return true
   })
+  // A window at its write cap is not a candidate: the act falls to another covering window or standing delegation instead of being
+  // masked by the highest-ceiling row (which evaluateDelegated would pick).
+  const open: LiveInstallerWindow[] = []
+  const capped: LiveInstallerWindow[] = []
+  for (const w of windows) {
+    ;((await windowUsageCount(env, auth.tenant, w.grant, false)) >= INSTALLER_TIERS[w.tier].writeCap ? capped : open).push(w)
+  }
+  windows.length = 0
+  windows.push(...open)
   // High first, so a refusal's usage row names the widest window the caller held.
   windows.sort((a, b) => (a.tier === b.tier ? 0 : a.tier === 'high' ? -1 : 1))
-  return { rows: windows.map((w) => synthesizeRow(env, auth, w)), windows }
+  return { rows: windows.map((w) => synthesizeRow(env, auth, w)), windows, capped }
 }
 
 export interface InstallerWindowView {
@@ -152,21 +161,51 @@ export async function installerWindowView(env: Env, auth: AuthContext): Promise<
   // widest first: high beats standard, then the later expiry
   windows.sort((a, b) => (a.tier === b.tier ? Date.parse(b.grant.expires_at) - Date.parse(a.grant.expires_at) : a.tier === 'high' ? -1 : 1))
   const w = windows[0]
-  const used = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM elevation_usage_log WHERE tenant = ?1 AND elevation_grant_id = ?2 AND status = 'applied'",
-  )
-    .bind(auth.tenant, w.grant.id)
-    .first<{ n: number }>()
+  const usedCount = await windowUsageCount(env, auth.tenant, w.grant, false) // same count the cap enforces (pending reservations included)
   return {
     tier: w.tier,
     scope_type: w.grant.scope_type,
     scope_id: w.grant.scope_type === 'org' ? null : w.grant.scope_id,
     expires_at: w.grant.expires_at,
     acts: [...INSTALLER_TIERS[w.tier].acts].sort(),
-    used: used?.n ?? 0,
+    used: usedCount,
     write_cap: INSTALLER_TIERS[w.tier].writeCap,
     standing_grant_cap: INSTALLER_STANDING_GRANT_CAP,
   }
+}
+
+/** Usage rows of THIS window (a renewed grant keeps its id, so only rows since its own created_at count). Failed rows are refusals. */
+export async function windowUsageCount(env: Env, tenant: string, grant: ElevationGrantRecord, failed: boolean): Promise<number> {
+  const r = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM elevation_usage_log
+      WHERE tenant = ?1 AND elevation_grant_id = ?2 AND occurred_at >= ?3 AND ${failed ? "status = 'failed'" : "status <> 'failed'"}`,
+  )
+    .bind(tenant, grant.id, grant.created_at)
+    .first<{ n: number }>()
+  return r?.n ?? 0
+}
+
+/**
+ * Reserve one write slot ATOMICALLY: the pending usage row is inserted only while the window's non-failed row count is below the
+ * cap, in one statement, so two concurrent writes at cap-1 cannot both pass. Returns the usage row id, or null when the cap is hit.
+ */
+export async function reserveInstallerWrite(
+  env: Env,
+  tenant: string,
+  w: LiveInstallerWindow,
+  tool: string,
+  detail: unknown,
+): Promise<string | null> {
+  const id = crypto.randomUUID()
+  const res = await env.DB.prepare(
+    `INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending'
+      WHERE (SELECT COUNT(*) FROM elevation_usage_log
+              WHERE tenant = ?2 AND elevation_grant_id = ?3 AND occurred_at >= ?9 AND status <> 'failed') < ?10`,
+  )
+    .bind(id, tenant, w.grant.id, w.agentSessionId, w.grant.action, tool, JSON.stringify(detail), new Date().toISOString(), w.grant.created_at, INSTALLER_TIERS[w.tier].writeCap)
+    .run()
+  return Number(res.meta?.changes ?? 0) > 0 ? id : null
 }
 
 /** Which tier an act needs, for the refusal wording: standard when any tier-standard lists it, else high, else none. */

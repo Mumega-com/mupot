@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { capabilityRank, hasCapabilityOnDynamicScope, humanVerifiedLegacyRoleRank, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -207,6 +207,15 @@ export async function createElevationRequest(
       }
     }
   }
+  // Installer window: a window on a HOME squad/department could authorise nothing (home targets are never grantable), so it is
+  // refused before a human spends an approval on it.
+  if (uniqueActions.some(isInstallerAction) && (input.scopeType === 'department' || input.scopeType === 'squad')) {
+    const table = input.scopeType === 'department' ? 'departments' : 'squads'
+    const kind = await env.DB.prepare(`SELECT kind FROM ${table} WHERE id = ?1 LIMIT 1`).bind(input.scopeId).first<{ kind: string }>()
+    if (kind?.kind === 'home') {
+      return { ok: false, reason: 'invalid_scope', detail: 'an installer window cannot be scoped to a home squad or home department' }
+    }
+  }
   if (!isValidElevationDuration(input.durationMinutes)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid duration_minutes' }
   }
@@ -384,6 +393,8 @@ export interface DecideElevationInput {
    *  channel adapters set it from PASSKEY_CLASS_VIA. action:install_high is refused without it; a fresh IdP reauth or a
    *  Telegram device secret is not enough for it. Unset = not passkey-class. */
   decidedViaPasskey?: boolean
+  /** TRUE when that passkey-class proof came through the Cloudflare Access page (its strength is the configured ACCESS_REQUIRED_AMR). */
+  decidedViaAccess?: boolean
   note?: string
 }
 
@@ -699,7 +710,8 @@ export async function findElevationDecisionRefusal(
       return { ok: false, reason: 'reauth_required' }
     }
     // "Passkey only" must not silently degrade to any fresh Access login: without an AMR requirement configured it is unenforceable.
-    if (selected.includes('action:install_high') && !accessAmrConfigured(env)) {
+    // Only the Access path depends on that configuration; a verified WebAuthn assertion (secure moments) needs none.
+    if (selected.includes('action:install_high') && input.decidedViaAccess === true && !accessAmrConfigured(env)) {
       return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high needs ACCESS_REQUIRED_AMR configured with passkey-class methods only (hwk, swk, webauthn) on this pot' }
     }
     if (selected.includes('action:install_high') && input.decidedViaPasskey !== true) {
@@ -794,9 +806,35 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
+  // Installer window renewal: UNIQUE(agent_session_id, action, scope_type, scope_id) means a second window for the same tier and scope
+  // on one session cannot be INSERTed. When the earlier install grant has ENDED (expired or revoked) it is renewed in place (new
+  // request, approver, created_at, expiry; revoked cleared) and keeps its id; its write cap counts only usage since the new created_at.
+  // A still-live grant is left alone (the insert then fails as before). Other actions are unchanged.
+  const renewed = new Set<string>()
+  for (const g of grants) {
+    if (!isInstallerAction(g.action)) continue
+    const prior = await env.DB.prepare(
+      `SELECT id FROM elevation_grants
+        WHERE tenant = ?1 AND agent_session_id = ?2 AND action = ?3 AND scope_type = ?4 AND scope_id = ?5
+          AND (revoked_at IS NOT NULL OR expires_at <= ?6) LIMIT 1`,
+    )
+      .bind(input.tenant, g.agent_session_id, g.action, g.scope_type, g.scope_id, nowIso)
+      .first<{ id: string }>()
+    if (prior) {
+      g.id = prior.id
+      renewed.add(g.id)
+    }
+  }
   const batchResults = await env.DB.batch(
     grants.map((g) =>
-      env.DB.prepare(
+      renewed.has(g.id)
+        ? env.DB.prepare(
+            `UPDATE elevation_grants
+                SET elevation_request_id = ?2, approved_by_member_id = ?3, approved_by_web_session_hash = ?4,
+                    created_at = ?5, expires_at = ?6, revoked_at = NULL, revoke_reason = NULL, effect = ?7
+              WHERE id = ?1 AND tenant = ?8`,
+          ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at, g.effect, g.tenant)
+        : env.DB.prepare(
         `INSERT INTO elevation_grants
            (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
             approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
@@ -1031,6 +1069,8 @@ export interface HasElevatedActionOptions {
   /** Judge exactly this grant and no other (the installer window evaluates each live grant on its own, so an org grant
    *  cannot shadow a department grant on the same session). Unset = every existing caller, unchanged. */
   onlyGrantId?: string
+  /** Also accept an approver whose admin authority lives on the legacy role plane (humanVerifiedLegacyRoleRank). Installer windows only. */
+  approverRolePlane?: boolean
   toolName?: string
   detail?: unknown
 }
@@ -1165,7 +1205,18 @@ export async function hasElevatedAction(
   // closed with `approver_authority_lost` here, by design.
   const approverCapabilities = await resolveCapabilities(env, match.approved_by_member_id)
   if (!(await hasCapabilityOnDynamicScope(env, approverCapabilities, match.scope_type, match.scope_id || null, 'admin'))) {
-    return { granted: false, reason: 'approver_authority_lost' }
+    // Installer windows only: an approver on the LEGACY ROLE plane (owner/admin with no capability rows) was admitted at decision
+    // time through decidedByIsOrgAdmin; re-derive the same authority here (role plane + rows, live) or the window dies on arrival.
+    // Opt-in per caller so no other action's behaviour changes.
+    // The VERIFIED login identity's role (humanVerifiedLegacyRoleRank), never members.email (an inviter types that: #1551 class), and
+    // for a squad scope the same home-squad exclusion the decision applied (planeCoversScope('org', ...)).
+    const rolePlaneOk = opts.approverRolePlane === true
+      && (await humanVerifiedLegacyRoleRank(env, match.approved_by_member_id)) >= capabilityRank('admin')
+      && (match.scope_type !== 'squad' || await (async () => {
+        const sc = await loadSquadScope(env, match.scope_id)
+        return sc !== null && planeCoversScope('org', sc)
+      })())
+    if (!rolePlaneOk) return { granted: false, reason: 'approver_authority_lost' }
   }
 
   const approverSession = await loadWebSessionByHash(env, tenant, match.approved_by_web_session_hash)

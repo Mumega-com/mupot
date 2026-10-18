@@ -41,6 +41,8 @@ import {
 } from './delegations'
 import {
   installerDelegationsFor,
+  reserveInstallerWrite,
+  windowUsageCount,
   installerTierNeededFor,
   isInstallerDelegationId,
   liveInstallerWindows,
@@ -807,7 +809,7 @@ export async function authorizeStructuralWrite(
   const installerOn = installerWindowEnabled(env)
   const installer = installerOn && policy.delegable
     ? await installerDelegationsFor(env, auth, action)
-    : { rows: [] as DelegationRow[], windows: [] as LiveInstallerWindow[] }
+    : { rows: [] as DelegationRow[], windows: [] as LiveInstallerWindow[], capped: [] as LiveInstallerWindow[] }
   let sawDelegation = false
   if ((flagOn || installerOn) && policy.delegable) {
     // W2: a thread ATTACHED to this agent acts for the attaching human only. Another human's delegation to the same agent
@@ -825,7 +827,7 @@ export async function authorizeStructuralWrite(
         const w = installerWindowOf(installer.windows, verdict)
         if (w) {
           // Window-only fences the delegation engine does not know (the standing-grant cap and the per-window write cap). The receipt is already written: close it refused.
-          const fenced = await installerFence(env, auth, action, verdict, w)
+          const fenced = installerFence(action, verdict)
           if (fenced) {
             await finishDelegatedReceipt(env, verdict, false)
             return refusedUnderWindow(env, auth, action, installer.windows, fenced)
@@ -844,7 +846,13 @@ export async function authorizeStructuralWrite(
   }
 
   // Project edges never ride a window (INSTALLER_EXCLUDED_ACTS): while one is live, say so instead of falling to the legacy lane.
-  if (installerOn && INSTALLER_EXCLUDED_ACTS.has(action) && (await liveInstallerWindows(env, auth)).length > 0) {
+  // Every covering window is at its write cap and nothing else covers the act: say so (instead of the generic lane/refusal).
+  if (installer.rows.length === 0 && installer.capped.length > 0 && !sawDelegation) {
+    return refusedUnderWindow(env, auth, action, installer.capped, capReachedRefusal(action, installer.capped[0]))
+  }
+  const liveForExcluded = installerOn && INSTALLER_EXCLUDED_ACTS.has(action) ? await liveInstallerWindows(env, auth) : []
+  if (liveForExcluded.length > 0) {
+    await logRefusedUsage(env, auth, action, liveForExcluded[0], 'not_in_installer_window')
     return refuse(403, 'not_in_installer_window', {
       act: action,
       who_acts: 'owner',
@@ -870,35 +878,15 @@ function installerWindowOf(windows: LiveInstallerWindow[], verdict: DelegatedAut
   return windows.find((w) => ids.includes(`elev:${w.grant.id}`))
 }
 
-async function windowRowCount(env: Env, auth: AuthContext, grantId: string, failed: boolean): Promise<number> {
-  const r = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM elevation_usage_log WHERE tenant = ?1 AND elevation_grant_id = ?2 AND ${failed ? "status = 'failed'" : "status <> 'failed'"}`,
-  )
-    .bind(auth.tenant, grantId)
-    .first<{ n: number }>()
-  return r?.n ?? 0
-}
-
 /**
- * Fences that only an installer window needs (the delegation engine judges what an act confers and whom it touches; it does
- * not know the caller is also a beneficiary of the container, nor what the act destroys). Returns a refusal or null.
- *  - write cap per window
- *  - standing grants above MEMBER (INSTALLER_STANDING_GRANT_CAP), whatever the tier ceiling
+ * Fences that only an installer window needs and the delegation engine does not know: standing grants above MEMBER
+ * (INSTALLER_STANDING_GRANT_CAP), whatever the tier ceiling. The per-window write cap is enforced atomically at reservation
+ * (reserveInstallerWrite) and by dropping capped windows from candidate selection (installerDelegationsFor). Returns a refusal or null.
  */
-async function installerFence(
-  env: Env,
-  auth: AuthContext,
+function installerFence(
   action: StructuralAction,
   verdict: DelegatedAuthorization,
-  w: LiveInstallerWindow,
-): Promise<StructuralRefusal | null> {
-  const def = INSTALLER_TIERS[w.tier]
-  if ((await windowRowCount(env, auth, w.grant.id, false)) >= def.writeCap) {
-    return refuse(403, 'installer_window_cap_reached', {
-      act: action, cap: def.writeCap, who_acts: 'owner', next_tool: 'request_elevation', needs: 'human_approval',
-      next_step: `This installer window reached its ${def.writeCap}-write cap. Ask your human for a new window if you still need one: request_elevation { actions: ["${def.action}"], scope_type, duration_minutes: 60, reason }.`,
-    })
-  }
+): StructuralRefusal | null {
   const t = verdict.target
   const confers: Capability | null = t.capability ?? null
   if (confers && capabilityRank(confers) > capabilityRank(INSTALLER_STANDING_GRANT_CAP)) {
@@ -910,30 +898,52 @@ async function installerFence(
   return null
 }
 
-/** One elevation_usage_log row per authorised act, opened 'pending' BEFORE the write and closed with the chokepoint receipt. */
+/** One elevation_usage_log row per authorised act, reserved ATOMICALLY (cap-checked in the insert) BEFORE the write and closed with the chokepoint receipt. */
 async function withInstallerUsage(
   env: Env,
   auth: AuthContext,
   action: StructuralAction,
   windows: LiveInstallerWindow[],
   verdict: DelegatedAuthorization,
-): Promise<DelegatedAuthorization> {
+): Promise<DelegatedAuthorization | StructuralRefusal> {
   if (!isInstallerDelegationId(verdict.delegation.id)) return verdict
   const w = windows.find((x) => `elev:${x.grant.id}` === verdict.delegation.id)
   if (!w) return verdict
-  // "If the log write fails, the action must fail": beginElevationReceipt throws, the dispatcher leaves the chokepoint receipt
-  // at 'attempted' (authorised, outcome unknown), and no write has happened yet.
+  // "If the log write fails, the action must fail": the insert throws, the dispatcher leaves the chokepoint receipt at 'attempted'
+  // (authorised, outcome unknown), and no write has happened yet.
+  const usageId = await reserveInstallerWrite(env, auth.tenant, w, action, {
+    receipt_id: verdict.receiptId, act: action, tier: w.tier, target_agent_id: verdict.target.agentId ?? null, target_squad_id: verdict.target.squadId ?? null, capability: verdict.target.capability ?? null,
+  })
+  if (usageId === null) {
+    // Lost the race for the last slot (or the window filled between selection and reservation): close the receipt refused.
+    await finishDelegatedReceipt(env, verdict, false)
+    return refusedUnderWindow(env, auth, action, [w], capReachedRefusal(action, w))
+  }
+  const open = OPEN_INSTALLER_USAGE.get(auth)
+  if (open) open.set(verdict.receiptId, usageId)
+  else OPEN_INSTALLER_USAGE.set(auth, new Map([[verdict.receiptId, usageId]]))
+  return { ...verdict, installerUsageId: usageId }
+}
+
+function capReachedRefusal(action: StructuralAction, w: LiveInstallerWindow): StructuralRefusal {
+  const def = INSTALLER_TIERS[w.tier]
+  return refuse(403, 'installer_window_cap_reached', {
+    act: action, cap: def.writeCap, who_acts: 'owner', next_tool: 'request_elevation', needs: 'human_approval',
+    next_step: `This installer window reached its ${def.writeCap}-write cap. Ask your human for a new window if you still need one: request_elevation { actions: ["${def.action}"], scope_type, duration_minutes: 60, reason }.`,
+  })
+}
+
+/** One failed usage row for an attempt under a live window, capped so the log cannot be flooded (the refusal is still returned). */
+async function logRefusedUsage(env: Env, auth: AuthContext, action: StructuralAction, w: LiveInstallerWindow, errorCode: string): Promise<void> {
+  if ((await windowUsageCount(env, auth.tenant, w.grant, true)) >= INSTALLER_REFUSED_LOG_CAP) return
   const usageId = await beginElevationReceipt(
     env,
     auth.tenant,
     { id: w.grant.id, agent_session_id: w.agentSessionId, action: w.grant.action },
     action,
-    { receipt_id: verdict.receiptId, act: action, tier: w.tier, target_agent_id: verdict.target.agentId ?? null, target_squad_id: verdict.target.squadId ?? null, capability: verdict.target.capability ?? null },
+    { act: action, tier: w.tier, refusal: errorCode },
   )
-  const open = OPEN_INSTALLER_USAGE.get(auth)
-  if (open) open.set(verdict.receiptId, usageId)
-  else OPEN_INSTALLER_USAGE.set(auth, new Map([[verdict.receiptId, usageId]]))
-  return { ...verdict, installerUsageId: usageId }
+  await finishElevationReceipt(env, usageId, { status: 'failed', errorCode })
 }
 
 const ASK_HIGH = 'This act needs the high window (grants up to lead). Ask your human for it: request_elevation { actions: ["action:install_high"], scope_type, duration_minutes: 60, reason }. They approve with a passkey. Nothing is lost.'
@@ -947,19 +957,11 @@ async function refusedUnderWindow(
   windows: LiveInstallerWindow[],
   refusal: StructuralRefusal,
 ): Promise<StructuralRefusal> {
-  const w = windows[0]
+  // Attribute the refusal to the window the engine actually evaluated (named by the refusal's delegation_id), else the widest.
+  const named = typeof refusal.detail?.delegation_id === 'string' ? windows.find((x) => `elev:${x.grant.id}` === refusal.detail?.delegation_id) : undefined
+  const w = named ?? windows[0]
   if (!w) return refusal
-  // The refusal is always returned; only the LOG is capped, so an agent cannot flood the usage table by hammering a refused act.
-  if ((await windowRowCount(env, auth, w.grant.id, true)) < INSTALLER_REFUSED_LOG_CAP) {
-    const usageId = await beginElevationReceipt(
-      env,
-      auth.tenant,
-      { id: w.grant.id, agent_session_id: w.agentSessionId, action: w.grant.action },
-      action,
-      { act: action, tier: w.tier, refusal: refusal.error },
-    )
-    await finishElevationReceipt(env, usageId, { status: 'failed', errorCode: refusal.error })
-  }
+  await logRefusedUsage(env, auth, action, w, refusal.error)
   const detail: Record<string, unknown> = { ...(refusal.detail ?? {}), installer_window: w.tier }
   if (refusal.error === 'requires_human_approval' && w.tier === 'standard' && detail.next_step === undefined) {
     detail.who_acts = 'owner'
@@ -982,6 +984,7 @@ async function refuseWithoutWindow(env: Env, auth: AuthContext, action: Structur
   if (live.length > 0) {
     // A window is live but this act is not in its tier. Credential mint is the named exclusion.
     if (CREDENTIAL_ACTIONS.has(action)) {
+      await logRefusedUsage(env, auth, action, live[0], 'not_in_installer_window')
       return refuse(403, 'not_in_installer_window', {
         act: action,
         who_acts: 'owner',
@@ -992,6 +995,7 @@ async function refuseWithoutWindow(env: Env, auth: AuthContext, action: Structur
     }
     // The act exists only in the high tier and the caller holds only a standard window.
     if (installerTierNeededFor(action) === 'high' && !live.some((w) => w.tier === 'high')) {
+      await logRefusedUsage(env, auth, action, live[0], 'act_needs_high_window')
       return refuse(403, 'requires_human_approval', {
         requires_human_approval: true,
         act: action,

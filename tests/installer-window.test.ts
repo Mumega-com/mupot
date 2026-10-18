@@ -31,7 +31,9 @@ const { installerDelegationsFor, liveInstallerWindows } = await import('../src/o
 const { decideElevation } = await import('../src/access/decision-core')
 const { refusalGuidance } = await import('../src/mcp/refusal-next-step')
 const { isAttachedSudoAction } = await import('../src/auth/attached-ceiling')
-const { SENSITIVE_STEP_UP_ACTIONS } = await import('../src/auth/elevation-actions')
+const { SENSITIVE_STEP_UP_ACTIONS, ELEVATION_ACTIONS } = await import('../src/auth/elevation-actions')
+const { tgDecisionIsRoutine } = await import('../src/secure-moments/telegram-miniapp')
+const { reserveInstallerWrite } = await import('../src/operators/installer-window')
 
 const TENANT = 'tenant-iw'
 const ORIGIN = 'https://pot.test'
@@ -449,7 +451,7 @@ describe('approval policy: standard via Telegram biometric, high passkey-only, n
     expect(SENSITIVE_STEP_UP_ACTIONS.has(INSTALL_STANDARD_ACTION)).toBe(false)
   })
 
-  it('install_high is refused unless ACCESS_REQUIRED_AMR is configured (passkey-only cannot degrade to any fresh Access login); standard is unaffected', async () => {
+  it('install_high via the ACCESS path is refused unless ACCESS_REQUIRED_AMR names only passkey-class methods (passkey-only cannot degrade to any fresh Access login); standard is unaffected', async () => {
     const sessionId = await checkIn(op())
     const refusalFor = async (action: string, e: Env) => {
       const created = await createElevationRequest(env, {
@@ -461,10 +463,10 @@ describe('approval policy: standard via Telegram biometric, high passkey-only, n
       return findElevationDecisionRefusal(e, {
         tenant: TENANT, requestId: req.id, decision: 'approve', selectedActions: [action], decidedByMemberId: APPROVER,
         decidedByCapabilities: [{ member_id: APPROVER, scope_type: 'org', scope_id: null, capability: 'admin' }],
-        decidedByWebSessionHash: 'h', recentReauthOk: true, decidedViaPasskey: true,
+        decidedByWebSessionHash: 'h', recentReauthOk: true, decidedViaPasskey: true, decidedViaAccess: true,
       }, req)
     }
-    for (const amr of [undefined, '', ' , ', 'pwd', 'hwk,pwd', 'mfa']) {
+    for (const amr of [undefined, '', ' , ', 'pwd', 'hwk,pwd', 'mfa', 'otp']) {
       const r = await refusalFor(INSTALL_HIGH_ACTION, { ...env, ACCESS_REQUIRED_AMR: amr } as Env)
       expect(r?.reason, `amr=${String(amr)}`).toBe('invalid_elevation_request')
     }
@@ -649,7 +651,7 @@ describe('per-window caps', () => {
   function fakeUsage(grantId: string, sessionId: string, n: number, status: string): void {
     for (let i = 0; i < n; i++) {
       sql(
-        "INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status) VALUES (?, ?, ?, ?, ?, 'x', NULL, datetime('now'), ?)",
+        "INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status) VALUES (?, ?, ?, ?, ?, 'x', NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)",
         crypto.randomUUID(), TENANT, grantId, sessionId, INSTALL_STANDARD_ACTION, status,
       )
     }
@@ -772,5 +774,165 @@ describe('SCOPE CUT: seat sessions cannot hold or use an installer window (Q2a r
       expect(String(r.detail.next_step)).toMatch(/bound agent/)
     }
     expect(rows('SELECT 1 FROM elevation_requests')).toHaveLength(0)
+  })
+})
+
+describe('bot review round (codex): fixes', () => {
+  const stdRows = (grantId: string) => usage(grantId)
+
+  it('P1 renew: after a window ends, a fresh approval for the same tier/scope on the same session renews it in place (same grant id, cap reset)', async () => {
+    const w1 = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
+    sql("UPDATE elevation_grants SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?", w1.grantId)
+    expect(refusal(await call(op(), 'squad_member_remove', { agent: 'agent-b', squad: 'S1' })).error).toBe('installer_window_expired')
+    await new Promise((r) => setTimeout(r, 5))
+    const w2 = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    expect(w2.grantId).toBe(w1.grantId)
+    expect(rows('SELECT 1 FROM elevation_grants')).toHaveLength(1)
+    expect((await call(op(), 'squad_member_remove', { agent: 'agent-b', squad: 'S1' })).ok).toBe(true)
+    const st = (await call(op(), 'status', {})) as { result: { whoami: { installer_window: { used: number } } } }
+    expect(st.result.whoami.installer_window.used).toBe(1) // only the usage since the renewal counts toward the cap
+  })
+
+  it('P1 renew: a revoked window renews too', async () => {
+    const w1 = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    await revokeElevationGrant(env, TENANT, w1.grantId, 'test')
+    const w2 = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    expect(w2.grantId).toBe(w1.grantId)
+    expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
+  })
+
+  it('P1 role plane: an approver who is owner on the LEGACY role plane (no capability rows) yields a usable window', async () => {
+    sql('DELETE FROM capabilities WHERE member_id = ?', APPROVER)
+    sql("INSERT INTO users (id, email, role) VALUES ('u-appr', 'approver@example.test', 'owner')")
+    const sessionId = await checkIn(op())
+    const now = Date.now()
+    const web = await createWebSession(env, 'raw-role-plane', { tenant: TENANT, memberId: APPROVER, loginIdentityId: APPROVER_IDENTITY }, now)
+    const created = await createElevationRequest(env, { tenant: TENANT, agentSessionId: sessionId, agentId: 'agent-op', memberId: 'seat-agent-op', actions: [INSTALL_STANDARD_ACTION], scopeType: 'department', scopeId: 'D1', durationMinutes: 60, reason: 'x' }, now)
+    if (!created.ok) throw new Error('request refused')
+    const d = await decideElevationRequest(env, {
+      tenant: TENANT, requestId: created.request.id, decision: 'approve', selectedActions: [INSTALL_STANDARD_ACTION], decidedByMemberId: APPROVER,
+      decidedByCapabilities: [], decidedByIsOrgAdmin: true, decidedByWebSessionHash: web.id_hash, recentReauthOk: true,
+    }, now)
+    expect(d.ok, JSON.stringify(d)).toBe(true)
+    expect((await liveInstallerWindows(env, op())).length).toBe(1)
+    expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
+  })
+
+  it('P1 role plane: a members.email that merely MATCHES an owner (no verified identity) does not keep a window alive', async () => {
+    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    sql('DELETE FROM capabilities WHERE member_id = ?', APPROVER)
+    sql("UPDATE human_login_identities SET verified_email = 'someone-else@example.test' WHERE member_id = ?", APPROVER)
+    sql("INSERT INTO users (id, email, role) VALUES ('u-appr', 'approver@example.test', 'owner')")
+    expect((await liveInstallerWindows(env, op())).length).toBe(0)
+    expect(w.grantId).toBeTruthy()
+  })
+
+  it('P1 access/AMR: a verified WebAuthn assertion approves install_high with ACCESS_REQUIRED_AMR unset; the Access path with a non-passkey AMR does not', async () => {
+    const sessionId = await checkIn(op())
+    const via = async (v: 'webauthn' | 'access_passkey', e: Env) => {
+      const created = await createElevationRequest(env, { tenant: TENANT, agentSessionId: sessionId, agentId: 'agent-op', memberId: 'seat-agent-op', actions: [INSTALL_HIGH_ACTION], scopeType: 'org', scopeId: '', durationMinutes: 15, reason: 'x' })
+      if (!created.ok) throw new Error('request refused')
+      const approver = { userId: APPROVER, email: null, role: 'member', tenant: TENANT, channel: 'workspace', memberId: APPROVER, boundAgentId: null,
+        capabilities: [{ member_id: APPROVER, scope_type: 'org', scope_id: null, capability: 'admin' }] } as unknown as AuthContext // fixture human
+      await decideElevation(e, { id: created.request.id, decision: 'approve', selectedActions: [INSTALL_HIGH_ACTION], durationMinutes: 15, auth: approver,
+        proof: { memberId: APPROVER, via: v, evidence: {} },
+        mintSession: async () => ({ auth: approver, webSessionHash: (await createWebSession(env, `raw-amr-${++webSeq}`, { tenant: TENANT, memberId: APPROVER, loginIdentityId: APPROVER_IDENTITY }, Date.now())).id_hash }) })
+      const n = rows('SELECT 1 FROM elevation_grants WHERE action = ?', INSTALL_HIGH_ACTION).length
+      sql('DELETE FROM elevation_grants'); sql('DELETE FROM elevation_requests')
+      return n
+    }
+    expect(await via('access_passkey', { ...env, ACCESS_REQUIRED_AMR: 'otp' } as Env)).toBe(0)
+    expect(await via('access_passkey', { ...env, ACCESS_REQUIRED_AMR: undefined } as Env)).toBe(0)
+    expect(await via('webauthn', { ...env, ACCESS_REQUIRED_AMR: undefined } as Env)).toBe(1)
+    expect(await via('access_passkey', { ...env, ACCESS_REQUIRED_AMR: 'hwk' } as Env)).toBe(1)
+  })
+
+  it('P1 fresh proof: the Telegram trust token never carries an installer approval (routine only for deny / non-installer elevation)', () => {
+    const p = (decision: 'approve' | 'deny', actions: string[]) => ({ decision, actions, duration: 60 }) as never
+    expect(tgDecisionIsRoutine('elevation', p('approve', ['action:routine_policy']))).toBe(true)
+    expect(tgDecisionIsRoutine('elevation', p('approve', [INSTALL_STANDARD_ACTION]))).toBe(false)
+    expect(tgDecisionIsRoutine('elevation', p('approve', [INSTALL_HIGH_ACTION]))).toBe(false)
+    expect(tgDecisionIsRoutine('elevation', p('deny', [INSTALL_HIGH_ACTION]))).toBe(true)
+    expect(tgDecisionIsRoutine('seed_attach', p('approve', []))).toBe(false)
+  })
+
+  it('P2 attribution: a refusal is charged to the window the engine evaluated, not the widest', async () => {
+    const std = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
+    const high = await openWindow(op(), INSTALL_HIGH_ACTION, 'department', 'D2')
+    const r = refusal(await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'lead' }))
+    expect(r.error).toBe('requires_human_approval')
+    expect(stdRows(std.grantId).filter((x) => x.status === 'failed')).toHaveLength(1)
+    expect(stdRows(high.grantId)).toHaveLength(0)
+    expect(r.detail.installer_window).toBe('standard')
+  })
+
+  it('P2 out-of-tier attempts are logged: credential mint and a high-only act under a standard window', async () => {
+    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
+    expect(refusal(await call(op(), 'mint_agent_token', { agent: 'agent-b' })).error).toBe('not_in_installer_window')
+    expect(refusal(await call(op(), 'grant_agent_capability', { agent: 'agent-b', squad: 'S1', capability: 'member' })).error).toBe('requires_human_approval')
+    expect(stdRows(w.grantId).map((x) => x.error_code)).toEqual(['not_in_installer_window', 'act_needs_high_window'])
+  })
+
+  it('P2 boot_context carries installer_window while live', async () => {
+    await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    const b = (await call(op(), 'boot_context', {})) as { ok: boolean; result?: { whoami?: { installer_window?: { tier: string } } } }
+    expect(b.ok).toBe(true)
+    expect(b.result?.whoami?.installer_window?.tier).toBe('standard')
+  })
+
+  it('P2 atomic reservation: the last slot goes to exactly one of two reservations', async () => {
+    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    for (let i = 0; i < 49; i++) sql("INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status) VALUES (?, ?, ?, ?, ?, 'x', NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'applied')", crypto.randomUUID(), TENANT, w.grantId, w.sessionId, INSTALL_STANDARD_ACTION)
+    const [live] = await liveInstallerWindows(env, op())
+    const got = await Promise.all([reserveInstallerWrite(env, TENANT, live, 'a', {}), reserveInstallerWrite(env, TENANT, live, 'b', {})])
+    expect(got.filter((x) => x !== null)).toHaveLength(1)
+    expect(usage(w.grantId).filter((x) => x.status !== 'failed')).toHaveLength(50)
+  })
+
+  it('P2 pending reservations count as used (whoami matches enforcement)', async () => {
+    await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    const v = await authorizeStructuralWrite(env, op(), 'squad_member_add', { agentId: 'agent-b', squadId: 'S1', capability: 'member' })
+    expect(v.kind).toBe('delegated') // pending, never finished
+    const st = (await call(op(), 'status', {})) as { result: { whoami: { installer_window: { used: number } } } }
+    expect(st.result.whoami.installer_window.used).toBe(1)
+  })
+
+  it('P2 cap fallback: a capped high window does not mask a standard window that still has capacity', async () => {
+    const high = await openWindow(op(), INSTALL_HIGH_ACTION, 'org', '')
+    const std = await openWindow(op(), INSTALL_STANDARD_ACTION, 'org', '')
+    for (let i = 0; i < 200; i++) sql("INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status) VALUES (?, ?, ?, ?, ?, 'x', NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'applied')", crypto.randomUUID(), TENANT, high.grantId, high.sessionId, INSTALL_HIGH_ACTION)
+    expect((await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).ok).toBe(true)
+    expect(usage(std.grantId).map((x) => x.status)).toEqual(['applied'])
+  })
+
+  it('P2 cap: when EVERY covering window is capped the refusal says so', async () => {
+    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    for (let i = 0; i < 50; i++) sql("INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status) VALUES (?, ?, ?, ?, ?, 'x', NULL, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'applied')", crypto.randomUUID(), TENANT, w.grantId, w.sessionId, INSTALL_STANDARD_ACTION)
+    expect(refusal(await call(op(), 'squad_member_add', { agent: 'agent-b', squad: 'S1', capability: 'member' })).error).toBe('installer_window_cap_reached')
+    expect(membership('agent-b', 'S1')).toBeNull()
+  })
+
+  it('P2 home container: an installer request scoped to a home squad or department is refused', async () => {
+    const sessionId = await checkIn(op())
+    for (const [t, id] of [['squad', 'SH'], ['department', 'DH']] as const) {
+      const r = await createElevationRequest(env, { tenant: TENANT, agentSessionId: sessionId, agentId: 'agent-op', memberId: 'seat-agent-op', actions: [INSTALL_STANDARD_ACTION], scopeType: t, scopeId: id, durationMinutes: 15, reason: 'x' })
+      expect(r.ok, t).toBe(false)
+    }
+  })
+
+  it('P2 HTTP create-squad twin stamps created_via_elevation_grant', async () => {
+    const w = await openWindow(op(), INSTALL_STANDARD_ACTION, 'department', 'D1')
+    authState.current = op()
+    const res = await orgApp.request(new Request('https://pot.test/departments/D1/squads', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ slug: 'http-made', name: 'Http Made' }) }), undefined, env)
+    expect(res.status, await res.clone().text()).toBe(201)
+    expect(rows<{ v: string }>("SELECT created_via_elevation_grant AS v FROM squads WHERE slug = 'http-made'")[0].v).toBe(w.grantId)
+  })
+
+  it('P2 approval text no longer promises project access', () => {
+    for (const k of [INSTALL_STANDARD_ACTION, INSTALL_HIGH_ACTION]) {
+      const d = ELEVATION_ACTIONS[k]
+      expect(`${d.label} ${d.description} ${d.effectNote}`.toLowerCase()).not.toMatch(/organi[sz]e[^.]*project|access edge|attach a project/)
+    }
   })
 })

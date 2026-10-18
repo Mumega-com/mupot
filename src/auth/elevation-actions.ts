@@ -224,9 +224,9 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     key: 'action:install_standard',
     enforced: true,
     label: 'Installer window (standard)',
-    description: 'Time-boxed (max 50 writes): organise squads, agents and project access up to MEMBER standing inside the scope you grant. Cannot attach a project to a squad the agent itself belongs to, and cannot downgrade or remove anything above member. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
+    description: 'Time-boxed (max 50 writes): organise squads and agents (create squads and agents, add, remove and move agents) up to MEMBER standing inside the scope you grant. Cannot touch anything above member. Never changes project access, never mints credentials, never grants admin or gates, never touches humans or home squads.',
     effect: 'reversible',
-    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. Squads, agents and access edges it creates can be edited or removed by standing authority afterwards.',
+    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. Squads and agents it creates can be edited or removed by standing authority afterwards.',
   },
   'action:install_high': {
     key: 'action:install_high',
