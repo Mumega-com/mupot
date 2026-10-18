@@ -8,7 +8,7 @@
 //   - It never blocks a call, never writes agent_seats.admission_status, never creates a card or notification.
 
 import type { AuthContext, Env } from '../types'
-import { describeArgs, scoreWindow, windowIsFull, type TapeEvent } from './tape-rules'
+import { TAPE_THRESHOLDS, describeArgs, scoreWindow, windowIsFull, type TapeEvent } from './tape-rules'
 
 export const ADMISSION_STATUSES = ['observed', 'trusted', 'held'] as const
 export type AdmissionStatus = (typeof ADMISSION_STATUSES)[number]
@@ -39,6 +39,8 @@ export interface TapeCall {
   tool: string
   min: string
   args: Record<string, unknown>
+  /** the tool's inputSchema property names: the ONLY key names the tape may keep */
+  allowedKeys: ReadonlySet<string>
   outcome: { ok: true } | { ok: false; status: number; error: string }
   now: number
 }
@@ -74,7 +76,7 @@ export function buildTapeEvent(auth: AuthContext, call: TapeCall, facts: Pick<Se
     min: call.min,
     status: call.outcome.ok ? 200 : call.outcome.status,
     error: call.outcome.ok ? null : call.outcome.error,
-    arg_shape: describeArgs(call.args),
+    arg_shape: describeArgs(call.args, call.allowedKeys),
     target_drift: drift,
     t: call.now,
   }
@@ -105,16 +107,22 @@ export async function recordTapeCall(env: Env, auth: AuthContext, call: TapeCall
   }
   events.push(ev)
 
-  if (!windowIsFull(events, ev.t)) {
+  const serialised = JSON.stringify(events)
+  // Close early on size too, so a window row can never approach D1's row limit.
+  if (!windowIsFull(events, ev.t) && serialised.length < TAPE_THRESHOLDS.windowBytes) {
     await env.DB.prepare(
       `INSERT INTO seat_tape_window (seat_id, events_json) VALUES (?1, ?2)
        ON CONFLICT(seat_id) DO UPDATE SET events_json = excluded.events_json, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-    ).bind(seat.seatId, JSON.stringify(events)).run()
+    ).bind(seat.seatId, serialised).run()
     return
   }
 
   const scored = scoreWindow(events)
-  const prev = await env.DB.prepare('SELECT row_hash FROM seat_tape WHERE seat_id = ?1 ORDER BY window_end DESC, rowid DESC LIMIT 1').bind(seat.seatId).first<{ row_hash: string }>()
+  // The chain head is the row no other row names as its prev_hash (never "latest by time": a row can be inserted out of order).
+  const prev = await env.DB.prepare(
+    `SELECT t.row_hash FROM seat_tape t WHERE t.seat_id = ?1
+        AND NOT EXISTS (SELECT 1 FROM seat_tape n WHERE n.seat_id = t.seat_id AND n.prev_hash = t.row_hash) LIMIT 1`,
+  ).bind(seat.seatId).first<{ row_hash: string }>()
   const prevHash = prev?.row_hash ?? ''
   const id = crypto.randomUUID()
   const fields = {

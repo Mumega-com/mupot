@@ -11,6 +11,13 @@ export const TAPE_THRESHOLDS = {
   windowEvents: 20,
   /** ...or when its oldest event is this old (ms), whichever comes first. */
   windowMs: 10 * 60 * 1000,
+  /** ...or when the serialised window reaches this many bytes (D1 row limit is 2MB; close far below it). */
+  windowBytes: 200_000,
+  /** Keys recorded per event; the rest are only counted. */
+  maxKeysPerEvent: 32,
+  /** Unknown key names scanned per event, each truncated, so a key flood cannot cost unbounded CPU. */
+  maxUnknownScanned: 256,
+  unknownKeyScanChars: 256,
   /** Window score at or above this would hold the seat (design: score >= 70). */
   holdScore: 70,
   /** Floor refusals within probeWindowMs that make a hard trip (design: 3 in 5 min = probing). */
@@ -28,7 +35,12 @@ export type ArgClass = 'url' | 'email' | 'id' | 'secret_like'
 
 /** The ONLY thing about a call's arguments that the tape ever stores: key names, lengths, classes. Never values. */
 export interface ArgShape {
+  /** Only keys that the tool's own inputSchema declares (at most TAPE_THRESHOLDS.maxKeysPerEvent). */
   keys: Record<string, { type: string; len?: number; classes?: ArgClass[] }>
+  /** How many other keys the caller sent. Their names are caller-chosen text and are NEVER kept. */
+  unknown_keys: number
+  /** An unknown key's name or value looked secret-like (a secret or credentialed URL used as a key name). */
+  unknown_secret_like?: boolean
 }
 
 export interface TapeEvent {
@@ -99,6 +111,7 @@ const SECRET_VALUE_RES: readonly RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\b[A-Fa-f0-9]{40,}\b/, // long hex
   /\b[A-Za-z0-9+/_-]{48,}={0,2}/, // long base64/url-safe blob
+  /\bhttps?:\/\/[^/\s:@]+:[^/\s@]+@/i, // URL with embedded credentials
 ]
 const URL_RE = /^https?:\/\/\S+$/i
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -117,32 +130,50 @@ function classesOf(key: string, value: string): ArgClass[] {
   return out
 }
 
-/** Describe arguments WITHOUT keeping any value. Nested objects/arrays are summarised by type and size only,
- *  but their string leaves are still scanned for secret-like content (one level of classes, no values). */
-export function describeArgs(args: Record<string, unknown>): ArgShape {
+/** Describe arguments WITHOUT keeping any value. A key name is kept ONLY when `allowedKeys` (the tool's inputSchema
+ *  property names) contains it; every other key is counted, and its name and value are scanned for secret-like content
+ *  but never stored. Nested objects/arrays are summarised by type and size, their string leaves still scanned. */
+export function describeArgs(args: Record<string, unknown>, allowedKeys: ReadonlySet<string> = new Set()): ArgShape {
+  const T = TAPE_THRESHOLDS
   const keys: ArgShape['keys'] = {}
-  for (const [k, v] of Object.entries(args)) {
-    const name = k.slice(0, 64) // key names are caller-chosen text; bound them
+  let kept = 0
+  let unknown = 0
+  let scanned = 0
+  let unknownSecret = false
+  for (const k in args) {
+    if (!Object.prototype.hasOwnProperty.call(args, k)) continue
+    const v = args[k]
+    if (!allowedKeys.has(k) || kept >= T.maxKeysPerEvent) {
+      unknown++
+      if (!unknownSecret && scanned < T.maxUnknownScanned) {
+        scanned++
+        const head = k.slice(0, T.unknownKeyScanChars)
+        if (SECRET_VALUE_RES.some((re) => re.test(head)) || SECRET_KEY_RE.test(head)) unknownSecret = true
+        else if (typeof v === 'string' && classesOf(head, v.slice(0, 4096)).includes('secret_like')) unknownSecret = true
+      }
+      continue
+    }
+    kept++
     if (typeof v === 'string') {
       const classes = classesOf(k, v)
-      keys[name] = { type: 'string', len: v.length, ...(classes.length ? { classes } : {}) }
+      keys[k] = { type: 'string', len: v.length, ...(classes.length ? { classes } : {}) }
     } else if (Array.isArray(v)) {
       const leaves = v.filter((x): x is string => typeof x === 'string')
       const secret = leaves.some((s) => classesOf(k, s).includes('secret_like'))
-      keys[name] = { type: 'array', len: v.length, ...(secret ? { classes: ['secret_like' as const] } : {}) }
+      keys[k] = { type: 'array', len: v.length, ...(secret ? { classes: ['secret_like' as const] } : {}) }
     } else if (v !== null && typeof v === 'object') {
       const flat = JSON.stringify(v)
       const secret = SECRET_VALUE_RES.some((re) => re.test(flat))
-      keys[name] = { type: 'object', len: Object.keys(v).length, ...(secret ? { classes: ['secret_like' as const] } : {}) }
+      keys[k] = { type: 'object', len: Object.keys(v).length, ...(secret ? { classes: ['secret_like' as const] } : {}) }
     } else {
-      keys[name] = { type: v === null ? 'null' : typeof v }
+      keys[k] = { type: v === null ? 'null' : typeof v }
     }
   }
-  return { keys }
+  return { keys, unknown_keys: unknown, ...(unknownSecret ? { unknown_secret_like: true } : {}) }
 }
 
 export function hasSecretLike(shape: ArgShape): boolean {
-  return Object.values(shape.keys).some((k) => k.classes?.includes('secret_like'))
+  return shape.unknown_secret_like === true || Object.values(shape.keys).some((k) => k.classes?.includes('secret_like'))
 }
 
 // ── scorer ─────────────────────────────────────────────────────────────────────────────────────────────────────

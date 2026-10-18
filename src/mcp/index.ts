@@ -7899,6 +7899,7 @@ export async function invokeTool(
           tool: spec.name,
           min: spec.min,
           args,
+          allowedKeys: new Set(Object.keys(spec.inputSchema.properties)),
           outcome: outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error },
           now: Date.now(),
         }, ctx?.waitUntil)
