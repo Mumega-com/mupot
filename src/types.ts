@@ -540,6 +540,8 @@ export interface Agent {
   // display label) and from agent_keys (memberOwnsAssigneeAgent's conflict-of-
   // interest table) — do not conflate the three.
   owner_member_id: string | null
+  // attach_designated_member_id (0238): the human whose chats may become this agent via seat_attach (SEAT_ATTACH_DESIGNATED).
+  attach_designated_member_id?: string | null
 }
 
 export interface Membership {
