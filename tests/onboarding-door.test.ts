@@ -64,13 +64,13 @@ type Kind = 'chatgpt' | 'claude' | 'hermes' | 'unknown'
 const dead = (isDead: boolean): typeof it => (isDead ? it.fails : it)
 // Flip a flag to false when its lane lands. See the header for what each one means.
 const DEAD: Record<string, Record<Kind, boolean>> = {
-  seatLoop: { chatgpt: false, claude: true, hermes: false, unknown: false },
+  seatLoop: { chatgpt: false, claude: false, hermes: false, unknown: false },
   orientRefusal: { chatgpt: false, claude: false, hermes: false, unknown: true },
   bootstrapRefused: { chatgpt: true, claude: false, hermes: false, unknown: false },
   connectAfterBootstrap: { chatgpt: false, claude: false, hermes: false, unknown: false },
   humanStepOnly: { chatgpt: false, claude: false, hermes: false, unknown: true },
-  actionTask: { chatgpt: false, claude: true, hermes: false, unknown: true },
-  actionInbox: { chatgpt: false, claude: true, hermes: false, unknown: true },
+  actionTask: { chatgpt: false, claude: false, hermes: false, unknown: true },
+  actionInbox: { chatgpt: false, claude: false, hermes: false, unknown: true },
   threadAgent: { chatgpt: true, claude: true, hermes: false, unknown: false },
   noWhoami: { chatgpt: true, claude: true, hermes: true, unknown: true },
   splitSteps: { chatgpt: true, claude: true, hermes: false, unknown: true },
@@ -89,7 +89,7 @@ function memoryKv() {
 type Json = Record<string, unknown>
 interface Reply { refused: boolean; body: Json }
 /** props: OAuth grant props (AuthContext rebuilt per call); bearer: workspace token. */
-interface Client { kind: Kind; props: Json | null; bearer: string | null; meta?: Json }
+interface Client { kind: Kind; props: Json | null; bearer: string | null; meta?: Json; seat?: string }
 interface World { h: SqliteD1Harness; env: Env; agents: () => number; refusals: Json[] }
 
 function newWorld(): World {
@@ -173,7 +173,8 @@ async function rpc(w: World, c: Client, method: string, params: Json): Promise<R
 }
 
 async function call(w: World, c: Client, name: string, args: Json = {}): Promise<Reply> {
-  const res = await rpc(w, c, 'tools/call', { name, arguments: args })
+  // Lane C: a thread with no header and no _meta sends the seat_id seat_select returned as `seat` on every later call.
+  const res = await rpc(w, c, 'tools/call', { name, arguments: c.seat && !('seat' in args) ? { ...args, seat: c.seat } : args })
   const env = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Json }; error?: { message?: string; data?: unknown; who_acts?: unknown; next_step?: unknown; next_tool?: unknown } }
   if (env.result?.isError) { w.refusals.push(env.result.structuredContent ?? {}); return { refused: true, body: env.result.structuredContent ?? {} } }
   // Lane B: the refusal envelope rides as SIBLING members of the JSON-RPC error (beside `data`, which keeps its old shape).
@@ -232,7 +233,9 @@ async function takeDoor(w: World, c: Client, boot: Json, prior: Step[], humanSte
     const made = prior.map((s) => asObj(s.reply.body.agent).slug).find((x): x is string => typeof x === 'string')
     args = { agent_name: quoted ?? made ?? 'unknown-slug' }
   }
-  prior.push({ tool, reply: await call(w, c, tool, args) })
+  const reply = await call(w, c, tool, args)
+  prior.push({ tool, reply })
+  if (tool === 'seat_select' && typeof reply.body.seat_id === 'string') c.seat = reply.body.seat_id // do what the instruction says
 }
 
 async function walk(w: World, c: Client): Promise<Trace> {
@@ -259,7 +262,7 @@ async function walk(w: World, c: Client): Promise<Trace> {
   const refusals = [...w.refusals]
   // Last: run bootstrap_self for a client whose boot mentions it as a door or in prose and that did not already walk it.
   const mentioned = toolDoors(boot).includes('bootstrap_self') || stepWords(boot).some((x) => x.includes('bootstrap_self'))
-  const bootstrap = mentioned && !steps.some((s) => s.tool === 'bootstrap_self') ? await call(w, c, 'bootstrap_self', STATIC_ARGS.bootstrap_self) : null
+  const bootstrap = mentioned && !steps.some((s) => s.tool === 'bootstrap_self') ? await call(w, { ...c, seat: undefined }, 'bootstrap_self', STATIC_ARGS.bootstrap_self) : null // cold state: no seat carried
   return { w, c, tools, handleReply, boot, boot2, boot3, steps, humanSteps, orient, status, task, inbox, bootstrap, agentsBefore, agentsAfter, refusals }
 }
 

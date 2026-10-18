@@ -12,6 +12,9 @@ import { seatSelect } from '../members/seat-select'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { consentChoiceLabels, consentLabels } from './refusal-next-step'
 
+/** The thread has no header or _meta: it carries its seat as an ordinary argument on every call. */
+const SEAT_ARG_INSTRUCTION = (handle: string): string => `Pass \`seat: ${handle}\` on every call.`
+
 const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
   scope: 'self (find-or-create the agent seat for this harness + workspace; unbound directory session only)',
@@ -44,6 +47,11 @@ const toolSeatSelect: ToolSpec = {
         agent: result.agent,
         member_id: result.member_id,
         seat_handle: result.seat_handle,
+        // Lane C: the handle again under the name a thread passes back (`seat: <seat_id>`), the slug it acts
+        // as, and the one-line instruction. Same value as seat_handle; shown once, never stored in clear.
+        seat_id: result.seat_handle,
+        acts_as: result.agent.slug,
+        instruction: result.seat_handle ? SEAT_ARG_INSTRUCTION(result.seat_handle) : null,
         audit_id: result.audit_id,
         note: result.note,
       })

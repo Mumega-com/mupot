@@ -61,7 +61,8 @@ import {
 import {
   clientInfoFromMeta, readCredentialSharing, recordCredentialSession, sharedCredentialDetectEnabled, sharedCredentialHint,
 } from '../members/credential-sharing'
-import { SEAT_HANDLE_PREFIX } from '../members/seat-handle'
+import { notSeatAgentSql } from '../members/seat-agent'
+import { SEAT_HANDLE_PREFIX, seatHandleFromArgs } from '../members/seat-handle'
 import { applySeatForRequest } from '../members/seat-auto'
 import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
@@ -356,6 +357,8 @@ interface SeatBodyMeta {
   toolName?: string
   paramsMeta?: unknown
   argsMeta?: unknown
+  /** Lane C: a handle-shaped `arguments.seat` (see seatHandleFromArgs). Lowest-precedence carrier. */
+  argSeat?: string | null
 }
 
 /** `X-Mupot-Seat` is BOTH the legacy cosmetic seat label (ctx.seat) and, with SEAT_AUTO_ENROLL on,
@@ -573,6 +576,7 @@ async function resolveSeatSession(
   return applySeatForRequest(c.env, auth, {
     headerHandle: headerSeat,
     metaHandle: metaSeat,
+    argHandle: bodyMeta?.argSeat ?? null,
     hints: hintsFrom(facts),
     // The auto key comes ONLY from the request-level params._meta (written by the client harness), never
     // from params.arguments._meta (written by the MODEL, so a model could pick its own seat). seat_select
@@ -5779,10 +5783,11 @@ const toolPeers: ToolSpec = {
                 ORDER BY p.last_seen_at DESC LIMIT 1) AS presence_last_seen_at
          FROM agents a
         WHERE a.squad_id = ?1
+          AND (${notSeatAgentSql('a')} OR a.id = ?4)
         ORDER BY a.slug ASC
         LIMIT ?3`,
     )
-      .bind(squadRes.squad.id, env.TENANT_SLUG, limit)
+      .bind(squadRes.squad.id, env.TENANT_SLUG, limit, auth.boundAgentId ?? '')
       .all<PeerRow>()
 
     const nowMs = Date.now()
@@ -6758,6 +6763,8 @@ async function buildIdentityReceipt(
     // Hints are presence booleans only: openai/session, openai/subject and Codex threadId never
     // select a seat. seat_handle_rejected = a handle was presented and did NOT resolve.
     seat: seat ? { id: seat.seatId, label: seat.label, source: seat.source } : null,
+    // Lane C: the slug this request acts as when a seat is bound (the thread's identity), null otherwise.
+    acts_as: seat && agentRow ? agentRow.slug : null,
     // W2: "acting as <agent> via <connection name>". Server-derived from the seat the request was bound to (the human's own
     // label, else the app's registered name + the seat label); a label only, never authority. Only with SEAT_ATTACH on.
     ...(seat && seatAttachEnabled(env)
@@ -7455,6 +7462,32 @@ export const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+/** Lane C (threads-as-seats slice 1): the seat handle as an ORDINARY tool argument. Hosted chat clients
+ *  (claude.ai, Grok, Cursor, Codex web) send no header and no `_meta`, so the model passes back the
+ *  `seat_id` that seat_select returned on every call. ONE fragment, applied to ONE list. The value is
+ *  stripped from `arguments` in handleJsonRpc and verified by exactly the header path (applySeatHandle);
+ *  it carries no authority of its own. Tools that already declared `seat` (inbox, send, check_in,
+ *  boot_context: a mailbox/enrolment LABEL) keep their schema; their handlers only ever see a
+ *  non-handle-shaped value, because a handle-shaped one is stripped first. */
+export const SEAT_ARG = {
+  type: 'string',
+  description: 'Your seat handle (mseat_..., the seat_id seat_select returned). Pass it on every call so this conversation keeps its seat.',
+} as const
+export const SEAT_ARG_TOOLS: readonly string[] = [
+  'boot_context', 'orient', 'status', 'check_in', 'send', 'inbox', 'recall', 'remember', 'task_create',
+  'task_board', 'task_get', 'needs_you_list', 'project_context', 'seat_attach', 'peers',
+]
+/** Tools whose schema gained `seat` here (not natively): the curated profile door never advertises it. */
+const SEAT_ARG_INJECTED: Set<string> = new Set()
+for (const name of SEAT_ARG_TOOLS) {
+  const spec = TOOL_BY_NAME.get(name)
+  if (!spec) throw new Error(`SEAT_ARG tool ${name} is not registered`)
+  if (!Object.prototype.hasOwnProperty.call(spec.inputSchema.properties, 'seat')) {
+    spec.inputSchema.properties.seat = SEAT_ARG
+    SEAT_ARG_INJECTED.add(name)
+  }
+}
+
 /** mupot#1910: OpenAI-style function names (Codex, ChatGPT apps/Actions) allow only [A-Za-z0-9_-]{1,64}. The office
  *  tools are registered dotted (`office.review_approval`). Each dotted name gets an EXACT alias with the dots turned
  *  into underscores: the alias key points at the SAME ToolSpec object in TOOL_BY_NAME, so the capability floor,
@@ -7616,9 +7649,9 @@ function profileToolList(): Record<string, unknown>[] {
     const spec = TOOL_BY_NAME.get(entry.name)
     if (!spec) continue
     const base = mcpTool(spec)
-    if (entry.rejectArgs || entry.args !== undefined) {
+    if (entry.rejectArgs || entry.args !== undefined || SEAT_ARG_INJECTED.has(spec.name)) {
       const props = Object.fromEntries(
-        Object.entries(spec.inputSchema.properties).filter(([k]) => !entry.rejectArgs?.includes(k)),
+        Object.entries(spec.inputSchema.properties).filter(([k]) => !entry.rejectArgs?.includes(k) && !(k === 'seat' && SEAT_ARG_INJECTED.has(spec.name))),
       )
       base.inputSchema = { ...spec.inputSchema, properties: props }
       if (entry.args !== undefined) {
@@ -8050,7 +8083,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: seatHandleFromArgs(argsObject), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -8074,8 +8107,12 @@ async function handleJsonRpc(
     }
     // With the flag on, a `_meta` ARGUMENT is transport metadata, not a tool argument: strip it so
     // the tool's own (additionalProperties:false) schema never sees it. Flag off: untouched.
-    const toolArguments = profile === undefined && seatAutoEnrollEnabled(c.env) && argsObject !== null && '_meta' in argsObject
-      ? Object.fromEntries(Object.entries(argsObject).filter(([k]) => k !== '_meta'))
+    // Lane C: a handle-shaped `seat` ARGUMENT is the same kind of transport carrier and is stripped on EVERY flag
+    // state (flag off: it simply selects nothing), so no handler ever reads a handle out of its arguments.
+    const stripSeatArg = profile === undefined && seatHandleFromArgs(argsObject) !== null
+    const stripMetaArg = profile === undefined && seatAutoEnrollEnabled(c.env) && argsObject !== null && '_meta' in argsObject
+    const toolArguments = argsObject !== null && (stripSeatArg || stripMetaArg)
+      ? Object.fromEntries(Object.entries(argsObject).filter(([k]) => !(stripMetaArg && k === '_meta') && !(stripSeatArg && k === 'seat')))
       : params.arguments
     // Profile allowlist: refuse BEFORE invokeTool, regardless of the caller's capabilities.
     // Authentication above still comes first (401 for an anonymous caller, never a probe of

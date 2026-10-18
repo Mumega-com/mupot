@@ -18,7 +18,7 @@ import {
   SEAT_HANDLE_MAX_LIVE_PER_SEAT, NO_HINTS,
 } from '../src/members/seat-handle'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
-import { mcpApp, invokeTool } from '../src/mcp/index'
+import { mcpApp, invokeTool, TOOLS, SEAT_ARG_TOOLS } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { canOnSquad } from '../src/auth/capability'
@@ -1062,5 +1062,150 @@ describe('findLiveSeatForHandle: one violated conjunct per case', () => {
     // HUMAN's grant (token g1.tokenId, member HUMAN), presenting HUMAN2's harness id so ?5 agrees:
     const ctx = { ...g1.ctx, harnessId: g2.harnessId }
     expect((await applySeatHandle(env, ctx, { headerHandle: hd, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// Lane C (threads-as-seats slice 1): the handle as an ordinary `seat` tool ARGUMENT.
+describe('seat handle as a tool argument', () => {
+  it('seat_select returns seat_id (= the handle), acts_as (the slug) and the pass-it-back instruction', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    expect(a.sc.seat_id).toBe(a.handle)
+    expect(a.sc.acts_as).toBe((a.sc.agent as { slug: string }).slug)
+    expect(a.sc.instruction).toBe(`Pass \`seat: ${a.handle}\` on every call.`)
+  })
+
+  it('arguments.seat binds the seat (no header, no _meta) and the receipt names who it acts as', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const r = await rpc(env, g.ctx, 'boot_context', { seat: a.handle })
+    expect(r.body.error).toBeUndefined()
+    expect(r.sc.bound_agent_id).toBe(a.agentId)
+    expect(receiptOf(r)).toMatchObject({ binding_source: 'seat_handle', seat_handle_rejected: false, acts_as: (a.sc.agent as { slug: string }).slug })
+    const none = await rpc(env, g.ctx, 'boot_context', {})
+    expect(receiptOf(none).acts_as).toBeNull()
+  })
+
+  it('a bad, revoked-shaped or unknown argument handle is rejected exactly like a header one, and never falls back', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    for (const bad of [mintSeatHandle(), 'mseat_short', a.handle.slice(0, -2) + 'AA']) {
+      const viaArg = await rpc(env, g.ctx, 'boot_context', { seat: bad })
+      const viaHeader = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': bad } })
+      expect(viaArg.sc.bound_agent_id).toBeNull()
+      expect(receiptOf(viaArg).seat_handle_rejected).toBe(true)
+      expect(receiptOf(viaHeader).seat_handle_rejected).toBe(true)
+    }
+    // an UNPREFIXED value is a cosmetic label, not a carrier (same split as the header)
+    const label = await rpc(env, g.ctx, 'boot_context', { seat: 'cursor-mac' })
+    expect(label.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(label).seat_handle_rejected).toBe(false)
+  })
+
+  it('precedence: _meta > header > argument, one candidate one verdict (a failing winner is not retried)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a'); const b = await select(env, g, '/work/b')
+    const hdr = await rpc(env, g.ctx, 'boot_context', { seat: a.handle }, { headers: { 'x-mupot-seat': b.handle } })
+    expect(hdr.sc.bound_agent_id).toBe(b.agentId)
+    const meta = await rpc(env, g.ctx, 'boot_context', { seat: a.handle }, { meta: { 'mupot/seat': b.handle } })
+    expect(meta.sc.bound_agent_id).toBe(b.agentId)
+    const wrongHeader = await rpc(env, g.ctx, 'boot_context', { seat: a.handle }, { headers: { 'x-mupot-seat': mintSeatHandle() } })
+    expect(wrongHeader.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(wrongHeader).seat_handle_rejected).toBe(true)
+  })
+
+  it('is stripped from arguments before any handler or validateArgs: a tool without a seat property never sees it', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    // task_list has no `seat` property (additionalProperties:false): an unstripped handle would be `unknown field: seat`.
+    const r = await rpc(env, g.ctx, 'task_list', { seat: a.handle })
+    expect(JSON.stringify(r.body)).not.toContain('unknown field')
+    const bound = await rpc(env, g.ctx, 'status', { seat: a.handle })
+    expect(bound.body.error).toBeUndefined()
+    // the legacy label semantics of inbox/send/check_in survive for a non-handle value
+    const inbox = await rpc(env, g.ctx, 'inbox', { seat: a.handle, peek: true })
+    expect(JSON.stringify(inbox.body)).not.toContain('seat_mismatch')
+    expect(JSON.stringify(inbox.body)).not.toContain('seat_not_bound')
+  })
+
+  it('cannot escalate: another member\'s handle, or one presented on a different grant, is rejected', async () => {
+    const env = envFor(h)
+    const g1 = await grant(env, HUMAN)
+    const g2 = await grant(env, HUMAN2, 'client-cursor', 'Cursor')
+    const a = await select(env, g1, '/work/a')
+    const cross = await rpc(env, g2.ctx, 'boot_context', { seat: a.handle })
+    expect(cross.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(cross).seat_handle_rejected).toBe(true)
+    const other = await grant(env, HUMAN, 'client-other', 'Other')
+    const wrongHarness = await rpc(env, other.ctx, 'boot_context', { seat: a.handle })
+    expect(wrongHarness.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(wrongHarness).seat_handle_rejected).toBe(true)
+  })
+
+  it('an already-bound (seat-agent) session or the flag off never reads the argument as a selector', async () => {
+    const env = envFor(h, { SEAT_AUTO_ENROLL: '0' })
+    const g = await grant(envFor(h), HUMAN)
+    const a = await select(envFor(h), g, '/work/a')
+    const r = await rpc(env, g.ctx, 'status', { seat: a.handle })
+    expect(r.body.error).toBeUndefined() // stripped, selects nothing
+  })
+
+  it.each(SEAT_ARG_TOOLS.map((t) => [t]))('%s tolerates the seat argument (schema declares it; validateArgs does not refuse it)', async (name) => {
+    const spec = TOOLS.find((t) => t.name === name)!
+    expect(spec.inputSchema.properties.seat).toMatchObject({ type: 'string' })
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const args: Record<string, unknown> = { seat: a.handle }
+    for (const req of spec.inputSchema.required ?? []) {
+      const t = (spec.inputSchema.properties[req] as { type?: string } | undefined)?.type
+      args[req] = t === 'number' ? 1 : t === 'boolean' ? true : t === 'array' ? [] : t === 'object' ? {} : 'x'
+    }
+    const r = await rpc(env, g.ctx, name, args)
+    expect(JSON.stringify(r.body)).not.toContain('unknown field: seat')
+    expect(JSON.stringify(r.body)).not.toContain(a.handle)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('roster hygiene: seat agents are not roster members', () => {
+  it('peers and squad_member_list omit seat agents; resolve_agent by slug still finds one; the seat sees itself', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const slug = (a.sc.agent as { slug: string }).slug
+    const squadId = (a.sc.agent as { squad_id: string }).squad_id
+    h.sqlite.exec(`INSERT OR IGNORE INTO memberships (agent_id, squad_id, capability) VALUES ('${a.agentId}', '${squadId}', 'member')`)
+    const squadSlug = String(h.sqlite.prepare(`SELECT slug FROM squads WHERE id = ?`).get(squadId)!.slug)
+    const resolved = await rpc(env, g.ctx, 'resolve_agent', { seat: a.handle, query: slug })
+    expect(JSON.stringify(resolved.body)).toContain(a.agentId) // still resolvable by slug
+    const seatCtx = (await rpc(env, g.ctx, 'boot_context', { seat: a.handle }))
+    expect(seatCtx.sc.bound_agent_id).toBe(a.agentId)
+    const asSeat = await rpc(env, g.ctx, 'peers', { seat: a.handle, squad_id: squadId })
+    const peerList = (asSeat.sc.peers ?? []) as Array<{ slug: string; is_self: boolean }>
+    expect(peerList.find((p) => p.slug === slug)?.is_self).toBe(true) // own identity stays visible to itself
+    // a stranger who can read the squad (an org-style grant, not a seat): the seat agent is absent from both rosters
+    const stranger: AuthContext = {
+      ...g.ctx, boundAgentId: null, channel: 'workspace', harnessId: undefined,
+      capabilities: [{ member_id: HUMAN, scope_type: 'squad', scope_id: squadId, capability: 'admin' }],
+    }
+    const human = await invokeTool(stranger, env, 'peers', { squad_id: squadId }, { origin: 'https://pot.test', transport: 'mcp' })
+    expect(human.ok).toBe(true)
+    const humanPeers = ((human.ok ? (human.result as { peers: Array<{ slug: string }> }).peers : []))
+    expect(humanPeers.some((p) => p.slug === slug)).toBe(false)
+    const list = await invokeTool(stranger, env, 'squad_member_list', { squad: squadSlug }, { origin: 'https://pot.test', transport: 'mcp' })
+    expect(list.ok).toBe(true)
+    const members = (list.ok ? (list.result as { members: Array<{ slug: string }> }).members : [])
+    expect(members.some((m) => m.slug === slug)).toBe(false)
+    // control: a normal (non-seat) agent in the same squad IS listed, so the omission above is the seat predicate, not an empty roster
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, status, created_at) VALUES ('plain-1', '${squadId}', 'plain-agent', 'Plain', 'worker', 'active', '2026-10-09T00:00:00.000Z')`)
+    const after = await invokeTool(stranger, env, 'peers', { squad_id: squadId }, { origin: 'https://pot.test', transport: 'mcp' })
+    expect(after.ok && (after.result as { peers: Array<{ slug: string }> }).peers.map((p) => p.slug)).toEqual(['plain-agent'])
   })
 })

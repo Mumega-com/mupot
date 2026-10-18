@@ -1,4 +1,5 @@
 import { brandSquadScope, canOnSquad, hasCapability, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { notSeatAgentSql } from './seat-agent'
 import type { GrantVia } from '../auth/grant-events'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
@@ -336,6 +337,7 @@ export async function listSquadMembers(input: {
         AND c.scope_id = m.squad_id
         AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}
       WHERE m.squad_id = ?2
+        AND ${notSeatAgentSql('a')}
       ORDER BY a.slug ASC`,
   )
     .bind(input.env.TENANT_SLUG, input.squadId, nowCapabilitySql())

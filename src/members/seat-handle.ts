@@ -188,6 +188,9 @@ export interface SeatRequestInputs {
   headerHandle?: string | null
   /** `_meta["mupot/seat"]` (call params or call arguments), if any. */
   metaHandle?: string | null
+  /** `arguments.seat` (lane C): the handle as an ordinary tool argument, the only carrier hosted chat clients
+   *  (claude.ai, Grok, Cursor and Codex web) can use. Lowest precedence; same verification as the header. */
+  argHandle?: string | null
   hints: HarnessHints
 }
 
@@ -201,7 +204,20 @@ export function pickHandle(inputs: SeatRequestInputs): string | null {
   if (typeof inputs.metaHandle === 'string' && inputs.metaHandle.length > 0) return inputs.metaHandle
   const header = typeof inputs.headerHandle === 'string' ? inputs.headerHandle.trim() : ''
   if (header.startsWith(SEAT_HANDLE_PREFIX)) return header
+  if (typeof inputs.argHandle === 'string' && inputs.argHandle.length > 0) return inputs.argHandle
   return null
+}
+
+/** The `seat` tool-argument carrier, ONE definition (lane C). Returns the handle-shaped value of
+ *  `arguments.seat`, or null. A value without the handle prefix is NOT a carrier: several tools (check_in,
+ *  boot_context, send, inbox) already take `seat` as a cosmetic mailbox/enrolment LABEL, and the header
+ *  path makes the same split, so a label is never read as, nor rejected as, a handle. */
+export function seatHandleFromArgs(args: Record<string, unknown> | null): string | null {
+  if (args === null) return null
+  const raw = args.seat
+  if (typeof raw !== 'string') return null
+  const v = raw.trim()
+  return v.startsWith(SEAT_HANDLE_PREFIX) ? v : null
 }
 
 interface MatchRow {
