@@ -24,7 +24,7 @@
 // the human holds nothing on is dropped, so an agent's grant can only narrow, never widen. The human
 // must still be admin on the agent's home squad. Re-derived live on every request, never frozen.
 // Org / department grants keep hasCapability's existing rule: they do not reach a kind='home' squad.
-// Admin/owner is never produced here. Zero capabilities -> the human's ORIGINAL context comes back
+// Admin/owner is never produced here by the default seat or by the legacy-plane lift (an attached `full` ceiling can carry the agent's own rank where capability rows justify it). Zero capabilities -> the human's ORIGINAL context comes back
 // (never a zero-capability context wearing the agent's member id).
 //
 // WHAT NEVER SELECTS A SEAT BY ITSELF: Mcp-Session-Id (ChatGPT re-initialises per call, Claude web shares
@@ -37,7 +37,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
-import { capabilityRank, resolveCapabilities, canOnSquad } from '../auth/capability'
+import { capabilityRank, resolveCapabilities, canOnSquad, humanVerifiedLegacyRoleRank } from '../auth/capability'
 import { humanMaxRankOnScope } from '../mcp/oauth-authorize'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAutoEnrollEnabled } from './harness'
@@ -134,7 +134,10 @@ export async function prepareSeatHandleIssue(
  *
  * Precondition: the human must still stand as ADMIN on the agent's own (home) squad, the same floor
  * /oauth/consent applies. Returns [] otherwise, and the caller falls back to the human's context.
- * Every grant is re-stamped to the agent's dedicated member id. Admin/owner is never produced.
+ * Every grant is re-stamped to the agent's dedicated member id. The REAL bound: on the default (auto) seat nothing exceeds
+ * 'member'; an ATTACHED seat with ceiling 'full' may carry the agent's own higher rank, but only where the human's capability
+ * ROWS justify it. The legacy role-plane lift (an org owner/admin with no rows on a scope) is applied to the agent's grants
+ * only and is CAPPED at 'member' on every path, so it can never produce lead/admin/owner.
  */
 export async function resolveSeatCapabilities(
   env: Env,
@@ -143,12 +146,15 @@ export async function resolveSeatCapabilities(
   const humanGrants = await resolveCapabilities(env, p.humanMemberId)
   if (!(await canOnSquad(env, humanGrants, p.agentSquadId, 'admin'))) return []
   const agentGrants = await resolveCapabilities(env, p.agentMemberId)
+  const humanLegacyRank = await humanVerifiedLegacyRoleRank(env, p.humanMemberId)
 
   const memberRank = capabilityRank(SEAT_CEILING)
   const ceilingCap = p.ceiling ? ceilingCapability(p.ceiling) : 'member'
   const merged = new Map<string, CapabilityGrant>()
   const consider = async (g: CapabilityGrant, fromAgent: boolean): Promise<void> => {
-    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
+    // Legacy role plane counts only for the AGENT's grants (the ones the clamp used to drop for a rowless owner); a grant
+    // sourced from the human's own rows keeps its row-only rank, so no one's own observer row is lifted.
+    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, fromAgent ? humanLegacyRank : 0)
     // An ATTACHED seat's admission ceiling replaces the flat 'member' cap ONLY on scopes the agent itself holds (member
     // default, lead, or `full` = the agent's own standing); the human's live standing always caps. An attached seat gets no
     // scope the agent does not hold. Gates are not capabilities and are never included (see attached-ceiling.ts).
