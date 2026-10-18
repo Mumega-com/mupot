@@ -832,7 +832,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
 // `whoami`: an optional block a refusal carries as a SIBLING of its detail (orient on an unbound session), so the refusal and the map arrive together.
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown; whoami?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown; whoami?: Whoami }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -7696,6 +7696,17 @@ function guideCtxFor(env: Env, auth: AuthContext, origin: string): GuideCtx {
 }
 
 /** `envelope` rides as SIBLING members of `error` (beside `data`): `data` keeps the exact shape clients already read. */
+/** A refusal that carries whoami defers to whoami.missing[0] for who_acts / next_step / next_tool / link, so the two cannot disagree. */
+function orientEnvelope(table: object | undefined, w: Whoami | undefined): object | undefined {
+  if (w === undefined) return table
+  const first = w.missing[0]
+  return {
+    ...(table ?? {}),
+    ...(first ? { who_acts: first.who_acts, next_step: first.next_step, next_tool: first.next_tool, link: first.link } : {}),
+    whoami: w,
+  }
+}
+
 function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200, envelope?: object): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data, ...(envelope ?? {}) } }), {
     status,
@@ -8255,7 +8266,7 @@ async function handleJsonRpc(
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       // Same -32602; the envelope rides in `data` only where the table has a specific entry (orient "agent required", check_in poll).
-      return rpcError(id, -32602, outcome.error, outcome.detail, 200, { ...refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)), ...(outcome.whoami !== undefined ? { whoami: outcome.whoami } : {}) })
+      return rpcError(id, -32602, outcome.error, outcome.detail, 200, orientEnvelope(refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)), outcome.whoami))
     }
     // 5xx (internal_error, receipt_failed, 503s) stay JSON-RPC errors carrying their HTTP status so
     // server-fault monitoring keeps working; only 4xx authz/business refusals become isError.

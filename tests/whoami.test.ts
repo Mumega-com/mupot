@@ -92,7 +92,7 @@ describe('real handler: each reachable state', () => {
       expect(boot.next_step).toBe(wh.missing[0].next_step) // derived, not a second opinion
       expect(obj(boot.onboarding).next_step).toBe(wh.missing[0].next_step)
       expect(String(obj(boot.channel_limits).to_get_write_access)).toContain(wh.missing[0].next_step)
-      expect(arr(boot.available_doors).map((d) => d.tool)).toEqual(['connect', 'status', 'boot_context'])
+      expect(arr(boot.available_doors).map((d) => d.tool)).toEqual(['status', 'boot_context']) // connect is not a door for a caller handed no slug (#2031)
       // and the refusal side agrees: the tool still refuses nobody the advert hides (it is not the gate), so state the contract
       expect(wh.missing.every((m) => m.next_tool === undefined)).toBe(true) // owner step: no tool for THIS caller
     } finally { w.h.close() }
@@ -314,6 +314,94 @@ describe('round 2', () => {
 })
 
 const ORIGIN_P = 'https://pot.test'
+
+describe('auto_seat_refused: the step names the actor who can clear the reason (#2031)', () => {
+  it('real repro: home grant lowered, new conversation -> org_admin step with NO seat_select, and seat_select really is refused with the same code', async () => {
+    const w = newWorld()
+    try {
+      const c = await oauthClient(w, 'chatgpt', 'ChatGPT', HARNESS_CHOICE, { 'openai/session': 'conv-A' })
+      expect(whoamiOf((await call(w, c, 'boot_context')).body).state).toBe('own_seat') // the first conversation seats fine
+      const human = w.h.sqlite.prepare("SELECT id FROM members WHERE email = 'chatgpt@pot.test'").get() as { id: string }
+      w.h.sqlite.prepare("UPDATE capabilities SET capability = 'member' WHERE member_id = ? AND scope_type = 'squad' AND capability = 'admin'").run(human.id)
+      c.meta = { 'openai/session': 'conv-B' }
+      const wh = whoamiOf((await call(w, c, 'boot_context')).body)
+      const m = wh.missing.find((x) => x.code === 'auto_seat_refused')
+      expect(m, JSON.stringify(wh)).toBeDefined()
+      expect(m?.who_acts).toBe('org_admin')
+      expect(m?.next_tool).toBeUndefined()
+      expect(wh.missing.map((x) => x.next_tool)).not.toContain('seat_select')
+      const again = await call(w, c, 'seat_select', ARGS.seat_select)
+      expect(again.refused).toBe(true)
+      expect(String(again.body.error)).toContain('home_rank_insufficient')
+    } finally { w.h.close() }
+  })
+
+  const refused = (reason: string): Whoami => run(authOf({ harnessId: 'h-1', seatInputs: { handleRejected: false, hints: { openai_session: true, openai_subject: false, codex_thread_id: false }, autoSeatRefused: reason } }))
+  const only = (reason: string): Whoami['missing'][number] => {
+    const wh = refused(reason)
+    expect(wh.state).toBe('harness_unseated')
+    expect(wh.missing).toHaveLength(1) // no second, generic seat_select step beside it
+    return wh.missing[0]
+  }
+  it('home_rank_insufficient: org_admin, no tool', () => {
+    const m = only('home_rank_insufficient')
+    expect(m).toMatchObject({ code: 'auto_seat_refused', who_acts: 'org_admin' })
+    expect(m.next_tool).toBeUndefined()
+  })
+  it('member_not_active: org_admin, no tool', () => {
+    const m = only('member_not_active')
+    expect(m.who_acts).toBe('org_admin')
+    expect(m.next_tool).toBeUndefined()
+  })
+  it('harness_required: owner, re-consent link with the consent labels', () => {
+    const m = only('harness_required')
+    expect(m).toMatchObject({ who_acts: 'owner', link: mcpEndpoint(ORIGIN) })
+    expect(m.next_tool).toBeUndefined()
+    expect(m.next_step).toContain('"Me (auto)"')
+  })
+  it('seat_cap_reached: self, no seat_select', () => {
+    const m = only('seat_cap_reached')
+    expect(m.who_acts).toBe('self')
+    expect(m.next_tool).toBeUndefined()
+    expect(m.next_step).toMatch(/Retire a seat/)
+  })
+  it('rate_limited: self, wait then seat_select', () => {
+    const m = only('rate_limited')
+    expect(m).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })
+    expect(m.next_step).toMatch(/Wait about 5 minutes/)
+  })
+  it('reasons that clear on retry keep seat_select (self)', () => {
+    for (const reason of ['seat_not_live', 'error']) expect(only(reason)).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })
+  })
+})
+
+describe('doors and the orient refusal agree with whoami (#2031)', () => {
+  it('K3 stranger and K4: connect is not a door; doors[0] is never connect', async () => {
+    const w = newWorld()
+    try {
+      for (const c of [await oauthClient(w, 'unknown', 'Some New Harness', ''), await oauthClient(w, 'claude', 'Claude', HARNESS_CHOICE)]) {
+        const doors = arr((await call(w, c, 'boot_context')).body.available_doors).map((d) => d.tool)
+        expect(doors).not.toContain('connect')
+        expect(doors[0]).not.toBe('connect')
+      }
+    } finally { w.h.close() }
+  })
+
+  it('K3 in an empty pot: the orient refusal envelope is whoami.missing[0] (bootstrap_self, self), not the table row (re-consent, owner)', async () => {
+    const w = newWorld()
+    try {
+      w.h.sqlite.exec('DELETE FROM agents')
+      const c = await oauthClient(w, 'unknown', 'Some New Harness', '')
+      const res = await rpc(w, c, 'tools/call', { name: 'orient', arguments: {} })
+      const err = obj(((await res.json()) as { error?: Json }).error)
+      expect(err.message).toBe('invalid_args')
+      expect(whoamiOf(err).missing[0].next_tool).toBe('bootstrap_self')
+      expect(err.who_acts).toBe('self')
+      expect(err.next_tool).toBe('bootstrap_self')
+      expect(err.next_step).toBe(whoamiOf(err).missing[0].next_step)
+    } finally { w.h.close() }
+  })
+})
 
 // ── pure layer ────────────────────────────────────────────────────────────────
 
