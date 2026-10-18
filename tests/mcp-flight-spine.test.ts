@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
+import { withoutSeat } from './helpers/without-seat'
 
 const MEMBER_ID = 'member-flight-spine'
 const AGENT_ID = 'agent-flight-spine'
@@ -78,7 +79,7 @@ describe('Flight Spine MCP tool surface', () => {
 
   it('publishes exact closed schemas with no caller-controlled identity or runtime facts', () => {
     const schemas = Object.fromEntries(
-      flightSpineTools().map((tool) => [tool.name, tool.inputSchema]),
+      flightSpineTools().map((tool) => [tool.name, withoutSeat(tool.inputSchema)]),
     )
 
     expect(schemas).toEqual({

@@ -23,6 +23,7 @@ import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { withoutSeat } from './helpers/without-seat'
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
@@ -237,7 +238,7 @@ describe('presence_heartbeat / presence_deregister — self-scoped only', () => 
   it('presence_heartbeat schema has no identity/target field to name another principal', () => {
     const spec = TOOLS.find((t) => t.name === 'presence_heartbeat')
     expect(spec).toBeDefined()
-    const keys = Object.keys(spec?.inputSchema.properties ?? {})
+    const keys = Object.keys(spec?.inputSchema.properties ?? {}).filter((k) => k !== 'seat')
 
     // The exact list stays pinned (mupot#1117 added state/message/seq, the activity
     // report — see src/mcp/presence.ts). Keeping it exact means any FUTURE field has

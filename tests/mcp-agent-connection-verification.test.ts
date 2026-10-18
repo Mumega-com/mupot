@@ -11,6 +11,7 @@ import { revealCredentialClaim } from '../src/auth/credential-claim'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { mcpRequest } from './helpers/mcp-call'
+import { withoutSeat } from './helpers/without-seat'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'tenant-a'
@@ -137,7 +138,8 @@ describe('verify_agent_connection MCP callback', () => {
     const body = await response.json() as {
       result: { tools: Array<{ name: string; inputSchema: unknown }> }
     }
-    expect(body.result.tools.find((tool) => tool.name === 'verify_agent_connection')).toEqual({
+    const advertised = body.result.tools.find((tool) => tool.name === 'verify_agent_connection')
+    expect(advertised && { ...advertised, inputSchema: withoutSeat(advertised.inputSchema) }).toEqual({
       name: 'verify_agent_connection',
       description: expect.any(String),
       // mupot#1709: every tool now carries MCP annotations (values pinned in mcp-tool-annotations.test.ts).

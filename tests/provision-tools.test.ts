@@ -4,6 +4,7 @@ import type { ToolCtx, ToolSpec } from '../src/mcp'
 import { callerCanGrantAgentCapability, PROVISION_TOOLS } from '../src/mcp/provision'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
+import { withoutSeat } from './helpers/without-seat'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
 // org-builder surface. These tests drive them through the JSON-RPC seam (tools/call) the
@@ -300,7 +301,7 @@ describe('provision tools — advertised', () => {
       result: { tools: { name: string; inputSchema: unknown }[] }
     }
     const tool = body.result.tools.find(({ name }) => name === 'grant_agent_capability')
-    expect(tool?.inputSchema).toEqual({
+    expect(withoutSeat(tool?.inputSchema)).toEqual({
       type: 'object',
       properties: {
         agent: { type: 'string' },

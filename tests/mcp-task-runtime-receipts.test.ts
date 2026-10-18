@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { TOOLS } from '../src/mcp'
+import { withoutSeat } from './helpers/without-seat'
 
 describe('task_dispatch_runtime_receipt MCP contract', () => {
   it('advertises one strict receipt operation for MCP and generated REST Actions', () => {
@@ -8,7 +9,7 @@ describe('task_dispatch_runtime_receipt MCP contract', () => {
     expect(tool).toBeDefined()
     expect(tool?.scope).toBe('assigned task runtime receipt')
     expect(tool?.min).toBe('member')
-    expect(tool?.inputSchema).toEqual({
+    expect(withoutSeat(tool?.inputSchema)).toEqual({
       type: 'object',
       properties: {
         task_id: { type: 'string' },

@@ -49,6 +49,8 @@ export interface GuidanceEntry {
   error: string
   /** Only for this refused tool. */
   tool?: string
+  /** Never for these refused tools (connect has its own door text). */
+  notTools?: readonly string[]
   /** Only for these connection kinds. */
   kinds?: readonly ConnKind[]
   status?: number
@@ -177,9 +179,9 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
   { error: 'profile_args_not_allowed', who_acts: 'self', next_step: 'Those arguments are not allowed on this limited endpoint. Call the tool again without them.' },
 
   // ── a harness session that is not presenting its seat (a forgotten `seat` argument looks like a missing grant) ──
-  { error: 'forbidden', kinds: ['chat_harness'], status: 403, reasonIs: 'directory_channel_zero_capability', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
+  { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, reasonIs: 'directory_channel_zero_capability', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
     next_step: LOST_SEAT_STEP },
-  { error: 'forbidden', kinds: ['chat_harness'], status: 403, needsNeed: true, who_acts: 'self', next_tool: 'seat_select', next_step: LOST_SEAT_STEP },
+  { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, needsNeed: true, who_acts: 'self', next_tool: 'seat_select', next_step: LOST_SEAT_STEP },
 
   // ── send to an agent this session cannot see ──────────────────────────────────────────────────
   { error: 'send_target_not_visible', who_acts: 'owner',
@@ -218,6 +220,7 @@ function matchEntry(error: string, status: number, detail: unknown, tool: string
   for (const e of GUIDANCE_TABLE) {
     if (e.error !== error) continue
     if (e.tool !== undefined && e.tool !== tool) continue
+    if (e.notTools !== undefined && tool !== undefined && e.notTools.includes(tool)) continue
     if (e.kinds !== undefined && (kind === undefined || !e.kinds.includes(kind))) continue
     if (e.status !== undefined && e.status !== status) continue
     if (e.reasonIs !== undefined && !(typeof detail === 'object' && detail !== null && (detail as { reason?: unknown }).reason === e.reasonIs)) continue // narrowed by the typeof/null checks
