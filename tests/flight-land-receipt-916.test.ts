@@ -59,7 +59,7 @@ function fixture() {
     INSERT INTO agents (id, squad_id, slug, name, role, model, status)
       VALUES ('agent-1', 'squad-core', 'agent-1', 'Agent One', 'operator', 'test', 'active');
   `)
-  const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+  const env = { DB: harness.db, TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env
   harness.sqlite.exec(`
     INSERT INTO tasks (id, squad_id, title, status) VALUES ('${TASK}', 'squad-core', 'task', 'done');
   `)

@@ -151,6 +151,14 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
   { error: 'not_agent_bound', who_acts: 'admin', next_tool: 'mint_agent_token',
     next_step: `This tool needs an agent-bound credential and this session is not one. A CLI or daemon agent needs ${NEEDS_MINT}. {reach}` },
 
+  // ── flight landing evidence (#2025) ───────────────────────────────────────────────────────────
+  { error: 'land_requires_result_submission', who_acts: 'self', next_tool: 'task_submit_result',
+    next_step: 'A landing must prove the work: each task in task_ids needs a result submitted by THIS flight\'s own agent (tasks[] lists each task\'s assignee and status). If you are the assignee and the task is in_progress, call task_submit_result for it, then land again. If the task is assigned to a different agent, that assignee\'s submission cannot count for this flight, and if the task is already in review or done it cannot be resubmitted: cancel this flight (flight_cancel) and dispatch a new one whose tasks are assigned to its own agent.' },
+  { error: 'land_requires_independent_verdict', who_acts: 'admin', next_tool: 'flight_cancel',
+    next_step: 'A landing needs an approval that neither the task\'s assignee nor the flight\'s agent decided, and every task on this flight is already done, so a verdict can no longer be added: this flight cannot be landed. An admin or squad lead cancels it (flight_cancel), then the task is re-dispatched with a gate owner who is not the assignee (tasks[].gate_owner shows the current one; the self-completion lane never qualifies). {reach}' },
+  { error: 'watchdog_tasks_done_unverified', who_acts: 'admin', next_tool: 'flight_cancel',
+    next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so it was not landed, and done tasks can no longer take a verdict: a held flight cannot be landed. A squad lead or admin cancels it (flight_cancel), then the task is re-dispatched with a gate owner who is not the assignee. Left alone it expires to failed (unverified_expired) 7 days after it started. {reach}' },
+
   // ── pot features off ──────────────────────────────────────────────────────────────────────────
   { error: 'seat_attach_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
   { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },

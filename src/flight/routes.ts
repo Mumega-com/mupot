@@ -34,6 +34,7 @@ import {
   listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
   routineControlLandLacksWitness,
+  landEvidenceRefusal,
   FlightProjectError,
   FlightIdempotencyConflictError,
   FlightInsertConflictError,
@@ -454,6 +455,9 @@ flightsApp.post('/:id/land', async (c) => {
       if (governedMeta.routine_run_id && await routineControlLandLacksWitness(c.env, id)) {
         return c.json({ error: 'routine_proposal_receipt_missing' }, 409)
       }
+      // #2025: same evidence predicate and the same distinct refusals as flight_land.
+      const evidenceRefusal = await landEvidenceRefusal(c.env, id, governedMeta.task_ids)
+      if (evidenceRefusal) return c.json({ error: evidenceRefusal.error, task_ids: evidenceRefusal.task_ids, tasks: evidenceRefusal.tasks }, 409)
       return c.json({ error: 'flight_transition_conflict' }, 409)
     }
     const landed = await getFlight(c.env, id)

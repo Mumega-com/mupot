@@ -109,7 +109,7 @@ function envFor(harness: SqliteD1Harness): Env {
   const sessions = new Map<string, string>()
   return {
     DB: harness.db,
-    TENANT_SLUG: TENANT,
+    TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0',
     BUS: { send: vi.fn(async () => undefined) },
     SESSIONS: {
       async get(key: string, type?: string) {
@@ -887,5 +887,65 @@ describe('C. duplicate booking (mupot#1540)', () => {
   ])('refuses a client_request_id that is %s', async (_label, value) => {
     const res = await dispatch(env, ['task-1'], { client_request_id: value })
     expect(res).toMatchObject({ ok: false, status: 400, error: 'invalid_client_request_id' })
+  })
+})
+
+// #2025 P1-1: the system land (watchdog_system_land) is a landing like any other: it needs the same evidence and
+// writes the same receipt_refs. The rest of this file runs with the flag off; this block turns it on.
+describe('#2025 system land requires the same landing evidence', () => {
+  const evidenceEnv = (): Env => ({ ...env, LAND_REQUIRES_EVIDENCE: '1' }) as unknown as Env
+
+  // toReview here moves the task without task_submit_result, so seed the submission the agent would have made.
+  function seedSubmission(taskId: string): void {
+    harness.sqlite.prepare(
+      `INSERT INTO task_result_submissions
+         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+       SELECT 'sub-' || id, ?, id, squad_id, assignee_agent_id, '/tmp/x', ?, ?, result FROM tasks WHERE id = ?`,
+    ).run(TENANT, 'a'.repeat(64), 'a'.repeat(64), taskId)
+  }
+
+  it('lands an evidenced zombie and writes task-result-submission refs', async () => {
+    const id = await zombie(env, ['task-1'])
+    seedSubmission('task-1')
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(evidenceEnv(), { nowMs: since + 25 * HOUR })).toMatchObject({ system_landed: 1 })
+    const row = flightRow(harness, id)
+    expect(row.status).toBe('landed')
+    const refs = (JSON.parse(row.meta) as { receipt_refs: string[] }).receipt_refs
+    expect(refs).toHaveLength(1)
+    expect(refs[0]).toMatch(/^task-result-submission:/)
+  })
+
+  it('does NOT land a zombie whose submission no longer matches the task result; records watchdog_system_land_unverified and escalates once', async () => {
+    const id = await zombie(env, ['task-1'])
+    seedSubmission('task-1')
+    harness.sqlite.prepare(`UPDATE tasks SET result = 'rewritten after submission' WHERE id = 'task-1'`).run()
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await systemLandParkedFlight(evidenceEnv(), flightRow(harness, id), since + 25 * HOUR))
+      .toEqual({ landed: false, reason: 'land_evidence_missing' })
+    expect(flightRow(harness, id)).toMatchObject({ status: 'waiting', gate_reason: 'watchdog_system_land_unverified' })
+    expect(await sweepStalledFlights(evidenceEnv(), { nowMs: since + 25 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+  })
+
+  it('the guarded UPDATE re-asserts the evidence: a result rewritten between the pre-check and the write cannot be system-landed', async () => {
+    const id = await zombie(env, ['task-1'])
+    seedSubmission('task-1')
+    const since = flightRow(harness, id).waiting_since as number
+    const evEnv = evidenceEnv()
+    const realPrepare = evEnv.DB.prepare.bind(evEnv.DB)
+    let flipped = false
+    evEnv.DB.prepare = ((sql: string) => {
+      if (!flipped && sql.includes("status = 'landed', score = NULL")) {
+        flipped = true
+        harness.sqlite.prepare(`UPDATE tasks SET result = 'rewritten after the pre-check' WHERE id = 'task-1'`).run()
+      }
+      return realPrepare(sql)
+    }) as typeof evEnv.DB.prepare
+    const res = await systemLandParkedFlight(evEnv, flightRow(harness, id), since + 25 * HOUR)
+    evEnv.DB.prepare = realPrepare as typeof evEnv.DB.prepare
+    expect(flipped).toBe(true)
+    expect(res).toEqual({ landed: false, reason: 'transition_race' })
+    expect(flightRow(harness, id).status).toBe('waiting')
   })
 })

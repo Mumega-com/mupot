@@ -53,7 +53,7 @@ function makeHarness(): SqliteD1Harness {
 }
 
 function envFor(harness: SqliteD1Harness): Env {
-  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: 'tenant-a' } as unknown as Env
+  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: 'tenant-a', LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env
 }
 
 function grant(capability: CapabilityGrant['capability'], scope_id: string | null, scope_type: CapabilityGrant['scope_type'] = 'squad'): CapabilityGrant {

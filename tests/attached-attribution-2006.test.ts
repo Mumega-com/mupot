@@ -53,7 +53,7 @@ function fresh(): { harness: SqliteD1Harness; env: Env } {
     INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
       VALUES ('gg-i', 'gate:other', 'member', '${INDEP}', '${OWNER}', '${T0}');
   `)
-  return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env }
+  return { harness, env: { TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0', DB: harness.db } as Env }
 }
 
 /** agent_seat_* rows reference seats/harnesses we do not need; FKs off for this fixture write only. */
