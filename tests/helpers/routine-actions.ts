@@ -103,7 +103,7 @@ export async function makeReadyRoutineFixture(
 
   const env = {
     DB: harness.db,
-    TENANT_SLUG: 'tenant-a',
+    TENANT_SLUG: 'tenant-a', LAND_REQUIRES_EVIDENCE: '0',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
   const project = harness.sqlite.prepare(

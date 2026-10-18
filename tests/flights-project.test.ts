@@ -71,7 +71,7 @@ function envFor(harness: SqliteD1Harness, queries?: string[], beforeFlightInsert
           batch: harness.db.batch.bind(harness.db),
         }
       : harness.db
-  return { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env
+  return { DB: db, TENANT_SLUG: 'pot-a', LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env
 }
 
 interface BindObservation {
@@ -109,7 +109,7 @@ function envWithBindBudget(harness: SqliteD1Harness): { env: Env; observations: 
     },
     batch: harness.db.batch.bind(harness.db),
   }
-  return { env: { DB: db, TENANT_SLUG: 'pot-a' } as unknown as Env, observations }
+  return { env: { DB: db, TENANT_SLUG: 'pot-a', LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env, observations }
 }
 
 function seedBulkTasks(
@@ -328,7 +328,7 @@ describe('flight project attribution', () => {
       ['flight project access denied', 'project_access_forbidden'],
     ] as const) {
       const env = {
-        TENANT_SLUG: 'pot-a',
+        TENANT_SLUG: 'pot-a', LAND_REQUIRES_EVIDENCE: '0',
         DB: {
           prepare(sql: string) {
             return {

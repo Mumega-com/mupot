@@ -128,7 +128,7 @@ function runtimeFixture(opts: { unleased?: boolean } = {}) {
       capability: 'member',
     }],
   }
-  return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env, auth, gateAuth }
+  return { harness, env: { TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0', DB: harness.db } as Env, auth, gateAuth }
 }
 
 /** Shared org-admin auth builder for adminResetDispatchLease tests (mupot#1494 v4) — same

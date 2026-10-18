@@ -420,21 +420,79 @@ export interface GovernedLandingResult {
   receipt: boolean
 }
 
+export function landEvidenceEnabled(env: { LAND_REQUIRES_EVIDENCE?: string }): boolean {
+  return env.LAND_REQUIRES_EVIDENCE !== '0'
+}
+
+function assertSqlAlias(alias: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error('invalid_sql_alias')
+}
+
+/**
+ * #2025: the two evidence conjuncts, as boolean-GAP fragments (TRUE = this task is missing that evidence).
+ * ONE source for the eligibility predicate AND for the refusal diagnosis, so the reason a caller is told can
+ * never drift from the reason the UPDATE refused. `f` = flights alias, `t` = tasks alias (plain identifiers).
+ *   noResultSubmission     : no task_result_submissions row from THE FLIGHT'S AGENT whose result_text equals
+ *                            tasks.result (migration 0210 semantics; NULL result_text/result fails closed).
+ *   noIndependentVerdict   : the LATEST verdict is not 'approved', or was decided by the task's assignee or the
+ *                            flight's agent, or the task sits in the gate:agent-self-completion lane. A verdict
+ *                            via agent_attested_origin carries decided_by = the resolved MEMBER (a human
+ *                            decided), so it is independent by construction.
+ */
+export function landEvidenceGapSql(f: string, t: string): { noResultSubmission: string; noIndependentVerdict: string } {
+  assertSqlAlias(f)
+  assertSqlAlias(t)
+  return {
+    noResultSubmission: `NOT EXISTS (
+      SELECT 1 FROM task_result_submissions sub
+       WHERE sub.tenant = ${f}.tenant AND sub.task_id = ${t}.id
+         AND sub.submitted_by_agent_id = ${f}.agent AND sub.result_text = ${t}.result)`,
+    noIndependentVerdict: `NOT EXISTS (
+      SELECT 1 FROM task_verdicts lv
+       WHERE lv.id = (SELECT id FROM task_verdicts WHERE task_id = ${t}.id ORDER BY decided_at DESC, id DESC LIMIT 1)
+         AND lv.verdict = 'approved'
+         AND lv.decided_by <> COALESCE(${t}.assignee_agent_id, '')
+         AND lv.decided_by <> ${f}.agent
+         AND COALESCE(${t}.gate_owner, '') <> 'gate:agent-self-completion')`,
+  }
+}
+
+/** #2025: every task in meta.task_ids carries both evidence conjuncts. Vacuously true for an empty task list. */
+export function landEvidenceEligibleSql(alias: string): string {
+  assertSqlAlias(alias)
+  const gap = landEvidenceGapSql(alias, 'etask')
+  return `NOT EXISTS (
+         SELECT 1
+           FROM json_each(${alias}.meta, '$.task_ids') AS eref
+           JOIN tasks AS etask ON etask.id = eref.value
+          WHERE ${gap.noResultSubmission}
+             OR ${gap.noIndependentVerdict}
+       )`
+}
+
 /**
  * The ONE governed-land eligibility predicate (mupot#1748 P1). A flight may be marked landed only when:
  *   - it carries a budget policy (budget_micro_usd IS NOT NULL) and `budgetCompareSql` holds;
  *   - its meta is valid JSON of schema mupot.flight.meta/v1;
  *   - EVERY task in meta.task_ids exists, is in the flight's project, is `done`, and - if it has a gate_owner -
- *     its LATEST verdict is 'approved' (a gated task abandoned after a rejection, or done with no verdict, blocks).
+ *     its LATEST verdict is 'approved' (a gated task abandoned after a rejection, or done with no verdict, blocks);
+ *   - (#2025, `opts.evidence`) EVERY task also has a result submission from the flight's agent and an independent
+ *     approved verdict (landEvidenceGapSql). A routine control flight (`opts.evidence = false`) is witnessed by
+ *     its proposal receipt instead.
  * Used by landGovernedFlight (the executor's land) AND by the watchdog's done-land (resolveReapDisposition + its
  * guarded UPDATE), so the stall clock cannot land a flight the governed land would refuse. Do not copy it.
  *
  * `alias` is the flights table alias (plain identifier, interpolated); `budgetCompareSql` is a caller-owned boolean
  * fragment (the land compares the claimed cost, the watchdog the recorded cost) and must be built from literals.
  */
-export function governedLandEligibilitySql(alias: string, budgetCompareSql: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error('invalid_sql_alias')
+export function governedLandEligibilitySql(
+  alias: string,
+  budgetCompareSql: string,
+  opts: { evidence?: boolean } = {},
+): string {
+  assertSqlAlias(alias)
   const a = alias
+  const evidenceSql = opts.evidence === true ? `\n       AND ${landEvidenceEligibleSql(a)}` : ''
   return `(${a}.budget_micro_usd IS NOT NULL AND ${budgetCompareSql}
        AND json_valid(${a}.meta)
        AND json_extract(${a}.meta, '$.schema') = 'mupot.flight.meta/v1'
@@ -455,7 +513,62 @@ export function governedLandEligibilitySql(alias: string, budgetCompareSql: stri
                   LIMIT 1
                ), '') <> 'approved'
              )
-       ))`
+       )${evidenceSql})`
+}
+
+/** Land-evidence gaps for a flight's tasks, for the refusal envelope: which task ids lack which conjunct. */
+export async function listLandEvidenceGaps(
+  env: Env,
+  flightId: string,
+  taskIds: readonly string[],
+): Promise<{ missing_result_submission: string[]; missing_independent_verdict: string[] }> {
+  if (taskIds.length === 0) return { missing_result_submission: [], missing_independent_verdict: [] }
+  const gap = landEvidenceGapSql('f', 't')
+  const rows = await env.DB.prepare(
+    `SELECT t.id AS id,
+            CASE WHEN ${gap.noResultSubmission} THEN 1 ELSE 0 END AS no_sub,
+            CASE WHEN ${gap.noIndependentVerdict} THEN 1 ELSE 0 END AS no_verdict
+       FROM flights f
+       JOIN json_each(f.meta, '$.task_ids') AS r
+       JOIN tasks t ON t.id = r.value
+      WHERE f.id = ?1 AND f.tenant = ?2`,
+  ).bind(flightId, env.TENANT_SLUG).all<{ id: string; no_sub: number; no_verdict: number }>()
+  const out = rows.results ?? []
+  return {
+    missing_result_submission: out.filter((r) => r.no_sub === 1).map((r) => r.id),
+    missing_independent_verdict: out.filter((r) => r.no_verdict === 1).map((r) => r.id),
+  }
+}
+
+/**
+ * The refusal for a land the evidence predicate refused, or null when evidence is not the cause. Shared by
+ * flight_land (MCP) and REST land so both name the SAME failing conjunct. Submission is reported first: it is
+ * the agent's own step; the verdict is someone else's.
+ */
+export async function landEvidenceRefusal(
+  env: Env,
+  flightId: string,
+  taskIds: readonly string[],
+): Promise<{ error: 'land_requires_result_submission' | 'land_requires_independent_verdict'; task_ids: string[] } | null> {
+  if (!landEvidenceEnabled(env)) return null
+  const gaps = await listLandEvidenceGaps(env, flightId, taskIds)
+  if (gaps.missing_result_submission.length > 0) {
+    return { error: 'land_requires_result_submission', task_ids: gaps.missing_result_submission }
+  }
+  if (gaps.missing_independent_verdict.length > 0) {
+    return { error: 'land_requires_independent_verdict', task_ids: gaps.missing_independent_verdict }
+  }
+  return null
+}
+
+function parseReceiptRefs(raw: string | null | undefined): string[] {
+  if (typeof raw !== 'string') return []
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : []
+  } catch {
+    return []
+  }
 }
 
 export async function landGovernedFlight(
@@ -515,8 +628,40 @@ export async function landGovernedFlight(
          )
        )`
     : ''
+  // #2025: evidence is required unless rolled back (LAND_REQUIRES_EVIDENCE=0) or this is a routine CONTROL
+  // flight (witnessed by its proposal receipt above). A child flight that merely carries routine_run_id is
+  // NOT exempt: only the flight routine_runs.flight_id points at is. The routine_runs reference is attached
+  // only when the flight claims a routine_run_id (same reason as routineWitnessSql).
+  const evidenceRequired = landEvidenceEnabled(env)
+  const evidenceExtraSql = !evidenceRequired
+    ? ''
+    : opts.meta.routine_run_id
+      ? ` AND (EXISTS (SELECT 1 FROM routine_runs rr0
+                        WHERE rr0.flight_id = flights.id AND rr0.tenant = flights.tenant
+                          AND rr0.id = json_extract(flights.meta, '$.routine_run_id'))
+              OR ${landEvidenceEligibleSql('flights')})`
+      : ` AND ${landEvidenceEligibleSql('flights')}`
+  // Append task-result-submission:<id> per task (latest matching submission), de-duplicated against refs already present.
+  const receiptRefsSql = evidenceRequired
+    ? `meta = json_set(meta, '$.receipt_refs', (
+         SELECT json_group_array(ref) FROM (
+           SELECT value AS ref FROM json_each(COALESCE(json_extract(flights.meta, '$.receipt_refs'), json_array()))
+           UNION
+           SELECT 'task-result-submission:' || (
+                    SELECT sub.id FROM task_result_submissions sub
+                     WHERE sub.tenant = flights.tenant AND sub.task_id = task_ref.value
+                       AND sub.submitted_by_agent_id = flights.agent AND sub.result_text = t.result
+                     ORDER BY sub.seq DESC LIMIT 1)
+             FROM json_each(flights.meta, '$.task_ids') AS task_ref
+             JOIN tasks t ON t.id = task_ref.value
+            WHERE EXISTS (SELECT 1 FROM task_result_submissions sub2
+                           WHERE sub2.tenant = flights.tenant AND sub2.task_id = task_ref.value
+                             AND sub2.submitted_by_agent_id = flights.agent AND sub2.result_text = t.result)
+         ))),`
+    : ''
   const transition = env.DB.prepare(
     `UPDATE flights SET status='landed',
+            ${receiptRefsSql}
             -- #1738: a landing that claims no cost (0 / unmetered) must not erase usage already
             -- reported onto this flight by report_run_usage (metered, cost > 0). An explicit
             -- non-zero landing cost still wins.
@@ -526,9 +671,9 @@ export async function landGovernedFlight(
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')
-       AND ${governedLandEligibilitySql('flights', '(?7 = 0 OR ?4 <= flights.budget_micro_usd)')}
+       AND ${governedLandEligibilitySql('flights', '(?7 = 0 OR ?4 <= flights.budget_micro_usd)')}${evidenceExtraSql}
        ${routineWitnessSql}
-     RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd`,
+     RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd, json_extract(meta, '$.receipt_refs') AS receipt_refs`,
   )
     .bind(
       id,
@@ -592,6 +737,7 @@ export async function landGovernedFlight(
   // src/mcp/index.ts:2652 and consumeAgentInbox in src/agents/messages.ts.
   const transitionResult = await transition.all<{
     score: number | null; cost_micro_usd: number; cost_metered: number; budget_micro_usd: number | null
+    receipt_refs: string | null
   }>()
   const landedRows = transitionResult.results ?? []
   if (landedRows.length !== 1) return { transitioned: false, receipt: false }
@@ -618,6 +764,8 @@ export async function landGovernedFlight(
     score: landedRow?.score ?? opts.score ?? null,
     cost_micro_usd: storedMetered ? storedCost : null,
     cost_metered: storedMetered,
+    // #2025: the evidence the landing rested on (task-result-submission:<id> per task), as stored on the row.
+    receipt_refs: parseReceiptRefs(landedRow?.receipt_refs),
     budget_compliance: !storedMetered
       ? 'unknown'
       : storedBudget !== null && storedCost > storedBudget ? 'over_budget' : 'within_budget',

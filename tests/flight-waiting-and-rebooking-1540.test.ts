@@ -109,7 +109,7 @@ function envFor(harness: SqliteD1Harness): Env {
   const sessions = new Map<string, string>()
   return {
     DB: harness.db,
-    TENANT_SLUG: TENANT,
+    TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0',
     BUS: { send: vi.fn(async () => undefined) },
     SESSIONS: {
       async get(key: string, type?: string) {

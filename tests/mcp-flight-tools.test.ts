@@ -115,7 +115,7 @@ function makeEnv(
     } as never)
   }
   const env = {
-    TENANT_SLUG: TENANT,
+    TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0',
     SESSIONS: {
       async get(key: string, type?: string) {
         const value = cursors.get(key) ?? null
@@ -1449,7 +1449,7 @@ SHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88',
       `)
       harness.sqlite.exec(readFileSync(new URL('../migrations/0137_agent_message_integrity.sql', import.meta.url), 'utf8'))
       const env = {
-        TENANT_SLUG: TENANT,
+        TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0',
         DB: harness.db,
         BUS: { send: async (event: unknown) => { events.push(event) } },
       } as unknown as Env

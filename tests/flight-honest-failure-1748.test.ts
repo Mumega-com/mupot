@@ -34,7 +34,7 @@ let env: Env
 beforeEach(() => {
   h = createSqliteD1()
   applyAllMigrations(h.sqlite)
-  env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
+  env = { DB: h.db, TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env
   h.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD}', 'dept-a', 'squad-a', 'Squad A');

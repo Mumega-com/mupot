@@ -34,7 +34,7 @@ function fixture(budget: number | null = 100) {
     `INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, created_at, started_at)
      VALUES ('f1', ?, 'agent-1', 'g', 'running', ?, ?, ?, ?)`,
   ).run(TENANT, budget, JSON.stringify(meta()), Date.now(), Date.now())
-  return { h, env: { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env }
+  return { h, env: { DB: h.db, TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0' } as unknown as Env }
 }
 
 const base = { expected_agent: 'agent-1', agent_id: 'agent-1', actor: { kind: 'agent' as const, id: 'agent-1' } }

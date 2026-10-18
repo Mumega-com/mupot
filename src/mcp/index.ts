@@ -287,6 +287,7 @@ import {
   getFlight,
   landGovernedFlight,
   routineControlLandLacksWitness,
+  landEvidenceRefusal,
   listFlightProjectMismatchTaskIds,
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
@@ -4082,6 +4083,9 @@ const toolFlightLand: ToolSpec = {
       if (meta.routine_run_id && await routineControlLandLacksWitness(env, flight.id)) {
         return fail(409, 'routine_proposal_receipt_missing')
       }
+      // #2025: evidence conjuncts, one distinct refusal each (submission first: it is the agent's own step).
+      const evidenceRefusal = await landEvidenceRefusal(env, flight.id, meta.task_ids)
+      if (evidenceRefusal) return fail(409, evidenceRefusal.error, { task_ids: evidenceRefusal.task_ids })
       return fail(409, 'flight_transition_conflict')
     }
     const landed = await getFlight(env, flight.id)

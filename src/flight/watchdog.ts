@@ -29,7 +29,7 @@ import { routineEffectInFlightSql } from '../routines/running-action'
 import { routineControlId } from '../routines/identity'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { FlightRow, FlightStatus } from './service'
-import { getFlight, governedLandEligibilitySql } from './service'
+import { getFlight, governedLandEligibilitySql, landEvidenceEnabled } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
 import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
 
@@ -96,7 +96,7 @@ export type ReapDisposition = 'failed' | 'tasks_done' | 'bookkeeping_closed'
  * non-empty array, the shared governed-land predicate holds, and the flight is not bound to a routine run (a routine flight is closed by its run, same carve-out as the 0172 waiting triggers).
  * A flight with no task_ids has no evidence of finished work and is never matched.
  */
-function tasksAllDoneSql(alias = 'f'): string {
+function tasksAllDoneSql(alias = 'f', evidence = true): string {
   // Eligibility is landGovernedFlight's own predicate (budget policy, meta schema v1, every task done in project
   // with an approved latest verdict where gated), shared, never copied (#1748 P1). The watchdog compares the
   // RECORDED cost (an unmetered flight has no cost to compare). Only the routine carve-out and the non-empty
@@ -104,7 +104,7 @@ function tasksAllDoneSql(alias = 'f'): string {
   return `(json_valid(${alias}.meta)
     AND json_type(${alias}.meta, '$.task_ids') = 'array'
     AND json_array_length(${alias}.meta, '$.task_ids') > 0
-    AND ${governedLandEligibilitySql(alias, `(${alias}.cost_metered = 0 OR ${alias}.cost_micro_usd <= ${alias}.budget_micro_usd)`)}
+    AND ${governedLandEligibilitySql(alias, `(${alias}.cost_metered = 0 OR ${alias}.cost_micro_usd <= ${alias}.budget_micro_usd)`, { evidence })}
     AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = ${alias}.id AND rr.tenant = ${alias}.tenant))`
 }
 
@@ -122,7 +122,7 @@ export async function resolveReapDisposition(env: Env, flight: FlightRow): Promi
   if (flight.bookkeeping === 1) return 'bookkeeping_closed'
   if (flight.status !== 'running') return 'failed'
   const hit = await env.DB.prepare(
-    `SELECT 1 AS ok FROM flights f WHERE f.id = ?1 AND f.tenant = ?2 AND ${tasksAllDoneSql('f')}`,
+    `SELECT 1 AS ok FROM flights f WHERE f.id = ?1 AND f.tenant = ?2 AND ${tasksAllDoneSql('f', landEvidenceEnabled(env))}`,
   ).bind(flight.id, env.TENANT_SLUG).first<{ ok: number }>()
   return hit ? 'tasks_done' : 'failed'
 }
@@ -452,6 +452,31 @@ export async function reapStalledFlight(
     }
   }
 
+  // #2025: all tasks done but the landing evidence is missing. The stall clock must NOT land it (that is how a
+  // self-approved flight reached 'landed' with no proof) and must not fail finished work either. Record why on the
+  // flight, leave its status alone (no new status), and surface it as a refusal so the sweep logs the owner signal.
+  if (landEvidenceEnabled(env) && flight.status === 'running' && flight.bookkeeping === 0) {
+    const unverified = await env.DB.prepare(
+      `SELECT 1 AS ok FROM flights f
+        WHERE f.id = ?1 AND f.tenant = ?2
+          AND ${tasksAllDoneSql('f', false)}
+          AND NOT ${tasksAllDoneSql('f', true)}`,
+    ).bind(flight.id, env.TENANT_SLUG).first<{ ok: number }>()
+    if (unverified) {
+      await env.DB.prepare(
+        `UPDATE flights SET gate_reason = 'watchdog_tasks_done_unverified'
+          WHERE id = ?1 AND tenant = ?2 AND status = 'running'
+            AND COALESCE(gate_reason, '') <> 'watchdog_tasks_done_unverified'`,
+      ).bind(flight.id, env.TENANT_SLUG).run()
+      return {
+        transitioned: false,
+        flight_id: flightId,
+        previous_status: flight.status,
+        error: 'watchdog_tasks_done_unverified',
+      }
+    }
+  }
+
   const disposition = await resolveReapDisposition(env, flight)
   // Only a finished-work flight is LANDED. A bookkeeping flight stays 'failed' (readers relabel it via bookkeeping=1,
   // so it is not a real failure): landing it would make findFinishedWorkConflict (rebooking.ts) 409 every
@@ -515,7 +540,7 @@ export async function reapStalledFlight(
           AND (
             ?5 = 'failed'
             OR (?6 = 'bookkeeping_closed' AND flights.bookkeeping = 1)
-            OR (?6 = 'tasks_done' AND flights.status = 'running' AND flights.bookkeeping = 0 AND ${tasksAllDoneSql('flights')})
+            OR (?6 = 'tasks_done' AND flights.status = 'running' AND flights.bookkeeping = 0 AND ${tasksAllDoneSql('flights', landEvidenceEnabled(env))})
           )
         RETURNING id, status`,
     ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, targetStatus, disposition),
@@ -1094,6 +1119,7 @@ export async function sweepStalledFlights(
   // not escalated): finished parked flights past the grace. Land the independently-
   // approved ones; the rest cannot land and are escalated now (once), which also takes
   // them out of this window, so ineligible rows can never pile up in it.
+  const unverifiedFlightIds: string[] = []
   let systemLanded = 0
   const systemLandedFlightIds: string[] = []
   for (const flight of await listFinishedParkedFlights(env, nowMs, Math.min(Math.max(opts.limit ?? 100, 1), 500))) {
@@ -1165,7 +1191,10 @@ export async function sweepStalledFlights(
         closedWithoutFailure += 1
         closedWithoutFailureFlightIds.push(flight.id)
       } else if (result.transitioned) reaped += 1
-      else failed += 1
+      else if (result.error === 'watchdog_tasks_done_unverified') {
+        // #2025: finished work with no landing evidence stays running; not a failure of the sweep, but the owner must see it.
+        unverifiedFlightIds.push(flight.id)
+      } else failed += 1
     } catch (error) {
       // Fail-soft: a single bad flight must not strand the rest of the pass.
       //
@@ -1186,6 +1215,13 @@ export async function sweepStalledFlights(
     console.warn(
       `[flight-watchdog] ESCALATE — ${escalatedFlightIds.length} flight(s) waiting at a gate > 24h ` +
         `(never reaped): ${escalatedFlightIds.join(', ')}`,
+    )
+  }
+
+  if (unverifiedFlightIds.length > 0) {
+    console.warn(
+      `[flight-watchdog] HELD — ${unverifiedFlightIds.length} flight(s) have every task done but no landing evidence ` +
+        `(result submission + independent verdict); not landed: ${unverifiedFlightIds.join(', ')}`,
     )
   }
 

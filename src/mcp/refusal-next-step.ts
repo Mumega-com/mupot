@@ -151,6 +151,18 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
   { error: 'not_agent_bound', who_acts: 'admin', next_tool: 'mint_agent_token',
     next_step: `This tool needs an agent-bound credential and this session is not one. A CLI or daemon agent needs ${NEEDS_MINT}. {reach}` },
 
+  // ── flight landing evidence (#2025) ───────────────────────────────────────────────────────────
+  { error: 'land_requires_result_submission', tool: 'flight_land', who_acts: 'self', next_tool: 'task_submit_result',
+    next_step: 'A landing must prove the work: each task on the flight needs a result submitted by the flight\'s own agent, and the submitted text must still be the task\'s result. Call task_submit_result for each task in task_ids, then call flight_land again.' },
+  { error: 'land_requires_result_submission', who_acts: 'self', next_tool: 'task_submit_result',
+    next_step: 'A landing must prove the work: each task on the flight needs a result submitted by the flight\'s own agent. Submit the result for each task in task_ids (task_submit_result), then land again.' },
+  { error: 'land_requires_independent_verdict', tool: 'flight_land', who_acts: 'admin', next_tool: 'task_verdict',
+    next_step: 'A landing needs an approval someone other than the agent decided. The gate owner (an admin or the owning human) must call task_verdict { verdict: "approved" } on each task in task_ids; a task in the agent self-completion lane cannot satisfy this and must be moved to a gate with an independent owner. {reach}' },
+  { error: 'land_requires_independent_verdict', who_acts: 'admin', next_tool: 'task_verdict',
+    next_step: 'A landing needs an approval someone other than the agent decided. The gate owner must approve each task in task_ids with task_verdict; the agent cannot approve its own work. {reach}' },
+  { error: 'watchdog_tasks_done_unverified', who_acts: 'admin', next_tool: 'task_verdict',
+    next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so the watchdog did not land it. Supply the missing evidence, then the agent lands it with flight_land; or an admin cancels it. {reach}' },
+
   // ── pot features off ──────────────────────────────────────────────────────────────────────────
   { error: 'seat_attach_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
   { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
