@@ -27,7 +27,7 @@ import { SELECT_SEARCH_SCRIPT } from '../dashboard/select-search'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { suggestedConnectMode, type ConnectMode } from './consent-connect-mode'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, planeCoversScope, targetLegacyRoleRank } from '../auth/capability'
+import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
@@ -334,7 +334,10 @@ export async function humanMaxRankOnScope(
     const scope = await loadSquadScope(env, scopeId)
     if (!scope || !planeCoversScope('role', scope)) return rows
   }
-  return Math.max(rows, legacyRoleRank)
+  // The lift is CAPPED at member: a rank reached only through the role plane can never exceed 'member' (no lead/admin/owner
+  // from a lift, on the consent path, the seat path, or an attached `full` ceiling). Rank justified by capability rows is
+  // returned exactly as on base.
+  return Math.max(rows, Math.min(legacyRoleRank, capabilityRank('member')))
 }
 
 /** Live capabilities a directory session bound to `agentId`, consent-given by
@@ -429,7 +432,7 @@ export async function resolveConsentedAgentCapabilities(
   // removing live protection, and so this file does not misdescribe which line
   // a passing test actually depends on (see this PR's own mutation-table history
   // for why that distinction matters).
-  const humanLegacyRank = await targetLegacyRoleRank(env, consentingMemberId)
+  const humanLegacyRank = await humanVerifiedLegacyRoleRank(env, consentingMemberId)
   const clamped: CapabilityGrant[] = []
   for (const g of agentGrants) {
     const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, humanLegacyRank)

@@ -106,8 +106,14 @@ function seedWorkSquad(id: string): void {
   h.sqlite.exec(`INSERT OR IGNORE INTO departments (id, slug, name, created_at) VALUES ('d-clamp', 'd-clamp', 'DC', datetime('now'))`)
   h.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name, created_at) VALUES ('${id}', 'd-clamp', '${id}', '${id}', datetime('now'))`)
 }
-function seedUserRole(memberId: string, role: 'owner' | 'admin' | 'member'): void {
+/** users row (the role) plus, by default, the VERIFIED live login identity that bridges the human to it. `identity:false`
+ *  models a member row created by INVITE that merely carries the owner's email (no verified login behind it). */
+function seedUserRole(memberId: string, role: 'owner' | 'admin' | 'member', o: { identity?: boolean } = {}): void {
   h.sqlite.exec(`INSERT INTO users (id, email, role) VALUES ('u-${memberId}', '${memberId}@example.test', '${role}')`)
+  if (o.identity !== false) {
+    h.sqlite.exec(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id)
+      VALUES ('li-${memberId}', '${TENANT}', 'google', 'sub-${memberId}', '${memberId}@example.test', '${memberId}')`)
+  }
 }
 function giveAgent(agentMemberId: string, scopeType: string, scopeId: string | null, capability: string): void {
   h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${agentMemberId}', '${scopeType}', ${scopeId ? `'${scopeId}'` : 'NULL'}, '${capability}')`)
@@ -163,7 +169,7 @@ describe('seat clamp honours the legacy role plane (finding 5)', () => {
   const has = (caps: Array<{ scope_type: string; scope_id: string | null; capability: string }>, type: string, id: string | null) =>
     caps.find((c) => c.scope_type === type && c.scope_id === id)
 
-  it('legacy owner (users.role=owner, no row on the scope): the agent grant on a work squad is KEPT, at member', async () => {
+  it('legacy owner (users.role=owner, no row on the scope): agent lead grant on a work squad is KEPT, lifted to at most member', async () => {
     const env = envFor(h)
     const s = await seatAgent(env)
     seedWorkSquad('sq-w')
@@ -173,7 +179,7 @@ describe('seat clamp honours the legacy role plane (finding 5)', () => {
     expect(has(caps, 'squad', 'sq-w')?.capability).toBe('member') // clamped by the seat ceiling, never above
   })
 
-  it('legacy owner: an agent ORG grant is kept at member; admin/owner is never produced', async () => {
+  it('legacy owner: an agent ORG admin grant is kept at member only; the lift never produces lead/admin/owner', async () => {
     const env = envFor(h)
     const s = await seatAgent(env)
     seedUserRole(HUMAN, 'owner')
@@ -249,6 +255,55 @@ describe('seat clamp honours the legacy role plane (finding 5)', () => {
     expect(has(caps, 'squad', 'sq-w')?.capability).toBe('observer')
   })
 
+  it('legacy ADMIN (users.role=admin, rank 4) is lifted to member only, never lead/admin', async () => {
+    const env = envFor(h)
+    const s = await seatAgent(env)
+    seedWorkSquad('sq-w')
+    seedUserRole(HUMAN, 'admin')
+    giveAgent(s.agentMemberId, 'squad', 'sq-w', 'admin')
+    expect(has(await resolveFor(env, s), 'squad', 'sq-w')?.capability).toBe('member')
+  })
+
+  it('attached ceiling `full`: a legacy-lifted grant stays at member (no lead/admin from the lift)', async () => {
+    const env = envFor(h)
+    const s = await seatAgent(env)
+    seedWorkSquad('sq-w')
+    seedUserRole(HUMAN, 'owner')
+    giveAgent(s.agentMemberId, 'squad', 'sq-w', 'admin')
+    const caps = await resolveSeatCapabilities(env, { humanMemberId: HUMAN, agentId: s.agentId, agentSquadId: s.homeSquad, agentMemberId: s.agentMemberId, ceiling: 'full' })
+    expect(has(caps, 'squad', 'sq-w')?.capability).toBe('member')
+  })
+
+  it('attached ceiling `full`: where capability ROWS justify it the agent keeps its own rank (unchanged from base)', async () => {
+    const env = envFor(h)
+    const s = await seatAgent(env)
+    seedWorkSquad('sq-w')
+    seedUserRole(HUMAN, 'owner')
+    h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${HUMAN}', 'squad', 'sq-w', 'admin')`)
+    giveAgent(s.agentMemberId, 'squad', 'sq-w', 'lead')
+    const caps = await resolveSeatCapabilities(env, { humanMemberId: HUMAN, agentId: s.agentId, agentSquadId: s.homeSquad, agentMemberId: s.agentMemberId, ceiling: 'full' })
+    expect(has(caps, 'squad', 'sq-w')?.capability).toBe('lead')
+  })
+
+  it('a member row created by INVITE with the owner\'s email (no verified login identity) gets NO lift', async () => {
+    const env = envFor(h)
+    const s = await seatAgent(env)
+    seedWorkSquad('sq-w')
+    seedUserRole(HUMAN, 'owner', { identity: false })
+    giveAgent(s.agentMemberId, 'squad', 'sq-w', 'member')
+    expect(has(await resolveFor(env, s), 'squad', 'sq-w')).toBeUndefined()
+  })
+
+  it('a REVOKED login identity gives no lift', async () => {
+    const env = envFor(h)
+    const s = await seatAgent(env)
+    seedWorkSquad('sq-w')
+    seedUserRole(HUMAN, 'owner')
+    h.sqlite.exec(`UPDATE human_login_identities SET revoked_at = datetime('now')`)
+    giveAgent(s.agentMemberId, 'squad', 'sq-w', 'member')
+    expect(has(await resolveFor(env, s), 'squad', 'sq-w')).toBeUndefined()
+  })
+
   it('end to end: a legacy owner seat sees a project linked to a work squad the agent was granted', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
@@ -269,7 +324,7 @@ describe('seat clamp honours the legacy role plane (finding 5)', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('consent-time clamp (resolveConsentedAgentCapabilities) honours the legacy plane', () => {
-  async function setup(role: 'owner' | 'member' | null) {
+  async function setup(role: 'owner' | 'admin' | 'member' | null) {
     const env = envFor(h)
     seedWorkSquad('sq-w')
     seedWorkSquad('sq-agent')
@@ -282,10 +337,44 @@ describe('consent-time clamp (resolveConsentedAgentCapabilities) honours the leg
     giveAgent('m-ag1', 'squad', 'sq-w', 'member')
     return env
   }
-  it('legacy owner keeps the agent grant outside their rows', async () => {
+  it('legacy owner keeps the agent grant outside their rows (at member)', async () => {
     const env = await setup('owner')
     const caps = await resolveConsentedAgentCapabilities(env, 'ag1', HUMAN)
     expect(caps.find((c) => c.scope_id === 'sq-w')?.capability).toBe('member')
+  })
+  it('legacy owner + agent holding ORG admin and squad admin: the connector token gets member only, never admin (no ceiling on this path, so the lift itself is capped)', async () => {
+    const env = await setup('owner')
+    giveAgent('m-ag1', 'org', null, 'admin')
+    h.sqlite.exec(`UPDATE capabilities SET capability = 'admin' WHERE member_id = 'm-ag1' AND scope_id = 'sq-w'`)
+    const caps = await resolveConsentedAgentCapabilities(env, 'ag1', HUMAN)
+    expect(caps.find((c) => c.scope_type === 'org')?.capability).toBe('member')
+    expect(caps.find((c) => c.scope_id === 'sq-w')?.capability).toBe('member')
+    expect(caps.some((c) => c.capability === 'admin' || c.capability === 'owner' || c.capability === 'lead')).toBe(false)
+  })
+  it('legacy ADMIN (role=admin) with the same agent: still member only', async () => {
+    const env = await setup('admin')
+    giveAgent('m-ag1', 'org', null, 'admin')
+    const caps = await resolveConsentedAgentCapabilities(env, 'ag1', HUMAN)
+    expect(caps.find((c) => c.scope_type === 'org')?.capability).toBe('member')
+  })
+  it('rows outrank the lift: human capability-row admin on the scope keeps the agent lead (max(rows, lift), not lift only)', async () => {
+    const env = await setup('owner')
+    h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${HUMAN}', 'squad', 'sq-w', 'admin')`)
+    h.sqlite.exec(`UPDATE capabilities SET capability = 'lead' WHERE member_id = 'm-ag1' AND scope_id = 'sq-w'`)
+    const caps = await resolveConsentedAgentCapabilities(env, 'ag1', HUMAN)
+    expect(caps.find((c) => c.scope_id === 'sq-w')?.capability).toBe('lead')
+  })
+  it('invite-created member row carrying the owner\'s email (no verified identity) gets no lift on the connector path', async () => {
+    const env = envFor(h)
+    seedWorkSquad('sq-w'); seedWorkSquad('sq-agent')
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, status) VALUES ('ag1', 'sq-agent', 'ag1', 'Ag1', 'member', 'active')`)
+    h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('m-ag1', 'ag1@agents.test', 'Ag1', 'active', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+    h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'ag1', 'm-ag1', datetime('now'))`)
+    h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${HUMAN}', 'squad', 'sq-agent', 'admin')`)
+    seedUserRole(HUMAN, 'owner', { identity: false })
+    giveAgent('m-ag1', 'squad', 'sq-w', 'member')
+    const caps = await resolveConsentedAgentCapabilities(env, 'ag1', HUMAN)
+    expect(caps.find((c) => c.scope_id === 'sq-w')).toBeUndefined()
   })
   it('plain member and no-users-row humans are not widened', async () => {
     for (const role of ['member', null] as const) {

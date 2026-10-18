@@ -873,6 +873,29 @@ export async function targetLegacyRoleRank(env: Env, targetMemberId: string): Pr
 }
 
 /**
+ * The legacy role-plane rank a HUMAN holds through a VERIFIED, LIVE login identity (human_login_identities.verified_email,
+ * stamped by the identity provider at sign-in), never through members.email, which an inviter types (the #1551/#1583
+ * class: a member row created by invite carrying the owner's email must not inherit the owner's role). Used on the GRANT
+ * side (the seat / connector clamp lift). targetLegacyRoleRank stays as-is for the TARGET-ceiling use, where reading the
+ * higher of the two is the safe direction. 0 = no verified identity, or the identity's users row is a plain member.
+ */
+export async function humanVerifiedLegacyRoleRank(env: Env, memberId: string): Promise<number> {
+  const live = await env.DB.prepare(`SELECT 1 AS ok FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active' LIMIT 1`)
+    .bind(memberId, env.TENANT_SLUG).first<{ ok: number }>()
+  if (!live) return 0
+  // Keyed on the identity row's PROVIDER-verified email, not on any members.* column.
+  const rows = await env.DB.prepare(
+    `SELECT u.role AS role
+       FROM human_login_identities li
+       JOIN users u ON lower(u.email) = lower(li.verified_email)
+      WHERE li.tenant = ?1 AND li.member_id = ?2 AND li.revoked_at IS NULL AND li.verified_email IS NOT NULL`,
+  ).bind(env.TENANT_SLUG, memberId).all<{ role: AuthContext['role'] }>()
+  let max = 0
+  for (const r of rows.results ?? []) max = Math.max(max, legacyRoleRank(r.role))
+  return max
+}
+
+/**
  * The TARGET's highest effective capability rank across EVERY scope they hold
  * a grant on, AND their coarse legacy-role standing — not just the one scope
  * a caller happens to be checking, and not just one of the two authority
