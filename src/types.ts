@@ -355,6 +355,9 @@ export interface Env {
   // W2 (harness seats -> existing agents): strict '1' (AND SEAT_AUTO_ENROLL '1') turns on seat_attach, the
   // dashboard Connections attach/admit actions and the per-request attachment resolve. Unset = total no-op.
   SEAT_ATTACH?: string
+  // Admission by observation P0 (SHADOW ONLY): strict '1' taps every seat tool call into the seat_tape (shape-only, waitUntil)
+  // and adds whoami.admission for a seat with a status. Never blocks or changes a status. Unset = total no-op.
+  ADMISSION_TAPE?: string
   // #2025: a flight landing requires evidence (result submission from the flight agent + independent verdict). Default ON;
   // set to exactly "0" to roll back. Anything else, including unset, keeps it required.
   LAND_REQUIRES_EVIDENCE?: string

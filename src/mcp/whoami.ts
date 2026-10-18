@@ -46,6 +46,8 @@ export interface Whoami {
   /** Present when the request is bound to a seat. Never carries an agent id: `acts_as` is a slug/name. */
   seat?: { seat_id: string; acts_as: string | null; presented: boolean }
   harness: 'present' | 'absent'
+  /** ADMISSION_TAPE on AND the seat has a status only. Status band + reason class; the score is never exposed to the seat. */
+  admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
 }
 
 /** What the caller already read (best-effort; a failed read passes its safe default). */
@@ -60,6 +62,8 @@ export interface WhoamiFacts {
   actsAs: string | null
   /** Boot only: the runtime self-report step. Absent on status/orient (they take no runtime args). */
   report?: { missingFields: string[]; outcome?: string; detail?: string }
+  /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
+  admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
 }
 
 export interface WhoamiCtx {
@@ -261,6 +265,7 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
     agent,
     ...(seat ? { seat: { seat_id: seat.seatId, acts_as: facts.actsAs, presented: seat.source === 'handle' } } : {}),
     harness: hasHarness(auth) ? 'present' : 'absent',
+    ...(facts.admission ? { admission: facts.admission } : {}),
   }
 }
 

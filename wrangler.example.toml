@@ -50,6 +50,9 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 # SECURE_MOMENTS_HOST = "secure.example.com"  # dedicated host for those pages (a custom domain routed to this Worker).
 # SEAT_ATTACH = "1"               # a seat thread attaches to an EXISTING agent after one passkey tap (seat_attach). Needs
 #                                 # SEAT_AUTO_ENROLL=1 AND SECURE_MOMENTS (without it the human decides on the Connections page).
+# ADMISSION_TAPE = "1"            # admission by observation, P0 SHADOW ONLY: every seat tool call is described (shape only, never
+#                                 # values) to the append-only seat_tape and scored; whoami gains admission:{status,reason_class} for a seat
+#                                 # with a status. Never blocks a call or changes a status. Needs migration 0237. Unset = total no-op.
 # WEBHOOK_DOORBELL = "1"          # outbound per-agent wake webhook for bot endpoints (/doorbells, set_agent_webhook_doorbell).
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
                                   # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
