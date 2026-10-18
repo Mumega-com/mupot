@@ -391,16 +391,20 @@ change. In the same atomic transition, every task in the flight metadata must al
 `task_result_submissions` row submitted by the flight's own agent whose `result_text` equals the
 task's current `result`, and (2) a latest verdict that is `approved`, decided by someone other than
 the task's assignee and the flight's agent, on a task that is not in the `gate:agent-self-completion`
-lane. A verdict decided through `agent_attested_origin` carries the resolved human member as
-`decided_by`, so it counts as independent. A refused landing says which conjunct failed:
+lane. Independence policy: `decided_by` is compared with ids only. A verdict decided through `agent_attested_origin` carries the resolved human member as `decided_by`, so it counts; but an attested verdict by the owner of the task's assignee is refused at write time (`assignee_conflict`), so it never reaches a landing. A second agent with the same owner as the assignee DOES count as independent (deliberate, `verdict-independence.ts`). A task whose result the CI sync overwrote with `CI: success|neutral|skipped` still matches (a submission from the flight's agent must exist). A refused landing says which conjunct failed:
 `land_requires_result_submission` (the agent submits with `task_submit_result`) or
 `land_requires_independent_verdict` (the gate owner calls `task_verdict`), each with the offending
 `task_ids`. On success the landing appends `task-result-submission:<id>` per task to
 `meta.receipt_refs` (no duplicates) and writes the same refs into the `flight.landed` outbox payload,
-so "landed" flights are countable by receipts. REST land, `flight_land` and the watchdog's
-all-tasks-done close share this one predicate. The watchdog never lands a flight whose tasks are done
-but unevidenced: it records `gate_reason = 'watchdog_tasks_done_unverified'`, leaves the status
-unchanged, and logs a HELD line each sweep. Routine control flights are witnessed by their proposal
+so "landed" flights are countable by receipts. REST land, `flight_land`, the watchdog's
+all-tasks-done close and the watchdog system land (`watchdog_system_land`, which also writes
+`receipt_refs` but still no outbox row, #1547) share this one predicate. The watchdog never lands a
+flight whose tasks are done but unevidenced: it records `gate_reason = 'watchdog_tasks_done_unverified'`
+(`watchdog_system_land_unverified` for a parked flight, which escalates once), leaves the status
+unchanged and logs a HELD line. Held running flights are excluded from the reapable scan window, appear
+in `needs_you_list { view: 'stuck' }` (workspace admins; project-attached flights) with the task ids and
+the two exits (an independent `task_verdict` then `flight_land`, or `flight_cancel`), and expire to
+`failed` with reason `unverified_expired` 7 days after the flight started. Routine control flights are witnessed by their proposal
 receipt instead and are exempt. Rollback: set `LAND_REQUIRES_EVIDENCE` to `"0"` (default on).
 
 `flight_get` and `flight_list` require `observer` or higher on every squad referenced

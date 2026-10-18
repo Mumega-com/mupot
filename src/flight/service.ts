@@ -429,6 +429,18 @@ function assertSqlAlias(alias: string): void {
 }
 
 /**
+ * #2025 P1-3: a submission matches the task's result when its text is still the task's result, OR when the only
+ * thing that changed it is the CI sync (syncCiResultToTask overwrites tasks.result with `CI: <conclusion>` on
+ * PR-linked tasks, and task_submit_result needs in_progress so the agent cannot resubmit). In the CI case the text
+ * binding is relaxed, never the submitter binding: a submission from the flight's agent must still exist.
+ */
+export function landResultMatchSql(sub: string, t: string): string {
+  assertSqlAlias(sub)
+  assertSqlAlias(t)
+  return `(${sub}.result_text = ${t}.result OR ${t}.result IN ('CI: success', 'CI: neutral', 'CI: skipped'))`
+}
+
+/**
  * #2025: the two evidence conjuncts, as boolean-GAP fragments (TRUE = this task is missing that evidence).
  * ONE source for the eligibility predicate AND for the refusal diagnosis, so the reason a caller is told can
  * never drift from the reason the UPDATE refused. `f` = flights alias, `t` = tasks alias (plain identifiers).
@@ -446,7 +458,7 @@ export function landEvidenceGapSql(f: string, t: string): { noResultSubmission: 
     noResultSubmission: `NOT EXISTS (
       SELECT 1 FROM task_result_submissions sub
        WHERE sub.tenant = ${f}.tenant AND sub.task_id = ${t}.id
-         AND sub.submitted_by_agent_id = ${f}.agent AND sub.result_text = ${t}.result)`,
+         AND sub.submitted_by_agent_id = ${f}.agent AND ${landResultMatchSql('sub', t)})`,
     noIndependentVerdict: `NOT EXISTS (
       SELECT 1 FROM task_verdicts lv
        WHERE lv.id = (SELECT id FROM task_verdicts WHERE task_id = ${t}.id ORDER BY decided_at DESC, id DESC LIMIT 1)
@@ -455,6 +467,31 @@ export function landEvidenceGapSql(f: string, t: string): { noResultSubmission: 
          AND lv.decided_by <> ${f}.agent
          AND COALESCE(${t}.gate_owner, '') <> 'gate:agent-self-completion')`,
   }
+}
+
+/**
+ * #2025: SET fragment (with trailing comma) appending `task-result-submission:<latest matching submission id>` per
+ * task to meta.receipt_refs, de-duplicated against refs already present. A task with no matching submission
+ * contributes NOTHING (the EXISTS guard): never a NULL/bare ref, e.g. on a routine control flight.
+ */
+export function landReceiptRefsSetSql(alias: string): string {
+  assertSqlAlias(alias)
+  const f = alias
+  return `meta = json_set(meta, '$.receipt_refs', (
+         SELECT json_group_array(ref) FROM (
+           SELECT value AS ref FROM json_each(COALESCE(json_extract(${f}.meta, '$.receipt_refs'), json_array()))
+           UNION
+           SELECT 'task-result-submission:' || (
+                    SELECT sub.id FROM task_result_submissions sub
+                     WHERE sub.tenant = ${f}.tenant AND sub.task_id = task_ref.value
+                       AND sub.submitted_by_agent_id = ${f}.agent AND ${landResultMatchSql('sub', 't')}
+                     ORDER BY sub.seq DESC LIMIT 1)
+             FROM json_each(${f}.meta, '$.task_ids') AS task_ref
+             JOIN tasks t ON t.id = task_ref.value
+            WHERE EXISTS (SELECT 1 FROM task_result_submissions sub2
+                           WHERE sub2.tenant = ${f}.tenant AND sub2.task_id = task_ref.value
+                             AND sub2.submitted_by_agent_id = ${f}.agent AND ${landResultMatchSql('sub2', 't')})
+         ))),`
 }
 
 /** #2025: every task in meta.task_ids carries both evidence conjuncts. Vacuously true for an empty task list. */
@@ -516,27 +553,44 @@ export function governedLandEligibilitySql(
        )${evidenceSql})`
 }
 
+/** Who can fix a gap: the task's gate owner (verdict) and assignee (submission). Ids and lane labels only. */
+export interface LandEvidenceTaskInfo { id: string; gate_owner: string | null; assignee_agent_id: string | null; status: string }
+
 /** Land-evidence gaps for a flight's tasks, for the refusal envelope: which task ids lack which conjunct. */
 export async function listLandEvidenceGaps(
   env: Env,
   flightId: string,
   taskIds: readonly string[],
-): Promise<{ missing_result_submission: string[]; missing_independent_verdict: string[] }> {
-  if (taskIds.length === 0) return { missing_result_submission: [], missing_independent_verdict: [] }
+): Promise<{
+  missing_result_submission: string[]; missing_independent_verdict: string[]
+  result_submission_tasks: LandEvidenceTaskInfo[]; independent_verdict_tasks: LandEvidenceTaskInfo[]
+}> {
+  if (taskIds.length === 0) {
+    return { missing_result_submission: [], missing_independent_verdict: [], result_submission_tasks: [], independent_verdict_tasks: [] }
+  }
   const gap = landEvidenceGapSql('f', 't')
   const rows = await env.DB.prepare(
     `SELECT t.id AS id,
             CASE WHEN ${gap.noResultSubmission} THEN 1 ELSE 0 END AS no_sub,
-            CASE WHEN ${gap.noIndependentVerdict} THEN 1 ELSE 0 END AS no_verdict
+            CASE WHEN ${gap.noIndependentVerdict} THEN 1 ELSE 0 END AS no_verdict,
+            t.gate_owner AS gate_owner, t.assignee_agent_id AS assignee_agent_id, t.status AS status
        FROM flights f
        JOIN json_each(f.meta, '$.task_ids') AS r
        JOIN tasks t ON t.id = r.value
       WHERE f.id = ?1 AND f.tenant = ?2`,
-  ).bind(flightId, env.TENANT_SLUG).all<{ id: string; no_sub: number; no_verdict: number }>()
+  ).bind(flightId, env.TENANT_SLUG).all<{
+    id: string; no_sub: number; no_verdict: number
+    gate_owner: string | null; assignee_agent_id: string | null; status: string
+  }>()
   const out = rows.results ?? []
+  const info = (r: (typeof out)[number]): LandEvidenceTaskInfo => ({
+    id: r.id, gate_owner: r.gate_owner, assignee_agent_id: r.assignee_agent_id, status: r.status,
+  })
   return {
     missing_result_submission: out.filter((r) => r.no_sub === 1).map((r) => r.id),
     missing_independent_verdict: out.filter((r) => r.no_verdict === 1).map((r) => r.id),
+    result_submission_tasks: out.filter((r) => r.no_sub === 1).map(info),
+    independent_verdict_tasks: out.filter((r) => r.no_verdict === 1).map(info),
   }
 }
 
@@ -549,14 +603,17 @@ export async function landEvidenceRefusal(
   env: Env,
   flightId: string,
   taskIds: readonly string[],
-): Promise<{ error: 'land_requires_result_submission' | 'land_requires_independent_verdict'; task_ids: string[] } | null> {
+): Promise<{
+  error: 'land_requires_result_submission' | 'land_requires_independent_verdict'
+  task_ids: string[]; tasks: LandEvidenceTaskInfo[]
+} | null> {
   if (!landEvidenceEnabled(env)) return null
   const gaps = await listLandEvidenceGaps(env, flightId, taskIds)
   if (gaps.missing_result_submission.length > 0) {
-    return { error: 'land_requires_result_submission', task_ids: gaps.missing_result_submission }
+    return { error: 'land_requires_result_submission', task_ids: gaps.missing_result_submission, tasks: gaps.result_submission_tasks }
   }
   if (gaps.missing_independent_verdict.length > 0) {
-    return { error: 'land_requires_independent_verdict', task_ids: gaps.missing_independent_verdict }
+    return { error: 'land_requires_independent_verdict', task_ids: gaps.missing_independent_verdict, tasks: gaps.independent_verdict_tasks }
   }
   return null
 }
@@ -641,27 +698,13 @@ export async function landGovernedFlight(
                           AND rr0.id = json_extract(flights.meta, '$.routine_run_id'))
               OR ${landEvidenceEligibleSql('flights')})`
       : ` AND ${landEvidenceEligibleSql('flights')}`
-  // Append task-result-submission:<id> per task (latest matching submission), de-duplicated against refs already present.
-  const receiptRefsSql = evidenceRequired
-    ? `meta = json_set(meta, '$.receipt_refs', (
-         SELECT json_group_array(ref) FROM (
-           SELECT value AS ref FROM json_each(COALESCE(json_extract(flights.meta, '$.receipt_refs'), json_array()))
-           UNION
-           SELECT 'task-result-submission:' || (
-                    SELECT sub.id FROM task_result_submissions sub
-                     WHERE sub.tenant = flights.tenant AND sub.task_id = task_ref.value
-                       AND sub.submitted_by_agent_id = flights.agent AND sub.result_text = t.result
-                     ORDER BY sub.seq DESC LIMIT 1)
-             FROM json_each(flights.meta, '$.task_ids') AS task_ref
-             JOIN tasks t ON t.id = task_ref.value
-            WHERE EXISTS (SELECT 1 FROM task_result_submissions sub2
-                           WHERE sub2.tenant = flights.tenant AND sub2.task_id = task_ref.value
-                             AND sub2.submitted_by_agent_id = flights.agent AND sub2.result_text = t.result)
-         ))),`
-    : ''
+  const receiptRefsSql = evidenceRequired ? landReceiptRefsSetSql('flights') : ''
+  // A landed flight must not read as held: clear a watchdog `*_unverified` gate_reason (the evidence now exists).
+  const clearHeldReasonSql = `gate_reason = CASE WHEN gate_reason LIKE 'watchdog\\_%\\_unverified' ESCAPE '\\' THEN '' ELSE gate_reason END,`
   const transition = env.DB.prepare(
     `UPDATE flights SET status='landed',
             ${receiptRefsSql}
+            ${clearHeldReasonSql}
             -- #1738: a landing that claims no cost (0 / unmetered) must not erase usage already
             -- reported onto this flight by report_run_usage (metered, cost > 0). An explicit
             -- non-zero landing cost still wins.

@@ -4085,7 +4085,7 @@ const toolFlightLand: ToolSpec = {
       }
       // #2025: evidence conjuncts, one distinct refusal each (submission first: it is the agent's own step).
       const evidenceRefusal = await landEvidenceRefusal(env, flight.id, meta.task_ids)
-      if (evidenceRefusal) return fail(409, evidenceRefusal.error, { task_ids: evidenceRefusal.task_ids })
+      if (evidenceRefusal) return fail(409, evidenceRefusal.error, { task_ids: evidenceRefusal.task_ids, tasks: evidenceRefusal.tasks })
       return fail(409, 'flight_transition_conflict')
     }
     const landed = await getFlight(env, flight.id)

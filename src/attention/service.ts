@@ -86,6 +86,7 @@ export type NeedsYouKind =
   | 'blocked_task'
   | 'publishable_output'
   | 'project_recommit_due'
+  | 'flight_unverified'
 
 export type NeedsYouAction =
   | 'view'
@@ -100,7 +101,7 @@ export type NeedsYouAction =
 
 export interface NeedsYouItem {
   kind: NeedsYouKind
-  source_type: 'task' | 'routine_run' | 'project'
+  source_type: 'task' | 'routine_run' | 'project' | 'flight'
   source_id: string
   project_id: string
   project_name: string
@@ -256,6 +257,10 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal, decision?: Task
     return ['view']
   }
 
+  // #2025: a flight held for want of landing evidence is information for an admin (the stuck view only). The exits
+  // (independent task_verdict then flight_land, or flight_cancel) are tools, not list verbs, so no verb is offered.
+  if (row.source_type === 'flight') return ['view']
+
   if (row.source_type === 'project') {
     // Recommit is gated the SAME way the write route gates it — POST
     // /projects/:id/recommit and the project_recommit MCP tool both require
@@ -314,7 +319,7 @@ function itemFrom(row: SourceRow, principal: RoutinePrincipal, decision?: TaskDe
     requested_by: row.requested_by,
     created_at: row.created_at,
     deadline_at: row.deadline_at,
-    safe_url: row.source_type === 'task'
+    safe_url: row.source_type === 'task' || row.source_type === 'flight'
       ? `/projects/${safePath(row.project_id)}#work`
       : row.source_type === 'project'
         ? `/projects/${safePath(row.project_id)}`
@@ -460,7 +465,7 @@ async function sourceRows(
   `, projectScope, cursor)
 
   // The admin 'stuck' view is approvals only — never start the other sources for it.
-  if (stuckView) return [await approvals]
+  if (stuckView) return [await approvals, await heldUnverifiedFlights(env, projectClause, projectScope, visibility, cursor, projectLive)]
 
   // Rolling deploy: Worker may ship before D1 applies 0073. Skip Routine waits until tables exist.
   const routinesReady = await routineTablesReady(env)
@@ -698,6 +703,42 @@ async function recommitDueSource(
 }
 
 /**
+ * #2025: flights the watchdog refused to land because every task is done but the landing evidence is missing
+ * (gate_reason `watchdog_*_unverified`). Stuck view only (workspace admins). Project-attached flights only: the
+ * list is project-scoped, so a flight with no project is visible in the watchdog's HELD log line instead.
+ * The reason names the task ids and the two exits.
+ */
+async function heldUnverifiedFlights(
+  env: Env,
+  projectClause: string,
+  projectScope: unknown[],
+  visibility: { sql: string; binds: string[] },
+  cursor: NeedsYouCursor | null,
+  projectLive: string,
+): Promise<SourceResult> {
+  const iso = (col: string) => `strftime('%Y-%m-%dT%H:%M:%fZ', ${col} / 1000.0, 'unixepoch')`
+  return querySource(env, 'held_flights', `
+    SELECT
+      'flight_unverified' AS kind, 'flight' AS source_type, f.id AS source_id,
+      p.id AS project_id, p.name AS project_name, 'Flight ' || substr(f.id, 1, 8) || ': ' || substr(f.goal, 1, 120) AS title,
+      'Every task is done but the flight has no landing evidence (a result submission from its agent plus an independent approved verdict), so it was not landed. Task ids: '
+        || COALESCE((SELECT group_concat(value, ', ') FROM json_each(f.meta, '$.task_ids')), '')
+        || '. Exit 1: an independent task_verdict on each task, then flight_land. Exit 2: a squad lead or admin runs flight_cancel. It expires to failed (unverified_expired) 7 days after it started.' AS reason,
+      1 AS urgency_rank, f.agent AS responsible, f.dispatched_by_agent_id AS requested_by,
+      ${iso('f.created_at')} AS created_at, NULL AS deadline_at,
+      NULL AS squad_id, NULL AS squad_department_id, NULL AS squad_kind, NULL AS project_access_level,
+      NULL AS assignee_agent_id, NULL AS gate_owner,
+      '${DEADLINE_SENTINEL}' AS sort_deadline,
+      ${iso('f.created_at')} AS sort_timestamp
+    FROM flights f JOIN projects p ON p.id = f.project_id
+    WHERE f.tenant = ? AND f.status IN ('running', 'waiting')
+      AND f.gate_reason LIKE 'watchdog\\_%\\_unverified' ESCAPE '\\'${projectClause}
+      AND ${projectLive}
+      AND ${visibility.sql}
+  `, [env.TENANT_SLUG, ...projectScope], cursor)
+}
+
+/**
  * JS mirror of cursorPredicate's SQL tuple ordering, for the ONE source
  * (recommit-due) whose final urgency_rank cannot be known until a live
  * per-row idleness computation runs — it cannot be expressed as a single
@@ -723,7 +764,7 @@ function validateCursor(cursor: unknown): cursor is NeedsYouCursor {
     && Number.isSafeInteger(value.urgency_rank)
     && typeof value.deadline === 'string'
     && typeof value.timestamp === 'string'
-    && (value.type === 'task' || value.type === 'routine_run' || value.type === 'project')
+    && (value.type === 'task' || value.type === 'routine_run' || value.type === 'project' || value.type === 'flight')
     && typeof value.id === 'string'
 }
 

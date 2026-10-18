@@ -457,7 +457,7 @@ flightsApp.post('/:id/land', async (c) => {
       }
       // #2025: same evidence predicate and the same distinct refusals as flight_land.
       const evidenceRefusal = await landEvidenceRefusal(c.env, id, governedMeta.task_ids)
-      if (evidenceRefusal) return c.json({ error: evidenceRefusal.error, task_ids: evidenceRefusal.task_ids }, 409)
+      if (evidenceRefusal) return c.json({ error: evidenceRefusal.error, task_ids: evidenceRefusal.task_ids, tasks: evidenceRefusal.tasks }, 409)
       return c.json({ error: 'flight_transition_conflict' }, 409)
     }
     const landed = await getFlight(c.env, id)

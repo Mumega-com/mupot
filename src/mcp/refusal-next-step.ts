@@ -152,16 +152,12 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: `This tool needs an agent-bound credential and this session is not one. A CLI or daemon agent needs ${NEEDS_MINT}. {reach}` },
 
   // ── flight landing evidence (#2025) ───────────────────────────────────────────────────────────
-  { error: 'land_requires_result_submission', tool: 'flight_land', who_acts: 'self', next_tool: 'task_submit_result',
-    next_step: 'A landing must prove the work: each task on the flight needs a result submitted by the flight\'s own agent, and the submitted text must still be the task\'s result. Call task_submit_result for each task in task_ids, then call flight_land again.' },
   { error: 'land_requires_result_submission', who_acts: 'self', next_tool: 'task_submit_result',
-    next_step: 'A landing must prove the work: each task on the flight needs a result submitted by the flight\'s own agent. Submit the result for each task in task_ids (task_submit_result), then land again.' },
-  { error: 'land_requires_independent_verdict', tool: 'flight_land', who_acts: 'admin', next_tool: 'task_verdict',
-    next_step: 'A landing needs an approval someone other than the agent decided. The gate owner (an admin or the owning human) must call task_verdict { verdict: "approved" } on each task in task_ids; a task in the agent self-completion lane cannot satisfy this and must be moved to a gate with an independent owner. {reach}' },
+    next_step: 'A landing must prove the work: each task in task_ids needs a result submitted by THIS flight\'s own agent (tasks[] lists each task\'s assignee and status). If you are the assignee and the task is in_progress, call task_submit_result for it, then land again. If the task is assigned to a different agent, that assignee\'s submission cannot count for this flight, and if the task is already in review or done it cannot be resubmitted: cancel this flight (flight_cancel) and dispatch a new one whose tasks are assigned to its own agent.' },
   { error: 'land_requires_independent_verdict', who_acts: 'admin', next_tool: 'task_verdict',
-    next_step: 'A landing needs an approval someone other than the agent decided. The gate owner must approve each task in task_ids with task_verdict; the agent cannot approve its own work. {reach}' },
+    next_step: 'A landing needs an approval that neither the task\'s assignee nor the flight\'s agent decided. An admin, or the gate owner named in tasks[].gate_owner provided that owner is not the task\'s assignee, calls task_verdict { verdict: "approved" } on each task in task_ids; the agent cannot approve its own work, and a task in the agent self-completion lane cannot satisfy this and must be moved to a gate with an independent owner. {reach}' },
   { error: 'watchdog_tasks_done_unverified', who_acts: 'admin', next_tool: 'task_verdict',
-    next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so the watchdog did not land it. Supply the missing evidence, then the agent lands it with flight_land; or an admin cancels it. {reach}' },
+    next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so it was not landed. Exit 1: an independent task_verdict (admin, or a gate owner who is not the assignee) on each task, then the flight\'s agent calls flight_land. Exit 2: a squad lead or admin cancels it with flight_cancel. Left alone it expires to failed (unverified_expired) after 7 days. {reach}' },
 
   // ── pot features off ──────────────────────────────────────────────────────────────────────────
   { error: 'seat_attach_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
