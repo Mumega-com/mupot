@@ -393,7 +393,7 @@ task's current `result`, and (2) a latest verdict that is `approved`, decided by
 the task's assignee and the flight's agent, on a task that is not in the `gate:agent-self-completion`
 lane. Independence policy: `decided_by` is compared with ids only. A verdict decided through `agent_attested_origin` carries the resolved human member as `decided_by`, so it counts; but an attested verdict by the owner of the task's assignee is refused at write time (`assignee_conflict`), so it never reaches a landing. A second agent with the same owner as the assignee DOES count as independent (platform policy, `verdict-independence.ts:136`): two agents sharing an owner may approve each other's work, which is a collusion lever any Orca count must state. A task whose result the CI sync overwrote with `CI: success|neutral|skipped` still matches (a submission from the flight's agent must exist). A refused landing says which conjunct failed:
 `land_requires_result_submission` (the agent submits with `task_submit_result`) or
-`land_requires_independent_verdict` (the gate owner calls `task_verdict`), each with the offending
+`land_requires_independent_verdict` (every task is already done, so cancel and re-dispatch with an independent gate owner), each with the offending
 `task_ids`. On success the landing appends `task-result-submission:<id>` per task to
 `meta.receipt_refs` (no duplicates) and writes the same refs into the `flight.landed` outbox payload,
 so "landed" flights are countable by receipts. Caller-supplied `task-result-submission:*` refs are discarded at land (only the verified set is written, capped at 200); a count must still join `task_result_submissions` rather than trust ref strings. A result rewritten by a system path (CI sync `CI: ...`, gate-execute `Published via ...`/`Applied ... via ...`) still matches by its note shape; the submitter binding is never waived. REST land, `flight_land`, the watchdog's
@@ -403,7 +403,7 @@ flight whose tasks are done but unevidenced: it records `gate_reason = 'watchdog
 (`watchdog_system_land_unverified` for a parked flight, which escalates once), leaves the status
 unchanged and logs a HELD line. Held running flights are excluded from the reapable scan window, appear
 in `needs_you_list { view: 'stuck' }` (workspace admins; project-attached flights) with the task ids and
-the two exits (an independent `task_verdict` then `flight_land`, or `flight_cancel`), and expire to
+the way out (a held flight cannot be landed because done tasks take no verdict: `flight_cancel`, then re-dispatch with a gate owner who is not the assignee), and expire to
 `failed` with reason `unverified_expired` 7 days after the flight started. Routine control flights are witnessed by their proposal
 receipt instead and are exempt. Rollback: set `LAND_REQUIRES_EVIDENCE` to `"0"` (default on).
 

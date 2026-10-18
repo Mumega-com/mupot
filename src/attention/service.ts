@@ -258,7 +258,7 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal, decision?: Task
   }
 
   // #2025: a flight held for want of landing evidence is information for an admin (the stuck view only). The exits
-  // (independent task_verdict then flight_land, or flight_cancel) are tools, not list verbs, so no verb is offered.
+  // (flight_cancel, then re-dispatch with an independent gate owner) is a tool, not a list verb, so no verb is offered.
   if (row.source_type === 'flight') return ['view']
 
   if (row.source_type === 'project') {
@@ -723,7 +723,7 @@ async function heldUnverifiedFlights(
       p.id AS project_id, p.name AS project_name, 'Flight ' || substr(f.id, 1, 8) || ': ' || substr(f.goal, 1, 120) AS title,
       'Every task is done but the flight has no landing evidence (a result submission from its agent plus an independent approved verdict), so it was not landed. Task ids: '
         || COALESCE((SELECT group_concat(value, ', ') FROM json_each(f.meta, '$.task_ids')), '')
-        || '. Exit 1: an independent task_verdict on each task, then flight_land. Exit 2: a squad lead or admin runs flight_cancel. It expires to failed (unverified_expired) 7 days after it started.' AS reason,
+        || '. A held flight cannot be landed (done tasks take no verdict): a squad lead or admin runs flight_cancel, then the task is re-dispatched with a gate owner who is not the assignee. It expires to failed (unverified_expired) 7 days after it started.' AS reason,
       1 AS urgency_rank, f.agent AS responsible, f.dispatched_by_agent_id AS requested_by,
       ${iso('f.created_at')} AS created_at, NULL AS deadline_at,
       NULL AS squad_id, NULL AS squad_department_id, NULL AS squad_kind, NULL AS project_access_level,

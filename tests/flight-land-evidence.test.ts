@@ -239,7 +239,7 @@ describe('#2025 landGovernedFlight requires evidence', () => {
     expect(sub).toMatchObject({ who_acts: 'self', next_tool: 'task_submit_result' })
     expect(sub.next_step).toBeTruthy()
     const ver = refusalGuidance('land_requires_independent_verdict', 409, { task_ids: ['t1'] }, 'flight_land')
-    expect(ver).toMatchObject({ who_acts: 'admin', next_tool: 'task_verdict' })
+    expect(ver).toMatchObject({ who_acts: 'admin', next_tool: 'flight_cancel' })
     expect(refusalGuidance('watchdog_tasks_done_unverified', 409, undefined, 'flight_reap_stalled').who_acts).toBe('admin')
   })
 })
@@ -474,8 +474,7 @@ describe('#2025 held-unverified flights: window exclusion, expiry, surfacing (P1
     const item = page.items.find((i) => i.source_id === 'h1')
     expect(item).toMatchObject({ kind: 'flight_unverified', source_type: 'flight', allowed_actions: ['view'] })
     expect(item?.reason).toContain('task-h1')
-    expect(item?.reason).toContain('task_verdict')
-    expect(item?.reason).toContain('flight_land')
+    expect(item?.reason).toContain('cannot be landed')
     expect(item?.reason).toContain('flight_cancel')
     const member: RoutinePrincipal = { ...admin, actor_id: 'member-a', workspace_admin: false, legacy_owner_admin: false }
     expect((await listNeedsYou(env, member, { view: 'stuck' })).items).toEqual([])
