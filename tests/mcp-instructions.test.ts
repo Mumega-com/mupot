@@ -5,12 +5,6 @@ import { SEVEN_AXIS_HARNESSES } from '../src/fleet/presence'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from '../src/mcp/instructions'
 import { TOOLS } from '../src/mcp/index'
 
-function extractQuotedHarnesses(text: string, pattern: RegExp, surface: string): string[] {
-  const match = text.match(pattern)
-  if (!match) throw new Error(`could not extract check_in harnesses from ${surface}`)
-  return match[1].split('|').map((value) => JSON.parse(value.trim()) as string)
-}
-
 describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
   it('is a non-empty string with substantive onboarding guidance', () => {
     expect(typeof MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toBe('string')
@@ -113,12 +107,13 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     if (!toolCheckIn) throw new Error('check_in tool is missing from the public catalog')
     expect((toolCheckIn.inputSchema.properties.harness as { enum?: string[] }).enum).toBeUndefined()
     expect(toolCheckIn.args).toMatch(/harness\?: string/)
-    // The instruction examples stay a subset of the known list (suggestions, never a gate).
-    const instructionHarnesses = extractQuotedHarnesses(
-      MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
-      /harness:\s+"<harness>",\s+\/\/\s+(.+)\n/,
-      'static initialize instructions',
-    )
-    expect(instructionHarnesses).toEqual(SEVEN_AXIS_HARNESSES)
+    // The instructions say any bounded string is accepted (no closed list); the quoted examples stay a subset of the known list.
+    const line = MUPOT_MCP_INITIALIZE_INSTRUCTIONS.match(/harness:\s+"<harness>",.*\n/)?.[0] ?? ''
+    expect(line).toMatch(/any harness name/)
+    expect(line).toMatch(/authority is never derived from the name/)
+    expect(line).not.toContain('"cursor-ide" |')
+    const examples = [...line.matchAll(/"([a-z-]+)"/g)].map((m) => m[1])
+    expect(examples.length).toBeGreaterThan(0)
+    for (const e of examples) expect(SEVEN_AXIS_HARNESSES).toContain(e)
   })
 })

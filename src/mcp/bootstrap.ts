@@ -91,10 +91,11 @@ const toolBootstrapSelf: ToolSpec = {
               ? ' This chat already acts as a seat agent. To act as an agent you already have, call seat_attach { agent: "<its id, slug or name>" } (your human approves once with their passkey). To work as this seat agent, call orient.'
               : auth.seatBinding?.attached
                 ? ' This chat is already attached to an existing agent; call boot_context and orient.'
-                : ' Call boot_context: its next_step names what this session can do.'),
+                : ' If this credential is an agent or seat token you already are that agent: call boot_context. If it is an unbound member token with no agent, an admin mints you one (mint_agent_token).'),
         )
       case 'rate_limited':
-        return fail(403, result.error, result.detail)
+        // DE11: a rate limit is a 429 everywhere else; as a 403 it read as an authorization refusal and got no wait-and-retry teaching.
+        return fail(429, result.error, result.detail)
       case 'already_bootstrapped':
         return fail(
           409,

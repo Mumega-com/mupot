@@ -312,7 +312,7 @@ import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { mcpInitializeInstructions } from './instructions'
-import { refusalNextStep } from './refusal-next-step'
+import { refusalGuidance, withRefusalGuidance } from './refusal-next-step'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
@@ -7075,10 +7075,12 @@ const toolOrient: ToolSpec = {
     if (!ref) {
       // QA-1: dead-end refusal must carry the map out. An unbound token that calls orient
       // without naming an agent is stuck — give the two paths that resolve it.
+      // DE2: connect is session-local for a human token (a trigger makes the claim inert), so sending an unbound
+      // session to connect loops straight back here. The two paths that resolve it are an explicit agent and a seat.
       return fail(400, 'invalid_args', [
-        'agent required: your token is not agent-bound.',
-        'If you are a named agent connecting with a shared apikey, call connect { agent_name } first to claim your identity.',
-        'If you are a human or operator, pass { agent: "<id-or-slug>" } explicitly.',
+        'agent required: this session is not an agent yet.',
+        'Pass orient { agent: "<id-or-slug>" } for an agent you can observe.',
+        'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as "Many chats"); a seated session then calls orient with no arguments.',
       ].join(' '))
     }
 
@@ -7255,7 +7257,9 @@ const toolConnect: ToolSpec = {
             ...(seatAttachEnabled(env)
               ? [auth.seatBinding
                   ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
-                  : `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; Claude (web) calls seat_select and sends the handle in _meta["mupot/seat"]; a client that can set headers sends X-Mupot-Seat. Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
+                  : auth.harnessId
+                    ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and send the handle in _meta["mupot/seat"] (or X-Mupot-Seat if your client can set headers). Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
+                    : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks "Many chats"; then call seat_select, then seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
               : []),
             // Render the ID, never the slug. mint_agent_token resolves through the same
             // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
@@ -7337,11 +7341,14 @@ const toolConnect: ToolSpec = {
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
       binding: durable ? 'durable' : 'session_local',
+      // DE2: a session-local claim does not bind the session, so `orient {}` would answer "agent required". Name the agent.
       next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
-            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. Call orient {} for your basin-drop.`
-            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. A ChatGPT conversation gets a seat automatically; Claude (web) uses seat_select; a Claude Code / CLI session uses a workspace token your human mints on /admin/agent-token. Call orient {} for your basin-drop.`)
-        : 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
+            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your basin-drop call orient { agent: "${agentRef.slug}" }.`
+            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : 'Your human re-consents the connector choosing "Many chats" so it can get a seat (a ChatGPT conversation gets one automatically)'}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your basin-drop call orient { agent: "${agentRef.slug}" }.`)
+        : durable
+          ? 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.'
+          : `You are now hot (this claim is session-local). For your basin-drop call orient { agent: "${agentRef.slug}" }, or rely on this packet.`,
       packet: data,
       brief: renderBrief(data),
     })
@@ -7628,9 +7635,16 @@ function mcpToolRefusalResult(tool: string, status: number, error: string, detai
   const need = typeof detail === 'object' && detail !== null && 'need' in detail
     ? (detail as { need?: unknown }).need // narrowed by the 'in' check above
     : undefined
-  // A teaching line for the generic refusals (src/mcp/refusal-next-step.ts); absent when the tool's own detail already teaches.
-  const nextStep = refusalNextStep(error, status, detail)
-  const body = { ok: false, tool, error, status, ...(need !== undefined ? { need } : {}), ...(nextStep !== undefined ? { next_step: nextStep } : {}), detail }
+  // The one refusal envelope (src/mcp/refusal-next-step.ts): who_acts always; next_step unless the tool's own detail already teaches.
+  const g = refusalGuidance(error, status, detail, tool)
+  const body = {
+    ok: false, tool, error, status, ...(need !== undefined ? { need } : {}),
+    who_acts: g.who_acts,
+    ...(g.next_step !== undefined ? { next_step: g.next_step } : {}),
+    ...(g.next_tool !== undefined ? { next_tool: g.next_tool } : {}),
+    ...(g.link !== undefined ? { link: g.link } : {}),
+    detail,
+  }
   return { isError: true, content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body }
 }
 
@@ -8007,7 +8021,7 @@ async function handleJsonRpc(
       // mupot#1794 W4: the profile door never resolves a seat handle, so a harness session is by
       // definition seatless here: refused (its tools/call goes through invokeTool, which refuses too).
       if (isHarnessCredentialSession(profileAuth)) {
-        return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403)
+        return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, withRefusalGuidance(HARNESS_SESSION_SEAT_REQUIRED, 403, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE), 403)
       }
       return ok(id, { tools: profileToolList() })
     }
@@ -8058,7 +8072,7 @@ async function handleJsonRpc(
     // Authentication above still comes first (401 for an anonymous caller, never a probe of
     // which names are allowlisted).
     if (profile === 'needs-you' && !profileEntry(canonicalName)) {
-      return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403)
+      return rpcError(id, -32601, 'tool_not_in_profile', withRefusalGuidance('tool_not_in_profile', 403, { profile }, typeof canonicalName === 'string' ? canonicalName : undefined), 403)
     }
     // Profile arg refusal (e.g. boot_context runtime/model, which would reach selfReportAtBoot
     // and WRITE the fleet row). Refused, not stripped: a silent strip is a success-shaped no-op.
@@ -8066,7 +8080,7 @@ async function handleJsonRpc(
     if (rejectArgs && typeof params.arguments === 'object' && params.arguments !== null) {
       const supplied = rejectArgs.filter((k) => Object.prototype.hasOwnProperty.call(params.arguments, k))
       if (supplied.length > 0) {
-        return rpcError(id, -32602, 'profile_args_not_allowed', { tool: params.name, rejected: supplied }, 400)
+        return rpcError(id, -32602, 'profile_args_not_allowed', withRefusalGuidance('profile_args_not_allowed', 400, { tool: params.name, rejected: supplied }, typeof canonicalName === 'string' ? canonicalName : undefined), 400)
       }
     }
     const ctx: ToolCtx = {
@@ -8111,12 +8125,13 @@ async function handleJsonRpc(
       return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
-      return rpcError(id, -32602, outcome.error, outcome.detail)
+      // Same -32602; the envelope rides in `data` only where the table has a specific entry (orient "agent required", check_in poll).
+      return rpcError(id, -32602, outcome.error, withRefusalGuidance(outcome.error, outcome.status, outcome.detail, outcome.tool))
     }
     // 5xx (internal_error, receipt_failed, 503s) stay JSON-RPC errors carrying their HTTP status so
     // server-fault monitoring keeps working; only 4xx authz/business refusals become isError.
     if (outcome.status >= 500) {
-      return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, outcome.detail, outcome.status)
+      return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, withRefusalGuidance(outcome.error, outcome.status, outcome.detail, outcome.tool), outcome.status)
     }
     return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
   }
@@ -8140,7 +8155,7 @@ async function handleJsonRpc(
     }
     // mupot#1794 W4: events never resolve a seat handle; a harness session is seatless here: refused.
     if (isHarnessCredentialSession(auth)) {
-      return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403)
+      return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, withRefusalGuidance(HARNESS_SESSION_SEAT_REQUIRED, 403, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE), 403)
     }
 
     // W2 attached agents: the human's grant is an UNBOUND directory token, so without this a chat attached to an existing agent could

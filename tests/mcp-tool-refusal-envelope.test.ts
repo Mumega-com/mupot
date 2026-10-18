@@ -95,4 +95,26 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
     expect(body.result).toBeUndefined()
     expect(body.error).toMatchObject({ code: -32602, message: 'invalid_args' })
   })
+
+  it('every isError refusal carries who_acts; a floor refusal also carries next_step and next_tool (lane B)', async () => {
+    const res = await call(mcpApp, 'https://pot.example/', rpcCall)
+    const body = await res.json() as { result: { structuredContent: Record<string, unknown> } }
+    expect(body.result.structuredContent).toMatchObject({ error: 'forbidden', who_acts: 'admin', next_tool: 'grant_agent_capability' })
+    expect(String(body.result.structuredContent.next_step)).toContain('grant_agent_capability')
+  })
+
+  it('tool_not_in_profile keeps its JSON-RPC code and adds the envelope in data (DE5)', async () => {
+    const res = await call(mcpApp, 'https://pot.example/profile/needs-you', { ...rpcCall, params: { name: 'send', arguments: {} } })
+    const body = await res.json() as { error?: { code: number; message: string; data: Record<string, unknown> } }
+    expect(body.error).toMatchObject({ code: -32601, message: 'tool_not_in_profile' })
+    expect(body.error?.data).toMatchObject({ profile: 'needs-you', who_acts: 'self' })
+    expect(String(body.error?.data.next_step)).toContain('full endpoint /mcp')
+  })
+
+  it('REST /actions refusal body stays exactly as before: no who_acts, no next_step', async () => {
+    const res = await call(mcpActionsApp as unknown as typeof mcpApp, 'https://pot.example/actions/pot_list', {})
+    const body = await res.json() as Record<string, unknown>
+    expect(body).not.toHaveProperty('who_acts')
+    expect(body).not.toHaveProperty('next_step')
+  })
 })

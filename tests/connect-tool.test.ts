@@ -394,7 +394,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     expect(sc.next_step).toMatch(/mint_agent_token/)
   })
 
-  it('QA-1: orient without agent arg on unbound token → refusal includes connect instruction', async () => {
+  it('QA-1/DE2: orient without agent arg on unbound token → refusal names orient {agent} or seat_select, never "call connect"', async () => {
     const env = makeEnv({ boundAgentId: null })
     const res = await mcpRequest(
       'https://mcp.acme-example.co/',
@@ -411,10 +411,14 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
       env,
     )
     expect(res.status).toBe(400)
-    const body = (await res.json()) as { error: { message: string; data: string } }
+    const body = (await res.json()) as { error: { message: string; data: { detail: string; who_acts: string; next_step: string } } }
     expect(body.error.message).toBe('invalid_args')
-    // QA-1: must mention connect as the named-agent path out of the dead end
-    expect(body.error.data).toMatch(/connect/)
+    // DE2: connect is session-local for an unbound token, so sending it there loops back to this refusal.
+    expect(body.error.data.detail).not.toMatch(/call connect/)
+    expect(body.error.data.detail).toMatch(/orient \{ agent:/)
+    expect(body.error.data.detail).toMatch(/seat_select/)
+    expect(body.error.data.who_acts).toBe('self')
+    expect(body.error.data.next_step).toMatch(/orient \{ agent:/)
   })
 
   // ── QA finding 2 regression guard (D6 coverage) ─────────────────────────────
