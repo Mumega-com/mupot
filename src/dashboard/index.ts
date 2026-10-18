@@ -84,6 +84,8 @@ import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig, updateAgentProfile } from '../org/service'
 import { authorizeOwnerMemberChange, emitAgentOwnerUpdated } from '../org/agent-owner'
+import { seatAttachDesignatedEnabled } from '../members/attach-designated'
+import { checkWebSession } from '../secure-moments/enrol-mint'
 import { SQUAD_ACTIVE_SQL, TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
@@ -2071,6 +2073,14 @@ interface AgentOwnerView {
   canSet: boolean
   candidates: Array<{ id: string; label: string }>
   callerMemberId: string | null
+  /** Attach designation (SEAT_ATTACH_DESIGNATED on only): null = control hidden. */
+  designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean } | null
+}
+
+// First letter of each word then ***: enough to recognise yourself or a colleague, not enough to read a name off a shared screen.
+function maskName(name: string): string {
+  const words = name.trim().split(/\s+/).filter(Boolean)
+  return words.length ? words.map((w) => `${Array.from(w)[0] ?? ''}***`).join(' ') : 'a member'
 }
 
 async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Promise<AgentOwnerView> {
@@ -2100,8 +2110,75 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
       candidates.push({ id: m.id, label: [m.display_name, m.email].filter((v): v is string => !!v).join(' · ') || m.id })
     }
   }
-  return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null }
+  let designation: AgentOwnerView['designation'] = null
+  if (seatAttachDesignatedEnabled(env) && isOrgAdmin(auth) && !auth.boundAgentId && auth.memberId) {
+    let designeeLabel: string | null = null
+    if (agent.attach_designated_member_id) {
+      const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ? AND tenant = ?')
+        .bind(agent.attach_designated_member_id, env.TENANT_SLUG)
+        .first<{ display_name: string | null }>()
+      designeeLabel = row?.display_name ? maskName(row.display_name) : 'a member'
+    }
+    designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId }
+  }
+  return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation }
 }
+
+// "Allow my chats to become this agent" (attach designation). Plain form posts; the write is the SAME door and the SAME
+// compare-and-set as MCP update_agent (POST /agents/:id/designation below).
+function agentDesignationControl(agent: Agent, view: NonNullable<AgentOwnerView['designation']>) {
+  return html`<form method="post" action="/agents/${agent.id}/designation" class="inline-form" data-attach-designation>
+      <strong>Allow my chats to become this agent</strong>
+      <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
+      <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
+      <button type="submit" name="action" value="allow" class="btn">Allow for me</button>
+      ${agent.attach_designated_member_id ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
+    </form>`
+}
+
+// POST /agents/:id/designation. Gate order: flag, same-origin (plus csrf() on dashboardApp), a REAL web session of an active
+// human (Allow additionally needs a re-auth within five minutes: checkWebSession fresh:true, the dashboard's step-up rule;
+// Stop only reduces authority so needs the real session, as operator revoke does), THEN the one door
+// (authorizeOwnerMemberChange, 'attach_designated_member_id': org floor, rank ceilings, no self waiver, seats/attached refused)
+// and the one compare-and-set write (updateAgentProfile with expect = the value the door read). No second authorization path.
+dashboardApp.post('/agents/:id/designation', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  const deny = (status: 400 | 403 | 404 | 409, msg: string) => c.html(shell(c.env, 'Attach designation', errorBody(msg)), status)
+  if (!seatAttachDesignatedEnabled(c.env)) return deny(404, 'Not enabled.')
+  if (c.req.header('origin') !== new URL(c.req.url).origin) return deny(403, 'Cross-origin request refused.')
+  const auth = c.get('auth')
+  const form = await c.req.parseBody()
+  const action = typeof form.action === 'string' ? form.action : ''
+  if (action !== 'allow' && action !== 'stop') return deny(400, 'Unknown action.')
+  const session = await checkWebSession(c.env, auth, { fresh: action === 'allow' })
+  if (!session.ok) {
+    return c.html(shell(c.env, 'Attach designation', session.error === 'reauth_required'
+      ? html`<div class="card"><p>Confirm it is you first. <a href="/auth/reauth">Confirm it is you</a>, then come back to this page and try again.</p></div>`
+      : errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
+  }
+  if (auth.boundAgentId || !isOrgAdmin(auth)) return deny(403, 'Only an org admin can change an attach designation.')
+  const resolved = await resolveAgentRef(c.env, c.req.param('id'))
+  if (!resolved.ok) return deny(404, 'Agent not found.')
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
+  if (!agent) return deny(404, 'Agent not found.')
+  const target: string | null = action === 'allow' ? session.memberId : null
+  const gate = await authorizeOwnerMemberChange(c.env, auth, agent.id, target, 'attach_designated_member_id')
+  if (!gate.ok) {
+    return deny(403, gate.error === 'forbidden'
+      ? 'Only an org admin can change an attach designation.'
+      : gate.error === 'agent_rank_exceeds_ceiling' || gate.error === 'target_rank_exceeds_ceiling'
+        ? 'This agent, or its current designee, outranks you.'
+        : 'That is not allowed from this session.')
+  }
+  const result = await updateAgentProfile(c.env, agent.id, { attach_designated_member_id: target }, { id: session.memberId, type: 'user' },
+    { attach_designated_member_id: gate.current ?? null })
+  if (!result.ok) {
+    if (result.error === 'designation_changed') return deny(409, 'The designation changed while you were deciding. Reload and try again.')
+    if (result.error === 'owner_member_inactive' || result.error === 'owner_member_not_found') return deny(409, 'Your member record is not eligible.')
+    return deny(400, 'Could not change the designation.')
+  }
+  return c.redirect(`/agents/${agent.id}`, 303)
+})
 
 function agentOwnerControl(agent: Agent, view: AgentOwnerView) {
   return html`<form method="post" action="/agents/${agent.id}/owner" class="inline-form">
@@ -5986,6 +6063,7 @@ function agentConsoleBody(
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
+      ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation) : ''}
     </div>
     ${liveRuntimeCard(liveRuntime)}
     ${accessPanel ?? ''}
