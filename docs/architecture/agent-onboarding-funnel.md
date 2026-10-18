@@ -140,6 +140,41 @@ State ids are stable names so `boot_context` can adopt them as a `funnel.state` 
 
 ---
 
+## 2.4 The `whoami` contract (one answer to "where do I stand")
+
+`boot_context`, `status` and `orient` return the same block, built by `src/mcp/whoami.ts` (`buildWhoami`, pure; the caller supplies the few best-effort reads). The curated profile door omits it (it cannot call the tools the block names).
+
+```
+whoami: {
+  state: no_agent | own_seat | acting_as | host | harness_unseated,
+  basis?: attached | legacy_consent,          // only with acting_as
+  have: ["member","harness","seat","agent","keyed","inbox:consume"],
+  missing: [{ code, who_acts: self|owner|admin|org_admin, next_step, next_tool?, link? }],
+  agent: { keyed, inbox: consume|peek|none|fenced, can_self_report },
+  seat?: { seat_id, acts_as, presented },   // acts_as is a slug/name, never an agent id
+  harness: present | absent
+}
+```
+
+| state | connection kinds (door map) | derived from |
+|---|---|---|
+| `no_agent` | K3 plain directory consent, K2 unbound workspace token, a lapsed consent | no `boundAgentId`, no seat-capable harness |
+| `harness_unseated` | K4 OAuth harness grant, K5 harness token | harness pointer or `harnessCredential`, no seat yet |
+| `own_seat` | K6 handle or auto seat | `seatBinding`, not attached |
+| `acting_as` + `basis: attached` | K7 attached thread | `seatBinding.attached` |
+| `acting_as` + `basis: legacy_consent` | K8 consent-bound directory grant | directory + `consentedByMemberId` + bound |
+| `host` | K1 keyed or unkeyed agent token | bound, no seat, not directory |
+
+Rules:
+
+- `missing[]` is built from the predicates the tools enforce, so an advertised step cannot be refused for the caller it is shown to. `next_tool` is set only when `who_acts` is `self`; a step another actor takes carries prose and, where one exists, a `link`. A harness token (K5) is only ever pointed at `seat_select`.
+- `bootstrap_self` appears in `missing[]` only for an unbound directory session with no harness, no earlier bootstrap, and (no agents in the pot, or the member is an org admin). A stranger in a populated pot is never shown it (#2020). When the lookup fails the mint is not advertised.
+- `missing[]` is empty for a seated or keyed session in normal operation. It is not empty for a silent downgrade: `seat_handle_rejected`, `auto_seat_refused`, `attach_refused` and `consent_lapsed` each get an entry with the reason and who acts, and `state` reports the downgraded reality (`own_seat`, not `acting_as`).
+- `report_runtime` (boot only, unkeyed host) is the one step that points at `boot_context`; following it changes `registry.outcome` to `recorded`. A keyed agent reports through `POST /api/fleet/attach-signed` and has no missing step for it.
+- `next_step`, `onboarding.next_step`, `available_doors` and `channel_limits.to_get_write_access` in `boot_context` are read from `whoami` (first non-report step; the legacy doors filtered to what the connection can call). They remain for compatibility and will be deprecated.
+- `orient` with no agent on an unbound session still refuses, and the refusal carries `who_acts`, `next_step`, `next_tool`, `link` and the same `whoami`.
+- The consent `link` is the connector's MCP endpoint: removing and re-adding the connector starts the consent screen (there is no HTTP `/connect` page). Under prod flags (`SEAT_ATTACH` off) the tabs are "Me (auto)" and "Existing agent".
+
 ## 3. Friction list, ranked by how many agents it blocks
 
 "Blocks" counts distinct new agents stopped. Door A is the dominant population (every ChatGPT/Claude/Grok chat), then door B, then door C.

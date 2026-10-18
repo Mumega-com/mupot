@@ -71,6 +71,8 @@ function markBootstrapped(memberId: string): void {
 describe('an existing agent is pointed at seat_attach only when the session can actually call it', () => {
   const withSeat = (attached = false): AuthContext => ({
     ...seat('directory'),
+    // A real seat session is bound to its seat agent (whoami reads the state from boundAgentId + seatBinding).
+    boundAgentId: 'seat-agent-1',
     seatBinding: { seatId: 'seat-1', label: 'chat', harnessId: 'h-1', grantTokenId: 'g-1', humanMemberId: 'mem-newcomer', source: 'auto:openai_session',
       ...(attached ? { attached: { attachmentId: 'a', admissionId: 'adm', agentId: 'ag', seatAgentId: 'sa', ceiling: 'member' as const } } : {}) },
   }) as AuthContext
@@ -79,13 +81,13 @@ describe('an existing agent is pointed at seat_attach only when the session can 
     return ((out as { result?: BootResult }).result?.channel_limits?.to_get_write_access) ?? ''
   }
   const on = (): void => { ;(env as unknown as Record<string, string>).SEAT_ATTACH = '1'; (env as unknown as Record<string, string>).SEAT_AUTO_ENROLL = '1' }
-  it('SEAT_ATTACH on + a seat that is not attached: names seat_attach (after bootstrap_self, before the token route) and keeps the bearer for a daemon agent', async () => {
+  it('SEAT_ATTACH on + a seat that is not attached: names seat_attach (before the token route), never bootstrap_self (a seat cannot run it), and keeps the bearer for a daemon agent', async () => {
     on()
     const fix = await note(withSeat())
     expect(fix).toContain('seat_attach { agent:')
     expect(fix.toLowerCase()).toContain('passkey')
     expect(fix.toLowerCase()).toContain('will not help')
-    expect(fix.indexOf('bootstrap_self')).toBeLessThan(fix.indexOf('seat_attach'))
+    expect(fix).not.toContain('bootstrap_self') // dead end 4: a seat is bound, bootstrap_self answers not_unbound_directory_session
     expect(fix.indexOf('seat_attach')).toBeLessThan(fix.indexOf('mint_agent_token'))
     expect(fix).toContain('fixed CLI/daemon agent')
   })
@@ -188,9 +190,11 @@ describe('the advisory lookup can never cost the caller its map', () => {
     const r = ((out as { result?: BootResult }).result ?? {}) as BootResult
 
     expect(r.onboarding_state).toBe('unbound_no_agent')
-    // Fail toward MORE doors, never fewer: a caller wrongly shown bootstrap_self gets a
-    // clear 409 that names the consent flow. A caller wrongly denied it gets nothing.
-    expect(r.available_doors?.[0]?.tool).toBe('bootstrap_self')
+    // #2020: the lookup that decides whether the pot is populated failed, so the identity mint is NOT advertised (fail
+    // closed on the advert; the tool itself is unchanged). The caller still gets a map: doors, a next_step and whoami.
+    expect(r.available_doors?.map((d) => d.tool)).not.toContain('bootstrap_self')
+    expect(r.available_doors?.length).toBeGreaterThan(0)
+    expect(typeof r.next_step).toBe('string')
   })
 })
 

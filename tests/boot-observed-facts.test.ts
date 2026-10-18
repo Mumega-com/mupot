@@ -135,7 +135,7 @@ describe('attached and member boots write nothing', () => {
     const r = await boot(member(), { runtime: 'codex-cli', host: 'laptop' })
     expect(row()).toMatchObject({ runtime: 'grok', host: '', connection_kind: '' })
     expect(r.onboarding?.connection_kind).toBe('member')
-    expect(r.onboarding?.next_step).toMatch(/agent-bound connection/)
+    expect(r.onboarding?.next_step).toMatch(/mint_agent_token/)
   })
 
   it('sideEffectFree (profile) path writes nothing and adds no onboarding block', async () => {
@@ -193,14 +193,14 @@ describe('keyed agents', () => {
   const key = () => harness.sqlite.exec(`
     INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES ('mumega', '${AGENT}', 'AAAA', 'Ed25519', 'mem-1', datetime('now'));
   `)
-  it('a keyed agent-bound boot is told to use POST /api/fleet/attach-signed, not to call boot again', async () => {
+  it('a keyed agent-bound boot is told (registry.detail) to use POST /api/fleet/attach-signed, and onboarding repeats no second step', async () => {
     key()
     const r = await boot(bound(), { runtime: 'codex-cli' })
     expect(r.registry?.outcome).toBe('refused_signed_attach_required')
     const ob = r.onboarding as Onboarding & { who_acts?: string; agent?: { keyed: boolean; can_self_report: boolean } }
-    expect(ob.next_step).toContain('/api/fleet/attach-signed')
-    expect(ob.next_step).not.toMatch(/call boot_context again/)
-    expect(ob.who_acts).toBe('self')
+    expect(r.registry?.detail).toContain('/api/fleet/attach-signed')
+    expect(ob.next_step).toBeUndefined() // whoami is the source of next steps; it lists none for a keyed agent
+    expect(JSON.stringify(r)).not.toMatch(/call boot_context again/)
     expect(ob.agent).toMatchObject({ keyed: true, can_self_report: false })
     expect(row()?.runtime).toBe('grok')
   })
