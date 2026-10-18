@@ -2829,6 +2829,10 @@ async function resolveReplyTarget(
   // renaming itself to another sender's id would otherwise capture that sender's reply).
   const byId = (await env.DB.prepare(`SELECT 1 AS x FROM agents WHERE id IN (?1, ?2) LIMIT 1`)
     .bind(toRef, stripped).first<{ x: number }>()) !== null
+  // Slug is unique only per squad and names are not unique, so another seat can take a sender's
+  // slug/name. A ref that is not an agent id is therefore honoured only against an EXACT message
+  // id (that row's from_agent is the target, its slug/name must match); a request_id-cited reply
+  // must address the sender by agent id.
   // The sender filter is applied BEFORE the row is chosen (a request_id is only unique per
   // sender, so an unrelated sender's newer message with the same id string must not shadow the
   // real one). An exact message-id match wins over a request_id match, then the newest row.
@@ -2836,7 +2840,7 @@ async function resolveReplyTarget(
     `SELECT m.id AS mid, a.id, a.squad_id, a.slug, a.name
        FROM agent_messages m
        JOIN agents a ON a.id = m.from_agent
-      WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
+      WHERE m.tenant = ?1 AND m.to_agent = ?2 AND ${byId ? '(m.id = ?3 OR m.request_id = ?3)' : 'm.id = ?3'}
         AND julianday(m.created_at) >= julianday(?4)
         AND a.status != 'inactive'
         AND ${byId ? 'a.id IN (?5, ?6)' : '(a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))'}

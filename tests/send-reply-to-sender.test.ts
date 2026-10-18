@@ -319,7 +319,7 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     await sendFrom(env, b, { to: 'agent-kasra', body: 'b', request_id: 'same-rid' })
     h.sqlite.prepare(`UPDATE agents SET name = 'Twin' WHERE id IN (?, ?)`).run(a.agentId, b.agentId)
     const r = await rpc(env, kasra, 'send', { to: 'Twin', body: 'x', in_reply_to: 'same-rid' })
-    expect(r.status).toBe(404)
+    expect(r.status).toBe(404) // by name + request_id: refused (also ambiguous, belt and braces)
     expect(landed(a.agentId) + landed(b.agentId)).toBe(0)
   })
 
@@ -357,6 +357,32 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     expect(r.status).toBe(404)
     expect(landed(x.agentId)).toBe(0)
     expect(landed(s.agentId)).toBe(0)
+  })
+
+  it('F2b: slug/name addressing needs an exact message id; X taking S\'s slug and name in another squad captures nothing', async () => {
+    const s = await homeSeat(env, 'human-1', 's1')
+    const x = await homeSeat(env, 'human-2', 's2')
+    await sendFrom(env, s, { to: 'agent-kasra', body: 'from S', request_id: 'rid-s' })
+    const sId = msgId('agent-kasra', s.agentId)
+    await sendFrom(env, x, { to: 'agent-kasra', body: 'from X', request_id: 'rid-s' })
+    const sSlug = String(h.sqlite.prepare(`SELECT slug FROM agents WHERE id = ?`).get(s.agentId)!.slug)
+    const sName = String(h.sqlite.prepare(`SELECT name FROM agents WHERE id = ?`).get(s.agentId)!.name)
+    h.sqlite.prepare(`UPDATE agents SET slug = 'old-' || slug WHERE id = ?`).run(s.agentId)
+    h.sqlite.prepare(`UPDATE agents SET slug = ?, name = ? WHERE id = ?`).run(sSlug, sName, x.agentId)
+    // request_id citation by slug or name: refused even inside the window
+    expect((await rpc(env, kasra, 'send', { to: sSlug, body: 'r', in_reply_to: 'rid-s' })).status).toBe(404)
+    // expired exact id, by slug and by name: refused, nothing at X
+    h.sqlite.prepare(`UPDATE agent_messages SET created_at = ? WHERE id = ?`).run(new Date(Date.now() - 8 * 86400000).toISOString(), sId)
+    expect((await rpc(env, kasra, 'send', { to: sSlug, body: 'r', in_reply_to: sId })).status).toBe(404)
+    expect((await rpc(env, kasra, 'send', { to: sName, body: 'r', in_reply_to: sId })).status).toBe(404)
+    expect(landed(x.agentId)).toBe(0)
+    // inside the window, exact message id + S's CURRENT slug works and goes to S
+    h.sqlite.prepare(`UPDATE agent_messages SET created_at = ? WHERE id = ?`).run(new Date().toISOString(), sId)
+    h.sqlite.prepare(`UPDATE agents SET slug = 'old-' || slug WHERE id = ?`).run(x.agentId)
+    h.sqlite.prepare(`UPDATE agents SET slug = ? WHERE id = ?`).run(sSlug, s.agentId)
+    expect((await rpc(env, kasra, 'send', { to: sSlug, body: 'ok', in_reply_to: sId })).status).toBe(200)
+    expect(landed(s.agentId)).toBe(1)
+    expect(landed(x.agentId)).toBe(0)
   })
 })
 
