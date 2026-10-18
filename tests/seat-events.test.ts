@@ -1889,6 +1889,7 @@ describe('grant scope: own-home standing for the host key member', () => {
   async function homeWorld() {
     const w = await world()
     const k = await keypair()
+    const kAlt = await keypair()
     w.h.sqlite.exec(`
       INSERT INTO departments (id, slug, name, kind) VALUES ('dh1', 'dept-home-owner-m', 'Home — Owner', 'home'), ('dh2', 'dept-home-other-m', 'Home — Other', 'home');
       INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('home1', 'dh1', 'home-owner', 'Home — Owner', 'home'), ('home2', 'dh2', 'home-other', 'Home — Other', 'home');
@@ -1903,20 +1904,23 @@ describe('grant scope: own-home standing for the host key member', () => {
         ('home-seat-2', 'home2', 'hs2', 'HS2', 'member', 'm', 'active');
       INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES
         ('${TENANT}', 'host-owner', '${k.x}', 'Ed25519', 'owner-m', ${NOW}),
-        ('${TENANT}', 'host-alt', '${k.x}x', 'Ed25519', 'owner-alt-m', ${NOW}),
+        ('${TENANT}', 'host-alt', '${kAlt.x}', 'Ed25519', 'owner-alt-m', ${NOW}),
         ('${TENANT}', 'host-rando', '${k.x}y', 'Ed25519', 'rando-m', ${NOW});
     `)
-    return w
+    return Object.assign(w, { kOwner: k, kAlt })
   }
   const g = (w: World, host: string, agent: string) =>
     createSeatEventGrant(w.env, { hostAgentId: host, agentId: agent, memberId: 'admin', reason: 'home' })
-  const link = (w: World, id: string, member: string, email: string, revoked = false) =>
+  const link = (w: World, id: string, member: string, email: string, revoked = false, provider = 'google', tenant = TENANT) =>
     w.h.sqlite.exec(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, revoked_at)
-      VALUES ('${id}', '${TENANT}', 'google', 'sub-${id}', '${email}', '${member}', ${revoked ? "'2026-01-01'" : 'NULL'})`)
+      VALUES ('${id}', '${tenant}', '${provider}', 'sub-${id}', '${email}', '${member}', ${revoked ? "'2026-01-01'" : 'NULL'})`)
+  const linkBoth = (w: World) => { link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io') }
+  const refused = { ok: false, reason: 'host_no_squad_standing' }
 
   it('owner host -> own home seat granted', async () => {
     const w = await homeWorld()
     expect((await g(w, 'host-owner', 'home-seat-1')).ok).toBe(true)
+    expect(await hostMayReceive(w.env, 'host-owner', 'home-seat-1')).toBe(true)
   })
   it('owner host -> another member home seat refused', async () => {
     const w = await homeWorld()
@@ -1928,8 +1932,9 @@ describe('grant scope: own-home standing for the host key member', () => {
   })
   it('dual-member: key member and home owner share a live provider-verified identity email -> granted', async () => {
     const w = await homeWorld()
-    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'H@X.io')
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', ' H@X.io ')
     expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+    expect(await hostMayReceive(w.env, 'host-alt', 'home-seat-1')).toBe(true)
   })
   it('dual-member with a verified identity on the key member only (owner has none) -> refused', async () => {
     const w = await homeWorld()
@@ -1980,5 +1985,109 @@ describe('grant scope: own-home standing for the host key member', () => {
     const w = await homeWorld()
     w.h.sqlite.exec(`PRAGMA foreign_keys = OFF; UPDATE agents SET squad_id = 'ghost' WHERE id = 'home-seat-1'`)
     expect((await g(w, 'host-owner', 'home-seat-1')).ok).toBe(false)
+  })
+
+  // ── delivery: a grant the bridge accepts must be DELIVERABLE (same predicate on both paths) ──
+  it('bridge grant is deliverable: authorizeSeatDelivery, ticket mint, redeem and hint all go through', async () => {
+    const w = await homeWorld()
+    linkBoth(w)
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+    expect(await authorizeSeatDelivery(w.env, 'host-alt', 'home-seat-1')).toBe('granted')
+    const r = await verifyTicketRequest(w.env, await signedRequest(w.kAlt, { host: 'host-alt', agents: ['home-seat-1'] }), () => NOW)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.granted).toEqual(['home-seat-1'])
+    const hub = hubFor(w)
+    const sock = await hub.connect(await hub.ticketFor('host-alt', ['home-seat-1']))
+    expect(sock.sent.some((f) => f.includes('"ready"'))).toBe(true)
+    expect((await hub.hub().publish(hintFor('home-seat-1', insertMessage(w, 'home-seat-1')))).sent).toBe(1)
+  })
+  it('delivery re-checks: bridge identity revoked after the grant -> no longer delivered', async () => {
+    const w = await homeWorld()
+    linkBoth(w)
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+    w.h.sqlite.exec(`UPDATE human_login_identities SET revoked_at = '2026-01-01' WHERE id = 'l2'`)
+    expect(await authorizeSeatDelivery(w.env, 'host-alt', 'home-seat-1')).toBe('not_granted')
+  })
+  it('owner host delivery to own home seat', async () => {
+    const w = await homeWorld()
+    expect((await g(w, 'host-owner', 'home-seat-1')).ok).toBe(true)
+    expect(await authorizeSeatDelivery(w.env, 'host-owner', 'home-seat-1')).toBe('granted')
+  })
+
+  // ── hardening of the identity bridge ──
+  it('revoked OWNER identity -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io', true); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    // delivery side too: force a grant row past creation, delivery must still refuse
+    w.h.sqlite.exec(`INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, granted_by_member_id, reason, created_at) VALUES ('fg1', '${TENANT}', 'host-alt', 'home-seat-1', 'admin', 'x', 'x')`)
+    expect(await hostMayReceive(w.env, 'host-alt', 'home-seat-1')).toBe(false)
+  })
+  it.each(['bootstrap', 'local-test'])('unverified provider %s on the key side -> refused', async (prov) => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io', false, prov)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+  })
+  it.each(['bootstrap', 'local-test'])('unverified provider %s on the owner side -> refused', async (prov) => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io', false, prov); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+  })
+  it('empty verified_email on both sides -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', ''); link(w, 'l2', 'owner-alt-m', '  ')
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+  })
+  it('cross-tenant identity rows -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io', false, 'google', 'other-tenant'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    link(w, 'l3', 'owner-m', 'h@x.io') // owner now linked in-tenant -> granted; then key side foreign
+    w.h.sqlite.exec(`UPDATE human_login_identities SET tenant = 'other-tenant' WHERE id = 'l2'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    w.h.sqlite.exec(`INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, granted_by_member_id, reason, created_at) VALUES ('fg3', '${TENANT}', 'host-alt', 'home-seat-1', 'admin', 'x', 'x')`)
+    expect(await hostMayReceive(w.env, 'host-alt', 'home-seat-1')).toBe(false)
+  })
+  it('owner member in another tenant -> refused', async () => {
+    const w = await homeWorld()
+    linkBoth(w)
+    w.h.sqlite.exec(`UPDATE members SET tenant = 'other-tenant' WHERE id = 'owner-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    w.h.sqlite.exec(`INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, granted_by_member_id, reason, created_at) VALUES ('fg2', '${TENANT}', 'host-alt', 'home-seat-1', 'admin', 'x', 'x')`)
+    expect(await hostMayReceive(w.env, 'host-alt', 'home-seat-1')).toBe(false)
+  })
+  it('archived key member or archived owner -> refused', async () => {
+    const w = await homeWorld()
+    linkBoth(w)
+    w.h.sqlite.exec(`UPDATE members SET archived_at = '2026-01-01' WHERE id = 'owner-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    w.h.sqlite.exec(`UPDATE members SET archived_at = NULL WHERE id = 'owner-m'; UPDATE members SET archived_at = '2026-01-01' WHERE id = 'owner-alt-m'`)
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(false)
+  })
+  it('superseded member with only an email bridge -> refused (either side)', async () => {
+    const w = await homeWorld()
+    linkBoth(w)
+    w.h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'rando-m' WHERE id = 'owner-alt-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+    w.h.sqlite.exec(`UPDATE members SET superseded_by_member_id = NULL WHERE id = 'owner-alt-m'; UPDATE members SET superseded_by_member_id = 'rando-m' WHERE id = 'owner-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
+  })
+  it('explicit supersede link (key member superseded by owner) bridges without any email', async () => {
+    const w = await homeWorld()
+    w.h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'owner-m' WHERE id = 'owner-alt-m'`)
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+    expect(await authorizeSeatDelivery(w.env, 'host-alt', 'home-seat-1')).toBe('granted')
+  })
+  it('explicit supersede link (owner superseded by key member) bridges without any email', async () => {
+    const w = await homeWorld()
+    w.h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'owner-alt-m' WHERE id = 'owner-m'`)
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+    expect(await hostMayReceive(w.env, 'host-alt', 'home-seat-1')).toBe(true)
+  })
+  it('supersede link to an unrelated member does not bridge', async () => {
+    const w = await homeWorld()
+    w.h.sqlite.exec(`UPDATE members SET superseded_by_member_id = 'rando-m' WHERE id = 'owner-alt-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual(refused)
   })
 })

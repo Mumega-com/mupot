@@ -34,6 +34,7 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
+import { UNVERIFIED_LOGIN_PROVIDERS } from '../members/exclusive-control'
 import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 
 export const SEAT_EVENTS_FLAG = '1'
@@ -227,30 +228,43 @@ async function hostHasStandingInSquad(env: Env, hostAgentId: string, squadId: st
 // #1162 dual-member case: the member that registered the host key (agent_keys.member_id) can be
 // a different member row of the same human than the one holding the home squad's admin row
 // (createHomeForMember / bootstrapSelf write it; no route can grant into a home).
+// ONE predicate (homeOwnerBridgeSql) is shared by grant creation (here) and by per-delivery
+// authorization (HOST_STANDING_SQL), so a grant that is accepted is also deliverable:
 //   - the squad must be kind='home' (non-home squads get NO widening here — that is #2038);
 //   - the OWNER is the member holding the home's exact, live, squad-scope admin row written by
 //     one of the two home provisioners (granted_via) — never a slug or a name match;
-//   - key member == owner, OR both hold live human_login_identities with the same PROVIDER-
-//     verified email (the linkage humanVerifiedLegacyRoleRank trusts), never members.email;
-//   - the owner must be active (the key member's own activity is enforced by loadActiveAgentKey).
+//   - both members active, non-archived, in this tenant;
+//   - key member == owner, OR an explicit supersede link between the two members (either
+//     direction; needs no email), OR neither is superseded AND both hold live identities, from a
+//     provider that verifies email, with the same non-empty provider-verified email — never
+//     members.email.
+function homeOwnerBridgeSql(p: { tenant: string; keyMember: string; squad: string; now: string }): string {
+  const unverified = UNVERIFIED_LOGIN_PROVIDERS.map((x) => `'${x}'`).join(', ')
+  return `EXISTS (
+    SELECT 1 FROM squads hs
+      JOIN capabilities hc ON hc.scope_type = 'squad' AND hc.scope_id = hs.id AND hc.capability = 'admin'
+                          AND hc.granted_via IN ('home_provision', 'bootstrap')
+                          AND ${CAPABILITY_LIVE_PREDICATE('hc', p.now)}
+      JOIN members om ON om.id = hc.member_id AND om.tenant = ${p.tenant} AND om.status = 'active' AND om.archived_at IS NULL
+      JOIN members km ON km.id = ${p.keyMember} AND km.tenant = ${p.tenant} AND km.status = 'active' AND km.archived_at IS NULL
+     WHERE hs.id = ${p.squad} AND hs.kind = 'home'
+       AND (hc.member_id = km.id
+            OR km.superseded_by_member_id = om.id
+            OR om.superseded_by_member_id = km.id
+            OR (km.superseded_by_member_id IS NULL AND om.superseded_by_member_id IS NULL AND EXISTS (
+                  SELECT 1 FROM human_login_identities ka
+                    JOIN human_login_identities oa ON lower(trim(oa.verified_email)) = lower(trim(ka.verified_email))
+                   WHERE ka.tenant = ${p.tenant} AND oa.tenant = ${p.tenant}
+                     AND ka.member_id = km.id AND oa.member_id = om.id
+                     AND ka.revoked_at IS NULL AND oa.revoked_at IS NULL
+                     AND NULLIF(trim(ka.verified_email), '') IS NOT NULL AND NULLIF(trim(oa.verified_email), '') IS NOT NULL
+                     AND ka.provider NOT IN (${unverified}) AND oa.provider NOT IN (${unverified}))))
+  )`
+}
+
 async function keyMemberOwnsHomeSquad(env: Env, keyMemberId: string, squadId: string): Promise<boolean> {
   const row = await env.DB.prepare(
-    `SELECT 1 AS x
-       FROM squads s
-       JOIN capabilities c ON c.scope_type = 'squad' AND c.scope_id = s.id AND c.capability = 'admin'
-                          AND c.granted_via IN ('home_provision', 'bootstrap')
-                          AND ${CAPABILITY_LIVE_PREDICATE('c', '?4')}
-       JOIN members om ON om.id = c.member_id AND om.tenant = ?1 AND om.status = 'active'
-      WHERE s.id = ?2 AND s.kind = 'home'
-        AND (c.member_id = ?3
-             OR EXISTS (
-               SELECT 1 FROM human_login_identities ka
-                 JOIN human_login_identities oa ON lower(oa.verified_email) = lower(ka.verified_email)
-                WHERE ka.tenant = ?1 AND oa.tenant = ?1
-                  AND ka.member_id = ?3 AND oa.member_id = c.member_id
-                  AND ka.revoked_at IS NULL AND oa.revoked_at IS NULL
-                  AND ka.verified_email IS NOT NULL AND oa.verified_email IS NOT NULL))
-      LIMIT 1`,
+    `SELECT 1 AS x WHERE ${homeOwnerBridgeSql({ tenant: '?1', keyMember: '?3', squad: '?2', now: '?4' })}`,
   ).bind(env.TENANT_SLUG, squadId, keyMemberId, nowCapabilitySql()).first()
   return row !== null
 }
@@ -371,6 +385,7 @@ const HOST_STANDING_SQL = `(
     requiredRankParam: String(capabilityRank('member')),
     nowParam: "datetime('now')",
   })}
+  OR ${homeOwnerBridgeSql({ tenant: 'g.tenant', keyMember: 'k.member_id', squad: 'a.squad_id', now: "datetime('now')" })}
 )`
 
 /** The per-disclosure check. One indexed query: live grant for (host, agent), agent active,
