@@ -14,6 +14,7 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
   retry ceiling (#1807); task-dispatch/envelope/custody fences and release policy
   (#1811); successive brake/routine fixes (#1813, #1815, #1823); audited incident
   recovery (#1805). Broader acceptance remains subject to the frozen release evidence.
+- **Onboarding follow-ups:** blank claims now get the boot next_step, the non-adoption check sees through wider invisible, fullwidth and look-alike characters, a refused REST check-in no longer consumes the debounce slot, and the dashboard labels runtime facts "Last reported" (#2010, fixes #2008).
 - **Attached-thread attribution:** `send`, `task_submit_result` and `flight_land` made through a thread attached to an existing agent now record `attachment_id` + `consenting_member_id` (migration 0236), and the attaching human counts as affiliated with that agent for verdict independence and the runtime-gate check (#2007, fixes #2006).
 - **Harness seats:** records and selection (#1795), handles (#1797), explicit consent
   (#1801), harness credentials (#1806), per-thread auto-seating (#1816), and pool

@@ -13,7 +13,9 @@ export const MAX_REPORTED_MODEL = 128
 
 // Control characters (C0, DEL, C1), line/paragraph separators, zero-width and bidi-control characters.
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g
+// Also every Unicode default-ignorable code point and format (Cf) character: U+2060 word joiner, U+00AD soft
+// hyphen, variation selectors (U+FE0F), U+180E, tag characters (U+E0000 block) and the like.
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\p{Default_Ignorable_Code_Point}\p{Cf}]/gu
 
 /** Clean one reported string. Returns null for empty / whitespace-only (= not reported). */
 export function cleanReported(v: string, max = MAX_REPORTED): string | null {
@@ -68,10 +70,29 @@ export function canonicalHarness(raw: string | null | undefined): string {
 // and case folding, so 'goose' plus a zero-width character is refused too.
 const NON_ADOPTED: ReadonlySet<string> = new Set(['goo' + 'se', 'goo' + 'sed'])
 
+// Look-alike letters (Cyrillic, Greek, Latin script-g) for the letters in the refused names. A deliberately
+// small map, not a confusables database: this is a governance label, not a security boundary.
+const LOOKALIKE: Readonly<Record<string, string>> = {
+  '\u0261': 'g', // latin script g
+  '\u043e': 'o', // Cyrillic o
+  '\u03bf': 'o', // Greek omicron
+  '\u0435': 'e', // Cyrillic ie
+  '\u0455': 's', // Cyrillic dze
+  '\u0501': 'd', // Cyrillic komi de
+}
+
+/** Matcher key: clean, NFKC (fullwidth, compatibility forms), strip again, case fold, fold look-alikes. */
+function nonAdoptedKey(raw: string): string | null {
+  const cleaned = cleanReported(raw, 256)
+  if (cleaned === null) return null
+  const folded = cleaned.normalize('NFKC').replace(CONTROL_RE, '').toLowerCase()
+  return folded.replace(/[\u0261\u043e\u03bf\u0435\u0455\u0501]/g, (ch) => LOOKALIKE[ch] ?? ch)
+}
+
 export function isNonAdoptedRuntime(raw: unknown): boolean {
   if (typeof raw !== 'string') return false
-  const cleaned = cleanReported(raw, 256)
-  return cleaned !== null && NON_ADOPTED.has(cleaned.toLowerCase())
+  const key = nonAdoptedKey(raw)
+  return key !== null && NON_ADOPTED.has(key)
 }
 
 export const NON_ADOPTED_DETAIL = 'not adopted (see docs/fleet/goose-non-adoption-2026-07-22.md)'

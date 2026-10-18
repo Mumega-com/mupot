@@ -293,10 +293,31 @@ describe('writes are narrow', () => {
   })
 })
 
+describe('blank claims count as not reported (one predicate for advice and enforcement)', () => {
+  it('all-blank args still get the next_step naming every field', async () => {
+    const r = await boot(bound(), { runtime: '   ', model: '\u0007\u200b', host: '\u2060\u00ad' })
+    expect(r.onboarding?.next_step).toMatch(/runtime, model, host/)
+    expect(row()?.runtime).toBe('grok') // nothing blanked
+  })
+  it('a real claim next to a blank one lists only the blank field', async () => {
+    const r = await boot(bound(), { runtime: 'codex-cli', model: '  ', host: 'muvps' })
+    expect(r.onboarding?.next_step).toMatch(/passing model /)
+    expect(r.onboarding?.next_step).not.toMatch(/runtime|host/)
+  })
+  it('fully reported claims give no next_step', async () => {
+    const r = await boot(bound(), { runtime: 'codex-cli', model: 'gpt-5.6', host: 'muvps' })
+    expect(r.onboarding?.next_step).toBeUndefined()
+  })
+})
+
 describe('cleanReported', () => {
   it('strips zero-width and bidi characters', () => {
     expect(cleanReported('co\u200bde\u202ex\u2066\ufeff')).toBe('codex')
     expect(cleanReported('\u200b\u200f')).toBeNull()
+  })
+  it('strips default-ignorable and format characters from the stored value', () => {
+    expect(cleanReported('co\u2060d\u00ade\ufe0fx\u180e\u{e0067}')).toBe('codex')
+    expect(cleanReported('\u2060\u00ad\ufe0f\u180e\u{e0067}')).toBeNull()
   })
   it('does not split a surrogate pair at the cut', () => {
     const s = 'a'.repeat(63) + '\u{1F600}'
@@ -312,6 +333,16 @@ describe('non-adopted runtime is refused on every intake', () => {
     for (const v of variants) expect(isNonAdoptedRuntime(v)).toBe(true)
     expect(isNonAdoptedRuntime('gooseberry')).toBe(false)
     expect(isNonAdoptedRuntime(5)).toBe(false)
+  })
+  it('wider invisible and look-alike variants are refused; normal names are not', () => {
+    const refused = ['goo\u2060se', 'goo\u00adse', 'goose\ufe0f', 'g\u180eoose', 'goose\u{e0067}', '\u{e0067}goose', '\uff47\uff4f\uff4f\uff53\uff45', 'ＧＯＯＳＥ', 'g\u043eose', 'goos\u0435d', '\u0261oose']
+    for (const v of refused) expect(isNonAdoptedRuntime(v), JSON.stringify(v)).toBe(true)
+    for (const ok of ['claude-code', 'codex-cli', 'goosebumps', 'gander', 'my-new-harness', 'ｃｌａｕｄｅ']) expect(isNonAdoptedRuntime(ok), ok).toBe(false)
+  })
+  it('boot_context refuses a wide-invisible goose and writes nothing', async () => {
+    const r = await boot(bound(), { runtime: 'goo\u2060se' })
+    expect(r.registry?.outcome).toBe('refused_not_adopted')
+    expect(row()?.runtime).toBe('grok')
   })
   it('boot_context writes nothing', async () => {
     for (const v of variants) {

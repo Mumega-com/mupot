@@ -88,6 +88,27 @@ describe('lane A: runtime=pi + model on /attach (real D1)', () => {
     expect((await post('my-new-harness')).status).toBe(200)
   })
 
+  it('a refused check-in does not consume the debounce slot; a valid one then does', async () => {
+    const store = new Map<string, string>()
+    const kv = { get: async (k: string) => store.get(k) ?? null, put: async (k: string, v: string) => { store.set(k, v) } }
+    const e = { ...env, SESSIONS: kv } as unknown as Env
+    const post = (raw: string) => fleetCheckinApp.request('/checkin', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer tok-loom', 'content-type': 'application/json' },
+      body: raw,
+    }, e)
+    expect((await post(JSON.stringify({ seat: 'hs', harness: 'goo\u2060se' }))).status).toBe(400)
+    expect((await post('null')).status).toBe(400)
+    expect((await post('[1]')).status).toBe(400)
+    expect(store.size).toBe(0)
+    const ok = await post(JSON.stringify({ seat: 'hs', harness: 'pi' }))
+    expect(ok.status).toBe(200)
+    expect(((await ok.json()) as { debounced?: boolean }).debounced).toBeUndefined()
+    expect(store.size).toBe(1)
+    const again = await post(JSON.stringify({ seat: 'hs', harness: 'pi' }))
+    expect(((await again.json()) as { debounced?: boolean }).debounced).toBe(true)
+  })
+
   it('agents.model keeps the strict charset: odd model stored raw in fleet_agents, agents.model unchanged', async () => {
     const before = (harness.sqlite.prepare(`SELECT model FROM agents WHERE id = 'a-loom'`).get() as { model: string }).model
     const res = await fleetAttachApp.request('/attach', {

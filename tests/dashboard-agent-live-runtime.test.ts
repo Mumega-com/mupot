@@ -64,6 +64,8 @@ describe('GET /agents/:id Live runtime block', () => {
     authState.current = admin()
     const body = await page(env)
     const block = body.slice(body.indexOf('data-live-runtime'), body.indexOf('data-live-runtime') + 900)
+    expect(block).toContain('Last reported')
+    expect(block).not.toContain('Observed at boot')
     expect(block).toContain('codex-cli')
     expect(block).toContain('gpt-5.6')
     expect(block).toContain('agent_bound')
