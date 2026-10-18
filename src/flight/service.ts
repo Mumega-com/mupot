@@ -433,11 +433,18 @@ function assertSqlAlias(alias: string): void {
  * thing that changed it is the CI sync (syncCiResultToTask overwrites tasks.result with `CI: <conclusion>` on
  * PR-linked tasks, and task_submit_result needs in_progress so the agent cannot resubmit). In the CI case the text
  * binding is relaxed, never the submitter binding: a submission from the flight's agent must still exist.
+ * The same holds for the gate-execute close-the-loop write (markApprovedTaskDoneFromGate stores `Published via ...` /
+ * `Applied ... via ...`). Known limit: these are recognised by their fixed note shapes, not by a stored marker, so a
+ * party able to edit tasks.result could imitate one; the submitter binding and the independent verdict still hold.
+ * (A `tasks.result_source` column would make this structural; tracked as a follow-up.) `github_pr_closed` is written
+ * with COALESCE(result, ...) so it never replaces a submitted result.
  */
 export function landResultMatchSql(sub: string, t: string): string {
   assertSqlAlias(sub)
   assertSqlAlias(t)
-  return `(${sub}.result_text = ${t}.result OR ${t}.result IN ('CI: success', 'CI: neutral', 'CI: skipped'))`
+  return `(${sub}.result_text = ${t}.result
+    OR ${t}.result IN ('CI: success', 'CI: neutral', 'CI: skipped')
+    OR ${t}.result LIKE 'Published via %' OR ${t}.result LIKE 'Applied % via %')`
 }
 
 /**
@@ -472,14 +479,19 @@ export function landEvidenceGapSql(f: string, t: string): { noResultSubmission: 
 /**
  * #2025: SET fragment (with trailing comma) appending `task-result-submission:<latest matching submission id>` per
  * task to meta.receipt_refs, de-duplicated against refs already present. A task with no matching submission
- * contributes NOTHING (the EXISTS guard): never a NULL/bare ref, e.g. on a routine control flight.
+ * contributes NOTHING (the EXISTS guard): never a NULL/bare ref, e.g. on a routine control flight. Caller-supplied
+ * `task-result-submission:*` entries (forgeable at dispatch) are dropped and replaced by the verified set; other prefixes
+ * are kept; the list is capped at 200 (the meta maxItems), verified refs first. Any count of evidenced landings must
+ * still join task_result_submissions rather than trust the ref strings.
  */
 export function landReceiptRefsSetSql(alias: string): string {
   assertSqlAlias(alias)
   const f = alias
   return `meta = json_set(meta, '$.receipt_refs', (
-         SELECT json_group_array(ref) FROM (
+         SELECT json_group_array(ref) FROM (SELECT ref FROM (
+           -- caller-supplied task-result-submission:* entries are DROPPED: only refs this land verified are written
            SELECT value AS ref FROM json_each(COALESCE(json_extract(${f}.meta, '$.receipt_refs'), json_array()))
+            WHERE typeof(value) = 'text' AND value NOT LIKE 'task-result-submission:%'
            UNION
            SELECT 'task-result-submission:' || (
                     SELECT sub.id FROM task_result_submissions sub
@@ -491,7 +503,7 @@ export function landReceiptRefsSetSql(alias: string): string {
             WHERE EXISTS (SELECT 1 FROM task_result_submissions sub2
                            WHERE sub2.tenant = ${f}.tenant AND sub2.task_id = task_ref.value
                              AND sub2.submitted_by_agent_id = ${f}.agent AND ${landResultMatchSql('sub2', 't')})
-         ))),`
+         ) ORDER BY ref LIKE 'task-result-submission:%' DESC, ref LIMIT 200))),`
 }
 
 /** #2025: every task in meta.task_ids carries both evidence conjuncts. Vacuously true for an empty task list. */

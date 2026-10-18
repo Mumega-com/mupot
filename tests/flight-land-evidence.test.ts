@@ -11,6 +11,7 @@ import { listNeedsYou } from '../src/attention/service'
 import type { RoutinePrincipal } from '../src/routines/access'
 import { refusalGuidance } from '../src/mcp/refusal-next-step'
 import { parseFlightMetaV1 } from '../src/flight/meta'
+import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../src/routines/proposal'
 import type { Env } from '../src/types'
 
 vi.mock('../src/auth/member-bearer', () => ({
@@ -355,19 +356,7 @@ describe('#2025 routine flights (M2, M7)', () => {
     return parsed
   }
 
-  it('M7: a CHILD flight that merely carries routine_run_id is NOT exempt from evidence', async () => {
-    seedTask('t1', null)
-    seedFlight('child', ['t1'])
-    const meta = routineMeta(['t1'], 'run-nonexistent')
-    h.sqlite.prepare("UPDATE flights SET meta = ? WHERE id = 'child'").run(JSON.stringify(meta))
-    const res = await landGovernedFlight(env, 'child', {
-      cost_micro_usd: 1, expected_agent: AGENT, agent_id: AGENT, meta, actor: { kind: 'agent', id: AGENT },
-    })
-    expect(res.transitioned).toBe(false)
-    expect(flightRow('child').status).toBe('running')
-  })
-
-  it('M2: a routine CONTROL flight lands without evidence and gets NO null/bare submission ref', async () => {
+  function seedRoutineControl(): string {
     h.sqlite.exec(`
       INSERT INTO projects (id, slug, name, status) VALUES ('project-r','project-r','R','active');
       INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-r','${SQUAD}','write');
@@ -378,16 +367,34 @@ describe('#2025 routine flights (M2, M7)', () => {
       VALUES ('routine-r','${TENANT}','project-r','routine-r','o','enabled','cron',NULL,'* * * * *','UTC','${T}',
         'skip','propose','${SQUAD}',100000,3,300,NULL,1,'o','${T}','o','${T}','${T}');
     `)
-    seedTask('t1', null)
-    seedFlight('control', ['t1'])
+    seedTask('tc', null)
+    seedFlight('control', ['tc'])
     h.sqlite.exec(`
       INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
         trigger_kind, scheduled_for, status, attempt, flight_id, proposal_json, created_at, updated_at)
       VALUES ('run-r','${TENANT}','project-r','routine-r',1,'{}','manual:run-r','cron','${T}','running',1,'control',
         '{"version":"routine.proposal/v1"}','${T}','${T}');
     `)
-    const ref = 'routine.proposal:run-r'
-    const meta = routineMeta(['t1'], 'run-r', [ref])
+    return 'run-r'
+  }
+
+  it('M7: a CHILD flight carrying the routine_run_id of ANOTHER flight (a real run row) is NOT exempt from evidence', async () => {
+    const runId = seedRoutineControl()
+    seedTask('t1', null)
+    seedFlight('child', ['t1'])
+    const meta = routineMeta(['t1'], runId)
+    h.sqlite.prepare("UPDATE flights SET meta = ? WHERE id = 'child'").run(JSON.stringify(meta))
+    const res = await landGovernedFlight(env, 'child', {
+      cost_micro_usd: 1, expected_agent: AGENT, agent_id: AGENT, meta, actor: { kind: 'agent', id: AGENT },
+    })
+    expect(res.transitioned).toBe(false)
+    expect(flightRow('child').status).toBe('running')
+  })
+
+  it('M2: a routine CONTROL flight lands without evidence and gets NO null/bare submission ref', async () => {
+    const runId = seedRoutineControl()
+    const ref = `${ROUTINE_PROPOSAL_RECEIPT_PREFIX}${runId}`
+    const meta = routineMeta(['tc'], runId, [ref])
     h.sqlite.prepare("UPDATE flights SET meta = ? WHERE id = 'control'").run(JSON.stringify(meta))
     const res = await landGovernedFlight(env, 'control', {
       cost_micro_usd: 0, expected_agent: AGENT, agent_id: AGENT, meta, actor: { kind: 'agent', id: AGENT },
@@ -481,5 +488,50 @@ describe('#2025 held-unverified flights: window exclusion, expiry, surfacing (P1
     h.sqlite.prepare("UPDATE flights SET gate_reason = 'watchdog_tasks_done_unverified' WHERE id = 'f1'").run()
     expect((await land('f1', ['t1'])).transitioned).toBe(true)
     expect(flightRow('f1').gate_reason).toBe('')
+  })
+})
+
+describe('#2025 receipt_refs are only what the land verified; result rewritten by system paths', () => {
+  it('forged task-result-submission:* refs pre-filled at dispatch are replaced by the verified set; other prefixes are kept; capped at 200', async () => {
+    const sub = seedEvidenced('t1')
+    seedFlight('f1', ['t1'])
+    const forged = Array.from({ length: 199 }, (_, i) => `task-result-submission:FORGED-${i}`)
+    h.sqlite.prepare("UPDATE flights SET meta = json_set(meta, '$.receipt_refs', json(?))").run(
+      JSON.stringify([...forged, 'artifact:keep-me', 'task-result-submission:FORGED-last']),
+    )
+    expect((await land('f1', ['t1'])).transitioned).toBe(true)
+    const row = flightRow('f1')
+    const refs = (JSON.parse(row.meta) as { receipt_refs: string[] }).receipt_refs
+    expect(refs).toEqual(expect.arrayContaining([`task-result-submission:${sub}`, 'artifact:keep-me']))
+    expect(refs.some((r) => r.includes('FORGED'))).toBe(false)
+    expect(parseFlightMetaV1(JSON.parse(row.meta))).not.toBeNull()
+    const outbox = h.sqlite.prepare("SELECT payload FROM flight_event_outbox WHERE flight_id = 'f1'").get() as { payload: string }
+    expect((JSON.parse(outbox.payload) as { receipt_refs: string[] }).receipt_refs.some((r) => r.includes('FORGED'))).toBe(false)
+  })
+
+  it('a gate-approved task whose result the gate-execute close wrote ("Published via ...") still lands when the flight agent submitted', async () => {
+    seedTask('t1')
+    const sub = seedSubmission('t1', AGENT, 'agent submitted text')
+    h.sqlite.prepare("UPDATE tasks SET result = 'Published via inkwell: https://x.test/p' WHERE id = 't1'").run()
+    seedVerdict('t1', 'approved', OTHER)
+    seedFlight('f1', ['t1'])
+    expect((await land('f1', ['t1'])).transitioned).toBe(true)
+    expect((JSON.parse(flightRow('f1').meta) as { receipt_refs: string[] }).receipt_refs).toEqual([`task-result-submission:${sub}`])
+  })
+
+  it('the probe: 3 held + 1 stalled flight, sweep limit 3, three sweeps: the stalled flight is reaped', async () => {
+    for (const [i, id] of ['h1', 'h2', 'h3'].entries()) {
+      seedTask(`task-${id}`)
+      seedFlight(id, [`task-${id}`])
+      h.sqlite.prepare(
+        "UPDATE flights SET gate_reason = 'watchdog_tasks_done_unverified', created_at = ? WHERE id = ?",
+      ).run(T0 - 10 + i, id)
+    }
+    h.sqlite.prepare("INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id) VALUES ('tp', ?, 't', 'in_progress', ?)").run(SQUAD, AGENT)
+    seedFlight('plain', ['tp'])
+    h.sqlite.prepare("UPDATE flights SET created_at = ? WHERE id = 'plain'").run(T0 + 5)
+    for (let i = 0; i < 3; i += 1) await sweepStalledFlights(env, { nowMs: STALLED_NOW, limit: 3 })
+    expect(flightRow('plain').status).toBe('failed')
+    for (const id of ['h1', 'h2', 'h3']) expect(flightRow(id).status).toBe('running')
   })
 })
