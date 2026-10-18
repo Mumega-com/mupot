@@ -21,6 +21,7 @@ export type OwnerChangeRefusal =
   | { ok: false; status: 400; error: 'invalid_args'; detail: string }
   | { ok: false; status: 403; error: 'forbidden'; detail: { need: typeof MEMBER_BIND_MINT_FLOOR; scope: 'org' } }
   | { ok: false; status: 403; error: 'target_rank_exceeds_ceiling'; detail: { owner_member_id: string } }
+  | { ok: false; status: 403; error: 'agent_rank_exceeds_ceiling'; detail: { agent_id: string } }
   | { ok: false; status: 403; error: 'seat_session_forbidden'; detail: { column: OwnerDoorColumn } }
 
 export async function authorizeOwnerMemberChange(
@@ -65,6 +66,22 @@ export async function authorizeOwnerMemberChange(
   }
   if (await exceedsTargetRankCeiling(env, auth, ownerMemberId)) {
     return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: ownerMemberId } }
+  }
+  // AGENT ceiling (designation only): a chat that becomes the agent acts with the agent's standing, so the actor may not
+  // designate an agent whose owner OR welded/bound member outranks them (e.g. an owner-held or high-rank steward agent),
+  // even for themselves. Ranks come from the effective auth.capabilities of the actor (exceedsTargetRankCeiling).
+  if (designation) {
+    const holders = await env.DB.prepare(
+      `SELECT a.owner_member_id AS owner_member_id, b.member_id AS bound_member_id
+         FROM agents a LEFT JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id WHERE a.id = ?1`,
+    ).bind(agentId, env.TENANT_SLUG).all<{ owner_member_id: string | null; bound_member_id: string | null }>()
+    for (const r of holders.results ?? []) {
+      for (const m of [r.owner_member_id, r.bound_member_id]) {
+        if (m && await exceedsTargetRankCeiling(env, auth, m)) {
+          return { ok: false, status: 403, error: 'agent_rank_exceeds_ceiling', detail: { agent_id: agentId } }
+        }
+      }
+    }
   }
   return { ok: true }
 }

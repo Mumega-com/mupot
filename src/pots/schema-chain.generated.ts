@@ -4236,15 +4236,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0238_agent_attach_designated.sql",
-    sha256: "bce72914b3da6f0f45d8852bd23940ab329cda83877151c3f66560912c7d2d6f",
+    sha256: "dbd408a022797fad5be151429617b31163580bb6186b9666f4249dbfde6d8ae0",
     statements: [
       "-- 0238_agent_attach_designated.sql -- seat_attach: attach only to owner-designated agents (flag SEAT_ATTACH_DESIGNATED, default off).\n-- Audit: agents/kasra/docs/audit-seat-attach-and-codex-path-20261018.md section 5.\n--\n-- agents.attach_designated_member_id: the ONE human an agent is designated attachable for. NULL (every existing agent)\n-- = not attachable once SEAT_ATTACH_DESIGNATED is on. Written ONLY through the owner door (authorizeOwnerMemberChange\n-- with the self-target waiver removed: org-scope floor + target-rank ceiling), by update_agent / the dashboard, and\n-- audited by the agent_audit row updateAgentProfile writes in the same batch. Nothing reads it while the flag is off.\n-- The read side is ONE predicate (src/members/seat-attach.ts attachDesignatedClause) used at every attach site.\n--\n-- ADD COLUMN only: no table is rebuilt.\nALTER TABLE agents ADD COLUMN attach_designated_member_id TEXT REFERENCES members(id);",
+      "\n\n-- Un-designating (or re-pointing) ends everything the old designation authorised, so re-designating the same human can never\n-- revive a dormant attachment or admission without a NEW passkey. LIVE admissions of the old designee are revoked (the existing\n-- agent_seat_admissions_revoke_attachments trigger then detaches every attachment and revokes its token); PENDING ones are denied.\n-- Reads additionally re-check the designation (attachDesignatedClause), so this is the tidy-up that makes revival impossible.\nCREATE TRIGGER IF NOT EXISTS agents_attach_designation_end\nAFTER UPDATE OF attach_designated_member_id ON agents\nFOR EACH ROW\nWHEN OLD.attach_designated_member_id IS NOT NULL AND NEW.attach_designated_member_id IS NOT OLD.attach_designated_member_id\nBEGIN\n  UPDATE agent_seat_admissions\n     SET status = 'revoked', revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), revoked_by_member_id = NULL\n   WHERE agent_id = OLD.id AND human_member_id = OLD.attach_designated_member_id AND status = 'live';\n  UPDATE agent_seat_admissions\n     SET status = 'denied', decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n   WHERE agent_id = OLD.id AND human_member_id = OLD.attach_designated_member_id AND status = 'pending';\nEND;",
     ],
-    objects: [],
+    objects: [
+      { type: "trigger", name: "agents_attach_designation_end" },
+    ],
   },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "3dabf7a595f169e37320d07fcf598a53a1a9c0aeafc2c2a9cc63fe6876188d45"
+export const SCHEMA_CHAIN_DIGEST: string = "2516b338d27c5e7ce5963da5cde597dc17019b89aad673c416d11695bd1b3a0e"

@@ -31,6 +31,8 @@ import {
   seatAttachEnabled, findLiveAttachment,
 } from '../src/members/seat-attach'
 import { invokeTool } from '../src/mcp/index'
+import { loadAttachmentOriginOfSession } from '../src/auth/elevation'
+import { markMessagesHandledByAttachment } from '../src/members/attached-handled'
 import { authorizeOwnerMemberChange } from '../src/org/agent-owner'
 import { attachDesignatedClause, seatAttachDesignatedEnabled, resolveAttachableAgent } from '../src/members/seat-attach'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
@@ -385,6 +387,7 @@ describe('designated agent: attach, then the chat IS that agent (end to end)', (
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a') // admission live + attached
     await boot(env, g, 'conv-b')
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agents_attach_designation_end`) // isolate THIS guard from the cleanup trigger
     // conv-b attaches immediately (admission live). Between resolve and the insert batch, an org admin un-designates through the door.
     let raced = false
     const realDb = env.DB
@@ -484,5 +487,210 @@ describe('connect on a seat session says what it is (text only)', () => {
     const done = await attach(env, g, 'conv-a', 'rava')
     expect(String(done.sc.note)).not.toContain('at most member-level')
     expect(String(done.sc.note)).toContain('approved')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// Round 1 (P0): un-designation must stop EVERY reader of an attachment, not just the request chokepoint.
+describe('un-designation ends the events path, elevation, and cannot be revived without a new passkey', () => {
+  const CB = 'https://hooks.example.com/mcp/events'
+  const SECRET = `whsec_${Buffer.from('a'.repeat(32)).toString('base64')}`
+  const evEnv = (): Env => envFor(h, { ...DESIGNATED, EVENTS_ENABLED: 'true', EVENTS_CALLBACK_HOSTS: 'hooks.example.com', BUS: { send: vi.fn().mockResolvedValue(undefined) } })
+  const ev = async (env: Env, ctx: AuthContext, method: string, params: unknown): Promise<{ status: number; body: { result?: Record<string, unknown>; error?: { message: string; data?: Record<string, unknown> } } }> => {
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+    const res = await mcpApp.fetch(mcpInternalRequest(req, ctx), env)
+    return { status: res.status, body: (await res.json()) as never }
+  }
+  const sub = (): Record<string, unknown> => ({ name: 'message.created', arguments: {}, delivery: { mode: 'webhook', url: CB, secret: SECRET }, ttlMs: 3_600_000 })
+  beforeEach(() => {
+    vi.stubGlobal('fetch', async (_u: unknown, init?: RequestInit) => {
+      const b = JSON.parse(String(init?.body ?? '{}')) as { type?: string; challenge?: string }
+      return new Response(JSON.stringify(b.type === 'verification' ? { challenge: b.challenge } : {}), { status: 200 })
+    })
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+  const dropDesignationTrigger = (): void => { h.sqlite.exec(`DROP TRIGGER IF EXISTS agents_attach_designation_end`) }
+
+  it('end to end: after un-designation a NEW subscribe is refused, the existing subscription stops delivering, and re-designating needs a NEW passkey', async () => {
+    const env = evEnv()
+    await designate(env, 'agent-rava', HUMAN)
+    const g = await grant(env, HUMAN)
+    const key = await admitAndAttach(env, g, 'conv-a')
+    expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error).toBeUndefined()
+    const { subscriberAccessLive } = await import('../src/mcp/events-subscriptions')
+    const row = one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)!
+    expect(await subscriberAccessLive(env, row as never)).toEqual({ live: true })
+    expect((await designate(env, 'agent-rava', null)).ok).toBe(true)
+    expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error).toBeDefined()
+    expect((await subscriberAccessLive(env, row as never)).live).toBe(false)
+    // the trigger ended the admission and detached the attachment
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('revoked')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
+    // re-designating the SAME human does not revive anything: the chat is its own seat agent and must be re-admitted by passkey
+    await designate(env, 'agent-rava', HUMAN)
+    expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).not.toBe('agent-rava')
+    expect((await subscriberAccessLive(env, row as never)).live).toBe(false)
+    const again = await attach(env, g, 'conv-a', 'rava')
+    expect(again.sc.status).toBe('pending_admission')
+    const res = await decideMoment(env, String(again.sc.approve_url), key, 'approve')
+    expect(res.status).toBe(200)
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+  })
+
+  it('a PENDING admission of the old designee is denied on un-designation (cannot be approved later)', async () => {
+    const env = evEnv()
+    await designate(env, 'agent-rava', HUMAN)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('pending_admission')
+    await designate(env, 'agent-rava', null)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('denied')
+  })
+
+  describe('with the cleanup trigger MISSING, every reader re-checks the SAME predicate (one test per site)', () => {
+    async function liveAttached() {
+      const env = evEnv()
+      await designate(env, 'agent-rava', HUMAN)
+      const g = await grant(env, HUMAN)
+      await admitAndAttach(env, g, 'conv-a')
+      return { env, g }
+    }
+
+    it('events: listLiveAttachmentsForEvents drops the candidate and attachmentLiveness ends the wake (reason agent_not_designated)', async () => {
+      const { env, g } = await liveAttached()
+      expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error).toBeUndefined()
+      const { listLiveAttachmentsForEvents } = await import('../src/mcp/events-attached')
+      const { subscriberAccessLive } = await import('../src/mcp/events-subscriptions')
+      const row = one<Record<string, unknown>>(`SELECT * FROM event_subscriptions`)!
+      const ids = (): Promise<string[]> => listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId }).then((l) => l.map((a) => a.agentId))
+      expect(await ids()).toEqual(['agent-rava'])
+      dropDesignationTrigger()
+      expect((await designate(env, 'agent-rava', null)).ok).toBe(true)
+      expect(await ids()).toEqual([])
+      expect(await subscriberAccessLive(env, row as never)).toEqual({ live: false, reason: 'agent_not_designated' })
+      expect((await ev(env, g.ctx, 'events/subscribe', sub())).body.error).toBeDefined()
+    })
+
+    it('chokepoint: findLiveAttachment serves the seat agent again on the very next request', async () => {
+      const { env, g } = await liveAttached()
+      expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).toBe('agent-rava')
+      dropDesignationTrigger()
+      await designate(env, 'agent-rava', null)
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1) // still attached in the table
+      expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).not.toBe('agent-rava')
+    })
+
+    it('elevation: loadAttachmentOriginOfSession reports the attachment dead (decide-time and telegram-miniapp use it)', async () => {
+      const { env } = await liveAttached()
+      const tok = one<{ seat_token_id: string }>(`SELECT seat_token_id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.seat_token_id
+      expect(await loadAttachmentOriginOfSession(env, TENANT, tok)).toMatchObject({ live: true, agentId: 'agent-rava', humanMemberId: HUMAN })
+      dropDesignationTrigger()
+      await designate(env, 'agent-rava', null)
+      expect(await loadAttachmentOriginOfSession(env, TENANT, tok)).toMatchObject({ live: false })
+    })
+
+    it('inbox_mark_handled: the attachment can no longer record handled mail', async () => {
+      const { env } = await liveAttached()
+      h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) VALUES ('m-1', '${TENANT}', 'agent-rava', 'agent-hadi-admin', 'mem-agent-hadi-admin', 'message', 'x'), ('m-2', '${TENANT}', 'agent-rava', 'agent-hadi-admin', 'mem-agent-hadi-admin', 'message', 'y')`)
+      const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
+      const call = (id: string) => markMessagesHandledByAttachment(env, { attachmentId: att, agentId: 'agent-rava', seat: null, ids: [id] })
+      expect(await call('m-1')).toMatchObject({ ok: true, handled: ['m-1'] })
+      dropDesignationTrigger()
+      await designate(env, 'agent-rava', null)
+      expect(await call('m-2')).toMatchObject({ ok: true, handled: [], not_visible: ['m-2'] })
+    })
+
+    it('promoteAdmission: a designation cleared between the decision check and the promote lands no live admission', async () => {
+      const env = envFor(h, DESIGNATED)
+      await designate(env, 'agent-rava', HUMAN)
+      const g = await grant(env, HUMAN)
+      await boot(env, g, 'conv-a')
+      expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('pending_admission')
+      dropDesignationTrigger()
+      const admId = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
+      const realDb = env.DB
+      let raced = false
+      const racing = new Proxy(realDb, {
+        get(target, prop, receiver) {
+          if (prop === 'batch') return async (stmts: Parameters<typeof realDb.batch>[0]) => {
+            if (!raced) { raced = true; expect((await designate({ ...env, DB: realDb } as Env, 'agent-rava', null)).ok).toBe(true) }
+            return target.batch(stmts)
+          }
+          const v = Reflect.get(target, prop, receiver)
+          return typeof v === 'function' ? v.bind(target) : v
+        },
+      })
+      const r = await decideAdmissionDirect({ ...env, DB: racing } as Env, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve' })
+      expect(raced).toBe(true)
+      expect(r).toEqual({ ok: false, error: 'not_pending' })
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+    })
+
+    it('dashboard live-admission INSERT: a designation cleared before the insert creates no admission', async () => {
+      const env = envFor(h, DESIGNATED)
+      await designate(env, 'agent-rava', HUMAN)
+      const g = await grant(env, HUMAN)
+      await boot(env, g, 'conv-a')
+      const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!
+      const realDb = env.DB
+      let raced = false
+      const racing = new Proxy(realDb, {
+        get(target, prop, receiver) {
+          if (prop === 'batch') return async (stmts: Parameters<typeof realDb.batch>[0]) => {
+            if (!raced) { raced = true; expect((await designate({ ...env, DB: realDb } as Env, 'agent-rava', null)).ok).toBe(true) }
+            return target.batch(stmts)
+          }
+          const v = Reflect.get(target, prop, receiver)
+          return typeof v === 'function' ? v.bind(target) : v
+        },
+      })
+      const r = await attachSeatToAgent({ ...env, DB: racing } as Env, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'agent-rava', via: 'dashboard' })
+      expect(raced).toBe(true)
+      expect(r).toEqual({ ok: false, error: 'attach_refused' })
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status = 'live'`)).toBe(0)
+    })
+  })
+})
+
+// Round 1 (P1): the designation door also has a ceiling on the AGENT, and on whoever currently holds the designation.
+describe('the designation door: agent ceiling and outgoing-designee ceiling', () => {
+  const ORG_OWNER = 'member-org-owner-2'
+  const ownerAuth = (): AuthContext => ({ ...orgAdminAuth(ORG_OWNER), capabilities: [{ member_id: ORG_OWNER, scope_type: 'org', scope_id: null, capability: 'owner' }] as CapabilityGrant[], role: 'owner' } as AuthContext)
+  beforeEach(() => {
+    seedHuman(ORG_OWNER)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-org-owner-2', '${ORG_OWNER}', 'org', NULL, 'owner')`)
+  })
+
+  it('an agent OWNED by a higher-rank member: org admin refused (agent_rank_exceeds_ceiling), the owner is allowed', async () => {
+    const env = envFor(h, DESIGNATED)
+    expect((await invokeTool(ownerAuth(), env, 'update_agent', { agent: 'agent-hadi-admin', owner_member_id: ORG_OWNER }, 'https://pot.test')).ok).toBe(true) // production writer
+    const refused = await designate(env, 'agent-hadi-admin', OWNER) // org admin designating THEMSELVES
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('agent_rank_exceeds_ceiling')
+    expect(designatedOf('agent-hadi-admin')).toBeNull()
+    const allowed = await designate(env, 'agent-hadi-admin', ORG_OWNER, ownerAuth())
+    expect(allowed.ok, JSON.stringify(allowed)).toBe(true)
+    expect(designatedOf('agent-hadi-admin')).toBe(ORG_OWNER)
+  })
+
+  it('an agent whose WELDED/bound member outranks the actor (a steward agent): org admin refused, owner allowed', async () => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-owner', 'mem-agent-rava', 'org', NULL, 'owner')`)
+    const refused = await designate(env, 'agent-rava', HUMAN)
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('agent_rank_exceeds_ceiling')
+    expect((await designate(env, 'agent-rava', HUMAN, ownerAuth())).ok).toBe(true)
+  })
+
+  it('M11: replacing or clearing a higher-rank human\'s designation is refused for a lower-rank org admin', async () => {
+    const env = envFor(h, DESIGNATED)
+    expect((await designate(env, 'agent-rava', ORG_OWNER, ownerAuth())).ok).toBe(true)
+    for (const target of [HUMAN, null]) {
+      const r = await designate(env, 'agent-rava', target)
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.error).toBe('target_rank_exceeds_ceiling')
+    }
+    expect(designatedOf('agent-rava')).toBe(ORG_OWNER)
+    expect((await designate(env, 'agent-rava', null, ownerAuth())).ok).toBe(true)
   })
 })

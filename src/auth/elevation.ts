@@ -25,6 +25,7 @@
 // EVERY function that reads "now" takes it as an explicit parameter (default
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
+import { attachDesignatedClause } from '../members/attach-designated'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
 import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
@@ -469,7 +470,7 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
                     AND EXISTS (SELECT 1 FROM agents a
                                   JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = a.id
                                   JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
-                                 WHERE a.id = att.agent_id AND a.status = 'active')
+                                 WHERE a.id = att.agent_id AND a.status = 'active' ${attachDesignatedClause(env, 'a', 'att.human_member_id')})
                     AND adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id
                     AND EXISTS (SELECT 1 FROM harnesses hr WHERE hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id)
                     AND EXISTS (SELECT 1 FROM member_tokens t

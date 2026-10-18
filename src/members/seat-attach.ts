@@ -39,37 +39,17 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
-import { seatAutoEnrollEnabled } from './harness'
+
 import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding, sha256Hex } from './service'
 import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import { sanitizeLabel } from './harness'
 
-/** The one definition of "is attach on". Strict '1' on both flags: attach without seats means nothing. */
-export function seatAttachEnabled(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL'>): boolean {
-  return env.SEAT_ATTACH === '1' && seatAutoEnrollEnabled(env)
-}
-
-/** SEAT_ATTACH_DESIGNATED (strict '1', and only with attach itself on): attach is narrowed to agents an org admin designated for
- *  THIS human (agents.attach_designated_member_id, migration 0238). Off = today's behaviour, byte for byte. */
-export function seatAttachDesignatedEnabled(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>): boolean {
-  return seatAttachEnabled(env) && env.SEAT_ATTACH_DESIGNATED === '1'
-}
-
-/**
- * THE ONE "this agent is attach-designated for this human" predicate, as an SQL AND-fragment. Every attach site embeds
- * THIS function and nothing else: listAttachableAgents (request + resolve), admissionRefusal (the human's decision),
- * the findLiveAttachment join (every request) and the attachment INSERT guard. Grant time and use time therefore share
- * one definition, and un-designating detaches on the next request with no sweep. `agentAlias` is the agents table alias in
- * the host statement; `humanParam` the numbered bind that holds the human member id (e.g. '?4').
- * Flag off: a tautology that still consumes the bind (so the statements keep one bind shape) and changes nothing.
- */
-export function attachDesignatedClause(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>, agentAlias: string, humanParam: string): string {
-  return seatAttachDesignatedEnabled(env)
-    ? `AND ${agentAlias}.attach_designated_member_id = ${humanParam}`
-    : `AND ${humanParam} IS NOT NULL`
-}
+// The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
+// events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
+export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause } from './attach-designated'
+import { attachDesignatedClause, seatAttachEnabled } from './attach-designated'
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
 export const ATTACH_IDLE_DAYS = 30
@@ -255,7 +235,7 @@ export async function ensureAdmission(
           `INSERT INTO agent_seat_admissions
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
            SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
-            WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND status = 'active')
+            WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
@@ -370,7 +350,8 @@ async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: stri
     env.DB.prepare(
       `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
-          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active')`,
+          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
+                        ${attachDesignatedClause(env, 'ag', '?3')})`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
