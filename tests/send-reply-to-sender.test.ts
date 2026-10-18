@@ -13,7 +13,7 @@ import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
-import { REPLY_CAP_PER_MESSAGE, resolveVisibleSendTarget } from '../src/agents/messages'
+import { REPLY_CAP_PER_MESSAGE, resolveVisibleSendTarget, sendToRef } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -227,3 +227,100 @@ describe('reply into a home squad', () => {
     expect(viaResolver.ok).toBe(false)
   })
 })
+
+describe('reply path: no oracle, atomic cap, canonical key', () => {
+  async function thread(rid?: string) {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q', ...(rid ? { request_id: rid } : {}) })
+    return { seat, orig: msgId('agent-kasra', seat.agentId) }
+  }
+  const landed = (seatAgent: string): number => n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND from_agent = 'agent-kasra'`, seatAgent)
+
+  it('seat and project_id are refused on the reply path, identically for real and guessed values (no seat-label or membership probe)', async () => {
+    const { seat, orig } = await thread()
+    const label = String(h.sqlite.prepare(`SELECT label FROM member_tokens WHERE agent_id = ? LIMIT 1`).get(seat.agentId)?.label ?? 'x')
+    const probes = [{ seat: label }, { seat: 'no-such-seat' }, { project_id: 'no-such-project' }]
+    const out: string[] = []
+    for (const extra of probes) {
+      const r = await rpc(env, kasra, 'send', { to: seat.agentId, body: 'p', in_reply_to: orig, ...extra })
+      expect(r.status).toBe(404)
+      out.push(r.raw.replace(/\\"seq\\":\d+/g, ''))
+    }
+    expect(new Set(out).size).toBe(1)
+    expect(landed(seat.agentId)).toBe(0)
+  })
+
+  it('inbox_full on the reply path is indistinguishable from any other refusal', async () => {
+    const { seat, orig } = await thread()
+    h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at) VALUES ('fill-1', '${TENANT}', '${seat.agentId}', 'agent-kasra', 'mem-agent-kasra', 'message', 'x', '${new Date().toISOString()}')`)
+    const authz = { isAdmin: false, grants: kasra.capabilities ?? [] }
+    const res = await sendToRef(env, { fromAgent: 'agent-kasra', fromMember: kasra.memberId as string, toRef: seat.agentId, body: 'r', inReplyTo: orig }, authz, { maxUnread: 1 })
+    expect(res).toEqual({ ok: false, reason: 'send_target_not_visible', detail: undefined })
+  })
+
+  it('a non-admin caller whose grants span two members gets no reply path', async () => {
+    const { seat, orig } = await thread()
+    const grants = [...(kasra.capabilities ?? []), { ...(kasra.capabilities ?? [])[0], member_id: 'someone-else' }]
+    const res = await sendToRef(env, { fromAgent: 'agent-kasra', fromMember: kasra.memberId as string, toRef: seat.agentId, body: 'r', inReplyTo: orig }, { isAdmin: false, grants })
+    expect(res.ok).toBe(false)
+    expect(landed(seat.agentId)).toBe(0)
+  })
+
+  it('concurrent replies: 60 at once land exactly REPLY_CAP_PER_MESSAGE', async () => {
+    const { seat, orig } = await thread()
+    await Promise.all(Array.from({ length: 60 }, (_, i) => rpc(env, kasra, 'send', { to: seat.agentId, body: `c${i}`, in_reply_to: orig })))
+    expect(landed(seat.agentId)).toBe(REPLY_CAP_PER_MESSAGE)
+  })
+
+  it('citing the message id and the request_id share ONE cap, and both store the canonical id', async () => {
+    const { seat, orig } = await thread('req-mix')
+    await Promise.all(Array.from({ length: 60 }, (_, i) => rpc(env, kasra, 'send', { to: seat.agentId, body: `m${i}`, in_reply_to: i % 2 ? orig : 'req-mix' })))
+    expect(landed(seat.agentId)).toBe(REPLY_CAP_PER_MESSAGE)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'agent-kasra' AND in_reply_to = ?`, orig)).toBe(REPLY_CAP_PER_MESSAGE)
+  })
+
+  it('another agent\'s rows keyed on the same original never consume the replier\'s cap (per original + replier)', async () => {
+    const { seat, orig } = await thread()
+    await coreAgent(env, 'agent-third', 'third')
+    for (let i = 0; i < REPLY_CAP_PER_MESSAGE; i++) {
+      h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, in_reply_to, created_at) VALUES ('x-${i}', '${TENANT}', '${seat.agentId}', 'agent-third', 'mem-agent-third', 'message', 'x', '${orig}', '${new Date().toISOString()}')`)
+    }
+    expect((await rpc(env, kasra, 'send', { to: seat.agentId, body: 'mine', in_reply_to: orig })).status).toBe(200)
+  })
+
+  it('request_id shadowing: an unrelated sender\'s message whose request_id equals this id never shadows or redirects', async () => {
+    const a = await homeSeat(env, 'human-1', 's1')
+    const b = await homeSeat(env, 'human-2', 's2')
+    await sendFrom(env, a, { to: 'agent-kasra', body: 'from a' })
+    const aId = msgId('agent-kasra', a.agentId)
+    await sendFrom(env, b, { to: 'agent-kasra', body: 'from b, rid collides with a\'s message id', request_id: aId })
+    const bId = msgId('agent-kasra', b.agentId)
+    // to A citing A's id: the id match wins and lands on A, never on B
+    expect((await rpc(env, kasra, 'send', { to: a.agentId, body: 'to a', in_reply_to: aId })).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, a.agentId, aId)).toBe(1)
+    // to B citing the same string: B's request_id match is found (sender filtered before the pick)
+    expect((await rpc(env, kasra, 'send', { to: b.agentId, body: 'to b', in_reply_to: aId })).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, b.agentId, bId)).toBe(1)
+  })
+
+  it('pins which row wins: the exact message-id match beats a newer request_id match from the same sender', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'first' })
+    const x = msgId('agent-kasra', seat.agentId)
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'second, newer', request_id: x })
+    expect((await rpc(env, kasra, 'send', { to: seat.agentId, body: 'r', in_reply_to: x })).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, seat.agentId, x)).toBe(1)
+  })
+
+  it('a ref that matches two different senders of messages to the caller is refused as ambiguous', async () => {
+    const a = await homeSeat(env, 'human-1', 's1')
+    const b = await homeSeat(env, 'human-2', 's2')
+    await sendFrom(env, a, { to: 'agent-kasra', body: 'a', request_id: 'same-rid' })
+    await sendFrom(env, b, { to: 'agent-kasra', body: 'b', request_id: 'same-rid' })
+    h.sqlite.prepare(`UPDATE agents SET name = 'Twin' WHERE id IN (?, ?)`).run(a.agentId, b.agentId)
+    const r = await rpc(env, kasra, 'send', { to: 'Twin', body: 'x', in_reply_to: 'same-rid' })
+    expect(r.status).toBe(404)
+    expect(landed(a.agentId) + landed(b.agentId)).toBe(0)
+  })
+})
+

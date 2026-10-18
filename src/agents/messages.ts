@@ -224,6 +224,9 @@ interface GuestVisibilityFence {
 
 interface Opts {
   now?: () => string
+  /** Reply-exception fence: the INSERT lands only while this replier has sent fewer than `cap`
+   *  replies keyed on the ORIGINAL message id (atomic, like the unread cap). */
+  replyFence?: { originalId: string; cap: number }
   idGen?: () => string
   /** Override the per-recipient unread cap (tests). Defaults to MAX_UNREAD_PER_RECIPIENT. */
   maxUnread?: number
@@ -533,6 +536,14 @@ export async function sendAgentMessage(
       values.push(brakeFence.agentId, brakeFence.taskId)
       brakeFenceSql = `AND ${dispatchBrakesClearSql(`?${values.length - 1}`, `?${values.length}`)}`
     }
+    let replyFenceSql = ''
+    const replyFence = opts.replyFence
+    if (replyFence) {
+      values.push(replyFence.originalId, replyFence.cap)
+      replyFenceSql = `AND (SELECT COUNT(*) FROM agent_messages
+                             WHERE tenant = ?2 AND from_agent = ?4 AND to_agent = ?3
+                               AND in_reply_to = ?${values.length - 1}) < ?${values.length}`
+    }
     const routineRunParam = values.length + 1
     const fenced = receiverFence !== undefined || brakeFence !== undefined
     const returningSql = fenced ? ' RETURNING seq' : ''
@@ -572,7 +583,8 @@ export async function sendAgentMessage(
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
-                 ${brakeFenceSql}${returningSql}`,
+                 ${brakeFenceSql}
+                 ${replyFenceSql}${returningSql}`,
       ).bind(...values)
     // Fenced writes decide from RETURNING rows (never meta.changes); unfenced keep meta.changes.
     let landedRows: number
@@ -599,6 +611,15 @@ export async function sendAgentMessage(
       if (input.requestId !== undefined) {
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind)
+      }
+      if (replyFence) {
+        const used = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM agent_messages
+            WHERE tenant = ?1 AND from_agent = ?2 AND to_agent = ?3 AND in_reply_to = ?4`,
+        ).bind(tenant, input.fromAgent, input.toAgent, replyFence.originalId).first<{ n: number }>()
+        if ((used?.n ?? 0) >= replyFence.cap) {
+          return { ok: false, reason: 'send_target_not_visible', detail: `reply limit reached: at most ${replyFence.cap} replies per original message` }
+        }
       }
       if (receiverFence && !await receiverNotStopped(env, receiverFence.agentId)) {
         return { ok: false, reason: 'receiver_not_live' }
@@ -2789,8 +2810,8 @@ export const REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 export const REPLY_CAP_PER_MESSAGE = 20
 
 type ReplyResolution =
-  | { ok: true; value: SendAgentRow }
-  | { ok: false; capped: boolean }
+  | { ok: true; value: SendAgentRow; originalId: string }
+  | { ok: false }
 
 async function resolveReplyTarget(
   env: Env,
@@ -2799,29 +2820,29 @@ async function resolveReplyTarget(
 ): Promise<ReplyResolution> {
   const tenant = env.TENANT_SLUG
   const ref = input.inReplyTo
-  if (!tenant || ref === undefined || !RID_RE.test(ref)) return { ok: false, capped: false }
+  if (!tenant || ref === undefined || !RID_RE.test(ref)) return { ok: false }
+  const toRef = input.toRef.trim()
+  const stripped = stripOneLeadingAt(toRef) ?? toRef
   const cutoff = new Date(Date.parse(nowIso) - REPLY_WINDOW_MS).toISOString()
-  const orig = await env.DB.prepare(
+  // The sender filter is applied BEFORE the row is chosen (a request_id is only unique per
+  // sender, so an unrelated sender's newer message with the same id string must not shadow the
+  // real one). An exact message-id match wins over a request_id match, then the newest row.
+  const rows = await env.DB.prepare(
     `SELECT m.id AS mid, a.id, a.squad_id, a.slug, a.name
        FROM agent_messages m
        JOIN agents a ON a.id = m.from_agent
       WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
         AND julianday(m.created_at) >= julianday(?4)
         AND a.status != 'inactive'
-      ORDER BY m.seq DESC LIMIT 1`,
-  ).bind(tenant, input.fromAgent, ref, cutoff).first<SendAgentRow & { mid: string }>()
-  if (!orig) return { ok: false, capped: false }
-  const toRef = input.toRef.trim()
-  const stripped = stripOneLeadingAt(toRef)
-  const matches = (r: string): boolean =>
-    r === orig.id || r === orig.slug || r.toLowerCase() === orig.name.toLowerCase()
-  if (!matches(toRef) && !(stripped !== null && matches(stripped))) return { ok: false, capped: false }
-  const used = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM agent_messages
-      WHERE tenant = ?1 AND from_agent = ?2 AND to_agent = ?3 AND in_reply_to = ?4`,
-  ).bind(tenant, input.fromAgent, orig.id, ref).first<{ n: number }>()
-  if ((used?.n ?? 0) >= REPLY_CAP_PER_MESSAGE) return { ok: false, capped: true }
-  return { ok: true, value: { id: orig.id, squad_id: orig.squad_id, slug: orig.slug, name: orig.name } }
+        AND (a.id IN (?5, ?6) OR a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))
+      ORDER BY (m.id = ?3) DESC, m.seq DESC LIMIT 50`,
+  ).bind(tenant, input.fromAgent, ref, cutoff, toRef, stripped).all<SendAgentRow & { mid: string }>()
+  const found = rows.results ?? []
+  if (found.length === 0) return { ok: false }
+  // A ref that matches two different senders of messages to this caller is ambiguous: refuse.
+  if (new Set(found.map((r) => r.id)).size !== 1) return { ok: false }
+  const orig = found[0]
+  return { ok: true, value: { id: orig.id, squad_id: orig.squad_id, slug: orig.slug, name: orig.name }, originalId: orig.mid }
 }
 
 export async function sendToRef(
@@ -2927,17 +2948,22 @@ export async function sendToRef(
       if (retried.ok) attempt = retried
     }
   }
+  let replyFence: { originalId: string; cap: number } | undefined
+  let inReplyTo = input.inReplyTo
   if (!attempt.ok && attempt.reason === 'send_target_not_visible' && input.inReplyTo !== undefined) {
-    const reply = await resolveReplyTarget(env, input, (opts.now ?? (() => new Date().toISOString()))())
-    if (reply.ok) {
-      attempt = { ok: true, resolved: { value: reply.value }, squadViaProjectOnly: false }
-    } else if (reply.capped) {
-      return {
-        ok: false,
-        reason: 'send_target_not_visible',
-        detail: `reply limit reached: at most ${REPLY_CAP_PER_MESSAGE} replies per original message`,
-      }
-    }
+    // Reply exception: one sender, no seat label or project (either would be a probe of a home
+    // seat the caller cannot see), a caller that is a single coherent member when non-admin.
+    const eligible =
+      input.targetSeat === undefined &&
+      input.projectId === undefined &&
+      (authz.isAdmin || nonAdminGrantsSingleMember(authz.grants, input.fromMember))
+    const reply = eligible
+      ? await resolveReplyTarget(env, input, (opts.now ?? (() => new Date().toISOString()))())
+      : { ok: false as const }
+    if (!reply.ok) return { ok: false, reason: 'send_target_not_visible' }
+    attempt = { ok: true, resolved: { value: reply.value }, squadViaProjectOnly: false }
+    replyFence = { originalId: reply.originalId, cap: REPLY_CAP_PER_MESSAGE }
+    inReplyTo = reply.originalId // canonical: citing the id or the request_id keys the same cap
   }
   if (!attempt.ok) return { ok: false, reason: attempt.reason }
   resolved = attempt.resolved
@@ -2953,15 +2979,27 @@ export async function sendToRef(
       body: input.body,
       kind: input.kind,
       requestId: input.requestId,
-      inReplyTo: input.inReplyTo,
+      inReplyTo,
       projectId: input.projectId,
       targetSeat: input.targetSeat,
       attribution: input.attribution,
     },
     authz,
-    guestVisibilityFence ? { ...opts, guestVisibilityFence } : opts,
+    { ...opts, ...(guestVisibilityFence ? { guestVisibilityFence } : {}), ...(replyFence ? { replyFence } : {}) },
   )
   if (!res.ok) {
+    // Reply path: the caller can see nothing of this recipient, so no downstream reason
+    // (inbox_full, db_error, seat/project/fence refusals, ...) may differ from the ordinary
+    // invisible-target refusal. Only malformed-input reasons (the caller's own arguments) and
+    // the caller's own reply-limit detail pass through.
+    if (replyFence) {
+      if (res.reason.startsWith('invalid_')) return res
+      return {
+        ok: false,
+        reason: 'send_target_not_visible',
+        detail: res.reason === 'send_target_not_visible' ? res.detail : undefined,
+      }
+    }
     // Existence-oracle closure (re-gate fix, #401): resolveNonAdminSendTarget above already
     // proved the chosen target is visible to this sender (case a or the folded-in project
     // case). Reaching sendAgentMessage at all means the ref resolved to a real, now-visible
