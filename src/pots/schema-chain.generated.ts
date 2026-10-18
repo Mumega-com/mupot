@@ -4213,9 +4213,30 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_seat_admissions_agent_human" },
     ],
   },
+  {
+    file: "0237_seat_tape.sql",
+    sha256: "b82a472d71f7dab6989b6ba42a67a143891705a607526d7fcbffd3c10feb96c0",
+    statements: [
+      "-- 0237_seat_tape.sql -- admission by observation, P0 (SHADOW ONLY; flag ADMISSION_TAPE, default off).\n-- Design: agents/kasra/docs/design-admission-by-observation-20261018.md (b), (c).\n--\n-- seat_tape: one row per scored window of a seat's tool calls. APPEND-ONLY (BEFORE UPDATE / BEFORE DELETE\n-- triggers RAISE, in the style of agent_access_receipts 0187 and task_verdicts 0008) and hash-chained per\n-- seat: row_hash = sha256(prev_hash | canonical row fields); the first row of a seat has prev_hash ''.\n-- UNIQUE (seat_id, prev_hash) means two writers racing on the same chain head cannot both link to it.\n-- The tape holds scores and arg-SHAPE signals only, never raw argument values.\n--\n-- seat_tape_window: the rolling in-progress window per seat (shape-only events as JSON). Plain mutable\n-- scratch state for P0 (no Durable Object yet); it is not part of the record.\n--\n-- agent_seats.admission_status: nullable, NULL = no status (every existing seat). P0 never writes it.\n-- agent_seats_immutable (0199) guards identity columns only, so a later phase can update this one.\n--\n-- CREATE / ADD COLUMN only: no existing table is rebuilt.\n\nCREATE TABLE IF NOT EXISTS seat_tape (\n  id             TEXT PRIMARY KEY NOT NULL,\n  seat_id        TEXT NOT NULL,\n  member_id      TEXT NOT NULL,\n  window_start   TEXT NOT NULL,\n  window_end     TEXT NOT NULL,\n  event_count    INTEGER NOT NULL CHECK (event_count >= 0),\n  score          INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),\n  signals        TEXT NOT NULL CHECK (json_valid(signals)),\n  status_before  TEXT CHECK (status_before IS NULL OR status_before IN ('observed','trusted','held')),\n  status_after   TEXT CHECK (status_after IS NULL OR status_after IN ('observed','trusted','held')),\n  would_hold     INTEGER NOT NULL CHECK (would_hold IN (0,1)),\n  prev_hash      TEXT NOT NULL,\n  row_hash       TEXT NOT NULL CHECK (length(row_hash) = 64),\n  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_seat_tape_chain ON seat_tape (seat_id, prev_hash);",
+      "\nCREATE INDEX IF NOT EXISTS idx_seat_tape_seat_time ON seat_tape (seat_id, window_end DESC);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS seat_tape_no_update\nBEFORE UPDATE ON seat_tape\nBEGIN\n  SELECT RAISE(ABORT, 'seat_tape is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS seat_tape_no_delete\nBEFORE DELETE ON seat_tape\nBEGIN\n  SELECT RAISE(ABORT, 'seat_tape is append-only: DELETE is forbidden');\nEND;",
+      "\n\nCREATE TABLE IF NOT EXISTS seat_tape_window (\n  seat_id     TEXT PRIMARY KEY NOT NULL,\n  events_json TEXT NOT NULL,\n  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nALTER TABLE agent_seats ADD COLUMN admission_status TEXT\n  CHECK (admission_status IS NULL OR admission_status IN ('observed','trusted','held'));",
+    ],
+    objects: [
+      { type: "table", name: "seat_tape" },
+      { type: "index", name: "idx_seat_tape_chain" },
+      { type: "index", name: "idx_seat_tape_seat_time" },
+      { type: "trigger", name: "seat_tape_no_update" },
+      { type: "trigger", name: "seat_tape_no_delete" },
+      { type: "table", name: "seat_tape_window" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a59b4d8b0e0f9fed399df6b30e4dbab38c839b321d04b50c89ced314bea7c126"
+export const SCHEMA_CHAIN_DIGEST: string = "cd959a8dff01e75d5edf6a0fe26acb7a122b7756836561b662aed8491dd8699b"

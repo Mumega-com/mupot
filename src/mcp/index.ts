@@ -212,6 +212,7 @@ import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
@@ -6522,7 +6523,8 @@ async function gatherWhoamiFacts(
     unboundDirectory ? hasBootstrappedBefore(env, auth.memberId) : false,
     unboundDirectory ? anyAgentExists(env) : false,
   ])
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}) }
+  const admission = await gatherAdmission(env, auth)
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}) }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -7878,7 +7880,42 @@ export const DELEGATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'project_squad_remove',
 ])
 
+/**
+ * THE single exit of every tool call. With ADMISSION_TAPE off (default) this is exactly invokeToolInner. With it on, the
+ * finished outcome is described to the admission tape (SHADOW: shape only, waitUntil, errors swallowed and counted) and
+ * returned UNCHANGED; the tap can never alter, block or delay the response.
+ */
 export async function invokeTool(
+  auth: AuthContext,
+  env: Env,
+  toolName: unknown,
+  argsValue: unknown,
+  originOrCtx: string | Partial<ToolCtx> = '',
+): Promise<ToolOutcome & { tool?: string }> {
+  const outcome = await invokeToolInner(auth, env, toolName, argsValue, originOrCtx)
+  if (admissionTapeEnabled(env)) {
+    try {
+      const spec = typeof toolName === 'string' ? TOOL_BY_NAME.get(toolName) : undefined
+      const ctx = typeof originOrCtx === 'string' ? undefined : originOrCtx
+      if (spec && auth.seatBinding && !ctx?.sideEffectFree) {
+        const args = argsValue !== null && typeof argsValue === 'object' && !Array.isArray(argsValue) ? (argsValue as Record<string, unknown>) : {} // narrowed to a plain object on the line above; only describeArgs reads it, shape-only
+        tapToolCall(env, auth, {
+          tool: spec.name,
+          min: spec.min,
+          args,
+          allowedKeys: new Set(Object.keys(spec.inputSchema.properties)),
+          outcome: outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error },
+          now: Date.now(),
+        }, ctx?.waitUntil)
+      }
+    } catch {
+      // The tap must never reach the caller.
+    }
+  }
+  return outcome
+}
+
+async function invokeToolInner(
   auth: AuthContext,
   env: Env,
   toolName: unknown,
