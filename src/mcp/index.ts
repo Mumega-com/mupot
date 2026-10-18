@@ -206,6 +206,7 @@ import { agentKeyFingerprint, hasRegisteredKey, loadActiveAgentKey } from '../fl
 import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
+import { boundAgentMayBeInstalling, installerWindowView } from '../operators/installer-window'
 import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
@@ -6537,7 +6538,10 @@ async function anyAgentExists(env: Env): Promise<boolean> {
 /** The whoami block for status / orient (no runtime-report step: those tools take no runtime args). */
 async function whoamiFor(env: Env, auth: AuthContext, origin: string | undefined): Promise<Whoami> {
   const facts = await gatherWhoamiFacts(env, auth, { actsAs: auth.seatBinding ? await actsAsName(env, auth) : null })
-  return buildWhoami(env, auth, { facts, origin: canonicalOrigin(env, origin ?? '') })
+  const whoami = buildWhoami(env, auth, { facts, origin: canonicalOrigin(env, origin ?? '') })
+  // Installer window (flag off => one env read, no D1 read, `whoami` untouched): the elevated agent sees its live window.
+  const installerWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: whoami must always answer
+  return installerWindow ? { ...whoami, installer_window: installerWindow } : whoami
 }
 
 async function actsAsName(env: Env, auth: AuthContext): Promise<string | null> {
@@ -7977,7 +7981,15 @@ export async function invokeTool(
       DELEGATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
       delegatedOperatorsEnabled(env) &&
       (await agentHasLiveDelegation(env, auth.boundAgentId, attachedAuthority(auth)?.humanMemberId))
-    if (!mayBeElevated && !mayBeDelegated) {
+    // Installer window (design S1): a live install grant may reach past the floor for the delegable tools. Same shape again:
+    // flag-gated, bound agent, named tools only, and the handler's chokepoint call decides.
+    const mayBeInstalling =
+      !mayBeElevated &&
+      !mayBeDelegated &&
+      auth.boundAgentId != null &&
+      DELEGATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
+      (await boundAgentMayBeInstalling(env, auth))
+    if (!mayBeElevated && !mayBeDelegated && !mayBeInstalling) {
       // "sudo for attached chats": an attached thread without a live sudo grant is told the exact call to make, not the
       // generic agent hint (the human, not an admin elsewhere, approves it with their passkey).
       if (attachedAuthority(auth) && (spec.name === 'update_squad' || spec.name === 'update_department')) {

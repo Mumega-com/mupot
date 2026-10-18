@@ -947,7 +947,7 @@ describe('device secret rotation: a harvested copy dies at the next real use and
     return { dev, id: dev.split('.')[0] }
   }
   // One grant per (agent session, action, scope) can exist, so every moment asks for a DIFFERENT non-sensitive action.
-  const freeActions = Object.keys(ELEVATION_ACTIONS).filter((k) => !SENSITIVE_STEP_UP_ACTIONS.has(k) && !TELEGRAM_PASSKEY_ONLY_EXTRA.has(k) && isRequestableElevationAction(k))
+  const freeActions = Object.keys(ELEVATION_ACTIONS).filter((k) => !SENSITIVE_STEP_UP_ACTIONS.has(k) && !TELEGRAM_PASSKEY_ONLY_EXTRA.has(k) && isRequestableElevationAction(k) && !k.startsWith('action:install_')) // installer windows are flag-gated and requested alone (tests/installer-window.test.ts)
   let nextAction = 0
   const act = (): string => freeActions[nextAction++ % freeActions.length]
   const approveOne = async (dev: string, c: Partial<Choice> = {}): Promise<{ res: Response; m: Moment; action: string }> => {

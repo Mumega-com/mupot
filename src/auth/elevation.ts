@@ -45,6 +45,7 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
+import { installerRequestRefusal, installerWindowEnabled, isInstallerAction } from '../operators/installer-tiers'
 import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 
@@ -153,6 +154,14 @@ export async function createElevationRequest(
         detail: `"${action}" is defined but not yet enforced by any tool — it cannot be requested`,
       }
     }
+  }
+  // Installer window (design S1): flag-gated, requested alone, tier-specific durations. Skipped entirely for any other action.
+  if (uniqueActions.some(isInstallerAction)) {
+    if (!installerWindowEnabled(env)) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'the installer window is not enabled on this pot' }
+    }
+    const installRefusal = installerRequestRefusal(uniqueActions, input.durationMinutes)
+    if (installRefusal) return { ok: false, reason: 'invalid_elevation_request', detail: installRefusal }
   }
   if (!['org', 'department', 'squad'].includes(input.scopeType)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid scope_type' }
@@ -991,6 +1000,9 @@ export interface HasElevatedActionOptions {
    *  false for a pure visibility check (e.g. rendering "you could do X")
    *  that must not itself count as having DONE anything. */
   recordUsage?: boolean
+  /** Judge exactly this grant and no other (the installer window evaluates each live grant on its own, so an org grant
+   *  cannot shadow a department grant on the same session). Unset = every existing caller, unchanged. */
+  onlyGrantId?: string
   toolName?: string
   detail?: unknown
 }
@@ -1097,6 +1109,7 @@ export async function hasElevatedAction(
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
   const match = grants.find((g) => {
     if (g.action !== action) return false
+    if (opts.onlyGrantId !== undefined && g.id !== opts.onlyGrantId) return false
     if (attached && g.approved_by_member_id !== attached.humanMemberId) return false
     if (g.scope_type === 'org') return inheritancePlaneCovers('org')
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
@@ -1172,7 +1185,7 @@ export async function hasElevatedAction(
 // elevation_usage_log as though something happened.
 /** Shared by both probes below: the caller's own live agent_sessions row, or
  *  null for anything that is not a live bound-agent session. */
-async function loadLiveSessionForBoundAgent(
+export async function loadLiveSessionForBoundAgent(
   env: Env,
   auth: AuthContext,
   nowMs: number,

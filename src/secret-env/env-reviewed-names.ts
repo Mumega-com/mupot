@@ -95,6 +95,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'INKWELL_SECRET',
   'INKWELL_SVC',
   'INKWELL_TOKEN',
+  'INSTALLER_WINDOW', // installer window (design S1): opt-in flag for the time-boxed operator bundle (non-secret)
   'LAND_REQUIRES_EVIDENCE',
   'LOCAL_TEST_AUTH',
   'LOCAL_TEST_AUTH_EMAIL',

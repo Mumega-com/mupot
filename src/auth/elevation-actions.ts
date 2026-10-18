@@ -217,6 +217,25 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Read-only and scoped to a single squad; the access itself leaves no lasting effect once the grant expires.',
   },
+  // Installer window (PR-C, design S1). Consumed by src/operators/installer-window.ts, which turns a LIVE grant of one of
+  // these into an in-memory delegation row for the structural-write chokepoint. Tier table: src/operators/installer-tiers.ts.
+  // Credentials (token/key mint) are never part of either tier; request them separately as action:mint_token.
+  'action:install_standard': {
+    key: 'action:install_standard',
+    enforced: true,
+    label: 'Installer window (standard)',
+    description: 'Time-boxed: organise squads, agents and project access up to MEMBER standing inside the scope you grant. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
+    effect: 'reversible',
+    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. Squads, agents and access edges it creates can be edited or removed by standing authority afterwards.',
+  },
+  'action:install_high': {
+    key: 'action:install_high',
+    enforced: true,
+    label: 'Installer window (high: up to lead)',
+    description: 'Time-boxed: everything in the standard window plus granting agents up to LEAD standing, inside the scope you grant. Passkey only. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
+    effect: 'reversible',
+    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. A lead grant made inside the window stays until standing authority removes it.',
+  },
 })
 
 export type ElevationActionKey = keyof typeof ELEVATION_ACTIONS
@@ -266,4 +285,5 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:mint_token',
   'action:routine_archive', // irreversible
   'action:org_department_create', // irreversible: no tool deletes or archives a department
+  'action:install_high', // installer window, lead ceiling: passkey only (standard stays Telegram-biometric approvable)
 ])
