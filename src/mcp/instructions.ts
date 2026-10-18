@@ -64,7 +64,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - Required axes:
        check_in({
          seat: "<seat-id>",                 // e.g. "cursor-mac", "grok-desktop", "cursor-cloud-builder", "loom-hetzner"
-         harness: "<harness>",              // "cursor-ide" | "cursor-cloud" | "antigravity-cli" | "claude-code" | "codex-cli" | "prime" | "hermes" | "grok-cli" | "unknown"
+         harness: "<harness>",              // any harness name you run on, a short bounded string kept as reported (e.g. "claude-code", "codex-cli", "hermes", your own); authority is never derived from the name
          machine: "<machine>",              // e.g. "hadi-mac", "hetzner-ash-1", "cursor-cloud-vm"
          model: "<model>",                  // e.g. "claude-3-7-sonnet", "gemini-3.7-flash", "grok-4.6", "deepseek-v4-pro"
          provider: "<provider>",            // e.g. "anthropic", "google", "xai", "deepseek-ai", "cloudflare-ai"
@@ -99,7 +99,7 @@ ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when bo
    - First time, it returns status "pending_admission". If it includes an approve_url, give that URL to your human: they tap their passkey once. If it has none (the pot has no approval links), your human approves on their Connections page instead; the note in the result says which. Nothing attaches before that, and you cannot approve it yourself.
    - If your human has never registered a passkey, they must first add one in My Account (the dashboard /account page, while signed in). The approve link cannot enrol one for them.
    - After they approve, call 'seat_attach' again. It attaches immediately; your NEXT request acts as that agent (boot_context shows the identity_receipt).
-   - A session with no seat yet (a harness session before seat_select) can call only seat_select and boot_context. Call seat_select first, then seat_attach.
+   - A harness TOKEN session with no seat yet (a bearer minted for a harness, not an OAuth connector) can call only seat_select, boot_context and worktree_open: call seat_select first, then seat_attach. An OAuth connector consented as "Many chats" with no seat yet can call seat_select to get one (a ChatGPT conversation is seated automatically); until it has a seat, seat_attach answers seat_required.
    - A fixed CLI or daemon agent with no human in the chat does not use this: it connects with a workspace token an org admin mints for it.`
 
 export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string }): string {

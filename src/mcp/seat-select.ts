@@ -10,6 +10,7 @@ import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { seatSelect } from '../members/seat-select'
 import { seatAttachEnabled } from '../members/seat-attach'
+import { consentChoiceLabels, consentLabels } from './refusal-next-step'
 
 const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
@@ -55,14 +56,14 @@ const toolSeatSelect: ToolSpec = {
         return fail(
           403,
           result.error,
-          'seat_select only runs for an unbound directory-channel session. This session is already bound to an agent identity (an agent-bound connection, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat. To pick a seat explicitly, call seat_select from an unbound session: send no seat handle on that call.'
+          'seat_select only runs for a chat session that has no agent yet. This credential is already an agent (a workspace, agent or seat token, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat: use it as that agent, call boot_context to see which.'
             + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached ? ' To act as an agent you already have instead, call seat_attach { agent } from this session.' : ''),
         )
       case 'harness_required':
         return fail(
           403,
           result.error,
-          'This connection carries no verified harness. Reconnect this connector to register its harness, then retry.',
+          `This connection carries no verified harness. Your human re-consents this connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many} to register its harness; then call seat_select again.`,
         )
       case 'member_not_active':
         return fail(403, result.error)
