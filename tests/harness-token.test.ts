@@ -110,7 +110,7 @@ async function select(env: Env, raw: string, folder: string, project = 'mupot'):
   const r = await rpcBearer(env, raw, 'seat_select', { project, folder })
   const sc = r.sc
   if (typeof sc.seat_handle !== 'string') throw new Error(`no handle: ${JSON.stringify(r.body)}`)
-  return { handle: sc.seat_handle, agentId: (sc.agent as { id: string }).id, seatId: (sc.seat as { id: string }).id, disposition: sc.disposition as string }
+  return { handle: sc.seat_handle, agentId: (sc.agent as { id: string }).id, seatId: (sc.seat_row as { id: string }).id, disposition: sc.disposition as string }
 }
 
 beforeEach(() => {

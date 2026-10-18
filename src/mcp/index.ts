@@ -6762,7 +6762,7 @@ async function buildIdentityReceipt(
     // W2: the seat the SERVER bound this request to (null = none), and what the request presented.
     // Hints are presence booleans only: openai/session, openai/subject and Codex threadId never
     // select a seat. seat_handle_rejected = a handle was presented and did NOT resolve.
-    seat: seat ? { id: seat.seatId, label: seat.label, source: seat.source } : null,
+    seat: seat ? { row_id: seat.seatId, label: seat.label, source: seat.source } : null,
     // Lane C: the slug this request acts as when a seat is bound (the thread's identity), null otherwise.
     acts_as: seat && agentRow ? agentRow.slug : null,
     // W2: "acting as <agent> via <connection name>". Server-derived from the seat the request was bound to (the human's own
@@ -6889,7 +6889,7 @@ const toolBootContext: ToolSpec = {
     if (harnessSeatDoor) {
       availableDoors.unshift({
         tool: 'seat_select',
-        does: 'find-or-create the agent seat for this thread/worktree and receive a seat handle (prefix mseat_); send it as the X-Mupot-Seat header, or _meta["mupot/seat"] if your client cannot set headers, on every later request',
+        does: 'find-or-create the agent seat for this thread/worktree and receive a seat handle (prefix mseat_); pass it as the `seat` argument on every later call (a harness that can set headers may send X-Mupot-Seat instead)',
         requires: 'nothing beyond this connection — the seat agent is capped at member and your own access is the ceiling',
       })
     }
@@ -6934,7 +6934,7 @@ const toolBootContext: ToolSpec = {
           : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
 
     const nextStep = harnessSeatDoor
-      ? 'this connection is a harness session with no agent yet — call seat_select { project: "<workspace name>", folder?, thread? } first; it returns a seat handle (mseat_...) to send as the X-Mupot-Seat header or _meta["mupot/seat"] on every later request. See available_doors.'
+      ? 'this connection is a harness session with no agent yet — call seat_select { project: "<workspace name>", folder?, thread? } first; it returns a seat handle (mseat_...) to pass as the `seat` argument on every later call (a harness that can set headers may send X-Mupot-Seat instead). See available_doors.'
       : nextStepBase
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
@@ -7026,7 +7026,7 @@ const toolBootContext: ToolSpec = {
         ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) to receive your basin-drop packet.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
-        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`
+        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
     }
 
     return done({
@@ -7265,7 +7265,7 @@ const toolConnect: ToolSpec = {
               ? [auth.seatBinding
                   ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
                   : auth.harnessId
-                    ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and send the handle in _meta["mupot/seat"] (or X-Mupot-Seat if your client can set headers). Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
+                    ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and pass the returned handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead). Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
                     : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many}; then call seat_select, then seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
               : []),
             // Render the ID, never the slug. mint_agent_token resolves through the same
@@ -7469,22 +7469,28 @@ const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
  *  it carries no authority of its own. Tools that already declared `seat` (inbox, send, check_in,
  *  boot_context: a mailbox/enrolment LABEL) keep their schema; their handlers only ever see a
  *  non-handle-shaped value, because a handle-shaped one is stripped first. */
-export const SEAT_ARG = {
-  type: 'string',
-  description: 'Your seat handle (mseat_..., the seat_id seat_select returned). Pass it on every call so this conversation keeps its seat.',
-} as const
-export const SEAT_ARG_TOOLS: readonly string[] = [
+export const SEAT_ARG_DESCRIPTION = 'Optional. Your seat handle (starts with mseat_), the `seat` value seat_select returned. Pass it on every call so this conversation keeps its seat.'
+export const SEAT_ARG = { type: 'string', description: SEAT_ARG_DESCRIPTION } as const
+/** Tools that already used `seat` as a cosmetic mailbox/enrolment LABEL (send: recipient seat, inbox: partition,
+ *  check_in/boot_context: enrolment label). On these a value starting mseat_ is the handle; any other value
+ *  keeps its label meaning. Computed from the registry BEFORE injection, so it cannot drift. */
+const SEAT_LABEL_TOOLS: Set<string> = new Set(TOOLS.filter((t) => Object.prototype.hasOwnProperty.call(t.inputSchema.properties, 'seat')).map((t) => t.name))
+/** Every tool advertises `seat` (strict clients reject unknown args, models drop undeclared ones). */
+export const SEAT_ARG_TOOLS: readonly string[] = TOOLS.map((t) => t.name)
+/** The core work loop, pinned one-by-one in tests/seat-handle.test.ts. */
+export const SEAT_ARG_WORK_LOOP: readonly string[] = [
   'boot_context', 'orient', 'status', 'check_in', 'send', 'inbox', 'recall', 'remember', 'task_create',
-  'task_board', 'task_get', 'needs_you_list', 'project_context', 'seat_attach', 'peers',
-]
+  'task_board', 'task_get', 'task_list', 'task_update', 'inbox_ack', 'needs_you_list', 'project_context', 'project_list',
+  'seat_attach', 'peers', 'resolve_agent', 'squad_message',
+].filter((n) => TOOL_BY_NAME.has(n))
 /** Tools whose schema gained `seat` here (not natively): the curated profile door never advertises it. */
 const SEAT_ARG_INJECTED: Set<string> = new Set()
-for (const name of SEAT_ARG_TOOLS) {
-  const spec = TOOL_BY_NAME.get(name)
-  if (!spec) throw new Error(`SEAT_ARG tool ${name} is not registered`)
+for (const spec of TOOLS) {
   if (!Object.prototype.hasOwnProperty.call(spec.inputSchema.properties, 'seat')) {
     spec.inputSchema.properties.seat = SEAT_ARG
-    SEAT_ARG_INJECTED.add(name)
+    SEAT_ARG_INJECTED.add(spec.name)
+  } else {
+    spec.inputSchema.properties.seat = { type: 'string', description: `${SEAT_ARG_DESCRIPTION} (On this tool a value that does not start with mseat_ keeps its older meaning as a seat label.)` }
   }
 }
 
@@ -8083,7 +8089,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: seatHandleFromArgs(argsObject), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -8109,7 +8115,7 @@ async function handleJsonRpc(
     // the tool's own (additionalProperties:false) schema never sees it. Flag off: untouched.
     // Lane C: a handle-shaped `seat` ARGUMENT is the same kind of transport carrier and is stripped on EVERY flag
     // state (flag off: it simply selects nothing), so no handler ever reads a handle out of its arguments.
-    const stripSeatArg = profile === undefined && seatHandleFromArgs(argsObject) !== null
+    const stripSeatArg = profile === undefined && seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))) !== null
     const stripMetaArg = profile === undefined && seatAutoEnrollEnabled(c.env) && argsObject !== null && '_meta' in argsObject
     const toolArguments = argsObject !== null && (stripSeatArg || stripMetaArg)
       ? Object.fromEntries(Object.entries(argsObject).filter(([k]) => !(stripMetaArg && k === '_meta') && !(stripSeatArg && k === 'seat')))

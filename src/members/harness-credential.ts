@@ -30,7 +30,7 @@ export const HARNESS_SESSION_ALLOWED_TOOLS: ReadonlySet<string> = new Set(['seat
 export const HARNESS_SESSION_SEAT_REQUIRED = 'harness_session_seat_required'
 export const HARNESS_SESSION_SEAT_REQUIRED_MESSAGE =
   'This connection is a harness token: it can only call seat_select (to get a seat for this thread) and boot_context. '
-  + 'Call seat_select, then send the returned seat_handle as the X-Mupot-Seat header (or _meta["mupot/seat"]) on every request.'
+  + 'Call seat_select, then pass the returned seat value as the `seat` argument on every call (a harness that can set headers may send X-Mupot-Seat instead).'
 
 /** True for a context that must be confined to the harness allowlist. */
 export function isHarnessCredentialSession(auth: { harnessCredential?: boolean }): boolean {

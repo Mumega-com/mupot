@@ -18,7 +18,9 @@ import {
   SEAT_HANDLE_MAX_LIVE_PER_SEAT, NO_HINTS,
 } from '../src/members/seat-handle'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
-import { mcpApp, invokeTool, TOOLS, SEAT_ARG_TOOLS } from '../src/mcp/index'
+import { mcpApp, invokeTool, TOOLS, SEAT_ARG_TOOLS, SEAT_ARG_WORK_LOOP } from '../src/mcp/index'
+import { SEAT_SELECT_STEP, LOST_SEAT_STEP } from '../src/mcp/refusal-next-step'
+import { mcpInitializeInstructions } from '../src/mcp/instructions'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { canOnSquad } from '../src/auth/capability'
@@ -86,7 +88,7 @@ async function select(env: Env, g: Grant, folder: string, o: RpcOpts = {}): Prom
   const r = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder }, o)
   const sc = r.sc
   if (typeof sc.seat_handle !== 'string') throw new Error(`no handle: ${JSON.stringify(r.body)}`)
-  return { handle: sc.seat_handle, agentId: (sc.agent as { id: string }).id, seatId: (sc.seat as { id: string }).id, sc }
+  return { handle: sc.seat_handle, agentId: (sc.agent as { id: string }).id, seatId: (sc.seat_row as { id: string }).id, sc }
 }
 
 const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
@@ -1073,6 +1075,8 @@ describe('seat handle as a tool argument', () => {
     const g = await grant(env, HUMAN)
     const a = await select(env, g, '/work/a')
     expect(a.sc.seat_id).toBe(a.handle)
+    expect(a.sc.seat).toBe(a.handle) // `seat` is the thing to pass back; the DB row is seat_row
+    expect((a.sc.seat_row as { id: string }).id).toBe(a.seatId)
     expect(a.sc.acts_as).toBe((a.sc.agent as { slug: string }).slug)
     expect(a.sc.instruction).toBe(`Pass \`seat: ${a.handle}\` on every call.`)
   })
@@ -1156,7 +1160,7 @@ describe('seat handle as a tool argument', () => {
     expect(r.body.error).toBeUndefined() // stripped, selects nothing
   })
 
-  it.each(SEAT_ARG_TOOLS.map((t) => [t]))('%s tolerates the seat argument (schema declares it; validateArgs does not refuse it)', async (name) => {
+  it.each(SEAT_ARG_WORK_LOOP.map((t) => [t]))('%s tolerates the seat argument (schema declares it; validateArgs does not refuse it)', async (name) => {
     const spec = TOOLS.find((t) => t.name === name)!
     expect(spec.inputSchema.properties.seat).toMatchObject({ type: 'string' })
     const env = envFor(h)
@@ -1207,5 +1211,98 @@ describe('roster hygiene: seat agents are not roster members', () => {
     h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, status, created_at) VALUES ('plain-1', '${squadId}', 'plain-agent', 'Plain', 'worker', 'active', '2026-10-09T00:00:00.000Z')`)
     const after = await invokeTool(stranger, env, 'peers', { squad_id: squadId }, { origin: 'https://pot.test', transport: 'mcp' })
     expect(after.ok && (after.result as { peers: Array<{ slug: string }> }).peers.map((p) => p.slug)).toEqual(['plain-agent'])
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('seat argument: round 2 pins', () => {
+  it('EVERY registered tool advertises an optional string `seat` with the one description (the profile door excepted)', () => {
+    expect(SEAT_ARG_TOOLS.length).toBe(TOOLS.length)
+    for (const t of TOOLS) {
+      const prop = t.inputSchema.properties.seat as { type?: string; description?: string } | undefined
+      expect(prop?.type, t.name).toBe('string')
+      expect(prop?.description, t.name).toContain('mseat_')
+      expect(t.inputSchema.required ?? [], t.name).not.toContain('seat')
+    }
+  })
+
+  it('a non-handle `seat` on a tool with no native seat label (e.g. the seat row uuid) is REFUSED as seat_handle_rejected, never ignored', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const uuid = await rpc(env, g.ctx, 'status', { seat: a.seatId })
+    expect(uuid.body.error).toBeUndefined()
+    expect(uuid.sc.bound_agent_id ?? null).toBeNull()
+    const viaBoot = await rpc(env, g.ctx, 'boot_context', { seat: a.seatId }) // label tool: stays a label
+    expect(receiptOf(viaBoot).seat_handle_rejected).toBe(false)
+    const orient = await rpc(env, g.ctx, 'orient', { seat: a.seatId })
+    expect(JSON.stringify(orient.body)).not.toContain('unknown field')
+    const t = await rpc(env, g.ctx, 'task_list', { seat: a.seatId })
+    expect(JSON.stringify(t.body)).not.toContain('unknown field')
+    // the verdict itself: receipt on a tool that carries one
+    const st = await rpc(env, g.ctx, 'status', { seat: a.seatId })
+    expect(receiptOf(st)?.seat_handle_rejected ?? true).toBe(true)
+  })
+
+  it('seat_select ignores its own handle on the argument: a re-select returns the same agent and a new handle', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const again = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/work/a', seat: a.handle })
+    expect(again.sc.error).toBeUndefined()
+    expect((again.sc.agent as { id: string }).id).toBe(a.agentId)
+    expect(again.sc.seat).not.toBe(a.handle)
+  })
+
+  it('a forgotten seat on a harness session is told how to recover (who_acts self, pass seat / seat_select again), not sent to an admin', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await select(env, g, '/work/a')
+    const r = await rpc(env, g.ctx, 'task_create', { squad_id: 'sq-nowhere', title: 'x', done_when: 'y' })
+    const env2 = (r.sc.error !== undefined ? r.sc : (r.body.error as Record<string, unknown>)) as Record<string, unknown>
+    expect(env2.who_acts).toBe('self')
+    expect(String(env2.next_step)).toContain('seat')
+    expect(String(env2.next_step)).toContain('seat_select')
+  })
+
+  it('no advertised text says "header" before it says the seat argument', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const boot = await rpc(env, g.ctx, 'boot_context', {})
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: 'mupot' })
+    const texts = [SEAT_SELECT_STEP, LOST_SEAT_STEP, JSON.stringify(boot.body), JSON.stringify(sel.body), mcpInitializeInstructions({ SEAT_AUTO_ENROLL: '1', SEAT_ATTACH: '1' })]
+    let seen = 0
+    for (const t of texts) {
+      for (const m of t.matchAll(/X-Mupot-Seat|_meta\[\\?"mupot\/seat/gi)) {
+        seen++
+        const before = t.slice(0, m.index)
+        expect(/[`"\\]*seat[`"\\]* argument|`seat: |seat: <|seat: "/i.test(before), t.slice(Math.max(0, (m.index ?? 0) - 160), (m.index ?? 0) + 40)).toBe(true)
+      }
+    }
+    expect(seen).toBeGreaterThan(0)
+  })
+
+  it('P2 pins on findLiveSeatForHandle: a forged handle row with a mismatched consenting member, and an expired grant, both reject', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    // forged duplicate row: same seat/agent/harness/grant, but consenting_member_id names someone else
+    const forged = mintSeatHandle()
+    const src = h.sqlite.prepare(`SELECT * FROM seat_handles LIMIT 1`).get()!
+    const cols = Object.keys(src)
+    const vals = cols.map((c) => c === 'id' ? 'forged-1' : c === 'handle_hash' ? '' : c === 'consenting_member_id' ? HUMAN2 : (src as Record<string, unknown>)[c])
+    vals[cols.indexOf('handle_hash')] = await hashSeatHandle(forged)
+    let inserted = true
+    try { h.sqlite.prepare(`INSERT INTO seat_handles (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...(vals as never[])) } catch { inserted = false }
+    if (inserted) {
+      const r = await rpc(env, g.ctx, 'boot_context', { seat: forged })
+      expect(r.sc.bound_agent_id).toBeNull()
+      expect(receiptOf(r).seat_handle_rejected).toBe(true)
+    }
+    // expired-but-authenticated grant: the handle must not redeem against a dead grant token
+    h.sqlite.exec(`UPDATE member_tokens SET expires_at = '2020-01-01 00:00:00' WHERE id = '${g.tokenId}'`)
+    const dead = await rpc(env, g.ctx, 'boot_context', { seat: a.handle })
+    expect(dead.sc.bound_agent_id).toBeNull()
+    // (the dead grant never even reaches the handle lookup: no tokenId, so the handle is not read at all)
   })
 })

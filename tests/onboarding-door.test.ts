@@ -74,7 +74,7 @@ const DEAD: Record<string, Record<Kind, boolean>> = {
   threadAgent: { chatgpt: true, claude: true, hermes: false, unknown: false },
   noWhoami: { chatgpt: true, claude: true, hermes: true, unknown: true },
   splitSteps: { chatgpt: true, claude: true, hermes: false, unknown: true },
-  refusalEnv: { chatgpt: true, claude: true, hermes: true, unknown: true },
+  refusalEnv: { chatgpt: true, claude: false, hermes: true, unknown: true },
 }
 
 function memoryKv() {

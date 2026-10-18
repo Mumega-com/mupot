@@ -208,16 +208,18 @@ export function pickHandle(inputs: SeatRequestInputs): string | null {
   return null
 }
 
-/** The `seat` tool-argument carrier, ONE definition (lane C). Returns the handle-shaped value of
- *  `arguments.seat`, or null. A value without the handle prefix is NOT a carrier: several tools (check_in,
- *  boot_context, send, inbox) already take `seat` as a cosmetic mailbox/enrolment LABEL, and the header
- *  path makes the same split, so a label is never read as, nor rejected as, a handle. */
-export function seatHandleFromArgs(args: Record<string, unknown> | null): string | null {
+/** The `seat` tool-argument carrier, ONE definition (lane C). Returns the value of `arguments.seat` that is a
+ *  seat-handle CANDIDATE, or null. On a tool with a native `seat` LABEL meaning (send, inbox, check_in,
+ *  boot_context...: `labelTool`) only an `mseat_`-prefixed value is a candidate, exactly the header path's
+ *  split, so a label is never read as, nor rejected as, a handle. On every other tool ANY non-empty string is
+ *  a candidate (so a model that passes the seat row uuid is refused with seat_handle_rejected, not ignored). */
+export function seatHandleFromArgs(args: Record<string, unknown> | null, labelTool = false): string | null {
   if (args === null) return null
   const raw = args.seat
   if (typeof raw !== 'string') return null
   const v = raw.trim()
-  return v.startsWith(SEAT_HANDLE_PREFIX) ? v : null
+  if (v.startsWith(SEAT_HANDLE_PREFIX)) return v
+  return !labelTool && v.length > 0 ? v : null
 }
 
 interface MatchRow {

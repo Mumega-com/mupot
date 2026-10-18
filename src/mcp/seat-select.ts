@@ -42,7 +42,10 @@ const toolSeatSelect: ToolSpec = {
     if (result.ok) {
       return done({
         disposition: result.disposition,
-        seat: result.seat,
+        // `seat` is THE value to pass back as the `seat` argument (the mseat_ handle); the DB row is `seat_row`
+        // (a model that read `seat.id` as the thing to pass got a generic refusal).
+        seat: result.seat_handle,
+        seat_row: result.seat,
         harness: result.harness,
         agent: result.agent,
         member_id: result.member_id,
