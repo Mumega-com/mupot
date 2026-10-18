@@ -37,7 +37,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
-import { capabilityRank, resolveCapabilities, canOnSquad } from '../auth/capability'
+import { capabilityRank, resolveCapabilities, canOnSquad, targetLegacyRoleRank } from '../auth/capability'
 import { humanMaxRankOnScope } from '../mcp/oauth-authorize'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAutoEnrollEnabled } from './harness'
@@ -143,12 +143,15 @@ export async function resolveSeatCapabilities(
   const humanGrants = await resolveCapabilities(env, p.humanMemberId)
   if (!(await canOnSquad(env, humanGrants, p.agentSquadId, 'admin'))) return []
   const agentGrants = await resolveCapabilities(env, p.agentMemberId)
+  const humanLegacyRank = await targetLegacyRoleRank(env, p.humanMemberId)
 
   const memberRank = capabilityRank(SEAT_CEILING)
   const ceilingCap = p.ceiling ? ceilingCapability(p.ceiling) : 'member'
   const merged = new Map<string, CapabilityGrant>()
   const consider = async (g: CapabilityGrant, fromAgent: boolean): Promise<void> => {
-    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
+    // Legacy role plane counts only for the AGENT's grants (the ones the clamp used to drop for a rowless owner); a grant
+    // sourced from the human's own rows keeps its row-only rank, so no one's own observer row is lifted.
+    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, fromAgent ? humanLegacyRank : 0)
     // An ATTACHED seat's admission ceiling replaces the flat 'member' cap ONLY on scopes the agent itself holds (member
     // default, lead, or `full` = the agent's own standing); the human's live standing always caps. An attached seat gets no
     // scope the agent does not hold. Gates are not capabilities and are never included (see attached-ceiling.ts).

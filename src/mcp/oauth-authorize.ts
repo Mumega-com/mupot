@@ -27,7 +27,7 @@ import { SELECT_SEARCH_SCRIPT } from '../dashboard/select-search'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { suggestedConnectMode, type ConnectMode } from './consent-connect-mode'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope } from '../auth/capability'
+import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, planeCoversScope, targetLegacyRoleRank } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
@@ -307,16 +307,34 @@ export async function humanMaxRankOnScope(
   humanGrants: CapabilityGrant[],
   scopeType: CapabilityScopeType,
   scopeId: string | null,
+  /** The human's LEGACY role-plane rank (targetLegacyRoleRank: users.role owner=5/admin=4, else 0). REQUIRED, not
+   *  optional: an optional flag on a rank predicate is the shape that lets one caller silently read capability rows
+   *  alone (S2-0 finding 5). Pass 0 only when the plane is genuinely not in play. */
+  legacyRoleRank: number,
 ): Promise<number> {
   // hasCapabilityOnDynamicScope (not a hand-branched squad/else split): the
   // prior version's `if (scopeType === 'squad' && scopeId)` fell through to
   // the org/department-only branch for `scopeType === 'squad'` with a falsy
   // scopeId — walk the ladder top-down and stop at the first rank the human
   // actually clears, same as canOnSquad resolving department inheritance.
+  let rows = 0
   for (const cap of RANK_ORDER) {
-    if (await hasCapabilityOnDynamicScope(env, humanGrants, scopeType, scopeId, cap)) return capabilityRank(cap)
+    if (await hasCapabilityOnDynamicScope(env, humanGrants, scopeType, scopeId, cap)) {
+      rows = capabilityRank(cap)
+      break
+    }
   }
-  return 0
+  if (legacyRoleRank <= 0) return rows
+  // The legacy role plane (an org owner/admin characteristically holds ZERO capability rows) is an ORG-shaped fact: it
+  // never covers a home squad (planeCoversScope('role')) and a missing/unknown squad row fails CLOSED, exactly as
+  // actorRankOnScopeFor does. It can only raise the human's side of the clamp; the agent's own rank and the seat
+  // ceiling still cap the result, so no one is widened beyond what the agent already holds.
+  if (scopeType === 'squad') {
+    if (!scopeId) return rows
+    const scope = await loadSquadScope(env, scopeId)
+    if (!scope || !planeCoversScope('role', scope)) return rows
+  }
+  return Math.max(rows, legacyRoleRank)
 }
 
 /** Live capabilities a directory session bound to `agentId`, consent-given by
@@ -411,9 +429,10 @@ export async function resolveConsentedAgentCapabilities(
   // removing live protection, and so this file does not misdescribe which line
   // a passing test actually depends on (see this PR's own mutation-table history
   // for why that distinction matters).
+  const humanLegacyRank = await targetLegacyRoleRank(env, consentingMemberId)
   const clamped: CapabilityGrant[] = []
   for (const g of agentGrants) {
-    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
+    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, humanLegacyRank)
     const effectiveRank = Math.min(capabilityRank(g.capability), humanRank)
     if (effectiveRank <= 0) continue
     const clampedCapability = RANK_ORDER.find((c) => capabilityRank(c) === effectiveRank)
