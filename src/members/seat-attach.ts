@@ -22,9 +22,11 @@
 // takes effect on the very next request of every thread.
 //
 // AUTHORITY. The attached context is the SAME clamp every seat has (resolveSeatCapabilities): per scope
-// min(human live rank, agent rank, 'member'), human must be admin on the agent's squad. It never exceeds 'member',
+// min(human live rank, agent rank, the CEILING the human approved: member by default, lead or full only if chosen), human
+// must be admin on the agent's squad. It never exceeds that ceiling,
 // never gains the agent's gate authority (see callerHoldsGateCapability), and never reaches another member's agent:
-// the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent.
+// the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent (and, with
+// SEAT_ATTACH_DESIGNATED on, only agents an org admin designated for this human: attachDesignatedClause).
 //
 // TRUST BOUNDARY. A thread's client key is a SELECTOR (seat-auto.ts). Under that stance whoever holds the harness
 // grant can act as any of its threads; what attach adds is that reaching an agent needs the human's one-time
@@ -37,17 +39,17 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
-import { seatAutoEnrollEnabled } from './harness'
+
 import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding, sha256Hex } from './service'
 import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import { sanitizeLabel } from './harness'
 
-/** The one definition of "is attach on". Strict '1' on both flags: attach without seats means nothing. */
-export function seatAttachEnabled(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL'>): boolean {
-  return env.SEAT_ATTACH === '1' && seatAutoEnrollEnabled(env)
-}
+// The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
+// events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
+export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause } from './attach-designated'
+import { attachDesignatedClause, seatAttachEnabled } from './attach-designated'
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
 export const ATTACH_IDLE_DAYS = 30
@@ -102,11 +104,12 @@ export async function listAttachableAgents(env: Env, humanMemberId: string, refs
       WHERE a.status = 'active'
         AND (b.agent_id IS NULL OR am.id IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM agent_seats s WHERE s.agent_id = a.id)
+        ${attachDesignatedClause(env, 'a', refs ? '?3' : '?2')}
         ${where}
       ORDER BY a.name ASC
       LIMIT 400`,
   )
-  const rows = (refs ? await stmt.bind(refs.ref, env.TENANT_SLUG).all<AgentCandidate>() : await stmt.bind(env.TENANT_SLUG).all<AgentCandidate>()).results ?? []
+  const rows = (refs ? await stmt.bind(refs.ref, env.TENANT_SLUG, humanMemberId).all<AgentCandidate>() : await stmt.bind(env.TENANT_SLUG, humanMemberId).all<AgentCandidate>()).results ?? []
   if (rows.length === 0) return []
   const grants = await resolveCapabilities(env, humanMemberId)
   const out: AttachableAgent[] = []
@@ -232,7 +235,7 @@ export async function ensureAdmission(
           `INSERT INTO agent_seat_admissions
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
            SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
-            WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND status = 'active')
+            WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
@@ -269,11 +272,17 @@ export async function ensureAdmission(
        SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8
         WHERE (SELECT COUNT(*) FROM agent_seat_admissions
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
+          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 ${attachDesignatedClause(env, 'ag', '?4')})
        ON CONFLICT DO NOTHING`,
     ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN).run()
     const inserted = res.meta.changes === 1
     pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
-    if (!pending) return { ok: false, error: 'too_many_pending_admissions' }
+    if (!pending) {
+      // The insert also refuses when the designation changed after the caller resolved the agent: that is not a flood.
+      const stillDesignated = await env.DB.prepare(`SELECT 1 AS x FROM agents ag WHERE ag.id = ?1 ${attachDesignatedClause(env, 'ag', '?2')}`)
+        .bind(p.agentId, p.humanMemberId).first<{ x: number }>()
+      return { ok: false, error: stillDesignated ? 'too_many_pending_admissions' : 'attach_refused' }
+    }
     if (pending.status === 'live') return { ok: true, state: 'live', admission: pending }
     // Lost a concurrent first-ask race: the winner mints the one link. Minting here would rotate it and silently kill the
     // link the winner returned (bot review P2).
@@ -314,6 +323,10 @@ async function admissionRefusal(env: Env, adm: AdmissionRow): Promise<string | n
   const agent = await env.DB.prepare(`SELECT a.status AS status, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ status: string; squad_id: string }>()
   if (!agent || agent.status !== 'active') return 'agent_not_active'
+  // Designation is re-checked at the human's decision with the SAME predicate the list, the chokepoint and the insert use.
+  const designated = await env.DB.prepare(`SELECT 1 AS x FROM agents a WHERE a.id = ?1 ${attachDesignatedClause(env, 'a', '?2')} LIMIT 1`)
+    .bind(adm.agent_id, adm.human_member_id).first<{ x: number }>()
+  if (!designated) return 'agent_not_designated'
   const seatAgent = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE agent_id = ?1 LIMIT 1`).bind(adm.agent_id).first<{ x: number }>()
   if (seatAgent) return 'agent_is_seat_agent'
   // Identity-only (no binding row at all) is admissible: promoteAdmission welds it in the same batch. A binding row whose member is
@@ -343,7 +356,8 @@ async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: stri
     env.DB.prepare(
       `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
-          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active')`,
+          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
+                        ${attachDesignatedClause(env, 'ag', '?3')})`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
@@ -502,6 +516,7 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
         AND s.member_id = att.human_member_id
         AND s.harness_id = att.harness_id
         AND a.status = 'active'
+        ${attachDesignatedClause(env, 'a', '?4')}
         AND EXISTS (SELECT 1 FROM member_tokens g
                      WHERE g.id = ?3 AND g.member_id = ?4 AND g.tenant = ?1
                        AND g.channel = 'directory' AND g.agent_id IS NULL
@@ -586,6 +601,14 @@ export async function attachSeatToAgent(
   if (!resolved.ok) return resolved
   const agent = resolved.agent
 
+  // A live attachment row the designation predicate no longer admits is dead to every reader (findLiveAttachment already serves the
+  // seat agent). Retire it here so it cannot block a new attach with already_attached. No-op while the designation flag is off
+  // (the clause is then a tautology, so NOT EXISTS is false).
+  await env.DB.prepare(
+    `UPDATE agent_seat_attachments SET detached_at = ?3, detach_reason = 'admission_revoked', detached_by_member_id = ?4
+      WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_attachments.agent_id ${attachDesignatedClause(env, 'ag', 'agent_seat_attachments.human_member_id')})`,
+  ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
   const current = await liveAttachmentOfSeat(env, seat.id)
   if (current) {
     if (!p.moveIfAttached) return { ok: false, error: 'already_attached' }
@@ -614,8 +637,9 @@ export async function attachSeatToAgent(
   if (current) {
     statements.push(env.DB.prepare(
       `UPDATE agent_seat_attachments SET detached_at = ?2, detach_reason = 'moved', detached_by_member_id = ?3
-        WHERE id = ?1 AND tenant = ?4 AND detached_at IS NULL`,
-    ).bind(current.id, nowIso, p.humanMemberId, env.TENANT_SLUG))
+        WHERE id = ?1 AND tenant = ?4 AND detached_at IS NULL
+          AND EXISTS (SELECT 1 FROM agents na WHERE na.id = ?5 ${attachDesignatedClause(env, 'na', '?3')})`,
+    ).bind(current.id, nowIso, p.humanMemberId, env.TENANT_SLUG, agent.id))
   }
   const attachIndex = statements.length
   statements.push(env.DB.prepare(
@@ -629,7 +653,8 @@ export async function attachSeatToAgent(
        JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
        JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
       WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)`,
+        AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
+        ${attachDesignatedClause(env, 'a', '?8')}`,
   ).bind(attachmentId, env.TENANT_SLUG, tokenId, nowIso, admission.admission.id, agent.id, seat.id, p.humanMemberId))
   statements.push(env.DB.prepare(
     `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)

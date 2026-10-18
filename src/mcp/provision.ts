@@ -2159,6 +2159,9 @@ export const SELF_FORBIDDEN_FIELDS = [
   // self-grant of exactly that authority — admin-only even on the caller's
   // own row, same reasoning as capabilities/autonomy above.
   'owner_member_id',
+  // attach_designated_member_id (0238): which agents a human's chats may BECOME via seat_attach. Same reasoning as
+  // owner_member_id, stricter: no self-target waiver anywhere (see authorizeOwnerMemberChange).
+  'attach_designated_member_id',
 ] as const
 // The admin-path patch surface. Hoisted out of run() (it used to be an inline
 // literal) so tests can assert the partition invariant: every field here is
@@ -2179,13 +2182,14 @@ export const ADMIN_PATCHABLE_FIELDS = [
   'budget_window',
   'autonomy',
   'owner_member_id',
+  'attach_designated_member_id',
 ] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
   scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
   min: 'authenticated',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, owner_member_id?: string|null, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, owner_member_id?: string|null, attach_designated_member_id?: string|null, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
     ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
     ' but may only patch model/model_fallback/purpose/skills.' +
     ' name/role/slug/owner/owner_member_id/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
@@ -2216,6 +2220,9 @@ const toolUpdateAgent: ToolSpec = {
       // UPDATABLE_MEMBER_REF_COLUMNS in src/org/service.ts for the referential
       // validation (must name a real member in this tenant, or null to clear).
       owner_member_id: STRING_SCHEMA,
+      // attach_designated_member_id (0238): the human whose chats may become this agent via seat_attach (needs SEAT_ATTACH_DESIGNATED).
+      // Org-scope admin floor + target-rank ceiling with NO self-target waiver; seat and attached chats are refused.
+      attach_designated_member_id: { type: ['string', 'null'], description: 'Member id to designate, or null to clear. Org-scope admin required for both.' },
       // parent_agent_id is NOT patchable here. additionalProperties:false makes a
       // caller that still sends it fail loudly at the schema instead of silently
       // dropping the field. See UPDATABLE_TEXT_COLUMNS in src/org/service.ts.
@@ -2358,6 +2365,9 @@ const toolUpdateAgent: ToolSpec = {
     // dashboard owner form, mupot#1987); the rationale above applies to it unchanged.
     const ownerGate = await authorizeOwnerMemberChange(env, auth, agent.id, patch.owner_member_id)
     if (!ownerGate.ok) return fail(ownerGate.status, ownerGate.error, ownerGate.detail)
+    // The attach designation goes through the SAME door, minus the self-target waiver (agent-owner.ts).
+    const designationGate = await authorizeOwnerMemberChange(env, auth, agent.id, patch.attach_designated_member_id, 'attach_designated_member_id')
+    if (!designationGate.ok) return fail(designationGate.status, designationGate.error, designationGate.detail)
 
     // Audit actor: a self-correction is attributed to the agent itself (0086's
     // CHECK already permits actor_type 'agent'), not to the human whose bearer
@@ -2376,12 +2386,15 @@ const toolUpdateAgent: ToolSpec = {
       ? { id: auth.boundAgentId as string, type: 'agent' }
       : { id: auth.memberId as string, type: 'user' }
 
-    const result = await updateAgentProfile(env, agent.id, patch, actor)
+    // The designation door's outgoing-value read travels into the write: if another designation change lands in between, 409.
+    const result = await updateAgentProfile(env, agent.id, patch, actor,
+      patch.attach_designated_member_id !== undefined ? { attach_designated_member_id: designationGate.current ?? null } : undefined)
     if (!result.ok) {
+      if (result.error === 'designation_changed') return fail(409, 'designation_changed', { agent: agentRef })
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
       if (result.error === 'owner_member_not_found') {
-        return fail(404, 'owner_member_not_found', { owner_member_id: args.owner_member_id })
+        return fail(404, 'owner_member_not_found', { owner_member_id: args.owner_member_id ?? args.attach_designated_member_id })
       }
       return fail(400, 'invalid_args', { reason: result.error })
     }

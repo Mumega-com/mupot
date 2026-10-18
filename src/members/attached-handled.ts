@@ -14,6 +14,7 @@
 // VISIBILITY. The attachment's own peek HIDES what it has marked handled (and `remaining` excludes it). Other
 // attachments and the host still see the message: handled is per attachment, never global.
 
+import { attachDesignatedClause } from './attach-designated'
 import type { Env } from '../types'
 
 export const MAX_MARK_HANDLED_IDS = 50
@@ -57,7 +58,8 @@ export async function markMessagesHandledByAttachment(
           AND (m.target_seat IS NULL OR (?5 IS NOT NULL AND m.target_seat = ?5))
           AND COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
           AND EXISTS (SELECT 1 FROM agent_seat_attachments a
-                       WHERE a.id = ?2 AND a.tenant = ?1 AND a.agent_id = ?3 AND a.detached_at IS NULL)`,
+                       WHERE a.id = ?2 AND a.tenant = ?1 AND a.agent_id = ?3 AND a.detached_at IS NULL
+                         AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = a.agent_id ${attachDesignatedClause(env, 'ag', 'a.human_member_id')}))`,
     ).bind(tenant, p.attachmentId, p.agentId, nowIso, p.seat, ...ids).run()
     const rows = await env.DB.prepare(
       `SELECT message_id FROM agent_attachment_handled

@@ -12,6 +12,7 @@
 // The subscription then stores the ATTACHMENT's token (not the human's grant), so every delivery re-derives liveness from that token
 // (subscriberAccessLive) plus an explicit attachment/admission check: detach, revoke, retire or deactivate stops wakes at the next
 // message. The wake is body-free (message_id/seq only), so nothing about identity, retrieval or inbox content is shared.
+import { attachDesignatedClause } from '../members/attach-designated'
 import type { AuthContext, Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
@@ -58,6 +59,7 @@ export async function listLiveAttachmentsForEvents(
          JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
          JOIN harnesses hr ON hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id
         WHERE att.tenant = ?1 AND att.human_member_id = ?2 AND att.harness_id = ?3 AND att.detached_at IS NULL
+          ${attachDesignatedClause(env, 'a', 'att.human_member_id')}
           AND EXISTS (SELECT 1 FROM member_tokens t
                        WHERE t.id = att.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id AND t.tenant = ?1
                          AND t.channel = 'directory' AND ${TOKEN_LIVE_PREDICATE('?5')})

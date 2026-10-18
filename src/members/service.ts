@@ -11,6 +11,7 @@
 // mint atomic batch (member envelope + canonical binding + escalation-guard capability
 // + agent-weld token) is written, so no logic lives in two places.
 
+import { attachDesignatedClause } from './attach-designated'
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten, assertWritten, rowsWritten } from '../lib/receipt'
@@ -450,7 +451,9 @@ export function prepareConditionalIdentityWeld(
   // provisions nothing (the admission UPDATE carries the same clause, so the approval closes rather than going live).
   const pending = `${admissionGuard}
                    AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?2 AND agent_id = ?4)
-                   AND EXISTS (SELECT 1 FROM agents WHERE id = ?4 AND status = 'active')`
+                   AND EXISTS (SELECT 1 FROM agents WHERE id = ?4 AND status = 'active')
+                   AND EXISTS (SELECT 1 FROM agents wa WHERE wa.id = ?4
+                                 ${attachDesignatedClause(env, 'wa', '(SELECT human_member_id FROM agent_seat_admissions WHERE id = ?1)')})`
   const statements = [
     env.DB.prepare(
       `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
