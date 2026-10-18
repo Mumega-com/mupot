@@ -7079,8 +7079,8 @@ const toolOrient: ToolSpec = {
       // session to connect loops straight back here. The two paths that resolve it are an explicit agent and a seat.
       return fail(400, 'invalid_args', [
         'agent required: this session is not an agent yet.',
-        'Pass orient { agent: "<id-or-slug>" } for an agent you can observe.',
         'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as "Many chats"); a seated session then calls orient with no arguments.',
+        'For an agent you can observe, pass orient { agent: "<id-or-slug>" }.',
       ].join(' '))
     }
 

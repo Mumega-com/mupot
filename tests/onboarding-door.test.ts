@@ -65,7 +65,7 @@ const dead = (isDead: boolean): typeof it => (isDead ? it.fails : it)
 // Flip a flag to false when its lane lands. See the header for what each one means.
 const DEAD: Record<string, Record<Kind, boolean>> = {
   seatLoop: { chatgpt: false, claude: true, hermes: false, unknown: false },
-  orientRefusal: { chatgpt: false, claude: true, hermes: false, unknown: true },
+  orientRefusal: { chatgpt: false, claude: false, hermes: false, unknown: true },
   bootstrapRefused: { chatgpt: true, claude: false, hermes: false, unknown: false },
   connectAfterBootstrap: { chatgpt: false, claude: false, hermes: false, unknown: false },
   humanStepOnly: { chatgpt: false, claude: false, hermes: false, unknown: true },

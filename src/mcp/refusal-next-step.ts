@@ -105,7 +105,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
 
   // ── orient / connect ──────────────────────────────────────────────────────────────────────────
   { error: 'invalid_args', tool: 'orient', detailMatch: /agent required/, who_acts: 'self', next_tool: 'orient',
-    next_step: 'orient needs an agent. For one you can observe, call orient { agent: "<id-or-slug>" }. In a chat connector that has no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as "Many chats"); a seated session then calls orient with no arguments.' },
+    next_step: 'orient needs an agent and this session is not one yet. In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as "Many chats"); a seated session then calls orient with no arguments. For an agent you can observe, pass orient { agent: "<id-or-slug>" }.' },
 
   // ── profile door ──────────────────────────────────────────────────────────────────────────────
   { error: 'tool_not_in_profile', who_acts: 'self', next_step: 'This tool is not on this limited endpoint. Use the full endpoint /mcp for this tool.' },
