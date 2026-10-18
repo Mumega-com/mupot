@@ -23,7 +23,7 @@ import { seatAutoEnrollEnabled } from '../members/harness'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { mcpEndpoint } from '../dashboard/connect'
-import { consentChoiceLabels, consentLabels, SEAT_SELECT_STEP as TABLE_SEAT_SELECT_STEP, type WhoActs as TableWhoActs } from './refusal-next-step'
+import { consentChoiceLabels, consentLabels, refusalGuidance, SEAT_SELECT_STEP as TABLE_SEAT_SELECT_STEP, type WhoActs as TableWhoActs } from './refusal-next-step'
 
 export type WhoamiState = 'no_agent' | 'own_seat' | 'acting_as' | 'host' | 'harness_unseated'
 export type WhoActs = TableWhoActs // one vocabulary with the refusal envelope (refusal-next-step.ts)
@@ -121,12 +121,36 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
     })
   }
   if (auth.seatInputs?.autoSeatRefused) {
-    missing.push({
-      code: 'auto_seat_refused',
-      who_acts: seatSelectCallable ? 'self' : 'owner',
-      next_step: `this chat's automatic seat was refused (${auth.seatInputs.autoSeatRefused}), so it has no agent of its own. ${seatSelectCallable ? SEAT_SELECT_STEP : `Your human can reconnect the connector and pick ${labels.many} to retry.`}`,
-      ...(seatSelectCallable ? { next_tool: 'seat_select' } : { link: consentUrl }),
-    })
+    const reason = auth.seatInputs.autoSeatRefused
+    // seat_select runs the same resolveOrCreateSeat path as the auto seat, so a reason that cannot clear on retry is refused
+    // again with the same code. Each such reason maps to the actor and sentence of the refusal table's own row (one text).
+    const g = refusalGuidance(reason, 403, undefined, 'seat_select', { kind: 'chat_harness', choiceLabels: consentChoiceLabels(env), origin: ctx.origin })
+    if (reason === 'harness_required' || reason === 'member_not_active' || reason === 'home_rank_insufficient') {
+      missing.push({
+        code: 'auto_seat_refused',
+        who_acts: g.who_acts,
+        next_step: `this chat's automatic seat was refused (${reason}). ${g.next_step ?? ''}`.trim(),
+        ...(reason === 'harness_required' ? { link: consentUrl } : {}),
+      })
+    } else if (reason === 'seat_cap_reached' || reason === 'rate_limited') {
+      // The auto pool has its own cap and window (migration 0205), separate from the select pool seat_select draws on, so seat_select
+      // is expected to work. The step is the refusal table's seat_cap_reached row ("call seat_select with the same labels").
+      const row = refusalGuidance('seat_cap_reached', 403, undefined, 'seat_select', { kind: 'chat_harness', choiceLabels: consentChoiceLabels(env), origin: ctx.origin })
+      missing.push({
+        code: 'auto_seat_refused',
+        who_acts: row.who_acts,
+        next_step: `this chat's automatic seat was refused (${reason}). ${row.next_step ?? ''}`.trim(),
+        ...(seatSelectCallable && row.next_tool ? { next_tool: row.next_tool } : {}),
+      })
+    } else {
+      // Reasons that can clear on retry (seat_not_live, error, no_capabilities, ...) keep the seat_select step.
+      missing.push({
+        code: 'auto_seat_refused',
+        who_acts: seatSelectCallable ? 'self' : 'owner',
+        next_step: `this chat's automatic seat was refused (${reason}), so it has no agent of its own. ${seatSelectCallable ? SEAT_SELECT_STEP : `Your human can reconnect the connector and pick ${labels.many} to retry.`}`,
+        ...(seatSelectCallable ? { next_tool: 'seat_select' } : { link: consentUrl }),
+      })
+    }
   }
   if (auth.seatInputs?.attachRefused) {
     missing.push({
@@ -148,7 +172,8 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
   if (state === 'harness_unseated') {
     if (seatAutoEnrollEnabled(env)) {
       // A seat handle was already shown the dead-end way if handleRejected; seat_select is the one next move either way.
-      if (!missing.some((m) => m.next_tool === 'seat_select')) {
+      // A refused auto seat has already said what to do (its reason decides whether seat_select can work): no second, generic step.
+      if (!missing.some((m) => m.next_tool === 'seat_select' || m.code === 'auto_seat_refused')) {
         missing.push({ code: 'seat_required', who_acts: 'self', next_step: SEAT_SELECT_STEP, next_tool: 'seat_select' })
       }
     } else {
@@ -249,6 +274,8 @@ export function whoamiDoorFilter(env: Env, auth: AuthContext, w: Whoami): (tool:
     if (tool === 'bootstrap_self') return offered.has('bootstrap_self')
     if (tool === 'seat_select') return offered.has('seat_select')
     if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat'
+    // K3/K4: connect needs a slug this caller was never handed (the step is a human re-consent or seat_select), so it is not a door.
+    if (tool === 'connect' && (w.state === 'no_agent' || w.state === 'harness_unseated')) return false
     // K2 (member token, no agent): connect answers no_squad_access and the step is an org admin's mint_agent_token, so only that stays.
     if (w.state === 'no_agent' && auth.channel !== 'directory') return tool === 'mint_agent_token' || tool === 'status' || tool === 'boot_context'
     return true

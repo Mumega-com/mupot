@@ -210,8 +210,16 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
   // dead end human-step-only: boot's first door after the walk is a tool:null human step
   dead(DEAD.humanStepOnly[kind])('boot does not lead with a human step (tool:null door) as the first move', () => {
     pre()
+    const first = toolDoors(t.boot2).find((x) => !SKIP.includes(x)) // the first real tool door, past status/boot_context
     expect(doorList(t.boot2)[0]?.tool).not.toBeNull()
     expect(t.humanSteps).toEqual([])
+    // the human step lives in whoami.missing[0] (who_acts owner/org_admin, no tool for this caller), and connect is no door for a caller with no slug
+    const step = asObj(asArr(asObj(t.boot2.whoami).missing)[0])
+    if (kind === 'unknown') {
+      expect(['owner', 'org_admin']).toContain(step.who_acts)
+      expect(step.next_tool).toBeUndefined()
+      expect(first).not.toBe('connect')
+    }
   })
 
   // dead end orient-refusal: bound -> a real packet about the bound agent; unbound -> an envelope naming a callable door
