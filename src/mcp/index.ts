@@ -7483,6 +7483,7 @@ export const SEAT_ARG_WORK_LOOP: readonly string[] = [
   'task_board', 'task_get', 'task_list', 'task_update', 'inbox_ack', 'needs_you_list', 'project_context', 'project_list',
   'seat_attach', 'peers', 'resolve_agent', 'squad_message',
 ].filter((n) => TOOL_BY_NAME.has(n))
+const SEAT_ARG_RECEIPT_TOOLS: ReadonlySet<string> = new Set(['boot_context', 'orient', 'status', 'check_in'])
 /** Tools whose schema gained `seat` here (not natively): the curated profile door never advertises it. */
 const SEAT_ARG_INJECTED: Set<string> = new Set()
 for (const spec of TOOLS) {
@@ -8092,6 +8093,14 @@ async function handleJsonRpc(
     const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
+    }
+    // Lane C: a `seat` ARGUMENT that did not resolve is refused outright on the work tools, so a wrong value (the seat row
+    // id, a label, a stale handle) never silently runs the call as the human with no agent. The tools that RETURN the
+    // identity receipt (boot_context, orient, status, check_in) keep showing seat_handle_rejected instead.
+    if (profile === undefined && auth.seatInputs?.handleRejected === true && typeof canonicalName === 'string'
+      && seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(canonicalName)) !== null
+      && !SEAT_ARG_RECEIPT_TOOLS.has(canonicalName) && canonicalName !== 'seat_select') {
+      return ok(id, mcpToolRefusalResult(canonicalName, 403, 'seat_handle_rejected', { reason: 'seat_argument_not_accepted' }))
     }
     // mupot#1794 W4: shared-credential detection (SHARED_CREDENTIAL_DETECT, default off). Records a
     // session fingerprint against the CREDENTIAL (a seat session's credential is the human's grant

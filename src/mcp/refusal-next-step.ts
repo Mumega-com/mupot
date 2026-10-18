@@ -178,13 +178,16 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'This tool is not on this limited endpoint, and a session cannot change its own endpoint. Whoever configured this connector points it at the full endpoint {full_mcp}. {reach}' },
   { error: 'profile_args_not_allowed', who_acts: 'self', next_step: 'Those arguments are not allowed on this limited endpoint. Call the tool again without them.' },
 
+  { error: 'seat_handle_rejected', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
+    next_step: 'That `seat` value was not accepted: it must be the mseat_ handle seat_select returned (not a seat id, label or agent id). Pass the mseat_ value on every call; if it is lost or stale, call seat_select again with the same project (it returns the same agent and a new handle).' },
+
   // ── a harness session that is not presenting its seat (a forgotten `seat` argument looks like a missing grant) ──
   { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, reasonIs: 'directory_channel_zero_capability', who_acts: 'self', next_tool: 'seat_select', overridesReason: true,
     next_step: LOST_SEAT_STEP },
   { error: 'forbidden', kinds: ['chat_harness'], notTools: ['connect'], status: 403, needsNeed: true, who_acts: 'self', next_tool: 'seat_select', next_step: LOST_SEAT_STEP },
 
   // ── send to an agent this session cannot see ──────────────────────────────────────────────────
-  { error: 'send_target_not_visible', who_acts: 'owner',
+  { error: 'send_target_not_visible', who_acts: 'owner', next_tool: 'squad_join_request',
     next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). {reach}' },
 
   // ── generic floors ────────────────────────────────────────────────────────────────────────────

@@ -1239,9 +1239,13 @@ describe('seat argument: round 2 pins', () => {
     expect(JSON.stringify(orient.body)).not.toContain('unknown field')
     const t = await rpc(env, g.ctx, 'task_list', { seat: a.seatId })
     expect(JSON.stringify(t.body)).not.toContain('unknown field')
-    // the verdict itself: receipt on a tool that carries one
-    const st = await rpc(env, g.ctx, 'status', { seat: a.seatId })
-    expect(receiptOf(st)?.seat_handle_rejected ?? true).toBe(true)
+    // the verdict: a work tool REFUSES with seat_handle_rejected + the recovery step; it does not run as the human
+    const refused = await rpc(env, g.ctx, 'task_list', { seat: a.seatId })
+    expect(refused.body.error).toBeUndefined()
+    expect(refused.sc).toMatchObject({ ok: false, error: 'seat_handle_rejected', who_acts: 'self', next_tool: 'seat_select' })
+    expect(String(refused.sc.next_step)).toContain('mseat_')
+    const ok = await rpc(env, g.ctx, 'task_list', { seat: a.handle })
+    expect(ok.sc.error).toBeUndefined()
   })
 
   it('seat_select ignores its own handle on the argument: a re-select returns the same agent and a new handle', async () => {
