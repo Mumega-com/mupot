@@ -27,7 +27,19 @@ export interface InstallerTierDef {
   readonly maxGrant: 'member' | 'lead'
   readonly acts: ReadonlySet<StructuralAction>
   readonly durationsMinutes: readonly number[]
+  /** Per-window cap on authorised structural writes (pending or applied usage rows). Refused attempts do not count. */
+  readonly writeCap: number
 }
+
+/**
+ * Standing grants made under ANY window are capped at MEMBER, whatever the tier ceiling (safe default pending Hadi's decision;
+ * same precedent as the elevated-grant cap in src/mcp/provision.ts). The lead ceiling stays in force for the target-standing
+ * check (what the window may touch) but not for what it may confer.
+ */
+export const INSTALLER_STANDING_GRANT_CAP = 'member' as const
+
+/** Failed (refused) usage rows kept per window; past this a refusal is still returned but no longer logged, so the log cannot be flooded. */
+export const INSTALLER_REFUSED_LOG_CAP = 100
 
 const STANDARD_ACTS: readonly StructuralAction[] = [
   'squad_member_add',
@@ -47,6 +59,7 @@ export const INSTALLER_TIERS: Readonly<Record<InstallerTier, InstallerTierDef>> 
     maxGrant: 'member',
     acts: new Set<StructuralAction>(STANDARD_ACTS),
     durationsMinutes: [15, 60, 240],
+    writeCap: 50,
   },
   high: {
     tier: 'high',
@@ -54,6 +67,7 @@ export const INSTALLER_TIERS: Readonly<Record<InstallerTier, InstallerTierDef>> 
     maxGrant: 'lead',
     acts: new Set<StructuralAction>([...STANDARD_ACTS, 'grant_agent_capability']),
     durationsMinutes: [15, 60, 240, 480],
+    writeCap: 200,
   },
 }
 

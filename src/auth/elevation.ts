@@ -370,6 +370,10 @@ export interface DecideElevationInput {
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
   recentReauthOk: boolean
+  /** TRUE only when the decision's proof is a passkey-class assertion (WebAuthn UV, or the access passkey login): the
+   *  channel adapters set it from PASSKEY_CLASS_VIA. action:install_high is refused without it; a fresh IdP reauth or a
+   *  Telegram device secret is not enough for it. Unset = not passkey-class. */
+  decidedViaPasskey?: boolean
   note?: string
 }
 
@@ -673,9 +677,19 @@ export async function findElevationDecisionRefusal(
 
     // An attached chat's request is ALWAYS a step-up decision (a fresh passkey / reauth), whatever the action's own
     // sensitivity: it is the human lending their own admin to a chat, the one thing a stale session must not do.
-    const needsStepUp = attachmentOrigin !== null || selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
+    // Installer window: not in SENSITIVE_STEP_UP_ACTIONS for the standard tier (Telegram's biometric may carry it) but it is never
+    // approvable from a plain live dashboard session: a step-up (Mini App biometric / passkey / fresh reauth) is required for
+    // both tiers, and the high tier needs a PASSKEY-class assertion specifically. Flag off: neither can be approved at all.
+    const installing = selected.filter(isInstallerAction)
+    if (installing.length > 0 && !installerWindowEnabled(env)) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'the installer window is not enabled on this pot' }
+    }
+    const needsStepUp = attachmentOrigin !== null || installing.length > 0 || selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
     if (needsStepUp && !input.recentReauthOk) {
       return { ok: false, reason: 'reauth_required' }
+    }
+    if (selected.includes('action:install_high') && input.decidedViaPasskey !== true) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:install_high is approved with a passkey; open the approval link in your browser' }
     }
   }
   return null

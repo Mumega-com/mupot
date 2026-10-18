@@ -27,6 +27,7 @@ import type { StructuralAction } from './chokepoint'
 import type { DelegationRow } from './delegations'
 import {
   INSTALLER_ACTION_KEYS,
+  INSTALLER_STANDING_GRANT_CAP,
   INSTALLER_TIERS,
   installerTierForAction,
   installerWindowEnabled,
@@ -133,6 +134,10 @@ export interface InstallerWindowView {
   expires_at: string
   acts: string[]
   used: number
+  /** Per-window write cap (authorised writes). */
+  write_cap: number
+  /** Standing grants made under this window are capped at this rank, whatever the tier (pending Hadi's decision). */
+  standing_grant_cap: 'member'
 }
 
 /** What the elevated agent sees in whoami: its widest live window, or nothing. Flag off => undefined, no reads. */
@@ -155,6 +160,8 @@ export async function installerWindowView(env: Env, auth: AuthContext): Promise<
     expires_at: w.grant.expires_at,
     acts: [...INSTALLER_TIERS[w.tier].acts].sort(),
     used: used?.n ?? 0,
+    write_cap: INSTALLER_TIERS[w.tier].writeCap,
+    standing_grant_cap: INSTALLER_STANDING_GRANT_CAP,
   }
 }
 

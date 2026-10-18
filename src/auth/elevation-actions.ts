@@ -224,17 +224,17 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     key: 'action:install_standard',
     enforced: true,
     label: 'Installer window (standard)',
-    description: 'Time-boxed: organise squads, agents and project access up to MEMBER standing inside the scope you grant. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
+    description: 'Time-boxed (max 50 writes): organise squads, agents and project access up to MEMBER standing inside the scope you grant. Cannot attach a project to a squad the agent itself belongs to, and cannot downgrade or remove anything above member. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
     effect: 'reversible',
     effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. Squads, agents and access edges it creates can be edited or removed by standing authority afterwards.',
   },
   'action:install_high': {
     key: 'action:install_high',
     enforced: true,
-    label: 'Installer window (high: up to lead)',
-    description: 'Time-boxed: everything in the standard window plus granting agents up to LEAD standing, inside the scope you grant. Passkey only. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
+    label: 'Installer window (high: may touch up to lead; grants capped at member)',
+    description: 'Time-boxed (max 200 writes), passkey only: everything in the standard window plus it may touch agents that hold up to LEAD standing and use grant_agent_capability. Standing grants it makes are still capped at MEMBER. Never mints credentials, never grants admin or gates, never touches humans or home squads.',
     effect: 'reversible',
-    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. A lead grant made inside the window stays until standing authority removes it.',
+    effectNote: 'Every act is receipted and ends at expiry; the window is revocable in one tap. Standing grants made inside the window (capped at member) stay until standing authority removes them.',
   },
 })
 

@@ -309,6 +309,7 @@ export async function decideElevation(
     decidedByWebSessionHash: webSessionHash,
     // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up.
     recentReauthOk: true,
+    decidedViaPasskey: PASSKEY_CLASS_VIA.has(proof.via),
     note: `via:${proof.via}`,
   })
   const refusal = await findElevationDecisionRefusal(env, decideInput('', capabilities, hasWorkspaceAdmin(input.auth)), pre)

@@ -46,7 +46,7 @@ import {
   liveInstallerWindows,
   type LiveInstallerWindow,
 } from './installer-window'
-import { installerWindowEnabled } from './installer-tiers'
+import { INSTALLER_REFUSED_LOG_CAP, INSTALLER_STANDING_GRANT_CAP, INSTALLER_TIERS, installerWindowEnabled } from './installer-tiers'
 
 /** Every act that writes org structure, standing authority or credentials. The registry is the ratchet's source. */
 export type StructuralAction =
@@ -821,7 +821,19 @@ export async function authorizeStructuralWrite(
       const resolved = typeof target === 'function' ? await target() : target
       if (isRefusal(resolved)) return resolved
       const verdict = await evaluateDelegated(env, auth, action, resolved, delegations, surface)
-      if (verdict.kind === 'delegated') return withInstallerUsage(env, auth, action, installer.windows, verdict)
+      if (verdict.kind === 'delegated') {
+        const w = installerWindowOf(installer.windows, verdict)
+        if (w) {
+          // Window-only fences the delegation engine does not know (self-benefit through a container, destroying authority above the
+          // ceiling, the standing-grant cap, the per-window write cap). The receipt is already written: close it refused.
+          const fenced = await installerFence(env, auth, action, verdict, w)
+          if (fenced) {
+            await finishDelegatedReceipt(env, verdict, false)
+            return refusedUnderWindow(env, auth, action, installer.windows, fenced)
+          }
+        }
+        return withInstallerUsage(env, auth, action, installer.windows, verdict)
+      }
       // A refusal that is about the CEILING or a hard rule must not silently fall to a lane that was not asked for.
       if (verdict.error !== 'outside_delegation_scope') return refusedUnderWindow(env, auth, action, installer.windows, verdict)
       // Outside every delegation: only a live elevation lane may still apply.
@@ -843,6 +855,94 @@ export async function authorizeStructuralWrite(
 }
 
 // ── installer window: usage log + refusal wording (flag on only; none of this is reached with the flag off) ──────────
+
+/** The window whose synthesized row covered (or attached for) this verdict, if any. */
+function installerWindowOf(windows: LiveInstallerWindow[], verdict: DelegatedAuthorization): LiveInstallerWindow | undefined {
+  const ids = [verdict.delegation.id, verdict.attachDelegation?.id].filter((x): x is string => typeof x === 'string' && isInstallerDelegationId(x))
+  return windows.find((w) => ids.includes(`elev:${w.grant.id}`))
+}
+
+/** Does the caller already belong to this squad, or to its department, by ANY route: its home squad (agents.squad_id), a
+ *  membership row, or a live rank on it (seat capabilities incl. inheritance)? Used only for the window's self-benefit fence. */
+async function callerBelongsToSquadOrDepartment(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
+  const agentId = auth.boundAgentId as string // only reached for a bound-agent caller
+  const target = await loadSquad(env, squadId)
+  if (!target) return false
+  const mine = await env.DB.prepare(
+    `SELECT s.id AS id, s.department_id AS department_id
+       FROM squads s
+      WHERE s.id IN (SELECT squad_id FROM agents WHERE id = ?1 AND squad_id IS NOT NULL)
+         OR s.id IN (SELECT squad_id FROM memberships WHERE agent_id = ?1)`,
+  )
+    .bind(agentId)
+    .all<{ id: string; department_id: string }>()
+  for (const m of mine.results ?? []) {
+    if (m.id === squadId || m.department_id === target.department_id) return true
+  }
+  const rank = auth.memberId ? await currentMemberRankOnScope(env, auth.memberId, 'squad', squadId) : 0
+  return rank > 0
+}
+
+async function windowRowCount(env: Env, auth: AuthContext, grantId: string, failed: boolean): Promise<number> {
+  const r = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM elevation_usage_log WHERE tenant = ?1 AND elevation_grant_id = ?2 AND ${failed ? "status = 'failed'" : "status <> 'failed'"}`,
+  )
+    .bind(auth.tenant, grantId)
+    .first<{ n: number }>()
+  return r?.n ?? 0
+}
+
+/**
+ * Fences that only an installer window needs (the delegation engine judges what an act confers and whom it touches; it does
+ * not know the caller is also a beneficiary of the container, nor what the act destroys). Returns a refusal or null.
+ *  - write cap per window
+ *  - project edge acts on a squad (or department) the caller itself belongs to: the edge outlives the window and widens the caller
+ *  - project edge acts (set/downgrade/remove) over an existing edge ABOVE the tier ceiling
+ *  - standing grants above MEMBER (INSTALLER_STANDING_GRANT_CAP), whatever the tier ceiling
+ */
+async function installerFence(
+  env: Env,
+  auth: AuthContext,
+  action: StructuralAction,
+  verdict: DelegatedAuthorization,
+  w: LiveInstallerWindow,
+): Promise<StructuralRefusal | null> {
+  const def = INSTALLER_TIERS[w.tier]
+  if ((await windowRowCount(env, auth, w.grant.id, false)) >= def.writeCap) {
+    return refuse(403, 'installer_window_cap_reached', {
+      act: action, cap: def.writeCap, who_acts: 'owner', next_tool: 'request_elevation', needs: 'human_approval',
+      next_step: `This installer window reached its ${def.writeCap}-write cap. Ask your human for a new window if you still need one: request_elevation { actions: ["${def.action}"], scope_type, duration_minutes: 60, reason }.`,
+    })
+  }
+  const t = verdict.target
+  if ((action === 'project_squad_set' || action === 'project_squad_remove') && t.squadId) {
+    if (await callerBelongsToSquadOrDepartment(env, auth, t.squadId)) {
+      return refuse(403, 'installer_self_benefit', {
+        act: action, reason: 'own_container', who_acts: 'owner', needs: 'human_approval',
+        next_step: 'A window cannot attach or detach a project on a squad (or department) this agent itself belongs to: the edge outlives the window and widens the agent. Ask your human to make that edge.',
+      })
+    }
+    if (t.projectId) {
+      const edge = await env.DB.prepare('SELECT access_level FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2 LIMIT 1')
+        .bind(t.projectId, t.squadId)
+        .first<{ access_level: ProjectAccessLevel }>()
+      if (edge && capabilityRank(LEVEL_TO_CAPABILITY[edge.access_level]) > capabilityRank(def.maxGrant)) {
+        return refuse(403, 'requires_human_approval', {
+          requires_human_approval: true, act: action, reason: 'existing_edge_above_ceiling', who_acts: 'owner', needs: 'human_approval',
+          next_step: 'That project edge is above what this window may touch (changing or removing it would destroy authority above the window). Ask your human.',
+        })
+      }
+    }
+  }
+  const confers: Capability | null = t.projectAccessLevel ? LEVEL_TO_CAPABILITY[t.projectAccessLevel] : (t.capability ?? null)
+  if (confers && capabilityRank(confers) > capabilityRank(INSTALLER_STANDING_GRANT_CAP)) {
+    return refuse(403, 'requires_human_approval', {
+      requires_human_approval: true, act: action, reason: 'installer_standing_grant_cap_member', who_acts: 'owner', needs: 'human_approval',
+      next_step: 'Standing grants made inside an installer window are capped at member. Ask your human to grant anything higher directly.',
+    })
+  }
+  return null
+}
 
 /** One elevation_usage_log row per authorised act, opened 'pending' BEFORE the write and closed with the chokepoint receipt. */
 async function withInstallerUsage(
@@ -883,21 +983,24 @@ async function refusedUnderWindow(
 ): Promise<StructuralRefusal> {
   const w = windows[0]
   if (!w) return refusal
-  const usageId = await beginElevationReceipt(
-    env,
-    auth.tenant,
-    { id: w.grant.id, agent_session_id: w.agentSessionId, action: w.grant.action },
-    action,
-    { act: action, tier: w.tier, refusal: refusal.error },
-  )
-  await finishElevationReceipt(env, usageId, { status: 'failed', errorCode: refusal.error })
+  // The refusal is always returned; only the LOG is capped, so an agent cannot flood the usage table by hammering a refused act.
+  if ((await windowRowCount(env, auth, w.grant.id, true)) < INSTALLER_REFUSED_LOG_CAP) {
+    const usageId = await beginElevationReceipt(
+      env,
+      auth.tenant,
+      { id: w.grant.id, agent_session_id: w.agentSessionId, action: w.grant.action },
+      action,
+      { act: action, tier: w.tier, refusal: refusal.error },
+    )
+    await finishElevationReceipt(env, usageId, { status: 'failed', errorCode: refusal.error })
+  }
   const detail: Record<string, unknown> = { ...(refusal.detail ?? {}), installer_window: w.tier }
-  if (refusal.error === 'requires_human_approval' && w.tier === 'standard') {
+  if (refusal.error === 'requires_human_approval' && w.tier === 'standard' && detail.next_step === undefined) {
     detail.who_acts = 'owner'
     detail.next_step = ASK_HIGH
     detail.next_tool = 'request_elevation'
     detail.needs = 'human_approval'
-  } else if (refusal.error === 'outside_delegation_scope') {
+  } else if (refusal.error === 'outside_delegation_scope' && detail.next_step === undefined) {
     detail.who_acts = 'owner'
     detail.next_step = 'This act is outside the scope your installer window covers. Ask your human for a window whose scope_type/scope_id covers it: request_elevation { actions: ["action:install_' + w.tier + '"], scope_type, scope_id, duration_minutes: 60, reason }.'
     detail.next_tool = 'request_elevation'
