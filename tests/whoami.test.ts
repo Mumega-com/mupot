@@ -321,8 +321,7 @@ describe('auto_seat_refused: the step names the actor who can clear the reason (
     try {
       const c = await oauthClient(w, 'chatgpt', 'ChatGPT', HARNESS_CHOICE, { 'openai/session': 'conv-A' })
       expect(whoamiOf((await call(w, c, 'boot_context')).body).state).toBe('own_seat') // the first conversation seats fine
-      const human = w.h.sqlite.prepare("SELECT id FROM members WHERE email = 'chatgpt@pot.test'").get() as { id: string }
-      w.h.sqlite.prepare("UPDATE capabilities SET capability = 'member' WHERE member_id = ? AND scope_type = 'squad' AND capability = 'admin'").run(human.id)
+      w.h.sqlite.exec("UPDATE capabilities SET capability = 'member' WHERE member_id = (SELECT id FROM members WHERE email = 'chatgpt@pot.test') AND scope_type = 'squad' AND capability = 'admin'")
       c.meta = { 'openai/session': 'conv-B' }
       const wh = whoamiOf((await call(w, c, 'boot_context')).body)
       const m = wh.missing.find((x) => x.code === 'auto_seat_refused')
