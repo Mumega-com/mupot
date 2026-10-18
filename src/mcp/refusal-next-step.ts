@@ -196,7 +196,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
 
   // ── send to an agent this session cannot see ──────────────────────────────────────────────────
   { error: 'send_target_not_visible', who_acts: 'owner', next_tool: 'squad_join_request',
-    next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). {reach}' },
+    next_step: 'That agent is not on a squad this session can see, so it cannot be reached from here. Ask the owner of the squad it sits on to add this seat to it (squad_join_request, or an admin adds it with squad_member_add). To answer an agent that messaged you, resend with in_reply_to set to that message\'s id (or its request_id): a reply to the sender of a message addressed to you is allowed even from outside its squad, for 7 days. {reach}' },
 
   // ── generic floors ────────────────────────────────────────────────────────────────────────────
   { error: 'forbidden', tool: 'orient', status: 403, needsNeed: true, who_acts: 'owner',

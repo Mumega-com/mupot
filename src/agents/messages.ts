@@ -2771,6 +2771,59 @@ function systemSenderRefusal(ref: string): SendFailure {
   }
 }
 
+// ── REPLY exception ───────────────────────────────────────────────────────────────────────
+// A home-squad seat can send to an agent it can see, but that agent cannot answer: nothing of
+// the replier's grants covers the home squad (home-squad privacy), so the answer was refused
+// with send_target_not_visible and requests arrived without any way back. A reply is a
+// different authority from "may address": the caller was ADDRESSED by the target, so it may
+// answer that one sender. Narrow by construction, all of these must hold:
+//   - in_reply_to names a message in THIS tenant (id, or the sender's request_id for the ack
+//     protocol) whose to_agent is the caller's own agent and whose from_agent is the target;
+//   - the message is no older than REPLY_WINDOW_MS;
+//   - at most REPLY_CAP_PER_MESSAGE replies per original message have been sent;
+//   - the target is exactly that one sender: matched by id/slug/name of THAT row only, so the
+//     exception never resolves a ref to anyone else and never reveals any other agent.
+// It grants no visibility: roster, peers, lists and every other tool are untouched, and any
+// failure here falls back to the ordinary collapsed send_target_not_visible.
+export const REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+export const REPLY_CAP_PER_MESSAGE = 20
+
+type ReplyResolution =
+  | { ok: true; value: SendAgentRow }
+  | { ok: false; capped: boolean }
+
+async function resolveReplyTarget(
+  env: Env,
+  input: { fromAgent: string; toRef: string; inReplyTo?: string },
+  nowIso: string,
+): Promise<ReplyResolution> {
+  const tenant = env.TENANT_SLUG
+  const ref = input.inReplyTo
+  if (!tenant || ref === undefined || !RID_RE.test(ref)) return { ok: false, capped: false }
+  const cutoff = new Date(Date.parse(nowIso) - REPLY_WINDOW_MS).toISOString()
+  const orig = await env.DB.prepare(
+    `SELECT m.id AS mid, a.id, a.squad_id, a.slug, a.name
+       FROM agent_messages m
+       JOIN agents a ON a.id = m.from_agent
+      WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
+        AND julianday(m.created_at) >= julianday(?4)
+        AND a.status != 'inactive'
+      ORDER BY m.seq DESC LIMIT 1`,
+  ).bind(tenant, input.fromAgent, ref, cutoff).first<SendAgentRow & { mid: string }>()
+  if (!orig) return { ok: false, capped: false }
+  const toRef = input.toRef.trim()
+  const stripped = stripOneLeadingAt(toRef)
+  const matches = (r: string): boolean =>
+    r === orig.id || r === orig.slug || r.toLowerCase() === orig.name.toLowerCase()
+  if (!matches(toRef) && !(stripped !== null && matches(stripped))) return { ok: false, capped: false }
+  const used = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM agent_messages
+      WHERE tenant = ?1 AND from_agent = ?2 AND to_agent = ?3 AND in_reply_to = ?4`,
+  ).bind(tenant, input.fromAgent, orig.id, ref).first<{ n: number }>()
+  if ((used?.n ?? 0) >= REPLY_CAP_PER_MESSAGE) return { ok: false, capped: true }
+  return { ok: true, value: { id: orig.id, squad_id: orig.squad_id, slug: orig.slug, name: orig.name } }
+}
+
 export async function sendToRef(
   env: Env,
   input: {
@@ -2872,6 +2925,18 @@ export async function sendToRef(
     if (stripped !== null) {
       const retried = await attemptResolve(stripped)
       if (retried.ok) attempt = retried
+    }
+  }
+  if (!attempt.ok && attempt.reason === 'send_target_not_visible' && input.inReplyTo !== undefined) {
+    const reply = await resolveReplyTarget(env, input, (opts.now ?? (() => new Date().toISOString()))())
+    if (reply.ok) {
+      attempt = { ok: true, resolved: { value: reply.value }, squadViaProjectOnly: false }
+    } else if (reply.capped) {
+      return {
+        ok: false,
+        reason: 'send_target_not_visible',
+        detail: `reply limit reached: at most ${REPLY_CAP_PER_MESSAGE} replies per original message`,
+      }
     }
   }
   if (!attempt.ok) return { ok: false, reason: attempt.reason }
