@@ -694,3 +694,181 @@ describe('the designation door: agent ceiling and outgoing-designee ceiling', ()
     expect((await designate(env, 'agent-rava', null, ownerAuth())).ok).toBe(true)
   })
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// Codex review round: dispositions pinned by tests.
+describe('codex review dispositions', () => {
+  const liveAtt = (agent: string): number => n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE agent_id = ? AND detached_at IS NULL`, agent)
+  const dropTrigger = (): void => { h.sqlite.exec(`DROP TRIGGER IF EXISTS agents_attach_designation_end`) }
+  const raceOnBatch = (env: Env, onFirstBatch: () => Promise<void>): Env => {
+    const realDb = env.DB
+    let raced = false
+    const racing = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === 'batch') return async (stmts: Parameters<typeof realDb.batch>[0]) => { if (!raced) { raced = true; await onFirstBatch() } return target.batch(stmts) }
+        const v = Reflect.get(target, prop, receiver)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+    return { ...env, DB: racing } as Env
+  }
+
+  it('P1 schema: update_agent advertises attach_designated_member_id as string OR null', () => {
+    const t = advertisedTools(envFor(h, DESIGNATED)).find((x) => x.name === 'update_agent')!
+    const prop = (t.inputSchema as { properties: Record<string, { type: unknown }> }).properties.attach_designated_member_id
+    expect(prop.type).toEqual(['string', 'null'])
+  })
+
+  it('P1 floor on CLEAR: a squad admin without the org floor cannot clear a designation; an org admin can', async () => {
+    const env = envFor(h, DESIGNATED)
+    await designate(env, 'agent-rava', HUMAN)
+    const squadAdmin = { ...orgAdminAuth(HUMAN), capabilities: [{ member_id: HUMAN, scope_type: 'squad', scope_id: 'squad-core', capability: 'admin' }] as CapabilityGrant[] }
+    const r = await designate(env, 'agent-rava', null, squadAdmin)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toBe('forbidden')
+    expect(designatedOf('agent-rava')).toBe(HUMAN)
+    expect((await designate(env, 'agent-rava', null)).ok).toBe(true)
+  })
+
+  it('P1 revival (probe G): a pre-flag live admission + attachment is ended on the FIRST designation; same human needs a new passkey', async () => {
+    const off = envFor(h)
+    const g = await grant(off, HUMAN)
+    const key = await admitAndAttach(off, g, 'conv-g')
+    const on = envFor(h, DESIGNATED)
+    expect((await boot(on, g, 'conv-g')).sc.bound_agent_id).not.toBe('agent-rava') // flag on, undesignated: serves seat agent
+    expect((await designate(on, 'agent-rava', HUMAN)).ok).toBe(true)
+    expect((await boot(on, g, 'conv-g')).sc.bound_agent_id).not.toBe('agent-rava') // NOT revived
+    expect(liveAtt('agent-rava')).toBe(0)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('revoked')
+    const again = await attach(on, g, 'conv-g', 'rava')
+    expect(again.sc.status).toBe('pending_admission')
+    expect((await decideMoment(on, String(again.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await attach(on, g, 'conv-g', 'rava')).sc.status).toBe('attached')
+  })
+
+  it('P1 revival: a designation for H ends OTHER humans\' live and pending admissions of that agent too', async () => {
+    const off = envFor(h)
+    const g1 = await grant(off, HUMAN)
+    await admitAndAttach(off, g1, 'conv-1')
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h2-core', '${HUMAN2}', 'squad', 'squad-core', 'admin')`)
+    const g2 = await grant(off, HUMAN2)
+    await boot(off, g2, 'conv-2')
+    expect((await attach(off, g2, 'conv-2', 'rava')).sc.status).toBe('pending_admission')
+    expect((await designate(envFor(h, DESIGNATED), 'agent-rava', HUMAN)).ok).toBe(true)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status IN ('live','pending')`)).toBe(0)
+  })
+
+  it('flag-off compatibility (probe E): unrelated updates and a NULL->NULL designation write leave today\'s attachment alone', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-e')
+    expect((await invokeTool(orgAdminAuth(), env, 'update_agent', { agent: 'agent-rava', name: 'Rava2', purpose: 'x' }, 'https://pot.test')).ok).toBe(true)
+    expect((await designate(env, 'agent-rava', null)).ok).toBe(true)
+    expect(liveAtt('agent-rava')).toBe(1)
+    expect((await boot(env, g, 'conv-e')).sc.bound_agent_id).toBe('agent-rava')
+  })
+
+  it('P1 :513 a designation-invalid stale attachment does not block re-attach to another designated agent', async () => {
+    const env = envFor(h, DESIGNATED)
+    await designate(env, 'agent-rava', HUMAN)
+    await designate(env, 'agent-hadi-admin', HUMAN)
+    const g = await grant(env, HUMAN)
+    const key = await admitAndAttach(env, g, 'conv-a', 'rava')
+    dropTrigger() // the stale row case: the cleanup trigger did not run, the row is live but invisible to every reader
+    await designate(env, 'agent-rava', null)
+    expect(liveAtt('agent-rava')).toBe(1)
+    const pend = await attach(env, g, 'conv-a', 'hadi-admin')
+    expect(errOf(pend)).not.toBe('already_attached')
+    expect(pend.sc.status).toBe('pending_admission')
+    expect((await decideMoment(env, String(pend.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await attach(env, g, 'conv-a', 'hadi-admin')).sc.status).toBe('attached')
+    expect(liveAtt('agent-rava')).toBe(0)
+  })
+
+  it('P2 :642 a move whose replacement is refused by the designation leaves the CURRENT attachment in place', async () => {
+    const env = envFor(h, DESIGNATED)
+    await designate(env, 'agent-rava', HUMAN)
+    await designate(env, 'agent-hadi-admin', HUMAN)
+    const g = await grant(env, HUMAN)
+    const key = await admitAndAttach(env, g, 'conv-a', 'rava')
+    await boot(env, g, 'conv-b')
+    const p2 = await attach(env, g, 'conv-b', 'hadi-admin')
+    await decideMoment(env, String(p2.sc.approve_url), key, 'approve') // admission live for hadi-admin; conv-b still unattached
+    const seat = one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE agent_id = 'agent-rava' AND detached_at IS NULL`)!.seat_id
+    dropTrigger() // isolate the batch guard from the trigger's admission revoke
+    const racing = raceOnBatch(env, async () => { expect((await designate(env, 'agent-hadi-admin', null)).ok).toBe(true) })
+    const r = await attachSeatToAgent(racing, { humanMemberId: HUMAN, seatId: seat, agentRef: 'agent-hadi-admin', via: 'dashboard', moveIfAttached: true })
+    expect(r).toEqual({ ok: false, error: 'attach_refused' })
+    expect(liveAtt('agent-rava')).toBe(1) // not left unattached
+  })
+
+  it('P2 :354 weld: a designation cleared before an identity-only agent\'s promote creates no member/binding/capability', async () => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    await designate(env, 'agent-bare', HUMAN)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    expect((await attach(env, g, 'conv-a', 'bare')).sc.status).toBe('pending_admission')
+    dropTrigger()
+    const admId = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
+    const racing = raceOnBatch(env, async () => { expect((await designate(env, 'agent-bare', null)).ok).toBe(true) })
+    const r = await decideAdmissionDirect(racing, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve' })
+    expect(r).toEqual({ ok: false, error: 'not_pending' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE agent_id = 'agent-bare' AND action = 'identity_weld'`)).toBe(0)
+  })
+
+  it('P2 :2365 interleave: the write is conditional on the outgoing designation the door authorised (409 designation_changed)', async () => {
+    const env = envFor(h, DESIGNATED)
+    const ORG_OWNER = 'member-org-owner-9'
+    seedHuman(ORG_OWNER)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-oo9', '${ORG_OWNER}', 'org', NULL, 'owner')`)
+    // The admin's door check reads current = null; before ITS write lands, the owner installs a higher-rank designation.
+    const realPrepare = env.DB.prepare.bind(env.DB)
+    let fired = false
+    const interleaved = { ...env, DB: new Proxy(env.DB, { get(t, prop, rcv) {
+      if (prop === 'prepare') return (sql: string) => {
+        if (!fired && /INSERT INTO agent_audit/.test(sql) && /update_agent/.test(sql)) { fired = true; h.sqlite.exec(`UPDATE agents SET attach_designated_member_id = '${ORG_OWNER}' WHERE id = 'agent-rava'`) }
+        return realPrepare(sql)
+      }
+      const v = Reflect.get(t, prop, rcv); return typeof v === 'function' ? v.bind(t) : v } }) } as Env
+    const r = await designate(interleaved, 'agent-rava', HUMAN)
+    expect(fired).toBe(true)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toBe('designation_changed')
+    expect(designatedOf('agent-rava')).toBe(ORG_OWNER) // the higher-rank value was NOT overwritten
+  })
+
+  it('P2 :323 pending insert: a designation cleared before the pending admission insert creates no admission or link', async () => {
+    const env = envFor(h, DESIGNATED)
+    await designate(env, 'agent-rava', HUMAN)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!
+    const realPrepare = env.DB.prepare.bind(env.DB)
+    let fired = false
+    const racing = { ...env, DB: new Proxy(env.DB, { get(t, prop, rcv) {
+      if (prop === 'prepare') return (sql: string) => {
+        if (!fired && /INSERT INTO agent_seat_admissions/.test(sql) && /'pending'/.test(sql)) { fired = true; h.sqlite.exec(`UPDATE agents SET attach_designated_member_id = NULL WHERE id = 'agent-rava'`) }
+        return realPrepare(sql)
+      }
+      const v = Reflect.get(t, prop, rcv); return typeof v === 'function' ? v.bind(t) : v } }) } as Env
+    const r = await attachSeatToAgent(racing, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'agent-rava', via: 'tool' })
+    expect(fired).toBe(true)
+    expect(r).toEqual({ ok: false, error: 'attach_refused' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit'`)).toBe(0)
+  })
+
+  it('P2 :7437 connect label: a designated agent the human cannot administer is NOT called undesignated', async () => {
+    const env = envFor(h, DESIGNATED)
+    await designate(env, 'agent-other', HUMAN) // squad-other: HUMAN has no admin there (member read access only)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-other', '${HUMAN}', 'squad', 'squad-other', 'member')`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const r = await rpc(env, g.ctx, 'connect', { agent_name: 'agent-other' }, { meta: thread('conv-a') })
+    const next = String(r.sc.next_step)
+    expect(next).not.toContain('not designated')
+    expect(next).toContain('right now')
+  })
+})

@@ -51,7 +51,7 @@ import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
-import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
+import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
 import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
@@ -7433,8 +7433,10 @@ const toolConnect: ToolSpec = {
           how = `Becoming ${agentRef.slug} from this chat is not enabled on this pot (seat_attach is off). Ask your human; a Codex/CLI host uses a workspace token an admin mints on /admin/agent-token.`
         } else if (auth.seatBinding.attached) {
           how = `This chat is attached to ${actingLabel} and stays so; ask your human to move or detach it on their Connections page.`
-        } else if (seatAttachDesignatedEnabled(env) && !(await resolveAttachableAgent(env, auth.seatBinding.humanMemberId, agentRef.id)).ok) {
+        } else if (seatAttachDesignatedEnabled(env) && !(await env.DB.prepare(`SELECT 1 AS x FROM agents a WHERE a.id = ?1 ${attachDesignatedClause(env, 'a', '?2')}`).bind(agentRef.id, auth.seatBinding.humanMemberId).first<{ x: number }>())) {
           how = `This chat cannot become ${agentRef.slug}: it is not designated for your human, so seat_attach would answer agent_not_found. An org admin designates agents for a human.`
+        } else if (!(await resolveAttachableAgent(env, auth.seatBinding.humanMemberId, agentRef.id)).ok) {
+          how = `This chat cannot become ${agentRef.slug} right now: seat_attach would answer agent_not_found (your human needs admin on its squad, and it must be a normal agent with a usable identity). Ask your human or an admin.`
         } else {
           how = `To BE ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves with their passkey and this chat then acts as that agent.`
         }

@@ -2217,7 +2217,7 @@ const toolUpdateAgent: ToolSpec = {
       owner_member_id: STRING_SCHEMA,
       // attach_designated_member_id (0238): the human whose chats may become this agent via seat_attach (needs SEAT_ATTACH_DESIGNATED).
       // Org-scope admin floor + target-rank ceiling with NO self-target waiver; seat and attached chats are refused.
-      attach_designated_member_id: STRING_SCHEMA,
+      attach_designated_member_id: { type: ['string', 'null'], description: 'Member id to designate, or null to clear. Org-scope admin required for both.' },
       // parent_agent_id is NOT patchable here. additionalProperties:false makes a
       // caller that still sends it fail loudly at the schema instead of silently
       // dropping the field. See UPDATABLE_TEXT_COLUMNS in src/org/service.ts.
@@ -2381,8 +2381,11 @@ const toolUpdateAgent: ToolSpec = {
       ? { id: auth.boundAgentId as string, type: 'agent' }
       : { id: auth.memberId as string, type: 'user' }
 
-    const result = await updateAgentProfile(env, agent.id, patch, actor)
+    // The designation door's outgoing-value read travels into the write: if another designation change lands in between, 409.
+    const result = await updateAgentProfile(env, agent.id, patch, actor,
+      patch.attach_designated_member_id !== undefined ? { attach_designated_member_id: designationGate.current ?? null } : undefined)
     if (!result.ok) {
+      if (result.error === 'designation_changed') return fail(409, 'designation_changed', { agent: agentRef })
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
       if (result.error === 'owner_member_not_found') {

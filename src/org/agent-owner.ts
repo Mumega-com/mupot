@@ -17,7 +17,7 @@ import { attachedAuthority } from '../auth/attached-ceiling'
 export type OwnerDoorColumn = 'owner_member_id' | 'attach_designated_member_id'
 
 export type OwnerChangeRefusal =
-  | { ok: true }
+  | { ok: true; /** the outgoing value read by THIS check; carry it into the write so the check and the write cannot interleave */ current?: string | null }
   | { ok: false; status: 400; error: 'invalid_args'; detail: string }
   | { ok: false; status: 403; error: 'forbidden'; detail: { need: typeof MEMBER_BIND_MINT_FLOOR; scope: 'org' } }
   | { ok: false; status: 403; error: 'target_rank_exceeds_ceiling'; detail: { owner_member_id: string } }
@@ -54,12 +54,19 @@ export async function authorizeOwnerMemberChange(
       return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: currentOwnerMemberId } }
     }
   }
-  if (typeof ownerMemberId !== 'string' || ownerMemberId.length === 0) return { ok: true }
+  if (designation && ownerMemberId !== undefined) {
+    // Clearing a designation disables every attached chat of the agent, so it needs the same org floor as setting one.
+    const floorRank = await actorRankOnScopeFor(env, auth, 'org', null)
+    if (floorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
+      return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
+    }
+  }
+  if (typeof ownerMemberId !== 'string' || ownerMemberId.length === 0) return { ok: true, current: currentOwnerMemberId }
   if (/\s/.test(ownerMemberId)) {
     return { ok: false, status: 400, error: 'invalid_args', detail: 'owner_member_id must not contain whitespace' }
   }
   const isSelfTarget = !designation && auth.memberId != null && auth.memberId === ownerMemberId
-  if (isSelfTarget) return { ok: true }
+  if (isSelfTarget) return { ok: true, current: currentOwnerMemberId }
   const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
   if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
     return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
@@ -83,7 +90,7 @@ export async function authorizeOwnerMemberChange(
       }
     }
   }
-  return { ok: true }
+  return { ok: true, current: currentOwnerMemberId }
 }
 
 // Same org.provisioned / agent_updated event shape MCP update_agent emits (a small

@@ -272,11 +272,17 @@ export async function ensureAdmission(
        SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8
         WHERE (SELECT COUNT(*) FROM agent_seat_admissions
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
+          AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 ${attachDesignatedClause(env, 'ag', '?4')})
        ON CONFLICT DO NOTHING`,
     ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN).run()
     const inserted = res.meta.changes === 1
     pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
-    if (!pending) return { ok: false, error: 'too_many_pending_admissions' }
+    if (!pending) {
+      // The insert also refuses when the designation changed after the caller resolved the agent: that is not a flood.
+      const stillDesignated = await env.DB.prepare(`SELECT 1 AS x FROM agents ag WHERE ag.id = ?1 ${attachDesignatedClause(env, 'ag', '?2')}`)
+        .bind(p.agentId, p.humanMemberId).first<{ x: number }>()
+      return { ok: false, error: stillDesignated ? 'too_many_pending_admissions' : 'attach_refused' }
+    }
     if (pending.status === 'live') return { ok: true, state: 'live', admission: pending }
     // Lost a concurrent first-ask race: the winner mints the one link. Minting here would rotate it and silently kill the
     // link the winner returned (bot review P2).
@@ -595,6 +601,14 @@ export async function attachSeatToAgent(
   if (!resolved.ok) return resolved
   const agent = resolved.agent
 
+  // A live attachment row the designation predicate no longer admits is dead to every reader (findLiveAttachment already serves the
+  // seat agent). Retire it here so it cannot block a new attach with already_attached. No-op while the designation flag is off
+  // (the clause is then a tautology, so NOT EXISTS is false).
+  await env.DB.prepare(
+    `UPDATE agent_seat_attachments SET detached_at = ?3, detach_reason = 'admission_revoked', detached_by_member_id = ?4
+      WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_attachments.agent_id ${attachDesignatedClause(env, 'ag', 'agent_seat_attachments.human_member_id')})`,
+  ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
   const current = await liveAttachmentOfSeat(env, seat.id)
   if (current) {
     if (!p.moveIfAttached) return { ok: false, error: 'already_attached' }
@@ -623,8 +637,9 @@ export async function attachSeatToAgent(
   if (current) {
     statements.push(env.DB.prepare(
       `UPDATE agent_seat_attachments SET detached_at = ?2, detach_reason = 'moved', detached_by_member_id = ?3
-        WHERE id = ?1 AND tenant = ?4 AND detached_at IS NULL`,
-    ).bind(current.id, nowIso, p.humanMemberId, env.TENANT_SLUG))
+        WHERE id = ?1 AND tenant = ?4 AND detached_at IS NULL
+          AND EXISTS (SELECT 1 FROM agents na WHERE na.id = ?5 ${attachDesignatedClause(env, 'na', '?3')})`,
+    ).bind(current.id, nowIso, p.humanMemberId, env.TENANT_SLUG, agent.id))
   }
   const attachIndex = statements.length
   statements.push(env.DB.prepare(

@@ -1349,7 +1349,7 @@ export async function setAgentStatus(
 
 export type UpdateAgentProfileResult =
   | { ok: true; value: AgentProfileSummary; auditId: string }
-  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' | 'owner_member_not_found' | 'owner_member_inactive' }
+  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' | 'owner_member_not_found' | 'owner_member_inactive' | 'designation_changed' }
 
 /** Who made a correction. `actor_type` is constrained by 0086's CHECK; a member
  *  acting through the MCP tool is a 'user'. */
@@ -1521,6 +1521,9 @@ export async function updateAgentProfile(
   agentId: string,
   patch: AgentProfilePatch,
   actor: AuditActor = SYSTEM_ACTOR,
+  // When set, the write lands ONLY if agents.attach_designated_member_id still equals this value (the one the authorization read),
+  // so an owner door check and its write cannot interleave with another designation change. undefined = unguarded (every other caller).
+  expect?: { attach_designated_member_id: string | null },
 ): Promise<UpdateAgentProfileResult> {
   const sets: string[] = []
   const binds: (string | number | null)[] = []
@@ -1675,6 +1678,8 @@ export async function updateAgentProfile(
   const auditId = crypto.randomUUID()
   const fieldsChanged = JSON.stringify(Object.keys(patch).filter((k) => patch[k as UpdatableAgentField] !== undefined))
 
+  const expectSql = expect ? ' AND attach_designated_member_id IS ?' : ''
+  const expectBinds: (string | null)[] = expect ? [expect.attach_designated_member_id] : []
   let changes = 0
   try {
     // No updated_at column on `agents` — 0049 rebuilt the table without one and
@@ -1706,9 +1711,9 @@ export async function updateAgentProfile(
         `INSERT INTO agent_audit
            (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
          SELECT ?, id, ?, ?, 'update_agent', ?, ${AGENT_SNAPSHOT_JSON}, ''
-           FROM agents WHERE id = ?`,
-      ).bind(auditId, actor.id, actor.type, fieldsChanged, agentId),
-      env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?`).bind(...binds, agentId),
+           FROM agents WHERE id = ?${expectSql}`,
+      ).bind(auditId, actor.id, actor.type, fieldsChanged, agentId, ...expectBinds),
+      env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?${expectSql}`).bind(...binds, agentId, ...expectBinds),
       env.DB.prepare(
         `UPDATE agent_audit
             SET after_state = (SELECT ${AGENT_SNAPSHOT_JSON} FROM agents WHERE id = ?)
@@ -1720,7 +1725,13 @@ export async function updateAgentProfile(
     if (isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
     throw err
   }
-  if (!changes) return { ok: false, error: 'not_found' }
+  if (!changes) {
+    if (expect) {
+      const exists = await env.DB.prepare('SELECT 1 AS x FROM agents WHERE id = ?').bind(agentId).first<{ x: number }>()
+      if (exists) return { ok: false, error: 'designation_changed' }
+    }
+    return { ok: false, error: 'not_found' }
+  }
 
   const profile = await getAgentProfile(env, agentId)
   if (!profile) return { ok: false, error: 'not_found' }
