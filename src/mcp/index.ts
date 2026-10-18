@@ -49,6 +49,7 @@ import {
 } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
+import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, seatAttachEnabled } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction } from '../auth/attached-ceiling'
@@ -830,7 +831,8 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown }
+// `whoami`: an optional block a refusal carries as a SIBLING of its detail (orient on an unbound session), so the refusal and the map arrive together.
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown; whoami?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -6270,7 +6272,7 @@ const toolStatus: ToolSpec = {
     properties: { agent_id: STRING_SCHEMA },
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agentId = str(args.agent_id)
     if (!agentId) {
       // No agent specified → echo the member's own principal (who am I + caps + seat).
@@ -6324,6 +6326,8 @@ const toolStatus: ToolSpec = {
         active_seat: activeSeat,
         seat_roster: seatRoster,
         capabilities: auth.capabilities ?? [],
+        // Same block boot_context and orient carry: where this connection stands and what is still missing.
+        ...(ctx?.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx?.origin) }),
       })
     }
 
@@ -6486,7 +6490,7 @@ async function reportSelfAtBoot(
 // What boot tells the caller about HOW it is connected. Tool/route names only, never a token.
 // `next_step` is the one thing the CALLER can do first; `who_acts` says who that is. Anything only a
 // human or the agent's host can do goes in `for_owner` (who_acts: 'owner'), as information.
-type WhoActs = 'self' | 'owner' | 'admin'
+type WhoActs = 'self' | 'owner' | 'admin' | 'org_admin'
 interface BootOnboarding {
   connection_kind: ConnectionKind
   inbox?: 'peek_only' | 'none'
@@ -6496,34 +6500,78 @@ interface BootOnboarding {
   for_owner?: { next_step: string; who_acts: 'owner' }
 }
 
-async function buildBootOnboarding(
+/** Best-effort reads behind `whoami`. Advisory: every read falls back to the safe answer and never throws
+ *  (boot is the one response that must always succeed). Fails toward NOT advertising the identity mint. */
+async function gatherWhoamiFacts(
   env: Env,
   auth: AuthContext,
+  opts: { actsAs?: string | null; report?: WhoamiFacts['report'] } = {},
+): Promise<WhoamiFacts> {
+  const agentId = auth.boundAgentId ?? null
+  const unboundDirectory = auth.channel === 'directory' && !agentId
+  const [keyed, fenced, bootstrappedBefore, tenantHasAgents] = await Promise.all([
+    agentId ? hasRegisteredKey(env, agentId).catch(() => false) : false,
+    agentId ? inboxFencedToHost(env, agentId).catch(() => false) : false,
+    unboundDirectory ? hasBootstrappedBefore(env, auth.memberId) : false,
+    unboundDirectory ? anyAgentExists(env) : false,
+  ])
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}) }
+}
+
+/** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
+async function anyAgentExists(env: Env): Promise<boolean> {
+  try {
+    const r = await env.DB.prepare('SELECT 1 AS one FROM agents LIMIT 1').first<{ one: number }>()
+    return r !== null && r !== undefined
+  } catch {
+    return true
+  }
+}
+
+/** The whoami block for status / orient (no runtime-report step: those tools take no runtime args). */
+async function whoamiFor(env: Env, auth: AuthContext, origin: string | undefined): Promise<Whoami> {
+  const facts = await gatherWhoamiFacts(env, auth, { actsAs: auth.seatBinding ? await actsAsName(env, auth) : null })
+  return buildWhoami(env, auth, { facts, origin: canonicalOrigin(env, origin ?? '') })
+}
+
+async function actsAsName(env: Env, auth: AuthContext): Promise<string | null> {
+  if (!auth.boundAgentId) return null
+  const row = await env.DB.prepare('SELECT slug, name FROM agents WHERE id = ?1 LIMIT 1').bind(auth.boundAgentId).first<{ slug: string; name: string }>().catch(() => null)
+  return row?.slug ?? row?.name ?? null
+}
+
+// What the runtime-report step needs from this boot's args + self-report. Same predicate boot enforcement uses (cleanReported).
+function reportFacts(args: Record<string, unknown>, selfReport: unknown): NonNullable<WhoamiFacts['report']> {
+  const sr = selfReport as { outcome?: string; detail?: string } | null
+  const missingFields = ['runtime', 'model', 'host'].filter((k) => {
+    const v = args[k]
+    return typeof v !== 'string' || cleanReported(v) === null
+  })
+  return { missingFields, ...(sr?.outcome ? { outcome: sr.outcome } : {}), ...(sr?.detail ? { detail: sr.detail } : {}) }
+}
+
+function buildBootOnboarding(
+  env: Env,
   kind: ConnectionKind,
-  args: Record<string, unknown>,
-  selfReport: unknown,
-): Promise<BootOnboarding> {
-  const agentId = auth.boundAgentId
-  // Best-effort reads: onboarding is advisory and must never take boot down.
-  const keyed = agentId ? await hasRegisteredKey(env, agentId).catch(() => false) : false
-  const fenced = agentId ? await inboxFencedToHost(env, agentId).catch(() => false) : false
+  whoami: Whoami,
+): BootOnboarding {
+  const { keyed, inbox: agentInbox } = whoami.agent
+  const fenced = agentInbox === 'fenced'
   const ownerNote = {
     next_step: "for your human: the agent's own runtime should connect with the agent-bound connection (its minted agent token) and call boot_context with runtime, model and host; this connection cannot record them.",
     who_acts: 'owner' as const,
   }
+  const first = whoami.missing[0]
 
   if (kind === 'attached') {
-    // Inside the `kind === 'attached'` branch; the fenced case is handled separately below.
+    // The fenced case is handled separately below; the fenced step is whoami's inbox_fenced entry.
     const canMark = seatAttachEnabled(env)
     return {
       connection_kind: kind,
       inbox: 'peek_only',
-      agent: { keyed, inbox: fenced ? 'fenced' : 'peek', can_self_report: false },
-      ...(fenced
-        ? {
-            next_step: "this agent's inbox is fenced to its signing host (signed_only): peek is refused for this thread, so there is nothing to read here. The agent host consumes it; an org admin can change the fence with set_agent_inbox_consumer. Boot records no runtime, model or host for an attached thread.",
-            who_acts: 'admin' as const,
-          }
+      agent: whoami.agent,
+      ...(fenced && first
+        ? { next_step: `${first.next_step} Boot records no runtime, model or host for an attached thread.`, who_acts: first.who_acts }
         : {
             next_step: `read the agent inbox with inbox { peek: true }${canMark ? ', then record what you handled with inbox_mark_handled { ids } so this thread stops re-reading it' : ''}. This thread cannot consume, lease or ack the inbox, and boot records no runtime, model or host for it.`,
             who_acts: 'self' as const,
@@ -6532,19 +6580,17 @@ async function buildBootOnboarding(
     }
   }
   if (kind === 'member') {
+    // Unbound: the next step IS whoami's first missing step (one derivation, so the fields cannot disagree).
     return {
       connection_kind: kind,
       inbox: 'none',
-      agent: { keyed: false, inbox: 'none', can_self_report: false },
-      next_step: "this connection is a member token with no agent binding, so boot records no runtime, model or host. An agent's own runtime should connect with the agent-bound connection (see available_doors: bootstrap_self, or mint_agent_token by an org admin) and call boot_context with runtime, model and host.",
-      who_acts: 'owner',
+      agent: whoami.agent,
+      ...(first ? { next_step: first.next_step, who_acts: first.who_acts } : {}),
     }
   }
-  // agent_bound or seat: the caller IS the agent's runtime.
-  const base = {
-    connection_kind: kind,
-    agent: { keyed, inbox: fenced ? ('fenced' as const) : ('consume' as const), can_self_report: !keyed },
-  }
+  // agent_bound or seat: the caller IS the agent's runtime (a seat is its own agent: no runtime/model/host nag, #door-map cut list).
+  const base = { connection_kind: kind, agent: whoami.agent }
+  if (kind === 'seat') return base
   if (keyed) {
     return {
       ...base,
@@ -6552,22 +6598,8 @@ async function buildBootOnboarding(
       who_acts: 'self',
     }
   }
-  const outcome = (selfReport as { outcome?: string; detail?: string } | null)?.outcome
-  const detail = (selfReport as { detail?: string } | null)?.detail
-  if (outcome === 'refused_not_a_string' || outcome === 'refused_not_adopted') {
-    return { ...base, next_step: `boot_context did not record your report (${detail ?? outcome}). Call it again with runtime, model and host as plain strings.`, who_acts: 'self' }
-  }
-  // Same predicate boot enforcement uses (cleanReported): whitespace/control-only counts as not reported.
-  const missing = ['runtime', 'model', 'host'].filter((k) => {
-    const v = args[k]
-    return typeof v !== 'string' || cleanReported(v) === null
-  })
-  return {
-    ...base,
-    ...(missing.length > 0
-      ? { next_step: `call boot_context again passing ${missing.join(', ')} (any short string: what you are actually running on) so the registry shows your real seat.`, who_acts: 'self' as const }
-      : {}),
-  }
+  const report = whoami.missing.find((m) => m.code === 'report_refused' || m.code === 'report_runtime')
+  return { ...base, ...(report ? { next_step: report.next_step, who_acts: report.who_acts } : {}) }
 }
 
 // ── first-run onboarding: state + doors (mupot#1283) ─────────────────────────────
@@ -6784,6 +6816,30 @@ async function buildIdentityReceipt(
   }
 }
 
+// channel_limits.to_get_write_access, derived from whoami so it can never name a tool this connection cannot call
+// (it used to say "call bootstrap_self" to every directory session, including seats and K2 member tokens: dead ends 3, 4).
+function writeAccessHint(env: Env, w: Whoami, firstStep: string | undefined): string {
+  const noGrant = 'Requesting a squad grant will NOT help — this door discards grants by construction.'
+  switch (w.state) {
+    case 'harness_unseated':
+      return `${firstStep ?? 'this connection has no agent yet.'} ${noGrant}`
+    case 'no_agent':
+      // The mint is named only when whoami offers it to THIS session (never to a stranger in a populated pot, #2020).
+      return `${firstStep ?? 'this connection has no agent yet.'} If your agent already exists, ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. ${noGrant}`
+    case 'own_seat':
+      return 'this chat acts as its own seat agent, capped at member and at your human\'s own access. '
+        + (seatAttachEnabled(env)
+          ? 'To act as an agent you already have instead, call seat_attach { agent: "<its name or id>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
+            + 'Only a fixed CLI/daemon agent with no human in the chat needs an org-admin to mint a WORKSPACE-channel token for it (mint_agent_token), connecting with that bearer. '
+          : 'To act as an agent you already have, ask an org-admin for a WORKSPACE-channel token for it (mint_agent_token) and connect with that bearer. ')
+        + noGrant
+    case 'acting_as':
+      return `this connection already acts as an agent; its authority is the lowest of your human's standing, the agent's own grants and the approved ceiling. For more, an org-admin raises the agent's grants. ${noGrant}`
+    case 'host':
+      return "this connection is the agent's own runtime; its authority is the agent's grants. For more, an org-admin raises them."
+  }
+}
+
 const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
@@ -6851,7 +6907,21 @@ const toolBootContext: ToolSpec = {
           connectionKind,
         )
       : null
-    const bootOnboarding = ctx?.sideEffectFree ? null : await buildBootOnboarding(env, auth, connectionKind, args, selfReport)
+    // mupot#1794 W1 — identity receipt. Additive, and present ONLY while SEAT_AUTO_ENROLL is on so
+    // a flag-off response is semantically identical to before. Every value is server-derived; labels the
+    // caller supplied (seat / label args, x-mupot-seat) are only COMPARED, never believed.
+    const identityReceipt = seatAutoEnrollEnabled(env)
+      ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
+      : undefined
+    // ONE derivation of state / have / missing[] (src/mcp/whoami.ts). next_step, onboarding, available_doors and
+    // channel_limits below are all read FROM it, so they cannot disagree with each other or with the tools.
+    const receiptAgent = identityReceipt?.agent as { slug?: unknown; name?: unknown } | null | undefined
+    const whoamiFacts = await gatherWhoamiFacts(env, auth, {
+      actsAs: typeof receiptAgent?.slug === 'string' ? receiptAgent.slug : typeof receiptAgent?.name === 'string' ? receiptAgent.name : null,
+      report: attachedAuthority(auth) || ctx?.sideEffectFree ? undefined : reportFacts(args, selfReport),
+    })
+    const whoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin) })
+    const bootOnboarding = ctx?.sideEffectFree ? null : buildBootOnboarding(env, connectionKind, whoami)
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
     // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
@@ -6878,14 +6948,16 @@ const toolBootContext: ToolSpec = {
     const onboardingState: OnboardingState = isMinted
       ? 'bound'
       : auth.channel === 'directory'
-        ? (await hasBootstrappedBefore(env, auth.memberId) ? 'unbound_agent_exists' : 'unbound_no_agent')
+        ? (whoamiFacts.bootstrappedBefore ? 'unbound_agent_exists' : 'unbound_no_agent')
         : 'unbound_workspace'
 
-    const availableDoors = buildAvailableDoors(onboardingState)
-    // mupot#1794 W3 — an unbound harness session (consented as "Me — auto per workspace") has ONE
-    // right first move: seat_select. Flag off, or any other session shape, leaves the doors and
-    // next_step untouched. Gate mirrors resolveSeatSession's: the very sessions a handle can serve.
-    const harnessSeatDoor = seatAutoEnrollEnabled(env) && !isMinted && auth.channel === 'directory' && !!auth.harnessId
+    // available_doors = the legacy door list FILTERED to what whoami says this connection can call (a harness token
+    // never sees connect/status/bootstrap_self; a stranger never sees bootstrap_self, #2020), then led by whoami's own step.
+    const doorOk = whoamiDoorFilter(env, auth, whoami)
+    const availableDoors = buildAvailableDoors(onboardingState).filter((d) => doorOk(d.tool))
+    // mupot#1794 W3 — an unbound harness session (consented as "Me — auto per workspace") has ONE right first move:
+    // seat_select. Offered exactly when whoami offers it (same gate as seat_select itself).
+    const harnessSeatDoor = whoami.missing.some((m) => m.next_tool === 'seat_select')
     if (harnessSeatDoor) {
       availableDoors.unshift({
         tool: 'seat_select',
@@ -6925,17 +6997,11 @@ const toolBootContext: ToolSpec = {
     // The workspace-channel wording is unchanged: bootstrap_self is gated to the
     // directory channel inside bootstrapSelf, so advertising it here would be a door
     // that refuses the caller it was offered to.
-    const nextStepBase = isMinted
-      ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
-      : onboardingState === 'unbound_no_agent'
-        ? 'you have no agent yet — call bootstrap_self { agent_name: "<the name you are giving it>" } to create it, mint its credential and grant yourself admin on its squad in one act. No other human is required. See available_doors for every door open to you.'
-        : onboardingState === 'unbound_agent_exists'
-          ? 'you already bootstrapped an agent — bind this session to it at /oauth/consent, or call connect { agent_name: "<slug>" } to claim it session-locally now. See available_doors.'
-          : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
-
-    const nextStep = harnessSeatDoor
-      ? 'this connection is a harness session with no agent yet — call seat_select { project: "<workspace name>", folder?, thread? } first; it returns a seat handle (mseat_...) to pass as the `seat` argument on every later call (a harness that can set headers may send X-Mupot-Seat instead). See available_doors.'
-      : nextStepBase
+    // next_step IS whoami's first requirement step (a runtime-report nag is not a first step). Bound with nothing missing: orient.
+    const firstStep = whoami.missing.find((m) => !m.code.startsWith('report_'))
+    const nextStep = firstStep
+      ? firstStep.next_step
+      : 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -6968,34 +7034,25 @@ const toolBootContext: ToolSpec = {
               'owner or admin elsewhere does not inherit those here. Your grants still exist; they',
               'are simply not ambient on this door.',
             ].join(' '),
-            you_can: [
-              'status, boot_context — always',
-              'connect { agent_name }, orient { agent } — for agents your member has capability on',
-              'remember, recall — your own memory',
-            ],
-            you_cannot: [
-              'create or update tasks, projects, agents, or any other write',
-              'anything requiring a standing capability, regardless of what you hold elsewhere',
-            ],
-            to_get_write_access:
-              'if you have no agent yet, call bootstrap_self { agent_name } — it creates your agent, mints its credential and makes you admin of its squad in one atomic act, with no other human involved. '
-              + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached
-                // Only for a session that HAS a seat and is not yet attached: seat_attach refuses a seatless caller (seat_required), so a seatless
-                // directory session keeps the old text rather than a dead end. The advertised journey for a CHAT: attach with one passkey approval, no token. The bearer is for a
-                // fixed CLI/daemon agent with no human in the chat. (Athena's native onboarding, 2026-10-15: this text still said "bearer".)
-                ? 'If your agent already exists and you are a chat with a human present, call seat_attach { agent: "<its name or id>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
-                  + 'Only a fixed CLI/daemon agent with no human in the chat needs an org-admin to mint a WORKSPACE-channel token for it (mint_agent_token), connecting with that bearer. '
-                : 'If your agent already exists, ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. ')
-              + 'Requesting a squad grant will NOT help — this door discards grants by construction.',
+            you_can: auth.harnessCredential === true
+              ? ['seat_select, boot_context, worktree_open — the only tools a harness connection may call before its thread has a seat']
+              : [
+                  'status, boot_context — always',
+                  'connect { agent_name }, orient { agent } — for agents your member has capability on',
+                  'remember, recall — your own memory',
+                ],
+            you_cannot: auth.boundAgentId && (auth.capabilities ?? []).length > 0
+              ? [
+                  "anything beyond this agent's own grants (see capabilities): your authority is the lowest of your human's standing, the agent's grants and any approved ceiling",
+                  'anything requiring a standing capability, regardless of what you hold elsewhere',
+                ]
+              : [
+                  'create or update tasks, projects, agents, or any other write',
+                  'anything requiring a standing capability, regardless of what you hold elsewhere',
+                ],
+            to_get_write_access: writeAccessHint(env, whoami, firstStep?.next_step),
           }
         : undefined
-
-    // mupot#1794 W1 — identity receipt. Additive, and present ONLY while SEAT_AUTO_ENROLL is on so
-    // a flag-off response is semantically identical to before. Every value is server-derived; labels the
-    // caller supplied (seat / label args, x-mupot-seat) are only COMPARED, never believed.
-    const identityReceipt = seatAutoEnrollEnabled(env)
-      ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
-      : undefined
 
     // mupot#1794 W4 — shared-credential hint. Present ONLY with SHARED_CREDENTIAL_DETECT on, only when
     // the credential this session came in on shows more than N concurrent session fingerprints. A
@@ -7027,6 +7084,9 @@ const toolBootContext: ToolSpec = {
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
         : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
+
+      // A silent downgrade (attach refused, handle rejected, auto seat refused) is said out loud, after the acting-as line.
+      if (firstStep) nextStepOut = `${nextStepOut} ${firstStep.next_step}`
     }
 
     return done({
@@ -7044,6 +7104,9 @@ const toolBootContext: ToolSpec = {
       // Additive. Structured so a harness can act on it: what kind of connection this is, whether
       // its inbox reads consume, and (only when something is wrong or missing) a plain next_step.
       ...(bootOnboarding ? { onboarding: bootOnboarding } : {}),
+      // One derivation of state / have / missing[] (src/mcp/whoami.ts); absent on the curated profile door, which cannot
+      // call the tools whoami's steps name.
+      ...(ctx?.sideEffectFree ? {} : { whoami }),
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,
@@ -7084,11 +7147,15 @@ const toolOrient: ToolSpec = {
       // without naming an agent is stuck — give the two paths that resolve it.
       // DE2: connect is session-local for a human token (a trigger makes the claim inert), so sending an unbound
       // session to connect loops straight back here. The two paths that resolve it are an explicit agent and a seat.
-      return fail(400, 'invalid_args', [
-        'agent required: this session is not an agent yet.',
-        'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as ' + consentLabels(consentChoiceLabels(env)).many + '); a seated session then calls orient with no arguments.',
-        'For an agent you can observe, pass orient { agent: "<id-or-slug>" }.',
-      ].join(' '))
+      // Refusal AND whoami: the envelope (who_acts/next_step/next_tool) comes from the refusal table, the map rides beside it.
+      return {
+        ...fail(400, 'invalid_args', [
+          'agent required: this session is not an agent yet.',
+          'In a chat connector with no seat, call seat_select { project: "<workspace name>" } first (it needs a connector consented as ' + consentLabels(consentChoiceLabels(env)).many + '); a seated session then calls orient with no arguments.',
+          'For an agent you can observe, pass orient { agent: "<id-or-slug>" }.',
+        ].join(' ')),
+        whoami: await whoamiFor(env, auth, ctx?.origin),
+      }
     }
 
     // Resolve id-first, slug-with-ambiguity-refusal (shared ../org/resolve). A bare slug
@@ -7132,7 +7199,7 @@ const toolOrient: ToolSpec = {
       { recordInduction: !ctx.sideEffectFree },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
-    return done({ packet: data, brief: renderBrief(data) })
+    return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
   },
 }
 
@@ -8187,7 +8254,7 @@ async function handleJsonRpc(
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       // Same -32602; the envelope rides in `data` only where the table has a specific entry (orient "agent required", check_in poll).
-      return rpcError(id, -32602, outcome.error, outcome.detail, 200, refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)))
+      return rpcError(id, -32602, outcome.error, outcome.detail, 200, { ...refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)), ...(outcome.whoami !== undefined ? { whoami: outcome.whoami } : {}) })
     }
     // 5xx (internal_error, receipt_failed, 503s) stay JSON-RPC errors carrying their HTTP status so
     // server-fault monitoring keeps working; only 4xx authz/business refusals become isError.

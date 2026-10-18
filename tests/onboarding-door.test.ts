@@ -48,148 +48,28 @@
 // the provider are stubbed only at the consent edge; the Hermes token and agent_keys row are seeded by SQL.
 
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { applyAllMigrations } from './helpers/migrations'
-import { buildAuthContextFromProps, handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
-import { hashMemberToken } from '../src/auth/member-bearer'
-import { mcpApp } from '../src/mcp/index'
-import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
-import type { AuthContext, Env } from '../src/types'
+import { call, hermesClient, listTools, newWorld, oauthClient, HARNESS_CHOICE, type Client, type Json, type Kind, type Reply, type World } from './helpers/door-clients'
 
-const TENANT = 'mumega'
-const HARNESS_CHOICE = '__harness__'
-const NOW = '2026-10-18T00:00:00.000Z'
-
-type Kind = 'chatgpt' | 'claude' | 'hermes' | 'unknown'
 const dead = (isDead: boolean): typeof it => (isDead ? it.fails : it)
 // Flip a flag to false when its lane lands. See the header for what each one means.
 const DEAD: Record<string, Record<Kind, boolean>> = {
   seatLoop: { chatgpt: false, claude: false, hermes: false, unknown: false },
-  orientRefusal: { chatgpt: false, claude: false, hermes: false, unknown: true },
-  bootstrapRefused: { chatgpt: true, claude: false, hermes: false, unknown: false },
+  orientRefusal: { chatgpt: false, claude: false, hermes: false, unknown: false },
+  bootstrapRefused: { chatgpt: false, claude: false, hermes: false, unknown: false },
   connectAfterBootstrap: { chatgpt: false, claude: false, hermes: false, unknown: false },
-  humanStepOnly: { chatgpt: false, claude: false, hermes: false, unknown: true },
+  humanStepOnly: { chatgpt: false, claude: false, hermes: false, unknown: false },
   actionTask: { chatgpt: false, claude: false, hermes: false, unknown: true },
   actionInbox: { chatgpt: false, claude: false, hermes: false, unknown: true },
   threadAgent: { chatgpt: true, claude: true, hermes: false, unknown: false },
-  noWhoami: { chatgpt: true, claude: true, hermes: true, unknown: true },
-  splitSteps: { chatgpt: true, claude: true, hermes: false, unknown: true },
+  noWhoami: { chatgpt: false, claude: false, hermes: false, unknown: false },
+  splitSteps: { chatgpt: false, claude: false, hermes: false, unknown: false },
   refusalEnv: { chatgpt: true, claude: false, hermes: true, unknown: true },
-}
-
-function memoryKv() {
-  const store = new Map<string, string>()
-  return {
-    async get(key: string, type?: string) { const v = store.get(key); return v === undefined ? null : type === 'json' ? JSON.parse(v) : v },
-    async put(key: string, value: string) { store.set(key, value) },
-    async delete(key: string) { store.delete(key) },
-  }
-}
-
-type Json = Record<string, unknown>
-interface Reply { refused: boolean; body: Json }
-/** props: OAuth grant props (AuthContext rebuilt per call); bearer: workspace token. */
-interface Client { kind: Kind; props: Json | null; bearer: string | null; meta?: Json; seat?: string }
-interface World { h: SqliteD1Harness; env: Env; agents: () => number; refusals: Json[] }
-
-function newWorld(): World {
-  const h = createSqliteD1()
-  applyAllMigrations(h.sqlite)
-  // A populated tenant: an org admin and an existing agent, so nobody below is the first member.
-  h.sqlite.exec(`
-    INSERT INTO departments (id, slug, name) VALUES ('d0', 'd0', 'd0');
-    INSERT INTO squads (id, department_id, slug, name) VALUES ('sq0', 'd0', 'sq0', 'sq0'), ('sq-other', 'd0', 'sq-other', 'sq-other');
-    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-hermes', 'sq0', 'hermes', 'Hermes', 'active');
-    INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('mem-admin', 'admin@pot.test', 'Admin', 'active', '${NOW}', '${TENANT}');
-    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin', 'mem-admin', 'org', NULL, 'admin');
-  `)
-  const env = {
-    DB: h.db, TENANT_SLUG: TENANT, BRAND: 'mupot', POT_TIER: 'scale', PUBLIC_ORIGIN: 'https://pot.test',
-    GOOGLE_CLIENT_ID: 'cid.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'secret',
-    SESSIONS: memoryKv(), BUS: { send: async () => {} },
-    SEAT_AUTO_ENROLL: '1', REALTIME_SEAT_EVENTS: '1', // prod flags; SEAT_ATTACH and SECURE_MOMENTS are off/unset in prod
-  } as unknown as Env
-  return { h, env, agents: () => Number(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n), refusals: [] }
-}
-
-/** The real consent path: /authorize -> Google callback -> POST /oauth/consent. Returns the props the handler
- *  passed to completeAuthorization (which is what McpOAuthApiHandler hands every later request). */
-async function consent(w: World, clientName: string, email: string, choice: string): Promise<Json> {
-  const completeAuthorization = vi.fn(async () => ({ redirectTo: 'https://client.test/cb?code=x' }))
-  const env = { ...w.env, OAUTH_PROVIDER: {
-    parseAuthRequest: async () => ({ clientId: `client-${clientName}`, scope: ['mcp:read', 'mcp:write'] }),
-    completeAuthorization, lookupClient: async () => ({ clientName }),
-  } } as unknown as Env
-  const auth = await handleOAuthAuthorize(new Request('https://pot.test/authorize?client_id=c&response_type=code&redirect_uri=https://client.test/cb&code_challenge=abc&code_challenge_method=S256'), env)
-  const nonce = /mupot_oauth_nonce_([0-9a-f-]{36})=/.exec(auth.headers.get('Set-Cookie') ?? '')![1]
-  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-    const url = String(input)
-    if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'g' }), { status: 200 })
-    if (url.includes('userinfo')) return new Response(JSON.stringify({ id: `sub-${email}`, name: 'Human', email, verified_email: true }), { status: 200 })
-    throw new Error(`unexpected fetch ${url}`)
-  }))
-  const cb = await handleOAuthAuthorize(new Request(`https://pot.test/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce_${nonce}=1` } }), env)
-  const cookie = cb.headers.getSetCookie().find((c) => c.startsWith('mupot_oauth_consent_')) ?? ''
-  const cn = /mupot_oauth_consent_([0-9a-f-]{36})=/.exec(cookie)![1]
-  const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${cn}=1` },
-    body: new URLSearchParams({ consent_nonce: cn, action: 'continue', agent_id: choice }).toString(),
-  }), env)
-  if (res.status !== 302) throw new Error(`consent fixture failed: ${res.status}`)
-  vi.unstubAllGlobals()
-  const call = completeAuthorization.mock.calls[0] as unknown as [{ props: Json }]
-  return call[0].props
-}
-
-async function oauthClient(w: World, kind: Kind, clientName: string, choice: string, meta?: Json): Promise<Client> {
-  return { kind, props: await consent(w, clientName, `${kind}@pot.test`, choice), bearer: null, meta }
-}
-
-async function hermesClient(w: World): Promise<Client> {
-  w.h.sqlite.exec(`
-    INSERT INTO members (id, display_name, status, created_at, tenant) VALUES ('mem-hermes', 'Hermes', 'active', '${NOW}', '${TENANT}');
-    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'ag-hermes', 'mem-hermes', '${NOW}');
-    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-hermes', 'mem-hermes', 'squad', 'sq0', 'member');
-    INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES ('${TENANT}', 'ag-hermes', 'pk-hermes', 'Ed25519', 'mem-hermes', 1);
-    INSERT INTO member_tokens (id, member_id, token_hash, label, channel, agent_id, created_at, tenant)
-      VALUES ('tok-hermes', 'mem-hermes', '${await hashMemberToken('raw-hermes-token')}', 'hermes', 'workspace', 'ag-hermes', '${NOW}', '${TENANT}');
-  `)
-  return { kind: 'hermes', props: null, bearer: 'raw-hermes-token' }
-}
-
-/** One tools/call exactly as the client would send it. Only the ChatGPT client sends params._meta; nobody sends x-mupot-seat. */
-async function rpc(w: World, c: Client, method: string, params: Json): Promise<Response> {
-  if (c.meta) params._meta = c.meta
-  // Prod rebuilds the AuthContext from the stored props on every request (McpOAuthApiHandler).
-  const ctx = c.props ? await buildAuthContextFromProps(w.env, c.props as unknown as Parameters<typeof buildAuthContextFromProps>[1]) : null // props are the consent handler's own OAuthMemberProps
-  if (c.props && !ctx) throw new Error('grant no longer resolves to an AuthContext')
-  const req = new Request(ctx ? 'https://pot.test/mcp' : 'https://pot.test/', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(c.bearer ? { authorization: `Bearer ${c.bearer}` } : {}) },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  })
-  return mcpApp.fetch(ctx ? mcpInternalRequest(req, ctx) : req, w.env)
-}
-
-async function call(w: World, c: Client, name: string, args: Json = {}): Promise<Reply> {
-  // Lane C: a thread with no header and no _meta sends the seat_id seat_select returned as `seat` on every later call.
-  const res = await rpc(w, c, 'tools/call', { name, arguments: c.seat && !('seat' in args) ? { ...args, seat: c.seat } : args })
-  const env = (await res.json()) as { result?: { isError?: boolean; structuredContent?: Json }; error?: { message?: string; data?: unknown; who_acts?: unknown; next_step?: unknown; next_tool?: unknown } }
-  if (env.result?.isError) { w.refusals.push(env.result.structuredContent ?? {}); return { refused: true, body: env.result.structuredContent ?? {} } }
-  // Lane B: the refusal envelope rides as SIBLING members of the JSON-RPC error (beside `data`, which keeps its old shape).
-  if (env.error) { const b = { error: env.error.message, detail: env.error.data, who_acts: env.error.who_acts, next_step: env.error.next_step, next_tool: env.error.next_tool }; w.refusals.push(b); return { refused: true, body: b } }
-  return { refused: res.status >= 400, body: env.result?.structuredContent ?? {} }
-}
-
-async function listTools(w: World, c: Client): Promise<Set<string>> {
-  const res = (await (await rpc(w, c, 'tools/list', {})).json()) as { result?: { tools?: Array<{ name?: string }> } }
-  return new Set((res.result?.tools ?? []).flatMap((t) => (typeof t.name === 'string' ? [t.name] : [])))
 }
 
 interface Door { tool: string | null; does?: string }
 const doorList = (b: Json): Door[] => (Array.isArray(b.available_doors) ? (b.available_doors as Door[]) : [])
 const toolDoors = (b: Json): string[] => doorList(b).flatMap((d) => (typeof d.tool === 'string' ? [d.tool] : []))
+const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : [])
 const asObj = (v: unknown): Json => (v && typeof v === 'object' ? (v as Json) : {})
 const strs = (...v: unknown[]): string[] => v.filter((x): x is string => typeof x === 'string')
 /** The two next-step fields. */
@@ -228,10 +108,12 @@ async function takeDoor(w: World, c: Client, boot: Json, prior: Step[], humanSte
   if (!tool) return
   let args = STATIC_ARGS[tool] ?? {}
   if (tool === 'connect') {
-    // slug: the quoted name in boot's own next_step, else the agent the previous door created
+    // slug: the quoted name in boot's own next_step, else the agent the previous door created. A client that was handed
+    // no slug (a stranger with no agent: boot's step is a human one) cannot take this door, so it is not walked.
     const quoted = /agent_name:\s*"([^"<>]+)"/.exec(stepFields(boot).join(' '))?.[1]
     const made = prior.map((s) => asObj(s.reply.body.agent).slug).find((x): x is string => typeof x === 'string')
-    args = { agent_name: quoted ?? made ?? 'unknown-slug' }
+    if (quoted === undefined && made === undefined) return
+    args = { agent_name: quoted ?? made }
   }
   const reply = await call(w, c, tool, args)
   prior.push({ tool, reply })
@@ -286,7 +168,8 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
   const pre = (): void => {
     expect(typeof t.boot.onboarding_state).toBe('string')
     expect(doorList(t.boot).length).toBeGreaterThan(0)
-    expect(t.steps.length).toBeGreaterThan(0)
+    // a walked tool door, or (a stranger with nothing callable) a human handoff in whoami.missing[0]
+    expect(t.steps.length > 0 || asObj(asArr(asObj(t.boot.whoami).missing)[0]).who_acts !== undefined).toBe(true)
     expect(Object.keys(t.status.body).length).toBeGreaterThan(0)
     expect(Object.keys(t.orient.body).length).toBeGreaterThan(0)
     expect(t.refusals.length).toBeGreaterThan(0)
@@ -297,21 +180,27 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
     expect(String(t.refusals[0].error)).toMatch(/forbidden|capability/i)
   })
 
-  it('the first advertised tool door is not refused', () => {
+  it('the first advertised tool door is not refused (a client with no callable door is handed a human step instead)', () => {
+    if (t.steps.length === 0) {
+      const first = asObj(asArr(asObj(t.boot.whoami).missing)[0])
+      expect(first.next_tool).toBeUndefined()
+      expect(typeof first.link === 'string' || typeof first.next_step === 'string').toBe(true)
+      return
+    }
     expect(t.steps[0].reply.refused, JSON.stringify(t.steps[0].reply.body)).toBe(false)
   })
 
   // dead end connect-after-bootstrap: the second door (unknown: connect after bootstrap_self) is refused
   dead(DEAD.connectAfterBootstrap[kind])('the second advertised tool door is not refused', () => {
     pre()
-    expect(t.steps.length).toBeGreaterThan(1)
+    if (t.steps.length < 2) return // nothing was walked past the first door (a stranger has no second tool door)
     expect(t.steps[1].reply.refused, JSON.stringify(t.steps[1].reply.body)).toBe(false)
   })
 
   // dead end seat-loop (seat_select only): the thread is bound afterwards, and the handle it was shown is accepted
   dead(DEAD.seatLoop[kind])('after seat_select the thread is bound and its seat handle is accepted on the next call', async () => {
     pre()
-    if (t.steps[0].tool !== 'seat_select') return
+    if (t.steps[0]?.tool !== 'seat_select') return
     expect(t.boot2.bound_agent_id ?? null).not.toBeNull()
     expect(t.handleReply, 'a handle was shown').not.toBeNull()
     expect(t.handleReply?.refused, JSON.stringify(t.handleReply?.body)).toBe(false)
@@ -336,17 +225,23 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
       expect(t.orient.refused).toBe(true)
       expect(['self', 'owner', 'admin', 'org_admin']).toContain(field(t.orient.body, 'who_acts'))
       const next = actionIn(String(field(t.orient.body, 'next_step') ?? ''), t.tools)
-      expect(toolDoors(t.boot3)).toContain(next)
-      // Lane B round 2: a door that boot lists is not enough; the named tool must NOT be refused for this very session
-      // ("Call seat_attach", "Call boot_context", "Call connect" would each satisfy the line above and fail here).
-      expect(next).toBeDefined()
-      const again = await call(t.w, t.c, String(next), STATIC_ARGS[String(next)] ?? {})
-      expect(again.refused, `${String(next)}: ${JSON.stringify(again.body)}`).toBe(false)
-      if (kind === 'claude') {
-        // Pinned per connection kind: a Claude thread (harness, no seat) acts for itself; seat_select first.
-        expect(field(t.orient.body, 'who_acts')).toBe('self')
-        expect(next).toBe('seat_select')
+      // a tool step must be a boot door; a human step (no tool named) must carry a link and a next_step
+      if (next !== undefined) {
+        expect(toolDoors(t.boot3)).toContain(next)
+        // Lane B round 2: the named tool must NOT be refused for this very session
+        const again = await call(t.w, t.c, String(next), STATIC_ARGS[String(next)] ?? {})
+        expect(again.refused, `${String(next)}: ${JSON.stringify(again.body)}`).toBe(false)
+        if (kind === 'claude') {
+          expect(field(t.orient.body, 'who_acts')).toBe('self')
+          expect(next).toBe('seat_select')
+        }
+      } else {
+        // the refusal table's step is prose; the link lives in the whoami block that rides beside it
+        expect(typeof field(t.orient.body, 'next_step')).toBe('string')
+        expect(typeof asObj(asArr(asObj(field(t.orient.body, 'whoami')).missing)[0]).link).toBe('string')
       }
+      // refusal AND whoami: the orient refusal carries the same block boot does
+      expect(asObj(field(t.orient.body, 'whoami')).state).toBe(asObj(t.boot3.whoami).state)
     }
   })
 
@@ -404,8 +299,8 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
     pre()
     const whoami = asObj(t.boot3.whoami)
     const bound = (t.boot3.bound_agent_id ?? null) !== null
-    const BOUND = ['bound', 'own_seat', 'acting_as_agent', 'host']
-    const UNBOUND = ['no_agent', 'own_seat', 'unbound_no_agent', 'unbound_agent_exists', 'unbound_workspace']
+    const BOUND = ['own_seat', 'acting_as', 'host']
+    const UNBOUND = ['no_agent', 'harness_unseated']
     expect(bound ? BOUND : UNBOUND).toContain(whoami.state)
     const missing = Array.isArray(whoami.missing) ? (whoami.missing as Json[]) : []
     expect(Array.isArray(whoami.have)).toBe(true)
@@ -414,7 +309,7 @@ describe.each(Object.keys(CLIENTS) as Kind[])('cold %s client, first five minute
     for (const m of missing) {
       expect(String(m.who_acts ?? '')).not.toBe('')
       expect(String(m.next_step ?? '')).not.toBe('')
-      expect(typeof m.tool === 'string' ? t.tools.has(m.tool) : typeof m.link === 'string').toBe(true)
+      expect(typeof m.next_tool === 'string' ? t.tools.has(m.next_tool) : typeof m.link === 'string').toBe(true)
     }
   })
 
