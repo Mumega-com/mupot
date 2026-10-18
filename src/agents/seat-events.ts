@@ -34,7 +34,7 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
-import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
@@ -219,7 +219,40 @@ async function hostHasStandingInSquad(env: Env, hostAgentId: string, squadId: st
   const key = await loadActiveAgentKey(env, hostAgentId)
   if (!key) return false
   const grants = await resolveCapabilities(env, key.member_id)
-  return canOnSquad(env, grants, squadId, 'member')
+  if (await canOnSquad(env, grants, squadId, 'member')) return true
+  return keyMemberOwnsHomeSquad(env, key.member_id, squadId)
+}
+
+// A human's OWN host may serve seats in their OWN home squad. Capability rows alone miss the
+// #1162 dual-member case: the member that registered the host key (agent_keys.member_id) can be
+// a different member row of the same human than the one holding the home squad's admin row
+// (createHomeForMember / bootstrapSelf write it; no route can grant into a home).
+//   - the squad must be kind='home' (non-home squads get NO widening here — that is #2038);
+//   - the OWNER is the member holding the home's exact, live, squad-scope admin row written by
+//     one of the two home provisioners (granted_via) — never a slug or a name match;
+//   - key member == owner, OR both hold live human_login_identities with the same PROVIDER-
+//     verified email (the linkage humanVerifiedLegacyRoleRank trusts), never members.email;
+//   - the owner must be active (the key member's own activity is enforced by loadActiveAgentKey).
+async function keyMemberOwnsHomeSquad(env: Env, keyMemberId: string, squadId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x
+       FROM squads s
+       JOIN capabilities c ON c.scope_type = 'squad' AND c.scope_id = s.id AND c.capability = 'admin'
+                          AND c.granted_via IN ('home_provision', 'bootstrap')
+                          AND ${CAPABILITY_LIVE_PREDICATE('c', '?4')}
+       JOIN members om ON om.id = c.member_id AND om.tenant = ?1 AND om.status = 'active'
+      WHERE s.id = ?2 AND s.kind = 'home'
+        AND (c.member_id = ?3
+             OR EXISTS (
+               SELECT 1 FROM human_login_identities ka
+                 JOIN human_login_identities oa ON lower(oa.verified_email) = lower(ka.verified_email)
+                WHERE ka.tenant = ?1 AND oa.tenant = ?1
+                  AND ka.member_id = ?3 AND oa.member_id = c.member_id
+                  AND ka.revoked_at IS NULL AND oa.revoked_at IS NULL
+                  AND ka.verified_email IS NOT NULL AND oa.verified_email IS NOT NULL))
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, squadId, keyMemberId, nowCapabilitySql()).first()
+  return row !== null
 }
 
 /** Authorize host → agent. Refuses while another live grant holds the agent: moving an agent

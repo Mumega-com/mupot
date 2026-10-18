@@ -1883,3 +1883,102 @@ describe('a closed socket does not count toward the per-host authenticated cap',
     expect(extra.of('ready')[0]?.subscriptions[0]).toMatchObject({ agent: extraAgent, ok: true })
   })
 })
+
+// ═════ host standing in a HOME squad: a human's own host may serve seats in their own home ═════
+describe('grant scope: own-home standing for the host key member', () => {
+  async function homeWorld() {
+    const w = await world()
+    const k = await keypair()
+    w.h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name, kind) VALUES ('dh1', 'dept-home-owner-m', 'Home — Owner', 'home'), ('dh2', 'dept-home-other-m', 'Home — Other', 'home');
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('home1', 'dh1', 'home-owner', 'Home — Owner', 'home'), ('home2', 'dh2', 'home-other', 'Home — Other', 'home');
+      INSERT INTO members (id, display_name, status, tenant) VALUES
+        ('owner-m', 'Owner', 'active', '${TENANT}'), ('owner-alt-m', 'Owner Alt', 'active', '${TENANT}'),
+        ('other-m', 'Other', 'active', '${TENANT}'), ('rando-m', 'Rando', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via) VALUES
+        ('cap-home1', 'owner-m', 'squad', 'home1', 'admin', 'home_provision'),
+        ('cap-home2', 'other-m', 'squad', 'home2', 'admin', 'bootstrap');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('home-seat-1', 'home1', 'hs1', 'HS1', 'member', 'm', 'active'),
+        ('home-seat-2', 'home2', 'hs2', 'HS2', 'member', 'm', 'active');
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES
+        ('${TENANT}', 'host-owner', '${k.x}', 'Ed25519', 'owner-m', ${NOW}),
+        ('${TENANT}', 'host-alt', '${k.x}x', 'Ed25519', 'owner-alt-m', ${NOW}),
+        ('${TENANT}', 'host-rando', '${k.x}y', 'Ed25519', 'rando-m', ${NOW});
+    `)
+    return w
+  }
+  const g = (w: World, host: string, agent: string) =>
+    createSeatEventGrant(w.env, { hostAgentId: host, agentId: agent, memberId: 'admin', reason: 'home' })
+  const link = (w: World, id: string, member: string, email: string, revoked = false) =>
+    w.h.sqlite.exec(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, revoked_at)
+      VALUES ('${id}', '${TENANT}', 'google', 'sub-${id}', '${email}', '${member}', ${revoked ? "'2026-01-01'" : 'NULL'})`)
+
+  it('owner host -> own home seat granted', async () => {
+    const w = await homeWorld()
+    expect((await g(w, 'host-owner', 'home-seat-1')).ok).toBe(true)
+  })
+  it('owner host -> another member home seat refused', async () => {
+    const w = await homeWorld()
+    expect(await g(w, 'host-owner', 'home-seat-2')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('non-owner member host -> home seat refused', async () => {
+    const w = await homeWorld()
+    expect(await g(w, 'host-rando', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('dual-member: key member and home owner share a live provider-verified identity email -> granted', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'H@X.io')
+    expect((await g(w, 'host-alt', 'home-seat-1')).ok).toBe(true)
+  })
+  it('dual-member with a verified identity on the key member only (owner has none) -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('dual-member with a revoked link -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io', true)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('a non-home squad is never widened by the link (kind=work, owner row present)', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    w.h.sqlite.exec(`UPDATE squads SET kind = 'work' WHERE id = 'home1'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('an admin row on a home not written by a home provisioner does not make an owner', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    w.h.sqlite.exec(`UPDATE capabilities SET granted_via = 'manual' WHERE id = 'cap-home1'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('inactive key member (owner suspended) -> refused', async () => {
+    const w = await homeWorld()
+    w.h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'owner-m'`)
+    expect(await g(w, 'host-owner', 'home-seat-1')).toEqual({ ok: false, reason: 'host_key_missing' })
+  })
+  it('inactive home owner (alt key member active) -> refused', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    w.h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'owner-m'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('a mere member-level row on a home does not make an owner', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    w.h.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-home1'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('an expired owner row does not make an owner', async () => {
+    const w = await homeWorld()
+    link(w, 'l1', 'owner-m', 'h@x.io'); link(w, 'l2', 'owner-alt-m', 'h@x.io')
+    w.h.sqlite.exec(`UPDATE capabilities SET expires_at = '2020-01-01 00:00:00' WHERE id = 'cap-home1'`)
+    expect(await g(w, 'host-alt', 'home-seat-1')).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+  })
+  it('unknown squad fails closed', async () => {
+    const w = await homeWorld()
+    w.h.sqlite.exec(`PRAGMA foreign_keys = OFF; UPDATE agents SET squad_id = 'ghost' WHERE id = 'home-seat-1'`)
+    expect((await g(w, 'host-owner', 'home-seat-1')).ok).toBe(false)
+  })
+})
