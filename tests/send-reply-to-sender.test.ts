@@ -322,5 +322,41 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     expect(r.status).toBe(404)
     expect(landed(a.agentId) + landed(b.agentId)).toBe(0)
   })
+
+  it('F1: malformed kind/body gives the SAME response whether `to` is right or wrong, active or inactive sender', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    const bad = [{ kind: 'bogus' }, { body: 'y'.repeat(2_000_000) }]
+    const shape = async (extra: Record<string, unknown>, to: string): Promise<string> => {
+      const r = await rpc(env, kasra, 'send', { to, body: 'x', in_reply_to: orig, ...extra })
+      return r.raw
+    }
+    for (const extra of bad) {
+      const right = await shape(extra, seat.agentId)
+      const wrong = await shape(extra, 'agent-nobody')
+      h.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(seat.agentId)
+      const inactive = await shape(extra, seat.agentId)
+      h.sqlite.prepare(`UPDATE agents SET status = 'active' WHERE id = ?`).run(seat.agentId)
+      expect(right).toContain('send_target_not_visible')
+      expect(new Set([right, wrong, inactive]).size).toBe(1)
+    }
+    expect(landed(seat.agentId)).toBe(0)
+  })
+
+  it('F2: a seat renaming itself to another sender\'s agent id cannot capture that sender\'s reply after expiry', async () => {
+    const s = await homeSeat(env, 'human-1', 's1')
+    const x = await homeSeat(env, 'human-2', 's2')
+    await sendFrom(env, s, { to: 'agent-kasra', body: 'from S' })
+    const sId = msgId('agent-kasra', s.agentId)
+    await sendFrom(env, x, { to: 'agent-kasra', body: 'from X', request_id: sId })
+    h.sqlite.prepare(`UPDATE agents SET slug = ?, name = ? WHERE id = ?`).run(s.agentId + '-x', s.agentId, x.agentId)
+    h.sqlite.prepare(`UPDATE agents SET slug = ? WHERE id = ?`).run(s.agentId, x.agentId)
+    h.sqlite.prepare(`UPDATE agent_messages SET created_at = ? WHERE id = ?`).run(new Date(Date.now() - 8 * 86400000).toISOString(), sId)
+    const r = await rpc(env, kasra, 'send', { to: s.agentId, body: 'meant for S', in_reply_to: sId })
+    expect(r.status).toBe(404)
+    expect(landed(x.agentId)).toBe(0)
+    expect(landed(s.agentId)).toBe(0)
+  })
 })
 

@@ -2824,6 +2824,11 @@ async function resolveReplyTarget(
   const toRef = input.toRef.trim()
   const stripped = stripOneLeadingAt(toRef) ?? toRef
   const cutoff = new Date(Date.parse(nowIso) - REPLY_WINDOW_MS).toISOString()
+  // Precedence: a ref that is exactly an agent id means THAT agent and nothing else. Slug and
+  // display name are renameable by any sender, so they must never compete with an id (a seat
+  // renaming itself to another sender's id would otherwise capture that sender's reply).
+  const byId = (await env.DB.prepare(`SELECT 1 AS x FROM agents WHERE id IN (?1, ?2) LIMIT 1`)
+    .bind(toRef, stripped).first<{ x: number }>()) !== null
   // The sender filter is applied BEFORE the row is chosen (a request_id is only unique per
   // sender, so an unrelated sender's newer message with the same id string must not shadow the
   // real one). An exact message-id match wins over a request_id match, then the newest row.
@@ -2834,7 +2839,7 @@ async function resolveReplyTarget(
       WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
         AND julianday(m.created_at) >= julianday(?4)
         AND a.status != 'inactive'
-        AND (a.id IN (?5, ?6) OR a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))
+        AND ${byId ? 'a.id IN (?5, ?6)' : '(a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))'}
       ORDER BY (m.id = ?3) DESC, m.seq DESC LIMIT 50`,
   ).bind(tenant, input.fromAgent, ref, cutoff, toRef, stripped).all<SendAgentRow & { mid: string }>()
   const found = rows.results ?? []
@@ -2990,10 +2995,10 @@ export async function sendToRef(
   if (!res.ok) {
     // Reply path: the caller can see nothing of this recipient, so no downstream reason
     // (inbox_full, db_error, seat/project/fence refusals, ...) may differ from the ordinary
-    // invisible-target refusal. Only malformed-input reasons (the caller's own arguments) and
-    // the caller's own reply-limit detail pass through.
+    // invisible-target refusal. That includes invalid_* (otherwise a malformed body/kind is a
+    // liveness probe on the sender: it would only surface when the reply resolved). Only the
+    // caller's own reply-limit detail passes through.
     if (replyFence) {
-      if (res.reason.startsWith('invalid_')) return res
       return {
         ok: false,
         reason: 'send_target_not_visible',
