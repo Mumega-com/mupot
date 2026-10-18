@@ -22,9 +22,11 @@
 // takes effect on the very next request of every thread.
 //
 // AUTHORITY. The attached context is the SAME clamp every seat has (resolveSeatCapabilities): per scope
-// min(human live rank, agent rank, 'member'), human must be admin on the agent's squad. It never exceeds 'member',
+// min(human live rank, agent rank, the CEILING the human approved: member by default, lead or full only if chosen), human
+// must be admin on the agent's squad. It never exceeds that ceiling,
 // never gains the agent's gate authority (see callerHoldsGateCapability), and never reaches another member's agent:
-// the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent.
+// the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent (and, with
+// SEAT_ATTACH_DESIGNATED on, only agents an org admin designated for this human: attachDesignatedClause).
 //
 // TRUST BOUNDARY. A thread's client key is a SELECTOR (seat-auto.ts). Under that stance whoever holds the harness
 // grant can act as any of its threads; what attach adds is that reaching an agent needs the human's one-time
@@ -47,6 +49,26 @@ import { sanitizeLabel } from './harness'
 /** The one definition of "is attach on". Strict '1' on both flags: attach without seats means nothing. */
 export function seatAttachEnabled(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL'>): boolean {
   return env.SEAT_ATTACH === '1' && seatAutoEnrollEnabled(env)
+}
+
+/** SEAT_ATTACH_DESIGNATED (strict '1', and only with attach itself on): attach is narrowed to agents an org admin designated for
+ *  THIS human (agents.attach_designated_member_id, migration 0238). Off = today's behaviour, byte for byte. */
+export function seatAttachDesignatedEnabled(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>): boolean {
+  return seatAttachEnabled(env) && env.SEAT_ATTACH_DESIGNATED === '1'
+}
+
+/**
+ * THE ONE "this agent is attach-designated for this human" predicate, as an SQL AND-fragment. Every attach site embeds
+ * THIS function and nothing else: listAttachableAgents (request + resolve), admissionRefusal (the human's decision),
+ * the findLiveAttachment join (every request) and the attachment INSERT guard. Grant time and use time therefore share
+ * one definition, and un-designating detaches on the next request with no sweep. `agentAlias` is the agents table alias in
+ * the host statement; `humanParam` the numbered bind that holds the human member id (e.g. '?4').
+ * Flag off: a tautology that still consumes the bind (so the statements keep one bind shape) and changes nothing.
+ */
+export function attachDesignatedClause(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>, agentAlias: string, humanParam: string): string {
+  return seatAttachDesignatedEnabled(env)
+    ? `AND ${agentAlias}.attach_designated_member_id = ${humanParam}`
+    : `AND ${humanParam} IS NOT NULL`
 }
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
@@ -102,11 +124,12 @@ export async function listAttachableAgents(env: Env, humanMemberId: string, refs
       WHERE a.status = 'active'
         AND (b.agent_id IS NULL OR am.id IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM agent_seats s WHERE s.agent_id = a.id)
+        ${attachDesignatedClause(env, 'a', refs ? '?3' : '?2')}
         ${where}
       ORDER BY a.name ASC
       LIMIT 400`,
   )
-  const rows = (refs ? await stmt.bind(refs.ref, env.TENANT_SLUG).all<AgentCandidate>() : await stmt.bind(env.TENANT_SLUG).all<AgentCandidate>()).results ?? []
+  const rows = (refs ? await stmt.bind(refs.ref, env.TENANT_SLUG, humanMemberId).all<AgentCandidate>() : await stmt.bind(env.TENANT_SLUG, humanMemberId).all<AgentCandidate>()).results ?? []
   if (rows.length === 0) return []
   const grants = await resolveCapabilities(env, humanMemberId)
   const out: AttachableAgent[] = []
@@ -314,6 +337,10 @@ async function admissionRefusal(env: Env, adm: AdmissionRow): Promise<string | n
   const agent = await env.DB.prepare(`SELECT a.status AS status, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ status: string; squad_id: string }>()
   if (!agent || agent.status !== 'active') return 'agent_not_active'
+  // Designation is re-checked at the human's decision with the SAME predicate the list, the chokepoint and the insert use.
+  const designated = await env.DB.prepare(`SELECT 1 AS x FROM agents a WHERE a.id = ?1 ${attachDesignatedClause(env, 'a', '?2')} LIMIT 1`)
+    .bind(adm.agent_id, adm.human_member_id).first<{ x: number }>()
+  if (!designated) return 'agent_not_designated'
   const seatAgent = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE agent_id = ?1 LIMIT 1`).bind(adm.agent_id).first<{ x: number }>()
   if (seatAgent) return 'agent_is_seat_agent'
   // Identity-only (no binding row at all) is admissible: promoteAdmission welds it in the same batch. A binding row whose member is
@@ -502,6 +529,7 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
         AND s.member_id = att.human_member_id
         AND s.harness_id = att.harness_id
         AND a.status = 'active'
+        ${attachDesignatedClause(env, 'a', '?4')}
         AND EXISTS (SELECT 1 FROM member_tokens g
                      WHERE g.id = ?3 AND g.member_id = ?4 AND g.tenant = ?1
                        AND g.channel = 'directory' AND g.agent_id IS NULL
@@ -629,7 +657,8 @@ export async function attachSeatToAgent(
        JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
        JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
       WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)`,
+        AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
+        ${attachDesignatedClause(env, 'a', '?8')}`,
   ).bind(attachmentId, env.TENANT_SLUG, tokenId, nowIso, admission.admission.id, agent.id, seat.id, p.humanMemberId))
   statements.push(env.DB.prepare(
     `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)

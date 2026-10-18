@@ -4234,9 +4234,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "seat_tape_window" },
     ],
   },
+  {
+    file: "0238_agent_attach_designated.sql",
+    sha256: "bce72914b3da6f0f45d8852bd23940ab329cda83877151c3f66560912c7d2d6f",
+    statements: [
+      "-- 0238_agent_attach_designated.sql -- seat_attach: attach only to owner-designated agents (flag SEAT_ATTACH_DESIGNATED, default off).\n-- Audit: agents/kasra/docs/audit-seat-attach-and-codex-path-20261018.md section 5.\n--\n-- agents.attach_designated_member_id: the ONE human an agent is designated attachable for. NULL (every existing agent)\n-- = not attachable once SEAT_ATTACH_DESIGNATED is on. Written ONLY through the owner door (authorizeOwnerMemberChange\n-- with the self-target waiver removed: org-scope floor + target-rank ceiling), by update_agent / the dashboard, and\n-- audited by the agent_audit row updateAgentProfile writes in the same batch. Nothing reads it while the flag is off.\n-- The read side is ONE predicate (src/members/seat-attach.ts attachDesignatedClause) used at every attach site.\n--\n-- ADD COLUMN only: no table is rebuilt.\nALTER TABLE agents ADD COLUMN attach_designated_member_id TEXT REFERENCES members(id);",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "cd959a8dff01e75d5edf6a0fe26acb7a122b7756836561b662aed8491dd8699b"
+export const SCHEMA_CHAIN_DIGEST: string = "3dabf7a595f169e37320d07fcf598a53a1a9c0aeafc2c2a9cc63fe6876188d45"

@@ -11,19 +11,34 @@ import type { AuthContext, BusEvent, Env } from '../types'
 import { createBus } from '../bus'
 import { actorRankOnScopeFor, capabilityRank, exceedsTargetRankCeiling } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
+import { attachedAuthority } from '../auth/attached-ceiling'
+
+/** Which member-reference column on agents the change targets. Both are authenticate-as-conferring, both use ONE predicate. */
+export type OwnerDoorColumn = 'owner_member_id' | 'attach_designated_member_id'
 
 export type OwnerChangeRefusal =
   | { ok: true }
   | { ok: false; status: 400; error: 'invalid_args'; detail: string }
   | { ok: false; status: 403; error: 'forbidden'; detail: { need: typeof MEMBER_BIND_MINT_FLOOR; scope: 'org' } }
   | { ok: false; status: 403; error: 'target_rank_exceeds_ceiling'; detail: { owner_member_id: string } }
+  | { ok: false; status: 403; error: 'seat_session_forbidden'; detail: { column: OwnerDoorColumn } }
 
 export async function authorizeOwnerMemberChange(
   env: Env,
   auth: AuthContext,
   agentId: string,
   ownerMemberId: unknown,
+  column: OwnerDoorColumn = 'owner_member_id',
 ): Promise<OwnerChangeRefusal> {
+  // attach_designated_member_id (migration 0238) decides which agents a human's chats may BECOME. It goes through this same
+  // door with two differences: (1) NO self-target waiver (a squad admin could otherwise designate themselves on any agent),
+  // and (2) a seat or attached chat may never write it (a chat must not widen what chats may become). The seat test reads
+  // the server-derived auth.seatBinding / attachedAuthority, never a client claim. Ranks below are read from the EFFECTIVE
+  // auth.capabilities (actorRankOnScopeFor), never DB rows, so an attached or clamped session cannot out-rank its clamp.
+  const designation = column === 'attach_designated_member_id'
+  if (designation && ownerMemberId !== undefined && (auth.seatBinding || attachedAuthority(auth))) {
+    return { ok: false, status: 403, error: 'seat_session_forbidden', detail: { column } }
+  }
   // OUTGOING owner (mupot#1987 gate P1): replacing or clearing an owner who outranks
   // the caller would let them detach the verdict-independence / approval-routing
   // principal. Applies to replace, clear and take-over alike; the self-target waiver
@@ -31,7 +46,7 @@ export async function authorizeOwnerMemberChange(
   // The current owner is read HERE, fresh, so no caller can pass a stale or wrong one.
   const currentRow = ownerMemberId === undefined
     ? null
-    : await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string | null }>()
+    : await env.DB.prepare(`SELECT ${column} AS owner_member_id FROM agents WHERE id = ?`).bind(agentId).first<{ owner_member_id: string | null }>()
   const currentOwnerMemberId = currentRow?.owner_member_id ?? null
   if (ownerMemberId !== undefined && currentOwnerMemberId) {
     if (await exceedsTargetRankCeiling(env, auth, currentOwnerMemberId)) {
@@ -42,7 +57,7 @@ export async function authorizeOwnerMemberChange(
   if (/\s/.test(ownerMemberId)) {
     return { ok: false, status: 400, error: 'invalid_args', detail: 'owner_member_id must not contain whitespace' }
   }
-  const isSelfTarget = auth.memberId != null && auth.memberId === ownerMemberId
+  const isSelfTarget = !designation && auth.memberId != null && auth.memberId === ownerMemberId
   if (isSelfTarget) return { ok: true }
   const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
   if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {

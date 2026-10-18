@@ -51,7 +51,7 @@ import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
-import { connectionName, seatAttachEnabled } from '../members/seat-attach'
+import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
 import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
@@ -7418,12 +7418,42 @@ const toolConnect: ToolSpec = {
       }
     }
 
+    // SEAT / ATTACHED sessions (server-derived auth.seatBinding): connect never changes who the chat is. Say so, with the agent
+    // the chat IS acting as, and what (if anything) turns it into the claimed agent. Text + two fields only; no authority moves.
+    let seatNote: { acting_as: { id: string; slug: string | null }; next_step: string } | null = null
+    if (auth.seatBinding && auth.boundAgentId) {
+      const actingRow = await env.DB.prepare('SELECT slug FROM agents WHERE id = ?1').bind(auth.boundAgentId).first<{ slug: string | null }>()
+      const actingSlug = actingRow?.slug ?? null
+      const actingLabel = actingSlug ?? auth.boundAgentId
+      if (isSelf) {
+        seatNote = { acting_as: { id: auth.boundAgentId, slug: actingSlug }, next_step: `You are ${actingLabel} already: this chat is acting as ${actingLabel}. For your agent's briefing call orient { agent: "${agentRef.slug}" }, or rely on this packet.` }
+      } else {
+        let how: string
+        if (!seatAttachEnabled(env)) {
+          how = `Becoming ${agentRef.slug} from this chat is not enabled on this pot (seat_attach is off). Ask your human; a Codex/CLI host uses a workspace token an admin mints on /admin/agent-token.`
+        } else if (auth.seatBinding.attached) {
+          how = `This chat is attached to ${actingLabel} and stays so; ask your human to move or detach it on their Connections page.`
+        } else if (seatAttachDesignatedEnabled(env) && !(await resolveAttachableAgent(env, auth.seatBinding.humanMemberId, agentRef.id)).ok) {
+          how = `This chat cannot become ${agentRef.slug}: it is not designated for your human, so seat_attach would answer agent_not_found. An org admin designates agents for a human.`
+        } else {
+          how = `To BE ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves with their passkey and this chat then acts as that agent.`
+        }
+        seatNote = {
+          acting_as: { id: auth.boundAgentId, slug: actingSlug },
+          next_step: `This is a READ preview of ${agentRef.slug}'s briefing. This chat is still ${actingLabel} (reading only): your sends, inbox and permissions are ${actingLabel}'s, not ${agentRef.slug}'s. ${how} For ${agentRef.slug}'s briefing call orient { agent: "${agentRef.slug}" }.`,
+        }
+      }
+    }
+
     return done({
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
       binding: durable ? 'durable' : 'session_local',
+      ...(seatNote ? { identity_changed: false, acting_as: seatNote.acting_as } : {}),
       // DE2: a session-local claim does not bind the session, so `orient {}` would answer "agent required". Name the agent.
-      next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
+      next_step: seatNote
+        ? seatNote.next_step
+        : auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
             ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`
             : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`)

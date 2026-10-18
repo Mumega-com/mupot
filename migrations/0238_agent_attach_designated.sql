@@ -1,0 +1,11 @@
+-- 0238_agent_attach_designated.sql -- seat_attach: attach only to owner-designated agents (flag SEAT_ATTACH_DESIGNATED, default off).
+-- Audit: agents/kasra/docs/audit-seat-attach-and-codex-path-20261018.md section 5.
+--
+-- agents.attach_designated_member_id: the ONE human an agent is designated attachable for. NULL (every existing agent)
+-- = not attachable once SEAT_ATTACH_DESIGNATED is on. Written ONLY through the owner door (authorizeOwnerMemberChange
+-- with the self-target waiver removed: org-scope floor + target-rank ceiling), by update_agent / the dashboard, and
+-- audited by the agent_audit row updateAgentProfile writes in the same batch. Nothing reads it while the flag is off.
+-- The read side is ONE predicate (src/members/seat-attach.ts attachDesignatedClause) used at every attach site.
+--
+-- ADD COLUMN only: no table is rebuilt.
+ALTER TABLE agents ADD COLUMN attach_designated_member_id TEXT REFERENCES members(id);

@@ -1372,7 +1372,7 @@ const AGENT_SNAPSHOT_JSON = `json_object(
   'model', model, 'model_fallback', model_fallback, 'purpose', purpose, 'owner', owner,
   'capabilities', capabilities, 'skills', skills, 'parent_agent_id', parent_agent_id,
   'qnft_ref', qnft_ref, 'budget_cap_cents', budget_cap_cents, 'budget_window', budget_window,
-  'owner_member_id', owner_member_id
+  'owner_member_id', owner_member_id, 'attach_designated_member_id', attach_designated_member_id
 )`
 
 // Fields an admin may correct on an existing agent. `status` is deliberately
@@ -1488,7 +1488,9 @@ const UPDATABLE_AUTONOMY_COLUMNS = ['autonomy'] as const
 // UPDATABLE_TEXT_COLUMNS): the value must reference a REAL member in this
 // tenant, or be null to clear — a free-text write, unlike `owner`, is not
 // merely cosmetically wrong here, it is a security-relevant lie.
-const UPDATABLE_MEMBER_REF_COLUMNS = ['owner_member_id'] as const
+// attach_designated_member_id (0238) rides the same category and validator (a REAL, ACTIVE member of this tenant, or null to
+// clear); its authority is the owner door's (authorizeOwnerMemberChange, no self waiver), never this writer's.
+const UPDATABLE_MEMBER_REF_COLUMNS = ['owner_member_id', 'attach_designated_member_id'] as const
 
 export type UpdatableAgentField =
   | (typeof UPDATABLE_TEXT_COLUMNS)[number]
