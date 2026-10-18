@@ -13,7 +13,7 @@ import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
-import { REPLY_CAP_PER_MESSAGE, resolveVisibleSendTarget, sendToRef } from '../src/agents/messages'
+import { REPLY_CAP_PER_MESSAGE, resolveVisibleSendTarget, sendAgentMessage, sendToRef } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -200,8 +200,9 @@ describe('reply into a home squad', () => {
       expect(r.status).toBe(200)
     }
     const over = await rpc(env, kasra, 'send', { to: seat.agentId, body: 'too many', in_reply_to: orig })
-    expect(over.status).toBe(404)
-    expect(over.raw).toContain('reply limit')
+    expect(over.status).toBe(400)
+    expect(over.raw).toContain('reply_limit_reached')
+    expect(over.raw).not.toContain('resend with in_reply_to')
     expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, seat.agentId, orig)).toBe(REPLY_CAP_PER_MESSAGE)
   })
 
@@ -272,11 +273,12 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     expect(landed(seat.agentId)).toBe(REPLY_CAP_PER_MESSAGE)
   })
 
-  it('citing the message id and the request_id share ONE cap, and both store the canonical id', async () => {
+  it('citing the message id and the request_id share ONE cap (aliases of the same original); each keeps the caller\'s own correlation value', async () => {
     const { seat, orig } = await thread('req-mix')
     await Promise.all(Array.from({ length: 60 }, (_, i) => rpc(env, kasra, 'send', { to: seat.agentId, body: `m${i}`, in_reply_to: i % 2 ? orig : 'req-mix' })))
     expect(landed(seat.agentId)).toBe(REPLY_CAP_PER_MESSAGE)
-    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'agent-kasra' AND in_reply_to = ?`, orig)).toBe(REPLY_CAP_PER_MESSAGE)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'agent-kasra' AND in_reply_to IN (?, 'req-mix')`, orig)).toBe(REPLY_CAP_PER_MESSAGE)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'agent-kasra' AND in_reply_to = 'req-mix'`)).toBeGreaterThan(0)
   })
 
   it('another agent\'s rows keyed on the same original never consume the replier\'s cap (per original + replier)', async () => {
@@ -300,7 +302,8 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, a.agentId, aId)).toBe(1)
     // to B citing the same string: B's request_id match is found (sender filtered before the pick)
     expect((await rpc(env, kasra, 'send', { to: b.agentId, body: 'to b', in_reply_to: aId })).status).toBe(200)
-    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, b.agentId, bId)).toBe(1)
+    expect(bId).not.toBe(aId)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND in_reply_to = ?`, b.agentId, aId)).toBe(1)
   })
 
   it('pins which row wins: the exact message-id match beats a newer request_id match from the same sender', async () => {
@@ -383,6 +386,65 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     expect((await rpc(env, kasra, 'send', { to: sSlug, body: 'ok', in_reply_to: sId })).status).toBe(200)
     expect(landed(s.agentId)).toBe(1)
     expect(landed(x.agentId)).toBe(0)
+  })
+
+  it('ACK correlation: the stored in_reply_to is the request_id the caller cited, so the recipient can correlate', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'need', kind: 'request', request_id: 'req-corr' })
+    expect((await rpc(env, kasra, 'send', { to: seat.agentId, body: 'done', kind: 'ack', in_reply_to: 'req-corr' })).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = ? AND kind = 'ack' AND in_reply_to = 'req-corr'`, seat.agentId)).toBe(1)
+  })
+
+  it('an identical retry of the 20th reply returns the original (duplicate), not a cap refusal', async () => {
+    const { seat, orig } = await thread()
+    const send = (i: number) => rpc(env, kasra, 'send', { to: seat.agentId, body: `r${i}`, in_reply_to: orig, request_id: `rr-${i}` })
+    for (let i = 0; i < REPLY_CAP_PER_MESSAGE; i++) expect((await send(i)).status).toBe(200)
+    const retry = await send(REPLY_CAP_PER_MESSAGE - 1)
+    expect(retry.status).toBe(200)
+    expect(landed(seat.agentId)).toBe(REPLY_CAP_PER_MESSAGE)
+    expect((await send(REPLY_CAP_PER_MESSAGE)).status).toBe(400)
+  })
+
+  it('P1 collision: a visible agent sharing the sender\'s slug never receives the reply; the cited sender does', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    await coreAgent(env, 'agent-lookalike', 'lookalike')
+    h.sqlite.prepare(`UPDATE agents SET slug = 'shared-slug' WHERE id IN (?, 'agent-lookalike')`).run(seat.agentId)
+    expect((await rpc(env, kasra, 'send', { to: 'shared-slug', body: 'for the sender', in_reply_to: orig })).status).toBe(200)
+    expect(landed(seat.agentId)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-lookalike'`)).toBe(0)
+    // with a seat label the ambiguity cannot be resolved safely: refused, nothing lands anywhere
+    expect((await rpc(env, kasra, 'send', { to: 'shared-slug', body: 'x', in_reply_to: orig, seat: 'whatever' })).status).toBe(404)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-lookalike'`)).toBe(0)
+  })
+
+  it('a visible peer still works with in_reply_to (ordinary path, no reply cap or refusal changes)', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    const peer = await coreAgent(env, 'agent-peer', 'peer')
+    void peer
+    expect((await rpc(env, kasra, 'send', { to: 'agent-peer', body: 'hi peer', in_reply_to: orig })).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent = 'agent-peer'`)).toBe(1)
+  })
+
+  it('an admin replying by display name reaches the hidden home-seat sender', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    const name = String(h.sqlite.prepare(`SELECT name FROM agents WHERE id = ?`).get(seat.agentId)!.name)
+    const res = await sendToRef(env, { fromAgent: 'agent-kasra', fromMember: kasra.memberId as string, toRef: name, body: 'by name', inReplyTo: orig }, { isAdmin: true, grants: kasra.capabilities ?? [] })
+    expect(res.ok).toBe(true)
+    expect(landed(seat.agentId)).toBe(1)
+  })
+
+  it('the insert itself refuses a recipient deactivated after resolution (fence is in the INSERT)', async () => {
+    const { seat, orig } = await thread()
+    h.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(seat.agentId)
+    const res = await sendAgentMessage(env, { fromAgent: 'agent-kasra', fromMember: kasra.memberId as string, toAgent: seat.agentId, body: 'late', inReplyTo: orig }, { system: true, reason: 'test: exercising the reply fence directly' }, { replyFence: { originalId: orig, requestId: null, cap: REPLY_CAP_PER_MESSAGE } })
+    expect(res.ok).toBe(false)
+    expect(landed(seat.agentId)).toBe(0)
   })
 })
 
