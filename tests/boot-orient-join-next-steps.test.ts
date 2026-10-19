@@ -14,6 +14,7 @@ import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
 import { OBSERVED_FLOOR_TOOLS, OBSERVED_TIER_RANK, instantObservedJoin, observedFloorRefusal, readSeatAdmissionStatus } from '../src/members/vip-lane'
 import { capabilityRank } from '../src/auth/capability'
+import { joinNextSteps } from '../src/members/vip-lane'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -158,5 +159,34 @@ describe('next_steps.join', () => {
     for (let i = 0; i < 14; i++) { seedSquad(`squad-x${i}`); cap(OWNER, 'squad', `squad-x${i}`, 'admin') }
     const s = await seatFor(OWNER)
     expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).length).toBe(10)
+  })
+  it('archived squads are absent', async () => {
+    h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-second'`)
+    const s = await seatFor(OWNER)
+    const slugs = (joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)
+    expect(slugs).toContain('squad-target')
+    expect(slugs).not.toContain('squad-second')
+  })
+  it('the seat host squad is excluded', async () => {
+    const s = await seatFor(OWNER)
+    const host = one<{ squad_id: string }>(`SELECT squad_id FROM agents WHERE id = ?`, s.agentId)!.squad_id
+    const slugs = (joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)
+    expect(slugs).not.toContain(h.sqlite.prepare(`SELECT slug FROM squads WHERE id = ?`).get(host)!.slug)
+  })
+  it('a welded agent member is not an active human: no list', async () => {
+    const s = await seatFor(OWNER)
+    const other = await seatFor(OWNER, 'conv-b')
+    h.sqlite.exec(`INSERT OR REPLACE INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', '${other.agentId}', '${OWNER}', '2026-10-09T00:00:00.000Z')`)
+    const seatBinding = { seatId: s.seatId, label: '', harnessId: '', grantTokenId: '', humanMemberId: OWNER, source: 'handle' } as unknown as AuthContext['seatBinding']
+    const j = await joinNextSteps(env, { seatBinding, boundAgentId: s.agentId })
+    expect(j.squads).toBeUndefined()
+    expect(j.note).toContain('join_squad files a request')
+  })
+  it('flag off: joinNextSteps makes zero DB queries', async () => {
+    const prepare = vi.fn(() => { throw new Error('must not query') })
+    const off = { VIP_LANE: undefined, DB: { prepare } } as unknown as Env
+    const seatBinding = { seatId: 's', label: '', harnessId: '', grantTokenId: '', humanMemberId: OWNER, source: 'handle' } as unknown as AuthContext['seatBinding']
+    expect((await joinNextSteps(off, { seatBinding, boundAgentId: 'a' })).squads).toBeUndefined()
+    expect(prepare).not.toHaveBeenCalled()
   })
 })
