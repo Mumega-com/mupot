@@ -297,10 +297,11 @@ describe('rejoin ordering, liveness, and held-over-attach (CI + Codex fixes)', (
     const args = { humanMemberId: OWNER, seatId: s.seatId, seatAgentId: s.agentId, squad, grants }
     const mems = (): number => n(`SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND squad_id = 'squad-second'`, s.agentId)
     // reset batch fails: the add is never attempted
-    const failReset = { ...env, DB: new Proxy(env.DB, { get: (t, k) => (k === 'batch' ? async () => { throw new Error('batch down') } : Reflect.get(t, k).bind(t)) }) } as unknown as Env
-    expect(await instantObservedJoin(failReset, args)).toEqual({ ok: false, error: 'write_refused' })
+    h.sqlite.exec(`CREATE TRIGGER fail_audit BEFORE INSERT ON seat_admission_changes BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+    expect(await instantObservedJoin(env, args)).toEqual({ ok: false, error: 'write_refused' })
     expect(status(s.seatId)).toBe('trusted')
     expect(mems()).toBe(0)
+    h.sqlite.exec('DROP TRIGGER fail_audit')
     // reset succeeds, membership add fails: observed (restrictive), no membership
     h.sqlite.exec(`CREATE TRIGGER fail_mem BEFORE INSERT ON memberships BEGIN SELECT RAISE(ABORT, 'injected'); END`)
     await instantObservedJoin(env, args).catch(() => undefined)
