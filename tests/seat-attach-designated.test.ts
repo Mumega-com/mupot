@@ -66,6 +66,11 @@ let h: SqliteD1Harness
 let tokCounter = 0
 const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
 const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare(sql).get(...p) as T | undefined
+/** TEST SCAFFOLDING for pre-#2054 multi-chat fixtures: a live admission is bound to the ONE chat that asked, so to model a
+ *  second attached chat on the same admission the test re-points requested_seat_id at the next unattached seat. */
+const bindAdm = (agentId: string, seatId?: string): void => {
+  h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = COALESCE(?, (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1)) WHERE agent_id = ? AND status IN ('pending', 'live')`).run(seatId ?? null, agentId)
+}
 /** The attach code a tool-made pending admission carries (the human types it on Admit). */
 const codeOf = (id: string): string | null => one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions WHERE id = ?`, id)?.attach_code ?? null
 
@@ -412,6 +417,7 @@ describe('designated agent: attach, then the chat IS that agent (end to end)', (
       },
     })
     const seat = one<{ id: string }>(`SELECT s.id AS id FROM agent_seats s WHERE s.agent_id NOT IN ('agent-rava') AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id) LIMIT 1`)!
+    bindAdm('agent-rava', seat.id)
     const r = await attachSeatToAgent({ ...env, DB: racing } as Env, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'agent-rava', via: 'tool' })
     expect(raced).toBe(true)
     expect(r).toEqual({ ok: false, error: 'attach_refused' })
@@ -423,7 +429,7 @@ describe('designated agent: attach, then the chat IS that agent (end to end)', (
     await designate(env, 'agent-rava', HUMAN)
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
-    await boot(env, g, 'conv-b')
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     expect((await attach(env, g, 'conv-b', 'rava')).sc.status).toBe('attached')
     const att = one<{ id: string }>(`SELECT att.id AS id FROM agent_seat_attachments att JOIN agent_seats s ON s.id = att.seat_id WHERE att.detached_at IS NULL ORDER BY att.created_at DESC, att.id LIMIT 1`)!
     expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
@@ -803,6 +809,7 @@ describe('codex review dispositions', () => {
     const p2 = await attach(env, g, 'conv-b', 'hadi-admin')
     await decideMoment(env, String(p2.sc.approve_url), key, 'approve') // admission live for hadi-admin; conv-b still unattached
     const seat = one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE agent_id = 'agent-rava' AND detached_at IS NULL`)!.seat_id
+    bindAdm('agent-hadi-admin', seat)
     dropTrigger() // isolate the batch guard from the trigger's admission revoke
     const racing = raceOnBatch(env, async () => { expect((await designate(env, 'agent-hadi-admin', null)).ok).toBe(true) })
     const r = await attachSeatToAgent(racing, { humanMemberId: HUMAN, seatId: seat, agentRef: 'agent-hadi-admin', via: 'dashboard', moveIfAttached: true })

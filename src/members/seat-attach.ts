@@ -71,6 +71,7 @@ export type AttachFailure =
   | 'too_many_pending_admissions'
   | 'attach_refused'
   | 'attach_code_mismatch'
+  | 'approval_bound_to_other_chat'
 
 export interface AttachableAgent {
   id: string
@@ -235,7 +236,7 @@ export function weldAudit(env: Env, agentId: string, actorId: string, admissionI
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
   | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean }
-  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' }
+  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' }
 
 /**
  * Find or create the admission for (agent, human, harness).
@@ -258,10 +259,15 @@ export async function ensureAdmission(
   ).bind(env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, nowIso).run()
 
   const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
-  if (open && open.status === 'live') return { ok: true, state: 'live', admission: open }
+  // An admission is bound to the ONE chat (seat) that asked: the unique (agent, human, harness) slot means a second chat gets
+  // no row of its own, so it is refused (the human revokes, then it asks again and gets its own coded ask).
+  if (open && open.status === 'live') {
+    return open.requested_seat_id === p.seatId ? { ok: true, state: 'live', admission: open } : { ok: false, error: 'approval_bound_to_other_chat' }
+  }
 
   if (p.via === 'dashboard') {
     if (open && open.status === 'pending') {
+      if (open.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
       if (attachCodeRefused(open, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
       await promoteAdmission(env, open, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode)
     } else if (!open) {
@@ -286,6 +292,7 @@ export async function ensureAdmission(
       ])
     }
     const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    if (now && now.status === 'live' && now.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
     return now && now.status === 'live' ? { ok: true, state: 'live', admission: now } : { ok: false, error: 'attach_refused' }
   }
 
@@ -295,6 +302,10 @@ export async function ensureAdmission(
   // But a pending admission with NO live pending moment is stranded: the first mint failed, the link expired, or a decision
   // consumed the one-time moment and the admission write did not land (split write; waitUntil is not transactional). The
   // unique index covers pending moments only, so minting a fresh link here is safe and is the recovery path.
+  // Only the chat that filed the ask is handed (or re-handed) the approval link; any other chat gets no link and no code.
+  if (open && open.status === 'pending' && open.requested_seat_id !== p.seatId) {
+    return { ok: true, state: 'pending', admission: open, approveUrl: null, alreadyPending: true }
+  }
   if (open && open.status === 'pending') {
     const liveMoment = await env.DB.prepare(
       `SELECT 1 AS ok FROM secure_moments WHERE tenant = ?1 AND kind = 'seat_admit' AND subject_id = ?2 AND status = 'pending' AND expires_at > ?3 LIMIT 1`,
@@ -322,7 +333,7 @@ export async function ensureAdmission(
         .bind(p.agentId, p.humanMemberId).first<{ x: number }>()
       return { ok: false, error: stillDesignated ? 'too_many_pending_admissions' : 'attach_refused' }
     }
-    if (pending.status === 'live') return { ok: true, state: 'live', admission: pending }
+    if (pending.status === 'live') return pending.requested_seat_id === p.seatId ? { ok: true, state: 'live', admission: pending } : { ok: false, error: 'approval_bound_to_other_chat' }
     // Lost a concurrent first-ask race: the winner mints the one link. Minting here would rotate it and silently kill the
     // link the winner returned (bot review P2).
     if (!inserted && pending.status === 'pending') return { ok: true, state: 'pending', admission: pending, approveUrl: null, alreadyPending: true }
@@ -699,6 +710,7 @@ export async function attachSeatToAgent(
        FROM agent_seats s
        JOIN agent_seat_admissions adm ON adm.id = ?5 AND adm.tenant = s.tenant AND adm.status = 'live'
             AND adm.human_member_id = s.member_id AND adm.harness_id = s.harness_id AND adm.agent_id = ?6
+            AND adm.requested_seat_id = s.id -- the approval belongs to the chat that asked
        JOIN agents a ON a.id = adm.agent_id AND a.status = 'active'
        JOIN agent_member_bindings b ON b.tenant = s.tenant AND b.agent_id = a.id
        JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
@@ -831,7 +843,7 @@ export interface ConnectionAdmission {
   ceiling: AttachCeiling
   created_at: string
   expires_at: string | null
-  attach_code: string | null
+  has_code: number
   seat_label: string | null
   seat_first_seen: string | null
   live_threads: number
@@ -876,7 +888,7 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
   }))
   const admissions = (await env.DB.prepare(
     `SELECT adm.id AS id, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
-            adm.expires_at AS expires_at, adm.attach_code AS attach_code, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
+            adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
             (SELECT COUNT(*) FROM agent_seat_attachments x WHERE x.admission_id = adm.id AND x.detached_at IS NULL) AS live_threads
        FROM agent_seat_admissions adm
        JOIN agents a ON a.id = adm.agent_id

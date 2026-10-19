@@ -4257,15 +4257,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0240_admission_attach_code.sql",
-    sha256: "fa593a2363443186f42dc9cca9781a04e3653a26f64fec0a176c5de3c3519a07",
+    sha256: "55023c067f7282e0e5b27bd7d8fa9991e7aa1cc9ed1c8f2a54e49c7b061c65cc",
     statements: [
       "-- 0240_admission_attach_code.sql — mupot#2054. A pending seat admission carries a short human code that the asking chat\n-- shows its human and the /connections card repeats, so \"Admit\" can be tied to the chat that asked. Additive; NULL on\n-- every pre-existing row (legacy: Admit works without a code). A label, not a credential.\nALTER TABLE agent_seat_admissions ADD COLUMN attach_code TEXT;",
+      "\n\n-- The code never changes once set (it is what the human matched on the card). Additive: a new trigger only.\nCREATE TRIGGER IF NOT EXISTS agent_seat_admissions_attach_code_immutable\nBEFORE UPDATE OF attach_code ON agent_seat_admissions\nFOR EACH ROW\nWHEN OLD.attach_code IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_attach_code_immutable');\nEND;",
     ],
-    objects: [],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_attach_code_immutable" },
+    ],
   },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a436b2e3ea12abd5a7ff29b219978b65f1c48e1dfe657efac034555530e99dfb"
+export const SCHEMA_CHAIN_DIGEST: string = "e5a52f7583525455bab448615a830d0ec189e443b1816d314926f3229077914e"

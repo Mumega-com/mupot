@@ -431,7 +431,7 @@ momentsApp.get('/m/:id/:token', async (c) => {
   if (subject.kind === 'seat_admit') {
     const v = await admissionView(c.env, subject.adm)
     const codeBlock = subject.adm.attach_code
-      ? `<h2>Attach code</h2><p>The chat that asked was told to show you this code: <strong class="attach-code">${escapeHtml(subject.adm.attach_code)}</strong>. Type it below only if the chat you are looking at shows the same code.</p><label>Attach code <input name="attach_code" autocomplete="off" maxlength="12" size="8" required></label>`
+      ? `<h2>Attach code</h2><p>The chat that asked was told to show you a short code. Type the code that chat showed you; it is not printed here, so it proves you are looking at that chat.</p><label>Attach code <input name="attach_code" autocomplete="off" maxlength="12" size="8" required></label>`
       : ''
     inner = `${codeBlock}<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
 <dt>App</dt><dd>${untrustedBox('Connected app', `${v.harnessName} (${v.harnessKind})`)}</dd>

@@ -63,12 +63,21 @@ const toolSeatAttach: ToolSpec = {
       })
     }
     if (r.ok && r.already_pending) {
+      if (!r.attach_code) {
+        return done({
+          status: 'already_pending',
+          admission_id: r.admission_id,
+          expires_at: r.expires_at,
+          note: 'A different chat holds this pending request for this agent, so no code or link is given here. Ask your human to deny it on their Connections page, then ask again from this chat to get your own code.',
+        })
+      }
       return done({
         status: 'already_pending',
         admission_id: r.admission_id,
         expires_at: r.expires_at,
-        ...(r.attach_code ? { attach_code: r.attach_code, tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.` } : {}),
-        note: 'An admission for this agent is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page. After they approve, call seat_attach again.',
+        attach_code: r.attach_code,
+        tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.`,
+        note: 'Your request is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page and type your code. After they approve, call seat_attach again.',
       })
     }
     if (r.ok) {
@@ -98,6 +107,10 @@ const toolSeatAttach: ToolSpec = {
         return fail(429, r.error, 'Your human already has too many pending admissions. Ask them to clear some on their Connections page.')
       case 'seat_not_found':
         return fail(409, r.error, 'This thread has no live seat.')
+      case 'approval_bound_to_other_chat':
+        return fail(409, r.error, 'This agent is approved for a different chat; ask the human to approve this one (they revoke the old admission on their Connections page, then this chat asks again and gets its own code).')
+      case 'attach_code_mismatch':
+        return fail(403, r.error)
       case 'attach_refused':
         return fail(409, r.error, 'The attach could not be completed (the agent, the admission or this seat changed). Retry, or ask your human to check their Connections page.')
       default:

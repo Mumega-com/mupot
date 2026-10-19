@@ -63,6 +63,11 @@ let h: SqliteD1Harness
 let tokCounter = 0
 const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
 const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare(sql).get(...p) as T | undefined
+/** TEST SCAFFOLDING for pre-#2054 multi-chat fixtures: a live admission is bound to the ONE chat that asked, so to model a
+ *  second attached chat on the same admission the test re-points requested_seat_id at the next unattached seat. */
+const bindAdm = (agentId: string, seatId?: string): void => {
+  h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = COALESCE(?, (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1)) WHERE agent_id = ? AND status IN ('pending', 'live')`).run(seatId ?? null, agentId)
+}
 /** The attach code a tool-made pending admission carries (the human types it on Admit). */
 const codeOf = (id: string): string | null => one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions WHERE id = ?`, id)?.attach_code ?? null
 
@@ -269,7 +274,7 @@ describe('the flow: ask -> passkey admission -> attach -> act AS the agent', () 
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
-    await boot(env, g, 'conv-b')
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     const b = await attach(env, g, 'conv-b', 'rava')
     expect(b.sc.status).toBe('attached')
     expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit'`)).toBe(1)
@@ -757,7 +762,8 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
-    await boot(env, g, 'conv-b'); await attach(env, g, 'conv-b', 'rava')
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
+    await attach(env, g, 'conv-b', 'rava')
     const attTok = one<{ seat_token_id: string }>(`SELECT seat_token_id FROM agent_seat_attachments LIMIT 1`)!.seat_token_id
     const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
     const r = await revokeAdmission(env, { admissionId: adm, humanMemberId: HUMAN })
@@ -863,6 +869,7 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     await admitAndAttach(env, g, 'conv-a')
     await boot(env, g, 'conv-b')
     const seatB = one<{ id: string }>(`SELECT s.id FROM agent_seats s WHERE s.id NOT IN (SELECT seat_id FROM agent_seat_attachments)`)!.id
+    bindAdm('agent-rava', seatB)
     const rs = await Promise.all([1, 2, 3].map(() => attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'tool' })))
     expect(rs.filter((r) => r.ok && r.status === 'attached').length).toBeGreaterThanOrEqual(1)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, seatB)).toBe(1)
@@ -1144,13 +1151,14 @@ describe('dashboard: Connections', () => {
       expect(JSON.stringify(other.body)).not.toContain(String(r.sc.attach_code))
     })
 
-    it('the /connections card shows the code, the seat label and first-seen time, escaped', async () => {
+    it('the /connections card does NOT print the code: it shows the seat label, first-seen and a code input, escaped', async () => {
       const env = envFor(h)
       const { r } = await pendingFor(env)
       h.sqlite.prepare(`UPDATE harnesses SET client_name = ?`).run('<img src=x onerror=alert(1)>')
       const cookie = await session(env, `${HUMAN}@example.test`)
       const page = await (await dash(env, cookie, '/connections')).text()
-      expect(page).toContain(`>${String(r.sc.attach_code)}</strong>`)
+      expect(page).not.toContain(String(r.sc.attach_code)) // typed by the human from the chat, never printed beside the input
+      expect(page).toContain('Type the code the chat showed you')
       expect(page).toContain('first seen')
       expect(page).toContain('data-cx-acode=')
       expect(page).not.toContain('<img src=x')
@@ -1188,6 +1196,7 @@ describe('dashboard: Connections', () => {
     it('a legacy pending admission with a NULL code still approves without one', async () => {
       const env = envFor(h)
       const { adm } = await pendingFor(env)
+      h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_attach_code_immutable`) // fixture only: model a pre-0240 row
       h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = NULL WHERE id = ?`).run(adm)
       const cookie = await session(env, `${HUMAN}@example.test`)
       fresh()
@@ -1201,7 +1210,7 @@ describe('dashboard: Connections', () => {
       const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
       const page = await (await hit(new URL(String(r.sc.approve_url)).pathname, env)).text()
       expect(page).toContain('name="attach_code"')
-      expect(page).toContain(String(r.sc.attach_code))
+      expect(page).not.toContain(String(r.sc.attach_code)) // the page asks for the code, it does not print it
       expect(page).toContain('first seen')
       for (const bad of ['ZZ-ZZ', null]) {
         const res = await decideMoment(env, String(r.sc.approve_url), key, 'approve', undefined, undefined, bad)
@@ -1248,8 +1257,19 @@ describe('dashboard: Connections', () => {
         const c = (readFileSync(p, 'utf8').match(re) ?? []).length
         return c ? [`${p}:${c}`] : []
       }).sort()
-      // 1. the only UPDATE that sets status live lives in promoteAdmission
-      expect(hits(/UPDATE\s+agent_seat_admissions\s+SET\s+status\s*=\s*'live'/g)).toEqual(['src/members/seat-attach.ts:1'])
+      // 1. SEMANTIC: any SQL anywhere (src or migrations) that sets status to 'live' (or to a bind parameter) on agent_seat_admissions,
+      //    whatever the SET column order, is found. Exactly one: promoteAdmission.
+      const liveSetters = (text: string): number => {
+        let c = 0
+        for (const m of text.matchAll(/UPDATE\s+agent_seat_admissions\s+SET\s+([\s\S]*?)(?=\bWHERE\b|`|;|$)/gi)) {
+          if (/(?<![.\w])status\s*=\s*('live'|\?\d*)/i.test(m[1])) c++
+        }
+        return c
+      }
+      const sqlHits = [...walk('src').filter((p) => !p.endsWith('schema-chain.generated.ts')), ...readdirSync('migrations').filter((f) => f.endsWith('.sql')).map((f) => join('migrations', f))]
+        .flatMap((p) => { const c = liveSetters(readFileSync(p, 'utf8')); return c ? [`${p}:${c}`] : [] }).sort()
+      expect(sqlHits).toEqual(['src/members/seat-attach.ts:1'])
+      expect(liveSetters(`UPDATE agent_seat_admissions SET decided_at = ?2, status = 'live' WHERE id = ?1`)).toBe(1) // self-check: column order does not hide it
       // 2. the only INSERT of a row born live (dashboard attach with NO pending request: no chat asked, nothing to match)
       expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/seat-attach.ts:2'])
       // 3. every caller of promoteAdmission (each must pass the typed code): exactly these three
@@ -1259,6 +1279,94 @@ describe('dashboard: Connections', () => {
       // 4. no migration trigger or other SQL moves an admission to live
       const mig = readdirSync('migrations').filter((f) => f.endsWith('.sql')).filter((f) => /SET\s+status\s*=\s*'live'/i.test(readFileSync(join('migrations', f), 'utf8')) && /agent_seat_admissions/.test(readFileSync(join('migrations', f), 'utf8')))
       expect(mig).toEqual([])
+    })
+
+    it('attach_code is immutable once set (new trigger): UPDATE of it aborts', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      expect(() => h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = 'ZZ-ZZ' WHERE id = ?`).run(adm)).toThrow(/attach_code_immutable/)
+      expect(() => h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = NULL WHERE id = ?`).run(adm)).toThrow(/attach_code_immutable/)
+    })
+
+    it('per-chat binding: a live admission attaches ONLY the chat that asked; a second chat is refused (approval_bound_to_other_chat) and nothing attaches', async () => {
+      const env = envFor(h)
+      const g = await grant(env, HUMAN)
+      await admitAndAttach(env, g, 'conv-a')
+      await boot(env, g, 'conv-b')
+      const b = await attach(env, g, 'conv-b', 'rava')
+      expect(errOf(b)).toBe('approval_bound_to_other_chat')
+      expect(JSON.stringify(b.body)).toContain('different chat')
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
+      expect((await boot(env, g, 'conv-b')).sc.bound_agent_id).not.toBe('agent-rava')
+      // the same chat that was admitted re-attaches fine after a detach
+      const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
+      expect((await detachAttachment(env, { attachmentId: att, humanMemberId: HUMAN })).ok).toBe(true)
+      expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+      // revoke, then the second chat asks again and gets its OWN coded ask
+      const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'live'`)!.id
+      expect((await revokeAdmission(env, { admissionId: adm, humanMemberId: HUMAN })).ok).toBe(true)
+      const again = await attach(env, g, 'conv-b', 'rava')
+      expect(again.sc.status).toBe('pending_admission')
+      expect(String(again.sc.attach_code)).toMatch(/^[A-Z2-9]{2}-[A-Z2-9]{2}$/)
+    })
+
+    it('the attach INSERT itself requires s.id = requested_seat_id (admission re-pointed between check and write -> refused)', async () => {
+      const env = envFor(h)
+      const g = await grant(env, HUMAN)
+      await admitAndAttach(env, g, 'conv-a')
+      const attId = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
+      expect((await detachAttachment(env, { attachmentId: attId, humanMemberId: HUMAN })).ok).toBe(true)
+      const seatA = one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE id = ?`, attId)!.seat_id
+      const db = env.DB
+      const proxied = new Proxy(db, {
+        get(t, k) {
+          if (k === 'batch') return async (st: Parameters<typeof db.batch>[0]) => { h.sqlite.exec(`UPDATE agent_seat_admissions SET requested_seat_id = 'some-other-seat'`); return t.batch(st) }
+          const v = (t as unknown as Record<string | symbol, unknown>)[k] // as: proxying an opaque D1 binding
+          return typeof v === 'function' ? v.bind(t) : v
+        },
+      })
+      const r = await attachSeatToAgent({ ...env, DB: proxied } as unknown as Env, { humanMemberId: HUMAN, seatId: seatA, agentRef: 'agent-rava', via: 'tool' })
+      expect(r).toEqual({ ok: false, error: 'attach_refused' })
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
+    })
+
+    it('a dashboard-born live admission is bound to the seat it attached; another seat is refused', async () => {
+      const env = envFor(h)
+      const g = await grant(env, HUMAN)
+      await boot(env, g, 'conv-a'); await boot(env, g, 'conv-b')
+      const seats = (h.sqlite.prepare(`SELECT id FROM agent_seats ORDER BY created_at, rowid`).all() as Array<{ id: string }>).map((r) => r.id)
+      expect((await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[0], agentRef: 'rava', via: 'dashboard' })).ok).toBe(true)
+      expect(one<{ requested_seat_id: string }>(`SELECT requested_seat_id FROM agent_seat_admissions`)?.requested_seat_id).toBe(seats[0])
+      expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[1], agentRef: 'rava', via: 'dashboard' })).toEqual({ ok: false, error: 'approval_bound_to_other_chat' })
+    })
+
+    it('stranded-pending recovery re-mints the link ONLY for the requesting chat; another chat gets no link, no code, and the "different chat" note', async () => {
+      const env = envFor(h)
+      const { g, r } = await pendingFor(env)
+      h.sqlite.exec(`UPDATE secure_moments SET status = 'expired' WHERE kind = 'seat_admit'`) // the first link is gone: stranded
+      await boot(env, g, 'conv-b')
+      const other = await attach(env, g, 'conv-b', 'rava')
+      expect(other.sc.status).toBe('already_pending')
+      expect(other.sc.approve_url).toBeUndefined()
+      expect(other.sc.attach_code).toBeUndefined()
+      expect(String(other.sc.note)).toContain('A different chat holds this pending request')
+      expect(String(other.sc.note)).not.toContain('still works')
+      expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit' AND status = 'pending'`)).toBe(0)
+      const mine = await attach(env, g, 'conv-a', 'rava')
+      expect(String(mine.sc.approve_url).startsWith(`${ORIGIN}/m/`)).toBe(true)
+      expect(mine.sc.attach_code).toBe(r.sc.attach_code)
+    })
+
+    it('/connections/attach over a coded pending ask: no dead end (the page tells the human to use the card and type the code), state unchanged', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      fresh()
+      const page = await (await dash(env, cookie, '/connections')).text()
+      expect(page).toContain('use Admit on the Waiting for your decision card')
+      const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
+      expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava' })).status).toBe(403)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
     })
 
     it('codes are generated from the unambiguous alphabet and differ between calls', async () => {
@@ -1721,6 +1829,7 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     await boot(env, g, 'conv-a'); await boot(env, g, 'conv-b')
     const seats = h.sqlite.prepare(`SELECT id FROM agent_seats ORDER BY created_at`).all() as Array<{ id: string }>
     expect((await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[0].id, agentRef: 'rava', via: 'dashboard' })).ok).toBe(true)
+    bindAdm('agent-rava', seats[1].id)
     return { g, seatB: seats[1].id }
   }
 
@@ -1805,6 +1914,7 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     const { invokeTool } = await import('../src/mcp/index')
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     await attach(env, g, 'conv-b', 'rava') // admission is live now: attaches immediately
     const labels = (h.sqlite.prepare(`SELECT t.label AS label FROM agent_seat_attachments a JOIN member_tokens t ON t.id = a.seat_token_id WHERE a.detached_at IS NULL`).all() as Array<{ label: string }>).map((r) => r.label)
     expect(labels.length).toBe(2)
@@ -2265,6 +2375,7 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     expect(idsOf(peek)).toEqual(['m-keep'])
     expect((peek as { result: { remaining: number; complete: boolean } }).result).toMatchObject({ remaining: 0, complete: true })
     // handled is PER ATTACHMENT: a second attachment of the same agent and the host still see the mail
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     await attach(env, g, 'conv-b', 'rava')
     const att2 = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
     expect(idsOf(await call(att2, 'inbox', { peek: true })).sort()).toEqual(['m-keep', 'm-null'])
@@ -2400,6 +2511,7 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     const { env, g, att, label, call } = await setup()
     msg('m-seat1', 'agent-rava', label) // visible to attachment 1 only
     expect(handledOf(await call(att, 'inbox_mark_handled', { ids: ['m-seat1'] })).handled).toEqual(['m-seat1'])
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     await attach(env, g, 'conv-b', 'rava')
     const att2 = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
     expect(handledOf(await call(att2, 'inbox_mark_handled', { ids: ['m-seat1'] })).not_visible).toEqual(['m-seat1'])
@@ -2414,6 +2526,7 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
 
   it('the write itself is bound to the CALLER\'s attachment row: a detached attachment cannot write while a second live attachment of the same agent exists', async () => {
     const { env, g, call } = await setup()
+    await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     await attach(env, g, 'conv-b', 'rava')
     msg('m-1')
     const [first, second] = (h.sqlite.prepare(`SELECT id FROM agent_seat_attachments ORDER BY created_at, rowid`).all() as Array<{ id: string }>).map((r) => r.id)

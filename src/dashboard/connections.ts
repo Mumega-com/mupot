@@ -76,6 +76,8 @@ function connectionsScript(): Html {
             var data = await res.json().catch(function () { return {}; });
             if (res.ok) { window.location.reload(); return; }
             if (data.error === 'reauth_required') reauthLink();
+            else if (data.error === 'attach_code_mismatch') say('That code does not match. A chat asked for this agent: use Admit on the Waiting for your decision card and type the code the chat showed you.');
+            else if (data.error === 'approval_bound_to_other_chat') say('This agent is approved (or requested) for a different chat. Revoke or deny that first, then have this chat ask again.');
             else say('Could not do that (' + (data.error || res.status) + ').');
           } catch (e) { say('Network error — try again.'); }
         }
@@ -136,16 +138,16 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
   const pendingBody = pending.length === 0
     ? emptyState({ title: 'Nothing waiting', detail: 'When a thread asks to act as an agent you have not admitted yet, it appears here (and as a one-time passkey link it hands you).' })
     : dataTable({
-      cols: [{ label: 'Attach code', width: '0.8fr' }, { label: 'Agent', width: '1.2fr' }, { label: 'App / chat', width: '1.4fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.8fr' }],
+      cols: [{ label: 'Attach code', width: '1fr' }, { label: 'Agent', width: '1.2fr' }, { label: 'App / chat', width: '1.4fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.8fr' }],
       rows: pending.map((a) => [
-        a.attach_code
-          ? html`<strong data-cx-code-shown="${a.id}" style="font-size:1.4rem;letter-spacing:0.1em">${a.attach_code}</strong>`
+        a.has_code
+          ? html`${pill('Code required', 'primary')} <span>Type the code the chat showed you.</span>`
           : html`${pill('no code (older request)', 'dim')}`,
         html`${a.agent_name}`,
         html`${a.harness_name}${a.seat_label ? html` · ${a.seat_label}` : ''}${a.seat_first_seen ? html` (first seen ${formatWhen(a.seat_first_seen)})` : ''}`,
         html`${formatWhen(a.created_at)}`,
         enabled
-          ? html`${a.attach_code ? html`<input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat"> ` : ''}<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
+          ? html`${a.has_code ? html`<input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat"> ` : ''}<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
           : html`${pill('Disabled', 'dim')}`,
       ]),
       empty: '',
@@ -232,6 +234,7 @@ const ATTACH_STATUS: Record<string, 400 | 403 | 404 | 409 | 429> = {
   already_attached: 409,
   attach_refused: 409,
   attach_code_mismatch: 403,
+  approval_bound_to_other_chat: 409,
 }
 
 export function makeConnectionsApp(shell: ShellFn) {

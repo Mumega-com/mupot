@@ -485,6 +485,8 @@ describe('sudo for attached chats: the grant belongs to ONE attachment', () => {
     expect((await updateSquad(w, 'squad-core')).ok).toBe(true) // control: the attached chat that asked has it
     // (a) a SECOND chat attached to the same agent by the same human
     await boot(w.env, w.g, 'conv-b')
+    // fixture: a live admission is bound to the chat that asked (#2054); re-point it so a second chat of the same agent can attach
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET requested_seat_id = (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1) WHERE agent_id = 'agent-rava' AND status = 'live'`)
     expect((await attach(w.env, w.g, 'conv-b', 'rava')).sc.status).toBe('attached')
     const second = await applySeatForRequest(w.env, w.g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
     expect(second.seatBinding?.attached?.agentId).toBe('agent-rava')
