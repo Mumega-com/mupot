@@ -69,6 +69,21 @@ export function attachmentAttribution(auth: Pick<AuthContext, 'seatBinding'>): A
 }
 
 /**
+ * mupot#2095 — what a VERDICT write needs on top of the attribution: the seat and the human's own grant token, so the write's
+ * atomic guard can re-assert the same chain findLiveAttachment reads per request. Derived from auth only, never args.
+ */
+export interface VerdictAttribution extends AttachmentAttribution {
+  seatId: string
+  grantTokenId: string
+}
+
+export function verdictAttribution(auth: Pick<AuthContext, 'seatBinding'>): VerdictAttribution | null {
+  const a = attachedAuthority(auth)
+  const b = auth.seatBinding
+  return a && b ? { attachmentId: a.attachmentId, consentingMemberId: a.humanMemberId, seatId: b.seatId, grantTokenId: b.grantTokenId } : null
+}
+
+/**
  * "sudo" for an ATTACHED chat: the ONLY elevation actions an attached thread may request (request_elevation) and use.
  * Everything else stays refused (attached_seat_cannot_elevate): minting, access, deploy, secrets, keys, irreversible
  * acts (org_department_create, routine_archive), home access and every gate power. Adding a key here is a reviewed

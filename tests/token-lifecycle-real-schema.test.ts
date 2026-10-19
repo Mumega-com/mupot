@@ -325,6 +325,20 @@ describe('every bearer door consumes the shared predicate', () => {
     { fingerprint: '9f569882be3c', why: "workspaces W1 reuseRevokedHarness (members/harness.ts): looks for a REVOKED consent token by design (the inverse of the live predicate) to adopt that grant's harness. Grants no access: the adopting UPDATE is re-checked by trigger harnesses_grant_immutable (old token revoked, new token live and the same member's)." },
   ]
 
+  /** The raw-text check cannot see through a helper, so exactly ONE helper is recognised: seatTokenLiveSql (src/members/attach-live-sql.ts),
+   *  whose body is `TOKEN_LIVE_PREDICATE(ph('now'))` (pinned by the next test). */
+  function consumesSharedPredicate(literal: string): boolean {
+    return literal.includes('TOKEN_LIVE_PREDICATE(') || /\$\{\w*[lL]ivePredicate\(/.test(literal) || /\$\{seatTokenLiveSql\(/.test(literal)
+  }
+
+  it('the recognised helper really consumes the predicate, and the check still flags a SELECT with neither', () => {
+    expect(readFileSync(join(SRC_DIR, 'members/attach-live-sql.ts'), 'utf8')).toMatch(/export function seatTokenLiveSql[\s\S]*?TOKEN_LIVE_PREDICATE\(ph\('now'\)\)/)
+    expect(consumesSharedPredicate('SELECT t.id FROM member_tokens t WHERE ${seatTokenLiveSql(ph)}')).toBe(true)
+    expect(consumesSharedPredicate('SELECT t.id FROM member_tokens t WHERE t.id = ?1')).toBe(false)
+    expect(consumesSharedPredicate('SELECT t.id FROM member_tokens t WHERE t.revoked_at IS NULL')).toBe(false)
+    expect(consumesSharedPredicate('SELECT t.id FROM member_tokens t -- seatTokenLiveSql')).toBe(false)
+  })
+
   it('EVERY SELECT over member_tokens in src/ consumes the shared predicate or is fingerprint-exempt', () => {
     const offenders: string[] = []
     const exempt = new Map(NON_AUTH_QUERIES.map((e) => [e.fingerprint, e.why]))
@@ -337,8 +351,7 @@ describe('every bearer door consumes the shared predicate', () => {
         if (!/FROM\s+member_tokens/i.test(literal)) continue
         if (!/^\s*SELECT/i.test(literal.trim())) continue
         inspected += 1
-        const usesShared =
-          literal.includes('TOKEN_LIVE_PREDICATE(') || /\$\{\w*[lL]ivePredicate\(/.test(literal)
+        const usesShared = consumesSharedPredicate(literal)
         if (usesShared) continue
         const fp = fingerprint(literal)
         seen.add(fp)

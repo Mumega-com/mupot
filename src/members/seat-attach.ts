@@ -38,7 +38,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
-import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, capabilityRank, currentMemberRankOnScope, exceedsTargetRankCeilingGivenRanks, resolveCapabilities, targetMaxRankAcrossScopes } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from './project-invites'
 
@@ -52,7 +52,8 @@ import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
 export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
-import { attachDesignatedClause, seatAttachDesignatedEnabled, seatAttachEnabled, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
+import { attachDesignatedClause, seatAttachDesignatedEnabled, seatAttachEnabled } from './attach-designated'
+import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from './attach-live-sql'
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
 export const ATTACH_IDLE_DAYS = 30
@@ -647,39 +648,14 @@ export interface LiveAttachmentRow {
  *   ?1 tenant ?2 seat id ?3 grant token id ?4 human member id ?5 now
  */
 export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string | null }, seatId: string): Promise<LiveAttachmentRow | null> {
+  const ph: LivePh = (k) => ({ tenant: '?1', seat: '?2', grantToken: '?3', human: '?4', now: '?5' })[k]
   const row = await env.DB.prepare(
     `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, adm.gate_authority AS gate_authority, s.admission_status AS seat_admission_status, s.id AS seat_id,
             s.label_basename AS seat_label, s.agent_id AS seat_agent_id, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, att.harness_id AS harness_id,
-            (SELECT t.id FROM member_tokens t
-              WHERE t.id = att.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id
-                AND t.tenant = ?1 AND t.channel = 'directory'
-                AND ${TOKEN_LIVE_PREDICATE('?5')}) AS seat_token_id
-       FROM agent_seat_attachments att
-       JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
-       JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant
-       JOIN agents a ON a.id = att.agent_id
-       JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = a.id
-       JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
-       JOIN harnesses hr ON hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id
-      WHERE att.tenant = ?1
-        AND att.seat_id = ?2
-        AND att.detached_at IS NULL
-        AND att.human_member_id = ?4
-        AND adm.status = 'live'
-        AND adm.agent_id = att.agent_id
-        AND adm.human_member_id = att.human_member_id
-        AND adm.harness_id = att.harness_id
-        AND ${ADMISSION_BOUND_TO_SEAT_SQL}
-        AND s.retired_at IS NULL
-        AND s.member_id = att.human_member_id
-        AND s.harness_id = att.harness_id
-        AND a.status = 'active'
-        ${attachDesignatedClause(env, 'a', '?4')}
-        AND (?3 IS NULL OR EXISTS (SELECT 1 FROM member_tokens g
-                     WHERE g.id = ?3 AND g.member_id = ?4 AND g.tenant = ?1
-                       AND g.channel = 'directory' AND g.agent_id IS NULL
-                       AND ${TOKEN_LIVE_PREDICATE('?5').replace(/\bt\./g, 'g.')}))
+            (SELECT t.id FROM member_tokens t WHERE ${seatTokenLiveSql(ph)}) AS seat_token_id
+       FROM ${LIVE_ATTACHMENT_FROM_SQL}
+      WHERE ${liveAttachmentConditionsSql(env, ph)}
       LIMIT 1`,
   ).bind(env.TENANT_SLUG, seatId, human.tokenId, human.memberId, nowSqlUtc())
     .first<Omit<LiveAttachmentRow, 'seat_token_id'> & { seat_token_id: string | null }>()
