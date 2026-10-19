@@ -66,7 +66,7 @@ describe('the full /mcp tools/list response includes them', () => {
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
     // SECURE_DROP is unset as well: the five secure-drop tools (W2) are not advertised either.
     const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !DROP.includes(t.name)).length)
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'join_squad' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
       // #1910: an office_* wire alias carries its dotted tool's row (same ToolSpec object).
       const canonical = resolveToolSpec(t.name)?.name ?? t.name
