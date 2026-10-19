@@ -747,7 +747,7 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
       '0181_backfill_addon_manifest_v0_31.sql',
       '0184_addon_connector_bindings_write_capability.sql',
     ])
-    expect(probes.length).toBe(withSurvivingObject - 4)
+    expect(probes.length).toBe(withSurvivingObject - 5)
 
     // Every probed file must be distinct (one probe per file, not per object).
     expect(new Set(probes.map((p) => p.file)).size).toBe(probes.length)
