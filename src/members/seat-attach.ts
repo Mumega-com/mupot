@@ -570,6 +570,7 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
         AND adm.agent_id = att.agent_id
         AND adm.human_member_id = att.human_member_id
         AND adm.harness_id = att.harness_id
+        AND adm.requested_seat_id = att.seat_id -- the approval belongs to the chat that asked (#2056); NULL never matches
         AND s.retired_at IS NULL
         AND s.member_id = att.human_member_id
         AND s.harness_id = att.harness_id

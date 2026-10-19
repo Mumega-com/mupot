@@ -915,6 +915,25 @@ describe('findLiveAttachment: every conjunct is load-bearing (forged / drifted r
     expect(await live()).toBeNull()
     void env
   })
+  it('the resolver honours the admission\'s chat binding (#2056): a legacy cross-seat attachment does not act as the agent', async () => {
+    const { env, g, seatId, live } = await setup()
+    // fixture: a second seat B carrying a live attachment on the SAME admission (legacy, pre-#2054 shape; the admission stays bound to seat A)
+    h.sqlite.exec(`CREATE TEMP TABLE seatb AS SELECT * FROM agent_seats WHERE id = '${seatId}'`)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-seat-b', 'squad-core', 'seatb', 'SeatB', 'r', 'm', 'active')`)
+    h.sqlite.exec(`UPDATE seatb SET agent_id = 'agent-seat-b', id = 'seat-b', label_basename = 'other-chat', key_hash = '${'b'.repeat(64)}'`)
+    h.sqlite.exec(`INSERT INTO agent_seats SELECT * FROM seatb`)
+    h.sqlite.exec(`CREATE TEMP TABLE attb AS SELECT * FROM agent_seat_attachments WHERE seat_id = '${seatId}'`)
+    h.sqlite.exec(`UPDATE attb SET id = 'att-b', seat_id = 'seat-b'`)
+    h.sqlite.exec(`INSERT INTO agent_seat_attachments SELECT * FROM attb`)
+    const liveB = () => findLiveAttachment(env, { memberId: HUMAN, tokenId: g.tokenId }, 'seat-b')
+    expect(await live()).not.toBeNull() // seat A (the chat that asked) still resolves
+    expect(await liveB()).toBeNull() // seat B does not: the admission is not bound to it
+    // a NULL binding matches nothing
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`)
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET requested_seat_id = NULL`)
+    expect(await live()).toBeNull()
+    expect(await liveB()).toBeNull()
+  })
 })
 
 describe('PINNED: an attached seat is never reclaimed by the auto pool', () => {
@@ -1982,6 +2001,8 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(labels.length).toBe(2)
     expect(new Set(labels).size).toBe(2)
     for (const l of labels) expect(l.startsWith('attach:rava')).toBe(true)
+    // the admission is bound to ONE chat (#2056): re-point it at conv-a's seat so conv-a (the request below) still resolves as the agent
+    bindAdm('agent-rava', one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments ORDER BY created_at, rowid LIMIT 1`)!.seat_id)
     const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
     expect(JSON.stringify(await invokeTool(att, env, 'inbox_dead_letters', {}, 'https://pot.test'))).toContain('attached_seat_peek_only')
   })
