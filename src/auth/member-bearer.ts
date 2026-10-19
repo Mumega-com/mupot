@@ -13,6 +13,7 @@ import type { Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from './token-lifecycle'
 import { authLookupOrNull } from './fail-closed'
+import { seatAgentIsFloored } from '../members/vip-lane'
 
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
@@ -77,6 +78,9 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
     .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
   if (!row || row.status !== 'active') return null
+  // #2060 P1-c: every REST surface resolves its bearer here. A seat agent that is observed/held has no REST reach (the observed floor is
+  // MCP tool names; REST routes are not on it), so a human-minted token bound to such a seat agent resolves to nobody. VIP_LANE off = no-op.
+  if (await seatAgentIsFloored(env, row.bound_agent_id)) return null
   // 0099: best-effort usage stamp, same contract as the mcp/index.ts copy — telemetry
   // that makes cleanup possible, never an authorization input.
   void touchTokenLastUsed(env, tokenHash)
@@ -101,7 +105,7 @@ export async function memberTokenHashIsLive(
 ): Promise<boolean> {
   if (!tokenHash || !expectedMemberId) return false
   const row = await env.DB.prepare(
-    `SELECT m.id AS member_id, m.status AS status
+    `SELECT m.id AS member_id, m.status AS status, t.agent_id AS bound_agent_id
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?1
@@ -112,7 +116,8 @@ export async function memberTokenHashIsLive(
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
-    .first<{ member_id: string; status: string }>()
+    .first<{ member_id: string; status: string; bound_agent_id: string | null }>()
+  if (row && (await seatAgentIsFloored(env, row.bound_agent_id))) return false // #2060 P1-c: a live presence socket drops when its seat is observed/held
   return !!row && row.status === 'active' && row.member_id === expectedMemberId
 }
 

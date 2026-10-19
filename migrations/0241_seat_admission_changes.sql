@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS seat_admission_changes (
   tenant      TEXT NOT NULL,
   seat_id     TEXT NOT NULL,
   member_id   TEXT NOT NULL,
-  action      TEXT NOT NULL CHECK (action IN ('hold','release','return')),
+  action      TEXT NOT NULL CHECK (action IN ('hold','release','return','rejoin_reset')),
   from_status TEXT NOT NULL CHECK (from_status IN ('observed','trusted','held')),
   to_status   TEXT NOT NULL CHECK (to_status IN ('observed','trusted','held')),
   at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))

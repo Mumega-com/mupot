@@ -95,6 +95,8 @@ beforeEach(async () => {
   for (const m of [OWNER, PLAIN]) seedHuman(m)
   seedSquad('squad-core')
   for (const m of [OWNER, PLAIN]) cap(m, 'squad', 'squad-core', 'admin')
+  seedSquad('squad-target'); seedSquad('squad-second')
+  cap(OWNER, 'squad', 'squad-target', 'admin'); cap(OWNER, 'squad', 'squad-second', 'admin')
   resetHarnessProbeSampling()
   resetAutoSeatRefusalCache()
 })
@@ -146,7 +148,7 @@ describe('transitions by the owner', () => {
       [null, 'hold', false], [null, 'release', false], [null, 'return', false],
       ['observed', 'hold', true], ['observed', 'return', false], ['observed', 'release', true],
       ['held', 'hold', false], ['held', 'return', true], ['held', 'release', true],
-      ['trusted', 'hold', false], ['trusted', 'return', false], ['trusted', 'release', false],
+      ['trusted', 'hold', true], ['trusted', 'return', true], ['trusted', 'release', false],
     ]
     for (const [from, action, ok] of cases) {
       setStatus(s.seatId, from)
@@ -156,6 +158,37 @@ describe('transitions by the owner', () => {
       expect(audit(s.seatId).length - before, `${from} ${action} audit`).toBe(ok ? 1 : 0)
       if (!ok) expect(status(s.seatId)).toBe(from)
     }
+  })
+
+  it('trusted is not a one-way door: hold and return from trusted work on a STALE session (they reduce reach); held -> observed does not', async () => {
+    const s = await seatFor(OWNER)
+    const cookie = await session(env, `${OWNER}@example.test`)
+    stale()
+    setStatus(s.seatId, 'trusted')
+    expect((await post(cookie, s.seatId, 'hold')).status).toBe(200)
+    expect(status(s.seatId)).toBe('held')
+    setStatus(s.seatId, 'trusted')
+    expect((await post(cookie, s.seatId, 'return')).status).toBe(200)
+    expect(status(s.seatId)).toBe('observed')
+    setStatus(s.seatId, 'held')
+    expect((await post(cookie, s.seatId, 'return')).status).toBe(403)
+    expect(status(s.seatId)).toBe('held')
+    // the writer enforces freshness itself, not only the route
+    expect(await changeSeatAdmission(env, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: false })).toEqual({ ok: false, error: 'reauth_required' })
+    setStatus(s.seatId, 'trusted')
+    const { dashboardApp } = await import('../src/dashboard/index')
+    const html = await (await dashboardApp.request('/connections', { headers: { cookie } }, { ...env, LOCAL_TEST_AUTH: '1' } as unknown as Env)).text()
+    expect(html).toContain(`data-cx-hold="${s.seatId}"`)
+    expect(html).toContain(`data-cx-return="${s.seatId}"`)
+    expect(html).not.toContain(`data-cx-release="${s.seatId}"`)
+  })
+
+  it('a retired seat cannot be changed (kills the retired_at guard)', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'observed')
+    h.sqlite.prepare(`UPDATE agent_seats SET retired_at = '2026-10-01T00:00:00.000Z' WHERE id = ?`).run(s.seatId)
+    expect(await changeSeatAdmission(env, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: true })).toEqual({ ok: false, error: 'seat_not_found' })
+    expect(status(s.seatId)).toBe('observed')
   })
 
   it('release and return need a FRESH reauth; hold does not; a cross-origin POST is refused', async () => {
@@ -220,9 +253,56 @@ describe('single writer', () => {
     const walk = (d: string): void => { for (const e of readdirSync(d, { withFileTypes: true })) { const f = pjoin(d, e.name); if (e.isDirectory()) walk(f); else if (f.endsWith('.ts')) files.push(f) } }
     walk(pjoin(__dirname, '..', 'src'))
     const importers = files.filter((f) => /seat-hold-release/.test(readFileSync(f, 'utf8')) && !f.endsWith('seat-hold-release.ts')).map((f) => f.replace(/.*\/src\//, ''))
-    expect(importers).toEqual(['dashboard/connections.ts'])
-    const writers = files.filter((f) => /SET\s+admission_status/i.test(readFileSync(f, 'utf8'))).map((f) => f.replace(/.*\/src\//, '')).sort()
+    expect(importers.sort()).toEqual(['dashboard/connections.ts', 'members/vip-lane.ts']) // vip-lane only for the trusted -> observed rejoin reset
+    const writers = files.filter((f) => /(\bSET\b[^`;]*\badmission_status\s*=|\bINSERT\b[^`;]*\bagent_seats\b[^`;]*\badmission_status)/is.test(readFileSync(f, 'utf8'))).map((f) => f.replace(/.*\/src\//, '')).sort()
     expect(writers).toEqual(['members/seat-hold-release.ts', 'members/vip-lane.ts'])
+  })
+})
+
+describe('trust does not carry across squads (P1-b)', () => {
+  it('a trusted seat joining ANOTHER squad is reset to observed with an audit row; re-joining a squad it is already in keeps trusted', async () => {
+    const s = await seatFor(OWNER)
+    const join = (squad: string) => rpc(s.ctx, 'join_squad', { squad }, s.session)
+    setStatus(s.seatId, null)
+    expect((await join('squad-target')).text).not.toContain('error')
+    expect(status(s.seatId)).toBe('observed')
+    setStatus(s.seatId, 'trusted')
+    await join('squad-target') // already a member: no reset
+    expect(status(s.seatId)).toBe('trusted')
+    expect(audit(s.seatId)).toEqual([])
+    await join('squad-second') // a new squad: back to observed
+    expect(status(s.seatId)).toBe('observed')
+    expect(audit(s.seatId).map((a) => `${a.action}:${a.from_status}>${a.to_status}`)).toEqual(['rejoin_reset:trusted>observed'])
+    expect(audit(s.seatId)[0].member_id).toBe(OWNER)
+  })
+})
+
+describe('REST bearer sweep (P1-c) and read-error posture', () => {
+  it('resolveMemberByToken refuses a token bound to an observed/held seat agent, allows trusted/NULL, and is inert with the flag off', async () => {
+    const { resolveMemberByToken, hashMemberToken } = await import('../src/auth/member-bearer')
+    const s = await seatFor(OWNER)
+    const raw = 'rest-token-1'
+    const bound = one<{ member_id: string }>(`SELECT member_id FROM agent_member_bindings WHERE agent_id = ?`, s.agentId)
+    if (!bound) throw new Error('seat agent has no member binding')
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id) VALUES ('tok-rest', ?, ?, 'x', 'workspace', '2026-10-09T00:00:00.000Z', ?, ?)`).run(bound.member_id, await hashMemberToken(raw), TENANT, s.agentId)
+    for (const [st, ok] of [[null, true], ['trusted', true], ['observed', false], ['held', false]] as const) {
+      setStatus(s.seatId, st)
+      expect((await resolveMemberByToken(env, raw)) !== null, String(st)).toBe(ok)
+    }
+    setStatus(s.seatId, 'observed')
+    expect(await resolveMemberByToken(envFor(h, { VIP_LANE: undefined }), raw)).not.toBeNull()
+  })
+
+  it('by-agent floor: a retired seat is not floored; a read error floors a seat-like caller (harness) but never an ordinary agent', async () => {
+    const s = await seatFor(OWNER)
+    const bare = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
+    delete bare.seatBinding
+    setStatus(s.seatId, 'observed')
+    h.sqlite.prepare(`UPDATE agent_seats SET retired_at = '2026-10-01T00:00:00.000Z' WHERE id = ?`).run(s.seatId)
+    expect(await observedFloorRefusal(env, bare, 'request_elevation')).toBeNull()
+    const broken = { ...env, DB: { prepare: () => { throw new Error('db down') } } } as unknown as Env
+    expect(await observedFloorRefusal(broken, { ...bare, harnessId: 'h1' } as AuthContext, 'request_elevation')).toEqual({ status: 'held' })
+    expect(await observedFloorRefusal(broken, { ...bare, harnessId: null } as AuthContext, 'request_elevation')).toBeNull()
   })
 })
 
@@ -284,6 +364,6 @@ describe('flag off', () => {
     const bare = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
     delete bare.seatBinding
     expect(await observedFloorRefusal(off, bare, 'request_elevation')).toBeNull()
-    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'release' })).toEqual({ ok: false, error: 'vip_lane_disabled' })
+    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: true })).toEqual({ ok: false, error: 'vip_lane_disabled' })
   })
 })

@@ -198,11 +198,15 @@ describe('eligible: instant observed seat', () => {
     expect(membership(s.agentId, 'squad-target')).toBeUndefined()
   })
 
-  it('a trusted seat keeps trusted (the stamp is NULL-only)', async () => {
+  it('a trusted seat is not re-stamped by a repeat join to a squad it is already in (the stamp is NULL-only); a NEW squad resets it (#2060, audited)', async () => {
     const s = await seatFor(OWNER)
+    h.sqlite.prepare(`INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('m-t', ?, 'squad-target', 'member')`).run(s.agentId)
     h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'trusted' WHERE id = ?`).run(s.seatId)
     expect((await join(s, { squad: 'squad-target' })).sc.admission_status).toBe('trusted')
     expect(status(s.seatId)).toBe('trusted')
+    cap(OWNER, 'squad', 'squad-second', 'admin')
+    expect((await join(s, { squad: 'squad-second' })).sc.admission_status).toBe('observed')
+    expect(status(s.seatId)).toBe('observed')
   })
 
   it('a higher standing someone else gave the seat is kept, never lowered', async () => {

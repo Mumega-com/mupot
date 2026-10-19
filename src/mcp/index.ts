@@ -8046,7 +8046,7 @@ async function invokeToolInner(
   {
     const floor = await observedFloorRefusal(env, auth, spec.name)
     if (floor) {
-      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). An owner of the squad lifts it.` }), tool: spec.name }
+      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
     }
   }
 

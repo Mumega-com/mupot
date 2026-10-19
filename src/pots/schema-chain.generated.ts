@@ -4270,9 +4270,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0241_seat_admission_changes.sql",
-    sha256: "36b888ce263423c96414c7c976e532539b8c5743b95d777ea117eb884c6e9207",
+    sha256: "9b6fe3e3b5fbb96e17a9b2a87edecc3dc9b3b0c8c068e1e7dfd4a74bc6561ea2",
     statements: [
-      "-- 0241_seat_admission_changes.sql -- #2060: audit of HUMAN hold/release/return on an observed seat.\n-- One row per applied transition of agent_seats.admission_status made by the seat's own human on the dashboard\n-- (Connections > Observed chats). APPEND-ONLY (UPDATE/DELETE triggers RAISE). Written in the SAME D1 batch as the status UPDATE.\n-- CREATE only: no existing table is rebuilt.\n\nCREATE TABLE IF NOT EXISTS seat_admission_changes (\n  id          TEXT PRIMARY KEY NOT NULL,\n  tenant      TEXT NOT NULL,\n  seat_id     TEXT NOT NULL,\n  member_id   TEXT NOT NULL,\n  action      TEXT NOT NULL CHECK (action IN ('hold','release','return')),\n  from_status TEXT NOT NULL CHECK (from_status IN ('observed','trusted','held')),\n  to_status   TEXT NOT NULL CHECK (to_status IN ('observed','trusted','held')),\n  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "-- 0241_seat_admission_changes.sql -- #2060: audit of HUMAN hold/release/return on an observed seat.\n-- One row per applied transition of agent_seats.admission_status made by the seat's own human on the dashboard\n-- (Connections > Observed chats). APPEND-ONLY (UPDATE/DELETE triggers RAISE). Written in the SAME D1 batch as the status UPDATE.\n-- CREATE only: no existing table is rebuilt.\n\nCREATE TABLE IF NOT EXISTS seat_admission_changes (\n  id          TEXT PRIMARY KEY NOT NULL,\n  tenant      TEXT NOT NULL,\n  seat_id     TEXT NOT NULL,\n  member_id   TEXT NOT NULL,\n  action      TEXT NOT NULL CHECK (action IN ('hold','release','return','rejoin_reset')),\n  from_status TEXT NOT NULL CHECK (from_status IN ('observed','trusted','held')),\n  to_status   TEXT NOT NULL CHECK (to_status IN ('observed','trusted','held')),\n  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_seat_admission_changes_seat ON seat_admission_changes (seat_id, at DESC);",
       "\n\nCREATE TRIGGER IF NOT EXISTS seat_admission_changes_no_update\nBEFORE UPDATE ON seat_admission_changes\nBEGIN\n  SELECT RAISE(ABORT, 'seat_admission_changes is append-only: UPDATE is forbidden');\nEND;",
       "\n\nCREATE TRIGGER IF NOT EXISTS seat_admission_changes_no_delete\nBEFORE DELETE ON seat_admission_changes\nBEGIN\n  SELECT RAISE(ABORT, 'seat_admission_changes is append-only: DELETE is forbidden');\nEND;",
@@ -4289,4 +4289,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "e2f57e3e2b3c6af3f56c3cd372dab3087f304308e83b1b1fa2d8a17b9142d8d3"
+export const SCHEMA_CHAIN_DIGEST: string = "85917fde71f241a41843fa2756a6f23fb6405ea58bf4bb1e7cbf3837831fe917"

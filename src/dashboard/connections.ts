@@ -209,9 +209,9 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
           rows: observed.map((o) => [
             html`${o.label || o.seat_id}`,
             html`${o.agent_name}`,
-            html`${pill(o.status, o.status === 'held' ? 'danger' : 'dim')}`,
+            html`${pill(o.status, o.status === 'held' ? 'danger' : o.status === 'trusted' ? 'ok' : 'dim')}`,
             html`${formatWhen(o.last_used_at)}`,
-            html`${o.status === 'observed' ? html`<button class="btn danger" data-cx-hold="${o.seat_id}">Hold</button>` : html`<button class="btn" data-cx-return="${o.seat_id}">Return to observed</button>`} <button class="btn" data-cx-release="${o.seat_id}">Release to trusted</button>`,
+            html`${o.status !== 'held' ? html`<button class="btn danger" data-cx-hold="${o.seat_id}">Hold</button>` : ''} ${o.status !== 'observed' ? html`<button class="btn" data-cx-return="${o.seat_id}">Return to observed</button>` : ''} ${o.status !== 'trusted' ? html`<button class="btn" data-cx-release="${o.seat_id}">Release to trusted</button>` : ''}`,
           ]),
           empty: '',
         }),
@@ -328,11 +328,14 @@ export function makeConnectionsApp(shell: ShellFn) {
   app.post('/connections/seats/:id/:action{hold|release|return}', async (c) => {
     const action = c.req.param('action')
     if (!isSeatHoldAction(action)) return c.json({ error: 'bad_request' }, 400)
-    const g = await guard(c, action !== 'hold')
+    // Real session first; whether the session is FRESH is decided by the writer per (action, from-status): only transitions that widen
+    // reach (release; held -> observed) need it. Hold, and trusted -> held / observed, reduce reach and work on a real session alone.
+    const g = await guard(c, false)
     if (!g.ok) return g.res
-    const r = await changeSeatAdmission(c.env, { humanMemberId: g.memberId, seatId: c.req.param('id').trim(), action })
+    const fresh = (await checkWebSession(c.env, c.get('auth'), { fresh: true })).ok
+    const r = await changeSeatAdmission(c.env, { humanMemberId: g.memberId, seatId: c.req.param('id').trim(), action, fresh })
     if (r.ok) return c.json({ ok: true, from: r.from, to: r.to, allowed_from: SEAT_TRANSITIONS[action].from })
-    return c.json({ error: r.error }, r.error === 'vip_lane_disabled' || r.error === 'member_ineligible' ? 403 : r.error === 'seat_not_found' ? 404 : 409)
+    return c.json({ error: r.error }, r.error === 'vip_lane_disabled' || r.error === 'member_ineligible' || r.error === 'reauth_required' ? 403 : r.error === 'seat_not_found' ? 404 : 409)
   })
 
   app.post('/connections/admissions/:id/approve', async (c) => {
