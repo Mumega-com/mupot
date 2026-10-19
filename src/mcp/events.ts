@@ -154,7 +154,7 @@ const MESSAGE_CREATED: EventDefinition = {
           'the triggering message is no longer readable.',
       },
       kind: { type: 'string', description: 'Message kind (e.g. message, task, request).' },
-      request_id: { type: ['string', 'null'], description: 'Correlation id when the sender set one, else null.' },
+      request_id: { type: 'string', description: 'Correlation id when the sender set one, else empty string.' },
     },
     required: ['message_id', 'seq', 'read_after_seq', 'kind', 'request_id'],
     additionalProperties: false,
