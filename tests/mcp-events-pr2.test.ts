@@ -1586,3 +1586,146 @@ describe('a lapsed native-wake lease is recorded, not silent', () => {
     expect(JSON.stringify(s)).toMatch(/Reconnect the mupot connector/)
   })
 })
+
+// ── refusal record (events/subscribe refused before verification is observable) ──────────────────
+describe('events/subscribe refusal record', () => {
+  const refusals = (): { agent_id: string | null; member_id: string | null; reason: string; host: string | null; at: string }[] =>
+    harness.sqlite.prepare('SELECT * FROM event_subscribe_refusals ORDER BY rowid').all() as never
+  const reasons = (): string[] => refusals().map((r) => r.reason)
+
+  it('unbound session: one row, reason events_require_bound_agent_with_capability, member recorded', async () => {
+    const r = await rpc('events/subscribe', subParams(), 'unbound-admin')
+    expect(r.body.error?.data?.reason).toBe('events_require_bound_agent_with_capability')
+    expect(refusals()).toHaveLength(1)
+    expect(refusals()[0]).toMatchObject({ agent_id: null, member_id: 'member-1', reason: 'forbidden:events_require_bound_agent_with_capability', host: HOST })
+    expect(logCapture.some((l) => l.includes('[mcp:events/subscribe] refused'))).toBe(true)
+  })
+
+  it('every pre-verification refusal writes its own reason', async () => {
+    await rpc('events/subscribe', subParams({ name: 'nope' }))
+    await rpc('events/subscribe', subParams({}, { mode: 'poll' }))
+    await rpc('events/subscribe', subParams({}, { url: 'https://evil.example.org/x' }))
+    await rpc('events/subscribe', subParams({}, { url: 'http://hooks.example.com/x' }))
+    await rpc('events/subscribe', subParams({}, { secret: 'whsec_short' }))
+    await rpc('events/subscribe', subParams({ ttlMs: -1 }))
+    await rpc('events/subscribe', subParams({ arguments: { x: 1 } }))
+    await rpc('events/subscribe', subParams(), 'bound-admin', makeEnv({ masterKey: null }))
+    await rpc('events/subscribe', subParams(), 'bound-nogrants')
+    expect(reasons()).toEqual([
+      'unknown_event',
+      'invalid_params:delivery.mode',
+      'CallbackEndpointError:callback_host_not_allowed',
+      'CallbackEndpointError:callback_scheme_not_https',
+      'invalid_params:whsec_base64_24_to_64_bytes',
+      'invalid_params:ttlMs',
+      'invalid_arguments:message.created_takes_no_arguments',
+      'secret_storage_unavailable',
+      'forbidden:events_require_bound_agent_with_capability',
+    ])
+    expect(refusals().find((r) => r.reason.endsWith('callback_host_not_allowed'))?.host).toBe('evil.example.org')
+  })
+
+  it('verification failure and rate limit are recorded too', async () => {
+    installFetch(() => new Response('no', { status: 500 }))
+    await rpc('events/subscribe', subParams())
+    expect(reasons()).toEqual(['CallbackEndpointError:callback_http_error'])
+  })
+
+  it('seat-handle session: refused and recorded as seat_session_events_unsupported', async () => {
+    const env = { ...makeEnv(), SEAT_AUTO_ENROLL: '1' } as Env
+    const res = await mcpApp.request('https://pot.example/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer dir-zero', 'x-mupot-seat': 'mseat_abc' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events/subscribe', params: subParams() }),
+    }, env)
+    expect(res.status).toBe(403)
+    expect(reasons()).toEqual(['seat_session_events_unsupported'])
+    expect(refusals()[0].member_id).toBe('member-dir')
+  })
+
+  it('unauthenticated: logged but never a D1 row', async () => {
+    const res = await mcpApp.request('https://pot.example/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events/subscribe', params: subParams() }),
+    }, makeEnv())
+    expect(res.status).toBe(401)
+    expect(refusals()).toHaveLength(0)
+    expect(logCapture.some((l) => l.includes('unauthenticated'))).toBe(true)
+  })
+
+  it('rate limit: the same principal+reason is one row per minute, a new reason or a later minute is a new row', async () => {
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const { recordSubscribeRefusal } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const auth = { boundAgentId: 'agent-a', memberId: 'member-agent-a', harnessId: null }
+    for (let i = 0; i < 20; i++) await recordSubscribeRefusal(env, T + i * 1000, { reason: 'agent_required', auth })
+    expect(refusals()).toHaveLength(1)
+    await recordSubscribeRefusal(env, T + 5000, { reason: 'other', auth })
+    expect(refusals()).toHaveLength(2)
+    await recordSubscribeRefusal(env, T + 61_000, { reason: 'agent_required', auth })
+    expect(refusals()).toHaveLength(3)
+  })
+
+  it('retention prune and per-tenant ceiling bound the table', async () => {
+    const { recordSubscribeRefusal, REFUSAL_RETENTION_MS } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    await recordSubscribeRefusal(env, T, { reason: 'old', auth: { boundAgentId: 'agent-a', memberId: 'm' } })
+    await recordSubscribeRefusal(env, T + REFUSAL_RETENTION_MS + 1000, { reason: 'new', auth: { boundAgentId: 'agent-a', memberId: 'm' } })
+    expect(reasons()).toEqual(['new'])
+  })
+
+  it('never stores the secret or the callback URL/path, only the host', async () => {
+    await rpc('events/subscribe', subParams({}, { url: 'https://evil.example.org/hook/PATHSECRET?k=QUERYSECRET', secret: SECRET_A }))
+    await rpc('events/subscribe', subParams({}, { secret: 'whsec_short' }))
+    const dump = JSON.stringify(harness.sqlite.prepare('SELECT * FROM event_subscribe_refusals').all())
+    expect(refusals().length).toBeGreaterThan(0)
+    for (const bad of [SECRET_A, 'PATHSECRET', 'QUERYSECRET', 'https://', 'whsec_short', 'bound-admin']) expect(dump).not.toContain(bad)
+    expect(logCapture.join('\n')).not.toMatch(/PATHSECRET|QUERYSECRET/)
+  })
+
+  it('a successful subscribe writes no refusal row and returns the same result', async () => {
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.body.error).toBeUndefined()
+    expect(refusals()).toHaveLength(0)
+    expect(subs()).toHaveLength(1)
+  })
+
+  it('per-principal cap binds; principal A at its cap does not block principal B', async () => {
+    const { recordSubscribeRefusal, REFUSAL_PRINCIPAL_ROW_CAP } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const A = { boundAgentId: 'agent-a', memberId: 'member-agent-a' }
+    for (let i = 0; i < REFUSAL_PRINCIPAL_ROW_CAP + 50; i++) await recordSubscribeRefusal(env, T + i * 61_000, { reason: `r${i}`, auth: A })
+    const count = (id: string): number => (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_subscribe_refusals WHERE agent_id = ?').get(id) as { n: number }).n
+    expect(count('agent-a')).toBe(REFUSAL_PRINCIPAL_ROW_CAP)
+    await recordSubscribeRefusal(env, T + 1000, { reason: 'x', auth: { boundAgentId: 'agent-b', memberId: 'member-agent-b' } })
+    expect(count('agent-b')).toBe(1)
+  })
+
+  it('tenant ceiling evicts oldest-first and keeps the newest row', async () => {
+    const { recordSubscribeRefusal, REFUSAL_TENANT_ROW_CEILING } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const ins = harness.sqlite.prepare("INSERT INTO event_subscribe_refusals (id, tenant, agent_id, member_id, reason, at) VALUES (?, ?, ?, 'm', 'seed', ?)")
+    for (let i = 0; i < REFUSAL_TENANT_ROW_CEILING; i++) ins.run(`seed-${i}`, TENANT, `ag-${i}`, new Date(T - 10_000_000 + i * 1000).toISOString())
+    await recordSubscribeRefusal(env, T, { reason: 'newest', auth: { boundAgentId: 'agent-a', memberId: 'member-agent-a' } })
+    const n = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_subscribe_refusals').get() as { n: number }).n
+    expect(n).toBe(REFUSAL_TENANT_ROW_CEILING)
+    expect(reasons()).toContain('newest')
+    expect(refusals().some((r) => r.agent_id === 'ag-0')).toBe(false)
+    expect(refusals().some((r) => r.agent_id === `ag-${REFUSAL_TENANT_ROW_CEILING - 1}`)).toBe(true)
+  })
+
+  it('a skipped insert does not run the prune', async () => {
+    const { recordSubscribeRefusal } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const auth = { boundAgentId: 'agent-a', memberId: 'member-agent-a' }
+    await recordSubscribeRefusal(env, T, { reason: 'dup', auth })
+    sqlLog.length = 0
+    await recordSubscribeRefusal(env, T + 1000, { reason: 'dup', auth })
+    expect(sqlLog.filter((q) => q.startsWith('DELETE FROM event_subscribe_refusals'))).toHaveLength(0)
+  })
+})

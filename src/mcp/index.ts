@@ -275,6 +275,7 @@ import {
 } from './events'
 import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_PROTOCOL_VERSION, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
+import { recordSubscribeRefusal } from './events-refusals'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
@@ -8464,10 +8465,17 @@ async function handleJsonRpc(
     // to mint one; the call is evaluated as the human's own (unbound) session.
     const auth = await resolveAuth(c, { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
+      if (method === 'events/subscribe') await recordSubscribeRefusal(c.env, Date.now(), { reason: 'unauthenticated' })
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
+    // Observability: every early refusal of events/subscribe is recorded (bounded, host-only) so "never asked" != "refused early".
+    const refusedSubscribe = (reason: string): Promise<void> =>
+      method === 'events/subscribe'
+        ? recordSubscribeRefusal(c.env, Date.now(), { reason, auth, rawUrl: asRecordOrNull(asRecordOrNull(body.params)?.delivery)?.url })
+        : Promise.resolve()
     // mupot#1794 W4: events never resolve a seat handle; a harness session is seatless here: refused.
     if (isHarnessCredentialSession(auth)) {
+      await refusedSubscribe('harness_credential_session')
       return rpcError(id, -32003, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE, 403, refusalEnvelope(HARNESS_SESSION_SEAT_REQUIRED, 403, undefined, undefined, guideCtxFor(c.env, auth, new URL(c.req.url).origin)))
     }
 
@@ -8545,6 +8553,7 @@ async function handleJsonRpc(
     // full /mcp door (never the profile door), and an authenticated caller; the handlers refuse
     // unbound / zero-capability sessions themselves.
     if (method === 'events/subscribe' && seatAutoEnrollEnabled(c.env) && requestPresentsSeatHandle(c, body.params)) {
+      await refusedSubscribe('seat_session_events_unsupported')
       return rpcError(id, -32602, 'seat_session_events_unsupported', {
         reason: 'events subscriptions are not available to a seat-handle session; call events/subscribe without the seat handle',
       }, 403)
@@ -8557,13 +8566,17 @@ async function handleJsonRpc(
       const rawArgs = p.arguments
       // Same strictness as an unattached subscribe: arguments must be absent, null, or a plain object (a string or array is invalid).
       if (rawArgs !== undefined && rawArgs !== null && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+        await refusedSubscribe('attached:invalid_arguments')
         return rpcError(id, -32602, 'invalid_arguments', { reason: 'arguments must be an object' })
       }
       const argObj = rawArgs !== undefined && rawArgs !== null ? rawArgs as Record<string, unknown> : {}
       const { agent: agentRef, ...restArgs } = argObj
       const picked = pickAttachment(attachedCandidates, agentRef)
       // A fixable PARAMETER error (name the agent / it is not attached): a JSON-RPC error on HTTP 200, never a 403 that a client would read as an auth failure.
-      if (!picked.ok) return rpcError(id, -32602, picked.code, picked.data)
+      if (!picked.ok) {
+        await refusedSubscribe(`attached:${picked.code}`)
+        return rpcError(id, -32602, picked.code, picked.data)
+      }
       evAuth = await eventsAuthForAttachment(c.env, auth, picked.attachment)
       // The salt is the human AND the harness (the connector): two connectors of one human attached to one agent must not share a row either.
       evAttached = { humanMemberId: `${auth.memberId as string}:${auth.harnessId as string}`, grantTokenId: auth.tokenId as string }
@@ -8577,6 +8590,10 @@ async function handleJsonRpc(
   }
 
   return rpcError(id, -32601, 'method_not_found', method)
+}
+
+function asRecordOrNull(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) ? v as Record<string, unknown> : null
 }
 
 // ── app ───────────────────────────────────────────────────────────────────────

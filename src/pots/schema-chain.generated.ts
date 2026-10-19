@@ -4284,9 +4284,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "seat_admission_changes_no_delete" },
     ],
   },
+  {
+    file: "0242_event_subscribe_refusals.sql",
+    sha256: "52a555cfad9a6a2422feb80094930df774eacb46360ecf0c2827cadc65e735e6",
+    statements: [
+      "-- 0242_event_subscribe_refusals.sql -- why an events/subscribe was refused (mupot observability).\n-- Before this, a subscribe refused before/at verification (seat handle, unbound session, agent_not_attached, bad callback host, ...)\n-- left no D1 row and no log, so \"the client never asked\" read the same as \"refused early\".\n-- BOUNDED: the writer inserts at most one row per (tenant, principal, reason) per minute, prunes rows older than 7 days, and stops at a\n-- per-tenant row ceiling. Stores the callback HOST only: never the URL, the secret, or any token. CREATE only; nothing is rebuilt.\n\nCREATE TABLE IF NOT EXISTS event_subscribe_refusals (\n  id         TEXT PRIMARY KEY NOT NULL,\n  tenant     TEXT NOT NULL,\n  agent_id   TEXT,\n  member_id  TEXT,\n  harness_id TEXT,\n  seat_id    TEXT,\n  reason     TEXT NOT NULL,\n  host       TEXT,\n  at         TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_event_subscribe_refusals_principal\n  ON event_subscribe_refusals (tenant, agent_id, member_id, reason, at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_subscribe_refusals_at\n  ON event_subscribe_refusals (tenant, at);",
+    ],
+    objects: [
+      { type: "table", name: "event_subscribe_refusals" },
+      { type: "index", name: "idx_event_subscribe_refusals_principal" },
+      { type: "index", name: "idx_event_subscribe_refusals_at" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "85917fde71f241a41843fa2756a6f23fb6405ea58bf4bb1e7cbf3837831fe917"
+export const SCHEMA_CHAIN_DIGEST: string = "f65f990f6742cd8cefb79ea1d9fdecf17bbfcba46fda7cabbfd1abf93e63d678"
