@@ -34,6 +34,33 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     expect(noAttach.next_step_plain).not.toContain('seat_attach {agent}')
   })
 
+  it('attached: a HANDLE-keyed seat keeps passing its handle; an OAuth/auto seat needs none', () => {
+    const att = { attachmentId: 'a', admissionId: 'adm', agentId: 'ag', seatAgentId: 'sa', ceiling: 'member' as const }
+    const handle = run(authOf({ boundAgentId: 'ag', seatBinding: { ...SEAT, source: 'handle', attached: att } }))
+    expect(handle.state).toBe('acting_as')
+    expect(handle.next_step_plain).toContain('keep passing your seat handle')
+    expect(handle.next_step_plain).not.toContain('no seat handle needed')
+    expect(handle.next_step_plain).toContain('never call seat_select or seat_attach')
+    for (const source of ['auto:openai_session', 'auto:codex_thread'] as const) {
+      const auto = run(authOf({ boundAgentId: 'ag', seatBinding: { ...SEAT, source, attached: att } }))
+      expect(auto.next_step_plain).toContain('no seat handle needed')
+      expect(auto.next_step_plain).not.toContain('keep passing')
+    }
+  })
+
+  it('own seat held / observed: seat_attach is NOT suggested (the floor refuses it) and the sentence says what they can do', () => {
+    for (const status of ['held', 'observed'] as const) {
+      const w = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: status }))
+      expect(w.state).toBe('own_seat')
+      expect(w.next_step_plain).toContain(`This seat is ${status}`)
+      expect(w.next_step_plain).toContain('inbox {peek:true}')
+      expect(w.next_step_plain).toContain('ask your human to lift')
+      expect(w.next_step_plain).not.toContain('seat_attach {agent}')
+    }
+    const trusted = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'trusted' }))
+    expect(trusted.next_step_plain).toContain('seat_attach {agent}')
+  })
+
   it('unseated harness chat: seat_select first, then seat_attach; seats off says so', () => {
     const w = run(authOf({ harnessId: 'h-1' }))
     expect(w.state).toBe('harness_unseated')
@@ -79,6 +106,8 @@ describe('docs/agent-door.md', () => {
     expect(doc.split('\n').length).toBeLessThanOrEqual(40)
     for (const s of ['acting_as', 'own_seat', 'harness_unseated', 'host', 'no_agent']) expect(doc).toContain(s)
     expect(doc).toMatch(/#2054/)
+    expect(doc).not.toContain('Do NOT send a seat handle')
+    expect(doc).toContain('a handle-keyed seat keeps passing its handle')
     expect(doc).not.toMatch(/@|\/home\/|mumega-state/)
   })
 })

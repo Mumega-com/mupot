@@ -127,7 +127,12 @@ export function plainNextStep(
   const as = facts.actsAs ?? 'your agent'
   if (state === 'acting_as' && basis === 'attached') {
     const ceiling = auth.seatBinding?.attached?.ceiling ?? 'member'
-    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; no seat handle needed, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} or your open work with needs_you_list.`
+    // A handle-keyed seat that got attached resolves the attachment ON THE HANDLE PATH (seat-handle.ts), so it must keep sending the handle;
+    // an OAuth / auto seat carries the attachment on the connection and needs none.
+    const handle = auth.seatBinding?.source === 'handle'
+      ? 'keep passing your seat handle with each request (this attachment is found through it)'
+      : 'no seat handle needed'
+    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; ${handle}, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} or your open work with needs_you_list.`
   }
   if (state === 'acting_as') {
     return `You are ${as} (your human consented this connection to it). Nothing to set up; no seat handle needed; the seat tools (seat_select, seat_attach) do not apply. Next: read your inbox or your open work with needs_you_list.`
@@ -136,7 +141,11 @@ export function plainNextStep(
     const handle = auth.seatBinding?.source === 'handle'
       ? 'Keep sending your seat handle with each request.'
       : 'This is an automatic seat tied to this chat: no seat handle is needed.'
-    const attach = seatAttachEnabled(env)
+    // A held / observed seat is limited to the read floor, and seat_attach is refused at that floor: do not offer it.
+    const limited = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
+    const attach = limited
+      ? `This seat is ${auth.seatAgentStatus}, so it is limited to the read floor until your human lifts it: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the limit.`
+      : seatAttachEnabled(env)
       ? 'To act as an existing agent your human administers, call seat_attach {agent}; do not call seat_select (you already have a seat).'
       : 'Attaching to an existing agent is not enabled on this pot; do not call seat_select (you already have a seat).'
     return `You are ${as} on this chat's own seat. ${handle} ${attach} Otherwise: read your inbox or your open work with needs_you_list.`
@@ -329,7 +338,7 @@ export function whoamiDoorFilter(env: Env, auth: AuthContext, w: Whoami): (tool:
     if (auth.harnessCredential === true) return HARNESS_SESSION_ALLOWED_TOOLS.has(tool)
     if (tool === 'bootstrap_self') return offered.has('bootstrap_self')
     if (tool === 'seat_select') return offered.has('seat_select')
-    if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat'
+    if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed'
     // K3/K4: connect needs a slug this caller was never handed (the step is a human re-consent or seat_select), so it is not a door.
     if (tool === 'connect' && (w.state === 'no_agent' || w.state === 'harness_unseated')) return false
     // K2 (member token, no agent): connect answers no_squad_access and the step is an org admin's mint_agent_token, so only that stays.
