@@ -84,7 +84,7 @@ CHANGELOG; this lists what the re-scope below builds on.
   Hold/Release (#2059, #2062, #2063, #2064, #2065, migration 0241), the tenant-header
   notice (#2058), reply-to-sender (#2041, #2052), the admission tape in shadow (#2034),
   the installer window (#2039), and connections dashboard fixes (#2046, #2048, #2050).
-  Flags ship off. Migrations 0235–0242.
+  Flags ship off. Migrations 0237–0242.
 
 ### After v0.31.0
 

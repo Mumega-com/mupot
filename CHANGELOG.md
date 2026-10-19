@@ -44,7 +44,7 @@ Feature flags named here ship **off** (unset) unless stated. Whether a flag is e
 any deployment is an operator fact read from that deployment's `/health/config`, not from
 this file. A merge is not a stable-release verdict.
 
-- **Admission tape (#2034, flag `ADMISSION_TAPE`, default off):** P0 shadow-only admission by observation: a rules scorer and an append-only `seat_tape` describe each seat tool call by shape only, with a size-capped window and a pinned chain hash. It records; it does not admit or refuse.
+- **Admission tape (#2034, flag `ADMISSION_TAPE`, default off, migration 0237):** P0 shadow-only admission by observation: a rules scorer and an append-only `seat_tape` describe each seat tool call by shape only, with a size-capped window and a pinned chain hash. It records; it does not admit or refuse.
 - **Seat clamp honours the legacy role plane (#2037):** the seat clamp reads the legacy role plane from the verified login identity, caps the lift at member, and reproduces seat project visibility.
 - **Installer window (#2039, flag `INSTALLER_WINDOW`, default off):** a time-boxed operator bundle over MCP with a self-benefit fence, a ceiling-destroy fence, a member cap, passkey-class AMR required for the high tier, project edges excluded, and seats unable to hold or use a window.
 - **Reply to the sender (#2041, migration 0239):** an agent may reply to the sender of a message addressed to it, even into a home squad, by exact message id only. The reply path keeps the caller's correlation id, collapses `invalid_*` refusals, closes probe oracles and enforces an atomic per-replier cap (indexed by 0239).
