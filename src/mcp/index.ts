@@ -8275,15 +8275,19 @@ async function logNegotiation(
     const p = typeof params === 'object' && params !== null && !Array.isArray(params) ? params as Record<string, unknown> : {} // narrowed to a plain object just above
     const meta = typeof p._meta === 'object' && p._meta !== null ? p._meta as Record<string, unknown> : {} // narrowed to an object just above
     const rawRequested = p.protocolVersion ?? c.req.header('mcp-protocol-version') ?? meta[PROTOCOL_VERSION_META_KEY]
-    let principal: { harnessId?: string | null; memberId?: string | null } | null = null
-    if (c.req.header('authorization') || c.req.header(AUTH_CONTEXT_HEADER)) {
-      const auth = await resolveAuth(c, { skipSeat: true })
-      if (auth && auth.tenant === c.env.TENANT_SLUG) principal = { harnessId: auth.harnessId, memberId: auth.memberId }
-    }
     const ci = typeof p.clientInfo === 'object' && p.clientInfo !== null ? (p.clientInfo as { name?: unknown }).name : undefined // narrowed to an object just above
-    const work = recordNegotiation(c.env, Date.now(), {
-      method, requested: describeRequestedVersion(rawRequested), negotiated, eventsReturned, principal, clientInfoName: ci,
-    })
+    const hasCredential = Boolean(c.req.header('authorization') || c.req.header(AUTH_CONTEXT_HEADER))
+    const requested = describeRequestedVersion(rawRequested)
+    const requestedBucket = requestedProtocolVersionForLog(params)
+    // The credential resolution rides INSIDE the background work: the hot path (initialize / server/discover) adds zero awaits and zero DB reads.
+    const work = (async () => {
+      let principal: { harnessId?: string | null; memberId?: string | null; heldSeat?: boolean } | null = null
+      if (hasCredential) {
+        const auth = await resolveAuth(c, { skipSeat: true })
+        if (auth && auth.tenant === c.env.TENANT_SLUG) principal = { harnessId: auth.harnessId, memberId: auth.memberId, heldSeat: auth.seatAgentStatus === 'held' }
+      }
+      await recordNegotiation(c.env, Date.now(), { method, requested, requestedBucket, negotiated, eventsReturned, principal, clientInfoName: ci })
+    })().catch((e: unknown) => { console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e)) })
     const wu = safeWaitUntil(c)
     if (wu) wu(work)
     else await work

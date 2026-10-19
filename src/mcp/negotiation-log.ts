@@ -31,7 +31,9 @@ export interface NegotiationRecord {
   negotiated: string
   eventsReturned: boolean
   /** Resolved principal; absent for an unauthenticated caller (console line only). */
-  principal?: { harnessId?: string | null; memberId?: string | null } | null
+  principal?: { harnessId?: string | null; memberId?: string | null; heldSeat?: boolean } | null
+  /** Bucketed version (known version or 'other'): the ONLY form an anonymous caller's value may reach the console line in. */
+  requestedBucket?: string
   /** clientInfo.name from the request, used only when the harness row has no label. */
   clientInfoName?: unknown
 }
@@ -50,24 +52,33 @@ export async function recordNegotiation(env: Env, nowMs: number, r: NegotiationR
   } catch {
     // label lookup is best effort
   }
+  const authenticated = Boolean(harnessId || memberId)
   console.info('[mcp:negotiation]', {
-    method: r.method, harness_id: harnessId, client_name: clientName, requested: r.requested, negotiated: r.negotiated, events_returned: r.eventsReturned,
+    method: r.method, harness_id: harnessId, client_name: clientName, requested: authenticated ? r.requested : (r.requestedBucket ?? 'other'), negotiated: r.negotiated, events_returned: r.eventsReturned,
   })
   // No principal => nothing to rate-limit against: log only, never an unbounded anonymous write.
   if (!harnessId && !memberId) return
+  // #2069: a HELD seat leaves no trace.
+  if (r.principal?.heldSeat) return
   try {
     const now = new Date(nowMs).toISOString()
     const windowStart = new Date(nowMs - NEGOTIATION_RATE_WINDOW_MS).toISOString()
     const retentionStart = new Date(nowMs - NEGOTIATION_RETENTION_MS).toISOString()
+    // ONE row per (principal, method, requested version): a NEW version always inserts (while the principal is under its distinct-version
+    // cap); a repeat only touches last_seen/hit_count, at most once a minute. A reconnecting client therefore never exhausts its quota.
     const ins = await env.DB.prepare(
-      `INSERT INTO mcp_negotiation_log (id, tenant, at, method, harness_id, member_id, client_name, requested_version, negotiated_version, events_returned)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-        WHERE NOT EXISTS (SELECT 1 FROM mcp_negotiation_log
-                           WHERE tenant = ?2 AND COALESCE(harness_id, '') = COALESCE(?5, '') AND COALESCE(member_id, '') = COALESCE(?6, '')
-                             AND method = ?4 AND requested_version = ?8 AND at > ?11)
-          AND (SELECT COUNT(*) FROM mcp_negotiation_log
+      `INSERT INTO mcp_negotiation_log (id, tenant, at, first_seen, hit_count, method, harness_id, member_id, client_name, requested_version, negotiated_version, events_returned)
+       SELECT ?1, ?2, ?3, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+        WHERE EXISTS (SELECT 1 FROM mcp_negotiation_log
+                       WHERE tenant = ?2 AND COALESCE(harness_id, '') = COALESCE(?5, '') AND COALESCE(member_id, '') = COALESCE(?6, '')
+                         AND method = ?4 AND requested_version = ?8)
+           OR (SELECT COUNT(*) FROM mcp_negotiation_log
                 WHERE tenant = ?2 AND COALESCE(harness_id, '') = COALESCE(?5, '') AND COALESCE(member_id, '') = COALESCE(?6, '')
-                  AND at > ?12) < ?13`,
+                  AND at > ?12) < ?13
+       ON CONFLICT (tenant, COALESCE(harness_id, ''), COALESCE(member_id, ''), method, requested_version) DO UPDATE SET
+         at = excluded.at, hit_count = hit_count + 1, negotiated_version = excluded.negotiated_version,
+         events_returned = excluded.events_returned, client_name = COALESCE(excluded.client_name, client_name)
+       WHERE mcp_negotiation_log.at <= ?11`,
     ).bind(crypto.randomUUID(), env.TENANT_SLUG, now, r.method, harnessId, memberId, clientName, r.requested, r.negotiated, r.eventsReturned ? 1 : 0,
       windowStart, retentionStart, NEGOTIATION_PRINCIPAL_ROW_CAP).run()
     if ((ins.meta?.changes ?? 0) === 0) return

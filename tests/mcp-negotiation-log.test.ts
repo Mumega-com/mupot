@@ -105,7 +105,8 @@ describe('mcp negotiation log', () => {
     const p = { harnessId: 'h-1', memberId: 'member-1' }
     const rec = (ms: number) => recordNegotiation(env(), base + ms, { method: 'initialize', requested: 'v', negotiated: '2025-06-18', eventsReturned: false, principal: p })
     await rec(0); await rec(30_000); await rec(61_000)
-    expect(rows().filter((x) => x.requested_version === 'v')).toHaveLength(2)
+    expect(rows().filter((x) => x.requested_version === 'v')).toHaveLength(1) // upsert: one row; the minute-apart repeat updates it in place
+    expect((harness.sqlite.prepare("SELECT hit_count AS n FROM mcp_negotiation_log WHERE requested_version = 'v'").get() as { n: number }).n).toBe(2) // 0s and 61s count; the 30s one is rate-limited
   })
 
   it('retention prune, per-principal cap, and tenant ceiling evicts oldest first', async () => {
@@ -119,8 +120,8 @@ describe('mcp negotiation log', () => {
     }
     expect(rows()).toHaveLength(NEGOTIATION_PRINCIPAL_ROW_CAP)
     harness.sqlite.exec('DELETE FROM mcp_negotiation_log')
-    const ins = harness.sqlite.prepare(`INSERT INTO mcp_negotiation_log (id, tenant, at, method, harness_id, requested_version, negotiated_version, events_returned) VALUES (?, ?, ?, 'initialize', ?, 'x', 'n', 0)`)
-    for (let i = 0; i < NEGOTIATION_TENANT_ROW_CEILING; i++) ins.run(`id${i}`, TENANT, new Date(base + 1000 + i).toISOString(), `other-${i % 50}`)
+    const ins = harness.sqlite.prepare(`INSERT INTO mcp_negotiation_log (id, tenant, at, method, harness_id, requested_version, negotiated_version, events_returned) VALUES (?, ?, ?, 'initialize', ?, ?, 'n', 0)`)
+    for (let i = 0; i < NEGOTIATION_TENANT_ROW_CEILING; i++) ins.run(`id${i}`, TENANT, new Date(base + 1000 + i).toISOString(), `other-${i % 50}`, `x${i}`)
     await recordNegotiation(env(), base + 10_000_000, { method: 'initialize', requested: 'fresh', negotiated: 'n', eventsReturned: false, principal: { harnessId: 'h-new' } })
     const all = rows()
     expect(all).toHaveLength(NEGOTIATION_TENANT_ROW_CEILING)
@@ -134,6 +135,36 @@ describe('mcp negotiation log', () => {
     const dump = JSON.stringify(rows()) + JSON.stringify(info.mock.calls)
     expect(dump).not.toContain('tok-secret-value')
     expect(dump.toLowerCase()).not.toContain('bearer')
-    expect(Object.keys(rows()[0]).sort()).toEqual(['at', 'client_name', 'events_returned', 'harness_id', 'id', 'member_id', 'method', 'negotiated_version', 'requested_version', 'tenant'])
+    expect(Object.keys(rows()[0]).sort()).toEqual(['at', 'client_name', 'events_returned', 'first_seen', 'harness_id', 'hit_count', 'id', 'member_id', 'method', 'negotiated_version', 'requested_version', 'tenant'])
+  })
+
+  it('upsert: a client reconnecting every minute for hours never exhausts its quota, and a NEW version still gets a row', async () => {
+    const base = Date.parse(T0)
+    const p = { harnessId: 'h-1', memberId: 'member-1' }
+    for (let i = 0; i < NEGOTIATION_PRINCIPAL_ROW_CAP + 50; i++) {
+      await recordNegotiation(env(), base + i * 61_000, { method: 'initialize', requested: '2025-06-18', negotiated: '2025-06-18', eventsReturned: false, principal: p })
+    }
+    expect(rows().filter((x) => x.requested_version === '2025-06-18')).toHaveLength(1)
+    const row = harness.sqlite.prepare("SELECT hit_count AS n, first_seen AS f, at FROM mcp_negotiation_log WHERE requested_version = '2025-06-18'").get() as { n: number; f: string; at: string }
+    expect(row.n).toBe(NEGOTIATION_PRINCIPAL_ROW_CAP + 50)
+    expect(row.f).toBe(T0)
+    expect(row.at > row.f).toBe(true)
+    await recordNegotiation(env(), base + 999 * 61_000, { method: 'initialize', requested: '2026-07-28', negotiated: '2025-06-18', eventsReturned: false, principal: p })
+    expect(rows().map((x) => x.requested_version).sort()).toEqual(['2025-06-18', '2026-07-28'])
+  })
+
+  it('anonymous: the console line carries only the bucketed version and no clientInfo label', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    await rpc('initialize', { protocolVersion: 'attacker-controlled-free-text', clientInfo: { name: 'evil-label' } }, false)
+    const line = JSON.stringify(info.mock.calls.filter((c) => c[0] === '[mcp:negotiation]'))
+    expect(line).not.toContain('attacker-controlled-free-text')
+    expect(line).not.toContain('evil-label')
+    expect(line).toContain('other')
+    expect(rows()).toHaveLength(0)
+  })
+
+  it('a held seat leaves no row', async () => {
+    await recordNegotiation(env(), Date.parse(T0), { method: 'initialize', requested: '2025-06-18', negotiated: 'n', eventsReturned: false, principal: { harnessId: 'h-1', heldSeat: true } })
+    expect(rows()).toHaveLength(0)
   })
 })
