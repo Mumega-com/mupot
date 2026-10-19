@@ -980,7 +980,10 @@ export interface WakeContract {
 
 // ── Ports (the swappable seams; CF profile implements these) ──
 export interface MemoryPort {
-  remember(agentId: string, text: string, concepts?: string[]): Promise<string> // returns engram id
+  /** returns engram id. With `opts.waitUntil` the embedding + vector upsert run AFTER the D1 row commits,
+   *  off the response path; a failure there is swallowed (the D1 row stays the source of truth and
+   *  recall's recent/lexical legs cover the gap). Without it the vector write is awaited as before. */
+  remember(agentId: string, text: string, concepts?: string[], opts?: { waitUntil?: (p: Promise<unknown>) => void }): Promise<string>
   recall(agentId: string, query: string, limit?: number): Promise<MemoryHit[]>
   /** Newest engrams in ONE scope (read-your-writes; does not depend on the vector index). */
   recent?(agentId: string, limit?: number): Promise<MemoryEngram[]>

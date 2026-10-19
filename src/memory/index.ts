@@ -89,7 +89,7 @@ function toEngram(r: EngramRow): MemoryEngram {
 
 export function createMemory(env: Env): MemoryPort {
   return {
-    async remember(agentId: string, text: string, concepts?: string[]): Promise<string> {
+    async remember(agentId: string, text: string, concepts?: string[], opts?: { waitUntil?: (p: Promise<unknown>) => void }): Promise<string> {
       const id = crypto.randomUUID()
       const conceptsJson = concepts && concepts.length > 0 ? JSON.stringify(concepts) : null
 
@@ -102,16 +102,24 @@ export function createMemory(env: Env): MemoryPort {
 
       // Embed and upsert the vector. Metadata carries agentId for query-time
       // filtering and engramId for the join back to D1.
-      const values = await embed(env, text)
-      await env.VEC.upsert([
-        {
-          id,
-          values,
-          // tenant scopes the vector even on a SHARED Vectorize index (the
-          // multi-tenant-operator model) — agentId alone is not a tenant boundary.
-          metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
-        },
-      ])
+      const indexVector = async (): Promise<void> => {
+        const values = await embed(env, text)
+        await env.VEC.upsert([
+          {
+            id,
+            values,
+            // tenant scopes the vector even on a SHARED Vectorize index (the
+            // multi-tenant-operator model) — agentId alone is not a tenant boundary.
+            metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
+          },
+        ])
+      }
+      if (opts?.waitUntil) {
+        // The D1 row is committed; embedding is an index, not the record. Never fail the write over it.
+        opts.waitUntil(indexVector().catch(() => {}))
+      } else {
+        await indexVector()
+      }
 
       return id
     },

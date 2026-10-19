@@ -6,6 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
+import { resetPresenceThrottle } from '../src/fleet/registry'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -68,6 +69,7 @@ describe('touchPollFleetPresence runs AFTER authz, never before (mupot#1494 roun
   let staleAt: string
 
   beforeEach(() => {
+    resetPresenceThrottle() // the 60s presence throttle is per-isolate; each test starts cold
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     staleAt = sqliteStamp(Date.now() - 300_000) // 5 min ago
