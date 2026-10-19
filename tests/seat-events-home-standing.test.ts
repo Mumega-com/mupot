@@ -52,18 +52,18 @@ async function world(hostOwnerSql: string, hostExtra = '') {
   return { h, env }
 }
 
-const grant = (env: Env, agent: string) =>
-  createSeatEventGrant(env, { hostAgentId: HOST, agentId: agent, memberId: 'admin', reason: 'test' })
+const grant = (env: Env, agent: string, writer = OWNER) =>
+  createSeatEventGrant(env, { hostAgentId: HOST, agentId: agent, memberId: writer, reason: 'test' })
 
 /** Insert the grant row directly so the SQL delivery gate can be probed independent of the JS gate. */
-function forceGrant(h: Awaited<ReturnType<typeof world>>['h'], agent: string) {
+function forceGrant(h: Awaited<ReturnType<typeof world>>['h'], agent: string, writer = OWNER) {
   h.sqlite.exec(`INSERT OR IGNORE INTO seat_event_grants (id, tenant, host_agent_id, agent_id, project_id, granted_by_member_id, reason, created_at)
-    VALUES ('g-${agent}', '${TENANT}', '${HOST}', '${agent}', NULL, 'admin', 'x', '2026-09-27T00:00:00Z')`)
+    VALUES ('g-${agent}', '${TENANT}', '${HOST}', '${agent}', NULL, '${writer}', 'x', '2026-09-27T00:00:00Z')`)
 }
 
-async function both(w: Awaited<ReturnType<typeof world>>, agent = SEAT) {
-  const created = await grant(w.env, agent)
-  forceGrant(w.h, agent)
+async function both(w: Awaited<ReturnType<typeof world>>, agent = SEAT, writer = OWNER) {
+  const created = await grant(w.env, agent, writer)
+  forceGrant(w.h, agent, writer)
   return { created, delivery: await authorizeSeatDelivery(w.env, HOST, agent) }
 }
 
@@ -196,5 +196,34 @@ describe('home-squad host standing (owner_member_id)', () => {
     const r = await both(w, 'work-seat')
     expect(r.created.ok).toBe(true)
     expect(r.delivery).toBe('granted')
+  })
+
+  it('org-admin writer who is not the home owner: refused at grant time and a pre-existing row is not delivered', async () => {
+    // Host owner IS the home owner (re-pointed by an admin), but the writer is 'admin'.
+    const w = await world(`'${OWNER}'`)
+    const r = await both(w, SEAT, 'admin')
+    expect(r.created).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+    expect(r.delivery).toBe('not_granted')
+  })
+
+  it('pre-existing grant row written by a non-owner is not delivered (per-delivery writer pin)', async () => {
+    const w = await world(`'${OWNER}'`)
+    forceGrant(w.h, SEAT, 'mem-other')
+    expect(await authorizeSeatDelivery(w.env, HOST, SEAT)).toBe('not_granted')
+  })
+
+  it('a DIFFERENT agent owned by the home owner does not give an unowned host standing (ho.id is pinned)', async () => {
+    const w = await world('NULL', `INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id)
+      VALUES ('other-owned', 'sw', 'oo', 'OO', 'member', 'm', 'active', '${OWNER}');`)
+    const r = await both(w)
+    expect(r.created).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+    expect(r.delivery).toBe('not_granted')
+  })
+
+  it('owner member row in another tenant: refused on both paths (om.tenant is pinned)', async () => {
+    const w = await world(`'${OWNER}'`, `UPDATE members SET tenant = 'other-tenant' WHERE id = '${OWNER}';`)
+    const r = await both(w)
+    expect(r.created).toEqual({ ok: false, reason: 'host_no_squad_standing' })
+    expect(r.delivery).toBe('not_granted')
   })
 })
