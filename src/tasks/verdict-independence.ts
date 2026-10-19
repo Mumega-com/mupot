@@ -114,6 +114,7 @@ export function agentLinkedToMemberSql(p: { agentExpr: string; memberExpr: strin
         EXISTS (SELECT 1 FROM agents lk_owner WHERE lk_owner.id = ${p.agentExpr} AND lk_owner.owner_member_id = ${p.memberExpr})
         OR EXISTS (SELECT 1 FROM agent_member_bindings lk_bind WHERE lk_bind.agent_id = ${p.agentExpr} AND lk_bind.member_id = ${p.memberExpr})
         OR EXISTS (SELECT 1 FROM agent_keys lk_key WHERE lk_key.agent_id = ${p.agentExpr} AND lk_key.member_id = ${p.memberExpr})
+        OR EXISTS (SELECT 1 FROM agent_seats lk_seat WHERE lk_seat.agent_id = ${p.agentExpr} AND lk_seat.member_id = ${p.memberExpr})
       )`
 }
 
@@ -145,6 +146,7 @@ function affiliatedConflictSqlRaw(): string {
   parts.push(`EXISTS (SELECT 1 FROM tasks mt WHERE mt.id = @T AND mt.assignee_member_id IS NOT NULL AND (
       EXISTS (SELECT 1 FROM agents ma WHERE ma.id = @D AND ma.owner_member_id = mt.assignee_member_id)
       OR EXISTS (SELECT 1 FROM agent_member_bindings mb WHERE mb.agent_id = @D AND mb.member_id = mt.assignee_member_id)
+      OR EXISTS (SELECT 1 FROM agent_seats ms WHERE ms.agent_id = @D AND ms.member_id = mt.assignee_member_id)
     ))`)
   return `(\n    ${parts.join('\n    OR ')}\n  )`
 }

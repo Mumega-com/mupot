@@ -4326,9 +4326,9 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0245_backfill_seat_agent_own_gate.sql",
-    sha256: "6861ba39b5d69842b20354cff52fafdafcac4cc0b81bc98d366b46318af25ec0",
+    sha256: "0cc746de0054d8fe5582d1734afc983a6e5ea506db9bd4cec1b910b373232da5",
     statements: [
-      "-- 0245 — backfill each active seat agent's OWN lane gate (gate:<its own slug>), the same grant the mint path\n-- gives (src/members/service.ts) and seat_select now gives at creation (src/members/seat-select.ts).\n-- Before this, an agent created by seat_select could never hold the gate of a task routed to its own lane.\n-- SCOPE: capability is exactly 'gate:' || that agent's slug, principal is that agent. No other gate, no member\n-- principal, nothing for inactive agents. Idempotent (INSERT OR IGNORE on UNIQUE(capability, principal_type, principal_id)).\n-- A fresh DB has no agent_seats rows, so this writes nothing there (gate_grants stays empty after migrations).\nINSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)\nSELECT lower(hex(randomblob(16))), 'gate:' || a.slug, 'agent', a.id, 'system:backfill-0245', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n  FROM agents a\n WHERE a.status = 'active'\n   AND a.id IN (SELECT agent_id FROM agent_seats)\n   AND a.slug IS NOT NULL AND a.slug <> '';",
+      "-- 0245 — backfill each seat agent's OWN lane gate (gate:<its own slug>), the same grant the mint path\n-- gives (src/members/service.ts) and seat_select now gives at creation (src/members/seat-select.ts).\n-- Before this, an agent created by seat_select could never hold the gate of a task routed to its own lane.\n-- SCOPE (tight on purpose): only SERVER-DERIVED slugs. A seat agent's slug is 'seat-' || first 12 chars of its\n-- seat's key_hash (src/members/seat-select.ts); an agent renamed to anything else (e.g. 'hadi') gets NOTHING.\n-- Capability is exactly 'gate:' || that slug, principal is that agent. Skips archived agents, inactive agents and\n-- retired seats; paused agents ARE included (hasActiveGateGrant refuses them at check time anyway).\n-- INSERT OR IGNORE on UNIQUE(capability, principal_type, principal_id): idempotent, never replaces an existing row.\n-- A fresh DB has no agent_seats rows, so this writes nothing (gate_grants stays empty after migrations).\nINSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)\nSELECT DISTINCT lower(hex(randomblob(16))), 'gate:' || a.slug, 'agent', a.id, 'system:backfill-0245', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n  FROM agent_seats s\n  JOIN agents a ON a.id = s.agent_id\n WHERE s.retired_at IS NULL\n   AND a.status IN ('active', 'paused')\n   AND a.archived_at IS NULL\n   AND a.slug = 'seat-' || substr(s.key_hash, 1, 12);",
     ],
     objects: [],
   },
@@ -4337,4 +4337,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "b5af6a129c769feb4383b6c9ce6e7dac9d237e63525b8c988701c8f87b65f11e"
+export const SCHEMA_CHAIN_DIGEST: string = "7c13746be71753799b64d252d8581506478311a8a2cf45352aa402fdd358fe15"

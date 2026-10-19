@@ -388,6 +388,41 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     })
   })
 
+  describe('a seat agent is linked to its human through agent_seats.member_id', () => {
+    function seedSeatOf(sqlite: SqliteD1Harness['sqlite'], agentId: string, memberId: string): void {
+      sqlite.exec('PRAGMA foreign_keys = OFF')
+      sqlite.prepare(
+        `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at, max_harness_total, source, max_auto_live)
+         VALUES ('seat-row-1', ?, ?, 'harness-x', ?, ?, 'x', 16, 64, 'tok', datetime('now'), 64, 'select', 8)`,
+      ).run(TENANT, memberId, 'ab'.repeat(32), agentId)
+      sqlite.exec('PRAGMA foreign_keys = ON')
+    }
+    it('H is assignee_member_id, H\'s seat S holds the gate: S is refused self_verdict, no row', async () => {
+      seedWorld(harness.sqlite, { humanAssignee: 'H' })
+      seedSeatOf(harness.sqlite, 'S', 'H')
+      const res = await decide(env, agentAuth('S'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+    })
+    it('a seat agent of the submission\'s consenting member is refused (agentLinkedToMemberSql seat leg)', async () => {
+      seedWorld(harness.sqlite)
+      seedSeatOf(harness.sqlite, 'SIB', 'H')
+      harness.sqlite.prepare(
+        `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, consenting_member_id)
+         VALUES ('sub-h', ?, ?, ?, 'A', '/tmp/h', ?, ?, 'H')`,
+      ).run(TENANT, TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32))
+      const res = await decide(env, agentAuth('SIB'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+    })
+    it('the same seat agent is allowed when the seat belongs to someone else (control)', async () => {
+      seedWorld(harness.sqlite, { humanAssignee: 'H' })
+      seedSeatOf(harness.sqlite, 'S', 'M_INDEP')
+      const res = await decide(env, agentAuth('S'))
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+    })
+  })
+
   describe('the PRE-CHECK predicate (evaluateVerdictGates) refuses on its own, before any write', () => {
     it('says self_verdict for every party and allows the independent deciders', async () => {
       seedWorld(harness.sqlite)
