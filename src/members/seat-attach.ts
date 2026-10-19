@@ -423,7 +423,7 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
   const attach = attachmentId && adm.requested_seat_id && agent && seatAttachEnabled(env)
     ? prepareAttachStatements(env, {
         attachmentId, tokenId: crypto.randomUUID(), tokenHash: await sha256Hex(mintRawToken()), nowIso, admissionId: adm.id,
-        agent: { id: adm.agent_id, slug: agent.slug }, seat: { id: adm.requested_seat_id, harnessId: adm.harness_id }, humanMemberId: adm.human_member_id, requireNoLiveAttachment: true,
+        agent: { id: adm.agent_id, slug: agent.slug }, seat: { id: adm.requested_seat_id, harnessId: adm.harness_id }, humanMemberId: adm.human_member_id, requireNoLiveAttachment: true, promotedAt: nowIso,
       })
     : []
   const out = await env.DB.batch([
@@ -578,7 +578,7 @@ export interface LiveAttachmentRow {
  * the attachment's own token live. Anything else -> null, and the caller serves the thread's own seat agent.
  *   ?1 tenant ?2 seat id ?3 grant token id ?4 human member id ?5 now
  */
-export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string }, seatId: string): Promise<LiveAttachmentRow | null> {
+export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string | null }, seatId: string): Promise<LiveAttachmentRow | null> {
   const row = await env.DB.prepare(
     `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, s.admission_status AS seat_admission_status, s.id AS seat_id,
             s.label_basename AS seat_label, s.agent_id AS seat_agent_id, a.id AS agent_id, a.squad_id AS agent_squad_id,
@@ -608,10 +608,10 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
         AND s.harness_id = att.harness_id
         AND a.status = 'active'
         ${attachDesignatedClause(env, 'a', '?4')}
-        AND EXISTS (SELECT 1 FROM member_tokens g
+        AND (?3 IS NULL OR EXISTS (SELECT 1 FROM member_tokens g
                      WHERE g.id = ?3 AND g.member_id = ?4 AND g.tenant = ?1
                        AND g.channel = 'directory' AND g.agent_id IS NULL
-                       AND ${TOKEN_LIVE_PREDICATE('?5').replace(/\bt\./g, 'g.')})
+                       AND ${TOKEN_LIVE_PREDICATE('?5').replace(/\bt\./g, 'g.')}))
       LIMIT 1`,
   ).bind(env.TENANT_SLUG, seatId, human.tokenId, human.memberId, nowSqlUtc())
     .first<Omit<LiveAttachmentRow, 'seat_token_id'> & { seat_token_id: string | null }>()
@@ -688,7 +688,7 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
  */
 function prepareAttachStatements(
   env: Env,
-  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean },
+  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string },
 ): D1PreparedStatement[] {
   return [
     env.DB.prepare(
@@ -704,9 +704,12 @@ function prepareAttachStatements(
          JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
         WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
+          ${p.promotedAt !== undefined ? 'AND adm.decided_at = ?9' : ''} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
           ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
           ${attachDesignatedClause(env, 'a', '?8')}`,
-    ).bind(p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId),
+    ).bind(...(p.promotedAt !== undefined
+      ? [p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId, p.promotedAt]
+      : [p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId])),
     env.DB.prepare(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
        SELECT ?1, b.member_id, ?2, ?3, 'directory', datetime('now'), b.agent_id, ?4
@@ -726,7 +729,7 @@ function prepareAttachStatements(
  */
 export async function attachSeatToAgent(
   env: Env,
-  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling; attachCode?: unknown },
+  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling; attachCode?: unknown; grantTokenId?: string | null },
   nowMs: number = Date.now(),
 ): Promise<AttachResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -749,6 +752,10 @@ export async function attachSeatToAgent(
     // Same agent already attached to THIS seat (e.g. Admit completed it for the asking chat): idempotent success, not already_attached.
     if (current.agent_id !== agent.id && !p.moveIfAttached) return { ok: false, error: 'already_attached' }
     if (current.agent_id === agent.id) {
+      // Idempotent success ONLY when the existing attachment passes the SAME predicate every request is served by (findLiveAttachment:
+      // live admission, live server-held token, active agent, ...). A dead one (e.g. its token revoked) is refused, not reported attached.
+      const live = await findLiveAttachment(env, { memberId: p.humanMemberId, tokenId: p.grantTokenId ?? null }, seat.id)
+      if (!live || live.attachment_id !== current.id) return { ok: false, error: 'attach_refused' }
       const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id)
       return adm && adm.status === 'live'
         ? { ok: true, status: 'attached', attachment_id: current.id, admission_id: adm.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }

@@ -40,17 +40,28 @@ const toolSeatAttach: ToolSpec = {
     if (!seat || auth.channel !== 'directory' || !auth.boundAgentId) {
       return fail(403, 'seat_required', 'seat_attach runs only from a seat session (a conversation-keyed auto seat, or a seat_select handle). An agent-bound connection cannot move itself into another agent.')
     }
-    // An already-attached thread falls through: attachSeatToAgent answers `attached` (idempotent) when the named agent IS the one this
-    // seat is attached to (Admit completes the attachment for the asking chat), and already_attached for any other agent.
+    // An already-attached thread: the requested ref is compared ONLY against the agent it is attached to (id or slug), without resolving
+    // any other agent, so a non-match is the same already_attached answer whether or not the named agent exists (no oracle).
+    const attachedAs = seat.attached ? seat.attached.agentId : null
+    if (attachedAs !== null) {
+      const ref = typeof args.agent === 'string' ? args.agent.trim() : ''
+      const row = ref.length > 0 && ref.length <= 128
+        ? await env.DB.prepare(`SELECT id, slug FROM agents WHERE id = ?1 LIMIT 1`).bind(attachedAs).first<{ id: string; slug: string }>()
+        : null
+      if (!row || (ref !== row.id && ref.toLowerCase() !== row.slug.toLowerCase())) {
+        return fail(409, 'already_attached', 'This thread is already attached to an agent. Ask your human to detach or move it on their Connections page.')
+      }
+    }
     const agentRef = typeof args.agent === 'string' ? args.agent.trim() : ''
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
 
     const r = await attachSeatToAgent(env, {
       humanMemberId: seat.humanMemberId,
       seatId: seat.seatId,
-      agentRef,
+      agentRef: attachedAs ?? agentRef, // already attached: only ever the agent it is attached to (id), never a second resolution of the caller's text
       via: 'tool',
       requesterAgentId: auth.boundAgentId,
+      grantTokenId: seat.grantTokenId,
     })
     if (r.ok && r.status === 'attached') {
       return done({
@@ -111,7 +122,7 @@ const toolSeatAttach: ToolSpec = {
       case 'attach_code_mismatch':
         return fail(403, r.error)
       case 'attach_refused':
-        return fail(409, r.error, 'The attach could not be completed (the agent, the admission or this seat changed). Retry, or ask your human to check their Connections page.')
+        return fail(409, r.error, 'The attach could not be completed (the agent, the admission, its token or this seat changed). Retry; if it persists the owner must re-admit this chat on their Connections page.')
       default:
         return fail(400, r.error)
     }

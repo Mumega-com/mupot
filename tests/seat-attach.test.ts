@@ -2772,3 +2772,68 @@ describe('Admit completes the attachment for the asking chat', () => {
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
   })
 })
+
+describe('Admit completes the attachment: gate round fixes', () => {
+  const asked = async (env: Env, g: Grant, session: string, agent = 'rava') => {
+    await boot(env, g, session)
+    const pend = await attach(env, g, session, agent)
+    const admId = String(pend.sc.admission_id)
+    const adm = (await loadAdmission(env, admId))!
+    return { admId, adm, seatId: adm.requested_seat_id as string }
+  }
+
+  it('P1: a same-agent attachment whose server-held token was revoked is NOT reported attached', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    expect(await decideAdmissionDirect(env, { admissionId: a.admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(a.admId) })).toEqual({ ok: true })
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = (SELECT seat_token_id FROM agent_seat_attachments WHERE seat_id = '${a.seatId}')`)
+    const r = await attach(env, g, 'conv-a', 'rava')
+    expect(r.sc.status).not.toBe('attached')
+    expect(errOf(r)).toBe('attach_refused')
+  })
+
+  it('P2: a second promotion batch after the first promoted and the human detached cannot recreate the attachment', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    const t1 = new Date().toISOString()
+    expect((await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', t1, 'member', codeOf(a.admId))).attachmentId).not.toBeNull()
+    const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE seat_id = ?`, a.seatId)!
+    expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
+    // A late concurrent approval of the SAME (stale, still-pending) row: the admission UPDATE no-ops, and the attach INSERT is tied to
+    // this batch's promotion timestamp, so it must not resurrect the detached attachment either.
+    const r = await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', new Date(Date.now() + 5).toISOString(), 'member', codeOf(a.admId))
+    expect(r.landed).toBe(false)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, a.seatId)).toBe(0)
+  })
+
+  it('P2: an already-attached thread naming ANY other ref (existing or not) gets the identical already_attached answer; its own agent by slug is idempotent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    await decideAdmissionDirect(env, { admissionId: a.admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(a.admId) })
+    const other = await attach(env, g, 'conv-a', 'hadi-admin')
+    const ghost = await attach(env, g, 'conv-a', 'no-such-agent-xyz')
+    expect(errOf(other)).toBe('already_attached')
+    expect(errOf(ghost)).toBe('already_attached')
+    expect(JSON.stringify(ghost.body)).toBe(JSON.stringify(other.body))
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+  })
+
+  it('probe: requested_seat_id swapped to the human\'s OTHER live seat -> only that named seat is considered, and it is never the asking chat\'s', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    await boot(env, g, 'conv-b')
+    const other = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id <> ? LIMIT 1`, a.seatId)!
+    // The admission's seat is swapped (fixture): Admit attaches exactly the seat the row NAMES now, never the original asking seat.
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
+    h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = ? WHERE id = ?`).run(other.id, a.admId)
+    const swapped = (await loadAdmission(env, a.admId))!
+    const r = await promoteAdmissionDetailed(env, swapped, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r.landed).toBe(true)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ?`, a.seatId)).toBe(0)
+  })
+})
