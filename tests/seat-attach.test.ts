@@ -1051,6 +1051,24 @@ describe('dashboard: Connections', () => {
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
   })
 
+  it('Referrer-Policy is same-origin (not no-referrer, which makes browsers send Origin: null); Origin null / cross-site still refused, page origin passes', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    await attach(env, g, 'conv-a', 'rava')
+    const cookie = await session(env, `${HUMAN}@example.test`)
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
+    fresh()
+    const page = await dash(env, cookie, '/connections')
+    expect(page.headers.get('Referrer-Policy')).toBe('same-origin')
+    expect(await page.text()).toContain('cx-row-err')
+    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'null')).status).toBe(403)
+    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'https://evil.test')).status).toBe(403)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+    // the page origin (what a browser sends under same-origin) passes the guard
+    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'http://localhost')).status).toBe(200)
+  })
+
   it('detach and revoke need only a real session (no fresh reauth) and work with SEAT_ATTACH off', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
