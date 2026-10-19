@@ -737,3 +737,12 @@ describe('task_list member filter — the branches and orderings the first tests
     }
   })
 })
+
+describe('task_list cursor fingerprint includes the member filter', () => {
+  it('a cursor minted under assignee_member_id does not match a request without it, and legacy fingerprints are unchanged', async () => {
+    const { filterFingerprint } = await import('../src/tasks/pagination')
+    expect(filterFingerprint({ status: 'open', assigneeMember: 'm1' })).not.toBe(filterFingerprint({ status: 'open' }))
+    expect(filterFingerprint({ status: 'open', assigneeMember: 'm1' })).not.toBe(filterFingerprint({ status: 'open', assigneeMember: 'm2' }))
+    expect(filterFingerprint({ status: 'open', projectId: 'p', assignee: 'a' })).toBe('open|p|a') // no member filter: byte-identical to before
+  })
+})
