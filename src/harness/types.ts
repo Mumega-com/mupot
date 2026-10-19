@@ -126,6 +126,12 @@ export interface ReconcileResult {
 
 export interface HarnessContext {
   waitUntil?: (promise: Promise<unknown>) => void
+  /**
+   * Set ONLY by the provider kernel, and only for an adapter whose `capabilities().callback` is 'mcp_token': a mupot credential
+   * minted for THIS run (member tier, short TTL), revoked by the kernel's finalize. The adapter hands it to the vendor and never
+   * stores or logs it; it is never read from env and never reaches a tool result.
+   */
+  runToken?: { raw: string; id: string }
 }
 
 export interface HarnessAdapter {
@@ -135,4 +141,67 @@ export interface HarnessAdapter {
   dispatch(env: Env, req: DispatchRequest, ctx?: HarnessContext): Promise<DispatchOutcome>
   status(env: Env, query: StatusQuery): Promise<RunStatusResult>
   reconcile(env: Env, reservationId: string): Promise<ReconcileResult>
+}
+
+// ── Provider adapter v2 ──────────────────────────────────────────────────────────────────────────────────────
+//
+// `harness-adapter/v1` (above) plus what the provider KERNEL (harness/kernel.ts) needs to hold the policy once, for every
+// provider: the adapter is a thin vendor client, the kernel owns the kill switch, the budget gate, the run token and the
+// settlement. An adapter never checks budgets, never mints tokens and never decides who may dispatch.
+
+export const PROVIDER_ADAPTER_V2 = 'provider-adapter/v2' as const
+
+/** What `usage()` can return for a finished run. 'none' = the vendor exposes no usage, so the kernel books the pre-call estimate. */
+export type ProviderUsageKind = 'vendor_exact' | 'vendor_tokens' | 'none'
+
+export interface ProviderCapabilities extends HarnessCapabilities {
+  usage: ProviderUsageKind
+  /** The vendor can enforce a hard per-run $ cap itself. */
+  vendorBudget: boolean
+  /** 'mcp_token': the run can be handed a mupot credential (the kernel mints and revokes one). 'none': it cannot. */
+  callback: 'mcp_token' | 'none'
+  /** The vendor can call a signed webhook (verifyWebhook). The reconcile cron is mandatory regardless: webhooks are lossy. */
+  webhook: boolean
+}
+
+/** Which key slot an adapter needs. PR 1 only declares it; slot resolution (tenant BYOK vs operator) lands in a later PR. */
+export type ProviderSlot = 'cursor_api' | 'anthropic_api' | 'openai_api'
+
+export interface ProviderCredentialNeeds {
+  /** null = no vendor key (a local adapter). */
+  slot: ProviderSlot | null
+  kinds: Array<'operator' | 'tenant_byok'>
+}
+
+/** What a finished run cost, as the VENDOR reports it (never the model's self-report). */
+export interface ProviderUsage {
+  model?: string
+  input?: number
+  output?: number
+  cacheRead?: number
+  cacheWrite?: number
+  /** Authoritative vendor cost when the vendor states one, micro-USD. */
+  costMicroUsd: number
+}
+
+export type ProviderCancelOutcome = 'cancelled' | 'already_terminal' | 'unsupported'
+
+export interface ProviderAdapter extends HarnessAdapter {
+  capabilities(): ProviderCapabilities
+  credentialNeeds(): ProviderCredentialNeeds
+  /** Micro-USD upper bound the meter reserves against BEFORE launch. Reads policy numbers from env, never a key, never the network. */
+  estimate(env: Env, req: DispatchRequest): number
+  /** Reserve + launch. For Cursor and Grok this is the existing `dispatch` (vendor I/O inside the attach step). */
+  launch(env: Env, req: DispatchRequest, ctx?: HarnessContext): Promise<DispatchOutcome>
+  /** Vendor-reported usage for a terminal run, or null when the vendor reports none. */
+  usage(env: Env, run: { reservationId: string; vendorAgentId: string | null; vendorRunId: string | null }): Promise<ProviderUsage | null>
+  cancel?(env: Env, run: { reservationId: string; vendorAgentId: string | null; vendorRunId: string | null }): Promise<ProviderCancelOutcome>
+  verifyWebhook?(req: Request, secret: string): Promise<{ vendorRef: string; eventId: string } | null>
+  /** Delete vendor-side artefacts (vaults, sessions) after settlement. Best effort. */
+  cleanup?(env: Env, run: { reservationId: string; vendorAgentId: string | null; vendorRunId: string | null }): Promise<void>
+}
+
+export function isProviderAdapter(a: HarnessAdapter): a is ProviderAdapter {
+  const p = a as Partial<ProviderAdapter>
+  return typeof p.estimate === 'function' && typeof p.launch === 'function' && typeof p.usage === 'function' && typeof p.credentialNeeds === 'function'
 }

@@ -281,6 +281,25 @@ export async function checkAndReserve(
 }
 
 /**
+ * What is left of the agent's dollar cap in its own window, for a CALLER that needs a number (the provider kernel's flight
+ * preflight signals). Read-only; it never reserves anything and never enforces: checkAndReserve is still the one gate.
+ * `remainingMicroUsd` is null when the agent has no enforceable cap (unlimited in dollars; the day caps still apply).
+ */
+export async function remainingCostMicroUsd(
+  env: Env,
+  agent: Pick<Agent, 'id' | 'budget_cap_cents' | 'budget_window'>,
+): Promise<{ capMicroUsd: number | null; spentMicroUsd: number; remainingMicroUsd: number | null }> {
+  const spent = agent.budget_window === 'week'
+    ? await sumWeekCostMicroUsd(env, env.TENANT_SLUG, agent.id)
+    : (await env.DB.prepare(`SELECT cost_micro_usd FROM execution_meter WHERE window_key = ? LIMIT 1`)
+        .bind(buildWindowKey(env.TENANT_SLUG, agent.id))
+        .first<{ cost_micro_usd: number }>())?.cost_micro_usd ?? 0
+  if (!isEnforceableCap(agent.budget_cap_cents)) return { capMicroUsd: null, spentMicroUsd: spent, remainingMicroUsd: null }
+  const cap = agent.budget_cap_cents * MICRO_USD_PER_CENT
+  return { capMicroUsd: cap, spentMicroUsd: spent, remainingMicroUsd: Math.max(cap - spent, 0) }
+}
+
+/**
  * Public read-only meter status. Authorization is resolved before the first
  * execution_meter query, so denied callers cannot learn spend or counts.
  */

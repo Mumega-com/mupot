@@ -4298,9 +4298,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_event_subscribe_refusals_at" },
     ],
   },
+  {
+    file: "0244_provider_kernel.sql",
+    sha256: "e3d4a99c72f7a34f33138e3080c058071708f49e283ec67ff8dd0dcec51bdaed",
+    statements: [
+      "-- 0244_provider_kernel.sql -- provider kernel (harness/kernel.ts): per-run bookkeeping on harness_reservations.\n--\n-- Every provider dispatch now passes one kernel: kill switch -> checkAndReserve (budget) BEFORE launch -> reservation ->\n-- (optional) per-run short-lived mupot token -> launch -> reconcile -> finalize. These columns carry what finalize needs:\n--   estimate_micro_usd   the pre-call estimate the meter reserved against (booked at finalize when the vendor reports no usage)\n--   run_token_id / run_token_member_id   the per-run mupot credential, revoked at finalize (NULL when the adapter has no callback)\n--   finalized_at         set exactly once, by the one finalizer that books usage, revokes the token and cleans up\n--   usage_cost_micro_usd / usage_estimated   what finalize booked, and whether it was an ESTIMATE (vendor exposes no usage)\n-- Additive only: ADD COLUMN, no rebuild, no data rewrite. Existing rows keep NULLs and finalize treats them as \"nothing to settle\".\n\nALTER TABLE harness_reservations ADD COLUMN estimate_micro_usd INTEGER;",
+      "\nALTER TABLE harness_reservations ADD COLUMN run_token_id TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN run_token_member_id TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN finalized_at TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN usage_cost_micro_usd INTEGER;",
+      "\nALTER TABLE harness_reservations ADD COLUMN usage_estimated INTEGER;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_reservations_unfinalized\n  ON harness_reservations (tenant, state, finalized_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_harness_reservations_unfinalized" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f65f990f6742cd8cefb79ea1d9fdecf17bbfcba46fda7cabbfd1abf93e63d678"
+export const SCHEMA_CHAIN_DIGEST: string = "d57271998a2d9d890b216784e7477c9a0437c5ab9c70e0b61be5b07c69a6e3b3"

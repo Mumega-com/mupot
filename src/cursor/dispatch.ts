@@ -16,6 +16,7 @@ import type { DispatchResult } from '../flight/dispatch'
 import type { FlightSignals } from '../flight/preflight'
 import { FLIGHT_META_V1_SCHEMA } from '../flight/meta'
 import { launchCursorAgent, resolveCursorApiToken } from './client'
+import { kernelFlightSignals } from '../harness/kernel'
 import {
   bindReservationTaskFlight,
   blockTaskForFailedReservation,
@@ -34,16 +35,9 @@ import { assertExecutionNotPaused, ExecutionPausedError } from '../harness/pause
 export const CURSOR_CLOUD_DONE_WHEN =
   'Cursor Cloud run finishes with a recorded result or pull request'
 
-export const CURSOR_CLOUD_PREFLIGHT_SIGNALS: FlightSignals = {
-  contextComplete: true,
-  toolsReachable: true,
-  budgetRemainingMicroUsd: 1_000_000,
-  budgetEstimateMicroUsd: 10_000,
-  recentProgress: 0.8,
-  progressPerStep: 0.6,
-  wastePerStep: 0.1,
-  stepSeconds: 60,
-}
+// The flight preflight signals are NOT constants any more: the provider kernel (harness/kernel.ts kernelFlightSignals) derives the
+// budget numbers from the agent's real cap and spend, and the caller passes them in. (The old hardcoded 1,000,000 / 10,000
+// made the preflight's budget check pass for every Cursor run, whatever the agent had left.)
 
 export interface CursorCloudRecord {
   agentId: string
@@ -74,6 +68,8 @@ export interface ReserveCursorCloudWorkInput {
   model?: string
   flightId?: string
   taskId?: string
+  /** Budget-aware preflight signals from the provider kernel. Omitted: derived here from the agent's real cap and spend. There is no constant that always passes. */
+  preflightSignals?: FlightSignals
 }
 
 export interface ReserveCursorCloudWorkResult {
@@ -229,7 +225,7 @@ export async function reserveCursorCloudWork(
           parent_flight_id: null,
         },
       },
-      CURSOR_CLOUD_PREFLIGHT_SIGNALS,
+      input.preflightSignals ?? await kernelFlightSignals(env, input.agentId, 0),
       undefined,
       { id: reservedFlightId },
     )

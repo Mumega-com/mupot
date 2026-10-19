@@ -7,6 +7,7 @@
 
 import { CursorApiError, resolveCursorApiToken } from '../cursor/client'
 import { cursorCloudAdapter } from '../harness/adapters/cursor'
+import { dispatchViaKernel } from '../harness/kernel'
 import type { AuthContext, Capability, Env } from '../types'
 import {
   type ToolSpec,
@@ -87,8 +88,9 @@ export const toolCursorDispatch: ToolSpec = {
 
     const idempotencyKey = clientKey ?? crypto.randomUUID()
 
-    const outcome = await cursorCloudAdapter.dispatch(
+    const outcome = await dispatchViaKernel(
       env,
+      cursorCloudAdapter,
       {
         name,
         repoUrl,
@@ -112,6 +114,9 @@ export const toolCursorDispatch: ToolSpec = {
       if (outcome.error === 'execution_paused') {
         return fail(409, 'execution_paused')
       }
+      if (outcome.error === 'provider_disabled') return fail(503, 'provider_disabled')
+      if (outcome.error === 'budget_blocked') return fail(429, 'budget_blocked', 'detail' in outcome ? outcome.detail : undefined)
+      if (outcome.error === 'agent_not_found' || outcome.error === 'agent_inactive') return fail(409, 'agent_binding_inactive')
       // outcome.error is already a fixed public code (publicHarnessError); raw DB/vendor text never reaches here.
       return fail(400, 'cursor_dispatch_failed', { code: outcome.error })
     }

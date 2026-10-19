@@ -253,6 +253,14 @@ export interface Env {
   PROJECT_LINK_SIGNING_KEY?: string // Ed25519 PRIVATE OKP JWK for signed cross-pot receipts; never shared with a peer pot.
   FLEET_CONSUMER_AGENT?: string // the host consumer agent id that reads + executes control-requests (the daemon reads its inbox as this). Absent ⇒ 503.
   // execution meter caps (env override; meter.ts defaults apply when absent)
+  /** Provider kernel (harness/kernel.ts): '1' blocks EVERY provider dispatch (global kill switch). Per-provider: org_settings `provider_disabled:<kind>` = '1'. */
+  HARNESS_DISPATCH_DISABLED?: string
+  /** Flat per-run estimate for a provider that reports no usage (Cursor), in cents. Default 50. */
+  CURSOR_RUN_ESTIMATE_CENTS?: string
+  /** Per-run mupot token lifetime for adapters with a callback, in minutes (default 120, max 120). */
+  HARNESS_RUN_TOKEN_TTL_MINUTES?: string
+  /** An 'attached' run older than this many hours that the vendor never reports terminal is closed as stale (default 24). */
+  HARNESS_RUN_MAX_AGE_HOURS?: string
   EXEC_MAX_DISPATCH_DAY?: string // max execute-mode dispatches per agent per UTC day
   EXEC_MAX_TOKENS_DAY?: string   // max tokens an agent may spend per UTC day
   // GHL act-channel secrets (issue #8) — set via `wrangler secret put`, NEVER in .toml.
