@@ -76,6 +76,8 @@ function connectionsScript(): Html {
             var data = await res.json().catch(function () { return {}; });
             if (res.ok) { window.location.reload(); return; }
             if (data.error === 'reauth_required') reauthLink();
+            else if (data.error === 'attach_code_mismatch') say('That code does not match. A chat asked for this agent: use Admit on the Waiting for your decision card and type the code the chat showed you.');
+            else if (data.error === 'approval_bound_to_other_chat') say('This agent is approved (or requested) for a different chat. Revoke or deny that first, then have this chat ask again.');
             else say('Could not do that (' + (data.error || res.status) + ').');
           } catch (e) { say('Network error — try again.'); }
         }
@@ -91,7 +93,9 @@ function connectionsScript(): Html {
         for (var a = 0; a < ap.length; a++) ap[a].addEventListener('click', function (ev) {
           var id = ev.currentTarget.getAttribute('data-cx-approve');
           var cs = document.querySelector('select[data-cx-aceiling="' + id + '"]');
-          post('/connections/admissions/' + encodeURIComponent(id) + '/approve', { ceiling: cs ? cs.value : 'member' });
+          var ci = document.querySelector('input[data-cx-acode="' + id + '"]');
+          if (ci && !ci.value.trim()) { say('Type the attach code the chat told you, from the card showing it.'); return; }
+          post('/connections/admissions/' + encodeURIComponent(id) + '/approve', { ceiling: cs ? cs.value : 'member', attach_code: ci ? ci.value : undefined });
         });
         var rn = document.querySelectorAll('button[data-cx-rename]');
         for (var r = 0; r < rn.length; r++) rn[r].addEventListener('click', function (ev) {
@@ -130,17 +134,21 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
 
   const pending = admissions.filter((a) => a.status === 'pending')
   const live = admissions.filter((a) => a.status === 'live')
+  const askingSeats = new Set(pending.filter((a) => a.has_code && a.requested_seat_id).map((a) => a.requested_seat_id))
 
   const pendingBody = pending.length === 0
     ? emptyState({ title: 'Nothing waiting', detail: 'When a thread asks to act as an agent you have not admitted yet, it appears here (and as a one-time passkey link it hands you).' })
     : dataTable({
-      cols: [{ label: 'Agent', width: '1.2fr' }, { label: 'App', width: '1.2fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.4fr' }],
+      cols: [{ label: 'Attach code', width: '1fr' }, { label: 'Agent', width: '1.2fr' }, { label: 'App / chat', width: '1.4fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.8fr' }],
       rows: pending.map((a) => [
+        a.has_code
+          ? html`${pill('Code required', 'primary')} <span>Type the code the chat showed you.</span>`
+          : html`${pill('no code (older request)', 'dim')}`,
         html`${a.agent_name}`,
-        html`${a.harness_name}`,
+        html`${a.harness_name}${a.seat_label ? html` · ${a.seat_label}` : ''}${a.seat_first_seen ? html` (first seen ${formatWhen(a.seat_first_seen)})` : ''}`,
         html`${formatWhen(a.created_at)}`,
         enabled
-          ? html`<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
+          ? html`${a.has_code ? html`<input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat"> ` : ''}<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
           : html`${pill('Disabled', 'dim')}`,
       ]),
       empty: '',
@@ -177,7 +185,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
             s.attachment_id
               ? html`<button class="btn danger" data-cx-detach="${s.attachment_id}">Detach</button>`
               : enabled && agents.length > 0
-                ? html`<select data-cx-agent="${s.seat_id}">${agents.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}</select> <select data-cx-ceiling="${s.seat_id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-attach="${s.seat_id}">Attach</button>`
+                ? html`<select data-cx-agent="${s.seat_id}">${agents.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}</select> <select data-cx-ceiling="${s.seat_id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-attach="${s.seat_id}">Attach</button>${askingSeats.has(s.seat_id) ? html` <span class="ui-sub">This chat already asked for an agent: use Admit on the Waiting for your decision card and type the code the chat showed you.</span>` : ''}`
                 : html`${pill(enabled ? 'No agent to attach' : 'Attach disabled', 'dim')}`,
           ]),
           empty: '',
@@ -226,6 +234,8 @@ const ATTACH_STATUS: Record<string, 400 | 403 | 404 | 409 | 429> = {
   too_many_pending_admissions: 429,
   already_attached: 409,
   attach_refused: 409,
+  attach_code_mismatch: 403,
+  approval_bound_to_other_chat: 409,
 }
 
 export function makeConnectionsApp(shell: ShellFn) {
@@ -263,7 +273,7 @@ export function makeConnectionsApp(shell: ShellFn) {
       return c.json({ error: 'bad_request' }, 400)
     }
     const r = await attachSeatToAgent(c.env, {
-      humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member',
+      humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member', attachCode: body.attach_code,
     })
     if (!r.ok) return c.json({ error: r.error }, ATTACH_STATUS[r.error] ?? 400)
     return c.json(r)
@@ -292,8 +302,9 @@ export function makeConnectionsApp(shell: ShellFn) {
     if (!seatAttachEnabled(c.env)) return c.json({ error: 'seat_attach_disabled' }, 403)
     const body: unknown = await c.req.json().catch(() => ({}))
     const rawCeiling = typeof body === 'object' && body !== null && 'ceiling' in body ? body.ceiling : undefined
-    const r = await decideAdmissionDirect(c.env, { admissionId: c.req.param('id').trim(), humanMemberId: g.memberId, decision: 'approve', ceiling: isAttachCeiling(rawCeiling) ? rawCeiling : 'member' })
-    return r.ok ? c.json({ ok: true }) : c.json({ error: r.error }, r.error === 'admission_not_found' ? 404 : 409)
+    const attachCode = typeof body === 'object' && body !== null && 'attach_code' in body ? body.attach_code : undefined
+    const r = await decideAdmissionDirect(c.env, { admissionId: c.req.param('id').trim(), humanMemberId: g.memberId, decision: 'approve', ceiling: isAttachCeiling(rawCeiling) ? rawCeiling : 'member', attachCode })
+    return r.ok ? c.json({ ok: true }) : c.json({ error: r.error }, r.error === 'admission_not_found' ? 404 : r.error === 'attach_code_mismatch' ? 403 : 409)
   })
 
   app.post('/connections/admissions/:id/deny', async (c) => {

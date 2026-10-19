@@ -128,12 +128,12 @@ async function enrolPasskey(e: Env, memberId: string): Promise<SoftAuthenticator
   return a
 }
 
-async function decide(url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', e: Env = env): Promise<{ status: number; body: J }> {
+async function decide(url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', e: Env = env, attachCode?: unknown): Promise<{ status: number; body: J }> {
   const path = new URL(url).pathname
   const csrf = csrfOf(await (await hit(path, e)).text())
   const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf } })).json()) as J
   const credential = await a.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey?.challenge ?? '' })
-  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential } })
+  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(typeof attachCode === 'string' ? { attach_code: attachCode } : {}) } })
   const raw = await res.text()
   let body: J = {} as J
   try { body = JSON.parse(raw) as J } catch { /* a 500 is plain text */ }
@@ -545,7 +545,7 @@ describe('an attached chat asks on behalf of its attached agent, and only that a
 
     const pend = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, 'conv-a')
     expect(pend.sc.status).toBe('pending_admission')
-    expect((await decide(String(pend.sc.approve_url), humanKey, 'approve')).status).toBe(200)
+    expect((await decide(String(pend.sc.approve_url), humanKey, 'approve', env, pend.sc.attach_code)).status).toBe(200)
     expect((await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, 'conv-a')).sc.status).toBe('attached')
 
     const other = await rpc(env, g.ctx, 'squad_join_request', { squad: 'squad-target', agent: 'hadi-admin' }, 'conv-a')

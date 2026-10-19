@@ -216,6 +216,8 @@ interface Params {
   sealed?: { encB64u: string; ctB64u: string; digestHex: string }
   /** seat_admit approve only: the ceiling the human chose (bound into the challenge digest). */
   ceiling?: AttachCeiling
+  /** seat_admit approve only: the attach code the human typed (not bound into the digest; checked before the one-time gate). */
+  attachCode?: string
   /** sha256 hex of the canonical decision: the digest the challenge is bound to. */
   payload: string
 }
@@ -254,7 +256,8 @@ async function readParams(m: MomentRow, body: JsonBody): Promise<Params | null> 
     const ceiling: AttachCeiling | null = raw === undefined || raw === null || raw === '' ? 'member' : isAttachCeiling(raw) ? raw : null
     if (ceiling === null) return null
     const d = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, ceiling })))
-    return { decision, actions, duration, ceiling, payload: d }
+    const attachCode = typeof body.attach_code === 'string' ? body.attach_code.slice(0, 32) : undefined
+    return { decision, actions, duration, ceiling, attachCode, payload: d }
   }
   const digest = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, actions, duration: duration ?? null })))
   return { decision, actions, duration, payload: digest }
@@ -427,9 +430,12 @@ momentsApp.get('/m/:id/:token', async (c) => {
   let promptBlock = ''
   if (subject.kind === 'seat_admit') {
     const v = await admissionView(c.env, subject.adm)
-    inner = `<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
+    const codeBlock = subject.adm.attach_code
+      ? `<h2>Attach code</h2><p>The chat that asked was told to show you a short code. Type the code that chat showed you; it is not printed here, so it proves you are looking at that chat.</p><label>Attach code <input name="attach_code" autocomplete="off" maxlength="12" size="8" required></label>`
+      : ''
+    inner = `${codeBlock}<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
 <dt>App</dt><dd>${untrustedBox('Connected app', `${v.harnessName} (${v.harnessKind})`)}</dd>
-<dt>Asked from chat</dt><dd>${escapeHtml(v.seatLabel ?? 'a chat')}</dd>
+<dt>Asked from chat</dt><dd>${escapeHtml(v.seatLabel ?? 'a chat')}${v.seatFirstSeen ? ` (first seen ${escapeHtml(v.seatFirstSeen.slice(0, 16).replace('T', ' '))} UTC)` : ''}</dd>
 <dt>Expires</dt><dd>${escapeHtml(subject.adm.expires_at ?? '')}</dd></dl>
 <h2>How much may ${escapeHtml(v.agentName)} do in your chats?</h2>
 <label class="choice"><input type="radio" name="ceiling" value="member" checked><span><strong>Member</strong>: everyday work (the default)</span></label>
@@ -607,7 +613,7 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   if (subject.kind === 'credential') return decideCredential(c, { m, token, p, subject: subject.drop, auth, passkeyId: passkey.id, memberId: passkey.member_id })
   if (p.decision === 'provide') return fail(c, 400, 'Invalid decision parameters.', 'Bad request') // provide exists only for credential moments
   if (subject.kind === 'seat_admit') {
-    return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling }, now))
+    return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling, attachCode: p.attachCode }, now))
   }
   if (subject.kind === 'squad_join') {
     return outcomeJson(c, await decideSquadJoin(c.env, { req: subject.req, decision: p.decision, proof, gate, waitUntil }, now))
