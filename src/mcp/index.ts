@@ -215,7 +215,7 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { VIP_LANE_TOOLS } from './vip-lane'
-import { observedFloorRefusal, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
+import { joinNextSteps, observedFloorRefusal, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -7154,6 +7154,7 @@ const toolBootContext: ToolSpec = {
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,
+      next_steps: { join: await joinNextSteps(env, auth) },
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
@@ -7244,7 +7245,7 @@ const toolOrient: ToolSpec = {
       { recordInduction: !ctx.sideEffectFree },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
-    return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
+    return done({ packet: data, brief: renderBrief(data), next_steps: { join: await joinNextSteps(env, auth) }, ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
   },
 }
 

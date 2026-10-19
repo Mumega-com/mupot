@@ -220,3 +220,35 @@ export async function observedTaskCreateRefusal(
   }
   return { refusal: null, forceNoDispatch: true }
 }
+
+// #2035 wall 5: boot_context / orient point at join_squad. READ-ONLY, no new authority: the list reuses humanMayInstantJoin (the
+// predicate join_squad itself runs) and shows only squads the human can admin, so it reveals nothing the human cannot already see.
+export const JOINABLE_LIST_MAX = 10
+const JOINABLE_SCAN_MAX = 200
+const JOIN_OTHER_LINE = 'for any other squad: join_squad files a request to its owner'
+const JOIN_FLAG_OFF_LINE = 'joining a squad: ask its owner/admin to add you (squad_join_request)'
+
+export interface JoinNextSteps {
+  note: string
+  squads?: Array<{ slug: string; name: string; call: string }>
+}
+
+/** Flag off: one line, no DB read. Flag on: the list only for an UNATTACHED seat of an ACTIVE human; everyone else gets the one line. */
+export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBinding' | 'boundAgentId'>): Promise<JoinNextSteps> {
+  if (!vipLaneEnabled(env)) return { note: JOIN_FLAG_OFF_LINE }
+  const seat = auth.seatBinding
+  if (!seat || seat.attached || !auth.boundAgentId || !(await memberIsActiveHuman(env, seat.humanMemberId))) return { note: JOIN_OTHER_LINE }
+  const grants = await resolveCapabilities(env, seat.humanMemberId)
+  const rows = await env.DB.prepare(
+    `SELECT s.id AS id, s.slug AS slug, s.name AS name FROM squads s
+     WHERE s.status != 'archived' AND s.kind != 'home'
+       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.agent_id = ?1 AND m.squad_id = s.id)
+     ORDER BY s.name, s.id LIMIT ?2`,
+  ).bind(auth.boundAgentId, JOINABLE_SCAN_MAX).all<{ id: string; slug: string; name: string }>()
+  const squads: NonNullable<JoinNextSteps['squads']> = []
+  for (const sq of rows.results ?? []) {
+    if (squads.length >= JOINABLE_LIST_MAX) break
+    if (await humanMayInstantJoin(env, grants, sq.id)) squads.push({ slug: sq.slug, name: sq.name, call: `join_squad {squad:"${sq.slug}"}` })
+  }
+  return { note: JOIN_OTHER_LINE, ...(squads.length ? { squads } : {}) }
+}
