@@ -2818,7 +2818,7 @@ type ReplyResolution =
   | { ok: true; value: SendAgentRow; originalId: string; requestId: string | null }
   | { ok: false }
 
-async function resolveReplyTarget(
+export async function resolveReplyTarget(
   env: Env,
   input: { fromAgent: string; toRef?: string; inReplyTo?: string },
   nowIso: string,
@@ -2835,6 +2835,27 @@ async function resolveReplyTarget(
   const toRef = (input.toRef ?? '').trim()
   const stripped = stripOneLeadingAt(toRef) ?? toRef
   const cutoff = new Date(Date.parse(nowIso) - REPLY_WINDOW_MS).toISOString()
+  if (infer) {
+    // Pick the cited row FIRST over EVERYTHING addressed to the caller (any sender, inactive or
+    // out-of-window included), then apply window/status to that one row. An exact message id wins
+    // and uses only that row (another sender squatting that string as a request_id can neither
+    // redirect nor block it). A request_id citation is honoured only when exactly one row holds
+    // it: a request_id is per-sender, so a squatter's identical string must refuse, not win.
+    const cited = await env.DB.prepare(
+      `SELECT m.id AS mid, m.request_id AS rid, m.created_at AS at, a.id, a.squad_id, a.slug, a.name, a.status AS astatus
+         FROM agent_messages m
+         JOIN agents a ON a.id = m.from_agent
+        WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
+        ORDER BY (m.id = ?3) DESC, m.seq DESC LIMIT 3`,
+    ).bind(tenant, input.fromAgent, ref).all<SendAgentRow & { mid: string; rid: string | null; at: string; astatus: string }>()
+    const rowsCited = cited.results ?? []
+    const exact = rowsCited.find((r) => r.mid === ref)
+    const pick = exact ?? (rowsCited.length === 1 ? rowsCited[0] : undefined)
+    if (!pick) return { ok: false }
+    if (!(Date.parse(pick.at) >= Date.parse(cutoff)) || pick.astatus === 'inactive') return { ok: false }
+    if (pick.id === input.fromAgent) return { ok: false }
+    return { ok: true, value: { id: pick.id, squad_id: pick.squad_id, slug: pick.slug, name: pick.name }, originalId: pick.mid, requestId: pick.rid }
+  }
   // Precedence: a ref that is exactly an agent id means THAT agent and nothing else. Slug and
   // display name are renameable by any sender, so they must never compete with an id (a seat
   // renaming itself to another sender's id would otherwise capture that sender's reply).
@@ -2851,10 +2872,10 @@ async function resolveReplyTarget(
     `SELECT m.id AS mid, m.request_id AS rid, a.id, a.squad_id, a.slug, a.name
        FROM agent_messages m
        JOIN agents a ON a.id = m.from_agent
-      WHERE m.tenant = ?1 AND m.to_agent = ?2 AND ${byId || infer ? '(m.id = ?3 OR m.request_id = ?3)' : 'm.id = ?3'}
+      WHERE m.tenant = ?1 AND m.to_agent = ?2 AND ${byId ? '(m.id = ?3 OR m.request_id = ?3)' : 'm.id = ?3'}
         AND julianday(m.created_at) >= julianday(?4)
         AND a.status != 'inactive'
-        AND ${infer ? '(?5 = ?5 AND ?6 = ?6)' : byId ? 'a.id IN (?5, ?6)' : '(a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))'}
+        AND ${byId ? 'a.id IN (?5, ?6)' : '(a.slug IN (?5, ?6) OR lower(a.name) IN (lower(?5), lower(?6)))'}
       ORDER BY (m.id = ?3) DESC, m.seq DESC LIMIT 50`,
   ).bind(tenant, input.fromAgent, ref, cutoff, toRef, stripped).all<SendAgentRow & { mid: string; rid: string | null }>()
   const found = rows.results ?? []
@@ -2862,8 +2883,6 @@ async function resolveReplyTarget(
   // A ref that matches two different senders of messages to this caller is ambiguous: refuse.
   if (new Set(found.map((r) => r.id)).size !== 1) return { ok: false }
   const orig = found[0]
-  // Never infer the caller itself (a message the caller addressed to itself).
-  if (infer && orig.id === input.fromAgent) return { ok: false }
   return { ok: true, value: { id: orig.id, squad_id: orig.squad_id, slug: orig.slug, name: orig.name }, originalId: orig.mid, requestId: orig.rid }
 }
 

@@ -13,7 +13,7 @@ import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
-import { REPLY_CAP_PER_MESSAGE, resolveVisibleSendTarget, sendAgentMessage, sendToRef } from '../src/agents/messages'
+import { REPLY_CAP_PER_MESSAGE, resolveReplyTarget, resolveVisibleSendTarget, sendAgentMessage, sendToRef } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -564,6 +564,49 @@ describe('reply with in_reply_to alone infers the recipient', () => {
     await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
     const orig = msgId('agent-kasra', seat.agentId)
     expect((await rpc(env, kasra, 'send', { to: seat.agentId, body: 'named', in_reply_to: orig })).status).toBe(200)
+  })
+
+  it('request_id squat: C using A\'s message uuid as its request_id never captures B\'s inferred reply (and the exact id still resolves)', async () => {
+    const a = await homeSeat(env, 'human-1', 's1')
+    const c = await homeSeat(env, 'human-3', 's3')
+    await sendFrom(env, a, { to: 'agent-kasra', body: 'from a' })
+    const origA = msgId('agent-kasra', a.agentId)
+    await sendFrom(env, c, { to: 'agent-kasra', body: 'squat', request_id: origA })
+    const r = await rpc(env, kasra, 'send', { body: 'reply', in_reply_to: origA })
+    expect(r.status).toBe(200)
+    expect(r.sc.to).toBe(a.agentId)
+    expect(landedTo(c.agentId)).toBe(0)
+  })
+
+  it('a request_id citation held by one live row plus an inactive/expired squatter is refused (any sender counts)', async () => {
+    const a = await homeSeat(env, 'human-1', 's1')
+    const c = await homeSeat(env, 'human-3', 's3')
+    await sendFrom(env, a, { to: 'agent-kasra', body: 'a', request_id: 'rid-shared' })
+    await sendFrom(env, c, { to: 'agent-kasra', body: 'c', request_id: 'rid-shared' })
+    h.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(c.agentId)
+    expect((await rpc(env, kasra, 'send', { body: 'x', in_reply_to: 'rid-shared' })).status).toBe(404)
+    expect(landedTo(a.agentId) + landedTo(c.agentId)).toBe(0)
+  })
+
+  it.each([[''], ['   '], [42], [null], [{}]])('a present non-string/empty `to` (%j) is refused, never infer mode', async (bad) => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    const r = await rpc(env, kasra, 'send', { to: bad, body: 'x', in_reply_to: orig })
+    expect(r.raw).toContain('invalid_args')
+    expect(landedTo(seat.agentId)).toBe(0)
+  })
+
+  it('resolver guard pinned directly: an inactive sender is refused by resolveReplyTarget itself (infer and named)', async () => {
+    const seat = await homeSeat(env, 'human-1', 's1')
+    await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
+    const orig = msgId('agent-kasra', seat.agentId)
+    const now = new Date().toISOString()
+    expect((await resolveReplyTarget(env, { fromAgent: 'agent-kasra', inReplyTo: orig }, now)).ok).toBe(true)
+    expect((await resolveReplyTarget(env, { fromAgent: 'agent-kasra', toRef: seat.agentId, inReplyTo: orig }, now)).ok).toBe(true)
+    h.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(seat.agentId)
+    expect((await resolveReplyTarget(env, { fromAgent: 'agent-kasra', inReplyTo: orig }, now)).ok).toBe(false)
+    expect((await resolveReplyTarget(env, { fromAgent: 'agent-kasra', toRef: seat.agentId, inReplyTo: orig }, now)).ok).toBe(false)
   })
 
   it('omitting `to` without in_reply_to says what is required', async () => {

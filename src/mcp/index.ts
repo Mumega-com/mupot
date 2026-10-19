@@ -4846,6 +4846,8 @@ const toolSend: ToolSpec = {
     }
     const to = str(args.to)
     const body = str(args.body)
+    // A PRESENT `to` that is not a usable string is a malformed call, never a silent switch to infer mode.
+    if (args.to !== undefined && !to) return fail(400, 'invalid_args', 'to must be a non-empty string when given')
     if (!to && !(typeof args.in_reply_to === 'string' && args.in_reply_to.length > 0))
       return fail(400, 'invalid_args', 'to is required unless in_reply_to cites a message sent to you')
     if (!body) return fail(400, 'invalid_args', 'body required')
