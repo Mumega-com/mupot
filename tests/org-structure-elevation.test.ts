@@ -556,6 +556,22 @@ describe('an elevated agent may only LOWER a squad budget (adversarial P1-B)', (
   })
 })
 
+describe('an elevated agent can never pin or clear a squad dyad pair (gate authority)', () => {
+  it('is refused with dyad_pair_standing_admin_only and nothing is written', async () => {
+    harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-peer', '${SQUAD_A1}', 'peer', 'Peer', 'active')`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 500 })).ok, 'baseline: elevation works for budget').toBe(true)
+    for (const patch of [{ dyad_agent_a: AGENT_ID, dyad_agent_b: 'agent-peer' }, { dyad_agent_a: null, dyad_agent_b: null }]) {
+      const out = await updateSquad(SQUAD_A1, patch)
+      expect(out.ok, JSON.stringify(patch)).toBe(false)
+      expect(JSON.stringify(out)).toMatch(/dyad_pair_standing_admin_only/)
+    }
+    const row = harness.sqlite.prepare('SELECT dyad_agent_a, dyad_agent_b FROM squads WHERE id = ?').get(SQUAD_A1) as { dyad_agent_a: string | null; dyad_agent_b: string | null }
+    expect(row).toEqual({ dyad_agent_a: null, dyad_agent_b: null })
+  })
+})
+
 describe('refusals teach the exact request (onboarding smoothness)', () => {
   it('a floor refusal names request_elevation, the action key AND the scope each tool needs', async () => {
     await checkIn()

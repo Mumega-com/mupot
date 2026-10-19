@@ -403,6 +403,19 @@ describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
     expect(f).not.toHaveBeenCalled()
   })
 
+  it('dyad default never applies to an observed seat: even when the seat agent is pinned with a gated peer, gate_owner stays null', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { e } = mk()
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('dy-peer', 'squad-target', 'dypeer', 'Peer', 'active')`)
+    h.sqlite.prepare(`UPDATE agents SET squad_id = 'squad-target' WHERE id = ?`).run(s.agentId)
+    h.sqlite.prepare(`UPDATE squads SET dyad_agent_a = ?, dyad_agent_b = 'dy-peer' WHERE id = 'squad-target'`).run(s.agentId)
+    h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-dy', 'gate:dypeer', 'agent', 'dy-peer', '${OWNER}', '2026-10-09T00:00:00.000Z')`)
+    const r = await create(s, e)
+    expect(r.text, r.text).toContain('marked external (observed-seat)')
+    expect(one<{ gate_owner: string | null }>(`SELECT gate_owner FROM tasks`)!.gate_owner).toBeNull()
+  })
+
   it('the task is stamped observed-seat:<seatId> (server-set, args cannot override) and NO poller picks it up; a normal task still is', async () => {
     const s = await seatFor(OWNER)
     await join(s, { squad: 'squad-target' })

@@ -37,7 +37,8 @@ describe('dyad gate default', () => {
   const grant = (cap: string, type: 'agent' | 'member', id: string) =>
     run(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))`,
       crypto.randomUUID(), cap, type, id, MADMIN)
-  const setDyad = (on: 0 | 1) => run('UPDATE squads SET dyad_gate = ?1 WHERE id = ?2', on, SQUAD)
+  const pin = (a = AX, b = AY) => run('UPDATE squads SET dyad_agent_a = ?1, dyad_agent_b = ?2 WHERE id = ?3', a, b, SQUAD)
+  const setDyad = (on: 0 | 1) => (on ? pin() : Promise.resolve())
 
   beforeEach(async () => {
     harness = createSqliteD1()
@@ -95,26 +96,66 @@ describe('dyad gate default', () => {
     expect(hintOf(r)).toMatch(/holds no live gate:ybot grant/)
   })
 
-  it('peer grant not live (agent paused): null plus a hint', async () => {
+  it('roster drift: a third active agent changes nothing; the pinned peer stays the peer', async () => {
+    await setDyad(1)
+    await grant('gate:ybot', 'agent', AY)
+    await run(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-z', ?1, 'zbot', 'zbot', 'member', 'test', 'active')`, SQUAD)
+    await grant('gate:zbot', 'agent', 'agent-z')
+    expect(gateOf(await create(agentAuth('x')))).toBe('gate:ybot')
+  })
+
+  it('pinned pair broken (peer paused, or moved out of the squad): no default, hint', async () => {
     await setDyad(1)
     await grant('gate:ybot', 'agent', AY)
     await run(`UPDATE agents SET status = 'paused' WHERE id = ?1`, AY)
     const r = await create(agentAuth('x'))
-    // a paused peer leaves ONE active agent: not a dyad
     expect(gateOf(r)).toBeNull()
-    expect(hintOf(r)).toMatch(/exactly two/)
+    expect(hintOf(r)).toMatch(/no longer two active agents of this squad/)
+    await run(`UPDATE agents SET status = 'active' WHERE id = ?1`, AY)
+    expect(gateOf(await create(agentAuth('x')))).toBe('gate:ybot')
+    await run(`INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-out', ?1, 'out-sqd', 'Out')`, DEPT)
+    await run(`UPDATE agents SET squad_id = 'sq-out' WHERE id = ?1`, AY)
+    const moved = await create(agentAuth('x'))
+    expect(gateOf(moved)).toBeNull()
+    expect(hintOf(moved)).toMatch(/no longer two active agents of this squad/)
   })
 
-  it('three or more active agents: no default, hint says dyad needs exactly two', async () => {
+  it('exclusive holder: a same-owner puppet agent in another squad holding the peer gate blocks the default', async () => {
+    await setDyad(1)
+    await grant('gate:ybot', 'agent', AY)
+    await run(`INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-out', ?1, 'out-sqd', 'Out')`, DEPT)
+    await run(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-p', 'sq-out', 'pbot', 'pbot', 'member', 'test', 'active')`)
+    expect(gateOf(await create(agentAuth('x')))).toBe('gate:ybot')
+    await grant('gate:ybot', 'agent', 'agent-p')
+    const r = await create(agentAuth('x'))
+    expect(gateOf(r)).toBeNull()
+    expect(hintOf(r)).toMatch(/not held exclusively/)
+  })
+
+  it('exclusive holder: the creator also holding the peer gate blocks the default', async () => {
+    await setDyad(1)
+    await grant('gate:ybot', 'agent', AY)
+    await grant('gate:ybot', 'agent', AX)
+    const r = await create(agentAuth('x'))
+    expect(gateOf(r)).toBeNull()
+    expect(hintOf(r)).toMatch(/not held exclusively/)
+  })
+
+  it('an unpinned third agent (not in the pair) creating gets no default', async () => {
     await setDyad(1)
     await grant('gate:ybot', 'agent', AY)
     await run(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-z', ?1, 'zbot', 'zbot', 'member', 'test', 'active')`, SQUAD)
-    const r = await create(agentAuth('x'))
+    await run(`INSERT INTO members (id, tenant, display_name, status, created_at) VALUES ('member-z', ?1, 'z', 'active', datetime('now'))`, TENANT)
+    const z: AuthContext = {
+      userId: 'member-z', memberId: 'member-z', email: null, role: 'member', tenant: TENANT, channel: 'workspace',
+      boundAgentId: 'agent-z', capabilities: [cap('member-z')],
+    }
+    const r = await create(z)
     expect(gateOf(r)).toBeNull()
-    expect(hintOf(r)).toMatch(/dyad needs exactly two/)
+    expect(hintOf(r)).toMatch(/pinned dyad agents/)
   })
 
-  it('dyad off: unchanged (no default, no hint), even with a live peer grant', async () => {
+  it('dyad off (no pair pinned): unchanged (no default, no hint), even with a live peer grant', async () => {
     await grant('gate:ybot', 'agent', AY)
     const r = await create(agentAuth('x'))
     expect(gateOf(r)).toBeNull()
@@ -163,7 +204,7 @@ describe('dyad gate default', () => {
     await grant('gate:ybot', 'member', MHUMAN)
     const r2 = await create(agentAuth('x'))
     expect(gateOf(r2)).toBeNull()
-    expect(hintOf(r2)).toMatch(/held by a member/)
+    expect(hintOf(r2)).toMatch(/not held exclusively/)
   })
 
   it('a human creator gets no default and a hint', async () => {
@@ -172,7 +213,7 @@ describe('dyad gate default', () => {
     const r = await create(humanAuth())
     expect((r as Out).ok, JSON.stringify(r)).toBe(true)
     expect(gateOf(r)).toBeNull()
-    expect(hintOf(r)).toMatch(/one of the two dyad agents/)
+    expect(hintOf(r)).toMatch(/pinned dyad agents/)
   })
 
   it('a bound agent from OUTSIDE the dyad (squad member grant, other home squad) gets no default', async () => {
@@ -189,35 +230,66 @@ describe('dyad gate default', () => {
     const r = await create(w)
     expect((r as Out).ok, JSON.stringify(r)).toBe(true)
     expect(gateOf(r)).toBeNull()
-    expect(hintOf(r)).toMatch(/one of the two dyad agents/)
+    expect(hintOf(r)).toMatch(/pinned dyad agents/)
   })
 
-  it('updateUnitConfig: dyad_gate is a strict boolean and squad-only', async () => {
-    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_gate: 'true' })).toEqual({ ok: false, error: 'invalid_dyad_gate' })
-    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_gate: 1 })).toEqual({ ok: false, error: 'invalid_dyad_gate' })
-    expect(await updateUnitConfig(env, 'agent', AX, { dyad_gate: true })).toEqual({ ok: false, error: 'invalid_dyad_gate' })
-    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_gate: true })).toEqual({ ok: true })
-    expect((harness.sqlite.prepare('SELECT dyad_gate FROM squads WHERE id = ?').get(SQUAD) as { dyad_gate: number }).dyad_gate).toBe(1)
+  it('updateUnitConfig: pair must be both-or-neither, distinct, active, in THIS squad; squad-only', async () => {
+    const bad = { ok: false, error: 'invalid_dyad_pair' }
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX })).toEqual(bad)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: null })).toEqual(bad)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: AX })).toEqual(bad)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: 'no-such' })).toEqual(bad)
+    expect(await updateUnitConfig(env, 'agent', AX, { dyad_agent_a: AX, dyad_agent_b: AY })).toEqual(bad)
+    await run(`INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-out', ?1, 'out-sqd', 'Out')`, DEPT)
+    await run(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-w', 'sq-out', 'wbot', 'wbot', 'member', 'test', 'active')`)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: 'agent-w' })).toEqual(bad)
+    await run(`UPDATE agents SET status = 'paused' WHERE id = ?1`, AY)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: AY })).toEqual(bad)
+    await run(`UPDATE agents SET status = 'active' WHERE id = ?1`, AY)
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: AX, dyad_agent_b: AY })).toEqual({ ok: true })
+    expect(await updateUnitConfig(env, 'squad', SQUAD, { dyad_agent_a: null, dyad_agent_b: null })).toEqual({ ok: true })
   })
 
-  describe('update_squad dyad_gate', () => {
-    const admin = (): AuthContext => ({
-      userId: MADMIN, memberId: MADMIN, email: 'a@example.com', role: 'admin', tenant: TENANT, channel: 'workspace',
-      boundAgentId: null, capabilities: [{ member_id: MADMIN, scope_type: 'squad', scope_id: SQUAD, capability: 'admin' } as CapabilityGrant],
+  describe('update_squad dyad pair', () => {
+    const admin = (role: 'owner' | 'member' = 'owner', caps?: CapabilityGrant[]): AuthContext => ({
+      userId: MADMIN, memberId: MADMIN, email: 'a@example.com', role, tenant: TENANT, channel: 'workspace',
+      boundAgentId: null, capabilities: caps ?? [{ member_id: MADMIN, scope_type: 'squad', scope_id: SQUAD, capability: 'admin' } as CapabilityGrant],
     })
-    it('admin sets it (strict boolean), result includes it; members cannot; non-booleans refused', async () => {
-      const on = await invokeTool(admin(), env, 'update_squad', { squad: 'duo-sqd', dyad_gate: true }, ORIGIN)
+    const upd = (auth: AuthContext, args: Record<string, unknown>) => invokeTool(auth, env, 'update_squad', { squad: 'duo-sqd', ...args }, ORIGIN)
+    const pair = () => harness.sqlite.prepare('SELECT dyad_agent_a AS a, dyad_agent_b AS b FROM squads WHERE id = ?').get(SQUAD) as { a: string | null; b: string | null }
+
+    it('org owner pins by slug, read returns ids, clears with nulls', async () => {
+      const on = await upd(admin('owner'), { dyad_agent_a: 'xbot', dyad_agent_b: 'ybot' })
       expect((on as { ok: boolean }).ok, JSON.stringify(on)).toBe(true)
-      expect((on as unknown as { result: { squad: { dyad_gate: number } } }).result.squad.dyad_gate).toBe(1)
-      for (const bad of ['true', 1, 'yes']) {
-        const r = await invokeTool(admin(), env, 'update_squad', { squad: 'duo-sqd', dyad_gate: bad }, ORIGIN)
+      expect(pair()).toEqual({ a: AX, b: AY })
+      expect((on as unknown as { result: { squad: { dyad_agent_a: string; dyad_agent_b: string } } }).result.squad).toMatchObject({ dyad_agent_a: AX, dyad_agent_b: AY })
+      expect((await upd(admin('owner'), { dyad_agent_a: null, dyad_agent_b: null }) as { ok: boolean }).ok).toBe(true)
+      expect(pair()).toEqual({ a: null, b: null })
+    })
+
+    it('a squad admin who is not org owner/admin is refused, set or clear', async () => {
+      const sqAdmin = admin('member')
+      for (const args of [{ dyad_agent_a: 'xbot', dyad_agent_b: 'ybot' }]) {
+        const r = await upd(sqAdmin, args)
         expect((r as { ok: boolean }).ok).toBe(false)
+        expect(JSON.stringify(r)).toMatch(/dyad_pair_org_admin_only/)
       }
-      const row = harness.sqlite.prepare('SELECT dyad_gate FROM squads WHERE id = ?').get(SQUAD) as { dyad_gate: number }
-      expect(row.dyad_gate).toBe(1)
-      const denied = await invokeTool(agentAuth('x'), env, 'update_squad', { squad: 'duo-sqd', dyad_gate: false }, ORIGIN)
-      expect((denied as { ok: boolean }).ok).toBe(false)
-      expect((harness.sqlite.prepare('SELECT dyad_gate FROM squads WHERE id = ?').get(SQUAD) as { dyad_gate: number }).dyad_gate).toBe(1)
+      expect(pair()).toEqual({ a: null, b: null })
+      await upd(admin('owner'), { dyad_agent_a: 'xbot', dyad_agent_b: 'ybot' })
+      expect((await upd(sqAdmin, { dyad_agent_a: null, dyad_agent_b: null }) as { ok: boolean }).ok).toBe(false)
+      expect(pair()).toEqual({ a: AX, b: AY })
+    })
+
+    it('half pair, same agent twice, non-member agent: refused; agents (bound) refused; home squad refused', async () => {
+      expect((await upd(admin('owner'), { dyad_agent_a: 'xbot' }) as { ok: boolean }).ok).toBe(false)
+      expect((await upd(admin('owner'), { dyad_agent_a: 'xbot', dyad_agent_b: 'xbot' }) as { ok: boolean }).ok).toBe(false)
+      expect((await upd(admin('owner'), { dyad_agent_a: 'xbot', dyad_agent_b: 'nobody' }) as { ok: boolean }).ok).toBe(false)
+      const agentAdmin: AuthContext = { ...admin('owner'), boundAgentId: AX }
+      expect((await upd(agentAdmin, { dyad_agent_a: 'xbot', dyad_agent_b: 'ybot' }) as { ok: boolean }).ok).toBe(false)
+      await run(`UPDATE squads SET kind = 'home' WHERE id = ?1`, SQUAD)
+      const home = await upd(admin('owner'), { dyad_agent_a: 'xbot', dyad_agent_b: 'ybot' })
+      expect((home as { ok: boolean }).ok).toBe(false)
+      expect(pair()).toEqual({ a: null, b: null })
     })
   })
 })
