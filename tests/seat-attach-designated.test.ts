@@ -888,3 +888,56 @@ describe('codex review dispositions', () => {
     expect(next).toContain('right now')
   })
 })
+
+describe('guide, do not dead-end: an undesignated agent the human could designate (agent_not_designated_for_you)', () => {
+  const detailOf = (r: Rpc): { who_acts?: string; next_step?: string; agent?: { id: string } } =>
+    (((r.body.result ?? {}) as { structuredContent?: { detail?: unknown } }).structuredContent?.detail ?? {}) as { who_acts?: string; next_step?: string; agent?: { id: string } }
+
+  it('org admin + undesignated agent: guided refusal naming the Allow-for-me step; nothing filed, nothing designated', async () => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-org', '${HUMAN}', 'org', NULL, 'admin')`)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const r = await attach(env, g, 'conv-a', 'rava')
+    expect(errOf(r)).toBe('agent_not_designated_for_you')
+    const d = detailOf(r)
+    expect(d.who_acts).toBe('owner')
+    expect(d.agent?.id).toBe('agent-rava')
+    expect(d.next_step).toBe(`Rava isn't set up for you yet. Ask your human to open Connections and press 'Allow for me' next to Rava, then ask me to attach again.`)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
+    expect(designatedOf('agent-rava')).toBeNull() // the request never designates
+  })
+
+  it('a stranger (no org standing, or another squad) still reads agent_not_found: no existence oracle', async () => {
+    const env = envFor(h, DESIGNATED)
+    const g = await grant(env, HUMAN) // squad admin of squad-core only: no org floor
+    await boot(env, g, 'conv-a')
+    expect(errOf(await attach(env, g, 'conv-a', 'rava'))).toBe('agent_not_found')
+    const g2 = await grant(env, HUMAN2)
+    await boot(env, g2, 'conv-b')
+    expect(errOf(await attach(env, g2, 'conv-b', 'rava'))).toBe('agent_not_found')
+    // org admin but the agent is designated for someone else: not overridden, not revealed
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-org', '${HUMAN}', 'org', NULL, 'admin')`)
+    await designate(env, 'agent-rava', HUMAN2)
+    expect(errOf(await attach(env, g, 'conv-a', 'rava'))).toBe('agent_not_found')
+  })
+
+  it('the org floor is its own guard: a squad admin over an IDENTITY-ONLY agent (no binding, so no ceiling to hide behind) still reads agent_not_found', async () => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-bare', 'squad-core', 'bare', 'Bare', 'r', 'm', 'active')`)
+    const g = await grant(env, HUMAN) // squad admin of squad-core, no org floor
+    await boot(env, g, 'conv-a')
+    expect(errOf(await attach(env, g, 'conv-a', 'bare'))).toBe('agent_not_found')
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-org', '${HUMAN}', 'org', NULL, 'admin')`)
+    expect(errOf(await attach(env, g, 'conv-a', 'bare'))).toBe('agent_not_designated_for_you')
+  })
+
+  it('designated for the human: the normal flow, unchanged', async () => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-org', '${HUMAN}', 'org', NULL, 'admin')`)
+    await designate(env, 'agent-rava', HUMAN)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).toBe('agent-rava')
+  })
+})
