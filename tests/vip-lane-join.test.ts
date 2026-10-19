@@ -430,7 +430,7 @@ describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
     expect(f).not.toHaveBeenCalled()
     const free = await seatFor(PLAIN, 'conv-gh')
     await create(free, e)
-    expect(f.mock.calls.some((c) => String(c[0]).includes('api.github.com'))).toBe(true)
+    expect(f.mock.calls.some((c) => new URL(String(c[0])).hostname === 'api.github.com')).toBe(true)
   })
 
   it('router dry_run never plans would_assign for a marked task (SELECT guard alone)', async () => {
