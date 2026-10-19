@@ -212,10 +212,55 @@ export type GrantResult =
 //     registered the host's OWN signing key, the SAME column authorizeSeatDelivery already
 //     joins through — holds standing on the target squad via the ordinary capability ladder
 //     (canOnSquad), the SAME primitive the grant-writer rank ceiling above already uses.
-async function hostHasStandingInSquad(env: Env, hostAgentId: string, squadId: string): Promise<boolean> {
+//
+// Third branch (home squads, orca-connection-diagnosis-20261019 §3 step 8): a member's HOME
+// squad has no standing grant path by design (G-FP1b), so the capability ladder above can never
+// admit a host there. A host agent whose agents.owner_member_id IS that home's owner member
+// has standing — see homeOwnerStandingSql, the ONE predicate shared with HOST_STANDING_SQL so
+// create-time and per-delivery checks can never diverge (the #2040 round-1 BLOCK class).
+//
+// The shared predicate for the home-owner branch. `hostIdExpr` / `squadIdExpr` are SQL
+// expressions (a column or a bound parameter). Nothing else widens standing:
+//   - host agent row must be active AND not archived;
+//   - owner_member_id must be non-NULL and non-'' (explicit — never rely on a join miss);
+//   - the owner member must be active;
+//   - the squad must be kind='home' and not archived, inside a kind='home' department whose
+//     slug is exactly `dept-home-<owner_member_id>` (the department-keyed home identity
+//     createHomeForMember/bootstrapSelf share — a slug alone on a work-kind row never counts);
+//   - the grant's WRITER (writerIdExpr) must BE the home owner: an org admin who re-points a
+//     host's owner_member_id at someone else must not mint reach into that someone's home;
+//   - the owner member row is pinned to the pot's tenant (tenantExpr).
+export function homeOwnerStandingSql(
+  hostIdExpr: string,
+  squadIdExpr: string,
+  writerIdExpr: string,
+  tenantExpr: string,
+): string {
+  return `EXISTS (
+    SELECT 1 FROM agents ho
+      JOIN members om ON om.id = ho.owner_member_id AND om.status = 'active' AND om.tenant = ${tenantExpr}
+      JOIN squads hs ON hs.id = ${squadIdExpr} AND hs.kind = 'home' AND hs.status = 'active'
+      JOIN departments hd ON hd.id = hs.department_id AND hd.kind = 'home'
+                         AND hd.slug = 'dept-home-' || ho.owner_member_id
+     WHERE ho.id = ${hostIdExpr}
+       AND ho.status = 'active' AND ho.archived_at IS NULL
+       AND ho.owner_member_id IS NOT NULL AND ho.owner_member_id <> ''
+       AND ${writerIdExpr} = ho.owner_member_id
+  )`
+}
+
+async function hostHasStandingInSquad(
+  env: Env,
+  hostAgentId: string,
+  squadId: string,
+  writerMemberId: string,
+): Promise<boolean> {
   const asAgent = await env.DB.prepare(`SELECT 1 AS x FROM agents WHERE id = ?1 AND squad_id = ?2`)
     .bind(hostAgentId, squadId).first()
   if (asAgent) return true
+  const asHomeOwner = await env.DB.prepare(`SELECT 1 AS x WHERE ${homeOwnerStandingSql('?1', '?2', '?3', '?4')}`)
+    .bind(hostAgentId, squadId, writerMemberId, env.TENANT_SLUG).first()
+  if (asHomeOwner) return true
   const key = await loadActiveAgentKey(env, hostAgentId)
   if (!key) return false
   const grants = await resolveCapabilities(env, key.member_id)
@@ -236,7 +281,7 @@ export async function createSeatEventGrant(
     .bind(input.agentId).first<{ squad_id: string }>()
   if (!agent) return { ok: false, reason: 'agent_not_found' }
   if (!(await loadActiveAgentKey(env, input.hostAgentId))) return { ok: false, reason: 'host_key_missing' }
-  if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id))) {
+  if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id, input.memberId))) {
     return { ok: false, reason: 'host_no_squad_standing' }
   }
   const projectId = input.projectId ?? null
@@ -326,12 +371,13 @@ export type SeatAuthorization = 'granted' | 'not_granted' | 'error'
 // all run through — folding host-squad-standing in HERE, as one more AND clause on the
 // SAME query, revalidates it on every one of those at once, for EVERY grant including ones
 // created before this requirement existed (nothing here reads when the grant was created).
-// Mirrors hostHasStandingInSquad's two branches (createSeatEventGrant, above) but as SQL,
+// Mirrors hostHasStandingInSquad's three branches (createSeatEventGrant, above) but as SQL,
 // reusing currentMemberRankAtLeastSql — the SAME embeddable rank-ladder fragment
 // acceptInvite's write-time re-check uses (src/auth/capability.ts) — rather than a second,
 // JS-side round trip per disclosure.
 const HOST_STANDING_SQL = `(
   EXISTS (SELECT 1 FROM agents ha WHERE ha.id = g.host_agent_id AND ha.squad_id = a.squad_id)
+  OR ${homeOwnerStandingSql('g.host_agent_id', 'a.squad_id', 'g.granted_by_member_id', 'g.tenant')}
   OR ${currentMemberRankAtLeastSql('squad', {
     inviterIdParam: 'k.member_id',
     scopeIdParam: 'a.squad_id',
