@@ -8,6 +8,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { runRouterTick } from '../src/router/engine'
+import { runTaskExecution } from '../src/agents/execute'
 import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { advertisedTools, invokeTool, mcpApp } from '../src/mcp/index'
@@ -383,11 +385,48 @@ describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
     const { send, fetch: f, e } = mk()
     const r = await create(s, e)
     expect(r.text).not.toContain('observed_floor')
-    expect(r.text, r.text).toContain('dispatch forced off')
+    expect(r.text, r.text).toContain('marked external (observed-seat)')
     expect((await create(s, e, { dispatch: false })).text).not.toContain('observed_floor')
     expect(tasks()).toBe(2)
     expect(send).not.toHaveBeenCalled()
     expect(f).not.toHaveBeenCalled()
+  })
+
+  it('the task is stamped observed-seat:<seatId> (server-set, args cannot override) and NO poller picks it up; a normal task still is', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { e } = mk()
+    const r = await create(s, e, { external_source: 'forged:marker' })
+    expect(r.text).not.toContain('observed_floor')
+    const row = one<{ id: string; external_source: string | null; assignee_agent_id: string | null }>(`SELECT id, external_source, assignee_agent_id FROM tasks WHERE title = 'T'`)!
+    expect(row.external_source).toBe(`observed-seat:${s.seatId}`)
+    expect(row.assignee_agent_id).toBeNull()
+    // a live squad agent exists: router_tick must not assign the observed task, but must assign a normal one
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-live', 'squad-target', 'live', 'Live', 'active');
+      INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES ('${TENANT}', 'seat-live', 'L', 'test', 'seat-live', 'agent-live', datetime('now'), datetime('now'))`)
+    const tick = (): ReturnType<typeof runRouterTick> => runRouterTick(e, { ok: true, tenant: TENANT, squadId: 'squad-target', agentId: null, source: 'principal' }, { squadId: 'squad-target' }, { memberId: OWNER })
+    const first = await tick()
+    expect(first.assigned).toBe(0)
+    expect(one<{ a: string | null }>(`SELECT assignee_agent_id AS a FROM tasks WHERE id = ?`, row.id)!.a).toBeNull()
+    // canAgentExecuteTask (via runTaskExecution): refused as task_not_found, model never runs
+    const model = { chat: vi.fn(async () => 'must not run') }
+    const agent = { id: 'agent-live', squad_id: 'squad-target', slug: 'live', name: 'Live', role: null, model: null, status: 'active', created_at: 'now' }
+    const ex = await runTaskExecution(e, agent, row.id, { model, emit: async () => {} })
+    expect(ex.ok).toBe(false)
+    expect(model.chat).not.toHaveBeenCalled()
+    // control: an ordinary unmarked task is routed
+    h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('t-normal', 'squad-target', 'N', 'the work is done', 'open')`).run()
+    expect((await tick()).assigned).toBe(1)
+    expect(one<{ a: string | null }>(`SELECT assignee_agent_id AS a FROM tasks WHERE id = 't-normal'`)!.a).toBe('agent-live')
+  })
+
+  it('doorbell gate pinned: the observed create never reaches scheduleTaskAssignedDoorbell (no fetch even with a webhook-registered agent)', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    await create(s, e)
+    expect(f).not.toHaveBeenCalled()
+    expect(send).not.toHaveBeenCalled()
   })
 
   it('a non-observed seat is unaffected (assignee allowed, task.created emitted), and flag off is a no-op', async () => {

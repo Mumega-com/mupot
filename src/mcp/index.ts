@@ -1221,7 +1221,11 @@ const toolTaskCreate: ToolSpec = {
     // above). Absent/null/blank -> undefined -> createTask defaults external_source to null,
     // same as every ordinary create call today.
     let externalSource: string | undefined
-    if (args.external_source !== undefined && args.external_source !== null) {
+    // #2062: an observed seat's task carries the untrusted-origin marker every status poller skips (concierge routing, execute
+    // auto-pickup, router_tick, loop backlog) and that turns on the untrusted-content fence. Server-set; args cannot override it.
+    if (observedCreate.forceNoDispatch && auth.seatBinding) {
+      externalSource = `observed-seat:${auth.seatBinding.seatId}`
+    } else if (args.external_source !== undefined && args.external_source !== null) {
       if (typeof args.external_source !== 'string') return fail(400, 'invalid_args', 'external_source must be a string')
       const trimmed = args.external_source.trim()
       if (trimmed.length === 0) return fail(400, 'invalid_args', 'external_source must not be blank')
@@ -1308,7 +1312,7 @@ const toolTaskCreate: ToolSpec = {
     if (dispatchOn) {
       await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil, assignment: task.updated_at })
     }
-    return done(observedCreate.forceNoDispatch ? { task, dispatch: false, note: 'observed seat: proposal-only task, dispatch forced off' } : { task })
+    return done(observedCreate.forceNoDispatch ? { task, dispatch: false, note: 'observed seat: proposal-only task; dispatch off, no assignee, marked external (observed-seat) so no agent auto-picks it until a human assigns it' } : { task })
   },
 }
 
