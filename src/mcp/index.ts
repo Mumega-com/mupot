@@ -8041,6 +8041,11 @@ async function invokeToolInner(
   const spec = TOOL_BY_NAME.get(toolName)
   if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName, env)), tool: toolName }
 
+  // #2069: the seat's admission decision is read ONCE, here, before any refusal can return: a held seat leaves no tape row even on
+  // the pre-floor exits (harness-session / flag refusals). The observed-floor block below only applies it.
+  const floorDecision = await observedFloorDecision(env, auth, spec.name)
+  if (floorDecision.status === 'held') { ctx.heldSeat = true; if (heldOut) heldOut.seat = true }
+
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
   // by a harness-token credential with NO applied seat handle may call only
@@ -8067,9 +8072,8 @@ async function invokeToolInner(
   // #2035 wall 1: the OBSERVED FLOOR. A seat whose agent_seats.admission_status is observed (or held) may call only
   // OBSERVED_FLOOR_TOOLS; decided per tool NAME, re-read from the seat row on every call, before args handling and the capability floor.
   {
-    const decision = await observedFloorDecision(env, auth, spec.name)
+    const decision = floorDecision
     const floor = decision.refusal
-    if (decision.status === 'held') { ctx.heldSeat = true; if (heldOut) heldOut.seat = true }
     if (floor) {
       return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
     }

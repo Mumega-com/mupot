@@ -46,7 +46,7 @@ import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import { sanitizeLabel } from './harness'
-import { seatRowIsHeld } from './vip-lane'
+import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
@@ -797,6 +797,7 @@ export function prepareIdleAttachmentSweep(env: Env, harnessId: string, nowIso: 
     `UPDATE agent_seat_attachments SET detached_at = ?3, detach_reason = 'idle_expired'
       WHERE tenant = ?1 AND harness_id = ?2 AND detached_at IS NULL
         AND julianday(COALESCE(last_used_at, created_at)) < julianday(?3) - ${ATTACH_IDLE_DAYS}
+        ${vipLaneEnabled(env) ? `AND seat_id NOT IN (SELECT id FROM agent_seats WHERE tenant = ?1 AND admission_status = 'held')` : ''}
         AND (SELECT COUNT(*) FROM agent_seats ls JOIN agents la ON la.id = ls.agent_id
               WHERE ls.tenant = ?1 AND ls.harness_id = ?2 AND ls.source = 'auto' AND ls.retired_at IS NULL
                 AND la.status IN ('active', 'paused')) >= ?4`,

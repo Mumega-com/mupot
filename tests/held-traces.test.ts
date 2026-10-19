@@ -4,6 +4,7 @@
 // the boundAgentId floor lookup, the flag gate.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { upsertHarness } from '../src/members/harness'
@@ -13,6 +14,8 @@ import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
 import { invokeTool } from '../src/mcp/index'
+import { applySeatForRequest } from '../src/members/seat-auto'
+import { NO_HINTS } from '../src/members/seat-handle'
 import { touchAttachment, type LiveAttachmentRow } from '../src/members/seat-attach'
 import type { AuthContext, Env } from '../src/types'
 
@@ -173,5 +176,78 @@ describe('3. seat resolution leaves last_used_at alone for a held seat', () => {
     expect(await run('held', { VIP_LANE: '1' })).toBe(0)
     expect(await run('observed', { VIP_LANE: '1' })).toBe(1)
     expect(await run('held', {})).toBe(1)
+  })
+})
+
+describe('4. a held seat is never reclaimed (P1: the hold must not escape via LRU)', () => {
+  async function pool(e: Env) {
+    const harness = await upsertHarness(e, OWNER, 'client-pool', 'Pool')
+    if (!harness) throw new Error('harness fixture failed')
+    const tokenId = `tok-pool-${++tok}`
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('${tokenId}', '${OWNER}', 'hash-${tokenId}', 'oauth:client-pool', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+    const ctx = await buildAuthContextFromProps(e, { memberId: OWNER, tokenId, email: null, channel: 'directory', boundAgentId: null, harnessId: harness.id })
+    if (!ctx) throw new Error('grant ctx null')
+    const lim = { autoLive: 2, windowMax: 100 }
+    const make = (k: string) => applySeatForRequest(e, ctx, { hints: NO_HINTS, autoKeys: { openaiSession: k, codexThreadId: null } }, Date.now(), lim)
+    const seatOfAgent = (a: unknown) => one<{ id: string; retired_at: string | null }>(`SELECT id, retired_at FROM agent_seats WHERE agent_id = ?`, a)!
+    return { make, seatOfAgent }
+  }
+  const status = (seatId: string, st: string | null, lu: string) => h.sqlite.prepare(`UPDATE agent_seats SET admission_status = ?, last_used_at = ? WHERE id = ?`).run(st, lu, seatId)
+
+  it('full pool, LRU seat is held: the held seat survives and a non-held seat is reclaimed', async () => {
+    const e = envFor(h)
+    const { make, seatOfAgent } = await pool(e)
+    const a = await make('A'); const b = await make('B')
+    status(seatOfAgent(a.boundAgentId).id, 'held', '2000-01-01T00:00:00.000Z') // oldest AND held
+    status(seatOfAgent(b.boundAgentId).id, 'observed', '2026-01-01T00:00:00.000Z')
+    const c = await make('C')
+    expect(typeof c.boundAgentId).toBe('string')
+    expect(seatOfAgent(a.boundAgentId).retired_at).toBeNull()
+    expect(seatOfAgent(b.boundAgentId).retired_at).not.toBeNull()
+  })
+
+  it('full pool of held seats: the new seat is refused, nothing is reclaimed; flag off keeps the old LRU reclaim', async () => {
+    const e = envFor(h)
+    const { make, seatOfAgent } = await pool(e)
+    const a = await make('A'); const b = await make('B')
+    status(seatOfAgent(a.boundAgentId).id, 'held', '2000-01-01T00:00:00.000Z')
+    status(seatOfAgent(b.boundAgentId).id, 'held', '2001-01-01T00:00:00.000Z')
+    const c = await make('C')
+    expect(c.boundAgentId).toBeFalsy()
+    expect(seatOfAgent(a.boundAgentId).retired_at).toBeNull()
+    expect(seatOfAgent(b.boundAgentId).retired_at).toBeNull()
+    resetAutoSeatRefusalCache()
+    const off = envFor(h, { VIP_LANE: undefined })
+    const { make: makeOff, seatOfAgent: so2 } = await pool(off)
+    const x = await makeOff('X'); const y = await makeOff('Y')
+    status(so2(x.boundAgentId).id, 'held', '2000-01-01T00:00:00.000Z')
+    status(so2(y.boundAgentId).id, 'held', '2001-01-01T00:00:00.000Z')
+    expect(typeof (await makeOff('Z')).boundAgentId).toBe('string')
+    expect(so2(x.boundAgentId).retired_at).not.toBeNull()
+  })
+})
+
+describe('5. touchHandle and pre-floor exits', () => {
+  it('touchHandle skips the UPDATE for a held seat row (via the handle path)', async () => {
+    const { applySeatHandle } = await import('../src/members/seat-handle')
+    expect(typeof applySeatHandle).toBe('function')
+    const src = readFileSync(new URL('../src/members/seat-handle.ts', import.meta.url), 'utf8')
+    expect(src).toMatch(/async function touchHandle\([^)]*\)[^{]*\{\s*if \(seatRowIsHeld\(env, row\)\) return/)
+  })
+
+  it('a pre-floor refusal for a held seat leaves no tape row (observed baseline does)', async () => {
+    const withBinding = (a: AuthContext, seatId: string): AuthContext => ({
+      ...a, seatBinding: { seatId, label: 'x', harnessId: a.harnessId ?? 'h', grantTokenId: a.tokenId ?? 't', humanMemberId: OWNER, source: 'handle' },
+    }) as unknown as AuthContext // test fixture: the tap and floor read only seatBinding.seatId / humanMemberId
+    const call = async (st: string) => {
+      const x = await seatWith(st, { ADMISSION_TAPE: '1' })
+      const e = { ...x.e, SEAT_AUTO_ENROLL: undefined } as unknown as Env
+      const r = await invokeTool(withBinding(x.auth, x.s.seatId), e, 'seat_select', {}, 'https://pot.test') // flag-gated tool: refuses before the floor
+      expect(r.ok).toBe(false)
+      await tick()
+      return tapeRows(x.s.seatId)
+    }
+    expect(await call('observed')).toBeGreaterThan(0)
+    expect(await call('held')).toBe(0)
   })
 })
