@@ -216,7 +216,7 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { VIP_LANE_TOOLS } from './vip-lane'
-import { joinNextSteps, observedFloorRefusal, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
+import { joinNextSteps, observedFloorDecision, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -896,6 +896,9 @@ export type ToolCtx = {
   /** Set by the /mcp middleware when the request carried a tenant header that differs from the resolved tenant (#2035 wall 4).
    *  Report-only: it selects nothing. status / boot_context / orient add its human line to their result. */
   tenantNotice?: TenantHeaderNotice
+  /** Set by invokeToolInner ONLY when the caller's seat status (read once at the floor) is 'held': a held seat leaves no trace, so inbox
+   *  never consumes, boot_context never self-reports, and no presence / poll-presence write happens. Never taken from a caller. */
+  heldSeat?: boolean
 }
 
 export interface ToolSpec {
@@ -1437,7 +1440,7 @@ const toolTaskList: ToolSpec = {
     // merely after the tool-layer 400/403/404 refusals: this is the LAST thing on the success
     // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
     // W2: an attached thread's activity is not the agent host's heartbeat (it would keep an offline host looking live to dispatch).
-    if (!ctx?.sideEffectFree && !attachedAuthority(auth)) await touchPollFleetPresence(env, auth.boundAgentId)
+    if (!ctx?.sideEffectFree && !ctx?.heldSeat && !attachedAuthority(auth)) await touchPollFleetPresence(env, auth.boundAgentId)
 
     return done({
       squad_id: squadRes.squad.id,
@@ -5098,6 +5101,8 @@ const toolInbox: ToolSpec = {
     }
     if (args.peek !== undefined && typeof args.peek !== 'boolean')
       return fail(400, 'invalid_args', 'peek must be a boolean')
+    // A HELD seat leaves no trace: the read never consumes (forced peek), whatever the caller asked.
+    const peek = ctx?.heldSeat ? true : args.peek === true
     // W2: attached threads read the inbox without consuming it (see inbox_lease).
     if (attachedAuthority(auth) && args.peek !== true) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot consume it')
     if (args.seat !== undefined && typeof args.seat !== 'string')
@@ -5107,7 +5112,7 @@ const toolInbox: ToolSpec = {
     if (rawSinceSeq !== undefined) {
       if (typeof rawSinceSeq !== 'number' || !Number.isSafeInteger(rawSinceSeq) || rawSinceSeq < 0)
         return fail(400, 'invalid_args', 'since_seq must be a non-negative safe integer')
-      if (args.peek !== true)
+      if (!peek)
         return fail(400, 'invalid_args', 'since_seq requires peek=true; use inbox_lease and inbox_ack for reliable consumption')
       sinceSeq = rawSinceSeq
     }
@@ -5122,7 +5127,7 @@ const toolInbox: ToolSpec = {
     const res = await readAgentInbox(env, {
       agent,
       limit,
-      peek: args.peek === true,
+      peek,
       sinceSeq,
       seat: seatArg.seat,
       // #1937: an attached chat's peek hides what THAT attachment marked handled (inbox_mark_handled).
@@ -5138,7 +5143,7 @@ const toolInbox: ToolSpec = {
     // consumer_fenced, or a service-layer 400) — that is a refusal too, and must leave
     // last_reported_at untouched exactly like a tool-layer refusal does. Last thing on the
     // success path only.
-    if (!attachedAuthority(auth)) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat
+    if (!attachedAuthority(auth) && !ctx?.heldSeat) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat; held seats leave no trace
     // `complete` is surfaced deliberately: a caller must be able to know it was
     // handed everything WITHOUT comparing a length against a cap it has to know.
     // #1937: an attached chat's peek hides what it handled, but handled rows still count toward the sender-side unread
@@ -5154,7 +5159,7 @@ const toolInbox: ToolSpec = {
       messages: res.messages,
       remaining: res.remaining,
       complete: res.complete,
-      consumed: args.peek !== true,
+      consumed: !peek,
       ...(warning ? { warning } : {}),
     })
   },
@@ -6921,7 +6926,7 @@ const toolBootContext: ToolSpec = {
   async run(auth, env, args, ctx) {
     // mupot#1794 W4 (gate P2): boot_context is allowlisted for a confined harness session as a READ;
     // it must not write presence under the human with a caller-chosen seat label.
-    if (auth.memberId && !ctx?.sideEffectFree && !isHarnessCredentialSession(auth) && !attachedAuthority(auth)) {
+    if (auth.memberId && !ctx?.sideEffectFree && !ctx?.heldSeat && !isHarnessCredentialSession(auth) && !attachedAuthority(auth)) {
       const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
       const bootTouch = (async () => {
         const id = await loadMemberIdentity(env, auth)
@@ -6964,7 +6969,7 @@ const toolBootContext: ToolSpec = {
       ? await reportSelfAtBoot(
           env,
           auth.boundAgentId as string,
-          ctx?.sideEffectFree || attachedAuthority(auth) ? null : { runtime: args.runtime, model: args.model, host: args.host },
+          ctx?.sideEffectFree || ctx?.heldSeat || attachedAuthority(auth) ? null : { runtime: args.runtime, model: args.model, host: args.host },
           connectionKind,
         )
       : null
@@ -8059,7 +8064,9 @@ async function invokeToolInner(
   // #2035 wall 1: the OBSERVED FLOOR. A seat whose agent_seats.admission_status is observed (or held) may call only
   // OBSERVED_FLOOR_TOOLS; decided per tool NAME, re-read from the seat row on every call, before args handling and the capability floor.
   {
-    const floor = await observedFloorRefusal(env, auth, spec.name)
+    const decision = await observedFloorDecision(env, auth, spec.name)
+    const floor = decision.refusal
+    if (decision.status === 'held') ctx.heldSeat = true
     if (floor) {
       return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
     }
@@ -8168,7 +8175,7 @@ async function invokeToolInner(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)
