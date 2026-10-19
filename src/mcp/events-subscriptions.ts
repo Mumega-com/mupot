@@ -16,6 +16,7 @@ import {
   validateCallbackUrl,
   verifyCallback,
 } from './events-webhook'
+import { reasonOfFailure, recordSubscribeRefusal } from './events-refusals'
 
 export const SUBSCRIBABLE_EVENTS: ReadonlySet<string> = new Set(['message.created'])
 
@@ -195,7 +196,7 @@ function grantTtlMs(raw: unknown): number | EventsFailure {
   return Math.min(Math.max(Math.floor(raw), TTL_MIN_MS), TTL_MAX_MS)
 }
 
-export async function eventsSubscribe(
+async function eventsSubscribeInner(
   env: Env,
   auth: AuthContext,
   floorOk: boolean,
@@ -501,6 +502,23 @@ export async function loadSigningSecrets(env: Env, sub: SubscriptionRow, nowMs: 
   const out = [await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.secret_ciphertext, aad)]
   if (sub.prev_secret_ciphertext && sub.prev_secret_expires_at && sub.prev_secret_expires_at > new Date(nowMs).toISOString()) {
     out.push(await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.prev_secret_ciphertext, aad))
+  }
+  return out
+}
+
+/** events/subscribe. Every refusal is recorded (bounded, host-only; see events-refusals.ts) so a refused-early call is visible. */
+export async function eventsSubscribe(
+  env: Env,
+  auth: AuthContext,
+  floorOk: boolean,
+  paramsRaw: unknown,
+  nowMs: number = Date.now(),
+  attached?: { humanMemberId: string; grantTokenId: string },
+): Promise<EventsSuccess | EventsFailure> {
+  const out = await eventsSubscribeInner(env, auth, floorOk, paramsRaw, nowMs, attached)
+  if (!out.ok) {
+    const delivery = asObject(asObject(paramsRaw)?.delivery)
+    await recordSubscribeRefusal(env, nowMs, { reason: reasonOfFailure(out), auth, rawUrl: delivery?.url })
   }
   return out
 }

@@ -85,14 +85,15 @@ function makeEnv(opts: EnvOpts, sqlLog: string[]): Env {
   } as unknown as Env
 }
 
-/** Every row of every table except member_tokens (the pre-existing last_used telemetry touch). */
+/** Every row of every table except member_tokens (the pre-existing last_used telemetry touch) and event_subscribe_refusals (the
+ *  refusal record is itself the observability write; it is asserted in mcp-events-pr2.test.ts and carries no subscription state). */
 function dumpState(): string {
   const tables = harness.sqlite
     .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
     .all() as { name: string }[]
   const out: Record<string, unknown[]> = {}
   for (const { name } of tables) {
-    if (name === 'member_tokens') continue
+    if (name === 'member_tokens' || name === 'event_subscribe_refusals') continue
     out[name] = harness.sqlite.prepare(`SELECT * FROM "${name}"`).all()
   }
   return JSON.stringify(out)
