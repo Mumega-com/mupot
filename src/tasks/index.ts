@@ -40,7 +40,7 @@ import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTas
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
-import { attachedAuthority, attachmentAttribution } from '../auth/attached-ceiling'
+import { attachedAuthority, verdictAttribution } from '../auth/attached-ceiling'
 import { attachedGateAgent } from '../auth/attached-gate'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
@@ -1552,11 +1552,16 @@ export async function primeVerdictIndependence(
   cache: VerdictGateCache,
   taskIds: readonly string[],
 ): Promise<void> {
-  const deciderId = verdictPrincipal(auth).id
-  const missing = taskIds.filter((id) => !cache.independence.has(`${deciderId}:${id}`))
-  if (missing.length === 0) return
-  const found = await findVerdictIndependenceConflicts(env, deciderId, missing)
-  for (const [taskId, kind] of found) cache.independence.set(`${deciderId}:${taskId}`, Promise.resolve(kind))
+  // An attached session is also judged as the HUMAN who attached it (evaluateVerdictGates), so that id is primed in the same pass.
+  const deciderIds = [verdictPrincipal(auth).id, attachedAuthority(auth)?.humanMemberId ?? null]
+    .filter((id): id is string => id !== null)
+    .filter((id, i, all) => all.indexOf(id) === i)
+  await Promise.all(deciderIds.map(async (deciderId) => {
+    const missing = taskIds.filter((id) => !cache.independence.has(`${deciderId}:${id}`))
+    if (missing.length === 0) return
+    const found = await findVerdictIndependenceConflicts(env, deciderId, missing)
+    for (const [taskId, kind] of found) cache.independence.set(`${deciderId}:${taskId}`, Promise.resolve(kind))
+  }))
 }
 
 function memberAffiliated(
@@ -1849,7 +1854,7 @@ tasksApp.post('/:id/verdict', async (c) => {
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: attachmentAttribution(c.get('auth')) },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: verdictAttribution(c.get('auth')) },
       principal.actor,
     )
 

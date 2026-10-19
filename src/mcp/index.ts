@@ -55,7 +55,7 @@ import { tenantHeaderNotice, TENANT_NOTICE_RESPONSE_HEADER, type TenantHeaderNot
 import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
-import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction } from '../auth/attached-ceiling'
+import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction, verdictAttribution } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
 import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
 import {
@@ -2752,7 +2752,7 @@ const toolTaskVerdict: ToolSpec = {
     try {
       const result = await writeVerdict(
         env,
-        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: attachmentAttribution(auth) }, // from auth, never args
+        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: verdictAttribution(auth) }, // from auth, never args
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.

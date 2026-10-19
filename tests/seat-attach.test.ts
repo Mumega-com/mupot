@@ -3065,11 +3065,21 @@ describe('attached session gate authority: gate_authority opt-in, live chain, bu
   })
 
   describe('the write re-asserts the chain inside its own UPDATE (check-to-write gap)', () => {
-    const attemptWrite = async (env: Env, taskId: string, att: { id: string }): Promise<'written' | 'refused'> => {
+    // The attribution a real request carries (verdictAttribution(auth)): attachment, human, the thread's seat and the human's own grant token.
+    const attributionFor = (att: { id: string }): { attachmentId: string; consentingMemberId: string; seatId: string; grantTokenId: string } => ({
+      attachmentId: att.id,
+      consentingMemberId: HUMAN,
+      seatId: one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE id = ?`, att.id)!.seat_id,
+      grantTokenId: one<{ id: string }>(`SELECT id FROM member_tokens WHERE member_id = ? AND agent_id IS NULL AND channel = 'directory' LIMIT 1`, HUMAN)!.id,
+    })
+    const writeAttached = async (env: Env, taskId: string, att: { id: string }): Promise<{ verdict: Record<string, unknown> }> => {
       const { writeVerdict } = await import('../src/tasks/service')
       const task = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = ?`, taskId)!
+      return writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: attributionFor(att) }) as never
+    }
+    const attemptWrite = async (env: Env, taskId: string, att: { id: string }): Promise<'written' | 'refused'> => {
       try {
-        await writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { attachmentId: att.id, consentingMemberId: HUMAN } })
+        await writeAttached(env, taskId, att)
         return 'written'
       } catch { return 'refused' }
     }
@@ -3120,7 +3130,7 @@ describe('attached session gate authority: gate_authority opt-in, live chain, bu
       const staleTask = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-regate'`)! // what the pre-check evaluated: gate:ops
       h.sqlite.exec(`UPDATE tasks SET gate_owner = 'gate:ops2' WHERE id = 'w-regate'`) // concurrent re-gate
       const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments`)!
-      await expect(writeVerdict(env, { task: staleTask as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { attachmentId: att.id, consentingMemberId: HUMAN } })).rejects.toThrow()
+      await expect(writeVerdict(env, { task: staleTask as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: attributionFor(att) })).rejects.toThrow()
       expect(verdictRows('w-regate')).toBe(0)
     })
     it('gate_authority 0 (opt-in absent) refuses the write itself', async () => {
@@ -3136,12 +3146,94 @@ describe('attached session gate authority: gate_authority opt-in, live chain, bu
         VALUES ('s9', '${TENANT}', 'w-hum', 'squad-core', 'agent-other', '${HUMAN}', '/tmp/m', '${'a'.repeat(64)}', '${'a'.repeat(64)}', 'r')`)
       expect(await attemptWrite(env, 'w-hum', live())).toBe('refused')
     })
+    // mupot#2095: every clause findLiveAttachment reads per request is re-read inside the write. Each test flips ONE of them
+    // between the pre-check and the write (the control above proves the same write lands with the chain intact).
+    const gapCases: Array<[string, string]> = [
+      ['the human\'s grant token revoked', `UPDATE member_tokens SET revoked_at = datetime('now') WHERE member_id = '${HUMAN}' AND agent_id IS NULL AND channel = 'directory'`],
+      ['the human\'s grant token expired', `UPDATE member_tokens SET expires_at = datetime('now', '-1 hour') WHERE member_id = '${HUMAN}' AND agent_id IS NULL AND channel = 'directory'`],
+      ['the seat (attachment) token revoked', `UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = (SELECT seat_token_id FROM agent_seat_attachments)`],
+      ['the seat (attachment) token expired', `UPDATE member_tokens SET expires_at = datetime('now', '-1 hour') WHERE id = (SELECT seat_token_id FROM agent_seat_attachments)`],
+      ['the seat retired', `UPDATE agent_seats SET retired_at = datetime('now') WHERE id = (SELECT seat_id FROM agent_seat_attachments)`],
+      ['harness ownership changed', `DROP TRIGGER harnesses_credential_immutable; UPDATE harnesses SET member_id = '${HUMAN2}' WHERE id = (SELECT harness_id FROM agent_seat_attachments)`],
+      ['the agent\'s welded member suspended', `UPDATE members SET status = 'suspended' WHERE id = (SELECT b.member_id FROM agent_member_bindings b WHERE b.agent_id = 'agent-rava')`],
+      // The cascade triggers (detach/revoke also revoke the seat token) are dropped so each of these isolates ITS OWN clause in the write guard.
+      ['the attachment detached (token cascade defeated)', `DROP TRIGGER agent_seat_attachments_revoke_token; UPDATE agent_seat_attachments SET detached_at = datetime('now')`],
+      ['the admission revoked (attachment cascade defeated)', `DROP TRIGGER agent_seat_admissions_revoke_attachments; UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = datetime('now')`],
+      ['the attachment\'s OWN seat token revoked while another live token of the same agent exists', `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('tok-spare', 'mem-agent-rava', 'hs', 'spare', 'directory', '2026-10-01', 'agent-rava', '${TENANT}'); UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = (SELECT seat_token_id FROM agent_seat_attachments)`],
+    ]
+    for (const [name, flip] of gapCases) {
+      it(`changed in the gap: ${name} -> the write is refused, no verdict, task stays in review`, async () => {
+        const { env } = await setup(true)
+        mkTask('w-gap')
+        const att = live()
+        const attribution = attributionFor(att) // what the request carried at pre-check time
+        const { writeVerdict } = await import('../src/tasks/service')
+        const task = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-gap'`)!
+        try { h.sqlite.exec(flip) } catch (e) { throw new Error(`fixture could not flip (${name}): ${String(e)}`) }
+        await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution })).rejects.toThrow()
+        expect(verdictRows('w-gap')).toBe(0)
+        expect(one<{ status: string }>(`SELECT status FROM tasks WHERE id = 'w-gap'`)?.status).toBe('review')
+      })
+    }
+    it('the grant-token clause binds the token the request carried: a different live token id does not stand in for it', async () => {
+      const { env } = await setup(true)
+      mkTask('w-tok')
+      const att = live()
+      const { writeVerdict } = await import('../src/tasks/service')
+      const task = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-tok'`)!
+      await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { ...attributionFor(att), grantTokenId: 'no-such-token' } })).rejects.toThrow()
+      expect(verdictRows('w-tok')).toBe(0)
+    })
+    it('the seat clause binds the seat the request carried', async () => {
+      const { env } = await setup(true)
+      mkTask('w-seat')
+      const att = live()
+      const { writeVerdict } = await import('../src/tasks/service')
+      const task = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-seat'`)!
+      await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { ...attributionFor(att), seatId: 'some-other-seat' } })).rejects.toThrow()
+      expect(verdictRows('w-seat')).toBe(0)
+    })
+    it('(a) the returned verdict carries attachment_id and consenting_member_id', async () => {
+      const { env } = await setup(true)
+      mkTask('w-ret')
+      const att = live()
+      const r = await writeAttached(env, 'w-ret', att)
+      expect(r.verdict).toMatchObject({ attachment_id: att.id, consenting_member_id: HUMAN, decided_by: 'agent-rava' })
+    })
+    it('(b) a DIRECT human conflict caught only at write time is self_verdict, not verdict_race', async () => {
+      const { env } = await setup(true)
+      mkTask('w-hd')
+      h.sqlite.exec(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, consenting_member_id, artifact_path, artifact_sha256, result_digest, result_text)
+        VALUES ('s8', '${TENANT}', 'w-hd', 'squad-core', 'agent-other', '${HUMAN}', '/tmp/m', '${'a'.repeat(64)}', '${'a'.repeat(64)}', 'r')`)
+      await expect(writeAttached(env, 'w-hd', live())).rejects.toMatchObject({ name: 'VerdictIndependenceError', kind: 'direct' })
+    })
+    it('(d) the human\'s AFFILIATED leg alone is enforced in the write guard (the human owns a submitter agent; not a direct party)', async () => {
+      const { env } = await setup(true)
+      mkTask('w-ha')
+      h.sqlite.exec(`UPDATE agents SET owner_member_id = '${HUMAN}' WHERE id = 'agent-other'`)
+      h.sqlite.exec(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+        VALUES ('s7', '${TENANT}', 'w-ha', 'squad-core', 'agent-other', '/tmp/m', '${'a'.repeat(64)}', '${'a'.repeat(64)}', 'r')`)
+      const { findVerdictIndependenceConflict } = await import('../src/tasks/verdict-independence')
+      expect(await findVerdictIndependenceConflict(env, HUMAN, 'w-ha')).toBe('affiliated') // the fixture is affiliated-only, not direct
+      await expect(writeAttached(env, 'w-ha', live())).rejects.toMatchObject({ name: 'VerdictIndependenceError', kind: 'affiliated' })
+      expect(verdictRows('w-ha')).toBe(0)
+    })
+    it('(c) the approvals list primes the attached human\'s independence in the same batch (no per-row human query)', async () => {
+      const { env, g } = await setup(true)
+      mkTask('w-p1')
+      mkTask('w-p2')
+      const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+      const { createVerdictGateCache, primeVerdictIndependence } = await import('../src/tasks/index')
+      const cache = createVerdictGateCache()
+      await primeVerdictIndependence(env, att, cache, ['w-p1', 'w-p2'])
+      expect([...cache.independence.keys()].sort()).toEqual([`${HUMAN}:w-p1`, `${HUMAN}:w-p2`, 'agent-rava:w-p1', 'agent-rava:w-p2'].sort())
+    })
     it('a forged attribution naming another human is refused (the attachment must be that human\'s)', async () => {
       const { env } = await setup(true)
       mkTask('w-forge')
       const { writeVerdict } = await import('../src/tasks/service')
       const task = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-forge'`)!
-      await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { attachmentId: live().id, consentingMemberId: HUMAN2 } })).rejects.toThrow()
+      await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { ...attributionFor(live()), consentingMemberId: HUMAN2 } })).rejects.toThrow()
     })
   })
 

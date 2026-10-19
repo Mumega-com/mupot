@@ -16,6 +16,9 @@ import { GATE_CAPABILITY_RE } from '../gates/grants'
 import { GATE_ASK_LIVE_PREDICATE, isGateAskExpired, isResubmitCapError } from '../gates/approval-expiry-rule'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
+import { nowSqlUtc } from '../auth/token-lifecycle'
+import type { VerdictAttribution } from '../auth/attached-ceiling'
 import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
@@ -1660,9 +1663,11 @@ export interface WriteVerdictInput {
    * both ids on the verdict row (0247) and re-asserts, inside the UPDATE's own WHERE, the chain the pre-check read:
    * attachment live, admission live with gate_authority = 1, the agent active and holding a live grant for the task's
    * CURRENT gate_owner, the task's gate_owner still being the one the pre-check evaluated (a concurrent re-gate loses the race, so the
-   * replacement gate's own policy is never skipped), and the attaching human not a party to / affiliated with the task (closes the check-to-write gap).
+   * replacement gate's own policy is never skipped), and the attaching human not a party to / affiliated with the task, and (mupot#2095) the SAME liveness chain findLiveAttachment reads per
+   * request (attachment-live-sql.ts): the human's grant token, the seat token, the seat not retired, the harness still the human's, the agent's
+   * welded member active, the attach designation (closes the check-to-write gap).
    */
-  attribution?: { attachmentId: string; consentingMemberId: string } | null
+  attribution?: VerdictAttribution | null
 }
 
 export type VerdictIndependenceWaiver = 'admin_supervisory' | 'owner_override'
@@ -1963,6 +1968,8 @@ export function buildVerdictStatements(
     decided_via: input.decidedVia ?? null,
     origin_agent_id: input.originAgentId ?? null,
     proposal_id: input.proposalId ?? null,
+    attachment_id: input.attribution?.attachmentId ?? null,
+    consenting_member_id: input.attribution?.consentingMemberId ?? null,
     reversed_at: null,
   }
 
@@ -2003,20 +2010,21 @@ export function buildVerdictStatements(
   // Attached-session verdict (0247): the live chain + the agent's grant + the human's independence, re-asserted in the write.
   const att = input.attribution ?? null
   const humanIndependence = att ? compileVerdictIndependenceSql(['direct', 'affiliated'], att.consentingMemberId, { column: 'tasks.id' }) : null
-  const attachedGuardSql = att && humanIndependence
-    ? ` AND EXISTS (SELECT 1 FROM agent_seat_attachments g_att
-                     JOIN agent_seat_admissions g_adm ON g_adm.id = g_att.admission_id AND g_adm.tenant = g_att.tenant
-                     JOIN agents g_ag ON g_ag.id = g_att.agent_id
-                    WHERE g_att.id = ? AND g_att.tenant = ? AND g_att.detached_at IS NULL AND g_att.agent_id = ? AND g_att.human_member_id = ?
-                      AND g_adm.status = 'live' AND g_adm.gate_authority = 1 AND g_adm.agent_id = g_att.agent_id
-                      AND g_adm.human_member_id = g_att.human_member_id AND g_ag.status = 'active')
-       AND tasks.gate_owner = ?
-       AND EXISTS (SELECT 1 FROM gate_grants g_gg WHERE g_gg.capability = tasks.gate_owner AND g_gg.principal_type = 'agent' AND g_gg.principal_id = ?)
+  // mupot#2095: the liveness chain is findLiveAttachment's own fragments, not a copy. Positional binds are recorded in text
+  // order (template expressions evaluate left to right), so the SQL and its params cannot drift.
+  const attachedParams: unknown[] = []
+  const bindv = (v: unknown): string => { attachedParams.push(v); return '?' }
+  const livePh: LivePh | null = att ? (k) => bindv({ tenant: env.TENANT_SLUG, seat: att.seatId, grantToken: att.grantTokenId, human: att.consentingMemberId, now: nowSqlUtc() }[k]) : null
+  const attachedGuardSql = att && humanIndependence && livePh
+    ? ` AND EXISTS (SELECT 1 FROM ${LIVE_ATTACHMENT_FROM_SQL}
+                    WHERE ${liveAttachmentConditionsSql(env, livePh)}
+                      AND att.id = ${bindv(att.attachmentId)} AND att.agent_id = ${bindv(input.decidedBy)} AND adm.gate_authority = 1
+                      AND EXISTS (SELECT 1 FROM member_tokens t WHERE ${seatTokenLiveSql(livePh)}))
+       AND tasks.gate_owner = ${bindv(input.task.gate_owner)}
+       AND EXISTS (SELECT 1 FROM gate_grants g_gg WHERE g_gg.capability = tasks.gate_owner AND g_gg.principal_type = 'agent' AND g_gg.principal_id = ${bindv(input.decidedBy)})
        AND NOT ${humanIndependence.sql}`
     : ''
-  const attachedGuardParams: unknown[] = att && humanIndependence
-    ? [att.attachmentId, env.TENANT_SLUG, input.decidedBy, att.consentingMemberId, input.task.gate_owner, input.decidedBy, ...humanIndependence.params]
-    : []
+  const attachedGuardParams: unknown[] = att && humanIndependence ? [...attachedParams, ...humanIndependence.params] : []
 
   const guardSql = `${laneGuardSql}${independenceSql}${attachedGuardSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
   const guardParams = [...independenceParams, ...attachedGuardParams, ...(extraGuard ? extraGuard.params : [])]
@@ -2167,6 +2175,12 @@ export async function writeVerdict(
       if (conflict === 'direct' || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory')) {
         throw new VerdictIndependenceError(input.task.id, conflict)
       }
+    }
+    // The attached session also acts for the human who attached it: a conflict that appeared for the HUMAN between the pre-check
+    // and the write is a self-verdict (no supervisory waiver applies to it), not a lost race.
+    if (input.attribution) {
+      const humanConflict = await findVerdictIndependenceConflict(env, input.attribution.consentingMemberId, input.task.id)
+      if (humanConflict !== null) throw new VerdictIndependenceError(input.task.id, humanConflict)
     }
     throw new VerdictRaceError(input.task.id)
   }
