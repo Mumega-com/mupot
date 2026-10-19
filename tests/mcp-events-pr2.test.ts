@@ -1268,6 +1268,18 @@ describe('recovery read described by the catalogue works on a real delivery', ()
     expect(Object.keys(data).filter((k) => !(k in schema.properties))).toEqual([])
     expect(data.request_id).toBe('rid-schema')
   })
+
+  it('request_id is advertised as a plain string and delivered as "" when the sender set none', async () => {
+    await subscribeOk('bound-admin')
+    const env = makeEnv()
+    const list = await rpc('events/list', {})
+    const schema = (list.body.result?.events as { name: string; payloadSchema: { properties: Record<string, { type: unknown }> } }[])
+      .find((e) => e.name === 'message.created')!.payloadSchema
+    expect(schema.properties.request_id.type).toBe('string')
+    const ev = await sendReal(env, 'agent-a', 'no request id')
+    const data = await deliverThroughQueue(env, ev)
+    expect(data.request_id).toBe('')
+  })
 })
 
 // ── hardening round (gates A + B on 75d05143) ─────────────────────────────────────

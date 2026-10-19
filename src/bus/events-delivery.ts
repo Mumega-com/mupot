@@ -344,7 +344,7 @@ export async function deliverSubscriptionEvent(env: Env, payload: unknown, opts:
       seq: msg.seq,
       read_after_seq: readAfter,
       kind: msg.kind,
-      request_id: msg.request_id,
+      request_id: msg.request_id ?? '',
     },
     cursor: null,
   })
