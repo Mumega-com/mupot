@@ -1300,7 +1300,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)

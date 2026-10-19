@@ -420,6 +420,28 @@ describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
     expect(one<{ a: string | null }>(`SELECT assignee_agent_id AS a FROM tasks WHERE id = 't-normal'`)!.a).toBe('agent-live')
   })
 
+  it('no GitHub issue is mirrored from an observed create (GITHUB_REPO + token set); a normal create still mirrors', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { fetch: f } = mk()
+    const e = envFor(h, { BUS: { send: vi.fn(async () => undefined) }, GITHUB_REPO: 'o/r', GITHUB_TOKEN: 'ghp_test' })
+    await create(s, e)
+    expect(tasks()).toBe(1)
+    expect(f).not.toHaveBeenCalled()
+    const free = await seatFor(PLAIN, 'conv-gh')
+    await create(free, e)
+    expect(f.mock.calls.some((c) => String(c[0]).includes('api.github.com'))).toBe(true)
+  })
+
+  it('router dry_run never plans would_assign for a marked task (SELECT guard alone)', async () => {
+    const { e } = mk()
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-live', 'squad-target', 'live', 'Live', 'active');
+      INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES ('${TENANT}', 'seat-live', 'L', 'test', 'seat-live', 'agent-live', datetime('now'), datetime('now'));
+      INSERT INTO tasks (id, squad_id, title, done_when, status, external_source) VALUES ('t-marked', 'squad-target', 'M', 'the work is done', 'open', 'observed-seat:x')`)
+    const r = await runRouterTick(e, { ok: true, tenant: TENANT, squadId: 'squad-target', agentId: null, source: 'principal' }, { squadId: 'squad-target', dryRun: true }, { memberId: OWNER })
+    expect(r.decisions).toEqual([])
+  })
+
   it('doorbell gate pinned: the observed create never reaches scheduleTaskAssignedDoorbell (no fetch even with a webhook-registered agent)', async () => {
     const s = await seatFor(OWNER)
     await join(s, { squad: 'squad-target' })
