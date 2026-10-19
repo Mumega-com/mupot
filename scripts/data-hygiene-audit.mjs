@@ -3,7 +3,7 @@
 //
 // WHY THIS EXISTS
 //
-// Hadi, 2026-09-22 (mupot#1496): "the current data in mupot is garbage majority because
+// Owner, 2026-09-22 (mupot#1496): "the current data in mupot is garbage majority because
 // we were building the system, but now we need to take data seriously." The mumega
 // tenant's members/agents/squads/projects accumulated 3+ months of build-time debris —
 // connector OAuth sessions that never had an invite accepted, throwaway test walkers,
@@ -12,7 +12,7 @@
 //
 // This script is READ-ONLY. It classifies; it never writes. Mark-and-archive (the
 // mupot#1496 ask) is a *separate*, human-gated step per issue's own instruction:
-// "execution needs Hadi's go per row class (identity tables)." Nothing in this file
+// "execution needs the owner's go per row class (identity tables)." Nothing in this file
 // calls a mutating tool, issues an UPDATE, or deletes anything.
 //
 // INPUT SHAPE
@@ -183,7 +183,7 @@ export function loadSnapshotFromDir(dir) {
  */
 export function buildD1SelectStatements() {
   return {
-    members: `SELECT id, display_name, email, status, tenant, created_at, has_tg FROM members;`,
+    members: `SELECT id, display_name, email, status, tenant, created_at, (telegram_chat_id IS NOT NULL) AS has_tg FROM members;`,
     memberIdentities: `SELECT member_id, provider, created_at FROM human_login_identities;`,
     memberTokens: `SELECT member_id, label, channel, created_at, revoked_at, expires_at FROM member_tokens;`,
     agents: `SELECT id, squad_id, slug, name, role, model, status, created_at, owner, owner_member_id, kind FROM agents;`,
@@ -412,8 +412,7 @@ export function classifyMember(member, ctx) {
   }
 
   // R-M3: a distinct external human email (not the agent-seat domain, not empty) is
-  // treated as a known contact even before they have logged in — Gavin Kelpin,
-  // Bardiya Rahimi and similar rows are real named humans awaiting/skipping login.
+  // treated as a known contact even before they have logged in — named external-contact rows are real humans awaiting/skipping login.
   if (emailDomain && emailDomain !== CANONICAL_AGENT_EMAIL_DOMAIN) {
     return { id: member.id, class: 'real', reasons: [`distinct external email (${emailDomain}) — known human contact, not yet logged in or login not required`], evidence }
   }
@@ -421,6 +420,12 @@ export function classifyMember(member, ctx) {
   // R-M4: explicit self-declared debris marker beats everything below.
   if (signals.includes('dnu') || signals.includes('delete-me') || signals.includes('walker/canary/probe/smoke')) {
     return { id: member.id, class: 'test', reasons: [`self-declared test/debris marker in name: ${signals.join(', ')}`], evidence }
+  }
+
+  // R-M4b: a Telegram binding is an identity anchor (a human reached mupot via the
+  // IM channel). Never debris, even with no email/capability/login.
+  if (member.has_tg) {
+    return { id: member.id, class: 'real', reasons: ['Telegram-bound (telegram_chat_id set) — identity anchor, not connector debris'], evidence }
   }
 
   // R-M5: duplicate display name, and THIS row carries no live binding at all —

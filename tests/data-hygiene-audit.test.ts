@@ -7,6 +7,8 @@
 // that breaks a rule's intent goes red here first.
 
 import { describe, expect, it } from 'vitest'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import {
   classifyMember,
   classifyAgent,
@@ -16,6 +18,7 @@ import {
   toMarkdown,
   escapeMdCell,
   buildIndexes,
+  buildD1SelectStatements,
   computeSnapshotAsOf,
   toEpochMs,
   daysBetween,
@@ -87,8 +90,8 @@ describe('computeSnapshotAsOf', () => {
 describe('classifyMember', () => {
   it('R-M1: a member with a login identity is real', () => {
     const data = baseData({
-      members: [{ id: 'mem-hadi', display_name: 'Hadi', email: 'hadi@mumega.com', status: 'active', created_at: '2026-06-03 15:39:36', has_tg: 0 }],
-      memberIdentities: [{ member_id: 'mem-hadi', provider: 'google', created_at: '2026-09-05T01:25:27.359Z' }],
+      members: [{ id: 'mem-owner', display_name: 'Owner', email: 'owner@example.com', status: 'active', created_at: '2026-06-03 15:39:36', has_tg: 0 }],
+      memberIdentities: [{ member_id: 'mem-owner', provider: 'google', created_at: '2026-09-05T01:25:27.359Z' }],
     })
     const r = classifyMember(data.members[0], ctxFor(data))
     expect(r.class).toBe('real')
@@ -97,16 +100,16 @@ describe('classifyMember', () => {
 
   it('R-M2: canonical @agents.mumega.com seat with capabilities is real', () => {
     const data = baseData({
-      members: [{ id: 'kasra-mem', display_name: 'Kasra', email: 'kasra@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 }],
-      capabilities: [{ member_id: 'kasra-mem', scope_type: 'squad', scope_id: 'squad-core', capability: 'admin' }],
+      members: [{ id: 'seat-mem', display_name: 'Seat A', email: 'seat-a@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 }],
+      capabilities: [{ member_id: 'seat-mem', scope_type: 'squad', scope_id: 'squad-core', capability: 'admin' }],
     })
     const r = classifyMember(data.members[0], ctxFor(data))
     expect(r.class).toBe('real')
   })
 
-  it('R-M3: a distinct external human email is real even with no login yet (Gavin/Bardiya shape)', () => {
+  it('R-M3: a distinct external human email is real even with no login yet (external-contact shape)', () => {
     const data = baseData({
-      members: [{ id: 'gavin', display_name: 'Gavin Kelpin', email: 'gkelpin63@gmail.com', status: 'active', created_at: '2026-07-22T16:01:33Z', has_tg: 0 }],
+      members: [{ id: 'ext-human', display_name: 'Example Person', email: 'person@example.com', status: 'active', created_at: '2026-07-22T16:01:33Z', has_tg: 0 }],
     })
     const r = classifyMember(data.members[0], ctxFor(data))
     expect(r.class).toBe('real')
@@ -114,7 +117,7 @@ describe('classifyMember', () => {
 
   it('R-M4: a DNU-marked member is test, even with some capabilities (name overrides)', () => {
     const data = baseData({
-      members: [{ id: 'dnu1', display_name: 'Hadi ChatGPT DNU', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 0 }],
+      members: [{ id: 'dnu1', display_name: 'Owner ChatGPT DNU', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 0 }],
     })
     const r = classifyMember(data.members[0], ctxFor(data))
     expect(r.class).toBe('test')
@@ -123,22 +126,22 @@ describe('classifyMember', () => {
   it('R-M5: a duplicate display_name with zero live binding is duplicate, not debris', () => {
     const data = baseData({
       members: [
-        { id: 'kasra-real', display_name: 'Kasra', email: 'kasra@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 },
-        { id: 'kasra-dup', display_name: 'Kasra', email: '', status: 'suspended', created_at: '2026-07-19T19:55:21.000Z', has_tg: 0 },
+        { id: 'seat-real', display_name: 'Seat A', email: 'seat-a@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 },
+        { id: 'kasra-dup', display_name: 'Seat A', email: '', status: 'suspended', created_at: '2026-07-19T19:55:21.000Z', has_tg: 0 },
       ],
-      capabilities: [{ member_id: 'kasra-real', scope_type: 'squad', scope_id: 'squad-core', capability: 'admin' }],
+      capabilities: [{ member_id: 'seat-real', scope_type: 'squad', scope_id: 'squad-core', capability: 'admin' }],
     })
     const dup = data.members[1]
     const r = classifyMember(dup, ctxFor(data))
     expect(r.class).toBe('duplicate')
-    expect(r.evidence.duplicate_name_siblings).toContain('kasra-real')
+    expect(r.evidence.duplicate_name_siblings).toContain('seat-real')
   })
 
   it('a duplicate-named member that IS live-bound (a real running fleet body) is routed to review, never auto-archived', () => {
     const data = baseData({
       members: [
-        { id: 'kasra-real', display_name: 'Kasra', email: 'kasra@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 },
-        { id: 'kasra-live-dup', display_name: 'Kasra', email: '', status: 'active', created_at: '2026-07-21T02:15:48.470Z', has_tg: 0 },
+        { id: 'seat-real', display_name: 'Seat A', email: 'seat-a@agents.mumega.com', status: 'active', created_at: '2026-06-28T18:20:00.000Z', has_tg: 0 },
+        { id: 'kasra-live-dup', display_name: 'Seat A', email: '', status: 'active', created_at: '2026-07-21T02:15:48.470Z', has_tg: 0 },
       ],
       presence: [{ member_id: 'kasra-live-dup', agent_id: 'ag1', last_seen_at: '2026-09-26 15:10:24' }],
       fleetAgents: [{ agent_id: 'ag1', member_id: 'kasra-live-dup', status: 'running', last_reported_at: '2026-09-26 15:10:24' }],
@@ -203,8 +206,8 @@ describe('classifyAgent', () => {
   it('R-A4: inactive agent superseded by an active same-slug sibling elsewhere is dormant, not review', () => {
     const data = baseData({
       agents: [
-        { id: 'old-hermes', slug: 'hadi-hermes', name: 'hadi-hermes', status: 'inactive', squad_id: 'sq-old', created_at: '2026-08-15T17:43:39.234Z' },
-        { id: 'new-hermes', slug: 'hadi-hermes', name: 'hadi-hermes', status: 'active', squad_id: 'sq-new', created_at: '2026-08-15T18:17:22.608Z' },
+        { id: 'old-hermes', slug: 'owner-hermes', name: 'owner-hermes', status: 'inactive', squad_id: 'sq-old', created_at: '2026-08-15T17:43:39.234Z' },
+        { id: 'new-hermes', slug: 'owner-hermes', name: 'owner-hermes', status: 'active', squad_id: 'sq-new', created_at: '2026-08-15T18:17:22.608Z' },
       ],
     })
     const r = classifyAgent(data.agents[0], ctxFor(data))
@@ -223,7 +226,7 @@ describe('classifyAgent', () => {
 
   it('R-A8: active agent, never seen in presence/fleet, zero squad receipts, old — dormant', () => {
     const data = baseData({
-      agents: [{ id: 'seat1', slug: 'hadi-portfolio', name: 'Hadi Portfolio', status: 'active', squad_id: 'sq-hadi-cc', created_at: '2026-06-01T00:00:00.000Z' }],
+      agents: [{ id: 'seat1', slug: 'owner-portfolio', name: 'Owner Portfolio', status: 'active', squad_id: 'sq-owner-cc', created_at: '2026-06-01T00:00:00.000Z' }],
     })
     const r = classifyAgent(data.agents[0], ctxFor(data))
     expect(r.class).toBe('dormant')
@@ -246,7 +249,7 @@ describe('classifySquad', () => {
   })
 
   it('R-S3: an empty squad with zero agents, caps, receipts is connector-debris', () => {
-    const data = baseData({ squads: [{ id: 'sq-empty', slug: 'gavin', name: 'Gavin', kind: 'work', created_at: '2026-07-22T13:05:22.179Z' }] })
+    const data = baseData({ squads: [{ id: 'sq-empty', slug: 'ext-squad', name: 'Ext Squad', kind: 'work', created_at: '2026-07-22T13:05:22.179Z' }] })
     const r = classifySquad(data.squads[0], ctxFor(data))
     expect(r.class).toBe('connector-debris')
   })
@@ -303,10 +306,10 @@ describe('runAudit + toMarkdown', () => {
   it('produces per-entity totals and a sorted-worst-first markdown table', () => {
     const data = baseData({
       members: [
-        { id: 'mem-hadi', display_name: 'Hadi', email: 'hadi@mumega.com', status: 'active', created_at: '2026-06-03 15:39:36', has_tg: 0 },
-        { id: 'dnu1', display_name: 'Hadi ChatGPT DNU', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 0 },
+        { id: 'mem-owner', display_name: 'Owner', email: 'owner@example.com', status: 'active', created_at: '2026-06-03 15:39:36', has_tg: 0 },
+        { id: 'dnu1', display_name: 'Owner ChatGPT DNU', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 0 },
       ],
-      memberIdentities: [{ member_id: 'mem-hadi', provider: 'google', created_at: '2026-09-05T01:25:27.359Z' }],
+      memberIdentities: [{ member_id: 'mem-owner', provider: 'google', created_at: '2026-09-05T01:25:27.359Z' }],
       agents: [{ id: 'a1', slug: 'dnu-cursor', name: 'DNU Cursor', status: 'active', squad_id: 'sq1', created_at: '2026-09-16T20:50:26.010Z' }],
       squads: [{ id: 'sq-dnu', slug: 'dnu', name: 'DNU', kind: 'work', created_at: '2026-09-16T20:33:44.891Z' }],
       projects: [{ id: 'p1', slug: 'mumega-com', name: 'mumega.com', status: 'active', stalled: 0, created_at: '2026-07-21T22:23:50.908Z' }],
@@ -323,7 +326,7 @@ describe('runAudit + toMarkdown', () => {
     // worst-first: the `test` row must appear before the `real` row in the members table.
     const memberSection = md.split('## agents')[0]
     expect(memberSection.indexOf('DNU Cursor')).toBe(-1) // sanity: agent name not leaked into member table
-    expect(memberSection.indexOf('Hadi ChatGPT DNU')).toBeLessThan(memberSection.indexOf('| mem-hadi |'))
+    expect(memberSection.indexOf('Owner ChatGPT DNU')).toBeLessThan(memberSection.indexOf('| mem-owner |'))
   })
 
   it('escapeMdCell escapes backslash before pipe so a cell cannot break out', () => {
@@ -372,5 +375,43 @@ describe('documented thresholds', () => {
     expect(RECENT_DAYS).toBe(7)
     expect(DORMANT_DAYS).toBe(30)
     expect(PROJECT_PLANNED_STALE_DAYS).toBe(14)
+  })
+})
+
+describe('D1 select statements run against the migrated schema', () => {
+  it('every SELECT in buildD1SelectStatements executes (no "no such column")', () => {
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    for (const [name, sql] of Object.entries(buildD1SelectStatements())) {
+      expect(() => h.sqlite.prepare(sql).all(), name).not.toThrow()
+    }
+  })
+
+  it('has_tg reflects telegram_chat_id IS NOT NULL', () => {
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.exec(`INSERT INTO members (id, display_name, telegram_chat_id) VALUES ('m-tg', 'Tg Member', '10001'), ('m-no', 'No Tg', NULL)`)
+    const rows = h.sqlite.prepare(buildD1SelectStatements().members).all() as Array<{ id: string; has_tg: number }>
+    const by = Object.fromEntries(rows.map((r) => [r.id, Number(r.has_tg)]))
+    expect(by['m-tg']).toBe(1)
+    expect(by['m-no']).toBe(0)
+  })
+})
+
+describe('R-M6 telegram anchor', () => {
+  it('a Telegram-bound member with no email/caps/login is not connector-debris', () => {
+    const data = baseData({
+      members: [{ id: 'tg1', display_name: 'Tg Only', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 1 }],
+    })
+    const r = classifyMember(data.members[0], ctxFor(data))
+    expect(r.class).not.toBe('connector-debris')
+    expect(r.class).toBe('real')
+  })
+
+  it('the same shape without a Telegram binding is still connector-debris', () => {
+    const data = baseData({
+      members: [{ id: 'tg0', display_name: 'No Tg', email: '', status: 'active', created_at: '2026-09-16T20:42:04.859Z', has_tg: 0 }],
+    })
+    expect(classifyMember(data.members[0], ctxFor(data)).class).toBe('connector-debris')
   })
 })
