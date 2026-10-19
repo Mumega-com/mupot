@@ -287,3 +287,10 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:org_department_create', // irreversible: no tool deletes or archives a department
   'action:install_high', // installer window, lead ceiling: passkey only (standard stays Telegram-biometric approvable)
 ])
+
+/**
+ * The ONLY actions whose step-up a tap in the approval bot's verified private chat may satisfy. Everything else that needs a
+ * step-up (SENSITIVE_STEP_UP_ACTIONS, e.g. the broad action:manage_access) stays passkey / Mini App / Access only: a bot tap
+ * is refused for it. An allow-list, never a global "a bot tap is a fresh reauth". Only args-bound single-use actions belong here.
+ */
+export const BOT_STEP_UP_ACTIONS: readonly string[] = Object.freeze([])

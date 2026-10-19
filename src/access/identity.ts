@@ -17,7 +17,7 @@ import type { AuthContext, Env } from '../types'
 import type { AccessClaims } from './jwt'
 import { resolveLoginIdentity } from '../auth/login-identity'
 import { createWebSession, markRecentReauth, randomWebSessionId, hashWebSessionId } from '../auth/web-sessions'
-import { resolveCapabilities } from '../auth/capability'
+import { humanVerifiedLegacyRole, resolveCapabilities } from '../auth/capability'
 import { findUserByEmail, AmbiguousUserEmailError } from '../auth/index'
 
 export const ACCESS_PROVIDER = 'cloudflare-access'
@@ -29,6 +29,8 @@ export interface ApproverMember {
   auth: AuthContext
   /** The explicit identity row this login resolved through. */
   identityId: string
+  /** The AuthContext's legacy role comes from a VERIFIED login identity, never members.email (bot / sudo channels). */
+  verifiedRole?: boolean
 }
 export type ResolveApproverResult = { ok: true; approver: ApproverMember } | { ok: false; reason: ApproverFailure }
 
@@ -42,21 +44,33 @@ export async function memberIsActiveHuman(env: Env, memberId: string): Promise<b
   return row !== null
 }
 
-export async function buildAuth(env: Env, memberId: string, webSession?: { idHash: string }): Promise<AuthContext> {
+export async function buildAuth(env: Env, memberId: string, webSession?: { idHash: string }, opts: { verifiedRole?: boolean } = {}): Promise<AuthContext> {
   // The resolved member's OWN email (not the JWT's) names the legacy role plane, via the shared chokepoint.
   const m = await env.DB.prepare('SELECT email FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
     .bind(memberId, env.TENANT_SLUG).first<{ email: string | null }>()
   const email = (m?.email ?? '').trim().toLowerCase()
   let user: { id: string; role: string } | null = null
-  try {
-    user = await findUserByEmail(env, email || null)
-  } catch (err) {
-    if (!(err instanceof AmbiguousUserEmailError)) throw err
-    user = null // ambiguous users rows: no legacy elevation, plain member authority only (fail closed)
+  let role: AuthContext['role']
+  if (opts.verifiedRole) {
+    // Channels that are not a sign-in (approval bot, owner sudo): the role is what a PROVIDER-VERIFIED identity proves, not what
+    // members.email (typed by an inviter) happens to match.
+    role = await humanVerifiedLegacyRole(env, memberId)
+    try {
+      user = await findUserByEmail(env, email || null)
+    } catch (err) {
+      if (!(err instanceof AmbiguousUserEmailError)) throw err
+    }
+  } else {
+    try {
+      user = await findUserByEmail(env, email || null)
+    } catch (err) {
+      if (!(err instanceof AmbiguousUserEmailError)) throw err
+      user = null // ambiguous users rows: no legacy elevation, plain member authority only (fail closed)
+    }
+    role = user?.role === 'owner' || user?.role === 'admin' ? user.role : 'member'
   }
-  const role: AuthContext['role'] = user?.role === 'owner' || user?.role === 'admin' ? user.role : 'member'
   const auth: AuthContext = {
-    userId: user?.id ?? memberId, email, role, tenant: env.TENANT_SLUG, memberId, channel: 'dashboard',
+    userId: opts.verifiedRole ? memberId : (user?.id ?? memberId), email, role, tenant: env.TENANT_SLUG, memberId, channel: 'dashboard',
     ...(webSession ? { webSessionMemberId: memberId, webSessionIdHash: webSession.idHash } : {}),
   }
   // Capabilities attach to plain members only, exactly as loadAuthFromCookie does, so an owner is never downgraded.
@@ -81,7 +95,7 @@ export async function mintApproverSession(
   const idHash = await hashWebSessionId(raw)
   await markRecentReauth(env, idHash, nowMs)
   return {
-    approver: { ...approver, auth: await buildAuth(env, approver.memberId, { idHash }) },
+    approver: { ...approver, auth: await buildAuth(env, approver.memberId, { idHash }, { verifiedRole: approver.verifiedRole === true }) },
     webSessionHash: idHash,
   }
 }

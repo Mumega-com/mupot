@@ -24,14 +24,14 @@ async function call(bot: OnStatus, method: string, body: Record<string, unknown>
     return { ok: false, error: 'send_failed' }
   }
   if (!res.ok) return { ok: false, error: res.status === 403 || res.status === 400 ? 'chat_unreachable' : 'send_failed' }
+  // A 2xx is not delivery: Telegram answers {ok:true,result:{message_id}}. Anything else (a proxy's HTML page, an empty body, ok:false) is NOT sent.
   try {
     const parsed: unknown = await res.json()
-    if (typeof parsed === 'object' && parsed !== null && 'ok' in parsed && parsed.ok !== true) return { ok: false, error: 'send_failed' }
-    const mid = typeof parsed === 'object' && parsed !== null && 'result' in parsed && typeof parsed.result === 'object' && parsed.result !== null && 'message_id' in parsed.result
-      ? parsed.result.message_id : null
+    if (typeof parsed !== 'object' || parsed === null || !('ok' in parsed) || parsed.ok !== true) return { ok: false, error: 'send_failed' }
+    const mid = 'result' in parsed && typeof parsed.result === 'object' && parsed.result !== null && 'message_id' in parsed.result ? parsed.result.message_id : null
     return { ok: true, messageId: typeof mid === 'number' ? String(mid) : null }
   } catch {
-    return { ok: true, messageId: null }
+    return { ok: false, error: 'send_failed' }
   }
 }
 

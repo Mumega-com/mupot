@@ -6279,7 +6279,11 @@ const toolRequestElevation: ToolSpec = {
       await env.DB.prepare('UPDATE elevation_requests SET recommendation = ?1 WHERE id = ?2 AND tenant = ?3')
         .bind(recommendation.slice(0, 500), result.request.id, env.TENANT_SLUG).run().catch(() => undefined) // display-only column; a pot that has not applied 0247 just shows no recommendation
     }
-    const botDelivery = await deliverElevationToApprovalBot(env, result.request, { waitUntil: ctx.waitUntil })
+    const botDelivery = await deliverElevationToApprovalBot(env, result.request, {
+      waitUntil: ctx.waitUntil,
+      // Bot still 'pending' when we answered and then failed: the Mini App button goes out instead.
+      fallback: moment ? () => deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil }) : undefined,
+    })
     let telegram: string = botDelivery
     if (botDelivery !== 'sent' && botDelivery !== 'pending') {
       const viaMiniapp = moment

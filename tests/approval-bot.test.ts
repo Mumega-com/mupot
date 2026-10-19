@@ -99,6 +99,10 @@ beforeEach(() => {
       ('mem-plain', 'plain@x.test', 'Plain', 'active', '${TENANT}', '${TG.plain}'),
       ('mem-sqadmin', 'sqadmin@x.test', 'Squad Admin', 'active', '${TENANT}', '${TG.sqadmin}'),
       ('mem-agent', 'agent@x.test', 'Agent Member', 'active', '${TENANT}', '${TG.agent}');
+    INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at) VALUES
+      ('hli-owner', '${TENANT}', 'email', 'owner@x.test', 'owner@x.test', 'mem-owner', datetime('now')),
+      ('hli-plain', '${TENANT}', 'email', 'plain@x.test', 'plain@x.test', 'mem-plain', datetime('now')),
+      ('hli-sqadmin', '${TENANT}', 'email', 'sqadmin@x.test', 'sqadmin@x.test', 'mem-sqadmin', datetime('now'));
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-x', 'squad-a', 'agent-x', 'Agent X', 'r', 'm', 'active');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-x', 'mem-agent', datetime('now'));
     INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at)
@@ -130,6 +134,30 @@ describe('config: off by default, dedicated, fail closed', () => {
     expect(approvalBotStatus({ ...base, TELEGRAM_MINIAPP_BOT_ID: '987654321' }).state).toBe('misconfigured')
     expect(approvalBotStatus({ ...base, IM_WEBHOOK_SECRET: WEBHOOK_SECRET }).state).toBe('misconfigured')
     expect(approvalBotStatus({ ...base, TELEGRAM_BOT_TOKEN: '555555555:AAnotification-bot-other-token-00' }).state).toBe('on')
+  })
+})
+
+const call_ = (tool: string): Promise<unknown> => invokeTool(agentAuth(), env, tool, {}, 'https://pot.test')
+
+describe('small fixes', () => {
+  it('bot usernames of 5 and 6 characters are accepted; 4 is not (Telegram minimum is 5)', () => {
+    const base = { APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_WEBHOOK_SECRET: WEBHOOK_SECRET }
+    for (const u of ['mubot', 'mu_bot', 'abbot']) expect(approvalBotStatus({ ...base, APPROVAL_BOT_USERNAME: u }).state, u).toBe('on')
+    expect(approvalBotStatus({ ...base, APPROVAL_BOT_USERNAME: 'xbot' }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, APPROVAL_BOT_USERNAME: 'notabo' }).state).toBe('misconfigured')
+  })
+  it('short ids are 8 symbols from the alphabet and unbiased: rejection sampling never maps a byte >= 240', async () => {
+    const { newShortId, SHORT_ID_RE } = await import('../src/approval-bot/policy')
+    const seen = new Set<string>()
+    for (let i = 0; i < 2000; i++) { const id = newShortId(); expect(id).toMatch(SHORT_ID_RE); for (const c of id) seen.add(c) }
+    expect(seen.size).toBe(30)
+    // all-0xFF randomness is rejected (>= 240) and the generator still terminates once real bytes arrive
+    let calls_ = 0
+    const real = crypto.getRandomValues.bind(crypto)
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation(((a: Uint8Array) => { calls_++; if (calls_ <= 3) a.fill(255); else real(a); return a }) as typeof crypto.getRandomValues)
+    expect(newShortId()).toMatch(SHORT_ID_RE)
+    expect(calls_).toBeGreaterThan(3)
+    vi.restoreAllMocks()
   })
 })
 
@@ -211,6 +239,68 @@ describe('delivery: ONE message from the approval bot', () => {
     expect(status(f.requestId).status).toBe('pending')
     expect(one<{ status: string }>('SELECT status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId).status).toBe('failed')
   })
+  it('a 2xx with a body that is not Telegram JSON is NOT sent', async () => {
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { calls.push({ url, method: url.split('/').pop() ?? '', body: JSON.parse(String(init.body)) as Record<string, unknown> }); return new Response('<html>proxy ok</html>', { status: 200 }) })
+    const f = await file()
+    expect(f.telegram).toBe('failed')
+    expect(one<{ status: string }>('SELECT status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId).status).toBe('failed')
+  })
+  it('a 2xx {ok:false} is NOT sent', async () => {
+    vi.stubGlobal('fetch', async () => new Response('{"ok":false,"description":"x"}', { status: 200 }))
+    expect((await file()).telegram).toBe('failed')
+  })
+  it('a reservation DB error is not "sent" (nothing is sent either)', async () => {
+    harness.sqlite.exec('DROP TABLE approval_bot_deliveries')
+    const f = await file()
+    expect(f.telegram).not.toBe('sent')
+    expect(approvalCalls()).toHaveLength(0)
+  })
+  it('an existing reserved (in-flight) slot answers pending, a failed one failed, only a sent one sent', async () => {
+    const f = await file()
+    const { deliverElevationToApprovalBot } = await import('../src/approval-bot/deliver')
+    const { loadElevationRequestById } = await import('../src/auth/elevation')
+    const req = (await loadElevationRequestById(env, TENANT, f.requestId))!
+    harness.sqlite.exec("UPDATE approval_bot_deliveries SET status = 'reserved'")
+    expect(await deliverElevationToApprovalBot(env, req)).toBe('pending')
+    harness.sqlite.exec("UPDATE approval_bot_deliveries SET status = 'failed'")
+    expect(await deliverElevationToApprovalBot(env, req)).toBe('failed')
+  })
+  it('pending past the wait and then SUCCEEDING does not fall back to the Mini App', async () => {
+    const f = await file()
+    const { deliverElevationToApprovalBot } = await import('../src/approval-bot/deliver')
+    const { loadElevationRequestById } = await import('../src/auth/elevation')
+    const req = (await loadElevationRequestById(env, TENANT, f.requestId))!
+    harness.sqlite.exec('DELETE FROM approval_bot_deliveries')
+    vi.stubGlobal('fetch', async () => { await new Promise((r) => setTimeout(r, 150)); return new Response('{"ok":true,"result":{"message_id":3}}', { status: 200 }) })
+    let fellBack = false
+    expect(await deliverElevationToApprovalBot(env, req, { timeoutMs: 20, fallback: async () => { fellBack = true } })).toBe('pending')
+    await new Promise((x) => setTimeout(x, 500))
+    expect(fellBack).toBe(false)
+    expect(one<{ status: string }>('SELECT status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId).status).toBe('sent')
+  })
+  it('pending past the wait and then failing falls back to the Mini App button', async () => {
+    const mini = baseEnv({ TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: MINIAPP_BOT, TELEGRAM_MINIAPP_BOT_TOKEN: `${MINIAPP_BOT}:AAEhqMY-dedicated-miniapp-test-token` })
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+      calls.push({ url, method: url.split('/').pop() ?? '', body: JSON.parse(String(init.body)) as Record<string, unknown> })
+      if (url.includes(BOT_TOKEN)) { await new Promise((r) => setTimeout(r, 300)); return new Response('{"ok":false}', { status: 403 }) }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 9 } }), { status: 200 })
+    })
+    await call_('check_in')
+    const { deliverElevationToApprovalBot } = await import('../src/approval-bot/deliver')
+    const { deliverMomentToTelegram } = await import('../src/secure-moments/telegram-miniapp-auto')
+    const { loadElevationRequestById } = await import('../src/auth/elevation')
+    const f = await file({}, mini)
+    // the tool already answered 'pending' or 'failed'; drive the helper directly with a short bound to pin the fallback contract
+    const req = (await loadElevationRequestById(mini, TENANT, f.requestId))!
+    harness.sqlite.exec('DELETE FROM approval_bot_deliveries')
+    calls.length = 0
+    let fellBack = false
+    const r = await deliverElevationToApprovalBot(mini, req, { timeoutMs: 20, fallback: async () => { fellBack = true } })
+    expect(r).toBe('pending')
+    for (let i = 0; i < 100 && !fellBack; i++) await new Promise((x) => setTimeout(x, 20))
+    expect(fellBack).toBe(true)
+    void deliverMomentToTelegram
+  })
   it('a second delivery attempt for the same request sends nothing more (once-only slot)', async () => {
     const f = await file()
     const { deliverElevationToApprovalBot } = await import('../src/approval-bot/deliver')
@@ -271,7 +361,6 @@ describe('decision: approve and deny land once, from the bound private chat only
     expect(String(sentTo('editMessageText')[0].body.text)).toContain('Approved')
     expect((sentTo('editMessageText')[0].body.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard).toEqual([])
     expect((await activeElevations()).filter((g) => g.live).map((g) => g.action)).toEqual(['action:project_status'])
-    expect(one<{ n: number }>("SELECT COUNT(*) AS n FROM human_login_identities WHERE provider = 'telegram_approval_bot' AND member_id = 'mem-owner'").n).toBe(1)
   })
   it('/muapprove <id> typed in the chat approves too, and replies in that chat', async () => {
     const f = await file()
@@ -404,13 +493,61 @@ describe('decision: every wrong way in is refused and changes nothing', () => {
     expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
     untouched(f.requestId)
   })
-  it('a login-identity row for this Telegram account that belongs to ANOTHER member, or is revoked, can never carry an approval', async () => {
+  it('IDENTITY: the bot writes NOTHING into human_login_identities; the session anchors on the member\'s own sign-in, and unlinking their last real login is still refused', async () => {
     const f = await file()
-    harness.sqlite.prepare("INSERT INTO human_login_identities (id, tenant, provider, provider_subject, member_id, created_at) VALUES ('hli-x', ?, 'telegram_approval_bot', ?, 'mem-plain', datetime('now'))").run(TENANT, String(TG.owner))
+    const before = count('human_login_identities')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('approved')
+    expect(count('human_login_identities')).toBe(before)
+    expect(count('human_login_identities', "provider = 'telegram_approval_bot'")).toBe(0)
+    expect(one<{ login_identity_id: string }>('SELECT login_identity_id FROM web_sessions ORDER BY rowid DESC LIMIT 1').login_identity_id).toBe('hli-owner')
+    const { unlinkSignIn } = await import('../src/auth/link-signin')
+    const ownerAuth: AuthContext = { userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'dashboard', memberId: 'mem-owner' }
+    expect(await unlinkSignIn(env, ownerAuth, 'hli-owner')).toEqual({ ok: false, error: 'last_identity' })
+    // the bot keeps working afterwards
+    const g = await file({ reason: 'again', actions: ['action:routine_policy'] })
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${g.shortId}`, { from: TG.owner }))).kind).toBe('approved')
+  })
+  it('ROLE at decision time: authority proven only by members.email (verified identity gone after the offer) cannot approve', async () => {
+    const f = await file()
+    harness.sqlite.exec("UPDATE human_login_identities SET verified_email = NULL WHERE id = 'hli-owner'")
+    harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'cap-o'")
     expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
     untouched(f.requestId)
-    harness.sqlite.exec("UPDATE human_login_identities SET member_id = 'mem-owner', revoked_at = datetime('now') WHERE id = 'hli-x'")
+  })
+  it('a member who has never signed in (no live login identity) approves nothing and gets told why', async () => {
+    const f = await file()
+    harness.sqlite.exec("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE member_id = 'mem-owner'")
+    calls.length = 0
     expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('Sign in')
+    untouched(f.requestId)
+    expect(count('human_login_identities', "provider = 'telegram_approval_bot'")).toBe(0)
+  })
+  it('ROLE: an approver whose members.email matches the owner but who has NO verified identity is not the owner', async () => {
+    harness.sqlite.exec("UPDATE human_login_identities SET verified_email = NULL WHERE id = 'hli-owner'")
+    harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'cap-o'")
+    const f = await file()
+    expect(f.telegram).toBe('not_bound') // not even offered: email-derived 'owner' no longer counts
+    expect(calls).toHaveLength(0)
+  })
+  it('STEP-UP: the broad action:manage_access is never offered to the bot, and a tap on it is refused even with a forged delivery row', async () => {
+    const f = await file({ actions: ['action:manage_access'] })
+    expect(approvalCalls()).toHaveLength(0)
+    harness.sqlite.exec("UPDATE elevation_requests SET short_id = 'mnpqrstv' WHERE id = '" + f.requestId + "'")
+    harness.sqlite.prepare("INSERT INTO approval_bot_deliveries (id, tenant, request_id, member_id, chat_id, message_id, status, created_at) VALUES ('d9', ?, ?, 'mem-owner', ?, '1', 'sent', datetime('now'))").run(TENANT, f.requestId, String(TG.owner))
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/muapprove mnpqrstv', { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('STEP-UP core: even if the carry check were bypassed, the core refuses a bot tap for a sensitive action (reauth_required)', async () => {
+    const { decideElevation } = await import('../src/access/decision-core')
+    const { buildAuth } = await import('../src/access/identity')
+    const f = await file({ actions: ['action:manage_access'] })
+    const out = await decideElevation(env, {
+      id: f.requestId, decision: 'approve', selectedActions: ['action:manage_access'], durationMinutes: undefined,
+      auth: await buildAuth(env, 'mem-owner', undefined, { verifiedRole: true }), proof: { memberId: 'mem-owner', via: 'approval_bot', evidence: {} },
+      mintSession: async () => { throw new Error('must not be reached') },
+    })
+    expect(out.status).not.toBe(200)
     untouched(f.requestId)
   })
   it('a request from an ATTACHED chat is not offered to the bot (it is approved with a passkey)', async () => {

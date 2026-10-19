@@ -20,8 +20,6 @@ import { approvalBotStatus } from './config'
 import { botMayCarry, parseRequestedActions, SHORT_ID_RE } from './policy'
 import { answerCallback, editBotMessage, sendBotMessage, type FetchFn } from './telegram'
 
-export const APPROVAL_BOT_PROVIDER = 'telegram_approval_bot'
-
 export type BotUpdateResult =
   | { kind: 'ignored'; reason: string }
   | { kind: 'refused'; reason: string }
@@ -95,22 +93,25 @@ function parseCommand(p: Parsed, username: string): Command | null {
 
 interface Delivery { member_id: string; chat_id: string; message_id: string | null; status: string }
 
-/** The approver session a grant binds to: a login-identity row for exactly this bound Telegram account, then a fresh web session. */
-async function mintBotApproverSession(env: Env, memberId: string, telegramUserId: string): Promise<{ auth: Awaited<ReturnType<typeof buildAuth>>; webSessionHash: string }> {
-  const existing = await env.DB.prepare(
-    'SELECT id, member_id, revoked_at FROM human_login_identities WHERE tenant = ?1 AND provider = ?2 AND provider_subject = ?3 LIMIT 1',
-  ).bind(env.TENANT_SLUG, APPROVAL_BOT_PROVIDER, telegramUserId).first<{ id: string; member_id: string; revoked_at: string | null }>()
-  let identityId: string
-  if (existing) {
-    if (existing.member_id !== memberId || existing.revoked_at !== null) throw new Error('approval_identity_unavailable')
-    identityId = existing.id
-  } else {
-    identityId = crypto.randomUUID()
-    await env.DB.prepare(
-      `INSERT INTO human_login_identities (id, tenant, provider, provider_subject, member_id, linked_by_member_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)`,
-    ).bind(identityId, env.TENANT_SLUG, APPROVAL_BOT_PROVIDER, telegramUserId, memberId, new Date().toISOString()).run()
-  }
-  const session = await mintApproverSession(env, { memberId, auth: await buildAuth(env, memberId), identityId })
+/**
+ * The login identity a bot approval's web session anchors to: one of the member's OWN live login identities (the sign-in they
+ * already made), newest verified one first. The bot writes NOTHING into human_login_identities: a synthetic row there would count
+ * as a login method (unlink guards, login lists) and could be unlinked or abused as one. The grant therefore also dies with that
+ * identity (revoking it ends the session). No identity = this member has never signed in: nothing is approved.
+ */
+async function liveLoginIdentityOf(env: Env, memberId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT id FROM human_login_identities WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL
+      ORDER BY (verified_email IS NOT NULL) DESC, created_at DESC LIMIT 1`,
+  ).bind(env.TENANT_SLUG, memberId).first<{ id: string }>()
+  return row?.id ?? null
+}
+
+/** The approver session a grant binds to: a fresh web session on the member's own login identity; their role is the VERIFIED one. */
+async function mintBotApproverSession(env: Env, memberId: string): Promise<{ auth: Awaited<ReturnType<typeof buildAuth>>; webSessionHash: string }> {
+  const identityId = await liveLoginIdentityOf(env, memberId)
+  if (!identityId) throw new Error('approval_identity_unavailable')
+  const session = await mintApproverSession(env, { memberId, auth: await buildAuth(env, memberId, undefined, { verifiedRole: true }), identityId, verifiedRole: true })
   return { auth: session.approver.auth, webSessionHash: session.webSessionHash }
 }
 
@@ -209,13 +210,17 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
 
   // 5-6. the shared decision core re-checks window, status, authority, self-approval and writes the receipt. Its own guarded
   // UPDATE is the single decision: a replay, a second tap and a concurrent decision all lose there.
-  const auth = await buildAuth(env, memberId)
+  if (!(await liveLoginIdentityOf(env, memberId))) {
+    await tell('Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
+    return { kind: 'refused', reason: 'no_login_identity' }
+  }
+  const auth = await buildAuth(env, memberId, undefined, { verifiedRole: true })
   let outcome: Outcome
   try {
     outcome = await decideElevation(env, {
       id: req.id, decision: cmd.op, selectedActions: parseRequestedActions(req), durationMinutes: undefined, auth,
       proof: { memberId, via: 'approval_bot', evidence: { telegram_user_id: p.fromId, chat_id: p.chatId, short_id: cmd.id, ...(p.updateId ? { update_id: p.updateId } : {}), ...(p.messageId ? { message_id: p.messageId } : {}) } },
-      mintSession: () => mintBotApproverSession(env, memberId, p.fromId as string), // p.fromId is non-null: the private-chat fence above returned otherwise
+      mintSession: () => mintBotApproverSession(env, memberId),
       waitUntil: opts.waitUntil,
     })
   } catch {

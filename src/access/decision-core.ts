@@ -29,7 +29,7 @@ import {
 } from '../auth/elevation'
 import { revokeWebSession } from '../auth/web-sessions'
 import { isValidSlugBase } from '../org/team-bootstrap'
-import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
+import { BOT_STEP_UP_ACTIONS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
 import {
   claimSeedRequest, denySeedRequest, finishSeedRequest, receiptHandlerFor, type DecisionVia, type SeedRequestRow, type StoredRequest,
@@ -316,8 +316,9 @@ export async function decideElevation(
     decidedByCapabilities: caps,
     decidedByIsOrgAdmin: admin,
     decidedByWebSessionHash: webSessionHash,
-    // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up.
-    recentReauthOk: true,
+    // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up. The approval bot
+    // is the one exception: a tap is NOT a fresh reauth in general, so it satisfies the step-up only for BOT_STEP_UP_ACTIONS.
+    recentReauthOk: proof.via === 'approval_bot' ? input.selectedActions.every((a) => BOT_STEP_UP_ACTIONS.includes(a)) : true,
     decidedViaPasskey: PASSKEY_CLASS_VIA.has(proof.via),
     decidedViaAccess: proof.via === 'access_passkey',
     note: `via:${proof.via}`,

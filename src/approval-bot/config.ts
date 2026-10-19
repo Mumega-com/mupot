@@ -16,7 +16,8 @@ export type ApprovalBotStatus =
   | { state: 'on'; username: string; botId: string; token: string }
 
 const TOKEN_RE = /^([1-9][0-9]{4,15}):[A-Za-z0-9_-]{20,}$/
-const USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{3,30}[Bb][Oo][Tt]$/
+// Telegram bot usernames are 5-32 characters, start with a letter and end in "bot".
+const USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{1,28}[Bb][Oo][Tt]$/
 /** Telegram's own secret_token alphabet and length (1..256 of A-Za-z0-9_-); a floor of 24 keeps it unguessable. */
 const SECRET_RE = /^[A-Za-z0-9_-]{24,256}$/
 

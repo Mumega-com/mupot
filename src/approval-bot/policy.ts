@@ -8,9 +8,8 @@ import type { Env } from '../types'
 import { ELEVATION_ACTIONS } from '../auth/elevation-actions'
 import type { ElevationRequestRecord } from '../auth/elevation'
 
-/** Reversible, enforced, and not credential- or structure-minting. Adding a key here is a reviewed one-line change. */
+/** Reversible, enforced, narrow, and not credential- or structure-minting. The broad action:manage_access is NOT here: it stays passkey / Mini App only. Adding a key here is a reviewed one-line change. */
 export const APPROVAL_BOT_ACTIONS: readonly string[] = [
-  'action:manage_access',
   'action:project_lifecycle',
   'action:org_structure',
   'action:workspace_project',
@@ -33,14 +32,19 @@ export function botMayCarry(req: Pick<ElevationRequestRecord, 'requested_actions
   return actions.length > 0 && actions.every((a) => APPROVAL_BOT_ACTIONS.includes(a))
 }
 
-const SHORT_ALPHABET = 'abcdefghjkmnpqrstvwxyz23456789' // no 0/o/1/l/i: typed by a human
+const SHORT_ALPHABET = 'abcdefghjkmnpqrstvwxyz23456789' // no 0/o/1/l/i: typed by a human; 30 symbols
 export const SHORT_ID_LEN = 8
 export const SHORT_ID_RE = /^[a-hjkmnp-tv-z2-9]{8}$/
 
 export function newShortId(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(SHORT_ID_LEN))
+  // Rejection sampling: 240 = 8 * 30, so a byte below 240 maps to a symbol with no modulo bias.
+  const limit = 256 - (256 % SHORT_ALPHABET.length)
   let out = ''
-  for (const b of bytes) out += SHORT_ALPHABET[b % SHORT_ALPHABET.length]
+  while (out.length < SHORT_ID_LEN) {
+    for (const b of crypto.getRandomValues(new Uint8Array(SHORT_ID_LEN * 2))) {
+      if (b < limit && out.length < SHORT_ID_LEN) out += SHORT_ALPHABET[b % SHORT_ALPHABET.length]
+    }
+  }
   return out
 }
 

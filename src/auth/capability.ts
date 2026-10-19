@@ -896,6 +896,18 @@ export async function humanVerifiedLegacyRoleRank(env: Env, memberId: string): P
 }
 
 /**
+ * The legacy ROLE a HUMAN holds through a VERIFIED, LIVE login identity (same source as humanVerifiedLegacyRoleRank, never
+ * members.email): 'owner' | 'admin' | 'member'. Used to build the AuthContext of a human who acts through a channel that is not a
+ * sign-in (the approval bot, owner sudo), so an inviter-typed email can never lend them the owner's role (#1551 class).
+ */
+export async function humanVerifiedLegacyRole(env: Env, memberId: string): Promise<AuthContext['role']> {
+  const rank = await humanVerifiedLegacyRoleRank(env, memberId)
+  if (rank >= legacyRoleRank('owner')) return 'owner'
+  if (rank >= legacyRoleRank('admin')) return 'admin'
+  return 'member'
+}
+
+/**
  * The TARGET's highest effective capability rank across EVERY scope they hold
  * a grant on, AND their coarse legacy-role standing — not just the one scope
  * a caller happens to be checking, and not just one of the two authority

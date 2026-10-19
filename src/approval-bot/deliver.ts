@@ -28,6 +28,8 @@ export interface BotDeliveryOpts {
   nowMs?: number
   timeoutMs?: number
   waitUntil?: (promise: Promise<unknown>) => void
+  /** Run when the bot ended up NOT delivering after the caller already stopped waiting ('pending'): the next channel (Mini App). */
+  fallback?: () => Promise<unknown>
 }
 
 /** Assign the short id once (unique per tenant); a collision retries with a fresh one. */
@@ -62,17 +64,19 @@ async function deliver(env: Env, req: ElevationRequestRecord, opts: BotDeliveryO
   if (!target) return 'not_bound'
   const chatId = await privateChatOf(env, target)
   if (!chatId) return 'not_bound'
-  if (!(await mayDecideElevation(env, await buildAuth(env, target), req))) return 'not_bound'
+  if (!(await mayDecideElevation(env, await buildAuth(env, target, undefined, { verifiedRole: true }), req))) return 'not_bound'
   const shortId = await ensureShortId(env, req)
   if (!shortId) return 'failed'
-  // Once-only slot: the UNIQUE(request_id) row is the whole guard, so a retry or a second call sends nothing more.
+  // Once-only slot: the UNIQUE(request_id) row is the whole guard, so a retry or a second call sends nothing more. Only an EXISTING
+  // row that says 'sent' may answer 'sent': a reservation that failed for any other reason (DB error) never reports delivery.
   const slotId = crypto.randomUUID()
   try {
     await env.DB.prepare(
       `INSERT INTO approval_bot_deliveries (id, tenant, request_id, member_id, chat_id, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6)`,
     ).bind(slotId, req.tenant, req.id, target, chatId, new Date(nowMs).toISOString()).run()
   } catch {
-    return 'sent'
+    const existing = await env.DB.prepare('SELECT status FROM approval_bot_deliveries WHERE request_id = ?1 AND tenant = ?2 LIMIT 1').bind(req.id, req.tenant).first<{ status: string }>().catch(() => null)
+    return existing?.status === 'sent' ? 'sent' : existing?.status === 'reserved' ? 'pending' : 'failed'
   }
   const sent = await sendBotMessage(bot, {
     chatId,
@@ -86,9 +90,15 @@ async function deliver(env: Env, req: ElevationRequestRecord, opts: BotDeliveryO
 
 export async function deliverElevationToApprovalBot(env: Env, req: ElevationRequestRecord, opts: BotDeliveryOpts = {}): Promise<ApprovalBotDelivery> {
   if (approvalBotStatus(env).state !== 'on') return 'unavailable'
+  let gaveUp = false
   const work: Promise<ApprovalBotDelivery> = deliver(env, req, opts).catch(() => 'failed' as const)
-  try { opts.waitUntil?.(work) } catch { /* no execution context: the race below still bounds the caller */ }
+  // The caller answered 'pending' and moved on; if the send then fails, the human must still get the request somewhere.
+  const chained = work.then(async (r) => {
+    if (gaveUp && r !== 'sent' && opts.fallback) await opts.fallback().catch(() => undefined)
+    return r
+  })
+  try { opts.waitUntil?.(chained) } catch { /* no execution context: the race below still bounds the caller */ }
   let timer: ReturnType<typeof setTimeout> | undefined
-  const bound = new Promise<ApprovalBotDelivery>((resolve) => { timer = setTimeout(() => resolve('pending'), opts.timeoutMs ?? BOT_DELIVERY_TIMEOUT_MS) })
+  const bound = new Promise<ApprovalBotDelivery>((resolve) => { timer = setTimeout(() => { gaveUp = true; resolve('pending') }, opts.timeoutMs ?? BOT_DELIVERY_TIMEOUT_MS) })
   try { return await Promise.race([work, bound]) } finally { if (timer !== undefined) clearTimeout(timer) }
 }

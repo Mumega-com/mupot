@@ -58,7 +58,7 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 # A DEDICATED Telegram bot the worker owns (never the notification bot, the Mini App bot or the Hermes/IM bot). An agent's
 # request_elevation reaches the human as ONE message with Approve / Deny buttons (or /muapprove <id>, /mudeny <id>, /murevoke).
 # Names only, never values. Secrets: `npx wrangler secret put APPROVAL_BOT_TOKEN` and `... APPROVAL_BOT_WEBHOOK_SECRET`
-# (or the secret_env request flow). Var: APPROVAL_BOT_USERNAME. Webhook: https://<host>/im/approve/webhook with that secret_token.
+# (NOT the secret_env request flow: it refuses every worker-owned name by design). Var: APPROVAL_BOT_USERNAME. Webhook: https://<host>/im/approve/webhook with that secret_token.
 # APPROVAL_BOT_USERNAME = ""      # the bot's @username (ends in "bot"); display and /command@bot matching only, carries no authority.
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
                                   # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
