@@ -605,10 +605,19 @@ export async function resolveOrCreateSeat(
     ? await prepareSeatHandleIssue(env, { seatId, agentId: agent.id, harnessId: harness.id, consentingMemberId: memberId, grantTokenId }, createdAt)
     : null
 
+  // Own-lane gate (same as the mint path, src/members/service.ts): the seat agent holds gate:<its own slug> and ONLY that.
+  // Upsert keeps it idempotent and always reports a written row (assertBatchWritten). Never another principal's gate.
+  const ownGate = env.DB.prepare(
+    `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+     VALUES (?1, ?2, 'agent', ?3, 'system:seat_select', ?4)
+     ON CONFLICT (capability, principal_type, principal_id) DO UPDATE SET created_at = created_at`,
+  ).bind(crypto.randomUUID(), `gate:${agent.slug}`, agent.id, createdAt)
+
   const statements: D1PreparedStatement[] = [
     ...preparedAgent.value.statements,
     ...weld,
     token.statement,
+    ownGate,
     auditStatement,
     ...reclaim,
     seatStatement,
