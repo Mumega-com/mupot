@@ -4298,9 +4298,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_event_subscribe_refusals_at" },
     ],
   },
+  {
+    file: "0243_mcp_negotiation_log.sql",
+    sha256: "73d44c8f7621ebb83388edfc9359df4c9cbce349a575dbecb8f21b36cec39d17",
+    statements: [
+      "-- 0243_mcp_negotiation_log.sql -- what protocol version each client requests on /mcp initialize + server/discover (mupot observability).\n-- ChatGPT stopped listing mupot as an event source; we never recorded the protocolVersion a client asked for, so \"client now asks for a\n-- version we do not negotiate to 2026-07-28\" was unprovable. BOUNDED: ONE row per (tenant, principal, method, requested version), upserted\n-- (first_seen / at = last_seen / hit_count), so a client that reconnects every minute never fills its quota and a NEW version always gets a\n-- row. Updates write at most once a minute; distinct versions per principal are capped; rows older than 7 days are pruned; the tenant has a ceiling.\n-- AUTHENTICATED callers only (anonymous: console line only). Never stores a token, header value, or param other than the bounded version\n-- string and a bounded client label. CREATE only; nothing is rebuilt.\n\nCREATE TABLE IF NOT EXISTS mcp_negotiation_log (\n  id                TEXT PRIMARY KEY NOT NULL,\n  tenant            TEXT NOT NULL,\n  at                TEXT NOT NULL,\n  method            TEXT NOT NULL,\n  harness_id        TEXT,\n  member_id         TEXT,\n  client_name       TEXT,\n  requested_version TEXT NOT NULL,\n  negotiated_version TEXT NOT NULL,\n  events_returned   INTEGER NOT NULL,\n  first_seen        TEXT NOT NULL DEFAULT '',\n  hit_count         INTEGER NOT NULL DEFAULT 1\n);",
+      "\n\n-- The upsert key. COALESCE: harness_id / member_id are NULL when absent, and NULLs are distinct in a plain unique index.\nCREATE UNIQUE INDEX IF NOT EXISTS uq_mcp_negotiation_log_key\n  ON mcp_negotiation_log (tenant, COALESCE(harness_id, ''), COALESCE(member_id, ''), method, requested_version);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_mcp_negotiation_log_principal\n  ON mcp_negotiation_log (tenant, harness_id, member_id, method, requested_version, at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_mcp_negotiation_log_at\n  ON mcp_negotiation_log (tenant, at);",
+    ],
+    objects: [
+      { type: "table", name: "mcp_negotiation_log" },
+      { type: "index", name: "uq_mcp_negotiation_log_key" },
+      { type: "index", name: "idx_mcp_negotiation_log_principal" },
+      { type: "index", name: "idx_mcp_negotiation_log_at" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f65f990f6742cd8cefb79ea1d9fdecf17bbfcba46fda7cabbfd1abf93e63d678"
+export const SCHEMA_CHAIN_DIGEST: string = "945833f2238c154843dfb63ce60f224bebe94db41b7eff7d8f4e69fbb0587b99"

@@ -272,10 +272,12 @@ import {
   withResultType,
   negotiateProtocolVersion,
   serverDiscoverResult,
+  SUPPORTED_PROTOCOL_VERSIONS,
 } from './events'
 import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_PROTOCOL_VERSION, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { recordSubscribeRefusal } from './events-refusals'
+import { recordNegotiation, describeRequestedVersion } from './negotiation-log'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
@@ -8273,6 +8275,44 @@ function requestedProtocolVersionForLog(params: unknown): string {
   return KNOWN_PROTOCOL_VERSIONS_FOR_LOG.has(v) ? v : 'other'
 }
 
+/** Record what this client requested on initialize / server/discover (observability only; never changes the response, never throws).
+ *  Auth is resolved ONLY when a credential is presented (no DB work for an anonymous caller, who gets the console line only), and
+ *  never enrols a seat (skipSeat). */
+async function logNegotiation(
+  c: import('hono').Context<AppEnv>,
+  method: 'initialize' | 'server/discover',
+  params: unknown,
+  negotiated: string,
+  eventsReturned: boolean,
+): Promise<void> {
+  try {
+    const p = typeof params === 'object' && params !== null && !Array.isArray(params) ? params as Record<string, unknown> : {} // narrowed to a plain object just above
+    // params.protocolVersion ONLY: it is the sole source negotiateProtocolVersion reads, so the logged version and the bucket always agree
+    // with what was negotiated (a header / _meta value the negotiation ignores must not be recorded as "requested").
+    const rawRequested = p.protocolVersion
+    const ci = typeof p.clientInfo === 'object' && p.clientInfo !== null ? (p.clientInfo as { name?: unknown }).name : undefined // narrowed to an object just above
+    const hasCredential = Boolean(c.req.header('authorization') || c.req.header(AUTH_CONTEXT_HEADER))
+    const requested = describeRequestedVersion(rawRequested)
+    const requestedBucket = requestedProtocolVersionForLog(params)
+    // The credential resolution rides INSIDE the background work: the hot path (initialize / server/discover) adds zero awaits and zero DB reads.
+    const work = (async () => {
+      let principal: { harnessId?: string | null; memberId?: string | null; heldSeat?: boolean } | null = null
+      if (hasCredential) {
+        const auth = await resolveAuth(c, { skipSeat: true })
+        if (auth && auth.tenant === c.env.TENANT_SLUG) principal = { harnessId: auth.harnessId, memberId: auth.memberId, heldSeat: auth.seatAgentStatus === 'held' }
+      }
+      await recordNegotiation(c.env, Date.now(), { method, requested, requestedBucket, negotiated, eventsReturned, principal, clientInfoName: ci })
+    })().catch((e: unknown) => { console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e)) })
+    // Never block the response on observability: with an ExecutionContext the work is kept alive by waitUntil; without one it is
+    // fire-and-forget (`work` already carries its own catch, so it cannot reject unhandled).
+    const wu = safeWaitUntil(c)
+    if (wu) wu(work)
+    else void work
+  } catch (e) {
+    console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e))
+  }
+}
+
 async function handleJsonRpc(
   c: import('hono').Context<AppEnv>,
   body: JsonRpcRequest,
@@ -8303,6 +8343,7 @@ async function handleJsonRpc(
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
       console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
+      if (profile === undefined) await logNegotiation(c, 'initialize', body.params, EVENTS_PROTOCOL_VERSION, true)
       return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
@@ -8317,6 +8358,7 @@ async function handleJsonRpc(
     const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
     const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
     console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
+    if (profile === undefined) await logNegotiation(c, 'initialize', body.params, initVersion, false)
     const legacyInit = ok(id, {
       protocolVersion: initVersion,
       capabilities: { tools: {} },
@@ -8476,7 +8518,14 @@ async function handleJsonRpc(
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
     console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
+    await logNegotiation(c, 'server/discover', body.params, SUPPORTED_PROTOCOL_VERSIONS.join(','), true)
     return ok(id, serverDiscoverResult())
+  }
+
+  // Events OFF: server/discover stays method_not_found, but the attempt is still recorded (events_returned=false) so "why did the
+  // connector not see events" has an answer. Observability only; the response below is unchanged.
+  if (method === 'server/discover' && !eventsOn && profile === undefined) {
+    await logNegotiation(c, 'server/discover', body.params, '<none>', false)
   }
 
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from

@@ -93,7 +93,7 @@ function dumpState(): string {
     .all() as { name: string }[]
   const out: Record<string, unknown[]> = {}
   for (const { name } of tables) {
-    if (name === 'member_tokens' || name === 'event_subscribe_refusals') continue
+    if (name === 'member_tokens' || name === 'event_subscribe_refusals' || name === 'mcp_negotiation_log') continue
     out[name] = harness.sqlite.prepare(`SELECT * FROM "${name}"`).all()
   }
   return JSON.stringify(out)
