@@ -113,7 +113,11 @@ export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName
   }
   let status: SeatAdmissionStatus | null
   if (seat) status = await readSeatAdmissionStatus(env, seat.seatId)
-  else if (auth.boundAgentId) status = await readSeatStatusByAgent(env, auth.boundAgentId, !!auth.harnessId)
+  else if (auth.boundAgentId) {
+    // The status rode the ONE token query (auth.seatAgentStatus): no second read, so no fail-open. Only a hand-built context (never produced by the
+    // bearer/OAuth paths with VIP_LANE on) lacks it; that case falls back to the guarded read.
+    status = auth.seatAgentStatus !== undefined ? auth.seatAgentStatus : await readSeatStatusByAgent(env, auth.boundAgentId, !!auth.harnessId)
+  }
   else return null
   if (status === null || status === 'trusted') return null
   const allowed = status === 'held' ? HELD_FLOOR_TOOLS : OBSERVED_FLOOR_TOOLS

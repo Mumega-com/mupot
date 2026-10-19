@@ -331,6 +331,54 @@ describe('rejoin ordering, liveness, and held-over-attach (CI + Codex fixes)', (
   })
 })
 
+describe('MCP bearer: seat status rides the token query (no fail-open read)', () => {
+  async function bearerFor(agentId: string, raw: string): Promise<string> {
+    const { hashMemberToken } = await import('../src/auth/member-bearer')
+    const bound = one<{ member_id: string }>(`SELECT member_id FROM agent_member_bindings WHERE agent_id = ?`, agentId)
+    if (!bound) throw new Error('no binding')
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id) VALUES (?, ?, ?, 'x', 'workspace', '2026-10-09T00:00:00.000Z', ?, ?)`).run(`tok-${raw}`, bound.member_id, await hashMemberToken(raw), TENANT, agentId)
+    return raw
+  }
+  const authOf = async (e: Env, raw: string): Promise<AuthContext> => {
+    const { authenticateMember } = await import('../src/mcp/index')
+    const a = await authenticateMember({ req: { header: (k: string) => (k.toLowerCase() === 'authorization' ? `Bearer ${raw}` : undefined) }, env: e })
+    if (!a) throw new Error('auth null')
+    return a
+  }
+  const dbThatThrowsOnSeats = (e: Env): Env => ({ ...e, DB: new Proxy(e.DB, { get: (t, k) => (k === 'prepare' ? (sql: string) => { if (/agent_seats/.test(sql)) throw new Error('seat read down'); return t.prepare(sql) } : Reflect.get(t, k).bind(t)) }) }) as unknown as Env
+
+  it('an observed/held seat agent on a bound-agent token is floored with every later agent_seats read failing; trusted and non-seat agents are not', async () => {
+    const s = await seatFor(OWNER)
+    const raw = await bearerFor(s.agentId, 'mcp-bound-1')
+    for (const [st, tool, want] of [['observed', 'request_elevation', 'observed'], ['held', 'task_create', 'held'], ['trusted', 'request_elevation', null], [null, 'request_elevation', null]] as const) {
+      setStatus(s.seatId, st)
+      const a = await authOf(env, raw)
+      expect(a.seatAgentStatus, String(st)).toBe(st)
+      const r = await observedFloorRefusal(dbThatThrowsOnSeats(env), a, tool)
+      expect(r?.status ?? null, String(st)).toBe(want)
+    }
+    // a non-seat bound agent: no seat row, never floored
+    seedHuman('member-plainagent')
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-plain-x', 'squad-core', 'plain-x', 'Plain X', 'r', 'm', 'active')`)
+    h.sqlite.prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, 'agent-plain-x', 'member-plainagent', '2026-10-09T00:00:00.000Z')`).run(TENANT)
+    const raw2 = await bearerFor('agent-plain-x', 'mcp-bound-2')
+    setStatus(s.seatId, 'observed')
+    const a2 = await authOf(env, raw2)
+    expect(a2.seatAgentStatus).toBeNull()
+    expect(await observedFloorRefusal(dbThatThrowsOnSeats(env), a2, 'request_elevation')).toBeNull()
+  })
+
+  it('flag off: authenticateMember carries no seat status and no floor', async () => {
+    const s = await seatFor(OWNER)
+    const raw = await bearerFor(s.agentId, 'mcp-bound-3')
+    setStatus(s.seatId, 'observed')
+    const off = envFor(h, { VIP_LANE: undefined })
+    const a = await authOf(off, raw)
+    expect(a.seatAgentStatus).toBeUndefined()
+    expect(await observedFloorRefusal(off, a, 'request_elevation')).toBeNull()
+  })
+})
+
 describe('REST bearer sweep (P1-c) and read-error posture', () => {
   it('resolveMemberByToken refuses a token bound to an observed/held seat agent, allows trusted/NULL, and is inert with the flag off', async () => {
     const { resolveMemberByToken, hashMemberToken } = await import('../src/auth/member-bearer')

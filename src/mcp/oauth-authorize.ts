@@ -44,6 +44,7 @@ import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
 import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
 import { decideHarnessBearer } from '../members/harness-credential'
@@ -1266,11 +1267,14 @@ async function buildAuthContextFromPropsInner(
   // Verify the referenced token is still live — neither revoked nor expired since
   // authorization. Both arms matter: this runs per-request, so it is also the only
   // thing that ends a session whose credential expires while it is open.
+  // #2060: the bound agent's seat status rides this ONE query (no second read to fail open). Flag off: no join, no column, no 5th bind.
+  const sf = seatFloorSql(env, 'COALESCE(t.agent_id, ?5)')
   const tokenRow = await env.DB.prepare(
     `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id,
-            t.harness_kind AS harness_kind
+            t.harness_kind AS harness_kind${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       ${sf.join}
       WHERE t.id = ?1
         AND t.member_id = ?2
         AND t.tenant = ?3
@@ -1280,12 +1284,14 @@ async function buildAuthContextFromPropsInner(
         -- expired credential working for its whole session, not just at handshake.
         AND ${TOKEN_LIVE_PREDICATE('?4')}
       LIMIT 1`,
-  ).bind(props.tokenId, props.memberId, env.TENANT_SLUG, nowSqlUtc()).first<{
+  ).bind(...(sf.join ? [props.tokenId, props.memberId, env.TENANT_SLUG, nowSqlUtc(), props.boundAgentId ?? null] : [props.tokenId, props.memberId, env.TENANT_SLUG, nowSqlUtc()])).first<{
     status: string
     email: string | null
     channel?: ConnectionChannel | null
     bound_agent_id?: string | null
     harness_kind?: string | null
+    seat_status?: string | null
+    seat_row_id?: string | null
   }>()
 
   if (!tokenRow || tokenRow.status !== 'active') return null
@@ -1401,6 +1407,7 @@ async function buildAuthContextFromPropsInner(
     // human's identity for a bound seat lives in consentedByMemberId instead;
     // resolveHumanStandingGrants re-derives THEIR grants, live and status-gated.
     ...(isHarnessCredential ? { harnessCredential: true } : {}),
+    ...(exposedBoundAgentId && seatAgentStatusFromRow(env, tokenRow) !== undefined ? { seatAgentStatus: seatAgentStatusFromRow(env, tokenRow) } : {}),
     latentCapabilities:
       isHarnessCredential
         ? []

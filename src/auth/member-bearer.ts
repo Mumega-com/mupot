@@ -55,10 +55,17 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
 
 /** #2060 P1-c: the seat status rides the ONE token query (no second read that could fail open). VIP_LANE off = no join, no column read.
  *  A seat row that is observed/held (or any unknown value) floors the bearer; a non-seat agent (no seat row) and trusted/NULL are unaffected. */
-function seatFloorSql(env: Env): { select: string; join: string } {
+export function seatFloorSql(env: Env, agentExpr = 't.agent_id'): { select: string; join: string } {
   return vipLaneEnabled(env)
-    ? { select: ', s.admission_status AS seat_status, s.id AS seat_row_id', join: 'LEFT JOIN agent_seats s ON s.agent_id = t.agent_id AND s.tenant = t.tenant AND s.retired_at IS NULL' }
+    ? { select: ', s.admission_status AS seat_status, s.id AS seat_row_id', join: `LEFT JOIN agent_seats s ON s.agent_id = ${agentExpr} AND s.tenant = t.tenant AND s.retired_at IS NULL` }
     : { select: ', NULL AS seat_status, NULL AS seat_row_id', join: '' }
+}
+/** The seat status carried on AuthContext from the ONE token query: undefined = flag off (not read), null = not a seat agent / no status,
+ *  otherwise the stored value (an unknown stored value maps to 'held', fail closed). No second read exists to fail open. */
+export function seatAgentStatusFromRow(env: Env, row: { seat_row_id?: string | null; seat_status?: string | null }): 'observed' | 'trusted' | 'held' | null | undefined {
+  if (!vipLaneEnabled(env)) return undefined
+  if (typeof row.seat_row_id !== 'string' || typeof row.seat_status !== 'string') return null
+  return row.seat_status === 'observed' || row.seat_status === 'trusted' ? row.seat_status : 'held'
 }
 const seatRowFloors = (row: { seat_row_id: string | null; seat_status: string | null }): boolean =>
   typeof row.seat_row_id === 'string' && typeof row.seat_status === 'string' && row.seat_status !== 'trusted'

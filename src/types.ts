@@ -789,6 +789,9 @@ export interface AuthContext {
    * harnesses row (tenant + member + id) live before use. Absent on every other session.
    */
   harnessId?: string | null
+  /** #2060: admission status of the LIVE seat whose agent is boundAgentId, read in the SAME query that authenticated the token (no second read to
+   *  fail open). undefined = not populated (VIP_LANE off, or a hand-built context); null = not a seat agent / no status. */
+  seatAgentStatus?: 'observed' | 'trusted' | 'held' | null
   /**
    * mupot#1794 W4: true when this session was authenticated by a HARNESS-TOKEN credential (a
    * member_tokens row with harness_kind set) and NO seat handle has been applied. Derived per request
