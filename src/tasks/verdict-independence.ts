@@ -58,6 +58,10 @@ export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigne
               WHERE assignee_admission.agent_id = assignee_agent.id AND assignee_admission.human_member_id = ${p.memberExpr}
                 AND assignee_admission.status IN ('live', 'revoked')
            )
+           OR EXISTS (
+             SELECT 1 FROM agent_seats assignee_seat
+              WHERE assignee_seat.agent_id = assignee_agent.id AND assignee_seat.member_id = ${p.memberExpr}
+           )
          )
     )`
 }

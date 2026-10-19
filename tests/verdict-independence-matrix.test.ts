@@ -415,6 +415,26 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
       expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
       expect(verdictRows(harness.sqlite)).toBe(0)
     })
+    it('MEMBER leg: H holds the gate, H\'s seat S SUBMITTED the work, H\'s verdict is refused', async () => {
+      seedWorld(harness.sqlite)
+      seedSeatOf(harness.sqlite, 'S', 'H') // S submitted sub-1 in the seeded world
+      const res = await decide(env, memberAuth('H'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+    })
+    it('MEMBER leg: H holds the gate, H\'s seat S is the ASSIGNEE (built it), H\'s verdict is refused', async () => {
+      seedWorld(harness.sqlite, { humanAssignee: 'H' }) // no submissions / receipts: the assignee leg stands alone
+      seedSeatOf(harness.sqlite, 'S', 'H')
+      harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'S', assignee_member_id = NULL WHERE id = ?`).run(TASK)
+      const res = await decide(env, memberAuth('H'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+    })
+    it('MEMBER leg: the same member is allowed when the seat is someone else\'s (control)', async () => {
+      seedWorld(harness.sqlite)
+      seedSeatOf(harness.sqlite, 'S', 'M_INDEP')
+      const res = await decide(env, memberAuth('H'))
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+    })
     it('the same seat agent is allowed when the seat belongs to someone else (control)', async () => {
       seedWorld(harness.sqlite, { humanAssignee: 'H' })
       seedSeatOf(harness.sqlite, 'S', 'M_INDEP')
