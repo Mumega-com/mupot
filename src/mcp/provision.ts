@@ -124,6 +124,7 @@ import {
   memberCanOnSquad,
   memberCanOnSquadAuth,
   hasWorkspaceAdmin,
+  isOrgOwnerAdmin,
 } from './index'
 import {
   hasElevatedAction,
@@ -2792,12 +2793,14 @@ const toolUpdateSquad: ToolSpec = {
   scope: 'squad',
   min: 'admin',
   args:
-    '{ squad: string (id|slug), slug?: string (new slug, must end "-sqd" — mupot#1495), budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
+    '{ squad: string (id|slug), slug?: string (new slug, must end "-sqd" — mupot#1495), budget_cap_cents?: number|null, budget_window?: "day"|"week", dyad_agent_a?: string|null (id|slug), dyad_agent_b?: string|null (id|slug) (pin an approved review pair, set together or both null to clear; org owner/admin only, never a home squad), reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       squad: STRING_SCHEMA,
       slug: STRING_SCHEMA,
+      dyad_agent_a: { type: ['string', 'null'] },
+      dyad_agent_b: { type: ['string', 'null'] },
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
@@ -2850,7 +2853,7 @@ const toolUpdateSquad: ToolSpec = {
       elevatedGrant = elevated.grant
     }
 
-    const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window'] as const
+    const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window', 'dyad_agent_a', 'dyad_agent_b'] as const
     const patch: UnitConfigPatch = {}
     for (const key of PATCHABLE) {
       if (key in args) patch[key] = args[key]
@@ -2889,15 +2892,19 @@ const toolUpdateSquad: ToolSpec = {
     // Before-image, read outside the UPDATE transaction — see the race caveat in
     // the doc comment above.
     const before = await env.DB.prepare(
-      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window, dyad_agent_a, dyad_agent_b FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string; dyad_agent_a: string | null; dyad_agent_b: string | null }>()
     if (!before) return fail(404, 'squad_not_found', { squad: squadRef })
 
     // An elevated AGENT may only LOWER a squad's budget (budget_cap_cents caps real objective spending). Raising or clearing
     // the cap, or changing the window, stays with a standing human admin (adversarial P1-B).
     if (elevationGrantId) {
+      // The dyad pair decides who reviews work by default: it is gate authority, so an elevated AGENT never flips it.
+      if ('dyad_agent_a' in patch || 'dyad_agent_b' in patch) {
+        return fail(403, 'forbidden', { reason: 'dyad_pair_standing_admin_only', remedy: 'An org owner/admin sets the dyad pair; an elevated agent may not.' })
+      }
       if ('budget_window' in patch) {
         return fail(403, 'forbidden', { reason: 'budget_window_standing_admin_only', remedy: 'A human admin changes a squad budget window; an elevated agent may only lower the cap.' })
       }
@@ -2916,6 +2923,31 @@ const toolUpdateSquad: ToolSpec = {
 
     const changedKeys = Object.keys(patch)
     const writePatch: UnitConfigPatch = { ...patch }
+    // Dyad pair: authority to say who gates whom is ORG-level and human. Squad admin is not enough, a bound agent is never
+    // enough (it would pick its own reviewer), and a home squad is a member's own, never a review pairing. Refs resolve to
+    // ids here; updateUnitConfig re-checks active + same-squad membership at the write.
+    if ('dyad_agent_a' in patch || 'dyad_agent_b' in patch) {
+      if (auth.boundAgentId != null || !isOrgOwnerAdmin(auth)) {
+        return fail(403, 'forbidden', { need: 'admin', scope: 'org', reason: 'dyad_pair_org_admin_only' })
+      }
+      if (squad.kind !== 'work') return fail(403, 'forbidden', { reason: 'dyad_pair_not_on_home_squad' })
+      if (!('dyad_agent_a' in patch) || !('dyad_agent_b' in patch)) {
+        return fail(400, 'invalid_args', { reason: 'dyad_agent_a and dyad_agent_b are set together (or both null to clear)' })
+      }
+      if (patch.dyad_agent_a === null && patch.dyad_agent_b === null) {
+        writePatch.dyad_agent_a = null
+        writePatch.dyad_agent_b = null
+      } else {
+        const refA = str(patch.dyad_agent_a)
+        const refB = str(patch.dyad_agent_b)
+        if (!refA || !refB) return fail(400, 'invalid_args', { reason: 'dyad pair needs two agent refs, or both null to clear' })
+        const ra = await resolveAgentRef(env, refA)
+        const rb = await resolveAgentRef(env, refB)
+        if (!ra.ok || !rb.ok) return fail(400, 'invalid_args', { reason: 'dyad_agent_not_found' })
+        writePatch.dyad_agent_a = ra.value.id
+        writePatch.dyad_agent_b = rb.value.id
+      }
+    }
     // The 'only lower' rule must hold at WRITE time, not just against the value read above: two overlapping elevated updates
     // could both read 1000 and then write 400 and 900 (the second RAISES the live cap). So an elevated budget change is a
     // compare-and-swap against the value this call observed, and a lost race is a conflict, never a silent raise (bot P1).
@@ -2945,10 +2977,10 @@ const toolUpdateSquad: ToolSpec = {
     }
 
     const after = await env.DB.prepare(
-      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window, dyad_agent_a, dyad_agent_b FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string; dyad_agent_a: string | null; dyad_agent_b: string | null }>()
 
     const changed: Record<string, { from: unknown; to: unknown }> = {}
     for (const key of changedKeys) {

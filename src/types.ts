@@ -486,6 +486,9 @@ export interface Squad {
   autonomy: Autonomy
   budget_cap_cents: number | null
   budget_window: BudgetWindow
+  /** Pinned dyad review pair (migration 0246, src/gates/dyad.ts): both set or both null. Optional for legacy fixtures. */
+  dyad_agent_a?: string | null
+  dyad_agent_b?: string | null
   /**
    * Who created this row (migration 0166) — NULL for every row created
    * before this column existed. Provenance ground for team_bootstrap's

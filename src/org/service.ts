@@ -1144,6 +1144,10 @@ export interface UnitConfigPatch {
   // an agent's slug bypass update_agent's own checks. See isValidSquadSlugUpdate
   // below for why a squad's NEW slug must carry the '-sqd' suffix.
   slug?: unknown
+  // dyad_agent_a / dyad_agent_b — SQUAD ONLY, resolved agent ids set together, or both null to clear
+  // (migrations/0246; see src/gates/dyad.ts). The caller (update_squad) owns the org-admin floor.
+  dyad_agent_a?: unknown
+  dyad_agent_b?: unknown
 }
 
 export type UpdateUnitConfigResult =
@@ -1160,6 +1164,7 @@ export type UpdateUnitConfigResult =
         | 'invalid_budget_cap_cents'
         | 'invalid_budget_window'
         | 'invalid_slug'
+        | 'invalid_dyad_pair'
         | 'slug_taken'
     }
 
@@ -1285,6 +1290,29 @@ export async function updateUnitConfig(
     if (!isValidSquadSlugUpdate(patch.slug)) return { ok: false, error: 'invalid_slug' }
     setClauses.push('slug = ?')
     binds.push(patch.slug)
+  }
+
+  // dyad pair — squad-only, both keys together: two DISTINCT agent ids that are active agents of THIS squad, or
+  // both null to clear. Checked here (the write chokepoint) so no caller can pin a stranger or a half pair.
+  if ('dyad_agent_a' in patch || 'dyad_agent_b' in patch) {
+    if (kind !== 'squad' || !('dyad_agent_a' in patch) || !('dyad_agent_b' in patch)) return { ok: false, error: 'invalid_dyad_pair' }
+    const a = patch.dyad_agent_a
+    const b = patch.dyad_agent_b
+    if (a === null && b === null) {
+      setClauses.push('dyad_agent_a = ?', 'dyad_agent_b = ?')
+      binds.push(null, null)
+    } else if (typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && a !== b) {
+      const ok = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM agents WHERE id IN (?1, ?2) AND squad_id = ?3 AND status = 'active'`,
+      )
+        .bind(a, b, id)
+        .first<{ n: number }>()
+      if (!ok || ok.n !== 2) return { ok: false, error: 'invalid_dyad_pair' }
+      setClauses.push('dyad_agent_a = ?', 'dyad_agent_b = ?')
+      binds.push(a, b)
+    } else {
+      return { ok: false, error: 'invalid_dyad_pair' }
+    }
   }
 
   // Nothing to patch — treat as a no-op success (caller is responsible for sending

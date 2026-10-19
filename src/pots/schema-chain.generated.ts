@@ -4332,9 +4332,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0246_squad_dyad_gate.sql",
+    sha256: "3d057d4c619e5dcd607eb714a3c1c60488fec2d2ae177650147d1b073355bc0d",
+    statements: [
+      "-- 0246 squad dyad pair: an APPROVED, PINNED two-agent review pairing for a squad.\n--\n-- When dyad_agent_a / dyad_agent_b are set (always together), a task_create in that squad by\n-- one of the pair with NO explicit gate_owner defaults gate_owner to the other's gate\n-- (gate:<peer.slug>), only if the peer is the EXCLUSIVE live holder of that capability.\n-- The human is not the default code reviewer. Pinning (not \"whichever two are active\")\n-- means roster drift never changes who the peer is. NULL/NULL = policy off, every existing\n-- squad unchanged. Set/cleared only by an org owner/admin (update_squad); both agents must\n-- be active members of the squad at set time and are re-checked at every use.\nALTER TABLE squads ADD COLUMN dyad_agent_a TEXT;",
+      "\nALTER TABLE squads ADD COLUMN dyad_agent_b TEXT;",
+      "\nCREATE TRIGGER IF NOT EXISTS squads_dyad_pair_shape_ins BEFORE INSERT ON squads\nWHEN (NEW.dyad_agent_a IS NULL) != (NEW.dyad_agent_b IS NULL) OR NEW.dyad_agent_a = NEW.dyad_agent_b\nBEGIN SELECT RAISE(ABORT, 'dyad pair must be two distinct agents set together'); END;",
+      "\nCREATE TRIGGER IF NOT EXISTS squads_dyad_pair_shape_upd BEFORE UPDATE OF dyad_agent_a, dyad_agent_b ON squads\nWHEN (NEW.dyad_agent_a IS NULL) != (NEW.dyad_agent_b IS NULL) OR NEW.dyad_agent_a = NEW.dyad_agent_b\nBEGIN SELECT RAISE(ABORT, 'dyad pair must be two distinct agents set together'); END;",
+    ],
+    objects: [
+      { type: "trigger", name: "squads_dyad_pair_shape_ins" },
+      { type: "trigger", name: "squads_dyad_pair_shape_upd" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "7c13746be71753799b64d252d8581506478311a8a2cf45352aa402fdd358fe15"
+export const SCHEMA_CHAIN_DIGEST: string = "cab81b0d28d4578e70a7be06ca828cf9354e6ddfbb3a369bedd7874e87611648"

@@ -38,6 +38,7 @@ import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityF
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { resolveDyadGateDefault } from '../gates/dyad'
 import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
 import { isHumanOriginAttestorToken } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -1285,6 +1286,18 @@ const toolTaskCreate: ToolSpec = {
       gateOwner = candidate
     }
 
+    // Dyad default (migrations/0246, src/gates/dyad.ts). ONLY when the caller passed no gate_owner
+    // at all; an explicit value always wins. Human gates (gate:hadi, member-principal gates) are
+    // reserved for money, identity, external and publish work and are never defaulted here.
+    let dyadNextStep: string | undefined
+    if (gateOwner === null && !observedCreate.forceNoDispatch && (args.gate_owner === undefined || args.gate_owner === null)) {
+      const dyad = await resolveDyadGateDefault(env, squad.id, auth.boundAgentId ?? null, assignee.value ?? null)
+      if (dyad) {
+        gateOwner = dyad.gate_owner
+        dyadNextStep = dyad.next_step
+      }
+    }
+
     const projectId = args.project_id == null ? null : str(args.project_id)
     if (args.project_id != null && !projectId) return fail(400, 'invalid_project_id')
 
@@ -1336,7 +1349,9 @@ const toolTaskCreate: ToolSpec = {
     if (dispatchOn) {
       await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil, assignment: task.updated_at })
     }
-    return done(observedCreate.forceNoDispatch ? { task, dispatch: false, note: 'observed seat: proposal-only task; dispatch off, no assignee, marked external (observed-seat) so no agent auto-picks it until a human assigns it' } : { task })
+    return done(observedCreate.forceNoDispatch
+      ? { task, dispatch: false, note: 'observed seat: proposal-only task; dispatch off, no assignee, marked external (observed-seat) so no agent auto-picks it until a human assigns it' }
+      : dyadNextStep ? { task, next_step: dyadNextStep } : { task })
   },
 }
 
