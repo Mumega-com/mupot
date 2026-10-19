@@ -77,6 +77,15 @@ CHANGELOG; this lists what the re-scope below builds on.
   approval expiry (count-only unless enforced by deployment var), and board cleanup.
   Migrations 0206–0234.
 
+- 2026-10-18 → 10-19 (see CHANGELOG `[Unreleased]`, "Release-scope highlights,
+  2026-10-18 → 2026-10-19"): the onboarding door: seat attach to designated agents
+  (#2042, migration 0238), attach code and per-chat binding (#2055, #2057, migration 0240),
+  the VIP lane `join_squad` with proposal-only observed seats, a boot join list and human
+  Hold/Release (#2059, #2062, #2063, #2064, #2065, migration 0241), the tenant-header
+  notice (#2058), reply-to-sender (#2041, #2052), the admission tape in shadow (#2034),
+  the installer window (#2039), and connections dashboard fixes (#2046, #2048, #2050).
+  Flags ship off. Migrations 0235–0242.
+
 ### After v0.31.0
 
 - Agent profiles, `agent_of_choice`, and steward design — #1564.
@@ -852,6 +861,12 @@ Release contract (done-when). `v0.32.0` is stable only when all seven hold:
    evidence passes `release-integrity-check.json`, and the version-specific final
    postpublication readiness check and independent verdict pass. Publication alone
    does not satisfy stable completion.
+
+Onboarding-door items merged to `main` toward this release (merged, not released; not a
+stable verdict): `whoami` (#2031 and the whoami lane), seat attach with designation
+(#2042), per-chat binding and attach code (#2055, #2057), and the VIP lane / `join_squad`
+(#2059, #2062, #2063, #2064, #2065). Open follow-ups: #2051, #2053, #2056, #2060, #2061,
+#2069.
 
 Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
 met by the frozen SHA, not by the existence of those PRs.
