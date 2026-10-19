@@ -249,6 +249,43 @@ export function homeOwnerStandingSql(
   )`
 }
 
+// Fourth branch (owner-admin standing): a host agent whose agents.owner_member_id currently
+// holds rank >= admin on the target squad (live capabilities via currentMemberRankAtLeastSql,
+// which also admits org owner/admin) has standing there, so an owner can wake a seat in a
+// non-home squad he administers from a host he owns. ONE predicate shared with HOST_STANDING_SQL.
+//   - host agent row active AND not archived;
+//   - owner_member_id non-NULL and non-'' (explicit, never a join miss);
+//   - the owner member is active and pinned to the pot's tenant (tenantExpr);
+//   - the target squad must be kind <> 'home' AND status = 'active' (a home squad's reach is only
+//     the home-owner branch; an exact squad-scoped admin row on someone else's home confers none,
+//     and an archived squad is never a target). squads has no tenant column (one pot per DB),
+//     so the tenant pin is the owner-member join above;
+//   - the grant's WRITER must BE the owner (the #2079 round-1 P0: a missing writer binding
+//     let an admin re-point owner_member_id and mint reach under someone else's rank);
+//   - rank is judged on the OWNER, live, on every use. Hosts with no owner never match.
+export function ownerAdminStandingSql(
+  hostIdExpr: string,
+  squadIdExpr: string,
+  writerIdExpr: string,
+  tenantExpr: string,
+): string {
+  return `EXISTS (
+    SELECT 1 FROM agents oa
+      JOIN members oam ON oam.id = oa.owner_member_id AND oam.status = 'active' AND oam.tenant = ${tenantExpr}
+      JOIN squads os ON os.id = ${squadIdExpr} AND os.kind <> 'home' AND os.status = 'active'
+     WHERE oa.id = ${hostIdExpr}
+       AND oa.status = 'active' AND oa.archived_at IS NULL
+       AND oa.owner_member_id IS NOT NULL AND oa.owner_member_id <> ''
+       AND ${writerIdExpr} = oa.owner_member_id
+       AND ${currentMemberRankAtLeastSql('squad', {
+         inviterIdParam: 'oa.owner_member_id',
+         scopeIdParam: squadIdExpr,
+         requiredRankParam: String(capabilityRank('admin')),
+         nowParam: "datetime('now')",
+       })}
+  )`
+}
+
 async function hostHasStandingInSquad(
   env: Env,
   hostAgentId: string,
@@ -261,6 +298,9 @@ async function hostHasStandingInSquad(
   const asHomeOwner = await env.DB.prepare(`SELECT 1 AS x WHERE ${homeOwnerStandingSql('?1', '?2', '?3', '?4')}`)
     .bind(hostAgentId, squadId, writerMemberId, env.TENANT_SLUG).first()
   if (asHomeOwner) return true
+  const asOwnerAdmin = await env.DB.prepare(`SELECT 1 AS x WHERE ${ownerAdminStandingSql('?1', '?2', '?3', '?4')}`)
+    .bind(hostAgentId, squadId, writerMemberId, env.TENANT_SLUG).first()
+  if (asOwnerAdmin) return true
   const key = await loadActiveAgentKey(env, hostAgentId)
   if (!key) return false
   const grants = await resolveCapabilities(env, key.member_id)
@@ -378,6 +418,7 @@ export type SeatAuthorization = 'granted' | 'not_granted' | 'error'
 const HOST_STANDING_SQL = `(
   EXISTS (SELECT 1 FROM agents ha WHERE ha.id = g.host_agent_id AND ha.squad_id = a.squad_id)
   OR ${homeOwnerStandingSql('g.host_agent_id', 'a.squad_id', 'g.granted_by_member_id', 'g.tenant')}
+  OR ${ownerAdminStandingSql('g.host_agent_id', 'a.squad_id', 'g.granted_by_member_id', 'g.tenant')}
   OR ${currentMemberRankAtLeastSql('squad', {
     inviterIdParam: 'k.member_id',
     scopeIdParam: 'a.squad_id',
