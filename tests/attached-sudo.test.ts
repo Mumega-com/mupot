@@ -490,8 +490,11 @@ describe('sudo for attached chats: the grant belongs to ONE attachment', () => {
     h.sqlite.exec(`UPDATE agent_seat_admissions SET requested_seat_id = (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1) WHERE agent_id = 'agent-rava' AND status = 'live'`)
     expect((await attach(w.env, w.g, 'conv-b', 'rava')).sc.status).toBe('attached')
     const second = await applySeatForRequest(w.env, w.g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
-    expect(second.seatBinding?.attached?.agentId).toBe('agent-rava')
-    expect(second.seatBinding?.attached?.attachmentId).not.toBe((await w.att()).seatBinding?.attached?.attachmentId)
+    // the admission is bound to the FIRST chat (#2056): the resolver no longer lets a legacy cross-seat attachment act as the agent,
+    // so the second chat falls back to its own identity (a fortiori it inherits nothing)
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET requested_seat_id = (SELECT seat_id FROM agent_seat_attachments ORDER BY created_at, rowid LIMIT 1) WHERE agent_id = 'agent-rava' AND status = 'live'`)
+    const secondResolved = await applySeatForRequest(w.env, w.g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-b', codexThreadId: null } })
+    expect(secondResolved.seatBinding?.attached).toBeUndefined()
     await invokeTool(second, w.env, 'check_in', {}, POT)
     h.sqlite.exec(`UPDATE squads SET budget_cap_cents = NULL WHERE id = 'squad-core'`)
     expect((await updateSquad(w, 'squad-core', second)).ok).toBe(false)
@@ -817,6 +820,8 @@ describe('sudo for attached chats: decide-time liveness mirrors use-time (each m
   // broken in production; the SQL mirrors them anyway (defence in depth) and they are deliberately not prestated here.
   const BREAKS: Array<[string, (member: string) => string]> = [
     ['seat retired', () => `UPDATE agent_seats SET retired_at = '2026-10-14 00:00:00'`],
+    ['admission bound to another chat (#2056)', () => `DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable; UPDATE agent_seat_admissions SET requested_seat_id = 'seat-other'`],
+    ['admission binding NULL (#2056)', () => `DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable; UPDATE agent_seat_admissions SET requested_seat_id = NULL`],
     ['agent inactive', () => `UPDATE agents SET status = 'inactive' WHERE id = 'agent-rava'`],
     ['seat token not directory channel', () => `UPDATE member_tokens SET channel = 'workspace' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],
     ['seat token not for this agent', () => `UPDATE member_tokens SET agent_id = NULL WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],

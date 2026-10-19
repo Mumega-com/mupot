@@ -25,7 +25,7 @@
 // EVERY function that reads "now" takes it as an explicit parameter (default
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
-import { attachDesignatedClause } from '../members/attach-designated'
+import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
 import { capabilityRank, hasCapabilityOnDynamicScope, humanVerifiedLegacyRoleRank, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
@@ -498,7 +498,7 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
   try {
     const row = await env.DB.prepare(
       `SELECT att.id AS attachment_id, att.human_member_id AS human_member_id, att.agent_id AS agent_id,
-              CASE WHEN att.detached_at IS NULL AND adm.status = 'live'
+              CASE WHEN att.detached_at IS NULL AND adm.status = 'live' AND ${ADMISSION_BOUND_TO_SEAT_SQL}
                     AND EXISTS (SELECT 1 FROM agent_seats s WHERE s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL
                                   AND s.member_id = att.human_member_id AND s.harness_id = att.harness_id)
                     AND EXISTS (SELECT 1 FROM agents a
