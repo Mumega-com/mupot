@@ -373,16 +373,42 @@ describe('HTTP door: POST /departments/:id/squads (mupot#1906)', () => {
     expect(usage('action:project_lifecycle')).toBeGreaterThan(0)
   })
 
-  it('capability floor: a zero-admin agent + matching grant is refused over HTTP (as on MCP); an admin-somewhere agent + matching grant is allowed', async () => {
+  it('no standing floor on the elevated branch (parity with MCP ELEVATION_FLOOR_BYPASS_TOOLS): zero-admin + matching grant is allowed; zero-admin + non-matching grant is 403', async () => {
     flagOn()
     const sessionId = await checkIn()
     await approve(sessionId, 'department', DEPT_A, 60, T0, ['action:project_lifecycle'])
-    const zero = await postSquad(DEPT_A, 'http-zero-admin', agentAuth())
-    expect(zero.status).toBe(403)
-    expect(squadExists('http-zero-admin')).toBe(false)
+    const ok = await postSquad(DEPT_A, 'http-zero-admin-ok', agentAuth())
+    expect(ok.status, await ok.clone().text()).toBeLessThan(300)
+    expect(squadExists('http-zero-admin-ok')).toBe(true)
+    const no = await postSquad(DEPT_B, 'http-zero-admin-no', agentAuth())
+    expect(no.status).toBe(403)
+    expect(squadExists('http-zero-admin-no')).toBe(false)
+  })
+
+  it('usage receipt only after success: bad body and slug conflict leave no usage row; success leaves exactly one', async () => {
+    flagOn()
+    const sessionId = await checkIn()
+    await approve(sessionId, 'department', DEPT_A, 60, T0, ['action:project_lifecycle'])
+    const { orgApp } = await import('../src/org/index')
+    authState.current = agentAuth()
+    const bad = await orgApp.request(`/departments/${DEPT_A}/squads`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{not json' }, env)
+    expect(bad.status).toBe(400)
     expect(usage('action:project_lifecycle')).toBe(0)
-    const admin = await postSquad(DEPT_A, 'http-admin-elsewhere', deptBAdmin())
-    expect(admin.status, await admin.clone().text()).toBeLessThan(300)
+    expect((await postSquad(DEPT_A, 'dup-sq', agentAuth())).status).toBeLessThan(300)
+    expect(usage('action:project_lifecycle')).toBe(1)
+    const dup = await postSquad(DEPT_A, 'dup-sq', agentAuth())
+    expect(dup.status).toBeGreaterThanOrEqual(400)
+    expect(usage('action:project_lifecycle')).toBe(1)
+  })
+
+  it('MCP create_squad: slug conflict leaves no usage row; success leaves one', async () => {
+    flagOn()
+    const sessionId = await checkIn()
+    await approve(sessionId, 'department', DEPT_A, 60, T0, ['action:project_lifecycle'])
+    expect((await createSquadVia(DEPT_A, 'a1-sqd', agentAuth())).ok).toBe(false) // slug of an existing squad
+    expect(usage('action:project_lifecycle')).toBe(0)
+    expect((await createSquadVia(DEPT_A, 'mcp-fresh', agentAuth())).ok).toBe(true)
+    expect(usage('action:project_lifecycle')).toBe(1)
   })
 
   it('flag ON: a human admin is unchanged; flag OFF: a standing dept admin agent is unchanged', async () => {

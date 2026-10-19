@@ -36,12 +36,12 @@ import { csrf } from 'hono/csrf'
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
-import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
+import { resolveCapabilities, hasCapability, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
-import { hasElevatedAction } from '../auth/elevation'
+import { hasElevatedAction, recordGrantUsage, type ElevationGrantRecord } from '../auth/elevation'
 import { agentMustHoldMatchingGrant, authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
 import {
@@ -235,17 +235,17 @@ orgApp.post('/departments/:id/squads', async (c) => {
   // department returns agent_legacy, and its standing admin here must not ride that (mupot#1906). It needs a grant matching
   // THIS department, same rule as the MCP door. Humans (and flag-off agents) keep the standing path.
   let createdViaElevationGrant: string | undefined
+  let elevatedGrant: ElevationGrantRecord | undefined
   if (gate.kind !== 'delegated' && (agentMustHoldMatchingGrant(c.env, c.get('auth'), 'create_squad') || !(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin')))) {
     if (gate.kind !== 'agent_legacy') return c.json({ error: 'forbidden', need: 'admin' }, 403)
-    // Same capability floor the MCP dispatcher applies to create_squad (spec.min 'admin'): a zero-admin agent holding a matching
-    // grant is refused on MCP, so it is refused here too (HTTP == MCP).
-    if (!hasWorkspaceAdmin(c.get('auth')) && !holdsCapabilityFloor(c.get('auth'), 'admin')) return c.json({ error: 'forbidden', need: 'admin' }, 403)
     const elevated = await hasElevatedAction(c.env, c.get('auth'), 'action:project_lifecycle', 'department', departmentId, {
       toolName: 'create_squad',
       detail: { department_id: departmentId, via: 'http' },
+      recordUsage: false, // settled by recordGrantUsage only after createSquad succeeds
     })
     if (!elevated.granted) return c.json({ error: 'forbidden', need: 'admin', elevation_denied: elevated.reason }, 403)
     createdViaElevationGrant = elevated.grant.id
+    elevatedGrant = elevated.grant
   }
 
   let body: CreateSquadBody
@@ -287,6 +287,7 @@ orgApp.post('/departments/:id/squads', async (c) => {
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
+  if (elevatedGrant) await recordGrantUsage(c.env, elevatedGrant, 'action:project_lifecycle', 'create_squad', { department_id: departmentId, squad_id: result.value.id, via: 'http' })
   return c.json({ squad: result.value }, 201)
 })
 

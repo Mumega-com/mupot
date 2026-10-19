@@ -131,6 +131,7 @@ import {
   elevationRemedyMessage,
   elevationHint,
   recordElevationUsage,
+  recordGrantUsage,
   type ElevationGrantRecord,
 } from '../auth/elevation'
 
@@ -663,6 +664,7 @@ const toolCreateSquad: ToolSpec = {
     // so a slug_taken refusal (or an adopt:true override) can report "created
     // by member X under elevation receipt Y" rather than just naming the actor.
     let createdViaElevationGrant: string | undefined
+    let squadElevatedGrant: ElevationGrantRecord | undefined
     // An installer window authorised this create (synthesized delegation `elev:<grantId>`): stamp the grant, same as the legacy elevation lane.
     if (squadGate.kind === 'delegated' && isInstallerDelegationId(squadGate.delegation.id)) {
       createdViaElevationGrant = installerGrantIdOf(squadGate.delegation.id)
@@ -674,6 +676,7 @@ const toolCreateSquad: ToolSpec = {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
         detail: { department_id: dept.id, slug: args.slug },
+        recordUsage: false, // settled by recordGrantUsage only after createSquad succeeds
       })
       if (!elevated.granted) {
         return fail(403, 'forbidden', {
@@ -684,6 +687,7 @@ const toolCreateSquad: ToolSpec = {
         })
       }
       createdViaElevationGrant = elevated.grant.id
+      squadElevatedGrant = elevated.grant
     }
 
     const result = await createSquad(
@@ -705,6 +709,7 @@ const toolCreateSquad: ToolSpec = {
     )
     await finishDelegatedReceipt(env, squadGate, result.ok)
     if (!result.ok) return createErrorToFail(result.error)
+    if (squadElevatedGrant) await recordGrantUsage(env, squadElevatedGrant, 'action:project_lifecycle', 'create_squad', { department_id: dept.id, squad_id: result.value.id, slug: args.slug })
     await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {
       squad_id: result.value.id,
     })
