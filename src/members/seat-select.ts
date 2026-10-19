@@ -61,6 +61,7 @@ import {
 import { loadHarness, seatAutoEnrollEnabled, type HarnessRow } from './harness'
 import { normalizeSeatKey, seatKeyHash, type NormalizedSeatKey, type SeatKeyArgs } from './seat-key'
 import { prepareSeatHandleIssue } from './seat-handle'
+import { vipLaneEnabled } from './vip-lane'
 import { deriveSeatName } from './seat-name'
 
 export const SEAT_MAX_PER_MEMBER_DEFAULT = 16
@@ -336,6 +337,16 @@ async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow, 
   }
 }
 
+async function harnessHasHeldAutoSeat(env: Env, harnessId: string): Promise<boolean> {
+  try {
+    const r = await env.DB.prepare(`SELECT 1 AS one FROM agent_seats s WHERE s.tenant = ?1 AND s.harness_id = ?2 AND s.source = 'auto' AND s.retired_at IS NULL AND s.admission_status = 'held' LIMIT 1`)
+      .bind(env.TENANT_SLUG, harnessId).first<{ one: number }>()
+    return r !== null
+  } catch {
+    return false
+  }
+}
+
 async function refundAutoSeatWindow(env: Env, harnessId: string): Promise<void> {
   try {
     await env.DB.prepare(`UPDATE auto_seat_windows SET count = MAX(count - 1, 0) WHERE tenant = ?1 AND harness_id = ?2`)
@@ -348,6 +359,9 @@ async function refundAutoSeatWindow(env: Env, harnessId: string): Promise<void> 
 /** Reclaim statements for a full auto pool (see resolveOrCreateSeat). Params: 1 tenant, 2 harness,
  *  3 now, 4 live cap. The victim is chosen INSIDE the statement (LRU among LIVE auto seats of this
  *  harness), so concurrent batches serialise on the cap, never on a stale pre-read. */
+/** SQL fragment over `s` (agent_seats): the seat is not held. NULL status = never classified = reclaimable as before. */
+export const NOT_HELD_SQL = `(s.admission_status IS NULL OR s.admission_status <> 'held')`
+
 export function prepareAutoSeatReclaim(env: Env, harnessId: string, liveCap: number, nowIso: string): D1PreparedStatement[] {
   const live = `SELECT s.id FROM agent_seats s JOIN agents a ON a.id = s.agent_id
                  WHERE s.tenant = ?1 AND s.harness_id = ?2 AND s.source = 'auto' AND s.retired_at IS NULL
@@ -355,9 +369,12 @@ export function prepareAutoSeatReclaim(env: Env, harnessId: string, liveCap: num
   // W2: a seat with a LIVE attachment to an existing agent is PINNED. It still counts toward the pool (the cap
   // trigger counts it) but is never the reclaim victim; only the human's detach / an admission revoke unpins it.
   // Flag off => no read of agent_seat_attachments at all, so code can deploy before migration 0220 is applied.
-  const victims = seatAttachEnabled(env)
+  const pinned = seatAttachEnabled(env)
     ? `${live} AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments pin WHERE pin.seat_id = s.id AND pin.detached_at IS NULL)`
     : live
+  // #2069: a HELD seat is NEVER the reclaim victim (it still counts toward the cap). Reclaiming it would let the returning chat come
+  // back as a fresh seat with admission_status NULL, i.e. the hold escaped. Only the human's release/return unpins it. VIP_LANE off => unchanged.
+  const victims = vipLaneEnabled(env) ? `${pinned} AND ${NOT_HELD_SQL}` : pinned
   const retired = `SELECT agent_id FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'auto' AND retired_at = ?3`
   return [
     // W2: attached threads idle for ATTACH_IDLE_DAYS are detached FIRST (unpinned), so a pool full of forgotten pinned
@@ -613,7 +630,11 @@ export async function resolveOrCreateSeat(
     // The batch is atomic: nothing from it is live, so there is nothing to compensate (the window spend
     // is refunded: a creation that did not happen must not eat the abuse budget).
     if (isAuto) await refundAutoSeatWindow(env, harness.id)
-    if (err instanceof Error && err.message.includes('seat_auto_cap_exceeded')) return { ok: false, error: 'seat_cap_reached', detail: { auto_live_cap: autoLiveCap } }
+    if (err instanceof Error && err.message.includes('seat_auto_cap_exceeded')) {
+      // #2069: when held seats are what keeps the pool full (they are never reclaimed), say who can free a slot.
+      const heldPinned = vipLaneEnabled(env) && isAuto && await harnessHasHeldAutoSeat(env, harness.id)
+      return { ok: false, error: 'seat_cap_reached', detail: heldPinned ? { auto_live_cap: autoLiveCap, reason: 'held_seats_pin_pool', who_acts: 'owner', next_step: 'Release a held chat on /connections to free a slot.' } : { auto_live_cap: autoLiveCap } }
+    }
     if (isTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
     if (isHarnessTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
     if (isCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { cap } }

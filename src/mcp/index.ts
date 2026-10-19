@@ -5105,7 +5105,7 @@ const toolInbox: ToolSpec = {
     // A HELD seat leaves no trace: the read never consumes (forced peek), whatever the caller asked.
     const peek = ctx?.heldSeat ? true : args.peek === true
     // W2: attached threads read the inbox without consuming it (see inbox_lease).
-    if (attachedAuthority(auth) && args.peek !== true) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot consume it')
+    if (attachedAuthority(auth) && !peek) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot consume it')
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
     let sinceSeq: number | undefined
@@ -7989,8 +7989,10 @@ export async function invokeTool(
   argsValue: unknown,
   originOrCtx: string | Partial<ToolCtx> = '',
 ): Promise<ToolOutcome & { tool?: string }> {
-  const outcome = await invokeToolInner(auth, env, toolName, argsValue, originOrCtx)
-  if (admissionTapeEnabled(env)) {
+  // invokeToolInner reports the held decision it already made at the floor (no second read): a held seat leaves no tape row.
+  const held = { seat: false }
+  const outcome = await invokeToolInner(auth, env, toolName, argsValue, originOrCtx, held)
+  if (admissionTapeEnabled(env) && !held.seat) {
     try {
       const spec = typeof toolName === 'string' ? TOOL_BY_NAME.get(toolName) : undefined
       const ctx = typeof originOrCtx === 'string' ? undefined : originOrCtx
@@ -8018,6 +8020,7 @@ async function invokeToolInner(
   toolName: unknown,
   argsValue: unknown,
   originOrCtx: string | Partial<ToolCtx> = '',
+  heldOut?: { seat: boolean },
 ): Promise<ToolOutcome & { tool?: string }> {
   const ctx: ToolCtx = typeof originOrCtx === 'string'
     ? { origin: originOrCtx, transport: 'mcp' }
@@ -8038,6 +8041,11 @@ async function invokeToolInner(
 
   const spec = TOOL_BY_NAME.get(toolName)
   if (!spec) return { ...fail(400, 'unknown_tool', unknownToolDetail(toolName, env)), tool: toolName }
+
+  // #2069: the seat's admission decision is read ONCE, here, before any refusal can return: a held seat leaves no tape row even on
+  // the pre-floor exits (harness-session / flag refusals). The observed-floor block below only applies it.
+  const floorDecision = await observedFloorDecision(env, auth, spec.name)
+  if (floorDecision.status === 'held') { ctx.heldSeat = true; if (heldOut) heldOut.seat = true }
 
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
@@ -8065,9 +8073,8 @@ async function invokeToolInner(
   // #2035 wall 1: the OBSERVED FLOOR. A seat whose agent_seats.admission_status is observed (or held) may call only
   // OBSERVED_FLOOR_TOOLS; decided per tool NAME, re-read from the seat row on every call, before args handling and the capability floor.
   {
-    const decision = await observedFloorDecision(env, auth, spec.name)
+    const decision = floorDecision
     const floor = decision.refusal
-    if (decision.status === 'held') ctx.heldSeat = true
     if (floor) {
       return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
     }
