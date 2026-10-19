@@ -410,8 +410,13 @@ export async function recordTokens(
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /** '<tenant>:<agent_id>:<YYYY-MM-DD>' UTC. */
-function buildWindowKey(tenant: string, agentId: string): string {
-  return `${tenant}:${agentId}:${isoDateUtc(new Date())}`
+function buildWindowKey(tenant: string, agentId: string, at: Date = new Date()): string {
+  return `${tenant}:${agentId}:${isoDateUtc(at)}`
+}
+
+/** The window row a given instant's spend belongs to (the provider kernel settles against the day a run was RESERVED, not the day it ended). */
+export function meterWindowKeyAt(tenant: string, agentId: string, at: Date): string {
+  return buildWindowKey(tenant, agentId, at)
 }
 
 /** YYYY-MM-DD (UTC) for a Date. */

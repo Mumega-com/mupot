@@ -16,17 +16,25 @@
 //                      self-report.
 //
 // A replay of an already-reserved idempotency key skips steps 1-2's SPEND (it is not a new run) but still honours the kill switch.
+// RECONCILE NEVER LAUNCHES: it observes an attached run and closes a stuck or stale one. Only dispatchViaKernel (and kernelLaunchCursor, the
+// Studio door) may put a request on the wire to a vendor, and both pass the kill switch and the budget gate first.
+// The dollar cap is RESERVED at admission (the adapter's estimate is added to the agent's window cost) and ADJUSTED at finalize (actual
+// minus estimate), so N in-flight runs cannot together exceed budget_cap_cents; a run that never launched refunds its whole slot.
 
 import type { Agent, Env } from '../types'
-import { buildAuthorizedExecution, checkAndReserve, recordTokens, remainingCostMicroUsd } from '../agents/meter'
+import { buildAuthorizedExecution, checkAndReserve, meterWindowKeyAt, recordTokens, remainingCostMicroUsd } from '../agents/meter'
 import { createTask } from '../tasks/service'
 import type { FlightSignals } from '../flight/preflight'
 import { mintRawToken, revokeMemberToken, sha256Hex } from '../members/service'
+import { launchCursorAgent, type CursorLaunchOutcome } from '../cursor/client'
 import {
+  blockTaskForFailedReservation,
   getReservation,
   getReservationByIdempotency,
+  LAUNCH_LEASE_EXPIRED_ERROR,
   listReconcileBatch,
   markReconciled,
+  RESERVATION_STUCK_MS,
   type HarnessReservationRow,
 } from './reservations'
 import { getHarnessAdapter } from './registry'
@@ -127,6 +135,12 @@ async function mintRunToken(env: Env, agentId: string): Promise<{ raw: string; i
       WHERE b.tenant = ?1 AND b.agent_id = ?2 LIMIT 1`,
   ).bind(env.TENANT_SLUG, agentId).first<{ member_id: string }>()
   if (!binding) return null
+  // Member tier, explicitly: a run token carries whatever its member's capability rows grant at auth time, so a member holding lead / admin /
+  // owner anywhere gets NO run token (the dispatch is refused) rather than a credential stronger than the agent's own member tier.
+  const above = await env.DB.prepare(
+    `SELECT 1 AS x FROM capabilities WHERE member_id = ?1 AND capability IN ('lead','admin','owner') AND (expires_at IS NULL OR expires_at > ?2) LIMIT 1`,
+  ).bind(binding.member_id, new Date().toISOString()).first<{ x: number }>()
+  if (above) return null
   const ttl = Math.min(Math.max(Number(env.HARNESS_RUN_TOKEN_TTL_MINUTES) || RUN_TOKEN_MAX_TTL_MINUTES, 1), RUN_TOKEN_MAX_TTL_MINUTES)
   const raw = mintRawToken()
   const id = crypto.randomUUID()
@@ -149,9 +163,51 @@ async function revokeRunToken(env: Env, row: Pick<HarnessReservationRow, 'run_to
   await revokeMemberToken(env, row.run_token_member_id, row.run_token_id)
 }
 
-// ── the pipeline ─────────────────────────────────────────────────────────────────────────────────────────────
+// ── the meter slot: reserved at admission, settled at finalize ──────────────────────────────────────────────
+
+/** Add `deltaMicroUsd` (may be negative) to the cost of the window a run was reserved in, never below zero. */
+async function adjustWindowCost(env: Env, agentId: string, at: Date, deltaMicroUsd: number, deltaCount = 0): Promise<void> {
+  if (deltaMicroUsd === 0 && deltaCount === 0) return
+  const key = meterWindowKeyAt(env.TENANT_SLUG, agentId, at)
+  await env.DB.prepare(
+    `UPDATE execution_meter SET cost_micro_usd = MAX(cost_micro_usd + ?2, 0), count = MAX(count + ?3, 0) WHERE window_key = ?1`,
+  ).bind(key, Math.round(deltaMicroUsd), deltaCount).run()
+}
+
+/** A slot that did not become a run (refused, thrown, or a concurrent duplicate that replayed another run): give the count and the estimate back. */
+async function refundSlot(env: Env, agentId: string, estimateMicroUsd: number, at: Date): Promise<void> {
+  try { await adjustWindowCost(env, agentId, at, -estimateMicroUsd, -1) } catch (error) {
+    console.error('[provider-kernel] slot refund failed', error instanceof Error ? error.message : String(error))
+  }
+}
 
 export interface KernelRefusal { accepted: false; error: 'provider_disabled' | 'budget_blocked' | 'agent_not_found' | 'agent_inactive'; detail?: Record<string, unknown> }
+
+type Admission = { ok: true; agent: KernelAgent; estimate: number; at: Date } | { ok: false; refusal: KernelRefusal }
+
+/**
+ * Steps 1-2 for any vendor call: the kill switch, then the budget gate with the estimate RESERVED into the agent's cost window so
+ * concurrent in-flight runs count against budget_cap_cents. A refusal creates nothing and raises the decision card.
+ */
+async function admit(env: Env, adapter: ProviderAdapter, req: DispatchRequest, spend: boolean): Promise<Admission> {
+  if (await isProviderDisabled(env, adapter.kind)) return { ok: false, refusal: { accepted: false, error: 'provider_disabled' } }
+  const agent = await loadKernelAgent(env, req.agentId)
+  if (!agent) return { ok: false, refusal: { accepted: false, error: 'agent_not_found' } }
+  if (agent.status !== 'active') return { ok: false, refusal: { accepted: false, error: 'agent_inactive' } }
+  const estimate = Math.max(Math.round(adapter.estimate(env, req)), 0)
+  const at = new Date()
+  if (spend) {
+    const gate = await checkAndReserve(env, buildAuthorizedExecution(env, agent, null, estimate))
+    if (!gate.ok) {
+      const card = await raiseBudgetDecisionCard(env, agent, gate.reason, adapter.kind, estimate)
+      return { ok: false, refusal: { accepted: false, error: 'budget_blocked', detail: { reason: gate.reason, retry_after_seconds: gate.retryAfterSec, ...(card ? { decision_card: card } : {}) } } }
+    }
+    await recordTokens(env, agent.id, 0, estimate) // reserve the dollars NOW (cost only; the slot count was taken by checkAndReserve)
+  }
+  return { ok: true, agent, estimate, at }
+}
+
+// ── the pipeline ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /** Dispatch through the kernel. THE entry point for every provider run: nothing else may call adapter.launch for a vendor run. */
 export async function dispatchViaKernel(
@@ -163,41 +219,70 @@ export async function dispatchViaKernel(
   // A local adapter's dry run writes nothing (grok-cli default): there is nothing to meter, reserve or mint.
   if (!adapter.capabilities().requiresApiToken && req.dryRun !== false) return adapter.launch(env, req, ctx)
 
-  if (await isProviderDisabled(env, adapter.kind)) return { accepted: false, error: 'provider_disabled' }
-
-  const agent = await loadKernelAgent(env, req.agentId)
-  if (!agent) return { accepted: false, error: 'agent_not_found' }
-  if (agent.status !== 'active') return { accepted: false, error: 'agent_inactive' }
-
   const existing = await getReservationByIdempotency(env, adapter.kind, req.squadId, req.idempotencyKey)
   const replay = existing !== null
-  const estimate = Math.max(Math.round(adapter.estimate(env, req)), 0)
-
-  if (!replay) {
-    // THE budget gate. Before the reservation, before any vendor call, before any token. A refusal creates nothing.
-    const gate = await checkAndReserve(env, buildAuthorizedExecution(env, agent, null, estimate))
-    if (!gate.ok) {
-      const card = await raiseBudgetDecisionCard(env, agent, gate.reason, adapter.kind, estimate)
-      return { accepted: false, error: 'budget_blocked', detail: { reason: gate.reason, retry_after_seconds: gate.retryAfterSec, ...(card ? { decision_card: card } : {}) } }
-    }
-  }
+  const admission = await admit(env, adapter, req, !replay)
+  if (!admission.ok) return admission.refusal
+  const { agent, estimate, at } = admission
 
   let runToken: { raw: string; id: string; memberId: string } | null = null
   if (!replay && adapter.capabilities().callback === 'mcp_token') {
     runToken = await mintRunToken(env, agent.id)
+    if (!runToken) {
+      await refundSlot(env, agent.id, estimate, at)
+      return { accepted: false, error: 'budget_blocked', detail: { reason: 'run_token_unavailable' } }
+    }
   }
 
-  const outcome = await adapter.launch(env, req, { ...ctx, ...(runToken ? { runToken: { raw: runToken.raw, id: runToken.id } } : {}) })
+  let outcome: DispatchOutcome
+  try {
+    outcome = await adapter.launch(env, req, { ...ctx, ...(runToken ? { runToken: { raw: runToken.raw, id: runToken.id } } : {}) })
+  } catch (error) {
+    // A throw after the credential was minted must not leave it live (it is TTL-bounded, but nothing used it): revoke, refund, rethrow.
+    if (runToken) { try { await revokeMemberToken(env, runToken.memberId, runToken.id) } catch { /* TTL still bounds it */ } }
+    if (!replay) await refundSlot(env, agent.id, estimate, at)
+    throw error
+  }
 
   if (runToken) {
     if (outcome.accepted && !outcome.replay) await recordRunToken(env, outcome.reservationId, runToken)
     else await revokeMemberToken(env, runToken.memberId, runToken.id) // refused or replayed: the credential was never used
   }
-  if (outcome.accepted && !outcome.replay) {
-    await env.DB.prepare(`UPDATE harness_reservations SET estimate_micro_usd = ?3 WHERE tenant = ?1 AND id = ?2 AND estimate_micro_usd IS NULL`)
-      .bind(env.TENANT_SLUG, outcome.reservationId, estimate).run()
+  if (!replay) {
+    // Not a new run (refused, or a concurrent duplicate that replayed the winner's reservation): the slot and the estimate go back, so the
+    // same idempotency key counts exactly once however many callers race it.
+    if (!outcome.accepted || outcome.replay) await refundSlot(env, agent.id, estimate, at)
+    else {
+      await env.DB.prepare(`UPDATE harness_reservations SET estimate_micro_usd = ?3 WHERE tenant = ?1 AND id = ?2 AND estimate_micro_usd IS NULL`)
+        .bind(env.TENANT_SLUG, outcome.reservationId, estimate).run()
+    }
   }
   return outcome
+}
+
+/**
+ * The Studio door: Studio launches a Cursor agent for a member without a reservation row of its own, so it cannot ride dispatchViaKernel,
+ * but it MUST NOT be a way around the kill switch or the meter. Same admission (kill switch, budget gate, estimate reserved, card on a cap
+ * hit); the slot is refunded when nothing launched and stays reserved for a launched or maybe-launched agent (it may be running).
+ */
+export async function kernelLaunchCursor(
+  env: Env,
+  adapter: ProviderAdapter,
+  admissionReq: DispatchRequest,
+  token: string,
+  launch: { name: string; repoUrl: string; prompt: string; model?: string },
+): Promise<{ ok: true; outcome: CursorLaunchOutcome } | { ok: false; refusal: KernelRefusal }> {
+  const admission = await admit(env, adapter, admissionReq, true)
+  if (!admission.ok) return { ok: false, refusal: admission.refusal }
+  let outcome: CursorLaunchOutcome
+  try {
+    outcome = await launchCursorAgent(token, launch)
+  } catch (error) {
+    await refundSlot(env, admission.agent.id, admission.estimate, admission.at)
+    throw error
+  }
+  if (outcome.state !== 'launched' && outcome.state !== 'maybe_launched') await refundSlot(env, admission.agent.id, admission.estimate, admission.at)
+  return { ok: true, outcome }
 }
 
 // ── 5 + 6. reconcile and finalize ────────────────────────────────────────────────────────────────────────────
@@ -235,9 +320,12 @@ export async function finalizeRun(env: Env, reservationId: string): Promise<Fina
   if ((claimed.meta?.changes ?? 0) !== 1) return none
 
   try {
-    if (cost > 0 || usage) {
-      const tokens = (usage?.input ?? 0) + (usage?.output ?? 0)
-      await recordTokens(env, row.agent_id, tokens, cost, usage ? { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite } : undefined)
+    // The estimate was RESERVED into the window at admission; settle by the difference (a run that never launched refunds all of it).
+    const reserved = Math.max(row.estimate_micro_usd ?? 0, 0)
+    await adjustWindowCost(env, row.agent_id, new Date(row.reserved_at), cost - reserved)
+    if (usage) {
+      const tokens = (usage.input ?? 0) + (usage.output ?? 0)
+      await recordTokens(env, row.agent_id, tokens, 0, { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite })
     }
     if (row.flight_id && launched) {
       // cost_metered = 1 only for a vendor-measured cost; an estimate stays 0 so a dashboard shows it as an estimate.
@@ -252,35 +340,59 @@ export async function finalizeRun(env: Env, reservationId: string): Promise<Fina
   return { reservationId, finalized: true, costMicroUsd: cost, estimated }
 }
 
-export interface ReconcileSweepResult { examined: number; reconciled: number; staleClosed: number; finalized: number }
+export interface ReconcileSweepResult { examined: number; reconciled: number; staleClosed: number; released: number; finalized: number }
 
 async function listUnfinalizedTerminal(env: Env, limit: number): Promise<HarnessReservationRow[]> {
   const res = await env.DB.prepare(
     `SELECT * FROM harness_reservations WHERE tenant = ?1 AND state IN ('reconciled','failed') AND finalized_at IS NULL
-       AND (vendor_run_id IS NOT NULL OR run_token_id IS NOT NULL)
+       AND (vendor_run_id IS NOT NULL OR run_token_id IS NOT NULL OR estimate_micro_usd IS NOT NULL)
       ORDER BY updated_at ASC LIMIT ?2`,
   ).bind(env.TENANT_SLUG, limit).all<HarnessReservationRow>()
   return res.results ?? []
 }
 
 /**
- * The scheduled reconcile (rides the maintenance cron). For every open reservation: ask its adapter to reconcile; an 'attached'
- * run the vendor never reports terminal past HARNESS_RUN_MAX_AGE_HOURS is closed as stale; every terminal run is finalized.
- * Bounded per tick, fail-soft per row.
+ * Release a reserved/attaching row that has outlived the stuck horizon. It is CLOSED, never attached: reconcile must not put a request on
+ * the wire. An 'attaching' row may have reached the vendor (the lease holder died mid-call), so it is closed exactly the way an expired lease
+ * is (launch_unconfirmed: lease_expired, never re-launched); a 'reserved' row was never leased, so nothing was launched.
+ */
+async function releaseStuckReservation(env: Env, row: HarnessReservationRow): Promise<boolean> {
+  const error = row.state === 'attaching' ? LAUNCH_LEASE_EXPIRED_ERROR : 'reserve_failed: released_unlaunched'
+  const res = await env.DB.prepare(
+    `UPDATE harness_reservations SET state = 'failed', last_error = ?3, attach_lease_until = NULL, updated_at = ?4
+      WHERE tenant = ?1 AND id = ?2 AND state IN ('reserved','attaching')`,
+  ).bind(env.TENANT_SLUG, row.id, error, new Date().toISOString()).run()
+  if ((res.meta?.changes ?? 0) !== 1) return false
+  if (row.task_id) await blockTaskForFailedReservation(env, row.task_id, row.id, error)
+  return true
+}
+
+/**
+ * The scheduled reconcile (rides the maintenance cron). RECONCILE NEVER LAUNCHES. For every open reservation:
+ *   - reserved / attaching: if older than the stuck horizon it is released (closed), otherwise left to its attacher. Never attached here.
+ *   - attached: the adapter observes the vendor run (read-only) and closes it when terminal; one the vendor never reports terminal past
+ *     HARNESS_RUN_MAX_AGE_HOURS is closed as stale.
+ * Every terminal run is then finalized. Rows are stamped reconcile_checked_at and served least-recently-checked first, so a long-running
+ * run cannot starve newer rows. Bounded per tick, fail-soft per row.
  */
 export async function reconcileProviderRuns(env: Env, limit = 25): Promise<ReconcileSweepResult> {
-  const out: ReconcileSweepResult = { examined: 0, reconciled: 0, staleClosed: 0, finalized: 0 }
+  const out: ReconcileSweepResult = { examined: 0, reconciled: 0, staleClosed: 0, released: 0, finalized: 0 }
   const maxAgeMs = (Number(env.HARNESS_RUN_MAX_AGE_HOURS) > 0 ? Number(env.HARNESS_RUN_MAX_AGE_HOURS) : DEFAULT_RUN_MAX_AGE_HOURS) * 3_600_000
   const open = await listReconcileBatch(env, limit)
   for (const row of open) {
     out.examined++
     try {
+      await env.DB.prepare(`UPDATE harness_reservations SET reconcile_checked_at = ?3 WHERE tenant = ?1 AND id = ?2`)
+        .bind(env.TENANT_SLUG, row.id, new Date().toISOString()).run()
+      if (row.state === 'reserved' || row.state === 'attaching') {
+        if (Date.now() - Date.parse(row.updated_at) > RESERVATION_STUCK_MS && await releaseStuckReservation(env, row)) out.released++
+        continue
+      }
       const adapter = getHarnessAdapter(row.adapter)
       if (!adapter) continue
-      const result = await adapter.reconcile(env, row.id)
+      const result = await adapter.reconcile(env, row.id) // 'attached' only: observation, never a launch
       if (result.nextState === 'reconciled' && result.changed) out.reconciled++
       if (result.nextState === 'attached' && Date.now() - Date.parse(row.reserved_at) > maxAgeMs) {
-        // Close a run the vendor never reports terminal: attached -> reconciled with an explicit stale status, never left open forever.
         if (await markReconciled(env, row.id, 'stale_timeout')) out.staleClosed++
       }
     } catch (error) {

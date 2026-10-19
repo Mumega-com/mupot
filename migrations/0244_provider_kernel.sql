@@ -14,6 +14,9 @@ ALTER TABLE harness_reservations ADD COLUMN run_token_member_id TEXT;
 ALTER TABLE harness_reservations ADD COLUMN finalized_at TEXT;
 ALTER TABLE harness_reservations ADD COLUMN usage_cost_micro_usd INTEGER;
 ALTER TABLE harness_reservations ADD COLUMN usage_estimated INTEGER;
+-- reconcile_checked_at: the reconcile cron stamps every row it examines, and orders by COALESCE(reconcile_checked_at, updated_at), so rows
+-- whose vendor run is still going cannot starve newer rows at the head of the queue.
+ALTER TABLE harness_reservations ADD COLUMN reconcile_checked_at TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_harness_reservations_unfinalized
   ON harness_reservations (tenant, state, finalized_at);

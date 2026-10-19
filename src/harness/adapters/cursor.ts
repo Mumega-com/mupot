@@ -302,13 +302,10 @@ export const cursorCloudAdapter: ProviderAdapter = {
     }
 
     if (row.state === 'reserved' || row.state === 'attaching') {
-      const attached = await attachCursorCloudExecution(env, reservationId)
-      return {
-        reservationId,
-        previousState,
-        nextState: attached.state,
-        changed: attached.state !== previousState,
-      }
+      // RECONCILE NEVER LAUNCHES. Attaching is dispatch's own step, run once by the dispatcher under a lease, after the kill switch and the
+      // budget gate. A row still reserved/attaching here is either in flight (its attacher is working) or stuck, and the provider kernel
+      // (reconcileProviderRuns) releases a stuck one by closing it. Re-attaching from a sweep would launch past both gates.
+      return { reservationId, previousState, nextState: previousState, changed: false }
     }
 
     if (row.state === 'attached' && row.vendor_agent_id && row.vendor_run_id) {

@@ -16,7 +16,7 @@ import type { DispatchResult } from '../flight/dispatch'
 import type { FlightSignals } from '../flight/preflight'
 import { FLIGHT_META_V1_SCHEMA } from '../flight/meta'
 import { launchCursorAgent, resolveCursorApiToken } from './client'
-import { kernelFlightSignals } from '../harness/kernel'
+import { isProviderDisabled, kernelFlightSignals } from '../harness/kernel'
 import {
   bindReservationTaskFlight,
   blockTaskForFailedReservation,
@@ -331,10 +331,23 @@ export async function attachCursorCloudExecution(
     await assertExecutionNotPaused(env, row.agent_id)
   } catch (error) {
     if (error instanceof ExecutionPausedError) {
+      // Released, not left reserved: a paused run is closed (and its task blocked) so nothing can launch it after the pause lifts. The
+      // dispatcher may dispatch again under a new key once resumed.
       await releaseAttachLease(env, reservationId, leaseId)
-      return { reservationId, state: 'reserved', error: 'execution_paused', replay: false }
+      const failed = await markReservationFailed(env, reservationId, 'execution_paused')
+      if (failed && row.task_id) await blockTaskForFailedReservation(env, row.task_id, reservationId, 'execution_paused')
+      return { reservationId, state: failed ? 'failed' : 'reserved', error: 'execution_paused', replay: false }
     }
     throw error
+  }
+
+  // The provider kill switch is re-checked here too, with the lease held and before the vendor call: it may have been thrown between reserve
+  // and attach. A switched-off run is released (failed, task blocked), never left reserved to launch later.
+  if (await isProviderDisabled(env, 'cursor-cloud')) {
+    await releaseAttachLease(env, reservationId, leaseId)
+    const failed = await markReservationFailed(env, reservationId, 'provider_disabled')
+    if (failed) await blockTaskForFailedReservation(env, row.task_id, reservationId, 'provider_disabled')
+    return { reservationId, state: failed ? 'failed' : 'reserved', error: 'provider_disabled', replay: false }
   }
 
   const task = await loadTask(env, row.task_id)

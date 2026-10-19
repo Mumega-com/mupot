@@ -21,7 +21,9 @@ import type { Context } from 'hono'
 import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { csrf } from 'hono/csrf'
-import { launchCursorAgent, resolveCursorApiToken } from '../cursor/client'
+import { resolveCursorApiToken } from '../cursor/client'
+import { kernelLaunchCursor } from '../harness/kernel'
+import { cursorCloudAdapter } from '../harness/adapters/cursor'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
@@ -222,7 +224,20 @@ export async function dispatchStudioFlight(
     const reserved = await reserveStudioSlot(env, auth.memberId ?? auth.userId, repoUrl)
     if (!reserved.ok) return { ok: false, status: 429, error: reserved.error }
     slot = reserved.slot
-    const outcome = await launchCursorAgent(token, { name: title, repoUrl, prompt: launchedPrompt })
+    // Studio is NOT a way around the provider kernel: same kill switch, same budget gate (estimate reserved on the home agent's window),
+    // same decision card on a cap hit. A refusal releases the Studio slot before anything launched.
+    const admitted = await kernelLaunchCursor(
+      env,
+      cursorCloudAdapter,
+      { name: title, prompt: launchedPrompt, repoUrl, squadId: home.squadId, agentId: home.agentId, actor: { kind: 'member', id: auth.memberId ?? auth.userId }, idempotencyKey: `studio:${reservedFlightId}` },
+      token,
+      { name: title, repoUrl, prompt: launchedPrompt },
+    )
+    if (!admitted.ok) {
+      await settleStudioSlot(env, slot, 'released')
+      return { ok: false, status: admitted.refusal.error === 'budget_blocked' ? 429 : 409, error: admitted.refusal.error }
+    }
+    const outcome = admitted.outcome
     await settleStudioSlot(env, slot, outcome.state === 'launched' ? 'launched' : outcome.state === 'maybe_launched' ? 'maybe' : 'released')
     if (outcome.state === 'launched') {
       cursor = {
