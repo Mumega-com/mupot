@@ -24,7 +24,7 @@
 //     squad exists. A repeat finds the pending row first and does not re-file or re-notify.
 
 import type { AuthContext, Capability, Env, OrgKind } from '../types'
-import { canOnSquad, capabilityRank, loadSquadScope, resolveCapabilities } from '../auth/capability'
+import { CAPABILITY_LIVE_PREDICATE, brandSquadScope, canOnSquad, capabilityRank, loadSquadScope, resolveCapabilities, type SquadScope } from '../auth/capability'
 import { buildAuth, memberIsActiveHuman } from '../access/identity'
 import { resolveSquadRef } from '../org/resolve'
 import { addSquadMember } from './squad-membership'
@@ -113,7 +113,12 @@ export async function resolveJoinTargets(env: Env, ref: { squad?: string; projec
 /** ELIGIBLE = the human's EFFECTIVE grants (resolveCapabilities) give admin on the squad (canOnSquad). One predicate, one source. */
 export async function humanMayInstantJoin(env: Env, grants: Awaited<ReturnType<typeof resolveCapabilities>>, squadId: string): Promise<boolean> {
   const scope = await loadSquadScope(env, squadId)
-  if (!scope || scope.kind === 'home') return false
+  return scope ? humanMayAdminScope(env, grants, scope) : false
+}
+
+/** The predicate itself, over an already-loaded scope (the list batches the scope read; join_squad loads one). */
+export async function humanMayAdminScope(env: Env, grants: Awaited<ReturnType<typeof resolveCapabilities>>, scope: SquadScope): Promise<boolean> {
+  if (scope.kind === 'home') return false
   return canOnSquad(env, grants, scope, 'admin')
 }
 
@@ -219,4 +224,42 @@ export async function observedTaskCreateRefusal(
     return { refusal: 'An observed seat may not dispatch a task (dispatch:true refused; omit it or pass false).', forceNoDispatch: true }
   }
   return { refusal: null, forceNoDispatch: true }
+}
+
+// #2035 wall 5: boot_context / orient point at join_squad. READ-ONLY, no new authority: the list reuses humanMayInstantJoin (the
+// predicate join_squad itself runs) and shows only squads the human can admin, so it reveals nothing the human cannot already see.
+export const JOINABLE_LIST_MAX = 10
+const JOINABLE_SCAN_MAX = 500 // ONE query; the cap (10) applies AFTER authorization, in memory, over the human's admin set
+const JOIN_OTHER_LINE = 'for any other squad: join_squad files a request to its owner'
+const JOIN_FLAG_OFF_LINE = 'joining a squad: ask its owner/admin to add you (squad_join_request)'
+
+export interface JoinNextSteps {
+  note: string
+  squads?: Array<{ id: string; slug: string; name: string; call: string }>
+}
+
+/** null = say nothing (a bare unbound session has no prerequisites). Flag off: one line, no DB read. Flag on: the list only for an
+ *  UNATTACHED, non-held seat of an ACTIVE human; everyone else with a seat/bound agent gets the one line. Query count is constant in the
+ *  number of squads: canOnSquad over a pre-loaded scope is pure, so the whole list is active-human + grants + held + ONE squads read. */
+export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBinding' | 'boundAgentId'>): Promise<JoinNextSteps | null> {
+  const seat = auth.seatBinding
+  if (!seat && !auth.boundAgentId) return null
+  if (!vipLaneEnabled(env)) return { note: JOIN_FLAG_OFF_LINE }
+  if (!seat || seat.attached || !auth.boundAgentId || !(await memberIsActiveHuman(env, seat.humanMemberId))) return { note: JOIN_OTHER_LINE }
+  if ((await readSeatAdmissionStatus(env, seat.seatId)) === 'held') return { note: JOIN_OTHER_LINE }
+  const grants = await resolveCapabilities(env, seat.humanMemberId)
+  const rows = await env.DB.prepare(
+    `SELECT s.id AS id, s.slug AS slug, s.name AS name, s.department_id AS department_id, s.kind AS kind FROM squads s
+     WHERE s.status != 'archived' AND s.kind != 'home'
+       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.agent_id = ?1 AND m.squad_id = s.id AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")})
+       AND s.id != COALESCE((SELECT a.squad_id FROM agents a WHERE a.id = ?1), '')
+     ORDER BY s.name, s.id LIMIT ?2`,
+  ).bind(auth.boundAgentId, JOINABLE_SCAN_MAX).all<{ id: string; slug: string; name: string; department_id: string; kind: OrgKind }>()
+  const squads: NonNullable<JoinNextSteps['squads']> = []
+  for (const sq of rows.results ?? []) {
+    if (squads.length >= JOINABLE_LIST_MAX) break
+    // brandSquadScope: the fields came straight off a real squads row above.
+    if (await humanMayAdminScope(env, grants, brandSquadScope({ id: sq.id, department_id: sq.department_id, kind: sq.kind }))) squads.push({ id: sq.id, slug: sq.slug, name: sq.name, call: `join_squad {squad:"${sq.id}"}` })
+  }
+  return { note: JOIN_OTHER_LINE, ...(squads.length ? { squads } : {}) }
 }
