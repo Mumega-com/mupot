@@ -231,8 +231,11 @@ describe('P2-1 task wakes are keyed by assignment occurrence', () => {
       vi.setSystemTime(new Date(Date.now() + 50))
       const out = await invokeTool(orgAdmin(), env, 'task_update', { task_id: 't1', assignee_agent_id: agent }, ctx)
       expect(out.ok, JSON.stringify(out)).toBe(true)
+      // Deliveries are fire-and-forget (waitUntil) and each one awaits crypto.subtle (real thread pool) before its
+      // POST, so under CPU load three in-flight deliveries can finish in any order (#2083). Settle each ring before
+      // the next assignment: the A, B, A order the assertion pins is then the delivery order, not a race.
+      await Promise.all(pending.splice(0))
     }
-    await Promise.all(pending)
     expect(posts.map((p) => p.body.agent_id)).toEqual(['ag-a', 'ag-b', 'ag-a'])
   })
 
