@@ -256,6 +256,10 @@ export function homeOwnerStandingSql(
 //   - host agent row active AND not archived;
 //   - owner_member_id non-NULL and non-'' (explicit, never a join miss);
 //   - the owner member is active and pinned to the pot's tenant (tenantExpr);
+//   - the target squad must be kind <> 'home' AND status = 'active' (a home squad's reach is only
+//     the home-owner branch; an exact squad-scoped admin row on someone else's home confers none,
+//     and an archived squad is never a target). squads has no tenant column (one pot per DB),
+//     so the tenant pin is the owner-member join above;
 //   - the grant's WRITER must BE the owner (the #2079 round-1 P0: a missing writer binding
 //     let an admin re-point owner_member_id and mint reach under someone else's rank);
 //   - rank is judged on the OWNER, live, on every use. Hosts with no owner never match.
@@ -268,6 +272,7 @@ export function ownerAdminStandingSql(
   return `EXISTS (
     SELECT 1 FROM agents oa
       JOIN members oam ON oam.id = oa.owner_member_id AND oam.status = 'active' AND oam.tenant = ${tenantExpr}
+      JOIN squads os ON os.id = ${squadIdExpr} AND os.kind <> 'home' AND os.status = 'active'
      WHERE oa.id = ${hostIdExpr}
        AND oa.status = 'active' AND oa.archived_at IS NULL
        AND oa.owner_member_id IS NOT NULL AND oa.owner_member_id <> ''

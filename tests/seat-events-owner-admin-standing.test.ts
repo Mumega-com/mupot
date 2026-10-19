@@ -211,16 +211,60 @@ describe('owner-admin host standing', () => {
     expect(r.delivery).toBe('granted')
   })
 
-  it('owner admin does NOT widen home squads: no home standing for an admin-owner via this branch', async () => {
+  const HOME_EXTRA = `INSERT INTO departments (id, slug, name, kind) VALUES ('dh', 'dept-home-mem-other', 'Home', 'home');
+    INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('sh', 'dh', 'home-other', 'H', 'home');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('home-seat', 'sh', 'hs', 'HS', 'member', 'm', 'active');`
+
+  it('org admin owner does NOT reach another member\'s home squad', async () => {
     const w = await world({
-      extra: `INSERT INTO departments (id, slug, name, kind) VALUES ('dh', 'dept-home-mem-other', 'Home', 'home');
-        INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('sh', 'dh', 'home-other', 'H', 'home');
-        INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('home-seat', 'sh', 'hs', 'HS', 'member', 'm', 'active');
+      ownerCap: null,
+      extra: `${HOME_EXTRA}
         INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-org', '${OWNER}', 'org', NULL, 'admin')`,
     })
-    // Owner is org admin, but a home squad of someone else is never reachable by the ladder.
     const r = await both(w, 'home-seat')
     expect(r.created).toEqual(DENIED)
     expect(r.delivery).toBe('not_granted')
+  })
+
+  it("exact squad-scoped admin row on ANOTHER member's home squad is refused on both paths", async () => {
+    const w = await world({
+      ownerCap: null,
+      extra: `${HOME_EXTRA}
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-home', '${OWNER}', 'squad', 'sh', 'admin')`,
+    })
+    const r = await both(w, 'home-seat')
+    expect(r.created).toEqual(DENIED)
+    expect(r.delivery).toBe('not_granted')
+  })
+
+  it('archived target squad: refused on both paths, and a live grant stops delivering when it is archived', async () => {
+    const w = await world()
+    const r = await both(w)
+    expect(r.delivery).toBe('granted')
+    w.h.sqlite.exec(`UPDATE squads SET status = 'archived', archived_at = datetime('now') WHERE id = 'sg'`)
+    expect(await authorizeSeatDelivery(w.env, HOST, SEAT)).toBe('not_granted')
+    const w2 = await world({ extra: `UPDATE squads SET status = 'archived', archived_at = datetime('now') WHERE id = 'sg'` })
+    const r2 = await both(w2)
+    expect(r2.created).toEqual(DENIED)
+    expect(r2.delivery).toBe('not_granted')
+  })
+
+  it('lead-only owner: refused on both paths (admin is the floor)', async () => {
+    const r = await both(await world({ ownerCap: 'lead' }))
+    expect(r.created).toEqual(DENIED)
+    expect(r.delivery).toBe('not_granted')
+  })
+
+  it('capability expiring relative to the REAL clock: live while future, dead once past (frozen-now pin)', async () => {
+    const future = new Date(Date.now() + 3600_000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+    const w = await world({ extra: `UPDATE capabilities SET expires_at = '${future}' WHERE id = 'cap-owner'` })
+    const r = await both(w)
+    expect(r.created.ok).toBe(true)
+    expect(r.delivery).toBe('granted')
+    const past = new Date(Date.now() - 3600_000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+    w.h.sqlite.exec(`UPDATE capabilities SET expires_at = '${past}' WHERE id = 'cap-owner'`)
+    expect(await authorizeSeatDelivery(w.env, HOST, SEAT)).toBe('not_granted')
+    const w2 = await world({ extra: `UPDATE capabilities SET expires_at = '${past}' WHERE id = 'cap-owner'` })
+    expect((await both(w2)).created).toEqual(DENIED)
   })
 })
