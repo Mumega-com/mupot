@@ -48,6 +48,10 @@ export interface Whoami {
   /** Present when the request is bound to a seat. Never carries an agent id: `acts_as` is a slug/name. */
   seat?: { seat_id: string; acts_as: string | null; presented: boolean }
   harness: 'present' | 'absent'
+  /** ONE plain sentence for this state: who you are, whether seat tools apply, and the single next call. Derived from the same state as `state`/`missing`. */
+  next_step_plain: string
+  /** The 3-4 door cases in one table. */
+  docs: string
   /** Installer window (flag INSTALLER_WINDOW): present only while this session holds a LIVE window. Never otherwise. */
   installer_window?: InstallerWindowView
   /** ADMISSION_TAPE on AND the seat has a status only. Status band + reason class; the score is never exposed to the seat. */
@@ -69,6 +73,8 @@ export interface WhoamiFacts {
   /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
   admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
 }
+
+export const AGENT_DOOR_DOCS_URL = 'https://github.com/Mumega-com/mupot/blob/main/docs/agent-door.md'
 
 export interface WhoamiCtx {
   facts: WhoamiFacts
@@ -106,6 +112,45 @@ export function bootstrapOffered(auth: AuthContext, facts: WhoamiFacts): boolean
 
 // The seat_select instruction is the refusal table's own sentence (one text, so boot and a refusal cannot disagree).
 const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet. ${TABLE_SEAT_SELECT_STEP} Lost the handle? Call seat_select again with the same project/folder/thread labels: you get your existing seat and a new handle.`
+
+/** The one-sentence answer per state (exported for the tests). It names whether the seat tools apply, so no agent has to read docs or
+ *  source to learn seat_select vs seat_attach or whether a handle is needed. The state is the same derivation as `state`. */
+export function plainNextStep(
+  env: Env,
+  auth: AuthContext,
+  state: WhoamiState,
+  basis: 'attached' | 'legacy_consent' | undefined,
+  facts: WhoamiFacts,
+  missing: WhoamiMissing[],
+  seatSelectCallable: boolean,
+): string {
+  const as = facts.actsAs ?? 'your agent'
+  if (state === 'acting_as' && basis === 'attached') {
+    const ceiling = auth.seatBinding?.attached?.ceiling ?? 'member'
+    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; no seat handle needed, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} or your open work with needs_you_list.`
+  }
+  if (state === 'acting_as') {
+    return `You are ${as} (your human consented this connection to it). Nothing to set up; no seat handle needed; the seat tools (seat_select, seat_attach) do not apply. Next: read your inbox or your open work with needs_you_list.`
+  }
+  if (state === 'own_seat') {
+    const handle = auth.seatBinding?.source === 'handle'
+      ? 'Keep sending your seat handle with each request.'
+      : 'This is an automatic seat tied to this chat: no seat handle is needed.'
+    const attach = seatAttachEnabled(env)
+      ? 'To act as an existing agent your human administers, call seat_attach {agent}; do not call seat_select (you already have a seat).'
+      : 'Attaching to an existing agent is not enabled on this pot; do not call seat_select (you already have a seat).'
+    return `You are ${as} on this chat's own seat. ${handle} ${attach} Otherwise: read your inbox or your open work with needs_you_list.`
+  }
+  if (state === 'host') {
+    return `You are ${as}; the seat tools (seat_select, seat_attach) do not apply to a workspace-token agent. Next: read your inbox or your open work with needs_you_list.`
+  }
+  if (state === 'harness_unseated') {
+    return seatSelectCallable
+      ? 'You have no agent yet. To get your own seat call seat_select {project, folder, thread}. To act as an existing agent, get a seat first, then call seat_attach {agent} from it.'
+      : 'You have no agent yet and seats are not enabled for this connection. ' + (missing[0]?.next_step ?? 'Ask your human or an org admin.')
+  }
+  return `You have no agent yet. ${missing[0]?.next_step ?? 'Ask your human or an org admin to connect you to one.'}`
+}
 
 export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami {
   const { facts } = ctx
@@ -264,6 +309,8 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
   return {
     state,
     ...(basis ? { basis } : {}),
+    next_step_plain: plainNextStep(env, auth, state, basis, facts, missing, seatSelectCallable),
+    docs: AGENT_DOOR_DOCS_URL,
     have,
     missing,
     agent,
