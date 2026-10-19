@@ -304,7 +304,8 @@ export async function buildOrient(
   // This removes the prior non-atomic SELECT-then-UPSERT race (cosmetic double
   // 'Welcome') AND caps write-amplification on the read path to one write per window.
   // recordInduction:false = no write at all (read-only profile).
-  const inductionWrite = opts.recordInduction === false
+  // Runs AFTER the reads resolve (not inside the Promise.all): a failed read must not leave an induction row behind.
+  const writeInduction = (): Promise<{ orient_count: number } | null> => opts.recordInduction === false
     ? Promise.resolve(null)
     : env.DB.prepare(
         `INSERT INTO agent_orientation (tenant, agent_id, first_inducted_at, last_oriented_at, orient_count)
@@ -316,7 +317,7 @@ export async function buildOrient(
         .bind(env.TENANT_SLUG, agent.id, nowMs, nowMs - INDUCTION_RATE_MS)
         .first<{ orient_count: number }>()
 
-  const [{ sq: squad, dept: department }, matesRes, tasksRes, fieldRow, row] = await Promise.all([
+  const [{ sq: squad, dept: department }, matesRes, tasksRes, fieldRow] = await Promise.all([
     squadThenDepartment,
     env.DB.prepare(
       `SELECT a.id AS agent_id, a.slug AS slug, a.name AS name, a.role AS role, m.capability AS capability
@@ -335,8 +336,8 @@ export async function buildOrient(
     )
       .bind(env.TENANT_SLUG, agent.id)
       .first<AgentFieldRow>(),
-    inductionWrite,
   ])
+  const row = await writeInduction()
   const members = matesRes.results ?? []
   const supervisor = resolveSupervisor(members, agent.id)
   const squadmates = members.filter((m) => m.agent_id !== agent.id && m.agent_id !== supervisor?.agent_id)

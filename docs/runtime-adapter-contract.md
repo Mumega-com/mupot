@@ -437,7 +437,7 @@ MCP tools:
 and the response carries `next_cursor` (opaque; `null` = last page) and `truncated`. Pass
 `next_cursor` back as `cursor` with the same squad/filters; a malformed or mismatched cursor is
 `400 invalid_args`. `task_board.counts` are true totals (not the returned rows); `truncated` and
-per-status `has_more` say when a column holds fewer rows than its count. `GET /api/tasks`
+per-status `has_more` say when a column holds fewer rows than its count. `task_board` rows carry `body` as a 200-character excerpt with `body_truncated: true` when cut; read the full body from `task_get` or `task_list`. `GET /api/tasks`
 accepts `?limit=&cursor=` the same way and flags a capped legacy read with `truncated`.
 
 Agent-bound tokens may omit `squad_id` for `task_list` and `task_board`; Mupot

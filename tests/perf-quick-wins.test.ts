@@ -97,6 +97,24 @@ describe('presence throttle', () => {
   })
 })
 
+describe('call-path presence throttle key', () => {
+  // task_board has no poll touch of its own, so every waitUntil push here is the dispatcher-level presence touch.
+  const callAs = async (agent: string): Promise<number> => {
+    const before = deferred.length
+    const out = await invokeTool({ ...auth(), boundAgentId: agent }, env, 'task_board', { squad_id: SQUAD }, { origin: 'https://pot.example', waitUntil, seat: 'seat-x' })
+    expect(out.ok).toBe(true)
+    return deferred.length - before
+  }
+  it('throttles a repeat call by the same agent + member + seat within 60s', async () => {
+    expect(await callAs('agent-a')).toBe(1)
+    expect(await callAs('agent-a')).toBe(0)
+  })
+  it('does not let two agents on the same member + seat starve each other (mupot#1664)', async () => {
+    expect(await callAs('agent-a')).toBe(1)
+    expect(await callAs('agent-b')).toBe(1)
+  })
+})
+
 describe('task_board shape', () => {
   it('carries a body excerpt + body_truncated; task_get keeps the full body', async () => {
     const out = await invokeTool(auth(), env, 'task_board', { squad_id: SQUAD }, 'https://pot.example')

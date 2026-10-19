@@ -116,7 +116,10 @@ export function createMemory(env: Env): MemoryPort {
       }
       if (opts?.waitUntil) {
         // The D1 row is committed; embedding is an index, not the record. Never fail the write over it.
-        opts.waitUntil(indexVector().catch(() => {}))
+        opts.waitUntil(indexVector().catch((err: unknown) => {
+          // D1 row is committed; recall's recent/lexical legs cover the gap. Log, never throw.
+          console.error('memory.vector_index_failed', { agent: agentId, engram: id, error: err instanceof Error ? err.name : typeof err })
+        }))
       } else {
         await indexVector()
       }

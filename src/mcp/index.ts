@@ -200,6 +200,7 @@ import {
   touchPollFleetPresence,
   touchPollFleetPresenceOffPath,
   presenceThrottleHit,
+  presenceCallThrottleKey,
   clearPollFleetPresence,
   persistSeatRuntimeFromHarness,
   POLL_PRESENCE_MODE,
@@ -8212,7 +8213,7 @@ async function invokeToolInner(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(`call:${env.TENANT_SLUG}:${auth.memberId}:${ctx.seat ?? auth.tokenId ?? ''}`)) {
+  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

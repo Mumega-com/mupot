@@ -345,6 +345,12 @@ export function presenceThrottleHit(key: string, nowMs: number = Date.now()): bo
   return false
 }
 
+/** Key for the dispatcher-level call touch. boundAgentId is part of it: two agents sharing a member and seat
+ *  label must each keep their own presence fresh (mupot#1664). */
+export function presenceCallThrottleKey(tenant: string, memberId: string | null, agentId: string | null | undefined, seatOrToken: string | null | undefined): string {
+  return `call:${tenant}:${memberId ?? ''}:${agentId ?? ''}:${seatOrToken ?? ''}`
+}
+
 /** Test seam: forget every throttle entry. */
 export function resetPresenceThrottle(): void {
   presenceTouchedAt.clear()
