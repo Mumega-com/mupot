@@ -49,6 +49,7 @@ import {
 } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
+import { tenantHeaderNotice, TENANT_NOTICE_RESPONSE_HEADER, type TenantHeaderNotice } from './tenant-header-notice'
 import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
@@ -329,7 +330,7 @@ import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
 import { toolAnnotations } from './tool-annotations'
 
-type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
+type AppEnv = { Bindings: Env; Variables: { auth: AuthContext; tenantNotice?: TenantHeaderNotice } }
 
 // ── auth context resolution — dual-door ──────────────────────────────────────
 // C1/C2 convergence: the OAuth API handler pre-resolves the AuthContext (with live
@@ -875,6 +876,9 @@ export type ToolCtx = {
    *  request tool. Runs AFTER every authz/schema gate in invokeTool, in place of the tool body; a non-null answer
    *  is returned as the outcome (read-only: it must never write). Absent everywhere else: behavior unchanged. */
   shortCircuit?: (args: Record<string, unknown>) => Promise<ToolOutcome | null>
+  /** Set by the /mcp middleware when the request carried a tenant header that differs from the resolved tenant (#2035 wall 4).
+   *  Report-only: it selects nothing. status / boot_context / orient add its human line to their result. */
+  tenantNotice?: TenantHeaderNotice
 }
 
 export interface ToolSpec {
@@ -7979,6 +7983,7 @@ async function invokeToolInner(
         source: originOrCtx?.source,
         sideEffectFree: originOrCtx?.sideEffectFree,
         shortCircuit: originOrCtx?.shortCircuit,
+        tenantNotice: originOrCtx?.tenantNotice,
       }
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
@@ -8156,8 +8161,15 @@ async function invokeToolInner(
   // surface is the one a polling runner's actual poll loop exercises, not every MCP call site in
   // the codebase.
 
+  // #2035 wall 4: the three "where am I" tools say when the client's tenant header was ignored. Additive; a refusal is untouched.
+  if (outcome.ok && ctx.tenantNotice && TENANT_NOTICE_TOOLS.has(spec.name) && typeof outcome.result === 'object' && outcome.result !== null && !Array.isArray(outcome.result)) {
+    return { ...outcome, result: { ...outcome.result, tenant_header_notice: ctx.tenantNotice }, tool: spec.name }
+  }
+
   return { ...outcome, tool: spec.name }
 }
+
+const TENANT_NOTICE_TOOLS: ReadonlySet<string> = new Set(['status', 'boot_context', 'orient'])
 
 function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>) => void) | undefined {
   try {
@@ -8329,6 +8341,7 @@ async function handleJsonRpc(
       waitUntil: safeWaitUntil(c),
       seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
       source: c.req.header('x-mupot-source'),
+      tenantNotice: c.get('tenantNotice'),
       // Profile mode = no session side effects (see ToolCtx.sideEffectFree).
       ...(profile === 'needs-you' ? { sideEffectFree: true } : {}),
     }
@@ -8518,6 +8531,37 @@ mcpApp.on(['GET', 'DELETE'], '/', async (c, next) => {
   return c.body(null, 405, { Allow: 'POST' })
 })
 
+// #2035 wall 4 / #1299: the tenant header NEVER selects a tenant. When a request carries one that differs from the
+// resolved tenant, EVERY response of that request says so (HTTP header + JSON `_meta`), so a client that believes it is
+// in another tenant finds out. Absent or equal header: this middleware does nothing (one header read, no DB).
+mcpApp.use('*', async (c, next) => {
+  const notice = await tenantHeaderNotice(c.env, c.req.raw.headers)
+  if (!notice) return next()
+  c.set('tenantNotice', notice)
+  await next()
+  const headers = new Headers(c.res.headers)
+  headers.set(TENANT_NOTICE_RESPONSE_HEADER, notice.header_value)
+  let body: BodyInit | null = c.res.body
+  if ((headers.get('content-type') ?? '').includes('application/json')) {
+    const text = await c.res.clone().text()
+    try {
+      const parsed: unknown = JSON.parse(text)
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        const env = parsed as Record<string, unknown> // a JSON object just parsed; only result / the notice key are touched
+        const result = env.result
+        const stamped = typeof result === 'object' && result !== null && !Array.isArray(result)
+          ? { ...env, result: { ...(result as Record<string, unknown>), _meta: { ...(typeof (result as { _meta?: unknown })._meta === 'object' && (result as { _meta?: unknown })._meta !== null ? (result as { _meta: Record<string, unknown> })._meta : {}), 'mupot/tenant_header_notice': notice } } } // result is a plain object per the check above
+          : { ...env, tenant_header_notice: notice }
+        body = JSON.stringify(stamped)
+        headers.delete('content-length')
+      }
+    } catch {
+      // not JSON after all: the response header still carries the notice
+    }
+  }
+  c.res = new Response(body, { status: c.res.status, statusText: c.res.statusText, headers })
+})
+
 mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.TENANT_SLUG }))
 
 // GET /mcp/tools — advertise the tool surface (no auth required to discover the
@@ -8591,6 +8635,7 @@ mcpApp.post('/', async (c) => {
     waitUntil: safeWaitUntil(c),
     seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
     source: c.req.header('x-mupot-source'),
+    tenantNotice: c.get('tenantNotice'),
   }
   const outcome = await invokeTool(auth, c.env, body.tool, body.args, ctx)
 

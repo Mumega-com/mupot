@@ -99,14 +99,14 @@ export async function hermesClient(w: World): Promise<Client> {
 }
 
 /** One tools/call exactly as the client would send it. Only the ChatGPT client sends params._meta; nobody sends x-mupot-seat. */
-export async function rpc(w: World, c: Client, method: string, params: Json): Promise<Response> {
+export async function rpc(w: World, c: Client, method: string, params: Json, extraHeaders: Record<string, string> = {}): Promise<Response> {
   if (c.meta) params._meta = c.meta
   // Prod rebuilds the AuthContext from the stored props on every request (McpOAuthApiHandler).
   const ctx = c.props ? await buildAuthContextFromProps(w.env, c.props as unknown as Parameters<typeof buildAuthContextFromProps>[1]) : null // props are the consent handler's own OAuthMemberProps
   if (c.props && !ctx) throw new Error('grant no longer resolves to an AuthContext')
   const req = new Request(ctx ? 'https://pot.test/mcp' : 'https://pot.test/', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(c.bearer ? { authorization: `Bearer ${c.bearer}` } : {}) },
+    headers: { 'content-type': 'application/json', ...(c.bearer ? { authorization: `Bearer ${c.bearer}` } : {}), ...extraHeaders },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   })
   return mcpApp.fetch(ctx ? mcpInternalRequest(req, ctx) : req, w.env)
