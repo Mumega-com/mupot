@@ -28,6 +28,7 @@ import { CAPABILITY_LIVE_PREDICATE, brandSquadScope, canOnSquad, capabilityRank,
 import { buildAuth, memberIsActiveHuman } from '../access/identity'
 import { resolveSquadRef } from '../org/resolve'
 import { addSquadMember } from './squad-membership'
+import { resetTrustedOnRejoin } from './seat-hold-release'
 
 export function vipLaneEnabled(env: Pick<Env, 'VIP_LANE'>): boolean {
   return env.VIP_LANE === '1'
@@ -72,14 +73,55 @@ export async function readSeatAdmissionStatus(env: Env, seatId: string): Promise
   }
 }
 
-/** The floor, applied at the tool chokepoint. null = allowed. Only an UNATTACHED seat session with VIP_LANE on is ever looked at. */
+/**
+ * What a HELD seat may call: the READ subset of the observed floor. Derived by filtering OBSERVED_FLOOR_TOOLS (never a second list), so
+ * held is strictly inside observed by construction. No writes: no remember, send, task_create/update, inbox_ack, check_in, presence
+ * writes, session end, connect or join.
+ */
+const HELD_READ_TOOLS: ReadonlySet<string> = new Set([
+  'boot_context', 'orient', 'status', 'whoami', 'presence_list', 'peers', 'inbox', 'message_get',
+  'recall', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
+  'task_list', 'task_board', 'task_get', 'kanban_board',
+  'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
+  'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
+])
+export const HELD_FLOOR_TOOLS: ReadonlySet<string> = new Set([...HELD_READ_TOOLS].filter((t) => OBSERVED_FLOOR_TOOLS.has(t)))
+
+/** The stored status of the LIVE seat whose AGENT is this one (a human-minted token bound to a seat agent carries no seatBinding).
+ *  A read error fails CLOSED to 'held' only when the caller looks like a seat (`seatLike`: it carries a harness), so a DB blip never floors an ordinary agent. */
+async function readSeatStatusByAgent(env: Env, agentId: string, seatLike: boolean): Promise<SeatAdmissionStatus | null> {
+  try {
+    const row = await env.DB.prepare(`SELECT admission_status AS s FROM agent_seats WHERE agent_id = ?1 AND tenant = ?2 AND retired_at IS NULL LIMIT 1`)
+      .bind(agentId, env.TENANT_SLUG).first<{ s: string | null }>()
+    if (!row || row.s === null) return null
+    return row.s === 'observed' || row.s === 'trusted' || row.s === 'held' ? row.s : 'held'
+  } catch {
+    return seatLike ? 'held' : null
+  }
+}
+
+/** The floor, applied at the tool chokepoint. null = allowed. An UNATTACHED seat session, or (#2060 P2) a session whose bound agent IS a
+ *  seat agent even without a seatBinding, with VIP_LANE on. observed = OBSERVED_FLOOR_TOOLS; held = HELD_FLOOR_TOOLS (read only). */
 export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName: string): Promise<{ status: SeatAdmissionStatus } | null> {
   if (!vipLaneEnabled(env)) return null
   const seat = auth.seatBinding
-  if (!seat || seat.attached) return null
-  const status = await readSeatAdmissionStatus(env, seat.seatId)
+  // An ATTACHED seat acts as the existing agent under the ceiling its human approved: the observed floor stays lifted for it (accepted), but a
+  // HOLD is the human's hard stop and still applies (read-only), attached or not.
+  if (seat?.attached) {
+    const st = await readSeatAdmissionStatus(env, seat.seatId)
+    return st === 'held' && !HELD_FLOOR_TOOLS.has(toolName) ? { status: 'held' } : null
+  }
+  let status: SeatAdmissionStatus | null
+  if (seat) status = await readSeatAdmissionStatus(env, seat.seatId)
+  else if (auth.boundAgentId) {
+    // The status rode the ONE token query (auth.seatAgentStatus): no second read, so no fail-open. Only a hand-built context (never produced by the
+    // bearer/OAuth paths with VIP_LANE on) lacks it; that case falls back to the guarded read.
+    status = auth.seatAgentStatus !== undefined ? auth.seatAgentStatus : await readSeatStatusByAgent(env, auth.boundAgentId, !!auth.harnessId)
+  }
+  else return null
   if (status === null || status === 'trusted') return null
-  return OBSERVED_FLOOR_TOOLS.has(toolName) ? null : { status }
+  const allowed = status === 'held' ? HELD_FLOOR_TOOLS : OBSERVED_FLOOR_TOOLS
+  return allowed.has(toolName) ? null : { status }
 }
 
 export interface JoinTarget { id: string; slug: string; name: string; department_id: string; kind: string; status: string }
@@ -150,11 +192,21 @@ export async function instantObservedJoin(
   if (now === null || now === 'held') return { ok: false, error: 'seat_held' }
   const squad = { id: p.squad.id, slug: p.squad.slug, name: p.squad.name }
 
-  const existing = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`)
+  const existing = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('', "datetime('now')")} LIMIT 1`)
     .bind(p.seatAgentId, p.squad.id).first<{ capability: string }>()
   if (existing) {
     // Idempotent: same membership, no second receipt. A higher standing someone else gave this seat is kept, never lowered.
     return { ok: true, admission_status: now, membership: capabilityRank(existing.capability as Capability) > OBSERVED_TIER_RANK ? 'kept' : 'already', squad } // stored value, closed CHECK list in 0001
+  }
+  // Trust does not carry across squads: a TRUSTED seat joining a squad it is not (live) in starts observed there (audited). FAIL-RESTRICTIVE ORDER:
+  // the reset commits BEFORE the membership write (after the eligibility re-check above), so no failure can leave trusted + a new membership. If the
+  // add then fails, the seat stays observed (more restrictive, accepted). If the reset cannot be proven, the add is not attempted.
+  let admission: SeatAdmissionStatus = now
+  if (now === 'trusted') {
+    const reset = await resetTrustedOnRejoin(env, { humanMemberId: p.humanMemberId, seatId: p.seatId }).catch(() => false)
+    admission = (await readSeatAdmissionStatus(env, p.seatId)) ?? 'held'
+    if (!reset && admission === 'trusted') return { ok: false, error: 'write_refused' }
+    if (admission === 'held') return { ok: false, error: 'seat_held' }
   }
   // The write runs AS the human, with the human's own effective grants (buildAuth leaves them undefined for a legacy owner/admin login).
   const humanAuth: AuthContext = { ...(await buildAuth(env, p.humanMemberId)), capabilities: grants }
@@ -164,7 +216,7 @@ export async function instantObservedJoin(
     capability: OBSERVED_TIER as 'member', neverLower: true, via: 'squad_join',
   })
   if (!w.ok) return { ok: false, error: 'write_refused' }
-  return { ok: true, admission_status: now, membership: 'created', squad }
+  return { ok: true, admission_status: admission, membership: 'created', squad }
 }
 
 /** Per-HUMAN card caps across ALL of that human's seats (a per-seat cap is multiplied by however many seats a session can mint). */

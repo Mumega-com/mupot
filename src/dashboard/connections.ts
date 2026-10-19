@@ -19,6 +19,8 @@ import { isAttachCeiling } from '../auth/attached-ceiling'
 import {
   attachSeatToAgent, decideAdmissionDirect, detachAttachment, listAttachableAgents, loadConnections, renameThread, revokeAdmission, seatAttachEnabled, ATTACH_IDLE_DAYS,
 } from '../members/seat-attach'
+import { changeSeatAdmission, isSeatHoldAction, listObservedSeats, SEAT_TRANSITIONS } from '../members/seat-hold-release'
+import { vipLaneEnabled } from '../members/vip-lane'
 import { pageHeader, sectionPanel, pill, emptyState, dataTable, type Html } from './ui'
 
 type ShellFn = (
@@ -109,6 +111,9 @@ function connectionsScript(): Html {
         });
         var simple = [
           ['button[data-cx-detach]', 'data-cx-detach', function (id) { return '/connections/attachments/' + encodeURIComponent(id) + '/detach'; }, 'Detach this thread? It goes back to its own seat agent on its next request.'],
+          ['button[data-cx-hold]', 'data-cx-hold', function (id) { return '/connections/seats/' + encodeURIComponent(id) + '/hold'; }, 'Hold this chat? It can then only read until you return it to observed or release it.'],
+          ['button[data-cx-return]', 'data-cx-return', function (id) { return '/connections/seats/' + encodeURIComponent(id) + '/return'; }, null],
+          ['button[data-cx-release]', 'data-cx-release', function (id) { return '/connections/seats/' + encodeURIComponent(id) + '/release'; }, 'Release this chat to trusted? The observed limits no longer apply to it.'],
           ['button[data-cx-deny]', 'data-cx-deny', function (id) { return '/connections/admissions/' + encodeURIComponent(id) + '/deny'; }, null],
           ['button[data-cx-revoke]', 'data-cx-revoke', function (id) { return '/connections/admissions/' + encodeURIComponent(id) + '/revoke'; }, 'Revoke this admission? Every thread attached through it goes back to its own seat agent on its next request.']
         ];
@@ -192,6 +197,26 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
         }),
     }))}`
 
+  const observed = await listObservedSeats(env, memberId)
+  const observedBlock = !vipLaneEnabled(env)
+    ? ''
+    : sectionPanel({
+      title: 'Observed chats',
+      body: observed.length === 0
+        ? emptyState({ title: 'No observed chats', detail: 'A chat that joined a squad instantly shows up here, where you can hold it or release it to trusted.' })
+        : dataTable({
+          cols: [{ label: 'Chat', width: '1.4fr' }, { label: 'Acting as', width: '1.2fr' }, { label: 'State', width: '0.7fr' }, { label: 'Last used', width: '1fr' }, { label: '', width: '2fr' }],
+          rows: observed.map((o) => [
+            html`${o.label || o.seat_id}`,
+            html`${o.agent_name}`,
+            html`${pill(o.status, o.status === 'held' ? 'danger' : o.status === 'trusted' ? 'ok' : 'dim')}`,
+            html`${formatWhen(o.last_used_at)}`,
+            html`${o.status !== 'held' ? html`<button class="btn danger" data-cx-hold="${o.seat_id}">Hold</button>` : ''} ${o.status !== 'observed' ? html`<button class="btn" data-cx-return="${o.seat_id}">Return to observed</button>` : ''} ${o.status !== 'trusted' ? html`<button class="btn" data-cx-release="${o.seat_id}">Release to trusted</button>` : ''}`,
+          ]),
+          empty: '',
+        }),
+    })
+
   const boundBlock = enabled && bound.length > 0
     ? sectionPanel({
       title: 'Apps connected as one agent',
@@ -215,6 +240,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
     })}
     ${enabled ? '' : sectionPanel({ title: 'Attaching is off', body: emptyState({ title: 'Attach is not enabled on this pot', detail: 'Threads keep their own seat agents. You can still detach or revoke anything below.' }) })}
     ${sectionPanel({ title: 'Waiting for your decision', body: pendingBody })}
+    ${observedBlock}
     ${harnessBlocks}
     ${sectionPanel({ title: 'Admitted agents', body: liveBody })}
     <p class="ui-sub">A level is chosen when an agent is admitted (Member, Lead, or Full = the agent's own standing, never more than yours). Threads never hold the agent's approval gates. To change a level, revoke the admission and admit again. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
@@ -294,6 +320,22 @@ export function makeConnectionsApp(shell: ShellFn) {
     const label = typeof body === 'object' && body !== null && 'label' in body ? body.label : undefined
     const r = await renameThread(c.env, { humanMemberId: g.memberId, seatId: c.req.param('id').trim(), label })
     return r.ok ? c.json({ ok: true, label: r.label }) : c.json({ error: r.error }, r.error === 'invalid_args' ? 400 : 404)
+  })
+
+  // #2060: HUMAN-only hold / release of an observed seat. Real web session of the seat's own human (the writer scopes to
+  // agent_seats.member_id = that human). Hold REDUCES reach (real session only, like detach); release and return-to-observed WIDEN it (fresh reauth,
+  // like approve). No MCP tool reaches this. VIP_LANE off = 403.
+  app.post('/connections/seats/:id/:action{hold|release|return}', async (c) => {
+    const action = c.req.param('action')
+    if (!isSeatHoldAction(action)) return c.json({ error: 'bad_request' }, 400)
+    // Real session first; whether the session is FRESH is decided by the writer per (action, from-status): only transitions that widen
+    // reach (release; held -> observed) need it. Hold, and trusted -> held / observed, reduce reach and work on a real session alone.
+    const g = await guard(c, false)
+    if (!g.ok) return g.res
+    const fresh = (await checkWebSession(c.env, c.get('auth'), { fresh: true })).ok
+    const r = await changeSeatAdmission(c.env, { humanMemberId: g.memberId, seatId: c.req.param('id').trim(), action, fresh })
+    if (r.ok) return c.json({ ok: true, from: r.from, to: r.to, allowed_from: SEAT_TRANSITIONS[action].from })
+    return c.json({ error: r.error }, r.error === 'vip_lane_disabled' || r.error === 'member_ineligible' || r.error === 'reauth_required' ? 403 : r.error === 'seat_not_found' ? 404 : 409)
   })
 
   app.post('/connections/admissions/:id/approve', async (c) => {

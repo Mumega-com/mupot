@@ -36,6 +36,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
+import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
 import { isHumanOriginAttestorToken } from '../im/origin-attestors'
@@ -484,12 +485,16 @@ async function resolveAuth(c: {
         // concept (resolveConsentedAgentCapabilities) and must not be clobbered
         // by this token-row re-derivation, which existed before #903b's consent
         // flow and never modeled it.
+        // #2060: the blob's seat status is never trusted; it is re-derived from the live token row below (same query, no second read).
+        delete auth.seatAgentStatus
         if (typeof auth.tokenId === 'string' && auth.tokenId.length > 0) {
+          const sf = seatFloorSql(c.env, 'COALESCE(t.agent_id, ?5)')
           const token = await c.env.DB.prepare(
             `SELECT t.id AS token_id, t.agent_id AS bound_agent_id, m.status AS member_status,
-                    t.harness_kind AS harness_kind
+                    t.harness_kind AS harness_kind${sf.select}
                FROM member_tokens t
                JOIN members m ON m.id = t.member_id
+               ${sf.join}
               WHERE t.id = ?1
                 AND t.member_id = ?2
                 AND t.tenant = ?3
@@ -500,11 +505,13 @@ async function resolveAuth(c: {
                 -- header on why that is a live bypass door, not a stylistic nit.
                 AND ${TOKEN_LIVE_PREDICATE('?4')}
               LIMIT 1`,
-          ).bind(auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc()).first<{
+          ).bind(...(sf.join ? [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc(), auth.boundAgentId ?? null] : [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc()])).first<{
             token_id: string
             bound_agent_id: string | null
             member_status: Member['status']
             harness_kind: string | null
+            seat_status?: string | null
+            seat_row_id?: string | null
           }>()
           // mupot#1794 W4: the token row says it is a harness credential -> ZERO capabilities, ZERO
           // latent capabilities, confined to the allowlist, whatever the blob claimed. Flag off: inert.
@@ -531,6 +538,8 @@ async function resolveAuth(c: {
           } else {
             auth.tokenId = token.token_id
             if (knownNonDirectory) auth.boundAgentId = token.bound_agent_id ?? null
+            const st = seatAgentStatusFromRow(c.env, token)
+            if (auth.boundAgentId && st !== undefined) auth.seatAgentStatus = st
           }
         } else {
           auth.tokenId = null
@@ -660,6 +669,7 @@ async function authenticateMemberInner(c: {
 
   const tokenHash = await sha256Hex(raw)
 
+  const sf = seatFloorSql(c.env) // #2060: seat status of the bound agent rides this one query (flag off: no join, no column)
   // Look up a live (not revoked) token, joined to its member. We re-check the
   // member's status: a suspended member's tokens are inert even if not revoked.
   const row = await c.env.DB.prepare(
@@ -672,9 +682,10 @@ async function authenticateMemberInner(c: {
             m.created_at    AS created_at,
             t.channel       AS channel,
             t.agent_id      AS bound_agent_id,
-            t.harness_kind  AS harness_kind
+            t.harness_kind  AS harness_kind${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       ${sf.join}
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
@@ -696,6 +707,8 @@ async function authenticateMemberInner(c: {
       channel: AuthContext['channel']
       bound_agent_id: string | null
       harness_kind: string | null
+      seat_status?: string | null
+      seat_row_id?: string | null
     }>()
 
   if (!row) return null
@@ -715,6 +728,7 @@ async function authenticateMemberInner(c: {
   // on the caller's critical path being load-bearing.
   void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
+  const seatStatus = seatAgentStatusFromRow(c.env, row)
 
   // A directory/unbound bearer (harness or not) carries ZERO capabilities, never the human's own: the
   // directory door's ceiling (B1), applied here from the row's shape.
@@ -735,6 +749,7 @@ async function authenticateMemberInner(c: {
     // A harness credential: zero capabilities AND zero latent capabilities, confined to the allowlist
     // at invokeTool until a seat handle is applied. The marker is set from the token row's shape.
     ...(harnessId ? { harnessId, harnessCredential: true, latentCapabilities: [] } : {}),
+    ...(row.bound_agent_id && seatStatus !== undefined ? { seatAgentStatus: seatStatus } : {}),
   }
   return auth
 }
@@ -8046,7 +8061,7 @@ async function invokeToolInner(
   {
     const floor = await observedFloorRefusal(env, auth, spec.name)
     if (floor) {
-      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). An owner of the squad lifts it.` }), tool: spec.name }
+      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
     }
   }
 
