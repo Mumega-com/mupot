@@ -328,6 +328,51 @@ export async function touchPollFleetPresence(env: Env, agentId: string | null | 
   }
 }
 
+/** Presence is a liveness marker with a 180s default TTL; touching it more than once a minute per isolate buys nothing. */
+export const PRESENCE_TOUCH_THROTTLE_MS = 60_000
+const presenceTouchedAt = new Map<string, number>()
+
+/**
+ * presenceThrottleHit — in-isolate throttle shared by the presence touch sites. Returns true when `key`
+ * was admitted less than PRESENCE_TOUCH_THROTTLE_MS ago (caller skips the write); otherwise records it and
+ * returns false. Per-isolate and best-effort: a cold isolate simply touches once, which is the old behaviour.
+ */
+export function presenceThrottleHit(key: string, nowMs: number = Date.now()): boolean {
+  const last = presenceTouchedAt.get(key)
+  if (last !== undefined && nowMs - last < PRESENCE_TOUCH_THROTTLE_MS) return true
+  if (presenceTouchedAt.size >= 5000) presenceTouchedAt.clear() // bound memory; worst case is one extra touch per key
+  presenceTouchedAt.set(key, nowMs)
+  return false
+}
+
+/** Key for the dispatcher-level call touch. boundAgentId is part of it: two agents sharing a member and seat
+ *  label must each keep their own presence fresh (mupot#1664). */
+export function presenceCallThrottleKey(tenant: string, memberId: string | null, agentId: string | null | undefined, seatOrToken: string | null | undefined): string {
+  return `call:${tenant}:${memberId ?? ''}:${agentId ?? ''}:${seatOrToken ?? ''}`
+}
+
+/** Test seam: forget every throttle entry. */
+export function resetPresenceThrottle(): void {
+  presenceTouchedAt.clear()
+}
+
+/**
+ * touchPollFleetPresenceOffPath — the hot-path form of touchPollFleetPresence for inbox / inbox_lease /
+ * task_list: skipped when this agent was touched < 60s ago, and the UPDATE runs in waitUntil (off the response
+ * path) when the caller has one. Nothing on the response path reads the row it writes.
+ */
+export async function touchPollFleetPresenceOffPath(
+  env: Env,
+  agentId: string | null | undefined,
+  waitUntil?: (p: Promise<unknown>) => void,
+): Promise<void> {
+  if (!agentId) return
+  if (presenceThrottleHit(`poll:${env.TENANT_SLUG}:${agentId}`)) return
+  const touch = touchPollFleetPresence(env, agentId) // never rejects (fail-soft inside)
+  if (waitUntil) waitUntil(touch)
+  else await touch
+}
+
 /**
  * clearPollFleetPresence — mupot#1494 round 2 (P2-g). `check_in({ presence_mode: 'resident' })`
  * is the explicit de-registration path: an agent that was poll-registered and is now switching

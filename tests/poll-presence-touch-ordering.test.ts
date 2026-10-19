@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
+import { resetPresenceThrottle } from '../src/fleet/registry'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -75,6 +76,7 @@ async function establishPollAndBackdate(backSeconds = 120): Promise<string> {
 
 describe('touchPollFleetPresence ordering — last thing on success only (mupot#1494 round 3, P2-c)', () => {
   beforeEach(() => {
+    resetPresenceThrottle() // the 60s presence throttle is per-isolate; each test starts cold
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seed(harness.sqlite)

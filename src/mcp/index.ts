@@ -198,6 +198,9 @@ import {
   pollPresenceTtlSec,
   upsertPollFleetPresence,
   touchPollFleetPresence,
+  touchPollFleetPresenceOffPath,
+  presenceThrottleHit,
+  presenceCallThrottleKey,
   clearPollFleetPresence,
   persistSeatRuntimeFromHarness,
   POLL_PRESENCE_MODE,
@@ -1458,7 +1461,7 @@ const toolTaskList: ToolSpec = {
     // merely after the tool-layer 400/403/404 refusals: this is the LAST thing on the success
     // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
     // W2: an attached thread's activity is not the agent host's heartbeat (it would keep an offline host looking live to dispatch).
-    if (!ctx?.sideEffectFree && !ctx?.heldSeat && !attachedAuthority(auth)) await touchPollFleetPresence(env, auth.boundAgentId)
+    if (!ctx?.sideEffectFree && !ctx?.heldSeat && !attachedAuthority(auth)) await touchPollFleetPresenceOffPath(env, auth.boundAgentId, ctx?.waitUntil)
 
     return done({
       squad_id: squadRes.squad.id,
@@ -1473,6 +1476,15 @@ const toolTaskList: ToolSpec = {
 
 // task_board — compact kanban-style view for brain loops. It is intentionally
 // read-only and squad-scoped; it groups the same rows task_list can read.
+// perf: the board is a glance view. Full bodies (up to ~10 KB each, 250 rows, sent twice as text +
+// structuredContent) made it ~1 MB; the board carries a short excerpt plus `body_truncated`, and
+// task_get returns the whole body. Same column set as TASK_SELECT_COLUMNS otherwise.
+const TASK_BOARD_BODY_EXCERPT_CHARS = 200
+const TASK_BOARD_COLUMNS = TASK_SELECT_COLUMNS.replace(
+  'title, body,',
+  `title, substr(body, 1, ${TASK_BOARD_BODY_EXCERPT_CHARS}) AS body, length(body) > ${TASK_BOARD_BODY_EXCERPT_CHARS} AS body_truncated,`,
+)
+
 const toolTaskBoard: ToolSpec = {
   name: 'task_board',
   scope: 'squad',
@@ -1497,14 +1509,14 @@ const toolTaskBoard: ToolSpec = {
       // ordering it by created_at means a board capped at `limit` drops the OLDEST rows
       // regardless of priority, so a P0 filed last month can fall out of the board entirely
       // while P3 chatter from today stays. Found by the ORDER-BY parity guard, not by me.
-      `SELECT ${TASK_SELECT_COLUMNS}
+      `SELECT ${TASK_BOARD_COLUMNS}
          FROM tasks
         WHERE squad_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY ${priorityOrderSql()}, created_at DESC
         LIMIT ?2`,
     )
       .bind(squadRes.squad.id, limit)
-      .all<Task>()
+      .all<Task & { body_truncated?: number }>()
 
     const columns: Record<TaskStatus, Task[]> = {
       open: [],
@@ -1515,7 +1527,8 @@ const toolTaskBoard: ToolSpec = {
       rejected: [],
       done: [],
     }
-    const visibleTaskRows = await loadGateWakeNotices(env, rows.results ?? [])
+    const boardRows = (rows.results ?? []).map((r) => ({ ...r, body_truncated: Number(r.body_truncated) === 1 }))
+    const visibleTaskRows = await loadGateWakeNotices(env, boardRows)
     // mupot#1494/#1502 (P1-a) — same reader as task_list; see its comment above.
     const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
     for (const task of visibleTaskRows) {
@@ -4396,7 +4409,7 @@ const toolRemember: ToolSpec = {
     required: ['text'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const text = str(args.text)
     if (!text) return fail(400, 'invalid_args', 'text required')
 
@@ -4404,7 +4417,7 @@ const toolRemember: ToolSpec = {
     if (concepts && !Array.isArray(concepts)) return concepts
 
     const scope = memberMemoryScope(auth.memberId as string)
-    const id = await createMemory(env).remember(scope, text, concepts)
+    const id = await createMemory(env).remember(scope, text, concepts, { waitUntil: ctx?.waitUntil })
     return done({ engram_id: id })
   },
 }
@@ -5161,7 +5174,7 @@ const toolInbox: ToolSpec = {
     // consumer_fenced, or a service-layer 400) — that is a refusal too, and must leave
     // last_reported_at untouched exactly like a tool-layer refusal does. Last thing on the
     // success path only.
-    if (!attachedAuthority(auth) && !ctx?.heldSeat) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat; held seats leave no trace
+    if (!attachedAuthority(auth) && !ctx?.heldSeat) await touchPollFleetPresenceOffPath(env, agent, ctx?.waitUntil) // W2: attached activity is not the host's heartbeat; held seats leave no trace
     // `complete` is surfaced deliberately: a caller must be able to know it was
     // handed everything WITHOUT comparing a length against a cap it has to know.
     // #1937: an attached chat's peek hides what it handled, but handled rows still count toward the sender-side unread
@@ -5320,7 +5333,7 @@ const toolInboxLease: ToolSpec = {
     // WITHIN leaseAgentInbox's attempt-id branch (a SERVICE-layer refusal) after the touch had
     // already run — a trivially repeatable no-op call held the agent 'live' forever. Last
     // thing on the success path only, regardless of which layer would have refused.
-    if (!attachedAuthority(auth)) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat
+    if (!attachedAuthority(auth)) await touchPollFleetPresenceOffPath(env, agent, ctx?.waitUntil) // W2: attached activity is not the host's heartbeat
     if ('state' in res) return done({
       tenant: res.tenant,
       agent_id: res.agent_id,
@@ -8200,7 +8213,7 @@ async function invokeToolInner(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

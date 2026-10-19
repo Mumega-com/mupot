@@ -4314,9 +4314,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_mcp_negotiation_log_at" },
     ],
   },
+  {
+    file: "0244_tasks_assignee_status_index.sql",
+    sha256: "f1ecb12167bfee137393d0a75246a3f84f10496b3577838d9127bbea952c961b",
+    statements: [
+      "-- perf: orient / task_list / inbox look tasks up by (assignee_agent_id, status). Additive, idempotent.\nCREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee_agent_id, status);",
+    ],
+    objects: [
+      { type: "index", name: "idx_tasks_assignee_status" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "945833f2238c154843dfb63ce60f224bebe94db41b7eff7d8f4e69fbb0587b99"
+export const SCHEMA_CHAIN_DIGEST: string = "26ecb7265540ba3be61fd43351347d1917964a2e8b2ab07633b8a2bedddc795c"

@@ -284,36 +284,17 @@ export async function buildOrient(
     }>()
   if (!agent) return { data: null, notFound: 'agent' }
 
-  const squad = await env.DB.prepare(`SELECT id, name, charter, okr, department_id FROM squads WHERE id = ?1 LIMIT 1`)
-    .bind(agent.squad_id)
-    .first<{ id: string; name: string; charter: string | null; okr: string | null; department_id: string }>()
-
-  const department = squad
-    ? await env.DB.prepare(`SELECT id, name FROM departments WHERE id = ?1 LIMIT 1`).bind(squad.department_id).first<{ id: string; name: string }>()
-    : null
-
-  const matesRes = await env.DB.prepare(
-    `SELECT a.id AS agent_id, a.slug AS slug, a.name AS name, a.role AS role, m.capability AS capability
-       FROM memberships m JOIN agents a ON a.id = m.agent_id
-      WHERE m.squad_id = ?1 AND a.status != 'inactive'`,
-  )
-    .bind(agent.squad_id)
-    .all<SquadMember>()
-  const members = matesRes.results ?? []
-  const supervisor = resolveSupervisor(members, agent.id)
-  const squadmates = members.filter((m) => m.agent_id !== agent.id && m.agent_id !== supervisor?.agent_id)
-
-  const tasksRes = await env.DB.prepare(
-    `SELECT id, title, status FROM tasks WHERE assignee_agent_id = ?1 AND status IN ('open','in_progress','blocked') AND ${TASK_NOT_ARCHIVED_SQL()} ORDER BY created_at ASC LIMIT 50`,
-  )
-    .bind(agent.id)
-    .all<OrientTask>()
-
-  const fieldRow = await env.DB.prepare(
-    `SELECT coherence, regime, trust_tier, trust_score, spin, field_updated_at FROM agent_field WHERE tenant = ?1 AND agent_id = ?2`,
-  )
-    .bind(env.TENANT_SLUG, agent.id)
-    .first<AgentFieldRow>()
+  // perf: every read below depends only on `agent`, so they run concurrently (one D1 round trip
+  // of wall time instead of six serial ones). squad -> department is the only true chain.
+  const squadThenDepartment = (async () => {
+    const sq = await env.DB.prepare(`SELECT id, name, charter, okr, department_id FROM squads WHERE id = ?1 LIMIT 1`)
+      .bind(agent.squad_id)
+      .first<{ id: string; name: string; charter: string | null; okr: string | null; department_id: string }>()
+    const dept = sq
+      ? await env.DB.prepare(`SELECT id, name FROM departments WHERE id = ?1 LIMIT 1`).bind(sq.department_id).first<{ id: string; name: string }>()
+      : null
+    return { sq, dept }
+  })()
 
   // Induction record — ATOMIC + rate-limited (#88). A single conditional upsert:
   //  - first call → INSERT, RETURNING orient_count = 1 → this is the induction.
@@ -322,9 +303,11 @@ export async function buildOrient(
   //    happens, RETURNING yields no row → induction = false (row already existed).
   // This removes the prior non-atomic SELECT-then-UPSERT race (cosmetic double
   // 'Welcome') AND caps write-amplification on the read path to one write per window.
-  const row = opts.recordInduction === false
-    ? null
-    : await env.DB.prepare(
+  // recordInduction:false = no write at all (read-only profile).
+  // Runs AFTER the reads resolve (not inside the Promise.all): a failed read must not leave an induction row behind.
+  const writeInduction = (): Promise<{ orient_count: number } | null> => opts.recordInduction === false
+    ? Promise.resolve(null)
+    : env.DB.prepare(
         `INSERT INTO agent_orientation (tenant, agent_id, first_inducted_at, last_oriented_at, orient_count)
            VALUES (?1, ?2, ?3, ?3, 1)
          ON CONFLICT(tenant, agent_id) DO UPDATE SET last_oriented_at = ?3, orient_count = orient_count + 1
@@ -333,6 +316,31 @@ export async function buildOrient(
       )
         .bind(env.TENANT_SLUG, agent.id, nowMs, nowMs - INDUCTION_RATE_MS)
         .first<{ orient_count: number }>()
+
+  const [{ sq: squad, dept: department }, matesRes, tasksRes, fieldRow] = await Promise.all([
+    squadThenDepartment,
+    env.DB.prepare(
+      `SELECT a.id AS agent_id, a.slug AS slug, a.name AS name, a.role AS role, m.capability AS capability
+         FROM memberships m JOIN agents a ON a.id = m.agent_id
+        WHERE m.squad_id = ?1 AND a.status != 'inactive'`,
+    )
+      .bind(agent.squad_id)
+      .all<SquadMember>(),
+    env.DB.prepare(
+      `SELECT id, title, status FROM tasks WHERE assignee_agent_id = ?1 AND status IN ('open','in_progress','blocked') AND ${TASK_NOT_ARCHIVED_SQL()} ORDER BY created_at ASC LIMIT 50`,
+    )
+      .bind(agent.id)
+      .all<OrientTask>(),
+    env.DB.prepare(
+      `SELECT coherence, regime, trust_tier, trust_score, spin, field_updated_at FROM agent_field WHERE tenant = ?1 AND agent_id = ?2`,
+    )
+      .bind(env.TENANT_SLUG, agent.id)
+      .first<AgentFieldRow>(),
+  ])
+  const row = await writeInduction()
+  const members = matesRes.results ?? []
+  const supervisor = resolveSupervisor(members, agent.id)
+  const squadmates = members.filter((m) => m.agent_id !== agent.id && m.agent_id !== supervisor?.agent_id)
   const induction = row?.orient_count === 1
 
   // Peer-exposure gate (#88): budget + field/trust are sensitive. Only the agent
