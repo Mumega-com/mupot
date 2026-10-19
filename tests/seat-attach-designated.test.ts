@@ -943,3 +943,46 @@ describe('guide, do not dead-end: an undesignated agent the human could designat
     expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).toBe('agent-rava')
   })
 })
+
+describe('mupot#2095: the verdict write re-asserts the attach designation (changed in the gap)', () => {
+  const setupGate = async (taskId: string): Promise<{ env: Env; attribution: { attachmentId: string; consentingMemberId: string; seatId: string; grantTokenId: string }; task: Record<string, unknown> }> => {
+    const env = envFor(h, DESIGNATED)
+    h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-r', 'gate:ops', 'agent', 'agent-rava', 'x', '2026-01-01')`) // before the admission, so it carries gate_authority 1
+    expect((await designate(env, 'agent-rava', HUMAN)).ok).toBe(true)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, created_at, updated_at)
+      VALUES (?, 'squad-core', 't', 'b', 'p', 'review', 'gate:ops', 'agent-hadi-admin', '2026-10-01', '2026-10-01')`).run(taskId)
+    const att = one<{ id: string; seat_id: string }>(`SELECT id, seat_id FROM agent_seat_attachments`)!
+    return {
+      env,
+      attribution: { attachmentId: att.id, consentingMemberId: HUMAN, seatId: att.seat_id, grantTokenId: g.tokenId },
+      task: one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = ?`, taskId)!,
+    }
+  }
+
+  it('control: with the designation intact the attached write lands', async () => {
+    const { env, attribution, task } = await setupGate('d-ok')
+    const { writeVerdict } = await import('../src/tasks/service')
+    await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution })).resolves.toBeTruthy()
+  })
+
+  it('designation moved to another member between the check and the write (cascade trigger defeated so only the write guard stands): refused', async () => {
+    const { env, attribution, task } = await setupGate('d-gap')
+    const { writeVerdict } = await import('../src/tasks/service')
+    h.sqlite.exec(`DROP TRIGGER agents_attach_designation_end`) // fixture only: in prod the trigger also revokes the admission; this isolates the guard's own clause
+    h.sqlite.exec(`UPDATE agents SET attach_designated_member_id = '${HUMAN2}' WHERE id = 'agent-rava'`)
+    await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution })).rejects.toThrow()
+    expect(n(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'd-gap'`)).toBe(0)
+    expect(one<{ status: string }>(`SELECT status FROM tasks WHERE id = 'd-gap'`)?.status).toBe('review')
+  })
+
+  it('designation cleared (NULL) between the check and the write: refused', async () => {
+    const { env, attribution, task } = await setupGate('d-null')
+    const { writeVerdict } = await import('../src/tasks/service')
+    h.sqlite.exec(`DROP TRIGGER agents_attach_designation_end`)
+    h.sqlite.exec(`UPDATE agents SET attach_designated_member_id = NULL WHERE id = 'agent-rava'`)
+    await expect(writeVerdict(env, { task: task as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution })).rejects.toThrow()
+    expect(n(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'd-null'`)).toBe(0)
+  })
+})
