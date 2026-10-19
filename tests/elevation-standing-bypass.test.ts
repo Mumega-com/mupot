@@ -10,8 +10,26 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createElevationRequest, decideElevationRequest } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { STRUCTURAL_ACTIONS, agentMustHoldMatchingGrant, type StructuralAction } from '../src/operators/chokepoint'
+
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+
+vi.mock('../src/auth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/auth')>()
+  return {
+    ...actual,
+    requireAuth: async (
+      c: { set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response },
+      next: () => Promise<void>,
+    ) => {
+      if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+      c.set('auth', authState.current)
+      await next()
+    },
+  }
+})
 
 const TENANT = 'tenant-struct'
 const ORIGIN = 'https://pot.test'
@@ -328,18 +346,88 @@ describe('create_squad: with DELEGATED_OPERATORS on, a grant on dept A never ope
   })
 })
 
-describe('ratchet: every act with an elevation door and no agent capability lane is gated through agentMustHoldMatchingGrant', () => {
-  const src = readFileSync(new URL('../src/mcp/provision.ts', import.meta.url), 'utf8')
-  const refuseWithDoor = (Object.entries(STRUCTURAL_ACTIONS) as Array<[StructuralAction, (typeof STRUCTURAL_ACTIONS)[StructuralAction]]>)
-    .filter(([, p]) => p.elevationAction && p.agentLane === 'refuse')
-    .map(([a]) => a)
+describe('HTTP door: POST /departments/:id/squads (mupot#1906)', () => {
+  const flagOn = () => { env = { ...env, DELEGATED_OPERATORS: '1' } as Env }
+  const deptBAdmin = () => agentAuth(standing(['department', DEPT_B, 'admin']))
+  async function postSquad(department: string, slug: string, auth: AuthContext): Promise<Response> {
+    const { orgApp } = await import('../src/org/index')
+    authState.current = auth
+    return orgApp.request(`/departments/${department}/squads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ slug, name: slug }),
+    }, env)
+  }
 
-  it('the table is non-empty and includes the four known acts', () => {
-    expect(refuseWithDoor).toEqual(expect.arrayContaining(['mint_agent_token', 'grant_agent_capability', 'update_squad', 'update_department']))
+  it('flag ON: standing dept-B admin + grant on dept A cannot create in B (no row, no usage); the grant works in A with a usage row and stamp', async () => {
+    flagOn()
+    const sessionId = await checkIn()
+    await approve(sessionId, 'department', DEPT_A, 60, T0, ['action:project_lifecycle'])
+    const refused = await postSquad(DEPT_B, 'http-sneaky-b', deptBAdmin())
+    expect(refused.status).toBe(403)
+    expect(squadExists('http-sneaky-b')).toBe(false)
+    expect(usage('action:project_lifecycle')).toBe(0)
+    const ok = await postSquad(DEPT_A, 'http-legit-a', deptBAdmin())
+    expect(ok.status, await ok.clone().text()).toBeLessThan(300)
+    expect(squadExists('http-legit-a')).toBe(true)
+    expect(usage('action:project_lifecycle')).toBeGreaterThan(0)
   })
 
-  it.each(refuseWithDoor)('%s: a handler consumes agentMustHoldMatchingGrant for it, true for a bound agent, false for a human', (action) => {
-    expect(src, `no agentMustHoldMatchingGrant(env, auth, '${action}') in src/mcp/provision.ts`).toContain(`agentMustHoldMatchingGrant(env, auth, '${action}')`)
+  it('flag ON: a human admin is unchanged; flag OFF: a standing dept admin agent is unchanged', async () => {
+    expect((await postSquad(DEPT_B, 'http-legacy-b', deptBAdmin())).status).toBeLessThan(300)
+    flagOn()
+    expect((await postSquad(DEPT_B, 'http-human-b', humanAdminAuth())).status).toBeLessThan(300)
+  })
+})
+
+describe('mint_agent_token: a grant never mints a non-expiring token from the standing org-owner plane', () => {
+  it('standing org OWNER agent + matching grant: non_expiring refused, a normal mint works', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_B1, 60, T0, ['action:mint_token'])
+    const a = agentAuth(standing(['org', null, 'owner']))
+    const refused = await mint(AGENT_B1, a, { non_expiring: true })
+    expect(refused.ok, JSON.stringify(refused)).toBe(false)
+    expect(JSON.stringify(refused)).toContain('non_expiring_owner_required')
+    expect(tokenCount(AGENT_B1)).toBe(0)
+    const ok = await mint(AGENT_B1, a)
+    expect(ok.ok, JSON.stringify(ok)).toBe(true)
+  })
+})
+
+function stripComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
+function walk(dir: string): string[] {
+  return readdirSync(dir).flatMap((n) => {
+    const f = join(dir, n)
+    return statSync(f).isDirectory() ? walk(f) : f.endsWith('.ts') ? [f] : []
+  })
+}
+
+describe('ratchet: every authorizeStructuralWrite caller of a grant-door act consults agentMustHoldMatchingGrant (code only, comments stripped)', () => {
+  const root = new URL('../src', import.meta.url).pathname
+  const entries = Object.entries(STRUCTURAL_ACTIONS) as Array<[StructuralAction, (typeof STRUCTURAL_ACTIONS)[StructuralAction]]>
+  // Acts whose standing lane an agent could ride in on a grant: a door the predicate can be true for.
+  const doorActs = entries.filter(([, p]) => p.elevationAction && (p.agentLane === 'refuse' || p.delegable)).map(([a]) => a)
+  // Callers that refuse EVERY non-principal verdict themselves (gate.kind !== 'principal'): no standing lane to ride.
+  const principalOnly = new Set(['org/squad-packs.ts', 'loops/outreach-pack.ts'])
+  const files = walk(root).map((f) => ({ rel: f.slice(root.length + 1), code: stripComments(readFileSync(f, 'utf8')) }))
+    .filter((f) => /authorizeStructuralWrite\(|structuralGate\(/.test(f.code) && f.rel !== 'operators/chokepoint.ts')
+
+  it('the door set and the caller scan are non-empty', () => {
+    expect(doorActs).toEqual(expect.arrayContaining(['mint_agent_token', 'grant_agent_capability', 'update_squad', 'update_department', 'create_squad']))
+    expect(files.map((f) => f.rel)).toEqual(expect.arrayContaining(['mcp/provision.ts', 'org/index.ts']))
+  })
+
+  const cases = doorActs.flatMap((a) => files.filter((f) => !principalOnly.has(f.rel) && f.code.includes(`'${a}'`)).map((f) => [a, f.rel] as const))
+  it.each(cases)('%s in %s consumes agentMustHoldMatchingGrant for it', (action, rel) => {
+    const code = files.find((f) => f.rel === rel)?.code ?? ''
+    expect(code, `${rel} gates '${action}' without agentMustHoldMatchingGrant(..., '${action}')`).toMatch(
+      new RegExp(`agentMustHoldMatchingGrant\\([^,]+,[^,]+,\\s*'${action}'\\)`),
+    )
+  })
+
+  it.each(doorActs.filter((a) => STRUCTURAL_ACTIONS[a].agentLane === 'refuse'))('%s: true for a bound agent, false for a human', (action) => {
     expect(agentMustHoldMatchingGrant(env, agentAuth(), action)).toBe(true)
     expect(agentMustHoldMatchingGrant(env, humanAdminAuth(), action)).toBe(false)
   })
@@ -347,6 +435,5 @@ describe('ratchet: every act with an elevation door and no agent capability lane
   it('create_squad (capability lane): true only when DELEGATED_OPERATORS is on', () => {
     expect(agentMustHoldMatchingGrant(env, agentAuth(), 'create_squad')).toBe(false)
     expect(agentMustHoldMatchingGrant({ ...env, DELEGATED_OPERATORS: '1' } as Env, agentAuth(), 'create_squad')).toBe(true)
-    expect(src).toContain("agentMustHoldMatchingGrant(env, auth, 'create_squad')")
   })
 })

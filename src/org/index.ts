@@ -41,7 +41,8 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
-import { authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
+import { hasElevatedAction } from '../auth/elevation'
+import { agentMustHoldMatchingGrant, authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
 import {
   setAgentSquadAccess,
@@ -230,8 +231,18 @@ orgApp.post('/departments/:id/squads', async (c) => {
   if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
 
   // Creating a squad in a department requires admin+ on THAT department.
-  if (gate.kind !== 'delegated' && !(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin'))) {
-    return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  // With DELEGATED_OPERATORS on, a bound agent never opens this with STANDING admin: a project_lifecycle grant on some other
+  // department returns agent_legacy, and its standing admin here must not ride that (mupot#1906). It needs a grant matching
+  // THIS department, same rule as the MCP door. Humans (and flag-off agents) keep the standing path.
+  let createdViaElevationGrant: string | undefined
+  if (gate.kind !== 'delegated' && (agentMustHoldMatchingGrant(c.env, c.get('auth'), 'create_squad') || !(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin')))) {
+    if (gate.kind !== 'agent_legacy') return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    const elevated = await hasElevatedAction(c.env, c.get('auth'), 'action:project_lifecycle', 'department', departmentId, {
+      toolName: 'create_squad',
+      detail: { department_id: departmentId, via: 'http' },
+    })
+    if (!elevated.granted) return c.json({ error: 'forbidden', need: 'admin', elevation_denied: elevated.reason }, 403)
+    createdViaElevationGrant = elevated.grant.id
   }
 
   let body: CreateSquadBody
@@ -266,7 +277,7 @@ orgApp.post('/departments/:id/squads', async (c) => {
     {
       createdByMemberId: auth.memberId ?? undefined,
       // an installer window authorised this create: stamp the grant, same as the MCP door
-      createdViaElevationGrant: gate.kind === 'delegated' && isInstallerDelegationId(gate.delegation.id) ? installerGrantIdOf(gate.delegation.id) : undefined,
+      createdViaElevationGrant: gate.kind === 'delegated' && isInstallerDelegationId(gate.delegation.id) ? installerGrantIdOf(gate.delegation.id) : createdViaElevationGrant,
     },
   )
   await finishDelegatedReceipt(c.env, gate, result.ok)

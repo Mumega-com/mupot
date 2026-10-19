@@ -991,7 +991,8 @@ export const toolMintAgentToken: ToolSpec = {
     const expiry = resolveAgentTokenExpiry({
       expiresInDays: args.expires_in_days as number | undefined,
       nonExpiring: args.non_expiring === true,
-      allowNonExpiring: hasCapability(grants, 'org', null, 'owner'),
+      // Under an elevation grant the standing org-owner plane is not the authority: a time-boxed grant never mints a non-expiring token.
+      allowNonExpiring: !elevatedGrant && hasCapability(grants, 'org', null, 'owner'),
     })
     if (!expiry.ok) return fail(400, expiry.code)
     const expiresAt = expiry.expiresAt
