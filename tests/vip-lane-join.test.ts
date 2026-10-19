@@ -126,6 +126,13 @@ describe('flag off', () => {
   })
 })
 
+// Every seat holds exactly its OWN derived gate (seat_select mint parity, #2089); a join must add nothing beyond that.
+function ownGateOnly(agentId: string): boolean {
+  const grants = h.sqlite.prepare(`SELECT capability, principal_type, principal_id FROM gate_grants`).all() as Array<{ capability: string; principal_type: string; principal_id: string }>
+  const slug = (h.sqlite.prepare(`SELECT slug FROM agents WHERE id = ?`).get(agentId) as { slug: string }).slug
+  return slug.startsWith('seat-') && grants.length === 1 && grants[0].capability === `gate:${slug}` && grants[0].principal_type === 'agent' && grants[0].principal_id === agentId
+}
+
 describe('eligible: instant observed seat', () => {
   it('a squad admin/owner: joins at once, stamped observed, ONE membership at the observed tier with a receipt', async () => {
     const s = await seatFor(OWNER)
@@ -137,7 +144,7 @@ describe('eligible: instant observed seat', () => {
     expect(OBSERVED_TIER_RANK).toBeLessThanOrEqual(capabilityRank('member')) // never above the seat ceiling
     expect(receipts()).toBe(1)
     expect(cards()).toBe(0)
-    expect(n(`SELECT COUNT(*) AS n FROM gate_grants`)).toBe(0)
+    expect(ownGateOnly(s.agentId)).toBe(true)
   })
 
   it('an org-admin (no row on the squad) joins instantly by slug or id', async () => {
@@ -178,7 +185,7 @@ describe('eligible: instant observed seat', () => {
     }
     // nothing was granted by any of those
     expect(membership(s.agentId, 'squad-target')).toEqual({ capability: 'member' })
-    expect(n(`SELECT COUNT(*) AS n FROM gate_grants`)).toBe(0)
+    expect(ownGateOnly(s.agentId)).toBe(true)
     // the floor names only tools that exist (a typo would be a silent hole in the other direction)
     const all = new Set(advertisedTools(env).map((t) => t.name))
     for (const name of OBSERVED_FLOOR_TOOLS) expect(all.has(name) || name === 'whoami', name).toBe(true)

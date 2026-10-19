@@ -4324,9 +4324,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_tasks_assignee_status" },
     ],
   },
+  {
+    file: "0245_backfill_seat_agent_own_gate.sql",
+    sha256: "0cc746de0054d8fe5582d1734afc983a6e5ea506db9bd4cec1b910b373232da5",
+    statements: [
+      "-- 0245 — backfill each seat agent's OWN lane gate (gate:<its own slug>), the same grant the mint path\n-- gives (src/members/service.ts) and seat_select now gives at creation (src/members/seat-select.ts).\n-- Before this, an agent created by seat_select could never hold the gate of a task routed to its own lane.\n-- SCOPE (tight on purpose): only SERVER-DERIVED slugs. A seat agent's slug is 'seat-' || first 12 chars of its\n-- seat's key_hash (src/members/seat-select.ts); an agent renamed to anything else (e.g. 'hadi') gets NOTHING.\n-- Capability is exactly 'gate:' || that slug, principal is that agent. Skips archived agents, inactive agents and\n-- retired seats; paused agents ARE included (hasActiveGateGrant refuses them at check time anyway).\n-- INSERT OR IGNORE on UNIQUE(capability, principal_type, principal_id): idempotent, never replaces an existing row.\n-- A fresh DB has no agent_seats rows, so this writes nothing (gate_grants stays empty after migrations).\nINSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)\nSELECT DISTINCT lower(hex(randomblob(16))), 'gate:' || a.slug, 'agent', a.id, 'system:backfill-0245', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n  FROM agent_seats s\n  JOIN agents a ON a.id = s.agent_id\n WHERE s.retired_at IS NULL\n   AND a.status IN ('active', 'paused')\n   AND a.archived_at IS NULL\n   AND a.slug = 'seat-' || substr(s.key_hash, 1, 12);",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "26ecb7265540ba3be61fd43351347d1917964a2e8b2ab07633b8a2bedddc795c"
+export const SCHEMA_CHAIN_DIGEST: string = "7c13746be71753799b64d252d8581506478311a8a2cf45352aa402fdd358fe15"
