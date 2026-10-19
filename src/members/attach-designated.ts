@@ -29,3 +29,7 @@ export function attachDesignatedClause(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO
     : `AND ${humanParam} IS NOT NULL`
 }
 
+
+/** The admission belongs to the chat that asked (#2056); NULL never matches. Shared by EVERY hand-copied attachment-liveness
+ *  check (resolver, elevation origin, events) so they cannot drift apart. Needs aliases `adm` (admission) and `att` (attachment). */
+export const ADMISSION_BOUND_TO_SEAT_SQL = 'adm.requested_seat_id = att.seat_id'

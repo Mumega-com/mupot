@@ -820,6 +820,8 @@ describe('sudo for attached chats: decide-time liveness mirrors use-time (each m
   // broken in production; the SQL mirrors them anyway (defence in depth) and they are deliberately not prestated here.
   const BREAKS: Array<[string, (member: string) => string]> = [
     ['seat retired', () => `UPDATE agent_seats SET retired_at = '2026-10-14 00:00:00'`],
+    ['admission bound to another chat (#2056)', () => `DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable; UPDATE agent_seat_admissions SET requested_seat_id = 'seat-other'`],
+    ['admission binding NULL (#2056)', () => `DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable; UPDATE agent_seat_admissions SET requested_seat_id = NULL`],
     ['agent inactive', () => `UPDATE agents SET status = 'inactive' WHERE id = 'agent-rava'`],
     ['seat token not directory channel', () => `UPDATE member_tokens SET channel = 'workspace' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],
     ['seat token not for this agent', () => `UPDATE member_tokens SET agent_id = NULL WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],

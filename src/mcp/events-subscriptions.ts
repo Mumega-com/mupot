@@ -4,7 +4,7 @@
 //
 // Only `message.created` (the bound agent's OWN inbox) is subscribable in this PR.
 
-import { attachDesignatedClause } from '../members/attach-designated'
+import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
 import type { AuthContext, Env } from '../types'
 import { decryptConnectorSecret, encryptConnectorSecret } from '../connectors/crypto'
 import { capabilityRank, holdsCapabilityFloor, resolveCapabilities } from '../auth/capability'
@@ -462,18 +462,30 @@ async function attachmentLiveness(env: Env, tokenId: string): Promise<{ live: tr
   try {
     const row = await env.DB.prepare(
       `SELECT att.detached_at AS detached_at, adm.status AS adm_status, s.retired_at AS retired_at,
-              CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.id = att.agent_id ${attachDesignatedClause(env, 'a', 'att.human_member_id')}) THEN 1 ELSE 0 END AS designated
+              CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.id = att.agent_id ${attachDesignatedClause(env, 'a', 'att.human_member_id')}) THEN 1 ELSE 0 END AS designated,
+              CASE WHEN ${ADMISSION_BOUND_TO_SEAT_SQL} THEN 1 ELSE 0 END AS bound,
+              CASE WHEN adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id THEN 1 ELSE 0 END AS adm_matches,
+              CASE WHEN s.member_id = att.human_member_id AND s.harness_id = att.harness_id THEN 1 ELSE 0 END AS seat_matches,
+              CASE WHEN EXISTS (SELECT 1 FROM agents a
+                                  JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = a.id
+                                  JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
+                                 WHERE a.id = att.agent_id AND a.status = 'active')
+                    AND EXISTS (SELECT 1 FROM harnesses hr WHERE hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id)
+                   THEN 1 ELSE 0 END AS chain_ok
          FROM agent_seat_attachments att
          LEFT JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
          LEFT JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant
         WHERE att.tenant = ?1 AND att.seat_token_id = ?2
         LIMIT 1`,
-    ).bind(env.TENANT_SLUG, tokenId).first<{ detached_at: string | null; adm_status: string | null; retired_at: string | null; designated: number }>()
+    ).bind(env.TENANT_SLUG, tokenId).first<{ detached_at: string | null; adm_status: string | null; retired_at: string | null; designated: number; bound: number; adm_matches: number; seat_matches: number; chain_ok: number }>()
     if (!row) return null
     if (row.detached_at !== null) return { live: false, reason: 'attachment_detached' }
     if (row.adm_status !== 'live') return { live: false, reason: 'admission_not_live' }
     if (row.retired_at !== null) return { live: false, reason: 'seat_retired' }
     if (row.designated !== 1) return { live: false, reason: 'agent_not_designated' }
+    if (row.bound !== 1) return { live: false, reason: 'admission_not_bound_to_seat' }
+    if (row.adm_matches !== 1 || row.seat_matches !== 1) return { live: false, reason: 'admission_mismatch' }
+    if (row.chain_ok !== 1) return { live: false, reason: 'agent_or_harness_not_live' }
     return { live: true }
   } catch (err) {
     if (/no such table:\s*agent_seat_(attachments|admissions|seats)\b/i.test(err instanceof Error ? err.message : String(err))) return null

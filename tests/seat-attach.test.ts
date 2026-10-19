@@ -2397,10 +2397,15 @@ describe('MCP Events for attached agents: revocation and isolation (gate round)'
     const ids = (): Promise<string[]> => listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId }).then((l) => l.map((a) => a.agentId))
     expect(await ids()).toEqual(['agent-rava'])
     dropAttachmentTriggers()
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
+    h.sqlite.exec('PRAGMA foreign_keys = OFF') // the cross-seat fixture binds to a seat row that need not exist
     const breaks: Array<[string, string, string, string, string | null]> = [
       // [name, break SQL, restore SQL, expected delivery reason, expected list-empty (null = delivery-only break)]
       ['admission not live', `UPDATE agent_seat_admissions SET status = 'revoked'`, `UPDATE agent_seat_admissions SET status = 'live'`, 'admission_not_live', 'x'],
       ['seat retired', `UPDATE agent_seats SET retired_at = '2026-10-15 00:00:00'`, `UPDATE agent_seats SET retired_at = NULL`, 'seat_retired', 'x'],
+      // #2056: the admission is bound to the chat that asked; a legacy cross-seat or NULL binding is not live (list AND delivery)
+      ['admission bound to another seat', `UPDATE agent_seat_admissions SET requested_seat_id = 'seat-other'`, `UPDATE agent_seat_admissions SET requested_seat_id = (SELECT seat_id FROM agent_seat_attachments LIMIT 1)`, 'admission_not_bound_to_seat', 'x'],
+      ['admission binding NULL', `UPDATE agent_seat_admissions SET requested_seat_id = NULL`, `UPDATE agent_seat_admissions SET requested_seat_id = (SELECT seat_id FROM agent_seat_attachments LIMIT 1)`, 'admission_not_bound_to_seat', 'x'],
       ['attachment token revoked', `UPDATE member_tokens SET revoked_at = '2026-10-15 00:00:00' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`, `UPDATE member_tokens SET revoked_at = NULL WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`, 'token_not_live', 'x'],
     ]
     for (const [name, brk, restore, reason] of breaks) {

@@ -49,8 +49,8 @@ import { sanitizeLabel } from './harness'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
-export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause } from './attach-designated'
-import { attachDesignatedClause, seatAttachEnabled } from './attach-designated'
+export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
+import { attachDesignatedClause, seatAttachEnabled, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
 export const ATTACH_IDLE_DAYS = 30
@@ -570,7 +570,7 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
         AND adm.agent_id = att.agent_id
         AND adm.human_member_id = att.human_member_id
         AND adm.harness_id = att.harness_id
-        AND adm.requested_seat_id = att.seat_id -- the approval belongs to the chat that asked (#2056); NULL never matches
+        AND ${ADMISSION_BOUND_TO_SEAT_SQL}
         AND s.retired_at IS NULL
         AND s.member_id = att.human_member_id
         AND s.harness_id = att.harness_id

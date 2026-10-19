@@ -12,7 +12,7 @@
 // The subscription then stores the ATTACHMENT's token (not the human's grant), so every delivery re-derives liveness from that token
 // (subscriberAccessLive) plus an explicit attachment/admission check: detach, revoke, retire or deactivate stops wakes at the next
 // message. The wake is body-free (message_id/seq only), so nothing about identity, retrieval or inbox content is shared.
-import { attachDesignatedClause } from '../members/attach-designated'
+import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
 import type { AuthContext, Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
@@ -50,7 +50,7 @@ export async function listLiveAttachmentsForEvents(
       `SELECT att.id AS attachment_id, a.id AS agent_id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
               b.member_id AS agent_member_id, att.seat_token_id AS seat_token_id
          FROM agent_seat_attachments att
-         JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant AND adm.status = 'live'
+         JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant AND adm.status = 'live' AND ${ADMISSION_BOUND_TO_SEAT_SQL}
               AND adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id
          JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL
               AND s.member_id = att.human_member_id AND s.harness_id = att.harness_id
