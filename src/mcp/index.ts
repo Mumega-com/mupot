@@ -8551,7 +8551,9 @@ mcpApp.use('*', async (c, next) => {
         const result = env.result
         const stamped = typeof result === 'object' && result !== null && !Array.isArray(result)
           ? { ...env, result: { ...(result as Record<string, unknown>), _meta: { ...(typeof (result as { _meta?: unknown })._meta === 'object' && (result as { _meta?: unknown })._meta !== null ? (result as { _meta: Record<string, unknown> })._meta : {}), 'mupot/tenant_header_notice': notice } } } // result is a plain object per the check above
-          : { ...env, tenant_header_notice: notice }
+          : typeof env.error === 'object' && env.error !== null && !Array.isArray(env.error)
+            ? stampErrorNotice(env, env.error as Record<string, unknown>, notice) // plain object per the check above
+            : { ...env, tenant_header_notice: notice } // legacy {tool,args} body: not JSON-RPC, a top-level field is safe
         body = JSON.stringify(stamped)
         headers.delete('content-length')
       }
@@ -8561,6 +8563,20 @@ mcpApp.use('*', async (c, next) => {
   }
   c.res = new Response(body, { status: c.res.status, statusText: c.res.statusText, headers })
 })
+
+/** JSON-RPC error: the SDK parses an error response strictly, so the notice may ride ONLY inside `error.data` (merged, never clobbering).
+ *  A non-object `data` (string detail) is left alone; the response header still carries the notice. */
+function stampErrorNotice(env: Record<string, unknown>, error: Record<string, unknown>, notice: TenantHeaderNotice): Record<string, unknown> {
+  const data = error.data
+  if (data === undefined || data === null) return { ...env, error: { ...error, data: { tenant_header_notice: notice } } }
+  if (typeof data === 'object' && !Array.isArray(data)) return { ...env, error: { ...error, data: { ...(data as Record<string, unknown>), tenant_header_notice: notice } } } // plain object per the check
+  return env
+}
+
+/** Exported for test only. */
+export function stampErrorNoticeForTest(env: Record<string, unknown>, notice: TenantHeaderNotice): Record<string, unknown> {
+  return stampErrorNotice(env, env.error as Record<string, unknown>, notice) // test passes an error envelope
+}
 
 mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.TENANT_SLUG }))
 
