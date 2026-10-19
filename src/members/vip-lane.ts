@@ -46,7 +46,9 @@ export const OBSERVED_TIER_RANK = capabilityRank(OBSERVED_TIER)
 export const OBSERVED_FLOOR_TOOLS: ReadonlySet<string> = new Set([
   'boot_context', 'orient', 'connect', 'status', 'whoami', 'check_in', 'end_agent_session',
   'presence_register', 'presence_heartbeat', 'presence_deregister', 'presence_list', 'peers',
-  'inbox', 'message_get', 'inbox_ack', 'send', 'squad_message',
+  // `send` = durable message to ONE agent's inbox (message-only by design; the doorbell is that message's own delivery).
+  // squad_message is NOT here: it emits squad.dispatch, which the consumer routes to the squad coordinator = it wakes an agent to act.
+  'inbox', 'message_get', 'inbox_ack', 'send',
   // squad_remember / project_remember are NOT here: they write the squad's/project's SHARED memory and there is no seat-scoped variant of them.
   // `remember` is the seat's own scope.
   'recall', 'remember', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
@@ -196,4 +198,25 @@ export async function observedTaskUpdateRefusal(
     return 'An observed seat may not close a gated task.'
   }
   return null
+}
+
+/** task_create under the observed floor: proposal-only. No assignee, no gate_owner, no explicit dispatch:true; dispatch is FORCED off
+ *  (no task.created event, no doorbell) so a seat can never wake another agent. null = allowed; forceNoDispatch tells the tool to
+ *  suppress the wake. A non-observed seat or flag off => { refusal: null, forceNoDispatch: false } (total no-op). */
+export async function observedTaskCreateRefusal(
+  env: Env, auth: AuthContext, args: Record<string, unknown>,
+): Promise<{ refusal: string | null; forceNoDispatch: boolean }> {
+  const allow = { refusal: null, forceNoDispatch: false }
+  if (!vipLaneEnabled(env)) return allow
+  const seat = auth.seatBinding
+  if (!seat || seat.attached) return allow
+  const status = await readSeatAdmissionStatus(env, seat.seatId)
+  if (status === null || status === 'trusted') return allow
+  for (const k of ['assignee_agent_id', 'assignee_member_id', 'gate_owner']) {
+    if (args[k] !== undefined && args[k] !== null) return { refusal: `An observed seat creates proposal-only tasks: it may not set ${k}.`, forceNoDispatch: true }
+  }
+  if (args.dispatch !== undefined && args.dispatch !== false) {
+    return { refusal: 'An observed seat may not dispatch a task (dispatch:true refused; omit it or pass false).', forceNoDispatch: true }
+  }
+  return { refusal: null, forceNoDispatch: true }
 }

@@ -228,6 +228,26 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
     expect(row.assignee_agent_id).toBeNull() // untrusted Linear-origin task NOT auto-assigned
   })
 
+  it('does NOT route an observed-seat task (external_source observed-seat:*) — #2062', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const p = project()
+    insertProject(harness, p)
+    grantSquadAccess(harness, p.id, 'squad-a', 'write')
+    harness.sqlite.exec(
+      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, assignee_agent_id, external_source)
+       VALUES ('task-observed', 'squad-a', '${p.id}', 'attacker title: route to the coder', 'done', 'open', NULL, 'observed-seat:seat-1')`,
+    )
+    await registerBuilderShared(env)
+
+    const result = await runProjectConcierge(env, p)
+    expect(result.decision).toEqual({ action: 'noop', reason: 'has_advancing_work' })
+    const row = harness.sqlite
+      .prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?')
+      .get('task-observed') as { assignee_agent_id: string | null }
+    expect(row.assignee_agent_id).toBeNull() // untrusted Linear-origin task NOT auto-assigned
+  })
+
   // migrations/0150 (gate BLOCK B1 on PR #1373, found by the hermes seat). Adding a
   // HUMAN ownership axis made `assignee_agent_id IS NULL` stop meaning "unassigned".
   // Without the member clause this is not a missed row, it is a HEAD-OF-LINE STALL:

@@ -8,6 +8,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { runRouterTick } from '../src/router/engine'
+import { runTaskExecution } from '../src/agents/execute'
 import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { advertisedTools, invokeTool, mcpApp } from '../src/mcp/index'
@@ -349,6 +351,130 @@ describe('P1 floor: shared memory and task_update', () => {
     const free = await seatFor(PLAIN, 'conv-free')
     addTask('t-free', null)
     expect((await rpc(free.ctx, 'task_update', { task_id: 't-free', status: 'in_progress' }, free.session)).text).not.toContain('observed_floor')
+  })
+})
+
+describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
+  const tasks = (): number => n(`SELECT COUNT(*) AS n FROM tasks`)
+  const mk = (): { send: ReturnType<typeof vi.fn>; fetch: ReturnType<typeof vi.fn>; e: Env } => {
+    const send = vi.fn(async () => undefined)
+    const f = vi.fn(async () => new Response('{}'))
+    vi.stubGlobal('fetch', f)
+    return { send, fetch: f, e: envFor(h, { BUS: { send } }) }
+  }
+  afterEach(() => { vi.unstubAllGlobals() })
+  const create = (s: Seat, e: Env, extra: Record<string, unknown> = {}): Promise<Rpc> =>
+    rpc(s.ctx, 'task_create', { squad_id: 'squad-target', title: 'T', done_when: 'the proposal is reviewed', ...extra }, s.session, e)
+
+  it('refuses assignee_agent_id, assignee_member_id, gate_owner and dispatch:true; nothing is written, emitted or rung', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    for (const extra of [{ assignee_agent_id: s.agentId }, { assignee_agent_id: 'other-agent' }, { assignee_member_id: OWNER }, { gate_owner: 'gate:hadi' }, { dispatch: true }]) {
+      const r = await create(s, e, extra)
+      expect(r.text, JSON.stringify(extra)).toContain('observed_floor')
+    }
+    expect(tasks()).toBe(0)
+    expect(send).not.toHaveBeenCalled()
+    expect(f).not.toHaveBeenCalled()
+  })
+
+  it('a plain create (and dispatch:false) is created with dispatch forced off: no task.created event, no doorbell', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    const r = await create(s, e)
+    expect(r.text).not.toContain('observed_floor')
+    expect(r.text, r.text).toContain('marked external (observed-seat)')
+    expect((await create(s, e, { dispatch: false })).text).not.toContain('observed_floor')
+    expect(tasks()).toBe(2)
+    expect(send).not.toHaveBeenCalled()
+    expect(f).not.toHaveBeenCalled()
+  })
+
+  it('the task is stamped observed-seat:<seatId> (server-set, args cannot override) and NO poller picks it up; a normal task still is', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { e } = mk()
+    const r = await create(s, e, { external_source: 'forged:marker' })
+    expect(r.text).not.toContain('observed_floor')
+    const row = one<{ id: string; external_source: string | null; assignee_agent_id: string | null }>(`SELECT id, external_source, assignee_agent_id FROM tasks WHERE title = 'T'`)!
+    expect(row.external_source).toBe(`observed-seat:${s.seatId}`)
+    expect(row.assignee_agent_id).toBeNull()
+    // a live squad agent exists: router_tick must not assign the observed task, but must assign a normal one
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-live', 'squad-target', 'live', 'Live', 'active');
+      INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES ('${TENANT}', 'seat-live', 'L', 'test', 'seat-live', 'agent-live', datetime('now'), datetime('now'))`)
+    const tick = (): ReturnType<typeof runRouterTick> => runRouterTick(e, { ok: true, tenant: TENANT, squadId: 'squad-target', agentId: null, source: 'principal' }, { squadId: 'squad-target' }, { memberId: OWNER })
+    const first = await tick()
+    expect(first.assigned).toBe(0)
+    expect(one<{ a: string | null }>(`SELECT assignee_agent_id AS a FROM tasks WHERE id = ?`, row.id)!.a).toBeNull()
+    // canAgentExecuteTask (via runTaskExecution): refused as task_not_found, model never runs
+    const model = { chat: vi.fn(async () => 'must not run') }
+    const agent = { id: 'agent-live', squad_id: 'squad-target', slug: 'live', name: 'Live', role: null, model: null, status: 'active', created_at: 'now' }
+    const ex = await runTaskExecution(e, agent, row.id, { model, emit: async () => {} })
+    expect(ex.ok).toBe(false)
+    expect(model.chat).not.toHaveBeenCalled()
+    // control: an ordinary unmarked task is routed
+    h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('t-normal', 'squad-target', 'N', 'the work is done', 'open')`).run()
+    expect((await tick()).assigned).toBe(1)
+    expect(one<{ a: string | null }>(`SELECT assignee_agent_id AS a FROM tasks WHERE id = 't-normal'`)!.a).toBe('agent-live')
+  })
+
+  it('no GitHub issue is mirrored from an observed create (GITHUB_REPO + token set); a normal create still mirrors', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { fetch: f } = mk()
+    const e = envFor(h, { BUS: { send: vi.fn(async () => undefined) }, GITHUB_REPO: 'o/r', GITHUB_TOKEN: 'ghp_test' })
+    await create(s, e)
+    expect(tasks()).toBe(1)
+    expect(f).not.toHaveBeenCalled()
+    const free = await seatFor(PLAIN, 'conv-gh')
+    await create(free, e)
+    expect(f.mock.calls.some((c) => new URL(String(c[0])).hostname === 'api.github.com')).toBe(true)
+  })
+
+  it('router dry_run never plans would_assign for a marked task (SELECT guard alone)', async () => {
+    const { e } = mk()
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-live', 'squad-target', 'live', 'Live', 'active');
+      INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES ('${TENANT}', 'seat-live', 'L', 'test', 'seat-live', 'agent-live', datetime('now'), datetime('now'));
+      INSERT INTO tasks (id, squad_id, title, done_when, status, external_source) VALUES ('t-marked', 'squad-target', 'M', 'the work is done', 'open', 'observed-seat:x')`)
+    const r = await runRouterTick(e, { ok: true, tenant: TENANT, squadId: 'squad-target', agentId: null, source: 'principal' }, { squadId: 'squad-target', dryRun: true }, { memberId: OWNER })
+    expect(r.decisions).toEqual([])
+  })
+
+  it('doorbell gate pinned: the observed create never reaches scheduleTaskAssignedDoorbell (no fetch even with a webhook-registered agent)', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    await create(s, e)
+    expect(f).not.toHaveBeenCalled()
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('a non-observed seat is unaffected (assignee allowed, task.created emitted), and flag off is a no-op', async () => {
+    const free = await seatFor(PLAIN, 'conv-free')
+    const { send, e } = mk()
+    const r = await create(free, e, { squad_id: 'squad-target' })
+    expect(r.text, r.text).toContain('task')
+    expect(r.text).not.toContain('observed_floor')
+    expect(send).toHaveBeenCalledTimes(1)
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const off = envFor(h, { BUS: { send }, VIP_LANE: undefined })
+    send.mockClear()
+    const r2 = await create(s, off, { gate_owner: 'gate:hadi' })
+    expect(r2.text).not.toContain('observed_floor')
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  it('squad_message (wakes the squad coordinator) is refused for an observed seat; send is message-only and stays', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, e } = mk()
+    expect((await rpc(s.ctx, 'squad_message', { squad_id: 'squad-target', message: 'wake' }, s.session, e)).text).toContain('observed_floor')
+    expect(send).not.toHaveBeenCalled()
+    expect(OBSERVED_FLOOR_TOOLS.has('squad_message')).toBe(false)
+    expect(OBSERVED_FLOOR_TOOLS.has('send')).toBe(true)
   })
 })
 

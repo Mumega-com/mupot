@@ -90,6 +90,8 @@ export async function runRouterTick(
       WHERE t.squad_id = ?1
         AND t.status = 'open'
         AND t.assignee_agent_id IS NULL
+        -- #2062: never auto-route an untrusted-origin task (cross-pot or external_source, incl. 'observed-seat:*'); an explicit assignee step is required.
+        AND t.source_pot IS NULL AND t.external_source IS NULL
         AND ${TASK_NOT_ARCHIVED_SQL('t')}
         -- mupot#1733 — a held task stays open+unassigned forever, so it must not occupy the
         -- bounded scan window (starvation). A real gate:* task is only scanned if SOME
@@ -176,6 +178,7 @@ export async function runRouterTick(
           AND squad_id = ?4
           AND status = 'open'
           AND assignee_agent_id IS NULL
+          AND source_pot IS NULL AND external_source IS NULL
           AND EXISTS (
             SELECT 1
               FROM squads actor_squad
