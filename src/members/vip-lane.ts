@@ -47,7 +47,9 @@ export const OBSERVED_FLOOR_TOOLS: ReadonlySet<string> = new Set([
   'boot_context', 'orient', 'connect', 'status', 'whoami', 'check_in', 'end_agent_session',
   'presence_register', 'presence_heartbeat', 'presence_deregister', 'presence_list', 'peers',
   'inbox', 'message_get', 'inbox_ack', 'send', 'squad_message',
-  'recall', 'remember', 'memory_recent', 'memory_get', 'squad_recall', 'squad_remember', 'project_recall', 'project_remember', 'project_memory_get',
+  // squad_remember / project_remember are NOT here: they write the squad's/project's SHARED memory and there is no seat-scoped variant of them.
+  // `remember` is the seat's own scope.
+  'recall', 'remember', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
   'task_list', 'task_board', 'task_get', 'kanban_board', 'task_create', 'task_update',
   'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
   'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
@@ -101,7 +103,7 @@ export async function resolveJoinTargets(env: Env, ref: { squad?: string; projec
   if (ids.length === 0) return { ok: false, error: 'not_found' }
   if (ids.length > 1) return { ok: false, error: 'ambiguous' }
   const rows = await env.DB.prepare(
-    `SELECT ${SQUAD_COLS} FROM project_squad_access a JOIN squads s ON s.id = a.squad_id WHERE a.project_id = ?1 ORDER BY s.id LIMIT 50`,
+    `SELECT ${SQUAD_COLS} FROM project_squad_access a JOIN squads s ON s.id = a.squad_id WHERE a.project_id = ?1 AND s.status != 'archived' ORDER BY s.id LIMIT 50`,
   ).bind(ids[0]).all<JoinTarget>()
   return { ok: true, squads: rows.results ?? [], via: 'project' }
 }
@@ -115,7 +117,7 @@ export async function humanMayInstantJoin(env: Env, grants: Awaited<ReturnType<t
 
 export type InstantJoinResult =
   | { ok: true; admission_status: SeatAdmissionStatus; membership: 'created' | 'already' | 'kept'; squad: Pick<JoinTarget, 'id' | 'slug' | 'name'> }
-  | { ok: false; error: 'member_not_active' | 'seat_held' | 'squad_not_joinable' | 'write_refused' }
+  | { ok: false; error: 'member_not_active' | 'seat_held' | 'squad_not_joinable' | 'write_refused' | 'standing_lost' }
 
 /**
  * The instant, observed join for an UNATTACHED seat. The caller (the tool) has already proved eligibility with humanMayInstantJoin;
@@ -129,9 +131,14 @@ export async function instantObservedJoin(
   if (p.squad.kind === 'home' || p.squad.status === 'archived') return { ok: false, error: 'squad_not_joinable' }
   const status = await readSeatAdmissionStatus(env, p.seatId)
   if (status === 'held') return { ok: false, error: 'seat_held' }
-  // Floor first (only while NULL): a held/trusted seat is never re-stamped by a repeat join.
-  await env.DB.prepare(`UPDATE agent_seats SET admission_status = 'observed' WHERE id = ?1 AND tenant = ?2 AND admission_status IS NULL`)
-    .bind(p.seatId, env.TENANT_SLUG).run()
+  // Re-derive standing NOW, at the write (the caller's grants may be stale by a few awaits): same function, fresh read. This narrows the
+  // window between check and write; it does not make them one statement (a demotion landing between this line and the write still wins the race).
+  const grants = await resolveCapabilities(env, p.humanMemberId)
+  if (!(await humanMayInstantJoin(env, grants, p.squad.id))) return { ok: false, error: 'standing_lost' }
+  // Floor first (only while NULL, only for a still-active member): a held/trusted seat is never re-stamped by a repeat join.
+  await env.DB.prepare(`UPDATE agent_seats SET admission_status = 'observed' WHERE id = ?1 AND tenant = ?2 AND admission_status IS NULL
+      AND EXISTS (SELECT 1 FROM members WHERE id = ?3 AND tenant = ?2 AND status = 'active' AND archived_at IS NULL)`)
+    .bind(p.seatId, env.TENANT_SLUG, p.humanMemberId).run()
   const now = await readSeatAdmissionStatus(env, p.seatId)
   if (now === null || now === 'held') return { ok: false, error: 'seat_held' }
   const squad = { id: p.squad.id, slug: p.squad.slug, name: p.squad.name }
@@ -143,7 +150,7 @@ export async function instantObservedJoin(
     return { ok: true, admission_status: now, membership: capabilityRank(existing.capability as Capability) > OBSERVED_TIER_RANK ? 'kept' : 'already', squad } // stored value, closed CHECK list in 0001
   }
   // The write runs AS the human, with the human's own effective grants (buildAuth leaves them undefined for a legacy owner/admin login).
-  const humanAuth: AuthContext = { ...(await buildAuth(env, p.humanMemberId)), capabilities: p.grants }
+  const humanAuth: AuthContext = { ...(await buildAuth(env, p.humanMemberId)), capabilities: grants }
   const w = await addSquadMember({
     env, auth: humanAuth, agentId: p.seatAgentId,
     squad: { id: p.squad.id, department_id: p.squad.department_id, kind: p.squad.kind as OrgKind }, // kind is the squads.kind CHECK list; 'home' was refused above
@@ -151,4 +158,42 @@ export async function instantObservedJoin(
   })
   if (!w.ok) return { ok: false, error: 'write_refused' }
   return { ok: true, admission_status: now, membership: 'created', squad }
+}
+
+/** Per-HUMAN card caps across ALL of that human's seats (a per-seat cap is multiplied by however many seats a session can mint). */
+export const VIP_CARD_MAX_PENDING_PER_HUMAN = 5
+export const VIP_CARD_MAX_PER_HOUR_PER_HUMAN = 10
+
+export async function humanCardCapReached(env: Env, humanMemberId: string, nowMs: number = Date.now()): Promise<boolean> {
+  const nowIso = new Date(nowMs).toISOString()
+  const pending = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM squad_join_requests r JOIN agent_seats s ON s.agent_id = r.agent_id
+      WHERE s.tenant = ?1 AND s.member_id = ?2 AND r.status = 'pending' AND r.expires_at > ?3`,
+  ).bind(env.TENANT_SLUG, humanMemberId, nowIso).first<{ n: number }>()
+  if (Number(pending?.n ?? 0) >= VIP_CARD_MAX_PENDING_PER_HUMAN) return true
+  const hour = await env.DB.prepare(
+    `SELECT COALESCE(SUM(l.count), 0) AS n FROM squad_join_rate_limits l JOIN agent_seats s ON s.agent_id = l.agent_id
+      WHERE s.tenant = ?1 AND s.member_id = ?2 AND l.bucket = ?3`,
+  ).bind(env.TENANT_SLUG, humanMemberId, nowIso.slice(0, 13)).first<{ n: number }>()
+  return Number(hour?.n ?? 0) >= VIP_CARD_MAX_PER_HOUR_PER_HUMAN
+}
+
+/** task_update under the observed floor: only a task assigned to THIS seat's agent (the tasks table has no creator column), and never the
+ *  gate/assignee fields, nor a terminal status on a gated task. null = allowed. */
+export async function observedTaskUpdateRefusal(
+  env: Env, auth: AuthContext, existing: { assignee_agent_id: string | null; gate_owner: string | null }, args: Record<string, unknown>,
+): Promise<string | null> {
+  if (!vipLaneEnabled(env)) return null
+  const seat = auth.seatBinding
+  if (!seat || seat.attached) return null
+  const status = await readSeatAdmissionStatus(env, seat.seatId)
+  if (status === null || status === 'trusted') return null
+  if (!auth.boundAgentId || existing.assignee_agent_id !== auth.boundAgentId) return 'An observed seat may update only tasks assigned to it.'
+  for (const k of ['gate_owner', 'gate_owner_reason', 'assignee_agent_id', 'assignee_member_id']) {
+    if (args[k] !== undefined) return `An observed seat may not change ${k}.`
+  }
+  if (existing.gate_owner && typeof args.status === 'string' && ['done', 'approved', 'rejected'].includes(args.status)) {
+    return 'An observed seat may not close a gated task.'
+  }
+  return null
 }

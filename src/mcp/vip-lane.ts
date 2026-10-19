@@ -10,8 +10,8 @@ import { fail, done, str } from './index'
 import { resolveCapabilities } from '../auth/capability'
 import { memberIsActiveHuman } from '../access/identity'
 import { secureMomentsStatus } from '../secure-moments/config'
-import { fileSquadJoinRequest, hasLivePendingJoin } from '../members/squad-join'
-import { humanMayInstantJoin, instantObservedJoin, resolveJoinTargets, OBSERVED_TIER, type JoinTarget } from '../members/vip-lane'
+import { completePendingJoinCard, fileSquadJoinRequest } from '../members/squad-join'
+import { humanCardCapReached, humanMayInstantJoin, instantObservedJoin, resolveJoinTargets, OBSERVED_TIER, type JoinTarget } from '../members/vip-lane'
 
 const JOIN_REQUESTED_TEXT = "Your request went to that squad's owner/admins as one pending card. Nothing changes until one of them decides with a passkey; you will hear back in your inbox."
 
@@ -47,7 +47,7 @@ const toolJoinSquad: ToolSpec = {
     if (!t.ok) {
       // A squad ref that does not resolve still gets the card (no existence oracle); a project that does not resolve is a 404.
       if (squadArg === undefined) return fail(404, 'project_not_found')
-      return requestCard(auth, env, agentId, squadArg, ctx?.waitUntil)
+      return requestCard(auth, env, agentId, squadArg, ctx?.waitUntil, seat?.humanMemberId)
     }
 
     // Eligibility from the human's EFFECTIVE grants, only for an UNATTACHED seat of an active human.
@@ -83,29 +83,40 @@ const toolJoinSquad: ToolSpec = {
         case 'member_not_active': return fail(403, r.error, 'The member behind this seat is not active.')
         case 'seat_held': return fail(403, r.error, 'This seat is held. An owner of the squad releases it; calling join_squad again does not.')
         case 'squad_not_joinable': return fail(409, r.error, 'That squad cannot be joined this way (a home or archived squad).')
+        case 'standing_lost': return fail(403, r.error, 'Your standing on that squad changed while this was being checked. Call join_squad again.')
         default: return fail(500, r.error)
       }
     }
 
     // Not eligible: ONE card. A project with several squads and none yours has no single owner to ask.
+    if (t.squads.length === 0) return fail(404, squadArg === undefined ? 'project_not_found' : 'squad_not_found')
     if (t.squads.length !== 1) return fail(400, 'name_a_squad', 'That project is open to more than one squad and none is yours. Call join_squad with the squad you want; its owner is then asked.')
-    return requestCard(auth, env, agentId, squadArg ?? t.squads[0].id, ctx?.waitUntil)
+    return requestCard(auth, env, agentId, squadArg ?? t.squads[0].id, ctx?.waitUntil, seat?.humanMemberId)
   },
 }
 
-async function requestCard(auth: Parameters<ToolSpec['run']>[0], env: Parameters<ToolSpec['run']>[1], agentId: string, squadRef: string, waitUntil: Parameters<typeof fileSquadJoinRequest>[1]['waitUntil']) {
+async function requestCard(auth: Parameters<ToolSpec['run']>[0], env: Parameters<ToolSpec['run']>[1], agentId: string, squadRef: string, waitUntil: Parameters<typeof fileSquadJoinRequest>[1]['waitUntil'], humanMemberId?: string) {
   if (secureMomentsStatus(env).state !== 'on') {
     return fail(503, 'secure_moments_unavailable', 'Approval cards are not enabled on this pot. Ask a squad admin to add you with squad_member_add.')
   }
-  const reply = { status: 'join_requested', decided_by: "the squad's owner/admins", agent_prompt: JOIN_REQUESTED_TEXT }
-  // Repeat: the pending card stands. Do not re-file, rotate the link or re-notify.
-  if (await hasLivePendingJoin(env, agentId, squadRef)) return done({ ...reply, already_pending: true })
+  const reply = { status: 'join_requested', card: 'filed', decided_by: "the squad's owner/admins", agent_prompt: JOIN_REQUESTED_TEXT }
+  const pendingLink = { ...reply, card: 'link_pending', agent_prompt: "Your request is filed, but its approval link could not be made yet, so nobody has been notified. Call join_squad again in a minute and it will be retried." }
+  // Repeat: a pending card stands. Do not re-file, rotate or re-notify; but a card whose link failed is completed here.
+  const existing = await completePendingJoinCard(env, agentId, squadRef, waitUntil)
+  if (existing === 'complete') return done({ ...reply, already_pending: true })
+  if (existing === 'link_pending') return done({ ...pendingLink, already_pending: true })
+  // Per-HUMAN caps across all of that human's seats (the per-agent caps are multiplied by every seat a session can make).
+  if (humanMemberId && (await humanCardCapReached(env, humanMemberId))) {
+    return fail(429, 'too_many_cards', 'This member already has too many join requests waiting or sent in the last hour across their seats. Wait for a decision.')
+  }
   const r = await fileSquadJoinRequest(env, { agentId, squadRef, capability: 'observer', reason: null, via: auth.seatBinding?.attached ? 'attached_chat' : 'agent', waitUntil, allowSeatAgent: true })
   if (r.ok) return done(reply)
   switch (r.error) {
     case 'agent_inactive': return fail(403, r.error, 'This agent is not active, so it cannot ask to join a squad.')
     case 'rate_limited': return fail(429, r.error, 'Too many join requests from this agent in the last hour. Wait, and use the card already filed.')
     case 'too_many_pending_requests': return fail(429, r.error, 'This agent already has too many join requests waiting. Wait for a decision.')
+    // The row may have been inserted before the link failed: say so, and the repeat call completes it.
+    case 'link_unavailable': return done({ ...pendingLink })
     default: return fail(503, 'secure_moments_unavailable', 'An approval card could not be made right now. Try again, or ask a squad admin to add you with squad_member_add.')
   }
 }

@@ -14,7 +14,7 @@ import { advertisedTools, invokeTool, mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
-import { OBSERVED_FLOOR_TOOLS, OBSERVED_TIER_RANK } from '../src/members/vip-lane'
+import { OBSERVED_FLOOR_TOOLS, OBSERVED_TIER_RANK, instantObservedJoin, observedFloorRefusal, readSeatAdmissionStatus } from '../src/members/vip-lane'
 import { capabilityRank } from '../src/auth/capability'
 import type { AuthContext, Env } from '../src/types'
 
@@ -313,5 +313,154 @@ describe('projects map to squads through their access edges', () => {
     const s = await seatFor(OWNER)
     expect((await join(s, {})).text).toContain('invalid_args')
     expect((await join(s, { squad: 'squad-target', project: 'gaf' })).text).toContain('invalid_args')
+  })
+})
+
+describe('P1 floor: shared memory and task_update', () => {
+  const addTask = (id: string, assignee: string | null, gate: string | null = null): void => {
+    h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id, gate_owner) VALUES (?, 'squad-target', ?, 'open', ?, ?)`).run(id, `T ${id}`, assignee, gate)
+  }
+  it('squad_remember and project_remember are refused for an observed seat (no seat-scoped variant exists); plain remember is not', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    expect((await rpc(s.ctx, 'squad_remember', { squad_id: 'squad-target', text: 'x' }, s.session)).text).toContain('observed_floor')
+    expect((await rpc(s.ctx, 'project_remember', { project_id: 'proj-1', text: 'x' }, s.session)).text).toContain('observed_floor')
+    expect((await rpc(s.ctx, 'remember', { text: 'x' }, s.session)).text).not.toContain('observed_floor')
+    expect(OBSERVED_FLOOR_TOOLS.has('squad_remember') || OBSERVED_FLOOR_TOOLS.has('project_remember')).toBe(false)
+  })
+  it('task_update: only a task assigned to the seat; never gate/assignee fields; never closes a gated task', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    addTask('t-other', null)
+    addTask('t-mine', s.agentId)
+    addTask('t-mine-gated', s.agentId, 'gate:hadi')
+    const taskStatus = (id: string): string => one<{ status: string }>(`SELECT status FROM tasks WHERE id = ?`, id)!.status
+    const other = await rpc(s.ctx, 'task_update', { task_id: 't-other', status: 'in_progress' }, s.session)
+    expect(other.text).toContain('observed_floor')
+    expect(taskStatus('t-other')).toBe('open')
+    expect((await rpc(s.ctx, 'task_update', { task_id: 't-mine', status: 'in_progress' }, s.session)).text).not.toContain('observed_floor')
+    expect(taskStatus('t-mine')).toBe('in_progress')
+    for (const args of [{ gate_owner: 'gate:x' }, { assignee_agent_id: 'someone' }, { assignee_member_id: OWNER }, { gate_owner_reason: 'r' }]) {
+      expect((await rpc(s.ctx, 'task_update', { task_id: 't-mine', ...args }, s.session)).text, JSON.stringify(args)).toContain('observed_floor')
+    }
+    expect((await rpc(s.ctx, 'task_update', { task_id: 't-mine-gated', status: 'done' }, s.session)).text).toContain('observed_floor')
+    expect(taskStatus('t-mine-gated')).toBe('open')
+    // a seat with no status is not touched by this rule
+    const free = await seatFor(PLAIN, 'conv-free')
+    addTask('t-free', null)
+    expect((await rpc(free.ctx, 'task_update', { task_id: 't-free', status: 'in_progress' }, free.session)).text).not.toContain('observed_floor')
+  })
+})
+
+describe('P1 card caps per HUMAN', () => {
+  it('two seats of one human share ONE cap: pending cards across both stop at the limit; a repeat of an existing card still answers', async () => {
+    for (let i = 1; i <= 6; i++) seedSquad(`squad-c${i}`)
+    const a = await seatFor(PLAIN, 'conv-a')
+    const b = await seatFor(PLAIN, 'conv-b')
+    expect(a.agentId).not.toBe(b.agentId)
+    for (const sq of ['squad-c1', 'squad-c2', 'squad-c3']) expect((await join(a, { squad: sq })).sc.status).toBe('join_requested')
+    for (const sq of ['squad-c4', 'squad-c5']) expect((await join(b, { squad: sq })).sc.status).toBe('join_requested')
+    const over = await join(b, { squad: 'squad-c6' })
+    expect(over.text).toContain('too_many_cards')
+    expect(cards()).toBe(5)
+    expect((await join(b, { squad: 'squad-c4' })).sc.already_pending).toBe(true)
+    expect((await join(a, { squad: 'squad-c6' })).text).toContain('too_many_cards')
+    // another human is unaffected
+    const other = await seatFor(NOBODY, 'conv-n')
+    expect((await join(other, { squad: 'squad-c6' })).sc.status).toBe('join_requested')
+  })
+})
+
+describe('P1 card with no link is not reported complete', () => {
+  it('link failure: honest link_pending (row kept), and the repeat creates the link and does not file a second card', async () => {
+    const s = await seatFor(PLAIN)
+    h.sqlite.exec(`CREATE TRIGGER block_moment BEFORE INSERT ON secure_moments BEGIN SELECT RAISE(ABORT, 'blocked'); END;`)
+    const first = await join(s, { squad: 'squad-target' })
+    expect(first.sc.status, first.text).toBe('join_requested')
+    expect(first.sc.card).toBe('link_pending')
+    expect(String(first.sc.agent_prompt)).toContain('could not be made')
+    expect(cards()).toBe(1)
+    expect(moments()).toBe(0)
+    const still = await join(s, { squad: 'squad-target' })
+    expect(still.sc.card).toBe('link_pending')
+    expect(still.sc.already_pending).toBe(true)
+    expect(cards()).toBe(1)
+    h.sqlite.exec(`DROP TRIGGER block_moment`)
+    const again = await join(s, { squad: 'squad-target' })
+    expect(again.sc.card).toBe('filed')
+    expect(cards()).toBe(1)
+    expect(moments()).toBe(1)
+    expect((await join(s, { squad: 'squad-target' })).sc.already_pending).toBe(true)
+    expect(moments()).toBe(1)
+  })
+})
+
+describe('P2 fail-closed pins', () => {
+  it('a project whose only edge is an archived squad is not found (archived squads are not counted)', async () => {
+    h.sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'arch', 'Arch', 'active');
+      UPDATE squads SET status = 'archived' WHERE id = 'squad-second';
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-a', 'squad-second', 'write');`)
+    const s = await seatFor(OWNER)
+    expect((await join(s, { project: 'arch' })).text).toContain('project_not_found')
+    // an archived edge does not make a second target either
+    h.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-a', 'squad-target', 'write')`)
+    expect((await join(s, { project: 'arch' })).sc.status).toBe('joined')
+  })
+
+  it('standing is re-derived at the write: grants that were true at check time but are gone now refuse and write nothing', async () => {
+    const s = await seatFor(OWNER)
+    const stale = [{ member_id: OWNER, scope_type: 'squad' as const, scope_id: 'squad-target', capability: 'admin' as const }]
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${OWNER}' AND scope_id = 'squad-target'`)
+    const sq = one<{ id: string; slug: string; name: string; department_id: string; kind: string; status: string }>(`SELECT id, slug, name, department_id, kind, status FROM squads WHERE id = 'squad-target'`)!
+    const r = await instantObservedJoin(env, { humanMemberId: OWNER, seatId: s.seatId, seatAgentId: s.agentId, squad: sq, grants: stale })
+    expect(r).toEqual({ ok: false, error: 'standing_lost' })
+    expect(status(s.seatId)).toBeNull()
+    expect(membership(s.agentId, 'squad-target')).toBeUndefined()
+  })
+
+  it('a held seat is floored (read tools pass, everything else is refused)', async () => {
+    const s = await seatFor(OWNER)
+    h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(s.seatId)
+    expect((await rpc(s.ctx, 'request_elevation', {}, s.session)).text).toContain('observed_floor')
+    expect((await rpc(s.ctx, 'status', {}, s.session)).text).not.toContain('observed_floor')
+  })
+
+  it('an unknown stored status reads as held; a read error reads as held', async () => {
+    const fake = (first: () => unknown): Env => ({ TENANT_SLUG: TENANT, DB: { prepare: () => ({ bind: () => ({ first: async () => first() }) }) } } as unknown as Env)
+    expect(await readSeatAdmissionStatus(fake(() => ({ s: 'bogus' })), 'x')).toBe('held')
+    expect(await readSeatAdmissionStatus(fake(() => { throw new Error('d1 down') }), 'x')).toBe('held')
+    expect(await readSeatAdmissionStatus(fake(() => ({ s: null })), 'x')).toBeNull()
+    expect(await readSeatAdmissionStatus(fake(() => null), 'x')).toBeNull()
+    const seatCtx = { seatBinding: { seatId: 's', label: '', harnessId: '', grantTokenId: '', humanMemberId: 'm', source: 'handle' } } as unknown as AuthContext
+    const down = { ...fake(() => { throw new Error('d1 down') }), VIP_LANE: '1' } as Env
+    expect(await observedFloorRefusal(down, seatCtx, 'request_elevation')).toEqual({ status: 'held' })
+  })
+
+  it('flag off: the floor never reads the seat row', async () => {
+    const boom = { VIP_LANE: undefined, TENANT_SLUG: TENANT, DB: { prepare: () => { throw new Error('must not be read') } } } as unknown as Env
+    const seatCtx = { seatBinding: { seatId: 's', label: '', harnessId: '', grantTokenId: '', humanMemberId: 'm', source: 'handle' } } as unknown as AuthContext
+    expect(await observedFloorRefusal(boom, seatCtx, 'request_elevation')).toBeNull()
+  })
+
+  it('an ATTACHED seat can never instant-join, even for its owner-human: it gets the card, no membership, no status', async () => {
+    const s = await seatFor(OWNER)
+    const bind = { seatId: s.seatId, label: 'x', harnessId: 'h', grantTokenId: 't', humanMemberId: OWNER, source: 'handle' as const }
+    const attached: AuthContext = { ...s.ctx, boundAgentId: s.agentId, seatBinding: { ...bind, attached: { attachmentId: 'att', admissionId: 'adm', agentId: s.agentId, seatAgentId: s.agentId, ceiling: 'member' } } }
+    const r = await invokeTool(attached, env, 'join_squad', { squad: 'squad-target' }, 'https://pot.test')
+    expect(r.ok && (r.result as { status: string }).status, JSON.stringify(r)).toBe('join_requested')
+    expect(membership(s.agentId, 'squad-target')).toBeUndefined()
+    expect(status(s.seatId)).toBeNull()
+  })
+
+  it('a home squad is refused by the write itself (squad_not_joinable) and by the tool (no membership)', async () => {
+    const s = await seatFor(OWNER)
+    cap(OWNER, 'squad', 'squad-home-x', 'admin')
+    const sq = one<{ id: string; slug: string; name: string; department_id: string; kind: string; status: string }>(`SELECT id, slug, name, department_id, kind, status FROM squads WHERE id = 'squad-home-x'`)!
+    const grants = [{ member_id: OWNER, scope_type: 'squad' as const, scope_id: 'squad-home-x', capability: 'admin' as const }]
+    expect(await instantObservedJoin(env, { humanMemberId: OWNER, seatId: s.seatId, seatAgentId: s.agentId, squad: sq, grants })).toEqual({ ok: false, error: 'squad_not_joinable' })
+    expect(status(s.seatId)).toBeNull()
+    expect((await join(s, { squad: 'squad-home-x' })).text).not.toContain('"joined"')
+    expect(membership(s.agentId, 'squad-home-x')).toBeUndefined()
+    expect(status(s.seatId)).toBeNull()
   })
 })

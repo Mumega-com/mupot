@@ -215,7 +215,7 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { VIP_LANE_TOOLS } from './vip-lane'
-import { observedFloorRefusal, vipLaneEnabled } from '../members/vip-lane'
+import { observedFloorRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -1672,6 +1672,10 @@ const toolTaskUpdate: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
+
+    // #2035 wall 1: an OBSERVED seat updates only its own assigned tasks, never gate/assignee fields, never closes a gated task.
+    const observedTaskRefusal = await observedTaskUpdateRefusal(env, auth, existing, args)
+    if (observedTaskRefusal) return fail(403, 'observed_floor', observedTaskRefusal)
 
     // mupot#1592 NEW-1, keyed per mupot#1602 r2 on freeze existence rather than
     // gate_owner (r2 BLOCK P1 — see officeTaskContentLocked's own doc comment,

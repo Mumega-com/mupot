@@ -136,6 +136,27 @@ export async function hasLivePendingJoin(env: Env, agentId: string, squadRef: st
 }
 
 /**
+ * A pending request can exist WITHOUT a link (the row was inserted, then issueMomentLink failed). For a pending row with no live
+ * moment, make the link now and notify the approvers; with a live moment there is nothing to do (no rotation, no re-notify).
+ * 'none' = no live pending row. 'link_pending' = still no link (the caller says so honestly and the next repeat retries).
+ */
+export async function completePendingJoinCard(
+  env: Env, agentId: string, squadRef: string, waitUntil?: WaitUntil, nowMs: number = Date.now(),
+): Promise<'complete' | 'link_pending' | 'none'> {
+  const row = await findPending(env, agentId, `ref:${squadRef.trim().toLowerCase()}`, new Date(nowMs).toISOString())
+  if (!row) return 'none'
+  const live = await env.DB.prepare(`SELECT 1 AS x FROM secure_moments WHERE kind = 'squad_join' AND subject_id = ?1 AND status = 'pending' LIMIT 1`).bind(row.id).first<{ x: number }>()
+  if (live) return 'complete'
+  const agent = await env.DB.prepare(`SELECT name FROM agents WHERE id = ?1 LIMIT 1`).bind(agentId).first<{ name: string }>()
+  const link = await issueMomentLink(env, { kind: 'squad_join', subjectId: row.id, requesterAgentId: agentId, subjectExpiresAtIso: row.expires_at })
+  if (!link) return 'link_pending'
+  const notice = notifyApprovers(env, row, link.url, agent?.name ?? '')
+  if (waitUntil) waitUntil(notice)
+  else await notice
+  return 'complete'
+}
+
+/**
  * File (or re-issue) the request and mint its link. Never reveals anything about the squad: the squad is resolved here only
  * to key the dedupe row and to show the APPROVER later. The caller (the tool) has already established WHICH agent is asking
  * from the session, never from args.
