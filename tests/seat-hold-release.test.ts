@@ -1,0 +1,289 @@
+// tests/seat-hold-release.test.ts — #2060: HUMAN hold / release / return of observed seats + the seatBinding-less floor.
+// Real sqlite D1 from the full migration chain; seats from the real OAuth auto-seat path; the dashboard routes through the real dashboardApp.
+// MUTATIONS proven (see PR body): the owner scope (member_id) in changeSeatAdmission, the SEAT_TRANSITIONS table, the HELD floor list,
+// the boundAgentId floor lookup, the flag gate.
+
+import { readdirSync, readFileSync } from 'node:fs'
+import { join as pjoin } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
+import { upsertHarness } from '../src/members/harness'
+import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
+import { advertisedTools, mcpApp } from '../src/mcp/index'
+import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
+import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
+import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
+import { HELD_FLOOR_TOOLS, OBSERVED_FLOOR_TOOLS, observedFloorRefusal } from '../src/members/vip-lane'
+import { changeSeatAdmission } from '../src/members/seat-hold-release'
+import type { AuthContext, Env } from '../src/types'
+
+const TENANT = 'mumega'
+const OWNER = 'member-owner' // admin on squad-target + admin on its own home squad (squad-core hosts its seat agents)
+const ORGADM = 'member-orgadmin'
+const PLAIN = 'member-plain' // only a member on squad-target
+const NOBODY = 'member-nobody' // no rows on squad-target
+const STALE = 'member-stale' // owner grant on squad-target, EXPIRED
+const HOST = 'secure.example.test'
+const MASTER = 'a1'.repeat(32)
+
+function memoryKv() {
+  const store = new Map<string, string>()
+  return {
+    async get(key: string, type?: string) { const v = store.get(key); return v === undefined ? null : type === 'json' ? JSON.parse(v) : v },
+    async put(key: string, value: string) { store.set(key, value) },
+    async delete(key: string) { store.delete(key) },
+  }
+}
+function envFor(h: SqliteD1Harness, extra: Record<string, unknown> = {}): Env {
+  return {
+    DB: h.db, TENANT_SLUG: TENANT, PUBLIC_ORIGIN: 'https://colony.example.test', SESSIONS: memoryKv(), OAUTH_KV: { get: async () => null, put: async () => undefined },
+    CONNECTOR_MASTER_KEY: MASTER, SECURE_MOMENTS: '1', SECURE_MOMENTS_HOST: HOST,
+    SEAT_AUTO_ENROLL: '1', SEAT_ATTACH: '1', VIP_LANE: '1', SEAT_MAX_PER_MEMBER: '100', SEAT_MAX_TOTAL_PER_MEMBER: '200', SEAT_MAX_TOTAL_PER_HARNESS: '200', ...extra,
+  } as unknown as Env
+}
+
+let h: SqliteD1Harness
+let env: Env
+let tok = 0
+const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
+const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare(sql).get(...p) as T | undefined
+
+const seedHuman = (id: string): void => { h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('${id}', '${id}@example.test', 'Human ${id}', 'active', '2026-10-09T00:00:00.000Z', '${TENANT}')`) }
+function seedSquad(id: string, kind = 'work'): void {
+  h.sqlite.exec(`INSERT OR IGNORE INTO departments (id, slug, name) VALUES ('dept-${id}', 'dept-${id}', 'Dept ${id}');
+    INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('${id}', 'dept-${id}', '${id}', 'Squad ${id}', '${kind}');`)
+}
+const cap = (member: string, scope: 'squad' | 'org', scopeId: string | null, capability: string, expires: string | null = null): void => {
+  h.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES (?, ?, ?, ?, ?, ?)`).run(`cap-${member}-${scope}-${scopeId ?? 'org'}-${capability}`, member, scope, scopeId, capability, expires)
+}
+
+interface Seat { ctx: AuthContext; session: string; seatId: string; agentId: string }
+async function seatFor(memberId: string, session = 'conv-a'): Promise<Seat> {
+  const harness = await upsertHarness(env, memberId, 'client-chatgpt', 'ChatGPT')
+  if (!harness) throw new Error('harness fixture failed')
+  const tokenId = `tok-${memberId}-${++tok}`
+  h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('${tokenId}', '${memberId}', 'hash-${tokenId}', 'oauth:client-chatgpt', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+  const ctx = await buildAuthContextFromProps(env, { memberId, tokenId, email: null, channel: 'directory', boundAgentId: null, harnessId: harness.id })
+  if (!ctx) throw new Error('grant ctx null')
+  const boot = await rpc(ctx, 'boot_context', {}, session)
+  const row = one<{ id: string; agent_id: string }>(`SELECT id, agent_id FROM agent_seats WHERE member_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`, memberId)
+  if (!row) throw new Error(`no seat made: ${JSON.stringify(boot.body)}`)
+  return { ctx, session, seatId: row.id, agentId: row.agent_id }
+}
+interface Rpc { body: Record<string, unknown>; sc: Record<string, unknown>; text: string }
+async function rpc(ctx: AuthContext, name: string, args: Record<string, unknown>, session: string, e: Env = env): Promise<Rpc> {
+  const req = new Request('https://pot.test/mcp', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args, _meta: { 'openai/session': session } } }),
+  })
+  const res = await mcpApp.fetch(mcpInternalRequest(req, ctx), e)
+  const body = (await res.json()) as Record<string, unknown>
+  return { body, sc: ((body.result ?? {}) as { structuredContent?: Record<string, unknown> }).structuredContent ?? {}, text: JSON.stringify(body) }
+}
+
+
+const status = (seatId: string): string | null => one<{ s: string | null }>(`SELECT admission_status AS s FROM agent_seats WHERE id = ?`, seatId)?.s ?? null
+const setStatus = (seatId: string, s: string | null): void => { h.sqlite.prepare(`UPDATE agent_seats SET admission_status = ? WHERE id = ?`).run(s, seatId) }
+const audit = (seatId: string): Array<{ member_id: string; action: string; from_status: string; to_status: string; at: string }> =>
+  h.sqlite.prepare(`SELECT member_id, action, from_status, to_status, at FROM seat_admission_changes WHERE seat_id = ? ORDER BY rowid`).all(seatId) as never
+
+beforeEach(async () => {
+  h = createSqliteD1()
+  applyAllMigrations(h.sqlite)
+  env = envFor(h)
+  for (const m of [OWNER, PLAIN]) seedHuman(m)
+  seedSquad('squad-core')
+  for (const m of [OWNER, PLAIN]) cap(m, 'squad', 'squad-core', 'admin')
+  resetHarnessProbeSampling()
+  resetAutoSeatRefusalCache()
+})
+afterEach(() => { h.close(); vi.restoreAllMocks() })
+
+async function session(e: Env, email: string): Promise<string> {
+  const { authApp } = await import('../src/auth')
+  const res = await authApp.request('/dev-login', {}, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: email } as unknown as Env)
+  const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
+  if (!m) throw new Error('no session cookie')
+  return `mupot_session=${m[1]}`
+}
+async function dash(e: Env, cookie: string, path: string, origin: string | null = 'http://localhost'): Promise<Response> {
+  const { dashboardApp } = await import('../src/dashboard/index')
+  const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }
+  if (origin) headers.origin = origin
+  return dashboardApp.request(path, { method: 'POST', headers, body: '{}' }, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'x' } as unknown as Env)
+}
+const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
+const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString()) }
+const post = (cookie: string, seatId: string, action: string, e: Env = env): Promise<Response> => dash(e, cookie, `/connections/seats/${seatId}/${action}`)
+
+describe('transitions by the owner', () => {
+  it('hold, return and release each move the status and write one audit row (who, from, to, at)', async () => {
+    const s = await seatFor(OWNER)
+    const cookie = await session(env, `${OWNER}@example.test`)
+    setStatus(s.seatId, 'observed')
+    stale() // hold needs only a real session
+    expect((await post(cookie, s.seatId, 'hold')).status).toBe(200)
+    expect(status(s.seatId)).toBe('held')
+    fresh()
+    expect((await post(cookie, s.seatId, 'return')).status).toBe(200)
+    expect(status(s.seatId)).toBe('observed')
+    await post(cookie, s.seatId, 'hold')
+    expect((await post(cookie, s.seatId, 'release')).status).toBe(200) // held -> trusted
+    expect(status(s.seatId)).toBe('trusted')
+    expect(audit(s.seatId).map((a) => `${a.action}:${a.from_status}>${a.to_status}`)).toEqual(['hold:observed>held', 'return:held>observed', 'hold:observed>held', 'release:held>trusted'])
+    expect(audit(s.seatId).every((a) => a.member_id === OWNER && a.at.length > 10)).toBe(true)
+    setStatus(s.seatId, 'observed')
+    expect((await post(cookie, s.seatId, 'release')).status).toBe(200) // observed -> trusted
+    expect(status(s.seatId)).toBe('trusted')
+  })
+
+  it('the allowed set is exact: no hold of held/trusted/NULL, no return of observed, no release of trusted/NULL; no audit row on refusal', async () => {
+    const s = await seatFor(OWNER)
+    const cookie = await session(env, `${OWNER}@example.test`)
+    fresh()
+    const cases: Array<[string | null, string, boolean]> = [
+      [null, 'hold', false], [null, 'release', false], [null, 'return', false],
+      ['observed', 'hold', true], ['observed', 'return', false], ['observed', 'release', true],
+      ['held', 'hold', false], ['held', 'return', true], ['held', 'release', true],
+      ['trusted', 'hold', false], ['trusted', 'return', false], ['trusted', 'release', false],
+    ]
+    for (const [from, action, ok] of cases) {
+      setStatus(s.seatId, from)
+      const before = audit(s.seatId).length
+      const res = await post(cookie, s.seatId, action)
+      expect(res.status === 200, `${from} ${action}`).toBe(ok)
+      expect(audit(s.seatId).length - before, `${from} ${action} audit`).toBe(ok ? 1 : 0)
+      if (!ok) expect(status(s.seatId)).toBe(from)
+    }
+  })
+
+  it('release and return need a FRESH reauth; hold does not; a cross-origin POST is refused', async () => {
+    const s = await seatFor(OWNER)
+    const cookie = await session(env, `${OWNER}@example.test`)
+    stale()
+    setStatus(s.seatId, 'held')
+    expect((await post(cookie, s.seatId, 'release')).status).toBe(403)
+    expect((await post(cookie, s.seatId, 'return')).status).toBe(403)
+    expect(status(s.seatId)).toBe('held')
+    fresh()
+    expect((await dash(env, cookie, `/connections/seats/${s.seatId}/return`, 'http://evil.test')).status).toBe(403)
+    expect(status(s.seatId)).toBe('held')
+  })
+})
+
+describe('only the seat\'s own human', () => {
+  it('another human cannot hold, release or return it (404, status and audit untouched); GET lists only own seats', async () => {
+    const s = await seatFor(OWNER)
+    const other = await session(env, `${PLAIN}@example.test`)
+    fresh()
+    for (const [from, action] of [['observed', 'hold'], ['observed', 'release'], ['held', 'return'], ['held', 'release']] as const) {
+      setStatus(s.seatId, from)
+      expect((await post(other, s.seatId, action)).status, action).toBe(404)
+      expect(status(s.seatId)).toBe(from)
+    }
+    expect(audit(s.seatId)).toEqual([])
+    const { dashboardApp } = await import('../src/dashboard/index')
+    const listFor = async (cookie: string): Promise<string> => (await dashboardApp.request('/connections', { headers: { cookie } }, { ...env, LOCAL_TEST_AUTH: '1' } as unknown as Env)).text()
+    setStatus(s.seatId, 'observed')
+    expect(await listFor(other)).not.toContain(`data-cx-hold="${s.seatId}"`)
+    const mine = await listFor(await session(env, `${OWNER}@example.test`))
+    expect(mine).toContain('Observed chats')
+    expect(mine).toContain(`data-cx-hold="${s.seatId}"`)
+  })
+
+  it('an agent / MCP caller cannot reach it: no tool, no web session', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'observed')
+    for (const t of advertisedTools(env)) expect(t.name).not.toMatch(/admission_status|seat_(hold|release|status|trust)|^(hold|release)_/i)
+    // an MCP session of the seat's own human has no dashboard web session: the route refuses it
+    const { dashboardApp } = await import('../src/dashboard/index')
+    const res = await dashboardApp.request(`/connections/seats/${s.seatId}/release`, { method: 'POST', headers: { origin: 'http://localhost', authorization: 'Bearer not-a-web-session' }, body: '{}' }, env)
+    expect(res.status).not.toBe(200)
+    expect(status(s.seatId)).toBe('observed')
+    expect(audit(s.seatId)).toEqual([])
+  })
+
+  it('the audit table is append-only', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'observed')
+    const cookie = await session(env, `${OWNER}@example.test`)
+    await post(cookie, s.seatId, 'hold')
+    expect(() => h.sqlite.prepare(`UPDATE seat_admission_changes SET to_status = 'trusted'`).run()).toThrow()
+    expect(() => h.sqlite.prepare(`DELETE FROM seat_admission_changes`).run()).toThrow()
+  })
+})
+
+describe('single writer', () => {
+  it('only the dashboard route imports the transition writer, and nothing outside it (and the NULL stamp) writes admission_status', () => {
+    const files: string[] = []
+    const walk = (d: string): void => { for (const e of readdirSync(d, { withFileTypes: true })) { const f = pjoin(d, e.name); if (e.isDirectory()) walk(f); else if (f.endsWith('.ts')) files.push(f) } }
+    walk(pjoin(__dirname, '..', 'src'))
+    const importers = files.filter((f) => /seat-hold-release/.test(readFileSync(f, 'utf8')) && !f.endsWith('seat-hold-release.ts')).map((f) => f.replace(/.*\/src\//, ''))
+    expect(importers).toEqual(['dashboard/connections.ts'])
+    const writers = files.filter((f) => /SET\s+admission_status/i.test(readFileSync(f, 'utf8'))).map((f) => f.replace(/.*\/src\//, '')).sort()
+    expect(writers).toEqual(['members/seat-hold-release.ts', 'members/vip-lane.ts'])
+  })
+})
+
+describe('what each state means at the chokepoint', () => {
+  it('held refuses write/propose tools that observed allows; held tools are a strict subset of observed', async () => {
+    const s = await seatFor(OWNER)
+    for (const t of HELD_FLOOR_TOOLS) expect(OBSERVED_FLOOR_TOOLS.has(t), t).toBe(true)
+    for (const t of ['remember', 'task_create', 'task_update', 'send', 'check_in', 'join_squad']) {
+      expect(HELD_FLOOR_TOOLS.has(t), t).toBe(false)
+      expect(OBSERVED_FLOOR_TOOLS.has(t), t).toBe(true)
+    }
+    setStatus(s.seatId, 'observed')
+    expect((await rpc(s.ctx, 'task_create', { title: 'x' }, s.session)).text).not.toContain('observed_floor')
+    setStatus(s.seatId, 'held')
+    const refused = await rpc(s.ctx, 'task_create', { title: 'x' }, s.session)
+    expect(refused.text).toContain('observed_floor')
+    expect(refused.text).toContain('held')
+    expect((await rpc(s.ctx, 'task_list', {}, s.session)).text).not.toContain('observed_floor')
+  })
+
+  it('trusted lifts the floor; observed holds it', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'observed')
+    expect((await rpc(s.ctx, 'request_elevation', {}, s.session)).text).toContain('observed_floor')
+    setStatus(s.seatId, 'trusted')
+    expect((await rpc(s.ctx, 'request_elevation', {}, s.session)).text).not.toContain('observed_floor')
+  })
+
+  it('a bound-agent session with NO seatBinding is still floored when its agent is an observed/held seat agent (#2060 P2)', async () => {
+    const s = await seatFor(OWNER)
+    const bare = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
+    delete bare.seatBinding
+    setStatus(s.seatId, 'observed')
+    expect(await observedFloorRefusal(env, bare, 'request_elevation')).toEqual({ status: 'observed' })
+    expect(await observedFloorRefusal(env, bare, 'task_list')).toBeNull()
+    setStatus(s.seatId, 'held')
+    expect(await observedFloorRefusal(env, bare, 'task_create')).toEqual({ status: 'held' })
+    setStatus(s.seatId, 'trusted')
+    expect(await observedFloorRefusal(env, bare, 'request_elevation')).toBeNull()
+    setStatus(s.seatId, null)
+    expect(await observedFloorRefusal(env, bare, 'request_elevation')).toBeNull()
+    // an ordinary (non-seat) bound agent is untouched
+    expect(await observedFloorRefusal(env, { ...bare, boundAgentId: 'agent-not-a-seat' } as AuthContext, 'request_elevation')).toBeNull()
+  })
+})
+
+describe('flag off', () => {
+  it('VIP_LANE off: the writer refuses, nothing changes, no audit, the section is absent, the floor is not read', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'observed')
+    const off = envFor(h, { VIP_LANE: undefined })
+    const cookie = await session(off, `${OWNER}@example.test`)
+    fresh()
+    expect((await post(cookie, s.seatId, 'release', off)).status).toBe(403)
+    expect(status(s.seatId)).toBe('observed')
+    expect(audit(s.seatId)).toEqual([])
+    const { dashboardApp } = await import('../src/dashboard/index')
+    expect(await (await dashboardApp.request('/connections', { headers: { cookie } }, { ...off, LOCAL_TEST_AUTH: '1' } as unknown as Env)).text()).not.toContain('Observed chats')
+    const bare = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
+    delete bare.seatBinding
+    expect(await observedFloorRefusal(off, bare, 'request_elevation')).toBeNull()
+    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'release' })).toEqual({ ok: false, error: 'vip_lane_disabled' })
+  })
+})

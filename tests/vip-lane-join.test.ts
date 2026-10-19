@@ -193,7 +193,7 @@ describe('eligible: instant observed seat', () => {
     const s = await seatFor(OWNER)
     h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(s.seatId)
     const r = await join(s, { squad: 'squad-target' })
-    expect(r.text).toContain('seat_held')
+    expect(r.text).toContain('observed_floor') // #2060: held is read-only, so the floor refuses join_squad before the tool's own seat_held guard
     expect(status(s.seatId)).toBe('held')
     expect(membership(s.agentId, 'squad-target')).toBeUndefined()
   })

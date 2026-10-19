@@ -72,14 +72,45 @@ export async function readSeatAdmissionStatus(env: Env, seatId: string): Promise
   }
 }
 
-/** The floor, applied at the tool chokepoint. null = allowed. Only an UNATTACHED seat session with VIP_LANE on is ever looked at. */
+/**
+ * What a HELD seat may call: the READ subset of the observed floor. Derived by filtering OBSERVED_FLOOR_TOOLS (never a second list), so
+ * held is strictly inside observed by construction. No writes: no remember, send, task_create/update, inbox_ack, check_in, presence
+ * writes, session end, connect or join.
+ */
+const HELD_READ_TOOLS: ReadonlySet<string> = new Set([
+  'boot_context', 'orient', 'status', 'whoami', 'presence_list', 'peers', 'inbox', 'message_get',
+  'recall', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
+  'task_list', 'task_board', 'task_get', 'kanban_board',
+  'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
+  'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
+])
+export const HELD_FLOOR_TOOLS: ReadonlySet<string> = new Set([...HELD_READ_TOOLS].filter((t) => OBSERVED_FLOOR_TOOLS.has(t)))
+
+/** The stored status of the seat whose AGENT is this one (a human-minted token bound to a seat agent carries no seatBinding). */
+async function readSeatStatusByAgent(env: Env, agentId: string): Promise<SeatAdmissionStatus | null> {
+  try {
+    const row = await env.DB.prepare(`SELECT admission_status AS s FROM agent_seats WHERE agent_id = ?1 AND tenant = ?2 LIMIT 1`)
+      .bind(agentId, env.TENANT_SLUG).first<{ s: string | null }>()
+    if (!row || row.s === null) return null
+    return row.s === 'observed' || row.s === 'trusted' || row.s === 'held' ? row.s : 'held'
+  } catch {
+    return 'held'
+  }
+}
+
+/** The floor, applied at the tool chokepoint. null = allowed. An UNATTACHED seat session, or (#2060 P2) a session whose bound agent IS a
+ *  seat agent even without a seatBinding, with VIP_LANE on. observed = OBSERVED_FLOOR_TOOLS; held = HELD_FLOOR_TOOLS (read only). */
 export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName: string): Promise<{ status: SeatAdmissionStatus } | null> {
   if (!vipLaneEnabled(env)) return null
   const seat = auth.seatBinding
-  if (!seat || seat.attached) return null
-  const status = await readSeatAdmissionStatus(env, seat.seatId)
+  if (seat?.attached) return null
+  let status: SeatAdmissionStatus | null
+  if (seat) status = await readSeatAdmissionStatus(env, seat.seatId)
+  else if (auth.boundAgentId) status = await readSeatStatusByAgent(env, auth.boundAgentId)
+  else return null
   if (status === null || status === 'trusted') return null
-  return OBSERVED_FLOOR_TOOLS.has(toolName) ? null : { status }
+  const allowed = status === 'held' ? HELD_FLOOR_TOOLS : OBSERVED_FLOOR_TOOLS
+  return allowed.has(toolName) ? null : { status }
 }
 
 export interface JoinTarget { id: string; slug: string; name: string; department_id: string; kind: string; status: string }
