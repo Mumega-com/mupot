@@ -36,6 +36,29 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
 - **Messaging:** inbox rows from system-sender literals (mupot-review-gate, mupot-flights, mupot-dispatch, ...) report `reply_basis: system_sender` with `reply_via`, and a send to one is refused as `system_sender_not_addressable` (#2003).
 - **Onboarding:** boot_context now records observed facts (runtime, model, host, server-derived connection kind, last boot; migration 0235) for agent-bound callers, returns an `onboarding.next_step` to attached threads and member tokens (which still write nothing), and the agent page shows a read-only Live runtime block; runtime/harness/model/host intake is graceful: any bounded string is kept as reported with a canonical hint (`other` when unknown), check_in `harness` is no longer an enum, only non-strings are refused, except the formally non-adopted goose/goosed which one shared check refuses on every intake; boot also gives keyed agents and fenced attached threads a truthful `next_step` with `who_acts`, and seat-handle sessions record connection kind `seat` (#2005).
 
+### Release-scope highlights, 2026-10-18 → 2026-10-19 (merged to `main`; unreleased)
+
+Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.
+Migrations named here must be applied before the code that reads them is deployed.
+Feature flags named here ship **off** (unset) unless stated. Whether a flag is enabled in
+any deployment is an operator fact read from that deployment's `/health/config`, not from
+this file. A merge is not a stable-release verdict.
+
+- **Admission tape (#2034, flag `ADMISSION_TAPE`, default off, migration 0237):** P0 shadow-only admission by observation: a rules scorer and an append-only `seat_tape` describe each seat tool call by shape only, with a size-capped window and a pinned chain hash. It records; it does not admit or refuse.
+- **Seat clamp honours the legacy role plane (#2037):** the seat clamp reads the legacy role plane from the verified login identity, caps the lift at member, and reproduces seat project visibility.
+- **Installer window (#2039, flag `INSTALLER_WINDOW`, default off):** a time-boxed operator bundle over MCP with a self-benefit fence, a ceiling-destroy fence, a member cap, passkey-class AMR required for the high tier, project edges excluded, and seats unable to hold or use a window.
+- **Reply to the sender (#2041, migration 0239):** an agent may reply to the sender of a message addressed to it, even into a home squad, by exact message id only. The reply path keeps the caller's correlation id, collapses `invalid_*` refusals, closes probe oracles and enforces an atomic per-replier cap (indexed by 0239).
+- **Seat attach to designated agents (#2042, flags `SEAT_ATTACH` and `SEAT_ATTACH_DESIGNATED`, default off, migration 0238):** with `SEAT_ATTACH_DESIGNATED`, a thread may attach only to an agent an org admin designated for that human (`attach_designated_member_id`). Revoking a designation reaches the events, elevation and promote readers, and an agent rank ceiling applies.
+- **Connections dashboard fixes (#2046, #2048, #2050):** the owner can allow their chats to attach to an agent from a designation control (#2046); the designation POST relies on the shared `csrf()` check like every other form (#2048); `Referrer-Policy: same-origin` so same-origin POSTs carry `Origin` (Admit did nothing live without it, #2050).
+- **`send` with `in_reply_to` alone infers the recipient (#2052):** the original sender is the recipient.
+- **Attach code (#2055, migration 0240):** an attach code ties the Admit card to the asking chat.
+- **Per-chat binding (#2057):** the attach resolver honours the admission's chat binding (#2056 follow-up).
+- **Tenant-header notice (#2058):** the door says when `x-mupot-tenant-slug` is ignored.
+- **VIP lane (#2059, #2062, #2063, #2064, #2065; flag `VIP_LANE`, default off, migration 0241):** `join_squad` gives an owner or org admin an instant observed seat (#2059); observed seats create proposal-only tasks with no assignee and no dispatch (#2062); boot_context and orient point at `join_squad` (#2063); a human can Hold or Release an observed chat, audited in `seat_admission_changes` (#2064); a held seat leaves no trace: inbox peek only, no presence, no self-report (#2065).
+- **Escalation emit testable (#1381):** the agent escalation emit is now covered by tests.
+- **Events/subscribe refusals recorded (#2067, migration 0242, additive):** an early `events/subscribe` refusal now writes a structured log line and one bounded `event_subscribe_refusals` row.
+- **Data-hygiene audit (#2068):** a read-only classifier script for the #1496 data-hygiene audit.
+
 ### Release-scope highlights, 2026-10-12 → 2026-10-16 (merged to `main`; unreleased)
 
 Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.
