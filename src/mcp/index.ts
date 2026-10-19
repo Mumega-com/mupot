@@ -4821,7 +4821,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string, project_id?: string, seat?: string }',
+  args: '{ to?: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label; optional ONLY when in_reply_to cites a message sent to you: the reply then goes to that message\'s original sender), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string (a message id, or the sender\'s request_id), project_id?: string, seat?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4833,7 +4833,7 @@ const toolSend: ToolSpec = {
       project_id: STRING_SCHEMA,
       seat: STRING_SCHEMA,
     },
-    required: ['to', 'body'],
+    required: ['body'],
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
@@ -4846,7 +4846,10 @@ const toolSend: ToolSpec = {
     }
     const to = str(args.to)
     const body = str(args.body)
-    if (!to) return fail(400, 'invalid_args', 'to required')
+    // A PRESENT `to` that is not a usable string is a malformed call, never a silent switch to infer mode.
+    if (args.to !== undefined && !to) return fail(400, 'invalid_args', 'to must be a non-empty string when given')
+    if (!to && !(typeof args.in_reply_to === 'string' && args.in_reply_to.length > 0))
+      return fail(400, 'invalid_args', 'to is required unless in_reply_to cites a message sent to you')
     if (!body) return fail(400, 'invalid_args', 'body required')
     if (args.kind !== undefined && typeof args.kind !== 'string')
       return fail(400, 'invalid_args', 'kind must be a string')
@@ -4868,7 +4871,7 @@ const toolSend: ToolSpec = {
       {
         fromAgent,
         fromMember: auth.memberId as string,
-        toRef: to,
+        toRef: to || undefined, // omitted + in_reply_to: infer the original sender (src/agents/messages.ts)
         body,
         kind: args.kind as 'message' | 'request' | 'ack' | undefined,
         requestId: typeof args.request_id === 'string' ? args.request_id : undefined,

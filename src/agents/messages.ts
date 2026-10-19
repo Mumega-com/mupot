@@ -2818,17 +2818,44 @@ type ReplyResolution =
   | { ok: true; value: SendAgentRow; originalId: string; requestId: string | null }
   | { ok: false }
 
-async function resolveReplyTarget(
+export async function resolveReplyTarget(
   env: Env,
-  input: { fromAgent: string; toRef: string; inReplyTo?: string },
+  input: { fromAgent: string; toRef?: string; inReplyTo?: string },
   nowIso: string,
 ): Promise<ReplyResolution> {
   const tenant = env.TENANT_SLUG
   const ref = input.inReplyTo
   if (!tenant || ref === undefined || !RID_RE.test(ref)) return { ok: false }
-  const toRef = input.toRef.trim()
+  // INFER mode (toRef omitted): the recipient is the ORIGINAL SENDER of the cited message. It is
+  // the same lookup and the same predicate as the named-target reply below (addressed to the
+  // caller, 7-day window, active sender, ambiguity refusal) with the sender filter dropped, so
+  // there is exactly one reply resolver. Both id and request_id citations are accepted (a
+  // request_id is only unique per sender: two different senders sharing it is ambiguous, refused).
+  const infer = input.toRef === undefined
+  const toRef = (input.toRef ?? '').trim()
   const stripped = stripOneLeadingAt(toRef) ?? toRef
   const cutoff = new Date(Date.parse(nowIso) - REPLY_WINDOW_MS).toISOString()
+  if (infer) {
+    // Pick the cited row FIRST over EVERYTHING addressed to the caller (any sender, inactive or
+    // out-of-window included), then apply window/status to that one row. An exact message id wins
+    // and uses only that row (another sender squatting that string as a request_id can neither
+    // redirect nor block it). A request_id citation is honoured only when exactly one row holds
+    // it: a request_id is per-sender, so a squatter's identical string must refuse, not win.
+    const cited = await env.DB.prepare(
+      `SELECT m.id AS mid, m.request_id AS rid, m.created_at AS at, a.id, a.squad_id, a.slug, a.name, a.status AS astatus
+         FROM agent_messages m
+         JOIN agents a ON a.id = m.from_agent
+        WHERE m.tenant = ?1 AND m.to_agent = ?2 AND (m.id = ?3 OR m.request_id = ?3)
+        ORDER BY (m.id = ?3) DESC, m.seq DESC LIMIT 3`,
+    ).bind(tenant, input.fromAgent, ref).all<SendAgentRow & { mid: string; rid: string | null; at: string; astatus: string }>()
+    const rowsCited = cited.results ?? []
+    const exact = rowsCited.find((r) => r.mid === ref)
+    const pick = exact ?? (rowsCited.length === 1 ? rowsCited[0] : undefined)
+    if (!pick) return { ok: false }
+    if (!(Date.parse(pick.at) >= Date.parse(cutoff)) || pick.astatus === 'inactive') return { ok: false }
+    if (pick.id === input.fromAgent) return { ok: false }
+    return { ok: true, value: { id: pick.id, squad_id: pick.squad_id, slug: pick.slug, name: pick.name }, originalId: pick.mid, requestId: pick.rid }
+  }
   // Precedence: a ref that is exactly an agent id means THAT agent and nothing else. Slug and
   // display name are renameable by any sender, so they must never compete with an id (a seat
   // renaming itself to another sender's id would otherwise capture that sender's reply).
@@ -2864,7 +2891,9 @@ export async function sendToRef(
   input: {
     fromAgent: string
     fromMember: string
-    toRef: string
+    /** Omitted (undefined) + inReplyTo: the recipient is inferred as the original sender of the
+     *  cited message, via the same resolver and predicate as a named reply. */
+    toRef?: string
     body: string
     kind?: MessageKind
     requestId?: string
@@ -2875,6 +2904,65 @@ export async function sendToRef(
   },
   authz: SendTargetAuthz,
   opts: Opts = {},
+): Promise<SendToRefResult> {
+  if (input.toRef === undefined) return sendInferredReply(env, { ...input, toRef: undefined }, authz, opts)
+  return sendToResolvedRef(env, { ...input, toRef: input.toRef }, authz, opts)
+}
+
+type SendToRefInput = Parameters<typeof sendToRef>[1]
+
+// Reply with in_reply_to alone: the recipient is the original sender of the cited message,
+// resolved by resolveReplyTarget (infer mode). Same eligibility as a named reply (no seat or
+// project, coherent member when non-admin); every failure collapses to the ordinary
+// send_target_not_visible, and the atomic reply cap fence is applied on the write.
+async function sendInferredReply(
+  env: Env,
+  input: SendToRefInput,
+  authz: SendTargetAuthz,
+  opts: Opts,
+): Promise<SendToRefResult> {
+  if (input.inReplyTo === undefined) {
+    return { ok: false, reason: 'invalid_to', detail: 'to is required unless in_reply_to cites a message sent to you' }
+  }
+  const eligible =
+    input.targetSeat === undefined &&
+    input.projectId === undefined &&
+    (authz.isAdmin || nonAdminGrantsSingleMember(authz.grants, input.fromMember))
+  if (!eligible) return { ok: false, reason: 'send_target_not_visible' }
+  const reply = await resolveReplyTarget(
+    env,
+    { fromAgent: input.fromAgent, inReplyTo: input.inReplyTo },
+    (opts.now ?? (() => new Date().toISOString()))(),
+  )
+  if (!reply.ok) return { ok: false, reason: 'send_target_not_visible' }
+  const replyFence = { originalId: reply.originalId, requestId: reply.requestId, cap: REPLY_CAP_PER_MESSAGE }
+  const res = await sendAgentMessage(
+    env,
+    {
+      fromAgent: input.fromAgent,
+      fromMember: input.fromMember,
+      toAgent: reply.value.id,
+      body: input.body,
+      kind: input.kind,
+      requestId: input.requestId,
+      inReplyTo: input.inReplyTo,
+      attribution: input.attribution,
+    },
+    authz,
+    { ...opts, replyFence },
+  )
+  if (!res.ok) {
+    if (res.reason === 'reply_limit_reached') return res
+    return { ok: false, reason: 'send_target_not_visible' }
+  }
+  return { ok: true, id: res.id, seq: res.seq, duplicate: res.duplicate, toAgent: reply.value.id }
+}
+
+async function sendToResolvedRef(
+  env: Env,
+  input: SendToRefInput & { toRef: string },
+  authz: SendTargetAuthz,
+  opts: Opts,
 ): Promise<SendToRefResult> {
   // squadViaProjectOnly tracks whether the chosen target was visible ONLY through the
   // folded-in projectId channel (never through squad/guest visibility). Revealing
