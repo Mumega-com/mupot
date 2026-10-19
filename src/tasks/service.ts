@@ -1654,6 +1654,14 @@ export interface WriteVerdictInput {
    * (e.g. an admin who is a party is refused).
    */
   independenceWaiver?: VerdictIndependenceWaiver
+  /**
+   * Set ONLY from the server-resolved auth of an ATTACHED agent session (attachmentAttribution(auth), never args): the
+   * verdict is cast AS the bound agent (decidedBy = the agent id) on the owner's gate_authority opt-in. The write records
+   * both ids on the verdict row (0247) and re-asserts, inside the UPDATE's own WHERE, the chain the pre-check read:
+   * attachment live, admission live with gate_authority = 1, the agent active and holding a live grant for the task's
+   * CURRENT gate_owner, and the attaching human not a party to / affiliated with the task (closes the check-to-write gap).
+   */
+  attribution?: { attachmentId: string; consentingMemberId: string } | null
 }
 
 export type VerdictIndependenceWaiver = 'admin_supervisory' | 'owner_override'
@@ -1991,16 +1999,33 @@ export function buildVerdictStatements(
     ? selfCompletionLane ? [...selfCompletionProducerParams(input.decidedBy, env.TENANT_SLUG), input.decidedBy, ...independence.params] : independence.params
     : []
 
-  const guardSql = `${laneGuardSql}${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
-  const guardParams = [...independenceParams, ...(extraGuard ? extraGuard.params : [])]
+  // Attached-session verdict (0247): the live chain + the agent's grant + the human's independence, re-asserted in the write.
+  const att = input.attribution ?? null
+  const humanIndependence = att ? compileVerdictIndependenceSql(['direct', 'affiliated'], att.consentingMemberId, { column: 'tasks.id' }) : null
+  const attachedGuardSql = att && humanIndependence
+    ? ` AND EXISTS (SELECT 1 FROM agent_seat_attachments g_att
+                     JOIN agent_seat_admissions g_adm ON g_adm.id = g_att.admission_id AND g_adm.tenant = g_att.tenant
+                     JOIN agents g_ag ON g_ag.id = g_att.agent_id
+                    WHERE g_att.id = ? AND g_att.tenant = ? AND g_att.detached_at IS NULL AND g_att.agent_id = ? AND g_att.human_member_id = ?
+                      AND g_adm.status = 'live' AND g_adm.gate_authority = 1 AND g_adm.agent_id = g_att.agent_id
+                      AND g_adm.human_member_id = g_att.human_member_id AND g_ag.status = 'active')
+       AND EXISTS (SELECT 1 FROM gate_grants g_gg WHERE g_gg.capability = tasks.gate_owner AND g_gg.principal_type = 'agent' AND g_gg.principal_id = ?)
+       AND NOT ${humanIndependence.sql}`
+    : ''
+  const attachedGuardParams: unknown[] = att && humanIndependence
+    ? [att.attachmentId, env.TENANT_SLUG, input.decidedBy, att.consentingMemberId, input.decidedBy, ...humanIndependence.params]
+    : []
+
+  const guardSql = `${laneGuardSql}${independenceSql}${attachedGuardSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
+  const guardParams = [...independenceParams, ...attachedGuardParams, ...(extraGuard ? extraGuard.params : [])]
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()} AND ${GATE_ASK_LIVE_PREDICATE('tasks', "datetime('now')")}${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, attachment_id, consenting_member_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       verdictRow.id,
@@ -2012,6 +2037,8 @@ export function buildVerdictStatements(
       verdictRow.decided_via,
       verdictRow.origin_agent_id,
       verdictRow.proposal_id,
+      att ? att.attachmentId : null,
+      att ? att.consentingMemberId : null,
       input.task.id,
       newStatus,
       now,

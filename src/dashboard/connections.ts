@@ -243,7 +243,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
     ${observedBlock}
     ${harnessBlocks}
     ${sectionPanel({ title: 'Admitted agents', body: liveBody })}
-    <p class="ui-sub">A level is chosen when an agent is admitted (Member, Lead, or Full = the agent's own standing, never more than yours). Threads never hold the agent's approval gates. To change a level, revoke the admission and admit again. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
+    <p class="ui-sub">A level is chosen when an agent is admitted (Member, Lead, or Full = the agent's own standing, never more than yours). If the agent holds a review gate, an attached thread may also review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own; detaching the thread or revoking the admission ends that. To change a level, revoke the admission and admit again. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
     ${boundBlock}
     <div class="status-line" id="cx-status"></div>
     ${connectionsScript()}

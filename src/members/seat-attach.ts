@@ -24,7 +24,7 @@
 // AUTHORITY. The attached context is the SAME clamp every seat has (resolveSeatCapabilities): per scope
 // min(human live rank, agent rank, the CEILING the human approved: member by default, lead or full only if chosen), human
 // must be admin on the agent's squad. It never exceeds that ceiling,
-// never gains the agent's gate authority (see callerHoldsGateCapability), and never reaches another member's agent:
+// gains the agent's gate authority ONLY on the admission's gate_authority opt-in (0247, see callerHoldsGateCapability and src/auth/attached-gate.ts), and never reaches another member's agent:
 // the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent (and, with
 // SEAT_ATTACH_DESIGNATED on, only agents an org admin designated for this human: attachDesignatedClause).
 //

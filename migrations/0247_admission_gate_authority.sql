@@ -23,3 +23,53 @@ WHEN NEW.gate_authority IS NOT OLD.gate_authority AND OLD.status <> 'pending'
 BEGIN
   SELECT RAISE(ABORT, 'agent_seat_admission_gate_authority_immutable');
 END;
+
+-- AUDIT. A verdict cast through an attached session is decided_by = the bound agent; these record WHICH attachment and WHICH
+-- human consented, from the server-resolved auth only (same pattern as 0236 for agent_messages / task_result_submissions).
+-- decided_via is NOT used: 0155 pinned it to a single value by CHECK and a rebuild of task_verdicts is not worth the risk.
+-- Nullable, additive, no backfill; the append-only trigger is re-created below to pin the new columns as well.
+ALTER TABLE task_verdicts ADD COLUMN attachment_id TEXT;
+ALTER TABLE task_verdicts ADD COLUMN consenting_member_id TEXT;
+
+DROP TRIGGER IF EXISTS task_verdicts_no_update;
+
+CREATE TRIGGER task_verdicts_no_update
+BEFORE UPDATE ON task_verdicts
+WHEN NOT (
+  (
+    OLD.project_id IS NULL
+    AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)
+    AND NEW.id IS OLD.id
+    AND NEW.task_id IS OLD.task_id
+    AND NEW.verdict IS OLD.verdict
+    AND NEW.note IS OLD.note
+    AND NEW.decided_by IS OLD.decided_by
+    AND NEW.decided_at IS OLD.decided_at
+    AND NEW.decided_via IS OLD.decided_via
+    AND NEW.origin_agent_id IS OLD.origin_agent_id
+    AND NEW.proposal_id IS OLD.proposal_id
+    AND NEW.reversed_at IS OLD.reversed_at
+    AND NEW.attachment_id IS OLD.attachment_id
+    AND NEW.consenting_member_id IS OLD.consenting_member_id
+  )
+  OR
+  (
+    OLD.reversed_at IS NULL
+    AND NEW.reversed_at IS NOT NULL
+    AND NEW.id IS OLD.id
+    AND NEW.task_id IS OLD.task_id
+    AND NEW.verdict IS OLD.verdict
+    AND NEW.note IS OLD.note
+    AND NEW.decided_by IS OLD.decided_by
+    AND NEW.decided_at IS OLD.decided_at
+    AND NEW.decided_via IS OLD.decided_via
+    AND NEW.origin_agent_id IS OLD.origin_agent_id
+    AND NEW.proposal_id IS OLD.proposal_id
+    AND NEW.project_id IS OLD.project_id
+    AND NEW.attachment_id IS OLD.attachment_id
+    AND NEW.consenting_member_id IS OLD.consenting_member_id
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');
+END;

@@ -40,7 +40,7 @@ import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTas
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
-import { attachedAuthority } from '../auth/attached-ceiling'
+import { attachedAuthority, attachmentAttribution } from '../auth/attached-ceiling'
 import { attachedGateAgent } from '../auth/attached-gate'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
@@ -1849,7 +1849,7 @@ tasksApp.post('/:id/verdict', async (c) => {
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}) },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: attachmentAttribution(c.get('auth')) },
       principal.actor,
     )
 

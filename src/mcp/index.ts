@@ -2752,7 +2752,7 @@ const toolTaskVerdict: ToolSpec = {
     try {
       const result = await writeVerdict(
         env,
-        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}) },
+        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: attachmentAttribution(auth) }, // from auth, never args
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
@@ -7195,7 +7195,7 @@ const toolBootContext: ToolSpec = {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
       nextStepOut = auth.seatBinding.attached
-        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
