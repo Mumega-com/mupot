@@ -8,7 +8,7 @@ export interface GatePrincipal {
 }
 
 export function resolveGatePrincipal(auth: AuthContext): GatePrincipal | null {
-  // W2: an attached seat is neither the agent nor its member for gate / surface purposes (admission.gates is fixed at 0).
+  // W2: an attached seat is neither the agent nor its member for gate / surface purposes (gate authority is a separate, opt-in path: verdictPrincipal + attachedGateAgent).
   if (attachedAuthority(auth)) return null
   if (auth.boundAgentId) return { id: auth.boundAgentId, type: 'agent' }
   if (auth.memberId) return { id: auth.memberId, type: 'member' }

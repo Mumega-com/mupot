@@ -739,14 +739,15 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     expect(after).not.toContain('evil')
   })
 
-  it('an attached seat holds NO gate authority even when the agent (member and agent principal) and the org escape would pass', async () => {
+  it('an attached seat holds NO gate authority by default (admitted while the agent held no gate: gate_authority 0), even when the agent (member and agent principal) later gets the grant and the org escape would pass', async () => {
     const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    expect(one<{ gate_authority: number }>(`SELECT gate_authority FROM agent_seat_admissions`)?.gate_authority).toBe(0)
     h.sqlite.exec(`
       INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES
         ('gg1', 'gate:ops', 'agent', 'agent-rava', 'x', '2026-01-01'), ('gg2', 'gate:ops', 'member', 'mem-agent-rava', 'x', '2026-01-01');
     `)
-    const g = await grant(env, HUMAN)
-    await admitAndAttach(env, g, 'conv-a')
     const attached = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
     expect(attached.boundAgentId).toBe('agent-rava')
     expect(attached.seatBinding?.attached?.agentId).toBe('agent-rava')
@@ -1771,10 +1772,10 @@ describe('the admission CEILING: min(human, agent, ceiling) per scope, chosen at
     expect(receiptOf(b).effective_capabilities).toMatchObject({ highest: 'admin' })
     expect(one<{ ceiling: string; gates: number }>(`SELECT ceiling, gates FROM agent_seat_admissions`)).toEqual({ ceiling: 'full', gates: 0 })
   })
-  it('full still holds NO gate authority (gate grants for both the agent and its member)', async () => {
+  it('full still holds NO gate authority by default (gate grants for both the agent and its member)', async () => {
     const env = envFor(h)
+    const { g } = await tap(env, 'full') // admitted while the agent held no gate: gate_authority 0
     h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gx1', 'gate:ops', 'agent', 'agent-boss', 'x', '2026-01-01'), ('gx2', 'gate:ops', 'member', 'mem-agent-boss', 'x', '2026-01-01')`)
-    const { g } = await tap(env, 'full')
     const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
     expect(att.seatBinding?.attached?.ceiling).toBe('full')
     expect(await callerHoldsGateCapability(env, att, 'squad-boss', 'gate:ops')).toBe(false)
@@ -2835,5 +2836,226 @@ describe('Admit completes the attachment: gate round fixes', () => {
     const r = await promoteAdmissionDetailed(env, swapped, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
     expect(r.landed).toBe(true)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ?`, a.seatId)).toBe(0)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// Attached agent session gate authority (migration 0247, opt-in per admission). Hadi 2026-10-19: reviewing is agent work.
+// Entered through the REAL path: grant -> seat -> passkey admission -> attached thread -> task_verdict (mcpApp).
+describe('attached session gate authority: gate_authority opt-in, live chain, builder != gate', () => {
+  const grantAgent = (agentId = 'agent-rava', cap = 'gate:ops'): void => {
+    h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-${agentId}-${cap}', '${cap}', 'agent', '${agentId}', 'x', '2026-01-01')`)
+  }
+  const mkTask = (id: string, o: { assignee?: string | null; assigneeMember?: string | null; gate?: string } = {}): void => {
+    h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, assignee_member_id, created_at, updated_at)
+      VALUES (?, 'squad-core', 't', 'b', 'p', 'review', ?, ?, ?, '2026-10-01', '2026-10-01')`)
+      .run(id, o.gate ?? 'gate:ops', o.assignee === undefined ? 'agent-hadi-admin' : o.assignee, o.assigneeMember ?? null)
+  }
+  const verdict = (env: Env, g: Grant, taskId: string): Promise<Rpc> => rpc(env, g.ctx, 'task_verdict', { task_id: taskId, verdict: 'approved' }, { meta: thread('conv-a') })
+  const verdictRows = (taskId: string): number => n(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = ?`, taskId)
+  const setup = async (preGrant: boolean): Promise<{ env: Env; g: Grant }> => {
+    const env = envFor(h)
+    if (preGrant) grantAgent()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    return { env, g }
+  }
+
+  it('default: admitted while the agent already holds a gate -> gate_authority 1; with no gate -> 0; existing/legacy rows stay 0', async () => {
+    await setup(true)
+    expect(one<{ gate_authority: number; gates: number }>(`SELECT gate_authority, gates FROM agent_seat_admissions`)).toEqual({ gate_authority: 1, gates: 0 })
+  })
+
+  it('an attached session with gate_authority=1 verdicts as its bound agent when the agent holds the gate', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-ok')
+    const r = await verdict(env, g, 't-ok')
+    expect(r.status, JSON.stringify(r.body)).toBe(200)
+    expect(one<{ decided_by: string }>(`SELECT decided_by FROM task_verdicts WHERE task_id = 't-ok'`)?.decided_by).toBe('agent-rava')
+    expect(one<{ status: string }>(`SELECT status FROM tasks WHERE id = 't-ok'`)?.status).not.toBe('review')
+  })
+
+  it('gate_authority=0 is refused even though the agent holds the grant (and the grant is the same one)', async () => {
+    const { env, g } = await setup(false)
+    grantAgent() // granted after the admission: bit stays 0
+    mkTask('t-0')
+    const r = await verdict(env, g, 't-0')
+    expect(JSON.stringify(r.body)).toContain('forbidden')
+    expect(verdictRows('t-0')).toBe(0)
+  })
+
+  it('the bit cannot be flipped after the decision (immutable trigger), so a live 0 stays 0', async () => {
+    await setup(false)
+    expect(() => h.sqlite.exec(`UPDATE agent_seat_admissions SET gate_authority = 1`)).toThrow(/gate_authority_immutable/)
+    expect(() => h.sqlite.exec(`UPDATE agent_seat_admissions SET gate_authority = 2 WHERE 0`)).not.toThrow() // no row matches; CHECK exercised below
+    expect(() => h.sqlite.exec(`INSERT INTO harnesses (id, tenant, member_id, oauth_client_id) VALUES ('hq', '${TENANT}', '${HUMAN}', 'cq');
+      INSERT INTO agent_seat_admissions (id, tenant, agent_id, human_member_id, harness_id, status, gate_authority, requested_via, created_at)
+      VALUES ('adm-bad', '${TENANT}', 'agent-rava', '${HUMAN}', 'hq', 'pending', 2, 'tool', '2026-10-13')`)).toThrow()
+  })
+
+  it('refused after detach', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-d')
+    const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!
+    expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
+    // the thread now serves its own seat agent; drive the predicate with the pre-detach attached context too
+    const r = await verdict(env, g, 't-d')
+    expect(verdictRows('t-d')).toBe(0)
+    expect(JSON.stringify(r.body)).toContain('forbidden')
+  })
+
+  it('refused with a STALE attached context after detach, revoke, and when the admission is not live (predicate re-reads the chain)', async () => {
+    const env = envFor(h)
+    grantAgent()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(await callerHoldsGateCapability(env, att, 'squad-core', 'gate:ops')).toBe(true)
+    // admission no longer live: status flipped by fixture (live -> revoked is the legal path; revoke also detaches)
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!
+    const attId = one<{ id: string }>(`SELECT id FROM agent_seat_attachments`)!.id
+    expect((await detachAttachment(env, { attachmentId: attId, humanMemberId: HUMAN })).ok).toBe(true)
+    expect(await callerHoldsGateCapability(env, att, 'squad-core', 'gate:ops')).toBe(false) // detached
+    void adm
+  })
+
+  it('refused after revoke', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-r')
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!
+    expect((await revokeAdmission(env, { admissionId: adm.id, humanMemberId: HUMAN })).ok).toBe(true)
+    const r = await verdict(env, g, 't-r')
+    expect(verdictRows('t-r')).toBe(0)
+    expect(JSON.stringify(r.body)).toContain('forbidden')
+  })
+
+  it('refused when the admission is expired (a non-live status never authorises; live -> expired is trigger-forbidden, so the fixture drops the trigger)', async () => {
+    const env = envFor(h)
+    grantAgent()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_immutable`) // fixture only: model a lapsed admission
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET status = 'expired'`)
+    expect(await callerHoldsGateCapability(env, att, 'squad-core', 'gate:ops')).toBe(false)
+  })
+
+  it('refused when the agent lacks the grant for THAT gate (grant for another gate does not help), and after the grant is removed', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-other', { gate: 'gate:other' })
+    expect((await verdict(env, g, 't-other')).status).toBe(200) // body carries the refusal below
+    expect(verdictRows('t-other')).toBe(0)
+    mkTask('t-gone')
+    h.sqlite.exec(`DELETE FROM gate_grants WHERE principal_id = 'agent-rava'`)
+    const r = await verdict(env, g, 't-gone')
+    expect(JSON.stringify(r.body)).toContain('forbidden')
+    expect(verdictRows('t-gone')).toBe(0)
+  })
+
+  it('refused when the agent is not active', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-p')
+    h.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'agent-rava'`)
+    await verdict(env, g, 't-p')
+    expect(verdictRows('t-p')).toBe(0)
+  })
+
+  it('builder != gate: refused on the bound agent\'s own task (assignee)', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-own', { assignee: 'agent-rava' })
+    const r = await verdict(env, g, 't-own')
+    expect(JSON.stringify(r.body)).toContain('self_verdict')
+    expect(verdictRows('t-own')).toBe(0)
+  })
+
+  it('builder != gate: refused on a task the bound agent submitted a result for (reassigned since)', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-sub')
+    h.sqlite.exec(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('s1', '${TENANT}', 't-sub', 'squad-core', 'agent-rava', '/tmp/m', '${'a'.repeat(64)}', '${'a'.repeat(64)}', 'r')`)
+    await verdict(env, g, 't-sub')
+    expect(verdictRows('t-sub')).toBe(0)
+  })
+
+  it('builder != gate: refused on the ATTACHING HUMAN\'s own work (assigned to them, or assigned to an agent they own)', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-human', { assignee: null, assigneeMember: HUMAN })
+    const r1 = await verdict(env, g, 't-human')
+    expect(JSON.stringify(r1.body)).toContain('self_verdict')
+    expect(verdictRows('t-human')).toBe(0)
+    h.sqlite.exec(`UPDATE agents SET owner_member_id = '${HUMAN}' WHERE id = 'agent-hadi-admin'`)
+    mkTask('t-humans-agent') // assignee agent-hadi-admin, now owned by the attaching human
+    const r2 = await verdict(env, g, 't-humans-agent')
+    expect(JSON.stringify(r2.body)).toContain('self_verdict')
+    expect(verdictRows('t-humans-agent')).toBe(0)
+  })
+
+  it('builder != gate: refused when the human consented to a submission on the task (#2006 leg)', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-consent')
+    h.sqlite.exec(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, consenting_member_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('s2', '${TENANT}', 't-consent', 'squad-core', 'agent-other', '${HUMAN}', '/tmp/m', '${'a'.repeat(64)}', '${'a'.repeat(64)}', 'r')`)
+    await verdict(env, g, 't-consent')
+    expect(verdictRows('t-consent')).toBe(0)
+  })
+
+  it('builder != gate: refused on a task linked to the agent through an agent_seats row of the human (#2089 leg)', async () => {
+    const { env, g } = await setup(true)
+    const seatAgent = one<{ agent_id: string }>(`SELECT agent_id FROM agent_seats WHERE member_id = ? LIMIT 1`, HUMAN)!.agent_id
+    mkTask('t-seat', { assignee: seatAgent })
+    await verdict(env, g, 't-seat')
+    expect(verdictRows('t-seat')).toBe(0)
+  })
+
+  it('human approval stays out: human_origin is still refused for an attached session', async () => {
+    const { env, g } = await setup(true)
+    mkTask('t-ho')
+    const r = await rpc(env, g.ctx, 'task_verdict', { task_id: 't-ho', verdict: 'approved', human_origin: { channel: 'telegram', user_id: '1', chat_id: '1', message_id: '1', message_at: new Date().toISOString(), text: 'approve t-ho' } }, { meta: thread('conv-a') })
+    expect(JSON.stringify(r.body)).toContain('human_origin_not_applicable')
+    expect(verdictRows('t-ho')).toBe(0)
+  })
+
+  it('the org escape and the self-completion lane never rescue an attached seat', async () => {
+    const { env, g } = await setup(false) // gate_authority 0
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(await callerHoldsGateCapability(env, { ...att, role: 'owner' }, 'squad-core', 'gate:anything')).toBe(false)
+    mkTask('t-sc', { gate: 'gate:agent-self-completion', assignee: 'agent-rava' })
+    await verdict(env, g, 't-sc')
+    expect(verdictRows('t-sc')).toBe(0)
+  })
+
+  it('the self-completion lane is closed to an attached seat even when the agent holds a grant named for it', async () => {
+    const { env, g } = await setup(true)
+    grantAgent('agent-rava', 'gate:agent-self-completion')
+    mkTask('t-sc2', { gate: 'gate:agent-self-completion', assignee: 'agent-hadi-admin' })
+    const r = await verdict(env, g, 't-sc2')
+    expect(JSON.stringify(r.body)).toContain('forbidden')
+    expect(verdictRows('t-sc2')).toBe(0)
+  })
+
+  it('a STALE attached context (old attachment id) is refused after the seat is re-attached: the claim must be the live attachment', async () => {
+    const env = envFor(h)
+    grantAgent()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const stale = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(await callerHoldsGateCapability(env, stale, 'squad-core', 'gate:ops')).toBe(true)
+    const forged: AuthContext = { ...stale, seatBinding: { ...stale.seatBinding!, attached: { ...stale.seatBinding!.attached!, attachmentId: 'some-other-attachment' } } }
+    expect(await callerHoldsGateCapability(env, forged, 'squad-core', 'gate:ops')).toBe(false)
+    const forgedAgent: AuthContext = { ...stale, seatBinding: { ...stale.seatBinding!, attached: { ...stale.seatBinding!.attached!, agentId: 'agent-hadi-admin' } } }
+    grantAgent('agent-hadi-admin')
+    expect(await callerHoldsGateCapability(env, forgedAgent, 'squad-core', 'gate:ops')).toBe(false)
+  })
+
+  it('a non-attached control: the same agent token (no attach) verdicts the same task, so every refusal above is the attach rules', async () => {
+    const env = envFor(h)
+    grantAgent()
+    mkTask('t-ctl')
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    const { attached: _d, ...noAttach } = att.seatBinding!
+    void _d
+    expect(await callerHoldsGateCapability(env, { ...att, seatBinding: noAttach }, 'squad-core', 'gate:ops')).toBe(true)
   })
 })

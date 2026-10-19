@@ -4346,9 +4346,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "squads_dyad_pair_shape_upd" },
     ],
   },
+  {
+    file: "0247_admission_gate_authority.sql",
+    sha256: "76fdd6c450449b48c81ff611cc6bfadc2b2f7f61b57a8e4bafb2ed2c715150ce",
+    statements: [
+      "-- 0247_admission_gate_authority.sql — an ATTACHED agent session may exercise its bound agent's gate capability\n-- (task_verdict) when the admission opts in. Hadi (owner, 2026-10-19): reviewing is agent work; human approval is a\n-- different thing and stays out of this.\n--\n-- WHY A NEW COLUMN AND NOT A RELAXED `gates` CHECK. 0220 fixed `gates INTEGER CHECK (gates = 0)`. SQLite cannot alter a\n-- CHECK, so relaxing it means DROP TABLE agent_seat_admissions. That table is the PARENT of agent_seat_attachments\n-- (admission_id ... ON DELETE RESTRICT) and attachments are no-delete by trigger, so the rebuild would fail on any pot that\n-- already holds an attachment (RESTRICT is checked immediately; same trap 0202 documents for harnesses). `gates` therefore\n-- stays frozen at 0 forever (legacy, never read as authority) and `gate_authority` is the opt-in:\n--   0 = the attached seat holds NO gate authority (every existing row, the DEFAULT)\n--   1 = the attached seat may pass the gate check AS ITS BOUND AGENT, only while the attachment, the admission and the\n--       agent are live AND the agent itself holds a live gate_grants row for the capability (hasActiveGateGrant), and\n--       with every verdict-independence rule intact (src/auth/attached-gate.ts, src/tasks/index.ts).\n-- Decided exactly once, at the human's decision (pending -> live) or at insert for a dashboard admission that is born live;\n-- never changed afterwards (changing it takes a new admission: revoke + a new tap), like `ceiling`.\n-- Additive: no existing row, index or trigger is touched.\nALTER TABLE agent_seat_admissions ADD COLUMN gate_authority INTEGER NOT NULL DEFAULT 0 CHECK (gate_authority IN (0, 1));",
+      "\n\nCREATE TRIGGER IF NOT EXISTS agent_seat_admissions_gate_authority_immutable\nBEFORE UPDATE OF gate_authority ON agent_seat_admissions\nFOR EACH ROW\nWHEN NEW.gate_authority IS NOT OLD.gate_authority AND OLD.status <> 'pending'\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_gate_authority_immutable');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_gate_authority_immutable" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "cab81b0d28d4578e70a7be06ca828cf9354e6ddfbb3a369bedd7874e87611648"
+export const SCHEMA_CHAIN_DIGEST: string = "bb8b70db9a473aa12ae8bf09e659dd17ab3564e3b8123fd4e51aaa4b5ef0dfa9"
