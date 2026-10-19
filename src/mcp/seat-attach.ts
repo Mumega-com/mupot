@@ -108,11 +108,12 @@ const toolSeatAttach: ToolSpec = {
       case 'agent_not_found':
         return fail(404, r.error, 'No agent by that name is available for your human to admit.')
       case 'agent_not_designated_for_you': {
-        const who = r.agent?.name ?? r.agent?.slug ?? 'That agent'
         return fail(409, r.error, {
           who_acts: 'owner',
           agent: r.agent,
-          next_step: `${who} isn't set up for you yet. Ask your human to open Connections and press 'Allow for me' next to ${who}, then ask me to attach again.`,
+          // Static text (#2081): the agent is named in the structured `agent` field, never interpolated here. The control
+          // lives on the agent's own page, not on Connections.
+          next_step: "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again.",
         })
       }
       case 'agent_ambiguous':

@@ -903,7 +903,9 @@ describe('guide, do not dead-end: an undesignated agent the human could designat
     const d = detailOf(r)
     expect(d.who_acts).toBe('owner')
     expect(d.agent?.id).toBe('agent-rava')
-    expect(d.next_step).toBe(`Rava isn't set up for you yet. Ask your human to open Connections and press 'Allow for me' next to Rava, then ask me to attach again.`)
+    expect(d.next_step).toBe(`This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again.`)
+    expect(d.next_step).not.toMatch(/Connections/i) // #2081: the control is on the agent page, Connections shows "Nothing waiting"
+    expect(d.next_step).not.toContain('Rava') // static text: the name rides in the structured agent field
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
     expect(designatedOf('agent-rava')).toBeNull() // the request never designates
   })
