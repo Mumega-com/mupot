@@ -36,7 +36,7 @@ import { csrf } from 'hono/csrf'
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
-import { resolveCapabilities, hasCapability, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
@@ -237,6 +237,9 @@ orgApp.post('/departments/:id/squads', async (c) => {
   let createdViaElevationGrant: string | undefined
   if (gate.kind !== 'delegated' && (agentMustHoldMatchingGrant(c.env, c.get('auth'), 'create_squad') || !(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin')))) {
     if (gate.kind !== 'agent_legacy') return c.json({ error: 'forbidden', need: 'admin' }, 403)
+    // Same capability floor the MCP dispatcher applies to create_squad (spec.min 'admin'): a zero-admin agent holding a matching
+    // grant is refused on MCP, so it is refused here too (HTTP == MCP).
+    if (!hasWorkspaceAdmin(c.get('auth')) && !holdsCapabilityFloor(c.get('auth'), 'admin')) return c.json({ error: 'forbidden', need: 'admin' }, 403)
     const elevated = await hasElevatedAction(c.env, c.get('auth'), 'action:project_lifecycle', 'department', departmentId, {
       toolName: 'create_squad',
       detail: { department_id: departmentId, via: 'http' },

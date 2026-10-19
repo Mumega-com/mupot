@@ -373,6 +373,18 @@ describe('HTTP door: POST /departments/:id/squads (mupot#1906)', () => {
     expect(usage('action:project_lifecycle')).toBeGreaterThan(0)
   })
 
+  it('capability floor: a zero-admin agent + matching grant is refused over HTTP (as on MCP); an admin-somewhere agent + matching grant is allowed', async () => {
+    flagOn()
+    const sessionId = await checkIn()
+    await approve(sessionId, 'department', DEPT_A, 60, T0, ['action:project_lifecycle'])
+    const zero = await postSquad(DEPT_A, 'http-zero-admin', agentAuth())
+    expect(zero.status).toBe(403)
+    expect(squadExists('http-zero-admin')).toBe(false)
+    expect(usage('action:project_lifecycle')).toBe(0)
+    const admin = await postSquad(DEPT_A, 'http-admin-elsewhere', deptBAdmin())
+    expect(admin.status, await admin.clone().text()).toBeLessThan(300)
+  })
+
   it('flag ON: a human admin is unchanged; flag OFF: a standing dept admin agent is unchanged', async () => {
     expect((await postSquad(DEPT_B, 'http-legacy-b', deptBAdmin())).status).toBeLessThan(300)
     flagOn()
