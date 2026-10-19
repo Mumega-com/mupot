@@ -39,7 +39,8 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
-import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankOnScope, exceedsTargetRankCeilingGivenRanks, resolveCapabilities, targetMaxRankAcrossScopes } from '../auth/capability'
+import { MEMBER_BIND_MINT_FLOOR } from './project-invites'
 
 import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding, sha256Hex } from './service'
 import { issueMomentLink } from '../secure-moments/issue'
@@ -51,7 +52,7 @@ import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
 export { seatAttachEnabled, seatAttachDesignatedEnabled, attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
-import { attachDesignatedClause, seatAttachEnabled, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
+import { attachDesignatedClause, seatAttachDesignatedEnabled, seatAttachEnabled, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
 
 /** An attached thread unused this long is detached (and unpinned) when its app's thread pool is full. */
 export const ATTACH_IDLE_DAYS = 30
@@ -67,6 +68,7 @@ export type AttachFailure =
   | 'already_attached'
   | 'invalid_args'
   | 'agent_not_found'
+  | 'agent_not_designated_for_you'
   | 'agent_ambiguous'
   | 'agent_identity_unminted'
   | 'seat_not_found'
@@ -137,6 +139,55 @@ export async function resolveAttachableAgent(env: Env, humanMemberId: string, re
   if (found.length === 0) return { ok: false, error: 'agent_not_found' }
   if (found.length > 1) return { ok: false, error: 'agent_ambiguous' }
   return { ok: true, agent: found[0] }
+}
+
+/**
+ * THE ONE "this human has standing to designate this agent for themselves" predicate (member-id based: a seat chat's own auth may
+ * never write a designation, so it is re-derived from the human's CURRENT grants). Same standing the dashboard "Allow for me"
+ * control and update_agent enforce through authorizeOwnerMemberChange: org-scope MEMBER_BIND_MINT_FLOOR plus the rank ceiling over
+ * the agent's owner and welded member. Used ONLY to choose between a guiding refusal and agent_not_found; it writes nothing.
+ */
+export async function humanHasDesignationStanding(env: Env, humanMemberId: string, agentId: string): Promise<boolean> {
+  const live = await env.DB.prepare(`SELECT 1 AS x FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active' LIMIT 1`)
+    .bind(humanMemberId, env.TENANT_SLUG).first<{ x: number }>()
+  if (!live) return false
+  const actorRank = await currentMemberRankOnScope(env, humanMemberId, 'org', null)
+  if (actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) return false
+  const holders = await env.DB.prepare(
+    `SELECT a.owner_member_id AS owner_member_id, b.member_id AS bound_member_id
+       FROM agents a LEFT JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id WHERE a.id = ?1`,
+  ).bind(agentId, env.TENANT_SLUG).all<{ owner_member_id: string | null; bound_member_id: string | null }>()
+  for (const r of holders.results ?? []) {
+    for (const m of [r.owner_member_id, r.bound_member_id]) {
+      if (m && exceedsTargetRankCeilingGivenRanks(humanMemberId, actorRank, m, await targetMaxRankAcrossScopes(env, m))) return false
+    }
+  }
+  return true
+}
+
+/** Active, non-seat, UNDESIGNATED agents matching `ref` that this human could designate for themselves and administers.
+ *  Another human's designation is never a match. Anyone else reads as not found. */
+async function listDesignatableAgents(env: Env, humanMemberId: string, ref: string): Promise<AttachableAgent[]> {
+  if (!seatAttachDesignatedEnabled(env)) return []
+  const rows = (await env.DB.prepare(
+    `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id, sq.name AS squad_name
+       FROM agents a
+       JOIN squads sq ON sq.id = a.squad_id
+      WHERE a.status = 'active'
+        AND NOT EXISTS (SELECT 1 FROM agent_seats s WHERE s.agent_id = a.id)
+        AND a.attach_designated_member_id IS NULL
+        AND (a.id = ?1 OR a.slug = ?1 OR lower(a.name) = lower(?1))
+      ORDER BY a.name ASC
+      LIMIT 50`,
+  ).bind(ref).all<AgentCandidate>()).results ?? []
+  const out: AttachableAgent[] = []
+  if (rows.length === 0) return out
+  const grants = await resolveCapabilities(env, humanMemberId)
+  for (const r of rows) {
+    if (!(await humanHasDesignationStanding(env, humanMemberId, r.id))) continue
+    if (await canOnSquad(env, grants, r.squad_id, 'admin')) out.push(r)
+  }
+  return out
 }
 
 // ── admissions ───────────────────────────────────────────────────────────────
@@ -670,7 +721,8 @@ export interface AttachPending {
   /** A repeat ask while one was already pending: NO new link is minted (the human has one, or decides on /connections). */
   already_pending: boolean
 }
-export interface AttachErr { ok: false; error: AttachFailure }
+/** `agent` is set only for agent_not_designated_for_you (the caller has standing over it, so naming it reveals nothing). */
+export interface AttachErr { ok: false; error: AttachFailure; agent?: { id: string; slug: string; name: string } }
 export type AttachResult = AttachOk | AttachPending | AttachErr
 
 async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: string; agent_id: string } | null> {
@@ -736,7 +788,14 @@ export async function attachSeatToAgent(
   const seat = await loadHumanSeat(env, p.humanMemberId, p.seatId)
   if (!seat) return { ok: false, error: 'seat_not_found' }
   const resolved = await resolveAttachableAgent(env, p.humanMemberId, p.agentRef)
-  if (!resolved.ok) return resolved
+  if (!resolved.ok) {
+    // Tool path only: the human's own undesignated agent is a guided refusal, not agent_not_found. No standing = unchanged (no oracle).
+    if (resolved.error === 'agent_not_found' && p.via === 'tool') {
+      const d = await listDesignatableAgents(env, p.humanMemberId, p.agentRef)
+      if (d.length === 1) return { ok: false, error: 'agent_not_designated_for_you', agent: { id: d[0].id, slug: d[0].slug, name: d[0].name } }
+    }
+    return resolved
+  }
   const agent = resolved.agent
 
   // A live attachment row the designation predicate no longer admits is dead to every reader (findLiveAttachment already serves the

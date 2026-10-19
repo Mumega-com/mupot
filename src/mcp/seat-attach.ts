@@ -107,6 +107,14 @@ const toolSeatAttach: ToolSpec = {
         return fail(403, r.error)
       case 'agent_not_found':
         return fail(404, r.error, 'No agent by that name is available for your human to admit.')
+      case 'agent_not_designated_for_you': {
+        const who = r.agent?.name ?? r.agent?.slug ?? 'That agent'
+        return fail(409, r.error, {
+          who_acts: 'owner',
+          agent: r.agent,
+          next_step: `${who} isn't set up for you yet. Ask your human to open Connections and press 'Allow for me' next to ${who}, then ask me to attach again.`,
+        })
+      }
       case 'agent_ambiguous':
         return fail(409, r.error, 'More than one agent matches; use the agent id.')
       case 'agent_identity_unminted':
