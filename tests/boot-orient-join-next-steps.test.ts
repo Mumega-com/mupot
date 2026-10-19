@@ -105,8 +105,8 @@ beforeEach(async () => {
 })
 afterEach(() => { h.close(); vi.restoreAllMocks() })
 
-const joinOf = (r: Rpc): { note: string; squads?: Array<{ slug: string; call: string }> } =>
-  ((r.sc.next_steps ?? {}) as { join: { note: string; squads?: Array<{ slug: string; call: string }> } }).join
+const joinOf = (r: Rpc): { note: string; squads?: Array<{ id: string; slug: string; call: string }> } =>
+  ((r.sc.next_steps ?? {}) as { join: { note: string; squads?: Array<{ id: string; slug: string; call: string }> } }).join
 
 describe('next_steps.join', () => {
   it('flag on: lists the squads the human administers with the exact call; omits non-admin and home squads', async () => {
@@ -166,6 +166,56 @@ describe('next_steps.join', () => {
     expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)).not.toContain('squad-target')
     h.sqlite.prepare(`UPDATE memberships SET expires_at = '2026-01-01 00:00:00' WHERE agent_id = ? AND squad_id = 'squad-target'`).run(s.agentId)
     expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)).toContain('squad-target')
+  })
+  it('emits the globally unique squad id in the call, slug as label', async () => {
+    h.sqlite.exec(`UPDATE squads SET slug = 'label-second' WHERE id = 'squad-second'`)
+    const s = await seatFor(OWNER)
+    const sq = (joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).find((x) => x.id === 'squad-second')
+    expect(sq?.slug).toBe('label-second')
+    expect(sq?.call).toBe('join_squad {squad:"squad-second"}')
+  })
+  it('the cap applies AFTER authorization: 70 earlier-sorting non-admin squads do not hide the admin squads', async () => {
+    for (let i = 0; i < 70; i++) seedSquad(`a-noadmin-${String(i).padStart(2, '0')}`)
+    h.sqlite.exec(`UPDATE squads SET name = 'A ' || id WHERE id LIKE 'a-noadmin-%'; UPDATE squads SET name = 'Z ' || id WHERE id IN ('squad-target','squad-second')`)
+    const s = await seatFor(OWNER)
+    const slugs = (joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)
+    expect(slugs).toContain('squad-target')
+    expect(slugs).toContain('squad-second')
+  })
+  it('a HELD seat gets no list', async () => {
+    const s = await seatFor(OWNER)
+    h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(s.seatId)
+    const j = joinOf(await rpc(s.ctx, 'boot_context', {}, s.session))
+    expect(j.squads).toBeUndefined()
+    expect(j.note).toContain('join_squad files a request')
+  })
+  it('a bare unbound session gets no next_steps; the profile (sideEffectFree) path omits it', async () => {
+    const s = await seatFor(OWNER)
+    const bare = { ...s.ctx, boundAgentId: null, seatBinding: undefined } as unknown as AuthContext
+    const r = await invokeTool(bare, env, 'boot_context', {}, 'https://pot.test')
+    expect(JSON.stringify(r)).not.toContain('next_steps')
+    const bind = { seatId: s.seatId, label: 'x', harnessId: 'h', grantTokenId: 't', humanMemberId: OWNER, source: 'handle' as const }
+    const seated: AuthContext = { ...s.ctx, boundAgentId: s.agentId, seatBinding: bind }
+    const p = await invokeTool(seated, env, 'boot_context', {}, { origin: 'https://pot.test', sideEffectFree: true })
+    expect(JSON.stringify(p)).not.toContain('next_steps')
+    const o = await invokeTool(seated, env, 'orient', {}, { origin: 'https://pot.test', sideEffectFree: true })
+    expect(JSON.stringify(o)).not.toContain('next_steps')
+  })
+  it('query count is constant in the number of squads (30 candidates, same as 3)', async () => {
+    const s = await seatFor(OWNER)
+    const bind = { seatId: s.seatId, label: 'x', harnessId: 'h', grantTokenId: 't', humanMemberId: OWNER, source: 'handle' as const }
+    const count = async (): Promise<number> => {
+      let c = 0
+      const real = h.db.prepare.bind(h.db)
+      const spy = { ...env, DB: { ...h.db, prepare: (q: string) => { c++; return real(q) } } } as unknown as Env
+      await joinNextSteps(spy, { seatBinding: bind, boundAgentId: s.agentId })
+      return c
+    }
+    const few = await count()
+    for (let i = 0; i < 30; i++) { seedSquad(`squad-y${i}`); cap(OWNER, 'squad', `squad-y${i}`, 'admin') }
+    const many = await count()
+    expect(many).toBe(few)
+    expect(many).toBeLessThanOrEqual(8)
   })
   it('archived squads are absent', async () => {
     h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-second'`)

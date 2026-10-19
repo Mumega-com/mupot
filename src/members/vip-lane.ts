@@ -229,20 +229,24 @@ export async function observedTaskCreateRefusal(
 // #2035 wall 5: boot_context / orient point at join_squad. READ-ONLY, no new authority: the list reuses humanMayInstantJoin (the
 // predicate join_squad itself runs) and shows only squads the human can admin, so it reveals nothing the human cannot already see.
 export const JOINABLE_LIST_MAX = 10
-const JOINABLE_SCAN_MAX = 60
+const JOINABLE_SCAN_MAX = 500 // ONE query; the cap (10) applies AFTER authorization, in memory, over the human's admin set
 const JOIN_OTHER_LINE = 'for any other squad: join_squad files a request to its owner'
 const JOIN_FLAG_OFF_LINE = 'joining a squad: ask its owner/admin to add you (squad_join_request)'
 
 export interface JoinNextSteps {
   note: string
-  squads?: Array<{ slug: string; name: string; call: string }>
+  squads?: Array<{ id: string; slug: string; name: string; call: string }>
 }
 
-/** Flag off: one line, no DB read. Flag on: the list only for an UNATTACHED seat of an ACTIVE human; everyone else gets the one line. */
-export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBinding' | 'boundAgentId'>): Promise<JoinNextSteps> {
-  if (!vipLaneEnabled(env)) return { note: JOIN_FLAG_OFF_LINE }
+/** null = say nothing (a bare unbound session has no prerequisites). Flag off: one line, no DB read. Flag on: the list only for an
+ *  UNATTACHED, non-held seat of an ACTIVE human; everyone else with a seat/bound agent gets the one line. Query count is constant in the
+ *  number of squads: canOnSquad over a pre-loaded scope is pure, so the whole list is active-human + grants + held + ONE squads read. */
+export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBinding' | 'boundAgentId'>): Promise<JoinNextSteps | null> {
   const seat = auth.seatBinding
+  if (!seat && !auth.boundAgentId) return null
+  if (!vipLaneEnabled(env)) return { note: JOIN_FLAG_OFF_LINE }
   if (!seat || seat.attached || !auth.boundAgentId || !(await memberIsActiveHuman(env, seat.humanMemberId))) return { note: JOIN_OTHER_LINE }
+  if ((await readSeatAdmissionStatus(env, seat.seatId)) === 'held') return { note: JOIN_OTHER_LINE }
   const grants = await resolveCapabilities(env, seat.humanMemberId)
   const rows = await env.DB.prepare(
     `SELECT s.id AS id, s.slug AS slug, s.name AS name, s.department_id AS department_id, s.kind AS kind FROM squads s
@@ -255,7 +259,7 @@ export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBindi
   for (const sq of rows.results ?? []) {
     if (squads.length >= JOINABLE_LIST_MAX) break
     // brandSquadScope: the fields came straight off a real squads row above.
-    if (await humanMayAdminScope(env, grants, brandSquadScope({ id: sq.id, department_id: sq.department_id, kind: sq.kind }))) squads.push({ slug: sq.slug, name: sq.name, call: `join_squad {squad:"${sq.slug}"}` })
+    if (await humanMayAdminScope(env, grants, brandSquadScope({ id: sq.id, department_id: sq.department_id, kind: sq.kind }))) squads.push({ id: sq.id, slug: sq.slug, name: sq.name, call: `join_squad {squad:"${sq.id}"}` })
   }
   return { note: JOIN_OTHER_LINE, ...(squads.length ? { squads } : {}) }
 }
