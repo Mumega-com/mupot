@@ -33,7 +33,7 @@ const toolSeatEventGrant: ToolSpec = {
       return fail(403, 'operator_principal_required', {
         who_acts: 'owner',
         next_tool: 'request_elevation',
-        next_step: 'Ask your human to approve ONE call: request_elevation { actions: ["action:sudo_seat_event_grant"], scope_type: "squad", scope_id: <the agent\'s squad id>, duration_minutes: 15, reason }. They tap Approve in Telegram.',
+        next_step: 'Ask your human to approve ONE exact call: request_elevation { actions: ["action:sudo_seat_event_grant"], scope_type: "squad", scope_id: <the agent\'s squad id>, duration_minutes: 15, reason, sudo_args: { host_agent_id, agent_id, project_id? } }. They see those names in Telegram and tap Approve.',
         needs: 'human_approval',
       })
     }
@@ -45,20 +45,23 @@ const toolSeatEventGrant: ToolSpec = {
     const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
     const target = await authorizeSeatGrantTarget(env, { grants, orgAdmin: hasWorkspaceAdmin(auth) }, agentId)
     if (!target.ok) return fail(target.status, target.error)
+    // Owner sudo approved a call on ONE squad: the squad authorised here must be that one.
+    if (auth.ownerSudo && auth.ownerSudo.squadId !== target.squadId) return fail(404, 'agent_not_visible')
     const res = await createSeatEventGrant(env, {
       hostAgentId,
       agentId,
       projectId: str(args.project_id),
       memberId: auth.memberId,
       reason,
+      expectSquadId: target.squadId, // pinned through the write
     })
     if (!res.ok) {
-      const status = res.reason === 'agent_already_granted' ? 409
-        : res.reason === 'db_error' ? 500
-        : res.reason === 'invalid_args' ? 400
-        : res.reason === 'host_key_missing' || res.reason === 'project_access_denied' || res.reason === 'host_no_squad_standing' ? 403
-        : 404
-      return fail(status, res.reason)
+      // ONE uniform answer for every refusal after authorization (a missing host key, a host without standing, a project the agent
+      // lacks, an already-granted agent, a squad that moved), so the caller cannot probe which of them it was. Malformed input and a
+      // storage fault keep their own codes (they say nothing about other rows).
+      if (res.reason === 'invalid_args') return fail(400, 'invalid_args')
+      if (res.reason === 'db_error') return fail(500, 'db_error')
+      return fail(404, 'agent_not_visible')
     }
     return done({ ok: true, id: res.id })
   },

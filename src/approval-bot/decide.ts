@@ -179,7 +179,7 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
     const live = await listActiveElevationGrants(env, env.TENANT_SLUG)
     const mine = live.filter((g) => g.approved_by_member_id === memberId && (scopeRequest === null || g.elevation_request_id === scopeRequest.id))
     let revoked = 0
-    for (const g of mine) if ((await revokeElevationGrant(env, env.TENANT_SLUG, g.id, 'revoked_via_approval_bot')).revoked) revoked++
+    for (const g of mine) if ((await revokeElevationGrant(env, env.TENANT_SLUG, g.id, 'revoked_via_approval_bot', Date.now(), g.created_at)).revoked) revoked++
     await writeRevokeReceipt(env, memberId, { telegram_user_id: p.fromId, grants_revoked: revoked, request_id: scopeRequest?.id ?? null }, requestKey,
       scopeRequest ? 'elevation_request' : 'member', scopeRequest?.id ?? memberId).catch(() => undefined)
     await tell(revoked === 0 ? 'Nothing to revoke: you have no live approvals.' : `Revoked ${revoked} live approval${revoked === 1 ? '' : 's'}. The agents lost that access now.`)

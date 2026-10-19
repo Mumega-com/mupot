@@ -312,7 +312,7 @@ async function hostHasStandingInSquad(
  *  is revoke-then-grant, never an implicit takeover. */
 export async function createSeatEventGrant(
   env: Env,
-  input: { hostAgentId: string; agentId: string; projectId?: string | null; memberId: string; reason: string },
+  input: { hostAgentId: string; agentId: string; projectId?: string | null; memberId: string; reason: string; /** The squad the caller authorised against; the write only lands while the agent is still in it. */ expectSquadId?: string },
   now: () => string = () => new Date().toISOString(),
 ): Promise<GrantResult> {
   const tenant = env.TENANT_SLUG
@@ -321,6 +321,7 @@ export async function createSeatEventGrant(
   const agent = await env.DB.prepare(`SELECT squad_id FROM agents WHERE id = ?1 AND status = 'active'`)
     .bind(input.agentId).first<{ squad_id: string }>()
   if (!agent) return { ok: false, reason: 'agent_not_found' }
+  if (input.expectSquadId !== undefined && input.expectSquadId !== agent.squad_id) return { ok: false, reason: 'agent_not_found' }
   if (!(await loadActiveAgentKey(env, input.hostAgentId))) return { ok: false, reason: 'host_key_missing' }
   if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id, input.memberId))) {
     return { ok: false, reason: 'host_no_squad_standing' }
@@ -331,10 +332,14 @@ export async function createSeatEventGrant(
   }
   const id = crypto.randomUUID()
   try {
-    await env.DB.prepare(
+    // The target's squad is PINNED through the write: the standing checks above were made against agent.squad_id, so the insert only
+    // lands while the agent still sits in that squad (an agent moved between check and write writes nothing).
+    const r = await env.DB.prepare(
       `INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, project_id, granted_by_member_id, reason, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
-    ).bind(id, tenant, input.hostAgentId, input.agentId, projectId, input.memberId, input.reason.trim(), now()).run()
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+        WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?4 AND squad_id = ?9 AND status = 'active')`,
+    ).bind(id, tenant, input.hostAgentId, input.agentId, projectId, input.memberId, input.reason.trim(), now(), input.expectSquadId ?? agent.squad_id).run()
+    if (Number(r.meta?.changes ?? 0) !== 1) return { ok: false, reason: 'agent_not_found' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (/UNIQUE/i.test(msg)) return { ok: false, reason: 'agent_already_granted' }

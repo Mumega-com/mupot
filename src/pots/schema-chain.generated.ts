@@ -4379,9 +4379,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_approval_bot_deliveries_member" },
     ],
   },
+  {
+    file: "0249_owner_sudo_args.sql",
+    sha256: "d42dcd3c643529db7f4a53b2a3f14f272a737c29fbc6b9f1d30431949c8e377a",
+    statements: [
+      "-- 0249 owner sudo, exact-arguments binding: an owner-sudo elevation request carries the ONE call it authorises. The arguments are\n-- resolved to ids and canonicalised (src/auth/owner-sudo-args.ts); this stores the canonical JSON and its sha256. At use time the\n-- call's own arguments must canonicalise to the same digest or the call is refused. NULL on every non-sudo request.\nALTER TABLE elevation_requests ADD COLUMN sudo_args_json TEXT;",
+      "\nALTER TABLE elevation_requests ADD COLUMN sudo_args_sha256 TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0e2a8e190952614422d29bf9958e87e81a3b305cc39b667b6250147c93167260"
+export const SCHEMA_CHAIN_DIGEST: string = "80875e323cb7561eefc3602c999afb7ee183ac71f27c9306c11f121b35e4fc8e"

@@ -300,6 +300,8 @@ export interface Env {
   APPROVAL_BOT_TOKEN?: string
   APPROVAL_BOT_WEBHOOK_SECRET?: string
   APPROVAL_BOT_USERNAME?: string
+  // Owner sudo (src/auth/owner-sudo.ts): '1' or 'true' enables requesting and using the four action:sudo_* actions. Default OFF.
+  OWNER_SUDO_ENABLED?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].
@@ -834,7 +836,7 @@ export interface AuthContext {
    * authority); this names the agent that is actually executing. Server-derived on every call; resolveAuth deletes any such
    * field arriving in the internal header blob. Presence is never touched under such a context.
    */
-  ownerSudo?: { executorAgentId: string; executorMemberId: string | null; grantId: string; elevationRequestId: string; action: string; tool: string }
+  ownerSudo?: { executorAgentId: string; executorMemberId: string | null; grantId: string; elevationRequestId: string; action: string; tool: string; squadId: string | null }
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──

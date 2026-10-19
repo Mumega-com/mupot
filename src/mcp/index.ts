@@ -263,7 +263,7 @@ import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
-import { DYAD_PIN_SUDO_STEP, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, SUDO_ALREADY_USED, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
+import { DYAD_PIN_SUDO_STEP, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -6204,7 +6204,7 @@ const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
   scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'authenticated',
-  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason) }',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6214,6 +6214,7 @@ const toolRequestElevation: ToolSpec = {
       duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
       reason: STRING_SCHEMA,
       recommendation: STRING_SCHEMA,
+      sudo_args: { type: 'object' },
     },
     required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
     additionalProperties: false,
@@ -6267,6 +6268,7 @@ const toolRequestElevation: ToolSpec = {
       scopeId,
       durationMinutes,
       reason,
+      sudoArgs: args.sudo_args,
     })
     if (!result.ok) return fail(400, result.reason, result.detail)
 
@@ -8254,12 +8256,14 @@ async function invokeToolInner(
   // claim insert throws the tool does not run (the generic handler below turns the throw into internal_error).
   let sudoClaim: OwnerSudoClaim | null = null
   if (sudoPending) {
+    let claimed: Awaited<ReturnType<typeof claimOwnerSudo>>
     try {
-      sudoClaim = await claimOwnerSudo(env, sudoPending)
+      claimed = await claimOwnerSudo(env, sudoPending)
     } catch {
       return { ...fail(500, 'internal_error'), tool: spec.name }
     }
-    if (!sudoClaim) return { ...fail(SUDO_ALREADY_USED.status, SUDO_ALREADY_USED.error, SUDO_ALREADY_USED.detail), tool: spec.name }
+    if (!claimed.ok) return { ...fail(claimed.refusal.status, claimed.refusal.error, claimed.refusal.detail), tool: spec.name }
+    sudoClaim = claimed.claim
   }
 
   let outcome: ToolOutcome
