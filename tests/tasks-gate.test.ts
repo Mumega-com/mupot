@@ -247,6 +247,9 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
       // task.gate_owner !== 'gate:routines' WITHOUT touching the DB, and
       // makeTask() below does not set gate_owner to 'gate:routines'.
       null,
+      // attachment_id / consenting_member_id (0247): NULL for every verdict not cast through an attached agent session.
+      null,
+      null,
       // the landed-proof EXISTS params: task.id, newStatus, now
       task.id,
       'approved',

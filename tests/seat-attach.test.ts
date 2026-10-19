@@ -3112,6 +3112,17 @@ describe('attached session gate authority: gate_authority opt-in, live chain, bu
       mkTask('w-og', { gate: 'gate:other' })
       expect(await attemptWrite(env, 'w-og', live())).toBe('refused')
     })
+    it('the task is re-gated between the check and the write (gate_owner changed): the write loses the race even when the agent holds the new gate too', async () => {
+      const { env } = await setup(true)
+      grantAgent('agent-rava', 'gate:ops2')
+      mkTask('w-regate')
+      const { writeVerdict } = await import('../src/tasks/service')
+      const staleTask = one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = 'w-regate'`)! // what the pre-check evaluated: gate:ops
+      h.sqlite.exec(`UPDATE tasks SET gate_owner = 'gate:ops2' WHERE id = 'w-regate'`) // concurrent re-gate
+      const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments`)!
+      await expect(writeVerdict(env, { task: staleTask as never, verdict: 'approved', note: null, decidedBy: 'agent-rava', attribution: { attachmentId: att.id, consentingMemberId: HUMAN } })).rejects.toThrow()
+      expect(verdictRows('w-regate')).toBe(0)
+    })
     it('gate_authority 0 (opt-in absent) refuses the write itself', async () => {
       const { env } = await setup(false)
       grantAgent()

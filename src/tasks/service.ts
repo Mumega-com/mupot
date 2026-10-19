@@ -1659,7 +1659,8 @@ export interface WriteVerdictInput {
    * verdict is cast AS the bound agent (decidedBy = the agent id) on the owner's gate_authority opt-in. The write records
    * both ids on the verdict row (0247) and re-asserts, inside the UPDATE's own WHERE, the chain the pre-check read:
    * attachment live, admission live with gate_authority = 1, the agent active and holding a live grant for the task's
-   * CURRENT gate_owner, and the attaching human not a party to / affiliated with the task (closes the check-to-write gap).
+   * CURRENT gate_owner, the task's gate_owner still being the one the pre-check evaluated (a concurrent re-gate loses the race, so the
+   * replacement gate's own policy is never skipped), and the attaching human not a party to / affiliated with the task (closes the check-to-write gap).
    */
   attribution?: { attachmentId: string; consentingMemberId: string } | null
 }
@@ -2009,11 +2010,12 @@ export function buildVerdictStatements(
                     WHERE g_att.id = ? AND g_att.tenant = ? AND g_att.detached_at IS NULL AND g_att.agent_id = ? AND g_att.human_member_id = ?
                       AND g_adm.status = 'live' AND g_adm.gate_authority = 1 AND g_adm.agent_id = g_att.agent_id
                       AND g_adm.human_member_id = g_att.human_member_id AND g_ag.status = 'active')
+       AND tasks.gate_owner = ?
        AND EXISTS (SELECT 1 FROM gate_grants g_gg WHERE g_gg.capability = tasks.gate_owner AND g_gg.principal_type = 'agent' AND g_gg.principal_id = ?)
        AND NOT ${humanIndependence.sql}`
     : ''
   const attachedGuardParams: unknown[] = att && humanIndependence
-    ? [att.attachmentId, env.TENANT_SLUG, input.decidedBy, att.consentingMemberId, input.decidedBy, ...humanIndependence.params]
+    ? [att.attachmentId, env.TENANT_SLUG, input.decidedBy, att.consentingMemberId, input.task.gate_owner, input.decidedBy, ...humanIndependence.params]
     : []
 
   const guardSql = `${laneGuardSql}${independenceSql}${attachedGuardSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
