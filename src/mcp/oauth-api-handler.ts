@@ -50,6 +50,7 @@ export class McpOAuthApiHandler extends WorkerEntrypoint<Env> {
     // attach the resolved context before the internal dispatch.
     const forwarded = mcpInternalRequest(request, auth)
 
-    return mcpApp.fetch(forwarded, this.env)
+    // Pass the real ExecutionContext so background work (negotiation log) rides waitUntil instead of blocking the response.
+    return mcpApp.fetch(forwarded, this.env, this.ctx)
   }
 }

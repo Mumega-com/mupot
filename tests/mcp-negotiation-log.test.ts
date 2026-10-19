@@ -33,12 +33,21 @@ function env(events = 'true'): Env {
   return { TENANT_SLUG: TENANT, BRAND: 'Digid', OAUTH_PROVIDER: 'google', EVENTS_ENABLED: events, DB: harness.db } as unknown as Env
 }
 
+/** An ExecutionContext that collects waitUntil work so a test can drain the background negotiation write after the response. */
+function collectingCtx(): { ctx: ExecutionContext; drain: () => Promise<void> } {
+  const pending: Promise<unknown>[] = []
+  const ctx = { waitUntil: (p: Promise<unknown>) => { pending.push(p) }, passThroughOnException: () => {} } as unknown as ExecutionContext // test double: only waitUntil is exercised
+  return { ctx, drain: async () => { await Promise.all(pending) } }
+}
+
 async function rpc(method: string, params: unknown, auth: boolean, events = 'true') {
+  const { ctx, drain } = collectingCtx()
   const res = await mcpRequest('https://pot.example/', {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(auth ? { authorization: 'Bearer tok-secret-value' } : {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  }, env(events))
+  }, env(events), ctx)
+  await drain()
   return (await res.json()) as { result?: { protocolVersion?: string; capabilities?: Record<string, unknown> } }
 }
 
@@ -166,5 +175,86 @@ describe('mcp negotiation log', () => {
   it('a held seat leaves no row', async () => {
     await recordNegotiation(env(), Date.parse(T0), { method: 'initialize', requested: '2025-06-18', negotiated: 'n', eventsReturned: false, principal: { harnessId: 'h-1', heldSeat: true } })
     expect(rows()).toHaveLength(0)
+  })
+  // A DB whose negotiation INSERT blocks until released: proves the response never waits on the observability write.
+  function slowWriteEnv(): { env: Env; release: () => void; started: () => boolean } {
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let started = false
+    const real = harness.db
+    const db = new Proxy(real, {
+      get(t, k, rcv) {
+        if (k !== 'prepare') return Reflect.get(t, k, rcv)
+        return (sql: string) => {
+          const st = t.prepare(sql)
+          if (!sql.includes('INSERT INTO mcp_negotiation_log')) return st
+          return new Proxy(st, {
+            get(s, kk) {
+              if (kk === 'bind') return (...a: unknown[]) => { const b = s.bind(...a); return new Proxy(b, { get(bs, bk) { if (bk === 'run') return async () => { started = true; await gate; return bs.run() }; return Reflect.get(bs, bk) } }) }
+              return Reflect.get(s, kk)
+            },
+          })
+        }
+      },
+    })
+    return { env: { ...env(), DB: db } as unknown as Env, release, started: () => started }
+  }
+  const initBody = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } })
+  const initInit = { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer tok-secret-value' }, body: initBody }
+
+  it('NO execution context: initialize returns BEFORE a slow negotiation write resolves (fire-and-forget, not await)', async () => {
+    const slow = slowWriteEnv()
+    const res = await Promise.race([
+      mcpRequest('https://pot.example/', initInit, slow.env),
+      new Promise<'blocked'>((r) => setTimeout(() => r('blocked'), 1500)),
+    ])
+    expect(res).not.toBe('blocked')
+    expect(rows()).toHaveLength(0) // the write is still gated: the response did not wait for it
+    slow.release()
+    await vi.waitFor(() => expect(rows()).toHaveLength(1))
+  })
+
+  it('WITH an execution context: the write rides waitUntil and the response does not wait for it', async () => {
+    const slow = slowWriteEnv()
+    const pending: Promise<unknown>[] = []
+    const ctx = { waitUntil: (p: Promise<unknown>) => { pending.push(p) }, passThroughOnException: () => {} } as unknown as ExecutionContext
+    const res = await Promise.race([
+      mcpRequest('https://pot.example/', initInit, slow.env, ctx),
+      new Promise<'blocked'>((r) => setTimeout(() => r('blocked'), 1500)),
+    ])
+    expect(res).not.toBe('blocked')
+    expect(pending).toHaveLength(1)
+    expect(rows()).toHaveLength(0)
+    slow.release()
+    await Promise.all(pending)
+    expect(rows()).toHaveLength(1)
+  })
+
+  it('version source: header / _meta never leak into the recorded version or the bucket (negotiation reads params.protocolVersion only)', async () => {
+    const c1 = collectingCtx()
+    const res = await mcpRequest('https://pot.example/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer tok-secret-value', 'mcp-protocol-version': '2026-07-28' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } } }),
+    }, env(), c1.ctx)
+    await c1.drain()
+    expect(((await res.json()) as { result?: { protocolVersion?: string } }).result?.protocolVersion).toBe('2025-06-18')
+    expect(rows()[0]).toMatchObject({ requested_version: '<absent>', negotiated_version: '2025-06-18', events_returned: 0 })
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    await rpc('initialize', {}, false)
+    const line = info.mock.calls.find((c) => c[0] === '[mcp:negotiation]')
+    expect(JSON.stringify(line)).toContain('undefined') // bucket = typeof undefined, same as the [mcp:initialize] line
+  })
+
+  it('Events off: server/discover is logged as events_returned=false (and still answers method_not_found)', async () => {
+    const c2 = collectingCtx()
+    const res = await mcpRequest('https://pot.example/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer tok-secret-value' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'server/discover', params: { protocolVersion: '2026-07-28' } }),
+    }, env('false'), c2.ctx)
+    await c2.drain()
+    expect(((await res.json()) as { error?: { code?: number } }).error?.code).toBe(-32601)
+    expect(rows()[0]).toMatchObject({ method: 'server/discover', requested_version: '2026-07-28', events_returned: 0 })
   })
 })

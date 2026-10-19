@@ -272,7 +272,6 @@ import {
   withResultType,
   negotiateProtocolVersion,
   serverDiscoverResult,
-  PROTOCOL_VERSION_META_KEY,
   SUPPORTED_PROTOCOL_VERSIONS,
 } from './events'
 import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_PROTOCOL_VERSION, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
@@ -8273,8 +8272,9 @@ async function logNegotiation(
 ): Promise<void> {
   try {
     const p = typeof params === 'object' && params !== null && !Array.isArray(params) ? params as Record<string, unknown> : {} // narrowed to a plain object just above
-    const meta = typeof p._meta === 'object' && p._meta !== null ? p._meta as Record<string, unknown> : {} // narrowed to an object just above
-    const rawRequested = p.protocolVersion ?? c.req.header('mcp-protocol-version') ?? meta[PROTOCOL_VERSION_META_KEY]
+    // params.protocolVersion ONLY: it is the sole source negotiateProtocolVersion reads, so the logged version and the bucket always agree
+    // with what was negotiated (a header / _meta value the negotiation ignores must not be recorded as "requested").
+    const rawRequested = p.protocolVersion
     const ci = typeof p.clientInfo === 'object' && p.clientInfo !== null ? (p.clientInfo as { name?: unknown }).name : undefined // narrowed to an object just above
     const hasCredential = Boolean(c.req.header('authorization') || c.req.header(AUTH_CONTEXT_HEADER))
     const requested = describeRequestedVersion(rawRequested)
@@ -8288,9 +8288,11 @@ async function logNegotiation(
       }
       await recordNegotiation(c.env, Date.now(), { method, requested, requestedBucket, negotiated, eventsReturned, principal, clientInfoName: ci })
     })().catch((e: unknown) => { console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e)) })
+    // Never block the response on observability: with an ExecutionContext the work is kept alive by waitUntil; without one it is
+    // fire-and-forget (`work` already carries its own catch, so it cannot reject unhandled).
     const wu = safeWaitUntil(c)
     if (wu) wu(work)
-    else await work
+    else void work
   } catch (e) {
     console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e))
   }
@@ -8503,6 +8505,12 @@ async function handleJsonRpc(
     console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
     await logNegotiation(c, 'server/discover', body.params, SUPPORTED_PROTOCOL_VERSIONS.join(','), true)
     return ok(id, serverDiscoverResult())
+  }
+
+  // Events OFF: server/discover stays method_not_found, but the attempt is still recorded (events_returned=false) so "why did the
+  // connector not see events" has an answer. Observability only; the response below is unchanged.
+  if (method === 'server/discover' && !eventsOn && profile === undefined) {
+    await logNegotiation(c, 'server/discover', body.params, '<none>', false)
   }
 
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
