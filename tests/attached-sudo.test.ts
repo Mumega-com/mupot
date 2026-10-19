@@ -151,12 +151,18 @@ async function enrolPasskey(e: Env, memberId: string, email: string): Promise<So
   return a
 }
 
-async function decideMoment(e: Env, url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', ceiling?: string, decideCeiling: string | undefined = ceiling): Promise<{ status: number; body: J }> {
+/** The attach code the human types on the /m/* page: default = the code of the pending admission; null = type nothing. */
+const pendingCode = (c?: string | null): { attach_code?: string } => {
+  const v = c === undefined ? one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions ORDER BY (status = 'pending') DESC, created_at DESC LIMIT 1`)?.attach_code : c
+  return v ? { attach_code: v } : {}
+}
+
+async function decideMoment(e: Env, url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', ceiling?: string, decideCeiling: string | undefined = ceiling, attachCode?: string | null): Promise<{ status: number; body: J }> {
   const path = new URL(url).pathname
   const csrf = csrfOf(await (await hit(path, e)).text())
-  const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf, ...(ceiling ? { ceiling } : {}) } })).json()) as J
+  const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf, ...(ceiling ? { ceiling } : {}), ...pendingCode(attachCode) } })).json()) as J
   const credential = await a.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey?.challenge ?? '' })
-  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(decideCeiling ? { ceiling: decideCeiling } : {}) } })
+  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(decideCeiling ? { ceiling: decideCeiling } : {}), ...pendingCode(attachCode) } })
   const raw = await res.text()
   let body: J = {} as J
   try { body = JSON.parse(raw) as J } catch { /* a 500 is plain text */ }

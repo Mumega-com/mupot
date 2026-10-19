@@ -143,12 +143,18 @@ async function enrolPasskey(e: Env, memberId: string, email: string): Promise<So
   return a
 }
 
-async function decideMoment(e: Env, url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', ceiling?: string, decideCeiling: string | undefined = ceiling): Promise<{ status: number; body: J }> {
+/** The attach code the human types on the /m/* page: default = the code of the pending admission; null = type nothing. */
+const pendingCode = (c?: string | null): { attach_code?: string } => {
+  const v = c === undefined ? one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions ORDER BY (status = 'pending') DESC, created_at DESC LIMIT 1`)?.attach_code : c
+  return v ? { attach_code: v } : {}
+}
+
+async function decideMoment(e: Env, url: string, a: SoftAuthenticator, decision: 'approve' | 'deny', ceiling?: string, decideCeiling: string | undefined = ceiling, attachCode?: string | null): Promise<{ status: number; body: J }> {
   const path = new URL(url).pathname
   const csrf = csrfOf(await (await hit(path, e)).text())
-  const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf, ...(ceiling ? { ceiling } : {}) } })).json()) as J
+  const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf, ...(ceiling ? { ceiling } : {}), ...pendingCode(attachCode) } })).json()) as J
   const credential = await a.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey?.challenge ?? '' })
-  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(decideCeiling ? { ceiling: decideCeiling } : {}) } })
+  const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(decideCeiling ? { ceiling: decideCeiling } : {}), ...pendingCode(attachCode) } })
   const raw = await res.text()
   let body: J = {} as J
   try { body = JSON.parse(raw) as J } catch { /* a 500 is plain text */ }
@@ -421,7 +427,7 @@ describe('who may be attached, and who may call', () => {
     const p2 = await attach(env, g, 'conv-a', 'bare')
     const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'pending'`)!
     const out = await decideSeatAdmission(env, {
-      adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} },
+      adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, attachCode: codeOf(adm.id),
       gate: async () => { h.sqlite.exec(`UPDATE agent_seat_admissions SET status = 'denied' WHERE id = '${adm.id}'`); return true },
     }, Date.now())
     expect(out.status).toBe(409) // CLOSED: the admission write did not land
@@ -517,7 +523,7 @@ describe('who may be attached, and who may call', () => {
       const agentId = bound ? 'agent-rava' : 'agent-bare'
       const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE agent_id = ? AND status = 'pending'`, agentId)!
       const out = await decideSeatAdmission(env, {
-        adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} },
+        adm: (await loadAdmission(env, adm.id))!, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, attachCode: codeOf(adm.id),
         gate: async () => { h.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${agentId}'`); return true },
       }, Date.now())
       expect(out.status, slug).toBe(409)
@@ -1006,7 +1012,7 @@ describe('dashboard: Connections', () => {
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
-    expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava' })).status).toBe(200)
+    expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', attach_code: codeOf(one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id) })).status).toBe(200)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(1)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
   })
@@ -1187,6 +1193,72 @@ describe('dashboard: Connections', () => {
       fresh()
       expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(200)
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
+    })
+
+    it('/m/* passkey approve: wrong or missing code is refused BEFORE the one-time link is used; the right code admits; the page shows the code input and seat label', async () => {
+      const env = envFor(h)
+      const { r, adm } = await pendingFor(env)
+      const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+      const page = await (await hit(new URL(String(r.sc.approve_url)).pathname, env)).text()
+      expect(page).toContain('name="attach_code"')
+      expect(page).toContain(String(r.sc.attach_code))
+      expect(page).toContain('first seen')
+      for (const bad of ['ZZ-ZZ', null]) {
+        const res = await decideMoment(env, String(r.sc.approve_url), key, 'approve', undefined, undefined, bad)
+        expect(res.status).toBe(403)
+        expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
+        expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit' AND status = 'pending'`)).toBe(1) // link not burned
+      }
+      expect((await decideMoment(env, String(r.sc.approve_url), key, 'approve')).status).toBe(200)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('live')
+    })
+
+    it('/connections/attach (dashboard Attach promoting a PENDING request): wrong or missing code refused, still pending; right code goes live', async () => {
+      const env = envFor(h)
+      const { r, adm } = await pendingFor(env)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      fresh()
+      const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
+      for (const body of [{}, { attach_code: 'ZZ-ZZ' }]) {
+        const res = await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', ...body })
+        expect(res.status).toBe(403)
+        expect(await res.json()).toEqual({ error: 'attach_code_mismatch' })
+        expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
+      }
+      expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', attach_code: String(r.sc.attach_code) })).status).toBe(200)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('live')
+    })
+
+    it('promoteAdmission itself refuses a wrong code (no caller can skip the check)', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      const { loadAdmission, decideSeatAdmission } = await import('../src/members/seat-attach')
+      const row = (await loadAdmission(env, adm))!
+      // a caller that did its own pre-check wrongly (here: passes nothing) still cannot land the write
+      const out = await decideSeatAdmission(env, { adm: row, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, gate: async () => true }, Date.now())
+      expect(out.status).toBe(403)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
+    })
+
+    it('GUARD: the set of code paths that can make an admission LIVE is pinned; a new writer must be added here AND carry the code check', async () => {
+      const { readdirSync, readFileSync, statSync } = await import('node:fs')
+      const { join } = await import('node:path')
+      const walk = (d: string): string[] => readdirSync(d).flatMap((e) => { const p = join(d, e); return statSync(p).isDirectory() ? walk(p) : p.endsWith('.ts') ? [p] : [] })
+      const hits = (re: RegExp): string[] => walk('src').filter((p) => !p.endsWith('schema-chain.generated.ts')).flatMap((p) => {
+        const c = (readFileSync(p, 'utf8').match(re) ?? []).length
+        return c ? [`${p}:${c}`] : []
+      }).sort()
+      // 1. the only UPDATE that sets status live lives in promoteAdmission
+      expect(hits(/UPDATE\s+agent_seat_admissions\s+SET\s+status\s*=\s*'live'/g)).toEqual(['src/members/seat-attach.ts:1'])
+      // 2. the only INSERT of a row born live (dashboard attach with NO pending request: no chat asked, nothing to match)
+      expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/seat-attach.ts:2'])
+      // 3. every caller of promoteAdmission (each must pass the typed code): exactly these three
+      const src = readFileSync('src/members/seat-attach.ts', 'utf8')
+      expect(src.match(/await promoteAdmission\(env, [^\n]*attachCode\)/g)?.length).toBe(3)
+      expect(src.match(/promoteAdmission\(/g)?.length).toBe(4) // 3 calls + the definition
+      // 4. no migration trigger or other SQL moves an admission to live
+      const mig = readdirSync('migrations').filter((f) => f.endsWith('.sql')).filter((f) => /SET\s+status\s*=\s*'live'/i.test(readFileSync(join('migrations', f), 'utf8')) && /agent_seat_admissions/.test(readFileSync(join('migrations', f), 'utf8')))
+      expect(mig).toEqual([])
     })
 
     it('codes are generated from the unambiguous alphabet and differ between calls', async () => {
@@ -1709,7 +1781,7 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     const { loadAdmission, decideSeatAdmission } = await import('../src/members/seat-attach')
     const stale = (await loadAdmission(env, String(pend.sc.admission_id)))!
     h.sqlite.exec(`UPDATE agent_seat_admissions SET expires_at = '2000-01-01T00:00:00.000Z'`)
-    const out = await decideSeatAdmission(env, { adm: stale, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, gate: async () => true }, Date.now())
+    const out = await decideSeatAdmission(env, { adm: stale, decision: 'approve', proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, attachCode: stale.attach_code, gate: async () => true }, Date.now())
     expect(out.status).toBe(409)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_admit'`)).toBe(0)

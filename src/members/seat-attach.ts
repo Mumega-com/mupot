@@ -70,6 +70,7 @@ export type AttachFailure =
   | 'seat_not_found'
   | 'too_many_pending_admissions'
   | 'attach_refused'
+  | 'attach_code_mismatch'
 
 export interface AttachableAgent {
   id: string
@@ -197,6 +198,11 @@ export function attachCodeMatches(expected: string, given: unknown): boolean {
   return diff === 0 && a.length > 0
 }
 
+/** THE code predicate every path that moves a pending admission to live goes through (promoteAdmission enforces it too). */
+export function attachCodeRefused(adm: AdmissionRow, given: unknown): boolean {
+  return adm.attach_code !== null && !attachCodeMatches(adm.attach_code, given)
+}
+
 export function admissionIsPendingLive(row: AdmissionRow, nowMs: number): boolean {
   return row.status === 'pending' && row.expires_at !== null && Date.parse(row.expires_at) > nowMs
 }
@@ -229,7 +235,7 @@ export function weldAudit(env: Env, agentId: string, actorId: string, admissionI
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
   | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean }
-  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' }
+  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' }
 
 /**
  * Find or create the admission for (agent, human, harness).
@@ -241,7 +247,7 @@ export type EnsureAdmissionResult =
  */
 export async function ensureAdmission(
   env: Env,
-  p: { agentId: string; humanMemberId: string; harnessId: string; seatId: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; ceiling?: AttachCeiling },
+  p: { agentId: string; humanMemberId: string; harnessId: string; seatId: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; ceiling?: AttachCeiling; attachCode?: unknown },
   nowMs: number = Date.now(),
 ): Promise<EnsureAdmissionResult> {
   const nowIso = new Date(nowMs).toISOString()
@@ -256,7 +262,8 @@ export async function ensureAdmission(
 
   if (p.via === 'dashboard') {
     if (open && open.status === 'pending') {
-      await promoteAdmission(env, open, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member')
+      if (attachCodeRefused(open, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
+      await promoteAdmission(env, open, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode)
     } else if (!open) {
       const id = crypto.randomUUID()
       const agentRow = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
@@ -346,10 +353,10 @@ export async function decideAdmissionDirect(
     return r.meta.changes === 1 ? { ok: true } : { ok: false, error: 'not_pending' }
   }
   // Approve needs the code the asking chat showed (legacy rows with no code are exempt). Refused BEFORE any state change.
-  if (adm.attach_code !== null && !attachCodeMatches(adm.attach_code, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
+  if (attachCodeRefused(adm, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
   const refusal = await admissionRefusal(env, adm)
   if (refusal) return { ok: false, error: 'attach_refused' }
-  return (await promoteAdmission(env, adm, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member')) ? { ok: true } : { ok: false, error: 'not_pending' }
+  return (await promoteAdmission(env, adm, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode)) ? { ok: true } : { ok: false, error: 'not_pending' }
 }
 
 /** Why a pending admission may not be promoted NOW (agent gone/inactive/unwelded, harness gone, human lost admin). */
@@ -380,7 +387,9 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
   return !!row
 }
 
-async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling): Promise<boolean> {
+async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<boolean> {
+  // The single place a pending admission becomes live: the code is enforced HERE so no caller can forget it.
+  if (attachCodeRefused(adm, attachCode)) return false
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string }>()
@@ -438,13 +447,13 @@ export async function revokeAdmission(
 const CLOSED: Outcome = { status: 409, title: 'Request closed', message: 'This request is no longer pending.', tone: 'warn' }
 
 /** What the human sees for an admission request (rendered inside the decision form). All names are labels. */
-export async function admissionView(env: Env, adm: AdmissionRow): Promise<{ agentName: string; agentSlug: string; harnessName: string; harnessKind: string; seatLabel: string | null }> {
+export async function admissionView(env: Env, adm: AdmissionRow): Promise<{ agentName: string; agentSlug: string; harnessName: string; harnessKind: string; seatLabel: string | null; seatFirstSeen: string | null }> {
   const a = await env.DB.prepare(`SELECT name, slug FROM agents WHERE id = ?1 LIMIT 1`).bind(adm.agent_id).first<{ name: string; slug: string }>()
   const h = await env.DB.prepare(`SELECT client_name, kind FROM harnesses WHERE id = ?1 AND tenant = ?2 LIMIT 1`).bind(adm.harness_id, env.TENANT_SLUG).first<{ client_name: string; kind: string }>()
   const s = adm.requested_seat_id
-    ? await env.DB.prepare(`SELECT label_basename FROM agent_seats WHERE id = ?1 AND tenant = ?2 LIMIT 1`).bind(adm.requested_seat_id, env.TENANT_SLUG).first<{ label_basename: string }>()
+    ? await env.DB.prepare(`SELECT label_basename, created_at FROM agent_seats WHERE id = ?1 AND tenant = ?2 LIMIT 1`).bind(adm.requested_seat_id, env.TENANT_SLUG).first<{ label_basename: string; created_at: string }>()
     : null
-  return { agentName: a?.name ?? adm.agent_id, agentSlug: a?.slug ?? '', harnessName: h?.client_name ?? '', harnessKind: h?.kind ?? '', seatLabel: s?.label_basename ?? null }
+  return { agentName: a?.name ?? adm.agent_id, agentSlug: a?.slug ?? '', harnessName: h?.client_name ?? '', harnessKind: h?.kind ?? '', seatLabel: s?.label_basename ?? null, seatFirstSeen: s?.created_at ?? null }
 }
 
 // Same contract as durably() in access/decision-core (not imported: that module pulls the whole MCP tool graph into this
@@ -461,7 +470,7 @@ function durablyLocal<T>(waitUntil: WaitUntil | undefined, fn: () => Promise<T>)
  */
 export async function decideSeatAdmission(
   env: Env,
-  input: { adm: AdmissionRow; decision: 'approve' | 'deny'; proof: HumanProof; gate: Gate; waitUntil?: WaitUntil; ceiling?: AttachCeiling },
+  input: { adm: AdmissionRow; decision: 'approve' | 'deny'; proof: HumanProof; gate: Gate; waitUntil?: WaitUntil; ceiling?: AttachCeiling; attachCode?: unknown },
   nowMs: number,
 ): Promise<Outcome> {
   const { adm, decision, proof } = input
@@ -488,8 +497,12 @@ export async function decideSeatAdmission(
     if (refusal) {
       return { status: 409, title: 'Cannot admit', message: `This admission can no longer be granted (${refusal}). Nothing was changed.`, tone: 'warn' }
     }
+    // Before the one-time gate: a wrong code never burns the link.
+    if (attachCodeRefused(adm, input.attachCode)) {
+      return { status: 403, title: 'Wrong attach code', message: 'The attach code does not match the one the chat showed. Nothing was changed.', tone: 'warn' }
+    }
     if (!(await input.gate())) return CLOSED
-    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member')
+    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member', input.attachCode)
     if (!landed) return CLOSED
     // The write already landed: a failed name lookup must not turn a successful approval into an error page.
     const who = (await admissionView(env, adm).then((v) => v.agentName, () => null)) ?? 'this agent'
@@ -627,7 +640,7 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
  */
 export async function attachSeatToAgent(
   env: Env,
-  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling },
+  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling; attachCode?: unknown },
   nowMs: number = Date.now(),
 ): Promise<AttachResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -657,7 +670,7 @@ export async function attachSeatToAgent(
   }
 
   const admission = await ensureAdmission(env, {
-    agentId: agent.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, seatId: seat.id, via: p.via, requesterAgentId: p.requesterAgentId, ceiling: p.ceiling,
+    agentId: agent.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, seatId: seat.id, via: p.via, requesterAgentId: p.requesterAgentId, ceiling: p.ceiling, attachCode: p.attachCode,
   }, nowMs)
   if (!admission.ok) return { ok: false, error: admission.error }
   if (admission.state === 'pending') {

@@ -231,6 +231,7 @@ const ATTACH_STATUS: Record<string, 400 | 403 | 404 | 409 | 429> = {
   too_many_pending_admissions: 429,
   already_attached: 409,
   attach_refused: 409,
+  attach_code_mismatch: 403,
 }
 
 export function makeConnectionsApp(shell: ShellFn) {
@@ -268,7 +269,7 @@ export function makeConnectionsApp(shell: ShellFn) {
       return c.json({ error: 'bad_request' }, 400)
     }
     const r = await attachSeatToAgent(c.env, {
-      humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member',
+      humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member', attachCode: body.attach_code,
     })
     if (!r.ok) return c.json({ error: r.error }, ATTACH_STATUS[r.error] ?? 400)
     return c.json(r)

@@ -18,7 +18,7 @@ if(cb){cb.addEventListener('click',function(){var t=document.getElementById('age
 if(!window.PublicKeyCredential){show('Passkeys not available','This browser cannot use passkeys. Open the link in a browser that can.',false);lock(true);return}
 var form=document.getElementById('decision-form');
 form.addEventListener('submit',function(ev){ev.preventDefault()});
-function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),csrf:form.getAttribute('data-csrf')}}
+function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),ceiling:fd.get('ceiling'),attach_code:fd.get('attach_code'),csrf:form.getAttribute('data-csrf')}}
 var promptOrig=null;
 function setAgentPrompt(kind,title,message,verb){
  var box=document.getElementById('agent-prompt-box'),t=document.getElementById('agent-prompt');if(!box||!t)return;
