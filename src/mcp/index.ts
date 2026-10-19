@@ -7267,7 +7267,7 @@ const toolOrient: ToolSpec = {
       mcpEndpoint(canonicalOrigin(env, ctx.origin)),
       viewSensitive,
       Date.now(),
-      { recordInduction: !ctx.sideEffectFree },
+      { recordInduction: !ctx.sideEffectFree && !ctx.heldSeat },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
     return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : await joinNextStepsField(env, auth)), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })

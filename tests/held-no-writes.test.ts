@@ -170,4 +170,19 @@ describe('held seats leave no trace (#2064)', () => {
     expect(readAt()).not.toBeNull()
     expect(fleetSeen(s.agentId)).not.toBe(OLD)
   })
+
+  it('held orient writes no agent_orientation row', async () => {
+    const held = await fixture('held')
+    h.sqlite.prepare(`DELETE FROM agent_orientation`).run()
+    const r = await rpc(held.auth, 'orient', {}, held.s.session, held.e)
+    expect(r.text).not.toContain('observed_floor')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_orientation`)).toBe(0)
+  })
+
+  it('observed orient still records the induction', async () => {
+    const obs = await fixture('observed')
+    h.sqlite.prepare(`DELETE FROM agent_orientation`).run()
+    await rpc(obs.auth, 'orient', {}, obs.s.session, obs.e)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_orientation`)).toBeGreaterThan(0)
+  })
 })
