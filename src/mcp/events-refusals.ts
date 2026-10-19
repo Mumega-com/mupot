@@ -8,6 +8,8 @@ import type { AuthContext, Env } from '../types'
 export const REFUSAL_RATE_WINDOW_MS = 60_000
 export const REFUSAL_RETENTION_MS = 7 * 24 * 60 * 60_000
 export const REFUSAL_TENANT_ROW_CEILING = 5_000
+/** Binding limit for one principal inside the retention window: one caller cycling reasons can never crowd out the others. */
+export const REFUSAL_PRINCIPAL_ROW_CAP = 200
 
 export interface SubscribeRefusal {
   reason: string
@@ -50,17 +52,25 @@ export async function recordSubscribeRefusal(env: Env, nowMs: number, r: Subscri
   try {
     const now = new Date(nowMs).toISOString()
     const windowStart = new Date(nowMs - REFUSAL_RATE_WINDOW_MS).toISOString()
-    // ONE atomic guarded INSERT: skipped when this principal+reason already has a row inside the window, or the tenant is at its ceiling.
-    await env.DB.prepare(
+    // ONE atomic guarded INSERT: skipped when this principal+reason already has a row inside the window, or the principal is at its
+    // per-principal cap (the binding limit). The tenant ceiling below EVICTS oldest-first, so it can never blind newer principals.
+    const retentionStart = new Date(nowMs - REFUSAL_RETENTION_MS).toISOString()
+    const ins = await env.DB.prepare(
       `INSERT INTO event_subscribe_refusals (id, tenant, agent_id, member_id, harness_id, seat_id, reason, host, at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
         WHERE NOT EXISTS (SELECT 1 FROM event_subscribe_refusals
                            WHERE tenant = ?2 AND COALESCE(agent_id, '') = COALESCE(?3, '') AND COALESCE(member_id, '') = COALESCE(?4, '')
                              AND reason = ?7 AND at > ?10)
-          AND (SELECT COUNT(*) FROM event_subscribe_refusals WHERE tenant = ?2) < ?11`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, agentId, memberId, harnessId, seatId, reason, host, now, windowStart, REFUSAL_TENANT_ROW_CEILING).run()
-    await env.DB.prepare(`DELETE FROM event_subscribe_refusals WHERE tenant = ?1 AND at <= ?2`)
-      .bind(env.TENANT_SLUG, new Date(nowMs - REFUSAL_RETENTION_MS).toISOString()).run()
+          AND (SELECT COUNT(*) FROM event_subscribe_refusals
+                WHERE tenant = ?2 AND COALESCE(agent_id, '') = COALESCE(?3, '') AND COALESCE(member_id, '') = COALESCE(?4, '')
+                  AND at > ?11) < ?12`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, agentId, memberId, harnessId, seatId, reason, host, now, windowStart, retentionStart, REFUSAL_PRINCIPAL_ROW_CAP).run()
+    if ((ins.meta?.changes ?? 0) === 0) return
+    await env.DB.prepare(`DELETE FROM event_subscribe_refusals WHERE tenant = ?1 AND at <= ?2`).bind(env.TENANT_SLUG, retentionStart).run()
+    await env.DB.prepare(
+      `DELETE FROM event_subscribe_refusals WHERE rowid IN (
+         SELECT rowid FROM event_subscribe_refusals WHERE tenant = ?1 ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?2)`,
+    ).bind(env.TENANT_SLUG, REFUSAL_TENANT_ROW_CEILING).run()
   } catch (e) {
     console.error('[mcp:events/subscribe] refusal record failed', e instanceof Error ? e.message : String(e))
   }

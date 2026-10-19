@@ -1691,4 +1691,41 @@ describe('events/subscribe refusal record', () => {
     expect(refusals()).toHaveLength(0)
     expect(subs()).toHaveLength(1)
   })
+
+  it('per-principal cap binds; principal A at its cap does not block principal B', async () => {
+    const { recordSubscribeRefusal, REFUSAL_PRINCIPAL_ROW_CAP } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const A = { boundAgentId: 'agent-a', memberId: 'member-agent-a' }
+    for (let i = 0; i < REFUSAL_PRINCIPAL_ROW_CAP + 50; i++) await recordSubscribeRefusal(env, T + i * 61_000, { reason: `r${i}`, auth: A })
+    const count = (id: string): number => (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_subscribe_refusals WHERE agent_id = ?').get(id) as { n: number }).n
+    expect(count('agent-a')).toBe(REFUSAL_PRINCIPAL_ROW_CAP)
+    await recordSubscribeRefusal(env, T + 1000, { reason: 'x', auth: { boundAgentId: 'agent-b', memberId: 'member-agent-b' } })
+    expect(count('agent-b')).toBe(1)
+  })
+
+  it('tenant ceiling evicts oldest-first and keeps the newest row', async () => {
+    const { recordSubscribeRefusal, REFUSAL_TENANT_ROW_CEILING } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const ins = harness.sqlite.prepare("INSERT INTO event_subscribe_refusals (id, tenant, agent_id, member_id, reason, at) VALUES (?, ?, ?, 'm', 'seed', ?)")
+    for (let i = 0; i < REFUSAL_TENANT_ROW_CEILING; i++) ins.run(`seed-${i}`, TENANT, `ag-${i}`, new Date(T - 10_000_000 + i * 1000).toISOString())
+    await recordSubscribeRefusal(env, T, { reason: 'newest', auth: { boundAgentId: 'agent-a', memberId: 'member-agent-a' } })
+    const n = (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_subscribe_refusals').get() as { n: number }).n
+    expect(n).toBe(REFUSAL_TENANT_ROW_CEILING)
+    expect(reasons()).toContain('newest')
+    expect(refusals().some((r) => r.agent_id === 'ag-0')).toBe(false)
+    expect(refusals().some((r) => r.agent_id === `ag-${REFUSAL_TENANT_ROW_CEILING - 1}`)).toBe(true)
+  })
+
+  it('a skipped insert does not run the prune', async () => {
+    const { recordSubscribeRefusal } = await import('../src/mcp/events-refusals')
+    const env = makeEnv()
+    const T = Date.parse('2026-08-01T12:00:00.000Z')
+    const auth = { boundAgentId: 'agent-a', memberId: 'member-agent-a' }
+    await recordSubscribeRefusal(env, T, { reason: 'dup', auth })
+    sqlLog.length = 0
+    await recordSubscribeRefusal(env, T + 1000, { reason: 'dup', auth })
+    expect(sqlLog.filter((q) => q.startsWith('DELETE FROM event_subscribe_refusals'))).toHaveLength(0)
+  })
 })
