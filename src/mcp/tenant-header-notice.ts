@@ -26,7 +26,7 @@ export interface TenantHeaderNotice {
   /** True only when the value is a well-formed slug of an active registered pot. */
   known_tenant: boolean
   /** Only when known_tenant: the URL forms that exist in the router. */
-  use_instead?: { tenant_host: string; apex_path: string }
+  use_instead?: { apex_path: string }
   line: string
 }
 
@@ -76,8 +76,8 @@ export async function tenantHeaderNotice(env: Env, headers: Headers): Promise<Te
   if (raw.toLowerCase() === resolved) return null
   const echo = boundTenantHeaderValue(raw)
   const shown = echo.length > 0 ? echo : '(unprintable)'
-  // The comparison above is on the raw value; a value that only equals the tenant after bounding is not "the tenant".
-  const known = echo !== resolved && (await isKnownTenant(env, echo))
+  // Known/unknown is decided on the ORIGINAL value: if bounding changed it (stripped or truncated), it names nothing real.
+  const known = echo === raw.toLowerCase() && echo !== resolved && (await isKnownTenant(env, echo))
   if (!known) {
     return {
       code: TENANT_NOTICE_CODE, header_value: shown, resolved_tenant: resolved, known_tenant: false,
@@ -85,9 +85,10 @@ export async function tenantHeaderNotice(env: Env, headers: Headers): Promise<Te
     }
   }
   const root = rootHost(env, resolved)
-  const use = { tenant_host: `https://${echo}.${root}/mcp`, apex_path: `https://${root}/t/${echo}/mcp` }
+  // Only the apex path door: tenant subdomains do not answer TLS in prod (#2035 wall 3), so they are never advertised.
+  const use = { apex_path: `https://${root}/t/${echo}/mcp` }
   return {
     code: TENANT_NOTICE_CODE, header_value: echo, resolved_tenant: resolved, known_tenant: true, use_instead: use,
-    line: `tenant header '${echo}' ignored; you are in tenant '${resolved}'. To reach ${echo} use ${use.tenant_host} or /t/${echo}/mcp`,
+    line: `tenant header '${echo}' ignored; you are in tenant '${resolved}'. To reach ${echo} use ${use.apex_path}`,
   }
 }

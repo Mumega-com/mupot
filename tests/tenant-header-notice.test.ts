@@ -27,9 +27,10 @@ describe('tenant header notice', () => {
       const { w, c } = await setup()
       const { res, result, meta } = await callWith(w, c, tool, { 'x-mupot-tenant-slug': 'gaf' })
       const n = result.tenant_header_notice as Json
-      expect(n.line).toBe("tenant header 'gaf' ignored; you are in tenant 'mumega'. To reach gaf use https://gaf.pot.test/mcp or /t/gaf/mcp")
+      expect(n.line).toBe("tenant header 'gaf' ignored; you are in tenant 'mumega'. To reach gaf use https://pot.test/t/gaf/mcp")
       expect(n.known_tenant).toBe(true)
-      expect(n.use_instead).toEqual({ tenant_host: 'https://gaf.pot.test/mcp', apex_path: 'https://pot.test/t/gaf/mcp' })
+      expect(n.use_instead).toEqual({ apex_path: 'https://pot.test/t/gaf/mcp' })
+      expect(JSON.stringify(n)).not.toContain('gaf.pot.test')
       expect(res.headers.get('x-mupot-tenant-header-ignored')).toBe('gaf')
       expect((meta?.[META] as Json).code).toBe('tenant_header_ignored')
     })
@@ -143,5 +144,16 @@ describe('tenant header notice', () => {
     w.h.sqlite.exec(`INSERT INTO pots (id, slug, worker_script, status) VALUES ('pot-a', 'admin', 'admin', 'active')`)
     const { result } = await callWith(w, c, 'status', { 'x-mupot-tenant-slug': 'admin' })
     expect((result.tenant_header_notice as Json).known_tenant).toBe(false)
+  })
+
+  it('a value sanitizing altered is unknown: no lookup of the sanitized form, no URL', async () => {
+    const { w, c } = await setup()
+    for (const v of ['GAF!!', 'ga<f>', 'gaf' + 'x'.repeat(60), 'g af']) {
+      const { result } = await callWith(w, c, 'status', { 'x-mupot-tenant-slug': v })
+      const n = result.tenant_header_notice as Json
+      expect(n.known_tenant, v).toBe(false)
+      expect(n.use_instead).toBeUndefined()
+      expect(String(n.line)).not.toMatch(/https?:/)
+    }
   })
 })
