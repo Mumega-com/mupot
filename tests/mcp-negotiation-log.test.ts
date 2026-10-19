@@ -176,6 +176,17 @@ describe('mcp negotiation log', () => {
     await recordNegotiation(env(), Date.parse(T0), { method: 'initialize', requested: '2025-06-18', negotiated: 'n', eventsReturned: false, principal: { harnessId: 'h-1', heldSeat: true } })
     expect(rows()).toHaveLength(0)
   })
+
+  it('a held seat leaves no console line and touches the DB not at all', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const prepare = vi.fn(() => { throw new Error('DB must not be touched for a held seat') })
+    const e = { TENANT_SLUG: TENANT, DB: { prepare } } as unknown as Env
+    await recordNegotiation(e, Date.parse(T0), { method: 'initialize', requested: '2025-06-18', negotiated: 'n', eventsReturned: false, principal: { harnessId: 'h-1', memberId: 'member-1', heldSeat: true } })
+    expect(info).not.toHaveBeenCalled()
+    expect(err).not.toHaveBeenCalled()
+    expect(prepare).not.toHaveBeenCalled()
+  })
   // A DB whose negotiation INSERT blocks until released: proves the response never waits on the observability write.
   function slowWriteEnv(): { env: Env; release: () => void; started: () => boolean } {
     let release!: () => void

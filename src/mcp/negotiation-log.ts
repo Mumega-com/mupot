@@ -39,6 +39,8 @@ export interface NegotiationRecord {
 }
 
 export async function recordNegotiation(env: Env, nowMs: number, r: NegotiationRecord): Promise<void> {
+  // #2069: a HELD seat leaves no trace: no label lookup, no console line, no write. Must stay the first statement.
+  if (r.principal?.heldSeat) return
   const harnessId = r.principal?.harnessId ?? null
   const memberId = r.principal?.memberId ?? null
   // Unauthenticated free text is never stored or logged (same rule as requestedProtocolVersionForLog's callers): clientInfo.name only counts for a resolved principal.
@@ -58,8 +60,6 @@ export async function recordNegotiation(env: Env, nowMs: number, r: NegotiationR
   })
   // No principal => nothing to rate-limit against: log only, never an unbounded anonymous write.
   if (!harnessId && !memberId) return
-  // #2069: a HELD seat leaves no trace.
-  if (r.principal?.heldSeat) return
   try {
     const now = new Date(nowMs).toISOString()
     const windowStart = new Date(nowMs - NEGOTIATION_RATE_WINDOW_MS).toISOString()
