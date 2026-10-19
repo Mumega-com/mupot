@@ -42,9 +42,18 @@ export interface HumanProof {
   evidence: Record<string, string>
 }
 
+/** An elevation decision may also arrive over the approval bot (a Telegram tap in the bound private chat). It is NOT a seed channel:
+ *  seed decisions keep DecisionVia (their table's CHECK does not know it), and it is never passkey-class. */
+export type ElevationVia = DecisionVia | 'approval_bot'
+export interface ElevationProof {
+  memberId: string
+  via: ElevationVia
+  evidence: Record<string, string>
+}
+
 /** The channels whose proof is a genuine passkey / fresh-login step-up. An ALLOW-list on purpose: a channel added to DecisionVia later
  *  gets no sudo-approval power until it is named here. */
-const PASSKEY_CLASS_VIA: ReadonlySet<DecisionVia> = new Set<DecisionVia>(['webauthn', 'access_passkey'])
+const PASSKEY_CLASS_VIA: ReadonlySet<ElevationVia> = new Set<ElevationVia>(['webauthn', 'access_passkey'])
 
 export interface Outcome {
   status: 200 | 400 | 403 | 404 | 409 | 410 | 503
@@ -233,7 +242,7 @@ ${fromChat ? `<dt>Requested from</dt><dd><strong>a CHAT attached to ${agent ? es
 }
 
 async function writeElevationReceipt(
-  env: Env, proof: HumanProof, requestId: string, operation: string, evidence: Record<string, unknown>,
+  env: Env, proof: ElevationProof, requestId: string, operation: string, evidence: Record<string, unknown>,
 ): Promise<boolean> {
   try {
     const nowIso = new Date().toISOString()
@@ -246,7 +255,7 @@ async function writeElevationReceipt(
     ).bind(
       crypto.randomUUID(), env.TENANT_SLUG, proof.memberId, operation, requestId, `access-elevation:${requestId}`,
       JSON.stringify({ via: proof.via, ...proof.evidence, ...evidence }), nowIso,
-      receiptHandlerFor(proof.via),
+      proof.via === 'approval_bot' ? 'approval_bot' : receiptHandlerFor(proof.via),
     ).run()
     return true
   } catch {
@@ -274,7 +283,7 @@ export async function decideElevation(
     selectedActions: string[]
     durationMinutes: number | undefined
     auth: AuthContext
-    proof: HumanProof
+    proof: ElevationProof
     /** Mints the approver's web session. Called ONLY after the gate, so no session exists for a refused decision. */
     mintSession: () => Promise<ApproverSession>
     gate?: Gate

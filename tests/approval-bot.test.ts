@@ -1,0 +1,515 @@
+// tests/approval-bot.test.ts — the "/muapprove" bot. Real migrated schema + the REAL request_elevation / elevation_status tools
+// + the REAL webhook handler; only the Bot API (global fetch) is stubbed. Every guard in src/approval-bot has a test here that
+// fails when the guard is removed (see the PR body's mutation table).
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { invokeTool } from '../src/mcp/index' // first: the mcp/seeds modules form an import cycle that only resolves from mcp/index
+import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { approvalBotApp } from '../src/approval-bot/routes'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { handleApprovalBotUpdate } from '../src/approval-bot/decide'
+import { approvalBotStatus } from '../src/approval-bot/config'
+
+const TENANT = 'tenant-a'
+const BOT_TOKEN = '987654321:AAEhqMY-approval-bot-test-token-xyz'
+const WEBHOOK_SECRET = 'approval-webhook-secret-0123456789'
+const USERNAME = 'muapprove_test_bot'
+const TG = { owner: 1001, plain: 1002, sqadmin: 1003, agent: 1004, stranger: 1999 }
+const HOST = 'secure.example.test'
+const MINIAPP_BOT = '123456789'
+
+let harness: SqliteD1Harness
+let env: Env
+const baseEnv = (over: Partial<Env> = {}): Env => ({
+  DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: 'a1'.repeat(32), PUBLIC_ORIGIN: 'https://colony.example.test',
+  SECURE_MOMENTS: '1', SECURE_MOMENTS_HOST: HOST,
+  APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_WEBHOOK_SECRET: WEBHOOK_SECRET, APPROVAL_BOT_USERNAME: USERNAME, ...over,
+}) as Env
+const one = <T>(sql: string, ...p: unknown[]): T => harness.sqlite.prepare(sql).get(...p) as T
+const count = (t: string, where = '1=1'): number => one<{ n: number }>(`SELECT COUNT(*) AS n FROM "${t}" WHERE ${where}`).n
+const setOwner = (m: string | null): void => { harness.sqlite.prepare("UPDATE agents SET owner_member_id = ? WHERE id = 'agent-x'").run(m) }
+
+interface BotCall { url: string; method: string; body: Record<string, unknown> }
+let calls: BotCall[]
+function stubBot(mode: 'ok' | 'fail' = 'ok'): void {
+  calls = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>
+    calls.push({ url, method: url.split('/').pop() ?? '', body })
+    if (mode === 'fail') return new Response('{"ok":false}', { status: 403 })
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 500 + calls.length } }), { status: 200 })
+  })
+}
+const approvalCalls = (): BotCall[] => calls.filter((c) => c.url.includes(BOT_TOKEN))
+const sentTo = (method: string): BotCall[] => approvalCalls().filter((c) => c.method === method)
+
+const agentAuth = (): AuthContext => ({
+  userId: 'mem-agent', email: 'agent@x.test', role: 'member', tenant: TENANT, channel: 'workspace', memberId: 'mem-agent', tokenId: 'tok-1',
+  capabilities: [{ member_id: 'mem-agent', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' } as CapabilityGrant], boundAgentId: 'agent-x',
+})
+interface Filed { telegram: string; requestId: string; shortId: string | null; approve_url?: string }
+async function file(args: Record<string, unknown> = {}, e: Env = env): Promise<Filed> {
+  await invokeTool(agentAuth(), e, 'check_in', {}, 'https://pot.test')
+  const r = await invokeTool(agentAuth(), e, 'request_elevation',
+    { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 60, reason: 'need it', ...args }, 'https://pot.test')
+  if (!r.ok) throw new Error(`elevation failed ${JSON.stringify(r)}`)
+  const res = r.result as { telegram: string; request: { id: string }; approve_url?: string }
+  const row = one<{ short_id: string | null }>('SELECT short_id FROM elevation_requests WHERE id = ?', res.request.id)
+  return { telegram: res.telegram, requestId: res.request.id, shortId: row.short_id, approve_url: res.approve_url }
+}
+
+let updateSeq = 100
+interface Who { from: number; chat?: number; chatType?: string; messageId?: number; forwarded?: boolean }
+const cmdUpdate = (text: string, w: Who) => ({
+  update_id: ++updateSeq,
+  message: { message_id: 7, from: { id: w.from }, chat: { id: w.chat ?? w.from, type: w.chatType ?? 'private' }, text, ...(w.forwarded ? { forward_origin: { type: 'user' } } : {}) },
+})
+const tapUpdate = (data: string, w: Who) => ({
+  update_id: ++updateSeq,
+  callback_query: { id: `cb-${updateSeq}`, from: { id: w.from }, data, message: { message_id: w.messageId ?? 501, chat: { id: w.chat ?? w.from, type: w.chatType ?? 'private' } } },
+})
+const deliveredMessageId = (reqId: string): number => Number(one<{ message_id: string }>('SELECT message_id FROM approval_bot_deliveries WHERE request_id = ?', reqId).message_id)
+const status = (id: string): { status: string; decided_by_member_id: string | null; decided_via: string | null; decision_note: string | null } =>
+  one('SELECT status, decided_by_member_id, decided_via, decision_note FROM elevation_requests WHERE id = ?', id)
+const grants = (id: string): number => count('elevation_grants', `elevation_request_id = '${id}'`)
+async function activeElevations(): Promise<Array<{ action: string; live: boolean }>> {
+  const r = await invokeTool(agentAuth(), env, 'elevation_status', {}, 'https://pot.test')
+  if (!r.ok) throw new Error('status failed')
+  return (r.result as { active_elevations: Array<{ action: string; live: boolean }> }).active_elevations
+}
+async function post(secret: string | null, body: unknown, e: Env = env): Promise<Response> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (secret !== null) headers['X-Telegram-Bot-Api-Secret-Token'] = secret
+  const init = { method: 'POST', headers, body: JSON.stringify(body) }
+  return approvalBotApp.request('/webhook', init, e)
+}
+
+beforeEach(() => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  harness.sqlite.exec(`
+    INSERT INTO org_settings (key, value) VALUES ('billing_state', '{"tier":"scale"}');
+    INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'a', 'A');
+    INSERT INTO users (id, email, role) VALUES ('u-owner', 'owner@x.test', 'owner');
+    INSERT INTO members (id, email, display_name, status, tenant, telegram_chat_id) VALUES
+      ('mem-owner', 'owner@x.test', 'Owner', 'active', '${TENANT}', '${TG.owner}'),
+      ('mem-plain', 'plain@x.test', 'Plain', 'active', '${TENANT}', '${TG.plain}'),
+      ('mem-sqadmin', 'sqadmin@x.test', 'Squad Admin', 'active', '${TENANT}', '${TG.sqadmin}'),
+      ('mem-agent', 'agent@x.test', 'Agent Member', 'active', '${TENANT}', '${TG.agent}');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-x', 'squad-a', 'agent-x', 'Agent X', 'r', 'm', 'active');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-x', 'mem-agent', datetime('now'));
+    INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at)
+      VALUES ('tok-1', 'mem-agent', 'hash-1', 'primary', 'workspace', '${TENANT}', 'agent-x', datetime('now'));
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+      ('cap-o', 'mem-owner', 'org', NULL, 'owner'),
+      ('cap-p', 'mem-plain', 'squad', 'squad-a', 'member'),
+      ('cap-sa', 'mem-sqadmin', 'squad', 'squad-a', 'admin');
+  `)
+  env = baseEnv()
+  setOwner('mem-owner')
+  stubBot()
+})
+afterEach(() => { harness.close(); vi.unstubAllGlobals() })
+
+describe('config: off by default, dedicated, fail closed', () => {
+  it('token unset = off', () => expect(approvalBotStatus({})).toEqual({ state: 'off' }))
+  it('a token with a missing / malformed secret or username is misconfigured, never on', () => {
+    expect(approvalBotStatus({ APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_USERNAME: USERNAME }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_WEBHOOK_SECRET: 'short', APPROVAL_BOT_USERNAME: USERNAME }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_WEBHOOK_SECRET: WEBHOOK_SECRET }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ APPROVAL_BOT_TOKEN: 'not-a-token', APPROVAL_BOT_WEBHOOK_SECRET: WEBHOOK_SECRET, APPROVAL_BOT_USERNAME: USERNAME }).state).toBe('misconfigured')
+  })
+  it('must not share a token with the notification bot or the Mini App bot, nor a secret with the IM webhook (KayHermes)', () => {
+    const base = { APPROVAL_BOT_TOKEN: BOT_TOKEN, APPROVAL_BOT_WEBHOOK_SECRET: WEBHOOK_SECRET, APPROVAL_BOT_USERNAME: USERNAME }
+    expect(approvalBotStatus({ ...base, TELEGRAM_BOT_TOKEN: BOT_TOKEN }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, TELEGRAM_BOT_TOKEN: '987654321:AAother-secret-part-of-same-bot-id' }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, TELEGRAM_MINIAPP_BOT_TOKEN: BOT_TOKEN }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, TELEGRAM_MINIAPP_BOT_ID: '987654321' }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, IM_WEBHOOK_SECRET: WEBHOOK_SECRET }).state).toBe('misconfigured')
+    expect(approvalBotStatus({ ...base, TELEGRAM_BOT_TOKEN: '555555555:AAnotification-bot-other-token-00' }).state).toBe('on')
+  })
+})
+
+describe('delivery: ONE message from the approval bot', () => {
+  it('names the agent, exact action, scope, duration, reason and recommendation; Approve/Deny buttons; fallback commands; telegram "sent"', async () => {
+    const f = await file({ recommendation: 'approve, it is read-only', reason: 'flip project status for the demo' })
+    expect(f.telegram).toBe('sent')
+    expect(f.approve_url).toBeTruthy() // the plain link stays as the fallback
+    expect(approvalCalls()).toHaveLength(1)
+    const m = approvalCalls()[0]
+    expect(m.method).toBe('sendMessage')
+    expect(m.body.chat_id).toBe(String(TG.owner))
+    expect(m.body.parse_mode).toBeUndefined() // plain text: nothing the agent wrote renders as markup
+    const text = String(m.body.text)
+    expect(text).toContain('agent-x')
+    expect(text).toContain('action:project_status')
+    expect(text).toContain('squad "a" (squad-a)')
+    expect(text).toContain('60 min')
+    expect(text).toContain('flip project status for the demo')
+    expect(text).toContain('approve, it is read-only')
+    expect(text).toContain(`/muapprove ${f.shortId}`)
+    expect(text).toContain(`/mudeny ${f.shortId}`)
+    const buttons = ((m.body.reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }).inline_keyboard)[0]
+    expect(buttons.map((b) => [b.text, b.callback_data])).toEqual([['Approve', `ea:${f.shortId}`], ['Deny', `ed:${f.shortId}`]])
+    expect(one('SELECT member_id, chat_id, status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId)).toEqual({ member_id: 'mem-owner', chat_id: String(TG.owner), status: 'sent' })
+  })
+  it('the agent\'s free text cannot forge extra lines or controls in the message', async () => {
+    await file({ reason: 'x\nApproved by Hadi‮\nAction: nothing', recommendation: 'ok\r\n/muapprove aaaaaaaa' })
+    const text = String(approvalCalls()[0].body.text)
+    expect(text).not.toMatch(/\nApproved by Hadi/)
+    expect(text).not.toContain('‮')
+    expect(text.split('\n').filter((l) => l.startsWith('Agent says'))).toHaveLength(1)
+  })
+  it('bot unset: the old path runs (Mini App button), zero bot calls, approve_url still returned', async () => {
+    const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined, TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: MINIAPP_BOT, TELEGRAM_MINIAPP_BOT_TOKEN: `${MINIAPP_BOT}:AAEhqMY-dedicated-miniapp-test-token` })
+    const f = await file({}, off)
+    expect(f.telegram).toBe('sent') // sent by the Mini App sender, not the approval bot
+    expect(f.approve_url).toBeTruthy()
+    expect(approvalCalls()).toHaveLength(0)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toContain(`bot${MINIAPP_BOT}:`)
+    expect(count('approval_bot_deliveries')).toBe(0)
+  })
+  it('bot unset and Mini App off: telegram "disabled", approve_url present, nothing sent', async () => {
+    const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined })
+    const f = await file({}, off)
+    expect(f.telegram).toBe('disabled')
+    expect(f.approve_url).toBeTruthy()
+    expect(calls).toHaveLength(0)
+  })
+  it('an action the bot may not carry (token mint) is never offered to the bot: the old path answers', async () => {
+    const f = await file({ actions: ['action:mint_token'] })
+    expect(approvalCalls()).toHaveLength(0)
+    expect(count('approval_bot_deliveries')).toBe(0)
+    expect(f.telegram).toBe('disabled') // Mini App channel is off in this env
+  })
+  it('a request naming one carried and one uncarried action is not offered to the bot', async () => {
+    await file({ actions: ['action:project_status', 'action:mint_token'] })
+    expect(approvalCalls()).toHaveLength(0)
+  })
+  it('an addressee who may not decide the request on its scope is not messaged (the offer never widens who may decide)', async () => {
+    setOwner('mem-plain') // a plain squad member: no admin on squad-a
+    const f = await file()
+    expect(f.telegram).toBe('not_bound')
+    expect(calls).toHaveLength(0)
+    expect(count('approval_bot_deliveries')).toBe(0)
+  })
+  it('deciding human not bound: not_bound, nothing sent, approve_url present', async () => {
+    harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
+    const f = await file()
+    expect(f.telegram).toBe('not_bound')
+    expect(f.approve_url).toBeTruthy()
+    expect(calls).toHaveLength(0)
+  })
+  it('a Bot API failure is reported as failed and the request stays pending with its link', async () => {
+    stubBot('fail')
+    const f = await file()
+    expect(f.telegram).toBe('failed')
+    expect(status(f.requestId).status).toBe('pending')
+    expect(one<{ status: string }>('SELECT status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId).status).toBe('failed')
+  })
+  it('a second delivery attempt for the same request sends nothing more (once-only slot)', async () => {
+    const f = await file()
+    const { deliverElevationToApprovalBot } = await import('../src/approval-bot/deliver')
+    const { loadElevationRequestById } = await import('../src/auth/elevation')
+    const req = await loadElevationRequestById(env, TENANT, f.requestId)
+    expect(await deliverElevationToApprovalBot(env, req!)).toBe('sent')
+    expect(approvalCalls()).toHaveLength(1)
+  })
+})
+
+describe('webhook: the secret is enforced', () => {
+  const upd = (): unknown => cmdUpdate('/muhelp', { from: TG.owner })
+  it('bot off: 404 and nothing runs', async () => {
+    const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined })
+    expect((await post(WEBHOOK_SECRET, upd(), off)).status).toBe(404)
+    expect(calls).toHaveLength(0)
+  })
+  it('misconfigured: 503', async () => {
+    expect((await post(WEBHOOK_SECRET, upd(), baseEnv({ APPROVAL_BOT_WEBHOOK_SECRET: 'short' }))).status).toBe(503)
+  })
+  it('no header, wrong header, the IM secret, a prefix and a longer value: all 401, nothing sent', async () => {
+    const withIm = baseEnv({ IM_WEBHOOK_SECRET: 'some-other-im-secret-0123456789ab' })
+    for (const s of [null, '', 'wrong', 'some-other-im-secret-0123456789ab', WEBHOOK_SECRET.slice(0, -1), `${WEBHOOK_SECRET}x`]) {
+      expect((await post(s, upd(), withIm)).status).toBe(401)
+    }
+    expect(calls).toHaveLength(0)
+  })
+  it('the right secret: 200 and the update is handled', async () => {
+    const r = await post(WEBHOOK_SECRET, upd(), env)
+    expect(r.status).toBe(200)
+    expect(sentTo('sendMessage')).toHaveLength(1)
+  })
+  it('is mounted at /im/approve/webhook, before the IM sub-app can shadow it (the Worker entry cannot be imported outside workerd)', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
+    const mount = src.indexOf('app.route(`${ROUTES.im}/approve`, approvalBotApp)')
+    expect(mount).toBeGreaterThan(0)
+    expect(mount).toBeLessThan(src.indexOf('app.route(ROUTES.im, imApp)'))
+  })
+  it('a body that is not JSON is 400 after the secret check, never before', async () => {
+    const r = await approvalBotApp.request('/webhook', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': WEBHOOK_SECRET }, body: '{nope' }, env)
+    expect(r.status).toBe(400)
+    const unauth = await approvalBotApp.request('/webhook', { method: 'POST', body: '{nope' }, env)
+    expect(unauth.status).toBe(401)
+  })
+})
+
+describe('decision: approve and deny land once, from the bound private chat only', () => {
+  it('Approve tap: grants created, decided by the owner via approval_bot, receipt written, message edited, grant live for the agent', async () => {
+    const f = await file()
+    const r = await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: deliveredMessageId(f.requestId) }))
+    expect(r.kind).toBe('approved')
+    expect(status(f.requestId)).toMatchObject({ status: 'approved', decided_by_member_id: 'mem-owner', decided_via: 'approval_bot', decision_note: 'via:approval_bot' })
+    expect(grants(f.requestId)).toBe(1)
+    expect(one('SELECT handler, operation, member_id FROM mutation_audit_entries WHERE target_id = ? AND operation = ?', f.requestId, 'elevation_approve'))
+      .toEqual({ handler: 'approval_bot', operation: 'elevation_approve', member_id: 'mem-owner' })
+    expect(sentTo('answerCallbackQuery')).toHaveLength(1)
+    expect(sentTo('editMessageText')).toHaveLength(1)
+    expect(String(sentTo('editMessageText')[0].body.text)).toContain('Approved')
+    expect((sentTo('editMessageText')[0].body.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard).toEqual([])
+    expect((await activeElevations()).filter((g) => g.live).map((g) => g.action)).toEqual(['action:project_status'])
+    expect(one<{ n: number }>("SELECT COUNT(*) AS n FROM human_login_identities WHERE provider = 'telegram_approval_bot' AND member_id = 'mem-owner'").n).toBe(1)
+  })
+  it('/muapprove <id> typed in the chat approves too, and replies in that chat', async () => {
+    const f = await file()
+    calls.length = 0
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('approved')
+    expect(grants(f.requestId)).toBe(1)
+    expect(sentTo('sendMessage')[0].body.chat_id).toBe(String(TG.owner))
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('Approved')
+    // the command may carry our own @username; it still counts
+    const g = await file({ actions: ['action:routine_policy'], reason: 'second' })
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove@${USERNAME} ${g.shortId}`, { from: TG.owner }))).kind).toBe('approved')
+  })
+  it('Deny tap and /mudeny: denied, no grant, recorded via approval_bot', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ed:${f.shortId}`, { from: TG.owner, messageId: deliveredMessageId(f.requestId) }))).kind).toBe('denied')
+    expect(status(f.requestId)).toMatchObject({ status: 'denied', decided_by_member_id: 'mem-owner', decided_via: 'approval_bot' })
+    expect(grants(f.requestId)).toBe(0)
+    const g = await file({ reason: 'again' })
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${g.shortId}`, { from: TG.owner }))).kind).toBe('denied')
+    expect(status(g.requestId).status).toBe('denied')
+  })
+  it('REPLAY: the same approve twice lands once; a later deny cannot flip it; a deny then approve cannot flip it either', async () => {
+    const f = await file()
+    const mid = deliveredMessageId(f.requestId)
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: mid }))).kind).toBe('approved')
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: mid }))).kind).toBe('closed')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${f.shortId}`, { from: TG.owner }))).kind).toBe('closed')
+    expect(status(f.requestId).status).toBe('approved')
+    expect(grants(f.requestId)).toBe(1)
+    const g = await file({ reason: 'second' })
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${g.shortId}`, { from: TG.owner }))).kind).toBe('denied')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${g.shortId}`, { from: TG.owner }))).kind).toBe('closed')
+    expect(status(g.requestId).status).toBe('denied')
+    expect(grants(g.requestId)).toBe(0)
+  })
+  it('concurrent approves of one request: one decision, one grant set', async () => {
+    const f = await file()
+    const rs = await Promise.all(Array.from({ length: 6 }, () => handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))))
+    expect(rs.filter((r) => r.kind === 'approved')).toHaveLength(1)
+    expect(grants(f.requestId)).toBe(1)
+  })
+})
+
+describe('decision: every wrong way in is refused and changes nothing', () => {
+  const untouched = (id: string): void => {
+    expect(status(id).status).toBe('pending')
+    expect(grants(id)).toBe(0)
+  }
+  it('WRONG CHAT: another bound member tapping this request\'s button, or typing its id, is refused', async () => {
+    const f = await file()
+    for (const from of [TG.plain, TG.sqadmin]) {
+      expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from, messageId: deliveredMessageId(f.requestId) }))).kind).toBe('refused')
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from }))).kind).toBe('refused')
+    }
+    untouched(f.requestId)
+  })
+  it('an unbound Telegram account (a stranger) is refused', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.stranger }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('GROUP CHAT: the owner\'s own id in a supergroup / group / channel decides nothing and gets no reply there', async () => {
+    const f = await file()
+    calls.length = 0
+    for (const chatType of ['supergroup', 'group', 'channel']) {
+      const r = await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner, chat: -100123, chatType }))
+      expect(r.kind).toBe('ignored')
+    }
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, chat: -100123, chatType: 'supergroup', messageId: deliveredMessageId(f.requestId) }))).kind).toBe('ignored')
+    expect(sentTo('sendMessage')).toHaveLength(0)
+    untouched(f.requestId)
+  })
+  it('a private-typed chat whose id is not the sender\'s own id is refused (sender == chat)', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner, chat: TG.plain }))).kind).toBe('ignored')
+    untouched(f.requestId)
+  })
+  it('a FORWARDED command decides nothing', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner, forwarded: true }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('STALE: a request past its decision window cannot be approved (and is not left approvable)', async () => {
+    const f = await file()
+    harness.sqlite.prepare("UPDATE elevation_requests SET decision_expires_at = ? WHERE id = ?").run(new Date(Date.now() - 1000).toISOString(), f.requestId)
+    const r = await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect(r.kind === 'closed' || r.kind === 'refused').toBe(true)
+    expect(status(f.requestId).status).not.toBe('approved')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it('MISMATCHED ID: unknown id, malformed id, no id, and a callback with the wrong id are refused', async () => {
+    const f = await file()
+    for (const text of ['/muapprove zzzzzzzz', '/muapprove ABC', '/muapprove', `/muapprove ${f.shortId}0`]) {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(text, { from: TG.owner }))).kind).toBe('refused')
+    }
+    expect((await handleApprovalBotUpdate(env, tapUpdate('ea:aaaaaaaa', { from: TG.owner, messageId: deliveredMessageId(f.requestId) }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('an id addressed to ANOTHER member is refused even for an admin who could decide it', async () => {
+    setOwner('mem-sqadmin')
+    const f = await file() // delivered to mem-sqadmin
+    expect(one<{ member_id: string }>('SELECT member_id FROM approval_bot_deliveries WHERE request_id = ?', f.requestId).member_id).toBe('mem-sqadmin')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused') // the org owner, who has authority
+    untouched(f.requestId)
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.sqadmin }))).kind).toBe('approved')
+  })
+  it('the offer was made to ONE chat: if the member rebinds to another Telegram account afterwards, the old offer cannot be decided from the new one', async () => {
+    const f = await file()
+    harness.sqlite.exec("UPDATE members SET telegram_chat_id = '2001' WHERE id = 'mem-owner'")
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: 2001 }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a request whose offer never reached the human (send failed) cannot be decided by typing its id', async () => {
+    stubBot('fail')
+    const f = await file()
+    expect(f.telegram).toBe('failed')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a chat whose id equals the sender\'s but whose TYPE is not private is refused (type is checked, not just the id)', async () => {
+    const f = await file()
+    for (const chatType of ['supergroup', 'group', 'channel']) {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner, chat: TG.owner, chatType }))).kind).toBe('ignored')
+    }
+    untouched(f.requestId)
+  })
+  it('a delivery row that names a DIFFERENT member than the sender is refused even when the chat id matches the sender', async () => {
+    const f = await file()
+    harness.sqlite.prepare('UPDATE approval_bot_deliveries SET member_id = ? WHERE request_id = ?').run('mem-sqadmin', f.requestId)
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a login-identity row for this Telegram account that belongs to ANOTHER member, or is revoked, can never carry an approval', async () => {
+    const f = await file()
+    harness.sqlite.prepare("INSERT INTO human_login_identities (id, tenant, provider, provider_subject, member_id, created_at) VALUES ('hli-x', ?, 'telegram_approval_bot', ?, 'mem-plain', datetime('now'))").run(TENANT, String(TG.owner))
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+    harness.sqlite.exec("UPDATE human_login_identities SET member_id = 'mem-owner', revoked_at = datetime('now') WHERE id = 'hli-x'")
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a request from an ATTACHED chat is not offered to the bot (it is approved with a passkey)', async () => {
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO agent_seat_attachments (id, tenant, seat_id, human_member_id, harness_id, agent_id, admission_id, seat_token_id, created_at, detached_at, detach_reason)
+       VALUES ('att-1', ?, 'seat-1', 'mem-owner', 'h-1', 'agent-x', 'adm-1', 'tok-1', datetime('now'), datetime('now'), 'human')`,
+    ).run(TENANT)
+    await file({ actions: ['action:org_structure'], scope_type: 'squad', scope_id: 'squad-a' }).catch(() => undefined)
+    expect(approvalCalls()).toHaveLength(0)
+    expect(count('approval_bot_deliveries')).toBe(0)
+  })
+  it('a button on a DIFFERENT message than the one delivered is refused', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: 9999 }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('SELF-APPROVAL: the requesting agent\'s own Telegram binding resolves to nobody; its request is never approved through it', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.agent }))).kind).toBe('refused')
+    // even with a delivery row forged to name the agent's own member + chat, the core's requester fence holds
+    harness.sqlite.prepare('UPDATE approval_bot_deliveries SET member_id = ?, chat_id = ? WHERE request_id = ?').run('mem-agent', String(TG.agent), f.requestId)
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.agent }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a member WITHOUT authority on the request scope cannot decide it even with a delivery row naming them (core authority predicate)', async () => {
+    const f = await file()
+    harness.sqlite.prepare('UPDATE approval_bot_deliveries SET member_id = ?, chat_id = ? WHERE request_id = ?').run('mem-plain', String(TG.plain), f.requestId)
+    const r = await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.plain }))
+    expect(r.kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('a request whose actions the bot may not carry cannot be APPROVED through it, even with a forged delivery row', async () => {
+    const f = await file({ actions: ['action:mint_token'] })
+    harness.sqlite.exec("UPDATE elevation_requests SET short_id = 'mnpqrstv' WHERE id = '" + f.requestId + "'")
+    harness.sqlite.prepare("INSERT INTO approval_bot_deliveries (id, tenant, request_id, member_id, chat_id, message_id, status, created_at) VALUES ('d1', ?, ?, 'mem-owner', ?, '1', 'sent', datetime('now'))").run(TENANT, f.requestId, String(TG.owner))
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/muapprove mnpqrstv', { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+    // deny is always available
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/mudeny mnpqrstv', { from: TG.owner }))).kind).toBe('denied')
+  })
+  it('a command addressed to ANOTHER bot is not ours; the bot off ignores everything', async () => {
+    const f = await file()
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove@some_other_bot ${f.shortId}`, { from: TG.owner }))).kind).toBe('ignored')
+    expect((await handleApprovalBotUpdate(baseEnv({ APPROVAL_BOT_TOKEN: undefined }), cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('ignored')
+    untouched(f.requestId)
+  })
+  it('a suspended or archived approver is refused', async () => {
+    const f = await file()
+    harness.sqlite.exec("UPDATE members SET status = 'suspended' WHERE id = 'mem-owner'")
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    untouched(f.requestId)
+  })
+  it('the agent session ending before the decision: nothing is granted', async () => {
+    const f = await file()
+    harness.sqlite.exec("UPDATE agent_sessions SET revoked_at = datetime('now')")
+    const r = await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect(r.kind).not.toBe('approved')
+    expect(grants(f.requestId)).toBe(0)
+  })
+})
+
+describe('/murevoke and expiry end an approval', () => {
+  it('/murevoke revokes every live approval the member gave; the agent loses the access on the very next call', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect((await activeElevations()).some((g) => g.live)).toBe(true)
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.owner }))).kind).toBe('revoked')
+    expect((await activeElevations()).some((g) => g.live)).toBe(false)
+    expect(one<{ revoke_reason: string }>('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', f.requestId).revoke_reason).toBe('revoked_via_approval_bot')
+    expect(one('SELECT handler, operation FROM mutation_audit_entries WHERE operation = ?', 'elevation_revoke')).toEqual({ handler: 'approval_bot', operation: 'elevation_revoke' })
+  })
+  it('/murevoke <id> ends only that request\'s grants', async () => {
+    const f = await file({ actions: ['action:project_status'] })
+    const g = await file({ actions: ['action:routine_policy'], reason: 'second' })
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${g.shortId}`, { from: TG.owner }))
+    await handleApprovalBotUpdate(env, cmdUpdate(`/murevoke ${f.shortId}`, { from: TG.owner }))
+    expect((await activeElevations()).filter((x) => x.live).map((x) => x.action)).toEqual(['action:routine_policy'])
+  })
+  it('a member can revoke only what THEY approved (another admin\'s approval survives); a stranger revokes nothing', async () => {
+    setOwner('mem-sqadmin')
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.sqadmin }))
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.owner }))).kind).toBe('revoked')
+    expect((await activeElevations()).some((x) => x.live)).toBe(true)
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.stranger }))).kind).toBe('refused')
+    expect((await activeElevations()).some((x) => x.live)).toBe(true)
+  })
+  it('a revoke from a group chat does nothing', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.owner, chat: -1001, chatType: 'supergroup' }))).kind).toBe('ignored')
+    expect((await activeElevations()).some((x) => x.live)).toBe(true)
+  })
+  it('an approval ends at its duration with nothing else done', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    harness.sqlite.prepare('UPDATE elevation_grants SET expires_at = ? WHERE elevation_request_id = ?').run(new Date(Date.now() - 1000).toISOString(), f.requestId)
+    expect((await activeElevations()).some((x) => x.live)).toBe(false)
+  })
+})

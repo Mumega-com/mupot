@@ -261,6 +261,7 @@ import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
+import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -6199,7 +6200,7 @@ const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
   scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'authenticated',
-  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6208,6 +6209,7 @@ const toolRequestElevation: ToolSpec = {
       scope_id: STRING_SCHEMA,
       duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
       reason: STRING_SCHEMA,
+      recommendation: STRING_SCHEMA,
     },
     required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
     additionalProperties: false,
@@ -6269,10 +6271,23 @@ const toolRequestElevation: ToolSpec = {
     })
     const accessLink = approveUrl(env, 'elevation', result.request.id)
     const elevationLink = moment?.url ?? accessLink
-    // The agent need not know a second tool exists: the deciding human gets the Mini App button in Telegram now (best effort).
-    const telegram = moment
-      ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
-      : 'disabled'
+    // The approval bot (src/approval-bot/) takes the request first when it is on and may carry it: ONE message with Approve and
+    // Deny buttons from the bot only the worker drives. Otherwise (bot off, an action the bot may not carry, nobody reachable,
+    // a failed send) the Mini App button and the approve_url run exactly as before.
+    const recommendation = str(args.recommendation)
+    if (recommendation) {
+      await env.DB.prepare('UPDATE elevation_requests SET recommendation = ?1 WHERE id = ?2 AND tenant = ?3')
+        .bind(recommendation.slice(0, 500), result.request.id, env.TENANT_SLUG).run().catch(() => undefined) // display-only column; a pot that has not applied 0247 just shows no recommendation
+    }
+    const botDelivery = await deliverElevationToApprovalBot(env, result.request, { waitUntil: ctx.waitUntil })
+    let telegram: string = botDelivery
+    if (botDelivery !== 'sent' && botDelivery !== 'pending') {
+      const viaMiniapp = moment
+        ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
+        : 'disabled'
+      // Mini App channel off and the bot had its own answer (not_bound / failed): report that one, it is the more specific.
+      telegram = viaMiniapp === 'disabled' && botDelivery !== 'unavailable' ? botDelivery : viaMiniapp
+    }
 
     return done({
       request: {

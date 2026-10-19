@@ -295,6 +295,11 @@ export interface Env {
   TELEGRAM_MINIAPP_EXTRA_PUBKEYS?: string     // staging only: extra Ed25519 keys (64-hex, comma separated); production accepts Telegram's production key alone
   // W4.2 sub-flag: PIN fallback + user-chosen trusted-device window. OFF unless '1' or 'true' AND the Mini App channel is on; off = W4.1 behaviour.
   TELEGRAM_MINIAPP_PIN_WINDOW?: string
+  // Approval bot ("/muapprove"; src/approval-bot/): a DEDICATED Telegram bot the worker owns. OFF unless APPROVAL_BOT_TOKEN is set.
+  // APPROVAL_BOT_TOKEN and APPROVAL_BOT_WEBHOOK_SECRET are worker SECRETS (never in wrangler.toml); APPROVAL_BOT_USERNAME is its @username.
+  APPROVAL_BOT_TOKEN?: string
+  APPROVAL_BOT_WEBHOOK_SECRET?: string
+  APPROVAL_BOT_USERNAME?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].
