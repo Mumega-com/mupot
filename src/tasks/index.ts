@@ -40,7 +40,8 @@ import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTas
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
-import { attachedAuthority } from '../auth/attached-ceiling'
+import { attachedAuthority, attachmentAttribution } from '../auth/attached-ceiling'
+import { attachedGateAgent } from '../auth/attached-gate'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -198,6 +199,11 @@ function taskProjectErrorResponse(error: TaskProjectError): { body: { error: str
 }
 
 export function verdictPrincipal(auth: AuthContext): { id: string; type: 'member' | 'agent'; actor?: TaskActor } {
+  // An attached session verdicts AS its bound agent (never as the agent's welded member, never as the human). Only the
+  // verdict path reads this; resolveGatePrincipal stays null for attached seats (surface caps, approvals queue). Whether
+  // the session may use it at all is decided by callerHoldsGateCapability (attachedGateAgent).
+  const att = attachedAuthority(auth)
+  if (att) return { id: att.agentId, type: 'agent', actor: { kind: 'agent', id: att.agentId } }
   const principal = resolveGatePrincipal(auth)
   if (!principal) return { id: auth.userId, type: 'agent' }
   return { ...principal, actor: { kind: principal.type, id: principal.id } }
@@ -1409,9 +1415,14 @@ export async function callerHoldsGateCapability(
   _squadId: string,
   gateOwner: string,
 ): Promise<boolean> {
-  // W2 (SEAT_ATTACH): a thread attached to an EXISTING agent acts as that agent but holds NONE of its gate
-  // authority (admission.gates is fixed at 0). Refused before every other rule, including the org escape below.
-  if (attachedAuthority(auth)) return false
+  // W2 (SEAT_ATTACH): a thread attached to an EXISTING agent holds NONE of its gate authority by default. It holds it
+  // only on the owner's opt-in (admission.gate_authority = 1) while the attachment, admission and agent are live, AND the
+  // agent itself holds a live grant for this exact gate_owner. Decided before every other rule: the org owner/admin
+  // escape below never rescues an attached seat (a `full` ceiling can carry org admin), and no human-keyed path applies.
+  if (attachedAuthority(auth)) {
+    const gateAgent = await attachedGateAgent(env, auth)
+    return gateAgent !== null && (await hasActiveGateGrant(env, gateOwner, 'agent', gateAgent.agentId))
+  }
 
   // Org owners/admins always pass (same escape used throughout tasks).
   if (legacyOwnerAdmin(auth)) return true
@@ -1595,8 +1606,18 @@ async function holdsTaskGateLane(
   task: Omit<VerdictGateTask, 'id'>,
   cache?: VerdictGateCache,
 ): Promise<boolean> {
-  // W2: an attached seat holds no gate lane at all, including the self-completion assignee shortcut below.
-  if (attachedAuthority(auth)) return false
+  // W2: an attached seat holds a gate lane ONLY through callerHoldsGateCapability (opt-in admission + the agent's own live
+  // grant). The self-completion assignee shortcut below is never available to it: that lane is for the assignee itself or an
+  // org admin, and an attached session is neither (it is refused as a party anyway).
+  if (attachedAuthority(auth)) {
+    if (task.gate_owner === 'gate:agent-self-completion') return false
+    const attachedKey = cache ? `attached:${auth.seatBinding?.attached?.attachmentId}:${task.gate_owner}` : null
+    const cachedAttached = attachedKey !== null ? cache?.gateCapability.get(attachedKey) : undefined
+    if (cachedAttached) return cachedAttached
+    const p = callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner)
+    if (cache && attachedKey !== null) cache.gateCapability.set(attachedKey, p)
+    return p
+  }
   const principal = verdictPrincipal(auth)
   if (task.gate_owner === 'gate:agent-self-completion') {
     return principal.id === task.assignee_agent_id || legacyOwnerAdmin(auth)
@@ -1701,6 +1722,18 @@ export async function evaluateVerdictGates(
     const conflict = await independenceConflict(env, principal.id, task.id, cache)
     if (conflict === 'direct') {
       return { allowed: false, code: 'self_verdict', principal }
+    }
+    // An attached session also acts for the HUMAN who attached it: that human's own work (their assignments, results
+    // they consented to, agents they own / are bound to / ever attached to) is theirs to be judged, not to judge. Any
+    // conflict for the human, direct or affiliated, refuses with no supervisory waiver (the agent's own affiliation to the
+    // human is covered by the agent-decider legs above; agent_seats leg of #2089 included).
+    const attachedHuman = attachedAuthority(auth)
+    if (attachedHuman) {
+      const humanConflict = await independenceConflict(env, attachedHuman.humanMemberId, task.id, cache)
+      if (humanConflict !== null) return { allowed: false, code: 'self_verdict', principal }
+      if (task.assignee_agent_id !== null && (await memberAffiliated(env, attachedHuman.humanMemberId, task.assignee_agent_id, cache))) {
+        return { allowed: false, code: 'self_verdict', principal }
+      }
     }
     const affiliated = conflict === 'affiliated'
       || (principal.type === 'member' && task.assignee_agent_id !== null
@@ -1816,7 +1849,7 @@ tasksApp.post('/:id/verdict', async (c) => {
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}) },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: attachmentAttribution(c.get('auth')) },
       principal.actor,
     )
 

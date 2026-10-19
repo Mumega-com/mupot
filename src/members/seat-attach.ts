@@ -24,7 +24,7 @@
 // AUTHORITY. The attached context is the SAME clamp every seat has (resolveSeatCapabilities): per scope
 // min(human live rank, agent rank, the CEILING the human approved: member by default, lead or full only if chosen), human
 // must be admin on the agent's squad. It never exceeds that ceiling,
-// never gains the agent's gate authority (see callerHoldsGateCapability), and never reaches another member's agent:
+// gains the agent's gate authority ONLY on the admission's gate_authority opt-in (0247, see callerHoldsGateCapability and src/auth/attached-gate.ts), and never reaches another member's agent:
 // the attachable set is "agents on a squad the human administers", excluding any pool-managed seat agent (and, with
 // SEAT_ATTACH_DESIGNATED on, only agents an org admin designated for this human: attachDesignatedClause).
 //
@@ -200,6 +200,8 @@ export interface AdmissionRow {
   harness_id: string
   status: 'pending' | 'live' | 'denied' | 'revoked' | 'expired'
   gates: number
+  /** 0247: 1 = an attached seat may exercise the agent's own gate capability (see src/auth/attached-gate.ts). */
+  gate_authority: number
   ceiling: AttachCeiling
   requested_via: 'tool' | 'dashboard'
   requested_seat_id: string | null
@@ -214,7 +216,19 @@ export interface AdmissionRow {
   revoked_by_member_id: string | null
 }
 
-const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, attach_code,
+/**
+ * DEFAULT for gate_authority (0247): automatic, no extra tap. The human's passkey/dashboard decision that makes the admission
+ * live is the consent; the bit is 1 when the agent ALREADY holds its own live gate (any `gate:*` grant, agent principal,
+ * agent active) at that moment, else 0. It only ever opens the door: every verdict still needs a live grant for the task's
+ * exact gate_owner at use time (attachedGateAgent + hasActiveGateGrant), and verdict independence still applies.
+ */
+export function autoGateAuthoritySql(agentIdExpr: string): string {
+  return `CASE WHEN EXISTS (SELECT 1 FROM gate_grants agg JOIN agents aga ON aga.id = agg.principal_id
+            WHERE agg.principal_type = 'agent' AND agg.principal_id = ${agentIdExpr} AND agg.capability LIKE 'gate:%' AND aga.status = 'active')
+       THEN 1 ELSE 0 END`
+}
+
+const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, requested_via, requested_seat_id, attach_code,
   created_at, expires_at, decided_at, decided_by_member_id, decided_via, revoked_at, revoked_by_member_id`
 
 export async function loadAdmission(env: Env, id: string): Promise<AdmissionRow | null> {
@@ -330,8 +344,8 @@ export async function ensureAdmission(
       await env.DB.batch([
         env.DB.prepare(
           `INSERT INTO agent_seat_admissions
-             (id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
-           SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
+             (id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
+           SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ${autoGateAuthoritySql('?3')}, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
             WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
@@ -480,7 +494,8 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
   const out = await env.DB.batch([
     ...(weld ? weld.statements : []),
     env.DB.prepare(
-      `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6
+      `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6,
+              gate_authority = ${autoGateAuthoritySql('agent_seat_admissions.agent_id')}
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
                         ${attachDesignatedClause(env, 'ag', '?3')})`,
@@ -620,6 +635,8 @@ export interface LiveAttachmentRow {
   seat_token_id: string
   ceiling: AttachCeiling
   seat_admission_status?: string | null
+  /** adm.gate_authority: the owner's opt-in for gate authority on this attached seat (0247). */
+  gate_authority: number
 }
 
 /**
@@ -631,7 +648,7 @@ export interface LiveAttachmentRow {
  */
 export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string | null }, seatId: string): Promise<LiveAttachmentRow | null> {
   const row = await env.DB.prepare(
-    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, s.admission_status AS seat_admission_status, s.id AS seat_id,
+    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, adm.gate_authority AS gate_authority, s.admission_status AS seat_admission_status, s.id AS seat_id,
             s.label_basename AS seat_label, s.agent_id AS seat_agent_id, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, att.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t

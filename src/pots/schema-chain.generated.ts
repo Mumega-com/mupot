@@ -4346,9 +4346,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "squads_dyad_pair_shape_upd" },
     ],
   },
+  {
+    file: "0247_admission_gate_authority.sql",
+    sha256: "b91eff61b18b0065ec167aa31ec10d26eb8b8afea5936fcbb221a95768fb29cb",
+    statements: [
+      "-- 0247_admission_gate_authority.sql — an ATTACHED agent session may exercise its bound agent's gate capability\n-- (task_verdict) when the admission opts in. Hadi (owner, 2026-10-19): reviewing is agent work; human approval is a\n-- different thing and stays out of this.\n--\n-- WHY A NEW COLUMN AND NOT A RELAXED `gates` CHECK. 0220 fixed `gates INTEGER CHECK (gates = 0)`. SQLite cannot alter a\n-- CHECK, so relaxing it means DROP TABLE agent_seat_admissions. That table is the PARENT of agent_seat_attachments\n-- (admission_id ... ON DELETE RESTRICT) and attachments are no-delete by trigger, so the rebuild would fail on any pot that\n-- already holds an attachment (RESTRICT is checked immediately; same trap 0202 documents for harnesses). `gates` therefore\n-- stays frozen at 0 forever (legacy, never read as authority) and `gate_authority` is the opt-in:\n--   0 = the attached seat holds NO gate authority (every existing row, the DEFAULT)\n--   1 = the attached seat may pass the gate check AS ITS BOUND AGENT, only while the attachment, the admission and the\n--       agent are live AND the agent itself holds a live gate_grants row for the capability (hasActiveGateGrant), and\n--       with every verdict-independence rule intact (src/auth/attached-gate.ts, src/tasks/index.ts).\n-- Decided exactly once, at the human's decision (pending -> live) or at insert for a dashboard admission that is born live;\n-- never changed afterwards (changing it takes a new admission: revoke + a new tap), like `ceiling`.\n-- Additive: no existing row, index or trigger is touched.\nALTER TABLE agent_seat_admissions ADD COLUMN gate_authority INTEGER NOT NULL DEFAULT 0 CHECK (gate_authority IN (0, 1));",
+      "\n\nCREATE TRIGGER IF NOT EXISTS agent_seat_admissions_gate_authority_immutable\nBEFORE UPDATE OF gate_authority ON agent_seat_admissions\nFOR EACH ROW\nWHEN NEW.gate_authority IS NOT OLD.gate_authority AND OLD.status <> 'pending'\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_gate_authority_immutable');\nEND;",
+      "\n\n-- AUDIT. A verdict cast through an attached session is decided_by = the bound agent; these record WHICH attachment and WHICH\n-- human consented, from the server-resolved auth only (same pattern as 0236 for agent_messages / task_result_submissions).\n-- decided_via is NOT used: 0155 pinned it to a single value by CHECK and a rebuild of task_verdicts is not worth the risk.\n-- Nullable, additive, no backfill; the append-only trigger is re-created below to pin the new columns as well.\nALTER TABLE task_verdicts ADD COLUMN attachment_id TEXT;",
+      "\nALTER TABLE task_verdicts ADD COLUMN consenting_member_id TEXT;",
+      "\n\nDROP TRIGGER IF EXISTS task_verdicts_no_update;",
+      "\n\nCREATE TRIGGER task_verdicts_no_update\nBEFORE UPDATE ON task_verdicts\nWHEN NOT (\n  (\n    OLD.project_id IS NULL\n    AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.reversed_at IS OLD.reversed_at\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n  )\n  OR\n  (\n    OLD.reversed_at IS NULL\n    AND NEW.reversed_at IS NOT NULL\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.project_id IS OLD.project_id\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n  )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_gate_authority_immutable" },
+      { type: "trigger", name: "task_verdicts_no_update" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "cab81b0d28d4578e70a7be06ca828cf9354e6ddfbb3a369bedd7874e87611648"
+export const SCHEMA_CHAIN_DIGEST: string = "0bc663919aadca235ff7c067dca431bb9d91579a6b2e483febee9bde7e3c2f82"

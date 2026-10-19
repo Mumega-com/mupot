@@ -744,6 +744,10 @@ export interface TaskVerdict {
   // proposal-bound reader (executeRoutineAction's grant check) can exclude
   // a reversed approval instead of treating it as still 'latest approved'.
   proposal_id: string | null
+  // attachment_id / consenting_member_id (0247): set ONLY on a verdict cast through an ATTACHED agent session (decided_by = the
+  // bound agent). The attachment and the human who attached it; NULL on every other verdict.
+  attachment_id?: string | null
+  consenting_member_id?: string | null
   reversed_at: string | null
 }
 
@@ -811,7 +815,8 @@ export interface AuthContext {
    */
   seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string; source: 'handle' | 'auto:openai_session' | 'auto:codex_thread'
     /** W2 (SEAT_ATTACH): set ONLY by buildSeatContext when this thread is attached to an existing agent. A seat acting
-     *  as an attached agent holds NO gate authority (callerHoldsGateCapability refuses it). `agentId` is the attached
+     *  as an attached agent holds NO gate authority unless the admission opted in (gate_authority = 1, migration 0247; see
+     *  src/auth/attached-gate.ts and callerHoldsGateCapability). `agentId` is the attached
      *  agent; `seatAgentId` is the thread's own seat agent it would otherwise be. */
     attached?: { attachmentId: string; admissionId: string; agentId: string; seatAgentId: string; ceiling: 'member' | 'lead' | 'full' } }
   /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */

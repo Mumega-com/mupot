@@ -69,7 +69,7 @@ const toolSeatAttach: ToolSpec = {
         attachment_id: r.attachment_id,
         admission_id: r.admission_id,
         agent: r.agent,
-        note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and none of this agent's approval gates. Your human can detach you at any time.`,
+        note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
       })
     }
     if (r.ok && r.already_pending) {
