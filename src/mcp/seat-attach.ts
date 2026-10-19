@@ -22,7 +22,7 @@ import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandled
 
 const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
-  scope: 'self (attach THIS thread to an existing agent the human has admitted; seat session only)',
+  scope: 'Only for a chat on its own seat that wants to act as an existing agent its human administers. Never call it from a workspace-token agent; from an already-attached chat it only confirms the current attachment: self (attach THIS thread to an existing agent the human has admitted; seat session only)',
   min: 'authenticated',
   args: '{ agent: string }  // the agent id, slug or exact name; resolved only among agents your human administers',
   inputSchema: {

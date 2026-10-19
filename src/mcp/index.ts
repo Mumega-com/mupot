@@ -7317,7 +7317,7 @@ const toolOrient: ToolSpec = {
 // pattern: the description and inputSchema use only fictional examples.
 const toolConnect: ToolSpec = {
   name: 'connect',
-  scope: 'self (session-local agent identity claim — no args beyond agent_name)',
+  scope: 'Only for a signed-in member session claiming an agent by slug. Not for seat or attached chats (their identity already rides the connection): self (session-local agent identity claim, no args beyond agent_name)',
   min: 'authenticated',
   // QA-3 guard: fictional slugs only in the args documentation. Real tenant slugs must
   // never appear here — this string is the public tool description served to connectors.

@@ -17,7 +17,7 @@ const SEAT_ARG_INSTRUCTION = (handle: string): string => `Pass \`seat: ${handle}
 
 const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
-  scope: 'self (find-or-create the agent seat for this harness + workspace; unbound directory session only)',
+  scope: 'Only for a chat with no agent yet (an unbound directory chat). Never call it from an attached chat or from an agent that already has a seat: self (find-or-create the agent seat for this harness + workspace)',
   min: 'authenticated',
   args: '{ project: string, folder?: string, thread?: string, squad?: string }  // all values are LABELS that key the seat; none grants authority',
   inputSchema: {
