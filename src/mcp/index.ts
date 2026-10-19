@@ -272,10 +272,13 @@ import {
   withResultType,
   negotiateProtocolVersion,
   serverDiscoverResult,
+  PROTOCOL_VERSION_META_KEY,
+  SUPPORTED_PROTOCOL_VERSIONS,
 } from './events'
 import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_PROTOCOL_VERSION, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { recordSubscribeRefusal } from './events-refusals'
+import { recordNegotiation, describeRequestedVersion } from './negotiation-log'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
@@ -8258,6 +8261,37 @@ function requestedProtocolVersionForLog(params: unknown): string {
   return KNOWN_PROTOCOL_VERSIONS_FOR_LOG.has(v) ? v : 'other'
 }
 
+/** Record what this client requested on initialize / server/discover (observability only; never changes the response, never throws).
+ *  Auth is resolved ONLY when a credential is presented (no DB work for an anonymous caller, who gets the console line only), and
+ *  never enrols a seat (skipSeat). */
+async function logNegotiation(
+  c: import('hono').Context<AppEnv>,
+  method: 'initialize' | 'server/discover',
+  params: unknown,
+  negotiated: string,
+  eventsReturned: boolean,
+): Promise<void> {
+  try {
+    const p = typeof params === 'object' && params !== null && !Array.isArray(params) ? params as Record<string, unknown> : {} // narrowed to a plain object just above
+    const meta = typeof p._meta === 'object' && p._meta !== null ? p._meta as Record<string, unknown> : {} // narrowed to an object just above
+    const rawRequested = p.protocolVersion ?? c.req.header('mcp-protocol-version') ?? meta[PROTOCOL_VERSION_META_KEY]
+    let principal: { harnessId?: string | null; memberId?: string | null } | null = null
+    if (c.req.header('authorization') || c.req.header(AUTH_CONTEXT_HEADER)) {
+      const auth = await resolveAuth(c, { skipSeat: true })
+      if (auth && auth.tenant === c.env.TENANT_SLUG) principal = { harnessId: auth.harnessId, memberId: auth.memberId }
+    }
+    const ci = typeof p.clientInfo === 'object' && p.clientInfo !== null ? (p.clientInfo as { name?: unknown }).name : undefined // narrowed to an object just above
+    const work = recordNegotiation(c.env, Date.now(), {
+      method, requested: describeRequestedVersion(rawRequested), negotiated, eventsReturned, principal, clientInfoName: ci,
+    })
+    const wu = safeWaitUntil(c)
+    if (wu) wu(work)
+    else await work
+  } catch (e) {
+    console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e))
+  }
+}
+
 async function handleJsonRpc(
   c: import('hono').Context<AppEnv>,
   body: JsonRpcRequest,
@@ -8288,6 +8322,7 @@ async function handleJsonRpc(
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
       console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
+      if (profile === undefined) await logNegotiation(c, 'initialize', body.params, EVENTS_PROTOCOL_VERSION, true)
       return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
@@ -8302,6 +8337,7 @@ async function handleJsonRpc(
     const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
     const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
     console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
+    if (profile === undefined) await logNegotiation(c, 'initialize', body.params, initVersion, false)
     const legacyInit = ok(id, {
       protocolVersion: initVersion,
       capabilities: { tools: {} },
@@ -8461,6 +8497,7 @@ async function handleJsonRpc(
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
     console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
+    await logNegotiation(c, 'server/discover', body.params, SUPPORTED_PROTOCOL_VERSIONS.join(','), true)
     return ok(id, serverDiscoverResult())
   }
 

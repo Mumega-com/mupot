@@ -4298,9 +4298,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_event_subscribe_refusals_at" },
     ],
   },
+  {
+    file: "0243_mcp_negotiation_log.sql",
+    sha256: "8e229bb1022c8783051897230d51795ab0b2c13bc49d18fee06714506dfccc0e",
+    statements: [
+      "-- 0243_mcp_negotiation_log.sql -- what protocol version each client requests on /mcp initialize + server/discover (mupot observability).\n-- ChatGPT stopped listing mupot as an event source; we never recorded the protocolVersion a client asked for, so \"client now asks for a\n-- version we do not negotiate to 2026-07-28\" was unprovable. BOUNDED: the writer inserts at most one row per (tenant, principal, method,\n-- requested version) per minute, per-principal capped, prunes rows older than 7 days, and evicts oldest-first at a per-tenant ceiling.\n-- AUTHENTICATED callers only (anonymous: console line only). Never stores a token, header value, or param other than the bounded version\n-- string and a bounded client label. CREATE only; nothing is rebuilt.\n\nCREATE TABLE IF NOT EXISTS mcp_negotiation_log (\n  id                TEXT PRIMARY KEY NOT NULL,\n  tenant            TEXT NOT NULL,\n  at                TEXT NOT NULL,\n  method            TEXT NOT NULL,\n  harness_id        TEXT,\n  member_id         TEXT,\n  client_name       TEXT,\n  requested_version TEXT NOT NULL,\n  negotiated_version TEXT NOT NULL,\n  events_returned   INTEGER NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_mcp_negotiation_log_principal\n  ON mcp_negotiation_log (tenant, harness_id, member_id, method, requested_version, at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_mcp_negotiation_log_at\n  ON mcp_negotiation_log (tenant, at);",
+    ],
+    objects: [
+      { type: "table", name: "mcp_negotiation_log" },
+      { type: "index", name: "idx_mcp_negotiation_log_principal" },
+      { type: "index", name: "idx_mcp_negotiation_log_at" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f65f990f6742cd8cefb79ea1d9fdecf17bbfcba46fda7cabbfd1abf93e63d678"
+export const SCHEMA_CHAIN_DIGEST: string = "76ae8d76804e207970f0c2f5f5d19687b3773ee0047150b3df7b5b79f92966ed"
