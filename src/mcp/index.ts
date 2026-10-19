@@ -215,7 +215,7 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { VIP_LANE_TOOLS } from './vip-lane'
-import { observedFloorRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
+import { observedFloorRefusal, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -1185,6 +1185,11 @@ const toolTaskCreate: ToolSpec = {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
 
+    // #2059 P1: an OBSERVED seat creates proposal-only tasks: no assignee/gate_owner, dispatch forced off (no task.created, no doorbell).
+    const observedCreate = await observedTaskCreateRefusal(env, auth, args)
+    if (observedCreate.refusal) return fail(403, 'observed_floor', observedCreate.refusal)
+    const dispatchOn = !observedCreate.forceNoDispatch && args.dispatch !== false
+
     // `description` is an alias of `body` (mupot#1664). Both given and different is a
     // 400, never a silent pick — one of them would be dropped.
     if (args.description !== undefined && args.description !== null && typeof args.description !== 'string') {
@@ -1291,7 +1296,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: args.dispatch === false },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -1300,10 +1305,10 @@ const toolTaskCreate: ToolSpec = {
     }
 
     // Doorbell (mupot#1882): an assigned agent with a doorbell is rung; a backlog-only create (dispatch:false) never wakes.
-    if (args.dispatch !== false) {
+    if (dispatchOn) {
       await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil, assignment: task.updated_at })
     }
-    return done({ task })
+    return done(observedCreate.forceNoDispatch ? { task, dispatch: false, note: 'observed seat: proposal-only task, dispatch forced off' } : { task })
   },
 }
 

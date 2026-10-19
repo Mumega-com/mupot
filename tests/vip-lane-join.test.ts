@@ -352,6 +352,71 @@ describe('P1 floor: shared memory and task_update', () => {
   })
 })
 
+describe('P1 floor: observed task_create is proposal-only (#2059 P1)', () => {
+  const tasks = (): number => n(`SELECT COUNT(*) AS n FROM tasks`)
+  const mk = (): { send: ReturnType<typeof vi.fn>; fetch: ReturnType<typeof vi.fn>; e: Env } => {
+    const send = vi.fn(async () => undefined)
+    const f = vi.fn(async () => new Response('{}'))
+    vi.stubGlobal('fetch', f)
+    return { send, fetch: f, e: envFor(h, { BUS: { send } }) }
+  }
+  afterEach(() => { vi.unstubAllGlobals() })
+  const create = (s: Seat, e: Env, extra: Record<string, unknown> = {}): Promise<Rpc> =>
+    rpc(s.ctx, 'task_create', { squad_id: 'squad-target', title: 'T', done_when: 'the proposal is reviewed', ...extra }, s.session, e)
+
+  it('refuses assignee_agent_id, assignee_member_id, gate_owner and dispatch:true; nothing is written, emitted or rung', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    for (const extra of [{ assignee_agent_id: s.agentId }, { assignee_agent_id: 'other-agent' }, { assignee_member_id: OWNER }, { gate_owner: 'gate:hadi' }, { dispatch: true }]) {
+      const r = await create(s, e, extra)
+      expect(r.text, JSON.stringify(extra)).toContain('observed_floor')
+    }
+    expect(tasks()).toBe(0)
+    expect(send).not.toHaveBeenCalled()
+    expect(f).not.toHaveBeenCalled()
+  })
+
+  it('a plain create (and dispatch:false) is created with dispatch forced off: no task.created event, no doorbell', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, fetch: f, e } = mk()
+    const r = await create(s, e)
+    expect(r.text).not.toContain('observed_floor')
+    expect(r.text, r.text).toContain('dispatch forced off')
+    expect((await create(s, e, { dispatch: false })).text).not.toContain('observed_floor')
+    expect(tasks()).toBe(2)
+    expect(send).not.toHaveBeenCalled()
+    expect(f).not.toHaveBeenCalled()
+  })
+
+  it('a non-observed seat is unaffected (assignee allowed, task.created emitted), and flag off is a no-op', async () => {
+    const free = await seatFor(PLAIN, 'conv-free')
+    const { send, e } = mk()
+    const r = await create(free, e, { squad_id: 'squad-target' })
+    expect(r.text, r.text).toContain('task')
+    expect(r.text).not.toContain('observed_floor')
+    expect(send).toHaveBeenCalledTimes(1)
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const off = envFor(h, { BUS: { send }, VIP_LANE: undefined })
+    send.mockClear()
+    const r2 = await create(s, off, { gate_owner: 'gate:hadi' })
+    expect(r2.text).not.toContain('observed_floor')
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  it('squad_message (wakes the squad coordinator) is refused for an observed seat; send is message-only and stays', async () => {
+    const s = await seatFor(OWNER)
+    await join(s, { squad: 'squad-target' })
+    const { send, e } = mk()
+    expect((await rpc(s.ctx, 'squad_message', { squad_id: 'squad-target', message: 'wake' }, s.session, e)).text).toContain('observed_floor')
+    expect(send).not.toHaveBeenCalled()
+    expect(OBSERVED_FLOOR_TOOLS.has('squad_message')).toBe(false)
+    expect(OBSERVED_FLOOR_TOOLS.has('send')).toBe(true)
+  })
+})
+
 describe('P1 card caps per HUMAN', () => {
   it('two seats of one human share ONE cap: pending cards across both stop at the limit; a repeat of an existing card still answers', async () => {
     for (let i = 1; i <= 6; i++) seedSquad(`squad-c${i}`)
