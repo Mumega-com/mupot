@@ -36,6 +36,7 @@ import { mcpActionsApp, mcpApp } from './mcp'
 // esbuild lazy-wrap it and emit `await init_*()` inside a sync initializer — Worker fails to start.
 import { sweepStalledGateReviews } from './gates/stall-watchdog'
 import { runApprovalExpiryTick } from './gates/approval-expiry'
+import { reconcileProviderRuns } from './harness/kernel'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 import { inviteApp } from './dashboard/invite'
@@ -512,6 +513,9 @@ export default {
     // 13. Gate-stall watchdog (mupot#1705) — re-send the gate wake for a review task whose gate
     //     seat has not recorded a verdict past the threshold. Bounded + recorded durably; never
     //     changes status or verdicts. Requires migration 0191 (gate_stall_rewakes).
+    // 15. Provider reconcile (harness/kernel.ts) — close terminal and stale vendor runs and settle each exactly once:
+    //     book usage (vendor usage, or the pre-call estimate marked estimate=true), set the flight cost, revoke the per-run
+    //     token. The missing scheduled caller of listReconcileBatch; bounded per tick, fail-soft per row.
     // 14. Approval expiry (migrations/0232) — a gate ask unanswered 14 days after review entry moves
     //     review -> blocked (approval_expired | gate_owner_dead), receipted, assignee notified. Bounded
     //     per run + idempotent; dry run (counts only) unless APPROVAL_EXPIRY_ENFORCE=1. Rides this cron: no new trigger.
@@ -530,6 +534,7 @@ export default {
       ['flight-watchdog', () => sweepStalledFlights(env)],
       ['gate-stall-watchdog', () => sweepStalledGateReviews(env)],
       ['approval-expiry', () => runApprovalExpiryTick(env)],
+      ['provider-reconcile', () => reconcileProviderRuns(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

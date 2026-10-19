@@ -4298,9 +4298,26 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_event_subscribe_refusals_at" },
     ],
   },
+  {
+    file: "0244_provider_kernel.sql",
+    sha256: "53e65aa2661f4a35951da70edfb647ad31970f47be7aa0022d81c15c016cd1a2",
+    statements: [
+      "-- 0244_provider_kernel.sql -- provider kernel (harness/kernel.ts): per-run bookkeeping on harness_reservations.\n--\n-- Every provider dispatch now passes one kernel: kill switch -> checkAndReserve (budget) BEFORE launch -> reservation ->\n-- (optional) per-run short-lived mupot token -> launch -> reconcile -> finalize. These columns carry what finalize needs:\n--   estimate_micro_usd   the pre-call estimate the meter reserved against (booked at finalize when the vendor reports no usage)\n--   run_token_id / run_token_member_id   the per-run mupot credential, revoked at finalize (NULL when the adapter has no callback)\n--   finalized_at         set exactly once, by the one finalizer that books usage, revokes the token and cleans up\n--   usage_cost_micro_usd / usage_estimated   what finalize booked, and whether it was an ESTIMATE (vendor exposes no usage)\n-- Additive only: ADD COLUMN, no rebuild, no data rewrite. Existing rows keep NULLs and finalize treats them as \"nothing to settle\".\n\nALTER TABLE harness_reservations ADD COLUMN estimate_micro_usd INTEGER;",
+      "\nALTER TABLE harness_reservations ADD COLUMN run_token_id TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN run_token_member_id TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN finalized_at TEXT;",
+      "\nALTER TABLE harness_reservations ADD COLUMN usage_cost_micro_usd INTEGER;",
+      "\nALTER TABLE harness_reservations ADD COLUMN usage_estimated INTEGER;",
+      "\n-- reconcile_checked_at: the reconcile cron stamps every row it examines, and orders by COALESCE(reconcile_checked_at, updated_at), so rows\n-- whose vendor run is still going cannot starve newer rows at the head of the queue.\nALTER TABLE harness_reservations ADD COLUMN reconcile_checked_at TEXT;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_reservations_unfinalized\n  ON harness_reservations (tenant, state, finalized_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_harness_reservations_unfinalized" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f65f990f6742cd8cefb79ea1d9fdecf17bbfcba46fda7cabbfd1abf93e63d678"
+export const SCHEMA_CHAIN_DIGEST: string = "a51989db25c695338224173692a7de1d43af26904814b1fa2fe2280c9612fc8a"

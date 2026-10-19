@@ -40,6 +40,14 @@ export interface HarnessReservationRow {
   attached_at: string | null
   reconciled_at: string | null
   updated_at: string
+  // 0244 (provider kernel)
+  estimate_micro_usd: number | null
+  run_token_id: string | null
+  run_token_member_id: string | null
+  finalized_at: string | null
+  usage_cost_micro_usd: number | null
+  usage_estimated: number | null
+  reconcile_checked_at: string | null
 }
 
 export async function computeRequestDigest(adapter: HarnessKind, req: DispatchRequest): Promise<string> {
@@ -133,6 +141,13 @@ export async function insertReservation(
       attached_at: null,
       reconciled_at: null,
       updated_at: now,
+      estimate_micro_usd: null,
+      run_token_id: null,
+      run_token_member_id: null,
+      finalized_at: null,
+      usage_cost_micro_usd: null,
+      usage_estimated: null,
+      reconcile_checked_at: null,
     }
     return { outcome: 'inserted', row: inserted }
   } catch (error) {
@@ -440,8 +455,8 @@ export async function listReconcileBatch(
     `SELECT * FROM harness_reservations
      WHERE tenant = ?
        AND state IN ('reserved', 'attaching', 'attached')
-       AND updated_at < ?
-     ORDER BY updated_at ASC
+       AND COALESCE(reconcile_checked_at, updated_at) < ?
+     ORDER BY COALESCE(reconcile_checked_at, updated_at) ASC
      LIMIT ?`,
   )
     .bind(env.TENANT_SLUG, staleCutoff, limit)

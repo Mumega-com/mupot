@@ -32,9 +32,10 @@ import { assertExecutionNotPaused, ExecutionPausedError } from '../pause'
 import type {
   DispatchRequest,
   DispatchOutcome,
-  HarnessAdapter,
-  HarnessCapabilities,
   HarnessContext,
+  ProviderAdapter,
+  ProviderCapabilities,
+  ProviderCredentialNeeds,
   ReconcileResult,
   RunStatusResult,
   StatusQuery,
@@ -48,12 +49,16 @@ async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   return result ?? null
 }
 
-export const grokCliAdapter: HarnessAdapter = {
+export const grokCliAdapter: ProviderAdapter = {
   kind: 'grok-cli',
 
-  capabilities(): HarnessCapabilities {
+  capabilities(): ProviderCapabilities {
     return {
       kind: 'grok-cli',
+      usage: 'none',
+      vendorBudget: false,
+      callback: 'none',
+      webhook: false,
       launch: true,
       followUp: false,
       status: true,
@@ -66,6 +71,23 @@ export const grokCliAdapter: HarnessAdapter = {
 
   isAvailable(_env: Env): boolean {
     return true
+  },
+
+  credentialNeeds(): ProviderCredentialNeeds {
+    return { slot: null, kinds: [] } // a local, record-only adapter: no vendor key
+  },
+
+  /** Record-only dispatch spends nothing: the meter still counts it against the agent's dispatch cap. */
+  estimate(): number {
+    return 0
+  },
+
+  launch(env: Env, req: DispatchRequest, ctx?: HarnessContext): Promise<DispatchOutcome> {
+    return grokCliAdapter.dispatch(env, req, ctx)
+  },
+
+  async usage(): Promise<null> {
+    return null
   },
 
   async dispatch(

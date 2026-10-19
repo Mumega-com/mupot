@@ -7,6 +7,7 @@
 
 import type { Env } from '../../types'
 import { getCursorRun, resolveCursorApiToken } from '../../cursor/client'
+import { kernelFlightSignals, DEFAULT_CURSOR_RUN_ESTIMATE_CENTS, MICRO_USD_PER_CENT } from '../kernel'
 import {
   attachCursorCloudExecution,
   reserveCursorCloudWork,
@@ -22,9 +23,10 @@ import { ExecutionPausedError } from '../pause'
 import type {
   DispatchRequest,
   DispatchOutcome,
-  HarnessAdapter,
-  HarnessCapabilities,
   HarnessContext,
+  ProviderAdapter,
+  ProviderCapabilities,
+  ProviderCredentialNeeds,
   ReconcileResult,
   RunStatusResult,
   StatusQuery,
@@ -42,6 +44,8 @@ const PUBLIC_ERROR_CODES = new Set([
   'bind_unconfirmed',
   'bind_lost_lease',
   'cursor_token_missing',
+  'provider_disabled',
+  'budget_blocked',
   'repo_url_required',
   'reservation_unbound',
   'reserve_failed',
@@ -62,12 +66,16 @@ export function acceptedStateOf(state: string): 'reserved' | 'attaching' | 'atta
   return 'reserved'
 }
 
-export const cursorCloudAdapter: HarnessAdapter = {
+export const cursorCloudAdapter: ProviderAdapter = {
   kind: 'cursor-cloud',
 
-  capabilities(): HarnessCapabilities {
+  capabilities(): ProviderCapabilities {
     return {
       kind: 'cursor-cloud',
+      usage: 'none', // Cursor exposes no per-run usage: the kernel books the flat estimate, marked estimate=true
+      vendorBudget: false,
+      callback: 'none', // whether Cursor's API accepts a per-run MCP credential is unverified: no run token is minted
+      webhook: false,
       launch: true,
       followUp: true,
       status: true,
@@ -80,6 +88,24 @@ export const cursorCloudAdapter: HarnessAdapter = {
 
   isAvailable(env: Env): boolean {
     return Boolean(resolveCursorApiToken(env))
+  },
+
+  credentialNeeds(): ProviderCredentialNeeds {
+    return { slot: 'cursor_api', kinds: ['operator'] }
+  },
+
+  /** Flat per-run estimate (cents, default 50): the meter reserves against it and finalize books it (estimate=true). */
+  estimate(env: Env): number {
+    const raw = Number(env.CURSOR_RUN_ESTIMATE_CENTS)
+    return (Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_CURSOR_RUN_ESTIMATE_CENTS) * MICRO_USD_PER_CENT
+  },
+
+  launch(env: Env, req: DispatchRequest, ctx?: HarnessContext): Promise<DispatchOutcome> {
+    return cursorCloudAdapter.dispatch(env, req, ctx)
+  },
+
+  async usage(): Promise<null> {
+    return null
   },
 
   async dispatch(
@@ -107,6 +133,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
         model: req.model,
         flightId: req.flightId,
         taskId: req.taskId,
+        preflightSignals: await kernelFlightSignals(env, req.agentId, cursorCloudAdapter.estimate(env, req)),
       })
 
       if (reserved.state === 'failed') {
@@ -275,13 +302,10 @@ export const cursorCloudAdapter: HarnessAdapter = {
     }
 
     if (row.state === 'reserved' || row.state === 'attaching') {
-      const attached = await attachCursorCloudExecution(env, reservationId)
-      return {
-        reservationId,
-        previousState,
-        nextState: attached.state,
-        changed: attached.state !== previousState,
-      }
+      // RECONCILE NEVER LAUNCHES. Attaching is dispatch's own step, run once by the dispatcher under a lease, after the kill switch and the
+      // budget gate. A row still reserved/attaching here is either in flight (its attacher is working) or stuck, and the provider kernel
+      // (reconcileProviderRuns) releases a stuck one by closing it. Re-attaching from a sweep would launch past both gates.
+      return { reservationId, previousState, nextState: previousState, changed: false }
     }
 
     if (row.state === 'attached' && row.vendor_agent_id && row.vendor_run_id) {

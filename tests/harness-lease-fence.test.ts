@@ -301,7 +301,7 @@ describe('P2 fences', () => {
     harness.sqlite.exec(`UPDATE execution_pauses SET resumed_at = NULL, resumed_by_member_id = NULL, resume_reason = NULL`)
     const attach = await attachCursorCloudExecution(env, r.reservationId)
     expect(attach.error).toBe('execution_paused')
-    expect(attach.state).toBe('reserved')
+    expect(attach.state).toBe('failed') // released, not left reserved: nothing can launch it after the pause lifts
     expect(fetchMock).not.toHaveBeenCalled()
     expect(rowOf(harness, r.reservationId).attach_lease_id).toBeNull() // lease handed back, not stranded
   })
