@@ -11,3 +11,12 @@ WHEN OLD.attach_code IS NOT NULL
 BEGIN
   SELECT RAISE(ABORT, 'agent_seat_admission_attach_code_immutable');
 END;
+
+-- The chat an admission is bound to never changes either (the approval belongs to the chat that asked). New trigger only.
+CREATE TRIGGER IF NOT EXISTS agent_seat_admissions_requested_seat_immutable
+BEFORE UPDATE OF requested_seat_id ON agent_seat_admissions
+FOR EACH ROW
+WHEN OLD.requested_seat_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'agent_seat_admission_requested_seat_immutable');
+END;

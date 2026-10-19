@@ -4257,13 +4257,15 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0240_admission_attach_code.sql",
-    sha256: "55023c067f7282e0e5b27bd7d8fa9991e7aa1cc9ed1c8f2a54e49c7b061c65cc",
+    sha256: "cca4fcc3118984c00309c3367666574a0357036989a73517f0d20c7415b4cfa8",
     statements: [
       "-- 0240_admission_attach_code.sql — mupot#2054. A pending seat admission carries a short human code that the asking chat\n-- shows its human and the /connections card repeats, so \"Admit\" can be tied to the chat that asked. Additive; NULL on\n-- every pre-existing row (legacy: Admit works without a code). A label, not a credential.\nALTER TABLE agent_seat_admissions ADD COLUMN attach_code TEXT;",
       "\n\n-- The code never changes once set (it is what the human matched on the card). Additive: a new trigger only.\nCREATE TRIGGER IF NOT EXISTS agent_seat_admissions_attach_code_immutable\nBEFORE UPDATE OF attach_code ON agent_seat_admissions\nFOR EACH ROW\nWHEN OLD.attach_code IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_attach_code_immutable');\nEND;",
+      "\n\n-- The chat an admission is bound to never changes either (the approval belongs to the chat that asked). New trigger only.\nCREATE TRIGGER IF NOT EXISTS agent_seat_admissions_requested_seat_immutable\nBEFORE UPDATE OF requested_seat_id ON agent_seat_admissions\nFOR EACH ROW\nWHEN OLD.requested_seat_id IS NOT NULL\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_requested_seat_immutable');\nEND;",
     ],
     objects: [
       { type: "trigger", name: "agent_seat_admissions_attach_code_immutable" },
+      { type: "trigger", name: "agent_seat_admissions_requested_seat_immutable" },
     ],
   },
 ]
@@ -4271,4 +4273,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "e5a52f7583525455bab448615a830d0ec189e443b1816d314926f3229077914e"
+export const SCHEMA_CHAIN_DIGEST: string = "09003a4b7f8437a54225c43a69d0e36a811457faec44dea230575f1e048bf215"

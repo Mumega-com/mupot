@@ -134,6 +134,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
 
   const pending = admissions.filter((a) => a.status === 'pending')
   const live = admissions.filter((a) => a.status === 'live')
+  const askingSeats = new Set(pending.filter((a) => a.has_code && a.requested_seat_id).map((a) => a.requested_seat_id))
 
   const pendingBody = pending.length === 0
     ? emptyState({ title: 'Nothing waiting', detail: 'When a thread asks to act as an agent you have not admitted yet, it appears here (and as a one-time passkey link it hands you).' })
@@ -184,7 +185,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
             s.attachment_id
               ? html`<button class="btn danger" data-cx-detach="${s.attachment_id}">Detach</button>`
               : enabled && agents.length > 0
-                ? html`<select data-cx-agent="${s.seat_id}">${agents.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}</select> <select data-cx-ceiling="${s.seat_id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-attach="${s.seat_id}">Attach</button>`
+                ? html`<select data-cx-agent="${s.seat_id}">${agents.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}</select> <select data-cx-ceiling="${s.seat_id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-attach="${s.seat_id}">Attach</button>${askingSeats.has(s.seat_id) ? html` <span class="ui-sub">This chat already asked for an agent: use Admit on the Waiting for your decision card and type the code the chat showed you.</span>` : ''}`
                 : html`${pill(enabled ? 'No agent to attach' : 'Attach disabled', 'dim')}`,
           ]),
           empty: '',

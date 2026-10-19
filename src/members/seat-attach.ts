@@ -37,6 +37,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
 
@@ -193,10 +194,9 @@ function normalizeAttachCode(v: string): string {
 export function attachCodeMatches(expected: string, given: unknown): boolean {
   const a = normalizeAttachCode(expected)
   const b = typeof given === 'string' ? normalizeAttachCode(given.slice(0, 32)) : ''
-  let diff = a.length ^ b.length
-  const len = Math.max(a.length, b.length)
-  for (let i = 0; i < len; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0)
-  return diff === 0 && a.length > 0
+  // The one shared comparator (src/lib/crypto.ts); a second hand-rolled xor loop is refused by the timing-safe-equal ratchet.
+  if (a.length === 0) return false
+  return timingSafeEqual(a, b)
 }
 
 /** THE code predicate every path that moves a pending admission to live goes through (promoteAdmission enforces it too). */
@@ -398,7 +398,7 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
   return !!row
 }
 
-async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<boolean> {
+export async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<boolean> {
   // The single place a pending admission becomes live: the code is enforced HERE so no caller can forget it.
   if (attachCodeRefused(adm, attachCode)) return false
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
@@ -687,7 +687,7 @@ export async function attachSeatToAgent(
   if (admission.state === 'pending') {
     // Only the chat that filed the ask learns the code; a different chat hitting the same pending row gets none.
     const attachCode = admission.admission.requested_seat_id === seat.id ? admission.admission.attach_code : null
-    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.approveUrl, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode }
+    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.admission.requested_seat_id === seat.id ? admission.approveUrl : null, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode }
   }
   if ((await resolveAgentMemberBinding(env, agent.id)).kind !== 'bound') return { ok: false, error: 'agent_identity_unminted' }
 
@@ -844,6 +844,7 @@ export interface ConnectionAdmission {
   created_at: string
   expires_at: string | null
   has_code: number
+  requested_seat_id: string | null
   seat_label: string | null
   seat_first_seen: string | null
   live_threads: number
@@ -888,7 +889,7 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
   }))
   const admissions = (await env.DB.prepare(
     `SELECT adm.id AS id, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
-            adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
+            adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, adm.requested_seat_id AS requested_seat_id, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
             (SELECT COUNT(*) FROM agent_seat_attachments x WHERE x.admission_id = adm.id AND x.detached_at IS NULL) AS live_threads
        FROM agent_seat_admissions adm
        JOIN agents a ON a.id = adm.agent_id

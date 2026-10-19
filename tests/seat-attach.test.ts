@@ -66,6 +66,7 @@ const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare
 /** TEST SCAFFOLDING for pre-#2054 multi-chat fixtures: a live admission is bound to the ONE chat that asked, so to model a
  *  second attached chat on the same admission the test re-points requested_seat_id at the next unattached seat. */
 const bindAdm = (agentId: string, seatId?: string): void => {
+  h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
   h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = COALESCE(?, (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1)) WHERE agent_id = ? AND status IN ('pending', 'live')`).run(seatId ?? null, agentId)
 }
 /** The attach code a tool-made pending admission carries (the human types it on Admit). */
@@ -1261,7 +1262,7 @@ describe('dashboard: Connections', () => {
       //    whatever the SET column order, is found. Exactly one: promoteAdmission.
       const liveSetters = (text: string): number => {
         let c = 0
-        for (const m of text.matchAll(/UPDATE\s+agent_seat_admissions\s+SET\s+([\s\S]*?)(?=\bWHERE\b|`|;|$)/gi)) {
+        for (const m of text.matchAll(/UPDATE\s+agent_seat_admissions(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\s+([\s\S]*?)(?=\bWHERE\b|`|;|$)/gi)) {
           if (/(?<![.\w])status\s*=\s*('live'|\?\d*)/i.test(m[1])) c++
         }
         return c
@@ -1270,6 +1271,17 @@ describe('dashboard: Connections', () => {
         .flatMap((p) => { const c = liveSetters(readFileSync(p, 'utf8')); return c ? [`${p}:${c}`] : [] }).sort()
       expect(sqlHits).toEqual(['src/members/seat-attach.ts:1'])
       expect(liveSetters(`UPDATE agent_seat_admissions SET decided_at = ?2, status = 'live' WHERE id = ?1`)).toBe(1) // self-check: column order does not hide it
+      expect(liveSetters(`UPDATE agent_seat_admissions AS x SET decided_at = ?2, status = 'live' WHERE x.id = ?1`)).toBe(1) // ...nor an alias
+      expect(liveSetters(`UPDATE agent_seat_admissions x SET status='live' WHERE x.id = ?1`)).toBe(1)
+      // 1b. nothing in src or migrations may UPDATE requested_seat_id or attach_code (the chat binding and the code are write-once)
+      const setsColumn = (text: string, col: string): number => {
+        let c = 0
+        for (const m of text.matchAll(/UPDATE\s+agent_seat_admissions(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\s+([\s\S]*?)(?=\bWHERE\b|`|;|$)/gi)) if (new RegExp(`(?<![.\\w])${col}\\s*=`, 'i').test(m[1])) c++
+        return c
+      }
+      const files = [...walk('src').filter((p) => !p.endsWith('schema-chain.generated.ts')), ...readdirSync('migrations').filter((f) => f.endsWith('.sql')).map((f) => join('migrations', f))]
+      for (const col of ['requested_seat_id', 'attach_code']) expect(files.filter((p) => setsColumn(readFileSync(p, 'utf8'), col) > 0), col).toEqual([])
+      expect(setsColumn(`UPDATE agent_seat_admissions AS a SET requested_seat_id = ?1 WHERE id = ?2`, 'requested_seat_id')).toBe(1)
       // 2. the only INSERT of a row born live (dashboard attach with NO pending request: no chat asked, nothing to match)
       expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/seat-attach.ts:2'])
       // 3. every caller of promoteAdmission (each must pass the typed code): exactly these three
@@ -1317,6 +1329,7 @@ describe('dashboard: Connections', () => {
       const attId = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
       expect((await detachAttachment(env, { attachmentId: attId, humanMemberId: HUMAN })).ok).toBe(true)
       const seatA = one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE id = ?`, attId)!.seat_id
+      h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_requested_seat_immutable`) // fixture: simulate a drifted row to prove the INSERT guard on its own
       const db = env.DB
       const proxied = new Proxy(db, {
         get(t, k) {
@@ -1367,6 +1380,55 @@ describe('dashboard: Connections', () => {
       const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
       expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava' })).status).toBe(403)
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
+    })
+
+    it('requested_seat_id is immutable once set (new trigger)', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      expect(() => h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = 'x' WHERE id = ?`).run(adm)).toThrow(/requested_seat_immutable/)
+    })
+
+    it('promoteAdmission ITSELF refuses a wrong/missing code (called directly, no caller pre-check), and lands with the right one', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      const { loadAdmission, promoteAdmission } = await import('../src/members/seat-attach')
+      const row = (await loadAdmission(env, adm))!
+      const now = new Date().toISOString()
+      expect(await promoteAdmission(env, row, HUMAN, 'dashboard', now, 'member', 'ZZ-ZZ')).toBe(false)
+      expect(await promoteAdmission(env, row, HUMAN, 'dashboard', now, 'member', undefined)).toBe(false)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
+      expect(await promoteAdmission(env, row, HUMAN, 'dashboard', now, 'member', row.attach_code)).toBe(true)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('live')
+    })
+
+    it('dashboard Attach on ANOTHER seat while a chat\'s coded ask is pending is refused (approval_bound_to_other_chat) even with the right code', async () => {
+      const env = envFor(h)
+      const { g, r } = await pendingFor(env)
+      await boot(env, g, 'conv-b')
+      const seatB = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id <> (SELECT requested_seat_id FROM agent_seat_admissions) LIMIT 1`)!.id
+      const out = await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'dashboard', attachCode: r.sc.attach_code })
+      expect(out).toEqual({ ok: false, error: 'approval_bound_to_other_chat' })
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+    })
+
+    it('a different seat gets NO approve_url from attachSeatToAgent, with or without a live moment (no recovery link leak)', async () => {
+      const env = envFor(h)
+      const { g } = await pendingFor(env)
+      await boot(env, g, 'conv-b')
+      const seatB = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id <> (SELECT requested_seat_id FROM agent_seat_admissions) LIMIT 1`)!.id
+      for (const strand of [false, true]) {
+        if (strand) h.sqlite.exec(`UPDATE secure_moments SET status = 'expired' WHERE kind = 'seat_admit'`)
+        const out = await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'tool' })
+        expect(out).toMatchObject({ ok: true, status: 'pending_admission', approve_url: null, attach_code: null })
+      }
+    })
+
+    it('the Attach control of a chat that already has a coded ask pending says to use the pending card', async () => {
+      const env = envFor(h)
+      await pendingFor(env)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      const page = await (await dash(env, cookie, '/connections')).text()
+      expect(page).toContain('This chat already asked for an agent: use Admit on the Waiting for your decision card')
     })
 
     it('codes are generated from the unambiguous alphabet and differ between calls', async () => {

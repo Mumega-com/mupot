@@ -69,6 +69,7 @@ const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare
 /** TEST SCAFFOLDING for pre-#2054 multi-chat fixtures: a live admission is bound to the ONE chat that asked, so to model a
  *  second attached chat on the same admission the test re-points requested_seat_id at the next unattached seat. */
 const bindAdm = (agentId: string, seatId?: string): void => {
+  h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
   h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = COALESCE(?, (SELECT s.id FROM agent_seats s WHERE NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL) ORDER BY s.created_at, s.rowid LIMIT 1)) WHERE agent_id = ? AND status IN ('pending', 'live')`).run(seatId ?? null, agentId)
 }
 /** The attach code a tool-made pending admission carries (the human types it on Admit). */
