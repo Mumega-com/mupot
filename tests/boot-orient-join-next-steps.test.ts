@@ -160,6 +160,13 @@ describe('next_steps.join', () => {
     const s = await seatFor(OWNER)
     expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).length).toBe(10)
   })
+  it('an EXPIRED membership does not count as already a member', async () => {
+    const s = await seatFor(OWNER)
+    expect((await join(s, { squad: 'squad-target' })).sc.status).toBe('joined')
+    expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)).not.toContain('squad-target')
+    h.sqlite.prepare(`UPDATE memberships SET expires_at = '2026-01-01 00:00:00' WHERE agent_id = ? AND squad_id = 'squad-target'`).run(s.agentId)
+    expect((joinOf(await rpc(s.ctx, 'boot_context', {}, s.session)).squads ?? []).map((x) => x.slug)).toContain('squad-target')
+  })
   it('archived squads are absent', async () => {
     h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'squad-second'`)
     const s = await seatFor(OWNER)

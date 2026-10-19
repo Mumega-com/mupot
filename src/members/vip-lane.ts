@@ -24,7 +24,7 @@
 //     squad exists. A repeat finds the pending row first and does not re-file or re-notify.
 
 import type { AuthContext, Capability, Env, OrgKind } from '../types'
-import { brandSquadScope, canOnSquad, capabilityRank, loadSquadScope, resolveCapabilities, type SquadScope } from '../auth/capability'
+import { CAPABILITY_LIVE_PREDICATE, brandSquadScope, canOnSquad, capabilityRank, loadSquadScope, resolveCapabilities, type SquadScope } from '../auth/capability'
 import { buildAuth, memberIsActiveHuman } from '../access/identity'
 import { resolveSquadRef } from '../org/resolve'
 import { addSquadMember } from './squad-membership'
@@ -247,7 +247,7 @@ export async function joinNextSteps(env: Env, auth: Pick<AuthContext, 'seatBindi
   const rows = await env.DB.prepare(
     `SELECT s.id AS id, s.slug AS slug, s.name AS name, s.department_id AS department_id, s.kind AS kind FROM squads s
      WHERE s.status != 'archived' AND s.kind != 'home'
-       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.agent_id = ?1 AND m.squad_id = s.id)
+       AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.agent_id = ?1 AND m.squad_id = s.id AND ${CAPABILITY_LIVE_PREDICATE('m', "datetime('now')")})
        AND s.id != COALESCE((SELECT a.squad_id FROM agents a WHERE a.id = ?1), '')
      ORDER BY s.name, s.id LIMIT ?2`,
   ).bind(auth.boundAgentId, JOINABLE_SCAN_MAX).all<{ id: string; slug: string; name: string; department_id: string; kind: OrgKind }>()
