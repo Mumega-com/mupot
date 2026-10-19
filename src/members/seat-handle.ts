@@ -42,6 +42,7 @@ import { humanMaxRankOnScope } from '../mcp/oauth-authorize'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAutoEnrollEnabled } from './harness'
 import { ceilingCapability, type AttachCeiling } from '../auth/attached-ceiling'
+import { seatRowIsHeld } from './vip-lane'
 import { findLiveAttachment, seatAttachEnabled, touchAttachment } from './seat-attach'
 import { sha256Hex } from './service'
 
@@ -239,6 +240,7 @@ interface MatchRow {
   agent_email: string | null
   seat_token_id: string | null
   harness_id: string
+  seat_admission_status?: string | null
 }
 
 /**
@@ -258,7 +260,7 @@ async function findLiveSeatForHandle(
 ): Promise<MatchRow | null> {
   return env.DB.prepare(
     `SELECT h.id AS handle_id, h.last_used_at AS last_used_at, h.seat_id AS seat_id,
-            s.label_basename AS seat_label, a.id AS agent_id, a.squad_id AS agent_squad_id,
+            s.label_basename AS seat_label, s.admission_status AS seat_admission_status, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, h.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t
               WHERE t.id = s.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id
@@ -292,6 +294,7 @@ async function findLiveSeatForHandle(
 }
 
 async function touchHandle(env: Env, row: MatchRow, nowMs: number): Promise<void> {
+  if (seatRowIsHeld(env, row)) return // #2069: a held seat leaves no trace
   const last = row.last_used_at ? Date.parse(row.last_used_at) : NaN
   if (Number.isFinite(last) && nowMs - last < SEAT_HANDLE_TOUCH_INTERVAL_MS) return
   try {

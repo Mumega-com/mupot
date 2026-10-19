@@ -30,6 +30,19 @@ import { resolveSquadRef } from '../org/resolve'
 import { addSquadMember } from './squad-membership'
 import { resetTrustedOnRejoin } from './seat-hold-release'
 
+/**
+ * Is the seat row an auth-time query just read HELD? The seat resolvers already join agent_seats, so they select
+ * `s.admission_status` in the SAME statement (no parallel lookup) and ask this. VIP_LANE off: never held (flag-off is unchanged).
+ * Mirrors readSeatAdmissionStatus: an unrecognised non-null value fails closed to held. A held seat leaves no trace (#2069), so the
+ * resolvers skip their last_used_at bookkeeping touch for it (a held chat's polling must not keep it out of idle reclaim).
+ */
+export function seatRowIsHeld(env: Pick<Env, 'VIP_LANE'>, row: { seat_admission_status?: string | null }): boolean {
+  if (!vipLaneEnabled(env)) return false
+  const s = row.seat_admission_status
+  if (s === undefined || s === null) return false
+  return s !== 'observed' && s !== 'trusted'
+}
+
 export function vipLaneEnabled(env: Pick<Env, 'VIP_LANE'>): boolean {
   return env.VIP_LANE === '1'
 }

@@ -46,6 +46,7 @@ import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import { sanitizeLabel } from './harness'
+import { seatRowIsHeld } from './vip-lane'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
@@ -537,6 +538,7 @@ export interface LiveAttachmentRow {
   harness_id: string
   seat_token_id: string
   ceiling: AttachCeiling
+  seat_admission_status?: string | null
 }
 
 /**
@@ -548,7 +550,7 @@ export interface LiveAttachmentRow {
  */
 export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string }, seatId: string): Promise<LiveAttachmentRow | null> {
   const row = await env.DB.prepare(
-    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, s.id AS seat_id,
+    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, s.admission_status AS seat_admission_status, s.id AS seat_id,
             s.label_basename AS seat_label, s.agent_id AS seat_agent_id, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, att.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t
@@ -589,6 +591,7 @@ export async function findLiveAttachment(env: Env, human: { memberId: string; to
 
 /** LRU/display bookkeeping, never fails a request. */
 export async function touchAttachment(env: Env, row: LiveAttachmentRow, nowMs: number): Promise<void> {
+  if (seatRowIsHeld(env, row)) return // #2069: a held seat leaves no trace
   const last = row.last_used_at ? Date.parse(row.last_used_at) : NaN
   if (Number.isFinite(last) && nowMs - last < ATTACHMENT_TOUCH_INTERVAL_MS) return
   try {

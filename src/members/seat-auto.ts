@@ -51,6 +51,7 @@ import {
   applySeatHandle, buildSeatContext, SEAT_HANDLE_TOUCH_INTERVAL_MS,
   type HarnessHints, type SeatBindingSource, type SeatContextRow, type SeatRequestInputs,
 } from './seat-handle'
+import { seatRowIsHeld } from './vip-lane'
 import { resolveOrCreateSeat } from './seat-select'
 import { sha256Hex } from './service'
 
@@ -96,6 +97,7 @@ export async function autoSeatKey(c: AutoSeatCandidate, gen = 0): Promise<Normal
 interface AutoMatchRow extends SeatContextRow {
   seat_token_id: string
   last_used_at: string | null
+  seat_admission_status?: string | null
 }
 
 // ── refusal cache ────────────────────────────────────────────────────────────
@@ -147,7 +149,7 @@ export async function findLiveAutoSeat(
   const hashes = Array.isArray(keyHash) ? keyHash : [keyHash]
   const inList = hashes.map((_, i) => (i === 0 ? '?2' : `?${6 + i}`)).join(', ')
   const row = await env.DB.prepare(
-    `SELECT s.id AS seat_id, s.label_basename AS seat_label, s.last_used_at AS last_used_at, a.id AS agent_id, a.squad_id AS agent_squad_id,
+    `SELECT s.id AS seat_id, s.label_basename AS seat_label, s.last_used_at AS last_used_at, s.admission_status AS seat_admission_status, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, s.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t
               WHERE t.id = s.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id
@@ -180,6 +182,7 @@ export async function findLiveAutoSeat(
 
 /** LRU bookkeeping for reclaim: stamped at most every SEAT_HANDLE_TOUCH_INTERVAL_MS, never fails a request. */
 async function touchAutoSeat(env: Env, row: AutoMatchRow, nowMs: number): Promise<void> {
+  if (seatRowIsHeld(env, row)) return // #2069: a held seat leaves no trace
   const last = row.last_used_at ? Date.parse(row.last_used_at) : NaN
   if (Number.isFinite(last) && nowMs - last < SEAT_HANDLE_TOUCH_INTERVAL_MS) return
   try {
