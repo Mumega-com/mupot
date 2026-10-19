@@ -40,9 +40,8 @@ const toolSeatAttach: ToolSpec = {
     if (!seat || auth.channel !== 'directory' || !auth.boundAgentId) {
       return fail(403, 'seat_required', 'seat_attach runs only from a seat session (a conversation-keyed auto seat, or a seat_select handle). An agent-bound connection cannot move itself into another agent.')
     }
-    if (seat.attached) {
-      return fail(409, 'already_attached', 'This thread is already attached to an agent. Ask your human to detach or move it on their Connections page.')
-    }
+    // An already-attached thread falls through: attachSeatToAgent answers `attached` (idempotent) when the named agent IS the one this
+    // seat is attached to (Admit completes the attachment for the asking chat), and already_attached for any other agent.
     const agentRef = typeof args.agent === 'string' ? args.agent.trim() : ''
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
 

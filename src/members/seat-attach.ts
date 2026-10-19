@@ -399,13 +399,33 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
   return !!row
 }
 
+export type AttachSkipReason = 'no_requested_seat' | 'seat_gone' | 'seat_already_attached' | 'guard_refused'
+export interface PromoteResult { landed: boolean; attachmentId: string | null; attachSkipped?: AttachSkipReason }
+
 export async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<boolean> {
-  // The single place a pending admission becomes live: the code is enforced HERE so no caller can forget it.
-  if (attachCodeRefused(adm, attachCode)) return false
+  return (await promoteAdmissionDetailed(env, adm, humanMemberId, via, nowIso, ceiling, attachCode)).landed
+}
+
+/**
+ * The single place a pending admission becomes live. When the admission names a requested_seat_id, the attachment for THAT seat is
+ * created in the SAME batch through the same guarded INSERT attachSeatToAgent uses, so the asking chat is already acting as the agent
+ * on its next call. Any guard failure leaves the admission live with NO attachment (reported in attachSkipped) and the chat's
+ * next seat_attach works exactly as before. Never attaches any seat other than adm.requested_seat_id.
+ */
+export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<PromoteResult> {
+  // The code is enforced HERE so no caller can forget it.
+  if (attachCodeRefused(adm, attachCode)) return { landed: false, attachmentId: null }
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
-  const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
-    .bind(adm.agent_id).first<{ name: string; squad_id: string }>()
+  const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id, a.slug AS slug FROM agents a WHERE a.id = ?1 LIMIT 1`)
+    .bind(adm.agent_id).first<{ name: string; squad_id: string; slug: string }>()
   const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : null
+  const attachmentId = adm.requested_seat_id && agent ? crypto.randomUUID() : null
+  const attach = attachmentId && adm.requested_seat_id && agent && seatAttachEnabled(env)
+    ? prepareAttachStatements(env, {
+        attachmentId, tokenId: crypto.randomUUID(), tokenHash: await sha256Hex(mintRawToken()), nowIso, admissionId: adm.id,
+        agent: { id: adm.agent_id, slug: agent.slug }, seat: { id: adm.requested_seat_id, harnessId: adm.harness_id }, humanMemberId: adm.human_member_id, requireNoLiveAttachment: true,
+      })
+    : []
   const out = await env.DB.batch([
     ...(weld ? weld.statements : []),
     env.DB.prepare(
@@ -417,9 +437,19 @@ export async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberI
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
       'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\' AND decided_at = ?7)', [adm.id, nowIso]),
+    ...attach,
     ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
-  return out[weld ? weld.statements.length : 0].meta.changes === 1
+  const base = weld ? weld.statements.length : 0
+  if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null }
+  if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat' }
+  if (out[base + 2].meta.changes === 1) return { landed: true, attachmentId }
+  // The admission is live but the guarded INSERT wrote nothing: name the guard, so the human/chat is told why seat_attach is still needed.
+  const seat = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
+    .bind(adm.requested_seat_id, env.TENANT_SLUG, adm.human_member_id).first<{ x: number }>()
+  if (!seat) return { landed: true, attachmentId: null, attachSkipped: 'seat_gone' }
+  const other = await liveAttachmentOfSeat(env, adm.requested_seat_id as string) // as: attach is non-empty only when requested_seat_id is set
+  return { landed: true, attachmentId: null, attachSkipped: other ? 'seat_already_attached' : 'guard_refused' }
 }
 
 /** Revoke a live admission (or deny a pending one). Live -> revoked cascades to every live attachment (trigger). */
@@ -649,6 +679,47 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
 }
 
 /**
+ * THE attachment writer's statements (insert + server-held token + audit), shared by attachSeatToAgent and by promoteAdmission
+ * (Admit completes the attachment for the asking chat). Every guard lives in the INSERT's WHERE: the admission is LIVE and
+ * for exactly this (agent, human, harness) AND its requested_seat_id is THIS seat, the seat is un-retired and the human's, the
+ * agent is active/designated/welded to an active member and is not itself a seat agent. `requireNoLiveAttachment` (promote path)
+ * additionally refuses when the seat already has a live attachment, so a unique-index hit can never roll back the admission.
+ * Params: ?1 attachment ?2 tenant ?3 token ?4 now ?5 admission ?6 agent ?7 seat ?8 human.
+ */
+function prepareAttachStatements(
+  env: Env,
+  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean },
+): D1PreparedStatement[] {
+  return [
+    env.DB.prepare(
+      `INSERT INTO agent_seat_attachments (id, tenant, seat_id, human_member_id, harness_id, agent_id, admission_id, seat_token_id, created_at)
+       SELECT ?1, ?2, s.id, s.member_id, s.harness_id, a.id, adm.id, ?3, ?4
+         FROM agent_seats s
+         JOIN agent_seat_admissions adm ON adm.id = ?5 AND adm.tenant = s.tenant AND adm.status = 'live'
+              AND adm.human_member_id = s.member_id AND adm.harness_id = s.harness_id AND adm.agent_id = ?6
+              AND adm.requested_seat_id = s.id -- the approval belongs to the chat that asked
+         JOIN agents a ON a.id = adm.agent_id AND a.status = 'active'
+         JOIN agent_member_bindings b ON b.tenant = s.tenant AND b.agent_id = a.id
+         JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
+         JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
+        WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
+          ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
+          ${attachDesignatedClause(env, 'a', '?8')}`,
+    ).bind(p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId),
+    env.DB.prepare(
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+       SELECT ?1, b.member_id, ?2, ?3, 'directory', datetime('now'), b.agent_id, ?4
+         FROM agent_seat_attachments att JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = att.agent_id
+        WHERE att.id = ?5 AND att.seat_token_id = ?1`,
+    ).bind(p.tokenId, p.tokenHash, `attach:${p.agent.slug}`.slice(0, 100) + `:${p.seat.id.slice(-12)}`, env.TENANT_SLUG, p.attachmentId),
+    auditInsert(env, p.agent.id, p.humanMemberId, 'seat_attach',
+      { attachment_id: p.attachmentId, seat_id: p.seat.id, admission_id: p.admissionId, harness_id: p.seat.harnessId, human_member_id: p.humanMemberId },
+      'EXISTS (SELECT 1 FROM agent_seat_attachments WHERE id = ?6)', [p.attachmentId]),
+  ]
+}
+
+/**
  * Attach a human's seat to an admitted agent. The shared writer for the MCP tool (via 'tool') and the dashboard (via
  * 'dashboard'). `agentRef` is re-resolved here against the attachable set, so neither caller can name an agent the
  * human may not attach to. Attachment + token + audit land in ONE batch whose every guard is in the statements' WHERE.
@@ -675,7 +746,8 @@ export async function attachSeatToAgent(
   ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
   const current = await liveAttachmentOfSeat(env, seat.id)
   if (current) {
-    if (!p.moveIfAttached) return { ok: false, error: 'already_attached' }
+    // Same agent already attached to THIS seat (e.g. Admit completed it for the asking chat): idempotent success, not already_attached.
+    if (current.agent_id !== agent.id && !p.moveIfAttached) return { ok: false, error: 'already_attached' }
     if (current.agent_id === agent.id) {
       const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id)
       return adm && adm.status === 'live'
@@ -694,6 +766,14 @@ export async function attachSeatToAgent(
     return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.admission.requested_seat_id === seat.id ? admission.approveUrl : null, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode }
   }
   if ((await resolveAgentMemberBinding(env, agent.id)).kind !== 'bound') return { ok: false, error: 'agent_identity_unminted' }
+  // ensureAdmission may have just PROMOTED a pending admission, and promotion completes the attachment for the asking seat in the same batch:
+  // that attachment is exactly what this call would create, so report it instead of colliding with it.
+  if (!current) {
+    const completed = await liveAttachmentOfSeat(env, seat.id)
+    if (completed && completed.agent_id === agent.id) {
+      return { ok: true, status: 'attached', attachment_id: completed.id, admission_id: admission.admission.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
+    }
+  }
 
   const nowIso = new Date(nowMs).toISOString()
   const attachmentId = crypto.randomUUID()
@@ -708,30 +788,10 @@ export async function attachSeatToAgent(
     ).bind(current.id, nowIso, p.humanMemberId, env.TENANT_SLUG, agent.id))
   }
   const attachIndex = statements.length
-  statements.push(env.DB.prepare(
-    `INSERT INTO agent_seat_attachments (id, tenant, seat_id, human_member_id, harness_id, agent_id, admission_id, seat_token_id, created_at)
-     SELECT ?1, ?2, s.id, s.member_id, s.harness_id, a.id, adm.id, ?3, ?4
-       FROM agent_seats s
-       JOIN agent_seat_admissions adm ON adm.id = ?5 AND adm.tenant = s.tenant AND adm.status = 'live'
-            AND adm.human_member_id = s.member_id AND adm.harness_id = s.harness_id AND adm.agent_id = ?6
-            AND adm.requested_seat_id = s.id -- the approval belongs to the chat that asked
-       JOIN agents a ON a.id = adm.agent_id AND a.status = 'active'
-       JOIN agent_member_bindings b ON b.tenant = s.tenant AND b.agent_id = a.id
-       JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
-       JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
-      WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
-        ${attachDesignatedClause(env, 'a', '?8')}`,
-  ).bind(attachmentId, env.TENANT_SLUG, tokenId, nowIso, admission.admission.id, agent.id, seat.id, p.humanMemberId))
-  statements.push(env.DB.prepare(
-    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-     SELECT ?1, b.member_id, ?2, ?3, 'directory', datetime('now'), b.agent_id, ?4
-       FROM agent_seat_attachments att JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = att.agent_id
-      WHERE att.id = ?5 AND att.seat_token_id = ?1`,
-  ).bind(tokenId, tokenHash, `attach:${agent.slug}`.slice(0, 100) + `:${seat.id.slice(-12)}`, env.TENANT_SLUG, attachmentId))
-  statements.push(auditInsert(env, agent.id, p.humanMemberId, 'seat_attach',
-    { attachment_id: attachmentId, seat_id: seat.id, admission_id: admission.admission.id, harness_id: seat.harness_id, human_member_id: p.humanMemberId },
-    'EXISTS (SELECT 1 FROM agent_seat_attachments WHERE id = ?6)', [attachmentId]))
+  statements.push(...prepareAttachStatements(env, {
+    attachmentId, tokenId, tokenHash, nowIso, admissionId: admission.admission.id, agent: { id: agent.id, slug: agent.slug },
+    seat: { id: seat.id, harnessId: seat.harness_id }, humanMemberId: p.humanMemberId, requireNoLiveAttachment: false,
+  }))
 
   try {
     const out = await env.DB.batch(statements)
