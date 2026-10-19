@@ -194,6 +194,16 @@ export async function instantObservedJoin(
     // Idempotent: same membership, no second receipt. A higher standing someone else gave this seat is kept, never lowered.
     return { ok: true, admission_status: now, membership: capabilityRank(existing.capability as Capability) > OBSERVED_TIER_RANK ? 'kept' : 'already', squad } // stored value, closed CHECK list in 0001
   }
+  // Trust does not carry across squads: a TRUSTED seat joining a squad it is not (live) in starts observed there (audited). FAIL-RESTRICTIVE ORDER:
+  // the reset commits BEFORE the membership write (after the eligibility re-check above), so no failure can leave trusted + a new membership. If the
+  // add then fails, the seat stays observed (more restrictive, accepted). If the reset cannot be proven, the add is not attempted.
+  let admission: SeatAdmissionStatus = now
+  if (now === 'trusted') {
+    const reset = await resetTrustedOnRejoin(env, { humanMemberId: p.humanMemberId, seatId: p.seatId }).catch(() => false)
+    admission = (await readSeatAdmissionStatus(env, p.seatId)) ?? 'held'
+    if (!reset && admission === 'trusted') return { ok: false, error: 'write_refused' }
+    if (admission === 'held') return { ok: false, error: 'seat_held' }
+  }
   // The write runs AS the human, with the human's own effective grants (buildAuth leaves them undefined for a legacy owner/admin login).
   const humanAuth: AuthContext = { ...(await buildAuth(env, p.humanMemberId)), capabilities: grants }
   const w = await addSquadMember({
@@ -202,12 +212,7 @@ export async function instantObservedJoin(
     capability: OBSERVED_TIER as 'member', neverLower: true, via: 'squad_join',
   })
   if (!w.ok) return { ok: false, error: 'write_refused' }
-  // Trust does not carry across squads: a TRUSTED seat that has just gained membership in a NEW squad starts observed there (audited). Done only
-  // AFTER the eligibility re-check and the membership write succeeded, so a refused join leaves trusted intact.
-  if (now === 'trusted' && (await resetTrustedOnRejoin(env, { humanMemberId: p.humanMemberId, seatId: p.seatId }))) {
-    return { ok: true, admission_status: 'observed', membership: 'created', squad }
-  }
-  return { ok: true, admission_status: now, membership: 'created', squad }
+  return { ok: true, admission_status: admission, membership: 'created', squad }
 }
 
 /** Per-HUMAN card caps across ALL of that human's seats (a per-seat cap is multiplied by however many seats a session can mint). */

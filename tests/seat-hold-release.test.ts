@@ -289,6 +289,26 @@ describe('rejoin ordering, liveness, and held-over-attach (CI + Codex fixes)', (
     expect(audit(s.seatId)).toEqual([])
   })
 
+  it('failure injection: a reset that fails never leaves trusted + a new membership; an add that fails after the reset leaves observed', async () => {
+    const s = await seatFor(OWNER)
+    setStatus(s.seatId, 'trusted')
+    const squad = one<{ id: string; slug: string; name: string; department_id: string; kind: string; status: string }>(`SELECT id, slug, name, department_id, kind, status FROM squads WHERE id = 'squad-second'`)!
+    const grants = await (await import('../src/auth/capability')).resolveCapabilities(env, OWNER)
+    const args = { humanMemberId: OWNER, seatId: s.seatId, seatAgentId: s.agentId, squad, grants }
+    const mems = (): number => n(`SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND squad_id = 'squad-second'`, s.agentId)
+    // reset batch fails: the add is never attempted
+    const failReset = { ...env, DB: new Proxy(env.DB, { get: (t, k) => (k === 'batch' ? async () => { throw new Error('batch down') } : Reflect.get(t, k).bind(t)) }) } as unknown as Env
+    expect(await instantObservedJoin(failReset, args)).toEqual({ ok: false, error: 'write_refused' })
+    expect(status(s.seatId)).toBe('trusted')
+    expect(mems()).toBe(0)
+    // reset succeeds, membership add fails: observed (restrictive), no membership
+    h.sqlite.exec(`CREATE TRIGGER fail_mem BEFORE INSERT ON memberships BEGIN SELECT RAISE(ABORT, 'injected'); END`)
+    await instantObservedJoin(env, args).catch(() => undefined)
+    expect(status(s.seatId)).toBe('observed')
+    expect(mems()).toBe(0)
+    h.sqlite.exec('DROP TRIGGER fail_mem')
+  })
+
   it('an EXPIRED membership counts as absent: a trusted seat re-joining that squad is reset; a live one is not', async () => {
     const s = await seatFor(OWNER)
     h.sqlite.prepare(`INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at) VALUES ('m-exp', ?, 'squad-second', 'member', '2026-01-02 00:00:00')`).run(s.agentId)
