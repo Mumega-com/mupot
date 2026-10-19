@@ -102,14 +102,14 @@ async function readSeatStatusByAgent(env: Env, agentId: string, seatLike: boolea
 
 /** The floor, applied at the tool chokepoint. null = allowed. An UNATTACHED seat session, or (#2060 P2) a session whose bound agent IS a
  *  seat agent even without a seatBinding, with VIP_LANE on. observed = OBSERVED_FLOOR_TOOLS; held = HELD_FLOOR_TOOLS (read only). */
-export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName: string): Promise<{ status: SeatAdmissionStatus } | null> {
-  if (!vipLaneEnabled(env)) return null
+export async function observedFloorDecision(env: Env, auth: AuthContext, toolName: string): Promise<{ refusal: { status: SeatAdmissionStatus } | null; status: SeatAdmissionStatus | null }> {
+  if (!vipLaneEnabled(env)) return { refusal: null, status: null }
   const seat = auth.seatBinding
   // An ATTACHED seat acts as the existing agent under the ceiling its human approved: the observed floor stays lifted for it (accepted), but a
   // HOLD is the human's hard stop and still applies (read-only), attached or not.
   if (seat?.attached) {
     const st = await readSeatAdmissionStatus(env, seat.seatId)
-    return st === 'held' && !HELD_FLOOR_TOOLS.has(toolName) ? { status: 'held' } : null
+    return { refusal: st === 'held' && !HELD_FLOOR_TOOLS.has(toolName) ? { status: 'held' } : null, status: st }
   }
   let status: SeatAdmissionStatus | null
   if (seat) status = await readSeatAdmissionStatus(env, seat.seatId)
@@ -118,10 +118,14 @@ export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName
     // bearer/OAuth paths with VIP_LANE on) lacks it; that case falls back to the guarded read.
     status = auth.seatAgentStatus !== undefined ? auth.seatAgentStatus : await readSeatStatusByAgent(env, auth.boundAgentId, !!auth.harnessId)
   }
-  else return null
-  if (status === null || status === 'trusted') return null
+  else return { refusal: null, status: null }
+  if (status === null || status === 'trusted') return { refusal: null, status }
   const allowed = status === 'held' ? HELD_FLOOR_TOOLS : OBSERVED_FLOOR_TOOLS
-  return allowed.has(toolName) ? null : { status }
+  return { refusal: allowed.has(toolName) ? null : { status }, status }
+}
+
+export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName: string): Promise<{ status: SeatAdmissionStatus } | null> {
+  return (await observedFloorDecision(env, auth, toolName)).refusal
 }
 
 export interface JoinTarget { id: string; slug: string; name: string; department_id: string; kind: string; status: string }
