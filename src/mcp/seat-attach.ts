@@ -67,6 +67,7 @@ const toolSeatAttach: ToolSpec = {
         status: 'already_pending',
         admission_id: r.admission_id,
         expires_at: r.expires_at,
+        ...(r.attach_code ? { attach_code: r.attach_code, tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.` } : {}),
         note: 'An admission for this agent is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page. After they approve, call seat_attach again.',
       })
     }
@@ -76,6 +77,7 @@ const toolSeatAttach: ToolSpec = {
         admission_id: r.admission_id,
         approve_url: r.approve_url,
         expires_at: r.expires_at,
+        ...(r.attach_code ? { attach_code: r.attach_code, tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.` } : {}),
         note: r.approve_url
           ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let chats from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
           : 'Pending. Your human can approve this on their Connections page (no secure-moment link is available on this pot). Nothing is attached until then; after they approve, call seat_attach again.',

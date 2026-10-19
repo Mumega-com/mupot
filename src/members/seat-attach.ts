@@ -148,6 +148,8 @@ export interface AdmissionRow {
   ceiling: AttachCeiling
   requested_via: 'tool' | 'dashboard'
   requested_seat_id: string | null
+  /** Short human code the asking chat displays; null on legacy admissions (and dashboard-made rows). Not a credential. */
+  attach_code: string | null
   created_at: string
   expires_at: string | null
   decided_at: string | null
@@ -157,12 +159,42 @@ export interface AdmissionRow {
   revoked_by_member_id: string | null
 }
 
-const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id,
+const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, ceiling, requested_via, requested_seat_id, attach_code,
   created_at, expires_at, decided_at, decided_by_member_id, decided_via, revoked_at, revoked_by_member_id`
 
 export async function loadAdmission(env: Env, id: string): Promise<AdmissionRow | null> {
   return env.DB.prepare(`SELECT ${ADMISSION_COLUMNS} FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
     .bind(id, env.TENANT_SLUG).first<AdmissionRow>()
+}
+
+// Attach code: a short code the asking chat shows its human and the /connections card repeats, so the human can tell WHICH
+// chat is asking. Unambiguous alphabet (no I, O, L, 0, 1). It is a label, not a credential: it never rides in an audit field.
+const ATTACH_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+
+export function generateAttachCode(): string {
+  const limit = 256 - (256 % ATTACH_CODE_ALPHABET.length) // rejection sampling: no modulo bias
+  let out = ''
+  while (out.length < 4) {
+    const buf = crypto.getRandomValues(new Uint8Array(8))
+    for (const b of buf) {
+      if (b < limit && out.length < 4) out += ATTACH_CODE_ALPHABET[b % ATTACH_CODE_ALPHABET.length]
+    }
+  }
+  return `${out.slice(0, 2)}-${out.slice(2)}`
+}
+
+function normalizeAttachCode(v: string): string {
+  return v.toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+/** Constant-time, case-insensitive, separator-insensitive compare (no early exit on the first differing byte). */
+export function attachCodeMatches(expected: string, given: unknown): boolean {
+  const a = normalizeAttachCode(expected)
+  const b = typeof given === 'string' ? normalizeAttachCode(given.slice(0, 32)) : ''
+  let diff = a.length ^ b.length
+  const len = Math.max(a.length, b.length)
+  for (let i = 0; i < len; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0)
+  return diff === 0 && a.length > 0
 }
 
 export function admissionIsPendingLive(row: AdmissionRow, nowMs: number): boolean {
@@ -268,13 +300,13 @@ export async function ensureAdmission(
     const expiresAt = new Date(nowMs + ADMISSION_PENDING_TTL_MS).toISOString()
     const res = await env.DB.prepare(
       `INSERT INTO agent_seat_admissions
-         (id, tenant, agent_id, human_member_id, harness_id, status, gates, requested_via, requested_seat_id, created_at, expires_at)
-       SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8
+         (id, tenant, agent_id, human_member_id, harness_id, status, gates, requested_via, requested_seat_id, created_at, expires_at, attach_code)
+       SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8, ?10
         WHERE (SELECT COUNT(*) FROM agent_seat_admissions
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 ${attachDesignatedClause(env, 'ag', '?4')})
        ON CONFLICT DO NOTHING`,
-    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN).run()
+    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode()).run()
     const inserted = res.meta.changes === 1
     pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
     if (!pending) {
@@ -299,9 +331,9 @@ export async function ensureAdmission(
 /** The human's decision on a PENDING admission (dashboard path: no secure moment). */
 export async function decideAdmissionDirect(
   env: Env,
-  p: { admissionId: string; humanMemberId: string; decision: 'approve' | 'deny'; ceiling?: AttachCeiling },
+  p: { admissionId: string; humanMemberId: string; decision: 'approve' | 'deny'; ceiling?: AttachCeiling; attachCode?: unknown },
   nowMs: number = Date.now(),
-): Promise<{ ok: true } | { ok: false; error: 'admission_not_found' | 'not_pending' | 'attach_refused' }> {
+): Promise<{ ok: true } | { ok: false; error: 'admission_not_found' | 'not_pending' | 'attach_refused' | 'attach_code_mismatch' }> {
   const adm = await loadAdmission(env, p.admissionId)
   if (!adm || adm.human_member_id !== p.humanMemberId) return { ok: false, error: 'admission_not_found' }
   if (!admissionIsPendingLive(adm, nowMs)) return { ok: false, error: 'not_pending' }
@@ -313,6 +345,8 @@ export async function decideAdmissionDirect(
     ).bind(adm.id, nowIso, p.humanMemberId, env.TENANT_SLUG).run()
     return r.meta.changes === 1 ? { ok: true } : { ok: false, error: 'not_pending' }
   }
+  // Approve needs the code the asking chat showed (legacy rows with no code are exempt). Refused BEFORE any state change.
+  if (adm.attach_code !== null && !attachCodeMatches(adm.attach_code, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
   const refusal = await admissionRefusal(env, adm)
   if (refusal) return { ok: false, error: 'attach_refused' }
   return (await promoteAdmission(env, adm, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member')) ? { ok: true } : { ok: false, error: 'not_pending' }
@@ -573,6 +607,8 @@ export interface AttachPending {
   admission_id: string
   approve_url: string | null
   expires_at: string | null
+  /** The code to show the human; null on a repeat ask from a DIFFERENT chat (it must not learn the first chat's code). */
+  attach_code: string | null
   /** A repeat ask while one was already pending: NO new link is minted (the human has one, or decides on /connections). */
   already_pending: boolean
 }
@@ -625,7 +661,9 @@ export async function attachSeatToAgent(
   }, nowMs)
   if (!admission.ok) return { ok: false, error: admission.error }
   if (admission.state === 'pending') {
-    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.approveUrl, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending }
+    // Only the chat that filed the ask learns the code; a different chat hitting the same pending row gets none.
+    const attachCode = admission.admission.requested_seat_id === seat.id ? admission.admission.attach_code : null
+    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.approveUrl, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode }
   }
   if ((await resolveAgentMemberBinding(env, agent.id)).kind !== 'bound') return { ok: false, error: 'agent_identity_unminted' }
 
@@ -780,6 +818,9 @@ export interface ConnectionAdmission {
   ceiling: AttachCeiling
   created_at: string
   expires_at: string | null
+  attach_code: string | null
+  seat_label: string | null
+  seat_first_seen: string | null
   live_threads: number
 }
 
@@ -822,11 +863,12 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
   }))
   const admissions = (await env.DB.prepare(
     `SELECT adm.id AS id, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
-            adm.expires_at AS expires_at,
+            adm.expires_at AS expires_at, adm.attach_code AS attach_code, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
             (SELECT COUNT(*) FROM agent_seat_attachments x WHERE x.admission_id = adm.id AND x.detached_at IS NULL) AS live_threads
        FROM agent_seat_admissions adm
        JOIN agents a ON a.id = adm.agent_id
        JOIN harnesses h ON h.id = adm.harness_id
+       LEFT JOIN agent_seats rs ON rs.id = adm.requested_seat_id AND rs.tenant = adm.tenant
       WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live')
       ORDER BY adm.created_at DESC LIMIT 200`,
   ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission>()).results ?? []

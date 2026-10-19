@@ -66,6 +66,8 @@ let h: SqliteD1Harness
 let tokCounter = 0
 const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
 const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare(sql).get(...p) as T | undefined
+/** The attach code a tool-made pending admission carries (the human types it on Admit). */
+const codeOf = (id: string): string | null => one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions WHERE id = ?`, id)?.attach_code ?? null
 
 function seedHuman(id: string, email = `${id}@example.test`): void {
   h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('${id}', '${email}', 'Human ${id}', 'active', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
@@ -362,7 +364,7 @@ describe('designated agent: attach, then the chat IS that agent (end to end)', (
     expect(JSON.stringify(res.body)).toContain('agent_not_designated')
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     const admId = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
-    expect(await decideAdmissionDirect(on, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve' })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(await decideAdmissionDirect(on, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(admId) })).toEqual({ ok: false, error: 'attach_refused' })
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
   })
 
@@ -620,7 +622,7 @@ describe('un-designation ends the events path, elevation, and cannot be revived 
           return typeof v === 'function' ? v.bind(target) : v
         },
       })
-      const r = await decideAdmissionDirect({ ...env, DB: racing } as Env, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve' })
+      const r = await decideAdmissionDirect({ ...env, DB: racing } as Env, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(admId) })
       expect(raced).toBe(true)
       expect(r).toEqual({ ok: false, error: 'not_pending' })
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
@@ -812,7 +814,7 @@ describe('codex review dispositions', () => {
     dropTrigger()
     const admId = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
     const racing = raceOnBatch(env, async () => { expect((await designate(env, 'agent-bare', null)).ok).toBe(true) })
-    const r = await decideAdmissionDirect(racing, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve' })
+    const r = await decideAdmissionDirect(racing, { admissionId: admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(admId) })
     expect(r).toEqual({ ok: false, error: 'not_pending' })
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-bare'`)).toBe(0)
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE agent_id = 'agent-bare' AND action = 'identity_weld'`)).toBe(0)

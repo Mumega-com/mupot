@@ -91,7 +91,9 @@ function connectionsScript(): Html {
         for (var a = 0; a < ap.length; a++) ap[a].addEventListener('click', function (ev) {
           var id = ev.currentTarget.getAttribute('data-cx-approve');
           var cs = document.querySelector('select[data-cx-aceiling="' + id + '"]');
-          post('/connections/admissions/' + encodeURIComponent(id) + '/approve', { ceiling: cs ? cs.value : 'member' });
+          var ci = document.querySelector('input[data-cx-acode="' + id + '"]');
+          if (ci && !ci.value.trim()) { say('Type the attach code the chat told you, from the card showing it.'); return; }
+          post('/connections/admissions/' + encodeURIComponent(id) + '/approve', { ceiling: cs ? cs.value : 'member', attach_code: ci ? ci.value : undefined });
         });
         var rn = document.querySelectorAll('button[data-cx-rename]');
         for (var r = 0; r < rn.length; r++) rn[r].addEventListener('click', function (ev) {
@@ -134,13 +136,16 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
   const pendingBody = pending.length === 0
     ? emptyState({ title: 'Nothing waiting', detail: 'When a thread asks to act as an agent you have not admitted yet, it appears here (and as a one-time passkey link it hands you).' })
     : dataTable({
-      cols: [{ label: 'Agent', width: '1.2fr' }, { label: 'App', width: '1.2fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.4fr' }],
+      cols: [{ label: 'Attach code', width: '0.8fr' }, { label: 'Agent', width: '1.2fr' }, { label: 'App / chat', width: '1.4fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.8fr' }],
       rows: pending.map((a) => [
+        a.attach_code
+          ? html`<strong data-cx-code-shown="${a.id}" style="font-size:1.4rem;letter-spacing:0.1em">${a.attach_code}</strong>`
+          : html`${pill('no code (older request)', 'dim')}`,
         html`${a.agent_name}`,
-        html`${a.harness_name}`,
+        html`${a.harness_name}${a.seat_label ? html` · ${a.seat_label}` : ''}${a.seat_first_seen ? html` (first seen ${formatWhen(a.seat_first_seen)})` : ''}`,
         html`${formatWhen(a.created_at)}`,
         enabled
-          ? html`<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
+          ? html`${a.attach_code ? html`<input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat"> ` : ''}<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
           : html`${pill('Disabled', 'dim')}`,
       ]),
       empty: '',
@@ -292,8 +297,9 @@ export function makeConnectionsApp(shell: ShellFn) {
     if (!seatAttachEnabled(c.env)) return c.json({ error: 'seat_attach_disabled' }, 403)
     const body: unknown = await c.req.json().catch(() => ({}))
     const rawCeiling = typeof body === 'object' && body !== null && 'ceiling' in body ? body.ceiling : undefined
-    const r = await decideAdmissionDirect(c.env, { admissionId: c.req.param('id').trim(), humanMemberId: g.memberId, decision: 'approve', ceiling: isAttachCeiling(rawCeiling) ? rawCeiling : 'member' })
-    return r.ok ? c.json({ ok: true }) : c.json({ error: r.error }, r.error === 'admission_not_found' ? 404 : 409)
+    const attachCode = typeof body === 'object' && body !== null && 'attach_code' in body ? body.attach_code : undefined
+    const r = await decideAdmissionDirect(c.env, { admissionId: c.req.param('id').trim(), humanMemberId: g.memberId, decision: 'approve', ceiling: isAttachCeiling(rawCeiling) ? rawCeiling : 'member', attachCode })
+    return r.ok ? c.json({ ok: true }) : c.json({ error: r.error }, r.error === 'admission_not_found' ? 404 : r.error === 'attach_code_mismatch' ? 403 : 409)
   })
 
   app.post('/connections/admissions/:id/deny', async (c) => {

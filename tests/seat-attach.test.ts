@@ -63,6 +63,8 @@ let h: SqliteD1Harness
 let tokCounter = 0
 const n = (sql: string, ...p: unknown[]): number => Number(h.sqlite.prepare(sql).get(...p)!.n)
 const one = <T>(sql: string, ...p: unknown[]): T | undefined => h.sqlite.prepare(sql).get(...p) as T | undefined
+/** The attach code a tool-made pending admission carries (the human types it on Admit). */
+const codeOf = (id: string): string | null => one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions WHERE id = ?`, id)?.attach_code ?? null
 
 function seedHuman(id: string, email = `${id}@example.test`): void {
   h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('${id}', '${email}', 'Human ${id}', 'active', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
@@ -549,7 +551,7 @@ describe('who may be attached, and who may call', () => {
     h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`)
     const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'pending'`)!
     void pend
-    expect(await decideAdmissionDirect(env, { admissionId: adm.id, humanMemberId: HUMAN, decision: 'approve' })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(await decideAdmissionDirect(env, { admissionId: adm.id, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(adm.id) })).toEqual({ ok: false, error: 'attach_refused' })
     expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id = 'agent-rava'`)).toBe(1) // not re-welded
   })
 
@@ -1066,7 +1068,7 @@ describe('dashboard: Connections', () => {
     expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'https://evil.test')).status).toBe(403)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     // the page origin (what a browser sends under same-origin) passes the guard
-    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'http://localhost')).status).toBe(200)
+    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) }, 'http://localhost')).status).toBe(200)
   })
 
   it('detach and revoke need only a real session (no fresh reauth) and work with SEAT_ATTACH off', async () => {
@@ -1099,8 +1101,104 @@ describe('dashboard: Connections', () => {
     stale()
     expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBeGreaterThanOrEqual(401)
     fresh()
-    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(200)
+    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) })).status).toBe(200)
     expect(one(`SELECT status, decided_via FROM agent_seat_admissions`)).toMatchObject({ status: 'live', decided_via: 'dashboard' })
+  })
+
+  // mupot#2054: the Admit card is tied to the asking chat by a short code.
+  describe('attach code (#2054)', () => {
+    const pendingFor = async (env: Env) => {
+      const g = await grant(env, HUMAN)
+      await boot(env, g, 'conv-a')
+      const r = await attach(env, g, 'conv-a', 'rava')
+      const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
+      return { g, r, adm }
+    }
+
+    it('seat_attach returns the code with the instruction, and the same code is stored on the admission', async () => {
+      const env = envFor(h)
+      const { r, adm } = await pendingFor(env)
+      const code = String(r.sc.attach_code)
+      expect(code).toMatch(/^[A-HJ-KM-NP-Z2-9]{2}-[A-HJ-KM-NP-Z2-9]{2}$/)
+      expect(codeOf(adm)).toBe(code)
+      expect(r.sc.tell_the_person).toBe(`Tell the person: your attach code is ${code}. Press Admit only on the card showing this code.`)
+      // never in an audit field another agent can read
+      expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE fields_changed LIKE ? OR before_state LIKE ? OR after_state LIKE ?`, `%${code}%`, `%${code}%`, `%${code}%`)).toBe(0)
+    })
+
+    it('a repeat ask from the SAME chat shows the code again; a DIFFERENT chat on the same pending row never learns it', async () => {
+      const env = envFor(h)
+      const { g, r } = await pendingFor(env)
+      const again = await attach(env, g, 'conv-a', 'rava')
+      expect(again.sc.status).toBe('already_pending')
+      expect(again.sc.attach_code).toBe(r.sc.attach_code)
+      await boot(env, g, 'conv-b')
+      const other = await attach(env, g, 'conv-b', 'rava')
+      expect(other.sc.attach_code).toBeUndefined()
+      expect(JSON.stringify(other.body)).not.toContain(String(r.sc.attach_code))
+    })
+
+    it('the /connections card shows the code, the seat label and first-seen time, escaped', async () => {
+      const env = envFor(h)
+      const { r } = await pendingFor(env)
+      h.sqlite.prepare(`UPDATE harnesses SET client_name = ?`).run('<img src=x onerror=alert(1)>')
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      const page = await (await dash(env, cookie, '/connections')).text()
+      expect(page).toContain(`>${String(r.sc.attach_code)}</strong>`)
+      expect(page).toContain('first seen')
+      expect(page).toContain('data-cx-acode=')
+      expect(page).not.toContain('<img src=x')
+      expect(page).toContain('&lt;img src=x')
+    })
+
+    it('approve with the right code (any case, no dash) goes live', async () => {
+      const env = envFor(h)
+      const { r, adm } = await pendingFor(env)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      fresh()
+      const typed = String(r.sc.attach_code).toLowerCase().replace('-', '')
+      expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: typed })).status).toBe(200)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
+    })
+
+    it('a wrong or missing code is refused (attach_code_mismatch) and the admission stays pending; deny needs no code', async () => {
+      const env = envFor(h)
+      const { r, adm } = await pendingFor(env)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      fresh()
+      const real = String(r.sc.attach_code)
+      const wrong = real.startsWith('AA') ? 'BB-BB' : 'AA-AA'
+      for (const body of [{ attach_code: wrong }, {}, { attach_code: '' }, { attach_code: 42 }, { attach_code: real.slice(0, 3) }]) {
+        const res = await dash(env, cookie, `/connections/admissions/${adm}/approve`, body)
+        expect(res.status).toBe(403)
+        expect(await res.json()).toEqual({ error: 'attach_code_mismatch' })
+        expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+      }
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
+      expect((await dash(env, cookie, `/connections/admissions/${adm}/deny`, {})).status).toBe(200)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('denied')
+    })
+
+    it('a legacy pending admission with a NULL code still approves without one', async () => {
+      const env = envFor(h)
+      const { adm } = await pendingFor(env)
+      h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = NULL WHERE id = ?`).run(adm)
+      const cookie = await session(env, `${HUMAN}@example.test`)
+      fresh()
+      expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(200)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
+    })
+
+    it('codes are generated from the unambiguous alphabet and differ between calls', async () => {
+      const { generateAttachCode, attachCodeMatches } = await import('../src/members/seat-attach')
+      const seen = new Set<string>()
+      for (let i = 0; i < 200; i++) { const c = generateAttachCode(); expect(c).toMatch(/^[A-HJ-KM-NP-Z2-9]{2}-[A-HJ-KM-NP-Z2-9]{2}$/); seen.add(c) }
+      expect(seen.size).toBeGreaterThan(150)
+      expect(attachCodeMatches('K7-QX', 'k7qx')).toBe(true)
+      expect(attachCodeMatches('K7-QX', 'K7-QY')).toBe(false)
+      expect(attachCodeMatches('K7-QX', 'K7-QXX')).toBe(false)
+      expect(attachCodeMatches('K7-QX', undefined)).toBe(false)
+    })
   })
 })
 

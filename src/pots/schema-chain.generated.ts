@@ -4255,9 +4255,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_messages_reply_cap" },
     ],
   },
+  {
+    file: "0240_admission_attach_code.sql",
+    sha256: "fa593a2363443186f42dc9cca9781a04e3653a26f64fec0a176c5de3c3519a07",
+    statements: [
+      "-- 0240_admission_attach_code.sql — mupot#2054. A pending seat admission carries a short human code that the asking chat\n-- shows its human and the /connections card repeats, so \"Admit\" can be tied to the chat that asked. Additive; NULL on\n-- every pre-existing row (legacy: Admit works without a code). A label, not a credential.\nALTER TABLE agent_seat_admissions ADD COLUMN attach_code TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "daed280b2ee24fb3fce54ecd6fd2769dc0f53251439dded16a65403189153a23"
+export const SCHEMA_CHAIN_DIGEST: string = "a436b2e3ea12abd5a7ff29b219978b65f1c48e1dfe657efac034555530e99dfb"
