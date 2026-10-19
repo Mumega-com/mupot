@@ -1,4 +1,4 @@
--- 0247 approval bot ("/muapprove"): a dedicated Telegram bot, owned by the worker, delivers an elevation request to the
+-- 0248 approval bot ("/muapprove"): a dedicated Telegram bot, owned by the worker, delivers an elevation request to the
 -- deciding human's bound private chat and takes the Approve / Deny tap (or /muapprove <id>, /mudeny <id>, /murevoke).
 --
 -- elevation_requests.short_id    the id the human types or taps. Assigned lazily when a request is offered to the bot,
