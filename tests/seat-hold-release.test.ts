@@ -14,7 +14,7 @@ import { advertisedTools, mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
-import { HELD_FLOOR_TOOLS, OBSERVED_FLOOR_TOOLS, observedFloorRefusal } from '../src/members/vip-lane'
+import { HELD_FLOOR_TOOLS, OBSERVED_FLOOR_TOOLS, instantObservedJoin, observedFloorRefusal } from '../src/members/vip-lane'
 import { changeSeatAdmission } from '../src/members/seat-hold-release'
 import type { AuthContext, Env } from '../src/types'
 
@@ -277,6 +277,39 @@ describe('trust does not carry across squads (P1-b)', () => {
   })
 })
 
+describe('rejoin ordering, liveness, and held-over-attach (CI + Codex fixes)', () => {
+  it('a failed join leaves a trusted seat trusted (reset only after the eligibility re-check and the write succeed)', async () => {
+    const s = await seatFor(OWNER)
+    seedSquad('squad-nobody')
+    setStatus(s.seatId, 'trusted')
+    const squad = one<{ id: string; slug: string; name: string; department_id: string; kind: string; status: string }>(`SELECT id, slug, name, department_id, kind, status FROM squads WHERE id = 'squad-nobody'`)!
+    const r = await instantObservedJoin(env, { humanMemberId: OWNER, seatId: s.seatId, seatAgentId: s.agentId, squad, grants: [] as never })
+    expect(r).toEqual({ ok: false, error: 'standing_lost' })
+    expect(status(s.seatId)).toBe('trusted')
+    expect(audit(s.seatId)).toEqual([])
+  })
+
+  it('an EXPIRED membership counts as absent: a trusted seat re-joining that squad is reset; a live one is not', async () => {
+    const s = await seatFor(OWNER)
+    h.sqlite.prepare(`INSERT INTO memberships (id, agent_id, squad_id, capability, expires_at) VALUES ('m-exp', ?, 'squad-second', 'member', '2026-01-02 00:00:00')`).run(s.agentId)
+    setStatus(s.seatId, 'trusted')
+    expect((await rpc(s.ctx, 'join_squad', { squad: 'squad-second' }, s.session)).sc.admission_status).toBe('observed')
+    expect(audit(s.seatId).map((a) => a.action)).toEqual(['rejoin_reset'])
+  })
+
+  it('HELD overrides attach: an attached seat on hold is read-only; observed+attached stays lifted', async () => {
+    const s = await seatFor(OWNER)
+    const attached = { ...s.ctx, seatBinding: { seatId: s.seatId, label: 'x', harnessId: 'h', grantTokenId: 't', humanMemberId: OWNER, source: 'handle', attached: { attachmentId: 'a', admissionId: 'ad', agentId: 'other', seatAgentId: s.agentId, ceiling: 'member' } } } as AuthContext
+    setStatus(s.seatId, 'observed')
+    expect(await observedFloorRefusal(env, attached, 'request_elevation')).toBeNull()
+    setStatus(s.seatId, 'held')
+    expect(await observedFloorRefusal(env, attached, 'task_create')).toEqual({ status: 'held' })
+    expect(await observedFloorRefusal(env, attached, 'task_list')).toBeNull()
+    setStatus(s.seatId, 'trusted')
+    expect(await observedFloorRefusal(env, attached, 'task_create')).toBeNull()
+  })
+})
+
 describe('REST bearer sweep (P1-c) and read-error posture', () => {
   it('resolveMemberByToken refuses a token bound to an observed/held seat agent, allows trusted/NULL, and is inert with the flag off', async () => {
     const { resolveMemberByToken, hashMemberToken } = await import('../src/auth/member-bearer')
@@ -291,6 +324,9 @@ describe('REST bearer sweep (P1-c) and read-error posture', () => {
     }
     setStatus(s.seatId, 'observed')
     expect(await resolveMemberByToken(envFor(h, { VIP_LANE: undefined }), raw)).not.toBeNull()
+    // a token with no bound agent (an ordinary member/agent credential) is unaffected
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('tok-plain', ?, ?, 'x', 'workspace', '2026-10-09T00:00:00.000Z', ?)`).run(OWNER, await hashMemberToken('plain-token'), TENANT)
+    expect(await resolveMemberByToken(env, 'plain-token')).not.toBeNull()
   })
 
   it('by-agent floor: a retired seat is not floored; a read error floors a seat-like caller (harness) but never an ordinary agent', async () => {

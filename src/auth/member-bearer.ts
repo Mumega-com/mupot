@@ -13,7 +13,7 @@ import type { Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from './token-lifecycle'
 import { authLookupOrNull } from './fail-closed'
-import { seatAgentIsFloored } from '../members/vip-lane'
+import { vipLaneEnabled } from '../members/vip-lane'
 
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
@@ -53,13 +53,25 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
   return authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw))
 }
 
+/** #2060 P1-c: the seat status rides the ONE token query (no second read that could fail open). VIP_LANE off = no join, no column read.
+ *  A seat row that is observed/held (or any unknown value) floors the bearer; a non-seat agent (no seat row) and trusted/NULL are unaffected. */
+function seatFloorSql(env: Env): { select: string; join: string } {
+  return vipLaneEnabled(env)
+    ? { select: ', s.admission_status AS seat_status, s.id AS seat_row_id', join: 'LEFT JOIN agent_seats s ON s.agent_id = t.agent_id AND s.tenant = t.tenant AND s.retired_at IS NULL' }
+    : { select: ', NULL AS seat_status, NULL AS seat_row_id', join: '' }
+}
+const seatRowFloors = (row: { seat_row_id: string | null; seat_status: string | null }): boolean =>
+  typeof row.seat_row_id === 'string' && typeof row.seat_status === 'string' && row.seat_status !== 'trusted'
+
 async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<AgentIdentity | null> {
   if (!raw) return null
   const tokenHash = await hashMemberToken(raw)
+  const sf = seatFloorSql(env)
   const row = await env.DB.prepare(
-    `SELECT t.id AS token_id, m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id
+    `SELECT t.id AS token_id, m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       ${sf.join}
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
@@ -76,11 +88,11 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
-    .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null }>()
+    .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null; seat_status: string | null; seat_row_id: string | null }>()
   if (!row || row.status !== 'active') return null
   // #2060 P1-c: every REST surface resolves its bearer here. A seat agent that is observed/held has no REST reach (the observed floor is
   // MCP tool names; REST routes are not on it), so a human-minted token bound to such a seat agent resolves to nobody. VIP_LANE off = no-op.
-  if (await seatAgentIsFloored(env, row.bound_agent_id)) return null
+  if (seatRowFloors(row)) return null
   // 0099: best-effort usage stamp, same contract as the mcp/index.ts copy — telemetry
   // that makes cleanup possible, never an authorization input.
   void touchTokenLastUsed(env, tokenHash)
@@ -104,10 +116,12 @@ export async function memberTokenHashIsLive(
   expectedMemberId: string,
 ): Promise<boolean> {
   if (!tokenHash || !expectedMemberId) return false
+  const sf = seatFloorSql(env)
   const row = await env.DB.prepare(
-    `SELECT m.id AS member_id, m.status AS status, t.agent_id AS bound_agent_id
+    `SELECT m.id AS member_id, m.status AS status, t.agent_id AS bound_agent_id${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
+       ${sf.join}
       WHERE t.token_hash = ?1
         AND t.tenant = ?2
         AND m.tenant = ?2
@@ -116,8 +130,8 @@ export async function memberTokenHashIsLive(
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
-    .first<{ member_id: string; status: string; bound_agent_id: string | null }>()
-  if (row && (await seatAgentIsFloored(env, row.bound_agent_id))) return false // #2060 P1-c: a live presence socket drops when its seat is observed/held
+    .first<{ member_id: string; status: string; bound_agent_id: string | null; seat_status: string | null; seat_row_id: string | null }>()
+  if (row && seatRowFloors(row)) return false // #2060 P1-c: a live presence socket drops when its seat is observed/held
   return !!row && row.status === 'active' && row.member_id === expectedMemberId
 }
 

@@ -100,19 +100,17 @@ async function readSeatStatusByAgent(env: Env, agentId: string, seatLike: boolea
   }
 }
 
-/** REST surfaces (resolveMemberByToken): true when this bearer's bound agent is a seat agent that is observed or held. VIP_LANE off = false, nothing read. */
-export async function seatAgentIsFloored(env: Env, agentId: string | null): Promise<boolean> {
-  if (!agentId || !vipLaneEnabled(env)) return false
-  const st = await readSeatStatusByAgent(env, agentId, false)
-  return st === 'observed' || st === 'held'
-}
-
 /** The floor, applied at the tool chokepoint. null = allowed. An UNATTACHED seat session, or (#2060 P2) a session whose bound agent IS a
  *  seat agent even without a seatBinding, with VIP_LANE on. observed = OBSERVED_FLOOR_TOOLS; held = HELD_FLOOR_TOOLS (read only). */
 export async function observedFloorRefusal(env: Env, auth: AuthContext, toolName: string): Promise<{ status: SeatAdmissionStatus } | null> {
   if (!vipLaneEnabled(env)) return null
   const seat = auth.seatBinding
-  if (seat?.attached) return null
+  // An ATTACHED seat acts as the existing agent under the ceiling its human approved: the observed floor stays lifted for it (accepted), but a
+  // HOLD is the human's hard stop and still applies (read-only), attached or not.
+  if (seat?.attached) {
+    const st = await readSeatAdmissionStatus(env, seat.seatId)
+    return st === 'held' && !HELD_FLOOR_TOOLS.has(toolName) ? { status: 'held' } : null
+  }
   let status: SeatAdmissionStatus | null
   if (seat) status = await readSeatAdmissionStatus(env, seat.seatId)
   else if (auth.boundAgentId) status = await readSeatStatusByAgent(env, auth.boundAgentId, !!auth.harnessId)
@@ -178,11 +176,6 @@ export async function instantObservedJoin(
   if (p.squad.kind === 'home' || p.squad.status === 'archived') return { ok: false, error: 'squad_not_joinable' }
   const status = await readSeatAdmissionStatus(env, p.seatId)
   if (status === 'held') return { ok: false, error: 'seat_held' }
-  // Trust does not carry across squads: a trusted seat joining a squad it is not a member of yet starts observed again (audited).
-  if (status === 'trusted') {
-    const already = await env.DB.prepare(`SELECT 1 AS x FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`).bind(p.seatAgentId, p.squad.id).first<{ x: number }>()
-    if (!already) await resetTrustedOnRejoin(env, { humanMemberId: p.humanMemberId, seatId: p.seatId })
-  }
   // Re-derive standing NOW, at the write (the caller's grants may be stale by a few awaits): same function, fresh read. This narrows the
   // window between check and write; it does not make them one statement (a demotion landing between this line and the write still wins the race).
   const grants = await resolveCapabilities(env, p.humanMemberId)
@@ -195,7 +188,7 @@ export async function instantObservedJoin(
   if (now === null || now === 'held') return { ok: false, error: 'seat_held' }
   const squad = { id: p.squad.id, slug: p.squad.slug, name: p.squad.name }
 
-  const existing = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1`)
+  const existing = await env.DB.prepare(`SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('', "datetime('now')")} LIMIT 1`)
     .bind(p.seatAgentId, p.squad.id).first<{ capability: string }>()
   if (existing) {
     // Idempotent: same membership, no second receipt. A higher standing someone else gave this seat is kept, never lowered.
@@ -209,6 +202,11 @@ export async function instantObservedJoin(
     capability: OBSERVED_TIER as 'member', neverLower: true, via: 'squad_join',
   })
   if (!w.ok) return { ok: false, error: 'write_refused' }
+  // Trust does not carry across squads: a TRUSTED seat that has just gained membership in a NEW squad starts observed there (audited). Done only
+  // AFTER the eligibility re-check and the membership write succeeded, so a refused join leaves trusted intact.
+  if (now === 'trusted' && (await resetTrustedOnRejoin(env, { humanMemberId: p.humanMemberId, seatId: p.seatId }))) {
+    return { ok: true, admission_status: 'observed', membership: 'created', squad }
+  }
   return { ok: true, admission_status: now, membership: 'created', squad }
 }
 
