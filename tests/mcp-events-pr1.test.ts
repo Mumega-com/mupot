@@ -197,7 +197,7 @@ describe('flag-off / legacy surface is byte-identical to main', () => {
 
   it('tools/list tool NAMES are unchanged, flag off and on (derived from the registry, not a frozen body)', async () => {
     // SEAT_AUTO_ENROLL / ACCESS_APPROVE_ENABLED are unset in this env: flag-gated seat_select (mupot#1794), seed_attach_request and moment_miniapp_link (TELEGRAM_MINIAPP) are not advertised.
-    const expected = TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => wireName(t.name))
+    const expected = TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'join_squad' && t.name !== 'inbox_mark_handled' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => wireName(t.name))
     for (const flag of [undefined, 'true']) {
       const { text } = await rawRpc('tools/list', undefined, { events: flag })
       const names = (parse(text).result?.tools as { name: string }[]).map((t) => t.name)

@@ -129,6 +129,33 @@ async function findPending(env: Env, agentId: string, squadKey: string, nowIso: 
   ).bind(env.TENANT_SLUG, agentId, squadKey, nowIso).first<SquadJoinRow>()
 }
 
+/** Is a live pending request for this (agent, ref) already filed? The VIP lane asks BEFORE filing so a repeat join_squad does not
+ *  rotate the link and re-notify the approvers (one card, not a second). Same key derivation as fileSquadJoinRequest. */
+export async function hasLivePendingJoin(env: Env, agentId: string, squadRef: string, nowMs: number = Date.now()): Promise<boolean> {
+  return (await findPending(env, agentId, `ref:${squadRef.trim().toLowerCase()}`, new Date(nowMs).toISOString())) !== null
+}
+
+/**
+ * A pending request can exist WITHOUT a link (the row was inserted, then issueMomentLink failed). For a pending row with no live
+ * moment, make the link now and notify the approvers; with a live moment there is nothing to do (no rotation, no re-notify).
+ * 'none' = no live pending row. 'link_pending' = still no link (the caller says so honestly and the next repeat retries).
+ */
+export async function completePendingJoinCard(
+  env: Env, agentId: string, squadRef: string, waitUntil?: WaitUntil, nowMs: number = Date.now(),
+): Promise<'complete' | 'link_pending' | 'none'> {
+  const row = await findPending(env, agentId, `ref:${squadRef.trim().toLowerCase()}`, new Date(nowMs).toISOString())
+  if (!row) return 'none'
+  const live = await env.DB.prepare(`SELECT 1 AS x FROM secure_moments WHERE kind = 'squad_join' AND subject_id = ?1 AND status = 'pending' LIMIT 1`).bind(row.id).first<{ x: number }>()
+  if (live) return 'complete'
+  const agent = await env.DB.prepare(`SELECT name FROM agents WHERE id = ?1 LIMIT 1`).bind(agentId).first<{ name: string }>()
+  const link = await issueMomentLink(env, { kind: 'squad_join', subjectId: row.id, requesterAgentId: agentId, subjectExpiresAtIso: row.expires_at })
+  if (!link) return 'link_pending'
+  const notice = notifyApprovers(env, row, link.url, agent?.name ?? '')
+  if (waitUntil) waitUntil(notice)
+  else await notice
+  return 'complete'
+}
+
 /**
  * File (or re-issue) the request and mint its link. Never reveals anything about the squad: the squad is resolved here only
  * to key the dedupe row and to show the APPROVER later. The caller (the tool) has already established WHICH agent is asking
@@ -136,14 +163,16 @@ async function findPending(env: Env, agentId: string, squadKey: string, nowIso: 
  */
 export async function fileSquadJoinRequest(
   env: Env,
-  p: { agentId: string; squadRef: string; capability: JoinCapability; reason: string | null; via: 'agent' | 'attached_chat'; waitUntil?: WaitUntil },
+  p: { agentId: string; squadRef: string; capability: JoinCapability; reason: string | null; via: 'agent' | 'attached_chat'; waitUntil?: WaitUntil;
+    /** VIP lane only (join_squad): the asker is a harness SEAT's own agent, which squad_join_request refuses. The approver still decides with a passkey. */
+    allowSeatAgent?: boolean },
   nowMs: number = Date.now(),
 ): Promise<FileJoinResult> {
   if (secureMomentsStatus(env).state !== 'on') return { ok: false, error: 'secure_moments_unavailable' }
   const agent = await env.DB.prepare(`SELECT name, status FROM agents WHERE id = ?1 LIMIT 1`).bind(p.agentId).first<{ name: string; status: string }>()
   if (!agent || agent.status !== 'active') return { ok: false, error: 'agent_inactive' }
   const seatAgent = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE agent_id = ?1 LIMIT 1`).bind(p.agentId).first<{ x: number }>()
-  if (seatAgent) return { ok: false, error: 'agent_is_seat_agent' }
+  if (seatAgent && !p.allowSeatAgent) return { ok: false, error: 'agent_is_seat_agent' }
   if (!(await underRateLimit(env, p.agentId, nowMs))) return { ok: false, error: 'rate_limited' }
 
   const nowIso = new Date(nowMs).toISOString()

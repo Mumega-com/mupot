@@ -214,6 +214,8 @@ import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { VIP_LANE_TOOLS } from './vip-lane'
+import { observedFloorRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -1670,6 +1672,10 @@ const toolTaskUpdate: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
+
+    // #2035 wall 1: an OBSERVED seat updates only its own assigned tasks, never gate/assignee fields, never closes a gated task.
+    const observedTaskRefusal = await observedTaskUpdateRefusal(env, auth, existing, args)
+    if (observedTaskRefusal) return fail(403, 'observed_floor', observedTaskRefusal)
 
     // mupot#1592 NEW-1, keyed per mupot#1602 r2 on freeze existence rather than
     // gate_owner (r2 BLOCK P1 — see officeTaskContentLocked's own doc comment,
@@ -7561,6 +7567,7 @@ export const TOOLS: ToolSpec[] = [
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
   ...SEAT_ATTACH_TOOLS,
+  ...VIP_LANE_TOOLS,
   ...SQUAD_JOIN_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
@@ -7664,7 +7671,7 @@ export function longestSuffixTool(lower: string, names: Iterable<string>, allowe
   }
   return best
 }
-export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): string {
+export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE'>): string {
   // Only a tool this pot ADVERTISES is ever suggested (a flag-gated tool that is off stays undisclosed), and it is
   // suggested under its ADVERTISED wire name (an office.* tool is suggested as office_*).
   const advertised = new Set(advertisedTools(env).map((t) => t.name))
@@ -7704,6 +7711,8 @@ const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.ma
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
 // squad_join_request needs the passkey-class decision page, so it is advertised only while SECURE_MOMENTS is usable (flag off => tools/list unchanged).
 const SQUAD_JOIN_FLAG_TOOLS: ReadonlySet<string> = new Set(SQUAD_JOIN_TOOLS.map((t) => t.name))
+// #2035 wall 1: join_squad is advertised only while VIP_LANE is on (flag off => tools/list unchanged; a direct call refuses in invokeTool).
+const VIP_LANE_FLAG_TOOLS: ReadonlySet<string> = new Set(VIP_LANE_TOOLS.map((t) => t.name))
 // Secure drops (W2): the five drop tools are not advertised while SECURE_DROP is off, and a direct call refuses
 // in invokeTool before argument handling (so a flag-off pot never reveals their schemas).
 const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.map((t) => t.name))
@@ -7711,7 +7720,7 @@ const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.ma
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
 // Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
 const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
@@ -7719,8 +7728,9 @@ export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH
   const workspaces = workspacesEnabled(env)
   const attach = seatAttachEnabled(env)
   const moments = secureMomentsEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces && attach && moments) return TOOLS
-  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
+  const vip = vipLaneEnabled(env)
+  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip) return TOOLS
+  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -8010,6 +8020,19 @@ async function invokeToolInner(
 
   if (SQUAD_JOIN_FLAG_TOOLS.has(spec.name) && !secureMomentsEnabled(env)) {
     return { ...fail(503, 'secure_moments_unavailable', 'Approval links are not enabled on this pot, so a join request cannot be made.'), tool: spec.name }
+  }
+
+  if (VIP_LANE_FLAG_TOOLS.has(spec.name) && !vipLaneEnabled(env)) {
+    return { ...fail(403, 'vip_lane_disabled', 'The VIP lane is not enabled on this pot.'), tool: spec.name }
+  }
+
+  // #2035 wall 1: the OBSERVED FLOOR. A seat whose agent_seats.admission_status is observed (or held) may call only
+  // OBSERVED_FLOOR_TOOLS; decided per tool NAME, re-read from the seat row on every call, before args handling and the capability floor.
+  {
+    const floor = await observedFloorRefusal(env, auth, spec.name)
+    if (floor) {
+      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). An owner of the squad lifts it.` }), tool: spec.name }
+    }
   }
 
   if (SEAT_ATTACH_FLAG_TOOLS.has(spec.name) && !seatAttachEnabled(env)) {

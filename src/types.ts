@@ -361,6 +361,9 @@ export interface Env {
   // Admission by observation P0 (SHADOW ONLY): strict '1' taps every seat tool call into the seat_tape (shape-only, waitUntil)
   // and adds whoami.admission for a seat with a status. Never blocks or changes a status. Unset = total no-op.
   ADMISSION_TAPE?: string
+  // #2035 wall 1 (VIP lane): strict '1' turns on join_squad (an owner/org-admin's seat joins a squad instantly as OBSERVED) and enforces the
+  // observed floor on every call of a seat whose agent_seats.admission_status is observed/held. Unset = tool absent, no floor read, total no-op.
+  VIP_LANE?: string
   // #2025: a flight landing requires evidence (result submission from the flight agent + independent verdict). Default ON;
   // set to exactly "0" to roll back. Anything else, including unset, keeps it required.
   LAND_REQUIRES_EVIDENCE?: string
