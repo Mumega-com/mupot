@@ -2136,7 +2136,7 @@ function agentDesignationControl(agent: Agent, view: NonNullable<AgentOwnerView[
     </form>`
 }
 
-// POST /agents/:id/designation. Gate order: flag, same-origin (plus csrf() on dashboardApp), a REAL web session of an active
+// POST /agents/:id/designation. Gate order: flag, form content type (cross-origin is csrf() on dashboardApp), a REAL web session of an active
 // human (Allow additionally needs a re-auth within five minutes: checkWebSession fresh:true, the dashboard's step-up rule;
 // Stop only reduces authority so needs the real session, as operator revoke does), THEN the one door
 // (authorizeOwnerMemberChange, 'attach_designated_member_id': org floor, rank ceilings, no self waiver, seats/attached refused)
@@ -2145,7 +2145,13 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
   c.header('Cache-Control', 'no-store')
   const deny = (status: 400 | 403 | 404 | 409, msg: string) => c.html(shell(c.env, 'Attach designation', errorBody(msg)), status)
   if (!seatAttachDesignatedEnabled(c.env)) return deny(404, 'Not enabled.')
-  if (c.req.header('origin') !== new URL(c.req.url).origin) return deny(403, 'Cross-origin request refused.')
+  // Origin is csrf()'s job (dashboardApp.use('*', csrf())), exactly as for every other dashboard POST. A hand-rolled
+  // comparison against c.req.url's origin refused real browsers in production. csrf() only inspects form content types,
+  // so a JSON/text body must be refused here, before parseBody.
+  const ctype = (c.req.header('content-type') ?? '').toLowerCase()
+  if (!ctype.startsWith('application/x-www-form-urlencoded') && !ctype.startsWith('multipart/form-data')) {
+    return c.html(shell(c.env, 'Attach designation', errorBody('Form submissions only.')), 415)
+  }
   const auth = c.get('auth')
   const form = await c.req.parseBody()
   const action = typeof form.action === 'string' ? form.action : ''

@@ -107,7 +107,7 @@ describe('POST /agents/:id/designation', () => {
     expect(designee()).toBeNull()
   })
 
-  it('a missing or cross-origin Origin is refused, no write', async () => {
+  it('a missing or cross-origin Origin is refused by csrf() like the owner form, no write; same-origin form passes csrf', async () => {
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     expect((await post(env, cookie, 'allow', null)).status).toBe(403)
@@ -115,13 +115,17 @@ describe('POST /agents/:id/designation', () => {
     expect(designee()).toBeNull()
   })
 
-  it('the explicit Origin check holds for a content type csrf() does not inspect', async () => {
+  it('a non-form content type (which csrf() does not inspect) is refused 415 before parsing, even same-origin', async () => {
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     const res = await dashboardApp.request('/agents/ag1/designation', {
       method: 'POST', headers: { cookie, origin: 'https://evil.test', 'content-type': 'application/json' }, body: JSON.stringify({ action: 'allow' }),
     }, env)
-    expect(res.status).toBe(403)
+    expect(res.status).toBe(415)
+    const same = await dashboardApp.request('/agents/ag1/designation', {
+      method: 'POST', headers: { cookie, origin: ORIGIN, 'content-type': 'text/plain' }, body: 'action=allow',
+    }, env)
+    expect(same.status).toBe(415)
     expect(designee()).toBeNull()
   })
 
