@@ -29,7 +29,7 @@ import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import {
-  attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
+  attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, promoteAdmissionDetailed, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
   seatAttachEnabled, findLiveAttachment,
 } from '../src/members/seat-attach'
 import type { AuthContext, Env } from '../src/types'
@@ -2691,5 +2691,149 @@ describe('attached seat memory keying (write scope == read scope == the welded m
     expect(hitsOf(other).map((x) => x.id)).not.toContain(id)
     const get = await rpc(env, g.ctx, 'memory_get', { id }, { meta: thread('conv-other') })
     expect(get.sc.engram).toBeUndefined()
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('Admit completes the attachment for the asking chat', () => {
+  const pendingFor = async (env: Env, g: Grant, session: string, agent = 'rava') => {
+    await boot(env, g, session)
+    const pend = await attach(env, g, session, agent)
+    expect(pend.sc.status, JSON.stringify(pend.body)).toBe('pending_admission')
+    const admId = String(pend.sc.admission_id)
+    const adm = (await loadAdmission(env, admId))!
+    return { admId, adm, seatId: adm.requested_seat_id as string }
+  }
+  const attachmentsOf = (seatId: string): number => n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, seatId)
+
+  it('approve -> the attachment exists for the REQUESTED seat only, the next call acts as the agent, and a later seat_attach is idempotent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await pendingFor(env, g, 'conv-a')
+    await boot(env, g, 'conv-b') // a second chat on the same harness, never asked
+    expect(await decideAdmissionDirect(env, { admissionId: a.admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(a.admId) })).toEqual({ ok: true })
+    expect(attachmentsOf(a.seatId)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(1) // wrong seat never attached
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_attach' AND agent_id = 'agent-rava'`)).toBe(1)
+    const after = await boot(env, g, 'conv-a') // no seat_attach call, no human "done"
+    expect(after.sc.bound_agent_id).toBe('agent-rava')
+    expect(receiptOf(after)).toMatchObject({ binding_source: 'attached_seat' })
+    expect((await boot(env, g, 'conv-b')).sc.bound_agent_id).not.toBe('agent-rava')
+    const again = await attach(env, g, 'conv-a', 'rava')
+    expect(again.sc, JSON.stringify(again.body)).toMatchObject({ status: 'attached', agent: { id: 'agent-rava' } })
+    expect(attachmentsOf(a.seatId)).toBe(1) // idempotent: still ONE attachment
+    expect(errOf(await attach(env, g, 'conv-a', 'hadi-admin'))).toBe('already_attached') // any other agent is still refused
+  })
+
+  it('guard failure (seat retired before Admit): the admission goes live, NO attachment, and the reason is named', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await pendingFor(env, g, 'conv-a')
+    h.sqlite.prepare(`UPDATE agent_seats SET retired_at = datetime('now') WHERE id = ?`).run(a.seatId)
+    const r = await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r).toMatchObject({ landed: true, attachmentId: null, attachSkipped: 'seat_gone' })
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, a.admId)?.status).toBe('live')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
+  })
+
+  it('guard failure (the seat already has a live attachment): the admission goes live, the existing attachment is untouched, and seat_attach still works as before', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await pendingFor(env, g, 'conv-a')
+    // Another live attachment lands on the seat first (fixture: dashboard writer for a different agent).
+    const other = await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: a.seatId, agentRef: 'hadi-admin', via: 'dashboard' })
+    expect(other.ok, JSON.stringify(other)).toBe(true)
+    const r = await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r).toMatchObject({ landed: true, attachmentId: null, attachSkipped: 'seat_already_attached' })
+    expect(one<{ agent_id: string }>(`SELECT agent_id FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, a.seatId)?.agent_id).toBe('agent-hadi-admin')
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, a.admId)?.status).toBe('live')
+  })
+
+  it('an admission with no requested seat attaches nothing (and still goes live)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await pendingFor(env, g, 'conv-a')
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
+    h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = NULL WHERE id = ?`).run(a.admId)
+    const adm = (await loadAdmission(env, a.admId))!
+    const r = await promoteAdmissionDetailed(env, adm, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r).toMatchObject({ landed: true, attachmentId: null, attachSkipped: 'no_requested_seat' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
+  })
+
+  it('flag off: nothing attaches at Admit', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await pendingFor(env, g, 'conv-a')
+    const off = envFor(h, { SEAT_ATTACH: undefined })
+    const r = await promoteAdmissionDetailed(off, a.adm, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r.landed).toBe(true)
+    expect(r.attachmentId).toBeNull()
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
+  })
+})
+
+describe('Admit completes the attachment: gate round fixes', () => {
+  const asked = async (env: Env, g: Grant, session: string, agent = 'rava') => {
+    await boot(env, g, session)
+    const pend = await attach(env, g, session, agent)
+    const admId = String(pend.sc.admission_id)
+    const adm = (await loadAdmission(env, admId))!
+    return { admId, adm, seatId: adm.requested_seat_id as string }
+  }
+
+  it('P1: a same-agent attachment whose server-held token was revoked is NOT reported attached', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    expect(await decideAdmissionDirect(env, { admissionId: a.admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(a.admId) })).toEqual({ ok: true })
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = (SELECT seat_token_id FROM agent_seat_attachments WHERE seat_id = '${a.seatId}')`)
+    const r = await attach(env, g, 'conv-a', 'rava')
+    expect(r.sc.status).not.toBe('attached')
+    expect(errOf(r)).toBe('attach_refused')
+  })
+
+  it('P2: a second promotion batch after the first promoted and the human detached cannot recreate the attachment', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    const t1 = new Date().toISOString()
+    expect((await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', t1, 'member', codeOf(a.admId))).attachmentId).not.toBeNull()
+    const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE seat_id = ?`, a.seatId)!
+    expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
+    // A late concurrent approval of the SAME (stale, still-pending) row: the admission UPDATE no-ops, and the attach INSERT is tied to
+    // this batch's promotion timestamp, so it must not resurrect the detached attachment either.
+    const r = await promoteAdmissionDetailed(env, a.adm, HUMAN, 'dashboard', new Date(Date.now() + 5).toISOString(), 'member', codeOf(a.admId))
+    expect(r.landed).toBe(false)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, a.seatId)).toBe(0)
+  })
+
+  it('P2: an already-attached thread naming ANY other ref (existing or not) gets the identical already_attached answer; its own agent by slug is idempotent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    await decideAdmissionDirect(env, { admissionId: a.admId, humanMemberId: HUMAN, decision: 'approve', attachCode: codeOf(a.admId) })
+    const other = await attach(env, g, 'conv-a', 'hadi-admin')
+    const ghost = await attach(env, g, 'conv-a', 'no-such-agent-xyz')
+    expect(errOf(other)).toBe('already_attached')
+    expect(errOf(ghost)).toBe('already_attached')
+    expect(JSON.stringify(ghost.body)).toBe(JSON.stringify(other.body))
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+  })
+
+  it('probe: requested_seat_id swapped to the human\'s OTHER live seat -> only that named seat is considered, and it is never the asking chat\'s', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await asked(env, g, 'conv-a')
+    await boot(env, g, 'conv-b')
+    const other = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id <> ? LIMIT 1`, a.seatId)!
+    // The admission's seat is swapped (fixture): Admit attaches exactly the seat the row NAMES now, never the original asking seat.
+    h.sqlite.exec(`DROP TRIGGER IF EXISTS agent_seat_admissions_requested_seat_immutable`) // fixture only
+    h.sqlite.prepare(`UPDATE agent_seat_admissions SET requested_seat_id = ? WHERE id = ?`).run(other.id, a.admId)
+    const swapped = (await loadAdmission(env, a.admId))!
+    const r = await promoteAdmissionDetailed(env, swapped, HUMAN, 'dashboard', new Date().toISOString(), 'member', codeOf(a.admId))
+    expect(r.landed).toBe(true)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ?`, a.seatId)).toBe(0)
   })
 })
