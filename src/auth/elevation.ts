@@ -38,6 +38,8 @@ import {
 import { evaluateWebSession, loadWebSessionByHash } from './web-sessions'
 import {
   ELEVATION_ACTIONS,
+  OWNER_SUDO_MAX_MINUTES,
+  isOwnerSudoAction,
   type ElevationActionEffect,
   SENSITIVE_STEP_UP_ACTIONS,
   elevationActionEffect,
@@ -164,6 +166,22 @@ export async function createElevationRequest(
         reason: 'invalid_elevation_request',
         detail: `"${action}" is defined but not yet enforced by any tool — it cannot be requested`,
       }
+    }
+  }
+  // Owner sudo: ONE act per request (the human approves exactly what the message names), org or squad scope (a department grant
+  // would read as "every squad in it"), and short. Refused at REQUEST time so nothing un-approvable reaches a human.
+  if (uniqueActions.some(isOwnerSudoAction)) {
+    if (uniqueActions.length !== 1) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'an owner-sudo action must be requested alone' }
+    }
+    if (input.scopeType === 'department') {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'an owner-sudo action takes org or squad scope, not department' }
+    }
+    if (input.durationMinutes > OWNER_SUDO_MAX_MINUTES) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `an owner-sudo action lasts at most ${OWNER_SUDO_MAX_MINUTES} minutes` }
+    }
+    if (uniqueActions[0] === 'action:sudo_grant_gate_capability' && input.scopeType !== 'org') {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:sudo_grant_gate_capability is org scope' }
     }
   }
   // Installer window (design S1): flag-gated, requested alone, tier-specific durations. Skipped entirely for any other action.
@@ -807,13 +825,16 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
+  // Owner-sudo grants renew the same way (a SPENT one is revoked by finishOwnerSudo, so it counts as ended): without it an agent's
+  // second approval for the same one-call action in one session could never be written. Their single-use claim counts usage only
+  // since the renewed created_at (claimOwnerSudo), so the old spend does not follow the renewed row.
   // Installer window renewal: UNIQUE(agent_session_id, action, scope_type, scope_id) means a second window for the same tier and scope
   // on one session cannot be INSERTed. When the earlier install grant has ENDED (expired or revoked) it is renewed in place (new
   // request, approver, created_at, expiry; revoked cleared) and keeps its id; its write cap counts only usage since the new created_at.
   // A still-live grant is left alone (the insert then fails as before). Other actions are unchanged.
   const renewed = new Set<string>()
   for (const g of grants) {
-    if (!isInstallerAction(g.action)) continue
+    if (!isInstallerAction(g.action) && !isOwnerSudoAction(g.action)) continue
     const prior = await env.DB.prepare(
       `SELECT id FROM elevation_grants
         WHERE tenant = ?1 AND agent_session_id = ?2 AND action = ?3 AND scope_type = ?4 AND scope_id = ?5
@@ -1374,6 +1395,10 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   routine_update: 'action:routine_policy',
   project_update: 'action:project_status',
   unarchive_row: 'action:project_status',
+  // owner sudo: ONE call of the tool, run as the approving human (src/auth/owner-sudo.ts). update_squad keeps its org_structure hint.
+  squad_member_add: 'action:sudo_squad_member_add',
+  grant_gate_capability: 'action:sudo_grant_gate_capability',
+  seat_event_grant: 'action:sudo_seat_event_grant',
 })
 
 /** elevationHint — the refusal hint naming request_elevation + the action key
@@ -1392,6 +1417,9 @@ const ELEVATION_SCOPE_HINT_BY_TOOL: Readonly<Record<string, string>> = Object.fr
   create_department: 'scope_type "org" (an ORG-scope grant is required; scope_id is empty)',
   update_department: 'scope_type "department" with scope_id = that department\'s id (or scope_type "org")',
   update_squad: 'scope_type "squad" with scope_id = that squad\'s id (or its department\'s id, or scope_type "org")',
+  squad_member_add: 'scope_type "squad" with scope_id = that squad\'s id, duration_minutes 15 (it covers ONE call, run as your human)',
+  grant_gate_capability: 'scope_type "org", duration_minutes 15 (it covers ONE call, run as your human)',
+  seat_event_grant: 'scope_type "squad" with scope_id = the target agent\'s squad id, duration_minutes 15 (it covers ONE call, run as your human)',
 })
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {

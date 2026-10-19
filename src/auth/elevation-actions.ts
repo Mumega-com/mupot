@@ -217,6 +217,44 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Read-only and scoped to a single squad; the access itself leaves no lasting effect once the grant expires.',
   },
+  // OWNER SUDO ("/muapprove = sudo"; src/auth/owner-sudo.ts, docs/architecture/approval-bot.md). Each key names EXACTLY ONE
+  // owner-only tool. A live grant lets the agent that holds it make ONE call of that tool, run AS the approving human (their live
+  // standing, their rank ceilings, the tool's own checks unchanged), with the agent recorded as executor and the human as
+  // authority. They are deliberately NOT folded into action:manage_access / action:org_structure: those labels promise something
+  // narrower ("grant capabilities as an agent", "lower a budget"), and a live grant must never acquire power it was not approved
+  // under (S14 F1). Requested alone, org or squad scope, 60 minutes at most, single-use (see owner-sudo.ts).
+  'action:sudo_squad_member_add': {
+    key: 'action:sudo_squad_member_add',
+    enforced: true,
+    label: 'Add an agent to a squad, as you (one call)',
+    description: 'ONE squad_member_add call, run as you: add one agent to a squad you hold at observer or member standing. Single-use; cannot add the requesting agent to itself or confer lead/admin.',
+    effect: 'reversible',
+    effectNote: 'A squad membership can be removed by standing authority (squad_member_remove) after the call.',
+  },
+  'action:sudo_squad_dyad_pin': {
+    key: 'action:sudo_squad_dyad_pin',
+    enforced: true,
+    label: 'Pin or clear a squad review pair, as you (one call)',
+    description: 'ONE update_squad call that sets (or clears) the squad dyad review pair, run as you. Nothing else on the squad can change in that call. Single-use. The pair decides who reviews that squad\'s work by default, so you must be an org owner/admin to approve it.',
+    effect: 'reversible',
+    effectNote: 'The pair can be changed or cleared again by an org owner/admin.',
+  },
+  'action:sudo_grant_gate_capability': {
+    key: 'action:sudo_grant_gate_capability',
+    enforced: true,
+    label: 'Grant gate (verdict) authority, as you (one call)',
+    description: 'ONE grant_gate_capability call, run as you: give one gate:<owner> verdict capability to one member or agent (never the requesting agent or its own member). Single-use. Org scope only.',
+    effect: 'reversible',
+    effectNote: 'revoke_gate_capability removes the grant; it stays until someone with standing authority does.',
+  },
+  'action:sudo_seat_event_grant': {
+    key: 'action:sudo_seat_event_grant',
+    enforced: true,
+    label: 'Authorize a host to receive an agent\'s seat events, as you (one call)',
+    description: 'ONE seat_event_grant call, run as you: let one fleet host receive the seat-event hints of one agent. Single-use.',
+    effect: 'reversible',
+    effectNote: 'The seat-event grant can be revoked (DELETE /api/fleet/events/grants/:agent) after the call.',
+  },
   // Installer window (PR-C, design S1). Consumed by src/operators/installer-window.ts, which turns a LIVE grant of one of
   // these into an in-memory delegation row for the structural-write chokepoint. Tier table: src/operators/installer-tiers.ts.
   // Credentials (token/key mint) are never part of either tier; request them separately as action:mint_token.
@@ -286,11 +324,30 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:routine_archive', // irreversible
   'action:org_department_create', // irreversible: no tool deletes or archives a department
   'action:install_high', // installer window, lead ceiling: passkey only (standard stays Telegram-biometric approvable)
+  'action:sudo_squad_member_add', // owner sudo: the agent acts as the approving human
+  'action:sudo_squad_dyad_pin',
+  'action:sudo_grant_gate_capability',
+  'action:sudo_seat_event_grant',
 ])
+
+/** Owner-sudo actions: each names exactly one owner-only tool (src/auth/owner-sudo.ts). */
+export const OWNER_SUDO_ACTIONS: readonly string[] = Object.freeze([
+  'action:sudo_squad_member_add',
+  'action:sudo_squad_dyad_pin',
+  'action:sudo_grant_gate_capability',
+  'action:sudo_seat_event_grant',
+])
+
+export function isOwnerSudoAction(key: string): boolean {
+  return OWNER_SUDO_ACTIONS.includes(key)
+}
+
+/** A sudo request is for ONE act: asked alone, in an org or squad scope, for at most this long. */
+export const OWNER_SUDO_MAX_MINUTES = 60
 
 /**
  * The ONLY actions whose step-up a tap in the approval bot's verified private chat may satisfy. Everything else that needs a
  * step-up (SENSITIVE_STEP_UP_ACTIONS, e.g. the broad action:manage_access) stays passkey / Mini App / Access only: a bot tap
  * is refused for it. An allow-list, never a global "a bot tap is a fresh reauth". Only args-bound single-use actions belong here.
  */
-export const BOT_STEP_UP_ACTIONS: readonly string[] = Object.freeze([])
+export const BOT_STEP_UP_ACTIONS: readonly string[] = OWNER_SUDO_ACTIONS // all four sudo actions are args-bound (the digest is mandatory), single-use

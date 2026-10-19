@@ -828,6 +828,13 @@ export interface AuthContext {
   seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string; attachRefused?: string }
   webSessionIdHash?: string | null
   webSessionMemberId?: string
+  /**
+   * OWNER SUDO (src/auth/owner-sudo.ts): set ONLY by invokeTool, in memory, on the AuthContext it builds for the APPROVING human
+   * when an agent's live action:sudo_* grant covers exactly the tool being called. `memberId` is then the approving human (the
+   * authority); this names the agent that is actually executing. Server-derived on every call; resolveAuth deletes any such
+   * field arriving in the internal header blob. Presence is never touched under such a context.
+   */
+  ownerSudo?: { executorAgentId: string; executorMemberId: string | null; grantId: string; elevationRequestId: string; action: string; tool: string }
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──

@@ -15,6 +15,11 @@ export const APPROVAL_BOT_ACTIONS: readonly string[] = [
   'action:workspace_project',
   'action:routine_policy',
   'action:project_status',
+  // owner sudo: ONE call of ONE owner-only tool, run as the approver (src/auth/owner-sudo.ts)
+  'action:sudo_squad_member_add',
+  'action:sudo_squad_dyad_pin',
+  'action:sudo_grant_gate_capability',
+  'action:sudo_seat_event_grant',
 ]
 
 export function parseRequestedActions(req: Pick<ElevationRequestRecord, 'requested_actions_json'>): string[] {

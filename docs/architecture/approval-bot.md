@@ -29,6 +29,26 @@ Only `APPROVAL_BOT_ACTIONS` (`src/approval-bot/policy.ts`): reversible, non-mint
 so token mint, installer windows, irreversible acts, home access and anything from an attached chat keep their stronger
 channel; the bot is never offered for a request that names one of them and refuses to approve it even if offered.
 
+## Sudo: one owner action, as you
+
+Four owner-only tools refuse every agent. With a live approval that names exactly the tool, an agent makes ONE call of it,
+run as the approving human (the tool sees the human's live standing; the agent is recorded as executor):
+
+| action | tool | covers |
+|---|---|---|
+| `action:sudo_squad_member_add` | `squad_member_add` | add one agent to a squad as observer/member; never lead/admin, never demote, never the requesting agent |
+| `action:sudo_squad_dyad_pin` | `update_squad` | a call with only `squad`, `dyad_agent_a`, `dyad_agent_b` (and `reason`): pin or clear the review pair |
+| `action:sudo_grant_gate_capability` | `grant_gate_capability` | one `gate:<owner>` grant, org scope; never to the requesting agent or its member |
+| `action:sudo_seat_event_grant` | `seat_event_grant` (new MCP twin of `POST /api/fleet/events/grants`) | let one host receive one agent's seat events |
+
+Rules: requested alone, org or squad scope (squad for the two squad tools), 60 minutes at most. Every call re-derives the
+grant live (agent session, expiry, revocation, approver's current authority incl. the owner's role plane, approver's session).
+Single use: a guarded insert claims the grant; a refused call frees the claim; a success revokes the grant
+(`revoke_reason = owner_sudo_spent`) and a fresh approval in the same session renews it. `/murevoke` and expiry end it first.
+Receipts: `elevation_usage_log` (grant, executor session), `mutation_audit_entries` (handler `owner_sudo`, principal = agent,
+member = authority) and, for squad membership, `membership_receipts.actor_member_id = human`, `actor_bound_agent_id = agent`.
+Not in scope: money, token mint, identity mint, installer windows (they keep their own rules and stronger channels).
+
 ## Setup (one time, by the owner)
 
 1. In Telegram, message `@BotFather`: `/newbot`, choose a display name and a username ending in `bot`. Keep the token.

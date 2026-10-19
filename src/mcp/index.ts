@@ -241,6 +241,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { hasProjectWriteForSquads, callerCanWriteProject } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
+import { SEAT_EVENT_GRANT_TOOLS } from './seat-event-grant'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
@@ -262,6 +263,7 @@ import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
+import { DYAD_PIN_SUDO_STEP, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, SUDO_ALREADY_USED, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -413,6 +415,8 @@ async function resolveAuth(c: {
       // mupot#1794 W4: the harness-credential marker is re-derived below from the live token ROW; a blob can
       // never assert it (nor, by omitting it, shed it: the row says what the credential is).
       delete auth.harnessCredential
+      // OWNER SUDO is set only by invokeTool, in memory, per call: a header blob can never assert it.
+      delete auth.ownerSudo
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
         // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in
@@ -7672,6 +7676,7 @@ export const TOOLS: ToolSpec[] = [
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
+  ...SEAT_EVENT_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...SECRET_ENV_TOOLS,
   ...WEBHOOK_DOORBELL_TOOLS,
@@ -8166,6 +8171,20 @@ async function invokeToolInner(
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
 
+  // OWNER SUDO (src/auth/owner-sudo.ts): an agent holding a LIVE, human-approved action:sudo_* grant that names exactly this tool and
+  // covers exactly this call runs it AS the approving human, once. Decided here, before the floor, so the tool body and every check
+  // in it (org admin, rank ceilings, home refusals) see the human's live standing and nothing the agent holds. For every other call
+  // this is a no-op: `none` leaves `auth` and the refusal the tool always gave untouched.
+  let sudoPending: OwnerSudoPending | null = null
+  {
+    const sudo = await resolveOwnerSudo(env, auth, spec.name, args)
+    if (sudo.kind === 'refused') return { ...fail(sudo.refusal.status, sudo.refusal.error, sudo.refusal.detail), tool: spec.name }
+    if (sudo.kind === 'sudo') {
+      sudoPending = sudo.pending
+      auth = sudo.memberAuth // intentional rebinding: from here the call is the approving human's, with ownerSudo naming the executor
+    }
+  }
+
   // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
   // centrally, BEFORE argument validation. A tool that declares a capability minimum
   // can no longer fail-open if its handler omits the inline scope check: a caller
@@ -8216,7 +8235,9 @@ async function invokeToolInner(
       if (attachedAuthority(auth) && (spec.name === 'update_squad' || spec.name === 'update_department')) {
         return { ...(await attachedSudoRefusal(env, spec.name, spec.name === 'update_squad' ? args.squad : args.department)), tool: spec.name }
       }
-      const hint = elevationHint(spec.name)
+      // A dyad pin has its own one-call door (owner sudo); every other update_squad keeps the org_structure hint.
+      const dyadPin = spec.name === 'update_squad' && ('dyad_agent_a' in args || 'dyad_agent_b' in args)
+      const hint = dyadPin ? DYAD_PIN_SUDO_STEP : elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }
   }
@@ -8229,15 +8250,35 @@ async function invokeToolInner(
   // MCP client always gets a JSON-RPC error. `receipt_failed` (#186 write-receipt
   // guard) is the expected case; surface its code + safe message. For anything else
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
+  // OWNER SUDO, single use: spend the approval only now, after every refusal that can still happen (floor, schema). If the
+  // claim insert throws the tool does not run (the generic handler below turns the throw into internal_error).
+  let sudoClaim: OwnerSudoClaim | null = null
+  if (sudoPending) {
+    try {
+      sudoClaim = await claimOwnerSudo(env, sudoPending)
+    } catch {
+      return { ...fail(500, 'internal_error'), tool: spec.name }
+    }
+    if (!sudoClaim) return { ...fail(SUDO_ALREADY_USED.status, SUDO_ALREADY_USED.error, SUDO_ALREADY_USED.detail), tool: spec.name }
+  }
+
   let outcome: ToolOutcome
   try {
     outcome = (ctx.shortCircuit ? await ctx.shortCircuit(args) : null) ?? await spec.run(auth, env, args, ctx)
   } catch (err) {
+    // A throw after a claim: outcome unknown, so the claim stays 'pending' (the approval is treated as spent; stuck receipts surface it).
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
       return { ...fail(500, 'receipt_failed', msg), tool: spec.name }
     }
     return { ...fail(500, 'internal_error'), tool: spec.name }
+  }
+  if (sudoClaim) {
+    await finishOwnerSudo(env, sudoClaim, outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error })
+    // The agent is told what happened: it ran as its human, once, and the approval is spent.
+    if (outcome.ok && typeof outcome.result === 'object' && outcome.result !== null && !Array.isArray(outcome.result)) {
+      outcome = { ...outcome, result: { ...outcome.result, owner_sudo: { executed_as_authority: sudoClaim.authorityMemberId, approval: 'spent' } } }
+    }
   }
 
   // W0.1: close every delegated-operator receipt this call opened and the site left at 'attempted' (any early return
@@ -8247,7 +8288,7 @@ async function invokeToolInner(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
+  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && !auth.ownerSudo && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

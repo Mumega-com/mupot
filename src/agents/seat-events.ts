@@ -34,7 +34,8 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
-import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
+import type { CapabilityGrant } from '../types'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
@@ -1251,4 +1252,25 @@ export async function publishSeatHint(env: Env, tenant: string, payload: unknown
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'seat_events_fetch_failed' }
   }
+}
+
+/**
+ * Who may write a seat-event grant for this target agent, and the target's squad: an org admin, or a lead on the target's squad.
+ * ONE rule for the HTTP route and the MCP twin (seat_event_grant). A target the principal cannot act on and a target that does not
+ * exist answer identically (mupot#1594 P3: no agent-existence oracle). `orgAdmin` lets a principal whose org authority lives on
+ * the legacy role plane (an owner with no capability rows) count, which the rows-only route never could.
+ */
+export async function authorizeSeatGrantTarget(
+  env: Env,
+  principal: { grants: CapabilityGrant[]; orgAdmin?: boolean },
+  targetAgentId: string,
+): Promise<{ ok: true; squadId: string } | { ok: false; status: 404; error: string }> {
+  const row = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1').bind(targetAgentId).first<{ squad_id: string }>()
+  if (principal.orgAdmin === true || hasCapability(principal.grants, 'org', null, 'admin')) {
+    // An org admin's own authorization never depended on the row, but a missing agent still falls through to the SAME uniform 404.
+    if (row) return { ok: true, squadId: row.squad_id }
+  } else if (row && (await canOnSquad(env, principal.grants, row.squad_id, 'lead'))) {
+    return { ok: true, squadId: row.squad_id }
+  }
+  return { ok: false, status: 404, error: 'agent_not_visible' }
 }

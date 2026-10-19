@@ -204,7 +204,7 @@ export async function addSquadMember(input: {
         receiptInsert(input.env, {
           id: receiptId,
           actorMemberId: input.auth.memberId as string,
-          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          actorBoundAgentId: input.auth.boundAgentId ?? input.auth.ownerSudo?.executorAgentId ?? null, // owner sudo: the agent executes, the human (actor_member_id) is the authority
           targetAgentId: input.agentId,
           squadId: input.squad.id,
           action: 'add',
@@ -284,7 +284,7 @@ export async function removeSquadMember(input: {
         receiptInsert(input.env, {
           id: receiptId,
           actorMemberId: input.auth.memberId as string,
-          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          actorBoundAgentId: input.auth.boundAgentId ?? input.auth.ownerSudo?.executorAgentId ?? null, // owner sudo: the agent executes, the human (actor_member_id) is the authority
           targetAgentId: input.agentId,
           squadId: input.squad.id,
           action: 'remove',
