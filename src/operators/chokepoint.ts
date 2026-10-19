@@ -788,6 +788,30 @@ function clampDelegationsForAttached(auth: AuthContext, all: DelegationRow[]): D
 }
 
 /**
+ * The ONE answer to: "may this caller use STANDING authority for this act, or must it hold a grant matching the target?"
+ * (mupot#1906.)
+ *
+ * authorizeStructuralWrite returns `agent_legacy` when the agent holds ANY live grant for the act's elevation action: it
+ * cannot see the target. A handler that then checks the agent's standing capability FIRST turns a grant on unrelated scope Y
+ * into permission to act on every scope X the agent already administers: no usage-log row, none of the elevated-path guards.
+ * So a BOUND AGENT must go through the scope-matched elevation check (hasElevatedAction) whenever the act has an elevation
+ * door that the standing lane is not independently open for:
+ *  - agentLane 'refuse': the standing lane is never open for an agent, so the grant is the only way in;
+ *  - agentLane 'capability' on a delegable act with DELEGATED_OPERATORS on: delegation replaced the capability lane, so only
+ *    a delegation or a matching grant opens it. Flag off, the pre-W0 capability lane is open on its own and stays as before.
+ * Acts with agentLane 'capability' that are not delegable (project_create, create_department) keep standing authority open
+ * independently of any grant, so the grant is not their door and there is nothing for it to widen.
+ * Humans (no bound agent) keep the standing path. Every handler that consumes an `agent_legacy` verdict for an act with an
+ * elevationAction MUST consult this; tests/elevation-standing-bypass.test.ts pins that by source scan.
+ */
+export function agentMustHoldMatchingGrant(env: Env, auth: AuthContext, action: StructuralAction): boolean {
+  if (!auth.boundAgentId) return false
+  const policy = STRUCTURAL_ACTIONS[action]
+  if (!policy.elevationAction) return false
+  return policy.agentLane === 'refuse' || (policy.delegable && delegatedOperatorsEnabled(env))
+}
+
+/**
  * THE chokepoint. Call it from every structural write on MCP and HTTP, as the FIRST statement that reads `auth`.
  * `target` may be a thunk: it is invoked only when a live delegation could apply, so an agent with no delegation is
  * refused before any caller-supplied reference is resolved (no existence oracle).

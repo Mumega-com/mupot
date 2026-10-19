@@ -1023,6 +1023,15 @@ export async function recordElevationUsage(
   }
 }
 
+/**
+ * The ONE settle-after-success usage receipt for a grant-door write that authorized with `recordUsage: false`: call it only after
+ * the write succeeded, so a malformed body or a slug conflict never leaves an 'applied' row (mupot#1906). Not try/caught beyond
+ * recordElevationUsage's own missing-table rule: if the audit row cannot be written the call fails rather than report success untrailed.
+ */
+export async function recordGrantUsage(env: Env, grant: ElevationGrantRecord, action: string, toolName: string, detail: unknown): Promise<void> {
+  await recordElevationUsage(env, env.TENANT_SLUG, grant.id, grant.agent_session_id, action, toolName, detail, Date.now())
+}
+
 export async function listElevationUsage(env: Env, tenant: string, grantId: string): Promise<ElevationUsageLogRow[]> {
   try {
     const rows = await env.DB.prepare(

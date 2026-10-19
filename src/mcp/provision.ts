@@ -95,6 +95,7 @@ import { mcpEndpoint, requiredCanonicalOrigin, wakeContractForAgent } from '../d
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import {
+  agentMustHoldMatchingGrant,
   authorizeStructuralWrite,
   delegatedTargetDrift,
   finishDelegatedReceipt,
@@ -130,6 +131,7 @@ import {
   elevationRemedyMessage,
   elevationHint,
   recordElevationUsage,
+  recordGrantUsage,
   type ElevationGrantRecord,
 } from '../auth/elevation'
 
@@ -574,7 +576,7 @@ const toolUpdateDepartment: ToolSpec = {
     // A bound AGENT never opens this tool with standing admin (agentLane 'refuse'): its grant must match THIS department. Without
     // this, one grant on an unrelated scope returned agent_legacy from the chokepoint and the agent's standing admin then opened
     // every other department, unlogged (adversarial P1-A). Humans keep the standing path.
-    if (auth.boundAgentId != null || !hasCapability(grants, 'department', dept.id, 'admin')) {
+    if (agentMustHoldMatchingGrant(env, auth, 'update_department') || !hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await orgStructureElevation(env, auth, 'department', dept.id, {
         toolName: 'update_department',
         detail: { department_id: dept.id },
@@ -662,14 +664,19 @@ const toolCreateSquad: ToolSpec = {
     // so a slug_taken refusal (or an adopt:true override) can report "created
     // by member X under elevation receipt Y" rather than just naming the actor.
     let createdViaElevationGrant: string | undefined
+    let squadElevatedGrant: ElevationGrantRecord | undefined
     // An installer window authorised this create (synthesized delegation `elev:<grantId>`): stamp the grant, same as the legacy elevation lane.
     if (squadGate.kind === 'delegated' && isInstallerDelegationId(squadGate.delegation.id)) {
       createdViaElevationGrant = installerGrantIdOf(squadGate.delegation.id)
     }
-    if (!squadDelegated && !hasCapability(grants, 'department', dept.id, 'admin')) {
+    // With DELEGATED_OPERATORS on, delegation replaced the agent's capability lane: standing department admin must not open this
+    // because of a project_lifecycle grant on some OTHER department; the grant must match THIS one (mupot#1906). Installer-window
+    // creates are 'delegated' and skip this; the elevation stamp below is unchanged. Flag off, the pre-W0 lane is untouched.
+    if (!squadDelegated && (agentMustHoldMatchingGrant(env, auth, 'create_squad') || !hasCapability(grants, 'department', dept.id, 'admin'))) {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
         detail: { department_id: dept.id, slug: args.slug },
+        recordUsage: false, // settled by recordGrantUsage only after createSquad succeeds
       })
       if (!elevated.granted) {
         return fail(403, 'forbidden', {
@@ -680,6 +687,7 @@ const toolCreateSquad: ToolSpec = {
         })
       }
       createdViaElevationGrant = elevated.grant.id
+      squadElevatedGrant = elevated.grant
     }
 
     const result = await createSquad(
@@ -701,6 +709,7 @@ const toolCreateSquad: ToolSpec = {
     )
     await finishDelegatedReceipt(env, squadGate, result.ok)
     if (!result.ok) return createErrorToFail(result.error)
+    if (squadElevatedGrant) await recordGrantUsage(env, squadElevatedGrant, 'action:project_lifecycle', 'create_squad', { department_id: dept.id, squad_id: result.value.id, slug: args.slug })
     await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {
       squad_id: result.value.id,
     })
@@ -930,7 +939,8 @@ export const toolMintAgentToken: ToolSpec = {
     // ambiguous targets. Elevation does NOT substitute here — action:mint_token
     // authorizes ordinary minting only; revoking the prior credential mid-batch
     // is a heavier org-trust act this step deliberately leaves standing-admin-only.
-    if (replacementSupplied && !isOrgAdmin(auth)) {
+    // A bound agent never rotates: elevation does not cover it, and its standing org-admin must not open a credential-revocation act.
+    if (replacementSupplied && (agentMustHoldMatchingGrant(env, auth, 'mint_agent_token') || !isOrgAdmin(auth))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
     }
     if (replacementSupplied && !rotatePriorTokenId) {
@@ -952,7 +962,9 @@ export const toolMintAgentToken: ToolSpec = {
     // ruling recorded in src/dashboard/enroll.ts:128-136. It is the STANDING
     // authority question only: a principal who fails it still falls through to
     // the elevation limb below, unchanged.
-    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
+    // A bound agent never opens this with standing authority (agentLane 'refuse'): it needs an action:mint_token grant matching
+    // THIS agent's squad, so the usage log and elevated-path guards always run (mupot#1906).
+    if (agentMustHoldMatchingGrant(env, auth, 'mint_agent_token') || !(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('mint_agent_token') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
       const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
@@ -984,7 +996,8 @@ export const toolMintAgentToken: ToolSpec = {
     const expiry = resolveAgentTokenExpiry({
       expiresInDays: args.expires_in_days as number | undefined,
       nonExpiring: args.non_expiring === true,
-      allowNonExpiring: hasCapability(grants, 'org', null, 'owner'),
+      // Under an elevation grant the standing org-owner plane is not the authority: a time-boxed grant never mints a non-expiring token.
+      allowNonExpiring: !elevatedGrant && hasCapability(grants, 'org', null, 'owner'),
     })
     if (!expiry.ok) return fail(400, expiry.code)
     const expiresAt = expiry.expiresAt
@@ -1748,7 +1761,9 @@ export const toolGrantAgentCapability: ToolSpec = {
 
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    if (!grantDelegated && !(await memberCanOnSquad(env, grants, squad, 'admin'))) {
+    // Same rule: a bound agent holds a manage_access grant matching THIS squad (or is delegated); standing admin elsewhere never
+    // opens it, so the no-self-grant / ceiling guards on the elevated path cannot be skipped (mupot#1906).
+    if (!grantDelegated && (agentMustHoldMatchingGrant(env, auth, 'grant_agent_capability') || !(await memberCanOnSquad(env, grants, squad, 'admin')))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('grant_agent_capability') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
@@ -2815,7 +2830,7 @@ const toolUpdateSquad: ToolSpec = {
     // Same rule as update_department: a bound agent must hold a grant matching THIS squad (squad, its department, or org);
     // standing admin never opens it, so the home-squad guard, the attached-seat refusal and usage logging below cannot be
     // skipped by holding some unrelated grant.
-    if (auth.boundAgentId != null || !(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+    if (agentMustHoldMatchingGrant(env, auth, 'update_squad') || !(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
       if (squad.kind !== 'work') return fail(403, 'forbidden', { need: 'admin', scope: 'squad', reason: 'home_squad' })
       const elevated = await orgStructureElevation(env, auth, 'squad', squad.id, {
         toolName: 'update_squad',
