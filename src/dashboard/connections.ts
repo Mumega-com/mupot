@@ -38,10 +38,33 @@ function connectionsScript(): Html {
     <script>
       (function () {
         var status = document.getElementById('cx-status');
-        function say(t) { if (status) status.textContent = t; }
+        var lastBtn = null;
+        document.addEventListener('click', function (ev) {
+          var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+          if (b) lastBtn = b;
+        }, true);
+        // Errors show beside the clicked button (role=alert) AND in the top status line, which is scrolled into view + focused.
+        function rowNote(t) {
+          if (!lastBtn || !lastBtn.parentNode) return;
+          var n = lastBtn.parentNode.querySelector('.cx-row-err');
+          if (!n) { n = document.createElement('div'); n.className = 'cx-row-err'; n.setAttribute('role', 'alert'); lastBtn.parentNode.appendChild(n); }
+          n.textContent = t;
+        }
+        function say(t) {
+          if (!status) return;
+          status.textContent = t;
+          if (t && t !== 'saving…') {
+            rowNote(t);
+            status.setAttribute('tabindex', '-1');
+            status.setAttribute('role', 'alert');
+            if (status.scrollIntoView) status.scrollIntoView({ block: 'center' });
+            status.focus();
+          }
+        }
         function reauthLink() {
           if (!status) return;
           status.textContent = '';
+          rowNote('Confirm it is you first, then try again.');
           var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first';
           status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.'));
         }

@@ -342,10 +342,13 @@ dashboardApp.use('*', csrf())
 
 // Authenticated UI: never cache (the show-once token page especially must not
 // survive in any shared/proxy/back-button cache), never leak Referer off-origin.
+// same-origin, NOT no-referrer: under no-referrer browsers serialize Origin as "null" on same-origin fetch/form
+// POSTs, which the connections/designation Origin guards refuse (live: Admit did nothing). Referer still never
+// leaves the site.
 dashboardApp.use('*', async (c, next) => {
   await next()
   c.header('Cache-Control', 'no-store')
-  c.header('Referrer-Policy', 'no-referrer')
+  c.header('Referrer-Policy', 'same-origin')
 })
 
 // ── auth gate (redirect HTML callers to login instead of 401 JSON) ───────────
