@@ -1144,6 +1144,8 @@ export interface UnitConfigPatch {
   // an agent's slug bypass update_agent's own checks. See isValidSquadSlugUpdate
   // below for why a squad's NEW slug must carry the '-sqd' suffix.
   slug?: unknown
+  // dyad_gate — SQUAD ONLY, boolean (migrations/0246; see src/gates/dyad.ts).
+  dyad_gate?: unknown
 }
 
 export type UpdateUnitConfigResult =
@@ -1160,6 +1162,7 @@ export type UpdateUnitConfigResult =
         | 'invalid_budget_cap_cents'
         | 'invalid_budget_window'
         | 'invalid_slug'
+        | 'invalid_dyad_gate'
         | 'slug_taken'
     }
 
@@ -1285,6 +1288,14 @@ export async function updateUnitConfig(
     if (!isValidSquadSlugUpdate(patch.slug)) return { ok: false, error: 'invalid_slug' }
     setClauses.push('slug = ?')
     binds.push(patch.slug)
+  }
+
+  // dyad_gate — squad-only strict boolean. Truthy strings/numbers are refused: this flag changes who
+  // gates work by default, so it never coerces.
+  if ('dyad_gate' in patch) {
+    if (kind !== 'squad' || typeof patch.dyad_gate !== 'boolean') return { ok: false, error: 'invalid_dyad_gate' }
+    setClauses.push('dyad_gate = ?')
+    binds.push(patch.dyad_gate ? 1 : 0)
   }
 
   // Nothing to patch — treat as a no-op success (caller is responsible for sending

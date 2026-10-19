@@ -486,6 +486,8 @@ export interface Squad {
   autonomy: Autonomy
   budget_cap_cents: number | null
   budget_window: BudgetWindow
+  /** Opt-in dyad review policy (migration 0246, src/gates/dyad.ts); 0/1. Optional for legacy fixtures. */
+  dyad_gate?: number
   /**
    * Who created this row (migration 0166) — NULL for every row created
    * before this column existed. Provenance ground for team_bootstrap's

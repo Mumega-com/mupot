@@ -2792,12 +2792,13 @@ const toolUpdateSquad: ToolSpec = {
   scope: 'squad',
   min: 'admin',
   args:
-    '{ squad: string (id|slug), slug?: string (new slug, must end "-sqd" — mupot#1495), budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
+    '{ squad: string (id|slug), slug?: string (new slug, must end "-sqd" — mupot#1495), budget_cap_cents?: number|null, budget_window?: "day"|"week", dyad_gate?: boolean (opt-in: two-agent squad, each gates the other by default), reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       squad: STRING_SCHEMA,
       slug: STRING_SCHEMA,
+      dyad_gate: { type: 'boolean' },
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
@@ -2850,7 +2851,7 @@ const toolUpdateSquad: ToolSpec = {
       elevatedGrant = elevated.grant
     }
 
-    const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window'] as const
+    const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window', 'dyad_gate'] as const
     const patch: UnitConfigPatch = {}
     for (const key of PATCHABLE) {
       if (key in args) patch[key] = args[key]
@@ -2889,15 +2890,19 @@ const toolUpdateSquad: ToolSpec = {
     // Before-image, read outside the UPDATE transaction — see the race caveat in
     // the doc comment above.
     const before = await env.DB.prepare(
-      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window, dyad_gate FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string; dyad_gate: number }>()
     if (!before) return fail(404, 'squad_not_found', { squad: squadRef })
 
     // An elevated AGENT may only LOWER a squad's budget (budget_cap_cents caps real objective spending). Raising or clearing
     // the cap, or changing the window, stays with a standing human admin (adversarial P1-B).
     if (elevationGrantId) {
+      // dyad_gate decides who reviews work by default: it is gate authority, so an elevated AGENT never flips it.
+      if ('dyad_gate' in patch) {
+        return fail(403, 'forbidden', { reason: 'dyad_gate_standing_admin_only', remedy: 'A standing admin sets dyad_gate; an elevated agent may not.' })
+      }
       if ('budget_window' in patch) {
         return fail(403, 'forbidden', { reason: 'budget_window_standing_admin_only', remedy: 'A human admin changes a squad budget window; an elevated agent may only lower the cap.' })
       }
@@ -2945,10 +2950,10 @@ const toolUpdateSquad: ToolSpec = {
     }
 
     const after = await env.DB.prepare(
-      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window, dyad_gate FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string; dyad_gate: number }>()
 
     const changed: Record<string, { from: unknown; to: unknown }> = {}
     for (const key of changedKeys) {

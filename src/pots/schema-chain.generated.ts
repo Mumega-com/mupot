@@ -4332,9 +4332,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0246_squad_dyad_gate.sql",
+    sha256: "e29725c7b22edb0f9d1d1dcdf7e3570a911c8078980c491cb1ea967af521e807",
+    statements: [
+      "-- 0246 squad dyad_gate: opt-in \"dyad\" review policy for a squad.\n--\n-- When dyad_gate = 1 and the squad has EXACTLY two active agents, a task_create\n-- with no explicit gate_owner defaults gate_owner to the creator's PEER's gate\n-- (gate:<peer.slug>), but only if the peer holds a live gate_grants row for it.\n-- The human is not the default code reviewer. Squads have no config JSON, so\n-- this is an additive column. Default 0 = every existing squad is unchanged.\nALTER TABLE squads ADD COLUMN dyad_gate INTEGER NOT NULL DEFAULT 0 CHECK (dyad_gate IN (0, 1));",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "7c13746be71753799b64d252d8581506478311a8a2cf45352aa402fdd358fe15"
+export const SCHEMA_CHAIN_DIGEST: string = "9fb81bf4f9a90e31635e91219eef1a9bad61c4edf651dba00907d9dedd7eb24c"
