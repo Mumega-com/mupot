@@ -81,6 +81,29 @@ export async function grantGateCapability(
   }
 }
 
+export type GuardedGrantResult =
+  | { ok: true; grant: GateGrantRecord }
+  | { ok: false; error: 'gate_held_by_member' }
+
+/**
+ * Owner-sudo's grant: the human-lane exclusion lives INSIDE the insert. One statement inserts the grant only WHERE no member
+ * principal holds this lane at that instant, so a member grant that lands between an earlier check and this write makes it
+ * insert nothing and the caller refuses. (INSERT OR IGNORE keeps an identical re-grant idempotent; zero changes with no member
+ * holder means the same agent grant already existed.)
+ */
+export async function grantGateCapabilityUnlessHeldByMember(env: Env, input: GateGrantInput): Promise<GuardedGrantResult> {
+  const now = new Date().toISOString()
+  const res = await env.DB.prepare(
+    `INSERT OR IGNORE INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6
+      WHERE NOT EXISTS (SELECT 1 FROM gate_grants WHERE lower(capability) = lower(?2) AND principal_type = 'member')`,
+  ).bind(crypto.randomUUID(), input.capability, input.principalType, input.principalId, input.grantedBy, now).run()
+  if (Number(res.meta?.changes ?? 0) === 0) {
+    const held = await env.DB.prepare(`SELECT 1 AS x FROM gate_grants WHERE lower(capability) = lower(?1) AND principal_type = 'member' LIMIT 1`).bind(input.capability).first<{ x: number }>()
+    if (held) return { ok: false, error: 'gate_held_by_member' }
+  }
+  return { ok: true, grant: { capability: input.capability, principal_type: input.principalType, principal_id: input.principalId, granted_by: input.grantedBy, created_at: now } }
+}
 
 export interface GateGrantFilter {
   capability?: string

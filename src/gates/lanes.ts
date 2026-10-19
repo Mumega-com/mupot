@@ -19,6 +19,8 @@ export const GATE_ROUTINES = 'gate:routines'
 export const GATE_PROJECT_COMPLETION = 'gate:project-completion'
 export const GATE_ESCALATION = 'gate:escalation'
 export const GATE_ADDONS = 'gate:addons'
+export const GATE_OFFICE = 'gate:office'
+export const GATE_SELF_PREFIX = 'gate:self-'
 
 export interface CouncilGateLane {
   readonly lane: string
@@ -55,4 +57,22 @@ export function councilGateLaneFor(slug: string): string | null {
     if (entry.agentSlug === slug) return entry.lane
   }
   return null
+}
+
+/**
+ * Lanes with their OWN completion machinery: gate:office, gate:routines, gate:agent-self-completion and the whole `gate:self-*`
+ * family. task_create refuses these as an explicit gate_owner. ONE list: every reserved-lane rule below is built on it.
+ */
+export function isSubsystemReservedLane(capability: string): boolean {
+  const c = capability.trim().toLowerCase()
+  return c === GATE_OFFICE || c === GATE_ROUTINES || c === GATE_AGENT_SELF_COMPLETION || c.startsWith(GATE_SELF_PREFIX)
+}
+
+/**
+ * Subsystem lanes plus the human gate (gate:hadi): never a dyad default, never conferred by an agent-run path (owner sudo adds
+ * the named lanes and the add-on namespace on top). dyad.ts, task_create (mcp/index.ts, which still lets a caller NAME gate:hadi
+ * explicitly) and owner sudo (auth/owner-sudo-args.ts) all call these, so a lane added here is reserved everywhere.
+ */
+export function isReservedForHumansOrSubsystems(capability: string): boolean {
+  return capability.trim().toLowerCase() === 'gate:hadi' || isSubsystemReservedLane(capability)
 }

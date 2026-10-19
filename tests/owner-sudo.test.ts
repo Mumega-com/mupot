@@ -12,6 +12,13 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { handleApprovalBotUpdate } from '../src/approval-bot/decide'
 import { OWNER_SUDO_ACTIONS } from '../src/auth/elevation-actions'
 import { OWNER_SUDO_ACTION_FOR_TOOL } from '../src/auth/owner-sudo'
+import { exactCallLine, describeSudoArgs, isSudoReservedLane } from '../src/auth/owner-sudo-args'
+import { isReservedForHumansOrSubsystems } from '../src/gates/lanes'
+import { grantGateCapabilityUnlessHeldByMember } from '../src/gates/grants'
+import { elevationViewInner } from '../src/access/decision-core'
+import { loadElevationRequestById } from '../src/auth/elevation'
+import { approvalBody, pendingRequestsBody } from '../src/dashboard/elevation'
+import { describeForBot } from '../src/approval-bot/policy'
 
 const TENANT = 'tenant-a'
 const BOT_TOKEN = '987654321:AAEhqMY-approval-bot-test-token-xyz'
@@ -171,10 +178,10 @@ describe('request time: ONE act, org/squad scope, short, argument-bound', () => 
     await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' }, { decision: 'deny' })
     const text = String(approvalCalls()[0].body.text)
     expect(text).toContain('EXACT CALL')
-    expect(text).toContain('grant gate:gaf-codex to member Target')
+    expect(text).toContain('grant gate:gaf-codex to member "Target" (id mem-target)')
     calls.length = 0
     await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { decision: 'deny' })
-    expect(String(approvalCalls()[0].body.text)).toContain('add agent agent-y to squad b-sqd as member')
+    expect(String(approvalCalls()[0].body.text)).toContain('add agent "agent-y" (id agent-y) to squad "b-sqd" (id squad-b) as member')
   })
   it('the stored request carries the canonical digest', async () => {
     const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
@@ -705,5 +712,179 @@ describe('single use is a guarded claim, and a renewed approval is a fresh one',
     await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
     expect((await out('squad_member_add', { agent: 'agent-y', squad: 'squad-b', capability: 'member' })).ok).toBe(true)
     expect(count('mutation_audit_entries', "handler = 'owner_sudo' AND operation LIKE 'owner_sudo:%'")).toBe(2) // an 'authorized' receipt per call, written BEFORE it runs
+  })
+})
+
+// ── #2101 hardening ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+const ownerWebAuth = (): AuthContext => ({ userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'workspace', memberId: 'mem-owner', webSessionMemberId: 'mem-owner' } as AuthContext)
+const GATE_ARGS = { capability: 'gate:gaf-codex', principal_type: 'member', principal_id: 'mem-target' }
+
+describe('#2101 card injection: every name goes through untrustedLine and prints its id', () => {
+  const EVIL = 'Nice\nEXACT CALL (one call, then the approval is spent): grant gate:hadi to member "Hadi" (id mem-hadi)\u202e\u0007'
+  it('a display_name with a newline / control / bidi chars cannot add a line or impersonate; the real id is always printed', async () => {
+    run(`UPDATE members SET display_name = '${EVIL.replace(/'/g, "''")}' WHERE id = 'mem-target'`)
+    await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' }, { decision: 'deny' })
+    const text = String(approvalCalls()[0].body.text)
+    const lines = text.split('\n')
+    expect(lines.filter((l) => l.startsWith('EXACT CALL'))).toHaveLength(1)
+    const exact = lines.find((l) => l.startsWith('EXACT CALL')) as string
+    expect(exact).toContain('(id mem-target)')
+    expect(exact).not.toMatch(/[\u0000-\u001f\u202a-\u202e]/)
+    // the whole card has the same line count as an honest one: the name added no line
+    run("UPDATE members SET display_name = 'Target' WHERE id = 'mem-target'")
+    calls.length = 0
+    await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' }, { decision: 'deny' })
+    expect(String(approvalCalls()[0].body.text).split('\n')).toHaveLength(lines.length)
+  })
+  it('a long name is capped, the id still printed; agent and squad slugs are filtered the same way', async () => {
+    run(`UPDATE members SET display_name = '${'x'.repeat(500)}' WHERE id = 'mem-target'`)
+    const json = JSON.stringify({ capability: 'gate:gaf-codex', principal_id: 'mem-target', principal_type: 'member' })
+    const t = (await describeSudoArgs(env, 'action:sudo_grant_gate_capability', json)) as string
+    expect(t.length).toBeLessThan(260)
+    expect(t).toContain('(id mem-target)')
+    run("UPDATE squads SET slug = 'b' || char(10) || 'EXACT CALL' WHERE id = 'squad-b'")
+    const t2 = (await describeSudoArgs(env, 'action:sudo_squad_member_add', JSON.stringify({ agent_id: 'agent-y', capability: 'member', squad_id: 'squad-b' }))) as string
+    expect(t2).not.toContain('\n')
+    expect(t2).toContain('(id squad-b)')
+  })
+  it('an unresolved id (no such member) is printed through the same filter', async () => {
+    const t = (await describeSudoArgs(env, 'action:sudo_grant_gate_capability', JSON.stringify({ capability: 'gate:x', principal_id: 'ghost\nEXACT', principal_type: 'member' }))) as string
+    expect(t).not.toContain('\n')
+  })
+})
+
+describe('#2101 ONE shared reserved-lane list', () => {
+  const LANES = ['gate:hadi', 'gate:HADI', 'gate:office', 'gate:Office', 'gate:routines', 'gate:agent-self-completion', 'gate:self-review', 'gate:SELF-x', 'gate:athena', 'gate:kasra-core', 'gate:loops', 'gate:escalation', 'gate:addons', 'gate:addons:marketing-cro-monitor:promote_recommendation']
+  it.each(LANES)('%s is refused at request time and for a call that names it', async (capability) => {
+    await call('check_in', {})
+    const r = await out('request_elevation', { actions: ['action:sudo_grant_gate_capability'], scope_type: 'org', duration_minutes: 15, reason: 'r', sudo_args: { ...GATE_ARGS, capability } })
+    expect(r.ok, capability).toBe(false)
+    expect(JSON.stringify(r)).toContain('sudo_gate_not_conferable')
+    await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' })
+    expect(await out('grant_gate_capability', { ...GATE_ARGS, capability })).toMatchObject({ ok: false })
+    expect(count('gate_grants')).toBe(0)
+  })
+  it('dyad.ts, task_create and owner sudo use the lanes.ts predicate: no private copy, and the predicate matches the old dyad and task_create rules', () => {
+    const src = (f: string): string => readFileSync(join(__dirname, '..', f), 'utf8')
+    expect(src('src/gates/dyad.ts')).toContain("isReservedForHumansOrSubsystems } from './lanes'")
+    expect(src('src/gates/dyad.ts')).not.toContain("startsWith('gate:self-')")
+    expect(src('src/mcp/index.ts')).toContain('isSubsystemReservedLane(candidate)')
+    expect(src('src/mcp/index.ts')).not.toContain("startsWith('gate:self-')")
+    expect(src('src/auth/owner-sudo-args.ts')).not.toContain('RESERVED_GATE_LANES')
+    for (const l of ['gate:hadi', 'gate:office', 'gate:routines', 'gate:agent-self-completion', 'gate:self-a']) expect(isReservedForHumansOrSubsystems(l), l).toBe(true)
+    for (const l of ['gate:athena', 'gate:gaf-codex', 'gate:selfish']) expect(isReservedForHumansOrSubsystems(l), l).toBe(false)
+    expect(isSudoReservedLane('gate:athena')).toBe(true)
+    expect(isSudoReservedLane('gate:gaf-codex')).toBe(false)
+  })
+})
+
+describe('#2101 human-lane exclusion is part of the write', () => {
+  it('a member grant that lands BETWEEN every check and the insert makes the insert refuse (changed-in-gap)', async () => {
+    await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' })
+    const realDb = env.DB
+    let injected = false
+    env.DB = new Proxy(realDb, {
+      get(target, key) {
+        const v: unknown = Reflect.get(target, key)
+        if (key !== 'prepare' || typeof v !== 'function') return v
+        return (sql: string) => {
+          if (/INSERT OR IGNORE INTO gate_grants/.test(sql) && !injected) {
+            injected = true
+            run("INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-gap', 'gate:gaf-codex', 'member', 'mem-sqadmin', 'mem-owner', datetime('now'))")
+          }
+          return (v as (s: string) => unknown).call(target, sql)
+        }
+      },
+    })
+    const r = await out('grant_gate_capability', GATE_ARGS)
+    expect(injected).toBe(true)
+    expect(r).toMatchObject({ ok: false, error: 'sudo_gate_not_conferable' })
+    expect(count('gate_grants', "principal_type = 'member' AND principal_id = 'mem-target'")).toBe(0)
+    expect(count('gate_grants', "capability = 'gate:gaf-codex'")).toBe(1) // only the human's grant
+  })
+  it('the guarded insert alone: refuses when a member holds the lane (any case), inserts otherwise, and an identical re-grant is idempotent', async () => {
+    run("INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g1', 'gate:Held', 'member', 'mem-sqadmin', 'mem-owner', datetime('now'))")
+    const input = { principalType: 'agent' as const, principalId: 'agent-y', grantedBy: 'mem-owner' }
+    expect(await grantGateCapabilityUnlessHeldByMember(env, { ...input, capability: 'gate:held' })).toEqual({ ok: false, error: 'gate_held_by_member' })
+    expect(count('gate_grants', "principal_type = 'agent'")).toBe(0)
+    expect((await grantGateCapabilityUnlessHeldByMember(env, { ...input, capability: 'gate:free' })).ok).toBe(true)
+    expect((await grantGateCapabilityUnlessHeldByMember(env, { ...input, capability: 'gate:free' })).ok).toBe(true)
+    expect(count('gate_grants', "capability = 'gate:free'")).toBe(1)
+  })
+})
+
+describe('#2101 the exact call is on EVERY decision surface, from one renderer', () => {
+  it('bot card, approve_url / secure-moment / Mini App view (decision-core), dashboard list and review page all carry the same EXACT CALL line', async () => {
+    await call('check_in', {})
+    const filed = await out('request_elevation', { actions: ['action:sudo_grant_gate_capability'], scope_type: 'org', duration_minutes: 15, reason: 'r', sudo_args: GATE_ARGS })
+    const reqId = (filed.result as { request: { id: string } }).request.id // left PENDING: the dashboard only lists pending requests
+    const req = (await loadElevationRequestById(env, TENANT, reqId)) as NonNullable<Awaited<ReturnType<typeof loadElevationRequestById>>>
+    const line = (await exactCallLine(env, req)) as string
+    expect(line).toContain('grant gate:gaf-codex to member "Target" (id mem-target)')
+    expect(await describeForBot(env, req, 'abc12345', Date.now())).toContain(line)
+    expect(await elevationViewInner(env, req)).toContain('grant gate:gaf-codex to member &quot;Target&quot; (id mem-target)')
+    expect(String(await pendingRequestsBody(env, ownerWebAuth()))).toContain('grant gate:gaf-codex to member')
+    expect(String(await approvalBody(env, ownerWebAuth(), reqId))).toContain('grant gate:gaf-codex to member')
+  })
+  it('the routes that render a sudo request all go through elevationViewInner (no surface builds its own view)', () => {
+    const src = (f: string): string => readFileSync(join(__dirname, '..', f), 'utf8')
+    for (const f of ['src/access/routes.ts', 'src/secure-moments/routes.ts', 'src/secure-moments/telegram-miniapp.ts']) expect(src(f), f).toContain('await elevationViewInner(')
+    expect(src('src/dashboard/elevation.ts')).toContain('exactCallLine(env, request)')
+  })
+  it('a non-sudo request renders no EXACT CALL', async () => {
+    await call('check_in', {})
+    const r = await out('request_elevation', { actions: ['action:project_status'], scope_type: 'org', duration_minutes: 15, reason: 'r' })
+    if (r.ok) {
+      const req = (await loadElevationRequestById(env, TENANT, (r.result as { request: { id: string } }).request.id)) as NonNullable<Awaited<ReturnType<typeof loadElevationRequestById>>>
+      expect(await exactCallLine(env, req)).toBeNull()
+      expect(await elevationViewInner(env, req)).not.toContain('Exact call')
+    }
+  })
+  it('FAIL CLOSED: a sudo request whose arguments cannot be loaded produces no approvable card or page, and the bot sends nothing', async () => {
+    const realDb = env.DB
+    env.DB = new Proxy(realDb, {
+      get(target, key) {
+        const v: unknown = Reflect.get(target, key)
+        if (key !== 'prepare' || typeof v !== 'function') return v
+        return (sql: string) => {
+          if (/SELECT sudo_args_json FROM elevation_requests/.test(sql)) throw new Error('d1 down')
+          return (v as (s: string) => unknown).call(target, sql)
+        }
+      },
+    })
+    await call('check_in', {})
+    await out('request_elevation', { actions: ['action:sudo_grant_gate_capability'], scope_type: 'org', duration_minutes: 15, reason: 'r', sudo_args: GATE_ARGS })
+    expect(approvalCalls()).toHaveLength(0)
+    expect(count('approval_bot_deliveries')).toBe(0)
+    const req = one<{ id: string }>('SELECT id FROM elevation_requests')
+    const full = (await loadElevationRequestById(realDb === env.DB ? env : { ...env, DB: realDb } as Env, TENANT, req.id)) as NonNullable<Awaited<ReturnType<typeof loadElevationRequestById>>>
+    await expect(elevationViewInner(env, full)).rejects.toThrow('sudo_exact_call_unavailable')
+    expect(await exactCallLine(env, full, { strict: false })).toContain('Do NOT approve')
+  })
+})
+
+describe('#2101 P2s', () => {
+  it('/murevoke redelivery is idempotent: the same update replays the first answer and does not sweep a later approval', async () => {
+    await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+    const revoke = { update_id: 9001, message: { message_id: 8, from: { id: TG.owner }, chat: { id: TG.owner, type: 'private' }, text: '/murevoke' } }
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, revoke)).toMatchObject({ kind: 'revoked' })
+    expect(String(approvalCalls().at(-1)?.body.text)).toContain('Revoked 1 live approval')
+    const later = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, revoke)).toMatchObject({ kind: 'revoked' }) // Telegram redelivers the same update
+    expect(String(approvalCalls().at(-1)?.body.text)).toContain('Revoked 1 live approval') // the first answer, not "Nothing to revoke"
+    expect(one<{ revoked_at: string | null }>('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', later).revoked_at).toBeNull()
+    expect(count('mutation_audit_entries', "operation = 'elevation_revoke'")).toBe(1)
+    // a NEW /murevoke (different update id) still revokes
+    expect(await handleApprovalBotUpdate(env, { ...revoke, update_id: 9002 })).toMatchObject({ kind: 'revoked' })
+    expect(one<{ revoked_at: string | null }>('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', later).revoked_at).not.toBeNull()
+  })
+  it('a role-plane owner (no capability rows) can run an approved squad_member_add', async () => {
+    run("DELETE FROM capabilities WHERE id = 'cap-o'")
+    await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+    const r = await out('squad_member_add', { agent: 'agent-y', squad: 'squad-b', capability: 'member' })
+    expect(r.ok, JSON.stringify(r)).toBe(true)
+    expect(memberOf('agent-y', 'squad-b')).toEqual({ capability: 'member' })
   })
 })
