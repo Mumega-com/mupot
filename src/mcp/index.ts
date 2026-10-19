@@ -1342,7 +1342,7 @@ const toolTaskList: ToolSpec = {
   name: 'task_list',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number, cursor?: string }',
+  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, assignee_member_id?: string, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1350,8 +1350,9 @@ const toolTaskList: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       status: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
+      assignee_member_id: { ...STRING_SCHEMA, description: 'Filter to tasks owned by this human (member id). Mutually exclusive with assignee_agent_id: a task has one owner, so passing both can only ever match nothing.' },
       limit: { ...OPTIONAL_NUMBER_SCHEMA, description: 'Page size (default 25, max 100). This is a PAGE size, not a total cap: follow next_cursor to read further pages.' },
-      cursor: { ...STRING_SCHEMA, description: 'Opaque next_cursor from the previous page. Pass it back with the SAME squad_id/project_id/status/assignee_agent_id; a malformed or mismatched cursor is a 400 invalid_args. next_cursor null = no more pages.' },
+      cursor: { ...STRING_SCHEMA, description: 'Opaque next_cursor from the previous page. Pass it back with the SAME squad_id/project_id/status/assignee_agent_id/assignee_member_id; a malformed or mismatched cursor is a 400 invalid_args. next_cursor null = no more pages.' },
     },
     additionalProperties: false,
   },
@@ -1365,6 +1366,16 @@ const toolTaskList: ToolSpec = {
     const assignee = args.assignee_agent_id
     if (assignee !== undefined && assignee !== null && typeof assignee !== 'string') {
       return fail(400, 'invalid_args', 'assignee_agent_id must be a string')
+    }
+    // The human axis (migrations/0150). Without this filter assignee_member_id is WRITE-ONLY: task_create and task_update accept it and
+    // no read surface selects BY it, so a person could be given work they had no way to query (same shape as mupot#1381).
+    const assigneeMember = args.assignee_member_id
+    if (assigneeMember !== undefined && assigneeMember !== null && typeof assigneeMember !== 'string') {
+      return fail(400, 'invalid_args', 'assignee_member_id must be a string')
+    }
+    // Rejected rather than silently returning zero rows: a task has exactly one owner, so this combination can never match.
+    if (typeof assignee === 'string' && assignee.trim() && typeof assigneeMember === 'string' && assigneeMember.trim()) {
+      return fail(400, 'task_single_assignee', 'a task has one owner: filter by assignee_agent_id or assignee_member_id, never both')
     }
     const limit = readLimit(args.limit, 25, 100)
     if (typeof limit !== 'number') return limit
@@ -1388,13 +1399,17 @@ const toolTaskList: ToolSpec = {
       baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
       baseBinds.push(assignee.trim())
     }
+    if (typeof assigneeMember === 'string' && assigneeMember.trim()) {
+      baseClauses.push(`assignee_member_id = ?${baseBinds.length + 1}`)
+      baseBinds.push(assigneeMember.trim())
+    }
 
     // #22 v1 ATC ranking (src/tasks/ranking.ts) + mupot#1784 keyset pagination.
     // The fetch is SPLIT (actionable first, terminal fills the rest) and BOUNDED at the SQL
     // layer, and paged by an opaque keyset cursor over the SAME ORDER BY (…, created_at, id)
     // — see src/tasks/pagination.ts. `limit` is the PAGE size; next_cursor is non-null iff a
     // further row exists, so a capped read can never pass for a complete one.
-    const filterTag = filterFingerprint({ status: typeof status === 'string' ? status : undefined, projectId, assignee: typeof assignee === 'string' ? assignee.trim() : undefined })
+    const filterTag = filterFingerprint({ status: typeof status === 'string' ? status : undefined, projectId, assignee: typeof assignee === 'string' ? assignee.trim() : undefined, assigneeMember: typeof assigneeMember === 'string' ? assigneeMember.trim() : undefined })
     const pageCtx = { squadTag: squadRes.squad.id, filterTag, status: typeof status === 'string' ? status : undefined }
     let cursor: TaskCursor | null = null
     if (args.cursor !== undefined && args.cursor !== null) {
