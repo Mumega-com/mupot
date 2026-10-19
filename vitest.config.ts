@@ -24,7 +24,7 @@ import { defineConfig, configDefaults } from 'vitest/config'
 export default defineConfig({
   test: {
     globalSetup: ['./tests/helpers/migration-global-setup.ts'],
-    setupFiles: ['./tests/helpers/migration-worker-setup.ts'],
+    setupFiles: ['./tests/helpers/migration-worker-setup.ts', './tests/helpers/presence-throttle-setup.ts'],
     exclude: [
       ...configDefaults.exclude,
       'fleet-runtime/**',
