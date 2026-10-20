@@ -15,7 +15,11 @@
 //   node scripts/staleness-check.mjs           # human-readable report
 //   node scripts/staleness-check.mjs --json    # machine-readable (used by CI)
 //
-// Exit code 1 when ANY pot is not exactly current with HEAD (drift, unstamped,
+// mupot#2107 M1: pots.manifest.json `legacy` entries (frozen) are probed and
+// reported as INFORMATIONAL only. They never affect the exit code; only `pots`
+// (deployment entries) can fail the run.
+//
+// Exit code 1 when ANY deployment pot is not exactly current with HEAD (drift, unstamped,
 // unreachable, or errored). Exit code 0 only when every pot's live commit
 // equals HEAD exactly. Wired into .github/workflows/staleness-check.yml on a
 // schedule, so a divergence shows up as a failed scheduled run (GitHub emails
@@ -26,6 +30,7 @@ import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
+import { deploymentPots, legacyPots } from './lib/pots-manifest.mjs'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -78,17 +83,61 @@ export async function checkPot(pot, head, { fetchImpl = fetch, timeoutMs = 10000
   return { slug: pot.slug, status: 'current', head, live: commit }
 }
 
+function readManifest(manifestPath) {
+  return JSON.parse(readFileSync(manifestPath, 'utf8'))
+}
+
+/** Checks DEPLOYMENT entries (`pots`) only. Legacy entries are never included here. */
 export async function checkAllPots({
   manifestPath = join(REPO, 'pots.manifest.json'),
   head = headSha(),
   ...opts
 } = {}) {
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const manifest = readManifest(manifestPath)
   const results = []
-  for (const pot of manifest.pots) {
+  for (const pot of deploymentPots(manifest)) {
     results.push(await checkPot(pot, head, opts))
   }
   return results
+}
+
+/**
+ * Probe one frozen legacy pot. Informational only: reports whether it answers
+ * and what commit it claims, with NO judgement against HEAD/tenant. Never
+ * throws (a legacy pot being down is expected, not an error).
+ */
+export async function probeLegacyPot(pot, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
+  const base = { slug: pot.slug, kind: 'legacy' }
+  if (typeof pot.health !== 'string' || !pot.health) {
+    return { ...base, status: 'unreachable', error: 'no health url' }
+  }
+  try {
+    const res = await fetchImpl(pot.health, { signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) return { ...base, status: 'unreachable', http: res.status }
+    const body = await res.json().catch(() => ({}))
+    const live = typeof body?.commit === 'string' && body.commit ? body.commit : null
+    return { ...base, status: 'reachable', live }
+  } catch (err) {
+    return { ...base, status: 'unreachable', error: String(err?.message ?? err) }
+  }
+}
+
+/** Probes `legacy` entries (absent => []). Results are informational; callers must not use them for the exit code. */
+export async function checkLegacyPots({
+  manifestPath = join(REPO, 'pots.manifest.json'),
+  ...opts
+} = {}) {
+  const manifest = readManifest(manifestPath)
+  const results = []
+  for (const pot of legacyPots(manifest)) {
+    results.push(await probeLegacyPot(pot, opts))
+  }
+  return results
+}
+
+/** Exit code for a run: 1 iff any DEPLOYMENT result is not `current`. Legacy results are deliberately not an input. */
+export function exitCodeFor(deploymentResults) {
+  return deploymentResults.some((r) => r.status !== 'current') ? 1 : 0
 }
 
 /**
@@ -104,7 +153,7 @@ export async function checkAllPots({
  * Actions for every event, including `workflow_dispatch`) — omit it and the
  * report says plain `HEAD`, never a guessed branch name.
  */
-export function formatReport(head, results, { ref } = {}) {
+export function formatReport(head, results, { ref, legacy = [] } = {}) {
   const refLabel = ref ? `ref '${ref}' @ ${head}` : `HEAD ${head}`
   const lines = [`mupot staleness check — ${refLabel}`, '']
   for (const r of results) {
@@ -126,20 +175,43 @@ export function formatReport(head, results, { ref } = {}) {
                     : `✘ ERROR (${r.error})`
     lines.push(`  ${r.slug.padEnd(10)} ${label}`)
   }
+  if (legacy.length > 0) {
+    lines.push('', 'legacy pots (frozen, informational only — not counted, see #2107)')
+    for (const r of legacy) {
+      const detail =
+        r.status === 'reachable'
+          ? `reachable (live=${r.live ? r.live.slice(0, 12) : 'none'})`
+          : r.http !== undefined
+            ? `unreachable (http ${r.http})`
+            : `unreachable (${r.error})`
+      lines.push(`  ${r.slug.padEnd(10)} ${detail}`)
+    }
+  }
   return lines.join('\n')
+}
+
+/**
+ * Whole run as a pure-ish function so the exact output + exit code are
+ * testable. Deployment results alone decide `exitCode`; `legacy` is report-only.
+ */
+export async function runCheck({ manifestPath, head = headSha(), ref = null, json = false, ...opts } = {}) {
+  const base = manifestPath ? { manifestPath } : {}
+  const results = await checkAllPots({ ...base, head, ...opts })
+  const legacy = await checkLegacyPots({ ...base, ...opts })
+  const output = json
+    ? JSON.stringify({ head, ref, pots: results, ...(legacy.length ? { legacy } : {}) }, null, 2)
+    : formatReport(head, results, { ref, legacy })
+  return { output, exitCode: exitCodeFor(results), results, legacy }
 }
 
 // ── CLI entry ────────────────────────────────────────────────────────────────
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 if (isMain) {
-  const head = headSha()
-  const ref = process.env.GITHUB_REF_NAME || null
-  const results = await checkAllPots({ head })
-  if (process.argv.includes('--json')) {
-    console.log(JSON.stringify({ head, ref, pots: results }, null, 2))
-  } else {
-    console.log(formatReport(head, results, { ref }))
-  }
-  const bad = results.some((r) => r.status !== 'current')
-  process.exit(bad ? 1 : 0)
+  const { output, exitCode } = await runCheck({
+    head: headSha(),
+    ref: process.env.GITHUB_REF_NAME || null,
+    json: process.argv.includes('--json'),
+  })
+  console.log(output)
+  process.exit(exitCode)
 }

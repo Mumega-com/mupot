@@ -4,7 +4,9 @@
 // calls, no dependency on any pot actually being live.
 
 import { describe, it, expect } from 'vitest'
-import { checkPot, checkAllPots, formatReport } from '../scripts/staleness-check.mjs'
+import { readFileSync } from 'node:fs'
+import { checkPot, checkAllPots, formatReport, runCheck, exitCodeFor } from '../scripts/staleness-check.mjs'
+import { deploymentPots, legacyPots, resolveUpdateTargets } from '../scripts/lib/pots-manifest.mjs'
 
 const HEAD = 'a'.repeat(40)
 
@@ -180,5 +182,136 @@ describe('formatReport', () => {
       const out = formatReport(HEAD, [], { ref: 'main' })
       expect(out).toContain(`ref 'main' @ ${HEAD}`)
     })
+  })
+})
+
+// ── mupot#2107 M1 — legacy pots are informational; deployment pots still gate ──
+describe('legacy pots (mupot#2107 M1)', () => {
+  const fx = (name: string) => new URL(`./fixtures/${name}`, import.meta.url).pathname
+  const H = 'cafe'.repeat(10)
+
+  // current-pot is healthy and at HEAD unless `deployDrift`; legacy hosts follow `legacy`.
+  function fetchFor({ deployDrift = false, legacy = 'down' }: { deployDrift?: boolean; legacy?: 'down' | 'up' | 'throws' } = {}) {
+    return async (url: string) => {
+      const u = String(url)
+      if (u.includes('current.example')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, tenant: 'current-pot', commit: deployDrift ? 'b'.repeat(40) : H, clean: true }) }
+      }
+      if (u.includes('drifted.example')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, tenant: 'drifted-pot', commit: 'c'.repeat(40), clean: true }) }
+      }
+      if (legacy === 'throws') throw new Error('ECONNREFUSED')
+      if (legacy === 'up') return { ok: true, status: 200, json: async () => ({ ok: true, tenant: 'whatever', commit: 'd'.repeat(40) }) }
+      return { ok: false, status: 503, json: async () => ({}) }
+    }
+  }
+
+  it('deployment drift still fails the run (exit 1) even when legacy pots are fine', async () => {
+    const r = await runCheck({ manifestPath: fx('staleness-manifest-legacy.json'), head: H, fetchImpl: fetchFor({ deployDrift: true, legacy: 'up' }) })
+    expect(r.exitCode).toBe(1)
+    expect(r.output).toContain('  current-pot ⚠ DRIFT (live=bbbbbbbbbbbb)')
+  })
+
+  it('legacy pots unreachable (http 503) do NOT fail the run: exit 0, reported as informational', async () => {
+    const r = await runCheck({ manifestPath: fx('staleness-manifest-legacy.json'), head: H, fetchImpl: fetchFor({ legacy: 'down' }) })
+    expect(r.exitCode).toBe(0)
+    expect(r.output.split('\n')).toEqual([
+      `mupot staleness check — HEAD ${H}`,
+      '',
+      '  current-pot ✓ current',
+      '',
+      'legacy pots (frozen, informational only — not counted, see #2107)',
+      '  old-a      unreachable (http 503)',
+      '  old-b      unreachable (http 503)',
+    ])
+  })
+
+  it('legacy fetch throwing does NOT fail the run and is reported with its error', async () => {
+    const r = await runCheck({ manifestPath: fx('staleness-manifest-legacy.json'), head: H, fetchImpl: fetchFor({ legacy: 'throws' }) })
+    expect(r.exitCode).toBe(0)
+    expect(r.output).toContain('  old-a      unreachable (ECONNREFUSED)')
+  })
+
+  it('a reachable legacy pot reports its live commit but never affects the exit code, even when it differs from HEAD', async () => {
+    const r = await runCheck({ manifestPath: fx('staleness-manifest-legacy.json'), head: H, fetchImpl: fetchFor({ legacy: 'up' }) })
+    expect(r.exitCode).toBe(0)
+    expect(r.output).toContain('  old-a      reachable (live=dddddddddddd)')
+    expect(r.legacy.map((l: { slug: string; status: string }) => `${l.slug}:${l.status}`)).toEqual(['old-a:reachable', 'old-b:reachable'])
+  })
+
+  it('legacy absent = old behaviour: exact old report, no legacy section, no legacy key in --json', async () => {
+    const manifestPath = fx('staleness-manifest.json') // no `legacy` key
+    const fetchImpl = async (url: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, tenant: String(url).includes('drifted') ? 'drifted-pot' : 'current-pot', commit: String(url).includes('drifted') ? 'c'.repeat(40) : H, clean: true }),
+    })
+    const r = await runCheck({ manifestPath, head: H, fetchImpl })
+    expect(r.exitCode).toBe(1)
+    expect(r.output.split('\n')).toEqual([
+      `mupot staleness check — HEAD ${H}`,
+      '',
+      '  current-pot ✓ current',
+      '  drifted-pot ⚠ DRIFT (live=cccccccccccc)',
+    ])
+    const j = await runCheck({ manifestPath, head: H, json: true, fetchImpl })
+    expect(Object.keys(JSON.parse(j.output))).toEqual(['head', 'ref', 'pots'])
+  })
+
+  it('a pot moved to legacy is never treated as a deployment: its drift does not fail the run and checkAllPots omits it', async () => {
+    const manifestPath = fx('staleness-manifest-moved.json')
+    const fetchImpl = fetchFor()
+    const deployments = await checkAllPots({ manifestPath, head: H, fetchImpl })
+    expect(deployments.map((d: { slug: string }) => d.slug)).toEqual(['current-pot'])
+    const r = await runCheck({ manifestPath, head: H, fetchImpl })
+    expect(r.exitCode).toBe(0)
+    expect(r.output).toContain('  drifted-pot reachable (live=cccccccccccc)')
+    expect(r.output).not.toContain('DRIFT')
+  })
+
+  it('exitCodeFor takes deployment results only: one non-current => 1, all current => 0, empty => 0', () => {
+    expect(exitCodeFor([{ status: 'current' }])).toBe(0)
+    expect(exitCodeFor([{ status: 'current' }, { status: 'error' }])).toBe(1)
+    expect(exitCodeFor([])).toBe(0)
+  })
+
+  it('the real pots.manifest.json keeps only mumega as a deployment and freezes viamar + digid under legacy', async () => {
+    const manifest = JSON.parse(readFileSync(new URL('../pots.manifest.json', import.meta.url).pathname, 'utf8'))
+    expect(deploymentPots(manifest).map((p: { slug: string }) => p.slug)).toEqual(['mumega'])
+    expect(legacyPots(manifest).map((p: { slug: string; status: string }) => `${p.slug}:${p.status}`)).toEqual(['viamar:frozen', 'digid:frozen'])
+    for (const p of legacyPots(manifest)) {
+      expect(p.note).toContain('#2107')
+      expect(p.health).toMatch(/^https:\/\//)
+    }
+  })
+})
+
+describe('mupot-update target resolution (mupot#2107 M1)', () => {
+  const manifest = {
+    pots: [{ slug: 'mumega', db: 'mupot' }],
+    legacy: [{ slug: 'viamar', status: 'frozen' }, { slug: 'digid', status: 'frozen' }],
+  }
+
+  it('--all selects deployment entries only and names legacy as skipped', () => {
+    const r = resolveUpdateTargets(manifest, '--all')
+    expect(r.targets.map((t: { slug: string }) => t.slug)).toEqual(['mumega'])
+    expect(r.skippedLegacy).toEqual(['viamar', 'digid'])
+    expect(r.error).toBeNull()
+  })
+
+  it('naming a legacy slug is refused with a frozen-legacy error and no targets', () => {
+    const r = resolveUpdateTargets(manifest, 'viamar')
+    expect(r.targets).toEqual([])
+    expect(r.error).toBe("'viamar' is a frozen legacy pot (#2107) — mupot-update does not deploy legacy pots.")
+  })
+
+  it('an unknown slug lists only deployment slugs as known', () => {
+    expect(resolveUpdateTargets(manifest, 'nope').error).toBe("unknown pot 'nope'. Known: mumega")
+  })
+
+  it('no legacy key = old behaviour with an empty skipped list', () => {
+    const r = resolveUpdateTargets({ pots: manifest.pots }, '--all')
+    expect(r.targets).toHaveLength(1)
+    expect(r.skippedLegacy).toEqual([])
   })
 })

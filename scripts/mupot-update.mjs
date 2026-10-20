@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
 import { isFullSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
 import { generateBuildInfo } from './generate-build-info.mjs'
+import { resolveUpdateTargets } from './lib/pots-manifest.mjs'
 
 // Automatically stamp src/build-info.ts prior to multi-pot update
 generateBuildInfo()
@@ -52,9 +53,10 @@ function sh(cmd, cmdArgs, opts = {}) {
 if (!target) die('usage: mupot-update <slug|--all> [--apply] [--force] [--json]')
 
 const manifest = JSON.parse(readFileSync(join(REPO, 'pots.manifest.json'), 'utf8'))
-const all = manifest.pots
-const targets = target === '--all' ? all : all.filter((p) => p.slug === target)
-if (targets.length === 0) die(`unknown pot '${target}'. Known: ${all.map((p) => p.slug).join(', ')}`)
+// #2107 M1: only `pots` (deployment entries) are ever targets. `legacy` entries
+// are frozen — skipped and named in the output, never deployable from here.
+const { targets, skippedLegacy, error: targetError } = resolveUpdateTargets(manifest, target)
+if (targetError) die(targetError)
 
 // ── source-state guard (BLOCK-2): never push a dirty tree or a non-main ref to a
 // customer pot without an explicit override. Reported in dry-run + apply.
@@ -182,7 +184,7 @@ for (const e of pf) {
 
 function printReport(phase) {
   if (JSON_OUT) {
-    console.log(JSON.stringify({ phase, apply: APPLY, git: GIT, report: pf }, null, 2))
+    console.log(JSON.stringify({ phase, apply: APPLY, git: GIT, report: pf, ...(skippedLegacy.length ? { skipped_legacy: skippedLegacy } : {}) }, null, 2))
     return
   }
   const gitLabel = `${GIT.branch}@${GIT.sha}${GIT.dirty ? ' (DIRTY)' : ''}`
@@ -191,6 +193,9 @@ function printReport(phase) {
     const p = e.pending ? `${e.pending.length} pending${e.destructive?.length ? ` (${e.destructive.length} DESTRUCTIVE)` : ''}` : '—'
     const miss = e.missing?.length ? ` · MISSING: ${e.missing.join(',')}` : ''
     console.log(`  ${e.slug.padEnd(10)} ${String(e.status).padEnd(26)} migrations: ${p}${miss}${e.health ? ` · health ${e.health}` : ''}${e.error ? ` · ${e.error}` : ''}`)
+  }
+  for (const slug of skippedLegacy) {
+    console.log(`  ${slug.padEnd(10)} ${'SKIPPED_legacy'.padEnd(26)} frozen legacy pot (#2107) — not deployed by this tool`)
   }
 }
 
