@@ -418,6 +418,7 @@ async function resolveAuth(c: {
       delete auth.harnessCredential
       // OWNER SUDO is set only by invokeTool, in memory, per call: a header blob can never assert it.
       delete auth.ownerSudo
+      delete auth.ownerSudoVerifiedRole
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
         // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in

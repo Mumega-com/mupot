@@ -836,6 +836,9 @@ export interface AuthContext {
    * authority); this names the agent that is actually executing. Server-derived on every call; resolveAuth deletes any such
    * field arriving in the internal header blob. Presence is never touched under such a context.
    */
+  /** Set ONLY by the owner-sudo auth builder (owner-sudo.ts), next to `ownerSudo`, after buildAuth(verifiedRole:true): says `role` was proven by a
+   *  provider-verified identity, so squad-membership may map it to an org grant. Never derived from `role` alone; resolveAuth deletes it. */
+  ownerSudoVerifiedRole?: true
   ownerSudo?: { executorAgentId: string; executorMemberId: string | null; grantId: string; elevationRequestId: string; action: string; tool: string; squadId: string | null }
 }
 

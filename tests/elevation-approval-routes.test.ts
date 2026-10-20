@@ -127,12 +127,12 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     return { session }
   }
 
-  async function seedPendingRequest(env: Env, agentSessionId: string, actions: string[] = ['action:manage_access']) {
+  async function seedPendingRequest(env: Env, agentSessionId: string, actions: string[] = ['action:manage_access'], sudoArgs?: unknown) {
     const result = await createElevationRequest(env, {
       tenant: TENANT, agentSessionId, agentId: AGENT_ID, memberId: AGENT_MEMBER,
-      actions, scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'need it for the task',
+      actions, scopeType: 'squad', scopeId: SQUAD, durationMinutes: 60, reason: 'need it for the task', ...(sudoArgs === undefined ? {} : { sudoArgs }),
     })
-    if (!result.ok) throw new Error('setup: could not create elevation request')
+    if (!result.ok) throw new Error('setup: could not create elevation request ' + JSON.stringify(result))
     return result.request
   }
 
@@ -148,6 +148,26 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     expect(res.status).toBe(302)
     return cookieFrom(res)
   }
+
+  it('#2103: GET /auth/elevation/requests carries exact_call for a sudo request, null for an ordinary one', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    env.OWNER_SUDO_ENABLED = '1'
+    const plain = await seedPendingRequest(env, session.id)
+    await env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-b', ?1, 'agent-b', 'Agent B', 'member', 'test', 'active')`).bind(SQUAD).run()
+    const sudo = await seedPendingRequest(env, session.id, ['action:sudo_squad_member_add'], { squad: SQUAD, agent: 'agent-b', capability: 'member' })
+    const cookie = await devLogin(env)
+    const res = await authApp.request('/elevation/requests', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    const body = (await res.json()) as { requests: Array<{ id: string; exact_call: string | null }> }
+    const byId = new Map(body.requests.map((r) => [r.id, r.exact_call]))
+    expect(byId.get(plain.id)).toBeNull()
+    expect(byId.get(sudo.id)).toContain(`EXACT CALL (one call, then the approval is spent): add agent agent-b (`)
+    // arguments that cannot be loaded never read as an ordinary request
+    await env.DB.prepare('UPDATE elevation_requests SET sudo_args_json = NULL WHERE id = ?1').bind(sudo.id).run()
+    const res2 = await authApp.request('/elevation/requests', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    const body2 = (await res2.json()) as { requests: Array<{ id: string; exact_call: string | null }> }
+    expect(body2.requests.find((r) => r.id === sudo.id)?.exact_call).toContain('Do NOT approve')
+  })
 
   it('an operator with admin-on-squad sees the pending request in GET /auth/elevation/requests', async () => {
     const env = makeEnv('admin@x.test')
