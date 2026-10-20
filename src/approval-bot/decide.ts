@@ -176,6 +176,18 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
         return { kind: 'refused', reason: 'unknown_request' }
       }
     }
+    // Telegram redelivers an update it did not see acknowledged. A redelivered /murevoke is the SAME revoke: answer what the first
+    // run did (its receipt carries the count), and revoke nothing now, so a grant approved in between is never swept by a replay.
+    if (p.updateId !== undefined && p.updateId !== null) {
+      const prior = await env.DB.prepare('SELECT evidence_json FROM mutation_audit_entries WHERE tenant = ?1 AND idempotency_key = ?2 LIMIT 1')
+        .bind(env.TENANT_SLUG, requestKey).first<{ evidence_json: string | null }>().catch(() => null)
+      if (prior) {
+        let n = 0
+        try { const e: unknown = JSON.parse(prior.evidence_json ?? '{}'); if (typeof e === 'object' && e !== null && typeof (e as { grants_revoked?: unknown }).grants_revoked === 'number') n = (e as { grants_revoked: number }).grants_revoked } catch { /* count stays 0 */ }
+        await tell(n === 0 ? 'Nothing to revoke: you have no live approvals.' : `Revoked ${n} live approval${n === 1 ? '' : 's'}. The agents lost that access now.`)
+        return { kind: 'revoked' }
+      }
+    }
     const live = await listActiveElevationGrants(env, env.TENANT_SLUG)
     const mine = live.filter((g) => g.approved_by_member_id === memberId && (scopeRequest === null || g.elevation_request_id === scopeRequest.id))
     let revoked = 0

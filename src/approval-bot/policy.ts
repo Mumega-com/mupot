@@ -7,7 +7,8 @@
 import type { Env } from '../types'
 import { ELEVATION_ACTIONS } from '../auth/elevation-actions'
 import type { ElevationRequestRecord } from '../auth/elevation'
-import { describeSudoArgs } from '../auth/owner-sudo-args'
+import { exactCallLine } from '../auth/owner-sudo-args'
+import { untrustedLine } from '../auth/untrusted-line'
 
 /** Reversible, enforced, narrow, and not credential- or structure-minting. The broad action:manage_access is NOT here: it stays passkey / Mini App only. Adding a key here is a reviewed one-line change. */
 export const APPROVAL_BOT_ACTIONS: readonly string[] = [
@@ -54,11 +55,7 @@ export function newShortId(): string {
   return out
 }
 
-/** Untrusted text (the agent wrote it): one line, no control characters, bounded. Shown in quotes and labelled as the agent's words. */
-export function untrustedLine(text: string | null | undefined, max: number): string {
-  const flat = (text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').replace(/\s+/g, ' ').trim()
-  return flat.length > max ? `${flat.slice(0, max - 1)}...` : flat
-}
+export { untrustedLine }
 
 async function scopeName(env: Env, req: ElevationRequestRecord): Promise<string> {
   if (req.requested_scope_type === 'org') return 'the whole organisation'
@@ -78,16 +75,14 @@ export async function describeForBot(env: Env, req: ElevationRequestRecord, shor
     return def ? `- ${def.label} [${a}] (${def.effect})` : `- unrecognised action [${untrustedLine(a, 60)}]`
   })
   const mins = req.requested_duration_minutes
-  // An owner-sudo request carries its ONE exact call: shown resolved to names, from the stored canonical args (not the agent's text).
-  const sudoRow = await env.DB.prepare('SELECT sudo_args_json FROM elevation_requests WHERE id = ?1 LIMIT 1').bind(req.id).first<{ sudo_args_json: string | null }>().catch(() => null)
-  const sudoAction = parseRequestedActions(req).find((a) => a.startsWith('action:sudo_'))
-  const exact = sudoAction && sudoRow?.sudo_args_json ? await describeSudoArgs(env, sudoAction, sudoRow.sudo_args_json) : null
+  // An owner-sudo request carries its ONE exact call, from the shared renderer every decision surface uses.
+  const exact = await exactCallLine(env, req)
   const lines = [
     `Approval request ${shortId}`,
     `Agent: ${who}`,
     'Wants to do, as you:',
     ...actions,
-    ...(exact ? [`EXACT CALL (one call, then the approval is spent): ${exact}`] : []),
+    ...(exact ? [exact] : []),
     `Scope: ${await scopeName(env, req)}`,
     `Duration: ${mins} min from the moment you approve`,
     `Agent says (its own words, unverified): "${untrustedLine(req.reason, 300)}"`,

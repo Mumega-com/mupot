@@ -31,6 +31,7 @@ import { revokeWebSession } from '../auth/web-sessions'
 import { isValidSlugBase } from '../org/team-bootstrap'
 import { BOT_STEP_UP_ACTIONS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
+import { exactCallLine } from '../auth/owner-sudo-args'
 import {
   claimSeedRequest, denySeedRequest, finishSeedRequest, receiptHandlerFor, type DecisionVia, type SeedRequestRow, type StoredRequest,
 } from './seed-request'
@@ -233,9 +234,10 @@ export async function elevationViewInner(env: Env, req: ElevationRequestRecord):
   }).join('')
   const durations = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= req.requested_duration_minutes)
     .map((m) => `<option value="${m}"${m === req.requested_duration_minutes ? ' selected' : ''}>${m} minutes</option>`).join('')
+  const exact = await exactCallLine(env, req)
   return `<dl><dt>Agent</dt><dd>${agent ? escapeHtml(agent) : '<span class="muted">unknown</span>'} (<code>${escapeHtml(req.agent_id)}</code>)</dd>
 ${fromChat ? `<dt>Requested from</dt><dd><strong>a CHAT attached to ${agent ? escapeHtml(agent) : 'this agent'}</strong> (sudo: only you, who attached it, can approve)</dd>` : ''}<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
-<dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
+${exact ? `<dt>Exact call</dt><dd><strong>${escapeHtml(exact)}</strong></dd>` : ''}<dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
 <h2>Actions (untick to narrow)</h2><ul class="choices">${boxes}</ul>
 <h2>Duration (you can only shorten)</h2><select name="duration_minutes">${durations}</select>
 <h2>Why the agent says it needs this</h2>${untrustedBox('Reason', req.reason)}`

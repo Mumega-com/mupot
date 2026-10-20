@@ -67,6 +67,9 @@ async function deliver(env: Env, req: ElevationRequestRecord, opts: BotDeliveryO
   if (!(await mayDecideElevation(env, await buildAuth(env, target, undefined, { verifiedRole: true }), req))) return 'not_bound'
   const shortId = await ensureShortId(env, req)
   if (!shortId) return 'failed'
+  // The card text is built BEFORE the once-only slot is taken: an owner-sudo request whose exact arguments cannot be loaded
+  // throws here, so nothing is sent and no slot is left stuck (a transient read failure must not yield an approvable card).
+  const cardText = await describeForBot(env, req, shortId, nowMs)
   // Once-only slot: the UNIQUE(request_id) row is the whole guard, so a retry or a second call sends nothing more. Only an EXISTING
   // row that says 'sent' may answer 'sent': a reservation that failed for any other reason (DB error) never reports delivery.
   const slotId = crypto.randomUUID()
@@ -80,7 +83,7 @@ async function deliver(env: Env, req: ElevationRequestRecord, opts: BotDeliveryO
   }
   const sent = await sendBotMessage(bot, {
     chatId,
-    text: await describeForBot(env, req, shortId, nowMs),
+    text: cardText,
     buttons: [{ text: 'Approve', callback_data: `ea:${shortId}` }, { text: 'Deny', callback_data: `ed:${shortId}` }],
   }, opts.fetchFn)
   await env.DB.prepare('UPDATE approval_bot_deliveries SET status = ?1, message_id = ?2, error = ?3 WHERE id = ?4')

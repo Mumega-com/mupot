@@ -7,6 +7,7 @@
 import type { AuthContext, Env } from '../types'
 import {
   grantGateCapability,
+  grantGateCapabilityUnlessHeldByMember,
   listGateCapabilities,
   parseGateGrantArgs,
   revokeGateCapability,
@@ -62,6 +63,18 @@ const toolGrantGateCapability: ToolSpec = {
       return fail(400, parsed.error)
     }
 
+    if (auth.ownerSudo) {
+      // Owner sudo: the human-held-lane exclusion is part of the insert itself (not a check made earlier), so a member grant
+      // that lands in the gap refuses instead of being shadowed.
+      const guarded = await grantGateCapabilityUnlessHeldByMember(env as Env, {
+        capability: parsed.capability,
+        principalType: parsed.principalType,
+        principalId: parsed.principalId,
+        grantedBy: by,
+      })
+      if (!guarded.ok) return fail(403, 'sudo_gate_not_conferable', 'that gate is held by a member (a human lane)')
+      return done({ grant: guarded.grant })
+    }
     const grant = await grantGateCapability(env as Env, {
       capability: parsed.capability,
       principalType: parsed.principalType,

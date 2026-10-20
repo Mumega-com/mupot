@@ -97,6 +97,7 @@ import {
 } from '../auth/elevation-actions'
 import { hasRecentReauth, loadWebSessionByHash } from '../auth/web-sessions'
 import { evaluateAgentSession, loadAgentSessionById, type AgentSessionRecord } from '../auth/agent-sessions'
+import { exactCallLine } from '../auth/owner-sudo-args'
 import { pageHeader, sectionPanel, pill, statusDot, emptyState, type Html, type Tone } from './ui'
 
 type ShellFn = (
@@ -298,11 +299,12 @@ async function splitByOperatorScope<T>(
 // ── Screen 1: GET /elevation — pending requests ─────────────────────────────
 
 async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Promise<Html> {
-  const [agent, scopeLabel, session, fromChat] = await Promise.all([
+  const [agent, scopeLabel, session, fromChat, exactCall] = await Promise.all([
     loadAgentLabel(env, r.agent_id),
     loadScopeLabel(env, r.requested_scope_type, r.requested_scope_id),
     loadAgentSessionById(env, env.TENANT_SLUG, r.agent_session_id),
     requestIsFromAttachedChat(env, r),
+    exactCallLine(env, r, { strict: false }),
   ])
   const sessionLive = session ? evaluateAgentSession(session).ok : false
   const actions: string[] = JSON.parse(r.requested_actions_json)
@@ -319,6 +321,7 @@ async function renderPendingRequestCard(env: Env, r: ElevationRequestRecord): Pr
         <span>Asked ${formatWhen(r.created_at)}</span>
         <span>Decision window ends ${formatWhen(r.decision_expires_at)}</span>
       </div>
+      ${exactCall ? html`<p style="margin:6px 0;"><strong>${exactCall}</strong></p>` : ''}
       <p style="margin:6px 0;"><strong>Reason given:</strong> ${r.reason}</p>
       <div style="margin:8px 0;">
         ${actions.map((a) => {
@@ -506,10 +509,11 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       <p><a href="/elevation">← Back to pending requests</a> · <a href="/elevation/grants">Active elevations →</a></p>`
   }
 
-  const [agent, session, fromChat] = await Promise.all([
+  const [agent, session, fromChat, exactCall] = await Promise.all([
     loadAgentLabel(env, request.agent_id),
     loadAgentSessionById(env, env.TENANT_SLUG, request.agent_session_id),
     requestIsFromAttachedChat(env, request),
+    exactCallLine(env, request),
   ])
   const actions: string[] = JSON.parse(request.requested_actions_json)
   const hasIrreversible = actions.some((a) => ELEVATION_ACTIONS[a]?.effect === 'irreversible')
@@ -543,6 +547,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
     ${sectionPanel({
       title: '3. What it is asking, and why',
       body: html`
+        ${exactCall ? html`<p style="margin:4px 0;"><strong>${exactCall}</strong></p>` : ''}
         <p style="margin:4px 0;"><strong>Reason given:</strong> ${request.reason}</p>
         ${actionChecklist(actions)}
       `,
