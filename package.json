@@ -99,6 +99,7 @@
     "undici": "7.29.1",
     "nanoid": "^3.3.18",
     "source-map-js": "^1.2.2",
-    "proxy-addr": "^2.0.8"
+    "proxy-addr": "^2.0.8",
+    "vite": "8.1.6"
   }
 }
