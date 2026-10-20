@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
-import { deploymentPots, legacyPots } from './lib/pots-manifest.mjs'
+import { deploymentPots, legacyPots, validateManifest } from './lib/pots-manifest.mjs'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -107,6 +107,11 @@ export async function checkAllPots({
  * throws (a legacy pot being down is expected, not an error).
  */
 export async function probeLegacyPot(pot, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
+  // Never throws: a malformed entry is reported (runCheck separately fails the
+  // run on it via validateManifest — one rule, manifest errors exit 1).
+  if (typeof pot !== 'object' || pot === null || typeof pot.slug !== 'string') {
+    return { slug: String(pot?.slug ?? '?'), kind: 'legacy', status: 'unreachable', error: 'malformed legacy entry' }
+  }
   const base = { slug: pot.slug, kind: 'legacy' }
   if (typeof pot.health !== 'string' || !pot.health) {
     return { ...base, status: 'unreachable', error: 'no health url' }
@@ -116,7 +121,8 @@ export async function probeLegacyPot(pot, { fetchImpl = fetch, timeoutMs = 10000
     if (!res.ok) return { ...base, status: 'unreachable', http: res.status }
     const body = await res.json().catch(() => ({}))
     const live = typeof body?.commit === 'string' && body.commit ? body.commit : null
-    return { ...base, status: 'reachable', live }
+    const tenant = typeof body?.tenant === 'string' && body.tenant ? body.tenant : null
+    return { ...base, status: 'reachable', live, tenant }
   } catch (err) {
     return { ...base, status: 'unreachable', error: String(err?.message ?? err) }
   }
@@ -135,9 +141,13 @@ export async function checkLegacyPots({
   return results
 }
 
-/** Exit code for a run: 1 iff any DEPLOYMENT result is not `current`. Legacy results are deliberately not an input. */
+/**
+ * Exit code for a run: 1 iff there are NO deployment results (nothing verified
+ * is never green) or any DEPLOYMENT result is not `current`. Legacy results are
+ * deliberately not an input.
+ */
 export function exitCodeFor(deploymentResults) {
-  return deploymentResults.some((r) => r.status !== 'current') ? 1 : 0
+  return deploymentResults.length === 0 || deploymentResults.some((r) => r.status !== 'current') ? 1 : 0
 }
 
 /**
@@ -180,7 +190,7 @@ export function formatReport(head, results, { ref, legacy = [] } = {}) {
     for (const r of legacy) {
       const detail =
         r.status === 'reachable'
-          ? `reachable (live=${r.live ? r.live.slice(0, 12) : 'none'})`
+          ? `reachable — NOT verified (live=${r.live ? r.live.slice(0, 12) : 'none'}, tenant=${r.tenant ?? 'none'}), informational only`
           : r.http !== undefined
             ? `unreachable (http ${r.http})`
             : `unreachable (${r.error})`
@@ -194,14 +204,22 @@ export function formatReport(head, results, { ref, legacy = [] } = {}) {
  * Whole run as a pure-ish function so the exact output + exit code are
  * testable. Deployment results alone decide `exitCode`; `legacy` is report-only.
  */
-export async function runCheck({ manifestPath, head = headSha(), ref = null, json = false, ...opts } = {}) {
-  const base = manifestPath ? { manifestPath } : {}
-  const results = await checkAllPots({ ...base, head, ...opts })
-  const legacy = await checkLegacyPots({ ...base, ...opts })
+export async function runCheck({ manifestPath = join(REPO, 'pots.manifest.json'), head = headSha(), ref = null, json = false, requiredSlug = 'mumega', ...opts } = {}) {
+  // Fail closed: a malformed manifest (no/empty/non-array `pots`, missing the
+  // SaaS deployment, slug in both lists, unfrozen/malformed legacy) is never green.
+  const errors = validateManifest(readManifest(manifestPath), { requiredSlug })
+  if (errors.length > 0) {
+    const output = json
+      ? JSON.stringify({ head, ref, manifest_errors: errors }, null, 2)
+      : [`mupot staleness check — ${ref ? `ref '${ref}' @ ${head}` : `HEAD ${head}`}`, '', ...errors.map((e) => `  ✘ ${e}`)].join('\n')
+    return { output, exitCode: 1, results: [], legacy: [], errors }
+  }
+  const results = await checkAllPots({ manifestPath, head, ...opts })
+  const legacy = await checkLegacyPots({ manifestPath, ...opts })
   const output = json
     ? JSON.stringify({ head, ref, pots: results, ...(legacy.length ? { legacy } : {}) }, null, 2)
     : formatReport(head, results, { ref, legacy })
-  return { output, exitCode: exitCodeFor(results), results, legacy }
+  return { output, exitCode: exitCodeFor(results), results, legacy, errors: [] }
 }
 
 // ── CLI entry ────────────────────────────────────────────────────────────────
