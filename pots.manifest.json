@@ -1,8 +1,10 @@
 {
-  "_comment": "Pots this mupot core deploys to. `config: null` = the repo default wrangler.toml (mumega's pot). Others point at the tenant's wrangler config (copied into the repo root at deploy time so src/ + migrations/ resolve). `db` = the D1 database name. Used by scripts/mupot-update.mjs.",
+  "_comment": "Pots this mupot core deploys to. `pots` = DEPLOYMENT entries only (scripts/mupot-update.mjs deploys them; scripts/staleness-check.mjs enforces them). `config: null` = the repo default wrangler.toml (mumega's pot). `db` = the D1 database name. `legacy` = frozen entries: probed by the staleness check for information only (never fails the run) and skipped by mupot-update. See #2107.",
   "pots": [
-    { "slug": "mumega", "config": null, "db": "mupot", "health": "https://mupot.mumega.com/health" },
-    { "slug": "viamar", "config": "../mumega.com/agents/viamar/mupot-viamar.wrangler.toml", "db": "mupot-viamar", "health": "https://mupot-viamar.weathered-scene-2272.workers.dev/health" },
-    { "slug": "digid", "config": "../mumega.com/agents/digid/mupot-digid.wrangler.toml", "db": "mupot-digid", "health": "https://agents.digid.ca/health" }
+    { "slug": "mumega", "config": null, "db": "mupot", "health": "https://mupot.mumega.com/health" }
+  ],
+  "legacy": [
+    { "slug": "viamar", "status": "frozen", "note": "Frozen legacy pot; informational only, not deployed or enforced. See #2107.", "config": "../mumega.com/agents/viamar/mupot-viamar.wrangler.toml", "db": "mupot-viamar", "health": "https://mupot-viamar.weathered-scene-2272.workers.dev/health" },
+    { "slug": "digid", "status": "frozen", "note": "Frozen legacy pot; informational only, not deployed or enforced. See #2107.", "config": "../mumega.com/agents/digid/mupot-digid.wrangler.toml", "db": "mupot-digid", "health": "https://agents.digid.ca/health" }
   ]
 }

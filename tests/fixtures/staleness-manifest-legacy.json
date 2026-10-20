@@ -1,0 +1,10 @@
+{
+  "_comment": "Test fixture: one deployment pot plus two frozen legacy pots (mupot#2107 M1).",
+  "pots": [
+    { "slug": "current-pot", "config": null, "db": "test", "health": "https://current.example/health" }
+  ],
+  "legacy": [
+    { "slug": "old-a", "status": "frozen", "note": "see #2107", "config": null, "db": "a", "health": "https://old-a.example/health" },
+    { "slug": "old-b", "status": "frozen", "note": "see #2107", "config": null, "db": "b", "health": "https://old-b.example/health" }
+  ]
+}
