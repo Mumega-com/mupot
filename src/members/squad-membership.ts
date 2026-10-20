@@ -49,6 +49,14 @@ function isSelfGrant(auth: AuthContext, targetAgentId: string, callerBoundAgentI
   return callerBoundAgentId === targetAgentId
 }
 
+function rolePlaneGrants(auth: AuthContext, memberId: string): CapabilityGrant[] {
+  if (auth.boundAgentId) return []
+  // Only the owner-sudo auth builder sets this marker; auth.role alone is never trusted for the role-plane widening.
+  if (auth.ownerSudoVerifiedRole !== true) return []
+  if (auth.role !== 'owner' && auth.role !== 'admin') return []
+  return [{ member_id: memberId, scope_type: 'org', scope_id: null, capability: auth.role }]
+}
+
 /**
  * Single authorization predicate for add and remove. Auth is on the TARGET
  * squad (lead+), never on a capability the caller holds elsewhere. Self-grant
@@ -69,7 +77,11 @@ export async function authorizeSquadMembershipWrite(input: {
   if (isSelfGrant(input.auth, input.targetAgentId, callerBoundAgentId)) {
     return { ok: false, error: 'self_grant' }
   }
-  const grants: CapabilityGrant[] = input.auth.capabilities ?? []
+  // A legacy role-plane owner/admin (auth.capabilities left UNDEFINED by the auth bridge, including the verified-role principal an
+  // owner-sudo call runs as) holds its authority as a ROLE, not as rows. Reading `capabilities ?? []` refused exactly that principal.
+  // Give it the org grant its role stands for (same rank), so lead check, target-rank guard and rank ceiling all see it. Never for a
+  // bound agent, and a home squad is refused before this predicate (planeCoversScope keeps zero standing there).
+  const grants: CapabilityGrant[] = input.auth.capabilities ?? rolePlaneGrants(input.auth, input.auth.memberId)
   const scope = brandSquadScope(input.squad)
   const mayMutate = await canOnSquad(input.env, grants, scope, 'lead')
   if (!mayMutate) {
@@ -204,7 +216,7 @@ export async function addSquadMember(input: {
         receiptInsert(input.env, {
           id: receiptId,
           actorMemberId: input.auth.memberId as string,
-          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          actorBoundAgentId: input.auth.boundAgentId ?? input.auth.ownerSudo?.executorAgentId ?? null, // owner sudo: the agent executes, the human (actor_member_id) is the authority
           targetAgentId: input.agentId,
           squadId: input.squad.id,
           action: 'add',
@@ -284,7 +296,7 @@ export async function removeSquadMember(input: {
         receiptInsert(input.env, {
           id: receiptId,
           actorMemberId: input.auth.memberId as string,
-          actorBoundAgentId: input.auth.boundAgentId ?? null,
+          actorBoundAgentId: input.auth.boundAgentId ?? input.auth.ownerSudo?.executorAgentId ?? null, // owner sudo: the agent executes, the human (actor_member_id) is the authority
           targetAgentId: input.agentId,
           squadId: input.squad.id,
           action: 'remove',

@@ -34,7 +34,8 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
-import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
+import type { CapabilityGrant } from '../types'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
@@ -311,7 +312,7 @@ async function hostHasStandingInSquad(
  *  is revoke-then-grant, never an implicit takeover. */
 export async function createSeatEventGrant(
   env: Env,
-  input: { hostAgentId: string; agentId: string; projectId?: string | null; memberId: string; reason: string },
+  input: { hostAgentId: string; agentId: string; projectId?: string | null; memberId: string; reason: string; /** The squad the caller authorised against; the write only lands while the agent is still in it. */ expectSquadId?: string },
   now: () => string = () => new Date().toISOString(),
 ): Promise<GrantResult> {
   const tenant = env.TENANT_SLUG
@@ -320,6 +321,7 @@ export async function createSeatEventGrant(
   const agent = await env.DB.prepare(`SELECT squad_id FROM agents WHERE id = ?1 AND status = 'active'`)
     .bind(input.agentId).first<{ squad_id: string }>()
   if (!agent) return { ok: false, reason: 'agent_not_found' }
+  if (input.expectSquadId !== undefined && input.expectSquadId !== agent.squad_id) return { ok: false, reason: 'agent_not_found' }
   if (!(await loadActiveAgentKey(env, input.hostAgentId))) return { ok: false, reason: 'host_key_missing' }
   if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id, input.memberId))) {
     return { ok: false, reason: 'host_no_squad_standing' }
@@ -330,10 +332,14 @@ export async function createSeatEventGrant(
   }
   const id = crypto.randomUUID()
   try {
-    await env.DB.prepare(
+    // The target's squad is PINNED through the write: the standing checks above were made against agent.squad_id, so the insert only
+    // lands while the agent still sits in that squad (an agent moved between check and write writes nothing).
+    const r = await env.DB.prepare(
       `INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, project_id, granted_by_member_id, reason, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
-    ).bind(id, tenant, input.hostAgentId, input.agentId, projectId, input.memberId, input.reason.trim(), now()).run()
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+        WHERE EXISTS (SELECT 1 FROM agents WHERE id = ?4 AND squad_id = ?9 AND status = 'active')`,
+    ).bind(id, tenant, input.hostAgentId, input.agentId, projectId, input.memberId, input.reason.trim(), now(), input.expectSquadId ?? agent.squad_id).run()
+    if (Number(r.meta?.changes ?? 0) !== 1) return { ok: false, reason: 'agent_not_found' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (/UNIQUE/i.test(msg)) return { ok: false, reason: 'agent_already_granted' }
@@ -1251,4 +1257,25 @@ export async function publishSeatHint(env: Env, tenant: string, payload: unknown
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'seat_events_fetch_failed' }
   }
+}
+
+/**
+ * Who may write a seat-event grant for this target agent, and the target's squad: an org admin, or a lead on the target's squad.
+ * ONE rule for the HTTP route and the MCP twin (seat_event_grant). A target the principal cannot act on and a target that does not
+ * exist answer identically (mupot#1594 P3: no agent-existence oracle). `orgAdmin` lets a principal whose org authority lives on
+ * the legacy role plane (an owner with no capability rows) count, which the rows-only route never could.
+ */
+export async function authorizeSeatGrantTarget(
+  env: Env,
+  principal: { grants: CapabilityGrant[]; orgAdmin?: boolean },
+  targetAgentId: string,
+): Promise<{ ok: true; squadId: string } | { ok: false; status: 404; error: string }> {
+  const row = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1').bind(targetAgentId).first<{ squad_id: string }>()
+  if (principal.orgAdmin === true || hasCapability(principal.grants, 'org', null, 'admin')) {
+    // An org admin's own authorization never depended on the row, but a missing agent still falls through to the SAME uniform 404.
+    if (row) return { ok: true, squadId: row.squad_id }
+  } else if (row && (await canOnSquad(env, principal.grants, row.squad_id, 'lead'))) {
+    return { ok: true, squadId: row.squad_id }
+  }
+  return { ok: false, status: 404, error: 'agent_not_visible' }
 }

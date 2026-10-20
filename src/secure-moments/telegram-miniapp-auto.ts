@@ -42,7 +42,7 @@ export interface AutoDeliveryOpts {
  *  target); (4) the tenant's single human org owner/admin WHO HAS A BOUND TELEGRAM CHAT. Two or more such humans is ambiguous and
  *  addresses NOBODY ('not_bound', never a fan-out). A member welded to an agent is never a human; archived/suspended/other-tenant
  *  members never count (privateChatOf applies the same active-human predicate the sender uses). */
-async function decidingHuman(env: Env, requesterAgentId: string | null, requesterMemberId: string | null): Promise<string | null> {
+export async function decidingHuman(env: Env, requesterAgentId: string | null, requesterMemberId: string | null): Promise<string | null> {
   const isHuman = async (id: string): Promise<boolean> => {
     const welded = await env.DB.prepare('SELECT 1 AS w FROM agent_member_bindings WHERE member_id = ?1 LIMIT 1').bind(id).first<{ w: number }>()
     return !welded

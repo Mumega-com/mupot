@@ -39,6 +39,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/tok
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { resolveDyadGateDefault } from '../gates/dyad'
+import { isSubsystemReservedLane } from '../gates/lanes'
 import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
 import { isHumanOriginAttestorToken } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -241,6 +242,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { hasProjectWriteForSquads, callerCanWriteProject } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
+import { SEAT_EVENT_GRANT_TOOLS } from './seat-event-grant'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
@@ -261,6 +263,8 @@ import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
+import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
+import { DYAD_PIN_SUDO_STEP, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -412,6 +416,9 @@ async function resolveAuth(c: {
       // mupot#1794 W4: the harness-credential marker is re-derived below from the live token ROW; a blob can
       // never assert it (nor, by omitting it, shed it: the row says what the credential is).
       delete auth.harnessCredential
+      // OWNER SUDO is set only by invokeTool, in memory, per call: a header blob can never assert it.
+      delete auth.ownerSudo
+      delete auth.ownerSudoVerifiedRole
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
         // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in
@@ -1274,7 +1281,7 @@ const toolTaskCreate: ToolSpec = {
       if (!isValidGateOwnerForm(candidate)) {
         return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
       }
-      if (candidate === 'gate:office' || candidate === 'gate:routines' || candidate === 'gate:agent-self-completion' || candidate.startsWith('gate:self-')) {
+      if (isSubsystemReservedLane(candidate)) {
         return fail(403, 'gate_owner_reserved', 'this gate is reserved for its own subsystem and cannot be set at task_create')
       }
       const creatorIsAssignee =
@@ -6199,7 +6206,7 @@ const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
   scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'authenticated',
-  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -6208,6 +6215,8 @@ const toolRequestElevation: ToolSpec = {
       scope_id: STRING_SCHEMA,
       duration_minutes: { type: 'number', enum: [...ELEVATION_DURATION_PRESETS_MINUTES] },
       reason: STRING_SCHEMA,
+      recommendation: STRING_SCHEMA,
+      sudo_args: { type: 'object' },
     },
     required: ['actions', 'scope_type', 'duration_minutes', 'reason'],
     additionalProperties: false,
@@ -6261,6 +6270,7 @@ const toolRequestElevation: ToolSpec = {
       scopeId,
       durationMinutes,
       reason,
+      sudoArgs: args.sudo_args,
     })
     if (!result.ok) return fail(400, result.reason, result.detail)
 
@@ -6269,10 +6279,27 @@ const toolRequestElevation: ToolSpec = {
     })
     const accessLink = approveUrl(env, 'elevation', result.request.id)
     const elevationLink = moment?.url ?? accessLink
-    // The agent need not know a second tool exists: the deciding human gets the Mini App button in Telegram now (best effort).
-    const telegram = moment
-      ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
-      : 'disabled'
+    // The approval bot (src/approval-bot/) takes the request first when it is on and may carry it: ONE message with Approve and
+    // Deny buttons from the bot only the worker drives. Otherwise (bot off, an action the bot may not carry, nobody reachable,
+    // a failed send) the Mini App button and the approve_url run exactly as before.
+    const recommendation = str(args.recommendation)
+    if (recommendation) {
+      await env.DB.prepare('UPDATE elevation_requests SET recommendation = ?1 WHERE id = ?2 AND tenant = ?3')
+        .bind(recommendation.slice(0, 500), result.request.id, env.TENANT_SLUG).run().catch(() => undefined) // display-only column; a pot that has not applied 0247 just shows no recommendation
+    }
+    const botDelivery = await deliverElevationToApprovalBot(env, result.request, {
+      waitUntil: ctx.waitUntil,
+      // Bot still 'pending' when we answered and then failed: the Mini App button goes out instead.
+      fallback: moment ? () => deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil }) : undefined,
+    })
+    let telegram: string = botDelivery
+    if (botDelivery !== 'sent' && botDelivery !== 'pending') {
+      const viaMiniapp = moment
+        ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
+        : 'disabled'
+      // Mini App channel off and the bot had its own answer (not_bound / failed): report that one, it is the more specific.
+      telegram = viaMiniapp === 'disabled' && botDelivery !== 'unavailable' ? botDelivery : viaMiniapp
+    }
 
     return done({
       request: {
@@ -7653,6 +7680,7 @@ export const TOOLS: ToolSpec[] = [
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
+  ...SEAT_EVENT_GRANT_TOOLS,
   ...LOOP_TOOLS,
   ...SECRET_ENV_TOOLS,
   ...WEBHOOK_DOORBELL_TOOLS,
@@ -8147,6 +8175,20 @@ async function invokeToolInner(
     return { ...fail(400, 'invalid_args', 'args must be an object'), tool: spec.name }
   }
 
+  // OWNER SUDO (src/auth/owner-sudo.ts): an agent holding a LIVE, human-approved action:sudo_* grant that names exactly this tool and
+  // covers exactly this call runs it AS the approving human, once. Decided here, before the floor, so the tool body and every check
+  // in it (org admin, rank ceilings, home refusals) see the human's live standing and nothing the agent holds. For every other call
+  // this is a no-op: `none` leaves `auth` and the refusal the tool always gave untouched.
+  let sudoPending: OwnerSudoPending | null = null
+  {
+    const sudo = await resolveOwnerSudo(env, auth, spec.name, args)
+    if (sudo.kind === 'refused') return { ...fail(sudo.refusal.status, sudo.refusal.error, sudo.refusal.detail), tool: spec.name }
+    if (sudo.kind === 'sudo') {
+      sudoPending = sudo.pending
+      auth = sudo.memberAuth // intentional rebinding: from here the call is the approving human's, with ownerSudo naming the executor
+    }
+  }
+
   // AAGATE (#183) — deny-by-default capability FLOOR. `spec.min` is enforced HERE,
   // centrally, BEFORE argument validation. A tool that declares a capability minimum
   // can no longer fail-open if its handler omits the inline scope check: a caller
@@ -8197,7 +8239,9 @@ async function invokeToolInner(
       if (attachedAuthority(auth) && (spec.name === 'update_squad' || spec.name === 'update_department')) {
         return { ...(await attachedSudoRefusal(env, spec.name, spec.name === 'update_squad' ? args.squad : args.department)), tool: spec.name }
       }
-      const hint = elevationHint(spec.name)
+      // A dyad pin has its own one-call door (owner sudo); every other update_squad keeps the org_structure hint.
+      const dyadPin = spec.name === 'update_squad' && ('dyad_agent_a' in args || 'dyad_agent_b' in args)
+      const hint = dyadPin ? DYAD_PIN_SUDO_STEP : elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }
   }
@@ -8210,15 +8254,37 @@ async function invokeToolInner(
   // MCP client always gets a JSON-RPC error. `receipt_failed` (#186 write-receipt
   // guard) is the expected case; surface its code + safe message. For anything else
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
+  // OWNER SUDO, single use: spend the approval only now, after every refusal that can still happen (floor, schema). If the
+  // claim insert throws the tool does not run (the generic handler below turns the throw into internal_error).
+  let sudoClaim: OwnerSudoClaim | null = null
+  if (sudoPending) {
+    let claimed: Awaited<ReturnType<typeof claimOwnerSudo>>
+    try {
+      claimed = await claimOwnerSudo(env, sudoPending)
+    } catch {
+      return { ...fail(500, 'internal_error'), tool: spec.name }
+    }
+    if (!claimed.ok) return { ...fail(claimed.refusal.status, claimed.refusal.error, claimed.refusal.detail), tool: spec.name }
+    sudoClaim = claimed.claim
+  }
+
   let outcome: ToolOutcome
   try {
     outcome = (ctx.shortCircuit ? await ctx.shortCircuit(args) : null) ?? await spec.run(auth, env, args, ctx)
   } catch (err) {
+    // A throw after a claim: outcome unknown, so the claim stays 'pending' (the approval is treated as spent; stuck receipts surface it).
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
       return { ...fail(500, 'receipt_failed', msg), tool: spec.name }
     }
     return { ...fail(500, 'internal_error'), tool: spec.name }
+  }
+  if (sudoClaim) {
+    await finishOwnerSudo(env, sudoClaim, outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error })
+    // The agent is told what happened: it ran as its human, once, and the approval is spent.
+    if (outcome.ok && typeof outcome.result === 'object' && outcome.result !== null && !Array.isArray(outcome.result)) {
+      outcome = { ...outcome, result: { ...outcome.result, owner_sudo: { executed_as_authority: sudoClaim.authorityMemberId, approval: 'spent' } } }
+    }
   }
 
   // W0.1: close every delegated-operator receipt this call opened and the site left at 'attempted' (any early return
@@ -8228,7 +8294,7 @@ async function invokeToolInner(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
+  if (outcome.ok && !ctx.sideEffectFree && !ctx.heldSeat && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && !auth.ownerSudo && spec.name !== 'check_in' && spec.name !== 'boot_context' && !presenceThrottleHit(presenceCallThrottleKey(env.TENANT_SLUG, auth.memberId, auth.boundAgentId, ctx.seat ?? auth.tokenId))) {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

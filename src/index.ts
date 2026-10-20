@@ -37,6 +37,7 @@ import { mcpActionsApp, mcpApp } from './mcp'
 import { sweepStalledGateReviews } from './gates/stall-watchdog'
 import { runApprovalExpiryTick } from './gates/approval-expiry'
 import { imApp } from './im'
+import { approvalBotApp } from './approval-bot/routes'
 import { dashboardApp } from './dashboard'
 import { inviteApp } from './dashboard/invite'
 import { channelsApp, reconcileMembership } from './channels'
@@ -124,6 +125,8 @@ app.route(ROUTES.bus, busApp)
 app.route(ROUTES.members, membersApp)
 app.route(ROUTES.mcp, mcpApp)
 app.route('/', mcpActionsApp)
+// The approval bot's webhook ("/muapprove"): its own secret, its own route; mounted before imApp so no IM route can shadow it.
+app.route(`${ROUTES.im}/approve`, approvalBotApp)
 app.route(ROUTES.im, imApp)
 // channel adapters: the scoped webhook (/channels/:platform/webhook) + binding admin.
 // Mounted BEFORE the dashboard '/' catch-all so the specific prefixes win.

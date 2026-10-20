@@ -4362,9 +4362,35 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdicts_no_update" },
     ],
   },
+  {
+    file: "0248_approval_bot.sql",
+    sha256: "abb080a0dc337a708d20d0b356c468deac792511548823dc6d0dafc5ad74273c",
+    statements: [
+      "-- 0248 approval bot (\"/muapprove\"): a dedicated Telegram bot, owned by the worker, delivers an elevation request to the\n-- deciding human's bound private chat and takes the Approve / Deny tap (or /muapprove <id>, /mudeny <id>, /murevoke).\n--\n-- elevation_requests.short_id    the id the human types or taps. Assigned lazily when a request is offered to the bot,\n--                                unique per tenant. It carries NO authority: every decision still needs the bound private\n--                                chat of a member who may decide the request.\n-- elevation_requests.recommendation  optional one-line recommendation the filing agent supplied (display only, untrusted).\n-- elevation_requests.decided_via the channel that carried the decision ('approval_bot'); decision_note carries the same fact\n--                                atomically with the decision (via:approval_bot), this column is the queryable copy.\n-- approval_bot_deliveries        one row per request: who the bot addressed, in which chat, and the message id. A decision\n--                                from the bot is accepted only from the member and chat recorded here (once-only slot).\nALTER TABLE elevation_requests ADD COLUMN short_id TEXT;",
+      "\nALTER TABLE elevation_requests ADD COLUMN recommendation TEXT;",
+      "\nALTER TABLE elevation_requests ADD COLUMN decided_via TEXT;",
+      "\nCREATE UNIQUE INDEX IF NOT EXISTS idx_elevation_requests_short_id\n  ON elevation_requests(tenant, short_id) WHERE short_id IS NOT NULL;",
+      "\n\nCREATE TABLE IF NOT EXISTS approval_bot_deliveries (\n  id          TEXT PRIMARY KEY,\n  tenant      TEXT NOT NULL,\n  request_id  TEXT NOT NULL UNIQUE REFERENCES elevation_requests(id) ON DELETE CASCADE,\n  member_id   TEXT NOT NULL,\n  chat_id     TEXT NOT NULL,\n  message_id  TEXT,\n  status      TEXT NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved', 'sent', 'failed')),\n  error       TEXT,\n  created_at  TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_approval_bot_deliveries_member ON approval_bot_deliveries(tenant, member_id, created_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_elevation_requests_short_id" },
+      { type: "table", name: "approval_bot_deliveries" },
+      { type: "index", name: "idx_approval_bot_deliveries_member" },
+    ],
+  },
+  {
+    file: "0249_owner_sudo_args.sql",
+    sha256: "d42dcd3c643529db7f4a53b2a3f14f272a737c29fbc6b9f1d30431949c8e377a",
+    statements: [
+      "-- 0249 owner sudo, exact-arguments binding: an owner-sudo elevation request carries the ONE call it authorises. The arguments are\n-- resolved to ids and canonicalised (src/auth/owner-sudo-args.ts); this stores the canonical JSON and its sha256. At use time the\n-- call's own arguments must canonicalise to the same digest or the call is refused. NULL on every non-sudo request.\nALTER TABLE elevation_requests ADD COLUMN sudo_args_json TEXT;",
+      "\nALTER TABLE elevation_requests ADD COLUMN sudo_args_sha256 TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0bc663919aadca235ff7c067dca431bb9d91579a6b2e483febee9bde7e3c2f82"
+export const SCHEMA_CHAIN_DIGEST: string = "80875e323cb7561eefc3602c999afb7ee183ac71f27c9306c11f121b35e4fc8e"

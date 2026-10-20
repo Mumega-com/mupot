@@ -38,6 +38,8 @@ import {
 import { evaluateWebSession, loadWebSessionByHash } from './web-sessions'
 import {
   ELEVATION_ACTIONS,
+  OWNER_SUDO_MAX_MINUTES,
+  isOwnerSudoAction,
   type ElevationActionEffect,
   SENSITIVE_STEP_UP_ACTIONS,
   elevationActionEffect,
@@ -48,6 +50,7 @@ import {
 import { assertBatchWritten } from '../lib/receipt'
 import { installerRequestRefusal, installerWindowEnabled, isInstallerAction } from '../operators/installer-tiers'
 import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
+import { canonicalizeSudoArgs, ownerSudoEnabled, type SudoActionKey } from './owner-sudo-args'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
@@ -127,6 +130,8 @@ export interface CreateElevationRequestInput {
   scopeId: string
   durationMinutes: number
   reason: string
+  /** Owner sudo: the ONE call being authorised (mandatory for every action:sudo_*; see owner-sudo-args.ts). */
+  sudoArgs?: unknown
 }
 
 export type CreateElevationRequestResult =
@@ -164,6 +169,36 @@ export async function createElevationRequest(
         reason: 'invalid_elevation_request',
         detail: `"${action}" is defined but not yet enforced by any tool — it cannot be requested`,
       }
+    }
+  }
+  // Owner sudo: ONE act per request (the human approves exactly what the message names), org or squad scope (a department grant
+  // would read as "every squad in it"), short, flag-gated, and argument-bound. Refused at REQUEST time so nothing un-approvable
+  // reaches a human.
+  let sudoCanonical: Awaited<ReturnType<typeof canonicalizeSudoArgs>> | null = null
+  if (uniqueActions.some(isOwnerSudoAction)) {
+    if (!ownerSudoEnabled(env)) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'owner sudo is not enabled on this pot' }
+    }
+    if (uniqueActions.length !== 1) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'an owner-sudo action must be requested alone' }
+    }
+    if (input.scopeType === 'department') {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'an owner-sudo action takes org or squad scope, not department' }
+    }
+    if (input.durationMinutes > OWNER_SUDO_MAX_MINUTES) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `an owner-sudo action lasts at most ${OWNER_SUDO_MAX_MINUTES} minutes` }
+    }
+    if (uniqueActions[0] === 'action:sudo_grant_gate_capability' && input.scopeType !== 'org') {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:sudo_grant_gate_capability is org scope' }
+    }
+    // The exact call: mandatory, resolved, fenced, canonicalised. The same canonicaliser judges the call at use time.
+    sudoCanonical = await canonicalizeSudoArgs(env, uniqueActions[0] as SudoActionKey, input.sudoArgs, { agentId: input.agentId, memberId: input.memberId })
+    if (!sudoCanonical.ok) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `${sudoCanonical.error}: ${sudoCanonical.detail}` }
+    }
+    // A squad-scope approval is for THAT squad: a grant on another squad could never be used, so it is not asked for.
+    if (input.scopeType === 'squad' && sudoCanonical.value.squadId !== null && sudoCanonical.value.squadId !== input.scopeId) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'scope_id must be the squad the call touches' }
     }
   }
   // Installer window (design S1): flag-gated, requested alone, tier-specific durations. Skipped entirely for any other action.
@@ -251,6 +286,11 @@ export async function createElevationRequest(
       decisionExpiresAt,
     )
     .run()
+
+  if (sudoCanonical?.ok) {
+    await env.DB.prepare('UPDATE elevation_requests SET sudo_args_json = ?1, sudo_args_sha256 = ?2 WHERE id = ?3 AND tenant = ?4')
+      .bind(sudoCanonical.value.json, sudoCanonical.value.sha256, id, input.tenant).run()
+  }
 
   return {
     ok: true,
@@ -807,13 +847,16 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
+  // Owner-sudo grants renew the same way (a SPENT one is revoked by finishOwnerSudo, so it counts as ended): without it an agent's
+  // second approval for the same one-call action in one session could never be written. Their single-use claim counts usage only
+  // since the renewed created_at (claimOwnerSudo), so the old spend does not follow the renewed row.
   // Installer window renewal: UNIQUE(agent_session_id, action, scope_type, scope_id) means a second window for the same tier and scope
   // on one session cannot be INSERTed. When the earlier install grant has ENDED (expired or revoked) it is renewed in place (new
   // request, approver, created_at, expiry; revoked cleared) and keeps its id; its write cap counts only usage since the new created_at.
   // A still-live grant is left alone (the insert then fails as before). Other actions are unchanged.
   const renewed = new Set<string>()
   for (const g of grants) {
-    if (!isInstallerAction(g.action)) continue
+    if (!isInstallerAction(g.action) && !isOwnerSudoAction(g.action)) continue
     const prior = await env.DB.prepare(
       `SELECT id FROM elevation_grants
         WHERE tenant = ?1 AND agent_session_id = ?2 AND action = ?3 AND scope_type = ?4 AND scope_id = ?5
@@ -945,12 +988,16 @@ export async function revokeElevationGrant(
   id: string,
   reason: string,
   nowMs: number = Date.now(),
+  /** The grant's `created_at` as the caller READ it. A renewed grant keeps its id but gets a new created_at (a new generation): with
+   *  this set the revoke can only end the generation the caller saw, never a later approval that reused the row. */
+  generation?: string,
 ): Promise<{ revoked: boolean }> {
   const nowIso = new Date(nowMs).toISOString()
   const result = await env.DB.prepare(
-    `UPDATE elevation_grants SET revoked_at = ?1, revoke_reason = ?2 WHERE id = ?3 AND tenant = ?4 AND revoked_at IS NULL`,
+    `UPDATE elevation_grants SET revoked_at = ?1, revoke_reason = ?2 WHERE id = ?3 AND tenant = ?4 AND revoked_at IS NULL
+        AND (?5 IS NULL OR created_at = ?5)`,
   )
-    .bind(nowIso, reason, id, tenant)
+    .bind(nowIso, reason, id, tenant, generation ?? null)
     .run()
   return { revoked: Number(result.meta?.changes ?? 0) > 0 }
 }
@@ -1374,6 +1421,10 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   routine_update: 'action:routine_policy',
   project_update: 'action:project_status',
   unarchive_row: 'action:project_status',
+  // owner sudo: ONE call of the tool, run as the approving human (src/auth/owner-sudo.ts). update_squad keeps its org_structure hint.
+  squad_member_add: 'action:sudo_squad_member_add',
+  grant_gate_capability: 'action:sudo_grant_gate_capability',
+  seat_event_grant: 'action:sudo_seat_event_grant',
 })
 
 /** elevationHint — the refusal hint naming request_elevation + the action key
@@ -1392,6 +1443,9 @@ const ELEVATION_SCOPE_HINT_BY_TOOL: Readonly<Record<string, string>> = Object.fr
   create_department: 'scope_type "org" (an ORG-scope grant is required; scope_id is empty)',
   update_department: 'scope_type "department" with scope_id = that department\'s id (or scope_type "org")',
   update_squad: 'scope_type "squad" with scope_id = that squad\'s id (or its department\'s id, or scope_type "org")',
+  squad_member_add: 'scope_type "squad" with scope_id = that squad\'s id, duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
+  grant_gate_capability: 'scope_type "org", duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
+  seat_event_grant: 'scope_type "squad" with scope_id = the target agent\'s squad id, duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
 })
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {

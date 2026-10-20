@@ -13,10 +13,11 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { CapabilityGrant, Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
-import { resolveCapabilities, hasCapability, canOnSquad, currentMemberRankOnScope } from '../auth/capability'
+import { resolveCapabilities, currentMemberRankOnScope } from '../auth/capability'
 import { presenceLiveDoUpgradeRequest } from '../registry/realtime'
 import {
   activeSeatEventGrant,
+  authorizeSeatGrantTarget,
   consumeTicketPreCheck,
   createSeatEventGrant,
   isMemberActive,
@@ -87,18 +88,8 @@ async function authorizeGrantTarget(
   principal: { grants: CapabilityGrant[] },
   targetAgentId: string,
 ): Promise<{ ok: true; squadId: string } | { ok: false; status: 404; error: string }> {
-  const row = await c.env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1')
-    .bind(targetAgentId)
-    .first<{ squad_id: string }>()
-  if (hasCapability(principal.grants, 'org', null, 'admin')) {
-    // Org admin still needs the row to exist to report a real squadId to the caller — but an
-    // org admin's own authorization never depended on it, so a missing agent falls through
-    // to the SAME uniform 404 below rather than a separate admin-only branch.
-    if (row) return { ok: true, squadId: row.squad_id }
-  } else if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) {
-    return { ok: true, squadId: row.squad_id }
-  }
-  return { ok: false, status: 404, error: 'agent_not_visible' }
+  // The rule lives in seat-events.ts (shared with the MCP twin seat_event_grant); the route's principal stays rows-only.
+  return authorizeSeatGrantTarget(c.env, principal, targetAgentId)
 }
 
 function clientIp(c: Ctx): string {

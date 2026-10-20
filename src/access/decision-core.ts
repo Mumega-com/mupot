@@ -29,8 +29,9 @@ import {
 } from '../auth/elevation'
 import { revokeWebSession } from '../auth/web-sessions'
 import { isValidSlugBase } from '../org/team-bootstrap'
-import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
+import { BOT_STEP_UP_ACTIONS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
+import { exactCallLine } from '../auth/owner-sudo-args'
 import {
   claimSeedRequest, denySeedRequest, finishSeedRequest, receiptHandlerFor, type DecisionVia, type SeedRequestRow, type StoredRequest,
 } from './seed-request'
@@ -42,9 +43,18 @@ export interface HumanProof {
   evidence: Record<string, string>
 }
 
+/** An elevation decision may also arrive over the approval bot (a Telegram tap in the bound private chat). It is NOT a seed channel:
+ *  seed decisions keep DecisionVia (their table's CHECK does not know it), and it is never passkey-class. */
+export type ElevationVia = DecisionVia | 'approval_bot'
+export interface ElevationProof {
+  memberId: string
+  via: ElevationVia
+  evidence: Record<string, string>
+}
+
 /** The channels whose proof is a genuine passkey / fresh-login step-up. An ALLOW-list on purpose: a channel added to DecisionVia later
  *  gets no sudo-approval power until it is named here. */
-const PASSKEY_CLASS_VIA: ReadonlySet<DecisionVia> = new Set<DecisionVia>(['webauthn', 'access_passkey'])
+const PASSKEY_CLASS_VIA: ReadonlySet<ElevationVia> = new Set<ElevationVia>(['webauthn', 'access_passkey'])
 
 export interface Outcome {
   status: 200 | 400 | 403 | 404 | 409 | 410 | 503
@@ -224,16 +234,17 @@ export async function elevationViewInner(env: Env, req: ElevationRequestRecord):
   }).join('')
   const durations = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= req.requested_duration_minutes)
     .map((m) => `<option value="${m}"${m === req.requested_duration_minutes ? ' selected' : ''}>${m} minutes</option>`).join('')
+  const exact = await exactCallLine(env, req)
   return `<dl><dt>Agent</dt><dd>${agent ? escapeHtml(agent) : '<span class="muted">unknown</span>'} (<code>${escapeHtml(req.agent_id)}</code>)</dd>
 ${fromChat ? `<dt>Requested from</dt><dd><strong>a CHAT attached to ${agent ? escapeHtml(agent) : 'this agent'}</strong> (sudo: only you, who attached it, can approve)</dd>` : ''}<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
-<dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
+${exact ? `<dt>Exact call</dt><dd><strong>${escapeHtml(exact)}</strong></dd>` : ''}<dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
 <h2>Actions (untick to narrow)</h2><ul class="choices">${boxes}</ul>
 <h2>Duration (you can only shorten)</h2><select name="duration_minutes">${durations}</select>
 <h2>Why the agent says it needs this</h2>${untrustedBox('Reason', req.reason)}`
 }
 
 async function writeElevationReceipt(
-  env: Env, proof: HumanProof, requestId: string, operation: string, evidence: Record<string, unknown>,
+  env: Env, proof: ElevationProof, requestId: string, operation: string, evidence: Record<string, unknown>,
 ): Promise<boolean> {
   try {
     const nowIso = new Date().toISOString()
@@ -246,7 +257,7 @@ async function writeElevationReceipt(
     ).bind(
       crypto.randomUUID(), env.TENANT_SLUG, proof.memberId, operation, requestId, `access-elevation:${requestId}`,
       JSON.stringify({ via: proof.via, ...proof.evidence, ...evidence }), nowIso,
-      receiptHandlerFor(proof.via),
+      proof.via === 'approval_bot' ? 'approval_bot' : receiptHandlerFor(proof.via),
     ).run()
     return true
   } catch {
@@ -274,7 +285,7 @@ export async function decideElevation(
     selectedActions: string[]
     durationMinutes: number | undefined
     auth: AuthContext
-    proof: HumanProof
+    proof: ElevationProof
     /** Mints the approver's web session. Called ONLY after the gate, so no session exists for a refused decision. */
     mintSession: () => Promise<ApproverSession>
     gate?: Gate
@@ -307,8 +318,9 @@ export async function decideElevation(
     decidedByCapabilities: caps,
     decidedByIsOrgAdmin: admin,
     decidedByWebSessionHash: webSessionHash,
-    // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up.
-    recentReauthOk: true,
+    // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up. The approval bot
+    // is the one exception: a tap is NOT a fresh reauth in general, so it satisfies the step-up only for BOT_STEP_UP_ACTIONS.
+    recentReauthOk: proof.via === 'approval_bot' ? input.selectedActions.every((a) => BOT_STEP_UP_ACTIONS.includes(a)) : true,
     decidedViaPasskey: PASSKEY_CLASS_VIA.has(proof.via),
     decidedViaAccess: proof.via === 'access_passkey',
     note: `via:${proof.via}`,

@@ -295,6 +295,13 @@ export interface Env {
   TELEGRAM_MINIAPP_EXTRA_PUBKEYS?: string     // staging only: extra Ed25519 keys (64-hex, comma separated); production accepts Telegram's production key alone
   // W4.2 sub-flag: PIN fallback + user-chosen trusted-device window. OFF unless '1' or 'true' AND the Mini App channel is on; off = W4.1 behaviour.
   TELEGRAM_MINIAPP_PIN_WINDOW?: string
+  // Approval bot ("/muapprove"; src/approval-bot/): a DEDICATED Telegram bot the worker owns. OFF unless APPROVAL_BOT_TOKEN is set.
+  // APPROVAL_BOT_TOKEN and APPROVAL_BOT_WEBHOOK_SECRET are worker SECRETS (never in wrangler.toml); APPROVAL_BOT_USERNAME is its @username.
+  APPROVAL_BOT_TOKEN?: string
+  APPROVAL_BOT_WEBHOOK_SECRET?: string
+  APPROVAL_BOT_USERNAME?: string
+  // Owner sudo (src/auth/owner-sudo.ts): '1' or 'true' enables requesting and using the four action:sudo_* actions. Default OFF.
+  OWNER_SUDO_ENABLED?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].
@@ -823,6 +830,16 @@ export interface AuthContext {
   seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string; attachRefused?: string }
   webSessionIdHash?: string | null
   webSessionMemberId?: string
+  /**
+   * OWNER SUDO (src/auth/owner-sudo.ts): set ONLY by invokeTool, in memory, on the AuthContext it builds for the APPROVING human
+   * when an agent's live action:sudo_* grant covers exactly the tool being called. `memberId` is then the approving human (the
+   * authority); this names the agent that is actually executing. Server-derived on every call; resolveAuth deletes any such
+   * field arriving in the internal header blob. Presence is never touched under such a context.
+   */
+  /** Set ONLY by the owner-sudo auth builder (owner-sudo.ts), next to `ownerSudo`, after buildAuth(verifiedRole:true): says `role` was proven by a
+   *  provider-verified identity, so squad-membership may map it to an org grant. Never derived from `role` alone; resolveAuth deletes it. */
+  ownerSudoVerifiedRole?: true
+  ownerSudo?: { executorAgentId: string; executorMemberId: string | null; grantId: string; elevationRequestId: string; action: string; tool: string; squadId: string | null }
 }
 
 // ── Members & capabilities — humans are first-class network nodes ──

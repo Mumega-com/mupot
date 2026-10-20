@@ -27,22 +27,12 @@
 
 import type { Env } from '../types'
 import { GATE_CAPABILITY_RE, resolveSoleGateOwnerAgent } from './grants'
+import { isReservedForHumansOrSubsystems } from './lanes'
 
 export interface DyadGateDefault {
   readonly gate_owner: string | null
   /** Present when no default was applied although a dyad pair is pinned. */
   readonly next_step?: string
-}
-
-/** Lanes with their own completion machinery plus the human gate; never a dyad default. */
-function isReservedForHumansOrSubsystems(capability: string): boolean {
-  return (
-    capability === 'gate:hadi' ||
-    capability === 'gate:office' ||
-    capability === 'gate:routines' ||
-    capability === 'gate:agent-self-completion' ||
-    capability.startsWith('gate:self-')
-  )
 }
 
 interface PairRow {

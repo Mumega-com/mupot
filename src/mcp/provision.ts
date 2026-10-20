@@ -69,6 +69,7 @@ import {
   sha256Hex,
 } from '../members/service'
 import { attachedAuthority } from '../auth/attached-ceiling'
+import { DYAD_PIN_SUDO_STEP } from '../auth/owner-sudo'
 import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
 import {
   createCredentialClaim,
@@ -2788,6 +2789,14 @@ export const toolMoveAgentSquad: ToolSpec = {
 // UPDATE is still a single statement with normal SQLite atomicity, so no invalid
 // value is ever persisted. A durable, race-free squad audit trail is a fast-follow
 // if wanted, and needs its own migration.
+/** An agent cannot pin the dyad pair itself; ONE call can run as its human after an approval in Telegram (src/auth/owner-sudo.ts). */
+const DYAD_PIN_SUDO_NEXT_STEP = {
+  who_acts: 'owner',
+  next_tool: 'request_elevation',
+  next_step: DYAD_PIN_SUDO_STEP,
+  needs: 'human_approval',
+} as const
+
 const toolUpdateSquad: ToolSpec = {
   name: 'update_squad',
   scope: 'squad',
@@ -2903,7 +2912,7 @@ const toolUpdateSquad: ToolSpec = {
     if (elevationGrantId) {
       // The dyad pair decides who reviews work by default: it is gate authority, so an elevated AGENT never flips it.
       if ('dyad_agent_a' in patch || 'dyad_agent_b' in patch) {
-        return fail(403, 'forbidden', { reason: 'dyad_pair_standing_admin_only', remedy: 'An org owner/admin sets the dyad pair; an elevated agent may not.' })
+        return fail(403, 'forbidden', { reason: 'dyad_pair_standing_admin_only', remedy: 'An org owner/admin sets the dyad pair; an elevated agent may not.', ...DYAD_PIN_SUDO_NEXT_STEP })
       }
       if ('budget_window' in patch) {
         return fail(403, 'forbidden', { reason: 'budget_window_standing_admin_only', remedy: 'A human admin changes a squad budget window; an elevated agent may only lower the cap.' })
@@ -2928,7 +2937,7 @@ const toolUpdateSquad: ToolSpec = {
     // ids here; updateUnitConfig re-checks active + same-squad membership at the write.
     if ('dyad_agent_a' in patch || 'dyad_agent_b' in patch) {
       if (auth.boundAgentId != null || !isOrgOwnerAdmin(auth)) {
-        return fail(403, 'forbidden', { need: 'admin', scope: 'org', reason: 'dyad_pair_org_admin_only' })
+        return fail(403, 'forbidden', { need: 'admin', scope: 'org', reason: 'dyad_pair_org_admin_only', ...(auth.boundAgentId != null ? DYAD_PIN_SUDO_NEXT_STEP : {}) })
       }
       if (squad.kind !== 'work') return fail(403, 'forbidden', { reason: 'dyad_pair_not_on_home_squad' })
       if (!('dyad_agent_a' in patch) || !('dyad_agent_b' in patch)) {
