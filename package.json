@@ -75,7 +75,7 @@
     "@cloudflare/workers-oauth-provider": "^0.4.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "cron-schedule": "^6.0.0",
-    "hono": "^4.13.7"
+    "hono": "^4.13.11"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.20.2",
