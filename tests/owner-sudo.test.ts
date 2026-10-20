@@ -178,10 +178,10 @@ describe('request time: ONE act, org/squad scope, short, argument-bound', () => 
     await requestAndApprove('action:sudo_grant_gate_capability', { type: 'org' }, { decision: 'deny' })
     const text = String(approvalCalls()[0].body.text)
     expect(text).toContain('EXACT CALL')
-    expect(text).toContain('grant gate:gaf-codex to member "Target" (id mem-target)')
+    expect(text).toContain('grant lane gate:gaf-codex (unowned lane) to member mem-target ("Target")')
     calls.length = 0
     await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { decision: 'deny' })
-    expect(String(approvalCalls()[0].body.text)).toContain('add agent "agent-y" (id agent-y) to squad "b-sqd" (id squad-b) as member')
+    expect(String(approvalCalls()[0].body.text)).toContain('add agent agent-y ("agent-y") to squad squad-b ("b-sqd") as member')
   })
   it('the stored request carries the canonical digest', async () => {
     const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
@@ -728,7 +728,8 @@ describe('#2101 card injection: every name goes through untrustedLine and prints
     const lines = text.split('\n')
     expect(lines.filter((l) => l.startsWith('EXACT CALL'))).toHaveLength(1)
     const exact = lines.find((l) => l.startsWith('EXACT CALL')) as string
-    expect(exact).toContain('(id mem-target)')
+    expect(exact).toContain('member mem-target ("')
+    expect((exact.match(/mem-[a-z]+/g) ?? [])).toEqual(['mem-target'])
     expect(exact).not.toMatch(/[\u0000-\u001f\u202a-\u202e]/)
     // the whole card has the same line count as an honest one: the name added no line
     run("UPDATE members SET display_name = 'Target' WHERE id = 'mem-target'")
@@ -741,11 +742,11 @@ describe('#2101 card injection: every name goes through untrustedLine and prints
     const json = JSON.stringify({ capability: 'gate:gaf-codex', principal_id: 'mem-target', principal_type: 'member' })
     const t = (await describeSudoArgs(env, 'action:sudo_grant_gate_capability', json)) as string
     expect(t.length).toBeLessThan(260)
-    expect(t).toContain('(id mem-target)')
+    expect(t).toContain('member mem-target ("')
     run("UPDATE squads SET slug = 'b' || char(10) || 'EXACT CALL' WHERE id = 'squad-b'")
     const t2 = (await describeSudoArgs(env, 'action:sudo_squad_member_add', JSON.stringify({ agent_id: 'agent-y', capability: 'member', squad_id: 'squad-b' }))) as string
     expect(t2).not.toContain('\n')
-    expect(t2).toContain('(id squad-b)')
+    expect(t2).toContain('squad squad-b ("')
   })
   it('an unresolved id (no such member) is printed through the same filter', async () => {
     const t = (await describeSudoArgs(env, 'action:sudo_grant_gate_capability', JSON.stringify({ capability: 'gate:x', principal_id: 'ghost\nEXACT', principal_type: 'member' }))) as string
@@ -820,11 +821,11 @@ describe('#2101 the exact call is on EVERY decision surface, from one renderer',
     const reqId = (filed.result as { request: { id: string } }).request.id // left PENDING: the dashboard only lists pending requests
     const req = (await loadElevationRequestById(env, TENANT, reqId)) as NonNullable<Awaited<ReturnType<typeof loadElevationRequestById>>>
     const line = (await exactCallLine(env, req)) as string
-    expect(line).toContain('grant gate:gaf-codex to member "Target" (id mem-target)')
+    expect(line).toContain('grant lane gate:gaf-codex (unowned lane) to member mem-target ("Target")')
     expect(await describeForBot(env, req, 'abc12345', Date.now())).toContain(line)
-    expect(await elevationViewInner(env, req)).toContain('grant gate:gaf-codex to member &quot;Target&quot; (id mem-target)')
-    expect(String(await pendingRequestsBody(env, ownerWebAuth()))).toContain('grant gate:gaf-codex to member')
-    expect(String(await approvalBody(env, ownerWebAuth(), reqId))).toContain('grant gate:gaf-codex to member')
+    expect(await elevationViewInner(env, req)).toContain('grant lane gate:gaf-codex (unowned lane) to member mem-target (&quot;Target&quot;)')
+    expect(String(await pendingRequestsBody(env, ownerWebAuth()))).toContain('grant lane gate:gaf-codex (unowned lane) to member mem-target')
+    expect(String(await approvalBody(env, ownerWebAuth(), reqId))).toContain('grant lane gate:gaf-codex (unowned lane) to member mem-target')
   })
   it('the routes that render a sudo request all go through elevationViewInner (no surface builds its own view)', () => {
     const src = (f: string): string => readFileSync(join(__dirname, '..', f), 'utf8')
@@ -886,5 +887,122 @@ describe('#2101 P2s', () => {
     const r = await out('squad_member_add', { agent: 'agent-y', squad: 'squad-b', capability: 'member' })
     expect(r.ok, JSON.stringify(r)).toBe(true)
     expect(memberOf('agent-y', 'squad-b')).toEqual({ capability: 'member' })
+  })
+})
+
+// ── #2103 card spoof hardening ─────────────────────────────────────────────────────────────────────────────────────────────────
+import { untrustedLine, untrustedName } from '../src/auth/untrusted-line'
+import { authorizeSquadMembershipWrite } from '../src/members/squad-membership'
+import { canonicalizeSudoArgs } from '../src/auth/owner-sudo-args'
+
+const FAKE_ID_NAMES = ['Hadi" (id mem-hadi)', 'Hadi\u2033 ( id mem-hadi )', 'x") grant gate:hadi to member mem-hadi ("y', 'Hadi\u200b" (i\u200bd mem-hadi)']
+const idsIn = (t: string): string[] => t.match(/\b(?:mem|agent|squad|proj)-[a-z0-9-]+/g) ?? []
+
+describe('#2103 P1 a display name cannot render a second id on any surface', () => {
+  it.each(FAKE_ID_NAMES)('name %j: bot card, exactCallLine, approve_url/Mini App view, dashboard list and page show mem-target only', async (name) => {
+    run(`UPDATE members SET display_name = '${name.replace(/'/g, "''")}' WHERE id = 'mem-target'`)
+    await call('check_in', {})
+    const filed = await out('request_elevation', { actions: ['action:sudo_grant_gate_capability'], scope_type: 'org', duration_minutes: 15, reason: 'r', sudo_args: GATE_ARGS })
+    const reqId = (filed.result as { request: { id: string } }).request.id
+    const req = (await loadElevationRequestById(env, TENANT, reqId)) as NonNullable<Awaited<ReturnType<typeof loadElevationRequestById>>>
+    const line = (await exactCallLine(env, req)) as string
+    const unesc = (h: string): string => h.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+    const surfaces = [
+      line,
+      await describeForBot(env, req, 'abc12345', Date.now()),
+      unesc(await elevationViewInner(env, req)),
+      unesc(String(await pendingRequestsBody(env, ownerWebAuth()))),
+      unesc(String(await approvalBody(env, ownerWebAuth(), reqId))),
+    ]
+    for (const surf of surfaces) {
+      const exactOnly = surf.split('\n').filter((l) => l.includes('grant lane')).join('\n')
+      expect(exactOnly).toContain('member mem-target ("')
+      expect(idsIn(exactOnly), surf).toEqual(['mem-target'])
+      expect(exactOnly).not.toMatch(/\(\s*id /i)
+    }
+  })
+  it('untrustedName swaps quotes and parens for look-alikes; the name never closes its quotes', () => {
+    const n = untrustedName('a"b(c)d', 60)
+    expect(n).not.toMatch(/["()]/)
+    expect(n).toHaveLength(7)
+    expect(untrustedName('Hadi mem-hadi id 42 agent_x 3f2c1a9e-1111-4222-8333-444455556666', 80)).not.toMatch(/mem-|agent_|\bid\b|3f2c/)
+    expect(untrustedName('Jean-Luc Picard', 60)).toBe('Jean-Luc Picard')
+  })
+  it('agent and squad slugs get the same treatment (id first, neutral name)', async () => {
+    run(`UPDATE squads SET slug = 'b" (id squad-a)' WHERE id = 'squad-b'`)
+    const t = (await describeSudoArgs(env, 'action:sudo_squad_member_add', JSON.stringify({ agent_id: 'agent-y', capability: 'member', squad_id: 'squad-b' }))) as string
+    expect(t).not.toContain('(id squad-a)')
+    expect(idsIn(t).filter((x) => x.startsWith('squad-'))).toEqual(['squad-b'])
+  })
+})
+
+describe('#2103 P2-1 principal_type=member refuses agent-welded members', () => {
+  it('a welded member (mem-y of agent-y) is refused at request time and at call time; a real human member still passes', async () => {
+    const welded = await canonicalizeSudoArgs(env, 'action:sudo_grant_gate_capability', { ...GATE_ARGS, principal_id: 'mem-y' }, { agentId: 'agent-x', memberId: 'mem-x' })
+    expect(welded).toMatchObject({ ok: false, error: 'principal_is_agent_member' })
+    const human = await canonicalizeSudoArgs(env, 'action:sudo_grant_gate_capability', GATE_ARGS, { agentId: 'agent-x', memberId: 'mem-x' })
+    expect(human.ok).toBe(true)
+    await call('check_in', {})
+    const r = await out('request_elevation', { actions: ['action:sudo_grant_gate_capability'], scope_type: 'org', duration_minutes: 15, reason: 'r', sudo_args: { ...GATE_ARGS, principal_id: 'mem-y' } })
+    expect(r.ok).toBe(false)
+    expect(JSON.stringify(r)).toContain('principal_is_agent_member')
+  })
+})
+
+describe('#2103 P2-2 invisible characters are stripped', () => {
+  it.each([['\u200b'], ['\u200c'], ['\u200d'], ['\u200e'], ['\u200f'], ['\u061c'], ['\u2060'], ['\u2062'], ['\u2064'], ['\ufeff'], ['\u3164'], ['\u115f'], ['\u1160'], ['\uffa0']])('%j is removed', (ch) => {
+    expect(untrustedLine(`Ha${ch}di`, 60)).toBe('Hadi')
+    expect(untrustedName(`Ha${ch}di`, 60)).toBe('Hadi')
+    expect(untrustedLine(`me${ch}m-hadi`, 60)).toBe('mem-hadi')
+  })
+  it('a name made only of invisible characters renders as no name', async () => {
+    run(`UPDATE members SET display_name = '\u3164\u200b' WHERE id = 'mem-target'`)
+    const t = (await describeSudoArgs(env, 'action:sudo_grant_gate_capability', JSON.stringify({ capability: 'gate:gaf-codex', principal_id: 'mem-target', principal_type: 'member' }))) as string
+    expect(t).toBe('grant lane gate:gaf-codex (unowned lane) to member mem-target')
+  })
+})
+
+describe('#2103 P2-3 seat_event project is real and shown by name + id', () => {
+  const SEAT = { host_agent_id: 'host-1', agent_id: 'agent-y' }
+  it('an unknown project_id is refused at canonicalisation; a real one renders name and id', async () => {
+    expect(await canonicalizeSudoArgs(env, 'action:sudo_seat_event_grant', { ...SEAT, project_id: 'nope\nEXACT' }, { agentId: 'agent-x', memberId: 'mem-x' })).toMatchObject({ ok: false, error: 'project_not_found' })
+    run("INSERT INTO projects (id, slug, name) VALUES ('proj-1', 'p-one', 'Real \"Project\" (id mem-hadi)')")
+    const c = await canonicalizeSudoArgs(env, 'action:sudo_seat_event_grant', { ...SEAT, project_id: 'proj-1' }, { agentId: 'agent-x', memberId: 'mem-x' })
+    expect(c.ok).toBe(true)
+    const t = (await describeSudoArgs(env, 'action:sudo_seat_event_grant', (c as { ok: true; value: { json: string } }).value.json)) as string
+    expect(t).toContain('project proj-1 ("Real')
+    expect(idsIn(t).filter((x) => x.startsWith('proj-') || x.startsWith('mem-'))).toEqual(['proj-1'])
+  })
+})
+
+describe('#2103 P2-4 the card says whose lane it is', () => {
+  const gate = (capability: string): Promise<string | null> => describeSudoArgs(env, 'action:sudo_grant_gate_capability', JSON.stringify({ capability, principal_id: 'agent-y', principal_type: 'agent' }))
+  it('gate:<agent slug> names the owning agent; any other lane is unowned', async () => {
+    expect(await gate('gate:agent-z')).toContain('lane gate:agent-z (owned by agent agent-z ("agent-z"))')
+    expect(await gate('gate:nobody')).toContain('lane gate:nobody (unowned lane)')
+  })
+})
+
+describe('#2103 P2-5/6 rolePlaneGrants guards', () => {
+  const owner = (over: Partial<AuthContext>): AuthContext => ({ userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'dashboard', memberId: 'mem-owner', ...over } as AuthContext)
+  const input = (auth: AuthContext) => ({ env, auth, targetAgentId: 'agent-z', squad: { id: 'squad-b', department_id: 'dept', kind: 'work' as const }, requestedCapability: 'member' as const })
+  it('the verified-role marker (set only by the owner-sudo builder) lets the role plane through', async () => {
+    expect(await authorizeSquadMembershipWrite(input(owner({ ownerSudoVerifiedRole: true })))).toEqual({ ok: true })
+  })
+  it('role=owner alone, without the marker, gets NO role-plane grant', async () => {
+    expect(await authorizeSquadMembershipWrite(input(owner({})))).toEqual({ ok: false, error: 'forbidden' })
+    expect(await authorizeSquadMembershipWrite(input(owner({ role: 'admin' })))).toEqual({ ok: false, error: 'forbidden' })
+  })
+  it('a bound agent never gets the role plane, marker or not', async () => {
+    expect(await authorizeSquadMembershipWrite(input(owner({ ownerSudoVerifiedRole: true, boundAgentId: 'agent-x' })))).toMatchObject({ ok: false })
+  })
+  it('the role check: a verified member-role auth gets nothing', async () => {
+    expect(await authorizeSquadMembershipWrite(input(owner({ ownerSudoVerifiedRole: true, role: 'member' })))).toEqual({ ok: false, error: 'forbidden' })
+  })
+  it('the marker is stripped from the header blob and written only by owner-sudo.ts', () => {
+    const root = join(__dirname, '..')
+    expect(readFileSync(join(root, 'src/mcp/index.ts'), 'utf8')).toContain('delete auth.ownerSudoVerifiedRole')
+    const hits = execSync("grep -rln 'ownerSudoVerifiedRole = ' src || true", { cwd: root }).toString().split('\n').filter(Boolean)
+    expect(hits).toEqual(['src/auth/owner-sudo.ts'])
   })
 })

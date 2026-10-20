@@ -13,6 +13,7 @@
 //   - peekSessionAuth : same cookie/KV read as requireAuth, null instead of 401
 //   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
+import { exactCallLine } from './owner-sudo-args'
 import { Hono } from 'hono'
 import { credentialBase, pinnedBase, parseTenantPrefix, prefixUrlValue } from '../platform/tenant-path'
 import { csrf } from 'hono/csrf'
@@ -1879,6 +1880,8 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
       reason: r.reason,
       created_at: r.created_at,
       decision_expires_at: r.decision_expires_at,
+      // Sudo requests carry the exact call (never an ordinary-looking row); non-sudo requests: null.
+      exact_call: await exactCallLine(c.env, r, { strict: false }),
     })
   }
   return c.json({ requests: visible })

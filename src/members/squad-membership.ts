@@ -51,6 +51,8 @@ function isSelfGrant(auth: AuthContext, targetAgentId: string, callerBoundAgentI
 
 function rolePlaneGrants(auth: AuthContext, memberId: string): CapabilityGrant[] {
   if (auth.boundAgentId) return []
+  // Only the owner-sudo auth builder sets this marker; auth.role alone is never trusted for the role-plane widening.
+  if (auth.ownerSudoVerifiedRole !== true) return []
   if (auth.role !== 'owner' && auth.role !== 'admin') return []
   return [{ member_id: memberId, scope_type: 'org', scope_id: null, capability: auth.role }]
 }

@@ -13,7 +13,7 @@
 import type { Env } from '../types'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import * as lanes from '../gates/lanes'
-import { untrustedLine } from './untrusted-line'
+import { untrustedLine, untrustedName } from './untrusted-line'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
 
 /** OWNER_SUDO_ENABLED = '1' | 'true'. Default OFF: with it off no sudo action can be requested and resolveOwnerSudo is a no-op. */
@@ -137,6 +137,12 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
       ? await env.DB.prepare('SELECT 1 AS x FROM agents WHERE id = ?1 LIMIT 1').bind(pid).first<{ x: number }>()
       : await env.DB.prepare('SELECT 1 AS x FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1').bind(pid, env.TENANT_SLUG).first<{ x: number }>()
     if (!exists) return bad('principal_not_found', 'unknown principal')
+    // A member row welded to an agent (agent_member_bindings) is the AGENT's identity, not a person: its display name is agent-controlled
+    // and a gate granted to it is an agent gate. Gate grants to a member principal go to real human members only.
+    if (pt === 'member') {
+      const welded = await env.DB.prepare('SELECT 1 AS x FROM agent_member_bindings WHERE tenant = ?1 AND member_id = ?2 LIMIT 1').bind(env.TENANT_SLUG, pid).first<{ x: number }>()
+      if (welded) return bad('principal_is_agent_member', 'that member is an agent\'s own identity; use principal_type=agent for it')
+    }
     return finish({ capability: cap, principal_type: pt, principal_id: pid }, null)
   }
 
@@ -145,6 +151,10 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
   if (!hostId || !agentId) return bad('sudo_args_required', 'host_agent_id and agent_id are required')
   const projectId = raw.project_id === undefined || raw.project_id === null ? null : text(raw.project_id)
   if (raw.project_id !== undefined && raw.project_id !== null && !projectId) return bad('sudo_args_invalid', 'project_id must be a string')
+  if (projectId) {
+    const proj = await env.DB.prepare('SELECT 1 AS x FROM projects WHERE id = ?1 LIMIT 1').bind(projectId).first<{ x: number }>()
+    if (!proj) return bad('project_not_found', 'project_id must be the id of a real project')
+  }
   if (who.agentId && hostId === who.agentId) return bad('cannot_grant_to_self', 'the seat-event host may not be the requesting agent')
   const row = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1').bind(agentId).first<{ squad_id: string }>()
   if (!row) return bad('agent_not_visible', 'unknown agent')
@@ -167,11 +177,12 @@ export function sudoRawFromToolArgs(tool: 'squad_member_add' | 'update_squad' | 
 const NAME_MAX = 60
 
 /** A name for the card: ONE line, control/bidi chars stripped, length capped, and the id ALWAYS printed beside it, so a name can
- *  neither add a line nor stand in for the id. The id is printed through the same filter (an unresolved id is still agent text). */
+ *  neither add a line nor stand in for the id (the id is printed BEFORE the name). The id is printed through the same filter (an unresolved id is still agent text). */
 function labelled(kind: string, name: string | null | undefined, id: unknown): string {
   const idText = untrustedLine(typeof id === 'string' ? id : String(id), 80)
-  const n = untrustedLine(name, NAME_MAX)
-  return n ? `${kind} "${n}" (id ${idText})` : `${kind} (id ${idText})`
+  const n = untrustedLine(name, NAME_MAX) === idText ? idText : untrustedName(name, NAME_MAX) // a slug equal to its own id is the id, not a spoof
+  // The id comes FIRST and the name last inside quotes with its quotes/parens neutralised: a name can never add a second id.
+  return n ? `${kind} ${idText} ("${n}")` : `${kind} ${idText}`
 }
 
 /** One human line naming the approved call in NAMES (never the agent's free text), for the approval message. Every name goes
@@ -187,6 +198,17 @@ export async function describeSudoArgs(env: Env, action: string, json: string): 
     const r = typeof id === 'string' ? await env.DB.prepare('SELECT slug FROM squads WHERE id = ?1 LIMIT 1').bind(id).first<{ slug: string }>().catch(() => null) : null
     return labelled('squad', r?.slug, id)
   }
+  const project = async (id: string): Promise<string> => {
+    const r = await env.DB.prepare('SELECT name FROM projects WHERE id = ?1 LIMIT 1').bind(id).first<{ name: string }>().catch(() => null)
+    return labelled('project', r?.name, id)
+  }
+  // Whose lane: gate:<slug> is owned by the agent with that slug; anything else is an unowned lane.
+  const laneOf = async (v: unknown): Promise<string> => {
+    const lane = untrustedLine(typeof v === 'string' ? v : String(v), 130)
+    const slug = lane.toLowerCase().startsWith('gate:') ? lane.slice(5) : ''
+    const r = slug ? await env.DB.prepare('SELECT id, slug FROM agents WHERE lower(slug) = ?1 LIMIT 1').bind(slug.toLowerCase()).first<{ id: string; slug: string }>().catch(() => null) : null
+    return r ? `lane ${lane} (owned by ${labelled('agent', r.slug, r.id)})` : `lane ${lane} (unowned lane)`
+  }
   const cap = (v: unknown): string => untrustedLine(typeof v === 'string' ? v : String(v), 130)
   if (action === 'action:sudo_squad_member_add') return `add ${await agent(o.agent_id)} to ${await squad(o.squad_id)} as ${cap(o.capability)}`
   if (action === 'action:sudo_squad_dyad_pin') {
@@ -201,9 +223,9 @@ export async function describeSudoArgs(env: Env, action: string, json: string): 
         : null
       who = labelled('member', row?.display_name, o.principal_id)
     }
-    return `grant ${cap(o.capability)} to ${who}`
+    return `grant ${await laneOf(o.capability)} to ${who}`
   }
-  if (action === 'action:sudo_seat_event_grant') return `let host ${await agent(o.host_agent_id)} receive the seat events of ${await agent(o.agent_id)}${o.project_id ? ` (project ${untrustedLine(String(o.project_id), 80)})` : ''}`
+  if (action === 'action:sudo_seat_event_grant') return `let host ${await agent(o.host_agent_id)} receive the seat events of ${await agent(o.agent_id)}${typeof o.project_id === 'string' && o.project_id ? ` for ${await project(o.project_id)}` : ''}`
   return null
 }
 

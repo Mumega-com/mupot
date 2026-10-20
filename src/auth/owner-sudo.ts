@@ -204,6 +204,7 @@ export async function resolveOwnerSudo(env: Env, auth: AuthContext, toolName: st
     const rows = await resolveCapabilities(env, grant.approved_by_member_id)
     if (hasCapability(rows, 'org', null, 'admin')) memberAuth.capabilities = rows
   }
+  memberAuth.ownerSudoVerifiedRole = true // buildAuth ran with verifiedRole above; the ONLY place this marker is set
   memberAuth.ownerSudo = {
     executorAgentId: auth.boundAgentId,
     executorMemberId: auth.memberId ?? null,
