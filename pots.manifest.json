@@ -1,5 +1,5 @@
 {
-  "_comment": "Pots this mupot core deploys to. `pots` = DEPLOYMENT entries only (scripts/mupot-update.mjs deploys them; scripts/staleness-check.mjs enforces them). `config: null` = the repo default wrangler.toml (mumega's pot). `db` = the D1 database name. `legacy` = frozen entries: probed by the staleness check for information only (never fails the run) and skipped by mupot-update. See #2107.",
+  "_comment": "Pots this mupot core deploys to. `pots` = DEPLOYMENT entries only (scripts/mupot-update.mjs deploys them; scripts/staleness-check.mjs enforces them). `config: null` = the repo default wrangler.toml (mumega's pot). `db` = the D1 database name. `required_slug` (optional) = the deployment slug the staleness check requires in `pots` (default mumega; env STALENESS_REQUIRED_SLUG overrides). `legacy` = frozen entries: probed by the staleness check for information only (never fails the run) and skipped by mupot-update. See #2107.",
   "pots": [
     { "slug": "mumega", "config": null, "db": "mupot", "health": "https://mupot.mumega.com/health" }
   ],

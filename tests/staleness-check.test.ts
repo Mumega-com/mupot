@@ -3,12 +3,15 @@
 // unstamped / unreachable / error) with an injected fetch mock — no network
 // calls, no dependency on any pot actually being live.
 
-import { describe, it, expect } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { checkPot, checkAllPots, formatReport, runCheck, exitCodeFor, probeLegacyPot } from '../scripts/staleness-check.mjs'
-import { deploymentPots, legacyPots, resolveUpdateTargets, validateManifest } from '../scripts/lib/pots-manifest.mjs'
+import { deploymentPots, legacyPots, resolveRequiredSlug, resolveUpdateTargets, validateManifest } from '../scripts/lib/pots-manifest.mjs'
 
 const HEAD = 'a'.repeat(40)
 
@@ -115,6 +118,21 @@ describe('checkPot', () => {
       fetchImpl: jsonFetch({ ok: true, tenant: 'viamar' }),
     })
     expect(r.status).toBe('wrong_tenant')
+  })
+})
+
+describe('malformed /health JSON (mupot#2109)', () => {
+  const pot = { slug: 'mumega', health: 'https://x.example/health' }
+  it.each([
+    ['null', null],
+    ['a number', 7],
+    ['a string', 'ok'],
+    ['an array', [{ ok: true }]],
+  ])('a 2xx whose body is %s => an error result with a message, not a TypeError', async (_name, body) => {
+    const r = await checkPot(pot, HEAD, { fetchImpl: jsonFetch(body) })
+    expect(r).toEqual({ slug: 'mumega', status: 'error', head: HEAD, error: 'health body is not a JSON object' })
+    expect(exitCodeFor([r])).toBe(1)
+    expect(formatReport(HEAD, [r])).toContain('✘ ERROR (health body is not a JSON object)')
   })
 })
 
@@ -390,7 +408,7 @@ describe('mupot-update target resolution (mupot#2107 M1)', () => {
     const both = { pots: [{ slug: 'mumega', db: 'mupot' }], legacy: [{ slug: 'mumega', status: 'frozen' }] }
     const msg = "manifest: slug 'mumega' is in both pots and legacy"
     expect(resolveUpdateTargets(both, '--all')).toEqual({ targets: [], skippedLegacy: ['mumega'], error: msg })
-    expect(resolveUpdateTargets(both, 'mumega')).toEqual({ targets: [], skippedLegacy: ['mumega'], error: msg })
+    expect(resolveUpdateTargets(both, 'mumega')).toEqual({ targets: [], skippedLegacy: [], error: msg })
   })
 
   it('an unfrozen legacy entry is refused', () => {
@@ -426,5 +444,366 @@ describe('mupot-update target resolution (mupot#2107 M1)', () => {
     const r = resolveUpdateTargets({ pots: manifest.pots }, '--all')
     expect(r.targets).toHaveLength(1)
     expect(r.skippedLegacy).toEqual([])
+  })
+})
+
+describe('resolveUpdateTargets reports skips only for --all (mupot#2109)', () => {
+  const manifest = {
+    pots: [{ slug: 'mumega', db: 'mupot' }],
+    legacy: [{ slug: 'viamar', status: 'frozen' }, { slug: 'digid', status: 'frozen' }],
+  }
+
+  it('a single-slug target reports no skipped legacy pots', () => {
+    const r = resolveUpdateTargets(manifest, 'mumega')
+    expect(r.error).toBeNull()
+    expect(r.targets.map((t: { slug: string }) => t.slug)).toEqual(['mumega'])
+    expect(r.skippedLegacy).toEqual([])
+  })
+
+  it('a refused legacy-slug target reports no skips either; --all still names them', () => {
+    expect(resolveUpdateTargets(manifest, 'viamar').skippedLegacy).toEqual([])
+    expect(resolveUpdateTargets(manifest, '--all').skippedLegacy).toEqual(['viamar', 'digid'])
+  })
+})
+
+describe('manifest guards (mupot#2109)', () => {
+  const okPot = { slug: 'mumega', config: null, db: 'mupot', health: 'https://mumega.example/health' }
+
+  it('pots[i] without a slug => "pots[i] is malformed (no slug)", with the right index', () => {
+    const errors = validateManifest({ pots: [okPot, { db: 'x' }, null, 'str'] })
+    expect(errors).toEqual([
+      'manifest: pots[1] is malformed (no slug)',
+      'manifest: pots[2] is malformed (no slug)',
+      'manifest: pots[3] is malformed (no slug)',
+    ])
+  })
+
+  it('an empty-string slug is malformed too', () => {
+    expect(validateManifest({ pots: [okPot, { slug: '' }] })).toEqual(['manifest: pots[1] is malformed (no slug)'])
+  })
+
+  it.each([
+    ['an object', {}],
+    ['a string', 'viamar'],
+    ['null', null],
+  ])('legacy that is %s (not an array) => "legacy is not an array"', (_name, legacy) => {
+    expect(validateManifest({ pots: [okPot], legacy })).toEqual(['manifest: legacy is not an array'])
+  })
+
+  it('legacy absent is fine; legacy: [] is fine', () => {
+    expect(validateManifest({ pots: [okPot] })).toEqual([])
+    expect(validateManifest({ pots: [okPot], legacy: [] })).toEqual([])
+  })
+
+  it('mupot-update refuses (via resolveUpdateTargets) on both new guards', () => {
+    expect(resolveUpdateTargets({ pots: [okPot, { db: 'x' }] }, '--all').error).toBe('manifest: pots[1] is malformed (no slug)')
+    expect(resolveUpdateTargets({ pots: [okPot], legacy: {} }, '--all').error).toBe('manifest: legacy is not an array')
+  })
+})
+
+describe('required deployment slug is configurable (mupot#2109)', () => {
+  const H = 'beef'.repeat(10)
+  const forkPot = { slug: 'acme', config: null, db: 'mupot-acme', health: 'https://acme.example/health' }
+  const dir = mkdtempSync(join(tmpdir(), 'staleness-required-'))
+  let n = 0
+  function manifestFile(body: unknown): string {
+    const f = join(dir, `m${n++}.json`)
+    writeFileSync(f, JSON.stringify(body))
+    return f
+  }
+  const acmeGreen = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, tenant: 'acme', commit: H, clean: true }) })
+  const run = (body: unknown, env: Record<string, string> = {}) =>
+    runCheck({ manifestPath: manifestFile(body), head: H, fetchImpl: acmeGreen, env })
+
+  it('resolveRequiredSlug precedence: env > manifest field > mumega', () => {
+    expect(resolveRequiredSlug({}, {})).toBe('mumega')
+    expect(resolveRequiredSlug({ required_slug: 'acme' }, {})).toBe('acme')
+    expect(resolveRequiredSlug({ required_slug: 'acme' }, { STALENESS_REQUIRED_SLUG: 'globex' })).toBe('globex')
+    expect(resolveRequiredSlug({ required_slug: 'acme' }, { STALENESS_REQUIRED_SLUG: '  ' })).toBe('acme')
+  })
+
+  it('default is unchanged: a fork without mumega and no override still fails closed', async () => {
+    const r = await run({ pots: [forkPot] })
+    expect(r.exitCode).toBe(1)
+    expect(r.errors).toEqual(["manifest: deployment pots do not include 'mumega' — refusing to report green"])
+  })
+
+  it('manifest `required_slug` lets a fork pass when that pot is current', async () => {
+    const r = await run({ required_slug: 'acme', pots: [forkPot] })
+    expect(r.errors).toEqual([])
+    expect(r.exitCode).toBe(0)
+  })
+
+  it('env STALENESS_REQUIRED_SLUG lets a fork pass', async () => {
+    const r = await run({ pots: [forkPot] }, { STALENESS_REQUIRED_SLUG: 'acme' })
+    expect(r.exitCode).toBe(0)
+  })
+
+  it('still fails closed when the configured slug is not in pots', async () => {
+    const r = await run({ required_slug: 'globex', pots: [forkPot] })
+    expect(r.exitCode).toBe(1)
+    expect(r.errors).toEqual(["manifest: deployment pots do not include 'globex' — refusing to report green"])
+    const e = await run({ pots: [forkPot] }, { STALENESS_REQUIRED_SLUG: 'globex' })
+    expect(e.exitCode).toBe(1)
+  })
+
+  it.each([
+    ['empty string', ''],
+    ['whitespace', '   '],
+    ['a number', 7],
+    ['null', null],
+    ['an array', ['acme']],
+  ])('an invalid manifest `required_slug` (%s) => exit 1, never silently defaulted', async (_name, bad) => {
+    const r = await run({ required_slug: bad, pots: [okPotMumega()] })
+    expect(r.exitCode).toBe(1)
+    expect(r.errors).toContain('manifest: required_slug must be a non-empty string')
+  })
+
+  function okPotMumega() {
+    return { slug: 'mumega', config: null, db: 'mupot', health: 'https://mumega.example/health' }
+  }
+
+  it('a configured slug that is only in `legacy` is refused (legacy is never a deployment)', async () => {
+    const r = await run({ required_slug: 'viamar', pots: [okPotMumega()], legacy: [{ slug: 'viamar', status: 'frozen' }] })
+    expect(r.exitCode).toBe(1)
+  })
+})
+
+describe('unreadable manifest fails closed (mupot#2109)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'staleness-unreadable-'))
+
+  it('a missing manifest file => exit 1 with a manifest error, not a throw', async () => {
+    const r = await runCheck({ manifestPath: join(dir, 'nope.json'), head: HEAD })
+    expect(r.exitCode).toBe(1)
+    expect(r.errors[0]).toMatch(/^manifest: cannot read or parse /)
+  })
+
+  it('invalid JSON => exit 1 with a manifest error, not a throw', async () => {
+    const f = join(dir, 'bad.json')
+    writeFileSync(f, '{ not json')
+    const r = await runCheck({ manifestPath: f, head: HEAD })
+    expect(r.exitCode).toBe(1)
+    expect(r.errors[0]).toMatch(/^manifest: cannot read or parse /)
+  })
+})
+
+// ── CLI wiring: spawn the real scripts so the process exit code is what is asserted ──
+const REPO_ROOT = new URL('..', import.meta.url).pathname
+const CLI = join(REPO_ROOT, 'scripts', 'staleness-check.mjs')
+const UPDATE_CLI = join(REPO_ROOT, 'scripts', 'mupot-update.mjs')
+
+function runNode(script: string, args: string[], env: Record<string, string> = {}, cwd: string = REPO_ROOT): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [script, ...args], {
+      cwd,
+      env: { ...process.env, STALENESS_REQUIRED_SLUG: '', GITHUB_REF_NAME: '', ...env },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (d) => (stdout += d))
+    child.stderr.on('data', (d) => (stderr += d))
+    child.on('close', (code) => resolveRun({ code, stdout, stderr }))
+  })
+}
+
+describe('staleness-check CLI exit code (mupot#2109)', () => {
+  const head = (spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout || '').trim()
+  const dir = mkdtempSync(join(tmpdir(), 'staleness-cli-'))
+  let server: Server
+  let base = ''
+  let liveCommit = head
+
+  // Local /health: tenant per path (/mumega, /acme), commit switchable per test.
+  beforeAll(async () => {
+    server = createServer((req, res) => {
+      const tenant = (req.url ?? '').split('/')[1] || 'mumega'
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ok: true, tenant, commit: liveCommit, clean: true }))
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()))
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}` // AddressInfo: listen(0) on a TCP server always yields an object
+  })
+  afterAll(() => {
+    server.close()
+  })
+
+  let n = 0
+  function manifestFile(body: unknown): string {
+    const f = join(dir, `m${n++}.json`)
+    writeFileSync(f, JSON.stringify(body))
+    return `--manifest=${f}`
+  }
+  const mumega = () => ({ slug: 'mumega', config: null, db: 'mupot', health: `${base}/mumega/health` })
+  const acme = () => ({ slug: 'acme', config: null, db: 'mupot-acme', health: `${base}/acme/health` })
+
+  it('sanity: HEAD resolves to a 40-hex sha (the fixture compares against it)', () => {
+    expect(head).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  it('every deployment pot current => exit 0', async () => {
+    liveCommit = head
+    const r = await runNode(CLI, [manifestFile({ pots: [mumega()] })])
+    expect(r.stdout).toContain('✓ current')
+    expect(r.code).toBe(0)
+  })
+
+  it('a drifted pot => exit 1 (the CLI exit is not hardcoded to 0)', async () => {
+    liveCommit = 'f'.repeat(40)
+    const r = await runNode(CLI, [manifestFile({ pots: [mumega()] })])
+    expect(r.stdout).toContain('DRIFT')
+    expect(r.code).toBe(1)
+  })
+
+  it('a manifest without mumega => exit 1 even when every pot is current (requiredSlug is wired)', async () => {
+    liveCommit = head
+    const r = await runNode(CLI, [manifestFile({ pots: [acme()] })])
+    expect(r.stdout).toContain("deployment pots do not include 'mumega'")
+    expect(r.code).toBe(1)
+  })
+
+  it('the same fork manifest passes with STALENESS_REQUIRED_SLUG=acme, and with manifest required_slug', async () => {
+    liveCommit = head
+    const viaEnv = await runNode(CLI, [manifestFile({ pots: [acme()] })], { STALENESS_REQUIRED_SLUG: 'acme' })
+    expect(viaEnv.code).toBe(0)
+    const viaField = await runNode(CLI, [manifestFile({ required_slug: 'acme', pots: [acme()] })])
+    expect(viaField.code).toBe(0)
+  })
+
+  it('a missing or invalid manifest => non-zero exit, never a silent pass', async () => {
+    const missing = await runNode(CLI, [`--manifest=${join(dir, 'does-not-exist.json')}`])
+    expect(missing.code).toBe(1)
+    expect(missing.stdout).toContain('manifest: cannot read or parse')
+    const f = join(dir, 'garbage.json')
+    writeFileSync(f, 'nope')
+    const garbage = await runNode(CLI, [`--manifest=${f}`])
+    expect(garbage.code).toBe(1)
+  })
+
+  it('the space form `--manifest <path>` is rejected (exit 1), never silently checking the repo manifest', async () => {
+    liveCommit = head
+    const f = join(dir, 'space.json')
+    writeFileSync(f, JSON.stringify({ pots: [mumega()] }))
+    const r = await runNode(CLI, ['--manifest', f])
+    expect(r.code).toBe(1)
+    expect(r.stdout).toBe('') // refused before any check ran
+    expect(r.stderr).toContain('space form is not supported')
+  })
+
+  it('--json mode keeps the same exit code', async () => {
+    liveCommit = 'f'.repeat(40)
+    const r = await runNode(CLI, ['--json', manifestFile({ pots: [mumega()] })])
+    expect(JSON.parse(r.stdout).pots[0].status).toBe('drift')
+    expect(r.code).toBe(1)
+  })
+})
+
+describe('mupot-update refuses a bad target before any wrangler call (mupot#2109)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mupot-update-'))
+  const bin = join(dir, 'bin')
+  const marker = join(dir, 'wrangler-was-called')
+  mkdirSync(bin)
+  // Fake npx/wrangler: any call leaves a marker, so "no marker" proves nothing reached wrangler.
+  for (const name of ['npx', 'wrangler']) {
+    const f = join(bin, name)
+    writeFileSync(f, `#!/bin/sh\necho "$0 $*" >> "${marker}"\nexit 1\n`)
+    chmodSync(f, 0o755)
+  }
+  const env = { PATH: `${bin}:${process.env.PATH ?? ''}` }
+  let n = 0
+  function manifestArg(body: unknown): string {
+    const f = join(dir, `m${n++}.json`)
+    writeFileSync(f, JSON.stringify(body))
+    return `--manifest=${f}`
+  }
+  const mumega = { slug: 'mumega', config: null, db: 'mupot', health: 'https://mumega.example/health' }
+  const frozen = (slug: string) => ({ slug, status: 'frozen', config: null, db: slug, health: `https://${slug}.example/health` })
+
+  it('control: an accepted target DOES reach wrangler (proves the marker detects calls)', async () => {
+    const r = await runNode(UPDATE_CLI, ['mumega', manifestArg({ pots: [mumega] })], env)
+    expect(existsSync(marker)).toBe(true)
+    expect(r.code).toBe(1) // the fake wrangler fails the migration check
+  })
+
+  it.each([
+    ['a frozen legacy slug', 'viamar', { pots: [mumega], legacy: [frozen('viamar')] }, /frozen legacy pot/],
+    ['an unknown slug', 'nope', { pots: [mumega] }, /unknown pot 'nope'/],
+    ['a slug in both pots and legacy (--all)', '--all', { pots: [mumega], legacy: [frozen('mumega')] }, /is in both pots and legacy/],
+    ['an unfrozen legacy entry (--all)', '--all', { pots: [mumega], legacy: [{ ...frozen('viamar'), status: 'active' }] }, /must have status "frozen"/],
+  ])('%s => non-zero exit, error on stderr, wrangler never called', async (_name, target, manifest, msg) => {
+    rmMarker()
+    const r = await runNode(UPDATE_CLI, [target, manifestArg(manifest)], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toMatch(msg)
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('--apply on a frozen legacy slug (SHIPPED manifest) dies on the frozen-legacy refusal, not on a git guard', async () => {
+    rmMarker()
+    // No --manifest: the repo's own pots.manifest.json lists viamar under `legacy`.
+    const r = await runNode(UPDATE_CLI, ['viamar', '--apply'], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain("'viamar' is a frozen legacy pot (#2107)")
+    expect(r.stderr).not.toMatch(/DIRTY|not 'main'/)
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('--apply with --manifest is refused outright, even for a manifest that lists viamar under `pots`', async () => {
+    rmMarker()
+    // The pre-#2108 shape: a frozen pot sitting in `pots` is a valid deploy target to that manifest.
+    const old = manifestArg({ pots: [mumega, { slug: 'viamar', config: null, db: 'mupot-viamar', health: 'https://viamar.example/health' }] })
+    const r = await runNode(UPDATE_CLI, ['viamar', '--apply', old], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain('--manifest=<path> is dry-run only and cannot be combined with --apply')
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('--manifest on a dry run still works (the override is dry-run only, not removed)', async () => {
+    rmMarker()
+    const r = await runNode(UPDATE_CLI, ['mumega', manifestArg({ pots: [mumega] })], env)
+    expect(r.stderr).not.toContain('dry-run only')
+    expect(existsSync(marker)).toBe(true) // reached the (fake) wrangler
+  })
+
+  it('the space form `--manifest <path>` is rejected, not silently ignored', async () => {
+    rmMarker()
+    const f = join(dir, 'space.json')
+    writeFileSync(f, JSON.stringify({ pots: [mumega] }))
+    const r = await runNode(UPDATE_CLI, ['mumega', '--manifest', f], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain('space form is not supported')
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('a refused target leaves no src/build-info.ts write; an accepted one does (ordering pinned)', async () => {
+    rmMarker()
+    // Run from a scratch cwd: generateBuildInfo() writes <cwd>/src/build-info.ts.
+    const scratch = mkdtempSync(join(tmpdir(), 'mupot-update-cwd-'))
+    mkdirSync(join(scratch, 'src'))
+    const info = join(scratch, 'src', 'build-info.ts')
+    const refused = await runNode(UPDATE_CLI, ['viamar', manifestArg({ pots: [mumega], legacy: [frozen('viamar')] })], env, scratch)
+    expect(refused.code).toBe(1)
+    expect(existsSync(info)).toBe(false)
+    const accepted = await runNode(UPDATE_CLI, ['mumega', manifestArg({ pots: [mumega] })], env, scratch)
+    expect(accepted.code).toBe(1) // fake wrangler fails the migration check
+    expect(existsSync(info)).toBe(true) // control: the stamp does happen once the target is accepted
+  })
+
+  it('an unreadable manifest => non-zero exit before wrangler', async () => {
+    rmMarker()
+    const r = await runNode(UPDATE_CLI, ['--all', `--manifest=${join(dir, 'missing.json')}`], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toMatch(/cannot read or parse manifest/)
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  function rmMarker() {
+    rmSync(marker, { force: true })
+  }
+})
+
+describe('staleness workflow pins the required slug (mupot#2109)', () => {
+  it('the check step sets STALENESS_REQUIRED_SLUG: mumega so a manifest edit cannot move it in CI', () => {
+    const yml = readFileSync(new URL('../.github/workflows/staleness-check.yml', import.meta.url).pathname, 'utf8')
+    expect(yml).toMatch(/^\s+STALENESS_REQUIRED_SLUG: mumega$/m)
   })
 })

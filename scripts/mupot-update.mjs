@@ -23,9 +23,6 @@ import { isFullSha, isMainDescendant, releaseShaDeployArgs } from './lib/release
 import { generateBuildInfo } from './generate-build-info.mjs'
 import { resolveUpdateTargets } from './lib/pots-manifest.mjs'
 
-// Automatically stamp src/build-info.ts prior to multi-pot update
-generateBuildInfo()
-
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const DESTRUCTIVE = /\bDROP\s+TABLE\b|\bDROP\s+COLUMN\b|\bDELETE\s+FROM\b|\bTRUNCATE\b|\bRENAME\s+TO\b/i
 // Bindings the current core REQUIRES at runtime. A config missing any of these can
@@ -52,11 +49,32 @@ function sh(cmd, cmdArgs, opts = {}) {
 
 if (!target) die('usage: mupot-update <slug|--all> [--apply] [--force] [--json]')
 
-const manifest = JSON.parse(readFileSync(join(REPO, 'pots.manifest.json'), 'utf8'))
+// `--manifest=<path>` overrides the manifest for DRY RUNS only (used by the refusal
+// tests). It can never be combined with --apply: an old or hand-written manifest
+// (e.g. a pre-#2108 one listing frozen pots under `pots`) must not be able to turn
+// a legacy pot into a deploy target. The space form is rejected, not ignored.
+const manifestArg = args.find((a) => a.startsWith('--manifest='))
+if (args.some((a) => a === '--manifest' || (a.startsWith('--manifest') && !a.startsWith('--manifest=')))) {
+  die('use --manifest=<path> (with an equals sign); the space form is not supported.')
+}
+if (manifestArg && APPLY) {
+  die('--manifest=<path> is dry-run only and cannot be combined with --apply: deploys always use the repo pots.manifest.json (#2107).')
+}
+const manifestPath = manifestArg ? resolve(manifestArg.slice('--manifest='.length)) : join(REPO, 'pots.manifest.json')
+let manifest
+try {
+  manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+} catch (err) {
+  die(`cannot read or parse manifest ${manifestPath} (${String(err?.message ?? err)})`)
+}
 // #2107 M1: only `pots` (deployment entries) are ever targets. `legacy` entries
 // are frozen — skipped and named in the output, never deployable from here.
 const { targets, skippedLegacy, error: targetError } = resolveUpdateTargets(manifest, target)
 if (targetError) die(targetError)
+
+// Stamp src/build-info.ts only AFTER the target is accepted: a refused target must
+// exit before touching anything (#2109).
+generateBuildInfo()
 
 // ── source-state guard (BLOCK-2): never push a dirty tree or a non-main ref to a
 // customer pot without an explicit override. Reported in dry-run + apply.
@@ -154,7 +172,8 @@ for (const pot of targets) {
   const e = { slug: pot.slug, db: pot.db }
   const applied = appliedMigrations(pot.db, pot.config ? resolve(REPO, pot.config) : null)
   if (!applied.ok) {
-    e.error = applied.error
+    // A failed check with EMPTY output must still block: '' is falsy and blocker() reads e.error.
+    e.error = applied.error || 'migration check failed (no output from wrangler)'
     pf.push(e)
     continue
   }

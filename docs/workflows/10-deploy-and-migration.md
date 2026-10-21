@@ -11,8 +11,10 @@ flight (see `src/projects/deploy.ts`) and is a different workflow.
 A human operator running commands from the runbook, never an MCP tool call. Two
 paths, chosen by whether the pot is registered:
 
-- Pot listed in `pots.manifest.json` → the update-guard path (`docs/production-runbook.md:164-181`).
-- Pot not listed → the manual path (`docs/production-runbook.md:183-193`).
+- Pot listed in the `pots` array of `pots.manifest.json` → the update-guard path (`docs/production-runbook.md`, "Upgrade path").
+- Pot not listed in the manifest at all → the manual path (same section).
+- Pot listed under `legacy` (viamar, digid) → **frozen, no deploy path** (mupot#2107):
+  `mupot-update` refuses it, and the manual path must not be used to deploy it either.
 
 ## Actor(s)
 

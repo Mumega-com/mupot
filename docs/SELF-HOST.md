@@ -85,6 +85,20 @@ node scripts/deploy.mjs --config wrangler.acme.toml
 Migrations are additive and ordered; applying them is idempotent (already-applied
 migrations are skipped).
 
+### Staleness check on a fork
+
+`scripts/staleness-check.mjs` (and its scheduled workflow) requires the SaaS pot
+`mumega` to be listed in `pots.manifest.json`. A fork that does not deploy
+`mumega` names its own primary pot instead, either with a top-level
+`"required_slug": "acme"` in `pots.manifest.json` or the environment variable
+`STALENESS_REQUIRED_SLUG=acme` (the env var wins). The named slug must still be
+in the `pots` array (a `legacy` entry never counts), and an empty or non-string
+`required_slug` fails the run rather than falling back to `mumega`.
+
+The upstream workflow pins `STALENESS_REQUIRED_SLUG: mumega` in
+`.github/workflows/staleness-check.yml` so a manifest edit cannot move the required
+slug in upstream CI. A fork running that workflow changes that one env value to its own slug.
+
 ## What you get
 
 A governed loop runtime on your own infra: declare loops (`POST /api/loops`), the cron

@@ -161,7 +161,12 @@ MCP OAuth provider: https://<your-pot-host>/oauth/google-callback
 
 ## Upgrade path
 
-Prefer the update guard when the pot is listed in `pots.manifest.json`:
+Prefer the update guard when the pot is listed in the `pots` array of
+`pots.manifest.json`. Pots in the manifest's `legacy` array (viamar, digid) are
+**frozen** (mupot#2107): `mupot-update` refuses to deploy them and the staleness
+check only reports them. Do not use the manual path below to deploy a frozen
+pot either; the freeze is the decision, and the manual path would route around
+it. See mupot#2107 for the plan and #2109 for this runbook note.
 
 ```bash
 git fetch origin
@@ -182,7 +187,7 @@ Apply only after reading the dry-run:
 node scripts/mupot-update.mjs "$POT" --apply
 ```
 
-If the pot is not in `pots.manifest.json`, use the manual path:
+If the pot is not in `pots.manifest.json` at all (neither `pots` nor `legacy`), use the manual path:
 
 ```bash
 git fetch origin
