@@ -148,6 +148,10 @@ async function formHtml(c: Context<AppEnv>, kind: string, id: string, inner: str
 // ── seed ────────────────────────────────────────────────────────────────────────────────────────
 
 function outcomePage(c: Context<AppEnv>, o: Outcome): Response {
+  if (o.error) {
+    secure(c)
+    return c.json({ ok: false, error: 'approver_identity_not_live', next_step: o.next_step, title: o.title, message: o.message }, 409)
+  }
   return page(c, o.status, o.title, o.message, o.tone)
 }
 

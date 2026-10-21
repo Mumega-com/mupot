@@ -19,6 +19,7 @@ import {
   LAST_SEEN_COALESCE_MS,
   RECENT_REAUTH_WINDOW_MS,
   createWebSession,
+  LoginIdentityNotLiveError,
   evaluateWebSession,
   hasRecentReauth,
   hashWebSessionId,
@@ -78,6 +79,15 @@ describe('web-session registry (D1, real migration chain)', () => {
     expect(row).toBeTruthy()
     // The raw value never appears anywhere in the persisted row.
     expect(JSON.stringify(row)).not.toContain(raw)
+  })
+
+  it('live identity session mint refuses an identity belonging to another member', async () => {
+    const identityId = await seedMemberAndIdentity('m1', 'a@x.test')
+    await seedMemberAndIdentity('m2', 'b@x.test')
+    await expect(createWebSession(env, 'cross-member', {
+      tenant: TENANT, memberId: 'm2', loginIdentityId: identityId, requireLiveIdentity: true,
+    })).rejects.toBeInstanceOf(LoginIdentityNotLiveError)
+    expect(await env.DB.prepare('SELECT id_hash FROM web_sessions').first()).toBeNull()
   })
 
   it('sets independent idle (24h) and absolute (7d) ceilings at creation', async () => {

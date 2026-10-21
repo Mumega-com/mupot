@@ -27,7 +27,7 @@ import {
   canDecideElevationRequest, deciderMemberIdOf, decideElevationRequest, requestIsFromAttachedChat, findElevationDecisionRefusal, loadElevationRequestById,
   type DecideElevationInput, type DecideElevationResult, type ElevationRequestRecord,
 } from '../auth/elevation'
-import { revokeWebSession } from '../auth/web-sessions'
+import { LoginIdentityNotLiveError, revokeWebSession } from '../auth/web-sessions'
 import { isValidSlugBase } from '../org/team-bootstrap'
 import { BOT_STEP_UP_ACTIONS, ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
@@ -61,6 +61,8 @@ export interface Outcome {
   title: string
   message: string
   tone: 'ok' | 'warn' | 'bad'
+  error?: 'approver_identity_not_live'
+  next_step?: string
 }
 
 export const NOT_FOUND_OUTCOME: Outcome = { status: 404, title: 'Not found', message: 'There is nothing here for you.', tone: 'bad' }
@@ -218,8 +220,13 @@ export function elevationIsLive(req: ElevationRequestRecord, nowMs: number): boo
 
 /** Does this member hold the authority to decide THIS request (scope-local, the existing predicate). */
 export async function mayDecideElevation(env: Env, auth: AuthContext, req: ElevationRequestRecord): Promise<boolean> {
+  // A verified legacy owner/admin is built WITHOUT capability rows (assigning rows to a role-only owner would downgrade them), but an
+  // exact squad row they ALSO hold (the only authority on a member's HOME squad) must still count: read the rows here, exactly as the
+  // decision itself does below (decideElevation resolves them the same way when auth carries none). #2106.
+  const memberId = deciderMemberIdOf(auth)
+  const capabilities = auth.capabilities ?? (memberId ? await resolveCapabilities(env, memberId) : undefined)
   // canDecideElevationRequest = the scope predicate PLUS "a request from an attached chat is decided by the human who attached it".
-  return canDecideElevationRequest(env, auth, auth.capabilities, req, deciderMemberIdOf(auth))
+  return canDecideElevationRequest(env, auth, capabilities, req, memberId)
 }
 
 export async function elevationViewInner(env: Env, req: ElevationRequestRecord): Promise<string> {
@@ -274,7 +281,7 @@ export interface ApproverSession {
 function refusalOutcome(result: Exclude<DecideElevationResult, { ok: true }>): Outcome {
   if (result.reason === 'not_found' || result.reason === 'forbidden') return NOT_FOUND_OUTCOME
   const detail = 'detail' in result ? ` (${result.detail})` : ''
-  return { status: 409, title: 'Not decided', message: `The decision was not recorded: ${result.reason}${detail}.`, tone: 'warn' }
+  return { status: 409, title: result.reason === 'already_decided' ? 'Request closed' : 'Not decided', message: `The decision was not recorded: ${result.reason}${detail}.`, tone: 'warn' }
 }
 
 export async function decideElevation(
@@ -318,6 +325,9 @@ export async function decideElevation(
     decidedByCapabilities: caps,
     decidedByIsOrgAdmin: admin,
     decidedByWebSessionHash: webSessionHash,
+    // The decision row is written only while this session AND its login identity are still live, checked in the write itself (#2106).
+    // (The pre-gate refusal pass below never writes, so the flag is inert there.)
+    requireLiveApproverSession: true,
     // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up. The approval bot
     // is the one exception: a tap is NOT a fresh reauth in general, so it satisfies the step-up only for BOT_STEP_UP_ACTIONS.
     recentReauthOk: proof.via === 'approval_bot' ? input.selectedActions.every((a) => BOT_STEP_UP_ACTIONS.includes(a)) : true,
@@ -336,7 +346,17 @@ export async function decideElevation(
     if (input.gate && !(await input.gate())) return CLOSED
     // The grant (and the decision row) binds to a web session for this proof, minted now (after the gate; the
     // refusals are already cleared) for approve and deny alike.
-    const session = await input.mintSession()
+    let session: ApproverSession
+    try {
+      session = await input.mintSession()
+    } catch (err) {
+      if (!(err instanceof LoginIdentityNotLiveError)) throw err
+      const next_step = input.gate
+        ? 'sign in again, then retry with a fresh approval link; this one-shot proof was consumed'
+        : 'sign in again, then retry'
+      return { status: 409, title: 'Not decided', error: 'approver_identity_not_live', next_step,
+        message: `Sign in again, then retry. The approver identity is no longer live.${input.gate ? ' This one-shot proof was consumed; reopen the request with a fresh approval link.' : ''}`, tone: 'warn' }
+    }
     const result = await decideElevationRequest(
       env, decideInput(session.webSessionHash, session.auth.capabilities ?? (await resolveCapabilities(env, proof.memberId)), hasWorkspaceAdmin(session.auth)),
     )

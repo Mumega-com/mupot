@@ -1364,3 +1364,27 @@ describe('Mini App approvals now end on unbind', () => {
     } finally { spy.mockRestore() }
   })
 })
+
+
+it('Mini App identity race returns 409 with rotated device and a consumed-proof remedy', async () => {
+  const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
+  const m = await fileElevation(['action:project_status'])
+  const prepare = env.DB.prepare.bind(env.DB)
+  let fired = false
+  const spy = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+    if (!fired && /INSERT INTO web_sessions/.test(sql)) {
+      fired = true
+      harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
+    }
+    return prepare(sql)
+  })
+  try {
+    const res = await decide(m, TG.owner, dev, { decision: 'deny' })
+    expect(fired).toBe(true)
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'approver_identity_not_live', next_step: expect.stringContaining('one-shot proof was consumed'), device_token_next: expect.any(String) })
+    expect(one('SELECT status FROM secure_moments WHERE id = ?', m.id)).toEqual({ status: 'denied' })
+    expect(one('SELECT status FROM elevation_requests WHERE id = ?', m.subject)).toEqual({ status: 'pending' })
+    expect(count('web_sessions')).toBe(0)
+  } finally { spy.mockRestore() }
+})

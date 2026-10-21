@@ -41,6 +41,7 @@ describe('refusal codes are registered', () => {
   })
 
   it('the scanner sees the codes this PR wires (self-test that it is not silently empty)', () => {
+    expect(found.has('approver_identity_not_live')).toBe(true)
     expect(found.has('gate_owner_creator_is_assignee')).toBe(true)
     expect(found.has('artifact_verification_failed')).toBe(true)
     expect(found.size).toBeGreaterThan(100)

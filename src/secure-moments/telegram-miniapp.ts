@@ -462,7 +462,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const waitUntil = waitUntilOf(c)
     const now = Date.now()
     const withRotation = (o: Outcome): Response => jsonOut(c, o.status, {
-      ok: o.status === 200, title: o.title, message: o.message, ...(nextDeviceToken ? { device_token_next: nextDeviceToken } : {}),
+      ok: o.status === 200, title: o.title, message: o.message, ...(o.error ? { error: o.error, next_step: o.next_step } : {}), ...(nextDeviceToken ? { device_token_next: nextDeviceToken } : {}),
       ...(trustOut.nextTrustToken ? { trust_token_next: trustOut.nextTrustToken, trusted_until: trustOut.trustedUntil } : {}),
     })
     if (subject.kind === 'seed_attach') {
