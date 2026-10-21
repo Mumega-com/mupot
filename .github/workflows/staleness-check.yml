@@ -53,5 +53,8 @@ jobs:
           # the report names the REAL ref, never an assumed "main" — see
           # scripts/staleness-check.mjs formatReport (mupot#571).
           GITHUB_REF_NAME: ${{ github.ref_name }}
+          # Pinned: a manifest edit (`required_slug`) must not be able to move the
+          # required deployment slug in OUR CI. Env wins over the manifest field (#2109).
+          STALENESS_REQUIRED_SLUG: mumega
         run: |
           node scripts/staleness-check.mjs | tee -a "$GITHUB_STEP_SUMMARY"

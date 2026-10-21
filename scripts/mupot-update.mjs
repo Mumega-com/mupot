@@ -49,8 +49,17 @@ function sh(cmd, cmdArgs, opts = {}) {
 
 if (!target) die('usage: mupot-update <slug|--all> [--apply] [--force] [--json]')
 
-// `--manifest=<path>` overrides the manifest (used by the refusal tests); default is the repo's.
+// `--manifest=<path>` overrides the manifest for DRY RUNS only (used by the refusal
+// tests). It can never be combined with --apply: an old or hand-written manifest
+// (e.g. a pre-#2108 one listing frozen pots under `pots`) must not be able to turn
+// a legacy pot into a deploy target. The space form is rejected, not ignored.
 const manifestArg = args.find((a) => a.startsWith('--manifest='))
+if (args.some((a) => a === '--manifest' || (a.startsWith('--manifest') && !a.startsWith('--manifest=')))) {
+  die('use --manifest=<path> (with an equals sign); the space form is not supported.')
+}
+if (manifestArg && APPLY) {
+  die('--manifest=<path> is dry-run only and cannot be combined with --apply: deploys always use the repo pots.manifest.json (#2107).')
+}
 const manifestPath = manifestArg ? resolve(manifestArg.slice('--manifest='.length)) : join(REPO, 'pots.manifest.json')
 let manifest
 try {

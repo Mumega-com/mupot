@@ -95,6 +95,10 @@ migrations are skipped).
 in the `pots` array (a `legacy` entry never counts), and an empty or non-string
 `required_slug` fails the run rather than falling back to `mumega`.
 
+The upstream workflow pins `STALENESS_REQUIRED_SLUG: mumega` in
+`.github/workflows/staleness-check.yml` so a manifest edit cannot move the required
+slug in upstream CI. A fork running that workflow changes that one env value to its own slug.
+
 ## What you get
 
 A governed loop runtime on your own infra: declare loops (`POST /api/loops`), the cron

@@ -121,6 +121,21 @@ describe('checkPot', () => {
   })
 })
 
+describe('malformed /health JSON (mupot#2109)', () => {
+  const pot = { slug: 'mumega', health: 'https://x.example/health' }
+  it.each([
+    ['null', null],
+    ['a number', 7],
+    ['a string', 'ok'],
+    ['an array', [{ ok: true }]],
+  ])('a 2xx whose body is %s => an error result with a message, not a TypeError', async (_name, body) => {
+    const r = await checkPot(pot, HEAD, { fetchImpl: jsonFetch(body) })
+    expect(r).toEqual({ slug: 'mumega', status: 'error', head: HEAD, error: 'health body is not a JSON object' })
+    expect(exitCodeFor([r])).toBe(1)
+    expect(formatReport(HEAD, [r])).toContain('✘ ERROR (health body is not a JSON object)')
+  })
+})
+
 describe('checkAllPots', () => {
   it('checks every pot in the manifest and preserves per-pot results', async () => {
     const manifestPath = new URL('./fixtures/staleness-manifest.json', import.meta.url).pathname
@@ -577,10 +592,10 @@ const REPO_ROOT = new URL('..', import.meta.url).pathname
 const CLI = join(REPO_ROOT, 'scripts', 'staleness-check.mjs')
 const UPDATE_CLI = join(REPO_ROOT, 'scripts', 'mupot-update.mjs')
 
-function runNode(script: string, args: string[], env: Record<string, string> = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runNode(script: string, args: string[], env: Record<string, string> = {}, cwd: string = REPO_ROOT): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
     const child = spawn(process.execPath, [script, ...args], {
-      cwd: REPO_ROOT,
+      cwd,
       env: { ...process.env, STALENESS_REQUIRED_SLUG: '', GITHUB_REF_NAME: '', ...env },
     })
     let stdout = ''
@@ -664,6 +679,16 @@ describe('staleness-check CLI exit code (mupot#2109)', () => {
     expect(garbage.code).toBe(1)
   })
 
+  it('the space form `--manifest <path>` is rejected (exit 1), never silently checking the repo manifest', async () => {
+    liveCommit = head
+    const f = join(dir, 'space.json')
+    writeFileSync(f, JSON.stringify({ pots: [mumega()] }))
+    const r = await runNode(CLI, ['--manifest', f])
+    expect(r.code).toBe(1)
+    expect(r.stdout).toBe('') // refused before any check ran
+    expect(r.stderr).toContain('space form is not supported')
+  })
+
   it('--json mode keeps the same exit code', async () => {
     liveCommit = 'f'.repeat(40)
     const r = await runNode(CLI, ['--json', manifestFile({ pots: [mumega()] })])
@@ -712,11 +737,55 @@ describe('mupot-update refuses a bad target before any wrangler call (mupot#2109
     expect(existsSync(marker)).toBe(false)
   })
 
-  it('an --apply with a refused target is also refused before wrangler', async () => {
+  it('--apply on a frozen legacy slug (SHIPPED manifest) dies on the frozen-legacy refusal, not on a git guard', async () => {
     rmMarker()
-    const r = await runNode(UPDATE_CLI, ['viamar', '--apply', manifestArg({ pots: [mumega], legacy: [frozen('viamar')] })], env)
+    // No --manifest: the repo's own pots.manifest.json lists viamar under `legacy`.
+    const r = await runNode(UPDATE_CLI, ['viamar', '--apply'], env)
     expect(r.code).toBe(1)
+    expect(r.stderr).toContain("'viamar' is a frozen legacy pot (#2107)")
+    expect(r.stderr).not.toMatch(/DIRTY|not 'main'/)
     expect(existsSync(marker)).toBe(false)
+  })
+
+  it('--apply with --manifest is refused outright, even for a manifest that lists viamar under `pots`', async () => {
+    rmMarker()
+    // The pre-#2108 shape: a frozen pot sitting in `pots` is a valid deploy target to that manifest.
+    const old = manifestArg({ pots: [mumega, { slug: 'viamar', config: null, db: 'mupot-viamar', health: 'https://viamar.example/health' }] })
+    const r = await runNode(UPDATE_CLI, ['viamar', '--apply', old], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain('--manifest=<path> is dry-run only and cannot be combined with --apply')
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('--manifest on a dry run still works (the override is dry-run only, not removed)', async () => {
+    rmMarker()
+    const r = await runNode(UPDATE_CLI, ['mumega', manifestArg({ pots: [mumega] })], env)
+    expect(r.stderr).not.toContain('dry-run only')
+    expect(existsSync(marker)).toBe(true) // reached the (fake) wrangler
+  })
+
+  it('the space form `--manifest <path>` is rejected, not silently ignored', async () => {
+    rmMarker()
+    const f = join(dir, 'space.json')
+    writeFileSync(f, JSON.stringify({ pots: [mumega] }))
+    const r = await runNode(UPDATE_CLI, ['mumega', '--manifest', f], env)
+    expect(r.code).toBe(1)
+    expect(r.stderr).toContain('space form is not supported')
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('a refused target leaves no src/build-info.ts write; an accepted one does (ordering pinned)', async () => {
+    rmMarker()
+    // Run from a scratch cwd: generateBuildInfo() writes <cwd>/src/build-info.ts.
+    const scratch = mkdtempSync(join(tmpdir(), 'mupot-update-cwd-'))
+    mkdirSync(join(scratch, 'src'))
+    const info = join(scratch, 'src', 'build-info.ts')
+    const refused = await runNode(UPDATE_CLI, ['viamar', manifestArg({ pots: [mumega], legacy: [frozen('viamar')] })], env, scratch)
+    expect(refused.code).toBe(1)
+    expect(existsSync(info)).toBe(false)
+    const accepted = await runNode(UPDATE_CLI, ['mumega', manifestArg({ pots: [mumega] })], env, scratch)
+    expect(accepted.code).toBe(1) // fake wrangler fails the migration check
+    expect(existsSync(info)).toBe(true) // control: the stamp does happen once the target is accepted
   })
 
   it('an unreadable manifest => non-zero exit before wrangler', async () => {
@@ -730,4 +799,11 @@ describe('mupot-update refuses a bad target before any wrangler call (mupot#2109
   function rmMarker() {
     rmSync(marker, { force: true })
   }
+})
+
+describe('staleness workflow pins the required slug (mupot#2109)', () => {
+  it('the check step sets STALENESS_REQUIRED_SLUG: mumega so a manifest edit cannot move it in CI', () => {
+    const yml = readFileSync(new URL('../.github/workflows/staleness-check.yml', import.meta.url).pathname, 'utf8')
+    expect(yml).toMatch(/^\s+STALENESS_REQUIRED_SLUG: mumega$/m)
+  })
 })

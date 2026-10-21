@@ -63,6 +63,11 @@ export async function checkPot(pot, head, { fetchImpl = fetch, timeoutMs = 10000
     return { slug: pot.slug, status: 'unreachable', head, http: res.status }
   }
   const body = await res.json().catch(() => ({}))
+  // A 2xx whose JSON is null / a scalar / an array is a malformed health body: report it
+  // as a pot error (exit 1 WITH a report) instead of a TypeError on `body.ok`.
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { slug: pot.slug, status: 'error', head, error: 'health body is not a JSON object' }
+  }
   if (body.ok !== true) {
     return { slug: pot.slug, status: 'unhealthy', head, ok: body.ok ?? null }
   }
@@ -242,6 +247,11 @@ if (isMain) {
   // `--manifest=<path>` overrides the manifest (used by the CLI exit-code tests);
   // the scheduled workflow passes nothing and gets the repo's pots.manifest.json.
   const manifestArg = process.argv.find((a) => a.startsWith('--manifest='))
+  // The space form would be silently ignored (and the repo manifest checked instead): reject it.
+  if (process.argv.some((a) => a === '--manifest' || (a.startsWith('--manifest') && !a.startsWith('--manifest=')))) {
+    console.error('use --manifest=<path> (with an equals sign); the space form is not supported.')
+    process.exit(1)
+  }
   const { output, exitCode } = await runCheck({
     ...(manifestArg ? { manifestPath: resolve(manifestArg.slice('--manifest='.length)) } : {}),
     head: headSha(),
