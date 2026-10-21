@@ -14,7 +14,8 @@
 import type { Env } from '../types'
 import { buildAuth, mintApproverSession } from '../access/identity'
 import { decideElevation, type Outcome } from '../access/decision-core'
-import { listActiveElevationGrants, loadElevationRequestById, revokeElevationGrant, type ElevationRequestRecord } from '../auth/elevation'
+import { listActiveElevationGrants, loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
+import { LoginIdentityNotLiveError } from '../auth/web-sessions'
 import { resolveTelegramMember } from '../secure-moments/telegram-miniapp-binding'
 import { approvalBotStatus } from './config'
 import { botMayCarry, parseRequestedActions, SHORT_ID_RE } from './policy'
@@ -115,16 +116,6 @@ async function mintBotApproverSession(env: Env, memberId: string): Promise<{ aut
   return { auth: session.approver.auth, webSessionHash: session.webSessionHash }
 }
 
-async function writeRevokeReceipt(env: Env, memberId: string, evidence: Record<string, unknown>, requestKey: string, targetKind: string, targetId: string): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO mutation_audit_entries (
-       id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
-       target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-     VALUES (?1, ?2, 'member', ?3, ?3, 'admin_ui', 'approval_bot', 'elevation_revoke', ?4, ?5, ?6, ?6, ?7, ?8)
-     ON CONFLICT DO NOTHING`,
-  ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, targetKind, targetId, requestKey, JSON.stringify({ via: 'approval_bot', ...evidence }), new Date().toISOString()).run()
-}
-
 const HELP = 'Approval bot. When an agent asks for time-boxed access you get a message with Approve and Deny buttons. You can also reply /muapprove <id> or /mudeny <id>. /murevoke ends every live approval you gave (or /murevoke <id> for one).'
 
 export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: BotUpdateOpts = {}): Promise<BotUpdateResult> {
@@ -176,25 +167,50 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
         return { kind: 'refused', reason: 'unknown_request' }
       }
     }
+    const revokedMessage = (n: number): string => (n === 0 ? 'Nothing to revoke: you have no live approvals.' : `Revoked ${n} live approval${n === 1 ? '' : 's'}. The agents lost that access now.`)
     // Telegram redelivers an update it did not see acknowledged. A redelivered /murevoke is the SAME revoke: answer what the first
     // run did (its receipt carries the count), and revoke nothing now, so a grant approved in between is never swept by a replay.
-    if (p.updateId !== undefined && p.updateId !== null) {
+    const answerFromPrior = async (): Promise<boolean> => {
       const prior = await env.DB.prepare('SELECT evidence_json FROM mutation_audit_entries WHERE tenant = ?1 AND idempotency_key = ?2 LIMIT 1')
         .bind(env.TENANT_SLUG, requestKey).first<{ evidence_json: string | null }>().catch(() => null)
-      if (prior) {
-        let n = 0
-        try { const e: unknown = JSON.parse(prior.evidence_json ?? '{}'); if (typeof e === 'object' && e !== null && typeof (e as { grants_revoked?: unknown }).grants_revoked === 'number') n = (e as { grants_revoked: number }).grants_revoked } catch { /* count stays 0 */ }
-        await tell(n === 0 ? 'Nothing to revoke: you have no live approvals.' : `Revoked ${n} live approval${n === 1 ? '' : 's'}. The agents lost that access now.`)
-        return { kind: 'revoked' }
-      }
+      if (!prior) return false
+      let n = 0
+      try { const e: unknown = JSON.parse(prior.evidence_json ?? '{}'); if (typeof e === 'object' && e !== null && typeof (e as { grants_revoked?: unknown }).grants_revoked === 'number') n = (e as { grants_revoked: number }).grants_revoked } catch { /* count stays 0 */ }
+      await tell(revokedMessage(n))
+      return true
     }
+    if (p.updateId !== undefined && p.updateId !== null && (await answerFromPrior())) return { kind: 'revoked' }
     const live = await listActiveElevationGrants(env, env.TENANT_SLUG)
     const mine = live.filter((g) => g.approved_by_member_id === memberId && (scopeRequest === null || g.elevation_request_id === scopeRequest.id))
-    let revoked = 0
-    for (const g of mine) if ((await revokeElevationGrant(env, env.TENANT_SLUG, g.id, 'revoked_via_approval_bot', Date.now(), g.created_at)).revoked) revoked++
-    await writeRevokeReceipt(env, memberId, { telegram_user_id: p.fromId, grants_revoked: revoked, request_id: scopeRequest?.id ?? null }, requestKey,
-      scopeRequest ? 'elevation_request' : 'member', scopeRequest?.id ?? memberId).catch(() => undefined)
-    await tell(revoked === 0 ? 'Nothing to revoke: you have no live approvals.' : `Revoked ${revoked} live approval${revoked === 1 ? '' : 's'}. The agents lost that access now.`)
+    // ONE batch (all or nothing): the replay marker (the receipt row, unique per update) and the sweep. Each revoke statement holds only
+    // if THIS call's marker row exists, so a redelivery that lost the marker race sweeps nothing, and a marker that cannot be written
+    // takes the sweep down with it (the error propagates, the webhook answers non-2xx and Telegram retries the whole revoke). #2106.
+    const markerId = crypto.randomUUID()
+    const nowIso = new Date().toISOString()
+    const targetKind = scopeRequest ? 'elevation_request' : 'member'
+    const targetId = scopeRequest?.id ?? memberId
+    const evidence = JSON.stringify({ via: 'approval_bot', telegram_user_id: p.fromId, grants_revoked: mine.length, request_id: scopeRequest?.id ?? null })
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO mutation_audit_entries (
+           id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
+           target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
+         VALUES (?1, ?2, 'member', ?3, ?3, 'admin_ui', 'approval_bot', 'elevation_revoke', ?4, ?5, ?6, ?6, ?7, ?8)
+         ON CONFLICT DO NOTHING`,
+      ).bind(markerId, env.TENANT_SLUG, memberId, targetKind, targetId, requestKey, evidence, nowIso),
+      ...mine.map((g) => env.DB.prepare(
+        `UPDATE elevation_grants SET revoked_at = ?1, revoke_reason = 'revoked_via_approval_bot'
+          WHERE id = ?2 AND tenant = ?3 AND revoked_at IS NULL AND created_at = ?4
+            AND EXISTS (SELECT 1 FROM mutation_audit_entries WHERE id = ?5)`,
+      ).bind(nowIso, g.id, env.TENANT_SLUG, g.created_at, markerId)),
+    ])
+    if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
+      // Another delivery of this same update wrote the marker first: it did (or is doing) the sweep. Answer from its receipt.
+      if (await answerFromPrior()) return { kind: 'revoked' }
+      throw new Error('revoke_marker_missing')
+    }
+    const revoked = results.slice(1).reduce((n, r) => n + Number(r.meta?.changes ?? 0), 0)
+    await tell(revokedMessage(revoked))
     return { kind: 'revoked' }
   }
 
@@ -235,7 +251,13 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
       mintSession: () => mintBotApproverSession(env, memberId),
       waitUntil: opts.waitUntil,
     })
-  } catch {
+  } catch (err) {
+    // The sign-in this approval anchors to was revoked after the check above and before the session could be written: nothing was
+    // decided (the session insert is conditional on the identity being live), so say why instead of a generic failure (#2106).
+    if (err instanceof LoginIdentityNotLiveError) {
+      await tell('Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
+      return { kind: 'refused', reason: 'no_login_identity' }
+    }
     await tell('The decision could not be recorded. Nothing was changed.', { editMessageId: editId })
     return { kind: 'refused', reason: 'decision_error' }
   }

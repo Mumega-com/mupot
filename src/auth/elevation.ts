@@ -264,12 +264,17 @@ export async function createElevationRequest(
   const decisionExpiresAt = new Date(nowMs + REQUEST_DECISION_WINDOW_MS).toISOString()
   const scopeId = input.scopeId ?? ''
 
+  // The exact sudo arguments and their digest are part of the SAME insert: a request row that names a sudo act exists only together with
+  // the arguments the human is shown and the call is checked against. A second statement could fail and leave an approvable request
+  // with no arguments bound to it (#2106).
+  const sudoCols = sudoCanonical?.ok ? ', sudo_args_json, sudo_args_sha256' : ''
+  const sudoVals = sudoCanonical?.ok ? ', ?13, ?14' : ''
   await env.DB.prepare(
     `INSERT INTO elevation_requests
        (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
         requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
-        status, created_at, decision_expires_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)`,
+        status, created_at, decision_expires_at${sudoCols})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12${sudoVals})`,
   )
     .bind(
       id,
@@ -284,13 +289,9 @@ export async function createElevationRequest(
       input.reason.trim(),
       nowIso,
       decisionExpiresAt,
+      ...(sudoCanonical?.ok ? [sudoCanonical.value.json, sudoCanonical.value.sha256] : []),
     )
     .run()
-
-  if (sudoCanonical?.ok) {
-    await env.DB.prepare('UPDATE elevation_requests SET sudo_args_json = ?1, sudo_args_sha256 = ?2 WHERE id = ?3 AND tenant = ?4')
-      .bind(sudoCanonical.value.json, sudoCanonical.value.sha256, id, input.tenant).run()
-  }
 
   return {
     ok: true,
@@ -426,6 +427,11 @@ export interface DecideElevationInput {
    *  cached/stale set here. */
   decidedByCapabilities: CapabilityGrant[]
   decidedByWebSessionHash: string
+  /** TRUE = the decision row is written only while `decidedByWebSessionHash` is STILL a live session on a still-live login identity,
+   *  checked inside the very UPDATE that records the decision (#2106). Without it, an identity revoked (and its sessions swept) between
+   *  the caller's checks and this write would still land an approved/denied row. Leave unset only for callers whose hash is not a real
+   *  web session (tests that exercise the ledger alone). */
+  requireLiveApproverSession?: boolean
   /** Whether the approver's web session proved a fresh (<=5min) reauth
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
@@ -762,6 +768,23 @@ export async function findElevationDecisionRefusal(
   return null
 }
 
+/** The condition that makes a decision write atomic with the approver's identity: the web session is unrevoked AND its login identity is
+ *  unrevoked, evaluated inside the same UPDATE. `tenantParam` and `hashParam` are the numbered binds the statement already carries. */
+function liveApproverSessionSql(tenantParam: string, hashParam: string): string {
+  return `AND EXISTS (SELECT 1 FROM web_sessions ws JOIN human_login_identities hli ON hli.id = ws.login_identity_id
+                       WHERE ws.id_hash = ${hashParam} AND ws.tenant = ${tenantParam} AND ws.revoked_at IS NULL AND hli.revoked_at IS NULL)`
+}
+
+/** A guarded decision UPDATE changed nothing: either someone else decided, or (when the live-approver condition was asked for) the
+ *  approver's session/identity ended first. Same row read tells which. */
+async function decisionLostReason(env: Env, input: DecideElevationInput, requestId: string, status: ElevationRequestStatus): Promise<DecideElevationResult> {
+  if (input.requireLiveApproverSession === true) {
+    const now = await loadElevationRequestById(env, input.tenant, requestId)
+    if (now?.status === 'pending') return { ok: false, reason: 'invalid_elevation_request', detail: 'approver_session_ended' }
+  }
+  return { ok: false, reason: 'already_decided', status }
+}
+
 /**
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
@@ -804,11 +827,11 @@ export async function decideElevationRequest(
       `UPDATE elevation_requests
           SET status = 'denied', decided_at = ?1, decided_by_member_id = ?2,
               decided_by_web_session_hash = ?3, decision_note = ?4
-        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
+        WHERE id = ?5 AND tenant = ?6 AND status = 'pending' ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?6', '?3') : ''}`,
     )
       .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
       .run()
-    if (Number(result.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'denied' }
+    if (Number(result.meta?.changes ?? 0) === 0) return decisionLostReason(env, input, request.id, 'denied')
     const updated = await loadElevationRequestById(env, input.tenant, request.id)
     return { ok: true, request: updated ?? { ...request, status: 'denied' }, grants: [] }
   }
@@ -823,11 +846,11 @@ export async function decideElevationRequest(
     `UPDATE elevation_requests
         SET status = 'approved', decided_at = ?1, decided_by_member_id = ?2,
             decided_by_web_session_hash = ?3, decision_note = ?4
-      WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
+      WHERE id = ?5 AND tenant = ?6 AND status = 'pending' ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?6', '?3') : ''}`,
   )
     .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
     .run()
-  if (Number(flip.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
+  if (Number(flip.meta?.changes ?? 0) === 0) return decisionLostReason(env, input, request.id, 'approved')
 
   const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
   const grants: ElevationGrantRecord[] = selected.map((action) => ({

@@ -1006,3 +1006,28 @@ describe('#2103 P2-5/6 rolePlaneGrants guards', () => {
     expect(hits).toEqual(['src/auth/owner-sudo.ts'])
   })
 })
+
+describe('#2106 P2: sudo request atomicity and a stuck claim is surfaced', () => {
+  it('a request that names a sudo act is never stored without its exact arguments (no half-written, approvable row)', async () => {
+    run("CREATE TRIGGER no_sudo_args_update BEFORE UPDATE ON elevation_requests BEGIN SELECT RAISE(ABORT, 'db down'); END")
+    await call('check_in', {})
+    const r = await out('request_elevation', { actions: ['action:sudo_squad_member_add'], scope_type: 'squad', scope_id: 'squad-b', duration_minutes: 15, reason: 'r', sudo_args: DEFAULT_ARGS['action:sudo_squad_member_add'] })
+    run('DROP TRIGGER no_sudo_args_update')
+    expect(count('elevation_requests', "requested_actions_json LIKE '%action:sudo_%' AND sudo_args_json IS NULL")).toBe(0)
+    if (r.ok) expect(count('elevation_requests', "requested_actions_json LIKE '%action:sudo_%' AND sudo_args_json IS NOT NULL")).toBe(1)
+  })
+  it('the args and their digest are written by the same statement that creates the request', async () => {
+    run("CREATE TABLE probe_partial (id TEXT)")
+    run("CREATE TRIGGER probe_insert AFTER INSERT ON elevation_requests WHEN NEW.sudo_args_json IS NULL AND NEW.requested_actions_json LIKE '%action:sudo_%' BEGIN INSERT INTO probe_partial VALUES (NEW.id); END")
+    await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+    expect(count('probe_partial')).toBe(0)
+  })
+  it('a refused tool whose claim cannot be released says so (it would otherwise read as sudo_already_used on the retry)', async () => {
+    const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { args: { squad: 'squad-b', agent: 'agent-u', capability: 'member' } })
+    run("CREATE TRIGGER no_release BEFORE UPDATE ON elevation_usage_log WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'db down'); END")
+    const bad = await out('squad_member_add', { agent: 'agent-u', squad: 'squad-b', capability: 'member' })
+    expect(bad).toMatchObject({ ok: false, error: 'sudo_claim_release_failed' })
+    expect(usage(reqId)).toEqual([{ status: 'pending' }])
+    expect(JSON.stringify(bad)).toContain('sudo_already_used') // the detail explains the symptom the agent will see on retry
+  })
+})
