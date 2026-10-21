@@ -19,6 +19,24 @@ export function legacyPots(manifest) {
   return Array.isArray(manifest?.legacy) ? manifest.legacy : []
 }
 
+export const DEFAULT_REQUIRED_SLUG = 'mumega'
+
+/**
+ * The deployment slug the staleness check requires in `pots`.
+ * Precedence: env `STALENESS_REQUIRED_SLUG` (non-empty) > manifest top-level
+ * `required_slug` > 'mumega'. Self-hosted forks whose primary pot is not
+ * `mumega` set one of the first two instead of failing every run (#2109).
+ * An invalid manifest `required_slug` is NOT resolved here: validateManifest
+ * reports it and the run fails closed.
+ */
+export function resolveRequiredSlug(manifest, env = {}) {
+  const fromEnv = typeof env?.STALENESS_REQUIRED_SLUG === 'string' ? env.STALENESS_REQUIRED_SLUG.trim() : ''
+  if (fromEnv) return fromEnv
+  const fromManifest = manifest?.required_slug
+  if (typeof fromManifest === 'string' && fromManifest.trim()) return fromManifest.trim()
+  return DEFAULT_REQUIRED_SLUG
+}
+
 const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v)
 const hasSlug = (v) => isPlainObject(v) && typeof v.slug === 'string' && v.slug.length > 0
 
@@ -27,11 +45,14 @@ const hasSlug = (v) => isPlainObject(v) && typeof v.slug === 'string' && v.slug.
  * human-readable errors (empty = valid). Consumers FAIL CLOSED on any error:
  * staleness-check exits 1, mupot-update refuses.
  *
- * `requiredSlug` (default 'mumega'): the SaaS deployment that must be in `pots`.
+ * `requiredSlug` (default 'mumega'; see resolveRequiredSlug): the deployment that must be in `pots`.
  * Pass `null` to skip that check (mupot-update only needs structural sanity).
  */
 export function validateManifest(manifest, { requiredSlug = 'mumega' } = {}) {
   const errors = []
+  if (manifest?.required_slug !== undefined && (typeof manifest.required_slug !== 'string' || !manifest.required_slug.trim())) {
+    errors.push('manifest: required_slug must be a non-empty string')
+  }
   const pots = manifest?.pots
   if (!Array.isArray(pots) || pots.length === 0) {
     errors.push('manifest: no deployment pots — refusing to report green')
@@ -72,13 +93,15 @@ export function validateManifest(manifest, { requiredSlug = 'mumega' } = {}) {
 export function resolveUpdateTargets(manifest, target) {
   const all = deploymentPots(manifest)
   const legacy = legacyPots(manifest)
-  const skippedLegacy = legacy.map((p) => p?.slug)
+  const legacySlugs = legacy.map((p) => p?.slug)
+  // Only `--all` silently passes over legacy entries, so only `--all` reports skips.
+  const skippedLegacy = target === '--all' ? legacySlugs : []
   // Fail closed on structural problems (slug in both lists, malformed/unfrozen legacy).
   const invalid = validateManifest(manifest, { requiredSlug: null }).filter((e) => !e.startsWith('manifest: no deployment pots'))
   if (invalid.length > 0) {
     return { targets: [], skippedLegacy, error: invalid.join('; ') }
   }
-  if (target !== '--all' && skippedLegacy.includes(target)) {
+  if (target !== '--all' && legacySlugs.includes(target)) {
     return {
       targets: [],
       skippedLegacy,

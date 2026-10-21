@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve } from 'node:path'
-import { deploymentPots, legacyPots, validateManifest } from './lib/pots-manifest.mjs'
+import { deploymentPots, legacyPots, resolveRequiredSlug, validateManifest } from './lib/pots-manifest.mjs'
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -200,14 +200,28 @@ export function formatReport(head, results, { ref, legacy = [] } = {}) {
   return lines.join('\n')
 }
 
+/** Read + validate; an unreadable/unparseable manifest is an error, never a throw or a pass. */
+function manifestErrors(manifestPath, requiredSlug, env) {
+  let manifest
+  try {
+    manifest = readManifest(manifestPath)
+  } catch (err) {
+    return [`manifest: cannot read or parse ${manifestPath} (${String(err?.message ?? err)})`]
+  }
+  return validateManifest(manifest, { requiredSlug: requiredSlug === undefined ? resolveRequiredSlug(manifest, env) : requiredSlug })
+}
+
 /**
  * Whole run as a pure-ish function so the exact output + exit code are
  * testable. Deployment results alone decide `exitCode`; `legacy` is report-only.
  */
-export async function runCheck({ manifestPath = join(REPO, 'pots.manifest.json'), head = headSha(), ref = null, json = false, requiredSlug = 'mumega', ...opts } = {}) {
-  // Fail closed: a malformed manifest (no/empty/non-array `pots`, missing the
-  // SaaS deployment, slug in both lists, unfrozen/malformed legacy) is never green.
-  const errors = validateManifest(readManifest(manifestPath), { requiredSlug })
+export async function runCheck({ manifestPath = join(REPO, 'pots.manifest.json'), head = headSha(), ref = null, json = false, requiredSlug, env = process.env, ...opts } = {}) {
+  // Fail closed: an unreadable/unparseable manifest, or a malformed one (no/empty/
+  // non-array `pots`, missing the required deployment, slug in both lists,
+  // unfrozen/malformed legacy) is never green. `requiredSlug` left undefined =>
+  // resolved from env / manifest `required_slug` / 'mumega' (#2109). An explicit
+  // `null` skips the required-slug check (tests only; the CLI never passes it).
+  const errors = manifestErrors(manifestPath, requiredSlug, env)
   if (errors.length > 0) {
     const output = json
       ? JSON.stringify({ head, ref, manifest_errors: errors }, null, 2)
@@ -225,7 +239,11 @@ export async function runCheck({ manifestPath = join(REPO, 'pots.manifest.json')
 // ── CLI entry ────────────────────────────────────────────────────────────────
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 if (isMain) {
+  // `--manifest=<path>` overrides the manifest (used by the CLI exit-code tests);
+  // the scheduled workflow passes nothing and gets the repo's pots.manifest.json.
+  const manifestArg = process.argv.find((a) => a.startsWith('--manifest='))
   const { output, exitCode } = await runCheck({
+    ...(manifestArg ? { manifestPath: resolve(manifestArg.slice('--manifest='.length)) } : {}),
     head: headSha(),
     ref: process.env.GITHUB_REF_NAME || null,
     json: process.argv.includes('--json'),
