@@ -4388,9 +4388,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0250_bounty_task_binding.sql",
+    sha256: "349feeadfe8feeadf73ae80c8f7bd6e92a52a60ecc1c19e2571840afdc38519d",
+    statements: [
+      "-- 0250 bounty -> task binding (seed B1, docs: agents/kasra/docs/seed-build-plan-20261022.md).\n--\n-- A mumega.com bounty claim arrives at /api/events/ingest as `bounty.claimed` and becomes ONE task,\n-- tagged tasks.external_source = 'mumega-bounty:<bounty_id>'. Delivery is at-least-once (a lost\n-- response is retried), so creation must be create-or-recover: the same binding returns the same\n-- task, and a binding that does not match is a conflict, never an adoption of someone else's task.\n--\n-- ADDITIVE ONLY: one new table, two new indexes. No existing row, column, trigger or index changes.\n--\n-- WHY THE UNIQUE INDEX IS SCOPED. tasks.external_source is NOT a per-task key for other writers:\n-- src/events/ingest.ts stamps every event-ingested task with the constant 'event-ingest:<source>',\n-- so duplicate non-null values are normal and a table-wide UNIQUE index would fail to build (and\n-- would forbid the second ingested lead). Only the 'mumega-bounty:' namespace is a per-task key, so\n-- only it is unique. GLOB (case-sensitive) rather than LIKE so the predicate means exactly the\n-- prefix the application writes.\nCREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_mumega_bounty_source\n  ON tasks(external_source)\n  WHERE external_source GLOB 'mumega-bounty:*';",
+      "\n\n-- The binding carries what the task row cannot: which award revision created it and a digest of the\n-- exact validated payload, so a replay can be told apart from a conflicting claim. bounty_id is the\n-- PRIMARY KEY, so the bounty -> task map is one-to-one in both directions (task_id UNIQUE).\n-- claimant_identity_id / claimant_email_sha256 are the opaque mumega.com identity reference and a\n-- hash; the raw email never enters this table or the task. They are kept for the member-path result\n-- submission (seed B2) and are NOT placed in the task title/body.\nCREATE TABLE IF NOT EXISTS bounty_task_bindings (\n  bounty_id TEXT PRIMARY KEY,\n  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),\n  award_revision INTEGER NOT NULL CHECK (award_revision >= 0),\n  payload_sha256 TEXT NOT NULL,\n  issuer_tenant TEXT NOT NULL,\n  claimant_identity_id TEXT NOT NULL,\n  claimant_email_sha256 TEXT NOT NULL,\n  created_at TEXT NOT NULL\n);",
+    ],
+    objects: [
+      { type: "index", name: "uq_tasks_mumega_bounty_source" },
+      { type: "table", name: "bounty_task_bindings" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "80875e323cb7561eefc3602c999afb7ee183ac71f27c9306c11f121b35e4fc8e"
+export const SCHEMA_CHAIN_DIGEST: string = "53b0b0c64a6e2cd89fafa1404546684c5fb52bed3607964df48222f83208138a"

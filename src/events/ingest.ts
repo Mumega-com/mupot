@@ -29,6 +29,13 @@ import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
 import { createTask } from '../tasks/service'
 import type { CreateTaskOptions } from '../tasks/service'
+import {
+  BOUNTY_CLAIMED_EVENT,
+  deriveBountyClaimed,
+  ingestBountyClaimed,
+} from './bounty-claimed'
+import type { BountyConflictReason, PayloadIssue } from './bounty-claimed'
+import type { TaskProjectErrorCode } from '../tasks/service'
 
 // ── Normalized inbound event ────────────────────────────────────────────────
 //
@@ -175,6 +182,13 @@ export const EVENT_REGISTRY: ReadonlyMap<string, DoneWhenDeriver> = new Map([
       body: JSON.stringify(payload).slice(0, 2000),
     }
   }],
+
+  // ── bounty.claimed ────────────────────────────────────────────────────────
+  // A mumega.com bounty was claimed. Closed payload schema, idempotent binding to
+  // exactly one task keyed by external_source='mumega-bounty:<bounty_id>'. The
+  // create-or-recover logic lives in ./bounty-claimed (ingestEvent routes to it); this
+  // entry keeps the registry the single list of accepted types.
+  [BOUNTY_CLAIMED_EVENT, deriveBountyClaimed],
 ])
 
 // ── Core ingest function ─────────────────────────────────────────────────────
@@ -183,9 +197,14 @@ export interface IngestResult {
   ok: true
   task_id: string
   done_when: string
+  /** bounty.claimed only: true when an identical earlier delivery already created this task. */
+  replayed?: boolean
 }
 
 export type IngestError =
+  | { ok: false; code: 'invalid_payload'; issues: readonly PayloadIssue[] }
+  | { ok: false; code: 'binding_conflict'; reason: BountyConflictReason }
+  | { ok: false; code: 'project_rejected'; project_code: TaskProjectErrorCode }
   | { ok: false; code: 'unmapped_event_type'; event_type: string }
   | { ok: false; code: 'squad_not_found'; squad_id: string }
   | { ok: false; code: 'create_failed'; detail: string }
@@ -217,6 +236,14 @@ export async function ingestEvent(
     .first<{ id: string }>()
   if (!squadRow) {
     return { ok: false, code: 'squad_not_found', squad_id: event.squad_id }
+  }
+
+  // 2b. bounty.claimed has its own closed schema and create-or-recover semantics.
+  if (event.type === BOUNTY_CLAIMED_EVENT) {
+    return ingestBountyClaimed(env, event.squad_id, event.payload, {
+      ...options,
+      skipMirror: options.skipMirror ?? true,
+    })
   }
 
   // 3. Derive the task fields. The deriver is responsible for a non-placeholder done_when.
@@ -268,6 +295,9 @@ export async function ingestEvent(
 //
 // Returns:
 //   201 { ok: true, task_id, done_when }       — task created
+//   200 { ok: true, task_id, done_when, replayed: true } — bounty.claimed replay (same task)
+//   400 { error: 'invalid_payload', issues }   — bounty.claimed schema violation
+//   409 { error: 'bounty_binding_conflict', reason } — bounty.claimed key held by a different binding
 //   400 { error: 'unmapped_event_type', ... }  — no registry entry, not a silent drop
 //   400 { error: 'squad_not_found', ... }
 //   401 { error: 'unauthorized' }
@@ -399,8 +429,24 @@ eventIngestApp.post('/ingest', async (c) => {
     if (result.code === 'squad_not_found') {
       return c.json({ error: 'squad_not_found', squad_id: result.squad_id }, 404)
     }
+    if (result.code === 'invalid_payload') {
+      return c.json({ error: 'invalid_payload', issues: result.issues }, 400)
+    }
+    if (result.code === 'binding_conflict') {
+      return c.json({ error: 'bounty_binding_conflict', reason: result.reason }, 409)
+    }
+    if (result.code === 'project_rejected') {
+      const status = result.project_code === 'project_not_found' ? 404
+        : result.project_code === 'project_access_forbidden' ? 403
+        : result.project_code === 'archived_project' ? 409
+        : 400
+      return c.json({ error: result.project_code }, status)
+    }
     return c.json({ error: 'create_failed', detail: result.detail }, 500)
   }
 
+  if (result.replayed) {
+    return c.json({ ok: true, task_id: result.task_id, done_when: result.done_when, replayed: true }, 200)
+  }
   return c.json({ ok: true, task_id: result.task_id, done_when: result.done_when }, 201)
 })
