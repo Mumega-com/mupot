@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   NOTICE_KINDS,
+  NOTICE_STATES,
   buildNotice,
   canonicalNoticeString,
   NOTICE_MAX_FUTURE_SKEW_MS,
@@ -25,7 +26,7 @@ import {
   type Notice,
   type NoticeFields,
 } from '../src/projects/office-contract'
-import { githubNotice, linearNotice, type NoticeSource } from '../src/projects/office-notice-map'
+import { followsGithubAction, githubNotice, linearNotice, type NoticeSource } from '../src/projects/office-notice-map'
 
 function fixture(name: string): unknown {
   return JSON.parse(readFileSync(join(__dirname, 'fixtures', 'office', name), 'utf8'))
@@ -47,6 +48,7 @@ describe('GitHub pull_request.opened → Notice', () => {
       // a PR's version is its head sha: a new push is a new version
       version: '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567',
       kind: 'pr',
+      state: 'open',
       url: 'https://github.com/mumega/mupot/pull/2113',
       title: 'feat(office): ProjectOffice spike',
       actor: 'kasra-code',
@@ -154,7 +156,7 @@ describe('Linear Issue update → Notice', () => {
     const lin = await linearNotice(LIN_SRC, fixture('linear-issue-updated.json'))
     expect(Object.keys(gh ?? {}).sort()).toEqual(Object.keys(lin ?? {}).sort())
     expect(Object.keys(gh ?? {}).sort()).toEqual(
-      ['actor', 'connection', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'tenant', 'title', 'updated_at', 'url', 'version'],
+      ['actor', 'connection', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'state', 'tenant', 'title', 'updated_at', 'url', 'version'],
     )
     expect(NOTICE_KINDS).toContain(gh?.kind)
     expect(NOTICE_KINDS).toContain(lin?.kind)
@@ -164,7 +166,7 @@ describe('Linear Issue update → Notice', () => {
 describe('Notice hash', () => {
   const base: NoticeFields = {
     tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e1', version: 'v',
-    kind: 'pr', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+    kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
 
   it('is stable, and a redelivery (new event_id, same item version) hashes identically', async () => {
@@ -220,6 +222,14 @@ describe('ordering: an old webhook cannot overwrite newer state', () => {
     expect(isStale(b, a)).toBe(true)
   })
 
+  it('equal timestamp and version but DIFFERENT content (hash) is a tie, not a redelivery', () => {
+    const held = { ...at(T10, 'v1'), hash: 'a'.repeat(64) }
+    expect(noticeOrder(held, { ...at(T10, 'v1'), hash: 'b'.repeat(64) })).toBe('tie')
+    expect(isStale(held, { ...at(T10, 'v1'), hash: 'b'.repeat(64) })).toBe(true) // kept, not applied
+    expect(noticeOrder(held, { ...at(T10, 'v1'), hash: 'a'.repeat(64) })).toBe('same')
+    expect(noticeOrder(held, at(T10, 'v1'))).toBe('same') // without both hashes only the version can be compared
+  })
+
   it.each(['yesterday', '', 'Invalid Date', '2026-13-45T00:00:00Z'])('fails closed on an unparseable timestamp %j (either side)', (bad) => {
     expect(noticeOrder(at(T10), at(bad))).toBe('invalid')
     expect(noticeOrder(at(bad), at(T10))).toBe('invalid')
@@ -231,7 +241,7 @@ describe('ordering: an old webhook cannot overwrite newer state', () => {
 describe('buildNotice validates what it signs', () => {
   const ok: NoticeFields = {
     tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
-    kind: 'pr', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+    kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
   const bad = (over: Record<string, unknown>) => buildNotice({ ...ok, ...over } as unknown as NoticeFields)
 
@@ -258,6 +268,56 @@ describe('buildNotice validates what it signs', () => {
   })
 })
 
+describe('state: open | closed | merged, mapped from the source', () => {
+  const base = fixture('github-pull-request-opened.json') as Record<string, Record<string, unknown>>
+  const withPr = (over: Record<string, unknown>, action = 'synchronize') => ({ ...base, action, pull_request: { ...base.pull_request, ...over } })
+
+  it('PR: open, closed, and merged (closed + merged:true)', async () => {
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({})))?.state).toBe('open')
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({ state: 'closed' }, 'closed')))?.state).toBe('closed')
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({ state: 'closed', merged: true }, 'closed')))?.state).toBe('merged')
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({}, 'closed')))?.state).toBe('closed') // the action says so
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({ merged: true })))?.state).toBe('merged')
+  })
+
+  it('issue and comment take the thread’s state; Linear completed/canceled are closed', async () => {
+    const issue = (state: string, action = 'edited') => ({ action, sender: { login: 'x' }, issue: { node_id: 'I', html_url: 'https://github.com/o/r/issues/1', title: 'T', updated_at: '2026-10-22T08:00:00Z', state } })
+    expect((await githubNotice(GH_SRC, 'issues', issue('open')))?.state).toBe('open')
+    expect((await githubNotice(GH_SRC, 'issues', issue('closed', 'closed')))?.state).toBe('closed')
+    const comment = (state: string) => ({ action: 'created', sender: { login: 'x' }, issue: { title: 'T', state }, comment: { node_id: 'C', html_url: 'https://github.com/o/r/issues/1#c', updated_at: '2026-10-22T08:00:00Z' } })
+    expect((await githubNotice(GH_SRC, 'issue_comment', comment('closed')))?.state).toBe('closed')
+    const lin = fixture('linear-issue-updated.json') as { data: Record<string, unknown> }
+    for (const [type, want] of [['completed', 'closed'], ['canceled', 'closed'], ['started', 'open'], [undefined, 'open']] as const) {
+      const n = await linearNotice(LIN_SRC, { ...lin, data: { ...lin.data, state: type ? { type } : undefined } })
+      expect(n?.state, String(type)).toBe(want)
+    }
+  })
+
+  it('state is part of the hash and of the strict key set; a bad state is refused', async () => {
+    const f: NoticeFields = {
+      tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+      kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+    }
+    expect(await noticeHash(f)).not.toBe(await noticeHash({ ...f, state: 'closed' }))
+    expect(NOTICE_STATES).toEqual(['open', 'closed', 'merged'])
+    expect(noticeFieldsProblem({ ...f, state: 'deleted' as never })).toBe('state')
+    const n = await buildNotice(f)
+    const { state: _s, ...noState } = n
+    expect(await checkNotice(noState)).toEqual({ ok: false, problem: 'keys' })
+    expect(await checkNotice({ ...n, state: 'closed' })).toEqual({ ok: false, problem: 'hash' })
+  })
+})
+
+describe('the office follows only some actions (decided before any I/O)', () => {
+  it('follows what the mapper maps, and nothing else', () => {
+    for (const a of ['opened', 'synchronize', 'closed', 'reopened', 'edited', 'labeled', 'unlabeled', 'ready_for_review']) expect(followsGithubAction('pull_request', a), a).toBe(true)
+    for (const a of ['assigned', 'review_requested', 'locked', 'converted_to_draft', 'auto_merge_enabled', '', 5, null, undefined]) expect(followsGithubAction('pull_request', a), String(a)).toBe(false)
+    expect(followsGithubAction('issues', 'opened')).toBe(true)
+    expect(followsGithubAction('issues', 'synchronize')).toBe(false) // a PR action, not an issue one
+    expect(followsGithubAction('push', 'opened')).toBe(false)
+  })
+})
+
 describe('title and actor lose control and bidi characters in the mapper (#2130)', () => {
   const RLO = '\u202e' // right-to-left override
   const ZWSP = '\u200b'
@@ -280,6 +340,18 @@ describe('title and actor lose control and bidi characters in the mapper (#2130)
     expect(await githubNotice(GH_SRC, 'pull_request', payload)).toBeNull()
   })
 
+  it('keeps ZWNJ and ZWJ: a Persian title and an emoji sequence survive the mapper and the strict check', async () => {
+    const persian = 'می\u200cخواهم یک پیام' // ZWNJ between "mi" and "khaham"
+    const family = '\u{1F469}\u200d\u{1F469}\u200d\u{1F467}' // woman ZWJ woman ZWJ girl
+    const payload = { ...base, pull_request: { ...base.pull_request, title: `${persian} ${family}` } }
+    const n = await githubNotice(GH_SRC, 'pull_request', payload)
+    expect(n?.title).toBe(`${persian} ${family}`)
+    expect(hasUnsafeText(n?.title ?? '')).toBe(false)
+    expect((await checkNotice(n, Date.parse('2026-10-22T09:00:00Z'))).ok).toBe(true)
+    // ...while the neighbouring invisible characters stay refused
+    expect(stripUnsafeText('a\u200bb\u200c\u200dc\u202ed\u2060e')).toBe('ab\u200c\u200dcde')
+  })
+
   it('a javascript: or data: link drops the event instead of being mapped', async () => {
     for (const url of ['javascript:alert(1)', 'data:text/html,x', 'http://github.com/x/y/pull/1', 'https://u:p@github.com/x']) {
       const payload = { ...base, pull_request: { ...base.pull_request, html_url: url } }
@@ -291,7 +363,7 @@ describe('title and actor lose control and bidi characters in the mapper (#2130)
 describe('checkNotice: the strict boundary check (#2130)', () => {
   const fields: NoticeFields = {
     tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
-    kind: 'pr', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+    kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
   const NOW = Date.parse('2026-10-22T00:01:00.000Z')
 
@@ -398,7 +470,7 @@ describe('Doorbell envelope: pointers only', () => {
   it('a Notice is not a Doorbell and vice versa', async () => {
     const n: Notice = await buildNotice({
       tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
-      kind: 'pr', url: 'https://x.test/u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+      kind: 'pr', state: 'open', url: 'https://x.test/u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     expect(isDoorbell(n)).toBe(false)
   })

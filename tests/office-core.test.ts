@@ -11,6 +11,8 @@ import {
   projectOfficeName,
   OFFICE_ITEM_CAP,
   NOTICE_SEEN_RETENTION_MS,
+  advanceCursor,
+  OFFICE_SCHEMA_VERSION,
   applyNotice,
   ensureOfficeSchema,
   isPermanentBindingFailure,
@@ -202,7 +204,7 @@ describe('working-set schema', () => {
     expect(() => sql.exec(`INSERT INTO office_seen (provider, connection, event_id, seen_at) VALUES ('github', 'c', 'same', 'y')`)).toThrow()
     expect(() => sql.exec(`INSERT INTO office_cursor (provider, connection, cursor) VALUES ('linear', 'c', 'z')`)).toThrow()
     sql.exec(`INSERT INTO office_meta (key, value) VALUES ('ticks', '1')`)
-    expect(sql.all('SELECT value FROM office_meta')).toEqual([{ value: '1' }])
+    expect(sql.all(`SELECT value FROM office_meta WHERE key = 'ticks'`)).toEqual([{ value: '1' }])
   })
   it('a human-owned task keeps its member, so it never looks unassigned', async () => {
     const { sql } = officeStore()
@@ -225,7 +227,7 @@ describe('applyNotice', () => {
   const NOW = Date.parse('2026-10-22T09:00:00.000Z')
   const fields = (over: Partial<NoticeFields> = {}): NoticeFields => ({
     tenant: TENANT, connection: 'inst-1', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
-    kind: 'pr', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
+    kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
   })
   const notice = (over: Partial<NoticeFields> = {}): Promise<Notice> => buildNotice(fields(over))
   const items = (sql: OfficeSql) => sql.all('SELECT item_id, version, updated_at, title, conflict_version FROM office_items ORDER BY item_id')
@@ -236,23 +238,67 @@ describe('applyNotice', () => {
     return sql
   }
 
-  it('first sight is applied: item row, delivery id, cursor, counter', async () => {
+  it('first sight is applied: item row (with its state), delivery id, counter; the cursor is NOT touched', async () => {
     const sql = fresh()
-    expect(applyNotice(sql, await notice(), NOW)).toBe('applied')
+    expect(applyNotice(sql, await notice({ state: 'merged' }), NOW)).toBe('applied')
     expect(items(sql)).toEqual([{ item_id: 'PR_1', version: 'sha-a', updated_at: T(0), title: 'Title', conflict_version: null }])
+    expect(sql.all('SELECT state FROM office_items')).toEqual([{ state: 'merged' }])
     expect(sql.all('SELECT provider, connection, event_id FROM office_seen')).toEqual([{ provider: 'github', connection: 'inst-1', event_id: 'd-1' }])
-    expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([{ cursor: T(0) }])
-    expect(meta(sql)).toEqual({ notice_applied: '1' })
+    expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([])
+    expect(meta(sql)).toMatchObject({ notice_applied: '1' })
   })
 
-  it('replaying the same delivery is a no-op (delivery is at-least-once)', async () => {
+  it('schema_version is recorded once, and survives a second ensureOfficeSchema', () => {
+    const sql = fresh()
+    ensureOfficeSchema(sql)
+    expect(sql.all(`SELECT value FROM office_meta WHERE key = 'schema_version'`)).toEqual([{ value: OFFICE_SCHEMA_VERSION }])
+  })
+
+  it('office_seen has an index on seen_at, and the prune uses it', () => {
+    const sql = fresh()
+    expect(sql.all(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_office_seen_seen_at'`)).toHaveLength(1)
+    const plan = sql.all(`EXPLAIN QUERY PLAN DELETE FROM office_seen WHERE seen_at < 'x'`).map((r) => String(r.detail)).join(' ')
+    expect(plan).toContain('idx_office_seen_seen_at')
+  })
+
+  describe('the cursor is a reconcile watermark, not a webhook high-water mark', () => {
+    it('webhook notices never move it: A at t2, then B first seen at t1 leaves it empty and B is still recorded', async () => {
+      const sql = fresh()
+      expect(applyNotice(sql, await notice({ item_id: 'A', event_id: 'dA', updated_at: T(120) }), NOW)).toBe('applied')
+      expect(applyNotice(sql, await notice({ item_id: 'B', event_id: 'dB', updated_at: T(60) }), NOW)).toBe('applied')
+      expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([]) // A at t2 says nothing about B at t1
+      expect(items(sql).map((r) => r.item_id)).toEqual(['A', 'B'])
+    })
+
+    it('advanceCursor moves forward only', () => {
+      const sql = fresh()
+      expect(advanceCursor(sql, 'github', 'inst-1', T(60))).toBe(true)
+      expect(advanceCursor(sql, 'github', 'inst-1', T(120))).toBe(true)
+      expect(advanceCursor(sql, 'github', 'inst-1', T(30))).toBe(false) // a late or replayed page cannot rewind it
+      expect(advanceCursor(sql, 'github', 'inst-1', T(120))).toBe(false)
+      expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([{ cursor: T(120) }])
+      expect(advanceCursor(sql, 'github', 'inst-2', T(5))).toBe(true) // per connection
+      expect(advanceCursor(sql, 'linear', 'inst-1', T(5))).toBe(true) // per provider
+    })
+  })
+
+  it('same instant and version but different content (a close inside the same second) is a tie, not a duplicate', async () => {
+    const sql = fresh()
+    expect(applyNotice(sql, await notice({ event_id: 'd-1', state: 'open' }), NOW)).toBe('applied')
+    expect(applyNotice(sql, await notice({ event_id: 'd-2', state: 'closed' }), NOW)).toBe('tie_kept')
+    expect(sql.all('SELECT state, conflict_version FROM office_items')).toEqual([{ state: 'open', conflict_version: 'sha-a' }])
+    // an exact redelivery under a new delivery id (same content) is still a duplicate
+    expect(applyNotice(sql, await notice({ event_id: 'd-3', state: 'open' }), NOW)).toBe('duplicate')
+  })
+
+  it('replaying the same delivery is a no-op ', async () => {
     const sql = fresh()
     const n = await notice()
     expect(applyNotice(sql, n, NOW)).toBe('applied')
     const before = JSON.stringify([items(sql), sql.all('SELECT * FROM office_seen'), sql.all('SELECT * FROM office_cursor')])
     for (let i = 0; i < 3; i++) expect(applyNotice(sql, n, NOW + 1000)).toBe('duplicate')
     expect(JSON.stringify([items(sql), sql.all('SELECT * FROM office_seen'), sql.all('SELECT * FROM office_cursor')])).toBe(before)
-    expect(meta(sql)).toEqual({ notice_applied: '1', notice_duplicate: '3' })
+    expect(meta(sql)).toMatchObject({ notice_applied: '1', notice_duplicate: '3' })
   })
 
   it('a replay is a no-op even after the delivery id was forgotten: the version check still holds', async () => {
@@ -264,20 +310,19 @@ describe('applyNotice', () => {
     expect(items(sql)).toHaveLength(1)
   })
 
-  it('a newer notice replaces the item and moves the cursor forward', async () => {
+  it('a newer notice replaces the item', async () => {
     const sql = fresh()
     applyNotice(sql, await notice(), NOW)
     expect(applyNotice(sql, await notice({ event_id: 'd-2', version: 'sha-b', updated_at: T(60), title: 'Retitled' }), NOW)).toBe('applied')
     expect(items(sql)).toEqual([{ item_id: 'PR_1', version: 'sha-b', updated_at: T(60), title: 'Retitled', conflict_version: null }])
-    expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([{ cursor: T(60) }])
+    expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([])
   })
 
-  it('an OLDER version never overwrites a newer one, and never moves the cursor back', async () => {
+  it('an OLDER version never overwrites a newer one', async () => {
     const sql = fresh()
     applyNotice(sql, await notice({ event_id: 'd-new', version: 'sha-new', updated_at: T(120), title: 'Newest' }), NOW)
     expect(applyNotice(sql, await notice({ event_id: 'd-old', version: 'sha-old', updated_at: T(10), title: 'Stale' }), NOW)).toBe('stale')
     expect(items(sql)).toEqual([{ item_id: 'PR_1', version: 'sha-new', updated_at: T(120), title: 'Newest', conflict_version: null }])
-    expect(sql.all('SELECT cursor FROM office_cursor')).toEqual([{ cursor: T(120) }])
     expect(meta(sql)).toMatchObject({ notice_applied: '1', notice_stale: '1' })
   })
 
@@ -330,8 +375,8 @@ describe('applyNotice', () => {
     const sql = fresh()
     for (let i = 0; i < OFFICE_ITEM_CAP + 3; i++) {
       sql.exec(
-        `INSERT INTO office_items (provider, connection, item_id, kind, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
-         VALUES ('github', 'inst-1', ?, 'pr', 'v', 'https://x.test/1', 't', 'a', ?, 'h', 'e', 'x')`,
+        `INSERT INTO office_items (provider, connection, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
+         VALUES ('github', 'inst-1', ?, 'pr', 'open', 'v', 'https://x.test/1', 't', 'a', ?, 'h', 'e', 'x')`,
         `seed-${i}`,
         T(i),
       )

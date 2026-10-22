@@ -213,7 +213,7 @@ describe('binding: project -> tenant re-verified from D1', () => {
     const o = rpc(stub)
     const n = await buildNotice({
       tenant: TENANT, connection: 'c1', provider: 'github', item_id: 'i1', event_id: 'e1', version: 'v1',
-      kind: 'pr', url: 'https://example.test/1', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+      kind: 'pr', state: 'open', url: 'https://example.test/1', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     const refused = { ok: false, error: 'unbound', reason }
     expect(await o.notice(n)).toEqual(refused)
@@ -508,7 +508,7 @@ const NOTICE_PROJECT = 'proj-notice'
 const T = (sec: number): string => new Date(Date.parse('2026-10-22T08:00:00.000Z') + sec * 1000).toISOString()
 const fields = (over: Partial<NoticeFields> = {}): NoticeFields => ({
   tenant: TENANT, connection: 'inst-1', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
-  kind: 'pr', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
+  kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
 })
 const items = (s: Stub): Promise<Record<string, unknown>[]> =>
   runInDurableObject(s, (_i: ProjectOffice, state) => {
@@ -531,8 +531,10 @@ describe('notice: validated and recorded at the RPC boundary', () => {
     for (let i = 0; i < 3; i++) expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'duplicate' })
     expect(await items(stub)).toHaveLength(1)
     expect((await rpc(stub).snapshot()).items).toEqual([
-      expect.objectContaining({ provider: 'github', connection: 'inst-1', item_id: 'PR_1', kind: 'pr', version: 'sha-a' }),
+      expect.objectContaining({ provider: 'github', connection: 'inst-1', item_id: 'PR_1', kind: 'pr', state: 'open', version: 'sha-a' }),
     ])
+    const meta = await runInDurableObject(stub, (_i: ProjectOffice, st) => st.storage.sql.exec(`SELECT value FROM office_meta WHERE key = 'schema_version'`).toArray())
+    expect(meta).toEqual([{ value: '1' }])
   })
 
   it('an older version never overwrites a newer one, and a replay survives eviction', async () => {

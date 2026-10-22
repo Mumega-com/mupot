@@ -172,7 +172,7 @@ class OfficeAgent extends Agent<OfficeEnv> {
         'SELECT task_id, status, assignee_agent_id, assignee_member_id, gate_owner FROM office_tasks ORDER BY task_id',
       ),
       items: sql.all(
-        `SELECT provider, connection, item_id, kind, version, url, title, actor, updated_at, conflict_version
+        `SELECT provider, connection, item_id, kind, state, version, url, title, actor, updated_at, conflict_version
            FROM office_items ORDER BY provider, connection, item_id`,
       ),
     }

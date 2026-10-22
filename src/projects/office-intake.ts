@@ -8,16 +8,21 @@
 //   - The payload is data. It never selects the tenant or the project. The tenant is this pot's TENANT_SLUG; the
 //     connection is the installation recorded in D1 (github_installations) for that tenant; the project is whichever
 //     live project D1 says owns the repository (projects.repo_url or project_repos). The payload's installation id
-//     and repository name are only compared against those rows.
+//     is only compared against that row (the pin that matters: the webhook secret is shared by every installation of
+//     the app, so a valid signature does not say whose event this is) and its repository name only looked up.
 //   - A repository no project claims, or more than one project claims, is DROPPED and counted. The webhook answers
 //     the same as always, so a sender learns nothing about which repositories are connected.
 //   - Everything sits behind PROJECT_OFFICE (default off). With the flag off this returns before reading D1.
 //
 // It does not create tasks, assign, brief, dispatch, wake or write back. The existing webhook behaviour is unchanged.
+//
+// Delivery is AT-MOST-ONCE until reconcile lands: the route runs this in waitUntil after the delivery is claimed, so
+// a notice the office could not take (counted as office_error, office_refused) is not retried by anything yet. What
+// IS idempotent is the office: a replayed delivery id, or an older version, changes nothing.
 
 import type { Env } from '../types'
 import { repoKeyFromUrl } from '../workspaces/repo-key'
-import { githubNotice } from './office-notice-map'
+import { followsGithubAction, githubNotice } from './office-notice-map'
 import { isProjectOfficeEnabled, type NoticeOutcome } from './office-core'
 import { getProjectOffice } from './office-handle'
 
@@ -27,7 +32,6 @@ export type IntakeDropReason =
   | 'no_installation'
   | 'installation_mismatch'
   | 'bad_repo'
-  | 'owner_mismatch'
   | 'unknown_repo'
   | 'ambiguous_repo'
   | 'unmappable'
@@ -68,7 +72,6 @@ export async function countIntakeDrop(env: Pick<Env, 'SESSIONS'>, reason: Intake
 
 interface InstallationRow {
   installation_id: string
-  account_login: string | null
 }
 
 interface ProjectIdRow {
@@ -118,8 +121,9 @@ export async function resolveRepoProject(
 
 /**
  * Turn one verified GitHub delivery into a Notice and hand it to the owning project's office.
- * Never throws: every failure is a counted drop. At-least-once is the office's job: it dedups on the delivery id
- * and refuses to let an older version overwrite a newer one, so calling this twice for one delivery is a no-op.
+ * Never throws: every failure is a counted drop. The office dedups on the delivery id and refuses to let an older
+ * version overwrite a newer one, so calling this twice for one delivery is a no-op. Events and actions the office
+ * does not follow return 'event_ignored' before any D1 or KV access and are not counted: only real drops are.
  */
 export async function routeGitHubNoticeToOffice(
   env: Env,
@@ -130,6 +134,7 @@ export async function routeGitHubNoticeToOffice(
 ): Promise<IntakeResult> {
   if (!isProjectOfficeEnabled(env)) return { routed: false, reason: 'flag_off' }
   if (!(INTAKE_EVENTS as readonly string[]).includes(eventName)) return { routed: false, reason: 'event_ignored' }
+  if (!followsGithubAction(eventName, rec(payload)?.action)) return { routed: false, reason: 'event_ignored' }
 
   const drop = async (reason: IntakeDropReason): Promise<IntakeResult> => {
     await countIntakeDrop(env, reason, nowMs)
@@ -139,7 +144,7 @@ export async function routeGitHubNoticeToOffice(
   try {
     const p = rec(payload)
     const install = await env.DB
-      .prepare('SELECT installation_id, account_login FROM github_installations WHERE tenant = ?1')
+      .prepare('SELECT installation_id FROM github_installations WHERE tenant = ?1')
       .bind(env.TENANT_SLUG)
       .first<InstallationRow>()
     if (!install) return await drop('no_installation')
@@ -153,9 +158,6 @@ export async function routeGitHubNoticeToOffice(
     const fullName = rec(p?.repository)?.full_name
     const m = typeof fullName === 'string' ? FULL_NAME_RE.exec(fullName) : null
     if (!m) return await drop('bad_repo')
-    if (install.account_login && (m[1] as string).toLowerCase() !== install.account_login.toLowerCase()) {
-      return await drop('owner_mismatch')
-    }
     const repoKey = repoKeyFromUrl(`https://github.com/${fullName as string}`)
     if (!repoKey) return await drop('bad_repo')
 

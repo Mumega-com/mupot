@@ -124,7 +124,7 @@ beforeEach(() => {
     INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES ('p2', 'p2', 'Project Two', 'Ship', 'active', 'git@github.com:mumega/mcpwp.git');
     INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES ('p-none', 'p-none', 'No repo', 'Ship', 'active', NULL);
     INSERT INTO github_installations (tenant, installation_id, account_login, installed_at, updated_at)
-      VALUES ('${TENANT}', '${INSTALL}', 'mumega', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+      VALUES ('${TENANT}', '${INSTALL}', NULL, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
   `)
 })
 
@@ -146,6 +146,33 @@ describe('flag off: inert', () => {
     for (const ev of ['push', 'workflow_run', 'ping', 'issue_comment', 'projects_v2_item']) {
       expect(await route(env, pr('mumega/mupot'), 'd', ev), ev).toEqual({ routed: false, reason: 'event_ignored' })
     }
+  })
+})
+
+describe('actions the office does not follow are dropped before any I/O, and are not counted', () => {
+  it.each([
+    ['pull_request', 'assigned'], ['pull_request', 'review_requested'], ['pull_request', 'converted_to_draft'],
+    ['pull_request', 'locked'], ['pull_request', 'auto_merge_enabled'], ['issues', 'assigned'], ['issues', 'milestoned'],
+    ['issues', 'synchronize'], ['pull_request', ''],
+  ])('%s.%s: event_ignored, no D1, no KV, no namespace, no counter', async (event, action) => {
+    const boom = new Proxy({}, { get: () => { throw new Error('touched') } })
+    const env = makeEnv({ DB: boom, SESSIONS: boom })
+    expect(await route(env, pr('mumega/mupot', { action }), 'd', event)).toEqual({ routed: false, reason: 'event_ignored' })
+  })
+
+  it('a payload with no action at all is ignored the same way', async () => {
+    const boom = new Proxy({}, { get: () => { throw new Error('touched') } })
+    const payload = pr('mumega/mupot')
+    delete payload.action
+    expect(await route(makeEnv({ DB: boom, SESSIONS: boom }), payload)).toEqual({ routed: false, reason: 'event_ignored' })
+  })
+
+  it('an ignored action on an UNKNOWN repo is not a drop; a followed action on it is', async () => {
+    const env = makeEnv()
+    await route(env, pr('mumega/not-connected', { action: 'assigned' }), 'd-1')
+    expect(drops()).toEqual({})
+    await route(env, pr('mumega/not-connected', { action: 'opened' }), 'd-2')
+    expect(drops()).toEqual({ unknown_repo: '1' })
   })
 })
 
@@ -222,12 +249,6 @@ describe('the payload never selects the tenant or the project', () => {
     expect(await route(makeEnv(), pr('mumega/mupot'))).toEqual({ routed: false, reason: 'no_installation' })
     expect(drops()).toEqual({ no_installation: '1' })
   })
-
-  it('a repository owned by another account than the installation’s is dropped', async () => {
-    harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/other/repo' WHERE id = 'p1'`)
-    expect(await route(makeEnv(), pr('other/repo'))).toEqual({ routed: false, reason: 'owner_mismatch' })
-    expect(officeCalls).toEqual([])
-  })
 })
 
 describe('an unknown repo is dropped with a counter, never an error', () => {
@@ -245,6 +266,20 @@ describe('an unknown repo is dropped with a counter, never an error', () => {
     expect(await route(makeEnv(), pr('mumega/mupot'))).toEqual({ routed: false, reason: 'unknown_repo' })
     harness.sqlite.exec(`UPDATE projects SET status = 'active', archived_at = '2026-10-01T00:00:00Z' WHERE id = 'p1'`)
     expect(await route(makeEnv(), pr('mumega/mupot'), 'd-2')).toEqual({ routed: false, reason: 'unknown_repo' })
+  })
+
+  it('a project_repos row of an archived project owns nothing (both ways a project is archived)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, goal, status) VALUES ('p-arch-a', 'p-arch-a', 'A', 'x', 'active');
+      INSERT INTO projects (id, slug, name, goal, status) VALUES ('p-arch-b', 'p-arch-b', 'B', 'x', 'active');
+      INSERT INTO project_repos (project_id, repo_key) VALUES ('p-arch-a', 'github:mumega/listed-a');
+      INSERT INTO project_repos (project_id, repo_key) VALUES ('p-arch-b', 'github:mumega/listed-b');
+    `)
+    expect(await route(makeEnv(), pr('mumega/listed-a'), 'd-1')).toMatchObject({ routed: true, project_id: 'p-arch-a' }) // control: live
+    harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'p-arch-a'`)
+    harness.sqlite.exec(`UPDATE projects SET archived_at = '2026-10-01T00:00:00Z' WHERE id = 'p-arch-b'`)
+    expect(await route(makeEnv(), pr('mumega/listed-a'), 'd-2')).toEqual({ routed: false, reason: 'unknown_repo' })
+    expect(await route(makeEnv(), pr('mumega/listed-b'), 'd-3')).toEqual({ routed: false, reason: 'unknown_repo' })
   })
 
   it('SQL LIKE wildcards in a repo name do not widen the match', async () => {
@@ -329,9 +364,12 @@ describe('through the real webhook route', () => {
     const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
     return [...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)))].map((b) => b.toString(16).padStart(2, '0')).join('')
   }
-  async function deliver(env: Env, event: string, payload: unknown, delivery: string): Promise<Response> {
+  /** Deliver through the real route with an ExecutionContext; waits for waitUntil work unless `settle` is false. */
+  async function deliver(env: Env, event: string, payload: unknown, delivery: string, settle = true): Promise<Response> {
     const body = JSON.stringify(payload)
-    return githubInboundApp.fetch(
+    const pending: Promise<unknown>[] = []
+    const ctx = { waitUntil: (p: Promise<unknown>) => void pending.push(p), passThroughOnException: () => {} } as unknown as ExecutionContext
+    const res = await githubInboundApp.fetch(
       new Request('https://pot.test/', {
         method: 'POST',
         headers: {
@@ -343,7 +381,10 @@ describe('through the real webhook route', () => {
         body,
       }),
       env,
+      ctx,
     )
+    if (settle) await Promise.all(pending)
+    return res
   }
 
   it('the answer is exactly what it was without the office; the notice reaches the office; a redelivery is dropped by the ledger', async () => {
@@ -357,6 +398,36 @@ describe('through the real webhook route', () => {
     const b = await deliver(env, 'pull_request', payload, 'deliv-1')
     expect(await b.json()).toEqual({ ok: true, duplicate: true })
     expect(officeCalls).toEqual(['pot-a:p1']) // the replay never reached the office
+  })
+
+  it('a hung office RPC neither delays nor alters the webhook answer, and the existing handlers still run', async () => {
+    // issues.closed has an existing handler with an observable answer (syncTaskStatusFromIssue).
+    const issue = {
+      action: 'closed',
+      issue: { node_id: 'I_9', html_url: 'https://github.com/mumega/mupot/issues/9', title: 'Done', updated_at: '2026-10-22T08:50:00Z' },
+      repository: { full_name: 'mumega/mupot' },
+      sender: { login: 'someone' },
+      installation: { id: 4242 },
+    }
+    const baseline = await (await deliver(makeEnv({ PROJECT_OFFICE: undefined }), 'issues', issue, 'deliv-base')).json()
+    expect(baseline).toEqual({ ok: true, synced: false, action: 'closed' })
+
+    let rpcStarted = false
+    const hung = {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({ notice: () => { rpcStarted = true; return new Promise(() => {}) } }),
+    } as unknown as DurableObjectNamespace
+    const env = makeEnv({ PROJECT_OFFICE_DO: hung })
+    const started = Date.now()
+    const res = await Promise.race([
+      deliver(env, 'issues', issue, 'deliv-hung', false),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 3000)),
+    ])
+    expect(res).not.toBe('timeout')
+    expect(Date.now() - started).toBeLessThan(3000)
+    expect(await (res as Response).json()).toEqual(baseline) // same answer as with the office off
+    await new Promise((r) => setTimeout(r, 50))
+    expect(rpcStarted).toBe(true) // the intake did start; the response just did not wait for it
   })
 
   it('with the flag off the same delivery changes nothing in any office', async () => {
