@@ -41,6 +41,24 @@ test('a test with a real engine that pins individual migration files is class `f
   assert.equal(classify(IMPORTS + `read('migrations/0001_init.sql')\nDatabaseSync`), 'files')
 })
 
+test('the workers-pool sanctioned path — applyD1Migrations(db, TEST_MIGRATIONS) — is not a violation', () => {
+  assert.equal(
+    classify(IMPORTS + `await applyD1Migrations(testEnv.MUPOT_DB, testEnv.TEST_MIGRATIONS)\nawait testEnv.DB.prepare('SELECT 1').all()`),
+    null,
+  )
+})
+
+test('applyD1Migrations with a hand-built migrations list is NOT the committed chain', () => {
+  assert.equal(
+    classify(IMPORTS + `await applyD1Migrations(db, handBuilt)\nawait db.prepare('SELECT 1').all()`),
+    'mockDb',
+  )
+  assert.equal(
+    classify(IMPORTS + `await applyD1Migrations(db, [{ name: 'x', queries: [] }])\nawait db.prepare('SELECT 1').all()`),
+    'mockDb',
+  )
+})
+
 test('the sanctioned path — applyAllMigrations — is not a violation', () => {
   assert.equal(
     classify(IMPORTS + `const h = createSqliteD1()\napplyAllMigrations(h.sqlite)`),

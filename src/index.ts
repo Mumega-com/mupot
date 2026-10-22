@@ -97,6 +97,8 @@ export { SquadCoordinatorDO } from './agents/squad-do'
 export { PresenceChannelDO } from './registry/presence-channel-do'
 // Body-free seat-events channel, one socket per fleet host — see src/agents/seat-events.ts.
 export { SeatEventsDO } from './agents/seat-events-do'
+// Per-project back office (Agents SDK Agent). INERT: gated by PROJECT_OFFICE (default off), nothing routes to it.
+export { ProjectOffice } from './projects/project-office'
 // Workflow class — the CF Workflows runtime discovers it via this named export.
 // The class_name in [[workflows]] must match: "TaskWorkflow".
 export { TaskWorkflow } from './workflows/task-workflow'

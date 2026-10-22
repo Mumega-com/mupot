@@ -63,7 +63,15 @@ const migrations = (await readD1Migrations(fileURLToPath(new URL('./migrations',
 export default defineConfig({
   plugins: [
     cloudflareTest({
+      // The deployed entry, so the Durable Object classes it exports (AgentDO, SquadCoordinatorDO,
+      // SeatEventsDO, ProjectOffice, ...) are real classes the runtime can host. Needed by the
+      // ProjectOffice spike (tests/composition/project-office.test.ts).
+      main: './src/index.ts',
       miniflare: {
+        // ProjectOffice (Agents SDK Agent, SQLite-backed). `DB` and the flag/tenant vars are what the
+        // class reads from its own env; `DB` points at the SAME database as MUPOT_DB below so a test
+        // that migrates MUPOT_DB seeds what the office reads.
+        durableObjects: { PROJECT_OFFICE_DO: { className: 'ProjectOffice', useSQLite: true } },
         compatibilityDate: '2026-06-01',
         compatibilityFlags: ['nodejs_compat'],
         // mupot#919 — a scratch D1 binding, unused by src/index.ts and not backed by this
@@ -74,8 +82,8 @@ export default defineConfig({
         // that #916/#943 already found is MORE transactional than the platform it models).
         // This is the closest thing to production D1 available without live Cloudflare
         // credentials — same D1 implementation class Wrangler/Miniflare ship, not a shim.
-        d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe', MUPOT_DB: 'mupot-db' },
-        bindings: { TEST_MIGRATIONS: migrations },
+        d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe', MUPOT_DB: 'mupot-db', DB: 'mupot-db' },
+        bindings: { TEST_MIGRATIONS: migrations, PROJECT_OFFICE: '1', TENANT_SLUG: 'pot-a' },
       },
     }),
   ],
