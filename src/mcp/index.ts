@@ -233,6 +233,7 @@ import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { APPROVAL_EXPIRY_TOOLS } from './approval-expiry'
 import { isResubmitCapError } from '../gates/approval-expiry-rule'
 import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
+import { TASK_BRIEF_TOOLS } from './task-brief'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { dispatchBrakesClearSql, diagnoseDispatchBrake } from '../agents/execution-brake-sql'
@@ -637,7 +638,7 @@ function squadMemoryScope(squadId: string): string {
 // "everyone aligned by accessing the project" keystone: any agent with read access to
 // the project shares one memory. No migration — the engram row stores this string as
 // its agent_id, exactly as squad memory already stores `squad:<id>`.
-function projectMemoryScope(projectId: string): string {
+export function projectMemoryScope(projectId: string): string {
   return `project:${projectId}`
 }
 
@@ -1659,6 +1660,9 @@ const toolTaskGet: ToolSpec = {
     }
     return done({
       task: row,
+      // Context travels with the work: this row is a bare ticket; task_brief assembles the project goal, what the
+      // team knows, related work, conventions and open questions for it in one call.
+      hint: 'call task_brief { task_id } for full context before you start',
       // Loop brakes: the per-task execution hold, readable by anyone who can read the task. held =
       // an UNRELEASED hold exists; escalated_at / released_at are null when never held / not released.
       execution_hold: {
@@ -7671,6 +7675,7 @@ export const TOOLS: ToolSpec[] = [
   ...INCIDENT_REVERT_TOOLS,
   ...APPROVAL_EXPIRY_TOOLS,
   ...EXECUTION_PAUSE_TOOLS,
+  ...TASK_BRIEF_TOOLS,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
