@@ -15,6 +15,7 @@ import { buildTaskBrief, type BriefTask } from '../tasks/brief'
 import { canViewTaskReceipts } from '../tasks/index'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canReadTask, resolveVisibleTaskScope } from '../tasks/visibility'
+import { observedFloorDecision } from '../members/vip-lane'
 import { done, fail, projectMemoryScope, str, type ToolSpec } from './index'
 import { readAccess, readableProject } from './projects'
 import { visibleFlight, visibleObjective } from './flight-spine'
@@ -95,12 +96,17 @@ export const toolTaskBrief: ToolSpec = {
         ? { held: true, escalated_at: row.hold_held_at }
         : null,
     }
+    // An OBSERVED seat (floor not lifted by an attachment) may call task_brief but not objective_get, so the legs behind tools the
+    // floor refuses (objective, seed risk lists, verdict notes) are left out rather than served through this one.
+    const floor = await observedFloorDecision(env, auth, 'task_brief')
+    const flooredSeat = (floor.status === 'observed' || floor.status === 'held') && !auth.seatBinding?.attached
     const brief = await buildTaskBrief(env, {
       task,
       project,
       memoryScope: project ? projectMemoryScope(project.id) : null,
       scope,
       canViewReceipts,
+      flooredSeat,
       // Each source's OWN visibility function (the class rule): the flight check is flight-spine's visibleFlight
       // (observer on every squad of the flight + project read), the objective check its visibleObjective.
       visible: {

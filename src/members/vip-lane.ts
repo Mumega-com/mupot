@@ -94,7 +94,7 @@ export async function readSeatAdmissionStatus(env: Env, seatId: string): Promise
 const HELD_READ_TOOLS: ReadonlySet<string> = new Set([
   'boot_context', 'orient', 'status', 'whoami', 'presence_list', 'peers', 'inbox', 'message_get',
   'recall', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
-  'task_list', 'task_board', 'task_get', 'task_brief', 'kanban_board',
+  'task_list', 'task_board', 'task_get', 'kanban_board',
   'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
   'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
 ])

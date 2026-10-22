@@ -55,6 +55,15 @@ Each field has a cap; if the pack is still over, the least important lines are d
 memory, further siblings, notes), never the title, `done_when` or the ask. `trimmed` in the result
 says what was cut.
 
+Seat floors: an OBSERVED seat may call `task_brief` (it is on the observed floor) but a HELD seat may not
+(held is the human's hard stop; `task_get` stays on the held read floor, `task_brief` does not). For an
+observed, unattached seat the legs whose own tools the floor refuses are left out: the objective section,
+the seed's rule lists, and the reasons on project verdicts.
+
+Verdict reasons: the project's newest 3 verdicts exclude this task's own, and show their reason text only to a
+caller who passed `canViewTaskReceipts` (and is not a floored seat). This task's own rejection reasons appear
+once, under failed attempts, behind the same receipt check.
+
 Memory ranking: vector score plus a lexical-overlap bonus against the task title, `done_when` and ask;
 lessons get a small boost; a hit with no shared term and a distant vector is the index padding its
 topK and is dropped. If recall returns nothing, the newest entries are ranked by overlap alone. Wiki topics
