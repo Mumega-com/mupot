@@ -685,7 +685,7 @@ function isUniqueViolation(error: unknown): boolean {
 export async function findLatestVerdict(env: Env, taskId: string): Promise<TaskVerdict | null> {
   return env.DB.prepare(
     `SELECT id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, reversed_at,
-            submission_id, result_digest, receipt_actor_kind
+            submission_id, result_digest, receipt_actor_kind, attachment_id, consenting_member_id
        FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
   ).bind(taskId).first<TaskVerdict>()
 }

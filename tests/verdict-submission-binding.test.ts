@@ -754,6 +754,41 @@ describe('B4: idempotency, chain, failure, reconcile, reversal', () => {
     expect(receiptRows().map((r) => String(r.idempotency_key).split(':')[0])).toEqual(['verdict', 'verdict-reversed'])
   })
 
+  /** A verdict row exactly as an ATTACHED-session writeVerdict leaves it: attribution columns set, receipt owed, status approved. */
+  function seedAttachedSessionVerdict(taskId: string): string {
+    harness.sqlite.prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, attachment_id, consenting_member_id, receipt_actor_kind)
+       VALUES ('v-att', ?, 'approved', NULL, 'agent-att', '2026-10-22T04:00:00.000Z', 'att-1', 'member-consent', 'agent')`,
+    ).run(taskId)
+    setTaskState(taskId, 'approved', null)
+    return 'v-att'
+  }
+  const attributionOf = (r: Record<string, unknown> | undefined) => {
+    const c = JSON.parse(String(r?.claims_json)) as Record<string, unknown>
+    return { attachment_id: c.attachment_id, consenting_member_id: c.consenting_member_id }
+  }
+
+  it('ATTACHED SESSION: original receipt append failed -> reversal replays the verdict receipt WITH attachment_id + consenting_member_id from the row', async () => {
+    await chainTask('t1')
+    const id = seedAttachedSessionVerdict('t1') // its receipt was never appended
+    const res = await reverse('t1')
+    expect(res.ok && res.gate_receipt?.status).toBe('appended')
+    const rows = receiptRows()
+    expect(rows.map((r) => r.idempotency_key)).toEqual([`verdict:${id}`, `verdict-reversed:${id}`])
+    expect(attributionOf(rows[0])).toEqual({ attachment_id: 'att-1', consenting_member_id: 'member-consent' })
+  })
+
+  it('ATTACHED SESSION: when the full-attribution verdict receipt ALREADY exists, the reversal replay matches it (no idempotency conflict) and the reversal receipt is NOT deferred', async () => {
+    await chainTask('t1')
+    const id = seedAttachedSessionVerdict('t1')
+    const row = harness.sqlite.prepare('SELECT * FROM task_verdicts WHERE id = ?').get(id) as unknown as Parameters<typeof emitGateVerdictReceipt>[1]
+    expect((await emitGateVerdictReceipt(env, row))?.status).toBe('appended') // the original append, with attribution
+    const res = await reverse('t1')
+    expect(res.ok && res.gate_receipt?.status).toBe('appended')
+    expect(receiptRows().map((r) => r.idempotency_key)).toEqual([`verdict:${id}`, `verdict-reversed:${id}`])
+    expect(attributionOf(receiptRows()[0])).toEqual({ attachment_id: 'att-1', consenting_member_id: 'member-consent' })
+  })
+
   it('a reversal of an out-of-scope verdict emits nothing', async () => {
     seedTask('plain')
     await decide('plain')
