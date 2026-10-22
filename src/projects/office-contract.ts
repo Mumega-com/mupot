@@ -27,6 +27,22 @@
 
 // ── Notice ───────────────────────────────────────────────────────────────────
 
+/**
+ * Version of the Notice SHAPE (the key set, the hash recipe, the field rules). Intake stamps the current one on every
+ * notice (`buildNotice`); the office accepts only the versions it knows (`NOTICE_CONTRACT_VERSIONS_ACCEPTED`) and refuses
+ * the rest with a reason that names the problem (`contract_missing`, `contract_unsupported`) instead of the generic
+ * `keys` refusal. This is what lets the main Worker and the office Worker deploy in either order: a notice built by a
+ * newer Worker is refused loudly, never half-understood.
+ *
+ *   1  the original shape (no `contract`, no `scope`): never persisted anywhere, the office refuses it as contract_missing
+ *   2  adds `contract` and `scope` (the canonical source scope the item belongs to, e.g. 'github:owner/repo')
+ *
+ * Bump it WITH any change to NOTICE_KEYS or the hash recipe. To roll a new version out without lockstep, ship the office
+ * Worker that ACCEPTS both versions first, then the main Worker that stamps the new one, then drop the old version.
+ */
+export const NOTICE_CONTRACT_VERSION = 2
+export const NOTICE_CONTRACT_VERSIONS_ACCEPTED: readonly number[] = [2]
+
 export const NOTICE_PROVIDERS = ['github', 'linear', 'jira'] as const
 export type NoticeProvider = (typeof NOTICE_PROVIDERS)[number]
 
@@ -38,10 +54,18 @@ export const NOTICE_STATES = ['open', 'closed', 'merged'] as const
 export type NoticeState = (typeof NOTICE_STATES)[number]
 
 export interface Notice {
+  /** Notice contract version, stamped by `buildNotice`. Part of the hash. See NOTICE_CONTRACT_VERSION. */
+  contract: number
   /** Pot tenant slug. Stamped by the receiving pot from its own config, never read from the payload. */
   tenant: string
   /** The connection (installation / connector) the event arrived on. Adapter-scoped id. */
   connection: string
+  /**
+   * The source scope this item belongs to, canonical and provider-prefixed: for GitHub the repository key from
+   * `repoKeyFromUrl` ('github:owner/repo'). The office stores it with the item and re-asks D1 whether this project
+   * still owns it, so items of a repository the project gave up stop being served (#2137 item 2).
+   */
+  scope: string
   provider: NoticeProvider
   /** Stable id of the item in the source tool (GitHub node id, Linear issue id, ...). */
   item_id: string
@@ -68,7 +92,7 @@ export interface Notice {
 }
 
 /** Everything in a Notice except the hash; what an adapter's mapper assembles. */
-export type NoticeFields = Omit<Notice, 'hash'>
+export type NoticeFields = Omit<Notice, 'hash' | 'contract'>
 
 export function isNoticeState(value: unknown): value is NoticeState {
   return typeof value === 'string' && (NOTICE_STATES as readonly string[]).includes(value)
@@ -89,10 +113,12 @@ export function isNoticeProvider(value: unknown): value is NoticeProvider {
  * (a redelivery, a poll catching up with a webhook) hash identically, which is what lets the
  * office collapse them.
  */
-export function canonicalNoticeString(f: NoticeFields): string {
+export function canonicalNoticeString(f: NoticeFields, contract: number = NOTICE_CONTRACT_VERSION): string {
   return JSON.stringify([
+    contract,
     f.tenant,
     f.connection,
+    f.scope,
     f.provider,
     f.item_id,
     f.version,
@@ -109,8 +135,8 @@ function toHex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-export async function noticeHash(f: NoticeFields): Promise<string> {
-  const bytes = new TextEncoder().encode(canonicalNoticeString(f))
+export async function noticeHash(f: NoticeFields, contract: number = NOTICE_CONTRACT_VERSION): Promise<string> {
+  const bytes = new TextEncoder().encode(canonicalNoticeString(f, contract))
   return toHex(await crypto.subtle.digest('SHA-256', bytes))
 }
 
@@ -118,6 +144,7 @@ export async function noticeHash(f: NoticeFields): Promise<string> {
 export const NOTICE_LIMITS = {
   tenant: 128,
   connection: 256,
+  scope: 512,
   item_id: 256,
   event_id: 256,
   version: 256,
@@ -135,18 +162,33 @@ export const NOTICE_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000
 /**
  * Control (Cc), format (Cf: bidi overrides and isolates, zero-width, BOM, tag characters) and line/paragraph
  * separator characters. None belongs in a one-line title, handle, id or link.
- * Exception: U+200C (ZWNJ) and U+200D (ZWJ). Persian and other scripts need ZWNJ to spell ordinary words, and emoji
- * sequences need ZWJ; neither reorders text, so neither is a spoofing vector like the bidi overrides and isolates.
  */
-const UNSAFE_TEXT_RE = /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 
+/**
+ * The same, except U+200C (ZWNJ) and U+200D (ZWJ). Persian and other scripts need ZWNJ to spell ordinary words, and emoji
+ * sequences need ZWJ; neither reorders text, so neither is a spoofing vector like the bidi overrides and isolates.
+ * ONLY free text a person reads may use this (title, actor: `JOINER_ALLOWED_FIELDS`). An identifier, a link, a tenant or
+ * a version has no use for an invisible joiner, and in one it makes two different strings look identical.
+ */
+const UNSAFE_TEXT_ALLOWING_JOINERS_RE = /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+
+/** The only Notice fields in which ZWNJ and ZWJ are allowed. */
+export const JOINER_ALLOWED_FIELDS = ['title', 'actor'] as const
+
+/** True when `value` holds any control/format/separator character, ZWNJ and ZWJ included. The default, for every field. */
 export function hasUnsafeText(value: string): boolean {
   return UNSAFE_TEXT_RE.test(value)
 }
 
-/** Remove the characters `hasUnsafeText` refuses. For mappers, applied to title and actor before validation. */
+/** `hasUnsafeText` for a free-text field: ZWNJ and ZWJ are tolerated. Call it for title and actor only. */
+export function hasUnsafeTextAllowingJoiners(value: string): boolean {
+  return UNSAFE_TEXT_ALLOWING_JOINERS_RE.test(value)
+}
+
+/** Remove the characters `hasUnsafeTextAllowingJoiners` refuses. For mappers, applied to title and actor ONLY. */
 export function stripUnsafeText(value: string): string {
-  return value.replace(new RegExp(UNSAFE_TEXT_RE.source, 'gu'), '').trim()
+  return value.replace(new RegExp(UNSAFE_TEXT_ALLOWING_JOINERS_RE.source, 'gu'), '').trim()
 }
 
 /** https only, a real host, no embedded credentials, no whitespace or hidden characters anywhere in the text. */
@@ -161,6 +203,11 @@ export function isSafeNoticeUrl(value: string): boolean {
   return u.protocol === 'https:' && u.hostname !== '' && u.username === '' && u.password === ''
 }
 
+/** A scope names its provider: 'github:...' for GitHub, 'linear:...' for Linear, 'jira:...' for Jira. */
+function scopeMatchesProvider(provider: NoticeProvider, scope: string): boolean {
+  return scope.startsWith(`${provider}:`) && scope.length > provider.length + 1 && !/\s/.test(scope)
+}
+
 /**
  * Why these fields are not a valid Notice, or null. `updated_at` must be the canonical UTC form
  * (`Date#toISOString`): ordering and the hash both depend on one spelling per instant.
@@ -173,8 +220,10 @@ export function noticeFieldsProblem(f: NoticeFields, nowMs?: number): string | n
   for (const key of Object.keys(NOTICE_LIMITS) as (keyof typeof NOTICE_LIMITS)[]) {
     const v: unknown = f[key]
     if (typeof v !== 'string' || v.length === 0 || v.length > NOTICE_LIMITS[key]) return key
-    if (hasUnsafeText(v)) return key
+    const joinersOk = (JOINER_ALLOWED_FIELDS as readonly string[]).includes(key)
+    if (joinersOk ? hasUnsafeTextAllowingJoiners(v) : hasUnsafeText(v)) return key
   }
+  if (!scopeMatchesProvider(f.provider, f.scope)) return 'scope'
   if (!isSafeNoticeUrl(f.url)) return 'url'
   const t = typeof f.updated_at === 'string' ? Date.parse(f.updated_at) : Number.NaN
   if (!Number.isFinite(t) || new Date(t).toISOString() !== f.updated_at) return 'updated_at'
@@ -182,15 +231,17 @@ export function noticeFieldsProblem(f: NoticeFields, nowMs?: number): string | n
   return null
 }
 
+/** Validate the fields, stamp the current contract version, and hash. The one way an adapter makes a Notice. */
 export async function buildNotice(f: NoticeFields): Promise<Notice> {
   const problem = noticeFieldsProblem(f)
   if (problem) throw new Error(`notice_invalid:${problem}`)
-  return { ...f, hash: await noticeHash(f) }
+  return { ...f, contract: NOTICE_CONTRACT_VERSION, hash: await noticeHash(f, NOTICE_CONTRACT_VERSION) }
 }
 
 /** The exact key set of a Notice. Anything else on an incoming object is refused, not ignored. */
+/** Changing this list is a contract change: bump NOTICE_CONTRACT_VERSION with it. */
 const NOTICE_KEYS = [
-  'actor', 'connection', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'state', 'tenant', 'title', 'updated_at', 'url', 'version',
+  'actor', 'connection', 'contract', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'scope', 'state', 'tenant', 'title', 'updated_at', 'url', 'version',
 ] as const
 
 export type NoticeCheck = { ok: true; notice: Notice } | { ok: false; problem: string }
@@ -204,16 +255,22 @@ export type NoticeCheck = { ok: true; notice: Notice } | { ok: false; problem: s
 export async function checkNotice(value: unknown, nowMs?: number): Promise<NoticeCheck> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false, problem: 'shape' }
   const v = value as Record<string, unknown> // shape-checked key by key below
+  // Version before shape: a notice from a Worker that speaks another contract is named as such, not as "bad keys".
+  if (!('contract' in v)) return { ok: false, problem: 'contract_missing' }
+  const contract = v.contract
+  if (typeof contract !== 'number' || !NOTICE_CONTRACT_VERSIONS_ACCEPTED.includes(contract)) {
+    return { ok: false, problem: 'contract_unsupported' }
+  }
   if (Object.keys(v).sort().join(',') !== NOTICE_KEYS.join(',')) return { ok: false, problem: 'keys' }
   const fields = {
-    tenant: v.tenant, connection: v.connection, provider: v.provider, item_id: v.item_id, event_id: v.event_id,
+    tenant: v.tenant, connection: v.connection, scope: v.scope, provider: v.provider, item_id: v.item_id, event_id: v.event_id,
     version: v.version, kind: v.kind, state: v.state, url: v.url, title: v.title, actor: v.actor, updated_at: v.updated_at,
   } as NoticeFields // field types are enforced by noticeFieldsProblem on the next line
   const problem = noticeFieldsProblem(fields, nowMs)
   if (problem) return { ok: false, problem }
   if (typeof v.hash !== 'string' || !/^[0-9a-f]{64}$/.test(v.hash)) return { ok: false, problem: 'hash' }
-  if (v.hash !== (await noticeHash(fields))) return { ok: false, problem: 'hash' }
-  return { ok: true, notice: { ...fields, hash: v.hash } }
+  if (v.hash !== (await noticeHash(fields, contract))) return { ok: false, problem: 'hash' }
+  return { ok: true, notice: { ...fields, contract, hash: v.hash } }
 }
 
 export async function isNotice(value: unknown, nowMs?: number): Promise<boolean> {

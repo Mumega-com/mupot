@@ -226,7 +226,7 @@ describe('applyNotice', () => {
   const T = (s: number) => new Date(Date.parse('2026-10-22T08:00:00.000Z') + s * 1000).toISOString()
   const NOW = Date.parse('2026-10-22T09:00:00.000Z')
   const fields = (over: Partial<NoticeFields> = {}): NoticeFields => ({
-    tenant: TENANT, connection: 'inst-1', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
+    tenant: TENANT, connection: 'inst-1', scope: 'github:o/r', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
     kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
   })
   const notice = (over: Partial<NoticeFields> = {}): Promise<Notice> => buildNotice(fields(over))
@@ -359,7 +359,7 @@ describe('applyNotice', () => {
     const sql = fresh()
     applyNotice(sql, await notice(), NOW)
     applyNotice(sql, await notice({ connection: 'inst-2', event_id: 'd-9' }), NOW)
-    applyNotice(sql, await notice({ provider: 'linear', event_id: 'd-9' }), NOW)
+    applyNotice(sql, await notice({ provider: 'linear', scope: 'linear:team-1', event_id: 'd-9' }), NOW)
     expect(sql.all('SELECT count(*) AS n FROM office_items')).toEqual([{ n: 3 }])
   })
 
@@ -375,8 +375,8 @@ describe('applyNotice', () => {
     const sql = fresh()
     for (let i = 0; i < OFFICE_ITEM_CAP + 3; i++) {
       sql.exec(
-        `INSERT INTO office_items (provider, connection, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
-         VALUES ('github', 'inst-1', ?, 'pr', 'open', 'v', 'https://x.test/1', 't', 'a', ?, 'h', 'e', 'x')`,
+        `INSERT INTO office_items (provider, connection, scope, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
+         VALUES ('github', 'inst-1', 'github:o/r', ?, 'pr', 'open', 'v', 'https://x.test/1', 't', 'a', ?, 'h', 'e', 'x')`,
         `seed-${i}`,
         T(i),
       )

@@ -31,6 +31,29 @@ npm test                                    # workerd, --maxWorkers=2
 npx wrangler deploy --dry-run --config wrangler.example.toml
 ```
 
+## Notice contract version and deploy order
+
+Every Notice carries `contract` (see `NOTICE_CONTRACT_VERSION` in `../../src/projects/office-contract.ts`); the office
+accepts only the versions in `NOTICE_CONTRACT_VERSIONS_ACCEPTED` and refuses any other with `contract_unsupported`
+(or `contract_missing` for a notice from before the field existed), so a mismatch between the two Workers is a loud,
+counted refusal and never a half-understood notice. Changing the Notice key set or the hash recipe means bumping the
+version. To roll a new version out without lockstep: deploy the office Worker that accepts BOTH versions first, then
+the main Worker that stamps the new one, then drop the old version. The office's own SQLite carries
+`office_meta.schema_version` (now `2`: `office_items.scope`) and migrates older layouts in place on wake; a layout
+newer than the code is refused (`office_schema_too_new`), so rolling the office Worker back below a schema bump needs
+the office storage rebuilt from the source (it holds no authority).
+
+## Repository scope
+
+Each item records the repository it came from (`scope`, e.g. `github:owner/repo`). D1 is the authority on whether the
+project still owns that repository (`projects.repo_key` / `project_repos`). The office asks for each notice it takes in
+(one batched read) and in one batched sweep on a wake and then at most every 30 s (reads and alarm ticks share that
+TTL). A repository D1 says the project does not own is withheld at once and deleted only when a second sweep, at least
+30 s after the first, agrees (`office_meta.relinquished_seen_at:<scope>` records the first): one D1 answer never destroys
+rows. A repository D1 cannot be asked about is withheld, not deleted. The office only ever READS D1; it imports
+`office-repo-owner.ts` (read-only) and never `repo-key-heal.ts` (the cron and `scripts/backfill-repo-key.mjs` write the
+key; `tests/office-repo-owner.test.ts` pins both).
+
 ## Enabling (Phase 1, not before)
 
 1. deploy this Worker (`wrangler.example.toml` -> `wrangler.toml`, own migration history starting at `v1`);

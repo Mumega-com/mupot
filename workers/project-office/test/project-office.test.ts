@@ -75,6 +75,7 @@ interface Inner {
     listSchedules(c?: { type?: string }): Promise<{ callback: string; type: string; id: string }[]>
     followUpTick(): Promise<void>
     cancelClocks(): Promise<number>
+    sweptAtMs: number
   } | null
   verifiedAtMs: number
   env: { DB: D1Database; PROJECT_OFFICE?: string }
@@ -121,9 +122,11 @@ async function d1Fingerprint(): Promise<unknown[]> {
   return r.results
 }
 
-async function addProject(id: string): Promise<void> {
-  await bindings.DB.exec(`INSERT OR IGNORE INTO projects (id, slug, name, goal, status) VALUES ('${id}', '${id}', '${id}', 'x', 'active')`)
+async function addProject(id: string, repoUrl: string | null = null): Promise<void> {
+  const url = repoUrl === null ? 'NULL' : `'${repoUrl}'`
+  await bindings.DB.exec(`INSERT OR IGNORE INTO projects (id, slug, name, goal, status, repo_url) VALUES ('${id}', '${id}', '${id}', 'x', 'active', ${url})`)
 }
+const OWNS_OR = 'https://github.com/o/r' // the repository the default test notices are scoped to ('github:o/r')
 
 beforeAll(async () => {
   await applyD1Migrations(bindings.DB, bindings.TEST_MIGRATIONS)
@@ -212,7 +215,7 @@ describe('binding: project -> tenant re-verified from D1', () => {
     const stub = stubFor(name)
     const o = rpc(stub)
     const n = await buildNotice({
-      tenant: TENANT, connection: 'c1', provider: 'github', item_id: 'i1', event_id: 'e1', version: 'v1',
+      tenant: TENANT, connection: 'c1', scope: 'github:o/r', provider: 'github', item_id: 'i1', event_id: 'e1', version: 'v1',
       kind: 'pr', state: 'open', url: 'https://example.test/1', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     const refused = { ok: false, error: 'unbound', reason }
@@ -507,7 +510,7 @@ describe('destroy-and-rebuild', () => {
 const NOTICE_PROJECT = 'proj-notice'
 const T = (sec: number): string => new Date(Date.parse('2026-10-22T08:00:00.000Z') + sec * 1000).toISOString()
 const fields = (over: Partial<NoticeFields> = {}): NoticeFields => ({
-  tenant: TENANT, connection: 'inst-1', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
+  tenant: TENANT, connection: 'inst-1', scope: 'github:o/r', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
   kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
 })
 const items = (s: Stub): Promise<Record<string, unknown>[]> =>
@@ -519,8 +522,8 @@ const items = (s: Stub): Promise<Record<string, unknown>[]> =>
 
 describe('notice: validated and recorded at the RPC boundary', () => {
   beforeAll(async () => {
-    await addProject(NOTICE_PROJECT)
-    for (const id of ['proj-notice-2', 'proj-notice-3', 'proj-notice-4']) await addProject(id)
+    await addProject(NOTICE_PROJECT, OWNS_OR)
+    for (const id of ['proj-notice-2', 'proj-notice-3', 'proj-notice-4']) await addProject(id, OWNS_OR)
   })
 
   it('records a valid notice, and answers a replay of the same delivery as a duplicate', async () => {
@@ -534,7 +537,7 @@ describe('notice: validated and recorded at the RPC boundary', () => {
       expect.objectContaining({ provider: 'github', connection: 'inst-1', item_id: 'PR_1', kind: 'pr', state: 'open', version: 'sha-a' }),
     ])
     const meta = await runInDurableObject(stub, (_i: ProjectOffice, st) => st.storage.sql.exec(`SELECT value FROM office_meta WHERE key = 'schema_version'`).toArray())
-    expect(meta).toEqual([{ value: '1' }])
+    expect(meta).toEqual([{ value: '2' }])
   })
 
   it('an older version never overwrites a newer one, and a replay survives eviction', async () => {
@@ -587,7 +590,7 @@ describe('notice: validated and recorded at the RPC boundary', () => {
 
     it('a refusal builds nothing: a malformed notice to a fresh office creates no table', async () => {
       const project = 'proj-notice-fresh'
-      await addProject(project)
+      await addProject(project, OWNS_OR)
       const stub = office(TENANT, project)
       expect((await rpc(stub).notice({ junk: true })).error).toBe('invalid_notice')
       expect(await tables(stub)).toEqual([])
@@ -596,7 +599,7 @@ describe('notice: validated and recorded at the RPC boundary', () => {
 
   it('destroy-and-rebuild: notice state is not authority; D1 is untouched and the office refills from the source', async () => {
     const project = 'proj-notice-destroy'
-    await addProject(project)
+    await addProject(project, OWNS_OR)
     const stub = office(TENANT, project)
     const n = await buildNotice(fields({ event_id: 'd-destroy' }))
     expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'applied' })
@@ -611,6 +614,275 @@ describe('notice: validated and recorded at the RPC boundary', () => {
     expect((await rpc(stub).snapshot()).items).toEqual([]) // the D1-derived rebuild does not invent source items
     expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'applied' }) // lost dedup costs a harmless re-apply
     expect(await d1Fingerprint()).toEqual(d1Before)
+  })
+})
+
+// ── repository scope, contract version, schema v2 (#2137 items 2, 6) ────────────────────────────────
+
+const scopeItems = (s: Stub): Promise<Record<string, unknown>[]> =>
+  runInDurableObject(s, (_i: ProjectOffice, state) => {
+    const t = state.storage.sql.exec(`SELECT name FROM sqlite_master WHERE name = 'office_items'`).toArray()
+    if (t.length === 0) return []
+    return state.storage.sql.exec(`SELECT item_id, scope FROM office_items ORDER BY item_id`).toArray()
+  })
+const metaValue = (s: Stub, key: string): Promise<unknown[]> =>
+  runInDurableObject(s, (_i: ProjectOffice, state) =>
+    state.storage.sql.exec(`SELECT value FROM office_meta WHERE key = ?`, key).toArray().map((r) => r.value),
+  )
+const setRepo = (project: string, url: string | null): Promise<unknown> =>
+  bindings.DB.exec(`UPDATE projects SET repo_url = ${url === null ? 'NULL' : `'${url}'`} WHERE id = '${project}'`)
+/** The runtime clock cannot advance: make the next call sweep (as after a TTL), and optionally age the first-sighting marks a full window. */
+const makeScopeSweepDue = (s: Stub, opts: { confirm?: boolean } = {}): Promise<void> =>
+  runInDurableObject(s, (i: ProjectOffice, state) => {
+    const a = inner(i).officeAgent
+    if (a) a.sweptAtMs = 0
+    if (opts.confirm) state.storage.sql.exec(`UPDATE office_meta SET value = '2000-01-01T00:00:00.000Z' WHERE key LIKE 'relinquished_seen_at:%'`)
+  })
+/** Swap this object's D1 for one that throws, run `fn`, put the real one back. */
+async function withD1Down<T>(s: Stub, fn: () => Promise<T>): Promise<T> {
+  const real = await runInDurableObject(s, (i: ProjectOffice) => {
+    const e = inner(i).env
+    const kept = e.DB
+    e.DB = { prepare: () => { throw new Error('d1 down') }, batch: () => { throw new Error('d1 down') } } as unknown as D1Database
+    return Promise.resolve(kept)
+  })
+  try {
+    return await fn()
+  } finally {
+    await runInDurableObject(s, (i: ProjectOffice) => { inner(i).env.DB = real })
+  }
+}
+
+describe('repository scope: D1 decides what an office keeps and serves', () => {
+  it('refuses a notice scoped to a repository D1 does not give this project, and records nothing', async () => {
+    const project = 'proj-scope-refuse'
+    await addProject(project, 'https://github.com/o/mine')
+    const stub = office(TENANT, project)
+    const foreign = await buildNotice(fields({ scope: 'github:o/not-mine', event_id: 'f-1' }))
+    expect(await rpc(stub).notice(foreign)).toEqual({ ok: false, error: 'invalid_notice', problem: 'scope_not_owned' })
+    expect(await scopeItems(stub)).toEqual([])
+    const mine = await buildNotice(fields({ scope: 'github:o/mine', event_id: 'f-2' }))
+    expect(await rpc(stub).notice(mine)).toEqual({ ok: true, outcome: 'applied' })
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'PR_1', scope: 'github:o/mine' }])
+  })
+
+  it('a notice whose scope D1 cannot confirm is REFUSED (scope_unverifiable), not accepted on faith', async () => {
+    const project = 'proj-scope-unverifiable'
+    await addProject(project, 'https://github.com/o/unv')
+    const stub = office(TENANT, project)
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/unv', item_id: 'A', event_id: 'u-1' })))).toEqual({ ok: true, outcome: 'applied' })
+    const b = await buildNotice(fields({ scope: 'github:o/unv', item_id: 'B', event_id: 'u-2' }))
+    const refused = await withD1Down(stub, () => rpc(stub).notice(b))
+    expect(refused).toEqual({ ok: false, error: 'invalid_notice', problem: 'scope_unverifiable' })
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'A', scope: 'github:o/unv' }]) // B was not recorded
+  })
+
+  it('relinquish: D1 moves the repository away. The first sweep WITHHOLDS (nothing deleted); a confirming sweep a window later deletes', async () => {
+    const project = 'proj-scope-read'
+    await addProject(project, 'https://github.com/o/read')
+    const stub = office(TENANT, project)
+    for (const [i, item] of ['A', 'B'].entries()) {
+      expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/read', item_id: item, event_id: `r-${i}` })))).toEqual({ ok: true, outcome: 'applied' })
+    }
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(2)
+    await setRepo(project, 'https://github.com/o/elsewhere')
+    await makeScopeSweepDue(stub) // a TTL later
+    expect((await rpc(stub).snapshot()).items).toEqual([]) // not served...
+    expect(await scopeItems(stub)).toHaveLength(2) // ...and not destroyed on one answer
+    expect(await metaValue(stub, 'scope_purged')).toEqual([])
+    await makeScopeSweepDue(stub, { confirm: true }) // a second answer, a full window after the first
+    expect((await rpc(stub).snapshot()).items).toEqual([])
+    expect(await scopeItems(stub)).toEqual([])
+    expect(await metaValue(stub, 'scope_purged')).toEqual(['2'])
+    // ...and the same repository cannot be re-learned from a late delivery
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/read', item_id: 'C', event_id: 'r-late' })))).toEqual({
+      ok: false, error: 'invalid_notice', problem: 'scope_not_owned',
+    })
+    // giving it back (and a fresh delivery) serves again
+    await setRepo(project, 'https://github.com/o/read')
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/read', item_id: 'C', event_id: 'r-back' })))).toEqual({ ok: true, outcome: 'applied' })
+  })
+
+  it('a withheld scope that D1 gives back is served again, with nothing lost', async () => {
+    const project = 'proj-scope-blip'
+    await addProject(project, 'https://github.com/o/blip')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/blip', event_id: 'bl-1' })))
+    await setRepo(project, null)
+    await makeScopeSweepDue(stub)
+    expect((await rpc(stub).snapshot()).items).toEqual([])
+    await setRepo(project, 'https://github.com/o/blip') // it was a blip
+    await makeScopeSweepDue(stub, { confirm: true })
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1)
+    expect(await scopeItems(stub)).toHaveLength(1)
+    expect(await metaValue(stub, 'scope_purged')).toEqual([])
+  })
+
+  it('a notice D1 just vouched for voids the earlier doubt about its scope (the first-sighting mark is cleared)', async () => {
+    const project = 'proj-scope-vouch'
+    await addProject(project, 'https://github.com/o/vouch')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/vouch', event_id: 'v-1' })))
+    await setRepo(project, null)
+    await makeScopeSweepDue(stub)
+    await rpc(stub).snapshot()
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/vouch')).toHaveLength(1)
+    await setRepo(project, 'https://github.com/o/vouch')
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/vouch', item_id: 'V2', event_id: 'v-2' })))).toEqual({ ok: true, outcome: 'applied' })
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/vouch')).toEqual([])
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(2) // and it is served again at once
+  })
+
+  it('reads use the TTL’d sweep: a change inside the window is not re-read on every call', async () => {
+    const project = 'proj-scope-ttl'
+    await addProject(project, 'https://github.com/o/ttl')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/ttl', event_id: 'tt-1' })))
+    await setRepo(project, null)
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1) // inside the window: still the earlier answer
+    await makeScopeSweepDue(stub)
+    expect((await rpc(stub).snapshot()).items).toEqual([]) // once due, the next read sees it
+  })
+
+  it('relinquish: only the repository given up goes; the other stays', async () => {
+    const project = 'proj-scope-two'
+    await addProject(project, 'https://github.com/o/keep')
+    await bindings.DB.exec(`INSERT OR IGNORE INTO project_repos (project_id, repo_key) VALUES ('${project}', 'github:o/lose')`)
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/keep', item_id: 'K', event_id: 't-1' })))
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/lose', item_id: 'L', event_id: 't-2' })))
+    await bindings.DB.exec(`DELETE FROM project_repos WHERE project_id = '${project}'`)
+    await makeScopeSweepDue(stub)
+    await rpc(stub).snapshot()
+    await makeScopeSweepDue(stub, { confirm: true })
+    expect((await rpc(stub).snapshot()).items).toEqual([expect.objectContaining({ item_id: 'K', scope: 'github:o/keep' })])
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'K', scope: 'github:o/keep' }])
+  })
+
+  it('a WAKE sweeps with no read and no notice: the first call into a cold object marks what D1 took away', async () => {
+    const project = 'proj-scope-wake'
+    await addProject(project, 'https://github.com/o/wake')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/wake', event_id: 'w-1' })))
+    await setRepo(project, null)
+    await evictDurableObject(stub)
+    expect(await scopeItems(stub)).toHaveLength(1) // eviction alone changes nothing
+    expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true }) // any call into a cold object is a wake
+    expect((await metaValue(stub, 'relinquished_seen_at:github:o/wake'))).toHaveLength(1) // the wake sweep ran
+    expect(await scopeItems(stub)).toHaveLength(1) // one answer: marked, not destroyed
+    await evictDurableObject(stub) // the next wake is a second, independent answer; age the mark a window
+    await runInDurableObject(stub, (_i: ProjectOffice, state) => {
+      state.storage.sql.exec(`UPDATE office_meta SET value = '2000-01-01T00:00:00.000Z' WHERE key LIKE 'relinquished_seen_at:%'`)
+    })
+    expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true })
+    expect(await scopeItems(stub)).toEqual([])
+  })
+
+  it('the alarm tick sweeps too (and shares the TTL)', async () => {
+    const project = 'proj-scope-tick'
+    await addProject(project, 'https://github.com/o/tick')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/tick', event_id: 'k-1' })))
+    expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true })
+    await setRepo(project, null)
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/tick')).toEqual([]) // inside the TTL only the tick itself can notice
+    await makeScopeSweepDue(stub)
+    expect(await makeJobsDue(stub)).toBe(1)
+    await runDurableObjectAlarm(stub)
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/tick')).toHaveLength(1)
+    await makeScopeSweepDue(stub, { confirm: true })
+    expect(await makeJobsDue(stub)).toBe(1)
+    await runDurableObjectAlarm(stub)
+    expect(await scopeItems(stub)).toEqual([])
+  })
+
+  it('D1 cannot be asked: the read withholds the repository’s items rather than serving them unverified, and nothing is deleted', async () => {
+    const project = 'proj-scope-down'
+    await addProject(project, 'https://github.com/o/down')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/down', event_id: 'd-1' })))
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1)
+    await makeScopeSweepDue(stub)
+    await withD1Down(stub, async () => {
+      expect((await rpc(stub).snapshot()).items).toEqual([])
+      expect(await scopeItems(stub)).toHaveLength(1) // withheld, not deleted
+    })
+    await makeScopeSweepDue(stub)
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1) // D1 back: served again
+  })
+
+  it('a row with no recorded scope is never served, even if one somehow exists', async () => {
+    const project = 'proj-scope-blank'
+    await addProject(project, 'https://github.com/o/blank')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/blank', item_id: 'REAL', event_id: 'b-1' })))
+    await runInDurableObject(stub, (_i: ProjectOffice, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO office_items (provider, connection, scope, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
+         VALUES ('github', 'inst-1', '', 'BLANK', 'pr', 'open', 'v', 'https://github.com/o/blank/pull/9', 't', 'a', '2026-10-22T08:00:00.000Z', 'h', 'e', '2026-10-22T08:00:01.000Z')`,
+      )
+    })
+    expect((await rpc(stub).snapshot()).items).toEqual([expect.objectContaining({ item_id: 'REAL' })])
+  })
+
+  it('ownership held only as an un-canonicalized repo_url (a pending row) still counts, whatever the spelling', async () => {
+    const project = 'proj-scope-pending'
+    await addProject(project, 'git@github.com:O/Pending.git')
+    const stub = office(TENANT, project)
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/pending', event_id: 'p-1' })))).toEqual({ ok: true, outcome: 'applied' })
+    // the office is read-only against D1: the row is still pending afterwards
+    expect(await bindings.DB.prepare(`SELECT repo_key FROM projects WHERE id = '${project}'`).first()).toEqual({ repo_key: null })
+  })
+})
+
+describe('notice contract version at the RPC boundary', () => {
+  const project = 'proj-contract'
+  beforeAll(async () => addProject(project, OWNS_OR))
+
+  it('accepts the current version', async () => {
+    expect(await rpc(office(TENANT, project)).notice(await buildNotice(fields({ event_id: 'c-ok' })))).toEqual({ ok: true, outcome: 'applied' })
+  })
+
+  it('refuses an unknown version and a missing one, each with its own reason', async () => {
+    const stub = office(TENANT, project)
+    const n = await buildNotice(fields({ event_id: 'c-bad' }))
+    expect(await rpc(stub).notice({ ...n, contract: 3 })).toEqual({ ok: false, error: 'invalid_notice', problem: 'contract_unsupported' })
+    expect(await rpc(stub).notice({ ...n, contract: 1 })).toEqual({ ok: false, error: 'invalid_notice', problem: 'contract_unsupported' })
+    const { contract: _c, scope: _s, ...v1 } = n // what a main Worker from before this change sends
+    expect(await rpc(stub).notice(v1)).toEqual({ ok: false, error: 'invalid_notice', problem: 'contract_missing' })
+  })
+})
+
+describe('the office’s own SQLite migrates from schema v1 inside a real Durable Object', () => {
+  it('a v1 office wakes, migrates, and serves only what D1 still vouches for', async () => {
+    const project = 'proj-v1'
+    await addProject(project, 'https://github.com/o/legacy')
+    const stub = office(TENANT, project)
+    await runInDurableObject(stub, (_i: ProjectOffice, state) => {
+      const x = (q: string, ...b: (string | number)[]) => void state.storage.sql.exec(q, ...b)
+      x(`CREATE TABLE office_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+      x(`INSERT INTO office_meta (key, value) VALUES ('schema_version', '1')`)
+      x(`CREATE TABLE office_items (
+           provider TEXT NOT NULL, connection TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+           version TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL, actor TEXT NOT NULL, updated_at TEXT NOT NULL,
+           hash TEXT NOT NULL, last_event_id TEXT NOT NULL, conflict_version TEXT, applied_at TEXT NOT NULL,
+           PRIMARY KEY (provider, connection, item_id))`)
+      for (const [id, url] of [['KEEP', 'https://github.com/O/Legacy/pull/1'], ['OTHER', 'https://github.com/o/other/pull/2'], ['NOLINK', 'https://example.test/x']] as const) {
+        x(
+          `INSERT INTO office_items (provider, connection, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
+           VALUES ('github', 'inst-1', ?, 'pr', 'open', 'v', ?, 't', 'a', '2026-10-22T08:00:00.000Z', 'h', 'e', '2026-10-22T08:00:01.000Z')`,
+          id,
+          url,
+        )
+      }
+    })
+    const snap = await rpc(stub).snapshot()
+    expect(snap.items).toEqual([expect.objectContaining({ item_id: 'KEEP', scope: 'github:o/legacy' })]) // OTHER withheld (not this project's), NOLINK deleted by the migration
+    expect(await metaValue(stub, 'schema_version')).toEqual(['2'])
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'KEEP', scope: 'github:o/legacy' }, { item_id: 'OTHER', scope: 'github:o/other' }])
+    await makeScopeSweepDue(stub, { confirm: true }) // the confirming sweep
+    await rpc(stub).snapshot()
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'KEEP', scope: 'github:o/legacy' }])
   })
 })
 

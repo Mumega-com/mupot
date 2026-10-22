@@ -7,6 +7,12 @@
 //   - `notice` is real: it validates a Notice at the RPC boundary (checkNotice: exact keys, recomputed hash, https
 //     link, no control or bidi text, no future-dated clock) and records it in the working set (applyNotice).
 //     It does not dispatch, brief, wake or write back.
+//   - Repository scope: every item carries the repository it came from. The office re-asks D1 (the authority) whether
+//     this project still owns that repository: for each notice it takes in (one batched read), and in ONE batched sweep
+//     on a wake (first call after a cold start) and then at most every VERIFY_TTL_MS (calls and alarm ticks alike).
+//     A repository D1 says the project does not own is withheld at once and deleted only when a second sweep, at least
+//     SCOPE_RELINQUISH_CONFIRM_MS later, agrees; one D1 answer never destroys rows. A repository D1 cannot be asked
+//     about is withheld, not deleted. The office only ever READS D1.
 //   - The other six functions are still empty stubs. Their shape is fixed (office-contract.ts).
 //
 // SHAPE: a FACADE over an SDK Agent.
@@ -35,9 +41,12 @@ import { DurableObject } from 'cloudflare:workers'
 import { Agent, type Connection } from 'agents'
 import {
   applyNotice,
+  clearRelinquishMark,
   ensureOfficeSchema,
   isPermanentBindingFailure,
   rebuildWorkingSet,
+  sweepRelinquishedScopes,
+  verifyNoticeScope,
   verifyOfficeBinding,
   type OfficeBinding,
   type OfficeEnv,
@@ -47,6 +56,7 @@ import {
   type OfficeSql,
   type OfficeStubResult,
   type RebuildResult,
+  type ScopeSweepResult,
 } from '../../../src/projects/office-core'
 import { checkNotice, type Notice } from '../../../src/projects/office-contract'
 
@@ -90,6 +100,10 @@ class OfficeAgent extends Agent<OfficeEnv> {
 
   /** Set by the facade: re-verifies the binding (cached for VERIFY_TTL_MS). Closed until then. */
   gate: () => Promise<OfficeBinding> = async () => ({ ok: false, reason: 'flag_off' })
+
+  /** When the scope sweep last ran (0 = never: a cold object sweeps on its first call), and what it found. */
+  private sweptAtMs = 0
+  private lastSweep: ScopeSweepResult = { purged: 0, withheld: [], unverifiable: [] }
 
   officeSql(): OfficeSql {
     const storage = this.ctx.storage.sql
@@ -153,7 +167,31 @@ class OfficeAgent extends Agent<OfficeEnv> {
       `INSERT INTO office_meta (key, value) VALUES ('ticks', '1')
        ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
     )
-    // followUp is a stub in Phase 0: nothing to do after the tick is counted.
+    await this.sweepScopesIfDue(b)
+    // followUp is a stub in Phase 0: nothing more to do after the tick is counted.
+  }
+
+  /**
+   * The scope sweep, at most once per VERIFY_TTL_MS (and on the first call of a cold object). Returns the latest result,
+   * fresh or cached, so a reader filters by an answer no older than the TTL. One D1 batch per sweep.
+   */
+  async sweepScopesIfDue(binding: Extract<OfficeBinding, { ok: true }>): Promise<ScopeSweepResult> {
+    if (Date.now() - this.sweptAtMs >= VERIFY_TTL_MS) {
+      const startedAt = Date.now()
+      this.lastSweep = await sweepRelinquishedScopes(this.env, this.officeSql(), binding.projectId, startedAt)
+      this.sweptAtMs = startedAt
+    }
+    return this.lastSweep
+  }
+
+  /** A notice for this scope was just verified against D1: any earlier doubt about it is void. */
+  scopeVouched(scope: string): void {
+    clearRelinquishMark(this.officeSql(), scope)
+    this.lastSweep = {
+      ...this.lastSweep,
+      withheld: this.lastSweep.withheld.filter((x) => x !== scope),
+      unverifiable: this.lastSweep.unverifiable.filter((x) => x !== scope),
+    }
   }
 
   async rebuild(binding: Extract<OfficeBinding, { ok: true }>): Promise<RebuildResult> {
@@ -164,17 +202,25 @@ class OfficeAgent extends Agent<OfficeEnv> {
     return applyNotice(this.officeSql(), notice, nowMs)
   }
 
-  snapshot(): { project: Record<string, unknown>[]; tasks: Record<string, unknown>[]; items: Record<string, unknown>[] } {
+  /** Only items of repositories D1 vouched for in the latest sweep: a withheld or unverifiable scope is not served. */
+  snapshot(withheld: readonly string[]): {
+    project: Record<string, unknown>[]
+    tasks: Record<string, unknown>[]
+    items: Record<string, unknown>[]
+  } {
     const sql = this.officeSql()
+    const items = sql
+      .all(
+        `SELECT provider, connection, scope, item_id, kind, state, version, url, title, actor, updated_at, conflict_version
+           FROM office_items WHERE scope != '' ORDER BY provider, connection, item_id`,
+      )
+      .filter((r) => !withheld.includes(String(r.scope)))
     return {
       project: sql.all('SELECT project_id, name, status, goal FROM office_project_view'),
       tasks: sql.all(
         'SELECT task_id, status, assignee_agent_id, assignee_member_id, gate_owner FROM office_tasks ORDER BY task_id',
       ),
-      items: sql.all(
-        `SELECT provider, connection, item_id, kind, state, version, url, title, actor, updated_at, conflict_version
-           FROM office_items ORDER BY provider, connection, item_id`,
-      ),
+      items,
     }
   }
 }
@@ -210,12 +256,14 @@ export class ProjectOffice extends DurableObject<OfficeEnv> {
   }
 
   /** Verified agent, or the refusal. Also refuses a sub-agent object. */
-  private async openAgent(): Promise<{ agent: OfficeAgent; binding: Extract<OfficeBinding, { ok: true }> } | Unbound> {
+  private async openAgent(): Promise<{ agent: OfficeAgent; binding: Extract<OfficeBinding, { ok: true }>; swept: ScopeSweepResult } | Unbound> {
     const b = await this.requireBinding()
     if (!b.ok) return unbound(b)
     const agent = await this.agent()
     if (!agent.isTopLevel()) return unbound({ ok: false, reason: 'sub_agent' })
-    return { agent, binding: b }
+    // A wake (the first call of a cold object), then at most every VERIFY_TTL_MS: settle what D1 no longer gives this project.
+    const swept = await agent.sweepScopesIfDue(b)
+    return { agent, binding: b, swept }
   }
 
   // ── the seven functions: empty stubs (Phase 0) ─────────────────────────────
@@ -239,9 +287,14 @@ export class ProjectOffice extends DurableObject<OfficeEnv> {
     const checked = await checkNotice(input, now)
     if (!checked.ok) return { ok: false, error: 'invalid_notice', problem: checked.problem }
     if (checked.notice.tenant !== b.tenant) return { ok: false, error: 'invalid_notice', problem: 'tenant' }
+    // D1 must say this project owns the repository the notice is scoped to, whatever the caller believed.
+    const scope = await verifyNoticeScope(this.env, b.projectId, checked.notice)
+    if (!scope.ok) return { ok: false, error: 'invalid_notice', problem: scope.reason }
     const o = await this.openAgent()
     if ('error' in o) return o
-    return { ok: true, outcome: o.agent.recordNotice(checked.notice, now) }
+    const outcome = o.agent.recordNotice(checked.notice, now)
+    o.agent.scopeVouched(checked.notice.scope) // D1 vouched for it a moment ago
+    return { ok: true, outcome }
   }
 
   /** 2. prepare: write the source-linked brief for an item. */
@@ -293,9 +346,10 @@ export class ProjectOffice extends DurableObject<OfficeEnv> {
 
   /** Read-only snapshot of the working set, for tests and the future report function. */
   async snapshot(): Promise<ReturnType<OfficeAgent['snapshot']> | Unbound> {
+    // Filtered by the latest sweep, never older than VERIFY_TTL_MS (openAgent sweeps when it is due).
     const o = await this.openAgent()
     if ('error' in o) return o
-    return o.agent.snapshot()
+    return o.agent.snapshot([...o.swept.withheld, ...o.swept.unverifiable])
   }
 
   // ── platform handlers (not callable over RPC) ──────────────────────────────

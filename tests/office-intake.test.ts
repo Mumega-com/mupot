@@ -9,10 +9,13 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { githubInboundApp } from '../src/integrations/github-routes'
-import { checkNotice } from '../src/projects/office-contract'
+import { NOTICE_CONTRACT_VERSION, buildNotice, checkNotice } from '../src/projects/office-contract'
 import {
   applyNotice,
   ensureOfficeSchema,
+  SCOPE_RELINQUISH_CONFIRM_MS,
+  sweepRelinquishedScopes,
+  verifyNoticeScope,
   verifyOfficeBinding,
   type NoticeResult,
   type OfficeEnv,
@@ -60,6 +63,8 @@ function namespace(env: () => OfficeEnv): DurableObjectNamespace {
         const c = await checkNotice(input, NOW)
         if (!c.ok) return { ok: false, error: 'invalid_notice', problem: c.problem }
         if (c.notice.tenant !== b.tenant) return { ok: false, error: 'invalid_notice', problem: 'tenant' }
+        const scope = await verifyNoticeScope(env(), b.projectId, c.notice) // the facade asks D1 too
+        if (!scope.ok) return { ok: false, error: 'invalid_notice', problem: scope.reason }
         return { ok: true, outcome: applyNotice(memoryOffice(id.name), c.notice, NOW) }
       },
     }),
@@ -282,13 +287,13 @@ describe('an unknown repo is dropped with a counter, never an error', () => {
     expect(await route(makeEnv(), pr('mumega/listed-b'), 'd-3')).toEqual({ routed: false, reason: 'unknown_repo' })
   })
 
-  it('SQL LIKE wildcards in a repo name do not widen the match', async () => {
+  it('a wildcard-looking repo name matches only itself (lookup is by canonical key, not a pattern)', async () => {
     harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES ('p3', 'p3', 'P3', 'x', 'active', 'https://github.com/mumega/a_b')`)
     expect(await route(makeEnv(), pr('mumega/aXb'))).toEqual({ routed: false, reason: 'unknown_repo' })
     expect(await route(makeEnv(), pr('mumega/a_b'), 'd-2')).toMatchObject({ routed: true, project_id: 'p3' })
   })
 
-  it('a longer repo name that merely contains this one is not this repo (the LIKE is only a candidate filter)', async () => {
+  it('a longer repo name that merely contains this one is not this repo', async () => {
     harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES ('p-fork', 'p-fork', 'Fork', 'x', 'active', 'https://github.com/mumega/mupot-fork')`)
     expect(await route(makeEnv(), pr('mumega/mupot'))).toMatchObject({ routed: true, project_id: 'p1' }) // not ambiguous with p-fork
     expect(await route(makeEnv(), pr('mumega/mupot-fork'), 'd-2')).toMatchObject({ routed: true, project_id: 'p-fork' })
@@ -308,8 +313,8 @@ describe('an unknown repo is dropped with a counter, never an error', () => {
   })
 
   it('resolveRepoProject answers from D1 only', async () => {
-    expect(await resolveRepoProject({ DB: harness.db }, 'mumega/mupot', 'github:mumega/mupot')).toEqual({ ok: true, projectId: 'p1' })
-    expect(await resolveRepoProject({ DB: harness.db }, 'mumega/zzz', 'github:mumega/zzz')).toEqual({ ok: false, reason: 'unknown_repo' })
+    expect(await resolveRepoProject({ DB: harness.db }, 'github:mumega/mupot')).toEqual({ ok: true, projectId: 'p1' })
+    expect(await resolveRepoProject({ DB: harness.db }, 'github:mumega/zzz')).toEqual({ ok: false, reason: 'unknown_repo' })
   })
 
   it('a payload that does not map to a Notice (hostile link) is dropped and counted', async () => {
@@ -458,5 +463,49 @@ describe('through the real webhook route', () => {
     }
     expect(await (await deliver(env, 'issues', payload, 'deliv-5')).json()).toEqual({ ok: true, ignored: 'issues.edited' })
     expect(itemsOf('p1')).toMatchObject([{ kind: 'issue', title: 'Edited' }])
+  })
+})
+
+describe('the notice carries the repository D1 vouched for, and the contract version (#2137 items 2, 6)', () => {
+  it('scope is the canonical key intake resolved the owner by, whatever spelling the payload used', async () => {
+    expect(await route(makeEnv(), pr('MUMEGA/Mupot'))).toMatchObject({ routed: true, project_id: 'p1' })
+    expect(memoryOffice('pot-a:p1').all('SELECT scope FROM office_items')).toEqual([{ scope: 'github:mumega/mupot' }])
+  })
+
+  it('what the office receives is stamped with the current contract version', async () => {
+    const seen: unknown[] = []
+    const env = makeEnv()
+    const ns = env.PROJECT_OFFICE_DO as unknown as { get: (id: { name: string }) => { notice: (n: unknown) => Promise<NoticeResult> } }
+    const inner = ns.get
+    ns.get = (id) => {
+      const stub = inner(id)
+      return { notice: (n: unknown) => (seen.push(n), stub.notice(n)) }
+    }
+    expect((await route(env, pr('mumega/mupot'))).routed).toBe(true)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ contract: NOTICE_CONTRACT_VERSION, scope: 'github:mumega/mupot' })
+  })
+
+  it('a repository the project gave up is not routed to it any more, and its office sweeps the old items', async () => {
+    const env = makeEnv()
+    expect((await route(env, pr('mumega/mupot'), 'd-1')).routed).toBe(true)
+    harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/elsewhere' WHERE id = 'p1'`)
+    expect(await route(env, pr('mumega/mupot'), 'd-2')).toEqual({ routed: false, reason: 'unknown_repo' })
+    const sql = memoryOffice('pot-a:p1')
+    expect((await sweepRelinquishedScopes(env, sql, 'p1', NOW)).purged).toBe(0) // one answer withholds
+    expect((await sweepRelinquishedScopes(env, sql, 'p1', NOW + SCOPE_RELINQUISH_CONFIRM_MS)).purged).toBe(1) // two delete
+    expect(itemsOf('p1')).toEqual([])
+  })
+
+  it('the office refuses a scope D1 does not give it, whatever the caller routed (defence in depth)', async () => {
+    const env = makeEnv()
+    const forged = await buildNotice({
+      tenant: TENANT, connection: INSTALL, scope: 'github:mumega/mcpwp', provider: 'github', item_id: 'X', event_id: 'forged',
+      version: 'v', kind: 'pr', state: 'open', url: 'https://github.com/mumega/mcpwp/pull/1', title: 't', actor: 'a', updated_at: '2026-10-22T08:00:00.000Z',
+    })
+    const ns = env.PROJECT_OFFICE_DO as unknown as DurableObjectNamespace
+    const stub = ns.get(ns.idFromName(`${TENANT}:p1`)) as unknown as { notice: (n: unknown) => Promise<NoticeResult> }
+    expect(await stub.notice(forged)).toEqual({ ok: false, error: 'invalid_notice', problem: 'scope_not_owned' }) // mcpwp is p2's
+    expect(offices.get('pot-a:p1')?.all('SELECT * FROM office_items') ?? []).toEqual([])
   })
 })

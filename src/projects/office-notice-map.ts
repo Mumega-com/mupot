@@ -24,6 +24,11 @@ export interface NoticeSource {
   connection: string
   /** Delivery-unique id (x-github-delivery / Linear-Delivery header). */
   eventId: string
+  /**
+   * GitHub only: the canonical repository key (repoKeyFromUrl) the delivery was routed by. Stamped by the receiving pot
+   * from the SAME key it resolved the owning project with, so the Notice's scope is the repository D1 vouched for.
+   */
+  repoKey?: string
 }
 
 type Rec = Record<string, unknown>
@@ -74,6 +79,7 @@ export async function githubNotice(src: NoticeSource, eventName: string, payload
   if (!p || !action || !GITHUB_ACTIONS[eventName]?.has(action)) return null
   const actor = text(rec(p.sender), 'login')
   if (!actor) return null
+  if (!src.repoKey || !src.repoKey.startsWith('github:')) return null
 
   let kind: NoticeKind
   let item: Rec | null
@@ -111,6 +117,7 @@ export async function githubNotice(src: NoticeSource, eventName: string, payload
   return toNotice({
     tenant: src.tenant,
     connection: src.connection,
+    scope: src.repoKey,
     provider: 'github',
     item_id: itemId,
     event_id: src.eventId,
@@ -154,11 +161,15 @@ export async function linearNotice(src: NoticeSource, payload: unknown): Promise
   } else {
     title = text(data, 'title')
   }
-  if (!itemId || !updatedAt || !url || !actor || !title) return null
+  // The scope of a Linear item is its team. Nothing in D1 vouches for it yet (no Linear intake), so the office only
+  // stores it; see the repo-scope sweep in office-core.ts, which verifies repository scopes only.
+  const teamId = text(data, 'teamId') ?? text(rec(data.team), 'id')
+  if (!itemId || !updatedAt || !url || !actor || !title || !teamId) return null
 
   return toNotice({
     tenant: src.tenant,
     connection: src.connection,
+    scope: `linear:${teamId}`,
     provider: 'linear',
     item_id: itemId,
     event_id: src.eventId,

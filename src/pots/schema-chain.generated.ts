@@ -4440,9 +4440,26 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdicts_no_update_0252" },
     ],
   },
+  {
+    file: "0253_project_repo_key.sql",
+    sha256: "c7e957617b89079e6b2cba5034095b7e0abf363e706abc07d10ea3b7f84d95da",
+    statements: [
+      "-- 0253 canonical repo key on projects, so \"which project owns this repository\" is an indexed equality\n-- lookup instead of a substring scan (#2137 item 3).\n--\n-- projects.repo_key: repoKeyFromUrl(repo_url), the same fold project_repos.repo_key already stores\n-- ('github:owner/repo', 'url:host/path'). Three states, and the resolver (src/projects/office-repo-owner.ts)\n-- reads each one:\n--   a key        canonical; the lookup is `repo_key = ?` on the index below.\n--   ''           repo_url has no network identity (a local path, an unparseable string). Owns nothing.\n--   NULL         PENDING: repo_url is set but nobody has canonicalized it yet. The canonical key cannot be computed in SQL,\n--                so every row that exists at migration time starts here. A pending row still COUNTS as an owner: the\n--                lookups canonicalize its URL in memory at read time and write nothing. It is healed out of band, by a\n--                bounded slice per maintenance-cron tick (src/projects/repo-key-heal.ts) and, if you want it done now, by\n--                the one-time scripts/backfill-repo-key.mjs (idempotent, --dry-run). Both are compare-and-set.\n--\n-- DEPLOY ORDER. Apply this migration BEFORE the Worker that uses it: the project writers name repo_key, and a Worker\n-- running without the column fails every project create/update with \"no such column\". The deploy script migrates first.\n--\n-- Writers (createProject, updateProject, client-bootstrap upsert) set repo_key beside repo_url. The trigger below\n-- is the net under any writer that does not (raw SQL, a seed script, a future code path): when repo_url changes and\n-- repo_key was left as it was, the key is no longer evidence of anything, so it goes back to PENDING.\n--\n-- project_repos already carries a canonical repo_key (written canonical by its structural write path; there is no\n-- writer in the application today). It only gains an index on repo_key alone, since its primary key leads with\n-- project_id.\nALTER TABLE projects ADD COLUMN repo_key TEXT;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_projects_repo_key\n  ON projects(repo_key)\n  WHERE repo_key IS NOT NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_projects_repo_key_pending\n  ON projects(id)\n  WHERE repo_url IS NOT NULL AND repo_key IS NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_project_repos_repo_key\n  ON project_repos(repo_key);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS projects_repo_key_stale_on_url_change\nAFTER UPDATE OF repo_url ON projects\nFOR EACH ROW\nWHEN NEW.repo_url IS NOT OLD.repo_url AND NEW.repo_key IS OLD.repo_key\nBEGIN\n  UPDATE projects SET repo_key = NULL WHERE id = NEW.id;\nEND;",
+    ],
+    objects: [
+      { type: "index", name: "idx_projects_repo_key" },
+      { type: "index", name: "idx_projects_repo_key_pending" },
+      { type: "index", name: "idx_project_repos_repo_key" },
+      { type: "trigger", name: "projects_repo_key_stale_on_url_change" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "d208b27407b92cd8a2ec06a570ca88798cc7b85af263f540ab69284cb594fd07"
+export const SCHEMA_CHAIN_DIGEST: string = "c43ee7fa91221c16bb5a0d3fde450d87b8f07e2d1dfa4931c4ecd630af39f634"

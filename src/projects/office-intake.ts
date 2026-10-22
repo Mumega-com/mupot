@@ -25,6 +25,7 @@ import { repoKeyFromUrl } from '../workspaces/repo-key'
 import { followsGithubAction, githubNotice } from './office-notice-map'
 import { isProjectOfficeEnabled, type NoticeOutcome } from './office-core'
 import { getProjectOffice } from './office-handle'
+import { projectsOwningRepo } from './office-repo-owner'
 
 export const INTAKE_EVENTS = ['pull_request', 'issues'] as const
 
@@ -50,10 +51,6 @@ function rec(v: unknown): Rec | null {
 
 const FULL_NAME_RE = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/
 
-function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => `\\${c}`)
-}
-
 const COUNTER_TTL_SECONDS = 35 * 24 * 60 * 60
 
 /**
@@ -74,49 +71,21 @@ interface InstallationRow {
   installation_id: string
 }
 
-interface ProjectIdRow {
-  id: string
-}
-
-interface ProjectRepoRow {
-  id: string
-  repo_url: string | null
-}
-
 /**
- * The single live project of this pot that owns `repoKey`, from D1. Two sources: the project's own `repo_url` (folded
- * with repoKeyFromUrl, so every spelling of the URL matches) and the `project_repos` allow-list. Archived projects
- * do not own anything. More than one owner is ambiguous and resolves to none: a notice is never fanned out.
+ * The single live project of this pot that owns `repoKey`, from D1 (office-repo-owner.ts: stored canonical key, so every
+ * spelling of the URL matches and no row limit can hide the owner). Archived projects do not own anything. More than
+ * one owner is ambiguous and resolves to none: a notice is never fanned out. A D1 failure throws (the caller counts it
+ * as office_error) rather than answering "unknown repository".
  */
 export async function resolveRepoProject(
   env: Pick<Env, 'DB'>,
-  fullName: string,
   repoKey: string,
 ): Promise<{ ok: true; projectId: string } | { ok: false; reason: 'unknown_repo' | 'ambiguous_repo' }> {
-  const owners = new Set<string>()
-  const byUrl = await env.DB
-    .prepare(
-      `SELECT id, repo_url FROM projects
-        WHERE archived_at IS NULL AND status != 'archived' AND repo_url IS NOT NULL AND lower(repo_url) LIKE ?1 ESCAPE '\\'
-        LIMIT 200`,
-    )
-    .bind(`%${escapeLike(fullName.toLowerCase())}%`)
-    .all<ProjectRepoRow>()
-  for (const row of byUrl.results ?? []) {
-    if (repoKeyFromUrl(row.repo_url) === repoKey) owners.add(row.id)
-  }
-  const byList = await env.DB
-    .prepare(
-      `SELECT p.id AS id FROM project_repos r JOIN projects p ON p.id = r.project_id
-        WHERE r.repo_key = ?1 AND p.archived_at IS NULL AND p.status != 'archived' LIMIT 200`,
-    )
-    .bind(repoKey)
-    .all<ProjectIdRow>()
-  for (const row of byList.results ?? []) owners.add(row.id)
-
-  if (owners.size === 0) return { ok: false, reason: 'unknown_repo' }
-  if (owners.size > 1) return { ok: false, reason: 'ambiguous_repo' }
-  return { ok: true, projectId: [...owners][0] as string } // size is exactly 1 here
+  const found = await projectsOwningRepo(env.DB, repoKey)
+  if (!found.ok) throw new Error('repo_owner_lookup_unavailable')
+  if (found.owners.length === 0) return { ok: false, reason: 'unknown_repo' }
+  if (found.owners.length > 1) return { ok: false, reason: 'ambiguous_repo' }
+  return { ok: true, projectId: found.owners[0] as string } // length is exactly 1 here
 }
 
 /**
@@ -161,11 +130,11 @@ export async function routeGitHubNoticeToOffice(
     const repoKey = repoKeyFromUrl(`https://github.com/${fullName as string}`)
     if (!repoKey) return await drop('bad_repo')
 
-    const project = await resolveRepoProject(env, fullName as string, repoKey)
+    const project = await resolveRepoProject(env, repoKey)
     if (!project.ok) return await drop(project.reason)
 
     const notice = await githubNotice(
-      { tenant: env.TENANT_SLUG, connection: install.installation_id, eventId: deliveryId },
+      { tenant: env.TENANT_SLUG, connection: install.installation_id, eventId: deliveryId, repoKey },
       eventName,
       payload,
     )
