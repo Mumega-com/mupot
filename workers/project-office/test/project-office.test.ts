@@ -717,6 +717,20 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1) // D1 back: served again
   })
 
+  it('a row with no recorded scope is never served, even if one somehow exists', async () => {
+    const project = 'proj-scope-blank'
+    await addProject(project, 'https://github.com/o/blank')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/blank', item_id: 'REAL', event_id: 'b-1' })))
+    await runInDurableObject(stub, (_i: ProjectOffice, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO office_items (provider, connection, scope, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, applied_at)
+         VALUES ('github', 'inst-1', '', 'BLANK', 'pr', 'open', 'v', 'https://github.com/o/blank/pull/9', 't', 'a', '2026-10-22T08:00:00.000Z', 'h', 'e', '2026-10-22T08:00:01.000Z')`,
+      )
+    })
+    expect((await rpc(stub).snapshot()).items).toEqual([expect.objectContaining({ item_id: 'REAL' })])
+  })
+
   it('ownership held only as an un-canonicalized repo_url (a pending row) still counts, whatever the spelling', async () => {
     const project = 'proj-scope-pending'
     await addProject(project, 'git@github.com:O/Pending.git')

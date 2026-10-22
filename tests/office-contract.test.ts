@@ -510,6 +510,12 @@ describe('ZWNJ and ZWJ: allowed in title and actor only (#2137 item 4)', () => {
     }
   })
 
+  it('isSafeNoticeUrl refuses a joiner on its own, not only through the field loop', () => {
+    expect(isSafeNoticeUrl('https://github.com/o/r/pull/1')).toBe(true)
+    expect(isSafeNoticeUrl(`https://github.com/o/r/pull/1${ZWNJ}`)).toBe(false)
+    expect(isSafeNoticeUrl(`https://github.com/o${ZWJ}/r`)).toBe(false)
+  })
+
   it('a hidden joiner cannot make two identifiers look alike: item_id with a joiner is refused, not folded', async () => {
     await expect(buildNotice({ ...fields, item_id: `PR_kw${ZWJ}DO` })).rejects.toThrow('notice_invalid:item_id')
   })
