@@ -278,6 +278,26 @@ describe('MCP task cutover tools', () => {
     expect((res.result as { task: Task }).task.external_source).toBe('linear:ENG')
   })
 
+  // Seed B1: 'mumega-bounty:' is a unique idempotency KEY owned by the bounty ingest. task_create must
+  // refuse it in any case/whitespace form, so no member or steward reissue can squat a bounty's binding.
+  it.each(['mumega-bounty:bty-1', 'Mumega-Bounty:bty-1', '  MUMEGA-BOUNTY:bty-1  '])(
+    'task_create refuses the reserved external_source namespace (%j) and writes nothing',
+    async (source) => {
+      const { env, updates } = makeEnv([])
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'task_create',
+        { squad_id: SQUAD_ID, title: 'Squat attempt', done_when: 'MCP task tests pass', external_source: source },
+        'https://pot.example',
+      )
+
+      expect(res).toMatchObject({ ok: false, status: 403, error: 'external_source_reserved' })
+      expect(updates.some((u) => u.sql.includes('INSERT INTO tasks'))).toBe(false)
+    },
+  )
+
   it('task_create rejects a blank external_source rather than silently dropping it', async () => {
     const { env } = makeEnv([])
 

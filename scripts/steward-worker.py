@@ -154,6 +154,9 @@ def live_lineages() -> set[str]:
     return roots
 
 
+RESERVED_SOURCE_PREFIXES = ("mumega-bounty:",)  # keep in sync with src/tasks/provenance.ts
+
+
 def reissue(task: dict, reason: str, state: dict, live: set[str]) -> str | None:
     root = lineage_root(task)
     if root in state["reissued"] or root in live:
@@ -185,6 +188,13 @@ def reissue(task: dict, reason: str, state: dict, live: set[str]) -> str | None:
     # gates (no auto-pickup, admin-gated reassignment, untrusted-content prompt fence).
     external_source = task.get("external_source")
     if external_source:
+        # RESERVED namespaces (src/tasks/provenance.ts RESERVED_PROVENANCE_PREFIXES) are unique
+        # idempotency keys that only their own ingest may stamp; task_create refuses them. Dropping the
+        # marker would launder the task into a trusted-looking local one (the amplifier above), so the
+        # copy carries a DERIVED marker instead: still non-null external provenance (every guard the
+        # marker gates stays on), but not the key itself.
+        if str(external_source).strip().lower().startswith(RESERVED_SOURCE_PREFIXES):
+            external_source = f"reissued:{str(external_source).strip()}"[:200]
         payload["external_source"] = external_source
     assignee = task.get("assignee_agent_id")
     try:

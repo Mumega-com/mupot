@@ -330,7 +330,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
 // Vitest can import it without the CF runtime. See ./auth-header.ts.
 import { AUTH_CONTEXT_HEADER } from './auth-header'
-import { isExternallySourced } from '../tasks/provenance'
+import { isExternallySourced, isReservedProvenance } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
 import { mcpInitializeInstructions } from './instructions'
 import { consentChoiceLabels, consentLabels, refusalEnvelope, refusalGuidance, type ConnKind, type GuideCtx } from './refusal-next-step'
@@ -1162,12 +1162,16 @@ const toolTaskCreate: ToolSpec = {
       // existing external_source is legitimately re-created (today: scripts/steward-worker.py's
       // auto-reissue of a blocked/orphaned task — the "amplifier" the diverse-model gate
       // flagged, where a re-issued Linear-origin task lost its marker and re-entered the
-      // normal event-wake path unmarked). Safe to expose to any member+ caller: the field is
-      // MONOTONIC — it only ever ADDS restriction (no auto-pickup, admin-gated reassignment,
+      // normal event-wake path unmarked). Safe to expose to any member+ caller for ORDINARY
+      // markers: those only ever ADD restriction (no auto-pickup, admin-gated reassignment,
       // untrusted-content prompt fence; see canAgentExecuteTask/routeUnassignedWork/
-      // buildExecutePrompt), never removes it, so a caller setting it on its own new task
+      // buildExecutePrompt), never remove it, so a caller setting one on its own new task
       // cannot escalate privilege. It cannot be used to CLEAR an existing task's marker —
       // task_update has no assignee/provenance-mutation path for it.
+      // NOT monotonic for a RESERVED namespace: 'mumega-bounty:<id>' is a unique idempotency
+      // KEY (migration 0250), so stamping it is not restriction-only, it is squatting a bounty's
+      // binding. Those prefixes (tasks/provenance.ts RESERVED_PROVENANCE_PREFIXES) are refused
+      // here, and at the createTask choke point, for every caller but the owning ingest.
       external_source: STRING_SCHEMA,
       // Backlog vs dispatch (Flight-006 Slice 1 parity for the MCP path).
       // dispatch:false = planning-only create — task.created is suppressed so the
@@ -1262,6 +1266,9 @@ const toolTaskCreate: ToolSpec = {
       const trimmed = args.external_source.trim()
       if (trimmed.length === 0) return fail(400, 'invalid_args', 'external_source must not be blank')
       if (trimmed.length > 200) return fail(400, 'invalid_args', 'external_source must be at most 200 characters')
+      if (isReservedProvenance(trimmed)) {
+        return fail(403, 'external_source_reserved', 'this external_source namespace is reserved for its own ingest channel and cannot be set at task_create')
+      }
       externalSource = trimmed
     }
 

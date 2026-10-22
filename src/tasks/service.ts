@@ -10,7 +10,7 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
-import { isBlankProvenance } from './provenance'
+import { isBlankProvenance, isReservedProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import { GATE_ASK_LIVE_PREDICATE, isGateAskExpired, isResubmitCapError } from '../gates/approval-expiry-rule'
@@ -272,16 +272,26 @@ export interface CreateTaskOptions {
   // PR #659 P0 fix: provenance marker for a task written by a governed external
   // integration (see Task.external_source, migrations/0077). Undefined/null on every
   // normal create call -- only src/integrations/linear-issues.ts and the task_create
-  // MCP tool's carry-forward path (steward reissue) set this today. Monotonic-safe to
-  // expose broadly: it only ever ADDS restriction (no auto-pickup, admin-gated
-  // reassignment, untrusted-content prompt fence), never removes it, so a caller
-  // setting it on its own new task cannot escalate privilege.
+  // MCP tool's carry-forward path (steward reissue) set this today. For ORDINARY markers
+  // it is monotonic-safe to expose broadly: it only ever ADDS restriction (no auto-pickup,
+  // admin-gated reassignment, untrusted-content prompt fence), never removes it, so a
+  // caller setting it on its own new task cannot escalate privilege. RESERVED namespaces
+  // (tasks/provenance.ts RESERVED_PROVENANCE_PREFIXES, e.g. 'mumega-bounty:') are the
+  // exception: they are unique idempotency keys, so stamping one is squatting, not
+  // restriction. prepareGuardedTaskInsert refuses them unless reservedProvenanceAuthority
+  // names the owning ingest.
   /**
    * Allow creation with a recognized placeholder sentinel (e.g. agent-do fallback, loop spawn, channel quick-add).
    * The task is still blocked from transitioning to 'done' by assertCompletableDoneWhen until a real predicate is set.
    */
   allowDeferredPredicate?: boolean
   externalSource?: string | null
+  /**
+   * Internal capability to stamp a RESERVED provenance namespace (see RESERVED_PROVENANCE_PREFIXES).
+   * Only the code path that owns the namespace passes it (the bounty ingest). It is an option on a
+   * server-side call, never read from request arguments, so no caller-supplied field can set it.
+   */
+  reservedProvenanceAuthority?: 'mumega-bounty-ingest'
 }
 
 /**
@@ -293,6 +303,13 @@ export interface PreparedGuardedTaskInsert {
   readonly task: Task
   readonly sql: string
   readonly bindings: readonly (string | number | boolean | null)[]
+}
+
+export class ReservedProvenanceError extends Error {
+  constructor() {
+    super('external_source_reserved')
+    this.name = 'ReservedProvenanceError'
+  }
 }
 
 export class TaskCreateFenceError extends Error {
@@ -431,7 +448,7 @@ export class TaskEvidenceFenceError extends Error {
   }
 }
 
-function mapTaskProjectInsertError(error: unknown): never {
+export function mapTaskProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
   if (message.includes('task project not found')) throw new TaskProjectError('project_not_found')
   if (message.includes('task project archived')) throw new TaskProjectError('archived_project')
@@ -1384,6 +1401,15 @@ export async function prepareGuardedTaskInsert(
     )
   }
   const externalSource = rawExternalSource ?? null
+  // Reserved namespaces are stamped only by the code path that owns them. This is the choke point
+  // every createTask caller (MCP task_create, REST, integrations, steward reissue) goes through.
+  if (
+    externalSource !== null &&
+    isReservedProvenance(externalSource) &&
+    !(options.reservedProvenanceAuthority === 'mumega-bounty-ingest' && externalSource.startsWith('mumega-bounty:'))
+  ) {
+    throw new ReservedProvenanceError()
+  }
   // CHOKE-POINT FIX (PR #659 P0, widened per kasra-core's parallel-audit finding on
   // src/integrations/github-projects.ts:239-251 — confirmed live on main): an
   // external-origin task must NEVER be created pre-assigned. Before this guard,
