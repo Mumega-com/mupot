@@ -5,6 +5,7 @@
 // of that the project-level sections need project READ (readableProject, the project_recall gate); a
 // caller who can read the task but not its project simply gets a brief without the project sections.
 // Dispatch-failure detail rides canViewTaskReceipts, exactly as task_get's dispatch timeline does.
+// Flights and objectives are gated by flight-spine's own visibleFlight / visibleObjective (never re-derived from the task scope).
 // Everything else (what is assembled, how it is filtered) lives in src/tasks/brief.ts.
 //
 // READ-ONLY. The wiki leg is a GET to the Inkwell wiki service (best effort, 2s), which is why the
@@ -16,6 +17,7 @@ import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canReadTask, resolveVisibleTaskScope } from '../tasks/visibility'
 import { done, fail, projectMemoryScope, str, type ToolSpec } from './index'
 import { readAccess, readableProject } from './projects'
+import { visibleFlight, visibleObjective } from './flight-spine'
 
 interface BriefTaskRow extends Record<string, unknown> {
   id: string
@@ -99,6 +101,15 @@ export const toolTaskBrief: ToolSpec = {
       memoryScope: project ? projectMemoryScope(project.id) : null,
       scope,
       canViewReceipts,
+      // Each source's OWN visibility function (the class rule): the flight check is flight-spine's visibleFlight
+      // (observer on every squad of the flight + project read), the objective check its visibleObjective.
+      visible: {
+        flight: async (flightId) => (await visibleFlight(env, auth, flightId)) !== null,
+        objective: async (objectiveId) => {
+          const o = await visibleObjective(env, auth, objectiveId)
+          return o && o.tenant === env.TENANT_SLUG ? { title: o.title, successContract: o.successContract } : null
+        },
+      },
     })
     return done(brief)
   },
