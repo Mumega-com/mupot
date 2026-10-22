@@ -4422,9 +4422,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_task_assignment_wakes_task" },
     ],
   },
+  {
+    file: "0252_task_verdict_submission_binding.sql",
+    sha256: "86a0ea7202ff29074d67bb99da67c512c1423cdb41af83de11a6357f057826a2",
+    statements: [
+      "-- 0252 a verdict is bound to the exact submission it decided, and a chain-scope verdict owes a receipt\n-- (seed-build-plan-20261022, B3 + B4).\n--\n-- submission_id / result_digest: the task_result_submissions row (and its result_digest) the verdict decided, written by the\n-- verdict surfaces (writeVerdict, the harness-attested-origin path, the gate:office path) ONLY when that row is the task's\n-- CURRENT submission: the latest ledger row, whose result_text equals tasks.result, with no unreversed rejection after it.\n-- Otherwise NULL (several writers put a task into review with a new tasks.result and no ledger row). NULL as well on every\n-- pre-0252 verdict (additive, no backfill). The binding is re-asserted inside the status UPDATE's WHERE (same batch), so a\n-- verdict never lands against a submission it did not see. A verdict bound to submission N does not count as approval for\n-- N+1 (verdictForSubmission, src/tasks/verdict-binding.ts). No FK on submission_id: the ledger is append-only receipts.\n--\n-- receipt_actor_kind ('member' | 'agent'): non-NULL iff the task was in receipt-chain scope when the verdict was written, i.e.\n-- a `gate.verdict` execution receipt is OWED. It is the durable pending marker (written in the verdict INSERT, atomic with the\n-- verdict) that the reconcile sweep (reconcileGateVerdictReceipts, maintenance cron) reads, and the actor kind it replays with,\n-- so a receipt that failed to append is healed byte-identically. NULL = no receipt owed (and every pre-0252 verdict).\nALTER TABLE task_verdicts ADD COLUMN submission_id TEXT;",
+      "\nALTER TABLE task_verdicts ADD COLUMN result_digest TEXT;",
+      "\nALTER TABLE task_verdicts ADD COLUMN receipt_actor_kind TEXT CHECK (receipt_actor_kind IS NULL OR receipt_actor_kind IN ('member', 'agent'));",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_task_verdicts_submission\n  ON task_verdicts(task_id, submission_id)\n  WHERE submission_id IS NOT NULL;",
+      "\n\n-- Sweep index: owed receipts, oldest first.\nCREATE INDEX IF NOT EXISTS idx_task_verdicts_receipt_owed\n  ON task_verdicts(decided_at)\n  WHERE receipt_actor_kind IS NOT NULL;",
+      "\n\n-- Append-only trigger, replaced WITHOUT a window where no update trigger exists: the new one is created under a new name\n-- FIRST, and only then is the old one dropped. It pins the new columns on both branches (project hydrate and reversal stamp),\n-- exactly as 0247 did for attachment_id / consenting_member_id. (A later migration that re-creates the trigger must drop\n-- BOTH names.)\nCREATE TRIGGER IF NOT EXISTS task_verdicts_no_update_0252\nBEFORE UPDATE ON task_verdicts\nWHEN NOT (\n  (\n    OLD.project_id IS NULL\n    AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.reversed_at IS OLD.reversed_at\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n    AND NEW.submission_id IS OLD.submission_id\n    AND NEW.result_digest IS OLD.result_digest\n    AND NEW.receipt_actor_kind IS OLD.receipt_actor_kind\n  )\n  OR\n  (\n    OLD.reversed_at IS NULL\n    AND NEW.reversed_at IS NOT NULL\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.project_id IS OLD.project_id\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n    AND NEW.submission_id IS OLD.submission_id\n    AND NEW.result_digest IS OLD.result_digest\n    AND NEW.receipt_actor_kind IS OLD.receipt_actor_kind\n  )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS task_verdicts_no_update;",
+    ],
+    objects: [
+      { type: "index", name: "idx_task_verdicts_submission" },
+      { type: "index", name: "idx_task_verdicts_receipt_owed" },
+      { type: "trigger", name: "task_verdicts_no_update_0252" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "677fa5373480872127ab96227dea43a37bd1705798c5762a22c0a1337d2f3b8d"
+export const SCHEMA_CHAIN_DIGEST: string = "d208b27407b92cd8a2ec06a570ca88798cc7b85af263f540ab69284cb594fd07"

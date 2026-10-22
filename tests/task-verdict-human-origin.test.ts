@@ -1603,3 +1603,139 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.human_origin).toEqual({ applied: true })
   })
 })
+
+// seed B3/B4 (round 2): the human-origin path builds its own batch, so it must bind the CURRENT submission, honour the
+// harness-named expected_submission_id BEFORE spending the origin message, mark the receipt as owed and emit it.
+describe('seed B3/B4 — human_origin verdict binding and gate.verdict receipt', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+
+  beforeEach(() => {
+    attestors.clear()
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+    env = makeEnv(harness)
+    seedAgent(harness.sqlite, 'agent-b3')
+    seedMember(harness.sqlite, 'member-b3', { telegramChatId: '5551234' })
+    setAgentOwner(harness.sqlite, 'agent-b3', 'member-b3')
+    seedSquadMemberCapability(harness.sqlite, 'member-b3')
+    seedGateGrant(harness.sqlite, 'member', 'member-b3')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-b3')
+  })
+  afterEach(() => harness.close())
+
+  function chainTask(taskId: string, withSubmission: boolean): void {
+    seedReviewTask(harness.sqlite, taskId)
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO objectives (id, tenant, created_by_principal_kind, created_by_principal_id, created_by_member_id, squad_id, title,
+         success_contract, authority_envelope, policy_json, budget_micro_usd, payload_json, payload_digest, accepted_at, created_at)
+       VALUES ('obj-b3', ?, 'member', 'member-b3', 'member-b3', ?, 'O', 'ship', '{}', '{}', 0, '{}', ?, '2026-10-22T00:00:00Z', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, SQUAD, 'a'.repeat(64))
+    harness.sqlite.prepare(`INSERT INTO flights (id, tenant, agent, goal) VALUES ('flight-b3', ?, 'agent-x', 'g')`).run(TENANT)
+    harness.sqlite.prepare(`INSERT INTO flight_objectives (id, tenant, flight_id, objective_id, linked_at) VALUES ('fo-b3', ?, 'flight-b3', 'obj-b3', '2026-10-22T00:00:00Z')`).run(TENANT)
+    harness.sqlite.prepare(
+      `INSERT INTO flight_lanes (id, tenant, flight_id, lane_key, role, task_id, assignment_epoch, agent_id, done_when, created_at)
+       VALUES ('lane-b3', ?, 'flight-b3', 'k', 'worker', ?, 1, 'agent-x', 'done', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, taskId)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+    if (withSubmission) {
+      harness.sqlite.prepare(`UPDATE tasks SET result = 'R1' WHERE id = ?`).run(taskId)
+      harness.sqlite.prepare(
+        `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+         VALUES ('sub-b3', ?, ?, ?, 'someone-else', '/x', ?, ?, 'R1', '2026-10-20T00:00:00.000Z')`,
+      ).run(TENANT, taskId, SQUAD, 'a'.repeat(64), 'a'.repeat(64))
+    }
+  }
+
+  const counts = () => ({
+    verdicts: Number((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }).n),
+    reservations: Number((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM telegram_webhook_receipts').get() as { n: number }).n),
+    receipts: Number((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM execution_receipts').get() as { n: number }).n),
+  })
+
+  it('applied: binds the current submission, marks the receipt owed for the MEMBER, appends one gate.verdict, and surfaces gate_receipt', async () => {
+    chainTask('task-b3', true)
+    const res = await invokeVerdict(env, harnessAuth('agent-b3'), {
+      task_id: 'task-b3', verdict: 'approved', expected_submission_id: 'sub-b3', human_origin: origin({ text: 'approve task-b3' }),
+    })
+    const result = expectApplied(res) as unknown as { human_origin: { applied: boolean }; gate_receipt?: { status: string }; verdict: { id: string } }
+    expect(result.human_origin).toEqual({ applied: true })
+    expect(result.gate_receipt?.status).toBe('appended')
+    const row = harness.sqlite.prepare('SELECT submission_id, result_digest, receipt_actor_kind, decided_by FROM task_verdicts').get()
+    expect(row).toEqual({ submission_id: 'sub-b3', result_digest: 'a'.repeat(64), receipt_actor_kind: 'member', decided_by: 'member-b3' })
+    expect(harness.sqlite.prepare('SELECT type, actor_kind, actor_id, task_id FROM execution_receipts').all())
+      .toEqual([{ type: 'gate.verdict', actor_kind: 'member', actor_id: 'member-b3', task_id: 'task-b3' }])
+  })
+
+  it('a stale named submission is refused (409 submission_mismatch) BEFORE anything is spent: no verdict, no reservation, no receipt', async () => {
+    chainTask('task-b3', true)
+    const res = await invokeVerdict(env, harnessAuth('agent-b3'), {
+      task_id: 'task-b3', verdict: 'approved', expected_submission_id: 'sub-older', human_origin: origin({ text: 'approve task-b3' }),
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.status).toBe(409)
+    expect(res.error).toBe('submission_mismatch')
+    expect(counts()).toEqual({ verdicts: 0, reservations: 0, receipts: 0 })
+  })
+
+  it('human_origin on a chain-scope task WITHOUT expected_submission_id still applies (the plugin cannot send it yet); the human decision binds the current submission', async () => {
+    chainTask('task-b3', true)
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-b3'), {
+      task_id: 'task-b3', verdict: 'approved', human_origin: origin({ text: 'approve task-b3' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: true })
+    expect(harness.sqlite.prepare('SELECT submission_id, receipt_actor_kind, decided_by FROM task_verdicts').get())
+      .toEqual({ submission_id: 'sub-b3', receipt_actor_kind: 'member', decided_by: 'member-b3' })
+    expect(counts().receipts).toBe(1)
+  })
+
+  it('...but if the origin does NOT resolve, the fallback is the agent deciding in its own right: the id is required again (400), nothing written', async () => {
+    chainTask('task-b3', true)
+    const res = await invokeVerdict(env, harnessAuth('agent-b3'), {
+      task_id: 'task-b3', verdict: 'approved', human_origin: origin({ text: 'approve task-b3', chat_id: '9999999' }), // != user_id: invalid shape
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.status).toBe(400)
+    expect(res.error).toBe('expected_submission_id_required')
+    expect(counts()).toEqual({ verdicts: 0, reservations: 0, receipts: 0 })
+  })
+
+  it('explicit null is accepted for a chain-scope task that has no current submission', async () => {
+    chainTask('task-b3', false)
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-b3'), {
+      task_id: 'task-b3', verdict: 'approved', expected_submission_id: null, human_origin: origin({ text: 'approve task-b3' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: true })
+    expect(harness.sqlite.prepare('SELECT submission_id FROM task_verdicts').get()).toEqual({ submission_id: null })
+  })
+
+  it('the agent-seat fallback honours the same rules, and task_get shows the id to name', async () => {
+    chainTask('task-b3', true)
+    const auth = harnessAuth('agent-b3', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
+    const got = await invokeTool(auth, env, 'task_get', { task_id: 'task-b3' }, ORIGIN) as unknown as { ok: true; result: { current_submission: { id: string } | null } }
+    expect(got.result.current_submission?.id).toBe('sub-b3')
+    const missing = await invokeVerdict(env, auth, { task_id: 'task-b3', verdict: 'approved' })
+    expect(missing.ok).toBe(false)
+    if (missing.ok) throw new Error('expected refusal')
+    expect(missing.error).toBe('expected_submission_id_required')
+    const mismatch = await invokeVerdict(env, auth, { task_id: 'task-b3', verdict: 'approved', expected_submission_id: 'nope' })
+    expect(mismatch.ok).toBe(false)
+    if (mismatch.ok) throw new Error('expected refusal')
+    expect(mismatch.status).toBe(409)
+    expect(mismatch.error).toBe('submission_mismatch')
+    const ok = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-b3', verdict: 'approved', expected_submission_id: 'sub-b3' }))
+    expect(ok.verdict.decided_by).toBe('agent-b3')
+    expect(harness.sqlite.prepare('SELECT submission_id, receipt_actor_kind FROM task_verdicts').get()).toEqual({ submission_id: 'sub-b3', receipt_actor_kind: 'agent' })
+  })
+
+  it('a non-chain task is unaffected for an agent-bound caller', async () => {
+    seedReviewTask(harness.sqlite, 'task-plain')
+    const auth = harnessAuth('agent-b3', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
+    expectApplied(await invokeVerdict(env, auth, { task_id: 'task-plain', verdict: 'approved' }))
+    expect(counts().receipts).toBe(0)
+  })
+})

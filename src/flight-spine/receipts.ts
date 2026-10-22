@@ -26,6 +26,7 @@ const MUPOT_RECEIPT_TYPES = new Set<ExecutionReceiptType>([
   'effect.intent',
   'artifact.consumed',
   'result.reported',
+  'gate.verdict',
   'task.completed',
   'cost.finalized',
   'recovery.takeover',

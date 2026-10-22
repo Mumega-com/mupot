@@ -785,12 +785,16 @@ async function verdictReply(
     return `You can't decide "${task.title}" because you are the assignee.`
   }
 
+  // IM /approve is a HUMAN surface: it cannot name a submission (expected_submission_id stays undefined), so the verdict binds to
+  // the task's current submission as of this write, and the in-UPDATE guard refuses it if that changes after the read above.
+  let gateReceipt: Awaited<ReturnType<typeof writeVerdict>>['gate_receipt']
   try {
-    await writeVerdict(
+    const written = await writeVerdict(
       env,
       { task, verdict, note, decidedBy: member.id, ...(gateResult.independenceWaiver ? { independenceWaiver: gateResult.independenceWaiver } : {}) },
       memberActor(member.id),
     )
+    gateReceipt = written.gate_receipt
   } catch (err) {
     if (err instanceof TaskArchivedError) {
       return `"${task.title}" is archived and accepts no verdict.`
@@ -822,7 +826,9 @@ async function verdictReply(
     }
   }
 
-  return verdict === 'approved' ? `Approved "${task.title}".` : `Rejected "${task.title}".`
+  const done = verdict === 'approved' ? `Approved "${task.title}".` : `Rejected "${task.title}".`
+  // seed B4: never swallow a failed audit-chain append; the verdict stands and the scheduled sweep heals the receipt.
+  return gateReceipt?.status === 'failed' ? `${done} (The audit receipt could not be appended yet; it will be retried automatically.)` : done
 }
 
 // ── intent: human directive (cap: owner on org, direct chat only) ─────────────

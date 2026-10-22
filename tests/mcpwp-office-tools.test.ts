@@ -4027,3 +4027,68 @@ describe('gate:office via task_submit_result (mupot#1663)', () => {
     harness.close()
   })
 })
+
+// seed B3/B4 (round 2): the gate:office verdict path bypasses writeVerdict, so it must bind the submission and emit the
+// gate.verdict receipt ITSELF, and surface the outcome (not discard it).
+describe('seed B4: office.review_approval emits the gate.verdict receipt and surfaces it', () => {
+  function putOnObjectiveChain(harness: SqliteD1Harness, taskId: string): void {
+    const q = harness.sqlite
+    const squad = q.prepare('SELECT squad_id FROM tasks WHERE id = ?').get(taskId) as { squad_id: string }
+    q.exec('PRAGMA foreign_keys = OFF')
+    q.prepare(
+      `INSERT INTO objectives (id, tenant, created_by_principal_kind, created_by_principal_id, created_by_member_id, squad_id, title,
+         success_contract, authority_envelope, policy_json, budget_micro_usd, payload_json, payload_digest, accepted_at, created_at)
+       VALUES ('obj-o', ?, 'member', 'owner-1', 'owner-1', ?, 'O', 'ship', '{}', '{}', 0, '{}', ?, '2026-10-22T00:00:00Z', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, squad.squad_id, 'a'.repeat(64))
+    q.prepare(`INSERT INTO flights (id, tenant, agent, goal) VALUES ('flight-o', ?, 'agent-1', 'g')`).run(TENANT)
+    q.prepare(`INSERT INTO flight_objectives (id, tenant, flight_id, objective_id, linked_at) VALUES ('fo-o', ?, 'flight-o', 'obj-o', '2026-10-22T00:00:00Z')`).run(TENANT)
+    q.prepare(
+      `INSERT INTO flight_lanes (id, tenant, flight_id, lane_key, role, task_id, assignment_epoch, agent_id, done_when, created_at)
+       VALUES ('lane-o', ?, 'flight-o', 'k', 'worker', ?, 1, 'agent-1', 'done', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, taskId)
+    q.exec('PRAGMA foreign_keys = ON')
+  }
+
+  it('an objective-lane office task: approval carries the owed marker, appends one receipt, and returns gate_receipt', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-b4')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    putOnObjectiveChain(harness, taskId)
+
+    const expectedPayloadSha256 = await officeFreezeHash(testEnv, taskId)
+    const args: Record<string, unknown> = { task_id: taskId, verdict: 'approved' }
+    if (expectedPayloadSha256) args.expected_payload_sha256 = expectedPayloadSha256
+    const result = await invokeTool(orgOwnerAuth(), testEnv, 'office.review_approval', args, ORIGIN)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect((result.result as { gate_receipt?: { status: string } }).gate_receipt?.status).toBe('appended')
+
+    const verdict = harness.sqlite.prepare('SELECT id, receipt_actor_kind FROM task_verdicts WHERE task_id = ?').get(taskId) as { id: string; receipt_actor_kind: string | null }
+    expect(verdict.receipt_actor_kind).toBe('member')
+    const receipts = harness.sqlite.prepare(`SELECT type, objective_id, task_id, idempotency_key FROM execution_receipts`).all()
+    expect(receipts).toEqual([{ type: 'gate.verdict', objective_id: 'obj-o', task_id: taskId, idempotency_key: `verdict:${verdict.id}` }])
+    harness.close()
+  })
+
+  it('an office task outside any chain: no marker, no receipt, no gate_receipt field', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-b4b')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    const expectedPayloadSha256 = await officeFreezeHash(testEnv, taskId)
+    const args: Record<string, unknown> = { task_id: taskId, verdict: 'approved' }
+    if (expectedPayloadSha256) args.expected_payload_sha256 = expectedPayloadSha256
+    const result = await invokeTool(orgOwnerAuth(), testEnv, 'office.review_approval', args, ORIGIN)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect((result.result as { gate_receipt?: unknown }).gate_receipt).toBeUndefined()
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM execution_receipts').get()).toEqual({ n: 0 })
+    expect(harness.sqlite.prepare('SELECT receipt_actor_kind FROM task_verdicts WHERE task_id = ?').get(taskId)).toEqual({ receipt_actor_kind: null })
+    harness.close()
+  })
+})

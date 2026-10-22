@@ -762,6 +762,15 @@ export interface TaskVerdict {
   // bound agent). The attachment and the human who attached it; NULL on every other verdict.
   attachment_id?: string | null
   consenting_member_id?: string | null
+  // submission_id / result_digest (0252, seed-build-plan-20261022 B3): the task_result_submissions row (and its result_digest)
+  // this verdict decided, bound ONLY when that row is the task's CURRENT submission (latest, text equals tasks.result, no
+  // rejection after it). NULL otherwise, and on every pre-0252 verdict. A verdict bound to submission N does not count for N+1
+  // (verdictForSubmission).
+  submission_id?: string | null
+  result_digest?: string | null
+  // receipt_actor_kind (0252, seed B4): non-null iff the task was in receipt-chain scope when the verdict was written = "a
+  // gate.verdict receipt is owed". Doubles as the pending marker the reconcile sweep reads and the actor kind it replays with.
+  receipt_actor_kind?: 'member' | 'agent' | null
   reversed_at: string | null
 }
 

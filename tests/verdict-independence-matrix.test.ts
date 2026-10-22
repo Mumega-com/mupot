@@ -508,7 +508,7 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
 
     it('a builder-level batch (the origin/office seam) changes 0 rows for a party and lands nothing', async () => {
       seedWorld(harness.sqlite)
-      const { statements } = buildVerdictStatements(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MB' })
+      const { statements } = buildVerdictStatements(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MB', submission: null, receiptActorKind: null })
       const results = await env.DB.batch(statements)
       expect(results[0]?.meta?.changes ?? 0).toBe(0)
       expect(verdictRows(harness.sqlite)).toBe(0)

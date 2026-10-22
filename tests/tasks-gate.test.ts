@@ -222,8 +222,12 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
     expect(runs[0].args.slice(0, 3)).toEqual(['approved', result.task.updated_at, task.id])
     expect(runs[0].sql).toMatch(/AND NOT \(/)
     expect(runs[0].sql).toMatch(/task_result_submissions/)
-    expect(runs[0].args.slice(3).length).toBeGreaterThan(0)
-    expect(runs[0].args.slice(3).every((a) => a === 'member-42')).toBe(true)
+    // The trailing four params are the seed-B3 current-submission guard: (tenant, tenant, '' = no current submission, tasks.result IS NULL).
+    const independenceArgs = runs[0].args.slice(3, -4)
+    expect(independenceArgs.length).toBeGreaterThan(0)
+    expect(independenceArgs.every((a) => a === 'member-42')).toBe(true)
+    expect(runs[0].sql).toMatch(/COALESCE\(\(SELECT s\.id FROM task_result_submissions s/)
+    expect(runs[0].args.slice(-4)).toEqual(['test-tenant', 'test-tenant', '', null])
 
     // Second statement: INSERT task_verdicts, gated on the UPDATE's own
     // landed-proof (id/status/updated_at EXISTS on `tasks`) — not a bare
@@ -248,6 +252,10 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
       // makeTask() below does not set gate_owner to 'gate:routines'.
       null,
       // attachment_id / consenting_member_id (0247): NULL for every verdict not cast through an attached agent session.
+      null,
+      null,
+      // submission_id / result_digest / receipt_actor_kind (0252, seed B3/B4): NULL, no current submission and no receipt owed.
+      null,
       null,
       null,
       // the landed-proof EXISTS params: task.id, newStatus, now

@@ -39,6 +39,7 @@ import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEnt
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
+import { resolveVerdictSubmission, VerdictSubmissionMismatchError, VerdictSubmissionRequiredError, type GateVerdictReceiptOutcome } from './verdict-binding'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
 import { attachedAuthority, verdictAttribution } from '../auth/attached-ceiling'
@@ -556,7 +557,9 @@ export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): 
   const dispatchTimeline = (await canViewTaskReceipts(env, auth, task))
     ? await listTaskDispatchReceiptTimeline(env, task.id)
     : null
-  return jsonResponse({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
+  // seed B3: the submission a verdict would bind to right now (what a decider names as expected_submission_id), or null.
+  const currentSubmission = await resolveVerdictSubmission(env, task.id)
+  return jsonResponse({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline, current_submission: currentSubmission ? { id: currentSubmission.submissionId, result_digest: currentSubmission.resultDigest } : null })
 }
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────
@@ -848,6 +851,7 @@ tasksApp.patch('/:id', async (c) => {
   }
   let reversesVerdict = false
   let reversalReason = ''
+  let reversalReceipt: GateVerdictReceiptOutcome | undefined
   if (body.status !== undefined) {
     // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
     if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
@@ -1206,7 +1210,9 @@ tasksApp.patch('/:id', async (c) => {
     if (reversesVerdict) {
       // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
       // FIRST — see reverseTaskVerdict's own doc comment (src/tasks/service.ts).
-      const actorId = auth.memberId || auth.boundAgentId || 'unknown'
+      // The id and the kind must describe the SAME principal: an agent-bound token is recorded as that agent, not as the
+      // member that minted it (which would label a member id as an agent in the reversal row and on the receipt chain).
+      const actorId = auth.boundAgentId || auth.memberId || 'unknown'
       const actorType = auth.boundAgentId ? 'agent' : 'member'
       const outcome = await reverseTaskVerdict(c.env, {
         existing, next, tenant: c.env.TENANT_SLUG, reason: reversalReason, actorId, actorType,
@@ -1214,6 +1220,7 @@ tasksApp.patch('/:id', async (c) => {
       if (!outcome.ok) return c.json({ error: outcome.error, ...('detail' in outcome ? { detail: outcome.detail } : {}) }, 409)
       next.status = outcome.task.status
       next.updated_at = outcome.task.updated_at
+      reversalReceipt = outcome.gate_receipt
     } else {
       // The wake-on-assign enqueue runs below, AFTER the execution-hold release.
       await persistTaskUpdate(c.env, existing, next, false)
@@ -1279,7 +1286,7 @@ tasksApp.patch('/:id', async (c) => {
     await freezeOfficeTaskOnReviewEntry(c.env, next, auth.memberId || auth.boundAgentId || 'unknown')
   }
 
-  return c.json({ task: next })
+  return c.json(reversalReceipt ? { task: next, gate_receipt: reversalReceipt } : { task: next })
 })
 
 // ── POST /:id/local-smoke-complete — local browser harness result injection ──
@@ -1394,6 +1401,9 @@ interface VerdictBody {
   // Only honoured when the decider holds org owner role. Must be deliberate —
   // a caller cannot accidentally pass this; it must be an intentional opt-in.
   override_self_verdict?: unknown
+  // seed B3 decider-seen binding: the submission id the decider reviewed (null = "I saw none"). Required of an agent decider on
+  // a task in receipt-chain scope; optional for a human (see WriteVerdictInput.expectedSubmissionId).
+  expected_submission_id?: unknown
 }
 
 // K3 fix: check that the caller holds a SPECIFIC gate capability (e.g. 'gate:outreach').
@@ -1799,6 +1809,11 @@ tasksApp.post('/:id/verdict', async (c) => {
     return c.json({ error: 'invalid_verdict', accepted: ['approved', 'rejected'] }, 400)
   }
 
+  if (body.expected_submission_id !== undefined && body.expected_submission_id !== null && typeof body.expected_submission_id !== 'string') {
+    return c.json({ error: 'invalid_expected_submission_id' }, 400)
+  }
+  const expectedSubmissionId: string | null | undefined = body.expected_submission_id as string | null | undefined // narrowed by the check above
+
   // K4: note must be mutable so the self-verdict override can prepend an audit tag.
   let note: string | null =
     body.note === undefined || body.note === null
@@ -1870,7 +1885,7 @@ tasksApp.post('/:id/verdict', async (c) => {
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: verdictAttribution(c.get('auth')) },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), ...(expectedSubmissionId !== undefined ? { expectedSubmissionId } : {}), attribution: verdictAttribution(c.get('auth')) },
       principal.actor,
     )
 
@@ -1901,6 +1916,12 @@ tasksApp.post('/:id/verdict', async (c) => {
     }
     if (err instanceof VerdictIndependenceError) {
       return c.json({ error: 'self_verdict', reason: 'decider is a party to this task or acts for one; self-approval is forbidden' }, 409)
+    }
+    if (err instanceof VerdictSubmissionRequiredError) {
+      return c.json({ error: 'expected_submission_id_required', detail: 'this task is in receipt-chain scope; name the submission you reviewed (task_get current_submission.id, or null if there is none)' }, 400)
+    }
+    if (err instanceof VerdictSubmissionMismatchError) {
+      return c.json({ error: 'submission_mismatch', reason: 'the task\'s current submission is not the one you named; reload and re-review' }, 409)
     }
     if (err instanceof VerdictRaceError) {
       // K5: concurrent verdict won the race — task is no longer in 'review'.

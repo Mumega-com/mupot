@@ -34,8 +34,9 @@ export type ExecutionReceiptType =
 
 /**
  * Facts the Flight 2 control plane can issue itself. Runtime, host observation,
- * source/provider, artifact storage/retrieval and gate issuers are deferred;
- * dependency linking and artifact consumption are control-plane facts.
+ * source/provider and artifact storage/retrieval issuers are deferred. `gate.verdict` is issued by the control plane
+ * (issuer_kind 'mupot') from the three verdict write paths (writeVerdict, the harness-attested-origin path and the gate:office
+ * path, which share buildVerdictStatements), plus the reconcile sweep (seed B4); an independent 'gate' issuer stays deferred. Dependency linking and artifact consumption are control-plane facts.
  */
 export type MupotExecutionReceiptType =
   | 'objective.authorized'
@@ -49,6 +50,7 @@ export type MupotExecutionReceiptType =
   | 'effect.intent'
   | 'artifact.consumed'
   | 'result.reported'
+  | 'gate.verdict'
   | 'task.completed'
   | 'cost.finalized'
   | 'recovery.takeover'

@@ -115,6 +115,7 @@ import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from '
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { evaluateVerdictGates } from '../tasks/index'
 import { findVerdictIndependenceConflict } from '../tasks/verdict-independence'
+import { assertExpectedSubmission, emitGateVerdictReceipt, resolveGateVerdictScope, resolveVerdictSubmission, type GateVerdictReceiptOutcome } from '../tasks/verdict-binding'
 import { isGateAskExpired } from '../gates/approval-expiry-rule'
 import {
   assertVerdictWritable,
@@ -163,7 +164,7 @@ export type HumanOriginFailureReason =
 
 export type HumanOriginResolution =
   | { replayed: true }
-  | { replayed: false; applied: true; member: Member; auth: AuthContext; task: Task; verdict: TaskVerdict }
+  | { replayed: false; applied: true; member: Member; auth: AuthContext; task: Task; verdict: TaskVerdict; gate_receipt?: GateVerdictReceiptOutcome }
   | { replayed: false; applied: false; reason: HumanOriginFailureReason }
 
 // Freshness window — a short shelf life for a captured (chat_id, message_id,
@@ -509,6 +510,7 @@ async function commitOriginDecision(
   verdict: 'approved' | 'rejected',
   note: string | null,
   auth: AuthContext,
+  expectedSubmissionId?: string | null,
 ): Promise<HumanOriginResolution> {
   const updateId = `origin:telegram:${origin.chat_id}:${origin.message_id}`
   // text_hash (round 4 addendum): the digest binds not just WHO and WHICH
@@ -542,12 +544,20 @@ async function commitOriginDecision(
   // writeVerdict's auto-resolution. See resolveVerdictProposalId's doc
   // comment (src/tasks/service.ts) for why this is a safe read-then-write.
   const proposalId = await resolveVerdictProposalId(env, task)
+  // seed B3: the same latest-submission binding as writeVerdict; re-asserted in the verdict UPDATE's WHERE, so a submission
+  // landing after this read refuses the verdict (surfaces as verdict_race below) instead of binding it to an unseen submission.
+  const submission = await resolveVerdictSubmission(env, task.id)
+  // Decider-seen binding: the harness named the submission it relayed the human's approval for. Checked BEFORE the
+  // reservation INSERT, so a mismatch spends nothing (the origin message stays usable).
+  assertExpectedSubmission(task.id, submission, expectedSubmissionId)
+  // seed B4: the receipt-owed marker (chain scope from trusted rows); the decider recorded on the chain is the human member.
+  const receiptActorKind = (await resolveGateVerdictScope(env, task.id)) ? ('member' as const) : null
 
   const verdictBuild = buildVerdictStatements(
     env,
     {
       task, verdict, note, decidedBy: owner.id, decidedVia: 'agent_attested_origin',
-      originAgentId: boundAgentId, proposalId,
+      originAgentId: boundAgentId, proposalId, submission, receiptActorKind,
     },
     {
       sql: `${ownershipGuardSql} AND ${chatEligibleGuardSql} AND ${reservationLandedGuardSql}`,
@@ -641,6 +651,9 @@ async function commitOriginDecision(
   const actor: TaskActor = { kind: 'member', id: owner.id }
   await emitVerdictBusEvent(env, task, { task, verdict, note, decidedBy: owner.id }, verdictBuild.newStatus, verdictBuild.now, actor)
 
+  // seed B4: gate.verdict onto the receipt chain; never throws, never undoes the (already committed) verdict.
+  const gate_receipt = await emitGateVerdictReceipt(env, verdictBuild.verdictRow)
+
   await completeTelegramUpdate(env, identity, JSON.stringify({ applied: true, member_id: resolved.id }))
   return {
     replayed: false,
@@ -649,6 +662,7 @@ async function commitOriginDecision(
     auth,
     task: updatedTask,
     verdict: verdictBuild.verdictRow,
+    ...(gate_receipt ? { gate_receipt } : {}),
   }
 }
 
@@ -676,6 +690,7 @@ export async function resolveHarnessAttestedOrigin(
   gateOwner: string,
   verdict: 'approved' | 'rejected',
   note: string | null,
+  expectedSubmissionId?: string | null,
 ): Promise<HumanOriginResolution> {
   const parsed = parseHumanOrigin(rawOrigin)
   if (!parsed.ok) return { replayed: false, applied: false, reason: parsed.reason }
@@ -694,5 +709,5 @@ export async function resolveHarnessAttestedOrigin(
   const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task, gateOwner)
   if (!dryRun.ok) return { replayed: false, applied: false, reason: dryRun.reason }
 
-  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.auth)
+  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.auth, expectedSubmissionId)
 }

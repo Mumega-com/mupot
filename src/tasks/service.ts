@@ -21,6 +21,22 @@ import { nowSqlUtc } from '../auth/token-lifecycle'
 import type { VerdictAttribution } from '../auth/attached-ceiling'
 import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
 import { enqueueAssignmentWake, isWakeableTaskStatus, type AssignmentWakeContext } from '../agents/assignment-wake'
+import {
+  assertAgentNamedSubmission,
+  assertExpectedSubmission,
+  currentSubmissionConditionsSql,
+  emitGateVerdictReceipt,
+  emitGateVerdictReversalReceipt,
+  latestSubmissionGuardSql,
+  resolveGateVerdictScope,
+  resolveVerdictSubmission,
+  type GateVerdictReceiptOutcome,
+  type ReceiptActorKind,
+  type VerdictSubmissionBinding,
+} from './verdict-binding'
+import { VerdictRaceError } from './verdict-errors'
+
+export { VerdictRaceError }
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -668,7 +684,8 @@ function isUniqueViolation(error: unknown): boolean {
 // hand-rolling a second copy of this query.
 export async function findLatestVerdict(env: Env, taskId: string): Promise<TaskVerdict | null> {
   return env.DB.prepare(
-    `SELECT id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, reversed_at
+    `SELECT id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, reversed_at,
+            submission_id, result_digest, receipt_actor_kind
        FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
   ).bind(taskId).first<TaskVerdict>()
 }
@@ -687,7 +704,7 @@ export interface VerdictReversalInput {
 }
 
 export type VerdictReversalOutcome =
-  | { ok: true; task: Task }
+  | { ok: true; task: Task; gate_receipt?: GateVerdictReceiptOutcome }
   | { ok: false; error: 'no_verdict_to_reverse' }
   | { ok: false; error: 'task_archived' }
   // mupot#1616: an office publish is in flight or unresolved (claimed, no outcome).
@@ -896,7 +913,24 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
     if (!isUniqueViolation(error)) throw error
   }
 
-  return { ok: true, task: landed }
+  // seed B4: the reversal reaches the receipt chain too (only for a verdict that had a receipt owed), so the chain does not
+  // show "approved" forever. Replay-safe (keyed on the verdict) and never throws; the sweep heals a failed append.
+  // Chain order is verdict -> reversal: the verdict's own receipt goes first (a no-op replay if it already landed), and if it
+  // cannot be appended the reversal append is skipped; the owed marker + sweep heal both, in order. The reversal's actor is the
+  // one RECORDED on the verdict_reversals row (what a retry or the sweep would also use), never the current caller.
+  const verdictReceipt = await emitGateVerdictReceipt(env, verdict)
+  let gate_receipt = verdictReceipt
+  if (!verdictReceipt || verdictReceipt.status === 'appended') {
+    const recorded = await env.DB.prepare('SELECT actor_id, actor_type FROM verdict_reversals WHERE id = ?')
+      .bind(receiptId).first<{ actor_id: string; actor_type: string }>()
+    gate_receipt = await emitGateVerdictReversalReceipt(env, verdict, {
+      reversalId: receiptId,
+      actorId: recorded?.actor_id ?? actorId,
+      actorKind: (recorded?.actor_type ?? actorType) === 'agent' ? 'agent' : 'member',
+    })
+  }
+
+  return gate_receipt ? { ok: true, task: landed, gate_receipt } : { ok: true, task: landed }
 }
 
 // detectVerdictReversalRequest — a PATCH/task_update asking to move
@@ -1707,6 +1741,13 @@ export interface WriteVerdictInput {
   // does this automatically for its own callers when omitted (see below).
   proposalId?: string | null
   /**
+   * seed B3 decider-seen binding: the submission id the decider reviewed (null = "I saw none"; undefined = not asserted).
+   * When present and not the task's CURRENT submission the write is refused (VerdictSubmissionMismatchError, 409). An AGENT
+   * decider on a task in receipt-chain scope MUST supply it (VerdictSubmissionRequiredError). Human surfaces (IM /approve, the
+   * dashboard) cannot carry it yet and leave it undefined; the in-UPDATE guard still refuses a change after their read.
+   */
+  expectedSubmissionId?: string | null
+  /**
    * Policy rule 3 (nobody gives a verdict on their own task) is enforced INSIDE the verdict write
    * (buildVerdictStatements' UPDATE ... WHERE), not only in the callers' pre-checks. Omitted, the
    * write refuses a decider who is a party to the task or acts for one. A caller sets a waiver
@@ -1752,7 +1793,7 @@ export class VerdictIndependenceError extends Error {
  * assignee column alone is not authority: it is writable by any squad member+ outside review, so
  * an exemption keyed on it is only as narrow as whoever can write it. No ledger row, or a result
  * cleared by rework, means NO exemption (the decider is then judged like on any other lane).
- * `taskIdExpr` is a SQL expression; bind selfCompletionProducerParams(decider, tenant) (4 values) for the fragment.
+ * `taskIdExpr` is a SQL expression; bind selfCompletionProducerParams(decider, tenant) (4 values: assignee, tenant, tenant, submitter) for the fragment.
  */
 export function selfCompletionProducerSql(taskIdExpr: string): string {
   // Bound to the CURRENT result: the latest ledger row (this tenant, MAX(seq)) must be the
@@ -1764,22 +1805,18 @@ export function selfCompletionProducerSql(taskIdExpr: string): string {
   // Compared at millisecond precision: decided_at carries extra sub-millisecond digits and created_at
   // ends in 'Z', so a raw string compare would sort a same-millisecond rejection BEFORE the submission
   // (a digit sorts below 'Z') and ignore it. A tie counts as rejected (fails closed).
+  // The currency conditions (latest row, text equals tasks.result, no unreversed rejection after it) are shared with the
+  // verdict binding (currentSubmissionConditionsSql, verdict-binding.ts): one predicate, so "the producer of the current
+  // result" and "the submission a verdict binds to" can never disagree. Placeholders: assignee, tenant, tenant, submitter.
   return `(tasks.assignee_agent_id = ? AND tasks.result IS NOT NULL AND EXISTS (
     SELECT 1 FROM task_result_submissions lane_sub
-     WHERE lane_sub.tenant = ? AND lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
-       AND lane_sub.result_text IS NOT NULL AND lane_sub.result_text = tasks.result
-       AND lane_sub.seq = (SELECT MAX(lane_max.seq) FROM task_result_submissions lane_max
-                            WHERE lane_max.tenant = ? AND lane_max.task_id = ${taskIdExpr})
-       AND NOT EXISTS (SELECT 1 FROM task_verdicts lane_rej
-                        WHERE lane_rej.task_id = ${taskIdExpr} AND lane_rej.verdict = 'rejected'
-                          AND lane_rej.reversed_at IS NULL
-                          AND substr(lane_rej.decided_at, 1, 23) >= substr(lane_sub.created_at, 1, 23))
+     WHERE ${currentSubmissionConditionsSql('lane_sub', taskIdExpr, 'lane')} AND lane_sub.submitted_by_agent_id = ?
   ))`
 }
 
 /** Bind values for selfCompletionProducerSql, in placeholder order. */
 export function selfCompletionProducerParams(decidedBy: string, tenant: string): string[] {
-  return [decidedBy, tenant, decidedBy, tenant]
+  return [decidedBy, tenant, tenant, decidedBy]
 }
 
 /** True iff the task is on the self-completion lane and the decider produced its current result AND is its assignee RIGHT NOW. */
@@ -1792,13 +1829,6 @@ export async function isCurrentSelfCompletionProducer(
     `SELECT 1 AS one FROM tasks WHERE id = ? AND gate_owner = 'gate:agent-self-completion' AND ${selfCompletionProducerSql('tasks.id')}`,
   ).bind(input.task.id, ...selfCompletionProducerParams(input.decidedBy, env.TENANT_SLUG)).first<{ one: number }>()
   return row !== null
-}
-
-export class VerdictRaceError extends Error {
-  constructor(taskId: string) {
-    super(`verdict_race: task ${taskId} is no longer in review (concurrent verdict won)`)
-    this.name = 'VerdictRaceError'
-  }
 }
 
 /** mupot#1571: archived = no action. Subclasses VerdictRaceError on purpose so every
@@ -2005,9 +2035,20 @@ export interface VerdictStatementsResult {
  * require ITS OWN reservation to have landed in the SAME batch, so a lost
  * reservation race can never still flip the task's status.
  */
+/**
+ * seed B3: the builder is sync, so the submission the verdict binds to is resolved by the CALLER
+ * (resolveVerdictSubmission) and passed in. REQUIRED (null = the task has no submission), so a new verdict surface cannot
+ * silently skip the binding. The builder re-asserts it inside the status UPDATE's WHERE.
+ */
+export type BuildVerdictInput = WriteVerdictInput & {
+  submission: VerdictSubmissionBinding | null
+  /** Non-null iff the task is in receipt-chain scope: written onto the verdict row as the "receipt owed" marker + actor kind. */
+  receiptActorKind: ReceiptActorKind | null
+}
+
 export function buildVerdictStatements(
   env: Env,
-  input: WriteVerdictInput,
+  input: BuildVerdictInput,
   extraGuard?: { sql: string; params: unknown[] },
 ): VerdictStatementsResult {
   // mupot#1425 round 4 (kasra-review P0-2): a bare `new Date().toISOString()`
@@ -2034,6 +2075,9 @@ export function buildVerdictStatements(
     proposal_id: input.proposalId ?? null,
     attachment_id: input.attribution?.attachmentId ?? null,
     consenting_member_id: input.attribution?.consentingMemberId ?? null,
+    submission_id: input.submission ? input.submission.submissionId : null,
+    result_digest: input.submission ? input.submission.resultDigest : null,
+    receipt_actor_kind: input.receiptActorKind,
     reversed_at: null,
   }
 
@@ -2090,16 +2134,20 @@ export function buildVerdictStatements(
     : ''
   const attachedGuardParams: unknown[] = att && humanIndependence ? [...attachedParams, ...humanIndependence.params] : []
 
-  const guardSql = `${laneGuardSql}${independenceSql}${attachedGuardSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
-  const guardParams = [...independenceParams, ...attachedGuardParams, ...(extraGuard ? extraGuard.params : [])]
+  // seed B3: the verdict binds to the submission the caller read. If a newer submission (or the first one) landed since, the
+  // UPDATE changes 0 rows, so the INSERT below (which requires the UPDATE's landed-proof) is a no-op in the same batch and the
+  // caller sees a VerdictRaceError. A verdict is never written against a submission its decider did not see.
+  const submissionGuard = latestSubmissionGuardSql(env, input.submission, input.task.result ?? null)
+  const guardSql = `${laneGuardSql}${independenceSql}${attachedGuardSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''} AND ${submissionGuard.sql}`
+  const guardParams = [...independenceParams, ...attachedGuardParams, ...(extraGuard ? extraGuard.params : []), ...submissionGuard.params]
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()} AND ${GATE_ASK_LIVE_PREDICATE('tasks', "datetime('now')")}${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, attachment_id, consenting_member_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, attachment_id, consenting_member_id, submission_id, result_digest, receipt_actor_kind)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       verdictRow.id,
@@ -2113,6 +2161,9 @@ export function buildVerdictStatements(
       verdictRow.proposal_id,
       att ? att.attachmentId : null,
       att ? att.consentingMemberId : null,
+      verdictRow.submission_id ?? null,
+      verdictRow.result_digest ?? null,
+      input.receiptActorKind,
       input.task.id,
       newStatus,
       now,
@@ -2187,7 +2238,7 @@ export async function writeVerdict(
   env: Env,
   input: WriteVerdictInput,
   actor?: TaskActor,
-): Promise<{ task: Task; verdict: TaskVerdict }> {
+): Promise<{ task: Task; verdict: TaskVerdict; gate_receipt?: GateVerdictReceiptOutcome }> {
   if (input.task.gate_owner && GATE_OWNERS_WITH_DEDICATED_PREDICATE.has(input.task.gate_owner)) {
     throw new DedicatedGatePredicateRequiredError(input.task.id, input.task.gate_owner)
   }
@@ -2222,7 +2273,16 @@ export async function writeVerdict(
     ? input
     : { ...input, proposalId: await resolveVerdictProposalId(env, input.task) }
 
-  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, resolvedInput)
+  // seed B3: bind to the task's CURRENT submission (latest row, text equals tasks.result, no rejection after it; else null),
+  // read here and re-asserted inside the batch's UPDATE (see buildVerdictStatements). An agent decider on a chain-scope task
+  // must have named the submission it reviewed; any decider that names one must have named THIS one.
+  const decider = gateVerdictActor(input, actor)
+  const submission = await resolveVerdictSubmission(env, input.task.id)
+  if (decider.kind === 'agent') await assertAgentNamedSubmission(env, input.task.id, input.expectedSubmissionId)
+  assertExpectedSubmission(input.task.id, submission, input.expectedSubmissionId)
+  // seed B4: chain scope decided from trusted rows at write time; the marker rides the verdict INSERT (atomic with it).
+  const receiptActorKind: ReceiptActorKind | null = (await resolveGateVerdictScope(env, input.task.id)) ? decider.kind : null
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, { ...resolvedInput, submission, receiptActorKind })
   const results = await env.DB.batch(statements)
 
   if (!results[0]?.meta?.changes) {
@@ -2254,5 +2314,16 @@ export async function writeVerdict(
   // Emit verdict event (non-fatal — the verdict is already written).
   await emitVerdictBusEvent(env, input.task, input, newStatus, now, actor)
 
-  return { task: updatedTask, verdict: verdictRow }
+  // seed B4: gate.verdict onto the receipt chain (objective-chain tasks and mumega-bounty:* tasks only). Never throws, never
+  // rolls the verdict back; a failure is logged and surfaced as gate_receipt:{status:'failed'}. null = no receipt owed.
+  const gate_receipt = await emitGateVerdictReceipt(env, verdictRow)
+
+  return gate_receipt ? { task: updatedTask, verdict: verdictRow, gate_receipt } : { task: updatedTask, verdict: verdictRow }
+}
+
+/** The receipt chain records agent|member actors: an agent decider (attached session / agent seat) vs everything else. */
+export function gateVerdictActor(input: Pick<WriteVerdictInput, 'decidedBy'>, actor?: TaskActor): { kind: 'agent' | 'member'; id: string } {
+  return actor?.kind === 'agent' && actor.id === input.decidedBy
+    ? { kind: 'agent', id: input.decidedBy }
+    : { kind: 'member', id: input.decidedBy }
 }
