@@ -29,6 +29,12 @@ import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
 import { createTask } from '../tasks/service'
 import type { CreateTaskOptions } from '../tasks/service'
+import {
+  BOUNTY_CLAIMED_EVENT,
+  deriveBountyClaimed,
+  ingestBountyClaimed,
+} from './bounty-claimed'
+import type { BountyBindingError, BountyBindingResult } from './bounty-claimed'
 
 // ── Normalized inbound event ────────────────────────────────────────────────
 //
@@ -175,6 +181,13 @@ export const EVENT_REGISTRY: ReadonlyMap<string, DoneWhenDeriver> = new Map([
       body: JSON.stringify(payload).slice(0, 2000),
     }
   }],
+
+  // ── bounty.claimed ────────────────────────────────────────────────────────
+  // A mumega.com bounty was claimed. Closed payload schema, idempotent binding to
+  // exactly one task keyed by external_source='mumega-bounty:<bounty_id>'. The
+  // create-or-recover logic lives in ./bounty-claimed (ingestEvent routes to it); this
+  // entry keeps the registry the single list of accepted types.
+  [BOUNTY_CLAIMED_EVENT, deriveBountyClaimed],
 ])
 
 // ── Core ingest function ─────────────────────────────────────────────────────
@@ -183,9 +196,12 @@ export interface IngestResult {
   ok: true
   task_id: string
   done_when: string
+  /** bounty.claimed only: true when an identical earlier delivery already created this task. */
+  replayed?: boolean
 }
 
 export type IngestError =
+  | { ok: false; code: 'dedicated_channel_required'; event_type: string }
   | { ok: false; code: 'unmapped_event_type'; event_type: string }
   | { ok: false; code: 'squad_not_found'; squad_id: string }
   | { ok: false; code: 'create_failed'; detail: string }
@@ -205,6 +221,14 @@ export async function ingestEvent(
   event: InboundEvent,
   options: CreateTaskOptions = {},
 ): Promise<IngestResult | IngestError> {
+  // 0. bounty.claimed is authenticated by its OWN secret and audience (BOUNTY_INGEST_SECRET,
+  //    destination_tenant) and has create-or-recover semantics. It is reachable ONLY through the
+  //    route's dedicated branch (ingestBountyEvent), never through this generic entry point, so a
+  //    caller holding the shared event secret, or calling this function directly, cannot mint one.
+  if (event.type === BOUNTY_CLAIMED_EVENT) {
+    return { ok: false, code: 'dedicated_channel_required', event_type: event.type }
+  }
+
   // 1. Registry lookup — reject unmapped types rather than silently sentinel-ing.
   const deriver = EVENT_REGISTRY.get(event.type)
   if (!deriver) {
@@ -260,24 +284,38 @@ export async function ingestEvent(
 // POST /api/events/ingest
 //
 // Auth: HMAC-SHA256 of the raw request body, delivered in `x-mupot-signature`
-// header (hex). Verified against EVENT_INGEST_SECRET (wrangler secret put).
-// If the secret is not configured → 503. Bad/missing signature → 401.
+// header (hex). Two disjoint channels, chosen by the body's `type`:
+//   - every type except bounty.claimed: EVENT_INGEST_SECRET
+//   - bounty.claimed:                   BOUNTY_INGEST_SECRET ONLY (a different principal: the
+//     partner marketplace). The shared event secret is NOT accepted for it, and the bounty secret
+//     is not accepted for any other type. Each unset secret → 503 for ITS channel (fail closed).
+// Bad/missing signature → 401.
 //
 // Body (JSON):
 //   { type, source, squad_id, payload }
+//   `source` must match SOURCE_RE (<=100 chars, [A-Za-z0-9._:-]): it becomes actor.id.
 //
 // Returns:
 //   201 { ok: true, task_id, done_when }       — task created
+//   200 { ok: true, task_id, done_when, replayed: true } — bounty.claimed replay (same task)
+//   400 { error: 'invalid_payload', issues }   — bounty.claimed schema violation
+//   400 { error: 'invalid_source' }
+//   403 { error: 'wrong_tenant' }              — bounty.claimed destination_tenant != this pot
+//   409 { error: 'bounty_binding_conflict', reason } — bounty.claimed key held by a different binding
 //   400 { error: 'unmapped_event_type', ... }  — no registry entry, not a silent drop
-//   400 { error: 'squad_not_found', ... }
+//   404 { error: 'squad_not_found', ... }
 //   401 { error: 'unauthorized' }
 //   503 { error: 'not_configured' }
 
 interface EventRouteEnv {
   EVENT_INGEST_SECRET?: string
+  BOUNTY_INGEST_SECRET?: string
 }
 
 export const EVENT_INGEST_MAX_BODY_BYTES = 256 * 1024
+
+/** `source` becomes actor.id and part of external_source: bounded length, plain identifier charset. */
+export const EVENT_SOURCE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/
 
 function eventRouteEnv(env: Env): EventRouteEnv {
   // Same adapter pattern as GHL route (optional extras not in core Env).
@@ -299,17 +337,52 @@ async function computeHmacHex(secret: string, message: string): Promise<string> 
     .join('')
 }
 
-export async function verifyEventSignature(
-  env: Env,
+async function verifyHmac(
+  secret: string | undefined,
   rawBody: string,
   signatureHeader: string | null,
 ): Promise<'not_configured' | 'invalid' | 'ok'> {
-  const secret = eventRouteEnv(env).EVENT_INGEST_SECRET
   if (!secret || secret.length === 0) return 'not_configured'
   if (!signatureHeader || signatureHeader.length === 0) return 'invalid'
   const expected = await computeHmacHex(secret, rawBody)
   if (!timingSafeEqual(expected, signatureHeader.toLowerCase())) return 'invalid'
   return 'ok'
+}
+
+export function verifyEventSignature(
+  env: Env,
+  rawBody: string,
+  signatureHeader: string | null,
+): Promise<'not_configured' | 'invalid' | 'ok'> {
+  return verifyHmac(eventRouteEnv(env).EVENT_INGEST_SECRET, rawBody, signatureHeader)
+}
+
+/** The bounty channel's own secret. Deliberately shares nothing with EVENT_INGEST_SECRET. */
+export function verifyBountySignature(
+  env: Env,
+  rawBody: string,
+  signatureHeader: string | null,
+): Promise<'not_configured' | 'invalid' | 'ok'> {
+  return verifyHmac(eventRouteEnv(env).BOUNTY_INGEST_SECRET, rawBody, signatureHeader)
+}
+
+/**
+ * Read `type` from the still-UNAUTHENTICATED body only to choose WHICH secret verifies it. Nothing
+ * from the peek is trusted or acted on: the body is re-read after the signature check, and the
+ * comparison is the same exact (trimmed) string the registry uses, so a variant spelling is an
+ * unmapped type on the shared channel, never a bounty.
+ */
+function peekEventType(rawBody: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(rawBody)
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const type = (parsed as Record<string, unknown>).type // narrowed to a non-null object just above
+      if (typeof type === 'string') return type.trim()
+    }
+  } catch {
+    // Not JSON: verify on the shared channel, which will 401 or, if signed, 400 invalid_json.
+  }
+  return null
 }
 
 export const eventIngestApp = new Hono<{ Bindings: Env }>()
@@ -331,10 +404,16 @@ eventIngestApp.post('/ingest', async (c) => {
   }
 
   const signatureHeader = c.req.header('x-mupot-signature') ?? null
-  const verifyResult = await verifyEventSignature(c.env, rawBody, signatureHeader)
+  const isBountyChannel = peekEventType(rawBody) === BOUNTY_CLAIMED_EVENT
+  const verifyResult = isBountyChannel
+    ? await verifyBountySignature(c.env, rawBody, signatureHeader)
+    : await verifyEventSignature(c.env, rawBody, signatureHeader)
 
   if (verifyResult === 'not_configured') {
-    return c.json({ error: 'not_configured', detail: 'EVENT_INGEST_SECRET is not configured on this pot' }, 503)
+    return c.json({
+      error: 'not_configured',
+      detail: `${isBountyChannel ? 'BOUNTY_INGEST_SECRET' : 'EVENT_INGEST_SECRET'} is not configured on this pot`,
+    }, 503)
   }
   if (verifyResult === 'invalid') {
     return c.json({ error: 'unauthorized' }, 401)
@@ -357,6 +436,9 @@ eventIngestApp.post('/ingest', async (c) => {
   if (typeof body.squad_id !== 'string' || body.squad_id.trim().length === 0) {
     return c.json({ error: 'missing_field', field: 'squad_id' }, 400)
   }
+  if (!EVENT_SOURCE_RE.test(body.source.trim())) {
+    return c.json({ error: 'invalid_source', detail: 'source must be <=100 chars of [A-Za-z0-9._:-]' }, 400)
+  }
 
   const payload = body.payload !== null && typeof body.payload === 'object'
     ? (body.payload as Record<string, unknown>)
@@ -367,6 +449,12 @@ eventIngestApp.post('/ingest', async (c) => {
     source: body.source.trim(),
     squad_id: body.squad_id.trim(),
     payload,
+  }
+
+  // The channel the signature was verified on must be the channel the body asks for. (Both parse the
+  // same bytes, so this only trips on a parser disagreement, and then it fails closed.)
+  if ((event.type === BOUNTY_CLAIMED_EVENT) !== isBountyChannel) {
+    return c.json({ error: 'unauthorized' }, 401)
   }
 
   // PR #659 P0 fix, widened (kasra-core parallel-audit finding): flagged as a 5th
@@ -380,27 +468,48 @@ eventIngestApp.post('/ingest', async (c) => {
   // as found-and-fixed beyond the named list (see PR report) since the fix is the same
   // one-line, monotonic-safe marker as the other four and ingestEvent already threads
   // CreateTaskOptions straight through.
-  const result = await ingestEvent(c.env, event, {
-    actor: { kind: 'agent', id: event.source },
-    // event.source is caller-supplied free text (only checked non-empty above, no length
-    // cap) — bound it before it becomes part of a DB column, same discipline as the
-    // Linear identifier/url cap (finding #5, PR #659).
-    externalSource: `event-ingest:${event.source}`.slice(0, 100),
-  })
+  const actor = { kind: 'agent' as const, id: event.source }
+  const result: IngestResult | IngestError | BountyBindingResult | BountyBindingError = isBountyChannel
+    ? await ingestBountyClaimed(c.env, event.squad_id, event.payload, { actor, skipMirror: true })
+    : await ingestEvent(c.env, event, {
+      actor,
+      // event.source is validated above (EVENT_SOURCE_RE, <=100), so the column value is bounded
+      // (finding #5, PR #659).
+      externalSource: `event-ingest:${event.source}`.slice(0, 100),
+    })
 
   if (!result.ok) {
-    if (result.code === 'unmapped_event_type') {
-      return c.json({
-        error: 'unmapped_event_type',
-        event_type: result.event_type,
-        detail: 'no done_when registry entry for this event type — add one to EVENT_REGISTRY in src/events/ingest.ts',
-      }, 400)
+    switch (result.code) {
+      case 'unmapped_event_type':
+        return c.json({
+          error: 'unmapped_event_type',
+          event_type: result.event_type,
+          detail: 'no done_when registry entry for this event type — add one to EVENT_REGISTRY in src/events/ingest.ts',
+        }, 400)
+      case 'dedicated_channel_required':
+        return c.json({ error: 'unauthorized' }, 401)
+      case 'squad_not_found':
+        return c.json({ error: 'squad_not_found', squad_id: result.squad_id }, 404)
+      case 'wrong_tenant':
+        return c.json({ error: 'wrong_tenant' }, 403)
+      case 'invalid_payload':
+        return c.json({ error: 'invalid_payload', issues: result.issues }, 400)
+      case 'binding_conflict':
+        return c.json({ error: 'bounty_binding_conflict', reason: result.reason }, 409)
+      case 'project_rejected': {
+        const status = result.project_code === 'project_not_found' ? 404
+          : result.project_code === 'project_access_forbidden' ? 403
+          : result.project_code === 'archived_project' ? 409
+          : 400
+        return c.json({ error: result.project_code }, status)
+      }
+      case 'create_failed':
+        return c.json({ error: 'create_failed', detail: result.detail }, 500)
     }
-    if (result.code === 'squad_not_found') {
-      return c.json({ error: 'squad_not_found', squad_id: result.squad_id }, 404)
-    }
-    return c.json({ error: 'create_failed', detail: result.detail }, 500)
   }
 
+  if ('replayed' in result && result.replayed) {
+    return c.json({ ok: true, task_id: result.task_id, done_when: result.done_when, replayed: true }, 200)
+  }
   return c.json({ ok: true, task_id: result.task_id, done_when: result.done_when }, 201)
 })

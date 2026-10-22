@@ -32,6 +32,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'BILLING_PLAN_SECRET',
   'BLOBS',
   'BOOTSTRAP_OWNER_TOKEN',
+  'BOUNTY_INGEST_SECRET',
   'BRAND',
   'BUS',
   'BUS_TOKEN',

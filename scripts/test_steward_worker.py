@@ -87,7 +87,7 @@ def test_reissue_carries_external_source_forward_when_present(steward, monkeypat
 
     task = _base_task(external_source="linear:ENG")
     state = {"reissued": {}}
-    new_id = steward.reissue(task, "timed out", state)
+    new_id = steward.reissue(task, "timed out", state, set())
 
     assert new_id == "new-task-id"
     assert len(captured_calls) == 1
@@ -99,6 +99,25 @@ def test_reissue_carries_external_source_forward_when_present(steward, monkeypat
         "from a trusted local task (the exact amplifier PR #659's gate flagged)."
     )
     assert payload["external_source"] == "linear:ENG"
+
+
+@pytest.mark.parametrize("source", ["mumega-bounty:bty-001", "Mumega-Bounty:bty-001", "  MUMEGA-BOUNTY:x"])
+def test_reissue_never_copies_a_reserved_bounty_source(steward, monkeypatch, source):
+    """A reserved idempotency-key namespace must not be copied onto the reissued task (task_create
+    refuses it, and copying would let a reissue squat the bounty key). The copy still carries
+    NON-NULL external provenance: dropping it would launder the task into a trusted local one."""
+    captured: list[dict] = []
+
+    def fake_mcp(tool: str, args: dict) -> dict:
+        captured.append(args)
+        return {"task": {"id": "new-task-id", **args}}
+
+    monkeypatch.setattr(steward, "mcp", fake_mcp)
+    steward.reissue(_base_task(external_source=source), "timed out", {"reissued": {}}, set())
+    sent = captured[0]["external_source"]
+    assert sent.startswith("reissued:")
+    assert not sent.strip().lower().startswith("mumega-bounty:")
+    assert source.strip() in sent
 
 
 def test_reissue_of_a_local_task_does_not_forge_external_source(steward, monkeypatch):
@@ -115,7 +134,7 @@ def test_reissue_of_a_local_task_does_not_forge_external_source(steward, monkeyp
 
     task = _base_task()  # no external_source key at all — a local task
     state = {"reissued": {}}
-    steward.reissue(task, "timed out", state)
+    steward.reissue(task, "timed out", state, set())
 
     _, payload = captured_calls[0]
     assert "external_source" not in payload
@@ -135,7 +154,7 @@ def test_reissue_does_not_forward_a_falsy_external_source(steward, monkeypatch):
 
     task = _base_task(external_source=None)
     state = {"reissued": {}}
-    steward.reissue(task, "timed out", state)
+    steward.reissue(task, "timed out", state, set())
 
     _, payload = captured_calls[0]
     assert "external_source" not in payload

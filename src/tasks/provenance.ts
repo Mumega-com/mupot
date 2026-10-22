@@ -61,3 +61,19 @@ export function isBlankProvenance(value: string): boolean {
   }
   return true
 }
+
+/**
+ * Provenance namespaces that only ONE writer may stamp. `mumega-bounty:<id>` is the idempotency key of
+ * the bounty -> task binding (migration 0250, src/events/bounty-claimed.ts): a task carrying it is
+ * treated as THE task for that bounty, and a unique index makes it exclusive. If any other writer
+ * (MCP task_create, a steward reissue, an integration) could stamp it, that writer could squat a
+ * bounty's key before the real claim arrives (the claim would then be refused 409) or impersonate
+ * the bounty channel's trust marker. Matching is case-insensitive and trims, so 'Mumega-Bounty:x'
+ * cannot dodge it; migration 0250 also enforces the exact-case form in the database itself.
+ */
+export const RESERVED_PROVENANCE_PREFIXES: readonly string[] = ['mumega-bounty:']
+
+export function isReservedProvenance(value: string): boolean {
+  const v = value.trim().toLowerCase()
+  return RESERVED_PROVENANCE_PREFIXES.some((prefix) => v.startsWith(prefix))
+}

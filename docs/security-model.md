@@ -39,6 +39,7 @@ the files that enforce them.
 | Channel webhooks | Platform-specific signature/secret | `ChannelAdapter.verify` or adapter `respond` | Platform secrets in Worker secrets | Unknown/unverified platform returns `503` or `401` |
 | Hermes channel relay | `X-Relay-Secret` | Header equals `HERMES_RELAY_SECRET` | Worker secret | Missing secret returns `503`; bad header returns `401` |
 | Generic event ingest | HMAC of raw body | `x-mupot-signature` using `EVENT_INGEST_SECRET` | Worker secret | Missing secret returns `503`; bad signature returns `401` |
+| Bounty claim ingest (`type: bounty.claimed`) | HMAC of raw body | `x-mupot-signature` using the dedicated `BOUNTY_INGEST_SECRET` (the shared event secret is NOT accepted for this type, and this secret is not accepted for any other type) | Worker secret | Missing secret returns `503`; bad signature `401`; payload `destination_tenant` != this pot returns `403 wrong_tenant` |
 | GHL inbound | HMAC of raw body | `x-ghl-signature` using `GHL_WEBHOOK_SECRET` | Worker secret | Missing secret returns `503`; bad signature returns `401` |
 | GitHub inbound | HMAC of raw body | `x-hub-signature-256` using `GITHUB_WEBHOOK_SECRET` | Worker secret | Missing secret returns `503`; bad signature returns `401` |
 | Billing tier event | HMAC of raw body plus tenant/event ordering | `x-mupot-signature` using `BILLING_PLAN_SECRET` | Worker secret; last event state in D1 | Missing/bad secret returns `503`/`401`; wrong tenant returns `403` |
