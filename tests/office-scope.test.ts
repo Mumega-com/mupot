@@ -364,3 +364,41 @@ describe('office_meta.schema_version 1 -> 2', () => {
     expect(sql.all(`SELECT value FROM office_meta WHERE key = 'schema_version'`)).toEqual([{ value: '3' }]) // not downgraded
   })
 })
+
+describe('D1 cost: constant in the number of repositories an office holds (#2138 round 2)', () => {
+  function counting() {
+    const c = { serial: 0, batches: 0, statements: 0 }
+    const wrap = (st: any): any =>
+      new Proxy(st, {
+        get(t, k) {
+          if (k === 'bind') return (...a: unknown[]) => wrap(t.bind(...a))
+          if (k === 'all' || k === 'first' || k === 'run' || k === 'raw') return (...a: unknown[]) => (c.serial++, t[k](...a))
+          return t[k]
+        },
+      })
+    const db = {
+      prepare: (q: string) => wrap(harness.db.prepare(q)),
+      batch: (ss: any[]) => (c.batches++, (c.statements += ss.length), (harness.db as any).batch(ss)),
+    } as unknown as D1Database
+    return { db, c }
+  }
+
+  it('a sweep over 12 repositories is ONE batch of two statements, whatever the number of scopes', async () => {
+    const sql = await office(...Array.from({ length: 12 }, (_, i) => ({ item_id: `I${i}`, scope: `github:mumega/r${i}` })))
+    const { db, c } = counting()
+    await sweepRelinquishedScopes({ DB: db }, sql, 'p1', NOW)
+    expect(c).toEqual({ serial: 0, batches: 1, statements: 2 })
+  })
+
+  it('verifying one notice is ONE batch of two statements', async () => {
+    const { db, c } = counting()
+    expect(await verifyNoticeScope({ DB: db }, 'p1', { scope: 'github:mumega/widgets' })).toEqual({ ok: true })
+    expect(c).toEqual({ serial: 0, batches: 1, statements: 2 })
+  })
+
+  it('a sweep of an empty office asks D1 nothing', async () => {
+    const { db, c } = counting()
+    await sweepRelinquishedScopes({ DB: db }, await office(), 'p1', NOW)
+    expect(c).toEqual({ serial: 0, batches: 0, statements: 0 })
+  })
+})
