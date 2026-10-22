@@ -122,6 +122,13 @@ describe('REST wake-on-assign', () => {
     expect(enqueued).toBeGreaterThan(released)
   })
 
+  it('PATCH during a queue outage: the ledger row is committed before the bus event, so nothing is lost', async () => {
+    env = { ...env, BUS: { send: async () => { throw new Error('queue_down') } } } as unknown as Env
+    await call('PATCH', '/t1', { assignee_agent_id: 'ag' }).catch(() => undefined)
+    expect(h.sqlite.prepare('SELECT assignee_agent_id AS a FROM tasks WHERE id = ?').get('t1')).toEqual({ a: 'ag' })
+    expect(ledger()).toMatchObject([{ task_id: 't1', agent_id: 'ag', outcome: 'queued' }])
+  })
+
   it('PATCH a human assignee or a plain edit enqueues nothing', async () => {
     h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-s', 'm-sqadmin', 'squad', 'sq', 'member')`)
     expect((await call('PATCH', '/t1', { title: 'renamed' })).status).toBe(200)

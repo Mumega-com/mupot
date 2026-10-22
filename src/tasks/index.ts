@@ -1233,6 +1233,18 @@ tasksApp.patch('/:id', async (c) => {
       reason: 'human reassign via PATCH /tasks/:id', via: 'human_reassign' })).liftedAnything
   }
 
+  // Wake-on-assign inbox doorbell: right after the hold release and BEFORE the mirror / bus event, so a queue or mirror failure
+  // leaves the committed `queued` ledger row for the sweep. Same condition as the webhook ring below.
+  if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold) && isWakeableTaskStatus(next.status)) {
+    await enqueueAssignmentWake(c.env, {
+      taskId: next.id,
+      agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+      epoch: next.updated_at,
+      actorAgentId: auth.boundAgentId,
+      assignedBy: assignerLabel(auth),
+    })
+  }
+
   // A stale update must never reach the external mirror. The mirror remains
   // best-effort and update-only; project attribution does not alter its auth.
   next.github_issue_url = await mirrorTaskUpdate(c.env, next, {
@@ -1248,16 +1260,6 @@ tasksApp.patch('/:id', async (c) => {
   // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold (the agent is being told to resume).
   if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
     await scheduleTaskAssignedDoorbell(c.env, next.assignee_agent_id, next.id, { waitUntil: waitUntilFromContext(c), assignment: next.updated_at })
-    // Wake-on-assign inbox doorbell: after the hold release above, on the same condition as the webhook ring.
-    if (isWakeableTaskStatus(next.status)) {
-      await enqueueAssignmentWake(c.env, {
-        taskId: next.id,
-        agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
-        epoch: next.updated_at,
-        actorAgentId: auth.boundAgentId,
-        assignedBy: assignerLabel(auth),
-      })
-    }
   }
 
   // mupot#1592 NEW-1 — REST parity with the MCP task_update hook: freezes a

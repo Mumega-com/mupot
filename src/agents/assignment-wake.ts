@@ -61,9 +61,9 @@ export const ASSIGNMENT_WAKE_EVENT = 'assignment.wake'
 const SUMMARY_LIST_MAX = 10
 const TITLE_MAX = 100
 const NAME_MAX = 60
-const CLAIM_BATCH_MAX = 100
+const CLAIM_BATCH_MAX = 25
 const SWEEP_AGENTS_MAX = 5
-const PRUNE_BATCH_MAX = 200
+const PRUNE_BATCH_MAX = 25
 
 /** Task statuses in which a (new) assignee still has work to start. */
 const WAKEABLE_TASK_STATUSES: readonly string[] = ['open', 'in_progress', 'blocked', 'rejected']
@@ -147,8 +147,8 @@ export function cleanUntrustedText(raw: string, max: number): string {
  * ONE statement: INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING outcome. The conflict target is the idempotency
  * key (a replay inserts nothing), and the row's outcome is decided IN the statement from the agent's current window count
  * ('queued' under the cap, 'coalesced' at or over it), so concurrent assignments serialise on the write lock and cannot
- * overshoot the cap. A queued row also sends the `assignment.wake` bus job (no D1); a coalesced row sends it delayed to
- * when its window ends.
+ * overshoot the cap. A queued row also sends the `assignment.wake` bus job (no D1); the first coalesced row of a window sends ONE
+ * delayed job (to when the window ends); further held rows ride it or the sweep.
  */
 export async function enqueueAssignmentWake(
   env: Env,
@@ -170,20 +170,26 @@ export async function enqueueAssignmentWake(
          (id, tenant, task_id, agent_id, epoch, outcome, reason, assigned_by, created_at, updated_at)
        SELECT ?1, ?2, ?3, ?4, ?5,
               CASE WHEN c.n < ?8 THEN 'queued' ELSE 'coalesced' END,
-              CASE WHEN c.n < ?8 THEN NULL ELSE 'burst_cap' END,
+              CASE WHEN c.n < ?8 THEN NULL WHEN c.held = 0 THEN 'burst_cap_first' ELSE 'burst_cap' END,
               ?9, ?6, ?6
-         FROM (SELECT COUNT(*) AS n FROM task_assignment_wakes w
+         FROM (SELECT COUNT(*) AS n,
+                      (SELECT COUNT(*) FROM task_assignment_wakes h
+                        WHERE h.tenant = ?2 AND h.agent_id = ?4 AND h.outcome = 'coalesced' AND h.created_at > ?7) AS held
+                 FROM task_assignment_wakes w
                 WHERE w.tenant = ?2 AND w.agent_id = ?4
                   AND w.outcome IN ('queued', 'pending', 'sent') AND w.created_at > ?7) c
         WHERE 1
        ON CONFLICT (tenant, task_id, agent_id, epoch) DO NOTHING
-       RETURNING outcome`,
+       RETURNING outcome, reason`,
     )
       .bind(crypto.randomUUID(), tenant, input.taskId, input.agentId, input.epoch, nowIso, sinceIso, cap, input.assignedBy ?? null)
-      .first<{ outcome: 'queued' | 'coalesced' }>()
+      .first<{ outcome: 'queued' | 'coalesced'; reason: string | null }>()
     if (!row) return { outcome: 'duplicate' }
 
-    await sendWakeJob(env, tenant, input.agentId, nowIso, row.outcome === 'coalesced' ? ASSIGNMENT_WAKE_WINDOW_MS / 1000 + 5 : 0)
+    // A queued row gets an immediate job. Held rows share ONE delayed job per agent per window: only the first held row
+    // (decided inside the INSERT, so it is exact under concurrency) sends it; the others ride it or the sweep.
+    if (row.outcome === 'queued') await sendWakeJob(env, tenant, input.agentId, nowIso, 0)
+    else if (row.reason === 'burst_cap_first') await sendWakeJob(env, tenant, input.agentId, nowIso, ASSIGNMENT_WAKE_WINDOW_MS / 1000 + 5)
     return row.outcome === 'queued' ? { outcome: 'queued' } : { outcome: 'coalesced', reason: 'burst_cap' }
   } catch (error) {
     logWakeProblem('assignment_wake_enqueue_failed', { task_id: input.taskId, agent_id: input.agentId, reason: errorText(error) })
@@ -264,22 +270,28 @@ async function windowCount(env: Env, tenant: string, agentId: string, sinceIso: 
   return row?.n ?? 0
 }
 
-/** Claim-token fenced outcome write: a worker whose claim went stale cannot overwrite a newer one. */
-async function finish(
+/**
+ * Claim-token fenced outcome write for a group of claimed rows sharing one outcome (a worker whose claim went stale cannot
+ * overwrite a newer one). One statement per group of up to CLAIM_BATCH_MAX rows, not one per row.
+ */
+async function finishMany(
   env: Env,
-  row: ClaimedRow,
+  rows: readonly ClaimedRow[],
   token: string,
   outcome: 'sent' | 'summarized' | 'skipped' | 'failed',
   nowIso: string,
   extra: { reason?: string; seq?: number; bumpAttempts?: boolean } = {},
 ): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE task_assignment_wakes
-        SET outcome = ?3, reason = ?4, message_seq = ?5, updated_at = ?6, attempts = attempts + ?7
-      WHERE id = ?1 AND claim_token = ?2 AND outcome = 'pending'`,
-  )
-    .bind(row.id, token, outcome, extra.reason ?? null, extra.seq ?? null, nowIso, extra.bumpAttempts ? 1 : 0)
-    .run()
+  for (let i = 0; i < rows.length; i += CLAIM_BATCH_MAX) {
+    const chunk = rows.slice(i, i + CLAIM_BATCH_MAX)
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes
+          SET outcome = ?2, reason = ?3, message_seq = ?4, updated_at = ?5, attempts = attempts + ?6
+        WHERE claim_token = ?1 AND outcome = 'pending' AND id IN (${chunk.map((_, n) => `?${n + 7}`).join(', ')})`,
+    )
+      .bind(token, outcome, extra.reason ?? null, extra.seq ?? null, nowIso, extra.bumpAttempts ? 1 : 0, ...chunk.map((r) => r.id))
+      .run()
+  }
 }
 
 function singleBody(live: LiveTask): string {
@@ -341,11 +353,16 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
     return none
   }
   if (state.kind === 'hold') {
-    // Paused: nothing is dropped. Touching updated_at rotates this agent behind the others in the sweep's order.
+    // Paused: nothing is dropped. Queued / held rows stay held; EVERY undelivered row (failed and stale-pending ones too) gets
+    // updated_at bumped, so this agent rotates behind the others in the sweep's oldest-first order instead of starving them.
     await env.DB.prepare(
-      `UPDATE task_assignment_wakes SET outcome = 'coalesced', reason = ?3, updated_at = ?4
-        WHERE tenant = ?1 AND agent_id = ?2 AND outcome IN ('queued', 'coalesced')`,
-    ).bind(tenant, agentId, state.reason, nowIso).run()
+      `UPDATE task_assignment_wakes
+          SET outcome = CASE WHEN outcome IN ('queued', 'coalesced') THEN 'coalesced' ELSE outcome END,
+              reason = CASE WHEN outcome IN ('queued', 'coalesced') THEN ?3 ELSE reason END,
+              updated_at = ?4
+        WHERE tenant = ?1 AND agent_id = ?2
+          AND (outcome IN ('queued', 'coalesced', 'failed') OR (outcome = 'pending' AND updated_at < ?5))`,
+    ).bind(tenant, agentId, state.reason, nowIso, staleIso).run()
     return none
   }
 
@@ -383,44 +400,58 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
   }
 
   // Re-check every assignment at send time: still this agent's, still wakeable, not archived, not already dispatched.
+  // Two statements for the whole claimed batch, not two per row.
+  const taskIds = [...new Set(rows.map((r) => r.task_id))]
+  const inList = (offset: number) => taskIds.map((_, n) => `?${n + offset}`).join(', ')
+  const taskRows = await env.DB.prepare(
+    `SELECT t.id, t.title, t.status, t.assignee_agent_id, t.external_source, t.source_pot, p.name AS project_name,
+            ${TASK_NOT_ARCHIVED_SQL('t')} AS not_archived
+       FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+      WHERE t.id IN (${inList(1)})`,
+  )
+    .bind(...taskIds)
+    .all<{
+      id: string
+      title: string
+      status: string
+      assignee_agent_id: string | null
+      external_source: string | null
+      source_pot: string | null
+      project_name: string | null
+      not_archived: number
+    }>()
+  const tasks = new Map((taskRows.results ?? []).map((t) => [t.id, t]))
+  const dispatched = await env.DB.prepare(
+    `SELECT task_id, MAX(created_at) AS latest FROM task_dispatch_receipts
+      WHERE tenant = ?1 AND agent_id = ?2 AND task_id IN (${inList(3)}) GROUP BY task_id`,
+  )
+    .bind(tenant, agentId, ...taskIds)
+    .all<{ task_id: string; latest: string }>()
+  const latestDispatch = new Map((dispatched.results ?? []).map((d) => [d.task_id, d.latest]))
   const live: LiveTask[] = []
+  const skips = new Map<string, ClaimedRow[]>()
   for (const row of rows) {
-    const task = await env.DB.prepare(
-      `SELECT t.title, t.status, t.assignee_agent_id, t.external_source, t.source_pot, p.name AS project_name,
-              ${TASK_NOT_ARCHIVED_SQL('t')} AS not_archived
-         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
-        WHERE t.id = ?1 LIMIT 1`,
-    )
-      .bind(row.task_id)
-      .first<{
-        title: string
-        status: string
-        assignee_agent_id: string | null
-        external_source: string | null
-        source_pot: string | null
-        project_name: string | null
-        not_archived: number
-      }>()
+    const task = tasks.get(row.task_id)
     let skip: string | null = null
     if (!task) skip = 'task_not_found'
     else if (!task.not_archived) skip = 'task_archived'
     else if (task.assignee_agent_id !== agentId) skip = 'reassigned'
     else if (!isWakeableTaskStatus(task.status)) skip = 'task_not_wakeable'
-    else if (await dispatchLetterExists(env, tenant, row.task_id, agentId, row.epoch)) skip = 'dispatch_letter_exists'
+    else if ((latestDispatch.get(row.task_id) ?? '') >= row.epoch && latestDispatch.has(row.task_id)) skip = 'dispatch_letter_exists'
     if (skip || !task) {
-      await finish(env, row, token, 'skipped', nowIso, { reason: skip ?? 'task_not_found' })
+      const reason = skip ?? 'task_not_found'
+      skips.set(reason, [...(skips.get(reason) ?? []), row])
       continue
     }
     live.push({ row, title: task.title, projectName: task.project_name, externalSource: task.external_source, sourcePot: task.source_pot })
   }
+  for (const [reason, group] of skips) await finishMany(env, group, token, 'skipped', nowIso, { reason })
 
   // One entry per task: a task assigned twice in a row is announced once (the newest assignment represents it).
   const byTask = new Map<string, LiveTask>()
   for (const item of live) byTask.set(item.row.task_id, item)
   const primary = [...byTask.values()]
-  for (const item of live) {
-    if (byTask.get(item.row.task_id) !== item) await finish(env, item.row, token, 'summarized', nowIso, { reason: 'duplicate_task' })
-  }
+  await finishMany(env, live.filter((item) => byTask.get(item.row.task_id) !== item).map((item) => item.row), token, 'summarized', nowIso, { reason: 'duplicate_task' })
   if (primary.length === 0) return none
 
   // Webhook doorbell (flag-gated, fail-open, a no-op for an agent without one). Rung BEFORE the inbox-reader check: an agent
@@ -430,7 +461,7 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
   }
 
   if (!(await hasInboxReader(env, tenant, agentId))) {
-    for (const item of primary) await finish(env, item.row, token, 'skipped', nowIso, { reason: 'no_inbox_reader' })
+    await finishMany(env, primary.map((p) => p.row), token, 'skipped', nowIso, { reason: 'no_inbox_reader' })
     return none
   }
 
@@ -447,7 +478,7 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
     if (unread && !leased) {
       const age = now().getTime() - Date.parse(unread.created_at)
       if (age < ASSIGNMENT_WAKE_FOLD_MAX_AGE_MS) {
-        for (const item of primary) await finish(env, item.row, token, 'sent', nowIso, { seq: unread.seq, reason: 'folded' })
+        await finishMany(env, primary.map((p) => p.row), token, 'sent', nowIso, { seq: unread.seq, reason: 'folded' })
         return { delivered: primary.length, messages: 0 }
       }
       await env.DB.prepare(
@@ -479,19 +510,19 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
     )
     // request_id_conflict = this exact set already landed under a different body (a retry after a title edit): delivered.
     if (!sent.ok && sent.reason !== 'request_id_conflict') {
-      for (const item of primary) await finish(env, item.row, token, 'failed', nowIso, { reason: sent.reason, bumpAttempts: true })
+      await finishMany(env, primary.map((p) => p.row), token, 'failed', nowIso, { reason: sent.reason, bumpAttempts: true })
       logWakeProblem('assignment_wake_failed', { agent_id: agentId, count: primary.length, reason: sent.reason })
       return none
     }
     const seq = sent.ok ? sent.seq : undefined
-    for (const item of primary) await finish(env, item.row, token, 'sent', nowIso, { seq, reason: single ? undefined : 'summary' })
+    await finishMany(env, primary.map((p) => p.row), token, 'sent', nowIso, { seq, reason: single ? undefined : 'summary' })
     return { delivered: primary.length, messages: 1 }
   } catch (error) {
     // Leave every claimed row retryable and visible rather than 'pending' forever.
     const reason = errorText(error)
     logWakeProblem('assignment_wake_failed', { agent_id: agentId, count: primary.length, reason })
     try {
-      for (const item of primary) await finish(env, item.row, token, 'failed', nowIso, { reason, bumpAttempts: true })
+      await finishMany(env, primary.map((p) => p.row), token, 'failed', nowIso, { reason, bumpAttempts: true })
     } catch {
       // the stale-pending re-claim covers a ledger that cannot be written right now
     }
@@ -499,20 +530,9 @@ async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promis
   }
 }
 
-/** A dispatch letter (task_dispatch bridge / explicit dispatch) for this task and agent at or after this assignment. */
-async function dispatchLetterExists(env: Env, tenant: string, taskId: string, agentId: string, epoch: string): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 AS x FROM task_dispatch_receipts
-      WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND created_at >= ?4 LIMIT 1`,
-  )
-    .bind(tenant, taskId, agentId, epoch)
-    .first<{ x: number }>()
-  return row !== null
-}
-
 /**
- * task_dispatch carries its own letter: retire any not-yet-delivered doorbell for this task and agent so the assignee is
- * not told twice. Never throws.
+ * task_dispatch carries its own letter: retire any not-yet-delivered doorbell (queued, held or in flight) for this task and
+ * agent so the assignee is not told twice. Never throws.
  */
 export async function supersedeAssignmentWakesByDispatch(env: Env, taskId: string, agentId: string): Promise<void> {
   try {
@@ -520,7 +540,7 @@ export async function supersedeAssignmentWakesByDispatch(env: Env, taskId: strin
     if (!tenant) return
     await env.DB.prepare(
       `UPDATE task_assignment_wakes SET outcome = 'skipped', reason = 'dispatch_letter_exists', updated_at = ?4
-        WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND outcome IN ('queued', 'coalesced')`,
+        WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND outcome IN ('queued', 'coalesced', 'pending')`,
     ).bind(tenant, taskId, agentId, new Date().toISOString()).run()
   } catch (error) {
     logWakeProblem('assignment_wake_supersede_failed', { task_id: taskId, agent_id: agentId, reason: errorText(error) })

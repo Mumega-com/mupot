@@ -11,7 +11,7 @@ The assigning request must stay cheap (a 20-task router tick used to pay ~10 D1 
 
 | half | where | cost |
 |---|---|---|
-| **inline** `enqueueAssignmentWake` | the assigning request / tick, after the assignment committed | ONE conditional `INSERT ... ON CONFLICT DO NOTHING RETURNING outcome` into the ledger, then a queue send (no D1). Never throws, never touches the assignment. |
+| **inline** `enqueueAssignmentWake` | the assigning request / tick, after the assignment committed | ONE conditional `INSERT ... ON CONFLICT DO NOTHING RETURNING outcome` into the ledger, then a queue send (no D1). Written right after the assignment commits and BEFORE the mirror / bus event, so a queue outage leaves a committed `queued` row for the sweep. Never throws, never touches the assignment. |
 | **off-path** `processAssignmentWakes` | the queue consumer (`assignment.wake` job, `src/bus/consumer.ts`); `sweepAssignmentWakes` is the cron backstop | everything else: re-checks, reader lookup, fold or send |
 
 The `assignment.wake` job carries no authority: it is internal-only (`src/bus/internal-events.ts`; the shared emitter and
@@ -42,7 +42,7 @@ quote or backtick is removed, one line, bounded. A task from an external source 
 | `persistTaskUpdate` default (routine actions, any other caller) | `src/tasks/service.ts` | agent assignee changed and the task is open / in_progress / blocked / rejected |
 | `router_tick` | `src/router/engine.ts` | after the claim UPDATE (changes = 1); the claim is untouched |
 | concierge work-router `routeUnassignedWork` | `src/concierge/service.ts` | after the guarded UPDATE (changes = 1) |
-| `task_dispatch` | `src/mcp/index.ts` | **no doorbell of its own**: the dispatch letter is the notice, and any queued doorbell for the task is retired (`supersedeAssignmentWakesByDispatch`) |
+| `task_dispatch` | `src/mcp/index.ts` | **no doorbell of its own**: the dispatch letter is the notice, and any queued, held or in-flight doorbell for the task is retired (`supersedeAssignmentWakesByDispatch`) |
 | REST `POST /tasks` with `dispatch: true` | `src/tasks/index.ts` | **suppressed**: the request already wakes the assignee (`agent.wake`) |
 | `flight_dispatch` | `src/mcp/index.ts` | **no doorbell of its own**: it sends the `flight.dispatch/v1` envelope |
 
@@ -55,8 +55,8 @@ Members and humans are never rung. Assigning to yourself (`boundAgentId == assig
 - **Atomic cap.** The inline INSERT decides `queued` vs `coalesced` from the agent's window count IN the statement, so
   concurrent assignments serialise on the write lock: at most `ASSIGNMENT_WAKE_CAP` (5) queued per agent per 10 minutes,
   however many race. Only doorbell assignments count (peer messages and skipped / failed rows do not). Held rows are
-  delivered in ONE "You have K new assignments" message once the window has room; the queue job for a held row is delayed to
-  the end of its window and the sweep is the backstop.
+  delivered in ONE "You have K new assignments" message once the window has room; the FIRST held row of a window (decided inside the INSERT) sends
+  ONE queue job delayed to the end of that window; further held rows ride it, and the sweep is the backstop.
 - **At most one unread doorbell per agent.** While an unread doorbell is fresh (< 30 min, not leased), new assignments fold
   into it (`reason: folded`, no new inbox row); an older one is consumed and replaced. An agent that never reads its inbox
   therefore cannot fill the 1000-unread cap and starve dispatch / gate / peer messages.
@@ -70,9 +70,12 @@ Members and humans are never rung. Assigning to yourself (`boundAgentId == assig
 - **Fail-open, and the retry is real.** Nothing throws into the assignment. A failed doorbell is a visible `failed` row
   (`reason`, `attempts`), logged as `assignment_wake_failed`. The `assignment-wake` maintenance slot (`src/index.ts`) retries
   `failed` rows and crashed (`pending` > 2 min) claims up to 3 attempts, then leaves them visible.
+- **Off-path cost is batched.** A worker claims at most 25 rows, re-checks them with two statements (one task `IN (...)`, one
+  dispatch-receipt `GROUP BY`) and writes each outcome group with one fenced UPDATE: delivering 25 held rows is ~13 statements
+  (0.5 per row; it was 85, 3.4 per row, with per-row reads and writes).
 - **Ledger hygiene.** `sent` / `skipped` / `summarized` rows and exhausted `failed` rows are pruned after 7 days. The sweep
-  serves the 5 agents with the oldest undelivered rows per run (`INDEXED BY idx_task_assignment_wakes_sweep`); a held row that
-  cannot go yet is touched so its agent rotates to the back.
+  serves the 5 agents with the oldest undelivered rows per run (`INDEXED BY idx_task_assignment_wakes_sweep`); a paused agent's
+  held, failed and stale-pending rows, and a held row that cannot go yet, are touched so that agent rotates to the back.
 - **Webhook doorbell.** The worker rings `mupot.task.assigned` (same `<task>#<epoch>` ref as the existing sites) before the
   reader check, and the letter's `inbox.wake` shares that correlation: a webhook agent is POSTed once.
 

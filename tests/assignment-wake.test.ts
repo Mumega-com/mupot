@@ -391,11 +391,23 @@ describe('each assignment path enqueues exactly one doorbell', () => {
     expect(ledger({ task: 't1' })).toMatchObject([{ outcome: 'skipped', reason: 'dispatch_letter_exists' }])
   })
 
-  it('supersedeAssignmentWakesByDispatch retires queued rows', async () => {
+  it('supersedeAssignmentWakesByDispatch retires queued, held and in-flight (pending) rows', async () => {
     seedTask('t1', { assignee: 'ag-a' })
+    seedTask('t2', { assignee: 'ag-a' })
+    seedTask('t3', { assignee: 'ag-a' })
     await enqueueAssignmentWake(env, { taskId: 't1', agentId: 'ag-a', epoch: 'e1' })
+    for (const [task, outcome] of [['t2', 'coalesced'], ['t3', 'pending']]) {
+      h.sqlite.prepare(`INSERT INTO task_assignment_wakes (id, tenant, task_id, agent_id, epoch, outcome, claim_token, created_at, updated_at) VALUES (?, ?, ?, 'ag-a', 'e', ?, 'w', ?, ?)`)
+        .run(`w-${task}`, TENANT, task, outcome, T0.toISOString(), T0.toISOString())
+    }
+    for (const task of ['t1', 't2', 't3']) await supersedeAssignmentWakesByDispatch(env, task, 'ag-a')
+    expect(ledger().map((r) => [r.task_id, r.outcome, r.reason])).toEqual([
+      ['t1', 'skipped', 'dispatch_letter_exists'], ['t2', 'skipped', 'dispatch_letter_exists'], ['t3', 'skipped', 'dispatch_letter_exists'],
+    ])
+    // a delivered row is not rewritten
+    h.sqlite.exec(`UPDATE task_assignment_wakes SET outcome = 'sent', reason = NULL`)
     await supersedeAssignmentWakesByDispatch(env, 't1', 'ag-a')
-    expect(ledger({ task: 't1' })[0]).toMatchObject({ outcome: 'skipped', reason: 'dispatch_letter_exists' })
+    expect(ledger({ task: 't1' })[0].outcome).toBe('sent')
   })
 })
 
@@ -424,7 +436,9 @@ describe('the assigning request pays one statement per assignment', () => {
     expect(inline.length).toBeLessThanOrEqual(20 * 3)
     expect(sqls.filter((s) => /INSERT INTO agent_messages|FROM agent_messages/.test(s))).toEqual([]) // no send, no inbox read inline
     expect(inline.filter((s) => !/INSERT INTO task_assignment_wakes/.test(s))).toEqual([]) // no re-check, no send, inline
-    expect(jobs.filter((j) => j.type === 'assignment.wake')).toHaveLength(20)
+    // 20 ledger rows: 5 under the cap (one immediate job each) + 15 held, which share ONE delayed job
+    expect(ledger({ agent: 'ag-a' })).toHaveLength(20)
+    expect(jobs.filter((j) => j.type === 'assignment.wake')).toHaveLength(6)
   })
 
   it('a concierge routing tick likewise', async () => {
@@ -583,6 +597,23 @@ describe('burst cap (atomic) and coalescing', () => {
     expect(sent.slice(0, 5).every((s) => s.delay === undefined)).toBe(true)
     expect(sent[5].delay).toBeGreaterThanOrEqual(ASSIGNMENT_WAKE_WINDOW_MS / 1000)
   })
+
+  it('only the FIRST held row of a window sends the delayed job; further over-cap assignments send none', async () => {
+    const sent: Array<{ delay?: number }> = []
+    env = { ...env, BUS: { send: async (_e: BusEvent, o?: { delaySeconds?: number }) => { sent.push({ delay: o?.delaySeconds }) } } } as unknown as Env
+    for (let i = 0; i < 12; i++) await assign(`t${i}`, 'ag-a', i)
+    expect(sent.filter((x) => x.delay === undefined)).toHaveLength(5)
+    expect(sent.filter((x) => x.delay !== undefined)).toHaveLength(1)
+    expect(ledger({ agent: 'ag-a' }).filter((r) => r.outcome === 'coalesced')).toHaveLength(7)
+  })
+
+  it('concurrent over-cap assignments still send exactly one delayed job (the first is decided inside the INSERT)', async () => {
+    const sent: Array<{ delay?: number }> = []
+    env = { ...env, BUS: { send: async (_e: BusEvent, o?: { delaySeconds?: number }) => { sent.push({ delay: o?.delaySeconds }) } } } as unknown as Env
+    for (let i = 0; i < 20; i++) seedTask(`k${i}`, { assignee: 'ag-a' })
+    await Promise.all(Array.from({ length: 20 }, (_, i) => enqueueAssignmentWake(env, { taskId: `k${i}`, agentId: 'ag-a', epoch: `e${i}` }, { now: at(0) })))
+    expect(sent.filter((x) => x.delay !== undefined)).toHaveLength(1)
+  })
 })
 
 // ── at most one unread doorbell ──────────────────────────────────────────────────────────────────────────────────
@@ -656,6 +687,47 @@ describe('an agent that never reads its inbox cannot be used to fill it', () => 
     await processAssignmentWakes(env, 'ag-a', { now: at(60_000) })
     expect(doorbells('ag-a')).toHaveLength(2)
     expect(ledger({ task: 'l1' })[0].reason).not.toBe('folded')
+  })
+
+  const rawMessage = (id: string, from: string, kind: string, createdMs: number, extra: { lease?: string; dead?: string } = {}) =>
+    h.sqlite.prepare(
+      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at, lease_expires_at, dead_lettered_at)
+       VALUES (?, ?, 'ag-a', ?, 'm', ?, ?, ?, ?, ?)`,
+    ).run(id, TENANT, from, kind, `body ${id}`, new Date(T0.getTime() + createdMs).toISOString(), extra.lease ?? null, extra.dead ?? null)
+  const readAt = (id: string) => (h.sqlite.prepare('SELECT read_at FROM agent_messages WHERE id = ?').get(id) as { read_at: string | null }).read_at
+
+  it('replacing a stale doorbell consumes ONLY that doorbell: a peer request and an older leased doorbell beside it stay unread', async () => {
+    const stale = -(ASSIGNMENT_WAKE_FOLD_MAX_AGE_MS + 120_000)
+    rawMessage('leased-old', ASSIGNMENT_WAKE_SENDER, 'message', stale - 60_000, { lease: '2026-10-22T13:00:00.000Z' })
+    rawMessage('stale-doorbell', ASSIGNMENT_WAKE_SENDER, 'message', stale)
+    rawMessage('peer-request', 'sender', 'request', stale + 1000)
+    await assign('n0', 'ag-a', 0)
+    await processAssignmentWakes(env, 'ag-a', { now: at(0) })
+    expect(readAt('stale-doorbell')).not.toBeNull()
+    expect(readAt('peer-request')).toBeNull() // another sender's message is never consumed
+    expect(readAt('leased-old')).toBeNull() // a doorbell the agent is reading right now is never consumed
+    expect(doorbells('ag-a').filter((r) => r.read_at === null).map((r) => r.body).some((b) => b.includes('n0'))).toBe(true)
+  })
+
+  it('a dead-lettered doorbell is not a fold target: the new assignment gets its own message', async () => {
+    rawMessage('dead-doorbell', ASSIGNMENT_WAKE_SENDER, 'message', -60_000, { dead: T0.toISOString() })
+    await assign('d0', 'ag-a', 0)
+    await processAssignmentWakes(env, 'ag-a', { now: at(0) })
+    expect(ledger({ task: 'd0' })[0]).toMatchObject({ outcome: 'sent', reason: null })
+    expect(doorbells('ag-a').filter((r) => r.body.includes('d0'))).toHaveLength(1)
+  })
+
+  it('a request_id_conflict (the same assignment already landed under another body) counts as delivered, not failed', async () => {
+    await assign('q0', 'ag-a', 0)
+    await processAssignmentWakes(env, 'ag-a', { now: at(0) })
+    expect(doorbells('ag-a')).toHaveLength(1)
+    // a crash-and-re-claim of the same assignment after the title was edited: same request id, different body
+    h.sqlite.exec(`UPDATE agent_messages SET read_at = '${T0.toISOString()}' WHERE from_agent = '${ASSIGNMENT_WAKE_SENDER}'`)
+    h.sqlite.exec(`UPDATE tasks SET title = 'edited after the first send' WHERE id = 'q0'`)
+    h.sqlite.exec(`UPDATE task_assignment_wakes SET outcome = 'queued', claim_token = NULL, reason = NULL`)
+    await processAssignmentWakes(env, 'ag-a', { now: at(1000) })
+    expect(ledger({ task: 'q0' })[0].outcome).toBe('sent')
+    expect(doorbells('ag-a')).toHaveLength(1) // no second message
   })
 
   it('an agent with no inbox reader (in-Worker, webhook-only, dead seat) gets no inbox row', async () => {
@@ -879,7 +951,7 @@ describe('fail-open and retries', () => {
         get(target, prop, receiver) {
           if (prop !== 'prepare') { const v = Reflect.get(target, prop, receiver); return typeof v === 'function' ? v.bind(target) : v }
           return (sql: string) => {
-            if (/UPDATE task_assignment_wakes\s+SET outcome = \?3/.test(sql)) throw new Error('crashed_before_recording')
+            if (/UPDATE task_assignment_wakes\s+SET outcome = \?2/.test(sql)) throw new Error('crashed_before_recording')
             return target.prepare(sql)
           }
         },
@@ -912,6 +984,27 @@ describe('fail-open and retries', () => {
     expect(errors.some((e) => e.includes('assignment_wake_job_failed'))).toBe(true)
     await sweepAssignmentWakes(env)
     expect(doorbells('ag-a')).toHaveLength(1)
+  })
+
+  it('a queue outage after the commit loses nothing: the ledger row is written BEFORE the bus event and the sweep delivers it', async () => {
+    const healthy = env
+    env = { ...env, BUS: { send: async () => { throw new Error('queue_down') } } } as unknown as Env
+    // createTask: the task.created bus event throws, but the doorbell row was committed first
+    await expect(createTask(env, { squad_id: 'sq', title: 'Outage', done_when: DONE_WHEN, assignee_agent_id: 'ag-a', status: 'open' }, { skipMirror: true })).rejects.toThrow(/queue_down/)
+    const created = ledger({ agent: 'ag-a' })
+    expect(created).toHaveLength(1)
+    expect(created[0].outcome).toBe('queued')
+    // MCP task_update: the task.updated bus event throws, the doorbell row is already there
+    seedTask('u1', { assignee: null })
+    await invokeTool(orgAdmin(), env, 'task_update', { task_id: 'u1', assignee_agent_id: 'ag-b' }, mcp).catch(() => undefined)
+    expect(assignee('u1')).toBe('ag-b')
+    expect(ledger({ task: 'u1' })).toMatchObject([{ agent_id: 'ag-b', outcome: 'queued' }])
+    // the queue is back: the sweep (not a bus job) delivers both
+    env = healthy
+    const out = await sweepAssignmentWakes(env)
+    expect(out.delivered).toBe(2)
+    expect(doorbells('ag-a')).toHaveLength(1)
+    expect(doorbells('ag-b')).toHaveLength(1)
   })
 
   it('the worker and the sweep never throw (the whole ledger unreadable)', async () => {
@@ -967,6 +1060,48 @@ describe('ledger hygiene: retention, fairness, the scan index', () => {
     expect(doorbells('ag-b')).toEqual([])
     await sweepAssignmentWakes(env, { now: at(1000) })
     expect(doorbells('ag-b')).toHaveLength(1)
+  })
+
+  it('five paused agents with FAILED rows do not starve a healthy agent: it is served within two sweeps', async () => {
+    for (let i = 0; i < 5; i++) {
+      addAgentWithReader(`pf${i}`, 'paused')
+      insert(`failed${i}`, 'failed', 500_000 + i, `pf${i}`, 1)
+    }
+    seedTask('victim', { assignee: 'ag-b' })
+    insert('victim', 'queued', 1000, 'ag-b')
+    await sweepAssignmentWakes(env, { now: at(0) })
+    await sweepAssignmentWakes(env, { now: at(1000) })
+    expect(doorbells('ag-b')).toHaveLength(1)
+  })
+
+  it('five paused agents with stale PENDING rows do not starve a healthy agent either', async () => {
+    for (let i = 0; i < 5; i++) {
+      addAgentWithReader(`pp${i}`, 'paused')
+      h.sqlite.prepare(
+        `INSERT INTO task_assignment_wakes (id, tenant, task_id, agent_id, epoch, outcome, claim_token, attempts, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'e', 'pending', 'dead', 0, ?, ?)`,
+      ).run(`pend${i}`, TENANT, `pend${i}`, `pp${i}`, new Date(T0.getTime() - 900_000 - i).toISOString(), new Date(T0.getTime() - 900_000 - i).toISOString())
+    }
+    seedTask('victim', { assignee: 'ag-b' })
+    insert('victim', 'queued', 1000, 'ag-b')
+    await sweepAssignmentWakes(env, { now: at(0) })
+    await sweepAssignmentWakes(env, { now: at(1000) })
+    expect(doorbells('ag-b')).toHaveLength(1)
+  })
+
+  it('off-path cost: delivering 25 held rows is a constant handful of statements, and a claim takes at most 25 rows', async () => {
+    for (let i = 0; i < 30; i++) {
+      seedTask(`b${i}`, { assignee: 'ag-a' })
+      insert(`b${i}`, 'coalesced', 100_000 - i, 'ag-a')
+    }
+    sqls = []
+    const first = await processAssignmentWakes(env, 'ag-a', { now: at(0) })
+    expect(first.delivered).toBe(25)
+    expect(sqls.length).toBeLessThanOrEqual(20) // measured 13; was 85 (3.4 per row) with per-row re-checks and writes
+    const second = await processAssignmentWakes(env, 'ag-a', { now: at(1000) })
+    expect(second.delivered).toBe(0) // the window is full again (the first run's 25 count): the last 5 wait
+    await processAssignmentWakes(env, 'ag-a', { now: at(ASSIGNMENT_WAKE_WINDOW_MS + 60_000) })
+    expect(ledger({ agent: 'ag-a' }).every((r) => r.outcome === 'sent')).toBe(true)
   })
 
   it('the sweep scan uses the (tenant, outcome, agent_id, updated_at) index, not a table scan', () => {

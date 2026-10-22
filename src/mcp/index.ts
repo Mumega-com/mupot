@@ -2242,6 +2242,17 @@ const toolTaskUpdate: ToolSpec = {
       liftsHold = (await releaseExecutionHoldDetailed(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
         reason: 'human reassign via task_update', via: 'human_reassign' })).liftedAnything
     }
+    // Wake-on-assign inbox doorbell: right after the hold release and BEFORE the mirror / bus event, so a queue or mirror failure
+    // leaves the committed `queued` ledger row for the sweep. Same condition as the webhook ring below.
+    if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold) && isWakeableTaskStatus(next.status)) {
+      await enqueueAssignmentWake(env, {
+        taskId: next.id,
+        agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+        epoch: next.updated_at,
+        actorAgentId: auth.boundAgentId,
+        assignedBy: assignerLabel(auth),
+      })
+    }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
     })
@@ -2251,16 +2262,6 @@ const toolTaskUpdate: ToolSpec = {
     // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold.
     if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
       await scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil, assignment: next.updated_at })
-      // Wake-on-assign inbox doorbell: after the hold release above, on the same condition as the webhook ring.
-      if (isWakeableTaskStatus(next.status)) {
-        await enqueueAssignmentWake(env, {
-          taskId: next.id,
-          agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
-          epoch: next.updated_at,
-          actorAgentId: auth.boundAgentId,
-          assignedBy: assignerLabel(auth),
-        })
-      }
     }
     let gateWake: GateWakeOutcome | undefined
 

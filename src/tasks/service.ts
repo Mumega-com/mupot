@@ -1564,6 +1564,19 @@ export async function createTask(
   // actually landed before we emit "created" and return the task as success.
   assertWritten(taskInsert, 'tasks.insert')
 
+  // Wake-on-assign: record the doorbell in the ledger IMMEDIATELY after the insert, BEFORE the mirror and the bus event. If the
+  // queue (or the mirror) fails after this point, the committed `queued` row is still there and the cron sweep delivers it.
+  // Fail-open: a failed enqueue can never undo the create.
+  if (options.assignmentWake !== false && !options.skipEvent && task.assignee_agent_id && task.status === 'open') {
+    await enqueueAssignmentWake(env, {
+      taskId: task.id,
+      agentId: task.assignee_agent_id,
+      epoch: task.updated_at,
+      actorAgentId: options.assignmentWake?.actorAgentId ?? (options.actor?.kind === 'agent' ? options.actor.id : null),
+      assignedBy: options.assignmentWake?.assignedBy ?? (options.actor ? `${options.actor.kind}:${options.actor.id}` : null),
+    })
+  }
+
   // A task that ALREADY NAMES A HOME does not get a second one manufactured for it.
   //
   // mirrorTaskCreate resolves its destination from one tenant-wide GITHUB_REPO var, so
@@ -1622,16 +1635,6 @@ export async function createTask(
   }
 
   if (!options.skipEvent) await emitTaskEvent(env, 'task.created', task, options.actor)
-  // Wake-on-assign: fail-open and after the insert committed, so a failed doorbell can never undo the create.
-  if (options.assignmentWake !== false && !options.skipEvent && task.assignee_agent_id && task.status === 'open') {
-    await enqueueAssignmentWake(env, {
-      taskId: task.id,
-      agentId: task.assignee_agent_id,
-      epoch: task.updated_at,
-      actorAgentId: options.assignmentWake?.actorAgentId ?? (options.actor?.kind === 'agent' ? options.actor.id : null),
-      assignedBy: options.assignmentWake?.assignedBy ?? (options.actor ? `${options.actor.kind}:${options.actor.id}` : null),
-    })
-  }
   return task
 }
 
