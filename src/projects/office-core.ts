@@ -17,6 +17,7 @@
 
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { noticeOrder, type Notice } from './office-contract'
+import { projectsOwningRepo } from './office-repo-owner'
 
 /**
  * The slice of the Worker environment the office reads. Declared here (not `Env`) because the office runs in
@@ -169,8 +170,12 @@ export const OFFICE_SCHEMA = [
   // the SOURCE tool, not from D1, so rebuildWorkingSet leaves it alone and adapter.reconcile() refills it.
   // conflict_version: a same-instant, different-version notice that was held back (see noticeOrder 'tie'); it
   // names a version to refetch from the source, and is never trusted as current.
+  // scope: the canonical source scope the item belongs to (a repository key such as 'github:owner/repo'), with
+  // `connection` it says WHERE the item came from. D1 is the authority on whether this project still owns that scope:
+  // sweepRelinquishedScopes deletes the rows of a scope it no longer owns, and the read path serves only verified scopes.
   `CREATE TABLE IF NOT EXISTS office_items (
-     provider TEXT NOT NULL, connection TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+     provider TEXT NOT NULL, connection TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',
+     item_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
      version TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL, actor TEXT NOT NULL, updated_at TEXT NOT NULL,
      hash TEXT NOT NULL, last_event_id TEXT NOT NULL, conflict_version TEXT, applied_at TEXT NOT NULL,
      PRIMARY KEY (provider, connection, item_id))`,
@@ -178,15 +183,76 @@ export const OFFICE_SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_office_seen_seen_at ON office_seen (seen_at)`,
 ] as const
 
+/** Needs office_items.scope, which a v1 table only gets from migrateOfficeSchema: so it runs after it. The sweep lists distinct scopes and deletes by scope. */
+const OFFICE_SCHEMA_AFTER_MIGRATION = [
+  `CREATE INDEX IF NOT EXISTS idx_office_items_scope ON office_items (scope)`,
+] as const
+
 /**
  * Version of the office's own SQLite layout, kept in office_meta so a later change can detect what it is looking at
- * and migrate instead of guessing. Bump it WITH any change to OFFICE_SCHEMA that CREATE IF NOT EXISTS cannot express.
+ * and migrate instead of guessing. Bump it WITH any change to OFFICE_SCHEMA that CREATE IF NOT EXISTS cannot express,
+ * and add the step to `migrateOfficeSchema`.
+ *
+ *   1  office_items without `scope`
+ *   2  office_items.scope (repository scope, #2137 item 2)
  */
-export const OFFICE_SCHEMA_VERSION = '1'
+export const OFFICE_SCHEMA_VERSION = '2'
+
+/** Thrown when the stored layout is NEWER than this code knows: serving it would mean guessing. Fail closed. */
+export const OFFICE_SCHEMA_TOO_NEW = 'office_schema_too_new'
+
+function columnNames(sql: OfficeSql, table: string): string[] {
+  return sql.all(`PRAGMA table_info(${table})`).map((r) => String(r.name))
+}
+
+/**
+ * Bring an office created by an older layout up to date, in place. Decided from the actual columns as well as the
+ * stored version, so a layout whose version row is missing is still migrated. Idempotent.
+ *
+ * v1 -> v2: office_items gains `scope`. A v1 row has no recorded scope; GitHub item links name their repository
+ * (https://github.com/<owner>/<repo>/<pull|issues>/N), so the scope is read back from the link and the sweep then
+ * re-verifies it against D1 like any other. A row whose link yields no scope is deleted: unverifiable rows are not
+ * served, and the source (adapter.reconcile) refills the item. office_items is derived from the source tool, not from
+ * D1, so deleting a row loses nothing that cannot be re-read.
+ */
+function migrateOfficeSchema(sql: OfficeSql): void {
+  const stored = sql.all(`SELECT value FROM office_meta WHERE key = 'schema_version'`)[0]?.value
+  if (typeof stored === 'string' && Number(stored) > Number(OFFICE_SCHEMA_VERSION)) throw new Error(OFFICE_SCHEMA_TOO_NEW)
+  if (!columnNames(sql, 'office_items').includes('scope')) {
+    sql.exec(`ALTER TABLE office_items ADD COLUMN scope TEXT NOT NULL DEFAULT ''`)
+  }
+  const unscoped = sql.all(`SELECT provider, connection, item_id, url FROM office_items WHERE scope = ''`)
+  for (const row of unscoped) {
+    const scope = row.provider === 'github' ? githubScopeFromItemUrl(String(row.url)) : null
+    if (scope !== null) {
+      sql.exec(
+        'UPDATE office_items SET scope = ? WHERE provider = ? AND connection = ? AND item_id = ?',
+        scope, String(row.provider), String(row.connection), String(row.item_id),
+      )
+    } else {
+      sql.exec(
+        'DELETE FROM office_items WHERE provider = ? AND connection = ? AND item_id = ?',
+        String(row.provider), String(row.connection), String(row.item_id),
+      )
+    }
+  }
+  sql.exec(
+    `INSERT INTO office_meta (key, value) VALUES ('schema_version', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    OFFICE_SCHEMA_VERSION,
+  )
+}
+
+/** 'github:owner/repo' for https://github.com/owner/repo/(pull|issues)/N..., else null. Same fold as repoKeyFromUrl. */
+function githubScopeFromItemUrl(url: string): string | null {
+  const m = /^https:\/\/github\.com\/([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})\/(?:pull|issues)\/\d+/.exec(url)
+  return m ? `github:${m[1]!.toLowerCase()}/${m[2]!.toLowerCase()}` : null
+}
 
 export function ensureOfficeSchema(sql: OfficeSql): void {
   for (const ddl of OFFICE_SCHEMA) sql.exec(ddl)
-  sql.exec(`INSERT OR IGNORE INTO office_meta (key, value) VALUES ('schema_version', ?)`, OFFICE_SCHEMA_VERSION)
+  migrateOfficeSchema(sql)
+  for (const ddl of OFFICE_SCHEMA_AFTER_MIGRATION) sql.exec(ddl)
 }
 
 interface ProjectViewRow {
@@ -391,10 +457,11 @@ export function advanceCursor(sql: OfficeSql, provider: string, connection: stri
 function writeItem(sql: OfficeSql, n: Notice, nowIso: string, mode: 'insert' | 'replace'): void {
   sql.exec(
     `${mode === 'insert' ? 'INSERT' : 'INSERT OR REPLACE'} INTO office_items
-       (provider, connection, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, conflict_version, applied_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+       (provider, connection, scope, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, conflict_version, applied_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
     n.provider,
     n.connection,
+    n.scope,
     n.item_id,
     n.kind,
     n.state,
@@ -407,4 +474,81 @@ function writeItem(sql: OfficeSql, n: Notice, nowIso: string, mode: 'insert' | '
     n.event_id,
     nowIso,
   )
+}
+
+// ── repository scope: D1 decides what the office may keep and serve ──────────
+
+/** Scopes that name a repository, i.e. the ones D1 can vouch for (projects.repo_url / project_repos). Others are stored, not verified. */
+export function isRepoScope(scope: string): boolean {
+  return scope.startsWith('github:') || scope.startsWith('url:')
+}
+
+export type ScopeCheck =
+  | { ok: true }
+  | { ok: false; reason: 'scope_not_owned' | 'scope_unverifiable' }
+
+/**
+ * Does D1 say this project owns the repository a Notice is scoped to? Asked before the notice is applied, so an office
+ * never takes in an item for a repository it does not own, whatever the caller believed. A scope that is not a
+ * repository (Linear team) passes: nothing in D1 can contradict it yet. Ambiguous ownership (another project claims the
+ * repository too) still counts as owned here; intake is what refuses to route an ambiguous repository.
+ */
+export async function verifyNoticeScope(
+  env: Pick<OfficeEnv, 'DB'>,
+  projectId: string,
+  notice: Pick<Notice, 'scope'>,
+): Promise<ScopeCheck> {
+  if (!isRepoScope(notice.scope)) return { ok: true }
+  const found = await projectsOwningRepo(env.DB, notice.scope)
+  if (!found.ok) return { ok: false, reason: 'scope_unverifiable' }
+  return found.owners.includes(projectId) ? { ok: true } : { ok: false, reason: 'scope_not_owned' }
+}
+
+export interface ScopeSweepResult {
+  /** Items deleted because D1 says this project no longer owns their repository. */
+  purged: number
+  /** Repository scopes D1 could not be asked about; their items must not be served until it can. */
+  unverifiable: string[]
+}
+
+/**
+ * Drop every item whose repository this project no longer owns, per D1 (the authority), and report the scopes D1 could
+ * not answer for. Called on every wake and before every read, so a project that gave a repository up stops serving its
+ * items within one call, and the office rebuilds nothing from its own memory: whatever D1 stops vouching for goes.
+ * Only rows applied before the check began are deleted: an item that arrived while D1 was being asked was verified
+ * on its own (verifyNoticeScope) and is not this sweep's to remove.
+ */
+export async function sweepRelinquishedScopes(
+  env: Pick<OfficeEnv, 'DB'>,
+  sql: OfficeSql,
+  projectId: string,
+  nowMs: number,
+): Promise<ScopeSweepResult> {
+  const startIso = new Date(nowMs).toISOString()
+  const scopes = sql
+    .all(`SELECT DISTINCT scope FROM office_items WHERE scope != ''`)
+    .map((r) => String(r.scope))
+    .filter(isRepoScope)
+  let purged = 0
+  const unverifiable: string[] = []
+  for (const scope of scopes) {
+    const found = await projectsOwningRepo(env.DB, scope)
+    if (!found.ok) {
+      unverifiable.push(scope)
+      continue
+    }
+    if (found.owners.includes(projectId)) continue
+    const n = Number(sql.all('SELECT count(*) AS n FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)[0]?.n ?? 0)
+    sql.exec('DELETE FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)
+    purged += n
+  }
+  if (purged > 0) {
+    sql.exec(
+      `INSERT INTO office_meta (key, value) VALUES ('scope_purged', ?)
+       ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)`,
+      String(purged),
+      purged,
+    )
+  }
+  return { purged, unverifiable }
 }

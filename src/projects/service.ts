@@ -3,6 +3,7 @@ import { appliedReceiptStatement } from '../auth/elevation-receipt'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 import { projectSelectSql } from './columns'
+import { storedRepoKey } from './office-repo-owner'
 import { isSafeHttpsUrl, isValidWorkerName, slugFromProjectName } from './urls'
 import { assertWritten } from '../lib/receipt'
 
@@ -312,14 +313,14 @@ export async function createProject(
       `INSERT INTO projects
        (id, slug, name, description, goal, status, parent_project_id, target_date,
         cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
-        repo_url, worker_name, live_url, assigned_squad_id, deploy_status,
+        repo_url, repo_key, worker_name, live_url, assigned_squad_id, deploy_status,
         created_by_member_id, created_via_elevation_grant, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
       project.parent_project_id, project.target_date,
       project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
-      project.repo_url, project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
+      project.repo_url, storedRepoKey(project.repo_url), project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
       project.created_by_member_id, project.created_via_elevation_grant, project.created_at, project.updated_at,
     )
     // One batch = one transaction: the project row and its creator-squad edge
@@ -512,14 +513,14 @@ export async function updateProject(
     const updateStatement = env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
        target_date = ?, completion_proposed_by = ?,
-       repo_url = ?, worker_name = ?, live_url = ?, assigned_squad_id = ?,
+       repo_url = ?, repo_key = ?, worker_name = ?, live_url = ?, assigned_squad_id = ?,
        cycle_boundary_at = ?,
        updated_at = ?
        WHERE id = ? AND updated_at = ? AND status = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
       updated.parent_project_id, updated.target_date, updated.completion_proposed_by,
-      updated.repo_url, updated.worker_name, updated.live_url, updated.assigned_squad_id,
+      updated.repo_url, storedRepoKey(updated.repo_url), updated.worker_name, updated.live_url, updated.assigned_squad_id,
       updated.cycle_boundary_at,
       updated.updated_at,
       updated.id, existing.updated_at, existing.status,

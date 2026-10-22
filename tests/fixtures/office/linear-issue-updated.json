@@ -10,6 +10,7 @@
   "data": {
     "id": "5f0c7b9e-1111-4222-8333-444455556666",
     "identifier": "MUM-77",
+    "teamId": "team-mum",
     "title": "Doorbell contract",
     "priority": 2,
     "updatedAt": "2026-10-22T09:02:10.812Z"

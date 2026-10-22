@@ -1,5 +1,6 @@
 import type { Env, Project } from '../types'
 import { getProject, upsertProjectSquadAccess } from './service'
+import { storedRepoKey } from './office-repo-owner'
 
 export const CURSOR_SQUAD_SLUG = 'squad-cursor'
 export const CURSOR_SQUAD_ID = 'squad-cursor'
@@ -83,7 +84,7 @@ async function upsertClientProject(
     await env.DB.prepare(
       `UPDATE projects
           SET name = ?, description = ?, goal = ?,
-              repo_url = ?, worker_name = ?, live_url = ?,
+              repo_url = ?, repo_key = ?, worker_name = ?, live_url = ?,
               assigned_squad_id = ?, deploy_status = 'healthy',
               updated_at = ?
         WHERE id = ?`,
@@ -92,6 +93,7 @@ async function upsertClientProject(
       spec.description,
       spec.goal,
       spec.repo_url,
+      storedRepoKey(spec.repo_url),
       spec.worker_name,
       spec.live_url,
       squadId,
@@ -109,9 +111,9 @@ async function upsertClientProject(
     `INSERT INTO projects
      (id, slug, name, description, goal, status, parent_project_id, target_date,
       cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
-      repo_url, worker_name, live_url, assigned_squad_id, deploy_status,
+      repo_url, repo_key, worker_name, live_url, assigned_squad_id, deploy_status,
       created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, 0, NULL, NULL, ?, ?, ?, ?, 'healthy', ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, 0, NULL, NULL, ?, ?, ?, ?, ?, 'healthy', ?, ?)`,
   ).bind(
     spec.id,
     spec.slug,
@@ -119,6 +121,7 @@ async function upsertClientProject(
     spec.description,
     spec.goal,
     spec.repo_url,
+    storedRepoKey(spec.repo_url),
     spec.worker_name,
     spec.live_url,
     squadId,

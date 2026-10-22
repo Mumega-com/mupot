@@ -5,6 +5,10 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  NOTICE_CONTRACT_VERSION,
+  NOTICE_CONTRACT_VERSIONS_ACCEPTED,
+  JOINER_ALLOWED_FIELDS,
+  hasUnsafeTextAllowingJoiners,
   NOTICE_KINDS,
   NOTICE_STATES,
   buildNotice,
@@ -32,7 +36,7 @@ function fixture(name: string): unknown {
   return JSON.parse(readFileSync(join(__dirname, 'fixtures', 'office', name), 'utf8'))
 }
 
-const GH_SRC: NoticeSource = { tenant: 'pot-a', connection: 'gh-install-4242', eventId: '72d3162e-cc78-11e3-81ab-4c9367dc0958' }
+const GH_SRC: NoticeSource = { tenant: 'pot-a', connection: 'gh-install-4242', eventId: '72d3162e-cc78-11e3-81ab-4c9367dc0958', repoKey: 'github:mumega/mupot' }
 const LIN_SRC: NoticeSource = { tenant: 'pot-a', connection: 'linear-conn-1', eventId: 'lin-delivery-0001' }
 
 describe('GitHub pull_request.opened → Notice', () => {
@@ -40,8 +44,10 @@ describe('GitHub pull_request.opened → Notice', () => {
     const n = await githubNotice(GH_SRC, 'pull_request', fixture('github-pull-request-opened.json'))
     expect(n).not.toBeNull()
     expect(n).toMatchObject({
+      contract: NOTICE_CONTRACT_VERSION,
       tenant: 'pot-a',
       connection: 'gh-install-4242',
+      scope: 'github:mumega/mupot',
       provider: 'github',
       item_id: 'PR_kwDOExample2113',
       event_id: '72d3162e-cc78-11e3-81ab-4c9367dc0958',
@@ -106,8 +112,10 @@ describe('Linear Issue update → Notice', () => {
   it('maps every field of the contract', async () => {
     const n = await linearNotice(LIN_SRC, fixture('linear-issue-updated.json'))
     expect(n).toMatchObject({
+      contract: NOTICE_CONTRACT_VERSION,
       tenant: 'pot-a',
       connection: 'linear-conn-1',
+      scope: 'linear:team-mum',
       provider: 'linear',
       item_id: '5f0c7b9e-1111-4222-8333-444455556666',
       event_id: 'lin-delivery-0001',
@@ -156,7 +164,7 @@ describe('Linear Issue update → Notice', () => {
     const lin = await linearNotice(LIN_SRC, fixture('linear-issue-updated.json'))
     expect(Object.keys(gh ?? {}).sort()).toEqual(Object.keys(lin ?? {}).sort())
     expect(Object.keys(gh ?? {}).sort()).toEqual(
-      ['actor', 'connection', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'state', 'tenant', 'title', 'updated_at', 'url', 'version'],
+      ['actor', 'connection', 'contract', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'scope', 'state', 'tenant', 'title', 'updated_at', 'url', 'version'],
     )
     expect(NOTICE_KINDS).toContain(gh?.kind)
     expect(NOTICE_KINDS).toContain(lin?.kind)
@@ -165,7 +173,7 @@ describe('Linear Issue update → Notice', () => {
 
 describe('Notice hash', () => {
   const base: NoticeFields = {
-    tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e1', version: 'v',
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e1', version: 'v',
     kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
 
@@ -174,7 +182,7 @@ describe('Notice hash', () => {
     expect(await noticeHash({ ...base, event_id: 'e2' })).toBe(await noticeHash(base))
   })
 
-  it.each(['tenant', 'connection', 'provider', 'item_id', 'version', 'kind', 'url', 'title', 'actor', 'updated_at'] as const)(
+  it.each(['tenant', 'connection', 'scope', 'provider', 'item_id', 'version', 'kind', 'url', 'title', 'actor', 'updated_at'] as const)(
     'changes when %s changes',
     async (field) => {
       const changed = { ...base, [field]: field === 'provider' ? 'linear' : field === 'kind' ? 'issue' : `${base[field]}x` }
@@ -240,7 +248,7 @@ describe('ordering: an old webhook cannot overwrite newer state', () => {
 
 describe('buildNotice validates what it signs', () => {
   const ok: NoticeFields = {
-    tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
     kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
   const bad = (over: Record<string, unknown>) => buildNotice({ ...ok, ...over } as unknown as NoticeFields)
@@ -295,7 +303,7 @@ describe('state: open | closed | merged, mapped from the source', () => {
 
   it('state is part of the hash and of the strict key set; a bad state is refused', async () => {
     const f: NoticeFields = {
-      tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+      tenant: 't', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
       kind: 'pr', state: 'open', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     }
     expect(await noticeHash(f)).not.toBe(await noticeHash({ ...f, state: 'closed' }))
@@ -346,7 +354,7 @@ describe('title and actor lose control and bidi characters in the mapper (#2130)
     const payload = { ...base, pull_request: { ...base.pull_request, title: `${persian} ${family}` } }
     const n = await githubNotice(GH_SRC, 'pull_request', payload)
     expect(n?.title).toBe(`${persian} ${family}`)
-    expect(hasUnsafeText(n?.title ?? '')).toBe(false)
+    expect(hasUnsafeTextAllowingJoiners(n?.title ?? '')).toBe(false)
     expect((await checkNotice(n, Date.parse('2026-10-22T09:00:00Z'))).ok).toBe(true)
     // ...while the neighbouring invisible characters stay refused
     expect(stripUnsafeText('a\u200bb\u200c\u200dc\u202ed\u2060e')).toBe('ab\u200c\u200dcde')
@@ -362,7 +370,7 @@ describe('title and actor lose control and bidi characters in the mapper (#2130)
 
 describe('checkNotice: the strict boundary check (#2130)', () => {
   const fields: NoticeFields = {
-    tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
     kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
   }
   const NOW = Date.parse('2026-10-22T00:01:00.000Z')
@@ -469,9 +477,150 @@ describe('Doorbell envelope: pointers only', () => {
 
   it('a Notice is not a Doorbell and vice versa', async () => {
     const n: Notice = await buildNotice({
-      tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+      tenant: 't', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
       kind: 'pr', state: 'open', url: 'https://x.test/u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     expect(isDoorbell(n)).toBe(false)
+  })
+})
+
+describe('ZWNJ and ZWJ: allowed in title and actor only (#2137 item 4)', () => {
+  const ZWNJ = '\u200c'
+  const ZWJ = '\u200d'
+  const fields: NoticeFields = {
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+  }
+  const NOW = Date.parse('2026-10-22T00:01:00.000Z')
+
+  it('the allow-list is exactly title and actor', () => {
+    expect([...JOINER_ALLOWED_FIELDS].sort()).toEqual(['actor', 'title'])
+  })
+
+  it.each(['title', 'actor'] as const)('%s may carry ZWNJ and ZWJ, through the contract and the strict boundary check', async (key) => {
+    const value = `می${ZWNJ}خواهم \u{1F469}${ZWJ}\u{1F469}`
+    expect(noticeFieldsProblem({ ...fields, [key]: value })).toBeNull()
+    expect((await checkNotice(await buildNotice({ ...fields, [key]: value }), NOW)).ok).toBe(true)
+  })
+
+  it.each(['url', 'tenant', 'connection', 'item_id', 'event_id', 'version', 'scope'] as const)('%s refuses ZWNJ and ZWJ', async (key) => {
+    for (const j of [ZWNJ, ZWJ]) {
+      const value = key === 'url' ? `https://github.com/o/r/pull/1${j}2` : key === 'scope' ? `github:o/r${j}x` : `a${j}b`
+      expect(noticeFieldsProblem({ ...fields, [key]: value }), `${key} ${JSON.stringify(j)}`).toBe(key)
+    }
+  })
+
+  it('a hidden joiner cannot make two identifiers look alike: item_id with a joiner is refused, not folded', async () => {
+    await expect(buildNotice({ ...fields, item_id: `PR_kw${ZWJ}DO` })).rejects.toThrow('notice_invalid:item_id')
+  })
+
+  it('the strict check refuses them too (a hand-built notice with a valid hash)', async () => {
+    const bad = { ...fields, item_id: `i${ZWNJ}` }
+    const hash = await noticeHash(bad)
+    expect(await checkNotice({ ...bad, contract: NOTICE_CONTRACT_VERSION, hash }, NOW)).toEqual({ ok: false, problem: 'item_id' })
+  })
+
+  it('the helpers split exactly there: strict refuses joiners, the free-text variant does not, both refuse the rest', () => {
+    expect(hasUnsafeText(`a${ZWNJ}b`)).toBe(true)
+    expect(hasUnsafeText(`a${ZWJ}b`)).toBe(true)
+    expect(hasUnsafeTextAllowingJoiners(`a${ZWNJ}${ZWJ}b`)).toBe(false)
+    for (const bad of ['\u200b', '\u202e', '\u2060', '\ufeff', '\u0000', '\u2028']) {
+      expect(hasUnsafeText(`a${bad}b`)).toBe(true)
+      expect(hasUnsafeTextAllowingJoiners(`a${bad}b`)).toBe(true)
+    }
+  })
+
+  it('mappers: a joiner in the GitHub item id or link drops the event; in title and actor it survives', async () => {
+    const base = fixture('github-pull-request-opened.json') as Record<string, Record<string, unknown>>
+    const withPr = (over: Record<string, unknown>) => ({ ...base, pull_request: { ...base.pull_request, ...over } })
+    expect(await githubNotice(GH_SRC, 'pull_request', withPr({ node_id: `PR_kw${ZWJ}x` }))).toBeNull()
+    expect(await githubNotice(GH_SRC, 'pull_request', withPr({ html_url: `https://github.com/mumega/mupot/pull/${ZWNJ}7` }))).toBeNull()
+    expect((await githubNotice(GH_SRC, 'pull_request', withPr({ title: `a${ZWNJ}b` })))?.title).toBe(`a${ZWNJ}b`)
+    const actor = await githubNotice(GH_SRC, 'pull_request', { ...base, sender: { ...base.sender, login: `u${ZWJ}v` } })
+    expect(actor?.actor).toBe(`u${ZWJ}v`)
+  })
+})
+
+describe('Notice contract version (#2137 item 6)', () => {
+  const fields: NoticeFields = {
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+  }
+  const NOW = Date.parse('2026-10-22T00:01:00.000Z')
+
+  it('buildNotice stamps the current version, which the office accepts', async () => {
+    const n = await buildNotice(fields)
+    expect(n.contract).toBe(NOTICE_CONTRACT_VERSION)
+    expect(NOTICE_CONTRACT_VERSIONS_ACCEPTED).toContain(NOTICE_CONTRACT_VERSION)
+  })
+
+  it('the hash covers the version: the same fields under another version hash differently', async () => {
+    expect(await noticeHash(fields, 2)).not.toBe(await noticeHash(fields, 3))
+    expect(canonicalNoticeString(fields, 7).startsWith('[7,')).toBe(true)
+  })
+
+  it('pins the hash recipe: changing the field order, the key set or the encoding fails here, on purpose', async () => {
+    expect(canonicalNoticeString(fields)).toBe(
+      '[2,"pot-a","c","github:o/r","github","i","v","pr","open","https://github.com/o/r/pull/1","T","a","2026-10-22T00:00:00.000Z"]',
+    )
+    // sha-256 of that exact string, taken independently of the implementation (node:crypto)
+    expect(await noticeHash(fields)).toBe('4750251106e7bb3688140472107873fb83de97ecd2beeb010083037a0ef822dd')
+  })
+
+  it('an unknown version is refused with its own reason, even when everything else about the notice is valid', async () => {
+    const n = await buildNotice(fields)
+    for (const contract of [3, 99, 0, 1, -1, 2.5, '2', null, undefined, true]) {
+      expect(await checkNotice({ ...n, contract }, NOW), String(contract)).toEqual({ ok: false, problem: 'contract_unsupported' })
+    }
+    // ...including one a newer Worker signed correctly under ITS recipe
+    const future = { ...fields, contract: 3 }
+    expect(await checkNotice({ ...future, hash: await noticeHash(fields, 3) }, NOW)).toEqual({ ok: false, problem: 'contract_unsupported' })
+  })
+
+  it('a notice with no version (a Worker from before the field existed) is refused as contract_missing, not as "keys"', async () => {
+    const n = await buildNotice(fields)
+    const { contract: _c, ...noContract } = n
+    expect(await checkNotice(noContract, NOW)).toEqual({ ok: false, problem: 'contract_missing' })
+    const { contract: _c2, scope: _s, ...legacy } = n
+    expect(await checkNotice(legacy, NOW)).toEqual({ ok: false, problem: 'contract_missing' })
+  })
+
+  it('the version is read before the shape: an unknown version with extra keys is still named by its version', async () => {
+    const n = await buildNotice(fields)
+    expect(await checkNotice({ ...n, contract: 3, extra: 1 }, NOW)).toEqual({ ok: false, problem: 'contract_unsupported' })
+  })
+
+  it('an accepted version still gets the full check', async () => {
+    const n = await buildNotice(fields)
+    expect(await checkNotice({ ...n, extra: 1 }, NOW)).toEqual({ ok: false, problem: 'keys' })
+    expect(await checkNotice({ ...n, title: 'edited' }, NOW)).toEqual({ ok: false, problem: 'hash' })
+  })
+})
+
+describe('scope: the source scope an item belongs to (#2137 item 2)', () => {
+  const fields: NoticeFields = {
+    tenant: 'pot-a', connection: 'c', scope: 'github:o/r', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    kind: 'pr', state: 'open', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+  }
+
+  it('must be provider-prefixed, non-empty and whitespace-free', () => {
+    expect(noticeFieldsProblem(fields)).toBeNull()
+    for (const scope of ['', 'o/r', 'linear:team', 'github:', 'github: o/r', 'github:o/r\n', 'url:host/o/r']) {
+      expect(noticeFieldsProblem({ ...fields, scope }), JSON.stringify(scope)).toBe('scope')
+    }
+    expect(noticeFieldsProblem({ ...fields, scope: 'github:' + 'x'.repeat(NOTICE_LIMITS.scope) })).toBe('scope')
+  })
+
+  it('the GitHub mapper needs the routed repository key, and only a github one', async () => {
+    const pr = fixture('github-pull-request-opened.json')
+    expect(await githubNotice({ ...GH_SRC, repoKey: undefined }, 'pull_request', pr)).toBeNull()
+    expect(await githubNotice({ ...GH_SRC, repoKey: 'url:git.example/o/r' }, 'pull_request', pr)).toBeNull()
+    expect((await githubNotice({ ...GH_SRC, repoKey: 'github:o/other' }, 'pull_request', pr))?.scope).toBe('github:o/other')
+  })
+
+  it('the Linear mapper scopes by team and drops an event with no team', async () => {
+    const f = fixture('linear-issue-updated.json') as { data: Record<string, unknown> }
+    expect(await linearNotice(LIN_SRC, { ...f, data: { ...f.data, teamId: undefined } })).toBeNull()
+    expect((await linearNotice(LIN_SRC, { ...f, data: { ...f.data, teamId: undefined, team: { id: 'team-x' } } }))?.scope).toBe('linear:team-x')
   })
 })
