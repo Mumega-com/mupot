@@ -66,7 +66,7 @@ export const OBSERVED_FLOOR_TOOLS: ReadonlySet<string> = new Set([
   // squad_remember / project_remember are NOT here: they write the squad's/project's SHARED memory and there is no seat-scoped variant of them.
   // `remember` is the seat's own scope.
   'recall', 'remember', 'memory_recent', 'memory_get', 'squad_recall', 'project_recall', 'project_memory_get',
-  'task_list', 'task_board', 'task_get', 'kanban_board', 'task_create', 'task_update',
+  'task_list', 'task_board', 'task_get', 'task_brief', 'kanban_board', 'task_create', 'task_update',
   'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
   'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
   'join_squad', 'squad_join_request',

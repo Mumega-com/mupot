@@ -56,6 +56,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - Critical handoffs require ACK within 30s; routine within 60s.
 
 8. TASKS: READ ONE, CLOSE ONE
+   - START WITH 'task_brief' { task_id }: one compact context pack (project goal, what the team knows, related work, conventions, who approves what, open questions), every line with a [kind:id] handle to drill in.
    - Read a single task with 'task_get' { task_id }; a task you cannot read answers task_not_found.
    - A task you worked by hand (never dispatched) is closed by its assignee with 'task_submit_result' { task_id, result }; result must state "Artifact: <path>" and "SHA256: <64-hex>", and the task moves to review.
 

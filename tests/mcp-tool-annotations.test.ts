@@ -138,7 +138,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
     'project_wiki', 'project_wiki_get', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
     'routine_run_list', 'runner_list', 'secret_env_status', 'seed_draft', 'squad_member_list', 'squad_recall', 'status',
-    'supabase_query', 'supabase_schema', 'task_board', 'task_get', 'task_intake_audit', 'worktree_list',
+    'supabase_query', 'supabase_schema', 'task_board', 'task_brief', 'task_get', 'task_intake_audit', 'worktree_list',
   ]
   const ALL_DESTRUCTIVE = [
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
@@ -156,7 +156,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   const ALL_OPEN_WORLD = [
     'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',
     'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki', 'project_wiki_get', 'project_wiki_upsert', 'request_elevation', 'seed_attach_request',
-    'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
+    'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_brief', 'task_create',
     'task_submit_result', 'task_update', 'wake_agent',
   ]
   const names = Object.keys(TOOL_ANNOTATION_ROWS)

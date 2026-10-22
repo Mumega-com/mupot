@@ -207,7 +207,7 @@ function seatFailure(error: RuntimeSeatError): ToolOutcome {
   }
 }
 
-async function visibleObjective(
+export async function visibleObjective(
   env: Env,
   auth: AuthContext,
   objectiveId: string,
@@ -229,7 +229,7 @@ async function visibleObjective(
   return objective
 }
 
-async function visibleFlight(
+export async function visibleFlight(
   env: Env,
   auth: AuthContext,
   flightId: string,

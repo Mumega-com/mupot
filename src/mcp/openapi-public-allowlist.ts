@@ -139,6 +139,7 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'supabase_query',
   'supabase_schema',
   'task_board',
+  'task_brief',
   'task_create',
   'task_dispatch',
   'task_dispatch_runtime_receipt',
