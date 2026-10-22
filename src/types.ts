@@ -67,10 +67,10 @@ export interface Env {
   // Body-free seat-events channel: one hibernating WebSocket per fleet host (src/agents/seat-events.ts).
   // Optional binding; inert until REALTIME_SEAT_EVENTS=1.
   SEAT_EVENTS?: DurableObjectNamespace
-  // One Agents-SDK Durable Object per project (the "project back office", src/projects/project-office.ts).
-  // Optional binding; INERT unless PROJECT_OFFICE=1 (default off). Named PROJECT_OFFICE_DO because the
-  // PROJECT_OFFICE key below is the flag.
-  PROJECT_OFFICE_DO?: DurableObjectNamespace<import('./projects/project-office').ProjectOffice>
+  // One Durable Object per project (the "project back office"). The class lives in its OWN Worker
+  // (workers/project-office/), reached from here by a binding with script_name. Optional; INERT unless
+  // PROJECT_OFFICE=1 (default off). Named PROJECT_OFFICE_DO because the PROJECT_OFFICE key below is the flag.
+  PROJECT_OFFICE_DO?: DurableObjectNamespace
   // Durable task pipeline (issue #7, migration 0012).  Optional: only present
   // when the [[workflows]] binding is declared in wrangler.toml.  Code that
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the

@@ -180,12 +180,8 @@ const REAL_ENGINE = /createSqliteD1|DatabaseSync/
 // a hand-written stand-in for env.DB. Real-engine files also call `db.prepare(...)`, so
 // this is only consulted AFTER REAL_ENGINE has been ruled out.
 const MOCK_D1 = /\bprepare\s*[:(]/
-// The sanctioned path. Node pool: applyAllMigrations(). Workers pool (tests/composition/): the
-// same committed chain arrives as the TEST_MIGRATIONS binding (vitest.composition.config.ts runs
-// readD1Migrations over migrations/), applied by applyD1Migrations(db, env.TEST_MIGRATIONS). Only
-// that exact pairing counts: applyD1Migrations with any other migrations argument is NOT the
-// committed chain and stays a violation.
-const USES_HELPER = /applyAllMigrations\s*\(|applyD1Migrations\s*\(\s*[\w.]+\s*,\s*[\w.]*TEST_MIGRATIONS\s*\)/
+// The sanctioned path.
+const USES_HELPER = /applyAllMigrations\s*\(/
 
 /**
  * Which violating class does this file fall into, if any? Returns null when the rule does

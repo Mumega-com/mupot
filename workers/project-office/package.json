@@ -1,0 +1,34 @@
+{
+  "name": "mupot-project-office",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ProjectOffice: one Agents-SDK Durable Object per project, in its own Worker so the SDK never loads in the main mupot Worker.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --maxWorkers=2"
+  },
+  "dependencies": {
+    "agents": "0.29.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@cloudflare/workers-types": "^4.20260617.1",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.8",
+    "wrangler": "^4.102.0"
+  },
+  "license": "SEE LICENSE IN ../../LICENSE.md",
+  "overrides": {
+    "fast-uri": "^4.1.5",
+    "brace-expansion": "^5.0.9",
+    "postcss": "^8.5.23",
+    "ip-address": "^10.7.2",
+    "body-parser": "^2.2.3",
+    "undici": "7.29.1",
+    "nanoid": "^3.3.18",
+    "source-map-js": "^1.2.2",
+    "proxy-addr": "^2.0.8",
+    "vite": "8.1.6"
+  }
+}

@@ -15,9 +15,11 @@
 //   - Authority resolves in D1. A Doorbell carries {project, task_id, attempt, event, version, hash}
 //     and nothing a receiver could mistake for a grant.
 //   - `version` is OPAQUE and provider-defined (a PR head sha, an updated-at stamp, ...). It is
-//     comparable for EQUALITY within one (provider, item_id). ORDERING is decided only by
-//     `updated_at`, so an old webhook delivered late cannot overwrite newer state
-//     (see `isStale`).
+//     comparable for EQUALITY within one (provider, item_id). ORDERING is decided by `updated_at`;
+//     when two notices share a timestamp (GitHub's resolution is one second) the tie is broken by a
+//     fixed rule on `version`, so both delivery orders converge on the same held state
+//     (see `noticeOrder`). An old webhook delivered late cannot overwrite newer state, and anything
+//     that cannot be ordered is rejected rather than applied.
 
 // ── Notice ───────────────────────────────────────────────────────────────────
 
@@ -93,13 +95,69 @@ export async function noticeHash(f: NoticeFields): Promise<string> {
   return toHex(await crypto.subtle.digest('SHA-256', bytes))
 }
 
+/** Per-field caps. A Notice is a pointer, not a document: anything longer is refused, not truncated. */
+export const NOTICE_LIMITS = {
+  tenant: 128,
+  connection: 256,
+  item_id: 256,
+  event_id: 256,
+  version: 256,
+  url: 2048,
+  title: 1024,
+  actor: 256,
+} as const
+
+/**
+ * Why these fields are not a valid Notice, or null. `updated_at` must be the canonical UTC form
+ * (`Date#toISOString`): ordering and the hash both depend on one spelling per instant.
+ */
+export function noticeFieldsProblem(f: NoticeFields): string | null {
+  if (!isNoticeProvider(f.provider)) return 'provider'
+  if (!isNoticeKind(f.kind)) return 'kind'
+  for (const key of Object.keys(NOTICE_LIMITS) as (keyof typeof NOTICE_LIMITS)[]) {
+    const v: unknown = f[key]
+    if (typeof v !== 'string' || v.length === 0 || v.length > NOTICE_LIMITS[key]) return key
+  }
+  const t = typeof f.updated_at === 'string' ? Date.parse(f.updated_at) : Number.NaN
+  if (!Number.isFinite(t) || new Date(t).toISOString() !== f.updated_at) return 'updated_at'
+  return null
+}
+
 export async function buildNotice(f: NoticeFields): Promise<Notice> {
+  const problem = noticeFieldsProblem(f)
+  if (problem) throw new Error(`notice_invalid:${problem}`)
   return { ...f, hash: await noticeHash(f) }
 }
 
-/** True when `incoming` is not newer than what the office already holds for the same item. */
-export function isStale(held: Pick<Notice, 'updated_at'>, incoming: Pick<Notice, 'updated_at'>): boolean {
-  return Date.parse(incoming.updated_at) < Date.parse(held.updated_at)
+export type NoticeOrder = 'newer' | 'same' | 'older' | 'invalid'
+
+/**
+ * Order an incoming notice against what the office holds for the same item.
+ *   - an unparseable timestamp on either side is 'invalid' (never applied);
+ *   - a later `updated_at` is 'newer', an earlier one 'older';
+ *   - equal timestamps with equal versions are 'same' (a redelivery);
+ *   - equal timestamps with different versions are broken by plain string comparison of `version`:
+ *     arbitrary but total, so both arrival orders end on the same winner and neither silently overwrites.
+ */
+export function noticeOrder(
+  held: Pick<Notice, 'updated_at' | 'version'>,
+  incoming: Pick<Notice, 'updated_at' | 'version'>,
+): NoticeOrder {
+  const h = Date.parse(held.updated_at)
+  const i = Date.parse(incoming.updated_at)
+  if (!Number.isFinite(h) || !Number.isFinite(i)) return 'invalid'
+  if (i > h) return 'newer'
+  if (i < h) return 'older'
+  if (incoming.version === held.version) return 'same'
+  return incoming.version > held.version ? 'newer' : 'older'
+}
+
+/** True unless `incoming` is strictly newer than what is held. Fails closed: 'invalid' is stale. */
+export function isStale(
+  held: Pick<Notice, 'updated_at' | 'version'>,
+  incoming: Pick<Notice, 'updated_at' | 'version'>,
+): boolean {
+  return noticeOrder(held, incoming) !== 'newer'
 }
 
 // ── Adapter ──────────────────────────────────────────────────────────────────
@@ -182,22 +240,30 @@ export interface Doorbell {
   hash: string
 }
 
+/** Doorbell bounds. A pointer is short; anything bigger is not one. */
+export const DOORBELL_LIMITS = { project: 256, task_id: 128, version: 256, attempt: 1000 } as const
+
 export function isDoorbell(value: unknown): value is Doorbell {
-  if (typeof value !== 'object' || value === null) return false
-  const v = value as Record<string, unknown>
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const v = value as Record<string, unknown> // shape-checked key by key below
   const keys = Object.keys(v).sort().join(',')
   if (keys !== 'attempt,event,hash,project,task_id,version') return false
   return (
     typeof v.project === 'string' &&
     v.project.length > 0 &&
+    v.project.length <= DOORBELL_LIMITS.project &&
     typeof v.task_id === 'string' &&
     v.task_id.length > 0 &&
+    v.task_id.length <= DOORBELL_LIMITS.task_id &&
     typeof v.attempt === 'number' &&
     Number.isInteger(v.attempt) &&
     v.attempt >= 0 &&
+    v.attempt <= DOORBELL_LIMITS.attempt &&
     typeof v.event === 'string' &&
     (DOORBELL_EVENTS as readonly string[]).includes(v.event) &&
     typeof v.version === 'string' &&
+    v.version.length > 0 &&
+    v.version.length <= DOORBELL_LIMITS.version &&
     typeof v.hash === 'string' &&
     /^[0-9a-f]{64}$/.test(v.hash)
   )

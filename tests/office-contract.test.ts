@@ -9,8 +9,11 @@ import {
   buildNotice,
   canonicalNoticeString,
   isDoorbell,
+  DOORBELL_LIMITS,
+  NOTICE_LIMITS,
   isStale,
   noticeHash,
+  noticeOrder,
   type Doorbell,
   type Notice,
   type NoticeFields,
@@ -63,6 +66,21 @@ describe('GitHub pull_request.opened → Notice', () => {
     expect(JSON.stringify(n)).not.toContain('SECRET BODY')
   })
 
+  it.each(['labeled', 'unlabeled'])('follows label %s on a pull request and on an issue', async (action) => {
+    const pr = await githubNotice(GH_SRC, 'pull_request', { ...(fixture('github-pull-request-opened.json') as object), action })
+    expect(pr?.kind).toBe('pr')
+    const issue = await githubNotice(GH_SRC, 'issues', {
+      action,
+      issue: { node_id: 'I_1', html_url: 'https://github.com/o/r/issues/1', title: 'T', updated_at: '2026-10-22T08:00:00Z' },
+      sender: { login: 'x' },
+    })
+    expect(issue?.kind).toBe('issue')
+  })
+
+  it('actions are per event: `created` is a comment action, not a pull_request one', async () => {
+    expect(await githubNotice(GH_SRC, 'pull_request', { ...(fixture('github-pull-request-opened.json') as object), action: 'created' })).toBeNull()
+  })
+
   it.each([
     ['an event type the office does not follow', 'push', fixture('github-pull-request-opened.json')],
     ['an action it does not follow', 'pull_request', { ...(fixture('github-pull-request-opened.json') as object), action: 'review_requested' }],
@@ -101,6 +119,27 @@ describe('Linear Issue update → Notice', () => {
     ['a non-object payload', null],
   ])('returns null for %s', async (_label, payload) => {
     expect(await linearNotice(LIN_SRC, payload)).toBeNull()
+  })
+
+  it('maps a Comment by its issueId (the documented payload has no parent title) and copies no body', async () => {
+    const n = await linearNotice(LIN_SRC, fixture('linear-comment-created.json'))
+    expect(n).toMatchObject({
+      kind: 'comment',
+      item_id: 'c1c1c1c1-1111-4222-8333-444455556666',
+      title: 'Comment on issue 5f0c7b9e-1111-4222-8333-444455556666',
+      actor: 'Hadi',
+    })
+    expect(JSON.stringify(n)).not.toContain('COMMENT BODY')
+  })
+
+  it('a Comment with no issue reference at all is not a Notice', async () => {
+    const f = fixture('linear-comment-created.json') as { data: Record<string, unknown> }
+    expect(await linearNotice(LIN_SRC, { ...f, data: { ...f.data, issueId: undefined } })).toBeNull()
+  })
+
+  it('returns null for a payload whose fields exceed the Notice caps', async () => {
+    const f = fixture('linear-issue-updated.json') as { data: Record<string, unknown> }
+    expect(await linearNotice(LIN_SRC, { ...f, data: { ...f.data, title: 'x'.repeat(NOTICE_LIMITS.title + 1) } })).toBeNull()
   })
 
   it('both providers produce the same Notice key set (one contract)', async () => {
@@ -148,10 +187,68 @@ describe('Notice hash', () => {
 })
 
 describe('ordering: an old webhook cannot overwrite newer state', () => {
-  it('isStale compares updated_at only', () => {
-    expect(isStale({ updated_at: '2026-10-22T10:00:00Z' }, { updated_at: '2026-10-22T09:00:00Z' })).toBe(true)
-    expect(isStale({ updated_at: '2026-10-22T10:00:00Z' }, { updated_at: '2026-10-22T10:00:00Z' })).toBe(false)
-    expect(isStale({ updated_at: '2026-10-22T10:00:00Z' }, { updated_at: '2026-10-22T11:00:00Z' })).toBe(false)
+  const at = (updated_at: string, version = 'v1') => ({ updated_at, version })
+  const T10 = '2026-10-22T10:00:00.000Z'
+
+  it('orders by updated_at', () => {
+    expect(noticeOrder(at(T10), at('2026-10-22T09:00:00.000Z'))).toBe('older')
+    expect(noticeOrder(at(T10), at('2026-10-22T11:00:00.000Z'))).toBe('newer')
+    expect(isStale(at(T10), at('2026-10-22T09:00:00.000Z'))).toBe(true)
+    expect(isStale(at(T10), at('2026-10-22T11:00:00.000Z'))).toBe(false)
+  })
+
+  it('equal timestamp, equal version is a redelivery: stale, nothing to apply', () => {
+    expect(noticeOrder(at(T10, 'v1'), at(T10, 'v1'))).toBe('same')
+    expect(isStale(at(T10, 'v1'), at(T10, 'v1'))).toBe(true)
+  })
+
+  it('equal timestamp, different version is decided by a fixed rule, so both arrival orders converge', () => {
+    // GitHub timestamps have one-second resolution: two pushes in the same second share updated_at.
+    const a = at(T10, 'aaa111')
+    const b = at(T10, 'bbb222')
+    expect(noticeOrder(a, b)).toBe('newer')
+    expect(noticeOrder(b, a)).toBe('older')
+    // Whichever arrives first, the held version ends as 'bbb222'.
+    const heldAfter = (first: typeof a, second: typeof a) => (isStale(first, second) ? first : second)
+    expect(heldAfter(a, b).version).toBe('bbb222')
+    expect(heldAfter(b, a).version).toBe('bbb222')
+  })
+
+  it.each(['yesterday', '', 'Invalid Date', '2026-13-45T00:00:00Z'])('fails closed on an unparseable timestamp %j (either side)', (bad) => {
+    expect(noticeOrder(at(T10), at(bad))).toBe('invalid')
+    expect(noticeOrder(at(bad), at(T10))).toBe('invalid')
+    expect(isStale(at(T10), at(bad))).toBe(true)
+    expect(isStale(at(bad), at(T10))).toBe(true)
+  })
+})
+
+describe('buildNotice validates what it signs', () => {
+  const ok: NoticeFields = {
+    tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    kind: 'pr', url: 'https://x.test/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+  }
+  const bad = (over: Record<string, unknown>) => buildNotice({ ...ok, ...over } as unknown as NoticeFields)
+
+  it('accepts a well-formed notice', async () => {
+    expect((await buildNotice(ok)).hash).toMatch(/^[0-9a-f]{64}$/)
+  })
+  it.each([
+    ['provider', { provider: 'jirra' }],
+    ['kind', { kind: 'epic' }],
+    ['updated_at', { updated_at: 'yesterday' }],
+    ['updated_at', { updated_at: '2026-10-22T00:00:00Z' }], // parseable but not the canonical spelling
+    ['updated_at', { updated_at: '2026-10-22 00:00:00' }],
+    ['title', { title: '' }],
+    ['actor', { actor: '' }],
+    ['version', { version: '' }],
+    ['url', { url: 'x'.repeat(NOTICE_LIMITS.url + 1) }],
+    ['title', { title: 'x'.repeat(NOTICE_LIMITS.title + 1) }],
+    ['item_id', { item_id: 7 }],
+  ])('rejects a bad %s', async (field, over) => {
+    await expect(bad(over)).rejects.toThrow(`notice_invalid:${field}`)
+  })
+  it('accepts values exactly at the cap', async () => {
+    await expect(bad({ title: 'x'.repeat(NOTICE_LIMITS.title) })).resolves.toBeDefined()
   })
 })
 
@@ -163,6 +260,7 @@ describe('Doorbell envelope: pointers only', () => {
 
   it('accepts exactly {project, task_id, attempt, event, version, hash}', () => {
     expect(isDoorbell(ok)).toBe(true)
+    expect(isDoorbell({ ...ok, attempt: DOORBELL_LIMITS.attempt, version: 'v'.repeat(DOORBELL_LIMITS.version) })).toBe(true)
   })
 
   it.each([
@@ -174,6 +272,13 @@ describe('Doorbell envelope: pointers only', () => {
     ['a negative attempt', { ...ok, attempt: -1 }],
     ['a short hash', { ...ok, hash: 'abc' }],
     ['an empty task id', { ...ok, task_id: '' }],
+    ['an empty version', { ...ok, version: '' }],
+    ['an unbounded attempt', { ...ok, attempt: DOORBELL_LIMITS.attempt + 1 }],
+    ['a huge attempt', { ...ok, attempt: Number.MAX_SAFE_INTEGER }],
+    ['an over-long project', { ...ok, project: 'p'.repeat(DOORBELL_LIMITS.project + 1) }],
+    ['an over-long task id', { ...ok, task_id: 't'.repeat(DOORBELL_LIMITS.task_id + 1) }],
+    ['an over-long version', { ...ok, version: 'v'.repeat(DOORBELL_LIMITS.version + 1) }],
+    ['an uppercase hash', { ...ok, hash: 'A'.repeat(64) }],
     ['null', null],
     ['an array', [ok]],
   ])('rejects %s', (_label, v) => {
@@ -183,7 +288,7 @@ describe('Doorbell envelope: pointers only', () => {
   it('a Notice is not a Doorbell and vice versa', async () => {
     const n: Notice = await buildNotice({
       tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
-      kind: 'pr', url: 'u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00Z',
+      kind: 'pr', url: 'u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     expect(isDoorbell(n)).toBe(false)
   })

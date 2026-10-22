@@ -7,7 +7,7 @@
 // action, or a payload missing a field the contract requires). It never throws on hostile
 // input and never copies a body/description/comment text into the Notice.
 
-import { buildNotice, type Notice, type NoticeKind } from './office-contract'
+import { buildNotice, noticeFieldsProblem, type Notice, type NoticeFields, type NoticeKind } from './office-contract'
 
 export interface NoticeSource {
   /** Pot tenant slug, from the receiving pot's own config. Never taken from the payload. */
@@ -33,7 +33,17 @@ function isoOrNull(v: string | null): string | null {
   return v !== null && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : null
 }
 
-const GITHUB_ACTIONS: ReadonlySet<string> = new Set(['opened', 'reopened', 'edited', 'synchronize', 'closed', 'labeled', 'created'])
+// Per event: the actions the office follows. Label removal is a change like label addition.
+const GITHUB_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  pull_request: new Set(['opened', 'reopened', 'edited', 'synchronize', 'closed', 'labeled', 'unlabeled', 'ready_for_review']),
+  issues: new Set(['opened', 'reopened', 'edited', 'closed', 'labeled', 'unlabeled']),
+  issue_comment: new Set(['created', 'edited']),
+}
+
+/** Build the Notice, or null when the assembled fields are not a valid one (over-long, bad kind, bad time). */
+async function toNotice(f: NoticeFields): Promise<Notice | null> {
+  return noticeFieldsProblem(f) === null ? buildNotice(f) : null
+}
 
 /**
  * GitHub `pull_request` / `issues` / `issue_comment` deliveries.
@@ -43,7 +53,7 @@ const GITHUB_ACTIONS: ReadonlySet<string> = new Set(['opened', 'reopened', 'edit
 export async function githubNotice(src: NoticeSource, eventName: string, payload: unknown): Promise<Notice | null> {
   const p = rec(payload)
   const action = text(p, 'action')
-  if (!p || !action || !GITHUB_ACTIONS.has(action)) return null
+  if (!p || !action || !GITHUB_ACTIONS[eventName]?.has(action)) return null
   const actor = text(rec(p.sender), 'login')
   if (!actor) return null
 
@@ -75,7 +85,7 @@ export async function githubNotice(src: NoticeSource, eventName: string, payload
   const version = kind === 'pr' ? text(rec(item.head), 'sha') : updatedAt
   if (!version) return null
 
-  return buildNotice({
+  return toNotice({
     tenant: src.tenant,
     connection: src.connection,
     provider: 'github',
@@ -111,11 +121,18 @@ export async function linearNotice(src: NoticeSource, payload: unknown): Promise
   const updatedAt = isoOrNull(text(data, 'updatedAt'))
   const url = text(p, 'url') ?? text(data, 'url')
   const actor = text(rec(p.actor), 'name')
-  // A comment carries its parent issue's title under data.issue; an issue carries its own.
-  const title = kind === 'comment' ? text(rec(data.issue), 'title') : text(data, 'title')
+  // An issue carries its own title. A Linear Comment payload carries `issueId` (and sometimes a nested
+  // `issue`), not the parent's title; the Notice points at the thread, so fall back to naming it by id.
+  let title: string | null
+  if (kind === 'comment') {
+    const issueId = text(data, 'issueId') ?? text(rec(data.issue), 'id')
+    title = issueId ? (text(rec(data.issue), 'title') ?? `Comment on issue ${issueId}`) : null
+  } else {
+    title = text(data, 'title')
+  }
   if (!itemId || !updatedAt || !url || !actor || !title) return null
 
-  return buildNotice({
+  return toNotice({
     tenant: src.tenant,
     connection: src.connection,
     provider: 'linear',

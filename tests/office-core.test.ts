@@ -4,15 +4,17 @@
 
 import { DatabaseSync } from 'node:sqlite'
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { Env } from '../src/types'
 import {
   OFFICE_FUNCTIONS,
   isProjectOfficeEnabled,
   parseProjectOfficeName,
   projectOfficeName,
+  ensureOfficeSchema,
+  isPermanentBindingFailure,
   rebuildWorkingSet,
   verifyOfficeBinding,
   type OfficeBinding,
+  type OfficeEnv,
   type OfficeSql,
 } from '../src/projects/office-core'
 import { applyAllMigrations } from './helpers/migrations'
@@ -23,7 +25,7 @@ const NS = {} as DurableObjectNamespace // presence is all the flag check looks 
 
 let harness: SqliteD1Harness
 
-function envFor(over: Partial<Pick<Env, 'PROJECT_OFFICE' | 'PROJECT_OFFICE_DO'>> = {}): Pick<Env, 'DB' | 'TENANT_SLUG' | 'PROJECT_OFFICE' | 'PROJECT_OFFICE_DO'> {
+function envFor(over: Partial<Pick<OfficeEnv, 'PROJECT_OFFICE' | 'PROJECT_OFFICE_DO'>> = {}): OfficeEnv {
   return { DB: harness.db, TENANT_SLUG: TENANT, PROJECT_OFFICE: '1', PROJECT_OFFICE_DO: NS, ...over }
 }
 
@@ -49,6 +51,11 @@ beforeEach(() => {
     INSERT INTO tasks (id, squad_id, project_id, title, body, status) VALUES ('t-open', 'squad-a', 'p1', 'Open', 'b', 'open');
     INSERT INTO tasks (id, squad_id, project_id, title, body, status, gate_owner) VALUES ('t-rev', 'squad-a', 'p1', 'Review', 'b', 'review', 'gate:athena');
     INSERT INTO tasks (id, squad_id, project_id, title, body, status) VALUES ('t-done', 'squad-a', 'p1', 'Done', 'b', 'done');
+    INSERT INTO members (id, tenant, email, display_name, status) VALUES ('mem-1', '${TENANT}', 'm1@example.test', 'Member One', 'active');
+    INSERT INTO tasks (id, squad_id, project_id, title, body, status) VALUES ('t-appr', 'squad-a', 'p1', 'Approved', 'b', 'approved');
+    INSERT INTO tasks (id, squad_id, project_id, title, body, status, assignee_member_id) VALUES ('t-human', 'squad-a', 'p1', 'Human', 'b', 'in_progress', 'mem-1');
+    INSERT INTO tasks (id, squad_id, project_id, title, body, status) VALUES ('t-arch', 'squad-a', 'p1', 'Archived', 'b', 'open');
+    INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status) VALUES ('t-arch', '2026-10-01T00:00:00Z', 'x', 'mem-1', 'open');
     INSERT INTO tasks (id, squad_id, project_id, title, body, status) VALUES ('t-p2', 'squad-a', 'p2', 'Elsewhere', 'b', 'open');
   `)
 })
@@ -106,10 +113,14 @@ describe('destroy-and-rebuild (scaffold)', () => {
   const binding: Extract<OfficeBinding, { ok: true }> = { ok: true, tenant: TENANT, projectId: 'p1' }
   const NOW = '2026-10-22T10:00:00.000Z'
 
-  it('rebuilds only this project’s live work from D1', async () => {
+  it('rebuilds only this project’s live work from D1 (approved kept; done, archived and foreign excluded)', async () => {
     const { sql } = officeStore()
-    expect(await rebuildWorkingSet(envFor(), sql, binding, NOW)).toEqual({ tasks: 2 })
-    expect(sql.all('SELECT task_id FROM office_tasks ORDER BY task_id')).toEqual([{ task_id: 't-open' }, { task_id: 't-rev' }])
+    expect(await rebuildWorkingSet(envFor(), sql, binding, NOW)).toEqual({ tasks: 4 })
+    // live work: open, review, APPROVED (not terminal: it becomes done only after its post-verdict work), human-owned.
+    // not: done, archived, another project's.
+    expect(sql.all('SELECT task_id FROM office_tasks ORDER BY task_id')).toEqual([
+      { task_id: 't-appr' }, { task_id: 't-human' }, { task_id: 't-open' }, { task_id: 't-rev' },
+    ])
     expect(sql.all('SELECT project_id, name, goal, synced_at FROM office_project_view')).toEqual([
       { project_id: 'p1', name: 'Project One', goal: 'Ship', synced_at: NOW },
     ])
@@ -136,7 +147,7 @@ describe('destroy-and-rebuild (scaffold)', () => {
     await rebuildWorkingSet(envFor(), sql, binding, NOW)
     harness.sqlite.exec(`UPDATE tasks SET status = 'done' WHERE id = 't-open'`)
     await rebuildWorkingSet(envFor(), sql, binding, NOW)
-    expect(sql.all('SELECT task_id FROM office_tasks')).toEqual([{ task_id: 't-rev' }])
+    expect(sql.all('SELECT task_id FROM office_tasks ORDER BY task_id').map((r) => r.task_id)).toEqual(['t-appr', 't-human', 't-rev'])
   })
 
   it('does not rebuild dedup or cursors from D1 (those come from the source tool)', async () => {
@@ -150,5 +161,55 @@ describe('destroy-and-rebuild (scaffold)', () => {
 describe('the seven functions', () => {
   it('are the plan’s seven, in order', () => {
     expect([...OFFICE_FUNCTIONS]).toEqual(['notice', 'prepare', 'dispatch', 'followUp', 'gate', 'remember', 'report'])
+  })
+})
+
+describe('verify fails closed', () => {
+  it('a D1 error is verify_unavailable, not an exception and not ok', async () => {
+    const down = { prepare: () => { throw new Error('d1 down') } } as unknown as D1Database
+    expect(await verifyOfficeBinding({ ...envFor(), DB: down }, 'pot-a:p1')).toEqual({ ok: false, reason: 'verify_unavailable' })
+    const rejects = { prepare: () => ({ bind: () => ({ first: () => Promise.reject(new Error('boom')) }) }) } as unknown as D1Database
+    expect(await verifyOfficeBinding({ ...envFor(), DB: rejects }, 'pot-a:p1')).toEqual({ ok: false, reason: 'verify_unavailable' })
+  })
+  it('only the transient refusal is not permanent (the clock survives an outage, not an archive)', () => {
+    expect(isPermanentBindingFailure('verify_unavailable')).toBe(false)
+    for (const r of ['flag_off', 'bad_name', 'tenant_mismatch', 'project_not_found', 'project_archived', 'sub_agent'] as const) {
+      expect(isPermanentBindingFailure(r), r).toBe(true)
+    }
+  })
+  it('an undefined object name (an id minted without a name) is refused', async () => {
+    expect(await verifyOfficeBinding(envFor(), undefined)).toEqual({ ok: false, reason: 'bad_name' })
+  })
+  it('the SDK’s sub-agent identity prefix is never an office name, even for this pot', async () => {
+    expect(parseProjectOfficeName('cf-agents:v2:pot-a:p1')).toBeNull()
+    expect(await verifyOfficeBinding(envFor(), 'cf-agents:v2:p1')).toEqual({ ok: false, reason: 'bad_name' })
+  })
+})
+
+describe('working-set schema', () => {
+  it('scopes dedup and cursors by provider; the tick counter has its own table', () => {
+    const { sql } = officeStore()
+    ensureOfficeSchema(sql)
+    for (const p of ['github', 'linear']) {
+      sql.exec(`INSERT INTO office_seen (provider, connection, event_id, seen_at) VALUES (?, 'c', 'same', 'x')`, p)
+      sql.exec(`INSERT INTO office_cursor (provider, connection, cursor) VALUES (?, 'c', ?)`, p, p)
+    }
+    expect(sql.all('SELECT provider FROM office_seen ORDER BY provider')).toEqual([{ provider: 'github' }, { provider: 'linear' }])
+    expect(() => sql.exec(`INSERT INTO office_seen (provider, connection, event_id, seen_at) VALUES ('github', 'c', 'same', 'y')`)).toThrow()
+    expect(() => sql.exec(`INSERT INTO office_cursor (provider, connection, cursor) VALUES ('linear', 'c', 'z')`)).toThrow()
+    sql.exec(`INSERT INTO office_meta (key, value) VALUES ('ticks', '1')`)
+    expect(sql.all('SELECT value FROM office_meta')).toEqual([{ value: '1' }])
+  })
+  it('a human-owned task keeps its member, so it never looks unassigned', async () => {
+    const { sql } = officeStore()
+    await rebuildWorkingSet(envFor(), sql, { ok: true, tenant: TENANT, projectId: 'p1' }, '2026-10-22T10:00:00.000Z')
+    expect(sql.all(`SELECT assignee_agent_id, assignee_member_id FROM office_tasks WHERE task_id = 't-human'`)).toEqual([
+      { assignee_agent_id: null, assignee_member_id: 'mem-1' },
+    ])
+  })
+  it('rebuild excludes archived tasks (mutating the archive filter fails this)', async () => {
+    const { sql } = officeStore()
+    await rebuildWorkingSet(envFor(), sql, { ok: true, tenant: TENANT, projectId: 'p1' }, '2026-10-22T10:00:00.000Z')
+    expect(sql.all(`SELECT task_id FROM office_tasks WHERE task_id = 't-arch'`)).toEqual([])
   })
 })
