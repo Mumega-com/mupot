@@ -15,7 +15,7 @@
 
 import type { D1Database } from '@cloudflare/workers-types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { EVENT_REGISTRY, eventIngestApp, ingestEvent } from '../src/events/ingest'
+import { EVENT_REGISTRY, eventIngestApp, ingestEvent, normaliseEventSource } from '../src/events/ingest'
 import { createTask, ReservedProvenanceError } from '../src/tasks/service'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -209,25 +209,79 @@ describe('audience (destination_tenant)', () => {
 })
 
 describe('source', () => {
-  it.each([
+  const BAD_SOURCES: Array<[string, string]> = [
     ['too long', 'a'.repeat(101)],
     ['space', 'bad source'],
     ['newline', 'bad\nsource'],
     ['unicode lookalike', 'mumega\u2011com'],
     ['leading punctuation', '-mumega'],
-  ])('%s -> 400 invalid_source on both channels, nothing written', async (_n, source) => {
+  ]
+
+  // The dedicated bounty channel stays STRICT.
+  it.each(BAD_SOURCES)('bounty channel: %s -> 400 invalid_source, nothing written', async (_n, source) => {
     const bounty = await post({ ...envelope(payload()), source })
     expect(bounty.status).toBe(400)
     expect(bounty.json.error).toBe('invalid_source')
-    const lead = await post({ type: 'lead.captured', source, squad_id: SQUAD, payload: { lead_id: 'l' } })
-    expect(lead.status).toBe(400)
-    expect(lead.json.error).toBe('invalid_source')
     expect(count('tasks')).toBe(0)
   })
 
   it('exactly 100 chars is accepted', async () => {
     const res = await post({ ...envelope(payload()), source: 'a'.repeat(100) })
     expect(res.status).toBe(201)
+  })
+})
+
+describe('shared-channel source normalisation (non-breaking for existing producers)', () => {
+  const SAFE = /^[A-Za-z0-9._:-]{1,100}$/
+  const CASES: Array<[string, string, string]> = [
+    ['slash, at and spaces', 'crm/hooks @ viamar prod', 'crm_hooks___viamar_prod'],
+    ['150 chars', 'a'.repeat(150), 'a'.repeat(100)],
+    ['newline', 'bad\nsource', 'bad_source'],
+    ['unicode lookalike', 'mumega\u2011com', 'mumega_com'],
+  ]
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it.each(CASES)('%s -> 201, stored actor and external_source are bounded and clean', async (_n, source, expected) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await post({ type: 'lead.captured', source, squad_id: SQUAD, payload: { lead_id: 'l1' } })
+    expect(res.status).toBe(201)
+    const task = harness.sqlite.prepare('SELECT * FROM tasks WHERE id = ?').get(String(res.json.task_id)) as Record<string, unknown>
+    // The column is capped at 100 INCLUDING the 'event-ingest:' prefix (existing behaviour).
+    expect(task.external_source).toBe(`event-ingest:${expected}`.slice(0, 100))
+    expect(String(task.external_source).length).toBeLessThanOrEqual(100)
+    expect(String(task.external_source).slice('event-ingest:'.length)).toMatch(SAFE)
+    // actor.id lands in the audit trail / created_by: no raw source in any column of the task row.
+    expect(JSON.stringify(task)).not.toContain(source)
+    // The emitted task.created event carries actor.id / agent_id: both are the normalised value.
+    const emitted = busSend.mock.calls.map((c) => c[0] as { actor?: { id?: string }; agent_id?: string })
+    const created = emitted.find((e) => e.actor?.id !== undefined)
+    expect(created?.actor?.id).toBe(expected)
+    expect(created?.agent_id).toBe(expected)
+    // One structured warning with the original length only; none of the raw content.
+    const calls = warn.mock.calls.filter((c) => c[0] === 'source_normalised')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.[1]).toEqual({ original_length: source.length })
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(source)
+  })
+
+  it('a clean source is untouched and does not warn', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await post({ type: 'lead.captured', source: 'viamar-worker', squad_id: SQUAD, payload: { lead_id: 'l2' } })
+    expect(res.status).toBe(201)
+    expect(count('tasks', "external_source = 'event-ingest:viamar-worker'")).toBe(1)
+    expect(warn.mock.calls.filter((c) => c[0] === 'source_normalised')).toHaveLength(0)
+  })
+
+  it('whitespace-only source is still a missing_field (not normalised to unknown)', async () => {
+    const res = await post({ type: 'lead.captured', source: '   ', squad_id: SQUAD, payload: {} })
+    expect(res.status).toBe(400)
+    expect(res.json.error).toBe('missing_field')
+  })
+
+  it('normaliseEventSource: empty result defaults to unknown, always <=100 safe chars', () => {
+    expect(normaliseEventSource('')).toBe('unknown')
+    expect(normaliseEventSource('a b/c@d'.repeat(40))).toMatch(SAFE)
   })
 })
 

@@ -293,13 +293,16 @@ export async function ingestEvent(
 //
 // Body (JSON):
 //   { type, source, squad_id, payload }
-//   `source` must match SOURCE_RE (<=100 chars, [A-Za-z0-9._:-]): it becomes actor.id.
+//   `source` becomes actor.id, so it is always bounded (<=100 chars, [A-Za-z0-9._:-]):
+//     - bounty.claimed (dedicated secret): STRICT, must match EVENT_SOURCE_RE or 400 invalid_source.
+//     - every other type (shared channel): NORMALISED (disallowed chars -> '_', cut to 100,
+//       empty -> 'unknown') with one `source_normalised` warning, so existing producers keep working.
 //
 // Returns:
 //   201 { ok: true, task_id, done_when }       — task created
 //   200 { ok: true, task_id, done_when, replayed: true } — bounty.claimed replay (same task)
 //   400 { error: 'invalid_payload', issues }   — bounty.claimed schema violation
-//   400 { error: 'invalid_source' }
+//   400 { error: 'invalid_source' }            — bounty.claimed only (shared channel normalises instead)
 //   403 { error: 'wrong_tenant' }              — bounty.claimed destination_tenant != this pot
 //   409 { error: 'bounty_binding_conflict', reason } — bounty.claimed key held by a different binding
 //   400 { error: 'unmapped_event_type', ... }  — no registry entry, not a silent drop
@@ -316,6 +319,19 @@ export const EVENT_INGEST_MAX_BODY_BYTES = 256 * 1024
 
 /** `source` becomes actor.id and part of external_source: bounded length, plain identifier charset. */
 export const EVENT_SOURCE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/
+
+const EVENT_SOURCE_DISALLOWED_RE = /[^A-Za-z0-9._:-]/gu
+const EVENT_SOURCE_MAX_LEN = 100
+
+/**
+ * Shared-channel sources are not rejected (an existing producer may use '/', '@', spaces, or a long
+ * name); they are coerced into the bounded charset instead. The result is what becomes actor.id and
+ * external_source, so the safety property (<=100 chars of [A-Za-z0-9._:-]) holds either way.
+ */
+export function normaliseEventSource(raw: string): string {
+  const cleaned = raw.trim().replace(EVENT_SOURCE_DISALLOWED_RE, '_').slice(0, EVENT_SOURCE_MAX_LEN)
+  return cleaned.length === 0 ? 'unknown' : cleaned
+}
 
 function eventRouteEnv(env: Env): EventRouteEnv {
   // Same adapter pattern as GHL route (optional extras not in core Env).
@@ -436,8 +452,19 @@ eventIngestApp.post('/ingest', async (c) => {
   if (typeof body.squad_id !== 'string' || body.squad_id.trim().length === 0) {
     return c.json({ error: 'missing_field', field: 'squad_id' }, 400)
   }
-  if (!EVENT_SOURCE_RE.test(body.source.trim())) {
-    return c.json({ error: 'invalid_source', detail: 'source must be <=100 chars of [A-Za-z0-9._:-]' }, 400)
+  // Bounty channel stays strict. Shared channel normalises (non-breaking for existing producers).
+  let source = body.source.trim()
+  if (isBountyChannel) {
+    if (!EVENT_SOURCE_RE.test(source)) {
+      return c.json({ error: 'invalid_source', detail: 'source must be <=100 chars of [A-Za-z0-9._:-]' }, 400)
+    }
+  } else {
+    const normalised = normaliseEventSource(source)
+    if (normalised !== source) {
+      // Length only: the raw value is untrusted and may carry anything, so none of it is logged.
+      console.warn('source_normalised', { original_length: body.source.length })
+    }
+    source = normalised
   }
 
   const payload = body.payload !== null && typeof body.payload === 'object'
@@ -446,7 +473,7 @@ eventIngestApp.post('/ingest', async (c) => {
 
   const event: InboundEvent = {
     type: body.type.trim(),
-    source: body.source.trim(),
+    source,
     squad_id: body.squad_id.trim(),
     payload,
   }
@@ -473,7 +500,7 @@ eventIngestApp.post('/ingest', async (c) => {
     ? await ingestBountyClaimed(c.env, event.squad_id, event.payload, { actor, skipMirror: true })
     : await ingestEvent(c.env, event, {
       actor,
-      // event.source is validated above (EVENT_SOURCE_RE, <=100), so the column value is bounded
+      // event.source is validated (bounty) or normalised (shared) above, <=100, so the column value is bounded
       // (finding #5, PR #659).
       externalSource: `event-ingest:${event.source}`.slice(0, 100),
     })
