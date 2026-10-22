@@ -518,6 +518,10 @@ export default {
     // 14. Approval expiry (migrations/0232) — a gate ask unanswered 14 days after review entry moves
     //     review -> blocked (approval_expired | gate_owner_dead), receipted, assignee notified. Bounded
     //     per run + idempotent; dry run (counts only) unless APPROVAL_EXPIRY_ENFORCE=1. Rides this cron: no new trigger.
+    // 15. Wake-on-assign sweep (migration 0251) — the BACKSTOP for the `assignment.wake` bus job: retries failed doorbells
+    //     (bounded attempts), delivers held ones whose window reopened or whose agent resumed, prunes terminal ledger rows
+    //     older than 7 days. Bounded (5 agents per run), fail-open by contract. Rides this cron: no new trigger.
+    const { sweepAssignmentWakes } = await import('./agents/assignment-wake')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -533,6 +537,7 @@ export default {
       ['flight-watchdog', () => sweepStalledFlights(env)],
       ['gate-stall-watchdog', () => sweepStalledGateReviews(env)],
       ['approval-expiry', () => runApprovalExpiryTick(env)],
+      ['assignment-wake', () => sweepAssignmentWakes(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

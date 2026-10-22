@@ -247,6 +247,7 @@ import { SEAT_EVENT_GRANT_TOOLS } from './seat-event-grant'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
+import { assignerLabel, enqueueAssignmentWake, isWakeableTaskStatus, supersedeAssignmentWakesByDispatch } from '../agents/assignment-wake'
 import {
   dispatchDoorbellCorrelation,
   resolveDoorbellRecipients,
@@ -1352,7 +1353,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch, assignmentWake: { actorAgentId: auth.boundAgentId, assignedBy: assignerLabel(auth) } },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -2223,7 +2224,8 @@ const toolTaskUpdate: ToolSpec = {
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
       } else {
-        await persistTaskUpdate(env, existing, next)
+        // The wake-on-assign enqueue runs below, AFTER the execution-hold release (a same-agent reassignment that lifts a hold rings once).
+        await persistTaskUpdate(env, existing, next, false)
       }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -2239,6 +2241,17 @@ const toolTaskUpdate: ToolSpec = {
       // liftedAnything, not outcome === 'released': a counter-only release answers not_held yet un-sticks the task.
       liftsHold = (await releaseExecutionHoldDetailed(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
         reason: 'human reassign via task_update', via: 'human_reassign' })).liftedAnything
+    }
+    // Wake-on-assign inbox doorbell: right after the hold release and BEFORE the mirror / bus event, so a queue or mirror failure
+    // leaves the committed `queued` ledger row for the sweep. Same condition as the webhook ring below.
+    if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold) && isWakeableTaskStatus(next.status)) {
+      await enqueueAssignmentWake(env, {
+        taskId: next.id,
+        agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+        epoch: next.updated_at,
+        actorAgentId: auth.boundAgentId,
+        assignedBy: assignerLabel(auth),
+      })
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
@@ -3096,6 +3109,10 @@ const toolTaskDispatch: ToolSpec = {
       ).bind(message, env.TENANT_SLUG, receiptId).run()
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
+
+    // The dispatch carries its own letter: retire any not-yet-delivered wake-on-assign doorbell for this task so the
+    // assignee is not told twice (one statement; fail-open).
+    await supersedeAssignmentWakesByDispatch(env, task.id, task.assignee_agent_id)
 
     // Doorbell (mupot#1882): a (re-)dispatch tells the assignee to start. The bus path may ALSO ring it through the
     // inbox bridge (inbox.wake); the per-agent coalescing window turns the pair into one POST.

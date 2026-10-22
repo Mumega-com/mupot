@@ -915,6 +915,7 @@ export type BusEventType =
   // addon's /publish and /bridge and the /bus/emit allowlist all refuse it
   // (src/bus/internal-events.ts), and the consumer rebuilds every fact of the delivery from D1.
   | 'mcp.event.delivery'
+  | 'assignment.wake' // INTERNAL job (src/agents/assignment-wake.ts): deliver this agent's queued assignment doorbells
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
   | 'pot.self_serve_provisioned'

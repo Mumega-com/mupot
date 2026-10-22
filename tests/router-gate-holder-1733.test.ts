@@ -68,6 +68,8 @@ const tick = (dryRun = false) => runRouterTick(
   { squadId: SQUAD, dryRun },
   { memberId: OPERATOR },
 )
+// one agent.wake per assignment; the wake-on-assign doorbell letter adds its own message.created (assignment-wake.ts)
+const wakes = () => events.filter((e) => e.type === 'agent.wake')
 const assignee = () =>
   h.sqlite.prepare('SELECT assignee_agent_id AS a FROM tasks WHERE id = ?').get(TASK) as { a: string | null }
 
@@ -114,7 +116,7 @@ describe('router_tick gate-holder hold (#1733)', () => {
     const r = await tick()
     expect(r.decisions[0]).toMatchObject({ task_id: TASK, outcome: 'assigned', agent_id: WORKER })
     expect(assignee().a).toBe(WORKER)
-    expect(events).toHaveLength(1)
+    expect(wakes()).toHaveLength(1)
   })
 
   it('eligible independent human holder: wakes (normal-dispatch mode)', async () => {
@@ -135,7 +137,7 @@ describe('router_tick gate-holder hold (#1733)', () => {
     seed(g)
     const r = await tick()
     expect(r.decisions[0]?.outcome).toBe('assigned')
-    expect(events).toHaveLength(1)
+    expect(wakes()).toHaveLength(1)
   })
 })
 

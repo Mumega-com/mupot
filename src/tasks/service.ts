@@ -20,6 +20,7 @@ import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import type { VerdictAttribution } from '../auth/attached-ceiling'
 import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
+import { enqueueAssignmentWake, isWakeableTaskStatus, type AssignmentWakeContext } from '../agents/assignment-wake'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -292,6 +293,13 @@ export interface CreateTaskOptions {
    * server-side call, never read from request arguments, so no caller-supplied field can set it.
    */
   reservedProvenanceAuthority?: 'mumega-bounty-ingest'
+  /**
+   * Wake-on-assign (src/agents/assignment-wake.ts): an OPEN task created with an agent assignee enqueues ONE inbox doorbell
+   * for that agent, after the insert commits and unless `skipEvent` says another durable dispatch owns activation.
+   * `actorAgentId` = the agent making the call (assigning work to yourself is not a wake); `assignedBy` = who is shown as
+   * the assigner. `false` = the caller already wakes the assignee in this same request (e.g. REST `dispatch: true`).
+   */
+  assignmentWake?: AssignmentWakeContext | false
 }
 
 /**
@@ -596,6 +604,7 @@ export async function persistTaskUpdate(
   env: Env,
   existing: Task,
   next: Task,
+  wake: AssignmentWakeContext | false = {},
 ): Promise<void> {
   // Chokepoint enforcement for priority discipline (Issue #1040 Phase 2):
   // When a task is escalated or mutated to P0/P1, validate intake contract requirements
@@ -614,6 +623,22 @@ export async function persistTaskUpdate(
     mapTaskProjectUpdateError(error)
   }
   if (!result.meta?.changes) await throwTaskUpdateConflict(env, existing)
+  // Wake-on-assign: the assignee CHANGED to an agent and the task still has work to start. Fail-open, after the commit.
+  // `false`: the caller enqueues AFTER its own follow-ups (MCP / REST release an execution hold first), see task_update.
+  if (
+    wake !== false
+    && next.assignee_agent_id
+    && next.assignee_agent_id !== existing.assignee_agent_id
+    && isWakeableTaskStatus(next.status)
+  ) {
+    await enqueueAssignmentWake(env, {
+      taskId: next.id,
+      agentId: next.assignee_agent_id,
+      epoch: next.updated_at,
+      actorAgentId: wake.actorAgentId,
+      assignedBy: wake.assignedBy,
+    })
+  }
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -1538,6 +1563,19 @@ export async function createTask(
   // Receipt (#186): a 0-row INSERT resolves without throwing — verify the row
   // actually landed before we emit "created" and return the task as success.
   assertWritten(taskInsert, 'tasks.insert')
+
+  // Wake-on-assign: record the doorbell in the ledger IMMEDIATELY after the insert, BEFORE the mirror and the bus event. If the
+  // queue (or the mirror) fails after this point, the committed `queued` row is still there and the cron sweep delivers it.
+  // Fail-open: a failed enqueue can never undo the create.
+  if (options.assignmentWake !== false && !options.skipEvent && task.assignee_agent_id && task.status === 'open') {
+    await enqueueAssignmentWake(env, {
+      taskId: task.id,
+      agentId: task.assignee_agent_id,
+      epoch: task.updated_at,
+      actorAgentId: options.assignmentWake?.actorAgentId ?? (options.actor?.kind === 'agent' ? options.actor.id : null),
+      assignedBy: options.assignmentWake?.assignedBy ?? (options.actor ? `${options.actor.kind}:${options.actor.id}` : null),
+    })
+  }
 
   // A task that ALREADY NAMES A HOME does not get a second one manufactured for it.
   //

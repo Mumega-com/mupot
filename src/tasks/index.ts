@@ -16,6 +16,7 @@
 import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { scheduleTaskAssignedDoorbell, waitUntilFromContext } from '../agents/webhook-doorbell'
+import { assignerLabel, enqueueAssignmentWake, isWakeableTaskStatus } from '../agents/assignment-wake'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -711,6 +712,8 @@ tasksApp.post('/', async (c) => {
       // SquadCoordinatorDO /dispatch → wake-all-agents loop never fires for
       // planning work. dispatch:true keeps the event + the direct agent.wake.
       skipEvent: body.dispatch === false,
+      // dispatch:true also wakes the assignee itself (agent.wake, below): one notice, not two.
+      assignmentWake: body.dispatch === true ? false : { actorAgentId: auth.boundAgentId, assignedBy: assignerLabel(auth) },
     })
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -1212,7 +1215,8 @@ tasksApp.patch('/:id', async (c) => {
       next.status = outcome.task.status
       next.updated_at = outcome.task.updated_at
     } else {
-      await persistTaskUpdate(c.env, existing, next)
+      // The wake-on-assign enqueue runs below, AFTER the execution-hold release.
+      await persistTaskUpdate(c.env, existing, next, false)
     }
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -1227,6 +1231,18 @@ tasksApp.patch('/:id', async (c) => {
     // liftedAnything, not outcome === 'released': a counter-only release answers not_held yet un-sticks the task.
     liftsHold = (await releaseExecutionHoldDetailed(c.env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
       reason: 'human reassign via PATCH /tasks/:id', via: 'human_reassign' })).liftedAnything
+  }
+
+  // Wake-on-assign inbox doorbell: right after the hold release and BEFORE the mirror / bus event, so a queue or mirror failure
+  // leaves the committed `queued` ledger row for the sweep. Same condition as the webhook ring below.
+  if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold) && isWakeableTaskStatus(next.status)) {
+    await enqueueAssignmentWake(c.env, {
+      taskId: next.id,
+      agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+      epoch: next.updated_at,
+      actorAgentId: auth.boundAgentId,
+      assignedBy: assignerLabel(auth),
+    })
   }
 
   // A stale update must never reach the external mirror. The mirror remains

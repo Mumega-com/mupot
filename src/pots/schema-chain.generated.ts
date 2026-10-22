@@ -4406,9 +4406,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "bounty_task_bindings" },
     ],
   },
+  {
+    file: "0251_task_assignment_wakes.sql",
+    sha256: "5060533b271a04635da5aa5a67200441ce5bc2a20d28a82ed2f117b0ee101d57",
+    statements: [
+      "-- 0251 wake-on-assign ledger: one row per (task, agent, assignment epoch) that asked for an inbox doorbell.\n--\n-- Hadi 2026-10-22: mupot assigns work but never wakes the assignee. A plain inbox message DOES wake a seated agent\n-- (seatlink, the orca-mupot plugin, the webhook doorbell), so every assignment to an AGENT now enqueues one short\n-- doorbell (src/agents/assignment-wake.ts). The assigning request pays ONE conditional INSERT into this table; the\n-- send happens off the request path (an `assignment.wake` bus job, with a cron sweep as the backstop).\n-- The table is the idempotency key, the burst-cap ledger and the visible record of what happened to each doorbell.\n-- The authority stays in the task; this row carries none.\n--\n--   epoch        the assignment occurrence (the task's updated_at stamp at the assigning write, or a router/concierge\n--                stamp). A retry of the SAME assignment replays the same key and does nothing; a reassign A->B->A is a\n--                new epoch and rings again.\n--   outcome      queued      accepted, waiting for the off-path worker (counts toward the per-agent burst cap)\n--                coalesced   held: over the burst cap, or the agent is paused. Delivered later in ONE summary\n--                pending     claimed by a worker (claim_token), send in flight; re-claimable once stale\n--                sent        delivered (message_seq = the inbox row it rode in; reason 'folded' = it joined the agent's\n--                            still-unread doorbell instead of adding another row)\n--                summarized  a duplicate of a newer assignment of the same task, folded into that one\n--                skipped     not delivered, and will not be (reason: agent gone / inactive / archived / no inbox\n--                            reader / task moved on / dispatch letter already sent / self-assignment)\n--                failed      the doorbell could not be written (reason). The sweep retries it up to 3 attempts.\n--   claim_token  fences every outcome write of a worker: a stale worker cannot overwrite a newer claim.\n--   attempts     failed sends + crashed (stale pending) claims; the sweep stops at the ceiling.\n--   assigned_by  'member:<id>' | 'agent:<id>' | 'system:<name>' when known; shown in the doorbell.\n--\n-- Terminal rows (sent / skipped / summarized, and exhausted failed) are pruned after 7 days by the sweep.\n-- Additive: a new table and indexes, no existing object changes.\nCREATE TABLE IF NOT EXISTS task_assignment_wakes (\n  id           TEXT PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  task_id      TEXT NOT NULL,\n  agent_id     TEXT NOT NULL,\n  epoch        TEXT NOT NULL,\n  outcome      TEXT NOT NULL DEFAULT 'queued'\n               CHECK (outcome IN ('queued', 'coalesced', 'pending', 'sent', 'summarized', 'skipped', 'failed')),\n  reason       TEXT,\n  message_seq  INTEGER,\n  claim_token  TEXT,\n  attempts     INTEGER NOT NULL DEFAULT 0,\n  assigned_by  TEXT,\n  created_at   TEXT NOT NULL,\n  updated_at   TEXT NOT NULL,\n  UNIQUE (tenant, task_id, agent_id, epoch)\n);",
+      "\n-- the burst-cap window count and the per-agent claim\nCREATE INDEX IF NOT EXISTS idx_task_assignment_wakes_agent\n  ON task_assignment_wakes(tenant, agent_id, outcome, created_at);",
+      "\n-- the sweep's \"which agents have undelivered rows, oldest first\" scan (GROUP BY agent_id) and the retention prune\nCREATE INDEX IF NOT EXISTS idx_task_assignment_wakes_sweep\n  ON task_assignment_wakes(tenant, outcome, agent_id, updated_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_task_assignment_wakes_task\n  ON task_assignment_wakes(tenant, task_id);",
+    ],
+    objects: [
+      { type: "table", name: "task_assignment_wakes" },
+      { type: "index", name: "idx_task_assignment_wakes_agent" },
+      { type: "index", name: "idx_task_assignment_wakes_sweep" },
+      { type: "index", name: "idx_task_assignment_wakes_task" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "e8bf1f922f47a51448e478e28715441e9a8ac415aac70948b12ed062d7175c25"
+export const SCHEMA_CHAIN_DIGEST: string = "677fa5373480872127ab96227dea43a37bd1705798c5762a22c0a1337d2f3b8d"
