@@ -8,6 +8,7 @@ name = "mupot-project-office"
 main = "src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = false             # no public *.workers.dev URL: the office is reached only by the main Worker's Durable Object binding
 
 [vars]
 TENANT_SLUG = "mumega"          # must equal the main Worker's TENANT_SLUG: the office refuses any other tenant

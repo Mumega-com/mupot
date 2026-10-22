@@ -1,11 +1,13 @@
 // mupot — ProjectOffice: one Durable Object per project (the "project back office",
 // docs/plan-project-back-office-20261022), built on the Cloudflare Agents SDK, in its OWN Worker.
 //
-// STATUS: Phase 0 skeleton. INERT.
-//   - Gated by env.PROJECT_OFFICE (default off) AND the PROJECT_OFFICE_DO binding.
-//   - Nothing in the main Worker's request path, no cron and no workflow calls an office; the only caller
-//     is the test suite. With the flag off, every entry point refuses.
-//   - The seven functions are empty stubs. Their shape is fixed (office-contract.ts), their behaviour is Phase 1.
+// STATUS: Phase 1 slice 1. Still INERT unless PROJECT_OFFICE=1.
+//   - Gated by env.PROJECT_OFFICE (default off) AND the PROJECT_OFFICE_DO binding. With the flag off, every entry
+//     point refuses and the main Worker never calls an office.
+//   - `notice` is real: it validates a Notice at the RPC boundary (checkNotice: exact keys, recomputed hash, https
+//     link, no control or bidi text, no future-dated clock) and records it in the working set (applyNotice).
+//     It does not dispatch, brief, wake or write back.
+//   - The other six functions are still empty stubs. Their shape is fixed (office-contract.ts).
 //
 // SHAPE: a FACADE over an SDK Agent.
 //   The exported class `ProjectOffice` is a plain Durable Object whose public methods are exactly the office's
@@ -32,6 +34,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import { Agent, type Connection } from 'agents'
 import {
+  applyNotice,
   ensureOfficeSchema,
   isPermanentBindingFailure,
   rebuildWorkingSet,
@@ -39,11 +42,13 @@ import {
   type OfficeBinding,
   type OfficeEnv,
   type OfficeFunction,
+  type NoticeOutcome,
+  type NoticeResult,
   type OfficeSql,
   type OfficeStubResult,
   type RebuildResult,
 } from '../../../src/projects/office-core'
-import type { Notice } from '../../../src/projects/office-contract'
+import { checkNotice, type Notice } from '../../../src/projects/office-contract'
 
 /** A verified binding is trusted for this long, then re-read from D1 before the next function. */
 export const VERIFY_TTL_MS = 30_000
@@ -55,6 +60,21 @@ const WS_POLICY_VIOLATION = 1008
 const TICK_CALLBACK = 'followUpTick'
 
 type Unbound = Extract<OfficeStubResult, { error: 'unbound' }>
+
+/**
+ * Header prefixes the SDK reads to re-route a request or restore state (sub-agent forwarding, lifecycle props).
+ * They are for the SDK's own router, never for a caller: a request carrying any of them
+ * is answered 404 by the facade, before the binding check and before the SDK is built.
+ */
+export const SDK_CONTROL_HEADER_PREFIXES = ['x-cf-agents-', 'x-agents-'] as const
+
+export function carriesSdkControlHeader(headers: Headers): boolean {
+  for (const name of headers.keys()) {
+    const n = name.toLowerCase()
+    if (SDK_CONTROL_HEADER_PREFIXES.some((p) => n.startsWith(p))) return true
+  }
+  return false
+}
 
 function unbound(b: Extract<OfficeBinding, { ok: false }>): Unbound {
   return { ok: false, error: 'unbound', reason: b.reason }
@@ -140,12 +160,20 @@ class OfficeAgent extends Agent<OfficeEnv> {
     return rebuildWorkingSet(this.env, this.officeSql(), binding, new Date().toISOString())
   }
 
-  snapshot(): { project: Record<string, unknown>[]; tasks: Record<string, unknown>[] } {
+  recordNotice(notice: Notice, nowMs: number): NoticeOutcome {
+    return applyNotice(this.officeSql(), notice, nowMs)
+  }
+
+  snapshot(): { project: Record<string, unknown>[]; tasks: Record<string, unknown>[]; items: Record<string, unknown>[] } {
     const sql = this.officeSql()
     return {
       project: sql.all('SELECT project_id, name, status, goal FROM office_project_view'),
       tasks: sql.all(
         'SELECT task_id, status, assignee_agent_id, assignee_member_id, gate_owner FROM office_tasks ORDER BY task_id',
+      ),
+      items: sql.all(
+        `SELECT provider, connection, item_id, kind, state, version, url, title, actor, updated_at, conflict_version
+           FROM office_items ORDER BY provider, connection, item_id`,
       ),
     }
   }
@@ -198,9 +226,22 @@ export class ProjectOffice extends DurableObject<OfficeEnv> {
     return { ok: false, error: 'not_implemented', fn }
   }
 
-  /** 1. notice: ingest a normalized Notice from an adapter. */
-  async notice(_notice: Notice): Promise<OfficeStubResult> {
-    return this.stub('notice')
+  /**
+   * 1. notice: ingest a normalized Notice from an adapter.
+   * `input` is untrusted (any caller holding a stub can send anything), so it is checked here, not in the caller:
+   * exact key set, valid fields, recomputed hash, a clock not ahead of ours, and this pot's tenant. Order: binding,
+   * then shape, then the SDK half, so a malformed notice builds nothing and a foreign office serves nothing.
+   */
+  async notice(input: unknown): Promise<NoticeResult> {
+    const b = await this.requireBinding()
+    if (!b.ok) return unbound(b)
+    const now = Date.now()
+    const checked = await checkNotice(input, now)
+    if (!checked.ok) return { ok: false, error: 'invalid_notice', problem: checked.problem }
+    if (checked.notice.tenant !== b.tenant) return { ok: false, error: 'invalid_notice', problem: 'tenant' }
+    const o = await this.openAgent()
+    if ('error' in o) return o
+    return { ok: true, outcome: o.agent.recordNotice(checked.notice, now) }
   }
 
   /** 2. prepare: write the source-linked brief for an item. */
@@ -260,6 +301,9 @@ export class ProjectOffice extends DurableObject<OfficeEnv> {
   // ── platform handlers (not callable over RPC) ──────────────────────────────
 
   async fetch(request: Request): Promise<Response> {
+    // SDK control headers (sub-agent forwarding, lifecycle props, room/namespace overrides) are for the SDK's own
+    // router. A caller sending one is refused here, with the same body as any other refusal.
+    if (carriesSdkControlHeader(request.headers)) return Response.json({ error: 'not_found' }, { status: 404 })
     const b = await this.requireBinding()
     // Refused (flag off, wrong tenant, unknown or archived project): no SDK, no tables, no detail.
     if (!b.ok) return Response.json({ error: 'not_found' }, { status: 404 })

@@ -2,20 +2,21 @@
 //
 // The office class lives in its own Worker (workers/project-office/); the main Worker would hold a Durable
 // Object binding with `script_name` pointing at it (documented, commented out, in wrangler.example.toml).
-// Nothing in the main Worker calls getProjectOffice() in Phase 0; the only caller is the test suite.
+// The one production caller is office-intake.ts (GitHub webhook -> notice), behind the same flag.
 
 import type { Notice } from './office-contract'
 import {
   isProjectOfficeEnabled,
   projectOfficeName,
   type OfficeEnv,
+  type NoticeResult,
   type OfficeStubResult,
   type RebuildResult,
 } from './office-core'
 
 /** The RPC surface of an office: exactly these methods, nothing inherited. */
 export interface ProjectOfficeHandle {
-  notice(notice: Notice): Promise<OfficeStubResult>
+  notice(notice: Notice): Promise<NoticeResult>
   prepare(): Promise<OfficeStubResult>
   dispatch(): Promise<OfficeStubResult>
   followUp(): Promise<OfficeStubResult>

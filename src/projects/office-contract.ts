@@ -15,11 +15,15 @@
 //   - Authority resolves in D1. A Doorbell carries {project, task_id, attempt, event, version, hash}
 //     and nothing a receiver could mistake for a grant.
 //   - `version` is OPAQUE and provider-defined (a PR head sha, an updated-at stamp, ...). It is
-//     comparable for EQUALITY within one (provider, item_id). ORDERING is decided by `updated_at`;
-//     when two notices share a timestamp (GitHub's resolution is one second) the tie is broken by a
-//     fixed rule on `version`, so both delivery orders converge on the same held state
-//     (see `noticeOrder`). An old webhook delivered late cannot overwrite newer state, and anything
+//     comparable for EQUALITY within one (provider, item_id). ORDERING is decided by `updated_at`.
+//     When two notices share a timestamp (GitHub's resolution is one second) but carry different
+//     versions, `version` is attacker-influenceable (a head sha can be ground), so it is NEVER used to
+//     pick a winner: the order is 'tie', the holder keeps what it has and records the competing version
+//     for a refetch from the source (see `noticeOrder`). An old webhook delivered late cannot overwrite
+//     newer state, a future-dated `updated_at` is refused (see `NOTICE_MAX_FUTURE_SKEW_MS`), and anything
 //     that cannot be ordered is rejected rather than applied.
+//   - Every text field is data from a source tool a stranger may write to. Control, format and bidi
+//     characters are refused (mappers strip them from title and actor first), and `url` must be https.
 
 // ── Notice ───────────────────────────────────────────────────────────────────
 
@@ -28,6 +32,10 @@ export type NoticeProvider = (typeof NOTICE_PROVIDERS)[number]
 
 export const NOTICE_KINDS = ['issue', 'pr', 'comment', 'deadline'] as const
 export type NoticeKind = (typeof NOTICE_KINDS)[number]
+
+/** Lifecycle of the item in the source tool. Part of the hash: a close at the same instant is a different notice. */
+export const NOTICE_STATES = ['open', 'closed', 'merged'] as const
+export type NoticeState = (typeof NOTICE_STATES)[number]
 
 export interface Notice {
   /** Pot tenant slug. Stamped by the receiving pot from its own config, never read from the payload. */
@@ -42,6 +50,8 @@ export interface Notice {
   /** Opaque, provider-defined version of the item. Equality only. */
   version: string
   kind: NoticeKind
+  /** open | closed | merged, as the source tool reports it. Informational for ordering: ordering is `updated_at`. */
+  state: NoticeState
   /** Human link to the item in the source tool. */
   url: string
   title: string
@@ -49,12 +59,20 @@ export interface Notice {
   actor: string
   /** ISO-8601 UTC. The only field that orders two notices for the same item. */
   updated_at: string
-  /** sha-256 hex over the canonical form of the fields above; see `noticeHash`. */
+  /**
+   * sha-256 hex over the canonical form of the fields above; see `noticeHash`. UNKEYED: it guards integrity
+   * (a notice edited or truncated after hashing is refused), not authenticity (anyone can compute it). Who sent a
+   * notice is decided by the caller's own checks, never by this field.
+   */
   hash: string
 }
 
 /** Everything in a Notice except the hash; what an adapter's mapper assembles. */
 export type NoticeFields = Omit<Notice, 'hash'>
+
+export function isNoticeState(value: unknown): value is NoticeState {
+  return typeof value === 'string' && (NOTICE_STATES as readonly string[]).includes(value)
+}
 
 export function isNoticeKind(value: unknown): value is NoticeKind {
   return typeof value === 'string' && (NOTICE_KINDS as readonly string[]).includes(value)
@@ -79,6 +97,7 @@ export function canonicalNoticeString(f: NoticeFields): string {
     f.item_id,
     f.version,
     f.kind,
+    f.state,
     f.url,
     f.title,
     f.actor,
@@ -108,18 +127,58 @@ export const NOTICE_LIMITS = {
 } as const
 
 /**
+ * How far past the receiver's clock an `updated_at` may be before the notice is refused. `updated_at` is the only
+ * ordering field, so a far-future one would pin an item and make every genuine later notice look stale.
+ */
+export const NOTICE_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000
+
+/**
+ * Control (Cc), format (Cf: bidi overrides and isolates, zero-width, BOM, tag characters) and line/paragraph
+ * separator characters. None belongs in a one-line title, handle, id or link.
+ * Exception: U+200C (ZWNJ) and U+200D (ZWJ). Persian and other scripts need ZWNJ to spell ordinary words, and emoji
+ * sequences need ZWJ; neither reorders text, so neither is a spoofing vector like the bidi overrides and isolates.
+ */
+const UNSAFE_TEXT_RE = /(?![\u200c\u200d])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+
+export function hasUnsafeText(value: string): boolean {
+  return UNSAFE_TEXT_RE.test(value)
+}
+
+/** Remove the characters `hasUnsafeText` refuses. For mappers, applied to title and actor before validation. */
+export function stripUnsafeText(value: string): string {
+  return value.replace(new RegExp(UNSAFE_TEXT_RE.source, 'gu'), '').trim()
+}
+
+/** https only, a real host, no embedded credentials, no whitespace or hidden characters anywhere in the text. */
+export function isSafeNoticeUrl(value: string): boolean {
+  if (/\s/.test(value) || hasUnsafeText(value)) return false
+  let u: URL
+  try {
+    u = new URL(value)
+  } catch {
+    return false
+  }
+  return u.protocol === 'https:' && u.hostname !== '' && u.username === '' && u.password === ''
+}
+
+/**
  * Why these fields are not a valid Notice, or null. `updated_at` must be the canonical UTC form
  * (`Date#toISOString`): ordering and the hash both depend on one spelling per instant.
+ * With `nowMs`, a timestamp more than NOTICE_MAX_FUTURE_SKEW_MS ahead of it is refused ('updated_at_future').
  */
-export function noticeFieldsProblem(f: NoticeFields): string | null {
+export function noticeFieldsProblem(f: NoticeFields, nowMs?: number): string | null {
   if (!isNoticeProvider(f.provider)) return 'provider'
   if (!isNoticeKind(f.kind)) return 'kind'
+  if (!isNoticeState(f.state)) return 'state'
   for (const key of Object.keys(NOTICE_LIMITS) as (keyof typeof NOTICE_LIMITS)[]) {
     const v: unknown = f[key]
     if (typeof v !== 'string' || v.length === 0 || v.length > NOTICE_LIMITS[key]) return key
+    if (hasUnsafeText(v)) return key
   }
+  if (!isSafeNoticeUrl(f.url)) return 'url'
   const t = typeof f.updated_at === 'string' ? Date.parse(f.updated_at) : Number.NaN
   if (!Number.isFinite(t) || new Date(t).toISOString() !== f.updated_at) return 'updated_at'
+  if (nowMs !== undefined && t > nowMs + NOTICE_MAX_FUTURE_SKEW_MS) return 'updated_at_future'
   return null
 }
 
@@ -129,33 +188,73 @@ export async function buildNotice(f: NoticeFields): Promise<Notice> {
   return { ...f, hash: await noticeHash(f) }
 }
 
-export type NoticeOrder = 'newer' | 'same' | 'older' | 'invalid'
+/** The exact key set of a Notice. Anything else on an incoming object is refused, not ignored. */
+const NOTICE_KEYS = [
+  'actor', 'connection', 'event_id', 'hash', 'item_id', 'kind', 'provider', 'state', 'tenant', 'title', 'updated_at', 'url', 'version',
+] as const
+
+export type NoticeCheck = { ok: true; notice: Notice } | { ok: false; problem: string }
+
+/**
+ * Strict check for a Notice that crossed a trust boundary (the office RPC): a plain object with EXACTLY the Notice
+ * keys, every field valid (`noticeFieldsProblem`), and a `hash` equal to the one recomputed here, so a notice whose
+ * fields were edited after hashing, or built by something other than `buildNotice`, is refused.
+ * Returns a fresh object holding only the validated values, so nothing else the caller attached survives.
+ */
+export async function checkNotice(value: unknown, nowMs?: number): Promise<NoticeCheck> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false, problem: 'shape' }
+  const v = value as Record<string, unknown> // shape-checked key by key below
+  if (Object.keys(v).sort().join(',') !== NOTICE_KEYS.join(',')) return { ok: false, problem: 'keys' }
+  const fields = {
+    tenant: v.tenant, connection: v.connection, provider: v.provider, item_id: v.item_id, event_id: v.event_id,
+    version: v.version, kind: v.kind, state: v.state, url: v.url, title: v.title, actor: v.actor, updated_at: v.updated_at,
+  } as NoticeFields // field types are enforced by noticeFieldsProblem on the next line
+  const problem = noticeFieldsProblem(fields, nowMs)
+  if (problem) return { ok: false, problem }
+  if (typeof v.hash !== 'string' || !/^[0-9a-f]{64}$/.test(v.hash)) return { ok: false, problem: 'hash' }
+  if (v.hash !== (await noticeHash(fields))) return { ok: false, problem: 'hash' }
+  return { ok: true, notice: { ...fields, hash: v.hash } }
+}
+
+export async function isNotice(value: unknown, nowMs?: number): Promise<boolean> {
+  return (await checkNotice(value, nowMs)).ok
+}
+
+/**
+ * 'tie': the same instant (GitHub's resolution is one second) with two different versions. Nothing the notice
+ * itself carries can say which is current, so it is not ordered: see `noticeOrder`.
+ */
+export type NoticeOrder = 'newer' | 'same' | 'older' | 'tie' | 'invalid'
 
 /**
  * Order an incoming notice against what the office holds for the same item.
  *   - an unparseable timestamp on either side is 'invalid' (never applied);
  *   - a later `updated_at` is 'newer', an earlier one 'older';
- *   - equal timestamps with equal versions are 'same' (a redelivery);
- *   - equal timestamps with different versions are broken by plain string comparison of `version`:
- *     arbitrary but total, so both arrival orders end on the same winner and neither silently overwrites.
+ *   - equal timestamps with equal versions (and equal hashes, when both are given) are 'same' (a redelivery);
+ *   - equal timestamps with different versions, or the same version but different content (hash), are a 'tie'. `version` is chosen by whoever pushed it (a head sha can
+ *     be ground to sort high), so it must not decide a winner. The holder keeps what it has and resolves the tie
+ *     by fetching the item from the source (`OfficeAdapter.fetch`), never from this field.
  */
 export function noticeOrder(
-  held: Pick<Notice, 'updated_at' | 'version'>,
-  incoming: Pick<Notice, 'updated_at' | 'version'>,
+  held: Pick<Notice, 'updated_at' | 'version'> & { hash?: string },
+  incoming: Pick<Notice, 'updated_at' | 'version'> & { hash?: string },
 ): NoticeOrder {
   const h = Date.parse(held.updated_at)
   const i = Date.parse(incoming.updated_at)
   if (!Number.isFinite(h) || !Number.isFinite(i)) return 'invalid'
   if (i > h) return 'newer'
   if (i < h) return 'older'
-  if (incoming.version === held.version) return 'same'
-  return incoming.version > held.version ? 'newer' : 'older'
+  if (incoming.version !== held.version) return 'tie'
+  // Same instant, same version, but the content differs (a close or a retitle inside the same second): not a
+  // redelivery. Callers that hold the hash pass it; without both hashes only the version can be compared.
+  if (held.hash !== undefined && incoming.hash !== undefined && held.hash !== incoming.hash) return 'tie'
+  return 'same'
 }
 
-/** True unless `incoming` is strictly newer than what is held. Fails closed: 'invalid' is stale. */
+/** True unless `incoming` is strictly newer than what is held. Fails closed: 'invalid' and 'tie' are stale. */
 export function isStale(
-  held: Pick<Notice, 'updated_at' | 'version'>,
-  incoming: Pick<Notice, 'updated_at' | 'version'>,
+  held: Pick<Notice, 'updated_at' | 'version'> & { hash?: string },
+  incoming: Pick<Notice, 'updated_at' | 'version'> & { hash?: string },
 ): boolean {
   return noticeOrder(held, incoming) !== 'newer'
 }

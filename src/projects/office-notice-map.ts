@@ -7,7 +7,15 @@
 // action, or a payload missing a field the contract requires). It never throws on hostile
 // input and never copies a body/description/comment text into the Notice.
 
-import { buildNotice, noticeFieldsProblem, type Notice, type NoticeFields, type NoticeKind } from './office-contract'
+import {
+  buildNotice,
+  noticeFieldsProblem,
+  stripUnsafeText,
+  type Notice,
+  type NoticeFields,
+  type NoticeKind,
+  type NoticeState,
+} from './office-contract'
 
 export interface NoticeSource {
   /** Pot tenant slug, from the receiving pot's own config. Never taken from the payload. */
@@ -40,9 +48,19 @@ const GITHUB_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
   issue_comment: new Set(['created', 'edited']),
 }
 
-/** Build the Notice, or null when the assembled fields are not a valid one (over-long, bad kind, bad time). */
+/** True when the office follows this GitHub event + action. Lets a caller drop an event before any I/O. */
+export function followsGithubAction(eventName: string, action: unknown): boolean {
+  return typeof action === 'string' && (GITHUB_ACTIONS[eventName]?.has(action) ?? false)
+}
+
+/**
+ * Build the Notice, or null when the assembled fields are not a valid one (over-long, bad kind, bad time, a link
+ * that is not https). Title and actor are free text from a tool a stranger can write to: control, format and bidi
+ * characters are STRIPPED here (a title made only of them becomes empty and the event is dropped).
+ */
 async function toNotice(f: NoticeFields): Promise<Notice | null> {
-  return noticeFieldsProblem(f) === null ? buildNotice(f) : null
+  const clean: NoticeFields = { ...f, title: stripUnsafeText(f.title), actor: stripUnsafeText(f.actor) }
+  return noticeFieldsProblem(clean) === null ? buildNotice(clean) : null
 }
 
 /**
@@ -85,6 +103,11 @@ export async function githubNotice(src: NoticeSource, eventName: string, payload
   const version = kind === 'pr' ? text(rec(item.head), 'sha') : updatedAt
   if (!version) return null
 
+  // Lifecycle as GitHub reports it. A merged PR is `closed` with `merged: true`. A comment takes its thread's state.
+  const stateOwner = kind === 'comment' ? rec(p.issue) : item
+  let state: NoticeState = stateOwner?.state === 'closed' || action === 'closed' ? 'closed' : 'open'
+  if (kind === 'pr' && item.merged === true) state = 'merged'
+
   return toNotice({
     tenant: src.tenant,
     connection: src.connection,
@@ -93,6 +116,7 @@ export async function githubNotice(src: NoticeSource, eventName: string, payload
     event_id: src.eventId,
     version,
     kind,
+    state,
     url,
     title,
     actor,
@@ -140,6 +164,8 @@ export async function linearNotice(src: NoticeSource, payload: unknown): Promise
     event_id: src.eventId,
     version: updatedAt,
     kind,
+    // Linear workflow state types: completed and canceled are closed; everything else is open.
+    state: ['completed', 'canceled'].includes(text(rec(data.state), 'type') ?? '') ? 'closed' : 'open',
     url,
     title,
     actor,

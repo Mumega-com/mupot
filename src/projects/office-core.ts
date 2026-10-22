@@ -16,6 +16,7 @@
 //   - the seven function names (stubs live on the class)
 
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { noticeOrder, type Notice } from './office-contract'
 
 /**
  * The slice of the Worker environment the office reads. Declared here (not `Env`) because the office runs in
@@ -35,6 +36,15 @@ export const PROJECT_OFFICE_FLAG = '1'
 /** The seven functions of the back office, in order (plan: "Seven functions"). */
 export const OFFICE_FUNCTIONS = ['notice', 'prepare', 'dispatch', 'followUp', 'gate', 'remember', 'report'] as const
 export type OfficeFunction = (typeof OFFICE_FUNCTIONS)[number]
+
+/** What happened to a Notice the office accepted as well-formed. None of these is an error: all are idempotent. */
+export type NoticeOutcome = 'applied' | 'duplicate' | 'stale' | 'tie_kept'
+
+export type NoticeResult =
+  | { ok: true; outcome: NoticeOutcome }
+  // The notice was refused at the RPC boundary: wrong shape, bad field, bad hash, future-dated, or another tenant's.
+  | { ok: false; error: 'invalid_notice'; problem: string }
+  | Extract<OfficeStubResult, { error: 'unbound' }>
 
 export type OfficeBindingFailure =
   | 'flag_off'
@@ -143,7 +153,9 @@ export const OFFICE_SCHEMA = [
   // Dedup of delivery ids and per-connection source cursors, scoped by provider: a connection id and a
   // delivery id are unique only within one adapter. NOT rebuilt from D1: re-derived from the source tool
   // by adapter.reconcile(). Losing them costs a re-scan, and handlers are idempotent, so a lost row can
-  // only cause a harmless re-delivery.
+  // only cause a harmless re-delivery. office_cursor is a RECONCILE watermark ("everything up to here was read from
+  // the source"): only reconcile or poll moves it (advanceCursor). A webhook never does, because a webhook for one item
+  // says nothing about the other items older than it.
   `CREATE TABLE IF NOT EXISTS office_seen (
      provider TEXT NOT NULL, connection TEXT NOT NULL, event_id TEXT NOT NULL, seen_at TEXT NOT NULL,
      PRIMARY KEY (provider, connection, event_id))`,
@@ -152,10 +164,29 @@ export const OFFICE_SCHEMA = [
      PRIMARY KEY (provider, connection))`,
   // Office-local counters (alarm ticks). Not a cursor; kept out of office_cursor so it cannot collide with one.
   `CREATE TABLE IF NOT EXISTS office_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  // Compact view of the source items the office has been told about: one row per (provider, connection, item),
+  // holding the pointer fields of the newest accepted Notice and NO content. Like office_seen it is derived from
+  // the SOURCE tool, not from D1, so rebuildWorkingSet leaves it alone and adapter.reconcile() refills it.
+  // conflict_version: a same-instant, different-version notice that was held back (see noticeOrder 'tie'); it
+  // names a version to refetch from the source, and is never trusted as current.
+  `CREATE TABLE IF NOT EXISTS office_items (
+     provider TEXT NOT NULL, connection TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+     version TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL, actor TEXT NOT NULL, updated_at TEXT NOT NULL,
+     hash TEXT NOT NULL, last_event_id TEXT NOT NULL, conflict_version TEXT, applied_at TEXT NOT NULL,
+     PRIMARY KEY (provider, connection, item_id))`,
+  // The prune in applyNotice filters office_seen by age on every notice; without this it scans the whole table.
+  `CREATE INDEX IF NOT EXISTS idx_office_seen_seen_at ON office_seen (seen_at)`,
 ] as const
+
+/**
+ * Version of the office's own SQLite layout, kept in office_meta so a later change can detect what it is looking at
+ * and migrate instead of guessing. Bump it WITH any change to OFFICE_SCHEMA that CREATE IF NOT EXISTS cannot express.
+ */
+export const OFFICE_SCHEMA_VERSION = '1'
 
 export function ensureOfficeSchema(sql: OfficeSql): void {
   for (const ddl of OFFICE_SCHEMA) sql.exec(ddl)
+  sql.exec(`INSERT OR IGNORE INTO office_meta (key, value) VALUES ('schema_version', ?)`, OFFICE_SCHEMA_VERSION)
 }
 
 interface ProjectViewRow {
@@ -235,4 +266,145 @@ export async function rebuildWorkingSet(
     )
   }
   return { tasks: rows.length }
+}
+
+// ── notice intake (Phase 1, slice 1) ─────────────────────────────────────────
+
+/** Delivery ids older than this are forgotten. A redelivery that late still hits the version check, so it stays a no-op. */
+export const NOTICE_SEEN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Most items one office holds. A repository a stranger can open issues on must not be able to fill the office. */
+export const OFFICE_ITEM_CAP = 5000
+
+interface HeldItemRow {
+  version: string
+  updated_at: string
+  hash: string
+}
+
+function bump(sql: OfficeSql, key: string): void {
+  sql.exec(
+    `INSERT INTO office_meta (key, value) VALUES (?, '1')
+     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
+    key,
+  )
+}
+
+/**
+ * Record one VALIDATED Notice (checkNotice has already run; the tenant matches) in the working set.
+ * It does NOT move office_cursor: see advanceCursor. Delivery through the webhook is at-most-once until reconcile
+ * lands (a notice that never arrives is not repaired by anything yet), so nothing here may claim completeness.
+ * Synchronous on purpose: a Durable Object's SQLite calls with no await between them are atomic, so a delivery is
+ * either recorded in full or not at all.
+ *
+ *   duplicate   the delivery id was seen, or the same item at the same instant, version and content arrived again
+ *   stale       an older notice never overwrites a newer one
+ *   tie_kept    same instant, different version or different content: the held row stays, the competing version is
+ *               noted for refetch
+ *   applied     first sight of the item, or strictly newer than what is held
+ *
+ * Never reads D1, never assigns, dispatches or wakes anything: the office only remembers what it was told.
+ */
+export function applyNotice(sql: OfficeSql, notice: Notice, nowMs: number): NoticeOutcome {
+  const seen = sql.all(
+    'SELECT 1 AS hit FROM office_seen WHERE provider = ? AND connection = ? AND event_id = ?',
+    notice.provider,
+    notice.connection,
+    notice.event_id,
+  )
+  if (seen.length > 0) {
+    bump(sql, 'notice_duplicate')
+    return 'duplicate'
+  }
+
+  const nowIso = new Date(nowMs).toISOString()
+  const held = sql.all(
+    'SELECT version, updated_at, hash FROM office_items WHERE provider = ? AND connection = ? AND item_id = ?',
+    notice.provider,
+    notice.connection,
+    notice.item_id,
+  )[0] as unknown as HeldItemRow | undefined
+
+  let outcome: NoticeOutcome
+  if (!held) {
+    const n = Number(sql.all('SELECT count(*) AS n FROM office_items')[0]?.n ?? 0)
+    if (n >= OFFICE_ITEM_CAP) {
+      sql.exec(
+        `DELETE FROM office_items WHERE rowid IN (SELECT rowid FROM office_items ORDER BY updated_at ASC LIMIT ?)`,
+        n - OFFICE_ITEM_CAP + 1,
+      )
+    }
+    writeItem(sql, notice, nowIso, 'insert')
+    outcome = 'applied'
+  } else {
+    const order = noticeOrder(held, notice)  // held carries its hash: same instant + version but other content is a tie
+    if (order === 'newer') {
+      writeItem(sql, notice, nowIso, 'replace')
+      outcome = 'applied'
+    } else if (order === 'tie') {
+      sql.exec(
+        'UPDATE office_items SET conflict_version = ? WHERE provider = ? AND connection = ? AND item_id = ?',
+        notice.version,
+        notice.provider,
+        notice.connection,
+        notice.item_id,
+      )
+      outcome = 'tie_kept'
+    } else if (order === 'same') {
+      outcome = 'duplicate'
+    } else {
+      outcome = 'stale' // 'older', or 'invalid' (an unparseable held row): fail closed, never overwrite
+    }
+  }
+
+  sql.exec(
+    'INSERT INTO office_seen (provider, connection, event_id, seen_at) VALUES (?, ?, ?, ?)',
+    notice.provider,
+    notice.connection,
+    notice.event_id,
+    nowIso,
+  )
+  sql.exec('DELETE FROM office_seen WHERE seen_at < ?', new Date(nowMs - NOTICE_SEEN_RETENTION_MS).toISOString())
+  bump(sql, `notice_${outcome}`)
+  return outcome
+}
+
+/**
+ * Move a connection's reconcile watermark forward. For adapter.reconcile() / a poller ONLY: it asserts "every change up
+ * to `cursor` was read from the source", which one webhook can never assert (item A at t2 arriving says nothing about
+ * item B at t1 that has not arrived yet). Forward-only: a cursor older than the held one is ignored, so a late or
+ * replayed reconcile page cannot rewind the watermark. Returns whether it moved.
+ */
+export function advanceCursor(sql: OfficeSql, provider: string, connection: string, cursor: string): boolean {
+  const before = sql.all('SELECT cursor FROM office_cursor WHERE provider = ? AND connection = ?', provider, connection)[0]?.cursor
+  sql.exec(
+    `INSERT INTO office_cursor (provider, connection, cursor) VALUES (?, ?, ?)
+     ON CONFLICT(provider, connection) DO UPDATE SET cursor = excluded.cursor WHERE excluded.cursor > cursor`,
+    provider,
+    connection,
+    cursor,
+  )
+  const after = sql.all('SELECT cursor FROM office_cursor WHERE provider = ? AND connection = ?', provider, connection)[0]?.cursor
+  return after !== before
+}
+
+function writeItem(sql: OfficeSql, n: Notice, nowIso: string, mode: 'insert' | 'replace'): void {
+  sql.exec(
+    `${mode === 'insert' ? 'INSERT' : 'INSERT OR REPLACE'} INTO office_items
+       (provider, connection, item_id, kind, state, version, url, title, actor, updated_at, hash, last_event_id, conflict_version, applied_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    n.provider,
+    n.connection,
+    n.item_id,
+    n.kind,
+    n.state,
+    n.version,
+    n.url,
+    n.title,
+    n.actor,
+    n.updated_at,
+    n.hash,
+    n.event_id,
+    nowIso,
+  )
 }

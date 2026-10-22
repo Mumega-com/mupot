@@ -19,6 +19,7 @@ import { timingSafeEqual } from '../lib/crypto'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
+import { routeGitHubNoticeToOffice } from '../projects/office-intake'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -263,6 +264,19 @@ githubInboundApp.post('/', async (c) => {
   }
 
   const eventType = c.req.header('x-github-event') ?? 'unknown'
+
+  // ProjectOffice intake (back-office Phase 1, slice 1). Inert unless PROJECT_OFFICE=1; with the flag off it returns
+  // before touching D1. It runs in waitUntil, after the delivery was claimed: a slow or hung office must not delay or
+  // change the answer below, which stays exactly what this route has always done. It never throws (every failure is
+  // a counted drop inside), and the catch here is for the promise itself. At-most-once until reconcile lands.
+  const intake = routeGitHubNoticeToOffice(c.env, eventType, payload, deliveryId(c.req.raw, signatureHeader)).catch(
+    () => undefined,
+  )
+  try {
+    c.executionCtx.waitUntil(intake)
+  } catch {
+    // No ExecutionContext (a unit test calling app.fetch without one): the promise is already running and cannot reject.
+  }
 
   // #23 — a Project board item changed: reconcile the configured board → pot tasks (real-time
   // complement to the cron). No-op unless GITHUB_SYNC_PROJECT is set; idempotent (KV-deduped).
