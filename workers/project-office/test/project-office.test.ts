@@ -19,7 +19,7 @@ import { beforeAll, describe, expect, it } from 'vitest'
 import * as entry from '../src/index'
 import { ProjectOffice, VERIFY_TTL_MS } from '../src/project-office'
 import { projectOfficeName } from '../../../src/projects/office-core'
-import { buildNotice } from '../../../src/projects/office-contract'
+import { buildNotice, type NoticeFields } from '../../../src/projects/office-contract'
 
 // The bindings come from vitest.config.ts, not from a wrangler config, so `cloudflare:test`'s env has no
 // matching type. Casting through unknown is the accepted route (same as tests/composition/d1-batch-visibility.test.ts).
@@ -195,7 +195,7 @@ describe('Agents SDK in its own Worker', () => {
     expect(await tables(stub)).toEqual([]) // verified, but nothing built yet
     expect((await rpc(stub).snapshot()).tasks).toBeDefined() // work: builds the SDK half
     const t = await tables(stub)
-    expect(t.filter((n) => n.startsWith('office_'))).toEqual(['office_cursor', 'office_meta', 'office_project_view', 'office_seen', 'office_tasks'])
+    expect(t.filter((n) => n.startsWith('office_'))).toEqual(['office_cursor', 'office_items', 'office_meta', 'office_project_view', 'office_seen', 'office_tasks'])
     expect(t.some((n) => n.startsWith('cf_agents_'))).toBe(true)
   })
 })
@@ -238,13 +238,8 @@ describe('binding: project -> tenant re-verified from D1', () => {
     expect(await tables(stub)).toEqual([])
   })
 
-  it('each of the seven functions is an empty stub behind a verified binding', async () => {
+  it('the other six functions are still empty stubs behind a verified binding', async () => {
     const stub = rpc(office(TENANT, LIVE))
-    const n = await buildNotice({
-      tenant: TENANT, connection: 'c1', provider: 'github', item_id: 'i1', event_id: 'e1', version: 'v1',
-      kind: 'pr', url: 'https://example.test/1', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
-    })
-    expect(await stub.notice(n)).toEqual({ ok: false, error: 'not_implemented', fn: 'notice' })
     for (const fn of ['prepare', 'dispatch', 'followUp', 'gate', 'remember', 'report'] as const) {
       expect(await stub[fn](), fn).toEqual({ ok: false, error: 'not_implemented', fn })
     }
@@ -495,7 +490,7 @@ describe('destroy-and-rebuild', () => {
 
     // The next wake is a cold start on empty storage.
     await evictDurableObject(stub)
-    expect(await rpc(stub).snapshot()).toEqual({ project: [], tasks: [] })
+    expect(await rpc(stub).snapshot()).toEqual({ project: [], tasks: [], items: [] })
 
     // REBUILD from D1 alone.
     expect(await rpc(stub).rebuild()).toEqual({ tasks: 4 })
@@ -503,5 +498,159 @@ describe('destroy-and-rebuild', () => {
 
     // Nothing auditable lived in the office: D1 is exactly what it was.
     expect(await d1Fingerprint()).toEqual(d1Before)
+  })
+})
+
+
+// ── notice intake (Phase 1, slice 1) ─────────────────────────────────────────────────────────────────
+
+const NOTICE_PROJECT = 'proj-notice'
+const T = (sec: number): string => new Date(Date.parse('2026-10-22T08:00:00.000Z') + sec * 1000).toISOString()
+const fields = (over: Partial<NoticeFields> = {}): NoticeFields => ({
+  tenant: TENANT, connection: 'inst-1', provider: 'github', item_id: 'PR_1', event_id: 'd-1', version: 'sha-a',
+  kind: 'pr', url: 'https://github.com/o/r/pull/1', title: 'Title', actor: 'octo', updated_at: T(0), ...over,
+})
+const items = (s: Stub): Promise<Record<string, unknown>[]> =>
+  runInDurableObject(s, (_i: ProjectOffice, state) => {
+    const t = state.storage.sql.exec(`SELECT name FROM sqlite_master WHERE name = 'office_items'`).toArray()
+    if (t.length === 0) return [] // an office that never accepted work has no tables at all
+    return state.storage.sql.exec(`SELECT item_id, version, title, conflict_version FROM office_items ORDER BY item_id`).toArray()
+  })
+
+describe('notice: validated and recorded at the RPC boundary', () => {
+  beforeAll(async () => {
+    await addProject(NOTICE_PROJECT)
+    for (const id of ['proj-notice-2', 'proj-notice-3', 'proj-notice-4']) await addProject(id)
+  })
+
+  it('records a valid notice, and answers a replay of the same delivery as a duplicate', async () => {
+    const stub = office(TENANT, NOTICE_PROJECT)
+    const n = await buildNotice(fields())
+    expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'applied' })
+    expect(await items(stub)).toEqual([{ item_id: 'PR_1', version: 'sha-a', title: 'Title', conflict_version: null }])
+    for (let i = 0; i < 3; i++) expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'duplicate' })
+    expect(await items(stub)).toHaveLength(1)
+    expect((await rpc(stub).snapshot()).items).toEqual([
+      expect.objectContaining({ provider: 'github', connection: 'inst-1', item_id: 'PR_1', kind: 'pr', version: 'sha-a' }),
+    ])
+  })
+
+  it('an older version never overwrites a newer one, and a replay survives eviction', async () => {
+    const stub = office(TENANT, 'proj-notice-2')
+    const newer = await buildNotice(fields({ event_id: 'd-new', version: 'sha-new', updated_at: T(120), title: 'Newest' }))
+    const older = await buildNotice(fields({ event_id: 'd-old', version: 'sha-old', updated_at: T(10), title: 'Stale' }))
+    expect(await rpc(stub).notice(newer)).toEqual({ ok: true, outcome: 'applied' })
+    await evictDurableObject(stub)
+    expect(await rpc(stub).notice(older)).toEqual({ ok: true, outcome: 'stale' })
+    expect(await rpc(stub).notice(newer)).toEqual({ ok: true, outcome: 'duplicate' })
+    expect(await items(stub)).toEqual([{ item_id: 'PR_1', version: 'sha-new', title: 'Newest', conflict_version: null }])
+  })
+
+  it('a same-instant, different-version notice is a tie: the held row stays and the other version is only noted', async () => {
+    const stub = office(TENANT, 'proj-notice-3')
+    expect(await rpc(stub).notice(await buildNotice(fields({ event_id: 'd-1', version: 'aaa' })))).toEqual({ ok: true, outcome: 'applied' })
+    expect(await rpc(stub).notice(await buildNotice(fields({ event_id: 'd-2', version: 'zzz', title: 'Ground sha wins?' })))).toEqual({ ok: true, outcome: 'tie_kept' })
+    expect(await items(stub)).toEqual([{ item_id: 'PR_1', version: 'aaa', title: 'Title', conflict_version: 'zzz' }])
+  })
+
+  describe('strict isNotice at the boundary: nothing malformed reaches the working set', () => {
+    const cases: [string, (n: Awaited<ReturnType<typeof buildNotice>>) => unknown, string][] = [
+      ['an extra key', (n) => ({ ...n, assignee: 'attacker' }), 'keys'],
+      ['a missing key', (n) => { const { hash: _h, ...rest } = n; return rest }, 'keys'],
+      ['fields edited after hashing', (n) => ({ ...n, title: 'edited' }), 'hash'],
+      ['a forged hash', (n) => ({ ...n, hash: 'a'.repeat(64) }), 'hash'],
+      ['an unanchored hash', (n) => ({ ...n, hash: `${n.hash}0` }), 'hash'],
+      ['a javascript: link', (n) => ({ ...n, url: 'javascript:alert(1)' }), 'url'],
+      ['a bidi override in the title', (n) => ({ ...n, title: 'a\u202eb' }), 'title'],
+      ['a control character in the actor', (n) => ({ ...n, actor: 'a\u0000b' }), 'actor'],
+      ['a future-dated updated_at', (n) => ({ ...n, updated_at: '2999-01-01T00:00:00.000Z' }), 'updated_at_future'],
+      ['another tenant', (n) => ({ ...n, tenant: 'pot-b' }), 'hash'],
+    ]
+    it.each(cases)('refuses %s', async (_label, mutate, problem) => {
+      const stub = office(TENANT, 'proj-notice-4')
+      const before = await items(stub)
+      const bad = mutate(await buildNotice(fields({ event_id: `bad-${_label}` })))
+      expect(await rpc(stub).notice(bad)).toEqual({ ok: false, error: 'invalid_notice', problem })
+      expect(await items(stub)).toEqual(before)
+    })
+
+    it.each([null, undefined, 'x', 7, [], {}])('refuses a non-notice %j', async (v) => {
+      expect(await rpc(office(TENANT, 'proj-notice-4')).notice(v)).toMatchObject({ ok: false, error: 'invalid_notice' })
+    })
+
+    it('refuses a correctly hashed notice stamped with another pot’s tenant (the office re-checks its own)', async () => {
+      const foreign = await buildNotice(fields({ tenant: 'pot-b', event_id: 'foreign' }))
+      expect(await rpc(office(TENANT, 'proj-notice-4')).notice(foreign)).toEqual({ ok: false, error: 'invalid_notice', problem: 'tenant' })
+    })
+
+    it('a refusal builds nothing: a malformed notice to a fresh office creates no table', async () => {
+      const project = 'proj-notice-fresh'
+      await addProject(project)
+      const stub = office(TENANT, project)
+      expect((await rpc(stub).notice({ junk: true })).error).toBe('invalid_notice')
+      expect(await tables(stub)).toEqual([])
+    })
+  })
+
+  it('destroy-and-rebuild: notice state is not authority; D1 is untouched and the office refills from the source', async () => {
+    const project = 'proj-notice-destroy'
+    await addProject(project)
+    const stub = office(TENANT, project)
+    const n = await buildNotice(fields({ event_id: 'd-destroy' }))
+    expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'applied' })
+    const d1Before = await d1Fingerprint()
+    await runInDurableObject(stub, async (_i: ProjectOffice, state) => {
+      await state.storage.deleteAll()
+      await state.storage.deleteAlarm()
+    })
+    await evictDurableObject(stub)
+    expect(await rpc(stub).snapshot()).toEqual({ project: [], tasks: [], items: [] })
+    expect(await rpc(stub).rebuild()).toEqual({ tasks: 0 })
+    expect((await rpc(stub).snapshot()).items).toEqual([]) // the D1-derived rebuild does not invent source items
+    expect(await rpc(stub).notice(n)).toEqual({ ok: true, outcome: 'applied' }) // lost dedup costs a harmless re-apply
+    expect(await d1Fingerprint()).toEqual(d1Before)
+  })
+})
+
+describe('SDK control headers are refused by the facade, with the office’s own 404 (#2130)', () => {
+  const ownBody = JSON.stringify({ error: 'not_found' })
+
+  it('x-cf-agents-subagent-url on a WebSocket upgrade: 404, no 101, no stack frame', async () => {
+    const stub = office(TENANT, LIVE)
+    await rpc(stub).snapshot() // a live, verified office with its SDK half built: the case the vector needs
+    const res = await stub.fetch('https://office.test/', {
+      headers: { Upgrade: 'websocket', 'x-cf-agents-subagent-url': 'https://office.test/sub/project-office/x' },
+    })
+    expect(res.status).toBe(404)
+    expect(res.webSocket).toBeNull()
+    expect(await res.text()).toBe(ownBody)
+  })
+
+  it('x-agents-lifecycle-props garbage: 404 with the office’s own body, not a 500 with a stack', async () => {
+    const stub = office(TENANT, LIVE)
+    await rpc(stub).snapshot()
+    const res = await stub.fetch('https://office.test/', { headers: { 'x-agents-lifecycle-props': '%%%not-base64-json%%%' } })
+    expect(res.status).toBe(404)
+    expect(await res.text()).toBe(ownBody)
+  })
+
+  it('the guard is on the prefix, in any case, on any route, and before the binding is read', async () => {
+    const foreign = stubFor(projectOfficeName('pot-b', LIVE)) // would also be 404, but the header must short-circuit first
+    for (const [h, v] of [['X-CF-Agents-Anything', '1'], ['x-agents-other', '1'], ['X-Agents-Lifecycle-Props', '']] as const) {
+      for (const path of ['/', '/agents/project-office/pot-a:proj-live', '/sub/project-office/x']) {
+        for (const stub of [office(TENANT, LIVE), foreign]) {
+          const res = await stub.fetch(`https://office.test${path}`, { headers: { [h]: v } })
+          expect(res.status, `${h} ${path}`).toBe(404)
+          expect(await res.text()).toBe(ownBody)
+        }
+      }
+    }
+  })
+
+  it('an ordinary request is not caught by it: a verified office still answers its own 501', async () => {
+    const stub = office(TENANT, LIVE)
+    const res = await stub.fetch('https://office.test/', { headers: { 'x-request-id': 'abc', 'x-agent-hint': 'x' } })
+    expect(res.status).not.toBe(404) // not refused by the header guard
+    await res.text()
   })
 })

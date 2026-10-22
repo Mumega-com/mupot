@@ -19,6 +19,7 @@ import { timingSafeEqual } from '../lib/crypto'
 import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
+import { routeGitHubNoticeToOffice } from '../projects/office-intake'
 
 interface GitHubRouteEnv {
   GITHUB_WEBHOOK_SECRET?: string
@@ -263,6 +264,11 @@ githubInboundApp.post('/', async (c) => {
   }
 
   const eventType = c.req.header('x-github-event') ?? 'unknown'
+
+  // ProjectOffice intake (back-office Phase 1, slice 1). Inert unless PROJECT_OFFICE=1; with the flag off it returns
+  // before touching D1. It only informs the owning project's office and never changes the answer below, which stays
+  // exactly what this route has always done. The delivery was claimed above, so a replay never reaches this line.
+  await routeGitHubNoticeToOffice(c.env, eventType, payload, deliveryId(c.req.raw, signatureHeader))
 
   // #23 — a Project board item changed: reconcile the configured board → pot tasks (real-time
   // complement to the cron). No-op unless GITHUB_SYNC_PROJECT is set; idempotent (KV-deduped).

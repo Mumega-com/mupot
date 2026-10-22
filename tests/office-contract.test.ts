@@ -8,6 +8,13 @@ import {
   NOTICE_KINDS,
   buildNotice,
   canonicalNoticeString,
+  NOTICE_MAX_FUTURE_SKEW_MS,
+  checkNotice,
+  hasUnsafeText,
+  isNotice,
+  isSafeNoticeUrl,
+  noticeFieldsProblem,
+  stripUnsafeText,
   isDoorbell,
   DOORBELL_LIMITS,
   NOTICE_LIMITS,
@@ -202,16 +209,15 @@ describe('ordering: an old webhook cannot overwrite newer state', () => {
     expect(isStale(at(T10, 'v1'), at(T10, 'v1'))).toBe(true)
   })
 
-  it('equal timestamp, different version is decided by a fixed rule, so both arrival orders converge', () => {
-    // GitHub timestamps have one-second resolution: two pushes in the same second share updated_at.
+  it('equal timestamp, different version is a TIE, in either arrival order: no field the sender picked decides it', () => {
+    // GitHub timestamps have one-second resolution: two pushes in the same second share updated_at. A head sha can be
+    // ground to sort high, so `version` must not pick the winner (#2130).
     const a = at(T10, 'aaa111')
     const b = at(T10, 'bbb222')
-    expect(noticeOrder(a, b)).toBe('newer')
-    expect(noticeOrder(b, a)).toBe('older')
-    // Whichever arrives first, the held version ends as 'bbb222'.
-    const heldAfter = (first: typeof a, second: typeof a) => (isStale(first, second) ? first : second)
-    expect(heldAfter(a, b).version).toBe('bbb222')
-    expect(heldAfter(b, a).version).toBe('bbb222')
+    expect(noticeOrder(a, b)).toBe('tie')
+    expect(noticeOrder(b, a)).toBe('tie')
+    expect(isStale(a, b)).toBe(true) // the holder keeps what it has
+    expect(isStale(b, a)).toBe(true)
   })
 
   it.each(['yesterday', '', 'Invalid Date', '2026-13-45T00:00:00Z'])('fails closed on an unparseable timestamp %j (either side)', (bad) => {
@@ -252,6 +258,110 @@ describe('buildNotice validates what it signs', () => {
   })
 })
 
+describe('title and actor lose control and bidi characters in the mapper (#2130)', () => {
+  const RLO = '\u202e' // right-to-left override
+  const ZWSP = '\u200b'
+  const base = fixture('github-pull-request-opened.json') as Record<string, Record<string, unknown>>
+
+  it('strips them from title and actor and keeps the visible text', async () => {
+    const payload = {
+      ...base,
+      pull_request: { ...base.pull_request, title: `fix${RLO}gpj.exe${ZWSP}\u0007 now\n` },
+      sender: { ...base.sender, login: `kas\u0000ra${RLO}` },
+    }
+    const n = await githubNotice(GH_SRC, 'pull_request', payload)
+    expect(n?.title).toBe('fixgpj.exe now')
+    expect(n?.actor).toBe('kasra')
+    expect(hasUnsafeText(n?.title ?? '')).toBe(false)
+  })
+
+  it('a title that is only hidden characters drops the event', async () => {
+    const payload = { ...base, pull_request: { ...base.pull_request, title: `${RLO}${ZWSP}\u2028` } }
+    expect(await githubNotice(GH_SRC, 'pull_request', payload)).toBeNull()
+  })
+
+  it('a javascript: or data: link drops the event instead of being mapped', async () => {
+    for (const url of ['javascript:alert(1)', 'data:text/html,x', 'http://github.com/x/y/pull/1', 'https://u:p@github.com/x']) {
+      const payload = { ...base, pull_request: { ...base.pull_request, html_url: url } }
+      expect(await githubNotice(GH_SRC, 'pull_request', payload), url).toBeNull()
+    }
+  })
+})
+
+describe('checkNotice: the strict boundary check (#2130)', () => {
+  const fields: NoticeFields = {
+    tenant: 'pot-a', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
+    kind: 'pr', url: 'https://github.com/o/r/pull/1', title: 'T', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+  }
+  const NOW = Date.parse('2026-10-22T00:01:00.000Z')
+
+  it('accepts exactly what buildNotice makes, and returns a clean copy', async () => {
+    const n = await buildNotice(fields)
+    const r = await checkNotice(n, NOW)
+    expect(r).toEqual({ ok: true, notice: n })
+    expect(await isNotice(n, NOW)).toBe(true)
+    if (r.ok) expect(r.notice).not.toBe(n)
+  })
+
+  it.each([null, undefined, 'str', 7, [], [1, 2]])('refuses a non-object %j', async (v) => {
+    expect((await checkNotice(v)).ok).toBe(false)
+  })
+
+  it('refuses an extra key, and a missing key', async () => {
+    const n = await buildNotice(fields)
+    expect(await checkNotice({ ...n, assignee: 'attacker' })).toEqual({ ok: false, problem: 'keys' })
+    expect(await checkNotice({ ...n, __proto__: { x: 1 }, body: 'text' })).toEqual({ ok: false, problem: 'keys' })
+    const { hash: _hash, ...noHash } = n
+    expect(await checkNotice(noHash)).toEqual({ ok: false, problem: 'keys' })
+  })
+
+  it('refuses a hash that is not the recomputed one (edited after hashing, forged, or malformed)', async () => {
+    const n = await buildNotice(fields)
+    expect((await checkNotice({ ...n, title: 'edited after hashing' })).ok).toBe(false)
+    expect(await checkNotice({ ...n, hash: 'a'.repeat(64) })).toEqual({ ok: false, problem: 'hash' })
+    expect(await checkNotice({ ...n, hash: n.hash.toUpperCase() })).toEqual({ ok: false, problem: 'hash' })
+    expect(await checkNotice({ ...n, hash: `${n.hash}0` })).toEqual({ ok: false, problem: 'hash' })
+    expect(await checkNotice({ ...n, hash: `x${n.hash.slice(1)}` })).toEqual({ ok: false, problem: 'hash' })
+    expect(await checkNotice({ ...n, hash: ` ${n.hash}` })).toEqual({ ok: false, problem: 'hash' })
+    expect(await checkNotice({ ...n, hash: 7 })).toEqual({ ok: false, problem: 'hash' })
+  })
+
+  it('refuses a notice whose fields were swapped but whose hash was kept from another notice', async () => {
+    const a = await buildNotice(fields)
+    const b = await buildNotice({ ...fields, item_id: 'other' })
+    expect((await checkNotice({ ...b, hash: a.hash })).ok).toBe(false)
+  })
+
+  it('url: https only', async () => {
+    for (const url of ['javascript:alert(1)', 'JAVASCRIPT:alert(1)', 'data:text/html,x', 'http://github.com/o/r', 'ftp://x/y', 'file:///etc/passwd', '//github.com/o', 'github.com/o/r', 'https://u:p@github.com/o/r', 'https://', 'https://github.com/a b', 'https://github.com/a\nb']) {
+      expect(isSafeNoticeUrl(url), url).toBe(false)
+      expect(noticeFieldsProblem({ ...fields, url }), url).toBe('url')
+    }
+    expect(isSafeNoticeUrl('https://github.com/o/r/pull/1')).toBe(true)
+  })
+
+  it('refuses control, format and bidi characters in every text field', async () => {
+    for (const bad of ['\u202e', '\u2066', '\u200b', '\u200f', '\ufeff', '\u0000', '\u001b', '\u007f', '\u0085', '\u2028', '\u2029', '\u{e0041}']) {
+      for (const key of ['title', 'actor', 'item_id', 'connection', 'version', 'event_id', 'tenant'] as const) {
+        expect(noticeFieldsProblem({ ...fields, [key]: `a${bad}b` }), `${key} ${JSON.stringify(bad)}`).toBe(key)
+      }
+    }
+    expect(hasUnsafeText('plain ascii and ünïcode and 日本語')).toBe(false)
+    expect(stripUnsafeText(' a\u202eb\u200bc ')).toBe('abc')
+  })
+
+  it('skew clamp: refuses an updated_at more than the allowed skew ahead of the receiver, accepts the edge', async () => {
+    const future = (ms: number) => new Date(NOW + ms).toISOString()
+    expect(noticeFieldsProblem({ ...fields, updated_at: future(NOTICE_MAX_FUTURE_SKEW_MS) }, NOW)).toBeNull()
+    expect(noticeFieldsProblem({ ...fields, updated_at: future(NOTICE_MAX_FUTURE_SKEW_MS + 1000) }, NOW)).toBe('updated_at_future')
+    expect(noticeFieldsProblem({ ...fields, updated_at: '2999-01-01T00:00:00.000Z' }, NOW)).toBe('updated_at_future')
+    const far = await buildNotice({ ...fields, updated_at: '2999-01-01T00:00:00.000Z' })
+    expect(await checkNotice(far, NOW)).toEqual({ ok: false, problem: 'updated_at_future' })
+    // without a clock the check is not made (the mapper has none); the office always passes one
+    expect((await checkNotice(far)).ok).toBe(true)
+  })
+})
+
 describe('Doorbell envelope: pointers only', () => {
   const ok: Doorbell = {
     project: 'proj-1', task_id: 'task-1', attempt: 1, event: 'assigned', version: 'v1',
@@ -288,7 +398,7 @@ describe('Doorbell envelope: pointers only', () => {
   it('a Notice is not a Doorbell and vice versa', async () => {
     const n: Notice = await buildNotice({
       tenant: 't', connection: 'c', provider: 'github', item_id: 'i', event_id: 'e', version: 'v',
-      kind: 'pr', url: 'u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
+      kind: 'pr', url: 'https://x.test/u', title: 't', actor: 'a', updated_at: '2026-10-22T00:00:00.000Z',
     })
     expect(isDoorbell(n)).toBe(false)
   })
