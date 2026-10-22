@@ -36,6 +36,7 @@ IDP_PROVIDER = "google"           # google | telegram
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
 # REALTIME_SEAT_EVENTS = "1"      # opt-in body-free seat-events channel (/api/fleet/events). Off by default.
+# PROJECT_OFFICE = "1"            # opt-in per-project back office (ProjectOffice DO). Phase 0 skeleton: inert even when on. Off by default.
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 # EVENTS_ENABLED = "true"          # mupot#1618: MCP Events (protocol 2026-07-28) catalogue. ONLY the exact string "true" enables;
                                   # off = byte-identical to before (server/discover + events/* are method_not_found). Full /mcp door only; also gates the PR 2 delivery hook.
@@ -197,6 +198,20 @@ new_classes = ["PresenceChannelDO"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["SeatEventsDO"]
+
+# Per-project back office (Phase 0 skeleton, INERT). The ProjectOffice class is built on the Cloudflare Agents
+# SDK, which adds roughly 190 ms of startup CPU to every cold isolate, so it lives in its OWN Worker
+# (workers/project-office/, deployed as "mupot-project-office") and is NOT part of this Worker's bundle.
+# This Worker would reach it through a Durable Object binding with script_name. The binding stays COMMENTED OUT
+# until Phase 1: scripts/setup.sh copies this file for every new pot, and a pot must not get the office early.
+# No migration belongs here either: the class's new_sqlite_classes migration is in
+# workers/project-office/wrangler.example.toml (that Worker has its own migration history, starting at v1).
+# Deploy order when enabling: 1) deploy workers/project-office, 2) uncomment this binding + set PROJECT_OFFICE = "1"
+# under [vars] (the flag is read here AND in the office Worker), 3) deploy this Worker.
+# [[durable_objects.bindings]]
+# name = "PROJECT_OFFICE_DO"
+# class_name = "ProjectOffice"
+# script_name = "mupot-project-office"
 
 # ── durable task pipeline (issue #7) ──
 # Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute

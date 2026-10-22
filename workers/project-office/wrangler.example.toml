@@ -1,0 +1,30 @@
+# mupot-project-office — the ProjectOffice Durable Object, in its own Worker. TEMPLATE; copy to a real
+# wrangler.toml (gitignored) and replace the <YOUR_*> placeholders. Phase 0 skeleton: INERT, not deployed anywhere.
+#
+# WHY A SEPARATE WORKER: the Cloudflare Agents SDK adds about 190 ms of startup CPU to a cold isolate (measured,
+# see README.md). Exporting the class from the main mupot Worker would charge every request path for a feature that
+# is off. Here only the office pays it.
+name = "mupot-project-office"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+TENANT_SLUG = "mumega"          # must equal the main Worker's TENANT_SLUG: the office refuses any other tenant
+# PROJECT_OFFICE = "1"          # Off by default. The flag is read here AND in the main Worker.
+
+# Same D1 database as the main Worker: D1 is the authority, the office only reads it.
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot"
+database_id = "<YOUR_D1_DATABASE_ID>"
+
+[[durable_objects.bindings]]
+name = "PROJECT_OFFICE_DO"
+class_name = "ProjectOffice"
+
+# This Worker's OWN migration history (it starts at v1; the main Worker's tags are unrelated).
+# A NEW class needs a new_sqlite_classes entry.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProjectOffice"]

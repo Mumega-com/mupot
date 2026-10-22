@@ -1,0 +1,17 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "createdAt": "2026-10-22T09:30:00.000Z",
+  "url": "https://linear.app/mumega/issue/MUM-77/doorbell-contract#comment-c1",
+  "webhookTimestamp": 1792661400000,
+  "webhookId": "9d1c0e2a-0000-4000-8000-00000000aaaa",
+  "organizationId": "org-linear-1",
+  "actor": { "id": "usr-1", "name": "Hadi" },
+  "data": {
+    "id": "c1c1c1c1-1111-4222-8333-444455556666",
+    "body": "COMMENT BODY MUST NOT BE COPIED",
+    "issueId": "5f0c7b9e-1111-4222-8333-444455556666",
+    "userId": "usr-1",
+    "updatedAt": "2026-10-22T09:30:00.000Z"
+  }
+}

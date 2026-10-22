@@ -30,6 +30,9 @@ export default defineConfig({
       'fleet-runtime/**',
       '**/*.test.mjs',
       'tests/composition/**',
+      // workers/<name>/ are separate Workers with their own package.json, lockfile and workerd test config
+      // (e.g. workers/project-office, which carries the Agents SDK). They run in their own CI job.
+      'workers/**',
       // Git worktrees live under .wt/ INSIDE the repo root, so each is a full copy of this
       // repo checked out to a DIFFERENT branch. Without this line vitest globs into all of
       // them and runs the suite once per worktree. Measured 2026-08-10: 2871 test files

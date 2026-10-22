@@ -67,6 +67,10 @@ export interface Env {
   // Body-free seat-events channel: one hibernating WebSocket per fleet host (src/agents/seat-events.ts).
   // Optional binding; inert until REALTIME_SEAT_EVENTS=1.
   SEAT_EVENTS?: DurableObjectNamespace
+  // One Durable Object per project (the "project back office"). The class lives in its OWN Worker
+  // (workers/project-office/), reached from here by a binding with script_name. Optional; INERT unless
+  // PROJECT_OFFICE=1 (default off). Named PROJECT_OFFICE_DO because the PROJECT_OFFICE key below is the flag.
+  PROJECT_OFFICE_DO?: DurableObjectNamespace
   // Durable task pipeline (issue #7, migration 0012).  Optional: only present
   // when the [[workflows]] binding is declared in wrangler.toml.  Code that
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
@@ -171,6 +175,9 @@ export interface Env {
   // Set to "1" to enable /api/fleet/events (ticket + WebSocket), the message.created → SeatEventsDO
   // fan-out, and the /api/inbox/stream fence for agents with a live seat-events grant.
   REALTIME_SEAT_EVENTS?: string
+  // Set to "1" to let a ProjectOffice serve. Default off: with it off every office entry point
+  // refuses and nothing in the request path or any cron routes to one.
+  PROJECT_OFFICE?: string
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
