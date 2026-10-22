@@ -16,6 +16,7 @@
 import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { scheduleTaskAssignedDoorbell, waitUntilFromContext } from '../agents/webhook-doorbell'
+import { assignerLabel, enqueueAssignmentWake, isWakeableTaskStatus } from '../agents/assignment-wake'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -711,7 +712,8 @@ tasksApp.post('/', async (c) => {
       // SquadCoordinatorDO /dispatch → wake-all-agents loop never fires for
       // planning work. dispatch:true keeps the event + the direct agent.wake.
       skipEvent: body.dispatch === false,
-      assignmentWake: { actorAgentId: auth.boundAgentId, waitUntil: waitUntilFromContext(c) },
+      // dispatch:true also wakes the assignee itself (agent.wake, below): one notice, not two.
+      assignmentWake: body.dispatch === true ? false : { actorAgentId: auth.boundAgentId, assignedBy: assignerLabel(auth) },
     })
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -1213,7 +1215,8 @@ tasksApp.patch('/:id', async (c) => {
       next.status = outcome.task.status
       next.updated_at = outcome.task.updated_at
     } else {
-      await persistTaskUpdate(c.env, existing, next, { actorAgentId: auth.boundAgentId, waitUntil: waitUntilFromContext(c) })
+      // The wake-on-assign enqueue runs below, AFTER the execution-hold release.
+      await persistTaskUpdate(c.env, existing, next, false)
     }
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -1245,6 +1248,16 @@ tasksApp.patch('/:id', async (c) => {
   // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold (the agent is being told to resume).
   if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
     await scheduleTaskAssignedDoorbell(c.env, next.assignee_agent_id, next.id, { waitUntil: waitUntilFromContext(c), assignment: next.updated_at })
+    // Wake-on-assign inbox doorbell: after the hold release above, on the same condition as the webhook ring.
+    if (isWakeableTaskStatus(next.status)) {
+      await enqueueAssignmentWake(c.env, {
+        taskId: next.id,
+        agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+        epoch: next.updated_at,
+        actorAgentId: auth.boundAgentId,
+        assignedBy: assignerLabel(auth),
+      })
+    }
   }
 
   // mupot#1592 NEW-1 — REST parity with the MCP task_update hook: freezes a

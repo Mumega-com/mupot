@@ -17,6 +17,7 @@ import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
 import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
+import { processAssignmentWakes } from '../agents/assignment-wake'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DispatchBrakeRefusedError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
@@ -774,6 +775,14 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         // Not acked: handleQueue retries the source message (never a silent loss).
         throw new Error('message.created mcp events fan-out failed; retrying the source message')
       }
+      return true
+    }
+    case 'assignment.wake': {
+      // Wake-on-assign: the producer wrote the ledger row(s); everything else is rebuilt from D1 (nothing in this payload is
+      // trusted). processAssignmentWakes never throws, and a failed delivery is a visible `failed` row the sweep retries,
+      // so the job is always acked.
+      if (!event.agent_id) return true
+      await processAssignmentWakes(env, event.agent_id)
       return true
     }
     case 'mcp.event.delivery': {

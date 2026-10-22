@@ -247,6 +247,7 @@ import { SEAT_EVENT_GRANT_TOOLS } from './seat-event-grant'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
+import { assignerLabel, enqueueAssignmentWake, isWakeableTaskStatus, supersedeAssignmentWakesByDispatch } from '../agents/assignment-wake'
 import {
   dispatchDoorbellCorrelation,
   resolveDoorbellRecipients,
@@ -1352,7 +1353,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch, assignmentWake: { actorAgentId: auth.boundAgentId, waitUntil: ctx.waitUntil } },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch, assignmentWake: { actorAgentId: auth.boundAgentId, assignedBy: assignerLabel(auth) } },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -2223,7 +2224,8 @@ const toolTaskUpdate: ToolSpec = {
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
       } else {
-        await persistTaskUpdate(env, existing, next, { actorAgentId: auth.boundAgentId, waitUntil: ctx.waitUntil })
+        // The wake-on-assign enqueue runs below, AFTER the execution-hold release (a same-agent reassignment that lifts a hold rings once).
+        await persistTaskUpdate(env, existing, next, false)
       }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -2249,6 +2251,16 @@ const toolTaskUpdate: ToolSpec = {
     // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold.
     if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
       await scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil, assignment: next.updated_at })
+      // Wake-on-assign inbox doorbell: after the hold release above, on the same condition as the webhook ring.
+      if (isWakeableTaskStatus(next.status)) {
+        await enqueueAssignmentWake(env, {
+          taskId: next.id,
+          agentId: next.assignee_agent_id as string, // assigningAgent guarantees a string
+          epoch: next.updated_at,
+          actorAgentId: auth.boundAgentId,
+          assignedBy: assignerLabel(auth),
+        })
+      }
     }
     let gateWake: GateWakeOutcome | undefined
 
@@ -3096,6 +3108,10 @@ const toolTaskDispatch: ToolSpec = {
       ).bind(message, env.TENANT_SLUG, receiptId).run()
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
+
+    // The dispatch carries its own letter: retire any not-yet-delivered wake-on-assign doorbell for this task so the
+    // assignee is not told twice (one statement; fail-open).
+    await supersedeAssignmentWakesByDispatch(env, task.id, task.assignee_agent_id)
 
     // Doorbell (mupot#1882): a (re-)dispatch tells the assignee to start. The bus path may ALSO ring it through the
     // inbox bridge (inbox.wake); the per-agent coalescing window turns the pair into one POST.

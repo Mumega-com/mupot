@@ -1,5 +1,5 @@
 import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
-import { ringAssignmentWake } from '../agents/assignment-wake'
+import { enqueueAssignmentWake } from '../agents/assignment-wake'
 import { createBus } from '../bus'
 import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
@@ -253,8 +253,8 @@ export async function runRouterTick(
     await createBus(env).emit(wake)
     // Doorbell (mupot#1882): an auto-assigned task rings the assignee's webhook doorbell (flag-gated, fail-open).
     await scheduleTaskAssignedDoorbell(env, candidate.id, task.id, { waitUntil: opts.waitUntil, assignment: now })
-    // Wake-on-assign: the assignee also gets ONE inbox doorbell (fail-open, idempotent per task/agent/epoch).
-    await ringAssignmentWake(env, { taskId: task.id, agentId: candidate.id, epoch: now }, { waitUntil: opts.waitUntil })
+    // Wake-on-assign: ONE conditional INSERT (fail-open, idempotent per task/agent/epoch); the send is off this path.
+    await enqueueAssignmentWake(env, { taskId: task.id, agentId: candidate.id, epoch: now, assignedBy: `member:${authority.memberId}` })
     assigned += 1
     decisions.push({ task_id: task.id, outcome: 'assigned', agent_id: candidate.id })
   }

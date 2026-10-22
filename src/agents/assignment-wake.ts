@@ -1,50 +1,78 @@
 // src/agents/assignment-wake.ts — wake-on-assign: every assignment of a task to an AGENT rings that agent's inbox.
 //
 // Hadi 2026-10-22: mupot assigned work but never told the assignee. A plain inbox message does wake a seated agent
-// (seatlink, the orca-mupot plugin, the webhook doorbell), so an assignment now enqueues ONE short doorbell message
-// through the existing sendAgentMessage path. Doorbell semantics: an identifier plus a pointer. The authority stays
-// in the task; the body carries no secret and no instruction beyond "read task_get <id> and start".
+// (seatlink, the orca-mupot plugin, the webhook doorbell), so an assignment now enqueues ONE short doorbell through the
+// existing sendAgentMessage path. Doorbell semantics: an identifier plus a pointer. The authority stays in the task; the
+// body carries no secret and no instruction beyond "read task_get <id> and start".
 //
-//   - once per (task, agent, epoch): task_assignment_wakes (migration 0251) is the idempotency key. A replay of the
-//     same assignment sends nothing; a reassign A->B->A is a new epoch (the assigning write's updated_at stamp).
-//   - agents only: callers pass an agents.id; a member / human assignee never reaches this module.
-//   - throttled: an agent that is not active, is archived or is execution-paused gets no doorbell (a 'skipped' row
-//     records why). At most ASSIGNMENT_WAKE_CAP doorbells per agent per ASSIGNMENT_WAKE_WINDOW_MS; the extras are held
-//     ('coalesced') and announced by ONE summary message "you have K new assignments" as soon as the window has room.
-//     The cap is read-then-write, not atomic: concurrent assignments racing the same window can overshoot it by the
-//     concurrency, never unboundedly (every later ring sees the real count).
+// TWO HALVES, so the assigning request stays cheap (a 20-task router tick must not pay ~10 D1 statements per task):
+//
+//   INLINE   enqueueAssignmentWake — ONE conditional INSERT into task_assignment_wakes (migration 0251) that claims the
+//            (task, agent, epoch) idempotency key AND the per-agent burst cap in a single statement, then a bus
+//            `assignment.wake` job (a queue send, zero D1). It never throws and never touches the assignment itself.
+//   OFF-PATH processAssignmentWakes — the queue consumer (and the cron sweep, the backstop) does everything else: re-checks
+//            the assignment is still live, decides whether anyone can read the inbox, folds into an unread doorbell or
+//            sends one, and fences every outcome write with its claim token.
+//
+// Guarantees:
+//   - once per (task, agent, epoch); A -> B -> A is a new epoch for A. The cap is a conditional INSERT, so concurrent
+//     assignments cannot overshoot it.
+//   - agents only; self-assignment is not a wake.
+//   - at most ONE unread doorbell per agent: while one is unread (and fresh) later assignments fold into it, they do not add
+//     another inbox row, so an agent that never reads its inbox cannot be used to fill the 1000-unread cap and starve real
+//     dispatch / gate / peer messages. An unread doorbell older than FOLD_MAX_AGE_MS is consumed and replaced.
+//   - agents with no inbox reader (no live bound token, no live fleet runtime — in-Worker agents, webhook-only agents,
+//     dead seats) get no inbox row; the webhook doorbell, if they have one, is rung regardless.
+//   - an agent that is inactive / archived / gone is skipped; a PAUSED agent (status or execution pause) keeps its
+//     assignments held and gets ONE summary when it resumes.
+//   - at most ASSIGNMENT_WAKE_CAP assignments per agent per window ride individually; the extras are held and announced in
+//     ONE "you have K new assignments" message.
+//   - re-checked at send time: the task must still be this agent's, in a wakeable status, not archived, and not already
+//     carried by a dispatch letter.
 //   - fail-open: nothing here throws. A doorbell that cannot be written never fails or rolls back the assignment; it is
-//     logged (console.error, structured) and left visible as a 'failed' ledger row. A replay retries it.
+//     logged and left as a visible `failed` ledger row that the sweep retries (bounded attempts).
 
-import type { Env } from '../types'
+import type { BusEvent, Env } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { sha256Hex } from '../lib/canonical-json'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { getFleetAgentLiveness } from '../fleet/registry'
 import { isExecutionPaused } from './execution-brake-sql'
 import { sendAgentMessage } from './messages'
 import { ASSIGNMENT_WAKE_SENDER } from './system-senders'
-import { scheduleTaskAssignedDoorbell, type DoorbellWaitUntil } from './webhook-doorbell'
+import { scheduleTaskAssignedDoorbell } from './webhook-doorbell'
 
 export { ASSIGNMENT_WAKE_SENDER }
 /** from_member stamped on the doorbell: the server is the sender, not any member. */
 export const ASSIGNMENT_WAKE_ACTOR = 'system:assignment-wake'
-/** At most this many doorbell messages per agent per window; the rest are coalesced into one summary. */
+/** At most this many assignments per agent per window ride individually; the rest are held and summarised. */
 export const ASSIGNMENT_WAKE_CAP = 5
 export const ASSIGNMENT_WAKE_WINDOW_MS = 10 * 60_000
-/** A 'pending' claim older than this is a crashed attempt and may be re-claimed. */
+/** A 'pending' claim older than this is a crashed worker and may be re-claimed. */
 export const ASSIGNMENT_WAKE_PENDING_STALE_MS = 2 * 60_000
+/** Failed sends / crashed claims tolerated per row before the sweep gives up (the row stays visible as failed). */
+export const ASSIGNMENT_WAKE_MAX_ATTEMPTS = 3
+/** An unread doorbell younger than this absorbs new assignments; an older one is consumed and replaced. */
+export const ASSIGNMENT_WAKE_FOLD_MAX_AGE_MS = 30 * 60_000
+/** Terminal ledger rows older than this are pruned by the sweep. */
+export const ASSIGNMENT_WAKE_RETENTION_MS = 7 * 24 * 60 * 60_000
+export const ASSIGNMENT_WAKE_EVENT = 'assignment.wake'
+
 const SUMMARY_LIST_MAX = 10
 const TITLE_MAX = 100
-const FLUSH_ROWS_MAX = 100
-const FLUSH_AGENTS_MAX = 50
+const NAME_MAX = 60
+const CLAIM_BATCH_MAX = 100
+const SWEEP_AGENTS_MAX = 5
+const PRUNE_BATCH_MAX = 200
 
 /** Task statuses in which a (new) assignee still has work to start. */
 const WAKEABLE_TASK_STATUSES: readonly string[] = ['open', 'in_progress', 'blocked', 'rejected']
 
-export type AssignmentWakeOutcome = 'sent' | 'duplicate' | 'coalesced' | 'skipped' | 'failed'
+export type EnqueueOutcome = 'queued' | 'coalesced' | 'duplicate' | 'skipped' | 'failed'
 
-export interface AssignmentWakeResult {
-  outcome: AssignmentWakeOutcome
+export interface EnqueueResult {
+  outcome: EnqueueOutcome
   reason?: string
-  seq?: number
 }
 
 export interface AssignmentWakeInput {
@@ -55,15 +83,27 @@ export interface AssignmentWakeInput {
   epoch: string
   /** The agent that performed the assignment, if any: assigning work to yourself is not a wake. */
   actorAgentId?: string | null
+  /** Who assigned it, when known: 'member:<id>' | 'agent:<id>' | 'system:<name>'. Shown in the doorbell. */
+  assignedBy?: string | null
 }
 
 export interface AssignmentWakeOpts {
-  /** ctx.waitUntil of the hosting request: the webhook-doorbell POST of the inbox send outlives the response. */
-  waitUntil?: DoorbellWaitUntil
   /** Injected clock, deterministic tests. */
   now?: () => Date
   /** Burst cap override (tests). */
   cap?: number
+}
+
+/** Passed by assigning code paths (createTask options / persistTaskUpdate): who is assigning. */
+export interface AssignmentWakeContext {
+  actorAgentId?: string | null
+  assignedBy?: string | null
+}
+
+/** The assigner label shown in the doorbell: the bound agent when an agent-bound credential acts, else the member. */
+export function assignerLabel(auth: { memberId?: string | null; boundAgentId?: string | null }): string | null {
+  if (auth.boundAgentId) return `agent:${auth.boundAgentId}`
+  return auth.memberId ? `member:${auth.memberId}` : null
 }
 
 /** True when a task in `status` has work for a freshly assigned agent. */
@@ -71,249 +111,355 @@ export function isWakeableTaskStatus(status: string): boolean {
   return WAKEABLE_TASK_STATUSES.includes(status)
 }
 
-/** The webhook-doorbell ref of this assignment: matches scheduleTaskAssignedDoorbell's `<task>#<assignment>`, so a
- *  webhook-registered agent is rung once for the pair (task.assigned + inbox.wake). */
-function assignmentCorrelation(taskId: string, epoch: string): string {
-  return `${taskId}#${epoch}`
+function logWakeProblem(event: string, detail: Record<string, unknown>): void {
+  // console.error inside the failure path only: the doorbell is best-effort, so this is its visibility.
+  console.error(JSON.stringify({ event, ...detail }))
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 200) : 'unknown_error'
 }
 
 async function keyHash(parts: readonly string[]): Promise<string> {
   return (await sha256Hex(parts.join('\u0000'))).slice(0, 40)
 }
 
-function cleanTitle(raw: string): string {
-  // Untrusted task text inside an agent's inbox: one line, bounded, no quotes or control characters.
-  const oneLine = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/"/g, "'").replace(/\s+/g, ' ').trim()
-  return oneLine.length > TITLE_MAX ? `${oneLine.slice(0, TITLE_MAX - 1)}…` : oneLine
+/**
+ * Untrusted member-written text inside an agent's inbox: one line, bounded, with every control / format / separator code
+ * point (C0, C1 incl. NEL, bidi overrides, zero-width, U+2028/9) and every quote or backtick removed, so it cannot break
+ * out of the quoted, labelled slot it is rendered in.
+ */
+export function cleanUntrustedText(raw: string, max: number): string {
+  const flat = raw
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ')
+    .replace(/["'`\u2018\u2019\u201a\u201b\u2032\u00ab\u00bb\u201c\u201d\u201e\u201f\u2033\u2039\u203a]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const points = Array.from(flat)
+  return points.length > max ? `${points.slice(0, max - 1).join('')}…` : flat
 }
 
-function logWakeProblem(event: string, detail: Record<string, unknown>): void {
-  // console.error inside the failure path only: the doorbell is best-effort, so this is its visibility.
-  console.error(JSON.stringify({ event, ...detail }))
+// ── INLINE half ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Record an assignment for the off-path worker. Call AFTER the assignment has committed. Never throws.
+ *
+ * ONE statement: INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING outcome. The conflict target is the idempotency
+ * key (a replay inserts nothing), and the row's outcome is decided IN the statement from the agent's current window count
+ * ('queued' under the cap, 'coalesced' at or over it), so concurrent assignments serialise on the write lock and cannot
+ * overshoot the cap. A queued row also sends the `assignment.wake` bus job (no D1); a coalesced row sends it delayed to
+ * when its window ends.
+ */
+export async function enqueueAssignmentWake(
+  env: Env,
+  input: AssignmentWakeInput,
+  opts: AssignmentWakeOpts = {},
+): Promise<EnqueueResult> {
+  try {
+    const tenant = env.TENANT_SLUG
+    if (!tenant) return { outcome: 'failed', reason: 'no_tenant' }
+    if (!input.agentId || !input.taskId || !input.epoch) return { outcome: 'skipped', reason: 'incomplete_assignment' }
+    if (input.actorAgentId && input.actorAgentId === input.agentId) return { outcome: 'skipped', reason: 'self_assignment' }
+
+    const now = opts.now ?? (() => new Date())
+    const nowIso = now().toISOString()
+    const sinceIso = new Date(now().getTime() - ASSIGNMENT_WAKE_WINDOW_MS).toISOString()
+    const cap = opts.cap ?? ASSIGNMENT_WAKE_CAP
+    const row = await env.DB.prepare(
+      `INSERT INTO task_assignment_wakes
+         (id, tenant, task_id, agent_id, epoch, outcome, reason, assigned_by, created_at, updated_at)
+       SELECT ?1, ?2, ?3, ?4, ?5,
+              CASE WHEN c.n < ?8 THEN 'queued' ELSE 'coalesced' END,
+              CASE WHEN c.n < ?8 THEN NULL ELSE 'burst_cap' END,
+              ?9, ?6, ?6
+         FROM (SELECT COUNT(*) AS n FROM task_assignment_wakes w
+                WHERE w.tenant = ?2 AND w.agent_id = ?4
+                  AND w.outcome IN ('queued', 'pending', 'sent') AND w.created_at > ?7) c
+        WHERE 1
+       ON CONFLICT (tenant, task_id, agent_id, epoch) DO NOTHING
+       RETURNING outcome`,
+    )
+      .bind(crypto.randomUUID(), tenant, input.taskId, input.agentId, input.epoch, nowIso, sinceIso, cap, input.assignedBy ?? null)
+      .first<{ outcome: 'queued' | 'coalesced' }>()
+    if (!row) return { outcome: 'duplicate' }
+
+    await sendWakeJob(env, tenant, input.agentId, nowIso, row.outcome === 'coalesced' ? ASSIGNMENT_WAKE_WINDOW_MS / 1000 + 5 : 0)
+    return row.outcome === 'queued' ? { outcome: 'queued' } : { outcome: 'coalesced', reason: 'burst_cap' }
+  } catch (error) {
+    logWakeProblem('assignment_wake_enqueue_failed', { task_id: input.taskId, agent_id: input.agentId, reason: errorText(error) })
+    return { outcome: 'failed', reason: errorText(error) }
+  }
 }
 
-/** Why this agent must not be woken right now, or null. Order: unknown / inactive / archived, then execution pause. */
-async function wakeBlockedReason(env: Env, agentId: string): Promise<string | null> {
+async function sendWakeJob(env: Env, tenant: string, agentId: string, nowIso: string, delaySeconds: number): Promise<void> {
+  try {
+    if (!env.BUS?.send) return // no queue (tests, local): the cron sweep delivers
+    const event: BusEvent<Record<string, never>> = { type: ASSIGNMENT_WAKE_EVENT, tenant, agent_id: agentId, payload: {}, ts: nowIso }
+    if (delaySeconds > 0) await env.BUS.send(event, { delaySeconds })
+    else await env.BUS.send(event)
+  } catch (error) {
+    // The ledger row is durable; the sweep will deliver it. A dead queue never fails the assignment.
+    logWakeProblem('assignment_wake_job_failed', { agent_id: agentId, reason: errorText(error) })
+  }
+}
+
+// ── OFF-PATH half ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+export interface WorkerResult {
+  /** assignments delivered (rode in a new inbox row or folded into an unread one) */
+  delivered: number
+  /** new inbox rows written */
+  messages: number
+}
+
+interface ClaimedRow {
+  id: string
+  task_id: string
+  epoch: string
+  assigned_by: string | null
+}
+
+interface LiveTask {
+  row: ClaimedRow
+  title: string
+  projectName: string | null
+  externalSource: string | null
+  sourcePot: string | null
+}
+
+type AgentWakeState = { kind: 'ok' } | { kind: 'hold'; reason: string } | { kind: 'skip'; reason: string }
+
+async function agentWakeState(env: Env, agentId: string): Promise<AgentWakeState> {
   const agent = await env.DB.prepare('SELECT status, archived_at FROM agents WHERE id = ?1 LIMIT 1')
     .bind(agentId)
     .first<{ status: string; archived_at: string | null }>()
-  if (!agent) return 'agent_not_found'
-  if (agent.archived_at) return 'agent_archived'
-  if (agent.status !== 'active') return `agent_${agent.status}`
-  if (await isExecutionPaused(env, agentId)) return 'execution_paused'
-  return null
+  if (!agent) return { kind: 'skip', reason: 'agent_not_found' }
+  if (agent.archived_at) return { kind: 'skip', reason: 'agent_archived' }
+  if (agent.status === 'paused') return { kind: 'hold', reason: 'agent_paused' }
+  if (agent.status !== 'active') return { kind: 'skip', reason: `agent_${agent.status}` }
+  if (await isExecutionPaused(env, agentId)) return { kind: 'hold', reason: 'agent_paused' }
+  return { kind: 'ok' }
 }
 
-async function doorbellsInWindow(env: Env, tenant: string, agentId: string, sinceIso: string): Promise<number> {
-  const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM agent_messages
-      WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND created_at > ?4`,
+/** A reader exists when the agent has a live bound token (a seat, the plugin, seatlink) or a live fleet runtime. */
+async function hasInboxReader(env: Env, tenant: string, agentId: string): Promise<boolean> {
+  const token = await env.DB.prepare(
+    `SELECT 1 AS x FROM member_tokens t
+      WHERE t.tenant = ?1 AND t.agent_id = ?2 AND ${TOKEN_LIVE_PREDICATE('?3')}
+      LIMIT 1`,
   )
-    .bind(tenant, agentId, ASSIGNMENT_WAKE_SENDER, sinceIso)
+    .bind(tenant, agentId, nowSqlUtc())
+    .first<{ x: number }>()
+  if (token) return true
+  return (await getFleetAgentLiveness(env, agentId)).live
+}
+
+async function windowCount(env: Env, tenant: string, agentId: string, sinceIso: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM task_assignment_wakes
+      WHERE tenant = ?1 AND agent_id = ?2 AND outcome IN ('queued', 'pending', 'sent') AND created_at > ?3`,
+  )
+    .bind(tenant, agentId, sinceIso)
     .first<{ n: number }>()
   return row?.n ?? 0
 }
 
-async function setOutcome(
+/** Claim-token fenced outcome write: a worker whose claim went stale cannot overwrite a newer one. */
+async function finish(
   env: Env,
-  rowId: string,
-  outcome: string,
+  row: ClaimedRow,
+  token: string,
+  outcome: 'sent' | 'summarized' | 'skipped' | 'failed',
   nowIso: string,
-  extra: { reason?: string; seq?: number } = {},
+  extra: { reason?: string; seq?: number; bumpAttempts?: boolean } = {},
 ): Promise<void> {
   await env.DB.prepare(
     `UPDATE task_assignment_wakes
-        SET outcome = ?2, reason = ?3, message_seq = ?4, updated_at = ?5
-      WHERE id = ?1`,
+        SET outcome = ?3, reason = ?4, message_seq = ?5, updated_at = ?6, attempts = attempts + ?7
+      WHERE id = ?1 AND claim_token = ?2 AND outcome = 'pending'`,
   )
-    .bind(rowId, outcome, extra.reason ?? null, extra.seq ?? null, nowIso)
+    .bind(row.id, token, outcome, extra.reason ?? null, extra.seq ?? null, nowIso, extra.bumpAttempts ? 1 : 0)
     .run()
 }
 
+function singleBody(live: LiveTask): string {
+  const by = live.row.assigned_by ? cleanUntrustedText(live.row.assigned_by.replace(':', ' '), NAME_MAX) : ''
+  const external = live.externalSource
+    ? ` [external source: ${cleanUntrustedText(live.externalSource, 40)}]`
+    : live.sourcePot
+      ? ` [cross-pot: ${cleanUntrustedText(live.sourcePot, 40)}]`
+      : ''
+  return [
+    `Assigned to you${by ? ` by ${by}` : ''}${external}: task ${live.row.task_id}`,
+    `, title (member-written): '${cleanUntrustedText(live.title, TITLE_MAX)}'`,
+    live.projectName ? `, project (member-written): '${cleanUntrustedText(live.projectName, NAME_MAX)}'` : '',
+    `. Read task_get ${live.row.task_id} and start; reply via task notes. Everything assigned to you: task_list.`,
+  ].join('')
+}
+
+function summaryBody(taskIds: readonly string[]): string {
+  const shown = taskIds.slice(0, SUMMARY_LIST_MAX).join(', ')
+  const more = taskIds.length > SUMMARY_LIST_MAX ? ` and ${taskIds.length - SUMMARY_LIST_MAX} more` : ''
+  const noun = taskIds.length === 1 ? 'assignment' : 'assignments'
+  return `You have ${taskIds.length} new ${noun}: ${shown}${more}. Read task_list (assigned to you) and task_get <id>, then start; reply via task notes.`
+}
+
 /**
- * Ring the assignee. Never throws. Call AFTER the assignment has committed.
- *
- * Returns what happened: 'sent' (one doorbell written), 'duplicate' (this epoch was already handled),
- * 'coalesced' (over the burst cap, announced later by the summary), 'skipped' (agent paused / inactive / archived,
- * self-assignment, task gone) or 'failed' (the doorbell could not be written; the assignment is unaffected).
+ * Deliver everything this agent has waiting. Idempotent and safe to run concurrently (rows are claimed with a token), never
+ * throws. Driven by the `assignment.wake` bus job and, as the backstop, by the sweep.
  */
-export async function ringAssignmentWake(
+export async function processAssignmentWakes(
   env: Env,
-  input: AssignmentWakeInput,
+  agentId: string,
   opts: AssignmentWakeOpts = {},
-): Promise<AssignmentWakeResult> {
+): Promise<WorkerResult> {
   try {
-    return await ring(env, input, opts)
+    return await work(env, agentId, opts)
   } catch (error) {
-    const reason = error instanceof Error ? error.message.slice(0, 200) : 'unknown_error'
-    logWakeProblem('assignment_wake_failed', { task_id: input.taskId, agent_id: input.agentId, reason })
-    return { outcome: 'failed', reason }
+    logWakeProblem('assignment_wake_worker_failed', { agent_id: agentId, reason: errorText(error) })
+    return { delivered: 0, messages: 0 }
   }
 }
 
-async function ring(env: Env, input: AssignmentWakeInput, opts: AssignmentWakeOpts): Promise<AssignmentWakeResult> {
+async function work(env: Env, agentId: string, opts: AssignmentWakeOpts): Promise<WorkerResult> {
+  const none: WorkerResult = { delivered: 0, messages: 0 }
   const tenant = env.TENANT_SLUG
-  if (!tenant) return { outcome: 'failed', reason: 'no_tenant' }
-  if (!input.agentId || !input.taskId || !input.epoch) return { outcome: 'skipped', reason: 'incomplete_assignment' }
-  if (input.actorAgentId && input.actorAgentId === input.agentId) return { outcome: 'skipped', reason: 'self_assignment' }
-
+  if (!tenant) return none
   const now = opts.now ?? (() => new Date())
   const nowIso = now().toISOString()
-  const rowId = crypto.randomUUID()
+  const staleIso = new Date(now().getTime() - ASSIGNMENT_WAKE_PENDING_STALE_MS).toISOString()
+  const sinceIso = new Date(now().getTime() - ASSIGNMENT_WAKE_WINDOW_MS).toISOString()
+  const cap = opts.cap ?? ASSIGNMENT_WAKE_CAP
 
-  // Claim the (task, agent, epoch) key. A terminal row (sent / coalesced / summarized) is a no-op replay; a
-  // skipped / failed / stale-pending row is re-evaluated, so a retry after a transient failure is not blocked.
-  const staleBefore = new Date(now().getTime() - ASSIGNMENT_WAKE_PENDING_STALE_MS).toISOString()
-  const claim = await env.DB.prepare(
-    `INSERT INTO task_assignment_wakes (id, tenant, task_id, agent_id, epoch, outcome, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)
-     ON CONFLICT (tenant, task_id, agent_id, epoch) DO UPDATE
-        SET outcome = 'pending', reason = NULL, updated_at = excluded.updated_at
-      WHERE task_assignment_wakes.outcome IN ('skipped', 'failed')
-         OR (task_assignment_wakes.outcome = 'pending' AND task_assignment_wakes.updated_at < ?7)
-     RETURNING id`,
+  const state = await agentWakeState(env, agentId)
+  if (state.kind === 'skip') {
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes SET outcome = 'skipped', reason = ?3, updated_at = ?4
+        WHERE tenant = ?1 AND agent_id = ?2
+          AND (outcome IN ('queued', 'coalesced', 'failed') OR (outcome = 'pending' AND updated_at < ?5))`,
+    ).bind(tenant, agentId, state.reason, nowIso, staleIso).run()
+    return none
+  }
+  if (state.kind === 'hold') {
+    // Paused: nothing is dropped. Touching updated_at rotates this agent behind the others in the sweep's order.
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes SET outcome = 'coalesced', reason = ?3, updated_at = ?4
+        WHERE tenant = ?1 AND agent_id = ?2 AND outcome IN ('queued', 'coalesced')`,
+    ).bind(tenant, agentId, state.reason, nowIso).run()
+    return none
+  }
+
+  // Claim. Queued rows and retryable failures / crashed claims always; held rows only when the window has room.
+  const token = crypto.randomUUID()
+  const claim = async (where: string, binds: unknown[]): Promise<void> => {
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes
+          SET outcome = 'pending', claim_token = ?3, updated_at = ?4,
+              attempts = attempts + CASE WHEN outcome = 'pending' THEN 1 ELSE 0 END
+        WHERE id IN (SELECT id FROM task_assignment_wakes
+                      WHERE tenant = ?1 AND agent_id = ?2 AND (${where})
+                      ORDER BY created_at ASC, id ASC LIMIT ${CLAIM_BATCH_MAX})`,
+    ).bind(tenant, agentId, token, nowIso, ...binds).run()
+  }
+  await claim(
+    `outcome = 'queued' OR (outcome = 'failed' AND attempts < ?5) OR (outcome = 'pending' AND updated_at < ?6 AND attempts < ?5)`,
+    [ASSIGNMENT_WAKE_MAX_ATTEMPTS, staleIso],
   )
-    .bind(rowId, tenant, input.taskId, input.agentId, input.epoch, nowIso, staleBefore)
-    .first<{ id: string }>()
-  if (!claim) return { outcome: 'duplicate' }
-  const claimedId = claim.id
+  if ((await windowCount(env, tenant, agentId, sinceIso)) < cap) await claim(`outcome = 'coalesced'`, [])
+  const claimed = await env.DB.prepare(
+    `SELECT id, task_id, epoch, assigned_by FROM task_assignment_wakes
+      WHERE tenant = ?1 AND agent_id = ?2 AND claim_token = ?3 AND outcome = 'pending'
+      ORDER BY created_at ASC, id ASC`,
+  )
+    .bind(tenant, agentId, token)
+    .all<ClaimedRow>()
+  const rows = claimed.results ?? []
+  if (rows.length === 0) {
+    // Held rows with no room yet: touch them so the sweep rotates this agent behind the others instead of re-picking it forever.
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes SET updated_at = ?3 WHERE tenant = ?1 AND agent_id = ?2 AND outcome = 'coalesced'`,
+    ).bind(tenant, agentId, nowIso).run()
+    return none
+  }
 
-  try {
-    const blocked = await wakeBlockedReason(env, input.agentId)
-    if (blocked) {
-      await setOutcome(env, claimedId, 'skipped', nowIso, { reason: blocked })
-      return { outcome: 'skipped', reason: blocked }
-    }
-
+  // Re-check every assignment at send time: still this agent's, still wakeable, not archived, not already dispatched.
+  const live: LiveTask[] = []
+  for (const row of rows) {
     const task = await env.DB.prepare(
-      `SELECT t.id, t.title, t.status, t.assignee_agent_id, p.name AS project_name
+      `SELECT t.title, t.status, t.assignee_agent_id, t.external_source, t.source_pot, p.name AS project_name,
+              ${TASK_NOT_ARCHIVED_SQL('t')} AS not_archived
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
         WHERE t.id = ?1 LIMIT 1`,
     )
-      .bind(input.taskId)
-      .first<{ id: string; title: string; status: string; assignee_agent_id: string | null; project_name: string | null }>()
-    if (!task) {
-      await setOutcome(env, claimedId, 'skipped', nowIso, { reason: 'task_not_found' })
-      return { outcome: 'skipped', reason: 'task_not_found' }
+      .bind(row.task_id)
+      .first<{
+        title: string
+        status: string
+        assignee_agent_id: string | null
+        external_source: string | null
+        source_pot: string | null
+        project_name: string | null
+        not_archived: number
+      }>()
+    let skip: string | null = null
+    if (!task) skip = 'task_not_found'
+    else if (!task.not_archived) skip = 'task_archived'
+    else if (task.assignee_agent_id !== agentId) skip = 'reassigned'
+    else if (!isWakeableTaskStatus(task.status)) skip = 'task_not_wakeable'
+    else if (await dispatchLetterExists(env, tenant, row.task_id, agentId, row.epoch)) skip = 'dispatch_letter_exists'
+    if (skip || !task) {
+      await finish(env, row, token, 'skipped', nowIso, { reason: skip ?? 'task_not_found' })
+      continue
     }
-
-    // Capacity first for the backlog: held extras go out as one summary before this assignment competes for the window.
-    const cap = opts.cap ?? ASSIGNMENT_WAKE_CAP
-    await flushCoalescedForAgent(env, tenant, input.agentId, { ...opts, cap })
-
-    const sinceIso = new Date(now().getTime() - ASSIGNMENT_WAKE_WINDOW_MS).toISOString()
-    if ((await doorbellsInWindow(env, tenant, input.agentId, sinceIso)) >= cap) {
-      await setOutcome(env, claimedId, 'coalesced', nowIso, { reason: 'burst_cap' })
-      return { outcome: 'coalesced', reason: 'burst_cap' }
-    }
-
-    // Webhook doorbell (flag-gated, fail-open, a no-op for an agent without one): the same `mupot.task.assigned` ring the
-    // MCP / REST / router sites send themselves. Same `<task>#<epoch>` ref, so a site that also rings it coalesces to ONE
-    // POST, and the inbox.wake of the letter below (same correlation) joins it. Rung first so the richer event wins.
-    await scheduleTaskAssignedDoorbell(env, input.agentId, input.taskId, { waitUntil: opts.waitUntil, assignment: input.epoch })
-
-    const body = [
-      `Assigned to you: task ${task.id} "${cleanTitle(task.title)}"`,
-      task.project_name ? ` (project: ${cleanTitle(task.project_name)})` : '',
-      `. Read task_get ${task.id} and start; reply via task notes.`,
-    ].join('')
-    const sent = await sendAgentMessage(
-      env,
-      {
-        fromAgent: ASSIGNMENT_WAKE_SENDER,
-        fromMember: ASSIGNMENT_WAKE_ACTOR,
-        toAgent: input.agentId,
-        kind: 'message',
-        body,
-        requestId: `assign:${await keyHash([tenant, input.taskId, input.agentId, input.epoch])}`,
-      },
-      { system: true, reason: 'target is the agent the assignment just committed to, resolved server-side, not caller input' },
-      { waitUntil: opts.waitUntil, now: () => nowIso, doorbellCorrelation: assignmentCorrelation(input.taskId, input.epoch) },
-    )
-    if (!sent.ok) {
-      await setOutcome(env, claimedId, 'failed', nowIso, { reason: sent.reason })
-      logWakeProblem('assignment_wake_failed', { task_id: input.taskId, agent_id: input.agentId, reason: sent.reason })
-      return { outcome: 'failed', reason: sent.reason }
-    }
-    await setOutcome(env, claimedId, 'sent', nowIso, { seq: sent.seq })
-    return { outcome: 'sent', seq: sent.seq }
-  } catch (error) {
-    // Leave the claim re-claimable and visible rather than 'pending' forever.
-    const reason = error instanceof Error ? error.message.slice(0, 200) : 'unknown_error'
-    logWakeProblem('assignment_wake_failed', { task_id: input.taskId, agent_id: input.agentId, reason })
-    try {
-      await setOutcome(env, claimedId, 'failed', nowIso, { reason })
-    } catch {
-      // the stale-pending re-claim covers a ledger that cannot be written right now
-    }
-    return { outcome: 'failed', reason }
+    live.push({ row, title: task.title, projectName: task.project_name, externalSource: task.external_source, sourcePot: task.source_pot })
   }
-}
 
-interface CoalescedRow {
-  id: string
-  task_id: string
-  epoch: string
-}
+  // One entry per task: a task assigned twice in a row is announced once (the newest assignment represents it).
+  const byTask = new Map<string, LiveTask>()
+  for (const item of live) byTask.set(item.row.task_id, item)
+  const primary = [...byTask.values()]
+  for (const item of live) {
+    if (byTask.get(item.row.task_id) !== item) await finish(env, item.row, token, 'summarized', nowIso, { reason: 'duplicate_task' })
+  }
+  if (primary.length === 0) return none
 
-/**
- * Announce the assignments held by the burst cap in ONE message ("you have K new assignments"), once the agent's
- * window has room again. Rows whose task has since moved on (reassigned, finished) are dropped from the count, not
- * announced. Never throws. Returns how many assignments the summary carried (0 = nothing sent).
- */
-export async function flushCoalescedForAgent(
-  env: Env,
-  tenant: string,
-  agentId: string,
-  opts: AssignmentWakeOpts = {},
-): Promise<number> {
+  // Webhook doorbell (flag-gated, fail-open, a no-op for an agent without one). Rung BEFORE the inbox-reader check: an agent
+  // whose only consumer is its webhook is woken here and gets no inbox row.
+  for (const item of primary) {
+    await scheduleTaskAssignedDoorbell(env, agentId, item.row.task_id, { assignment: item.row.epoch })
+  }
+
+  if (!(await hasInboxReader(env, tenant, agentId))) {
+    for (const item of primary) await finish(env, item.row, token, 'skipped', nowIso, { reason: 'no_inbox_reader' })
+    return none
+  }
+
   try {
-    const held = await env.DB.prepare(
-      `SELECT id, task_id, epoch FROM task_assignment_wakes
-        WHERE tenant = ?1 AND agent_id = ?2 AND outcome = 'coalesced'
-        ORDER BY created_at ASC, id ASC LIMIT ?3`,
+    // At most one unread doorbell: fold into a fresh one; consume (and replace) a stale one.
+    const unread = await env.DB.prepare(
+      `SELECT seq, created_at, lease_expires_at FROM agent_messages
+        WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND read_at IS NULL AND dead_lettered_at IS NULL
+        ORDER BY seq DESC LIMIT 1`,
     )
-      .bind(tenant, agentId, FLUSH_ROWS_MAX)
-      .all<CoalescedRow>()
-    const rows = held.results ?? []
-    if (rows.length === 0) return 0
-
-    const now = opts.now ?? (() => new Date())
-    const nowIso = now().toISOString()
-
-    const blocked = await wakeBlockedReason(env, agentId)
-    if (blocked) {
-      await env.DB.prepare(
-        `UPDATE task_assignment_wakes SET outcome = 'skipped', reason = ?3, updated_at = ?4
-          WHERE tenant = ?1 AND agent_id = ?2 AND outcome = 'coalesced'`,
-      ).bind(tenant, agentId, blocked, nowIso).run()
-      return 0
-    }
-
-    const cap = opts.cap ?? ASSIGNMENT_WAKE_CAP
-    const sinceIso = new Date(now().getTime() - ASSIGNMENT_WAKE_WINDOW_MS).toISOString()
-    if ((await doorbellsInWindow(env, tenant, agentId, sinceIso)) >= cap) return 0
-
-    // Still the assignee's open work? A task reassigned or finished while it was held is not announced.
-    const live: CoalescedRow[] = []
-    for (const row of rows) {
-      const task = await env.DB.prepare('SELECT status, assignee_agent_id FROM tasks WHERE id = ?1 LIMIT 1')
-        .bind(row.task_id)
-        .first<{ status: string; assignee_agent_id: string | null }>()
-      if (task && task.assignee_agent_id === agentId && isWakeableTaskStatus(task.status)) {
-        live.push(row)
-      } else {
-        await setOutcome(env, row.id, 'skipped', nowIso, { reason: 'stale_at_flush' })
+      .bind(tenant, agentId, ASSIGNMENT_WAKE_SENDER)
+      .first<{ seq: number; created_at: string; lease_expires_at: string | null }>()
+    const leased = unread?.lease_expires_at != null && unread.lease_expires_at > nowIso
+    if (unread && !leased) {
+      const age = now().getTime() - Date.parse(unread.created_at)
+      if (age < ASSIGNMENT_WAKE_FOLD_MAX_AGE_MS) {
+        for (const item of primary) await finish(env, item.row, token, 'sent', nowIso, { seq: unread.seq, reason: 'folded' })
+        return { delivered: primary.length, messages: 0 }
       }
+      await env.DB.prepare(
+        `UPDATE agent_messages SET read_at = ?4
+          WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND read_at IS NULL
+            AND (lease_expires_at IS NULL OR lease_expires_at <= ?4)`,
+      ).bind(tenant, agentId, ASSIGNMENT_WAKE_SENDER, nowIso).run()
     }
-    if (live.length === 0) return 0
 
-    const ids = live.map((r) => r.task_id)
-    const shown = ids.slice(0, SUMMARY_LIST_MAX).join(', ')
-    const more = ids.length > SUMMARY_LIST_MAX ? ` and ${ids.length - SUMMARY_LIST_MAX} more` : ''
-    const noun = live.length === 1 ? 'assignment' : 'assignments'
-    const body = `You have ${live.length} new ${noun}: ${shown}${more}. Read task_list (assigned to you) and task_get <id>, then start; reply via task notes.`
-    const requestId = `assign-batch:${await keyHash([tenant, agentId, ...live.map((r) => `${r.task_id}@${r.epoch}`)])}`
+    const single = primary.length === 1
+    const body = single ? singleBody(primary[0]) : summaryBody(primary.map((p) => p.row.task_id))
+    const requestId = `assign:${await keyHash([tenant, agentId, ...primary.map((p) => `${p.row.task_id}@${p.row.epoch}`).sort()])}`
     const sent = await sendAgentMessage(
       env,
       {
@@ -324,52 +470,114 @@ export async function flushCoalescedForAgent(
         body,
         requestId,
       },
-      { system: true, reason: 'summary of assignments already committed to this agent, resolved server-side' },
-      { waitUntil: opts.waitUntil, now: () => nowIso },
+      { system: true, reason: 'target is the agent the assignment just committed to, resolved server-side, not caller input' },
+      {
+        now: () => nowIso,
+        // Same `<task>#<epoch>` ref as the task.assigned ring above: a webhook-registered agent is POSTed once.
+        ...(single ? { doorbellCorrelation: `${primary[0].row.task_id}#${primary[0].row.epoch}` } : {}),
+      },
     )
-    if (!sent.ok) {
-      logWakeProblem('assignment_wake_summary_failed', { agent_id: agentId, count: live.length, reason: sent.reason })
-      return 0
+    // request_id_conflict = this exact set already landed under a different body (a retry after a title edit): delivered.
+    if (!sent.ok && sent.reason !== 'request_id_conflict') {
+      for (const item of primary) await finish(env, item.row, token, 'failed', nowIso, { reason: sent.reason, bumpAttempts: true })
+      logWakeProblem('assignment_wake_failed', { agent_id: agentId, count: primary.length, reason: sent.reason })
+      return none
     }
-    for (const row of live) {
-      await env.DB.prepare(
-        `UPDATE task_assignment_wakes
-            SET outcome = 'summarized', summary_request_id = ?2, message_seq = ?3, updated_at = ?4
-          WHERE id = ?1 AND outcome = 'coalesced'`,
-      ).bind(row.id, requestId, sent.seq, nowIso).run()
-    }
-    return live.length
+    const seq = sent.ok ? sent.seq : undefined
+    for (const item of primary) await finish(env, item.row, token, 'sent', nowIso, { seq, reason: single ? undefined : 'summary' })
+    return { delivered: primary.length, messages: 1 }
   } catch (error) {
-    logWakeProblem('assignment_wake_summary_failed', {
-      agent_id: agentId,
-      reason: error instanceof Error ? error.message.slice(0, 200) : 'unknown_error',
-    })
-    return 0
+    // Leave every claimed row retryable and visible rather than 'pending' forever.
+    const reason = errorText(error)
+    logWakeProblem('assignment_wake_failed', { agent_id: agentId, count: primary.length, reason })
+    try {
+      for (const item of primary) await finish(env, item.row, token, 'failed', nowIso, { reason, bumpAttempts: true })
+    } catch {
+      // the stale-pending re-claim covers a ledger that cannot be written right now
+    }
+    return none
   }
 }
 
-/** Cron entry: announce every agent's held assignments whose window has room. Never throws. */
-export async function flushCoalescedAssignmentWakes(
+/** A dispatch letter (task_dispatch bridge / explicit dispatch) for this task and agent at or after this assignment. */
+async function dispatchLetterExists(env: Env, tenant: string, taskId: string, agentId: string, epoch: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x FROM task_dispatch_receipts
+      WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND created_at >= ?4 LIMIT 1`,
+  )
+    .bind(tenant, taskId, agentId, epoch)
+    .first<{ x: number }>()
+  return row !== null
+}
+
+/**
+ * task_dispatch carries its own letter: retire any not-yet-delivered doorbell for this task and agent so the assignee is
+ * not told twice. Never throws.
+ */
+export async function supersedeAssignmentWakesByDispatch(env: Env, taskId: string, agentId: string): Promise<void> {
+  try {
+    const tenant = env.TENANT_SLUG
+    if (!tenant) return
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes SET outcome = 'skipped', reason = 'dispatch_letter_exists', updated_at = ?4
+        WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND outcome IN ('queued', 'coalesced')`,
+    ).bind(tenant, taskId, agentId, new Date().toISOString()).run()
+  } catch (error) {
+    logWakeProblem('assignment_wake_supersede_failed', { task_id: taskId, agent_id: agentId, reason: errorText(error) })
+  }
+}
+
+// ── SWEEP (cron backstop) ─────────────────────────────────────────────────────────────────────────────────────────
+
+/** Which agents have undelivered rows, oldest first. INDEXED BY pins the (tenant, outcome, agent_id, updated_at) index. */
+export const SWEEP_DUE_SQL = `SELECT agent_id, MIN(updated_at) AS oldest FROM task_assignment_wakes INDEXED BY idx_task_assignment_wakes_sweep
+        WHERE tenant = ?1
+          AND (outcome IN ('queued', 'coalesced')
+               OR (outcome = 'failed' AND attempts < ?3)
+               OR (outcome = 'pending' AND updated_at < ?2 AND attempts < ?3))
+        GROUP BY agent_id ORDER BY oldest ASC LIMIT ${SWEEP_AGENTS_MAX}`
+
+/**
+ * Cron entry: prune old terminal rows, then work through the agents with undelivered rows, oldest first. Retries `failed`
+ * rows and stale `pending` claims (bounded by ASSIGNMENT_WAKE_MAX_ATTEMPTS) and delivers held rows whose window has room
+ * or whose agent resumed. Fair: a worker touches updated_at of what it cannot deliver, which rotates that agent to the
+ * back. Never throws.
+ */
+export async function sweepAssignmentWakes(
   env: Env,
   opts: AssignmentWakeOpts = {},
-): Promise<{ agents: number; announced: number }> {
+): Promise<{ agents: number; delivered: number; pruned: number }> {
   const tenant = env.TENANT_SLUG
-  if (!tenant) return { agents: 0, announced: 0 }
+  if (!tenant) return { agents: 0, delivered: 0, pruned: 0 }
   try {
-    const held = await env.DB.prepare(
-      `SELECT DISTINCT agent_id FROM task_assignment_wakes
-        WHERE tenant = ?1 AND outcome = 'coalesced' LIMIT ?2`,
-    )
-      .bind(tenant, FLUSH_AGENTS_MAX)
-      .all<{ agent_id: string }>()
-    let announced = 0
-    const agents = held.results ?? []
-    for (const { agent_id } of agents) announced += await flushCoalescedForAgent(env, tenant, agent_id, opts)
-    return { agents: agents.length, announced }
+    const now = opts.now ?? (() => new Date())
+    const nowIso = now().toISOString()
+    const staleIso = new Date(now().getTime() - ASSIGNMENT_WAKE_PENDING_STALE_MS).toISOString()
+    const oldIso = new Date(now().getTime() - ASSIGNMENT_WAKE_RETENTION_MS).toISOString()
+
+    // A crashed claim past its attempt ceiling is a failure, not a forever-pending row.
+    await env.DB.prepare(
+      `UPDATE task_assignment_wakes SET outcome = 'failed', reason = 'attempts_exhausted', updated_at = ?3
+        WHERE tenant = ?1 AND outcome = 'pending' AND updated_at < ?2 AND attempts >= ?4`,
+    ).bind(tenant, staleIso, nowIso, ASSIGNMENT_WAKE_MAX_ATTEMPTS).run()
+
+    const pruned = await env.DB.prepare(
+      `DELETE FROM task_assignment_wakes
+        WHERE id IN (SELECT id FROM task_assignment_wakes
+                      WHERE tenant = ?1 AND updated_at < ?2
+                        AND (outcome IN ('sent', 'skipped', 'summarized') OR (outcome = 'failed' AND attempts >= ?3))
+                      LIMIT ${PRUNE_BATCH_MAX})`,
+    ).bind(tenant, oldIso, ASSIGNMENT_WAKE_MAX_ATTEMPTS).run()
+
+    const due = await env.DB.prepare(SWEEP_DUE_SQL)
+      .bind(tenant, staleIso, ASSIGNMENT_WAKE_MAX_ATTEMPTS)
+      .all<{ agent_id: string; oldest: string }>()
+    let delivered = 0
+    const agents = due.results ?? []
+    for (const { agent_id } of agents) delivered += (await processAssignmentWakes(env, agent_id, opts)).delivered
+    return { agents: agents.length, delivered, pruned: pruned.meta?.changes ?? 0 }
   } catch (error) {
-    logWakeProblem('assignment_wake_flush_failed', {
-      reason: error instanceof Error ? error.message.slice(0, 200) : 'unknown_error',
-    })
-    return { agents: 0, announced: 0 }
+    logWakeProblem('assignment_wake_sweep_failed', { reason: errorText(error) })
+    return { agents: 0, delivered: 0, pruned: 0 }
   }
 }

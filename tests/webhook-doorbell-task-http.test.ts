@@ -62,15 +62,13 @@ async function call(method: string, path: string, body: unknown) {
     body: JSON.stringify(body),
   }), env)
 }
-// POSTED receipts: the attempts coalesced into an already-posted ring (the wake-on-assign inbox letter and the site's
-// own task.assigned share one ref) are recorded as skipped receipts and are not rings.
 async function receipts(n: number): Promise<number> {
   for (let i = 0; i < 100; i++) {
-    const c = (h.sqlite.prepare("SELECT count(*) AS n FROM agent_webhook_doorbell_receipts WHERE outcome = 'posted'").get() as { n: number }).n
+    const c = (h.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbell_receipts').get() as { n: number }).n
     if (c >= n) return c
     await new Promise((r) => setTimeout(r, 20))
   }
-  return (h.sqlite.prepare("SELECT count(*) AS n FROM agent_webhook_doorbell_receipts WHERE outcome = 'posted'").get() as { n: number }).n
+  return (h.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbell_receipts').get() as { n: number }).n
 }
 
 describe('REST task assignment doorbell', () => {

@@ -20,8 +20,7 @@ import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import type { VerdictAttribution } from '../auth/attached-ceiling'
 import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
-import { isWakeableTaskStatus, ringAssignmentWake } from '../agents/assignment-wake'
-import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
+import { enqueueAssignmentWake, isWakeableTaskStatus, type AssignmentWakeContext } from '../agents/assignment-wake'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -295,16 +294,12 @@ export interface CreateTaskOptions {
    */
   reservedProvenanceAuthority?: 'mumega-bounty-ingest'
   /**
-   * Wake-on-assign (src/agents/assignment-wake.ts): an OPEN task created with an agent assignee rings that agent's
-   * inbox once, after the insert commits and unless `skipEvent` says another durable dispatch owns activation.
-   * `actorAgentId` = the agent making the call (assigning work to yourself is not a wake); `waitUntil` = ctx.waitUntil.
+   * Wake-on-assign (src/agents/assignment-wake.ts): an OPEN task created with an agent assignee enqueues ONE inbox doorbell
+   * for that agent, after the insert commits and unless `skipEvent` says another durable dispatch owns activation.
+   * `actorAgentId` = the agent making the call (assigning work to yourself is not a wake); `assignedBy` = who is shown as
+   * the assigner. `false` = the caller already wakes the assignee in this same request (e.g. REST `dispatch: true`).
    */
-  assignmentWake?: AssignmentWakeContext
-}
-
-export interface AssignmentWakeContext {
-  actorAgentId?: string | null
-  waitUntil?: DoorbellWaitUntil
+  assignmentWake?: AssignmentWakeContext | false
 }
 
 /**
@@ -609,7 +604,7 @@ export async function persistTaskUpdate(
   env: Env,
   existing: Task,
   next: Task,
-  wake: AssignmentWakeContext = {},
+  wake: AssignmentWakeContext | false = {},
 ): Promise<void> {
   // Chokepoint enforcement for priority discipline (Issue #1040 Phase 2):
   // When a task is escalated or mutated to P0/P1, validate intake contract requirements
@@ -629,16 +624,20 @@ export async function persistTaskUpdate(
   }
   if (!result.meta?.changes) await throwTaskUpdateConflict(env, existing)
   // Wake-on-assign: the assignee CHANGED to an agent and the task still has work to start. Fail-open, after the commit.
+  // `false`: the caller enqueues AFTER its own follow-ups (MCP / REST release an execution hold first), see task_update.
   if (
-    next.assignee_agent_id
+    wake !== false
+    && next.assignee_agent_id
     && next.assignee_agent_id !== existing.assignee_agent_id
     && isWakeableTaskStatus(next.status)
   ) {
-    await ringAssignmentWake(
-      env,
-      { taskId: next.id, agentId: next.assignee_agent_id, epoch: next.updated_at, actorAgentId: wake.actorAgentId },
-      { waitUntil: wake.waitUntil },
-    )
+    await enqueueAssignmentWake(env, {
+      taskId: next.id,
+      agentId: next.assignee_agent_id,
+      epoch: next.updated_at,
+      actorAgentId: wake.actorAgentId,
+      assignedBy: wake.assignedBy,
+    })
   }
 }
 
@@ -1624,17 +1623,14 @@ export async function createTask(
 
   if (!options.skipEvent) await emitTaskEvent(env, 'task.created', task, options.actor)
   // Wake-on-assign: fail-open and after the insert committed, so a failed doorbell can never undo the create.
-  if (!options.skipEvent && task.assignee_agent_id && task.status === 'open') {
-    await ringAssignmentWake(
-      env,
-      {
-        taskId: task.id,
-        agentId: task.assignee_agent_id,
-        epoch: task.updated_at,
-        actorAgentId: options.assignmentWake?.actorAgentId ?? (options.actor?.kind === 'agent' ? options.actor.id : null),
-      },
-      { waitUntil: options.assignmentWake?.waitUntil },
-    )
+  if (options.assignmentWake !== false && !options.skipEvent && task.assignee_agent_id && task.status === 'open') {
+    await enqueueAssignmentWake(env, {
+      taskId: task.id,
+      agentId: task.assignee_agent_id,
+      epoch: task.updated_at,
+      actorAgentId: options.assignmentWake?.actorAgentId ?? (options.actor?.kind === 'agent' ? options.actor.id : null),
+      assignedBy: options.assignmentWake?.assignedBy ?? (options.actor ? `${options.actor.kind}:${options.actor.id}` : null),
+    })
   }
   return task
 }
