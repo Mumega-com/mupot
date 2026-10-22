@@ -21,6 +21,9 @@ export const DISPATCH_BRIDGE_SENDER = 'mupot-dispatch'
 export const SWEEPER_SENDER = 'mupot-approval-sweeper'
 export const SECURE_DROP_NOTIFY_SENDER = 'mupot-secure-drop'
 export const WAKE_ROUTER_SENDER = 'mupot-wake-router'
+// Wake-on-assign doorbell (src/agents/assignment-wake.ts): an identifier plus a pointer to the task. Informational:
+// the response is task notes on the task itself, not a message reply.
+export const ASSIGNMENT_WAKE_SENDER = 'mupot-assignment-wake'
 
 /** Response tool per system sender; null = informational, nothing to answer. */
 export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.freeze({
@@ -32,6 +35,7 @@ export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.fr
   [SWEEPER_SENDER]: null,
   [SECURE_DROP_NOTIFY_SENDER]: null,
   [WAKE_ROUTER_SENDER]: null,
+  [ASSIGNMENT_WAKE_SENDER]: null,
 })
 
 export function isSystemSender(ref: unknown): ref is string {

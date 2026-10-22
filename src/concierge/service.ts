@@ -56,6 +56,7 @@ import {
 import type { Task } from '../types'
 import { registerModule, listPresence, type ModulePresence, type RegistryResult } from '../registry/service'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { flushCoalescedAssignmentWakes, ringAssignmentWake } from '../agents/assignment-wake'
 
 /** Capability marker for "this roster entry can execute build work." The ONE place
  * that defines what counts as build-capable for dispatch purposes — extend here,
@@ -384,6 +385,7 @@ async function routeUnassignedWork(
     // see the work moved) and correctly signals "row changed" to the optimistic-
     // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
     // unchanged, so idempotency/TOCTOU safety is preserved.
+    const assignedAt = new Date().toISOString()
     const upd = await env.DB.prepare(
       // The member clause is repeated here, not merely in the SELECT above, because
       // this is the TOCTOU re-guard: a human may be given the task between the read
@@ -395,9 +397,12 @@ async function routeUnassignedWork(
           AND assignee_member_id IS NULL
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
-      .bind(picked.agent.id, task.id, new Date().toISOString())
+      .bind(picked.agent.id, task.id, assignedAt)
       .run()
     if (upd.meta.changes === 1) {
+      // Wake-on-assign: the work-router assigns from a cron tick, so without this the builder is only told when it
+      // next polls. ONE inbox doorbell, fail-open (never un-routes the task), idempotent per task/agent/epoch.
+      await ringAssignmentWake(env, { taskId: task.id, agentId: picked.agent.id, epoch: assignedAt })
       routed.push({ taskId: task.id, agentId: picked.agent.id })
       perAgent.set(picked.agent.id, (perAgent.get(picked.agent.id) ?? 0) + 1)
       loadBySlug.set(picked.agent.slug, (loadBySlug.get(picked.agent.slug) ?? 0) + 1)
@@ -613,6 +618,10 @@ export async function runConciergeTick(env: Env, deps: ConciergeDeps = {}): Prom
       errors++ // one bad project cycle must not stop the rest of the sweep
     }
   }
+
+  // Wake-on-assign: announce any assignments the per-agent burst cap held back, once their window has room.
+  // Fail-open by contract (never throws); riding this tick means no new trigger.
+  await flushCoalescedAssignmentWakes(env)
 
   return { ok: true, projects: batch.length, registered, dispatched, routed, noop, errors }
 }

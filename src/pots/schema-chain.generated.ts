@@ -4406,9 +4406,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "bounty_task_bindings" },
     ],
   },
+  {
+    file: "0251_task_assignment_wakes.sql",
+    sha256: "4a7d31901275c70ef8189d4c3b7395620a3d7bf63f9641ab30275ffc5d06c7a5",
+    statements: [
+      "-- 0251 wake-on-assign ledger: one row per (task, agent, assignment epoch) that asked for an inbox doorbell.\n--\n-- Hadi 2026-10-22: mupot assigns work but never wakes the assignee. A plain inbox message DOES wake a seated agent\n-- (seatlink, the orca-mupot plugin, the webhook doorbell), so every assignment to an AGENT now enqueues one short\n-- doorbell message (src/agents/assignment-wake.ts). This table is the idempotency key, the throttle ledger and the\n-- visible record of what happened to each doorbell. The authority stays in the task; this row carries none.\n--\n--   epoch        the assignment occurrence (the task's updated_at stamp at the assigning write, or a router/concierge\n--                stamp). A retry of the SAME assignment replays the same key and sends nothing; a reassign A->B->A is a\n--                new epoch and rings again.\n--   outcome      pending     claimed, send in flight (re-claimable once stale: a crash between claim and send)\n--                sent        the doorbell message was written to the agent's inbox (message_seq)\n--                coalesced   over the per-agent burst cap: held for ONE summary message (\"you have K new assignments\")\n--                summarized  announced by that summary (summary_request_id)\n--                skipped     agent paused / inactive / archived, or the task is gone (reason)\n--                failed      the doorbell could not be written (reason). The assignment itself is untouched.\n--   Only sent / coalesced / summarized are terminal; a replay re-evaluates pending(stale) / skipped / failed.\n--\n-- Additive: a new table and indexes, no existing object changes.\nCREATE TABLE IF NOT EXISTS task_assignment_wakes (\n  id                  TEXT PRIMARY KEY,\n  tenant              TEXT NOT NULL,\n  task_id             TEXT NOT NULL,\n  agent_id            TEXT NOT NULL,\n  epoch               TEXT NOT NULL,\n  outcome             TEXT NOT NULL DEFAULT 'pending'\n                      CHECK (outcome IN ('pending', 'sent', 'coalesced', 'summarized', 'skipped', 'failed')),\n  reason              TEXT,\n  message_seq         INTEGER,\n  summary_request_id  TEXT,\n  created_at          TEXT NOT NULL,\n  updated_at          TEXT NOT NULL,\n  UNIQUE (tenant, task_id, agent_id, epoch)\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_task_assignment_wakes_agent\n  ON task_assignment_wakes(tenant, agent_id, outcome, created_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_task_assignment_wakes_task\n  ON task_assignment_wakes(tenant, task_id);",
+    ],
+    objects: [
+      { type: "table", name: "task_assignment_wakes" },
+      { type: "index", name: "idx_task_assignment_wakes_agent" },
+      { type: "index", name: "idx_task_assignment_wakes_task" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "e8bf1f922f47a51448e478e28715441e9a8ac415aac70948b12ed062d7175c25"
+export const SCHEMA_CHAIN_DIGEST: string = "a92026f9cb2c2dd61178e043fa46f8176ce16f8f30546bdaa89fc668d684ebb7"

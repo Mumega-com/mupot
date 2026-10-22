@@ -438,7 +438,8 @@ describe('router_tick authorization and squad fencing', () => {
 
     const real = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, { squad_id: SQUAD_A, dry_run: false })
     expect(real).toMatchObject({ ok: true, result: { dry_run: false, assigned: 1 } })
-    expect(events).toHaveLength(1)
+    // one agent.wake; the wake-on-assign doorbell letter adds its own message.created (src/agents/assignment-wake.ts)
+    expect(events.filter((e) => (e as { type?: string }).type === 'agent.wake')).toHaveLength(1)
   })
 
   it('the defaulted dry run is observer-visible (router:read) but an observer still cannot execute', async () => {

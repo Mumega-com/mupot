@@ -711,6 +711,7 @@ tasksApp.post('/', async (c) => {
       // SquadCoordinatorDO /dispatch → wake-all-agents loop never fires for
       // planning work. dispatch:true keeps the event + the direct agent.wake.
       skipEvent: body.dispatch === false,
+      assignmentWake: { actorAgentId: auth.boundAgentId, waitUntil: waitUntilFromContext(c) },
     })
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
@@ -1212,7 +1213,7 @@ tasksApp.patch('/:id', async (c) => {
       next.status = outcome.task.status
       next.updated_at = outcome.task.updated_at
     } else {
-      await persistTaskUpdate(c.env, existing, next)
+      await persistTaskUpdate(c.env, existing, next, { actorAgentId: auth.boundAgentId, waitUntil: waitUntilFromContext(c) })
     }
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {

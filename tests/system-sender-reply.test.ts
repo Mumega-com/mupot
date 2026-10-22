@@ -19,10 +19,11 @@ const EXPECTED_VIA: Record<string, string | null> = {
   'mupot-approval-sweeper': null,
   'mupot-secure-drop': null,
   'mupot-wake-router': null,
+  'mupot-assignment-wake': null,
 }
 
 describe('registry', () => {
-  it('registers exactly the seven known literals with the right response tool', () => {
+  it('registers exactly the eight known literals with the right response tool', () => {
     expect({ ...SYSTEM_SENDERS }).toEqual(EXPECTED_VIA)
   })
   it('does not treat prototype keys or lookalikes as system senders', () => {
@@ -68,7 +69,7 @@ describe('inbox annotation', () => {
     }, SYSTEM_AUTHZ)
     const read = await readAgentInbox(env, { agent: 'agent-to', peek: true })
     if (!read.ok) throw new Error(read.reason)
-    expect(read.messages).toHaveLength(8)
+    expect(read.messages).toHaveLength(Object.keys(EXPECTED_VIA).length + 1)
     for (const m of read.messages) {
       if (m.from_agent in EXPECTED_VIA) {
         expect(m.expects_reply).toBe(false)

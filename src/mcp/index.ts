@@ -1352,7 +1352,7 @@ const toolTaskCreate: ToolSpec = {
           priority,
           parent_task_id: parentTaskId,
         },
-        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch },
+        { actor: memberActor(auth.memberId as string), externalSource, skipEvent: !dispatchOn, skipMirror: observedCreate.forceNoDispatch, assignmentWake: { actorAgentId: auth.boundAgentId, waitUntil: ctx.waitUntil } },
       )
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
@@ -2223,7 +2223,7 @@ const toolTaskUpdate: ToolSpec = {
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
       } else {
-        await persistTaskUpdate(env, existing, next)
+        await persistTaskUpdate(env, existing, next, { actorAgentId: auth.boundAgentId, waitUntil: ctx.waitUntil })
       }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
