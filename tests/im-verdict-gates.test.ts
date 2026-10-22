@@ -19,7 +19,7 @@
 //
 // Real SQLite via applyAllMigrations — no hand-rolled prepare().
 
-import { beforeEach, afterEach, describe, expect, it } from 'vitest'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -194,5 +194,50 @@ describe('IM verdictReply — gate:loops surface cap now enforced (mupot#1081)',
     expect(taskVerdictCount(harness.sqlite, 'task-office')).toBe(0)
     const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get('task-office') as { status: string }
     expect(row.status).toBe('review')
+  })
+})
+
+// seed B4 (round 2): IM /approve is a human surface; it must not discard a failed gate.verdict receipt append.
+describe('IM verdictReply — gate.verdict receipt outcome is surfaced (seed B4)', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+    seedMember(harness.sqlite, 'member-1', 'chat-1')
+    seedSquadMemberCapability(harness.sqlite, 'member-1')
+    seedGrant(harness.sqlite, 'gate:review', 'member', 'member-1')
+    seedReviewTask(harness.sqlite, 'task-b4', 'gate:review', null)
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO objectives (id, tenant, created_by_principal_kind, created_by_principal_id, created_by_member_id, squad_id, title,
+         success_contract, authority_envelope, policy_json, budget_micro_usd, payload_json, payload_digest, accepted_at, created_at)
+       VALUES ('obj-im', ?, 'member', 'member-1', 'member-1', 'squad-1', 'O', 'ship', '{}', '{}', 0, '{}', ?, '2026-10-22T00:00:00Z', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, 'a'.repeat(64))
+    harness.sqlite.prepare(`INSERT INTO flights (id, tenant, agent, goal) VALUES ('flight-im', ?, 'agent-x', 'g')`).run(TENANT)
+    harness.sqlite.prepare(`INSERT INTO flight_objectives (id, tenant, flight_id, objective_id, linked_at) VALUES ('fo-im', ?, 'flight-im', 'obj-im', '2026-10-22T00:00:00Z')`).run(TENANT)
+    harness.sqlite.prepare(
+      `INSERT INTO flight_lanes (id, tenant, flight_id, lane_key, role, task_id, assignment_epoch, agent_id, done_when, created_at)
+       VALUES ('lane-im', ?, 'flight-im', 'k', 'worker', 'task-b4', 1, 'agent-x', 'done', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+  })
+  afterEach(() => harness.close())
+
+  it('a chain-scope approval via IM appends the receipt and replies normally', async () => {
+    const reply = await handleImMessage(envFor(harness), 'chat-1', 'approve task-b4')
+    expect(reply).toMatch(/^Approved/)
+    expect(reply).not.toMatch(/audit receipt/i)
+    expect(harness.sqlite.prepare('SELECT type, actor_kind FROM execution_receipts').all()).toEqual([{ type: 'gate.verdict', actor_kind: 'member' }])
+  })
+
+  it('a failed append never blocks the verdict, and the reply says the receipt will be retried', async () => {
+    harness.sqlite.exec('ALTER TABLE execution_receipt_heads RENAME TO execution_receipt_heads_broken')
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const reply = await handleImMessage(envFor(harness), 'chat-1', 'approve task-b4')
+    quiet.mockRestore()
+    expect(reply).toMatch(/^Approved/)
+    expect(reply).toMatch(/audit receipt could not be appended yet/i)
+    expect(taskVerdictCount(harness.sqlite, 'task-b4')).toBe(1)
   })
 })

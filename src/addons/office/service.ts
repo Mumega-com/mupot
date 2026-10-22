@@ -72,10 +72,12 @@ import {
   buildVerdictStatements,
   assertVerdictWritable,
   emitVerdictBusEvent,
+  gateVerdictActor,
   type TaskActor,
   type WriteVerdictInput,
 } from '../../tasks/service'
 import { claimTimestamp } from '../../lib/claim-timestamp'
+import { emitGateVerdictReceipt, resolveGateVerdictScope, resolveVerdictSubmission, type GateVerdictReceiptOutcome } from '../../tasks/verdict-binding'
 import {
   OFFICE_GATE_OWNER,
   resolveEligibleActiveOfficeInstallationId,
@@ -340,6 +342,8 @@ export interface OfficeReviewApprovalInput {
 
 export interface OfficeReviewApprovalOutcome {
   readonly task: Task
+  /** seed B4: present only when a gate.verdict receipt was owed; {status:'failed'} means the sweep will heal it. */
+  readonly gate_receipt?: GateVerdictReceiptOutcome
 }
 
 interface OfficeFreezeBindingRow {
@@ -467,7 +471,7 @@ export async function reviewOfficeApproval(
       gateResult.principal.actor as TaskActor | undefined,
       gateResult.independenceWaiver,
     )
-    return { ok: true, value: { task: written.task } }
+    return { ok: true, value: written.gate_receipt ? { task: written.task, gate_receipt: written.gate_receipt } : { task: written.task } }
   } catch (error) {
     if (error instanceof TaskArchivedError) return { ok: false, reason: 'task_archived' }
     if (error instanceof ApprovalExpiredError) return { ok: false, reason: 'approval_expired' }
@@ -496,7 +500,7 @@ async function writeOfficeVerdictAndBindFreeze(
   expectedPayloadSha256: string | null,
   actor?: TaskActor,
   independenceWaiver?: WriteVerdictInput['independenceWaiver'],
-): Promise<{ task: Task; verdict: TaskVerdict }> {
+): Promise<{ task: Task; verdict: TaskVerdict; gate_receipt?: GateVerdictReceiptOutcome }> {
   await assertVerdictWritable(env, task)
   // gate:office tasks are never routine-created (resolveVerdictProposalId only
   // ever resolves for gate:routines) — passing null explicitly rather than paying
@@ -556,7 +560,11 @@ async function writeOfficeVerdictAndBindFreeze(
         params: [task.id, expectedPayloadSha256],
       }
     : undefined
-  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, input, extraGuard)
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, {
+    ...input,
+    submission: await resolveVerdictSubmission(env, task.id),
+    receiptActorKind: (await resolveGateVerdictScope(env, task.id)) ? gateVerdictActor(input, actor).kind : null,
+  }, extraGuard)
 
   // Anchored on `verdictRow.id` — a value this call minted itself before the batch
   // ran (buildVerdictStatements' own crypto.randomUUID()), so `EXISTS (SELECT 1
@@ -602,7 +610,10 @@ async function writeOfficeVerdictAndBindFreeze(
 
   const updatedTask: Task = { ...task, status: newStatus, updated_at: now }
   await emitVerdictBusEvent(env, task, input, newStatus, now, actor)
-  return { task: updatedTask, verdict: verdictRow }
+  // seed B3: office approvals are bound by the frozen payload hash (expected_payload_sha256), not by expected_submission_id; the
+  // submission binding above still applies. seed B4: same gate.verdict receipt as writeVerdict (this path bypasses it); never throws, never undoes the verdict.
+  const gate_receipt = await emitGateVerdictReceipt(env, verdictRow)
+  return gate_receipt ? { task: updatedTask, verdict: verdictRow, gate_receipt } : { task: updatedTask, verdict: verdictRow }
 }
 
 // ── office.publish_post ──────────────────────────────────────────────────────────

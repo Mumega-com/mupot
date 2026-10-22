@@ -436,7 +436,7 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect(verdictRows()).toBe(0)
     expect(row().status).toBe('review')
     // and the statement itself carries the lane guard for the override waiver
-    expect(buildVerdictStatements(env, { task: stale, verdict: 'approved', note: null, decidedBy: 'ADMIN', independenceWaiver: 'owner_override' }).statements.length).toBe(2)
+    expect(buildVerdictStatements(env, { task: stale, verdict: 'approved', note: null, decidedBy: 'ADMIN', independenceWaiver: 'owner_override', submission: null, receiptActorKind: null }).statements.length).toBe(2)
   })
 
   // ── REST twins for the earlier rounds' guards ────────────────────────────────

@@ -1085,7 +1085,10 @@ describe('MCP task cutover tools', () => {
     expect(receipt, 'no verdict_reversals receipt written').toBeTruthy()
     expect(receipt!.args).toContain('approved')
     expect(receipt!.args).toContain('new evidence proves flaw in implementation')
-    expect(receipt!.args).toContain(MEMBER_ID)
+    // seed B4: this token is agent-bound, so the reversal is recorded as that agent (id AND kind), matching the REST route.
+    expect(receipt!.args).toContain(AGENT_ID)
+    expect(receipt!.args).toContain('agent')
+    expect(receipt!.args).not.toContain(MEMBER_ID)
 
     const wakes = events.filter((e) => (e as { type?: string }).type === 'agent.wake')
     expect(wakes.length, 'gate owner was not woken on review re-entry').toBeGreaterThan(0)

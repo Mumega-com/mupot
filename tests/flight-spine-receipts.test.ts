@@ -1129,7 +1129,6 @@ describe('Flight Spine execution receipt ledger', () => {
       'source.ack',
       'artifact.stored',
       'artifact.retrieved',
-      'gate.verdict',
       'host_control.observed',
     ] as const satisfies readonly ExecutionReceiptType[]
 

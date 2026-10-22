@@ -226,3 +226,131 @@ describe('POST /:id/verdict — K5 lost race, real route + real D1, 0 verdict ro
     // tests/tasks-gate.test.ts's frozen-clock "P0-2 (frozen clock)" test)
   })
 })
+
+// ── seed B3 (round 2): the decider-seen binding on the real HTTP route ───────────────────────────────────────────
+describe('POST /:id/verdict + GET /:id — expected_submission_id and current_submission (seed B3)', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+    authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
+  })
+  afterEach(() => {
+    harness.close()
+    authState.current = null
+  })
+
+  function seedSubmitted(taskId: string): void {
+    seedReviewTask(harness.sqlite, taskId, 'gate:agent-self-completion')
+    harness.sqlite.prepare("UPDATE tasks SET result = 'R1' WHERE id = ?").run(taskId)
+    harness.sqlite.prepare(
+      `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+       VALUES ('sub-http', ?, ?, 'squad-1', 'someone-else', '/x', ?, ?, 'R1', '2026-10-20T00:00:00.000Z')`,
+    ).run(TENANT, taskId, 'a'.repeat(64), 'a'.repeat(64))
+  }
+  const verdictRowCount = () => Number((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }).n)
+
+  it('a named submission that is not the current one: 409 submission_mismatch, nothing written', async () => {
+    seedSubmitted('task-h1')
+    const res = await postVerdict('task-h1', { verdict: 'approved', expected_submission_id: 'sub-old' }, envFor(harness))
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'submission_mismatch' })
+    expect(verdictRowCount()).toBe(0)
+  })
+
+  it('the current one binds; the verdict row carries it', async () => {
+    seedSubmitted('task-h2')
+    const res = await postVerdict('task-h2', { verdict: 'approved', expected_submission_id: 'sub-http' }, envFor(harness))
+    expect(res.status).toBe(201)
+    expect(harness.sqlite.prepare('SELECT submission_id, result_digest FROM task_verdicts').get()).toEqual({ submission_id: 'sub-http', result_digest: 'a'.repeat(64) })
+  })
+
+  it('a non-string, non-null value is a 400, nothing written', async () => {
+    seedSubmitted('task-h3')
+    const res = await postVerdict('task-h3', { verdict: 'approved', expected_submission_id: 7 }, envFor(harness))
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'invalid_expected_submission_id' })
+    expect(verdictRowCount()).toBe(0)
+  })
+
+  it('a human omitting it is fine (optional on human surfaces)', async () => {
+    seedSubmitted('task-h4')
+    const res = await postVerdict('task-h4', { verdict: 'approved' }, envFor(harness))
+    expect(res.status).toBe(201)
+  })
+
+  it('GET /:id exposes current_submission (the id a decider names); null once the result has moved on', async () => {
+    seedSubmitted('task-h5')
+    const get = async () => (await (await tasksApp.fetch(new Request('https://pot.test/task-h5'), envFor(harness))).json()) as { current_submission: { id: string; result_digest: string } | null }
+    expect((await get()).current_submission).toEqual({ id: 'sub-http', result_digest: 'a'.repeat(64) })
+    harness.sqlite.prepare("UPDATE tasks SET result = 'rewritten by CI' WHERE id = 'task-h5'").run()
+    expect((await get()).current_submission).toBeNull()
+  })
+})
+
+// ── seed B4 (round 3): the reversal route records the SAME principal as id and kind, and returns the reversal receipt ──
+describe('PATCH /:id (verdict reversal) — actor and gate_receipt (seed B4)', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(`INSERT INTO flights (id, tenant, agent, goal) VALUES ('flight-r', ?, 'agent-x', 'g')`).run(TENANT)
+    harness.sqlite.prepare(
+      `INSERT INTO objectives (id, tenant, created_by_principal_kind, created_by_principal_id, created_by_member_id, squad_id, title,
+         success_contract, authority_envelope, policy_json, budget_micro_usd, payload_json, payload_digest, accepted_at, created_at)
+       VALUES ('obj-r', ?, 'member', 'owner-1', 'owner-1', 'squad-1', 'O', 'ship', '{}', '{}', 0, '{}', ?, '2026-10-22T00:00:00Z', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, 'a'.repeat(64))
+    harness.sqlite.prepare(`INSERT INTO flight_objectives (id, tenant, flight_id, objective_id, linked_at) VALUES ('fo-r', ?, 'flight-r', 'obj-r', '2026-10-22T00:00:00Z')`).run(TENANT)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+  })
+  afterEach(() => {
+    harness.close()
+    authState.current = null
+  })
+
+  async function approvedChainTask(taskId: string): Promise<void> {
+    seedReviewTask(harness.sqlite, taskId, 'gate:agent-self-completion')
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO flight_lanes (id, tenant, flight_id, lane_key, role, task_id, assignment_epoch, agent_id, done_when, created_at)
+       VALUES ('lane-r', ?, 'flight-r', 'k', 'worker', ?, 1, 'agent-x', 'done', '2026-10-22T00:00:00Z')`,
+    ).run(TENANT, taskId)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+    authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
+    const res = await postVerdict(taskId, { verdict: 'approved' }, envFor(harness))
+    expect(res.status).toBe(201)
+  }
+  async function patchReverse(taskId: string): Promise<Response> {
+    return tasksApp.fetch(
+      new Request(`https://pot.test/${taskId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'review', reversal_reason: 'approved in error' }),
+      }),
+      envFor(harness),
+    )
+  }
+
+  it('an AGENT-bound token is recorded as that agent (id AND kind), never the minting member labelled as an agent; the receipt is returned', async () => {
+    await approvedChainTask('task-rv1')
+    authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1', boundAgentId: 'agent-rev' }
+    const res = await patchReverse('task-rv1')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { gate_receipt?: { status: string } }
+    expect(body.gate_receipt?.status).toBe('appended')
+    expect(harness.sqlite.prepare('SELECT actor_id, actor_type FROM verdict_reversals').get()).toEqual({ actor_id: 'agent-rev', actor_type: 'agent' })
+    const rev = harness.sqlite.prepare(`SELECT actor_kind, actor_id FROM execution_receipts WHERE idempotency_key LIKE 'verdict-reversed:%'`).get()
+    expect(rev).toEqual({ actor_kind: 'agent', actor_id: 'agent-rev' })
+  })
+
+  it('a member principal is recorded as that member', async () => {
+    await approvedChainTask('task-rv2')
+    const res = await patchReverse('task-rv2')
+    expect(res.status).toBe(200)
+    expect(harness.sqlite.prepare('SELECT actor_id, actor_type FROM verdict_reversals').get()).toEqual({ actor_id: 'owner-1', actor_type: 'member' })
+    expect(harness.sqlite.prepare(`SELECT actor_kind, actor_id FROM execution_receipts WHERE idempotency_key LIKE 'verdict-reversed:%'`).get()).toEqual({ actor_kind: 'member', actor_id: 'owner-1' })
+  })
+})

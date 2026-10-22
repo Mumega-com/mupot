@@ -182,7 +182,7 @@ const toolOfficeReviewApproval: ToolSpec = {
       expectedPayloadSha256,
     })
     if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
-    return done({ task: result.value.task })
+    return done({ task: result.value.task, ...(result.value.gate_receipt ? { gate_receipt: result.value.gate_receipt } : {}) })
   },
 }
 

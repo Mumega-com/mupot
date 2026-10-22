@@ -43,6 +43,7 @@ import { isSubsystemReservedLane } from '../gates/lanes'
 import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
 import { isHumanOriginAttestorToken } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
+import { assertAgentNamedSubmission, resolveVerdictSubmission, VerdictSubmissionMismatchError, VerdictSubmissionRequiredError, type GateVerdictReceiptOutcome } from '../tasks/verdict-binding'
 import {
   persistGateWakeNotice,
   loadGateWakeNotices,
@@ -1639,6 +1640,7 @@ const toolTaskGet: ToolSpec = {
     row.execution_receipt_id = null // restored below only for a principal canViewTaskReceipts admits
     // Canonical latest-verdict reader (tasks/service.ts) - carries reversed_at; same ordering
     // every reversal path trusts. decided_by is shown in the REST timeline's display form.
+    const currentSubmission = await resolveVerdictSubmission(env, full.id)
     const v = await findLatestVerdict(env, full.id)
     const latestVerdict = v
       ? {
@@ -1679,6 +1681,8 @@ const toolTaskGet: ToolSpec = {
         released_at: full.hold_released_at ?? null,
       },
       latest_verdict: latestVerdict,
+      // seed B3: the submission a verdict would bind to right now (name it as task_verdict.expected_submission_id), or null.
+      current_submission: currentSubmission ? { id: currentSubmission.submissionId, result_digest: currentSubmission.resultDigest } : null,
       latest_dispatch_receipt: latestDispatch,
       dispatch_timeline: dispatchTimeline,
     })
@@ -2212,17 +2216,20 @@ const toolTaskUpdate: ToolSpec = {
         detail: 'task has an unreleased execution hold; only a non-agent-bound org-admin or squad-admin may reassign it (or use execution_release)',
       })
     }
+    let reversalReceipt: GateVerdictReceiptOutcome | undefined
     try {
       if (reversesVerdict) {
         // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
         // FIRST — see reverseTaskVerdict's own doc comment (src/tasks/service.ts).
         const outcome = await reverseTaskVerdict(env, {
           existing, next, tenant: env.TENANT_SLUG, reason: reversalReason,
-          actorId: auth.memberId as string, actorType: 'member',
+          // An agent-bound token is recorded as that agent (id AND kind), matching the REST route; never the minting member.
+          actorId: auth.boundAgentId || (auth.memberId as string), actorType: auth.boundAgentId ? 'agent' : 'member',
         })
         if (!outcome.ok) return fail(409, outcome.error, 'detail' in outcome ? outcome.detail : undefined)
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
+        reversalReceipt = outcome.gate_receipt
       } else {
         // The wake-on-assign enqueue runs below, AFTER the execution-hold release (a same-agent reassignment that lifts a hold rings once).
         await persistTaskUpdate(env, existing, next, false)
@@ -2331,7 +2338,7 @@ const toolTaskUpdate: ToolSpec = {
     // landed atomically, in the gate-closing-first order, inside
     // reverseTaskVerdict above — nothing left to do here.
 
-    return done({ task: next, ...(gateWake ? { gate_wake: gateWake } : {}) })
+    return done({ task: next, ...(gateWake ? { gate_wake: gateWake } : {}), ...(reversalReceipt ? { gate_receipt: reversalReceipt } : {}) })
   },
 }
 
@@ -2610,7 +2617,10 @@ const toolTaskVerdict: ToolSpec = {
     ' refused in both cases, no fallback). For an agent-bound caller, the outcome is ALWAYS visible in the' +
     ' response: human_origin: {applied:false, reason:"<conjunct>"} when one was supplied and refused,' +
     ' human_origin: {applied:false, reason:"absent"} when none was supplied at all — never silently omitted' +
-    ' the way an ordinary pre-feature agent-seat verdict would be. Non-agent-bound callers never see the field.',
+    ' the way an ordinary pre-feature agent-seat verdict would be. Non-agent-bound callers never see the field.' +
+    ' expected_submission_id (string|null): the submission you reviewed (task_get -> current_submission.id; null = none). REQUIRED of an' +
+    ' agent deciding in its own right on a task in receipt-chain scope (400 expected_submission_id_required); a human_origin call is exempt (verified when given); when given and not the current submission the' +
+    ' verdict is refused (409 submission_mismatch) and nothing is written. The verdict binds to the current submission only.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2619,6 +2629,7 @@ const toolTaskVerdict: ToolSpec = {
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
       override_self_verdict: { type: 'boolean' },
+      expected_submission_id: NULLABLE_STRING_SCHEMA,
       human_origin: HUMAN_ORIGIN_SCHEMA,
     },
     required: ['task_id', 'verdict'],
@@ -2645,6 +2656,24 @@ const toolTaskVerdict: ToolSpec = {
     if (!task.gate_owner) return fail(409, 'no_gate')
     if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
     const gateOwner = task.gate_owner
+
+    // seed B3: decider-seen binding. Absent = not asserted; null = "I saw no submission".
+    if (args.expected_submission_id !== undefined && args.expected_submission_id !== null && typeof args.expected_submission_id !== 'string') {
+      return fail(400, 'invalid_args', 'expected_submission_id must be a string or null')
+    }
+    const expectedSubmissionId: string | null | undefined = args.expected_submission_id as string | null | undefined // narrowed by the check above
+    // An agent-bound caller deciding IN ITS OWN RIGHT on a chain-scope task must name the submission. A call carrying
+    // human_origin (an agent relaying a harness-attested HUMAN decision) is exempt until the KayHermes plugin can send the id:
+    // it is accepted and verified when given (commitOriginDecision), and if the origin does not resolve and the call falls
+    // back to the agent's own authority, writeVerdict enforces the requirement for the agent decider there.
+    if (auth.boundAgentId && args.human_origin === undefined) {
+      try {
+        await assertAgentNamedSubmission(env, task.id, expectedSubmissionId)
+      } catch (err) {
+        if (err instanceof VerdictSubmissionRequiredError) return fail(400, 'expected_submission_id_required', { detail: err.message })
+        throw err
+      }
+    }
 
     const note: string | null = typeof args.note === 'string'
       ? args.note
@@ -2698,7 +2727,7 @@ const toolTaskVerdict: ToolSpec = {
       }
       try {
         const originOutcome = await resolveHarnessAttestedOrigin(
-          env, auth.boundAgentId, args.human_origin, task, gateOwner, verdict, note,
+          env, auth.boundAgentId, args.human_origin, task, gateOwner, verdict, note, expectedSubmissionId,
         )
         if (originOutcome.replayed) {
           return fail(409, 'origin_replayed')
@@ -2715,6 +2744,7 @@ const toolTaskVerdict: ToolSpec = {
           return done({
             task: originOutcome.task,
             verdict: originOutcome.verdict,
+            ...(originOutcome.gate_receipt ? { gate_receipt: originOutcome.gate_receipt } : {}),
             human_origin: humanOriginResponsePayload(originOutcome),
           })
         }
@@ -2724,6 +2754,7 @@ const toolTaskVerdict: ToolSpec = {
       } catch (err) {
         if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
         if (err instanceof ApprovalExpiredError) return fail(409, 'approval_expired', { detail: 'the gate ask expired unanswered; resubmit the task if it is still needed' })
+        if (err instanceof VerdictSubmissionMismatchError) return fail(409, 'submission_mismatch')
         if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
         throw err
       }
@@ -2783,7 +2814,7 @@ const toolTaskVerdict: ToolSpec = {
     try {
       const result = await writeVerdict(
         env,
-        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}), attribution: verdictAttribution(auth) }, // from auth, never args
+        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}), ...(expectedSubmissionId !== undefined ? { expectedSubmissionId } : {}), attribution: verdictAttribution(auth) }, // from auth, never args
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
@@ -2819,6 +2850,8 @@ const toolTaskVerdict: ToolSpec = {
           reason: 'decider is a party to this task (assignee, submitter or runner) or acts for one; self-approval is forbidden',
         })
       }
+      if (err instanceof VerdictSubmissionMismatchError) return fail(409, 'submission_mismatch')
+      if (err instanceof VerdictSubmissionRequiredError) return fail(400, 'expected_submission_id_required', { detail: err.message })
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
       if (err instanceof TaskEvidenceFenceError) {
         // #399: owning squad no longer holds write/admin on the task's project.

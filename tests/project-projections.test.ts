@@ -640,7 +640,8 @@ describe('project Activity and Evidence projections', () => {
     const fixture = harness()
     try {
       fixture.sqlite.exec(`
-        DROP TRIGGER task_verdicts_no_update;
+        DROP TRIGGER IF EXISTS task_verdicts_no_update;
+        DROP TRIGGER IF EXISTS task_verdicts_no_update_0252;
         INSERT INTO tasks (id, squad_id, title, status, project_id, created_at, updated_at)
         VALUES
           ('tie_a', 'squad-a', 'Underscore tie', 'open', 'project', '2026-07-18T20:00:00Z', '2026-07-18T20:00:00Z'),
