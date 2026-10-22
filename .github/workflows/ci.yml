@@ -261,6 +261,13 @@ jobs:
       - run: npm ci
       - name: Dependency audit (production)
         run: npm audit --omit=dev --audit-level=moderate
+      # The office imports the SDK-free modules in ../../src/projects (office-core, office-contract), and their
+      # type imports reach the rest of src/. tsc resolves those files' packages (hono, workers-types) from the
+      # ROOT node_modules, so the root install is needed for the typecheck only; it is NOT a dependency of the
+      # office bundle (see the dry-run below, which bundles only what is imported at runtime).
+      - name: Install root dependencies (type resolution for shared sources)
+        working-directory: .
+        run: npm ci
       - name: Typecheck
         run: npm run typecheck
       - name: Office tests (workerd)
