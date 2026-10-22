@@ -339,6 +339,7 @@ import { sweepAgentConnectionRetention } from './members/agent-connection'
 import { runRoutineScheduler } from './routines/scheduler'
 import { dispatchRoutineRun } from './routines/dispatch'
 import { MAINTENANCE_CRON, maintenanceSlot } from './scheduled/slots'
+import { healProjectRepoKeys, REPO_KEY_HEAL_PER_TICK } from './projects/repo-key-heal'
 import { reconcileGateVerdictReceipts } from './tasks/verdict-binding'
 
 const ROUTINE_CRON = '* * * * *'
@@ -474,7 +475,7 @@ export default {
       return
     }
 
-    // Sixteen independent maintenance heartbeats, staggered across each 15-minute
+    // Seventeen independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -526,6 +527,9 @@ export default {
     // 16. Gate-verdict receipt reconcile (seed B4, migration 0252) - heal verdicts whose `gate.verdict` execution receipt never
     //     landed (task_verdicts.receipt_actor_kind is the durable "receipt owed" marker); replays with the stored actor kind,
     //     idempotent on `verdict:<id>`; also heals missing reversal receipts. Bounded per run.
+    // 17. Repo-key heal (migration 0253) - canonicalize projects.repo_key for rows that never got one, REPO_KEY_HEAL_PER_TICK
+    //     rows per run, compare-and-set on repo_url, idempotent. The request paths never write the key; this and
+    //     scripts/backfill-repo-key.mjs are the healers. Fail-soft by contract (the cron wrapper catches).
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -543,6 +547,7 @@ export default {
       ['approval-expiry', () => runApprovalExpiryTick(env)],
       ['assignment-wake', () => sweepAssignmentWakes(env)],
       ['gate-verdict-receipts', () => reconcileGateVerdictReceipts(env)],
+      ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

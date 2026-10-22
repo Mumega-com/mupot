@@ -17,7 +17,7 @@
 
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { noticeOrder, type Notice } from './office-contract'
-import { projectsOwningRepo } from './office-repo-owner'
+import { reposOwnedByProject } from './office-repo-owner'
 
 /**
  * The slice of the Worker environment the office reads. Declared here (not `Env`) because the office runs in
@@ -491,7 +491,8 @@ export type ScopeCheck =
  * Does D1 say this project owns the repository a Notice is scoped to? Asked before the notice is applied, so an office
  * never takes in an item for a repository it does not own, whatever the caller believed. A scope that is not a
  * repository (Linear team) passes: nothing in D1 can contradict it yet. Ambiguous ownership (another project claims the
- * repository too) still counts as owned here; intake is what refuses to route an ambiguous repository.
+ * repository too) still counts as owned here; intake is what refuses to route an ambiguous repository. One D1 batch.
+ * A refusal here only refuses this notice: nothing already held is deleted on this answer.
  */
 export async function verifyNoticeScope(
   env: Pick<OfficeEnv, 'DB'>,
@@ -499,56 +500,101 @@ export async function verifyNoticeScope(
   notice: Pick<Notice, 'scope'>,
 ): Promise<ScopeCheck> {
   if (!isRepoScope(notice.scope)) return { ok: true }
-  const found = await projectsOwningRepo(env.DB, notice.scope)
-  if (!found.ok) return { ok: false, reason: 'scope_unverifiable' }
-  return found.owners.includes(projectId) ? { ok: true } : { ok: false, reason: 'scope_not_owned' }
-}
-
-export interface ScopeSweepResult {
-  /** Items deleted because D1 says this project no longer owns their repository. */
-  purged: number
-  /** Repository scopes D1 could not be asked about; their items must not be served until it can. */
-  unverifiable: string[]
+  const owned = await reposOwnedByProject(env.DB, projectId)
+  if (!owned.ok) return { ok: false, reason: 'scope_unverifiable' }
+  return owned.keys.has(notice.scope) ? { ok: true } : { ok: false, reason: 'scope_not_owned' }
 }
 
 /**
- * Drop every item whose repository this project no longer owns, per D1 (the authority), and report the scopes D1 could
- * not answer for. Called on every wake and before every read, so a project that gave a repository up stops serving its
- * items within one call, and the office rebuilds nothing from its own memory: whatever D1 stops vouching for goes.
- * Only rows applied before the check began are deleted: an item that arrived while D1 was being asked was verified
- * on its own (verifyNoticeScope) and is not this sweep's to remove.
+ * A scope D1 stopped vouching for is deleted only when TWO sweeps at least this far apart both say so. One answer is
+ * never enough to destroy rows: a D1 read can be wrong for a moment (a concurrent heal, a replica behind), and the items
+ * are expensive to re-learn. The facade's sweep TTL (VERIFY_TTL_MS) is the same length, so the second TTL'd sweep is
+ * the earliest that can confirm.
+ */
+export const SCOPE_RELINQUISH_CONFIRM_MS = 30_000
+
+const RELINQUISH_MARK_PREFIX = 'relinquished_seen_at:'
+
+export interface ScopeSweepResult {
+  /** Items deleted: D1 said not-owned on two sweeps at least SCOPE_RELINQUISH_CONFIRM_MS apart. */
+  purged: number
+  /** Scopes D1 said this project does not own, awaiting the confirming sweep. Not served, not yet deleted. */
+  withheld: string[]
+  /** Repository scopes D1 could not be asked about; not served until it can be. Nothing deleted. */
+  unverifiable: string[]
+}
+
+/** Forget the first-sighting mark of a scope (called when D1 vouches for it again, e.g. a notice just verified). */
+export function clearRelinquishMark(sql: OfficeSql, scope: string): void {
+  sql.exec('DELETE FROM office_meta WHERE key = ?', RELINQUISH_MARK_PREFIX + scope)
+}
+
+/**
+ * Settle what the office keeps against D1 (the authority), in ONE D1 batch regardless of how many repositories it holds.
+ *   - owned scope: any first-sighting mark is cleared;
+ *   - not owned, no mark yet: record `relinquished_seen_at:<scope>` = now and WITHHOLD the rows (nothing deleted);
+ *   - not owned, mark at least `confirmMs` old: a second, independent answer agrees, so delete the rows and the mark;
+ *   - D1 unreachable: every repository scope is `unverifiable` (withheld by the reader); no mark moves, nothing deleted.
+ * Only rows applied before the sweep began are deleted: an item that arrived while D1 was being asked was verified on
+ * its own (verifyNoticeScope). Non-repository scopes are never touched.
  */
 export async function sweepRelinquishedScopes(
   env: Pick<OfficeEnv, 'DB'>,
   sql: OfficeSql,
   projectId: string,
   nowMs: number,
+  confirmMs: number = SCOPE_RELINQUISH_CONFIRM_MS,
 ): Promise<ScopeSweepResult> {
   const startIso = new Date(nowMs).toISOString()
   const scopes = sql
     .all(`SELECT DISTINCT scope FROM office_items WHERE scope != ''`)
     .map((r) => String(r.scope))
     .filter(isRepoScope)
-  let purged = 0
-  const unverifiable: string[] = []
+  const marks = new Map<string, string>()
+  for (const r of sql.all(`SELECT key, value FROM office_meta WHERE key LIKE '${RELINQUISH_MARK_PREFIX}%'`)) {
+    marks.set(String(r.key).slice(RELINQUISH_MARK_PREFIX.length), String(r.value))
+  }
+  const result: ScopeSweepResult = { purged: 0, withheld: [], unverifiable: [] }
+  if (scopes.length === 0) {
+    for (const scope of marks.keys()) clearRelinquishMark(sql, scope) // nothing held, nothing to doubt
+    return result
+  }
+  const owned = await reposOwnedByProject(env.DB, projectId)
+  if (!owned.ok) {
+    result.unverifiable = scopes
+    return result
+  }
+  for (const scope of marks.keys()) if (!scopes.includes(scope)) clearRelinquishMark(sql, scope)
   for (const scope of scopes) {
-    const found = await projectsOwningRepo(env.DB, scope)
-    if (!found.ok) {
-      unverifiable.push(scope)
+    if (owned.keys.has(scope)) {
+      if (marks.has(scope)) clearRelinquishMark(sql, scope)
       continue
     }
-    if (found.owners.includes(projectId)) continue
-    const n = Number(sql.all('SELECT count(*) AS n FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)[0]?.n ?? 0)
-    sql.exec('DELETE FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)
-    purged += n
+    const first = Date.parse(marks.get(scope) ?? '')
+    if (!Number.isFinite(first)) {
+      sql.exec(
+        `INSERT INTO office_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        RELINQUISH_MARK_PREFIX + scope,
+        startIso,
+      )
+      result.withheld.push(scope)
+    } else if (nowMs - first >= confirmMs) {
+      const n = Number(sql.all('SELECT count(*) AS n FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)[0]?.n ?? 0)
+      sql.exec('DELETE FROM office_items WHERE scope = ? AND applied_at <= ?', scope, startIso)
+      // rows that arrived after this sweep began are still here: keep the (confirmed) mark so the next sweep finishes the job
+      if (Number(sql.all('SELECT count(*) AS n FROM office_items WHERE scope = ?', scope)[0]?.n ?? 0) === 0) clearRelinquishMark(sql, scope)
+      result.purged += n
+    } else {
+      result.withheld.push(scope)
+    }
   }
-  if (purged > 0) {
+  if (result.purged > 0) {
     sql.exec(
       `INSERT INTO office_meta (key, value) VALUES ('scope_purged', ?)
        ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)`,
-      String(purged),
-      purged,
+      String(result.purged),
+      result.purged,
     )
   }
-  return { purged, unverifiable }
+  return result
 }

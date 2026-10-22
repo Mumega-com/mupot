@@ -75,6 +75,7 @@ interface Inner {
     listSchedules(c?: { type?: string }): Promise<{ callback: string; type: string; id: string }[]>
     followUpTick(): Promise<void>
     cancelClocks(): Promise<number>
+    sweptAtMs: number
   } | null
   verifiedAtMs: number
   env: { DB: D1Database; PROJECT_OFFICE?: string }
@@ -630,6 +631,27 @@ const metaValue = (s: Stub, key: string): Promise<unknown[]> =>
   )
 const setRepo = (project: string, url: string | null): Promise<unknown> =>
   bindings.DB.exec(`UPDATE projects SET repo_url = ${url === null ? 'NULL' : `'${url}'`} WHERE id = '${project}'`)
+/** The runtime clock cannot advance: make the next call sweep (as after a TTL), and optionally age the first-sighting marks a full window. */
+const makeScopeSweepDue = (s: Stub, opts: { confirm?: boolean } = {}): Promise<void> =>
+  runInDurableObject(s, (i: ProjectOffice, state) => {
+    const a = inner(i).officeAgent
+    if (a) a.sweptAtMs = 0
+    if (opts.confirm) state.storage.sql.exec(`UPDATE office_meta SET value = '2000-01-01T00:00:00.000Z' WHERE key LIKE 'relinquished_seen_at:%'`)
+  })
+/** Swap this object's D1 for one that throws, run `fn`, put the real one back. */
+async function withD1Down<T>(s: Stub, fn: () => Promise<T>): Promise<T> {
+  const real = await runInDurableObject(s, (i: ProjectOffice) => {
+    const e = inner(i).env
+    const kept = e.DB
+    e.DB = { prepare: () => { throw new Error('d1 down') }, batch: () => { throw new Error('d1 down') } } as unknown as D1Database
+    return Promise.resolve(kept)
+  })
+  try {
+    return await fn()
+  } finally {
+    await runInDurableObject(s, (i: ProjectOffice) => { inner(i).env.DB = real })
+  }
+}
 
 describe('repository scope: D1 decides what an office keeps and serves', () => {
   it('refuses a notice scoped to a repository D1 does not give this project, and records nothing', async () => {
@@ -644,7 +666,18 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     expect(await scopeItems(stub)).toEqual([{ item_id: 'PR_1', scope: 'github:o/mine' }])
   })
 
-  it('relinquish: the next READ serves nothing of a repository D1 moved away, and the rows are gone', async () => {
+  it('a notice whose scope D1 cannot confirm is REFUSED (scope_unverifiable), not accepted on faith', async () => {
+    const project = 'proj-scope-unverifiable'
+    await addProject(project, 'https://github.com/o/unv')
+    const stub = office(TENANT, project)
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/unv', item_id: 'A', event_id: 'u-1' })))).toEqual({ ok: true, outcome: 'applied' })
+    const b = await buildNotice(fields({ scope: 'github:o/unv', item_id: 'B', event_id: 'u-2' }))
+    const refused = await withD1Down(stub, () => rpc(stub).notice(b))
+    expect(refused).toEqual({ ok: false, error: 'invalid_notice', problem: 'scope_unverifiable' })
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'A', scope: 'github:o/unv' }]) // B was not recorded
+  })
+
+  it('relinquish: D1 moves the repository away. The first sweep WITHHOLDS (nothing deleted); a confirming sweep a window later deletes', async () => {
     const project = 'proj-scope-read'
     await addProject(project, 'https://github.com/o/read')
     const stub = office(TENANT, project)
@@ -652,7 +685,12 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
       expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/read', item_id: item, event_id: `r-${i}` })))).toEqual({ ok: true, outcome: 'applied' })
     }
     expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(2)
-    await setRepo(project, 'https://github.com/o/elsewhere') // inside the verify TTL: the read must still re-ask D1
+    await setRepo(project, 'https://github.com/o/elsewhere')
+    await makeScopeSweepDue(stub) // a TTL later
+    expect((await rpc(stub).snapshot()).items).toEqual([]) // not served...
+    expect(await scopeItems(stub)).toHaveLength(2) // ...and not destroyed on one answer
+    expect(await metaValue(stub, 'scope_purged')).toEqual([])
+    await makeScopeSweepDue(stub, { confirm: true }) // a second answer, a full window after the first
     expect((await rpc(stub).snapshot()).items).toEqual([])
     expect(await scopeItems(stub)).toEqual([])
     expect(await metaValue(stub, 'scope_purged')).toEqual(['2'])
@@ -665,6 +703,47 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/read', item_id: 'C', event_id: 'r-back' })))).toEqual({ ok: true, outcome: 'applied' })
   })
 
+  it('a withheld scope that D1 gives back is served again, with nothing lost', async () => {
+    const project = 'proj-scope-blip'
+    await addProject(project, 'https://github.com/o/blip')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/blip', event_id: 'bl-1' })))
+    await setRepo(project, null)
+    await makeScopeSweepDue(stub)
+    expect((await rpc(stub).snapshot()).items).toEqual([])
+    await setRepo(project, 'https://github.com/o/blip') // it was a blip
+    await makeScopeSweepDue(stub, { confirm: true })
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1)
+    expect(await scopeItems(stub)).toHaveLength(1)
+    expect(await metaValue(stub, 'scope_purged')).toEqual([])
+  })
+
+  it('a notice D1 just vouched for voids the earlier doubt about its scope (the first-sighting mark is cleared)', async () => {
+    const project = 'proj-scope-vouch'
+    await addProject(project, 'https://github.com/o/vouch')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/vouch', event_id: 'v-1' })))
+    await setRepo(project, null)
+    await makeScopeSweepDue(stub)
+    await rpc(stub).snapshot()
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/vouch')).toHaveLength(1)
+    await setRepo(project, 'https://github.com/o/vouch')
+    expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/vouch', item_id: 'V2', event_id: 'v-2' })))).toEqual({ ok: true, outcome: 'applied' })
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/vouch')).toEqual([])
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(2) // and it is served again at once
+  })
+
+  it('reads use the TTL’d sweep: a change inside the window is not re-read on every call', async () => {
+    const project = 'proj-scope-ttl'
+    await addProject(project, 'https://github.com/o/ttl')
+    const stub = office(TENANT, project)
+    await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/ttl', event_id: 'tt-1' })))
+    await setRepo(project, null)
+    expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1) // inside the window: still the earlier answer
+    await makeScopeSweepDue(stub)
+    expect((await rpc(stub).snapshot()).items).toEqual([]) // once due, the next read sees it
+  })
+
   it('relinquish: only the repository given up goes; the other stays', async () => {
     const project = 'proj-scope-two'
     await addProject(project, 'https://github.com/o/keep')
@@ -673,10 +752,14 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/keep', item_id: 'K', event_id: 't-1' })))
     await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/lose', item_id: 'L', event_id: 't-2' })))
     await bindings.DB.exec(`DELETE FROM project_repos WHERE project_id = '${project}'`)
+    await makeScopeSweepDue(stub)
+    await rpc(stub).snapshot()
+    await makeScopeSweepDue(stub, { confirm: true })
     expect((await rpc(stub).snapshot()).items).toEqual([expect.objectContaining({ item_id: 'K', scope: 'github:o/keep' })])
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'K', scope: 'github:o/keep' }])
   })
 
-  it('a WAKE sweeps with no read and no notice: an evicted office that gets any call drops what D1 took away', async () => {
+  it('a WAKE sweeps with no read and no notice: the first call into a cold object marks what D1 took away', async () => {
     const project = 'proj-scope-wake'
     await addProject(project, 'https://github.com/o/wake')
     const stub = office(TENANT, project)
@@ -685,17 +768,29 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     await evictDurableObject(stub)
     expect(await scopeItems(stub)).toHaveLength(1) // eviction alone changes nothing
     expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true }) // any call into a cold object is a wake
+    expect((await metaValue(stub, 'relinquished_seen_at:github:o/wake'))).toHaveLength(1) // the wake sweep ran
+    expect(await scopeItems(stub)).toHaveLength(1) // one answer: marked, not destroyed
+    await evictDurableObject(stub) // the next wake is a second, independent answer; age the mark a window
+    await runInDurableObject(stub, (_i: ProjectOffice, state) => {
+      state.storage.sql.exec(`UPDATE office_meta SET value = '2000-01-01T00:00:00.000Z' WHERE key LIKE 'relinquished_seen_at:%'`)
+    })
+    expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true })
     expect(await scopeItems(stub)).toEqual([])
   })
 
-  it('the alarm tick sweeps too', async () => {
+  it('the alarm tick sweeps too (and shares the TTL)', async () => {
     const project = 'proj-scope-tick'
     await addProject(project, 'https://github.com/o/tick')
     const stub = office(TENANT, project)
     await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/tick', event_id: 'k-1' })))
     expect(await rpc(stub).armFollowUpClock(3600)).toEqual({ ok: true })
-    await setRepo(project, null) // inside the TTL: only the tick itself can notice
-    expect(await scopeItems(stub)).toHaveLength(1)
+    await setRepo(project, null)
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/tick')).toEqual([]) // inside the TTL only the tick itself can notice
+    await makeScopeSweepDue(stub)
+    expect(await makeJobsDue(stub)).toBe(1)
+    await runDurableObjectAlarm(stub)
+    expect(await metaValue(stub, 'relinquished_seen_at:github:o/tick')).toHaveLength(1)
+    await makeScopeSweepDue(stub, { confirm: true })
     expect(await makeJobsDue(stub)).toBe(1)
     await runDurableObjectAlarm(stub)
     expect(await scopeItems(stub)).toEqual([])
@@ -707,13 +802,12 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     const stub = office(TENANT, project)
     await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/down', event_id: 'd-1' })))
     expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1)
-    await bindings.DB.exec('ALTER TABLE project_repos RENAME TO project_repos_offline') // the ownership lookup now throws
-    try {
+    await makeScopeSweepDue(stub)
+    await withD1Down(stub, async () => {
       expect((await rpc(stub).snapshot()).items).toEqual([])
       expect(await scopeItems(stub)).toHaveLength(1) // withheld, not deleted
-    } finally {
-      await bindings.DB.exec('ALTER TABLE project_repos_offline RENAME TO project_repos')
-    }
+    })
+    await makeScopeSweepDue(stub)
     expect(((await rpc(stub).snapshot()).items as unknown[]).length).toBe(1) // D1 back: served again
   })
 
@@ -736,6 +830,8 @@ describe('repository scope: D1 decides what an office keeps and serves', () => {
     await addProject(project, 'git@github.com:O/Pending.git')
     const stub = office(TENANT, project)
     expect(await rpc(stub).notice(await buildNotice(fields({ scope: 'github:o/pending', event_id: 'p-1' })))).toEqual({ ok: true, outcome: 'applied' })
+    // the office is read-only against D1: the row is still pending afterwards
+    expect(await bindings.DB.prepare(`SELECT repo_key FROM projects WHERE id = '${project}'`).first()).toEqual({ repo_key: null })
   })
 })
 
@@ -781,8 +877,11 @@ describe('the office’s own SQLite migrates from schema v1 inside a real Durabl
       }
     })
     const snap = await rpc(stub).snapshot()
-    expect(snap.items).toEqual([expect.objectContaining({ item_id: 'KEEP', scope: 'github:o/legacy' })]) // OTHER swept (not this project's), NOLINK deleted
+    expect(snap.items).toEqual([expect.objectContaining({ item_id: 'KEEP', scope: 'github:o/legacy' })]) // OTHER withheld (not this project's), NOLINK deleted by the migration
     expect(await metaValue(stub, 'schema_version')).toEqual(['2'])
+    expect(await scopeItems(stub)).toEqual([{ item_id: 'KEEP', scope: 'github:o/legacy' }, { item_id: 'OTHER', scope: 'github:o/other' }])
+    await makeScopeSweepDue(stub, { confirm: true }) // the confirming sweep
+    await rpc(stub).snapshot()
     expect(await scopeItems(stub)).toEqual([{ item_id: 'KEEP', scope: 'github:o/legacy' }])
   })
 })

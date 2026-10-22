@@ -8,10 +8,13 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   NO_REPO_IDENTITY,
-  canonicalizePendingProjectRepos,
+  PENDING_SCAN_CAP,
   projectsOwningRepo,
+  reposOwnedByProject,
   storedRepoKey,
 } from '../src/projects/office-repo-owner'
+import { healProjectRepoKeys } from '../src/projects/repo-key-heal'
+import { backfill, loadCanonicalizer, sqlString } from '../scripts/backfill-repo-key.mjs'
 import { provisionDefaultClientProjects } from '../src/projects/client-bootstrap'
 import { createProject, updateProject } from '../src/projects/service'
 import { repoKeyFromUrl } from '../src/workspaces/repo-key'
@@ -97,13 +100,13 @@ describe('the real owner is found however many unrelated rows share a substring 
     expect(await owners('github:mumega/widgets')).toEqual(['z-owner'])
   })
 
-  it('pending rows: owner behind 450 pending decoys (more than two pages) is still found', async () => {
+  it('pending rows: owner behind 450 pending decoys is still found, in one read', async () => {
     for (let i = 0; i < 450; i++) addProject(`a-decoy-${String(i).padStart(3, '0')}`, decoy(i))
     addProject('z-owner', 'git@github.com:Mumega/Widgets.git')
     expect(await owners('github:mumega/widgets')).toEqual(['z-owner'])
-    // every pending row was canonicalized on the way, so the next lookup is the indexed one
-    expect(harness.sqlite.prepare("SELECT count(*) AS n FROM projects WHERE repo_key IS NULL").get()).toEqual({ n: 0 })
-    expect(keyOf('z-owner')).toBe('github:mumega/widgets')
+    // the lookup is READ-ONLY: it healed nothing (healing is the cron's and the backfill's job)
+    expect(keyOf('z-owner')).toBeNull()
+    expect(harness.sqlite.prepare("SELECT count(*) AS n FROM projects WHERE repo_key IS NULL").get()).toEqual({ n: 451 })
   })
 
   it('ownership through project_repos is not cut off either: 450 projects on the list for other repos', async () => {
@@ -114,6 +117,17 @@ describe('the real owner is found however many unrelated rows share a substring 
     addProject('z-listed', null)
     harness.sqlite.prepare('INSERT INTO project_repos (project_id, repo_key) VALUES (?, ?)').run('z-listed', 'github:mumega/widgets')
     expect(await owners('github:mumega/widgets')).toEqual(['z-listed'])
+  })
+
+  it('more pending rows than one read may take is `unavailable` (fail closed), never a truncated list', async () => {
+    harness.sqlite.exec('BEGIN')
+    const ins = harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES (?, ?, ?, 'x', 'active', ?)`)
+    for (let i = 0; i < PENDING_SCAN_CAP + 1; i++) ins.run(`d-${String(i).padStart(4, '0')}`, `d-${i}`, `d-${i}`, `https://github.com/mumega/decoy-${i}`)
+    harness.sqlite.exec('COMMIT')
+    expect(await projectsOwningRepo(harness.db, 'github:mumega/widgets')).toEqual({ ok: false, reason: 'unavailable' })
+    // ...and a heal pass drains the backlog, after which the lookup answers again
+    for (let i = 0; i < 25; i++) await healProjectRepoKeys(harness.db, { limit: 50 })
+    expect(await owners('github:mumega/widgets')).toEqual([])
   })
 
   it('more than 200 REAL owners are all reported (ambiguity cannot be hidden by a page limit)', async () => {
@@ -136,7 +150,7 @@ describe('who owns', () => {
     expect(await owners('github:mumega/widgets')).toEqual([])
   })
 
-  it('an archived PENDING project owns nothing, and is not healed (it is not scanned)', async () => {
+  it('an archived PENDING project owns nothing (and the resolver heals nothing)', async () => {
     addProject('p1', 'https://github.com/mumega/widgets')
     harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'p1'`)
     expect(await owners('github:mumega/widgets')).toEqual([])
@@ -157,42 +171,229 @@ describe('who owns', () => {
   })
 })
 
-describe('pending rows are canonicalized and healed in place', () => {
-  it('writes the canonical key, or the no-identity marker for a URL that has none', async () => {
+describe('one consistent read: every answer is a single db.batch (#2138 round 2)', () => {
+  /** A D1 that counts how reads reach it and can fire a hook after a read that is NOT part of a batch. */
+  function spying(onSerialRead?: () => void) {
+    const log = { serialReads: 0, batches: 0, batchedStatements: 0 }
+    const wrap = (stmt: any): any =>
+      new Proxy(stmt, {
+        get(t, k) {
+          if (k === 'bind') return (...a: unknown[]) => wrap(t.bind(...a))
+          if (k === 'all' || k === 'first' || k === 'run' || k === 'raw') {
+            return async (...a: unknown[]) => {
+              log.serialReads++
+              const r = await t[k](...a)
+              onSerialRead?.()
+              return r
+            }
+          }
+          return t[k]
+        },
+      })
+    const db = {
+      prepare: (sql: string) => wrap(harness.db.prepare(sql)),
+      batch: (ss: any[]) => {
+        log.batches++
+        log.batchedStatements += ss.length
+        return (harness.db as any).batch(ss)
+      },
+    } as unknown as D1Database
+    return { db, log }
+  }
+
+  it('the resolver reads in ONE batch of three and nothing outside it', async () => {
+    addProject('p1', 'https://github.com/mumega/widgets', 'github:mumega/widgets')
+    const { db, log } = spying()
+    expect(await projectsOwningRepo(db, 'github:mumega/widgets')).toEqual({ ok: true, owners: ['p1'] })
+    expect(log).toEqual({ serialReads: 0, batches: 1, batchedStatements: 3 })
+  })
+
+  it('the per-project read (what an office asks) is ONE batch of two, however many repositories it holds', async () => {
+    addProject('p1', 'https://github.com/mumega/widgets', 'github:mumega/widgets')
+    for (let i = 0; i < 40; i++) harness.sqlite.prepare('INSERT INTO project_repos (project_id, repo_key) VALUES (?, ?)').run('p1', `github:mumega/extra-${i}`)
+    const { db, log } = spying()
+    const r = await reposOwnedByProject(db, 'p1')
+    expect(r.ok && r.keys.size).toBe(41)
+    expect(log).toEqual({ serialReads: 0, batches: 1, batchedStatements: 2 })
+  })
+
+  it('the exact race: a heal landing between the reads cannot make a real owner vanish', async () => {
+    // A pending row is the real owner. In the old shape (key read, then allow-list read, then pending scan as separate
+    // round trips) a heal fired after the FIRST read leaves the row in neither result: owners [] -> the office purged.
+    addProject('real-owner', 'git@github.com:Mumega/Widgets.git')
+    const heal = () => harness.sqlite.exec(`UPDATE projects SET repo_key = 'github:mumega/widgets' WHERE id = 'real-owner' AND repo_key IS NULL`)
+    const { db, log } = spying(heal)
+    expect(await projectsOwningRepo(db, 'github:mumega/widgets')).toEqual({ ok: true, owners: ['real-owner'] })
+    expect(log.serialReads).toBe(0) // nothing outside the batch for the heal to slip between
+    expect(keyOf('real-owner')).toBeNull() // so the hook never fired
+    // the same for the per-project read
+    const second = spying(heal)
+    const r = await reposOwnedByProject(second.db, 'real-owner')
+    expect(r.ok && [...r.keys]).toEqual(['github:mumega/widgets'])
+    expect(second.log.serialReads).toBe(0)
+  })
+
+  it('a heal just BEFORE or just AFTER the batch gives the same answer (each is consistent)', async () => {
+    addProject('real-owner', 'git@github.com:Mumega/Widgets.git')
+    const healNow = () => harness.sqlite.exec(`UPDATE projects SET repo_key = 'github:mumega/widgets' WHERE id = 'real-owner'`)
+    expect(await owners('github:mumega/widgets')).toEqual(['real-owner'])
+    healNow()
+    expect(await owners('github:mumega/widgets')).toEqual(['real-owner'])
+  })
+})
+
+describe('the lookups never write D1, and neither does anything the office Worker imports (#2138 round 2)', () => {
+  it('the resolver is read-only: pending rows stay pending after any number of lookups', async () => {
+    addProject('p1', 'https://github.com/mumega/widgets')
+    for (let i = 0; i < 3; i++) {
+      await owners('github:mumega/widgets')
+      await reposOwnedByProject(harness.db, 'p1')
+    }
+    expect(keyOf('p1')).toBeNull()
+  })
+
+  it('ratchet: every D1 statement in the office’s import closure is a SELECT', () => {
+    const root = join(__dirname, '..')
+    const files = [
+      'src/projects/office-core.ts',
+      'src/projects/office-repo-owner.ts',
+      'src/projects/office-contract.ts',
+      ...readdirSync(join(root, 'workers/project-office/src')).filter((f) => f.endsWith('.ts')).map((f) => `workers/project-office/src/${f}`),
+    ]
+    const offenders: string[] = []
+    let prepares = 0
+    for (const f of files) {
+      const text = readFileSync(join(root, f), 'utf8')
+      // every `.prepare(` in these files talks to D1 (the office's own SQLite goes through sql.exec / storage.sql)
+      for (const m of text.matchAll(/\.prepare\(\s*(?:`([\s\S]*?)`|'([^']*)'|"([^"]*)")/g)) {
+        prepares++
+        const stmt = (m[1] ?? m[2] ?? m[3] ?? '').trim()
+        if (!/^SELECT\b/i.test(stmt)) offenders.push(`${f}: ${stmt.slice(0, 60)}`)
+      }
+      if (/\bDB\s*\.\s*(exec|dump)\b|\.run\(/.test(text) && !f.endsWith('project-office.ts')) offenders.push(`${f}: DB write verb`)
+    }
+    expect(offenders).toEqual([])
+    expect(prepares).toBeGreaterThanOrEqual(5) // verifyOfficeBinding, rebuildWorkingSet x2, owner reads x5: a ratchet that reads nothing proves nothing
+    // the module the main Worker uses to WRITE the key is not reachable from the office Worker
+    for (const f of files) expect(readFileSync(join(root, f), 'utf8')).not.toMatch(/from\s+['"][^'"]*repo-key-heal['"]/)
+  })
+})
+
+describe('healing pending rows (cron slice and one-time backfill), never on a request path', () => {
+  it('the cron heal writes the canonical key, or the no-identity marker, for a bounded slice', async () => {
     addProject('net', 'git@github.com:Mumega/Widgets.git')
     addProject('local', '/srv/git/widgets.git')
     addProject('none', null)
-    const r = await canonicalizePendingProjectRepos(harness.db, null)
-    expect(r.healed).toBe(2)
+    for (let i = 0; i < 5; i++) addProject(`more-${i}`, `https://github.com/mumega/more-${i}`)
+    const first = await healProjectRepoKeys(harness.db, { limit: 3 })
+    expect(first).toEqual({ scanned: 3, healed: 3, drained: false })
+    const rest = await healProjectRepoKeys(harness.db, { limit: 50 })
+    expect(rest).toEqual({ scanned: 4, healed: 4, drained: true })
     expect(keyOf('net')).toBe('github:mumega/widgets')
     expect(keyOf('local')).toBe(NO_REPO_IDENTITY)
     expect(keyOf('none')).toBeNull() // no URL, nothing pending
-    expect(await canonicalizePendingProjectRepos(harness.db, null)).toEqual({ matching: [], healed: 0 }) // nothing left to scan
+    expect(await healProjectRepoKeys(harness.db, { limit: 50 })).toEqual({ scanned: 0, healed: 0, drained: true })
   })
 
-  it('is compare-and-set on repo_url: a URL changed after the page was read is not overwritten with the old answer', async () => {
+  it('compare-and-set on repo_url: a URL changed after the row was read is not overwritten with the old answer', async () => {
     addProject('p1', 'https://github.com/mumega/old')
-    let raced = false
-    const racing = {
+    const racing = racingDb(() => harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/new' WHERE id = 'p1'`))
+    expect((await healProjectRepoKeys(racing, { limit: 10 })).healed).toBe(0)
+    expect(keyOf('p1')).toBeNull() // still pending (the trigger put it back), never the stale 'old'
+    expect(await owners('github:mumega/new')).toEqual(['p1'])
+    expect(await owners('github:mumega/old')).toEqual([])
+  })
+
+  it('compare-and-set on repo_key IS NULL: a key another healer or a writer filled in the meantime is never overwritten', async () => {
+    addProject('p1', 'https://github.com/mumega/widgets')
+    // between the heal's read and its write, a project writer stores a key for the SAME url (a different, deliberate value)
+    const racing = racingDb(() => harness.sqlite.exec(`UPDATE projects SET repo_key = 'github:mumega/writer-chose-this' WHERE id = 'p1'`))
+    expect((await healProjectRepoKeys(racing, { limit: 10 })).healed).toBe(0)
+    expect(keyOf('p1')).toBe('github:mumega/writer-chose-this')
+  })
+
+  /** A D1 whose first heal UPDATE is preceded by `interfere()` (another writer winning the race). */
+  function racingDb(interfere: () => void): D1Database {
+    let fired = false
+    return {
       prepare(sql: string) {
         const stmt = harness.db.prepare(sql)
         if (!sql.startsWith('UPDATE projects SET repo_key')) return stmt
         return {
           bind: (...v: unknown[]) => {
-            if (!raced) {
-              raced = true
-              harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/new' WHERE id = 'p1'`) // a writer wins the race
+            if (!fired) {
+              fired = true
+              interfere()
             }
             return stmt.bind(...v)
           },
         }
       },
     } as unknown as D1Database
-    const r = await canonicalizePendingProjectRepos(racing, null)
+  }
+})
+
+describe('scripts/backfill-repo-key.mjs: the one-time backfill (same canonicalizer, idempotent, --dry-run)', () => {
+  /** runSql backed by the real migrated SQLite, like wrangler would be backed by D1. */
+  const runSql = async (sql: string) => {
+    const stmt = harness.sqlite.prepare(sql)
+    if (/^\s*SELECT/i.test(sql)) return { rows: stmt.all() as { id: string; repo_url: string }[], changes: 0 }
+    return { rows: [], changes: Number(stmt.run().changes) }
+  }
+
+  it('uses the repo’s own canonicalizer: the loaded function agrees with storedRepoKey on every spelling', async () => {
+    const canon = await loadCanonicalizer()
+    for (const url of ['git@github.com:Mumega/Widgets.git', 'https://github.com/mumega/%77idgets', '/srv/git/x', 'https://git.example.com/Team/Repo.git', null])
+      expect(canon(url)).toBe(storedRepoKey(url))
+  })
+
+  it('backfills every pending row, pages through them, and a second run changes nothing', async () => {
+    const canon = await loadCanonicalizer()
+    for (let i = 0; i < 25; i++) addProject(`b-${String(i).padStart(2, '0')}`, i % 2 ? `git@github.com:Mumega/R${i}.git` : `https://github.com/mumega/r${i}`)
+    addProject('local', '/srv/git/x')
+    addProject('none', null)
+    const first = await backfill({ runSql, canonicalize: canon, pageSize: 7 })
+    expect(first).toEqual({ scanned: 26, healed: 26, skipped: 0, dryRun: false })
+    expect(keyOf('b-01')).toBe('github:mumega/r1')
+    expect(keyOf('local')).toBe(NO_REPO_IDENTITY)
+    expect(keyOf('none')).toBeNull()
+    expect(await backfill({ runSql, canonicalize: canon, pageSize: 7 })).toEqual({ scanned: 0, healed: 0, skipped: 0, dryRun: false })
+    expect(await owners('github:mumega/r1')).toEqual(['b-01']) // and the indexed lookup now answers
+  })
+
+  it('--dry-run reads and reports, and writes nothing', async () => {
+    const canon = await loadCanonicalizer()
+    addProject('p1', 'https://github.com/mumega/widgets')
+    const lines: string[] = []
+    const r = await backfill({ runSql, canonicalize: canon, dryRun: true, log: (l: string) => lines.push(l) })
+    expect(r).toEqual({ scanned: 1, healed: 0, skipped: 0, dryRun: true })
+    expect(lines).toEqual(['would set p1 -> github:mumega/widgets'])
+    expect(keyOf('p1')).toBeNull()
+  })
+
+  it('is compare-and-set: a row a writer changed or filled since it was read is left alone', async () => {
+    const canon = await loadCanonicalizer()
+    addProject('changed', 'https://github.com/mumega/old')
+    addProject('filled', 'https://github.com/mumega/widgets')
+    let n = 0
+    const racing = async (sql: string) => {
+      if (/^\s*UPDATE/i.test(sql) && n++ === 0) {
+        harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/new' WHERE id = 'changed'`)
+        harness.sqlite.exec(`UPDATE projects SET repo_key = 'github:mumega/by-writer' WHERE id = 'filled'`)
+      }
+      return runSql(sql)
+    }
+    const r = await backfill({ runSql: racing, canonicalize: canon })
     expect(r.healed).toBe(0)
-    expect(keyOf('p1')).toBeNull() // still pending (the trigger put it back), never the stale 'old'
-    expect(await owners('github:mumega/new')).toEqual(['p1'])
-    expect(await owners('github:mumega/old')).toEqual([])
+    expect(keyOf('filled')).toBe('github:mumega/by-writer')
+    expect(keyOf('changed')).toBeNull()
+  })
+
+  it('quotes hostile values: an apostrophe in a URL cannot break out of the statement', async () => {
+    expect(sqlString("a'b")).toBe("'a''b'")
+    addProject('p1', "https://github.com/mumega/it's-fine'; DROP TABLE projects; --")
+    await backfill({ runSql, canonicalize: await loadCanonicalizer() })
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM projects').get()).toEqual({ n: 1 })
   })
 })
 

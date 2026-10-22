@@ -26,7 +26,7 @@ vi.mock('../src/tasks/verdict-binding', async (importOriginal) => ({
 const { default: worker } = await import('../src/index')
 
 const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
-const HEARTBEATS = 16
+const HEARTBEATS = 17 // the receipts sweep is the second to last (index 15); repo-key-heal is index 16
 // the minutes MAINTENANCE_CRON fires on (0-9, 15-24, 30-39, 45-54)
 const FIRING_MINUTES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
 
@@ -42,7 +42,7 @@ async function tick(minute: number): Promise<void> {
 
 describe('gate-verdict-receipts maintenance heartbeat', () => {
   it('is reachable: some firing minute selects its slot, and ticking there runs the sweep exactly once', async () => {
-    const slotMinute = FIRING_MINUTES.find((m) => maintenanceSlot(m, HEARTBEATS) === HEARTBEATS - 1)
+    const slotMinute = FIRING_MINUTES.find((m) => maintenanceSlot(m, HEARTBEATS) === HEARTBEATS - 2)
     expect(slotMinute).toBeDefined()
     sweep.mockClear()
     vi.spyOn(console, 'info').mockImplementation(() => undefined)
@@ -57,7 +57,7 @@ describe('gate-verdict-receipts maintenance heartbeat', () => {
     await tick(0)
     expect(sweep).not.toHaveBeenCalled()
     sweep.mockRejectedValueOnce(new Error('boom'))
-    const slotMinute = FIRING_MINUTES.find((m) => maintenanceSlot(m, HEARTBEATS) === HEARTBEATS - 1) ?? -1
+    const slotMinute = FIRING_MINUTES.find((m) => maintenanceSlot(m, HEARTBEATS) === HEARTBEATS - 2) ?? -1
     await expect(tick(slotMinute)).resolves.toBeUndefined()
     expect(err).toHaveBeenCalledWith('[scheduled:gate-verdict-receipts]', expect.any(Error))
   })

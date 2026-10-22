@@ -6,11 +6,14 @@
 -- reads each one:
 --   a key        canonical; the lookup is `repo_key = ?` on the index below.
 --   ''           repo_url has no network identity (a local path, an unparseable string). Owns nothing.
---   NULL         PENDING: repo_url is set but nobody has canonicalized it yet. The resolver canonicalizes pending
---                rows in JS (it cannot be done in SQL), writes the answer back compare-and-set on repo_url, and
---                meanwhile still counts them, so a pending row can hide nothing.
--- Every row that exists at migration time is therefore PENDING (no SQL backfill: a half-right SQL copy of the
--- canonicalizer would be a wrong owner, which is worse than a slow lookup). The resolver heals them on first use.
+--   NULL         PENDING: repo_url is set but nobody has canonicalized it yet. The canonical key cannot be computed in SQL,
+--                so every row that exists at migration time starts here. A pending row still COUNTS as an owner: the
+--                lookups canonicalize its URL in memory at read time and write nothing. It is healed out of band, by a
+--                bounded slice per maintenance-cron tick (src/projects/repo-key-heal.ts) and, if you want it done now, by
+--                the one-time scripts/backfill-repo-key.mjs (idempotent, --dry-run). Both are compare-and-set.
+--
+-- DEPLOY ORDER. Apply this migration BEFORE the Worker that uses it: the project writers name repo_key, and a Worker
+-- running without the column fails every project create/update with "no such column". The deploy script migrates first.
 --
 -- Writers (createProject, updateProject, client-bootstrap upsert) set repo_key beside repo_url. The trigger below
 -- is the net under any writer that does not (raw SQL, a seed script, a future code path): when repo_url changes and

@@ -13,6 +13,7 @@ import { NOTICE_CONTRACT_VERSION, buildNotice, checkNotice } from '../src/projec
 import {
   applyNotice,
   ensureOfficeSchema,
+  SCOPE_RELINQUISH_CONFIRM_MS,
   sweepRelinquishedScopes,
   verifyNoticeScope,
   verifyOfficeBinding,
@@ -490,8 +491,9 @@ describe('the notice carries the repository D1 vouched for, and the contract ver
     expect((await route(env, pr('mumega/mupot'), 'd-1')).routed).toBe(true)
     harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/elsewhere' WHERE id = 'p1'`)
     expect(await route(env, pr('mumega/mupot'), 'd-2')).toEqual({ routed: false, reason: 'unknown_repo' })
-    const swept = await sweepRelinquishedScopes(env, memoryOffice('pot-a:p1'), 'p1', NOW)
-    expect(swept.purged).toBe(1)
+    const sql = memoryOffice('pot-a:p1')
+    expect((await sweepRelinquishedScopes(env, sql, 'p1', NOW)).purged).toBe(0) // one answer withholds
+    expect((await sweepRelinquishedScopes(env, sql, 'p1', NOW + SCOPE_RELINQUISH_CONFIRM_MS)).purged).toBe(1) // two delete
     expect(itemsOf('p1')).toEqual([])
   })
 

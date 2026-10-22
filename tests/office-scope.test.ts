@@ -12,6 +12,8 @@ import {
   ensureOfficeSchema,
   isRepoScope,
   rebuildWorkingSet,
+  SCOPE_RELINQUISH_CONFIRM_MS,
+  clearRelinquishMark,
   sweepRelinquishedScopes,
   verifyNoticeScope,
   type OfficeSql,
@@ -92,66 +94,159 @@ describe('verifyNoticeScope: D1 vouches for the repository before a notice is ta
   })
 })
 
-describe('sweepRelinquishedScopes: what D1 stops vouching for goes', () => {
-  it('repo_url moved to another project: the old office drops that repository’s items', async () => {
+const LATER = NOW + SCOPE_RELINQUISH_CONFIRM_MS
+const marks = (sql: OfficeSql) => sql.all(`SELECT key, value FROM office_meta WHERE key LIKE 'relinquished_seen_at:%' ORDER BY key`)
+/** The two answers that destroy: a sweep, then another at least the confirm window later. */
+async function sweepTwice(sql: OfficeSql, project = 'p1') {
+  const first = await sweepRelinquishedScopes(env(), sql, project, NOW)
+  const second = await sweepRelinquishedScopes(env(), sql, project, LATER)
+  return { first, second }
+}
+
+describe('sweepRelinquishedScopes: one answer withholds, two answers a TTL apart delete', () => {
+  it('repo_url moved to another project: first sweep withholds and marks, the confirming sweep deletes', async () => {
     const sql = await office({ item_id: 'W1' }, { item_id: 'W2' })
     harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/other' WHERE id = 'p1'`) // p1 gives widgets up
     harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, status, repo_url) VALUES ('p9', 'p9', 'Nine', 'x', 'active', 'https://github.com/mumega/widgets')`)
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 2, unverifiable: [] })
+    const first = await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
+    expect(first).toEqual({ purged: 0, withheld: ['github:mumega/widgets'], unverifiable: [] })
+    expect(held(sql)).toHaveLength(2) // nothing destroyed on one answer
+    expect(marks(sql)).toEqual([{ key: 'relinquished_seen_at:github:mumega/widgets', value: new Date(NOW).toISOString() }])
+    const second = await sweepRelinquishedScopes(env(), sql, 'p1', LATER)
+    expect(second).toEqual({ purged: 2, withheld: [], unverifiable: [] })
     expect(held(sql)).toEqual([])
+    expect(marks(sql)).toEqual([]) // the mark goes with the rows
+    expect(sql.all(`SELECT value FROM office_meta WHERE key = 'scope_purged'`)).toEqual([{ value: '2' }])
   })
 
-  it('items of a repository this project never owned (a replay, a mislabel) go too: ownership is asked, not remembered', async () => {
-    const sql = await office({ item_id: 'G1', scope: 'github:mumega/gadgets' }) // gadgets belongs to p2
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 1, unverifiable: [] })
+  it('a second sweep that comes too soon does not confirm (the mark must be a full window old)', async () => {
+    const sql = await office({ item_id: 'W1' })
+    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
+    const soon = await sweepRelinquishedScopes(env(), sql, 'p1', LATER - 1)
+    expect(soon).toEqual({ purged: 0, withheld: ['github:mumega/widgets'], unverifiable: [] })
+    expect(held(sql)).toHaveLength(1)
+    expect((await sweepRelinquishedScopes(env(), sql, 'p1', LATER)).purged).toBe(1)
   })
 
-  it('only the relinquished repository goes; the ones still owned stay', async () => {
+  it('THE RACE: one wrong "not owned" answer between two right ones deletes nothing and leaves no mark', async () => {
+    const sql = await office({ item_id: 'W1' })
+    // sweep 1: D1 momentarily answers as if the project owned nothing (a heal landing between split reads, a lagging replica)
+    const blip = { DB: { batch: async () => [{ results: [] }, { results: [] }], prepare: () => ({ bind: () => ({}) }) } as unknown as D1Database }
+    expect(await sweepRelinquishedScopes(blip, sql, 'p1', NOW)).toEqual({ purged: 0, withheld: ['github:mumega/widgets'], unverifiable: [] })
+    expect(held(sql)).toHaveLength(1)
+    // sweep 2, a window later: D1 is right again. The doubt is withdrawn, the rows were never touched.
+    expect(await sweepRelinquishedScopes(env(), sql, 'p1', LATER)).toEqual({ purged: 0, withheld: [], unverifiable: [] })
+    expect(held(sql)).toEqual([{ item_id: 'W1', scope: 'github:mumega/widgets' }])
+    expect(marks(sql)).toEqual([])
+    // and the same blip AFTER the window cannot delete either: it is a first sighting again, not a confirmation
+    expect((await sweepRelinquishedScopes(blip, sql, 'p1', LATER + SCOPE_RELINQUISH_CONFIRM_MS)).purged).toBe(0)
+    expect(held(sql)).toHaveLength(1)
+  })
+
+  it('a heal injected between the reads of the real resolver changes nothing (the batch is one snapshot)', async () => {
+    harness.sqlite.exec(`UPDATE projects SET repo_key = NULL WHERE id = 'p1'`) // p1's own row is pending
+    const sql = await office({ item_id: 'W1' })
+    const racing = {
+      prepare: (q: string) => {
+        const st = harness.db.prepare(q) as any
+        return new Proxy(st, { get: (t, k) => (k === 'bind' ? (...a: unknown[]) => t.bind(...a) : t[k]) })
+      },
+      batch: async (ss: D1PreparedStatement[]) => {
+        const out = await harness.db.batch(ss)
+        harness.sqlite.exec(`UPDATE projects SET repo_key = 'github:mumega/widgets' WHERE id = 'p1'`) // heal right after
+        return out
+      },
+    } as unknown as D1Database
+    expect(await sweepRelinquishedScopes({ DB: racing }, sql, 'p1', NOW)).toEqual({ purged: 0, withheld: [], unverifiable: [] })
+    expect(held(sql)).toHaveLength(1)
+  })
+
+  it('only the relinquished repository goes; the ones still owned stay and keep no mark', async () => {
     harness.sqlite.exec(`INSERT INTO project_repos (project_id, repo_key) VALUES ('p1', 'github:mumega/extra')`)
     const sql = await office({ item_id: 'W1' }, { item_id: 'X1', scope: 'github:mumega/extra' })
     harness.sqlite.exec(`DELETE FROM project_repos WHERE project_id = 'p1'`)
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 1, unverifiable: [] })
+    const { first, second } = await sweepTwice(sql)
+    expect(first.withheld).toEqual(['github:mumega/extra'])
+    expect(second.purged).toBe(1)
     expect(held(sql)).toEqual([{ item_id: 'W1', scope: 'github:mumega/widgets' }])
-    expect(sql.all(`SELECT value FROM office_meta WHERE key = 'scope_purged'`)).toEqual([{ value: '1' }])
+    expect(marks(sql)).toEqual([])
   })
 
-  it('an archived project or a cleared repo_url relinquishes everything', async () => {
+  it('regaining ownership between the two sweeps clears the mark: the second sweep starts over, not a confirmation', async () => {
+    const sql = await office({ item_id: 'W1' })
+    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
+    harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/widgets', repo_key = 'github:mumega/widgets' WHERE id = 'p1'`)
+    expect((await sweepRelinquishedScopes(env(), sql, 'p1', LATER)).purged).toBe(0)
+    expect(marks(sql)).toEqual([])
+    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
+    expect((await sweepRelinquishedScopes(env(), sql, 'p1', LATER + 1)).purged).toBe(0) // first sighting again
+    expect(held(sql)).toHaveLength(1)
+  })
+
+  it('an archived project or a cleared repo_url relinquishes everything (after confirmation)', async () => {
     const a = await office({ item_id: 'W1' })
     harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'p1'`)
-    expect((await sweepRelinquishedScopes(env(), a, 'p1', NOW)).purged).toBe(1)
+    expect((await sweepTwice(a)).second.purged).toBe(1)
     harness.sqlite.exec(`UPDATE projects SET status = 'active', repo_url = NULL WHERE id = 'p1'`)
     const b = await office({ item_id: 'W1' })
-    expect((await sweepRelinquishedScopes(env(), b, 'p1', NOW)).purged).toBe(1)
+    expect((await sweepTwice(b)).second.purged).toBe(1)
+  })
+
+  it('items of a repository this project never owned (a replay, a mislabel) go too, after confirmation', async () => {
+    const sql = await office({ item_id: 'G1', scope: 'github:mumega/gadgets' }) // gadgets belongs to p2
+    const { first, second } = await sweepTwice(sql)
+    expect(first.purged).toBe(0)
+    expect(second.purged).toBe(1)
   })
 
   it('a still-owned repository is untouched, and a second sweep is a no-op', async () => {
     const sql = await office({ item_id: 'W1' })
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 0, unverifiable: [] })
+    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 0, withheld: [], unverifiable: [] })
+    expect(await sweepRelinquishedScopes(env(), sql, 'p1', LATER)).toEqual({ purged: 0, withheld: [], unverifiable: [] })
     expect(held(sql)).toHaveLength(1)
-    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
-    await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 0, unverifiable: [] })
   })
 
-  it('D1 unreachable: nothing is deleted on a guess, and the scope is reported so the read path can withhold it', async () => {
+  it('D1 unreachable: nothing is deleted on a guess, no mark moves, and the scope is reported so the read path withholds it', async () => {
     const sql = await office({ item_id: 'W1' })
+    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW) // a real first sighting
     const down = { DB: { prepare: () => { throw new Error('d1 down') } } as unknown as D1Database }
-    expect(await sweepRelinquishedScopes(down, sql, 'p1', NOW)).toEqual({ purged: 0, unverifiable: ['github:mumega/widgets'] })
-    expect(held(sql)).toHaveLength(1)
+    expect(await sweepRelinquishedScopes(down, sql, 'p1', LATER)).toEqual({ purged: 0, withheld: [], unverifiable: ['github:mumega/widgets'] })
+    expect(held(sql)).toHaveLength(1) // an outage is not the confirming answer
+    expect(marks(sql)).toHaveLength(1)
   })
 
   it('non-repository scopes are never swept (no D1 source can vouch for them yet)', async () => {
     const sql = await office({ provider: 'linear', scope: 'linear:team-1', item_id: 'L1' })
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 0, unverifiable: [] })
+    expect((await sweepTwice(sql)).second).toEqual({ purged: 0, withheld: [], unverifiable: [] })
     expect(held(sql)).toHaveLength(1)
   })
 
-  it('an item that arrived after the check began (verified on its own) survives that sweep', async () => {
+  it('marks of scopes that no longer have items are forgotten', async () => {
+    const sql = await office({ item_id: 'W1' })
+    sql.exec(`INSERT INTO office_meta (key, value) VALUES ('relinquished_seen_at:github:mumega/gone', '2026-01-01T00:00:00.000Z')`)
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
+    expect(marks(sql)).toEqual([])
+  })
+
+  it('an item that arrived after the confirming check began survives that sweep', async () => {
     const sql = await office({ item_id: 'OLD' })
     harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
-    // applied_at of OLD is NOW; a sweep that started BEFORE it leaves it, one that started after removes it
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW - 2 * SCOPE_RELINQUISH_CONFIRM_MS) // first sighting, long ago
+    // OLD was applied at NOW; a confirming sweep that STARTED before then leaves it, one that started after removes it
     expect((await sweepRelinquishedScopes(env(), sql, 'p1', NOW - 1000)).purged).toBe(0)
     expect((await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).purged).toBe(1)
+  })
+
+  it('a notice verified against D1 voids an earlier doubt about its scope (facade: scopeVouched)', async () => {
+    const sql = await office({ item_id: 'W1' })
+    harness.sqlite.exec(`UPDATE projects SET repo_url = NULL WHERE id = 'p1'`)
+    await sweepRelinquishedScopes(env(), sql, 'p1', NOW)
+    expect(marks(sql)).toHaveLength(1)
+    clearRelinquishMark(sql, 'github:mumega/widgets')
+    expect(marks(sql)).toEqual([])
   })
 })
 
@@ -168,9 +263,9 @@ describe('the office is a projection: destroy-and-rebuild still passes', () => {
     const binding = { ok: true as const, tenant: 'pot-a', projectId: 'p1' }
     await rebuildWorkingSet(env(), before.sql, binding, '2026-10-22T10:00:00.000Z')
     applyNotice(before.sql, await notice({ item_id: 'W1' }), NOW)
-    // the project gives the repository up in D1
+    // the project gives the repository up in D1; two sweeps a window apart settle it
     harness.sqlite.exec(`UPDATE projects SET repo_url = 'https://github.com/mumega/other' WHERE id = 'p1'`)
-    await sweepRelinquishedScopes(env(), before.sql, 'p1', NOW)
+    await sweepTwice(before.sql)
     expect(held(before.sql)).toEqual([])
 
     // destroy: a brand-new office, rebuilt from D1 alone, holds the same D1-derived state
@@ -237,7 +332,7 @@ describe('office_meta.schema_version 1 -> 2', () => {
   it('a migrated office is then swept like any other: p1 keeps its repository, loses the one it never owned', async () => {
     const sql = v1Office()
     ensureOfficeSchema(sql)
-    expect(await sweepRelinquishedScopes(env(), sql, 'p1', NOW)).toEqual({ purged: 1, unverifiable: [] })
+    expect((await sweepTwice(sql)).second.purged).toBe(1)
     expect(sql.all('SELECT item_id FROM office_items ORDER BY item_id')).toEqual([{ item_id: 'ISS_ok' }, { item_id: 'PR_ok' }])
   })
 

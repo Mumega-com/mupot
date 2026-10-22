@@ -46,10 +46,13 @@ the office storage rebuilt from the source (it holds no authority).
 ## Repository scope
 
 Each item records the repository it came from (`scope`, e.g. `github:owner/repo`). D1 is the authority on whether the
-project still owns that repository (`projects.repo_key` / `project_repos`): the office re-asks before it takes a notice
-in, on every wake and alarm tick, at most every 30 s otherwise, and before every read; it deletes the items of a
-repository D1 no longer gives the project, and withholds (without deleting) items whose repository D1 cannot be asked
-about.
+project still owns that repository (`projects.repo_key` / `project_repos`). The office asks for each notice it takes in
+(one batched read) and in one batched sweep on a wake and then at most every 30 s (reads and alarm ticks share that
+TTL). A repository D1 says the project does not own is withheld at once and deleted only when a second sweep, at least
+30 s after the first, agrees (`office_meta.relinquished_seen_at:<scope>` records the first): one D1 answer never destroys
+rows. A repository D1 cannot be asked about is withheld, not deleted. The office only ever READS D1; it imports
+`office-repo-owner.ts` (read-only) and never `repo-key-heal.ts` (the cron and `scripts/backfill-repo-key.mjs` write the
+key; `tests/office-repo-owner.test.ts` pins both).
 
 ## Enabling (Phase 1, not before)
 
