@@ -4,7 +4,10 @@
 // to logs and error sites outside projections without cross-importing a
 // projection module.
 
-const ASSIGNMENT_RE = /((?:^|[\s,;{?&])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)[^,;}&\r\n]+/g
+// Matches only through `key[:=]` (not the value) so a leading label such as
+// `Note:` / `Label:` cannot swallow a later `key=value` pair (#2119). Lookbehind
+// keeps the boundary character available for the next scan.
+const ASSIGNMENT_KEY_RE = /(?<![A-Za-z0-9_.-])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*/g
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
 export function isSensitiveDetailKey(key: string): boolean {
@@ -29,14 +32,37 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
+/** Redact every sensitive `key[:=]value` pair, including those after a label. */
+function redactAssignmentPairs(text: string): string {
+  const edits: Array<{ start: number; end: number }> = []
+  ASSIGNMENT_KEY_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = ASSIGNMENT_KEY_RE.exec(text)) !== null) {
+    const key = match[1]
+    if (!key || !isSensitiveDetailKey(key)) continue
+    const start = match.index + match[0].length
+    let end = start
+    while (end < text.length && !/[,;}&\r\n]/.test(text[end]!)) end += 1
+    if (end > start) {
+      edits.push({ start, end })
+      // Skip the value so overlapping ranges stay consistent when applied.
+      ASSIGNMENT_KEY_RE.lastIndex = end
+    }
+  }
+  let out = text
+  for (let i = edits.length - 1; i >= 0; i -= 1) {
+    const { start, end } = edits[i]!
+    out = `${out.slice(0, start)}[redacted]${out.slice(end)}`
+  }
+  return out
+}
+
 export function redactSecretPatterns(text: string): string {
-  return text
-    .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
+  return redactAssignmentPairs(
+    text.replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
-    ))
-    .replace(ASSIGNMENT_RE, (match, prefix: string, key: string) => (
-      isSensitiveDetailKey(key) ? `${prefix}[redacted]` : match
-    ))
+    )),
+  )
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')

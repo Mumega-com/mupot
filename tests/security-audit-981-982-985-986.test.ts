@@ -124,3 +124,36 @@ describe('#985+#986 console redaction helpers', () => {
     expect(out).toBe('customer=acme&count=42')
   })
 })
+
+describe('#2119 ASSIGNMENT_RE scans every key[:=]value after a leading label', () => {
+  it('redacts api_key after a Note: label (generic value, not a known token shape)', () => {
+    const out = redactSecretPatterns('Note: api_key=generic-secret-value-xyz')
+    expect(out).not.toContain('generic-secret-value-xyz')
+    expect(out).toContain('api_key=[redacted]')
+    expect(out.startsWith('Note:')).toBe(true)
+  })
+
+  it('redacts api_key after Note: when the value is a known sk- shape', () => {
+    const out = redactSecretPatterns('Note: api_key=sk-live-1234567890abcdef')
+    expect(out).not.toContain('sk-live-1234567890abcdef')
+    expect(out).toContain('[redacted]')
+  })
+
+  it('redacts password when glued after Note: without a space', () => {
+    const out = redactSecretPatterns('Note:password: hunter2hunter2')
+    expect(out).not.toContain('hunter2hunter2')
+    expect(out).toContain('password: [redacted]')
+  })
+
+  it('redacts token after a Label: prefix', () => {
+    const out = redactSecretPatterns('Label: token=abc123secrettoken')
+    expect(out).not.toContain('abc123secrettoken')
+    expect(out).toContain('token=[redacted]')
+  })
+
+  it('redacts password after Note: with a space', () => {
+    const out = redactSecretPatterns('Note: password=hunter2hunter2')
+    expect(out).not.toContain('hunter2hunter2')
+    expect(out).toContain('password=[redacted]')
+  })
+})
