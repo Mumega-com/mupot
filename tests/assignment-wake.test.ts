@@ -391,23 +391,47 @@ describe('each assignment path enqueues exactly one doorbell', () => {
     expect(ledger({ task: 't1' })).toMatchObject([{ outcome: 'skipped', reason: 'dispatch_letter_exists' }])
   })
 
-  it('supersedeAssignmentWakesByDispatch retires queued, held and in-flight (pending) rows', async () => {
-    seedTask('t1', { assignee: 'ag-a' })
-    seedTask('t2', { assignee: 'ag-a' })
-    seedTask('t3', { assignee: 'ag-a' })
-    await enqueueAssignmentWake(env, { taskId: 't1', agentId: 'ag-a', epoch: 'e1' })
-    for (const [task, outcome] of [['t2', 'coalesced'], ['t3', 'pending']]) {
-      h.sqlite.prepare(`INSERT INTO task_assignment_wakes (id, tenant, task_id, agent_id, epoch, outcome, claim_token, created_at, updated_at) VALUES (?, ?, ?, 'ag-a', 'e', ?, 'w', ?, ?)`)
-        .run(`w-${task}`, TENANT, task, outcome, T0.toISOString(), T0.toISOString())
+  // #2140: this test once read the ledger back ORDER BY created_at while t1 was stamped by the wall clock (no injected `now`)
+  // and t2/t3 by the fixed T0 literal, so it passed only while the real clock was before T0 (2026-10-22T12:00Z). Every row is
+  // now stamped from the injected clock and the assertion is keyed by task_id, so it holds at any wall-clock time. The
+  // it.each pins that: the real clock is moved to well before, exactly at, and well after T0.
+  it.each([
+    ['a day before T0', '2026-10-21T12:00:00.000Z'],
+    ['one ms before T0', '2026-10-22T11:59:59.999Z'],
+    ['exactly T0', '2026-10-22T12:00:00.000Z'],
+    ['a day after T0', '2026-10-23T12:00:00.000Z'],
+  ])('supersedeAssignmentWakesByDispatch retires queued, held and in-flight (pending) rows (wall clock %s)', async (_label, wallClock) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(wallClock))
+    try {
+      seedTask('t1', { assignee: 'ag-a' })
+      seedTask('t2', { assignee: 'ag-a' })
+      seedTask('t3', { assignee: 'ag-a' })
+      await enqueueAssignmentWake(env, { taskId: 't1', agentId: 'ag-a', epoch: 'e1' }, { now: at(0) })
+      for (const [task, outcome] of [['t2', 'coalesced'], ['t3', 'pending']]) {
+        h.sqlite.prepare(`INSERT INTO task_assignment_wakes (id, tenant, task_id, agent_id, epoch, outcome, claim_token, created_at, updated_at) VALUES (?, ?, ?, 'ag-a', 'e', ?, 'w', ?, ?)`)
+          .run(`w-${task}`, TENANT, task, outcome, T0.toISOString(), T0.toISOString())
+      }
+      expect(ledger().map((r) => [r.task_id, r.outcome]).sort()).toEqual([['t1', 'queued'], ['t2', 'coalesced'], ['t3', 'pending']])
+      for (const task of ['t1', 't2', 't3']) await supersedeAssignmentWakesByDispatch(env, task, 'ag-a')
+      const byTask = (r: { task_id: string }, o: { task_id: string }) => r.task_id.localeCompare(o.task_id)
+      expect(ledger().sort(byTask).map((r) => [r.task_id, r.outcome, r.reason])).toEqual([
+        ['t1', 'skipped', 'dispatch_letter_exists'], ['t2', 'skipped', 'dispatch_letter_exists'], ['t3', 'skipped', 'dispatch_letter_exists'],
+      ])
+      // supersede only retires the outcome: it never rewrites created_at (the ledger's ordering key)
+      expect(h.sqlite.prepare('SELECT task_id, created_at FROM task_assignment_wakes ORDER BY task_id').all())
+        .toEqual([
+          { task_id: 't1', created_at: T0.toISOString() },
+          { task_id: 't2', created_at: T0.toISOString() },
+          { task_id: 't3', created_at: T0.toISOString() },
+        ])
+      // a delivered row is not rewritten
+      h.sqlite.exec(`UPDATE task_assignment_wakes SET outcome = 'sent', reason = NULL`)
+      await supersedeAssignmentWakesByDispatch(env, 't1', 'ag-a')
+      expect(ledger({ task: 't1' })[0].outcome).toBe('sent')
+    } finally {
+      vi.useRealTimers()
     }
-    for (const task of ['t1', 't2', 't3']) await supersedeAssignmentWakesByDispatch(env, task, 'ag-a')
-    expect(ledger().map((r) => [r.task_id, r.outcome, r.reason])).toEqual([
-      ['t1', 'skipped', 'dispatch_letter_exists'], ['t2', 'skipped', 'dispatch_letter_exists'], ['t3', 'skipped', 'dispatch_letter_exists'],
-    ])
-    // a delivered row is not rewritten
-    h.sqlite.exec(`UPDATE task_assignment_wakes SET outcome = 'sent', reason = NULL`)
-    await supersedeAssignmentWakesByDispatch(env, 't1', 'ag-a')
-    expect(ledger({ task: 't1' })[0].outcome).toBe('sent')
   })
 })
 
