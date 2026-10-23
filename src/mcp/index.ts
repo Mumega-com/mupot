@@ -35,7 +35,7 @@ import type {
   Task,
 } from '../types'
 import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
-import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { resolveDyadGateDefault } from '../gates/dyad'
@@ -699,7 +699,8 @@ async function authenticateMemberInner(c: {
             m.created_at    AS created_at,
             t.channel       AS channel,
             t.agent_id      AS bound_agent_id,
-            t.harness_kind  AS harness_kind${sf.select}
+            t.harness_kind  AS harness_kind,
+            t.last_used_at  AS last_used_at${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
        ${sf.join}
@@ -724,6 +725,7 @@ async function authenticateMemberInner(c: {
       channel: AuthContext['channel']
       bound_agent_id: string | null
       harness_kind: string | null
+      last_used_at?: string | null
       seat_status?: string | null
       seat_row_id?: string | null
     }>()
@@ -743,7 +745,8 @@ async function authenticateMemberInner(c: {
   // only grows), but it is not an authorization input. A failed write must never fail
   // an authenticated request, hence the swallowed catch and the absence of an await
   // on the caller's critical path being load-bearing.
-  void touchTokenLastUsed(c.env, tokenHash)
+  // Throttled: skipped when the row we just read says it was stamped < 60 s ago (D1 write load).
+  if (shouldStampLastUsed(row.last_used_at, Date.now())) void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
   const seatStatus = seatAgentStatusFromRow(c.env, row)
 
