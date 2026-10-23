@@ -27,11 +27,11 @@ import type { Env } from '../src/types'
 
 const ORIGIN = 'https://pot.test'
 
-function envFor(): Env {
+function envFor(slug = 'pot-a'): Env {
   const store = new Map<string, string>()
   return {
     DB: {} as unknown,
-    TENANT_SLUG: 'pot-a',
+    TENANT_SLUG: slug,
     BRAND: 'Test Pot',
     PUBLIC_ORIGIN: ORIGIN,
     SESSIONS: {
@@ -65,19 +65,44 @@ describe('GET / signed-out landing (mupot#1445)', () => {
     expect(body).toContain('/invite/')
   })
 
-  it('shows newcomer start-path links with exact hrefs + rel, and no literal entity', async () => {
-    const body = await (await dashboardApp.fetch(get('/'), envFor())).text()
-    for (const href of [
-      'https://mumega.com/docs/for-business-owners',
-      'https://mumega.com/docs/how-to-connect',
-      'https://mumega.com/onboarding',
-    ]) {
+  const LINKS = [
+    'https://mumega.com/docs/for-business-owners/',
+    'https://mumega.com/docs/how-to-connect/',
+    'https://mumega.com/onboarding/',
+  ]
+  const NEWCOMER = 'New to this?'
+
+  it('mumega tenant, non-pending: exactly the three links with rel, newcomer line, literal ellipsis', async () => {
+    const body = await (await dashboardApp.fetch(get('/'), envFor('mumega'))).text()
+    for (const href of LINKS) {
       expect(body).toContain(`<a href="${href}" rel="noopener noreferrer">`)
     }
+    expect(body.match(/<a href="https:\/\/mumega\.com\//g)?.length).toBe(3)
+    expect(body.match(/rel="noopener noreferrer"/g)?.length).toBe(3)
+    expect(body).toContain(NEWCOMER)
     expect(body).toContain('/invite/…')
-    expect(body).not.toContain('&hellip;')
-    expect(body).not.toContain('&amp;hellip;')
     expect(body).not.toMatch(/&(amp;)?hellip;/)
+  })
+
+  it('non-mumega tenant: no links, no newcomer line, ellipsis still literal', async () => {
+    const body = await (await dashboardApp.fetch(get('/'), envFor('pot-a'))).text()
+    expect(body).not.toContain('mumega.com/docs')
+    expect(body).not.toContain('mumega.com/onboarding')
+    expect(body).not.toContain(NEWCOMER)
+    expect(body).toContain('/invite/…')
+    expect(body).not.toMatch(/&(amp;)?hellip;/)
+  })
+
+  it('pending-invite variant (even on mumega): no links, no newcomer line', async () => {
+    const res = await dashboardApp.fetch(
+      get('/', { Cookie: `${PENDING_INVITE_COOKIE}=some-pending-id` }),
+      envFor('mumega'),
+    )
+    const body = await res.text()
+    expect(body).toContain('Finish joining')
+    expect(body).not.toContain('mumega.com/docs')
+    expect(body).not.toContain('mumega.com/onboarding')
+    expect(body).not.toContain(NEWCOMER)
   })
 
   it('carries no PII/token — only brand + static copy', async () => {
