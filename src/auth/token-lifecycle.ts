@@ -107,6 +107,32 @@ export function isTokenExpiringSoon(expiresAt: string | null | undefined, warnin
   return expTime > now && expTime <= threshold
 }
 
+/** A token whose stored `last_used_at` is younger than this is not re-stamped. The stamp is a D1
+ *  WRITE on every authenticated request (D1 serialises writes); the cleanup horizon this column
+ *  feeds is measured in days, so 60 s of staleness changes no decision. */
+export const LAST_USED_STAMP_MIN_INTERVAL_MS = 60_000
+
+// The two shapes member_tokens holds: SQL UTC text `YYYY-MM-DD HH:MM:SS` (nowSqlUtc, no zone
+// suffix) and ISO `YYYY-MM-DDTHH:MM:SS(.sss)Z`. Anything else is treated as unparseable.
+const STAMP_TIMESTAMP_SHAPE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?$/
+
+/** Whether `touchTokenLastUsed` should write, given the `last_used_at` the lookup already fetched.
+ *
+ *  Fails TOWARD stamping: null/undefined/unparseable/future => true (the pre-throttle behaviour).
+ *  Only a parseable timestamp aged in [0, LAST_USED_STAMP_MIN_INTERVAL_MS) skips the write; at
+ *  exactly the interval it stamps. TELEMETRY ONLY: this value never feeds an authorization
+ *  decision, and callers must compute it AFTER the auth outcome is already decided. */
+export function shouldStampLastUsed(lastUsedAt: string | null | undefined, nowMs: number = Date.now()): boolean {
+  if (typeof lastUsedAt !== 'string' || !STAMP_TIMESTAMP_SHAPE.test(lastUsedAt)) return true
+  // SQL-UTC text has no zone marker: pin it to UTC explicitly (a bare `T` string would parse as local time).
+  const iso = lastUsedAt.replace(' ', 'T')
+  const thenMs = Date.parse(iso.endsWith('Z') ? iso : `${iso}Z`)
+  if (!Number.isFinite(thenMs)) return true
+  const ageMs = nowMs - thenMs
+  if (ageMs < 0) return true
+  return ageMs >= LAST_USED_STAMP_MIN_INTERVAL_MS
+}
+
 /** Stamp `last_used_at` for a successfully authenticated token hash.
  *
  *  BEST-EFFORT BY CONTRACT. This is the telemetry that makes credential cleanup

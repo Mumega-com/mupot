@@ -126,7 +126,8 @@ describe('resolveMemberByToken', () => {
     const env = makeEnv({ member_id: 'm1', display_name: 'K', email: null, status: 'active' }, seen)
     await resolveMemberByToken(env, 'sk-x')
 
-    const stamp = seen.queries.find((q) => q.sql.includes('last_used_at'))
+    // The lookup SELECT now also names last_used_at (throttle), so target the UPDATE by shape.
+    const stamp = seen.queries.find((q) => q.sql.startsWith('UPDATE member_tokens SET last_used_at'))
     expect(stamp).toBeDefined()
     expect(stamp!.sql).toContain('tenant = ?3')
     expect(stamp!.binds[2]).toBe('digid')
