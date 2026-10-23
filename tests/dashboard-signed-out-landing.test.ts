@@ -65,6 +65,21 @@ describe('GET / signed-out landing (mupot#1445)', () => {
     expect(body).toContain('/invite/')
   })
 
+  it('shows newcomer start-path links with exact hrefs + rel, and no literal entity', async () => {
+    const body = await (await dashboardApp.fetch(get('/'), envFor())).text()
+    for (const href of [
+      'https://mumega.com/docs/for-business-owners',
+      'https://mumega.com/docs/how-to-connect',
+      'https://mumega.com/onboarding',
+    ]) {
+      expect(body).toContain(`<a href="${href}" rel="noopener noreferrer">`)
+    }
+    expect(body).toContain('/invite/…')
+    expect(body).not.toContain('&hellip;')
+    expect(body).not.toContain('&amp;hellip;')
+    expect(body).not.toMatch(/&(amp;)?hellip;/)
+  })
+
   it('carries no PII/token — only brand + static copy', async () => {
     const res = await dashboardApp.fetch(get('/'), envFor())
     const body = await res.text()
