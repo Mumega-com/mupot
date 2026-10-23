@@ -67,8 +67,6 @@ import { alertsApp } from './alerts/routes'
 import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { potsApp, publicPotsApp } from './pots/routes'
-import { pricingPageHtml } from './dashboard/pricing'
-import { isPotSelfServeCheckoutEnabled } from './pots/checkout-flag'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
@@ -149,9 +147,13 @@ app.route('/api/webhooks', supabaseWebhookApp)
 app.route('/api/billing', billingRoutesApp)
 app.route('/webhooks/stripe', billingRoutesApp)
 // Public Pricing & Self-Serve Sovereign Pot Provisioning:
-// mupot#1518: plan buttons render disabled (no POST wired) unless the checkout flag is on.
+// HIDDEN 2026-10-23 (Hadi: "hide pricing"): no prices are published until a pricing story exists.
+// The mumega tenant sends visitors to the canonical mumega.com page; every other tenant gets 404.
+// The renderer (src/dashboard/pricing.ts) stays in the tree, unmounted. To restore, revert this
+// route to: c.html(pricingPageHtml(origin, { checkoutEnabled: isPotSelfServeCheckoutEnabled(c.env) })).
+const PRICING_REDIRECT_URL = 'https://mumega.com/pricing/' // literal constant: never derived from the request
 app.get('/pricing', (c) =>
-  c.html(pricingPageHtml(new URL(c.req.url).origin, { checkoutEnabled: isPotSelfServeCheckoutEnabled(c.env) })),
+  c.env.TENANT_SLUG === 'mumega' ? c.redirect(PRICING_REDIRECT_URL, 302) : c.notFound(),
 )
 app.route('/api/pots/public', publicPotsApp)
 app.route('/api/pots', publicPotsApp)

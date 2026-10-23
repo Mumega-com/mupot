@@ -174,37 +174,31 @@ describe('flag "true" reaches the existing checkout handler through the root app
   })
 })
 
-describe('/pricing reads the same flag (mupot#1518)', () => {
-  it.each([
-    ['unset', undefined],
-    ['"TRUE"', 'TRUE'],
-    ['"1"', '1'],
-  ])('flag %s: disabled notice, buttons disabled, no checkout POST wired', async (_label, value) => {
-    const { env } = makeEnv(value)
-    for (const path of ['/pricing', '/t/mumega/pricing']) {
-      const res = await worker.fetch(new Request(`https://mupot.mumega.com${path}`), env, ctx)
-      expect(res.status, path).toBe(200)
-      const page = await res.text()
-      expect(page).toContain(CHECKOUT_UNAVAILABLE_NOTICE)
-      expect(page).not.toContain('/api/pots/checkout')
-      expect(page).not.toContain('data-tier=')
-      expect(page.match(/<button type="button" class="tier-cta" disabled aria-disabled="true">Contact us<\/button>/g)).toHaveLength(3)
-      // Prices are still shown — only the purchase path is off.
-      expect(page).toContain('$49')
-      expect(page).toContain('$99')
-      expect(page).toContain('$249')
+describe('/pricing is hidden (Hadi 2026-10-23); replaces the #1518 page-contents assertions', () => {
+  // The old tests asserted the rendered page (disabled buttons, $49/$99/$249, notice text, and
+  // the enabled-flag checkout POST). The page is no longer mounted, so those assertions are
+  // replaced by: mumega tenant redirects to a constant URL, other tenants 404, no prices anywhere.
+  const PRICE_STRINGS = ['$49', '$99', '$249']
+
+  it.each(['/pricing', '/t/mumega/pricing'])('mumega tenant %s: 302 to https://mumega.com/pricing/, no price strings', async (path) => {
+    for (const flag of [undefined, 'true']) {
+      const { env } = makeEnv(flag)
+      const res = await worker.fetch(new Request(`https://mupot.mumega.com${path}?next=https://evil.example`), env, ctx)
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toBe('https://mumega.com/pricing/')
+      const blob = (await res.text()) + JSON.stringify([...res.headers.entries()])
+      for (const p of PRICE_STRINGS) expect(blob).not.toContain(p)
+      expect(blob).not.toContain(CHECKOUT_UNAVAILABLE_NOTICE)
     }
   })
 
-  it('flag "true": buttons POST to checkout, no disabled notice', async () => {
-    const { env } = makeEnv('true')
-    const res = await worker.fetch(new Request('https://mupot.mumega.com/pricing'), env, ctx)
-    const page = await res.text()
-    expect(page).not.toContain(CHECKOUT_UNAVAILABLE_NOTICE)
-    expect(page).toContain("fetch('/api/pots/checkout'")
-    expect(page).toContain('data-tier="starter"')
-    expect(page).toContain('data-tier="pro"')
-    expect(page).toContain('data-tier="scale"')
-    expect(page).not.toContain('aria-disabled')
+  it.each(['/pricing', '/t/gaf/pricing'])('other tenant %s: plain 404, no price strings', async (path) => {
+    const { env } = makeEnv(undefined)
+    ;(env as unknown as Record<string, unknown>).TENANT_SLUG = 'gaf'
+    const res = await worker.fetch(new Request(`https://mupot.mumega.com${path}`), env, ctx)
+    expect(res.status).toBe(404)
+    expect(res.headers.get('location')).toBeNull()
+    const blob = (await res.text()) + JSON.stringify([...res.headers.entries()])
+    for (const p of PRICE_STRINGS) expect(blob).not.toContain(p)
   })
 })
