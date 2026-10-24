@@ -4457,9 +4457,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "projects_repo_key_stale_on_url_change" },
     ],
   },
+  {
+    file: "0254_github_installations_unique_installation.sql",
+    sha256: "b9722f8a0de0d301a75f2a9b766f9af3073edf23e015a580e4058eb1ea2d4c10",
+    statements: [
+      "-- mupot — one tenant per GitHub App installation.\n--\n-- Defense in depth for the connect flow: an installation id may be bound by at most one tenant.\n-- Read-only pre-check (run on the target D1 BEFORE applying; expect zero rows):\n--   SELECT installation_id, COUNT(*) AS n, GROUP_CONCAT(tenant) AS tenants\n--   FROM github_installations GROUP BY installation_id HAVING n > 1;\n-- If it returns rows, this migration FAILS LOUDLY on purpose (UNIQUE violation). Do not dedupe\n-- automatically: an operator must decide which binding is legitimate, then delete the other(s).\nCREATE UNIQUE INDEX IF NOT EXISTS idx_github_installations_installation_id\n  ON github_installations (installation_id);",
+    ],
+    objects: [
+      { type: "index", name: "idx_github_installations_installation_id" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "c43ee7fa91221c16bb5a0d3fde450d87b8f07e2d1dfa4931c4ecd630af39f634"
+export const SCHEMA_CHAIN_DIGEST: string = "5ff61f00ab8847b3df6028cc75018faabf30ee6e43219d5b9506c3b27a34ff32"

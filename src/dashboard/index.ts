@@ -296,7 +296,7 @@ import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
-import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
+import { installUrl, parseInstallCallback, storeInstallation, getInstallationId, verifyInstallationOwnership } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
 import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
@@ -3141,7 +3141,31 @@ dashboardApp.get('/connect/github/callback', async (c) => {
   if (!parsed) {
     return c.html(shell(c.env, 'Connect GitHub', errorBody('GitHub did not return a valid installation.')), 400)
   }
-  await storeInstallation(c.env, parsed.installationId, url.searchParams.get('account_login'))
+  const code = url.searchParams.get('code')
+  // A re-configure of the ALREADY-bound installation carries no code and changes no binding:
+  // nothing to verify, nothing to write. Any other code-less callback is refused below.
+  if (parsed.setupAction === 'update' && !code && (await getInstallationId(c.env)) === parsed.installationId) {
+    return c.redirect('/admin/github/status')
+  }
+  const verified = await verifyInstallationOwnership(c.env, code, parsed.installationId)
+  if (!verified.ok) {
+    const msg =
+      verified.reason === 'not_configured'
+        ? 'GitHub connect is not enabled on this pot yet.'
+        : verified.reason === 'missing_code'
+          ? 'GitHub did not send an authorization code. Start again from Connect GitHub on the dashboard.'
+          : verified.reason === 'org_admin_unverifiable'
+            ? 'Could not confirm you are an owner of this GitHub organization. Ask the platform operator to check the app permissions.'
+            : 'Could not verify this GitHub installation for your account.'
+    const status = verified.reason === 'not_owned' || verified.reason === 'not_org_admin' || verified.reason === 'not_account_owner' ? 403 : 400
+    return c.html(shell(c.env, 'Connect GitHub', errorBody(msg)), status)
+  }
+  try {
+    await storeInstallation(c.env, parsed.installationId, verified.accountLogin)
+  } catch {
+    // UNIQUE(installation_id): already bound by another tenant. Refuse without detail.
+    return c.html(shell(c.env, 'Connect GitHub', errorBody('This GitHub installation is already connected elsewhere.')), 409)
+  }
   return c.redirect('/admin/github/status')
 })
 

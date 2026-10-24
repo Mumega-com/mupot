@@ -93,7 +93,6 @@
     "tests/github-capabilities.test.ts",
     "tests/github-execute.test.ts",
     "tests/github-fleet-sync.test.ts",
-    "tests/github-install.test.ts",
     "tests/github-pr-mirror-close.test.ts",
     "tests/github-pr.test.ts",
     "tests/github-repo-write.test.ts",
