@@ -79,18 +79,274 @@ a path whose entire point is to be more honest than what it replaces.
 **B — CI publishes the built bundle to R2 at deploy time, keyed by `RELEASE_SHA`; this is
 the production target.** This was the design decision recorded on the issue 2026-09-04 (S2).
 `provisionSovereignPot` checks this FIRST via `loadPotWorkerBundle` — `env.POT_WORKER_BUNDLE_BUCKET`
-(new optional R2 binding, `src/types.ts`), object key `${RELEASE_SHA}/worker.js`. **Not
-implemented in this PR**: `scripts/deploy.mjs` does not yet write to this bucket, and no
-`wrangler.toml` R2 binding for it exists — this session cannot create Cloudflare resources
-(a bucket) or verify the write path live. `scripts/build-pot-worker-bundle.mjs` (new, this
-PR) produces the bundle text via `wrangler deploy --dry-run --outdir` — the actual "PUT it
-to R2 after a successful deploy" step in `scripts/deploy.mjs` is the follow-up.
+(optional R2 binding, `src/types.ts`), object key `${RELEASE_SHA}/worker.js`.
 
-**CI publish output contract (round 2 — required, not optional).** An R2 GET returning 200
-only proves the bytes were *readable*, not that they are the bytes CI actually built —
-silent corruption, a partial multipart write, or a stale key left over from a previous
-release would all read back successfully. `loadPotWorkerBundle` therefore treats an R2
-object as untrusted unless the CI publish step (once built) satisfies this exact contract:
+**Enablement (mupot#1285/#1516 follow-up — the R2-publish half of option B, now built):**
+the `mupot-pot-bundles` R2 bucket exists; a colony wires it up with the same binding block
+used everywhere else in this repo, in its own gitignored `wrangler.toml` (see
+`wrangler.example.toml` for the exact snippet — this is a config change, no code needed on
+that side):
+
+```toml
+[[r2_buckets]]
+binding = "POT_WORKER_BUNDLE_BUCKET"
+bucket_name = "mupot-pot-bundles"
+```
+
+With that binding present, `npm run deploy` (`scripts/deploy.mjs`) now publishes the
+just-deployed bundle to it automatically as a post-deploy step, calling
+`scripts/publish-pot-bundle.mjs` with the exact `RELEASE_SHA` (and `--config`, for a
+multi-tenant colony) the deploy itself just stamped:
+
+1. `scripts/build-pot-worker-bundle.mjs` builds the bundle text via `wrangler deploy
+   --dry-run --outdir` (unchanged from before this follow-up — now also forwards any extra
+   args like `--config` through to that dry-run build, so a non-default `wrangler.toml`
+   builds its OWN bundle rather than silently publishing the default one).
+2. `scripts/publish-pot-bundle.mjs` refuses to run at all from a dirty working tree, or
+   when the `RELEASE_SHA` it is given is not the exact commit `git rev-parse HEAD` reports
+   — the identical discipline `scripts/deploy.mjs` itself already applies before stamping a
+   build (see the next section for exactly why). It then signs and PUTs the built bundle to
+   `https://<account_id>.r2.cloudflarestorage.com/mupot-pot-bundles/${RELEASE_SHA}/worker.js`
+   via the R2 **S3-compatible API** — deliberately NOT the plain bearer-token Cloudflare v4
+   REST API's "Upload Object" endpoint, which (verified directly against the published
+   `cloudflare` npm package's own `ObjectUploadParams` type) has no way to set custom
+   metadata at upload time at all. Signing uses `aws4fetch`, pinned to an exact version
+   (`1.0.20`, not a caret range) and used only by these two scripts — never imported from
+   `src/`.
+3. **Credentials — a DEDICATED, bucket-scoped R2 API token, NOT the deploy's
+   `CLOUDFLARE_API_TOKEN`.** An earlier version of this PR derived S3 credentials from the
+   deploy token itself (Access Key ID = the token's own `id`, Secret Access Key =
+   `sha256(token value)`). Athena's round-1 ruling (2026-09-22) rejected that: it is not a
+   documented Cloudflare pattern, it hands a bundle-publish script the FULL scope of
+   whatever broker minted the deploy token (account-owned, not scoped to one bucket), and
+   the derivation's own verification call rejects an account-owned token in practice
+   anyway. The two scripts instead read `R2_POT_BUNDLES_ACCESS_KEY_ID` and
+   `R2_POT_BUNDLES_SECRET_ACCESS_KEY` straight from the environment (plus
+   `CLOUDFLARE_ACCOUNT_ID`, unchanged, for the endpoint hostname) and refuse — by env var
+   NAME only, values never printed, before any network call — if either is absent or
+   blank. See "Minting the R2 credential pair" below for how an operator produces and
+   stores this pair.
+4. A deploy whose bundle publish then FAILS is not reported as a successful deploy —
+   `scripts/deploy.mjs` exits non-zero and prints the retry command, so a tenant
+   provisioned moments later can never silently get "no bundle for this RELEASE_SHA" for a
+   release that in fact went out. Skip the step entirely with `--skip-bundle-publish
+   --skip-reason "<why>"` (a reason is REQUIRED — `deploy.mjs` refuses the flag without
+   one) — e.g. a colony that has not wired the bucket binding at all yet. Deploying from a
+   non-clean tree (`MUPOT_ALLOW_DIRTY_DEPLOY=1`) skips automatically, without needing
+   `--skip-reason`, since a `-dirty`-suffixed `RELEASE_SHA` is never a valid publish target
+   in the first place. Either way the skip is a **receipted** line in the deploy's own
+   output — `bundle_publish: skipped by <actor> reason=<reason>` (actor = `$USER`, falling
+   back to `git config user.name`) — never a silent gap.
+5. `scripts/verify-pot-bundle.mjs <release-sha>` is the operator receipt: it independently
+   re-fetches a previously-published object and re-verifies its digest against the same
+   `x-amz-meta-sha256` metadata `loadPotWorkerBundle` itself checks, for any past release —
+   not coupled to the local working tree at all. Same credential pair as publish.
+
+### Minting the R2 credential pair
+
+1. Cloudflare dashboard → **R2** → **Manage R2 API Tokens** → **Create API token**.
+2. Permission: **Object Read & Write**. Scope: **Apply to specific buckets only** →
+   `mupot-pot-bundles`. Never account-wide, never "Admin Read & Write" — the whole point of
+   this pair is that leaking it exposes exactly one bucket, nothing else the account-owned
+   `CLOUDFLARE_API_TOKEN` can reach.
+3. The dashboard hands back an **Access Key ID** and a **Secret Access Key** directly (this
+   IS the S3-compatible credential pair — no derivation step, unlike a general Cloudflare
+   API token). Copy both once; the Secret Access Key is not retrievable again after this
+   screen closes (re-create the token if lost).
+4. On the deploy host, store them as `~/.fleet/agents/r2-pot-bundles.env`, mode `600`,
+   under the same fleet-gated-paths discipline every other host credential file on this
+   estate follows (see `docs/security/secrets-inventory.md` Scope 1 — `~/.fleet/agents/`
+   is already the largest such directory and already 600-by-default):
+   ```
+   R2_POT_BUNDLES_ACCESS_KEY_ID=<access key id>
+   R2_POT_BUNDLES_SECRET_ACCESS_KEY=<secret access key>
+   ```
+5. A helper script **outside this repo's worktree** (this is host infrastructure, not
+   tenant/repo code — the same reason `wrangler.toml` itself is gitignored and hand-managed
+   per colony, not generated here) sources that file and `exec`s the real command with both
+   vars exported, e.g. a one-liner such as
+   `set -a; source ~/.fleet/agents/r2-pot-bundles.env; set +a; exec npm run deploy -- "$@"`
+   kept alongside the operator's other fleet-gate helper scripts. This repo's scripts never
+   read the file path themselves — they only ever read the two already-exported env vars,
+   so the file's location is a host/ops decision, not a code dependency.
+6. **Live-verify-before-merge receipt** (Kasra-core, required before merging this PR):
+   capture, as a PR comment, (a) UTC timestamp and operator name, (b) the git HEAD sha used
+   for the live run, (c) `npm run deploy -- --config <toml>` exit code, (d) the
+   `scripts/publish-pot-bundle.mjs` stdout JSON receipt — the EXACT fields the script emits
+   today: `{ok,key,sha256,size,already_published,timestamp}`. Deliberately **no `bucket`
+   field** (mupot#1524 round-2 successor decision): CodeQL js/clear-text-logging flagged
+   `bucket` reaching a printed receipt because it CAN carry the env-derived
+   `POT_WORKER_BUNDLE_R2_BUCKET` value — re-adding even the wrangler.example.toml
+   *constant* would create a second place that name can drift from
+   `POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT` without a test catching it. The bucket is already
+   documented once, above, and pinned by test (`POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT`
+   describe block, `tests/pot-bundle-r2.test.ts`) — the receipt does not need to repeat it.
+   (e) the `scripts/verify-pot-bundle.mjs <sha>` stdout JSON receipt confirming `ok:true`
+   (also run automatically by `scripts/deploy.mjs` itself before it prints success),
+   and (f) a `grep`-for-the-secret-value confirmation that neither
+   `R2_POT_BUNDLES_ACCESS_KEY_ID` nor `R2_POT_BUNDLES_SECRET_ACCESS_KEY`'s VALUE appears
+   anywhere in the captured terminal output being pasted. Merge only after that receipt is
+   posted.
+
+### Round 2 (Kasra-core adversarial pass, 2026-09-22): immutability, signed payloads, config parsing
+
+- **A published RELEASE_SHA bundle is now immutable.** `putPotWorkerBundleObject` PUTs with
+  `If-None-Match: '*'` (R2's S3-compatible conditional-write extension). A `412` means the
+  key already exists: an internal re-GET compares digests — identical bytes is a successful,
+  idempotent re-publish (`already_published: true` in the JSON receipt); DIFFERENT bytes is
+  refused outright (`bundle_sha_conflict`, exit 1), never silently overwritten. Before this,
+  a stale local tree, a non-reproducible build, or two colonies racing the same commit could
+  silently replace what a prior `loadPotWorkerBundle` call had already trusted.
+- **The PUT's body is now genuinely signature-covered.** `aws4fetch` defaults an s3-service
+  request to `X-Amz-Content-Sha256: UNSIGNED-PAYLOAD` unless that header is set before
+  signing — under that default the SigV4 signature does not cover the body at all.
+  `putPotWorkerBundleObject` sets it explicitly to the same digest it records as
+  `x-amz-meta-sha256`, so the signature genuinely covers the exact bytes sent.
+- **`--config`/`-c`/`--config=<path>` are all recognized, by ONE shared matcher**
+  (`scripts/lib/wrangler-config-arg.mjs`), used by both `scripts/deploy.mjs` (peek-only —
+  it must forward argv to `wrangler deploy` unchanged) and
+  `scripts/build-pot-worker-bundle.mjs` (which allowlists its own argv against this shape).
+  Before this, `scripts/deploy.mjs` matched only the long `--config <path>` form: a real
+  `-c wrangler.acme.toml` or `--config=wrangler.acme.toml` deploy would silently
+  build-and-publish the DEFAULT config's bundle under the RELEASE_SHA the RIGHT config's
+  deploy actually stamped — a self-consistent digest over the WRONG bytes, with nothing to
+  flag it.
+- **`scripts/build-pot-worker-bundle.mjs` now ALLOWLISTS its own argv** (`--outdir` and one
+  of the three `--config` spellings — nothing else) instead of forwarding everything to
+  `wrangler deploy --dry-run`. A caller-supplied `--dry-run=false` (or any other
+  wrangler flag this script doesn't know about) could otherwise have turned a documented
+  no-network dry-run build into a REAL deploy.
+- **`scripts/deploy.mjs` re-verifies what it just published** — after a successful
+  `scripts/publish-pot-bundle.mjs` run, it also runs `scripts/verify-pot-bundle.mjs
+  <release-sha>` (an independent re-GET + digest check) BEFORE printing its own
+  `bundle_publish: published by ...` receipt line. A publish step exiting 0 was not, on its
+  own, proof the object was live and byte-correct.
+- **The explicit `--skip-bundle-publish` receipt now states its consequence up front**: a
+  `⚠ ... pot_provision will refuse this RELEASE_SHA with 'no_bundle_source' ...` line prints
+  before the `bundle_publish: skipped by <actor> reason=<reason>` receipt line, so the skip
+  is never mistaken for a no-op.
+- **S3 error bodies are scrubbed of `<AWSAccessKeyId>` before being thrown, returned, or
+  printed** — an S3-shaped XML error can echo the access key id used in the failed request;
+  the VALUE is redacted, the rest of the diagnostic body is left intact.
+- **One bucket-name constant, pinned against `wrangler.example.toml`** —
+  `POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT` and the example config's `bucket_name` are asserted
+  equal by a dedicated test, so the two can never silently drift apart.
+
+### Round 2 successor (mupot#1524 round-2 adversarial gate, 2026-09-22 — this PR)
+
+The round-2 gate above was re-run against its own fix commit and found a NEW P0 in that fix
+plus several P1/P2 gaps. #1524 closed superseded; this PR carries the same base
+(`1dc9a0b5`) plus these fixes, gated fresh:
+
+- **P0 — `scripts/deploy.mjs` was silently dropping `rawArgs[0]` on every deploy that did
+  not pass `--skip-reason`.** `skipReasonFlagIndex = rawArgs.indexOf('--skip-reason')` is
+  `-1` when the flag is absent, and the old filter's `i !== skipReasonFlagIndex + 1` became
+  `i !== 0` — so `npm run deploy -- --config=wrangler.acme.toml` forwarded NOTHING to
+  `wrangler deploy`, which fell back to the repo-default `wrangler.toml` and deployed
+  successfully, exit 0, no error. Fixed by extracting the argv walk to
+  `scripts/lib/deploy-args.mjs` (`parseDeployArgs`) with an explicit, single-pass index —
+  the "skip the next token" behavior only ever triggers from INSIDE the loop, never from a
+  search result that can come back `-1`. Unit-tested directly
+  (`tests/deploy-args.test.ts`) plus a real end-to-end spawn of `scripts/deploy.mjs` with a
+  fake `npx`/`wrangler` shim recording its argv, proving the WIRING and not just the
+  extracted function.
+- **P1 — the `<AWSAccessKeyId>`-only redaction did not close the leak class.** A standard
+  S3 error body also carries `<BucketName>`/`<Endpoint>`/`<HostId>`/`<RequestId>`, and R2's
+  `<Endpoint>` is exactly `<bucket>.<account-id>.r2.cloudflarestorage.com` — a real error
+  response could still launder `CLOUDFLARE_ACCOUNT_ID` and the bucket name through
+  `console.log`, and CodeQL's dataflow analysis cannot see across the
+  env → signed-request → REMOTE response → log boundary to catch it. Replaced with an
+  ALLOW-LIST (Athena's rule: a printed field must be NAMED to be printed): only HTTP status
+  plus the S3 `<Code>` element (e.g. `HTTP 403 (AccessDenied)`) ever reach a thrown message
+  or a returned `reason`. Covered by sentinel-account/bucket tests through BOTH the PUT and
+  GET failure paths, including two tests that spawn the REAL `scripts/verify-pot-bundle.mjs`
+  and `scripts/publish-pot-bundle.mjs` processes with a fake-fetch preload
+  (`tests/pot-bundle-r2.test.ts`, "real CLI process" describe block).
+- **P2-1 — immutability rested only on an UNVERIFIED `If-None-Match: '*'`.** A server that
+  silently ignores the header would let a PUT of different bytes clobber an
+  already-published bundle with no visible error. `putPotWorkerBundleObject` now reads the
+  object back and compares digests BEFORE ever attempting a PUT: an identical digest
+  short-circuits to `already_published: true` with **zero PUT calls**; a different digest
+  throws `BundleShaConflictError` with **zero PUT calls**. `If-None-Match: '*'` remains a
+  second layer for the race the pre-check cannot see (two publishers racing the same
+  not-yet-published key).
+- **P2-2 — a flag value that itself looks like a flag was silently accepted.**
+  `--config --dry-run=false`, `--config=--x`, and `--outdir --x` were all accepted as
+  literal values instead of refused — `matchConfigFlag`
+  (`scripts/lib/wrangler-config-arg.mjs`) and `scripts/build-pot-worker-bundle.mjs`'s own
+  `--outdir` handling now refuse any value starting with `-`, and
+  `scripts/lib/deploy-args.mjs`'s `--skip-reason` handling does the same.
+- **P2-3 — recovering from a digest mismatch had no documented procedure**, and
+  `scripts/deploy.mjs`'s post-deploy failure message suggested "re-run publish" even for a
+  genuine conflict — which only refuses again, identically, forever (a published bundle is
+  immutable by design). See "Recovering from a digest mismatch" below;
+  `scripts/publish-pot-bundle.mjs` now exits with a dedicated code
+  (`BUNDLE_SHA_CONFLICT_EXIT_CODE = 2`) so `scripts/deploy.mjs` — which only sees that exit
+  code across the `spawnSync` boundary — can name the real procedure instead.
+- **P2-4 — a 412 whose confirming GET itself failed was reported as a confirmed digest
+  conflict.** `bundle_sha_conflict` claims a KNOWN, DIFFERENT digest; a 404/transport
+  error/unreadable-metadata result on the confirming GET establishes no such thing. Now
+  throws `BundlePublishUnconfirmedError` (`code: 'bundle_publish_unconfirmed'`, exit code
+  `BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE = 3`), naming the confirming GET's own status in the
+  message.
+- **Low — the auto-skip path (off-main/dirty release) now also names the
+  `no_bundle_source` consequence** up front, matching the explicit
+  `--skip-bundle-publish` path (previously only the explicit path did). `--skip-reason
+  --flag` and `-c`/`--config=`'s bare-flag-as-value shapes are refused (see P2-2).
+  **`scripts/deploy.mjs` now scopes the R2 credential pair explicitly**: its
+  `wrangler deploy` spawn runs with
+  `R2_POT_BUNDLES_ACCESS_KEY_ID`/`R2_POT_BUNDLES_SECRET_ACCESS_KEY` stripped from the
+  child's environment (`envWithoutR2PotBundlesCreds()`) — before this,
+  `spawnSync(..., { stdio: 'inherit' })` with no explicit `env` handed wrangler (and,
+  inside it, esbuild) the FULL operator shell environment by default, including a
+  credential pair neither ever reads. The `publish-pot-bundle.mjs`/`verify-pot-bundle.mjs`
+  spawns, which DO need the pair, now pass `env: process.env` explicitly too, so the
+  asymmetry is visible in the code rather than one spawn being explicit and the others an
+  unstated default. Covered by `tests/deploy-args.test.ts`'s env-scoping test.
+
+### Recovering from a digest mismatch (`bundle_sha_conflict`)
+
+A published RELEASE_SHA's bundle is immutable by design — re-running publish against the
+SAME key with DIFFERENT bytes will refuse identically, every time, forever. This is not a
+bug to retry past; it means either the wrong commit's bundle was built, or a previous
+publish left something behind that needs to go. Recovery:
+
+1. Confirm you actually mean to replace it: `node scripts/verify-pot-bundle.mjs
+   <release-sha>` and compare its `sha256` against what you expect to publish.
+2. **An operator** (this is a deliberate, receipted human action — not something either CLI
+   script does for you) deletes the object at the exact receipted key, via the Cloudflare
+   dashboard (R2 → the bucket → `<release-sha>/worker.js` → Delete) or
+   `wrangler r2 object delete --remote <bucket>/<release-sha>/worker.js` — **`--remote` is
+   required**; never rely on which of `--local`/`--remote` wrangler defaults to for this
+   command (mupot#1529 round-1 P3).
+3. Log a receipt line naming who deleted it, when, and why (the same PR-comment discipline
+   as the live-verify-before-merge receipt above).
+4. Re-run `node scripts/publish-pot-bundle.mjs --release-sha <release-sha> [--config ...]`
+   (or re-run `npm run deploy` for the same commit). The pre-PUT digest check (P2-1 above)
+   will find nothing published and proceed normally.
+
+`scripts/deploy.mjs`'s own post-deploy failure message names this exact procedure when the
+publish step exits with `BUNDLE_SHA_CONFLICT_EXIT_CODE` — it never says "re-run publish"
+for this case, since that alone does not fix anything.
+
+UNVERIFIED LIVE, same discipline as the rest of this module: this session cannot confirm R2's
+S3-compatible PutObject actually honors `If-None-Match: '*'` with a `412` on conflict —
+folded into the live-verify-before-merge receipt above (item (d)'s JSON receipt should show
+`already_published:false` on a genuinely fresh key, and a deliberate second run for the SAME
+sha should show `already_published:true`).
+
+**Still not done, and explicitly out of scope for this follow-up too:** this session never
+calls the live Cloudflare API (no bucket write, no deploy) — the S3 endpoint shapes above
+are sourced from developers.cloudflare.com and the published `cloudflare` npm package's own
+type definitions, not exercised against a real account. See the live-verify-before-merge
+receipt above for exactly what Kasra-core captures once a scoped R2 credential pair exists.
+
+**CI publish output contract (round 2 — required, not optional; this is the exact contract
+`scripts/publish-pot-bundle.mjs` now satisfies).** An R2 GET returning 200 only proves the
+bytes were *readable*, not that they are the bytes CI actually built — silent corruption, a
+partial multipart write, or a stale key left over from a previous release would all read
+back successfully. `loadPotWorkerBundle` therefore treats an R2 object as untrusted unless
+the publish step satisfies this exact contract:
 
 - **Object key:** `${RELEASE_SHA}/worker.js` (unchanged from the design above; `RELEASE_SHA`
   is the same value `scripts/deploy.mjs` already stamps for the colony worker, mupot#443).
@@ -98,8 +354,9 @@ object as untrusted unless the CI publish step (once built) satisfies this exact
   `src/pots/service.ts`) whose value is the lowercase hex sha256 digest of the EXACT bytes
   in the object body — i.e. `sha256 === sha256Hex(await fs.readFile(bundlePath, 'utf8'))`
   for whatever bundle text `scripts/build-pot-worker-bundle.mjs` produced, computed and set
-  in the SAME publish step that does the R2 `put()` (`{ customMetadata: { sha256 } }`), not
-  read back and hoped to match.
+  in the SAME publish step that does the R2 write (an `x-amz-meta-sha256` header on the
+  S3-compatible PUT — R2 maps that 1:1 onto `customMetadata.sha256` for a Workers-binding
+  reader, stripping the `x-amz-meta-` prefix), not read back and hoped to match.
 
 `loadPotWorkerBundle` recomputes the digest of what it reads and compares it to this custom
 metadata field. Missing metadata or a mismatch is a hard `deploy_worker` failure — never a
@@ -479,8 +736,16 @@ per-statement cap — the two bounds do not fight each other for an ordinary cal
 - Run `scripts/build-pot-worker-bundle.mjs` for real (needs a real `wrangler.toml`) and wire
   its output into a live `pot_provision` call end-to-end — with a real CF token, on a
   disposable test slug, watching the receipts land.
-- Design and land the R2-publish half of bundle option B (`scripts/deploy.mjs` writing to
-  `POT_WORKER_BUNDLE_BUCKET` after a successful deploy), and the actual bucket/binding.
+- Smoke-test `scripts/publish-pot-bundle.mjs` / `scripts/verify-pot-bundle.mjs` for real
+  (mupot#1285/#1516 enablement, now built — see "Bundle source trade-off" and "Minting the
+  R2 credential pair" above): a minted, scoped `R2_POT_BUNDLES_ACCESS_KEY_ID` /
+  `R2_POT_BUNDLES_SECRET_ACCESS_KEY` pair plus `CLOUDFLARE_ACCOUNT_ID`, the
+  `POT_WORKER_BUNDLE_BUCKET` binding added to the real `wrangler.toml`, one real
+  `npm run deploy`, and confirmation that `loadPotWorkerBundle` picks the published object
+  up on the next `pot_provision` call — captured as the live-verify-before-merge receipt
+  named above. This session never called the real R2 S3-compatible endpoint at all — it is
+  implemented against documentation and the published `cloudflare` npm package's own types,
+  not exercised live.
 - Migrate Psychonom's `psychonom-prj` / `psychonom-sqd` / `psychonom-mubot` rows (currently
   living inside the mumega tenant) into its own pot once one is actually stood up for it —
   named in the issue as part of this work's acceptance criteria, not attempted here (it is a
