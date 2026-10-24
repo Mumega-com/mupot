@@ -134,7 +134,7 @@ function operatorsScript(): Html {
         function reauthLink() {
           if (!status) return;
           status.textContent = '';
-          var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first';
+          var a = document.createElement('a'); a.href = '/auth/reauth?return=/operators'; a.textContent = 'Confirm it is you first';
           status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.'));
         }
         var add = document.getElementById('op-create');

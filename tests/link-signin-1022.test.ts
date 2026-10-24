@@ -233,6 +233,114 @@ describe('#1022 linked sign-ins', () => {
     expect(identity('sub-new')).toBeUndefined()
   })
 
+  // ── 3b. #1474 login loop: a slow link flow must finish on the proof taken at start ────────────────
+  const MIN = 60 * 1000
+  const advance = (ms: number) => vi.setSystemTime(Date.now() + ms)
+  const tamperState = (mutate: (o: Record<string, unknown>) => void) => {
+    for (const [k, v] of sessions.store) {
+      if (!k.startsWith('oauthstate:') || !v.includes('link_signin')) continue
+      const o = JSON.parse(v) as Record<string, unknown>
+      mutate(o)
+      sessions.store.set(k, JSON.stringify(o))
+    }
+  }
+
+  describe('#1474 slow link flow', () => {
+    beforeEach(() => vi.useFakeTimers({ toFake: ['Date'] }))
+    afterEach(() => vi.useRealTimers())
+
+    it('re-auth, start, then a slow Google sign-in (6 min) still links: no "confirm it is you again" loop', async () => {
+      const jar = await mainSession()
+      const { state } = await startLink(jar)
+      advance(6 * MIN) // session re-auth is now 6 min old; start proved it fresh
+      const cb = await completeLink(jar, state!, 'sub-new', 'other@gmail.test')
+      expect(cb.headers.get('location')).toBe('/account?signin=linked')
+      expect(identity('sub-new')?.member_id).toBe('mem-main')
+    })
+
+    it('a NEW start is still refused when the re-auth is older than five minutes (old sessions gain nothing)', async () => {
+      const jar = await mainSession()
+      advance(6 * MIN)
+      const { res, state } = await startLink(jar)
+      expect(state).toBeNull()
+      expect(res.headers.get('location')).toBe('/auth/reauth?return=/account')
+    })
+
+    it('the start-time proof is capped: a callback more than re-auth window + state lifetime after the re-auth links nothing', async () => {
+      const jar = await mainSession()
+      const { state } = await startLink(jar)
+      advance(16 * MIN)
+      const cb = await completeLink(jar, state!, 'sub-new', 'other@gmail.test')
+      expect(cb.headers.get('location')).toBe('/account?signin=reauth_required')
+      expect(identity('sub-new')).toBeUndefined()
+    })
+
+    it('a link state without the start-time proof (or with a non-number one) links nothing', async () => {
+      const jar = await mainSession()
+      const a = await startLink(jar)
+      tamperState((o) => { delete o.reauthProofAt })
+      expect((await completeLink(jar, a.state!, 'sub-new', 'other@gmail.test')).headers.get('location')).toBe('/account?signin=reauth_required')
+      const b = await startLink(jar)
+      tamperState((o) => { o.reauthProofAt = '2099-01-01T00:00:00.000Z' })
+      expect((await completeLink(jar, b.state!, 'sub-new', 'other@gmail.test')).headers.get('location')).toBe('/account?signin=reauth_required')
+      expect(identity('sub-new')).toBeUndefined()
+    })
+
+    it('a proof that is newer than the live session re-auth stamp (stamp moved back) links nothing', async () => {
+      const jar = await mainSession()
+      const { state } = await startLink(jar)
+      freshen('mem-main', 3 * MIN) // stamp now older than the proof the state carries
+      const cb = await completeLink(jar, state!, 'sub-new', 'other@gmail.test')
+      expect(cb.headers.get('location')).toBe('/account?signin=reauth_required')
+    })
+
+    it('a revoked session cannot finish a link even inside the proof window', async () => {
+      const jar = await mainSession()
+      const { state } = await startLink(jar)
+      h.sqlite.prepare(`UPDATE web_sessions SET revoked_at = ?, revoke_reason = 'test' WHERE member_id = 'mem-main'`).run(new Date().toISOString())
+      const cb = await completeLink(jar, state!, 'sub-new', 'other@gmail.test')
+      expect(cb.headers.get('location')).not.toBe('/account?signin=linked')
+      expect(identity('sub-new')).toBeUndefined()
+    })
+
+    it('the move confirm page can be read for 6 min and still confirms; after the proof cap it does not move', async () => {
+      const slow = await reachMoveConfirm()
+      advance(6 * MIN)
+      const done = await post(slow.jar, '/auth/link-signin/confirm')
+      expect(done.headers.get('location')).toBe('/account?signin=moved')
+      expect(identity('sub-dup')?.member_id).toBe('mem-main')
+    })
+
+    it('the move confirm refuses once the proof is older than the cap, and with no proof on the nonce record', async () => {
+      const late = await reachMoveConfirm()
+      advance(16 * MIN)
+      expect((await post(late.jar, '/auth/link-signin/confirm')).headers.get('location')).toBe('/account?signin=reauth_required')
+      expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+      const bare = await reachMoveConfirm()
+      for (const [k, v] of sessions.store) {
+        if (!k.startsWith('linkmove:')) continue
+        const o = JSON.parse(v) as Record<string, unknown>
+        delete o.reauthProofAt
+        sessions.store.set(k, JSON.stringify(o))
+      }
+      expect((await post(bare.jar, '/auth/link-signin/confirm')).headers.get('location')).toBe('/account?signin=reauth_required')
+      expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+    })
+
+    it('/auth/reauth?return= round-trips to the page the member was on, cookies respecting Path (RFC 6265)', async () => {
+      const jar = await signIn('sub-main', 'main@example.test')
+      const start = await visit(jar, '/auth/reauth?return=/operators')
+      const state = new URL(start.headers.get('location')!).searchParams.get('state')!
+      const stateCookie = [...jar].find(([name]) => name.includes('state') || name.startsWith('mupot_'))
+      expect(stateCookie).toBeTruthy()
+      advance(4 * MIN) // slow Google round trip, still inside the state lifetime
+      const back = await withGoogle('sub-main', 'main@example.test', () => visit(jar, `/auth/callback?code=c&state=${state}`))
+      expect(back.headers.get('location')).toBe('/operators')
+      const row = h.sqlite.prepare(`SELECT recent_reauth_at FROM web_sessions WHERE member_id = 'mem-main'`).get() as { recent_reauth_at: string | null }
+      expect(row.recent_reauth_at).not.toBeNull()
+    })
+  })
+
   // ── 4. already_linked / duplicate move ─────────────────────────────────────────────────────────
   it('already_linked: a subject live on a member that outranks you is refused, and nothing moves', async () => {
     h.sqlite.exec(`
