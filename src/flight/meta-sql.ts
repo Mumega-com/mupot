@@ -98,3 +98,18 @@ export function canonicalFlightMetaSql(flightAlias: string): string {
       )
     )`
 }
+
+/** Meta is canonical AND every squad in meta.squad_ids is in the JSON-array bind `readableIdsParam`. */
+export function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
+  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
+  return `${canonicalFlightMetaSql(flightAlias)}
+    AND NOT EXISTS (
+      SELECT 1
+        FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
+       WHERE NOT EXISTS (
+            SELECT 1
+              FROM json_each(${readableIdsParam}) readable_squad
+             WHERE CAST(readable_squad.value AS TEXT) = CAST(squad_ref.value AS TEXT)
+          )
+    )`
+}

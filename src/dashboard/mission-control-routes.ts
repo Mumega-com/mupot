@@ -53,7 +53,7 @@ export function makeMissionControlApp(shell: ShellFn) {
     const tenant = c.req.query('tenant') ?? 'mumega.com'
 
     const [radar, hostAgents, presence, motherboard, journeys, physics, spend, runners] = await Promise.all([
-      loadFleetRadar(c.env, Date.now(), squadIds),
+      loadFleetRadar(c.env, Date.now(), squadIds, auth),
       listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
       listPresence(c.env, Date.now(), squadIds, true),
       loadMotherboardData(c.env, tenant, auth),

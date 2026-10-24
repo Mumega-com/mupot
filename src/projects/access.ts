@@ -135,3 +135,45 @@ export async function anySquadHasProjectWrite(
   }
   return false
 }
+
+/**
+ * Of `projectIds`, the ones the viewer may read (workspace admin / org observer: all that exist).
+ * One D1 query, built on the same projectVisibilityClause the project readers use.
+ */
+export async function readableProjectIdSet(
+  env: Env,
+  auth: AuthContext,
+  projectIds: ReadonlyArray<string | null | undefined>,
+): Promise<Set<string>> {
+  const ids = [...new Set(projectIds.filter((id): id is string => typeof id === 'string' && id !== ''))]
+  if (ids.length === 0) return new Set()
+  const visibility = projectVisibilityClause(projectReadAccessFromGrants(auth, auth.capabilities ?? []))
+  const res = await env.DB.prepare(
+    `SELECT p.id AS id FROM projects p
+      WHERE p.id IN (SELECT CAST(value AS TEXT) FROM json_each(?)) AND ${visibility.sql}`,
+  ).bind(JSON.stringify(ids), ...visibility.binds).all<{ id: string }>()
+  return new Set((res.results ?? []).map((r) => r.id))
+}
+
+/**
+ * Null the joined `project_name` on rows whose project the viewer cannot read. Task visibility is
+ * squad-scoped and a task can sit in a project its squad has no edge to, so the project NAME needs
+ * its own read check. Fails closed: if the check cannot run, every name is dropped.
+ */
+export async function redactUnreadableProjectNames<T extends { project_id?: string | null; project_name?: string | null; project_slug?: string | null }>(
+  env: Env,
+  auth: AuthContext,
+  rows: T[],
+): Promise<T[]> {
+  if (!rows.some((r) => r.project_name || r.project_slug)) return rows
+  let readable: Set<string>
+  try {
+    readable = await readableProjectIdSet(env, auth, rows.map((r) => r.project_id))
+  } catch {
+    readable = new Set()
+  }
+  return rows.map((r) =>
+    // as T: the generic row only promises project_name is string|null|undefined; null is in that set.
+    (r.project_name || r.project_slug) && !(r.project_id && readable.has(r.project_id)) ? ({ ...r, project_name: null, ...(r.project_slug === undefined ? {} : { project_slug: null }) } as T) : r,
+  )
+}

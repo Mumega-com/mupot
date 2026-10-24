@@ -20,7 +20,8 @@
 // NOT flying-blind-safe), except 'offline' is excluded from stale_signals specifically
 // (see below) because it is an intentional detach, not a decayed heartbeat.
 
-import type { Env, Agent, Squad } from '../types'
+import type { AuthContext, Env, Agent, Squad } from '../types'
+import { readableProjectIdSet } from '../projects/access'
 import {
   loadAgentStats,
   loadAgentRuntimeStates,
@@ -366,6 +367,8 @@ export async function loadFleetRadar(
   env: Env,
   nowMs = Date.now(),
   squadIds?: string[] | null,
+  /** When given, flights in a project this viewer cannot read are dropped (session surfaces always pass it). */
+  auth?: AuthContext,
 ): Promise<FleetRadar> {
   const isFiltered = squadIds !== undefined && squadIds !== null
   const accessibleSet = isFiltered ? new Set(squadIds) : null
@@ -419,8 +422,20 @@ export async function loadFleetRadar(
     // accessibleSet membership check remains conditional on isFiltered.
     if (sIds.some((id) => homeSquadIds.has(id))) return false
     if (!accessibleSet) return true
-    return sIds.some((id) => accessibleSet.has(id))
+    // EVERY squad of the flight must be accessible (visibleFlight's rule), not just one.
+    return sIds.length > 0 && sIds.every((id) => accessibleSet.has(id))
   })
+  let projectOk: Set<string> | null = null
+  if (auth) {
+    try {
+      projectOk = await readableProjectIdSet(env, auth, scopedFlights.map((f) => f.project_id))
+    } catch {
+      projectOk = new Set() // fail closed: no project-bound flight without a passing check
+    }
+  }
+  const visibleScoped = projectOk
+    ? scopedFlights.filter((f) => !f.project_id || projectOk.has(f.project_id))
+    : scopedFlights
 
   return buildFleetRadar({
     nowMs,
@@ -431,7 +446,7 @@ export async function loadFleetRadar(
     fleetRuntimeRows,
     presence,
     recentTasks,
-    flights: scopedFlights,
+    flights: visibleScoped,
     presenceTtlSec: presenceTtlSec(env),
   })
 }

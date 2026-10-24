@@ -4,9 +4,9 @@
 // (resolveVisibleTaskScope + visibleTaskClause, src/tasks/visibility.ts) — the same
 // predicate task_list/task_board use. "Needs you" is listNeedsYou (via loadNeedsYouDashboard),
 // the needs_you tool's own source. Flights: running candidates (tenant-scoped) are each passed
-// through visibleFlight (src/mcp/flight-spine.ts, the MCP flight reader's check: observer on every
-// squad in meta.squad_ids + a readable project). The flight count is over the newest
-// FLIGHT_SCAN_CAP running flights.
+// through visibleFlights (./visible-flights: SQL narrowed to the viewer's squads and readable projects
+// BEFORE the cap, then visibleFlight per row). The flight count covers the newest FLIGHT_SCAN_CAP
+// visible running flights; when more may exist it renders as "N+" with a "scan limited" note.
 // The build sha is publicHealth(), the source /health uses. No SQL here re-derives who may see
 // what. Task text is data: it only ever flows through the `html` tag (auto-escaped).
 //
@@ -20,7 +20,8 @@ import { publicHealth } from '../health'
 // Load the MCP tool registry first: flight-spine imports it cyclically (mcp/projects -> elevated-principal
 // -> mcp/index), and entering that cycle from flight-spine leaves PROJECT_TOOLS uninitialised.
 import '../mcp'
-import { visibleFlight } from '../mcp/flight-spine'
+import { visibleFlights } from './visible-flights'
+import { redactUnreadableProjectNames } from '../projects/access'
 import { loadNeedsYouDashboard } from './needs-you'
 import type { NeedsYouDashboardView } from './needs-you'
 import { emptyState } from './ui'
@@ -39,6 +40,7 @@ export interface StatusTaskRow {
   reason: string
   created_at: string
   owner: string | null
+  project_id: string | null
   project_name: string | null
 }
 
@@ -59,6 +61,8 @@ export interface StatusView {
   counts: { open_p0: number; open_p1: number; in_progress: number; blocked: number; review: number }
   flights: StatusFlightRow[]
   flightCount: number
+  /** More running flights may exist than the count shows (scan cap or verification budget). */
+  flightsLimited: boolean
   /** Sections whose reader threw; they render as unavailable, the rest of the page still renders. */
   errors: string[]
   sha: string | null
@@ -74,16 +78,14 @@ async function settle<T>(name: string, errors: string[], p: Promise<T>): Promise
   }
 }
 
-async function loadRunningFlights(env: Env, auth: AuthContext): Promise<StatusFlightRow[]> {
-  const res = await env.DB.prepare(
-    `SELECT f.id, f.goal, COALESCE(a.name, f.agent) AS agent, f.started_at, f.created_at
-       FROM flights f LEFT JOIN agents a ON a.id = f.agent
-      WHERE f.tenant = ?1 AND f.status = 'running'
-      ORDER BY f.created_at DESC LIMIT ${FLIGHT_SCAN_CAP}`,
-  ).bind(env.TENANT_SLUG).all<StatusFlightRow>()
-  const rows = res.results ?? []
-  const ok = await Promise.all(rows.map(async (r) => (await visibleFlight(env, auth, r.id)) !== null))
-  return rows.filter((_, i) => ok[i])
+async function loadRunningFlights(env: Env, auth: AuthContext): Promise<{ rows: StatusFlightRow[]; limited: boolean }> {
+  const res = await visibleFlights(env, auth, { status: 'running', limit: FLIGHT_SCAN_CAP })
+  return {
+    rows: res.rows.map((r) => ({
+      id: r.id, goal: r.goal, agent: r.agent_name ?? r.agent, started_at: r.started_at, created_at: r.created_at,
+    })),
+    limited: res.scanLimited || res.more,
+  }
 }
 
 async function loadTaskBatch(env: Env, auth: AuthContext) {
@@ -97,7 +99,7 @@ async function loadTaskBatch(env: Env, auth: AuthContext) {
                 substr(COALESCE(NULLIF(t.result, ''), t.body, ''), -${TEXT_CAP}) AS reason,
                 t.created_at,
                 COALESCE(a.name, m.display_name) AS owner,
-                p.name AS project_name,
+                t.project_id AS project_id, p.name AS project_name,
                 ROW_NUMBER() OVER (PARTITION BY t.status ORDER BY ${priorityOrderSql('t.priority')}, t.created_at ASC, t.id) AS rn
            FROM tasks t
            LEFT JOIN agents a ON a.id = t.assignee_agent_id
@@ -116,7 +118,7 @@ async function loadTaskBatch(env: Env, auth: AuthContext) {
     ).bind(...clause.binds),
   ])
   return {
-    rows: (batch[0]?.results ?? []) as unknown as StatusTaskRow[], // shape fixed by the SELECT above
+    rows: await redactUnreadableProjectNames(env, auth, (batch[0]?.results ?? []) as unknown as StatusTaskRow[]), // shape fixed by the SELECT above
     countRows: (batch[1]?.results ?? []) as unknown as { status: string; priority: string | null; n: number }[],
   }
 }
@@ -146,8 +148,9 @@ export async function loadStatusView(env: Env, auth: AuthContext): Promise<Statu
       blocked: sum((r) => r.status === 'blocked'),
       review: sum((r) => r.status === 'review'),
     },
-    flights: (flights ?? []).slice(0, PER_SECTION_CAP),
-    flightCount: flights?.length ?? 0,
+    flights: (flights?.rows ?? []).slice(0, PER_SECTION_CAP),
+    flightCount: flights?.rows.length ?? 0,
+    flightsLimited: flights?.limited ?? false,
     errors,
     sha: health.commit,
     clean: health.clean,
@@ -172,13 +175,16 @@ function taskRow(t: StatusTaskRow, now: number, showReason: boolean): Html {
   </li>`
 }
 
-function section(title: string, count: number, body: Html | '', opts: { failed?: boolean; more?: boolean } = {}): Html {
+function section(title: string, count: number, body: Html | '', opts: { failed?: boolean; more?: boolean; limited?: boolean } = {}): Html {
   const empty = opts.failed
     ? emptyState({ title: 'Unavailable', detail: 'This section could not be loaded.' })
-    : opts.more
-      ? html`<p class="sv-line">More items waiting - <a href="/needs-you">see Needs You</a>.</p>`
-      : emptyState({ title: 'Nothing here', detail: 'All clear.' })
-  return html`<section class="sv-sec"><h2>${title} <span class="sv-n">${opts.failed ? '?' : String(count)}</span></h2>${body === '' ? empty : html`${body}${opts.more ? html`<p class="sv-line"><a href="/needs-you">more...</a></p>` : ''}`}</section>`
+    : opts.limited
+      ? html`<p class="sv-line">Scan limited - some items may not be shown.</p>`
+      : opts.more
+        ? html`<p class="sv-line">More items waiting - <a href="/needs-you">see Needs You</a>.</p>`
+        : emptyState({ title: 'Nothing here', detail: 'All clear.' })
+  const shown = opts.failed ? '?' : opts.limited ? `${String(count)}+` : String(count)
+  return html`<section class="sv-sec"><h2>${title} <span class="sv-n">${shown}</span></h2>${body === '' ? empty : html`${body}${opts.limited ? html`<p class="sv-line">Scan limited - there may be more.</p>` : ''}${opts.more ? html`<p class="sv-line"><a href="/needs-you">more...</a></p>` : ''}`}</section>`
 }
 
 export function statusBody(v: StatusView, now: number = Date.now()): Html {
@@ -191,7 +197,12 @@ export function statusBody(v: StatusView, now: number = Date.now()): Html {
   const flights = v.flights.length === 0 ? '' : html`<ul class="sv-list">${v.flights.map((f) => html`<li class="sv-row">
       <a class="sv-title" href="/flights">${f.goal}</a><span class="sv-meta">${f.agent}</span></li>`)}</ul>`
   const c = v.counts
-  const chip = (label: string, n: number) => html`<span class="sv-chip"><b>${String(n)}</b> ${label}</span>`
+  // A chip whose reader failed shows "?", never a false 0; a capped scan shows "N+".
+  const chip = (label: string, n: number, opts: { failed?: boolean; limited?: boolean } = {}) =>
+    html`<span class="sv-chip"><b>${opts.failed ? '?' : opts.limited ? `${String(n)}+` : String(n)}</b> ${label}</span>`
+  const tasksFailed = v.errors.includes('tasks')
+  const needsFailed = v.errors.includes('needs')
+  const flightsFailed = v.errors.includes('flights')
   return html`
   <style>
     .sv-chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
@@ -206,12 +217,12 @@ export function statusBody(v: StatusView, now: number = Date.now()): Html {
     .sv-build{color:var(--dim);font-size:13px}
   </style>
   <h1 class="ui-h1">Status</h1>
-  <div class="sv-chips">${chip('need you', v.needs.items.length)}${chip('P0', c.open_p0)}${chip('P1', c.open_p1)}${chip('in progress', c.in_progress)}${chip('blocked', c.blocked)}${chip('in review', c.review)}${chip('flights', v.flightCount)}</div>
+  <div class="sv-chips">${chip('need you', v.needs.items.length, { failed: needsFailed })}${chip('P0', c.open_p0, { failed: tasksFailed })}${chip('P1', c.open_p1, { failed: tasksFailed })}${chip('in progress', c.in_progress, { failed: tasksFailed })}${chip('blocked', c.blocked, { failed: tasksFailed })}${chip('in review', c.review, { failed: tasksFailed })}${chip('flights', v.flightCount, { failed: flightsFailed, limited: v.flightsLimited })}</div>
   ${section('Needs you', v.needs.items.length, needsList, { failed: v.errors.includes('needs'), more: v.needs.truncated || v.needs.nextCursor !== null })}
   ${section('Open P0 / P1', c.open_p0 + c.open_p1, list(v.open, false), { failed: v.errors.includes('tasks') })}
   ${section('In progress', c.in_progress, list(v.inProgress, false), { failed: v.errors.includes('tasks') })}
   ${section('Blocked', c.blocked, list(v.blocked, true), { failed: v.errors.includes('tasks') })}
   ${section('Review queue', c.review, list(v.review, false), { failed: v.errors.includes('tasks') })}
-  ${section('Running flights', v.flightCount, flights, { failed: v.errors.includes('flights') })}
+  ${section('Running flights', v.flightCount, flights, { failed: flightsFailed, limited: v.flightsLimited })}
   <p class="sv-build">Build ${v.sha ? v.sha.slice(0, 8) : 'unknown'}${v.sha && !v.clean ? ' (unverified)' : ''}</p>`
 }
