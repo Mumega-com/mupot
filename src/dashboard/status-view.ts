@@ -17,6 +17,10 @@ import type { AuthContext, Env } from '../types'
 import { priorityOrderSql } from '../tasks/ranking'
 import { resolveVisibleTaskScope, visibleTaskClause } from '../tasks/visibility'
 import { publicHealth } from '../health'
+// Load the MCP tool registry first: flight-spine imports it cyclically (mcp/projects -> elevated-principal
+// -> mcp/index), and entering that cycle from flight-spine leaves PROJECT_TOOLS uninitialised.
+import '../mcp'
+import { visibleFlight } from '../mcp/flight-spine'
 import { loadNeedsYouDashboard } from './needs-you'
 import type { NeedsYouDashboardView } from './needs-you'
 import { emptyState } from './ui'
@@ -78,8 +82,6 @@ async function loadRunningFlights(env: Env, auth: AuthContext): Promise<StatusFl
       ORDER BY f.created_at DESC LIMIT ${FLIGHT_SCAN_CAP}`,
   ).bind(env.TENANT_SLUG).all<StatusFlightRow>()
   const rows = res.results ?? []
-  // Lazy: flight-spine pulls the MCP tool registry, which would form an import cycle at module load.
-  const { visibleFlight } = await import('../mcp/flight-spine')
   const ok = await Promise.all(rows.map(async (r) => (await visibleFlight(env, auth, r.id)) !== null))
   return rows.filter((_, i) => ok[i])
 }
