@@ -33,6 +33,7 @@ import { resolveGatePrincipal } from '../gates/principal'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { resolveVisibleTaskScope, visibleTaskClause } from '../tasks/visibility'
 import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
+import { redactUnreadableProjectNames } from '../projects/access'
 
 export interface ApprovalItem {
   id: string
@@ -343,7 +344,7 @@ export async function loadApprovals(env: Env, auth: AuthContext): Promise<Approv
     .bind(principal.type, principal.id, APPROVALS_FETCH_CEILING)
     .all<ApprovalRow>()
   // Non-admin: the EXISTS above already means every row is a gate the viewer holds.
-  const decorated = await decorateApprovals(env, auth, (rs.results ?? []).map((r) => ({ ...r, own_gate: true })))
+  const decorated = await decorateApprovals(env, auth, (await redactUnreadableProjectNames(env, auth, rs.results ?? [])).map((r) => ({ ...r, own_gate: true })))
   return selectQueueWindow(decorated)
 }
 
@@ -493,7 +494,7 @@ export async function loadAsks(env: Env, auth: AuthContext): Promise<AskItem[]> 
       ORDER BY CASE t.status WHEN 'review' THEN 0 ELSE 1 END, t.updated_at DESC, t.id
       LIMIT ?${String(2 + visible.binds.length)}`,
   ).bind(auth.memberId, ...visible.binds, ASKS_LIMIT).all<Omit<AskItem, 'state' | 'via_agent'> & { status: string; assignee_member_id: string | null }>()
-  return (rs.results ?? []).map((r) => ({
+  return (await redactUnreadableProjectNames(env, auth, rs.results ?? [])).map((r) => ({
     id: r.id, title: r.title, body: r.body, gate_owner: r.gate_owner, priority: r.priority,
     project_id: r.project_id, project_name: r.project_name, assignee_agent_id: r.assignee_agent_id,
     agent_name: r.agent_name, review_entered_at: r.review_entered_at, created_at: r.created_at, updated_at: r.updated_at,

@@ -8,7 +8,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, sessionMemberId } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
-import { canonicalFlightMetaSql } from '../flight/meta-sql'
+import { readableFlightSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
 import {
   getProject,
@@ -358,20 +358,6 @@ export async function projectManageAccessContext(
 
 function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
-}
-
-function readableFlightSql(flightAlias: string, readableIdsParam: string): string {
-  const safeMeta = `CASE WHEN json_valid(${flightAlias}.meta) THEN ${flightAlias}.meta ELSE '{}' END`
-  return `${canonicalFlightMetaSql(flightAlias)}
-    AND NOT EXISTS (
-      SELECT 1
-        FROM json_each(${safeMeta}, '$.squad_ids') squad_ref
-       WHERE NOT EXISTS (
-            SELECT 1
-              FROM json_each(${readableIdsParam}) readable_squad
-             WHERE CAST(readable_squad.value AS TEXT) = CAST(squad_ref.value AS TEXT)
-          )
-    )`
 }
 
 function safeParent(project: Project): ParentContext {

@@ -12,6 +12,7 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../types'
 import { requireAuth } from '../auth'
+import { redactUnreadableProjectNames } from '../projects/access'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
@@ -176,7 +177,7 @@ export async function loadKanbanData(
       ...(isAllAccessible ? [] : [JSON.stringify(accessibleSquadIds ?? [])]),
     ).all<KanbanTaskRow>()
 
-    const tasks = taskRows.results ?? []
+    const tasks = await redactUnreadableProjectNames(env, auth, taskRows.results ?? [])
     const swimlanesMap = new Map<string, { label: string; tasks: KanbanTaskRow[] }>()
     for (const t of tasks) {
       const sKey = t.squad_id
@@ -261,7 +262,7 @@ export async function loadKanbanData(
     ORDER BY ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
   `).bind(targetSquadId).all<KanbanTaskRow>()
 
-  const tasks = taskRows.results ?? []
+  const tasks = await redactUnreadableProjectNames(env, auth, taskRows.results ?? [])
   const byLane = new Map<string, KanbanTaskRow[]>()
   for (const lane of KANBAN_STATUS_LANES) byLane.set(lane.key, [])
 

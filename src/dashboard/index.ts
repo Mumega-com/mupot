@@ -273,7 +273,8 @@ import { loadAgentConnectionStatus } from '../members/agent-connection-status'
 
 import { wakeFleetAgent, requestFleetControl, fleetScoped } from './fleet'
 import { emitControlRequest, emitSquadControlRequest } from '../fleet/control'
-import { listFlights } from '../flight/service'
+import type { FlightRow } from '../flight/service'
+import { visibleFlights } from './visible-flights'
 import { buildBoard } from '../flight/board'
 import { flightsBody } from './flights-deck'
 import { wizardApp } from './wizard'
@@ -1591,9 +1592,15 @@ dashboardApp.get('/flights', async (c) => {
   if (projectId !== undefined && !context) {
     return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   }
-  const result = context
-    ? await loadProjectFlights(c.env, context)
-    : { rows: await listFlights(c.env), scanLimited: false }
+  let result: { rows: FlightRow[]; scanLimited: boolean }
+  try {
+    result = context
+      ? await loadProjectFlights(c.env, context)
+      : await visibleFlights(c.env, c.get('auth'))
+  } catch {
+    // Fail closed: a visibility check that cannot run shows no flights, never unchecked ones.
+    return c.html(shell(c.env, 'Flights', errorBody('Flights could not be loaded right now.')), 503)
+  }
   const nowMs = Date.now()
   const cards = buildBoard(result.rows, nowMs)
   return c.html(shell(c.env, 'Flights', flightsBody(cards, context?.project, result.scanLimited, nowMs)))
