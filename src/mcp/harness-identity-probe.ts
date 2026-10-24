@@ -39,35 +39,49 @@ export interface ProbeInputs {
 
 /** Raw verbose facts as gathered at the call site. Reduced to keyed hashes before anything is logged. */
 export interface VerboseProbeInputs {
-  /** Top-level `_meta` entries whose value is a short string. */
-  metaValues: Array<[string, string]>
+  /** Top-level `_meta` entries as [name, value]. value is null when the key is present but must not be hashed. */
+  metaValues: Array<[string, string | null]>
   /** Request headers as [name, value]. Values are hashed only for allowlisted names. */
   headers: Array<[string, string]>
   clientInfoName: string | null
   clientInfoVersion: string | null
 }
 
-// Hard denylist, applied to every `_meta` key and header name before anything is read or hashed.
-export const PROBE_DENY_RE = /authorization|cookie|token|secret|key|password/i
-// Header names whose values may be hashed (names of all non-denied headers are listed regardless).
-const PROBE_HEADER_HASH_ALLOW_RE = /^(user-agent|openai-.+|x-openai-.+|x-cursor-.+|x-client-.+)$/i
+// Hard denylist, applied (after NFKC normalisation) to every `_meta` key and header name before anything is read or hashed.
+export const PROBE_DENY_RE = /auth|bearer|jwt|cred|token|secret|key|pass|pwd|pin|otp|sig|cookie|csrf|xsrf|nonce|private|cert|assertion|session-?id|seat|email|e-mail|phone|ip$/i
+// `_meta` keys whose VALUES may be hashed. Every other key is logged by name only (present: true). Extend here.
+export const PROBE_META_HASH_ALLOW: ReadonlySet<string> = new Set([
+  'openai/locale', 'openai/userAgent', 'openai/session', 'openai/subject', 'openai/organization', 'threadId', 'thread_id',
+])
+// Header names whose values may be hashed (names of all non-denied headers are listed regardless). Exact names for x-client-*:
+// ip / forwarded / cert / real-ip / connecting headers are never hashed.
+const PROBE_HEADER_HASH_ALLOW_RE = /^(user-agent|openai-.+|x-openai-.+|x-cursor-.+|x-client-name|x-client-version)$/i
+const CLIENT_VERSION_RE = /^[0-9A-Za-z.+-]{1,24}$/
+const NON_ASCII_RE = /[^\x00-\x7F]/
 const VERBOSE_VALUE_MAX = 256
 const VERBOSE_MAX_META = 24
 const VERBOSE_MAX_HEADER_NAMES = 40
 const VERBOSE_MAX_HEADER_HASHES = 16
 
+/** True when a key or header name may appear in the probe at all: ASCII only, and clear of the denylist before and after NFKC. */
+export function probeNameAllowed(name: string): boolean {
+  if (NON_ASCII_RE.test(name)) return false
+  return !PROBE_DENY_RE.test(name) && !PROBE_DENY_RE.test(name.normalize('NFKC'))
+}
+
 export function verboseProbeEnabled(env: Pick<Env, 'HARNESS_PROBE_VERBOSE'>): boolean {
   return env.HARNESS_PROBE_VERBOSE === '1'
 }
 
-/** Collect the verbose facts from a `_meta` object. Denied keys are dropped here, before any further use. */
-export function extractVerboseMetaValues(meta: unknown): Array<[string, string]> {
+/** Collect the verbose facts from a `_meta` object. Denied keys are dropped here; only allowlisted keys keep a value. */
+export function extractVerboseMetaValues(meta: unknown): Array<[string, string | null]> {
   const m = typeof meta === 'object' && meta !== null && !Array.isArray(meta) ? meta as Record<string, unknown> : {}
-  const out: Array<[string, string]> = []
+  const out: Array<[string, string | null]> = []
   for (const [k, v] of Object.entries(m)) {
     if (out.length >= VERBOSE_MAX_META) break
-    if (PROBE_DENY_RE.test(k)) continue
-    if (typeof v === 'string' && v.length > 0 && v.length <= VERBOSE_VALUE_MAX) out.push([k, v])
+    if (!probeNameAllowed(k)) continue
+    const hashable = PROBE_META_HASH_ALLOW.has(k) && typeof v === 'string' && v.length > 0 && v.length <= VERBOSE_VALUE_MAX
+    out.push([k, hashable ? v : null])
   }
   return out
 }
@@ -76,7 +90,8 @@ export function extractClientInfoVersion(meta: unknown): string | null {
   const m = typeof meta === 'object' && meta !== null && !Array.isArray(meta) ? meta as Record<string, unknown> : {}
   const raw = m['clientInfo'] ?? m['io.modelcontextprotocol/clientInfo']
   const ci = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : null
-  return ci ? str(ci['version']) : null
+  const v = ci ? str(ci['version']) : null
+  return v !== null && CLIENT_VERSION_RE.test(v) ? v : null
 }
 
 const cleanName = (k: string): string => k.replace(/[^A-Za-z0-9_./:-]/g, '?').slice(0, META_KEY_LEN)
@@ -114,7 +129,7 @@ export function hintsFrom(facts: Pick<ProbeInputs, 'openaiSession' | 'openaiSubj
 // openai/subject or Codex threadId digest cannot be correlated with the same value hashed anywhere
 // else, or reversed by guessing candidates. With no secret configured NO hash is emitted (null):
 // presence booleans still are.
-async function keyedHash(secret: string | undefined, v: string | null): Promise<string | null> {
+export async function keyedHash(secret: string | undefined, v: string | null): Promise<string | null> {
   if (v === null || !secret) return null
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
   const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`mupot:harness-probe:v1:${v}`))
@@ -128,27 +143,32 @@ export function resetHarnessProbeSampling(): void {
 
 async function buildVerbose(secret: string | undefined, vi: VerboseProbeInputs): Promise<Record<string, unknown>> {
   const meta_h: Record<string, string | null> = {}
+  const meta_present: Record<string, true> = {}
   for (const [k, v] of vi.metaValues) {
-    if (PROBE_DENY_RE.test(k)) continue
-    meta_h[cleanName(k)] = await keyedHash(secret, v)
+    if (!probeNameAllowed(k)) continue
+    // Re-checked here (not only at extraction): a value is hashed only for an allowlisted key.
+    if (v !== null && PROBE_META_HASH_ALLOW.has(k) && v.length <= VERBOSE_VALUE_MAX) meta_h[cleanName(k)] = await keyedHash(secret, v)
+    else meta_present[cleanName(k)] = true
   }
   const header_names: string[] = []
   const header_h: Record<string, string | null> = {}
   let denied = 0
   for (const [name, value] of vi.headers) {
-    if (PROBE_DENY_RE.test(name)) { denied++; continue }
+    if (!probeNameAllowed(name)) { denied++; continue }
     if (header_names.length < VERBOSE_MAX_HEADER_NAMES) header_names.push(cleanName(name.toLowerCase()))
     if (PROBE_HEADER_HASH_ALLOW_RE.test(name) && Object.keys(header_h).length < VERBOSE_MAX_HEADER_HASHES) {
       header_h[cleanName(name.toLowerCase())] = await keyedHash(secret, value.slice(0, VERBOSE_VALUE_MAX))
     }
   }
+  const ver = vi.clientInfoVersion !== null && CLIENT_VERSION_RE.test(vi.clientInfoVersion) ? vi.clientInfoVersion : null
   return {
     meta_h,
+    meta_present,
     header_names,
     header_h,
     denied_headers: denied,
     client_info_name: cleanLabel(vi.clientInfoName, 40),
-    client_info_version: cleanLabel(vi.clientInfoVersion, 24),
+    client_info_version: ver,
   }
 }
 

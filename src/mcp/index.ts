@@ -576,19 +576,24 @@ async function resolveAuth(c: {
   return bearerAuth
 }
 
-/** Gather the raw verbose facts (reduced to keyed hashes inside the probe). Only called with the flag on. */
+/** Gather the raw verbose facts (reduced to keyed hashes inside the probe). Only called with the flag on.
+ *  Observability must never change auth: any failure while gathering yields undefined. */
 function verboseInputsFor(
   c: { req: { raw?: { headers: Headers } } },
   bodyMeta: SeatBodyMeta | undefined,
   clientInfoName: string | null,
-): VerboseProbeInputs {
-  const headers: Array<[string, string]> = []
-  c.req.raw?.headers.forEach((value, name) => { headers.push([name, value]) })
-  return {
-    metaValues: extractVerboseMetaValues(bodyMeta?.paramsMeta),
-    headers,
-    clientInfoName,
-    clientInfoVersion: extractClientInfoVersion(bodyMeta?.paramsMeta),
+): VerboseProbeInputs | undefined {
+  try {
+    const headers: Array<[string, string]> = []
+    c.req.raw?.headers.forEach((value, name) => { headers.push([name, value]) })
+    return {
+      metaValues: extractVerboseMetaValues(bodyMeta?.paramsMeta),
+      headers,
+      clientInfoName,
+      clientInfoVersion: extractClientInfoVersion(bodyMeta?.paramsMeta),
+    }
+  } catch {
+    return undefined
   }
 }
 
@@ -597,19 +602,25 @@ async function emitVerboseProbeOnly(
   auth: AuthContext,
   bodyMeta: SeatBodyMeta | undefined,
 ): Promise<void> {
-  const pf = extractMetaFacts(bodyMeta?.paramsMeta)
-  await maybeEmitHarnessIdentityProbe(c.env, auth.tokenId ?? auth.userId, {
-    headerSeat: c.req.header('x-mupot-seat')?.trim() || null,
-    metaSeat: pf.metaSeat,
-    openaiSession: pf.openaiSession,
-    openaiSubject: pf.openaiSubject,
-    codexThreadId: pf.codexThreadId,
-    metaKeys: pf.metaKeys,
-    clientInfoName: pf.clientInfoName,
-    hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
-    protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
-    verbose: verboseInputsFor(c, bodyMeta, pf.clientInfoName),
-  })
+  try {
+    const pf = extractMetaFacts(bodyMeta?.paramsMeta)
+    const verbose = verboseInputsFor(c, bodyMeta, pf.clientInfoName)
+    if (verbose === undefined) return
+    await maybeEmitHarnessIdentityProbe(c.env, auth.tokenId ?? auth.userId, {
+      headerSeat: c.req.header('x-mupot-seat')?.trim() || null,
+      metaSeat: pf.metaSeat,
+      openaiSession: pf.openaiSession,
+      openaiSubject: pf.openaiSubject,
+      codexThreadId: pf.codexThreadId,
+      metaKeys: pf.metaKeys,
+      clientInfoName: pf.clientInfoName,
+      hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
+      protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
+      verbose,
+    })
+  } catch {
+    // Observability must never change auth.
+  }
 }
 
 // mupot#1794 W2 — the ONE place a presented seat handle turns the human's unbound directory grant
