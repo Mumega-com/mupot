@@ -76,3 +76,76 @@ export function parseInstallCallback(
   if (setupAction !== 'install' && setupAction !== 'update') return null
   return { installationId, setupAction }
 }
+
+export type InstallVerification =
+  | { ok: true; accountLogin: string | null }
+  | { ok: false; reason: 'not_configured' | 'missing_code' | 'exchange_failed' | 'lookup_failed' | 'not_owned' }
+
+const GH_TIMEOUT_MS = 8000
+const MAX_INSTALL_PAGES = 10
+
+/**
+ * Prove the authorizing GitHub user can access `installationId`. The setup callback carries a
+ * one-time OAuth `code` (the App has "Request user authorization during installation" on); it is
+ * exchanged for a user token, and the id must appear in that user's GET /user/installations.
+ * The account login is taken from GitHub's answer, never from the query string.
+ * Fails closed on missing config, missing code, any non-2xx, malformed JSON, or timeout.
+ */
+export async function verifyInstallationOwnership(
+  env: Env,
+  code: string | null,
+  installationId: string,
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<InstallVerification> {
+  const clientId = env.GITHUB_APP_CLIENT_ID
+  const clientSecret = env.GITHUB_APP_CLIENT_SECRET
+  if (!clientId || !clientSecret) return { ok: false, reason: 'not_configured' }
+  if (!code) return { ok: false, reason: 'missing_code' }
+  const doFetch = opts?.fetchImpl ?? fetch
+  const signal = () => AbortSignal.timeout(GH_TIMEOUT_MS)
+
+  let token: string
+  try {
+    const res = await doFetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code }),
+      signal: signal(),
+    })
+    if (!res.ok) return { ok: false, reason: 'exchange_failed' }
+    const data: unknown = await res.json()
+    const t = (data as { access_token?: unknown } | null)?.access_token
+    if (typeof t !== 'string' || !t) return { ok: false, reason: 'exchange_failed' }
+    token = t
+  } catch {
+    return { ok: false, reason: 'exchange_failed' }
+  }
+
+  try {
+    for (let page = 1; page <= MAX_INSTALL_PAGES; page++) {
+      const res = await doFetch(`https://api.github.com/user/installations?per_page=100&page=${page}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'mupot',
+        },
+        signal: signal(),
+      })
+      if (!res.ok) return { ok: false, reason: 'lookup_failed' }
+      const data: unknown = await res.json()
+      const list = (data as { installations?: unknown } | null)?.installations
+      if (!Array.isArray(list)) return { ok: false, reason: 'lookup_failed' }
+      for (const item of list) {
+        const inst = item as { id?: unknown; account?: { login?: unknown } | null }
+        if (String(inst.id) === installationId) {
+          const login = inst.account?.login
+          return { ok: true, accountLogin: typeof login === 'string' ? login : null }
+        }
+      }
+      if (list.length < 100) break
+    }
+  } catch {
+    return { ok: false, reason: 'lookup_failed' }
+  }
+  return { ok: false, reason: 'not_owned' }
+}

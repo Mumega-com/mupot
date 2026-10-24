@@ -1,12 +1,13 @@
 // Tests for the GitHub install store + connect-flow helpers (src/integrations/github-install.ts)
 // and the /admin/github/connect + /connect/github/callback routes.
 
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   installUrl,
   parseInstallCallback,
   storeInstallation,
   getInstallationId,
+  verifyInstallationOwnership,
 } from '../src/integrations/github-install'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
@@ -75,9 +76,12 @@ function connectEnv(role: 'admin' | 'member' = 'admin') {
     run: vi.fn(async () => ({ meta: { changes: 1 } })),
   }
   return {
+    stmt,
     env: {
       TENANT_SLUG: 't',
       BRAND: 'Test',
+      GITHUB_APP_CLIENT_ID: 'cid',
+      GITHUB_APP_CLIENT_SECRET: 'csecret',
       DB: { prepare: vi.fn(() => stmt) },
       SESSIONS: {
         get: vi.fn(async (k: string) =>
@@ -124,16 +128,85 @@ describe('GET /connect/github/callback', () => {
     expect(res.status).toBe(400)
   })
 
-  it('valid state + install → stores id, redirects to status', async () => {
-    const { env, kv } = connectEnv('admin')
+  afterEach(() => vi.unstubAllGlobals())
+
+  function ghFetch(installs: Array<{ id: number; account?: { login: string } }>, opts?: { exchangeOk?: boolean; lookupOk?: boolean }) {
+    return vi.fn(async (input: string | URL | Request) => {
+      const u = String(input)
+      if (u.includes('/login/oauth/access_token')) {
+        return opts?.exchangeOk === false
+          ? new Response(JSON.stringify({ access_token: 'utok' }), { status: 500 })
+          : new Response(JSON.stringify({ access_token: 'utok' }), { status: 200 })
+      }
+      if (u.includes('/user/installations')) {
+        return opts?.lookupOk === false
+          ? new Response(JSON.stringify({ installations: installs }), { status: 502 })
+          : new Response(JSON.stringify({ installations: installs }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+  }
+  const CB = '/connect/github/callback?installation_id=139955064&setup_action=install&state=good&code=abc'
+
+  it('valid state + owned install → stores id (login from GitHub), redirects to status', async () => {
+    const { env, kv, stmt } = connectEnv('admin')
     kv.set('ghstate:good', 't') // pre-seed a tenant-bound state
-    const res = await dashboardApp.fetch(
-      getReq('/connect/github/callback?installation_id=139955064&setup_action=install&state=good'),
-      env,
-    )
+    vi.stubGlobal('fetch', ghFetch([{ id: 139955064, account: { login: 'real-org' } }]))
+    const res = await dashboardApp.fetch(getReq(CB + '&account_login=spoofed'), env)
     expect(res.status).toBe(302)
     expect(res.headers.get('location')).toBe('/admin/github/status')
     expect(kv.has('ghstate:good')).toBe(false) // single-use: consumed
+    expect(stmt.run).toHaveBeenCalledTimes(1)
+  })
+
+  it('installation_id the user does not have → 403, no row written', async () => {
+    const { env, kv, stmt } = connectEnv('admin')
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghFetch([{ id: 777 }]))
+    const res = await dashboardApp.fetch(getReq(CB), env)
+    expect(res.status).toBe(403)
+    expect(stmt.run).not.toHaveBeenCalled()
+  })
+
+  it('missing code → refused, no row written', async () => {
+    const { env, kv, stmt } = connectEnv('admin')
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghFetch([{ id: 139955064 }]))
+    const res = await dashboardApp.fetch(getReq(CB.replace('&code=abc', '')), env)
+    expect(res.status).toBe(400)
+    expect(stmt.run).not.toHaveBeenCalled()
+  })
+
+  it('app credentials not configured → refused (fail closed), no row written', async () => {
+    const { env, kv, stmt } = connectEnv('admin')
+    kv.set('ghstate:good', 't')
+    delete (env as { GITHUB_APP_CLIENT_SECRET?: string }).GITHUB_APP_CLIENT_SECRET
+    vi.stubGlobal('fetch', ghFetch([{ id: 139955064 }]))
+    const res = await dashboardApp.fetch(getReq(CB), env)
+    expect(res.status).toBe(400)
+    expect(stmt.run).not.toHaveBeenCalled()
+  })
+
+  it('GitHub API error on exchange or lookup → refused, no row written', async () => {
+    for (const o of [{ exchangeOk: false }, { lookupOk: false }]) {
+      const { env, kv, stmt } = connectEnv('admin')
+      kv.set('ghstate:good', 't')
+      vi.stubGlobal('fetch', ghFetch([{ id: 139955064 }], o))
+      const res = await dashboardApp.fetch(getReq(CB), env)
+      expect(res.status).toBe(400)
+      expect(stmt.run).not.toHaveBeenCalled()
+    }
+  })
+
+  it('state minted for another tenant, or replayed → refused, no row written', async () => {
+    const { env, kv, stmt } = connectEnv('admin')
+    kv.set('ghstate:good', 'other-tenant')
+    vi.stubGlobal('fetch', ghFetch([{ id: 139955064 }]))
+    expect((await dashboardApp.fetch(getReq(CB), env)).status).toBe(400)
+    kv.set('ghstate:good', 't')
+    expect((await dashboardApp.fetch(getReq(CB), env)).status).toBe(302)
+    expect((await dashboardApp.fetch(getReq(CB), env)).status).toBe(400) // replay
+    expect(stmt.run).toHaveBeenCalledTimes(1)
   })
 
   it('valid state but bad install params → 400', async () => {
@@ -144,5 +217,24 @@ describe('GET /connect/github/callback', () => {
       env,
     )
     expect(res.status).toBe(400)
+  })
+})
+
+describe('verifyInstallationOwnership', () => {
+  const env = { GITHUB_APP_CLIENT_ID: 'c', GITHUB_APP_CLIENT_SECRET: 's' } as unknown as Env
+  it('finds the id on a later page', async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i + 1000 }))
+    const f = vi.fn(async (input: string | URL | Request) => {
+      const u = String(input)
+      if (u.includes('access_token')) return new Response(JSON.stringify({ access_token: 't' }))
+      return new Response(JSON.stringify({ installations: u.includes('page=2') ? [{ id: 5, account: { login: 'x' } }] : page1 }))
+    })
+    expect(await verifyInstallationOwnership(env, 'c', '5', { fetchImpl: f as unknown as typeof fetch })).toEqual({ ok: true, accountLogin: 'x' })
+  })
+  it('malformed lookup body → refused', async () => {
+    const f = vi.fn(async (input: string | URL | Request) =>
+      String(input).includes('access_token') ? new Response(JSON.stringify({ access_token: 't' })) : new Response('{"x":1}'))
+    const r = await verifyInstallationOwnership(env, 'c', '5', { fetchImpl: f as unknown as typeof fetch })
+    expect(r.ok).toBe(false)
   })
 })

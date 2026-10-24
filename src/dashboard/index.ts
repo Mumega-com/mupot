@@ -296,7 +296,7 @@ import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
-import { installUrl, parseInstallCallback, storeInstallation, getInstallationId } from '../integrations/github-install'
+import { installUrl, parseInstallCallback, storeInstallation, getInstallationId, verifyInstallationOwnership } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
 import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
@@ -3141,7 +3141,14 @@ dashboardApp.get('/connect/github/callback', async (c) => {
   if (!parsed) {
     return c.html(shell(c.env, 'Connect GitHub', errorBody('GitHub did not return a valid installation.')), 400)
   }
-  await storeInstallation(c.env, parsed.installationId, url.searchParams.get('account_login'))
+  const verified = await verifyInstallationOwnership(c.env, url.searchParams.get('code'), parsed.installationId)
+  if (!verified.ok) {
+    const msg = verified.reason === 'not_configured'
+      ? 'GitHub connect is not enabled on this pot yet.'
+      : 'Could not verify this GitHub installation for your account.'
+    return c.html(shell(c.env, 'Connect GitHub', errorBody(msg)), verified.reason === 'not_owned' ? 403 : 400)
+  }
+  await storeInstallation(c.env, parsed.installationId, verified.accountLogin)
   return c.redirect('/admin/github/status')
 })
 

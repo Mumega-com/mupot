@@ -179,6 +179,10 @@ export interface Env {
   // refuses and nothing in the request path or any cron routes to one.
   PROJECT_OFFICE?: string
   // secrets (present at runtime only)
+  // GitHub App user-authorization credentials (shared "mupot" App). Required to complete the
+  // GitHub connect flow; when unset the connect callback refuses (fail closed).
+  GITHUB_APP_CLIENT_ID?: string
+  GITHUB_APP_CLIENT_SECRET?: string
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string
   // One-time self-hosted first-owner ceremony. Enabled only while dashboard OAuth
