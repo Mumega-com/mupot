@@ -570,6 +570,21 @@ function googleAuthTime(idToken: string | undefined): number | null {
   }
 }
 
+/** Largest tolerated clock skew (seconds) for an auth_time that lies in the future; beyond it the claim is invalid. */
+export const GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS = 60
+
+/**
+ * The ONE gate for Google's auth_time, shared by the reauth and link callbacks. True only when the id_token carried a
+ * readable auth_time, it is not further in the future than the skew allowance, and it is no older than
+ * GOOGLE_AUTH_MAX_AGE_SECONDS, all measured on the server clock. A missing token or claim is NOT fresh (fails closed).
+ */
+export function googleAuthTimeIsFresh(authTimeSec: number | null, nowMs: number = Date.now()): boolean {
+  if (authTimeSec === null || !Number.isFinite(authTimeSec)) return false
+  const ageSec = nowMs / 1000 - authTimeSec
+  if (ageSec < -GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS) return false
+  return ageSec <= GOOGLE_AUTH_MAX_AGE_SECONDS
+}
+
 interface GoogleUserInfo {
   sub: string
   email?: string
@@ -832,6 +847,11 @@ authApp.get('/callback', async (c) => {
     if (!identity || identity.provider !== 'google' || identity.provider_subject !== info.sub) {
       return c.json({ error: 'reauth_identity_mismatch' }, 403)
     }
+    // A reauth must prove a fresh credential, not a consent click: Google must report an auth_time within the allowed age.
+    // Refusal stamps nothing and sends the member back with a clear message (never a 500).
+    if (!googleAuthTimeIsFresh(googleAuthTime(token.id_token))) {
+      return c.redirect('/account?signin=reauth_stale')
+    }
     await markRecentReauth(env, reauthTarget.webSessionIdHash)
     return c.redirect(returnPath ?? '/')
   }
@@ -944,9 +964,11 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
     scope: 'openid email',
     state,
     access_type: 'online',
-    // Force a fresh credential prompt — "recent reauth" must reflect a
-    // genuine just-now round-trip, not a silently reused provider cookie.
-    prompt: 'select_account consent',
+    // Force a fresh credential prompt — "recent reauth" must reflect a genuine just-now sign-in, not a silently
+    // reused provider session or a consent click. max_age=0 + prompt=login make Google re-authenticate; the callback
+    // then refuses unless the returned auth_time is fresh.
+    prompt: 'login select_account',
+    max_age: '0',
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
@@ -1107,7 +1129,7 @@ export const GOOGLE_AUTH_MAX_AGE_SECONDS = 15 * 60
 // once, at /link-signin/start, and the proof (the session's recent_reauth_at) is carried in the server-side state. The
 // later hops do not demand a second step-up-window session re-auth measured at THEIR clock: a slow Google sign-in or a slow
 // page made that impossible to finish (re-auth -> link -> slow -> "confirm it is you again" -> re-auth ...). The proof is
-// still bounded: capped at the step-up window itself (NOT window + state lifetime, which would be 40 min), so a link can never complete on a proof a dashboard step-up action would already refuse.
+// still bounded: capped at the step-up window itself (NOT window + state lifetime: with the old 5 min window that sum was 15 min (5 + 10)), so a link can never complete on a proof a dashboard step-up action would already refuse.
 export const LINK_PROOF_MAX_AGE_MS = RECENT_REAUTH_WINDOW_MS // = min(window + state lifetime, window)
 
 /** The start-time proof carried to a later hop: unchanged-or-newer on the live session, and not older than the flow allows. */
@@ -1194,7 +1216,7 @@ async function finishLinkSignIn(
   if (!linkProofHolds(target.reauthProofAt, session.session)) return linkSigninRedirect(c, 'reauth_required')
   // The link flow forces a fresh Google sign-in (prompt=login, max_age=0). When Google says when the user last authenticated,
   // a stale auth_time means a still-logged-in Google account was picked, not proven: refuse.
-  if (googleAuthTimeSec !== null && Date.now() / 1000 - googleAuthTimeSec > GOOGLE_AUTH_MAX_AGE_SECONDS) {
+  if (!googleAuthTimeIsFresh(googleAuthTimeSec)) {
     return linkSigninRedirect(c, 'stale_google_signin')
   }
   const input = { provider: 'google', subject, verifiedEmail: email }
