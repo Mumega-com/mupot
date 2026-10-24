@@ -8,6 +8,7 @@ import {
 import { redactSecretPatterns, redactStructuredDetail } from '../lib/redact'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../bus/fleet-bridge'
 import { routineTablesReady } from '../routines/schema-ready'
+import { unwrapBinding } from '../lib/server-timing'
 
 export type ProjectActivitySource = 'task' | 'message' | 'flight' | 'project_link' | 'routine_event'
 export type ProjectEvidenceSource =
@@ -102,7 +103,7 @@ function adminFlag(input: ProjectProjectionInput): number {
 }
 
 async function receiptKeysetHintsReady(env: Env): Promise<boolean> {
-  const database = env.DB as unknown as object
+  const database = unwrapBinding(env.DB as unknown as object) // raw DB identity: a per-request timing wrapper must not defeat the cache
   if (receiptKeysetReady.has(database)) return true
   const placeholders = RECEIPT_KEYSET_INDEXES.map((_, index) => `?${index + 1}`).join(', ')
   const result = await env.DB.prepare(
