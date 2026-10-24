@@ -16,14 +16,24 @@
 
 ALTER TABLE agent_seat_admissions ADD COLUMN scope TEXT NOT NULL DEFAULT 'seat' CHECK (scope IN ('seat', 'harness'));
 
+-- Shape CHECKs cannot be added to an existing table later without a rebuild, so they are written now (same hash shape as
+-- 0220 secure_moments.link_token_sha256: 64 lowercase hex chars; typeof() refuses a BLOB or a number of the right length).
 CREATE TABLE IF NOT EXISTS agent_dot_keys (
   id            TEXT PRIMARY KEY,
   tenant        TEXT NOT NULL,
   admission_id  TEXT NOT NULL REFERENCES agent_seat_admissions(id) ON DELETE RESTRICT,
-  key_hash      TEXT NOT NULL CHECK (length(key_hash) = 64),
-  subject_hash  TEXT CHECK (subject_hash IS NULL OR length(subject_hash) BETWEEN 1 AND 128),
-  created_at    TEXT NOT NULL,
-  revoked_at    TEXT
+  key_hash      TEXT NOT NULL CHECK (
+    typeof(key_hash) = 'text' AND length(key_hash) = 64 AND key_hash = lower(key_hash) AND key_hash NOT GLOB '*[^0-9a-f]*'
+  ),
+  subject_hash  TEXT CHECK (
+    subject_hash IS NULL OR (typeof(subject_hash) = 'text' AND length(subject_hash) = 64 AND subject_hash = lower(subject_hash) AND subject_hash NOT GLOB '*[^0-9a-f]*')
+  ),
+  created_at    TEXT NOT NULL CHECK (
+    typeof(created_at) = 'text' AND length(created_at) >= 20 AND created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*'
+  ),
+  revoked_at    TEXT CHECK (
+    revoked_at IS NULL OR (typeof(revoked_at) = 'text' AND length(revoked_at) >= 20 AND revoked_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*')
+  )
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dot_keys_key_hash ON agent_dot_keys(key_hash);
@@ -48,9 +58,75 @@ BEGIN
   SELECT RAISE(ABORT, 'agent_dot_key_immutable');
 END;
 
+-- INSERT OR REPLACE / REPLACE INTO deletes the conflicting row WITHOUT firing the no-delete trigger (recursive_triggers is off),
+-- which would silently un-revoke a key. BEFORE INSERT fires ahead of conflict resolution, so a colliding id or key_hash is refused.
+-- The key must also belong to an admission of the same tenant that can still be used (pending or live).
+CREATE TRIGGER IF NOT EXISTS agent_dot_keys_no_replace
+BEFORE INSERT ON agent_dot_keys
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM agent_dot_keys k WHERE k.id = NEW.id OR k.key_hash = NEW.key_hash)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_dot_key_immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_dot_keys_admission_binding
+BEFORE INSERT ON agent_dot_keys
+FOR EACH ROW
+WHEN NOT EXISTS (
+  SELECT 1 FROM agent_seat_admissions a
+   WHERE a.id = NEW.admission_id AND a.tenant = NEW.tenant AND a.status IN ('pending', 'live')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_dot_key_admission_invalid');
+END;
+
+-- Same hole on the parent: REPLACE on an admission id would delete it without the no-delete trigger firing.
+CREATE TRIGGER IF NOT EXISTS agent_seat_admissions_no_replace
+BEFORE INSERT ON agent_seat_admissions
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM agent_seat_admissions a WHERE a.id = NEW.id)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_seat_admission_immutable');
+END;
+
+-- Revoking an admission revokes its keys in the same statement (the keys' own one-way revoke rule still applies).
+CREATE TRIGGER IF NOT EXISTS agent_seat_admissions_revoke_dot_keys
+AFTER UPDATE OF status ON agent_seat_admissions
+FOR EACH ROW
+WHEN NEW.status = 'revoked' AND OLD.status <> 'revoked'
+BEGIN
+  UPDATE agent_dot_keys
+     SET revoked_at = CASE WHEN length(NEW.revoked_at) >= 20 THEN NEW.revoked_at ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END
+   WHERE admission_id = NEW.id AND revoked_at IS NULL;
+END;
+
 ALTER TABLE agent_seat_attachments ADD COLUMN dot_key_id TEXT REFERENCES agent_dot_keys(id) ON DELETE RESTRICT;
 
 CREATE INDEX IF NOT EXISTS idx_agent_seat_attachments_dot_key ON agent_seat_attachments(dot_key_id) WHERE dot_key_id IS NOT NULL;
+
+-- An attachment may name a key only if that key belongs to the attachment's own admission and tenant and is not revoked.
+-- Detach semantics are unchanged: these fire on INSERT and when dot_key_id is written, never on a plain detach.
+CREATE TRIGGER IF NOT EXISTS agent_seat_attachments_dot_key_binding_insert
+BEFORE INSERT ON agent_seat_attachments
+FOR EACH ROW
+WHEN NEW.dot_key_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM agent_dot_keys k
+   WHERE k.id = NEW.dot_key_id AND k.admission_id = NEW.admission_id AND k.tenant = NEW.tenant AND k.revoked_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_seat_attachment_dot_key_invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS agent_seat_attachments_dot_key_binding_update
+BEFORE UPDATE OF dot_key_id ON agent_seat_attachments
+FOR EACH ROW
+WHEN NEW.dot_key_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM agent_dot_keys k
+   WHERE k.id = NEW.dot_key_id AND k.admission_id = NEW.admission_id AND k.tenant = NEW.tenant AND k.revoked_at IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_seat_attachment_dot_key_invalid');
+END;
 
 -- Rebuild the two update guards from 0220 (identical to the originals) with the new column added, so scope and dot_key_id
 -- cannot be changed after the row is written.
