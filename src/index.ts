@@ -299,7 +299,7 @@ const oauthProvider = new OAuthProvider<Env>({
     fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
       // Operator-gated (SERVER_TIMING_KEY + matching x-server-timing-key; see src/lib/server-timing.ts). Never a plain flag.
       // /api/* only; anything else takes the original path untouched.
-      if (!new URL(req.url).pathname.startsWith('/api/') || !(await serverTimingAuthorized(env, req))) return app.fetch(req, env, ctx)
+      if (!new URL(req.url).pathname.startsWith('/api/') || !serverTimingAuthorized(env, req)) return app.fetch(req, env, ctx)
       const timed = instrumentEnv(env)
       const res = await app.fetch(req, timed.env, ctx)
       return withServerTiming(res, timed.timer)

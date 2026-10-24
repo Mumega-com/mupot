@@ -52,17 +52,17 @@ const KEY = 'operator-timing-key-0123456789abcdef'
 const req = (h?: string) => new Request('https://x.test/api/y', { headers: h === undefined ? {} : { [SERVER_TIMING_KEY_HEADER]: h } })
 
 describe('gate: serverTimingAuthorized', () => {
-  it('requires a >=24 char secret AND an exactly matching header', async () => {
-    expect(await serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req(KEY))).toBe(true)
-    expect(await serverTimingAuthorized({}, req(KEY))).toBe(false) // unset
-    expect(await serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req())).toBe(false) // no header
+  it('requires a >=24 char secret AND an exactly matching header', () => {
+    expect(serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req(KEY))).toBe(true)
+    expect(serverTimingAuthorized({}, req(KEY))).toBe(false) // unset
+    expect(serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req())).toBe(false) // no header
     for (const bad of ['', 'x', KEY.slice(1), KEY + 'x', KEY.toUpperCase()]) {
-      expect(await serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req(bad))).toBe(false)
+      expect(serverTimingAuthorized({ SERVER_TIMING_KEY: KEY }, req(bad))).toBe(false)
     }
     for (const weak of ['', 'a', 'x'.repeat(23)]) {
-      expect(await serverTimingAuthorized({ SERVER_TIMING_KEY: weak }, req(weak))).toBe(false) // short secret = disabled
+      expect(serverTimingAuthorized({ SERVER_TIMING_KEY: weak }, req(weak))).toBe(false) // short secret = disabled
     }
-    expect(await serverTimingAuthorized({ SERVER_TIMING_KEY: 'x'.repeat(24) }, req('x'.repeat(24)))).toBe(true)
+    expect(serverTimingAuthorized({ SERVER_TIMING_KEY: 'x'.repeat(24) }, req('x'.repeat(24)))).toBe(true)
   })
 })
 

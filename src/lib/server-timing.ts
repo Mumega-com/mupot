@@ -6,7 +6,7 @@
 // anti-enumeration work (#1272, #868, #1594: an existing vs missing target must be indistinguishable).
 //
 // Gate: env secret SERVER_TIMING_KEY (>= 24 chars) AND request header `x-server-timing-key` equal to it
-// (SHA-256 both, constant-time compare). Unset/short secret = disabled: nothing here runs, no wrapper,
+// (constant-time compare). Unset/short secret = disabled: nothing here runs, no wrapper,
 // no header, byte-identical to before. The key is never echoed. A matching key gets the header on any
 // status (the holder is an operator). /api/* only, PHASE NAMES AND DURATIONS ONLY. Never a key, id, token, cookie, header value or SQL text: the only strings that reach
 // the header are the fixed literals in this file, plus a numeric count in `desc`.
@@ -20,6 +20,7 @@
 // auth/kv/d1 overlap by design (auth includes its own D1/KV); handler + auth == total.
 
 import type { Env } from '../types'
+import { timingSafeEqual } from './crypto'
 
 export const MAX_KV_ENTRIES = 16
 
@@ -42,20 +43,13 @@ export function unwrapBinding<T extends object>(binding: T): T {
 export const SERVER_TIMING_KEY_HEADER = 'x-server-timing-key'
 export const MIN_KEY_CHARS = 24
 
-async function sha256(v: string): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)))
-}
-
-/** True only when a strong secret is configured AND the request presents it. Constant-time over the digests. */
-export async function serverTimingAuthorized(env: Pick<Env, 'SERVER_TIMING_KEY'>, req: Request): Promise<boolean> {
+/** True only when a strong secret is configured AND the request presents it. Uses the repo's single constant-time comparator. */
+export function serverTimingAuthorized(env: Pick<Env, 'SERVER_TIMING_KEY'>, req: Request): boolean {
   const secret = env.SERVER_TIMING_KEY
   if (typeof secret !== 'string' || secret.length < MIN_KEY_CHARS) return false
   const presented = req.headers.get(SERVER_TIMING_KEY_HEADER)
   if (presented === null) return false
-  const [a, b] = await Promise.all([sha256(secret), sha256(presented)])
-  let diff = 0
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i]
-  return diff === 0
+  return timingSafeEqual(secret, presented)
 }
 
 const now = (): number => performance.now()
