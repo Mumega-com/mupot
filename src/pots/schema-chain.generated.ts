@@ -4467,9 +4467,37 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_github_installations_installation_id" },
     ],
   },
+  {
+    file: "0255_admission_scope_dot_keys.sql",
+    sha256: "8cbac048cac431ce3188d306236584df7cfec057d9f1e63f37716873db63f5a3",
+    statements: [
+      "-- 0255_admission_scope_dot_keys.sql — schema only: an admission scope, a table of dot keys, and a nullable link from an\n-- attachment to the key it presented. NO reader or writer in the application uses any of this yet; every existing row\n-- keeps today's behaviour (scope 'seat', no key). Additive: nothing is dropped, renamed or backfilled.\n--\n--   agent_seat_admissions.scope   'seat'    the admission is tied to the one thread that asked (every existing row, the DEFAULT)\n--                                 'harness' the admission covers the (agent, human, harness) triple\n--   agent_dot_keys                one row per issued key; only a hash of the key is stored (never the key); revoke is a timestamp\n--   agent_seat_attachments.dot_key_id  the key an attachment was made with (NULL = none, the legacy path)\n--\n-- WHY A COLUMN WITH A CHECK AND NO REBUILD. SQLite cannot alter a CHECK in place, and agent_seat_admissions is the PARENT\n-- of agent_seat_attachments (admission_id ... ON DELETE RESTRICT) whose rows are no-delete by trigger, so a table rebuild\n-- fails on any pot that already holds an attachment (same trap 0247 documents). ADD COLUMN ... NOT NULL DEFAULT 'seat'\n-- CHECK (...) is allowed and gives every existing row 'seat'.\n--\n-- DEPLOY ORDER. Safe to apply before or after the Worker: nothing reads these columns.\n\nALTER TABLE agent_seat_admissions ADD COLUMN scope TEXT NOT NULL DEFAULT 'seat' CHECK (scope IN ('seat', 'harness'));",
+      "\n\nCREATE TABLE IF NOT EXISTS agent_dot_keys (\n  id            TEXT PRIMARY KEY,\n  tenant        TEXT NOT NULL,\n  admission_id  TEXT NOT NULL REFERENCES agent_seat_admissions(id) ON DELETE RESTRICT,\n  key_hash      TEXT NOT NULL CHECK (length(key_hash) = 64),\n  subject_hash  TEXT CHECK (subject_hash IS NULL OR length(subject_hash) BETWEEN 1 AND 128),\n  created_at    TEXT NOT NULL,\n  revoked_at    TEXT\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dot_keys_key_hash ON agent_dot_keys(key_hash);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_dot_keys_admission ON agent_dot_keys(admission_id);",
+      "\n\n-- A key row keeps its identity; revoking is the only change and it is one-way. History is never deleted.\nCREATE TRIGGER IF NOT EXISTS agent_dot_keys_immutable\nBEFORE UPDATE ON agent_dot_keys\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.admission_id IS NOT OLD.admission_id\n  OR NEW.key_hash IS NOT OLD.key_hash OR NEW.subject_hash IS NOT OLD.subject_hash\n  OR NEW.created_at IS NOT OLD.created_at\n  OR (OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS NOT OLD.revoked_at)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_dot_key_immutable');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS agent_dot_keys_no_delete\nBEFORE DELETE ON agent_dot_keys\nFOR EACH ROW\nBEGIN\n  SELECT RAISE(ABORT, 'agent_dot_key_immutable');\nEND;",
+      "\n\nALTER TABLE agent_seat_attachments ADD COLUMN dot_key_id TEXT REFERENCES agent_dot_keys(id) ON DELETE RESTRICT;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_seat_attachments_dot_key ON agent_seat_attachments(dot_key_id) WHERE dot_key_id IS NOT NULL;",
+      "\n\n-- Rebuild the two update guards from 0220 (identical to the originals) with the new column added, so scope and dot_key_id\n-- cannot be changed after the row is written.\nDROP TRIGGER IF EXISTS agent_seat_admissions_immutable;",
+      "\n\nCREATE TRIGGER agent_seat_admissions_immutable\nBEFORE UPDATE ON agent_seat_admissions\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.human_member_id IS NOT OLD.human_member_id OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.created_at IS NOT OLD.created_at OR NEW.requested_via IS NOT OLD.requested_via\n  OR NEW.gates IS NOT OLD.gates\n  OR NEW.scope IS NOT OLD.scope\n  OR (NEW.ceiling IS NOT OLD.ceiling AND OLD.status <> 'pending') -- the human picks it at the decision (pending -> live) and never after\n  OR OLD.status IN ('denied', 'revoked', 'expired')\n  OR (OLD.status = 'live' AND NEW.status NOT IN ('live', 'revoked'))\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_immutable');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS agent_seat_attachments_immutable;",
+      "\n\nCREATE TRIGGER agent_seat_attachments_immutable\nBEFORE UPDATE ON agent_seat_attachments\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.seat_id IS NOT OLD.seat_id\n  OR NEW.human_member_id IS NOT OLD.human_member_id OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.agent_id IS NOT OLD.agent_id OR NEW.admission_id IS NOT OLD.admission_id\n  OR NEW.seat_token_id IS NOT OLD.seat_token_id OR NEW.created_at IS NOT OLD.created_at\n  OR NEW.dot_key_id IS NOT OLD.dot_key_id\n  OR (OLD.detached_at IS NOT NULL AND (NEW.detached_at IS NOT OLD.detached_at OR NEW.detach_reason IS NOT OLD.detach_reason\n                                      OR NEW.detached_by_member_id IS NOT OLD.detached_by_member_id))\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_attachment_immutable');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_dot_keys" },
+      { type: "index", name: "uq_agent_dot_keys_key_hash" },
+      { type: "index", name: "idx_agent_dot_keys_admission" },
+      { type: "trigger", name: "agent_dot_keys_immutable" },
+      { type: "trigger", name: "agent_dot_keys_no_delete" },
+      { type: "index", name: "idx_agent_seat_attachments_dot_key" },
+      { type: "trigger", name: "agent_seat_admissions_immutable" },
+      { type: "trigger", name: "agent_seat_attachments_immutable" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5ff61f00ab8847b3df6028cc75018faabf30ee6e43219d5b9506c3b27a34ff32"
+export const SCHEMA_CHAIN_DIGEST: string = "b72d86f6c290563da5126f120891701b70ef8dc541688ca9378d97c52b859027"
