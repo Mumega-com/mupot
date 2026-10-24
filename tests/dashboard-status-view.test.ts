@@ -1,7 +1,6 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
@@ -19,15 +18,14 @@ vi.mock('../src/auth', () => ({
 
 const { dashboardApp } = await import('../src/dashboard')
 const visibility = await import('../src/tasks/visibility')
+await import('../src/mcp') // load the MCP registry first: flight-spine imports it cyclically
+const flightSpine = await import('../src/mcp/flight-spine')
 
-const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const SHA = 'abcdef0123456789abcdef0123456789abcdef01'
 
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((n) => n.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'delivery', 'Delivery'), ('dept-b', 'secret', 'Secret');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'alpha', 'Alpha'), ('squad-b', 'dept-b', 'beta', 'Beta');
@@ -41,11 +39,34 @@ function makeHarness(): SqliteD1Harness {
       ('blk-a', 'squad-a', 'Stuck thing', '', 'Unstuck', 'blocked', 'P2', 'waiting on vendor key', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
       ('rev-a', 'squad-a', 'Review me', '', 'Reviewed', 'review', 'P2', NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
       ('arch-a', 'squad-a', 'Archived P0', '', 'x', 'open', 'P0', NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
-      ('hid-p0', 'squad-b', 'SECRET hidden P0', '', 'x', 'open', 'P0', NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
-      ('hid-blk', 'squad-b', 'SECRET hidden blocked', '', 'x', 'blocked', 'P1', 'secret reason', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+      ('hid-p0', 'squad-b', 'HIDDENROW hidden P0', '', 'x', 'open', 'P0', NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
+      ('hid-blk', 'squad-b', 'HIDDENROW hidden blocked', '', 'x', 'blocked', 'P1', 'secret reason', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-a', 'squad-a', 'ag-a', 'OWNER<i>evil</i>', 'inactive'), ('ag-b', 'squad-b', 'ag-b', 'HIDDENROWAGENT', 'inactive');
+    INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'PROJ<u>evil</u>', 'active'), ('proj-b', 'proj-b', 'HIDDENROWPROJ', 'active');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-a', 'squad-a', 'write'), ('proj-b', 'squad-b', 'write');
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-a', 'gate:content', 'member', 'member-a', 'owner', '2026-07-01T00:00:00.000Z');
+    INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, priority, gate_owner, assignee_agent_id, result, created_at, updated_at) VALUES
+      ('need-a', 'squad-a', 'proj-a', 'NEED<em>mine</em>', '', 'ok', 'review', 'P2', 'gate:content', NULL, NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
+      ('need-b', 'squad-b', 'proj-b', 'HIDDENROW needs-you row', '', 'ok', 'review', 'P2', 'gate:content', NULL, NULL, '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z'),
+      ('blk-h', 'squad-a', 'proj-a', 'Hostile blocked', '', 'ok', 'blocked', 'P2', NULL, 'ag-a', 'REASON<s>evil</s>', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-z', 'z@example.test', 'Member Z', 'active', 'tenant-a');
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-z', 'gate:other', 'member', 'member-z', 'owner', '2026-07-01T00:00:00.000Z');
+    INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, priority, gate_owner, created_at, updated_at) VALUES
+      ('need-z', 'squad-a', 'proj-a', 'OTHERGATE row', '', 'ok', 'review', 'P2', 'gate:other', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+    INSERT INTO tasks (id, squad_id, title, body, done_when, status, priority, created_at, updated_at) VALUES
+      ('blk-long', 'squad-a', 'Long blocked', '${'x'.repeat(300)}TAILREASON', 'ok', 'blocked', 'P2', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
     INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
       VALUES ('arch-a', datetime('now'), 'test', 'member-a', 'open', datetime('now'));
   `)
+  const fl = (id: string, agent: string, goal: string, squad: string, status: string, at: number) =>
+    harness.sqlite.prepare('INSERT INTO flights (id, tenant, agent, goal, status, meta, created_at, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, 'tenant-a', agent, goal, status, JSON.stringify({
+        schema: 'mupot.flight.meta/v1', goal_id: 'g', objective_id: 'o', squad_ids: [squad], task_ids: ['t'], done_when: ['d'],
+        artifact_refs: [], receipt_refs: [], confidentiality: 'internal', publication_target: 'none', parent_flight_id: null,
+      }), at, at)
+  fl('fl-a', 'ag-a', 'GOAL<blink>a</blink>', 'squad-a', 'running', 1000)
+  fl('fl-b', 'ag-b', 'HIDDENROW flight goal', 'squad-b', 'running', 2000)
+  fl('fl-done', 'ag-a', 'Landed flight', 'squad-a', 'landed', 3000)
   return harness
 }
 
@@ -76,13 +97,18 @@ describe('GET /status board status page', () => {
     expect(await res.text()).not.toContain('Fix prod outage')
   })
 
-  it('renders ranked sections, counts, and the build sha, with no store caching', async () => {
+  const fetchStatus = async (auth: AuthContext) => {
     harness = makeHarness()
-    authState.current = member()
+    authState.current = auth
     const res = await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))
-    const body = await res.text()
+    return { res, body: await res.text() }
+  }
+  const chipCount = (body: string, label: string) => body.match(new RegExp(`<b>(\\d+)</b> ${label}`))?.[1]
+
+  it('renders ranked sections, exact counts, and the build sha, with no store caching', async () => {
+    const { res, body } = await fetchStatus(member())
     expect(res.status).toBe(200)
-    expect(res.headers.get('cache-control')).toContain('no-store')
+    expect(res.headers.get('cache-control')).toBe('no-store') // final header, set by the dashboard-wide middleware
     expect(body).toContain('Fix prod outage')
     expect(body).toContain('Building thing')
     expect(body).toContain('waiting on vendor key')
@@ -92,43 +118,128 @@ describe('GET /status board status page', () => {
     expect(body.indexOf('Fix prod outage')).toBeLessThan(body.indexOf('Tidy'))
     expect(body).toContain('Build abcdef01')
     expect(body).toContain('href="/status"')
-    expect(body).toMatch(/<b>1<\/b> P0/)
+    expect(chipCount(body, 'P0')).toBe('1')
+    expect(chipCount(body, 'P1')).toBe('1')
+    expect(chipCount(body, 'in progress')).toBe('1')
+    expect(chipCount(body, 'blocked')).toBe('3')
+    expect(chipCount(body, 'in review')).toBe('3')
+    expect(chipCount(body, 'flights')).toBe('1')
+    expect(chipCount(body, 'need you')).toBe('1')
+    expect(body).toContain('Open P0 / P1 <span class="sv-n">2</span>')
+    expect(body).toContain('Running flights <span class="sv-n">1</span>')
+    expect(body).toContain('GOAL&lt;blink&gt;')
+    expect(body).not.toContain('Landed flight')
+    expect(body).toContain('TAILREASON')
   })
 
-  it('goes through the shared visibility chokepoint and never renders rows the viewer cannot see', async () => {
+  it('goes through the shared visibility chokepoints and never renders rows the viewer cannot see', async () => {
     harness = makeHarness()
     authState.current = member()
     const scopeSpy = vi.spyOn(visibility, 'resolveVisibleTaskScope')
     const clauseSpy = vi.spyOn(visibility, 'visibleTaskClause')
+    const flightSpy = vi.spyOn(flightSpine, 'visibleFlight')
     const res = await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))
     const body = await res.text()
     expect(scopeSpy).toHaveBeenCalled()
     expect(clauseSpy).toHaveBeenCalled()
-    expect(body).not.toContain('SECRET')
+    expect(flightSpy).toHaveBeenCalled()
+    expect(body).not.toContain('HIDDENROW')
     expect(body).not.toContain('secret reason')
-    expect(body).toMatch(/<b>1<\/b> P0/) // true count excludes the hidden squad's P0 and the archived one
-    expect(body).toMatch(/<b>0<\/b> blocked|<b>1<\/b> blocked/)
-    expect(body).not.toMatch(/<b>2<\/b> blocked/)
+    expect(chipCount(body, 'need you')).toBe('1') // gate:other (held by member-z) is not listed for member-a
+    expect(chipCount(body, 'P0')).toBe('1')
+    expect(chipCount(body, 'flights')).toBe('1')
   })
 
-  it('a viewer with no squad grant sees no task rows at all', async () => {
-    harness = makeHarness()
-    authState.current = { ...member(), capabilities: [] }
-    const res = await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))
-    const body = await res.text()
+  it('a viewer granted only a DIFFERENT squad reaches the loader and sees only that squad', async () => {
+    const other: AuthContext = {
+      ...member(),
+      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-b', capability: 'member' }],
+    }
+    const { res, body } = await fetchStatus(other)
+    expect(res.status).toBe(200)
+    expect(body).toContain('HIDDENROW hidden P0')
+    expect(body).toContain('HIDDENROW flight goal')
     expect(body).not.toContain('Fix prod outage')
-    expect(body).not.toContain('SECRET')
+    expect(body).not.toContain('GOAL')
+    expect(body).not.toContain('NEED')
+    expect(chipCount(body, 'flights')).toBe('1')
   })
 
-  it('escapes task text as data', async () => {
+  it('escapes task text, reason, owner, project, needs-you title, flight goal and agent as data', async () => {
+    const { body } = await fetchStatus(member())
+    for (const raw of ['<script>alert(1)</script>', '<b>x</b>', '<s>evil</s>', '<i>evil</i>', '<u>evil</u>', '<em>mine</em>', '<blink>a</blink>']) {
+      expect(body).not.toContain(raw)
+    }
+    for (const esc of ['&lt;script&gt;alert(1)&lt;/script&gt;', '&lt;b&gt;x&lt;/b&gt;', 'REASON&lt;s&gt;', 'OWNER&lt;i&gt;', 'PROJ&lt;u&gt;', 'NEED&lt;em&gt;', 'GOAL&lt;blink&gt;']) {
+      expect(body).toContain(esc)
+    }
+  })
+
+  it('caps each section at 40 rows but keeps true counts', async () => {
+    harness = makeHarness()
+    for (let i = 0; i < 45; i++) {
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, priority, created_at, updated_at)
+        VALUES (?, 'squad-a', ?, '', 'x', 'in_progress', 'P2', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z')`).run(`bulk-${i}`, `BULK${i}`)
+    }
+    for (let i = 0; i < 45; i++) {
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, priority, created_at, updated_at)
+        VALUES (?, 'squad-a', ?, '', 'x', 'open', 'P1', '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z')`).run(`openp1-${i}`, `OPENP1-${i}`)
+    }
+    authState.current = member()
+    const body = await (await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))).text()
+    expect(chipCount(body, 'in progress')).toBe('46')
+    expect(body).toContain('Open P0 / P1 <span class="sv-n">47</span>') // true count, not the 40 rows shown
+    expect((body.match(/BULK\d+/g) ?? []).length).toBe(40)
+  })
+
+  it('degrades one section when a reader throws instead of 500ing the page', async () => {
     harness = makeHarness()
     authState.current = member()
-    const res = await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))
+    const env = envFor(harness)
+    const realBatch = env.DB.batch.bind(env.DB)
+    // fail only the status page's own two-statement task batch
+    vi.spyOn(env.DB, 'batch').mockImplementation(async (stmts) => {
+      if (stmts.length === 2) throw new Error('boom')
+      return realBatch(stmts)
+    })
+    const res = await dashboardApp.fetch(new Request('https://pot.test/status'), env)
     const body = await res.text()
-    expect(body).not.toContain('<script>alert(1)</script>')
-    expect(body).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
-    expect(body).not.toContain('<b>x</b>')
-    expect(body).toContain('&lt;b&gt;x&lt;/b&gt;')
+    expect(res.status).toBe(200)
+    expect(body).toContain('Unavailable')
+    expect(body).toContain('GOAL&lt;blink&gt;') // flights still render
+    expect(body).toContain('NEED&lt;em&gt;') // needs-you still renders
+  })
+
+  it('shows "more" instead of "All clear" when needs-you is truncated', async () => {
+    harness = makeHarness()
+    authState.current = member()
+    harness.sqlite.exec("DELETE FROM tasks WHERE gate_owner IS NOT NULL")
+    const needs = await import('../src/dashboard/needs-you')
+    vi.spyOn(needs, 'loadNeedsYouDashboard').mockResolvedValue({ items: [], nextCursor: 'abc', truncated: true, truncatedSources: ['task'] })
+    const body = await (await dashboardApp.fetch(new Request('https://pot.test/status'), envFor(harness))).text()
+    expect(body).toContain('More items waiting')
+  })
+
+  it('runs the task batch, needs-you and flights concurrently', async () => {
+    harness = makeHarness()
+    authState.current = member()
+    const env = envFor(harness)
+    const realBatch = env.DB.batch.bind(env.DB)
+    const realPrepare = env.DB.prepare.bind(env.DB)
+    let pending = false
+    let overlapped = false
+    vi.spyOn(env.DB, 'prepare').mockImplementation((q: string) => {
+      if (pending && (q.includes('FROM flights') || q.includes('gate_grants'))) overlapped = true // a sibling reader started mid-batch
+      return realPrepare(q)
+    })
+    vi.spyOn(env.DB, 'batch').mockImplementation(async (stmts) => {
+      pending = true
+      await new Promise((r) => setTimeout(r, 100)) // give concurrent readers a macrotask to start
+      pending = false
+      return realBatch(stmts)
+    })
+    await dashboardApp.fetch(new Request('https://pot.test/status'), env)
+    expect(overlapped).toBe(true)
   })
 
   it('reads tasks in one batched round trip', async () => {
@@ -137,6 +248,6 @@ describe('GET /status board status page', () => {
     const env = envFor(harness)
     const batchSpy = vi.spyOn(env.DB, 'batch')
     await dashboardApp.fetch(new Request('https://pot.test/status'), env)
-    expect(batchSpy).toHaveBeenCalledTimes(1)
+    expect(batchSpy.mock.calls.filter(([stmts]) => stmts.length === 2)).toHaveLength(1)
   })
 })

@@ -1210,7 +1210,6 @@ dashboardApp.get('/needs-you', async (c) => {
 // GET /status — phone-readable board status (session auth; tenant + visibility scoped).
 dashboardApp.get('/status', async (c) => {
   const view = await loadStatusView(c.env, c.get('auth'))
-  c.header('Cache-Control', 'private, no-store')
   return c.html(shell(c.env, 'Status', statusBody(view)))
 })
 
