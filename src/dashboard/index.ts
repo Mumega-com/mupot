@@ -388,12 +388,22 @@ function unauthenticatedRootWantsJson(c: Context<AppEnv>): boolean {
 function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
   const brand = esc(env.BRAND)
   const emailEnabled = isEmailLoginEnabled(env)
+  // Mumega-specific newcomer copy/links: only the mumega tenant's pot, never the invite variant.
+  const showStartPath = !hasPendingInvite && env.TENANT_SLUG === 'mumega'
   const withEmail = emailEnabled ? ' or email' : ''
   const intro = hasPendingInvite
     ? `<h1>Finish joining ${brand}</h1>
        <p class="muted">You accepted an invite — sign in with the same Google account${withEmail} to finish.</p>`
     : `<h1>${brand}</h1>
-       <p class="muted">${brand} runs on mupot: your org's governed agent workforce — humans decide, agents execute.</p>`
+       <p class="muted">${brand} runs on mupot: your org's governed agent workforce — humans decide, agents execute.</p>${showStartPath
+         ? `
+       <p class="muted">New to this? It is a plain-language way to connect the Claude you already use, give it a first task, and get a daily result you can approve.</p>`
+         : ''}`
+  const startLinks = showStartPath
+    ? `<p class="muted">New here? <a href="https://mumega.com/docs/for-business-owners/" rel="noopener noreferrer">How it works</a><br />
+       Developers: <a href="https://mumega.com/docs/how-to-connect/" rel="noopener noreferrer">how to connect</a><br />
+       No invite yet? <a href="https://mumega.com/onboarding/" rel="noopener noreferrer">Request early access</a></p>`
+    : ''
   const emailForm = emailEnabled
     ? `<form method="post" action="/auth/email/start" style="margin-top:14px">
          <label for="landing-email" class="muted" style="display:block;margin-bottom:6px">Or continue with email</label>
@@ -408,7 +418,8 @@ function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
     `${intro}
     <p><a class="btn" href="/auth/login">Sign in with Google</a></p>
     ${emailForm}
-    <p class="muted">Have an invite? Open the link you were sent — it looks like <code>/invite/&hellip;</code>.</p>`,
+    <p class="muted">Have an invite? Open the link you were sent — it looks like <code>/invite/…</code>.</p>
+    ${startLinks}`,
   )
 }
 
