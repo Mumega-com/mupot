@@ -34,10 +34,11 @@ function makeHarness(): SqliteD1Harness {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'delivery', 'Delivery'), ('dept-b', 'secret', 'Secret');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'alpha', 'Alpha'), ('squad-b', 'dept-b', 'beta', 'Beta');
+    INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('squad-home-a', 'dept-a', 'home-a', 'HomeA', 'home'), ('squad-home-b', 'dept-b', 'home-b', 'HomeB', 'home');
     INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-a', 'a@example.test', 'Member A', 'active', 'tenant-a');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-a', 'member-a', 'squad', 'squad-a', 'member');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-a', 'squad-a', 'ag-a', 'AGENTA', 'inactive'), ('ag-b', 'squad-b', 'ag-b', 'HIDDENAGENT', 'inactive');
-    INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'PROJA', 'active'), ('proj-b', 'proj-b', 'HIDDENPROJNAME', 'active');
+    INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'proj-a', 'PROJA', 'active'), ('proj-b', 'hidden-slug-b', 'HIDDENPROJNAME', 'active');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-a', 'squad-a', 'write'), ('proj-b', 'squad-b', 'write');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-b', 'squad-a', 'write');
     INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, priority, created_at, updated_at) VALUES
@@ -267,5 +268,144 @@ describe('flight lists are scoped to the viewer', () => {
     expect(json).toContain('Cross project task')
     expect(json).toContain('PROJA')
     expect(json).not.toContain('HIDDENPROJNAME')
+  })
+
+  const orgObserverWithHome = (): AuthContext => ({
+    ...member(),
+    capabilities: [
+      { member_id: 'member-a', scope_type: 'org', scope_id: null, capability: 'observer' },
+      { member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-home-a', capability: 'owner' as never },
+    ],
+  })
+
+  it('an org observer keeps flights of their EXACT home-squad grant (no false "All clear")', async () => {
+    h = makeHarness()
+    addFlight(h, 'fl-home', 'ag-a', 'OWNHOMEGOAL', ['squad-home-a'], 1000)
+    addFlight(h, 'fl-otherhome', 'ag-a', 'OTHERHOMEGOAL', ['squad-home-b'], 2000)
+    for (const path of ['/status', '/flights']) {
+      const { body } = await get(path, orgObserverWithHome())
+      expect(body).toContain('OWNHOMEGOAL')
+      expect(body).not.toContain('OTHERHOMEGOAL')
+    }
+  })
+
+  it('a NON-admin org grant is not treated as workspace admin (another member\'s home squad stays hidden)', async () => {
+    h = makeHarness(); seedFlights(h)
+    addFlight(h, 'fl-otherhome', 'ag-a', 'OTHERHOMEGOAL', ['squad-home-b'], 2000)
+    const orgObserver: AuthContext = { ...member(), capabilities: [{ member_id: 'member-a', scope_type: 'org', scope_id: null, capability: 'observer' }] }
+    const { body } = await get('/flights', orgObserver)
+    expect(body).toContain('VISIBLEGOAL')
+    expect(body).not.toContain('OTHERHOMEGOAL')
+  })
+
+  it('visibleFlight stays the final word: a flight the SQL stage passes but visibleFlight rejects is dropped', async () => {
+    h = makeHarness()
+    addFlight(h, 'fl-ok', 'ag-a', 'KEEPGOAL', ['squad-a'], 1000)
+    addFlight(h, 'fl-veto', 'ag-a', 'VETOGOAL', ['squad-a'], 2000)
+    const real = flightSpine.visibleFlight
+    vi.spyOn(flightSpine, 'visibleFlight').mockImplementation(async (e, a, id) => (id === 'fl-veto' ? null : real(e, a, id)))
+    const res = await visibleFlightsMod.visibleFlights(envFor(h), member())
+    expect(res.rows.map((r) => r.id)).toEqual(['fl-ok'])
+  })
+
+  it('scanLimited is exactly "more matched than limit AND fewer than limit survived"', async () => {
+    h = makeHarness()
+    for (let i = 0; i < 4; i++) addFlight(h, `fl-s${i}`, 'ag-a', `S${i}`, ['squad-a'], 1000 + i)
+    const env = envFor(h)
+    const full = await visibleFlightsMod.visibleFlights(env, member(), { limit: 2 })
+    expect(full).toMatchObject({ more: true, scanLimited: false }) // page is full: more is not a loss
+    const real = flightSpine.visibleFlight
+    vi.spyOn(flightSpine, 'visibleFlight').mockImplementation(async (e, a, id) => (id === 'fl-s3' ? null : real(e, a, id)))
+    const short = await visibleFlightsMod.visibleFlights(env, member(), { limit: 3 })
+    expect(short.rows).toHaveLength(2)
+    expect(short).toMatchObject({ more: true, scanLimited: true })
+    const exact = await visibleFlightsMod.visibleFlights(env, member(), { limit: 10 })
+    expect(exact).toMatchObject({ more: false, scanLimited: false })
+  })
+
+  it('/flights reports a partial list when more flights matched than shown', async () => {
+    h = makeHarness()
+    for (let i = 0; i < 101; i++) addFlight(h, `fl-p${i}`, 'ag-a', `P${i}`, ['squad-a'], 1000 + i)
+    const { body } = await get('/flights')
+    expect(body).toContain('Flight history is partial')
+  })
+
+  it('names of an agent/squad the viewer cannot observe are not shown on a visible flight', async () => {
+    h = makeHarness()
+    addFlight(h, 'fl-x', 'ag-b', 'CROSSAGENTGOAL', ['squad-a'], 1000)
+    for (const path of ['/flights', '/status']) {
+      const { body } = await get(path)
+      expect(body).toContain('CROSSAGENTGOAL')
+      expect(body).not.toContain('HIDDENAGENT')
+      expect(body).not.toContain('>Beta<')
+    }
+  })
+
+  it('/flights?project_id= applies the same squad and home-squad checks', async () => {
+    h = makeHarness()
+    // org observer reads every project (readableSquadIds === null): home/mixed-squad flights must still be dropped
+    addFlight(h, 'fl-pa', 'ag-a', 'PROJVISIBLE', ['squad-a'], 1000, { project: 'proj-a' })
+    addFlight(h, 'fl-pa-mixed', 'ag-a', 'PROJMIXED', ['squad-a', 'squad-home-b'], 2000, { project: 'proj-a' })
+    addFlight(h, 'fl-pa-home', 'ag-a', 'PROJOTHERHOME', ['squad-home-b'], 3000, { project: 'proj-a' })
+    const orgObserver: AuthContext = { ...member(), capabilities: [{ member_id: 'member-a', scope_type: 'org', scope_id: null, capability: 'observer' }] }
+    const { res, body } = await get('/flights?project_id=proj-a', orgObserver)
+    expect(res.status).toBe(200)
+    expect(body).toContain('PROJVISIBLE')
+    expect(body).not.toContain('PROJMIXED')
+    expect(body).not.toContain('PROJOTHERHOME')
+  })
+
+  it('/studio lists only flights the viewer may see', async () => {
+    h = makeHarness(); seedFlights(h)
+    const { loadStudioData } = await import('../src/dashboard/studio')
+    const data = await loadStudioData(envFor(h), member())
+    const goals = data.flights.map((f) => f.goal)
+    expect(goals).toContain('VISIBLEGOAL')
+    for (const g of ['HIDDENSQUADGOAL', 'HIDDENPROJGOAL', 'MIXEDSQUADGOAL']) expect(goals).not.toContain(g)
+  })
+
+  it('/studio shows no flights when the visibility check throws', async () => {
+    h = makeHarness(); seedFlights(h)
+    vi.spyOn(flightSpine, 'visibleFlight').mockRejectedValue(new Error('boom'))
+    const { loadStudioData } = await import('../src/dashboard/studio')
+    expect((await loadStudioData(envFor(h), member())).flights).toEqual([])
+  })
+
+  it('radar requires EVERY squad of a flight and a readable project', async () => {
+    h = makeHarness(); seedFlights(h)
+    addFlight(h, 'fl-ok2', 'ag-a', 'RADARVISIBLE', ['squad-a'], 500) // oldest: radar shows each agent's newest flight, so unfiltered hidden ones would shadow it
+    const { loadFleetRadar } = await import('../src/dashboard/radar')
+    const radar = JSON.stringify(await loadFleetRadar(envFor(h), 10_000, ['squad-a'], member()))
+    expect(radar).toContain('VISIBLEGOAL') // the agent's newest VISIBLE flight (hidden newer ones must not shadow it)
+    expect(radar).toContain('"active_flight_count":2')
+    expect(radar).not.toContain('MIXEDSQUADGOAL')
+    expect(radar).not.toContain('HIDDENPROJGOAL')
+    expect(radar).not.toContain('HIDDENSQUADGOAL')
+  })
+
+  it('loadAsks hides the project name of an unreadable project', async () => {
+    h = makeHarness()
+    h.sqlite.exec(`UPDATE tasks SET status = 'review', gate_owner = 'gate:content', assignee_member_id = 'member-a' WHERE id = 't-cross'`)
+    const { loadAsks } = await import('../src/dashboard/approvals')
+    const asks = await loadAsks(envFor(h), member())
+    expect(asks.map((a) => a.id)).toContain('t-cross')
+    expect(JSON.stringify(asks)).not.toContain('HIDDENPROJNAME')
+  })
+
+  it('kanban: no project_slug beside a nulled name, and a hidden project is not returned by slug or id', async () => {
+    h = makeHarness()
+    const { loadKanbanData } = await import('../src/dashboard/kanban-routes')
+    const env = envFor(h)
+    for (const data of [await loadKanbanData(env, member(), { view: 'matrix' }), await loadKanbanData(env, member(), { squadIdOrSlug: 'squad-a' })]) {
+      expect(JSON.stringify(data)).not.toContain('hidden-slug-b')
+      expect(JSON.stringify(data)).toContain('proj-a') // a readable project's slug still ships
+    }
+    for (const ref of ['hidden-slug-b', 'proj-b']) {
+      const data = await loadKanbanData(env, member(), { projectIdOrSlug: ref })
+      expect(data.project).toBeNull()
+      expect(JSON.stringify(data)).not.toContain('HIDDENPROJNAME')
+    }
+    const ok = await loadKanbanData(env, member(), { projectIdOrSlug: 'proj-a' })
+    expect(ok.project?.id).toBe('proj-a')
   })
 })

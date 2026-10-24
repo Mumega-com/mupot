@@ -24,7 +24,8 @@ import { csrf } from 'hono/csrf'
 import { launchCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
-import { createFlight, listFlights, type FlightRow } from '../flight/service'
+import { createFlight, type FlightRow } from '../flight/service'
+import { visibleFlights } from './visible-flights'
 import { createTask } from '../tasks/service'
 import { seedAttachedProjectsForRepo } from '../projects/deploy-policy'
 
@@ -114,7 +115,8 @@ export function normalizeStudioModel(raw: string | undefined): StudioModel {
 }
 
 export async function loadStudioData(env: Env, auth: AuthContext): Promise<StudioViewData> {
-  const flights = await listFlights(env, 12)
+  // Viewer-scoped; on a failed visibility check show no flights rather than unchecked ones.
+  const flights = await visibleFlights(env, auth, { limit: 12 }).then((r) => r.rows, () => [] as FlightRow[])
   const tier = await resolveTier(env)
 
   let agents: StudioAgentCard[] = []

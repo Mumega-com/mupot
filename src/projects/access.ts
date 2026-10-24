@@ -160,12 +160,12 @@ export async function readableProjectIdSet(
  * squad-scoped and a task can sit in a project its squad has no edge to, so the project NAME needs
  * its own read check. Fails closed: if the check cannot run, every name is dropped.
  */
-export async function redactUnreadableProjectNames<T extends { project_id?: string | null; project_name?: string | null }>(
+export async function redactUnreadableProjectNames<T extends { project_id?: string | null; project_name?: string | null; project_slug?: string | null }>(
   env: Env,
   auth: AuthContext,
   rows: T[],
 ): Promise<T[]> {
-  if (!rows.some((r) => r.project_name)) return rows
+  if (!rows.some((r) => r.project_name || r.project_slug)) return rows
   let readable: Set<string>
   try {
     readable = await readableProjectIdSet(env, auth, rows.map((r) => r.project_id))
@@ -174,6 +174,6 @@ export async function redactUnreadableProjectNames<T extends { project_id?: stri
   }
   return rows.map((r) =>
     // as T: the generic row only promises project_name is string|null|undefined; null is in that set.
-    r.project_name && !(r.project_id && readable.has(r.project_id)) ? ({ ...r, project_name: null } as T) : r,
+    (r.project_name || r.project_slug) && !(r.project_id && readable.has(r.project_id)) ? ({ ...r, project_name: null, ...(r.project_slug === undefined ? {} : { project_slug: null }) } as T) : r,
   )
 }

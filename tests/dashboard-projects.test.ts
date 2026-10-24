@@ -1496,7 +1496,7 @@ describe('project dashboard routes', () => {
       get(target, property, receiver) {
         if (property !== 'prepare') return Reflect.get(target, property, receiver)
         return (sql: string) => {
-          if (/SELECT \*[\s\S]*FROM\s+flights/i.test(sql)) observed.push(sql)
+          if (/SELECT f\.\*[\s\S]*FROM\s+flights/i.test(sql)) observed.push(sql)
           return target.prepare(sql)
         }
       },
@@ -1513,7 +1513,7 @@ describe('project dashboard routes', () => {
     expect(body).not.toContain('Legacy project flight')
     expect(body).not.toContain('Ship Mirror')
     expect(observed.some((sql) => (
-      /json_valid\(f\.meta\)[\s\S]*json_each\(\?3\)[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i
+      /json_valid\(f\.meta\)[\s\S]*json_each\(\?\)[\s\S]*ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?/i
         .test(sql)
     ))).toBe(true)
 
@@ -1581,7 +1581,7 @@ describe('project dashboard routes', () => {
       get(target, property, receiver) {
         if (property !== 'prepare') return Reflect.get(target, property, receiver)
         return (sql: string) => {
-          if (/SELECT \*[\s\S]*FROM\s+flights f/i.test(sql)) observed.push(sql)
+          if (/SELECT f\.\*[\s\S]*FROM\s+flights f/i.test(sql)) observed.push(sql)
           return target.prepare(sql)
         }
       },
@@ -1596,7 +1596,7 @@ describe('project dashboard routes', () => {
     expect(body).toContain('Ship Inkwell')
     expect(body).not.toContain('SQL-pass JS-fail')
     expect(observed).toHaveLength(1)
-    expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?4/i)
+    expect(observed[0]).toMatch(/ORDER BY f\.created_at DESC, f\.id DESC[\s\S]*LIMIT \?/i)
     expect(observed[0]).not.toMatch(/\bOFFSET\b/i)
   })
 
@@ -1618,7 +1618,7 @@ describe('project dashboard routes', () => {
       get(target, property, receiver) {
         if (property !== 'prepare') return Reflect.get(target, property, receiver)
         return (sql: string) => {
-          if (!/SELECT \*[\s\S]*FROM\s+flights f/i.test(sql)) return target.prepare(sql)
+          if (!/SELECT f\.\*[\s\S]*FROM\s+flights f/i.test(sql)) return target.prepare(sql)
           flightQueries += 1
           return {
             bind: () => ({ all: async () => ({ results: invalidCandidates }) }),

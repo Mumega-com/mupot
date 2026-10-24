@@ -971,6 +971,8 @@ export function projectFlightIsReadable(context: ProjectWorkContext, meta: strin
   }
 }
 
+// NOT a viewer-scoped reader: it checks project squads only. The /flights page uses visibleFlights
+// (./visible-flights) with a projectId; do not render this directly to a member.
 export async function loadProjectFlights(
   env: Env,
   context: ProjectWorkContext,

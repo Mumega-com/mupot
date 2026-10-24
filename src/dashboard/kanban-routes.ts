@@ -12,7 +12,7 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../types'
 import { requireAuth } from '../auth'
-import { redactUnreadableProjectNames } from '../projects/access'
+import { readableProjectIdSet, redactUnreadableProjectNames } from '../projects/access'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
@@ -22,8 +22,8 @@ export const kanbanApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContex
 interface KanbanTaskRow extends Task {
   squad_name?: string
   squad_slug?: string
-  project_name?: string
-  project_slug?: string
+  project_name?: string | null
+  project_slug?: string | null
   assignee_name?: string
   assignee_slug?: string
 }
@@ -87,6 +87,16 @@ export async function loadKanbanData(
       project = await env.DB.prepare('SELECT * FROM projects WHERE slug = ?1').bind(params.projectIdOrSlug).first<Project>()
     }
 
+    // A guessable slug/id must not return a project row the viewer cannot read (same answer as not-found).
+    if (project) {
+      let readable = false
+      try {
+        readable = (await readableProjectIdSet(env, auth, [project.id])).has(project.id)
+      } catch {
+        readable = false
+      }
+      if (!readable) project = null
+    }
     if (!project) {
       return { mode: 'project', project: null, lanes: [] }
     }

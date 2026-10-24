@@ -224,7 +224,6 @@ import {
   getReadableProject,
   loadProjectDetail,
   projectManageAccessContext,
-  loadProjectFlights,
   loadProjectParentOptions,
   loadProjectWorkContext,
   loadProjectsPage,
@@ -1594,9 +1593,8 @@ dashboardApp.get('/flights', async (c) => {
   }
   let result: { rows: FlightRow[]; scanLimited: boolean }
   try {
-    result = context
-      ? await loadProjectFlights(c.env, context)
-      : await visibleFlights(c.env, c.get('auth'))
+    const res = await visibleFlights(c.env, c.get('auth'), context ? { projectId: context.project.id } : {})
+    result = { rows: res.rows, scanLimited: res.scanLimited || res.more }
   } catch {
     // Fail closed: a visibility check that cannot run shows no flights, never unchecked ones.
     return c.html(shell(c.env, 'Flights', errorBody('Flights could not be loaded right now.')), 503)
