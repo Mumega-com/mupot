@@ -14,6 +14,7 @@ import { resolveCapabilities, hasCapability } from './capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from './token-lifecycle'
 import { authLookupOrNull } from './fail-closed'
 import { vipLaneEnabled } from '../members/vip-lane'
+import { withAuthTiming } from '../lib/server-timing'
 
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
@@ -50,7 +51,7 @@ export function bearerToken(header: string | undefined | null): string | null {
 export async function resolveMemberByToken(env: Env, raw: string | null): Promise<AgentIdentity | null> {
   // mupot#1281 — this copy sits under Hono's error handler, so its throw surfaced as a
   // clean 500 rather than a 1101. Same fault, different surface; guarded the same way.
-  return authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw))
+  return withAuthTiming(env, () => authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw)))
 }
 
 /** #2060 P1-c: the seat status rides the ONE token query (no second read that could fail open). VIP_LANE off = no join, no column read.
