@@ -12,7 +12,7 @@
 //   1. same-origin (Origin header must equal the request origin; a missing Origin is refused too);
 //   2. a REAL dashboard web session of an active human member (checkWebSession): a bearer / agent / OAuth caller has no
 //      web session and gets 403 before any argument is read;
-//   3. for CREATE only, a fresh session: re-authenticated within five minutes (the same rule as passkey enrolment,
+//   3. for CREATE only, a fresh session: re-authenticated within the step-up window (the same rule as passkey enrolment,
 //      shared through checkWebSession). Revoke needs only the real session: it reduces authority.
 // A passkey step-up for a dashboard action has no reusable helper today (secure moments are bound to approval
 // decisions), so the freshness rule is the bar, as the brief allows.
@@ -26,6 +26,7 @@ import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Env } from '../types'
 import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { RECENT_REAUTH_WINDOW_MINUTES } from '../auth/web-sessions'
 import {
   createDelegation,
   delegatedOperatorsEnabled,
@@ -196,7 +197,7 @@ async function createFormBody(env: Env, auth: AuthContext): Promise<Html> {
       <option value="lead">lead</option>
     </select>
     <button class="btn" id="op-create" style="margin-top:10px;">Make this agent an operator</button>
-    <p class="ui-sub" style="margin-top:6px;">Creating an operator needs a recent sign-in (within 5 minutes); you will be asked to confirm it is you if yours is older.</p>
+    <p class="ui-sub" style="margin-top:6px;">Creating an operator needs a recent sign-in (within ${RECENT_REAUTH_WINDOW_MINUTES} minutes); you will be asked to confirm it is you if yours is older.</p>
   `
 }
 

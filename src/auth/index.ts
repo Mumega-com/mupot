@@ -902,7 +902,7 @@ authApp.get('/callback', async (c) => {
 // provider for the CURRENT session, without minting a new one. This is the
 // primitive the elevation approval flow (Delivery Sequence step 3) will read
 // before admitting a sensitive-action approval ("recent reauthentication
-// within five minutes" — design doc, Approval Flow step 5). Requires an
+// within the step-up window" — design doc, Approval Flow step 5). Requires an
 // already-authenticated, D1-registered session: there is nothing to step up
 // for a session that was never bridged to a members row.
 authApp.get('/reauth', requireAuthMw(), async (c) => {
@@ -1088,7 +1088,7 @@ authApp.post('/telegram-link/confirm', async (c) => {
 
 
 // mupot#1022 — Linked sign-ins (src/auth/link-signin.ts). A SIGNED-IN member links another Google account to THIS member.
-//   POST /auth/link-signin/start        needs a live web session re-authenticated within five minutes (else it sends the
+//   POST /auth/link-signin/start        needs a live web session re-authenticated within the step-up window (RECENT_REAUTH_WINDOW_MS) (else it sends the
 //                                       member through /auth/reauth and back to /account). Writes a state bound to THAT
 //                                       session, behind the per-state browser cookie, and goes to Google.
 //   GET  /auth/callback                 (link-intent branch, finishLinkSignIn) the callback must arrive in the SAME session,
@@ -1100,16 +1100,18 @@ authApp.post('/telegram-link/confirm', async (c) => {
 // unauthenticated login, and never an identity named in a request.
 authApp.use('/link-signin/*', csrf())
 
-const GOOGLE_AUTH_MAX_AGE_SECONDS = 5 * 60
+// Max age of Google's auth_time at the callback. Sized for slow networks (the sign-in round trip must fit); the request itself
+// still sends max_age=0, so Google is always asked for a fresh sign-in and this only bounds the callback's arrival.
+export const GOOGLE_AUTH_MAX_AGE_SECONDS = 15 * 60
 // The link flow is several hops (start -> Google sign-in -> callback -> optional confirm page). Fresh re-auth is PROVEN
 // once, at /link-signin/start, and the proof (the session's recent_reauth_at) is carried in the server-side state. The
-// later hops do not demand a second five-minute session re-auth measured at THEIR clock: a slow Google sign-in or a slow
+// later hops do not demand a second step-up-window session re-auth measured at THEIR clock: a slow Google sign-in or a slow
 // page made that impossible to finish (re-auth -> link -> slow -> "confirm it is you again" -> re-auth ...). The proof is
-// still bounded: it may be at most one re-auth window (to start) plus one state lifetime (to finish) old.
-const LINK_PROOF_MAX_AGE_MS = RECENT_REAUTH_WINDOW_MS + STATE_TTL_SECONDS * 1000
+// still bounded: capped at the step-up window itself (NOT window + state lifetime, which would be 40 min), so a link can never complete on a proof a dashboard step-up action would already refuse.
+export const LINK_PROOF_MAX_AGE_MS = RECENT_REAUTH_WINDOW_MS // = min(window + state lifetime, window)
 
 /** The start-time proof carried to a later hop: unchanged-or-newer on the live session, and not older than the flow allows. */
-function linkProofHolds(proofAtMs: unknown, session: { recent_reauth_at: string | null }, nowMs: number = Date.now()): boolean {
+export function linkProofHolds(proofAtMs: unknown, session: { recent_reauth_at: string | null }, nowMs: number = Date.now()): boolean {
   if (typeof proofAtMs !== 'number' || !Number.isFinite(proofAtMs)) return false
   const current = session.recent_reauth_at ? Date.parse(session.recent_reauth_at) : Number.NaN
   if (!Number.isFinite(current) || current < proofAtMs) return false
@@ -1916,7 +1918,7 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
 // `actions`/`duration_minutes` may only NARROW the request (decideElevationRequest
 // enforces this — the route never widens what it forwards). Sensitive
 // actions (SENSITIVE_STEP_UP_ACTIONS) require the caller's web session to
-// have proven a fresh reauth within the last 5 minutes — same primitive
+// have proven a fresh reauth within the step-up window (RECENT_REAUTH_WINDOW_MS) — same primitive
 // GET /auth/reauth exists for.
 authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
   const auth = c.get('auth')

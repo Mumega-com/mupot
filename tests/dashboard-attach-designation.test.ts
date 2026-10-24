@@ -5,6 +5,7 @@
 //
 // Mutations proven (PR body): flag check removed; fresh:true flipped to false on Allow; checkWebSession removed; explicit
 // Origin check removed; the door call removed; the CAS `expect` dropped; designee column swapped to owner_member_id.
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
@@ -41,7 +42,7 @@ async function login(email: string, extra?: Record<string, string>): Promise<{ e
 }
 const setReauth = (memberId: string, at: string | null) => h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
 const fresh = () => new Date().toISOString()
-const stale = () => new Date(Date.now() - 10 * 60 * 1000).toISOString()
+const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()
 
 function post(env: Env, cookie: string, action: string, origin: string | null = ORIGIN, agent = 'ag1') {
   const headers: Record<string, string> = { cookie, 'content-type': 'application/x-www-form-urlencoded' }

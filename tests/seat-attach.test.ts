@@ -11,6 +11,7 @@
 // callerHoldsGateCapability, the attachable-set `canOnSquad admin`, the `seatBinding.attached` guard in seat_attach, the
 // secure-moment `proof.memberId !== adm.human_member_id` check and the dashboard's `moveIfAttached`/fresh guards.
 
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -1002,7 +1003,7 @@ describe('dashboard: Connections', () => {
     return dashboardApp.request(path, body === undefined && path.startsWith('/connections') && !path.includes('/attach') ? { headers: { cookie } } : { method: 'POST', headers, body: JSON.stringify(body ?? {}) }, e)
   }
   const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
-  const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString()) }
+  const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()) }
 
   it('GET lists the app, each thread with the agent it is acting as, and the attachable agents', async () => {
     const env = envFor(h)

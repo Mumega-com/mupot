@@ -3,6 +3,7 @@
 // MUTATIONS proven (see PR body): the owner scope (member_id) in changeSeatAdmission, the SEAT_TRANSITIONS table, the HELD floor list,
 // the boundAgentId floor lookup, the flag gate.
 
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join as pjoin } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -116,7 +117,7 @@ async function dash(e: Env, cookie: string, path: string, origin: string | null 
   return dashboardApp.request(path, { method: 'POST', headers, body: '{}' }, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'x' } as unknown as Env)
 }
 const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
-const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - 10 * 60 * 1000).toISOString()) }
+const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()) }
 const post = (cookie: string, seatId: string, action: string, e: Env = env): Promise<Response> => dash(e, cookie, `/connections/seats/${seatId}/${action}`)
 
 describe('transitions by the owner', () => {

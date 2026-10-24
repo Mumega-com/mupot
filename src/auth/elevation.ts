@@ -426,7 +426,7 @@ export interface DecideElevationInput {
    *  cached/stale set here. */
   decidedByCapabilities: CapabilityGrant[]
   decidedByWebSessionHash: string
-  /** Whether the approver's web session proved a fresh (<=5min) reauth
+  /** Whether the approver's web session proved a fresh (within RECENT_REAUTH_WINDOW_MS) reauth
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
   recentReauthOk: boolean

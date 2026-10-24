@@ -7,7 +7,7 @@
 //
 // Every POST: same-origin (Origin must equal the request origin), then a REAL dashboard web session of an active human
 // member (checkWebSession; an agent / bearer / OAuth caller has none). Actions that GRANT reach (attach, approve) need a
-// FRESH session (re-authenticated within five minutes, as /operators create does); actions that REDUCE it (detach, deny,
+// FRESH session (re-authenticated within the step-up window, as /operators create does); actions that REDUCE it (detach, deny,
 // revoke) need only the real session and keep working with the flag off.
 
 import { Hono } from 'hono'

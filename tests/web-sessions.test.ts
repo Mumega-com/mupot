@@ -311,6 +311,10 @@ describe('web-session registry (D1, real migration chain)', () => {
       .first<{ recent_reauth_at: string }>()
     expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + RECENT_REAUTH_WINDOW_MS)).toBe(true)
     expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + RECENT_REAUTH_WINDOW_MS + 1)).toBe(false)
+    // the window is pinned at 30 minutes: 29 min is fresh, 31 min is stale
+    expect(RECENT_REAUTH_WINDOW_MS).toBe(30 * 60 * 1000)
+    expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + 29 * 60 * 1000)).toBe(true)
+    expect(hasRecentReauth({ recent_reauth_at: row!.recent_reauth_at }, markedAt + 31 * 60 * 1000)).toBe(false)
   })
 
   it('loadLiveReauthIdentity requires BOTH the session and the identity to be live', async () => {

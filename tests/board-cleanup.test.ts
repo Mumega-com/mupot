@@ -4,6 +4,7 @@
 // Mutation (see PR body): removing the operator-only gate in the POST (the org-admin + not-agent check)
 // turns "a non-admin is refused" red.
 
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { Hono } from 'hono'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
@@ -49,7 +50,7 @@ function setReauth(memberId: string, at: string | null): void {
   harness.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
 }
 const freshNow = () => new Date().toISOString()
-const stale = () => new Date(Date.now() - 10 * 60 * 1000).toISOString()
+const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()
 
 function agentAuth(): AuthContext {
   return {

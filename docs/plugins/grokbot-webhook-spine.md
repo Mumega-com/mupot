@@ -65,7 +65,7 @@ Routine-fenced dispatch envelopes (`routineRunFence` on `sendAgentMessage`) do *
 ## Operator — register an agent (primary path: dashboard)
 
 1. In Grok Bot, create a webhook **routine** that peeks pot: `inbox({ peek: true })` **and** `task_list({ status: "open" })` (a task assignment may arrive without an inbox row). Every distinct message or assignment rings; only a repeat of the same event, or more than 6 wakes per agent per minute, is skipped, so keep a slow poll as the backstop. Copy its public HTTPS URL and choose the sender key.
-2. Open **Doorbells** in the dashboard (`/doorbells`) as an admin over the agent's squad (signed in within the last 5 minutes), pick the agent, paste the URL and the key, Save. The key is write-only: stored encrypted, shown as its last four characters.
+2. Open **Doorbells** in the dashboard (`/doorbells`) as an admin over the agent's squad (signed in within the last 30 minutes), pick the agent, paste the URL and the key, Save. The key is write-only: stored encrypted, shown as its last four characters.
 3. Press **Send test ping**: the pot POSTs `mupot.doorbell.test` and shows the HTTP status.
 4. **Remove** revokes it.
 

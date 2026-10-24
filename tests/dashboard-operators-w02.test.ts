@@ -6,6 +6,7 @@
 // cross-origin tests go red; (d) fresh:true flipped to false on create -> stale test red; fresh:false flipped to true on
 // revoke -> "revoke needs only a real session" goes red.
 
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { Hono } from 'hono'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
@@ -56,7 +57,7 @@ function setReauth(memberId: string, at: string | null): void {
 }
 
 const freshNow = () => new Date().toISOString()
-const stale = () => new Date(Date.now() - 10 * 60 * 1000).toISOString()
+const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()
 
 function post(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = ORIGIN) {
   const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }
@@ -159,7 +160,7 @@ describe('POST /operators/delegate', () => {
     expect(() => harness.sqlite.exec('DELETE FROM agent_operator_delegations')).toThrow(/never deleted/)
   })
 
-  it('refuses a stale session (re-authenticated more than five minutes ago, or never): reauth_required, no row', async () => {
+  it('refuses a stale session (re-authenticated beyond the step-up window, or never): reauth_required, no row', async () => {
     const { env, cookie } = await login('admin@x.test')
     for (const at of [stale(), null]) {
       setReauth('mem-admin', at)

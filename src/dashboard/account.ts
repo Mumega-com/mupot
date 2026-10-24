@@ -684,7 +684,7 @@ export function makeAccountApp(shell: ShellFn) {
   })
 
   // Change a phone's trusted-device window (W4.2, flag TELEGRAM_MINIAPP_PIN_WINDOW). LENGTHENING (or re-saving the same value) is
-  // an enrolment-grade change: a real web session re-authenticated within five minutes (checkEnrolmentSession, the ONE shared
+  // an enrolment-grade change: a real web session re-authenticated within the step-up window (checkEnrolmentSession, the ONE shared
   // rule). SHORTENING only reduces trust, so any real web session of the owner may do it (the revoke-device bar), with no
   // fresh re-auth: a stolen session cookie can only make the phone ask more often. The value must be a preset.
   app.post('/account/telegram-device/:id/window', async (c) => {
