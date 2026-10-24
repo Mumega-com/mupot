@@ -75,6 +75,8 @@ export default defineConfig({
         // This is the closest thing to production D1 available without live Cloudflare
         // credentials — same D1 implementation class Wrangler/Miniflare ship, not a shim.
         d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe', MUPOT_DB: 'mupot-db' },
+        // Real Miniflare KV for tests/composition/server-timing-entry.test.ts (timed KV wrappers over native bindings).
+        kvNamespaces: ['ST_SESSIONS', 'ST_OAUTH_KV'],
         bindings: { TEST_MIGRATIONS: migrations },
       },
     }),

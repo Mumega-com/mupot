@@ -1,4 +1,5 @@
 import type { Env } from '../types'
+import { unwrapBinding } from '../lib/server-timing'
 
 const routineSchemaReady = new WeakSet<object>()
 
@@ -8,7 +9,7 @@ const routineSchemaReady = new WeakSet<object>()
  * can roll out before D1 applies the Routine schema.
  */
 export async function routineTablesReady(env: Env): Promise<boolean> {
-  const database = env.DB as unknown as object
+  const database = unwrapBinding(env.DB as unknown as object) // raw DB identity (see projections.ts)
   if (routineSchemaReady.has(database)) return true
   const result = await env.DB.prepare(
     `SELECT COUNT(*) AS count

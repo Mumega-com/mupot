@@ -20,6 +20,7 @@ import type { Env } from './types'
 import { ROUTES } from './types'
 import { publicHealth } from './health'
 import { cliResponse } from './cli/serve'
+import { instrumentEnv, serverTimingAuthorized, withServerTiming } from './lib/server-timing'
 
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
@@ -295,7 +296,14 @@ const oauthProvider = new OAuthProvider<Env>({
 
   // All non-OAuth paths fall through to the root Hono app.
   defaultHandler: {
-    fetch: (req: Request, env: Env, ctx: ExecutionContext) => app.fetch(req, env, ctx),
+    fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+      // Operator-gated (SERVER_TIMING_KEY + matching x-server-timing-key; see src/lib/server-timing.ts). Never a plain flag.
+      // /api/* only; anything else takes the original path untouched.
+      if (!new URL(req.url).pathname.startsWith('/api/') || !serverTimingAuthorized(env, req)) return app.fetch(req, env, ctx)
+      const timed = instrumentEnv(env)
+      const res = await app.fetch(req, timed.env, ctx)
+      return withServerTiming(res, timed.timer)
+    },
   },
 
   // PKCE: S256 only (LOCK-OAuth-A parity with mumega).

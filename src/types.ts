@@ -372,6 +372,9 @@ export interface Env {
   // off) the probe still covers every OAuth context that reaches resolveSeatSession, rate-limited to one line per grant per
   // hour per isolate. `_meta` values are hashed only for the allowlisted keys in PROBE_META_HASH_ALLOW; other keys by name only.
   HARNESS_PROBE_VERBOSE?: string
+  // Secret (>= 24 chars). When set, a request presenting it in `x-server-timing-key` gets a Server-Timing header (phase names + ms only).
+  // Operator-gated by design; never replace with a plain flag (diagnostics would reopen the existence oracle). Unset = disabled.
+  SERVER_TIMING_KEY?: string
   // Workspaces W1: strict '1' turns on worktree_open / worktree_list and grant-keyed OAuth harnesses.
   // Anything else (including unset, the default) is a total no-op: no tool advertised, no read, no write.
   WORKSPACES?: string

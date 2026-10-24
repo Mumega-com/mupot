@@ -62,6 +62,7 @@ import {
   revokeElevationGrant,
 } from './elevation'
 import { ELEVATION_ACTIONS } from './elevation-actions'
+import { withAuthTiming } from '../lib/server-timing'
 import {
   PENDING_INVITE_COOKIE,
   decidePendingInviteLink,
@@ -2215,6 +2216,10 @@ function setSessionCookie(
  * Does not write a response — callers that must refuse use requireAuth.
  */
 async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | null> {
+  return withAuthTiming(c.env, () => loadAuthFromCookieInner(c))
+}
+
+async function loadAuthFromCookieInner(c: Context<AppEnv>): Promise<AuthContext | null> {
   const sessionId = getCookie(c, COOKIE_NAME)
   if (!sessionId) return null
   if (!c.env.SESSIONS) return null
