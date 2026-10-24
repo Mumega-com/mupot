@@ -256,6 +256,7 @@ import {
   submittedRoutineFormValues,
 } from './routines'
 import { loadNeedsYouDashboard, needsYouBody } from './needs-you'
+import { loadStatusView, statusBody } from './status-view'
 import { routinePrincipal } from '../routines/access'
 import {
   archiveRoutine,
@@ -1204,6 +1205,13 @@ dashboardApp.get('/needs-you', async (c) => {
   } catch {
     return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
   }
+})
+
+// GET /status — phone-readable board status (session auth; tenant + visibility scoped).
+dashboardApp.get('/status', async (c) => {
+  const view = await loadStatusView(c.env, c.get('auth'))
+  c.header('Cache-Control', 'private, no-store')
+  return c.html(shell(c.env, 'Status', statusBody(view)))
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -4906,6 +4914,11 @@ export function shell(
           <a class="nav-link" href="/send">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="5.5" cy="5.5" r="2"/><circle cx="5.5" cy="14.5" r="2"/><circle cx="14.5" cy="10" r="2"/><path d="M5.5 7.5v5M7.4 5.9 12.7 9.2M7.3 13.9 12.7 10.7"/></svg>
             <span class="nav-label">Work</span>
+          </a>
+
+          <a class="nav-link" href="/status">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4 5h12M4 10h12M4 15h8"/></svg>
+            <span class="nav-label">Status</span>
           </a>
 
           <a class="nav-link" href="/needs-you">
