@@ -2173,7 +2173,7 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
   const session = await checkWebSession(c.env, auth, { fresh: action === 'allow' })
   if (!session.ok) {
     return c.html(shell(c.env, 'Attach designation', session.error === 'reauth_required'
-      ? html`<div class="card"><p>Confirm it is you first. <a href="/auth/reauth">Confirm it is you</a>, then come back to this page and try again.</p></div>`
+      ? html`<div class="card"><p>Confirm it is you first. <a href="/auth/reauth?return=/agents/${encodeURIComponent(c.req.param('id'))}">Confirm it is you</a>, then come back to this page and try again.</p></div>`
       : errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
   }
   if (auth.boundAgentId || !isOrgAdmin(auth)) return deny(403, 'Only an org admin can change an attach designation.')

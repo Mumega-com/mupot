@@ -447,7 +447,7 @@ function decideScript(requestId: string): Html {
               setTimeout(function () { window.location.href = '/elevation'; }, 1200);
             } else if (data.reason === 'reauth_required') {
               status.innerHTML = 'Your identity check has expired — this includes a sensitive action. ' +
-                '<a href="/auth/reauth">Step up now</a>, then come back to this page and try again.';
+                '<a href="/auth/reauth?return=/elevation/${requestId}">Step up now</a>, then come back to this page and try again.';
               setBusy(false);
             } else {
               status.textContent = 'Could not decide: ' + (data.reason || data.error || res.status);
@@ -583,7 +583,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
           ${reauthOk
             ? html`Identity recently verified — you may approve the sensitive action(s) in this request.`
             : html`This request includes a sensitive action. Approving it needs a fresh identity check.
-                <a href="/auth/reauth">Step up now</a>, then return to this page.`}
+                <a href="/auth/reauth?return=/elevation/${encodeURIComponent(requestId)}">Step up now</a>, then return to this page.`}
         </div>`
       : ''}
 

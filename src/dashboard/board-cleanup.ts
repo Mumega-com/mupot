@@ -54,7 +54,7 @@ function resultsPanel(results: DecideRowResult[]): Html {
 
 function reauthNotice(): Html {
   return sectionPanel({
-    body: html`<p>Confirm it is you before archiving. <a class="ui-link" href="/auth/reauth">Confirm it is you first</a>, then come back to this page and try again.</p>`,
+    body: html`<p>Confirm it is you before archiving. <a class="ui-link" href="/auth/reauth?return=/board/cleanup">Confirm it is you first</a>, then come back to this page and try again.</p>`,
   })
 }
 

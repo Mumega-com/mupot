@@ -67,7 +67,7 @@ function connectionsScript(): Html {
           if (!status) return;
           status.textContent = '';
           rowNote('Confirm it is you first, then try again.');
-          var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first';
+          var a = document.createElement('a'); a.href = '/auth/reauth?return=/connections'; a.textContent = 'Confirm it is you first';
           status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.'));
         }
         async function post(url, body, confirmText) {

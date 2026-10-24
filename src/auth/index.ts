@@ -43,6 +43,7 @@ import {
   loadWebSession,
   loadWebSessionByHash,
   markRecentReauth,
+  RECENT_REAUTH_WINDOW_MS,
   revokeAllWebSessions,
   revokeWebSession,
   revokeWebSessionByHash,
@@ -749,12 +750,12 @@ authApp.get('/callback', async (c) => {
   // mupot#1022: POST /auth/link-signin/start encodes a link-intent into this same state value, bound to the session
   // that started it. Like the reauth marker it can only come from a state WE wrote (the state is server-side KV behind
   // a per-state browser cookie), and a link-intent state NEVER falls through to the login mint below.
-  let linkTarget: { webSessionIdHash: string; memberId: string } | null = null
+  let linkTarget: { webSessionIdHash: string; memberId: string; reauthProofAt: unknown } | null = null
   if (seen !== '1') {
     try {
-      const parsed = JSON.parse(seen) as { link_signin?: boolean; webSessionIdHash?: string; memberId?: string }
+      const parsed = JSON.parse(seen) as { link_signin?: boolean; webSessionIdHash?: string; memberId?: string; reauthProofAt?: unknown }
       if (parsed.link_signin === true && typeof parsed.webSessionIdHash === 'string' && typeof parsed.memberId === 'string') {
-        linkTarget = { webSessionIdHash: parsed.webSessionIdHash, memberId: parsed.memberId }
+        linkTarget = { webSessionIdHash: parsed.webSessionIdHash, memberId: parsed.memberId, reauthProofAt: parsed.reauthProofAt }
       }
     } catch {
       // Not a link-intent marker.
@@ -1099,6 +1100,20 @@ authApp.post('/telegram-link/confirm', async (c) => {
 authApp.use('/link-signin/*', csrf())
 
 const GOOGLE_AUTH_MAX_AGE_SECONDS = 5 * 60
+// The link flow is several hops (start -> Google sign-in -> callback -> optional confirm page). Fresh re-auth is PROVEN
+// once, at /link-signin/start, and the proof (the session's recent_reauth_at) is carried in the server-side state. The
+// later hops do not demand a second five-minute session re-auth measured at THEIR clock: a slow Google sign-in or a slow
+// page made that impossible to finish (re-auth -> link -> slow -> "confirm it is you again" -> re-auth ...). The proof is
+// still bounded: it may be at most one re-auth window (to start) plus one state lifetime (to finish) old.
+const LINK_PROOF_MAX_AGE_MS = RECENT_REAUTH_WINDOW_MS + STATE_TTL_SECONDS * 1000
+
+/** The start-time proof carried to a later hop: unchanged-or-newer on the live session, and not older than the flow allows. */
+function linkProofHolds(proofAtMs: unknown, session: { recent_reauth_at: string | null }, nowMs: number = Date.now()): boolean {
+  if (typeof proofAtMs !== 'number' || !Number.isFinite(proofAtMs)) return false
+  const current = session.recent_reauth_at ? Date.parse(session.recent_reauth_at) : Number.NaN
+  if (!Number.isFinite(current) || current < proofAtMs) return false
+  return nowMs - proofAtMs <= LINK_PROOF_MAX_AGE_MS
+}
 const LINK_MOVE_COOKIE = 'mupot_link_move'
 const LINK_MOVE_KV_PREFIX = 'linkmove:'
 const LINK_MOVE_CONFIRM_PATH = '/auth/link-signin/confirm'
@@ -1123,7 +1138,11 @@ authApp.post('/link-signin/start', async (c) => {
   const state = randomId(24)
   await env.SESSIONS.put(
     stateKey(state),
-    JSON.stringify({ link_signin: true, webSessionIdHash: session.session.id_hash, memberId: session.memberId, return: '/account' }),
+    JSON.stringify({
+      link_signin: true, webSessionIdHash: session.session.id_hash, memberId: session.memberId, return: '/account',
+      // fresh:true above guarantees recent_reauth_at is set and within the window.
+      reauthProofAt: Date.parse(session.session.recent_reauth_at ?? ''),
+    }),
     { expirationTtl: STATE_TTL_SECONDS },
   )
   const stateCookie = stateCookieName(state)
@@ -1153,7 +1172,7 @@ function linkMovePage(brand: string, inner: string): string {
 /** The link-intent branch of /auth/callback. Always returns a response; never mints a session. */
 async function finishLinkSignIn(
   c: Context<AppEnv>,
-  target: { webSessionIdHash: string; memberId: string },
+  target: { webSessionIdHash: string; memberId: string; reauthProofAt: unknown },
   subject: string,
   email: string | null,
   googleAuthTimeSec: number | null,
@@ -1166,8 +1185,10 @@ async function finishLinkSignIn(
   if (!auth || auth.webSessionIdHash !== target.webSessionIdHash || auth.memberId !== target.memberId) {
     return c.json({ error: 'link_session_mismatch' }, 403)
   }
-  const session = await checkWebSession(env, auth, { fresh: true })
+  // Live human web session (not revoked, member active) now; freshness is the proof carried from /link-signin/start.
+  const session = await checkWebSession(env, auth, { fresh: false })
   if (!session.ok) return linkSigninRedirect(c, 'reauth_required')
+  if (!linkProofHolds(target.reauthProofAt, session.session)) return linkSigninRedirect(c, 'reauth_required')
   // The link flow forces a fresh Google sign-in (prompt=login, max_age=0). When Google says when the user last authenticated,
   // a stale auth_time means a still-logged-in Google account was picked, not proven: refuse.
   if (googleAuthTimeSec !== null && Date.now() / 1000 - googleAuthTimeSec > GOOGLE_AUTH_MAX_AGE_SECONDS) {
@@ -1186,6 +1207,7 @@ async function finishLinkSignIn(
         email,
         identityId: plan.duplicate.identityId,
         oldMemberId: plan.duplicate.memberId,
+        reauthProofAt: target.reauthProofAt,
       }),
       { expirationTtl: STATE_TTL_SECONDS },
     )
@@ -1217,7 +1239,7 @@ authApp.post('/link-signin/confirm', async (c) => {
   // Single use: consumed before it is honoured.
   await env.SESSIONS.delete(`${LINK_MOVE_KV_PREFIX}${nonce}`)
   deleteCookie(c, LINK_MOVE_COOKIE, { path: authBasePath(env, c.req.raw) })
-  let pending: { webSessionIdHash?: unknown; memberId?: unknown; subject?: unknown; email?: unknown; identityId?: unknown; oldMemberId?: unknown }
+  let pending: { webSessionIdHash?: unknown; memberId?: unknown; subject?: unknown; email?: unknown; identityId?: unknown; oldMemberId?: unknown; reauthProofAt?: unknown }
   try {
     pending = JSON.parse(raw) as typeof pending // as: shape-checked field by field below
   } catch {
@@ -1231,8 +1253,9 @@ authApp.post('/link-signin/confirm', async (c) => {
   if (auth.webSessionIdHash !== pending.webSessionIdHash || auth.memberId !== pending.memberId) {
     return c.json({ error: 'link_session_mismatch' }, 403)
   }
-  const session = await checkWebSession(env, auth, { fresh: true })
+  const session = await checkWebSession(env, auth, { fresh: false })
   if (!session.ok) return linkSigninRedirect(c, 'reauth_required')
+  if (!linkProofHolds(pending.reauthProofAt, session.session)) return linkSigninRedirect(c, 'reauth_required')
   const result = await linkSignIn(
     env, auth,
     { provider: 'google', subject: pending.subject, verifiedEmail: pending.email },
