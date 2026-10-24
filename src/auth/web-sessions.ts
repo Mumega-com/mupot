@@ -91,6 +91,21 @@ export interface CreateWebSessionInput {
   tenant: string
   memberId: string
   loginIdentityId: string
+  /**
+   * TRUE = the insert holds only while this login identity is STILL live (same tenant, same member, not revoked) AT THE INSERT, in the
+   * same statement. A caller that checked liveness earlier (the identity can be revoked, and its sessions swept, between that check
+   * and this insert) would otherwise mint a live session on a dead identity: the sweep already ran and never sees it. Throws
+   * LoginIdentityNotLiveError when nothing was written. Off by default: the sign-in flows create the identity in the same request.
+   */
+  requireLiveIdentity?: boolean
+}
+
+/** The login identity was revoked (or never existed for this member) by the time the session would have been written. Nothing was written. */
+export class LoginIdentityNotLiveError extends Error {
+  constructor() {
+    super('login_identity_not_live')
+    this.name = 'LoginIdentityNotLiveError'
+  }
 }
 
 /**
@@ -111,14 +126,29 @@ export async function createWebSession(
   const idleExpiresAt = new Date(nowMs + IDLE_TIMEOUT_MS).toISOString()
   const absoluteExpiresAt = new Date(nowMs + ABSOLUTE_TTL_MS).toISOString()
 
-  await env.DB.prepare(
-    `INSERT INTO web_sessions
-       (id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at,
-        idle_expires_at, absolute_expires_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)`,
-  )
-    .bind(idHash, input.tenant, input.memberId, input.loginIdentityId, nowIso, idleExpiresAt, absoluteExpiresAt)
-    .run()
+  if (input.requireLiveIdentity === true) {
+    // ONE conditional statement: the row exists only if the identity is live in the very write. changes === 1 is the proof.
+    const written = await env.DB.prepare(
+      `INSERT INTO web_sessions
+         (id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at,
+          idle_expires_at, absolute_expires_at)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7
+        WHERE EXISTS (SELECT 1 FROM human_login_identities
+                       WHERE id = ?4 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL)`,
+    )
+      .bind(idHash, input.tenant, input.memberId, input.loginIdentityId, nowIso, idleExpiresAt, absoluteExpiresAt)
+      .run()
+    if (Number(written.meta?.changes ?? 0) !== 1) throw new LoginIdentityNotLiveError()
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO web_sessions
+         (id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at,
+          idle_expires_at, absolute_expires_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)`,
+    )
+      .bind(idHash, input.tenant, input.memberId, input.loginIdentityId, nowIso, idleExpiresAt, absoluteExpiresAt)
+      .run()
+  }
 
   return {
     id_hash: idHash,

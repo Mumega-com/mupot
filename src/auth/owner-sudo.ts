@@ -227,6 +227,10 @@ export const SUDO_GRANT_ENDED: SudoRefusal = {
   error: 'sudo_grant_ended',
   detail: { remedy: 'the approval ended (expired, revoked or renewed) before this call could start; nothing ran. Ask your human for a new approval with request_elevation' },
 }
+/** The claim could not be released after the call was refused (or its audit receipt failed). It stays 'pending', and a retry reads it as
+ *  spent ('sudo_already_used'): say so now, so the human and the agent are not left guessing. */
+export const SUDO_CLAIM_RELEASE_REMEDY = 'the call did not run, but its one-time approval could not be released and now reads as used (a retry will say sudo_already_used). Ask your human for a new approval with request_elevation, and tell the operator'
+export const SUDO_CLAIM_RELEASE_FAILED: SudoRefusal = { status: 500, error: 'sudo_claim_release_failed', detail: { remedy: SUDO_CLAIM_RELEASE_REMEDY } }
 export const SUDO_RECEIPT_FAILED: SudoRefusal = {
   status: 500,
   error: 'sudo_receipt_failed',
@@ -265,8 +269,9 @@ export async function claimOwnerSudo(env: Env, pending: OwnerSudoPending, nowMs:
   try {
     await writeSudoAudit(env, claim, `owner_sudo:${pending.tool}`, { phase: 'authorized', args_sha256: pending.detail.args_sha256 ?? null })
   } catch {
-    await finishElevationReceipt(env, usageId, { status: 'failed', errorCode: 'receipt_failed' }).catch(() => undefined)
-    return { ok: false, refusal: SUDO_RECEIPT_FAILED }
+    // Release the claim so the one call is not lost; if THAT fails too, the approval is stuck 'pending' and must be reported as such.
+    const released = await finishElevationReceipt(env, usageId, { status: 'failed', errorCode: 'receipt_failed' }).then(() => true, () => false)
+    return { ok: false, refusal: released ? SUDO_RECEIPT_FAILED : SUDO_CLAIM_RELEASE_FAILED }
   }
   return { ok: true, claim }
 }
@@ -284,11 +289,17 @@ async function writeSudoAudit(env: Env, claim: OwnerSudoClaim, operation: string
   ).run()
 }
 
-/** Close the claim and write the outcome receipt (agent = executor, human = authority). A refused tool frees the claim. Never throws. */
-export async function finishOwnerSudo(env: Env, claim: OwnerSudoClaim, outcome: { ok: true } | { ok: false; status: number; error: string }): Promise<void> {
-  await finishElevationReceipt(env, claim.usageId, outcome.ok ? { status: 'applied' } : { status: 'failed', errorCode: outcome.error.slice(0, 120) }).catch(() => undefined)
+/**
+ * Close the claim and write the outcome receipt (agent = executor, human = authority). A refused tool frees the claim.
+ * Never throws. Returns `released: false` when the claim could not be closed: for a REFUSED tool that leaves the one-time approval stuck
+ * 'pending' (a retry would read sudo_already_used), so the caller must surface it (#2106). For a tool that ran, a claim left pending is
+ * the safe direction (the approval is treated as spent) and `released` is informational.
+ */
+export async function finishOwnerSudo(env: Env, claim: OwnerSudoClaim, outcome: { ok: true } | { ok: false; status: number; error: string }): Promise<{ released: boolean }> {
+  const released = await finishElevationReceipt(env, claim.usageId, outcome.ok ? { status: 'applied' } : { status: 'failed', errorCode: outcome.error.slice(0, 120) }).then(() => true, () => false)
   // Spent: the approval ends now, visibly (revoked, not merely un-claimable), and a fresh approval for the same act can be written.
   // By GENERATION: it can only end the approval this call used, never a later approval that renewed the same grant row.
   if (outcome.ok) await revokeElevationGrant(env, env.TENANT_SLUG, claim.grant.id, 'owner_sudo_spent', Date.now(), claim.grant.created_at).catch(() => undefined)
   await writeSudoAudit(env, claim, `owner_sudo_result:${claim.tool}`, { ok: outcome.ok, ...(outcome.ok ? {} : { status: outcome.status, error: outcome.error }) }).catch(() => undefined)
+  return { released }
 }

@@ -650,3 +650,140 @@ describe('/murevoke and expiry end an approval', () => {
     expect((await activeElevations()).some((x) => x.live)).toBe(false)
   })
 })
+
+// ── #2106: post-merge review of #2098 (P1 revoked-identity race + P2s) ──────────────────────────────────────────────────────
+/** An env whose DB runs `hook` ONCE, right before the first prepared statement matching `re` is handed back: a race injected at that exact point. */
+function envWithRaceBefore(re: RegExp, hook: () => void): { env: Env; fired: () => boolean } {
+  let fired = false
+  const db = new Proxy(harness.db, {
+    get(target, prop, receiver) {
+      if (prop === 'prepare') {
+        return (sql: string) => {
+          if (!fired && re.test(sql)) { fired = true; hook() }
+          return target.prepare(sql)
+        }
+      }
+      const value: unknown = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value // bound: D1Database methods need the real receiver
+    },
+  })
+  return { env: { ...env, DB: db } as Env, fired: () => fired }
+}
+/** What src/auth/login-identity.ts does when a member's login identity is revoked: the identity first, then the sweep of its sessions. */
+const revokeOwnerIdentityAndSweep = (): void => {
+  harness.sqlite.exec("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = 'hli-owner'")
+  harness.sqlite.exec("UPDATE web_sessions SET revoked_at = datetime('now'), revoke_reason = 'identity_revoked' WHERE login_identity_id = 'hli-owner' AND revoked_at IS NULL")
+}
+const liveSessionsOnOwnerIdentity = (): number => count('web_sessions', "login_identity_id = 'hli-owner' AND revoked_at IS NULL")
+
+describe('#2106 P1: the identity check and the decision write are atomic (a revoke in between lands no decision)', () => {
+  it('identity revoked (and its sessions swept) between the liveness check and the session insert: no session, no decision, no grant', async () => {
+    const f = await file()
+    const raced = envWithRaceBefore(/INSERT INTO web_sessions/, revokeOwnerIdentityAndSweep)
+    const r = await handleApprovalBotUpdate(raced.env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect(raced.fired()).toBe(true)
+    expect(r.kind).toBe('refused')
+    expect(status(f.requestId)).toMatchObject({ status: 'pending', decided_by_member_id: null })
+    expect(grants(f.requestId)).toBe(0)
+    expect(liveSessionsOnOwnerIdentity()).toBe(0)
+    expect(count('mutation_audit_entries', "operation = 'elevation_approve'")).toBe(0)
+  })
+  it('the same race on a DENY lands no decision either', async () => {
+    const f = await file()
+    const raced = envWithRaceBefore(/INSERT INTO web_sessions/, revokeOwnerIdentityAndSweep)
+    expect((await handleApprovalBotUpdate(raced.env, cmdUpdate(`/mudeny ${f.shortId}`, { from: TG.owner }))).kind).toBe('refused')
+    expect(status(f.requestId)).toMatchObject({ status: 'pending', decided_by_member_id: null })
+  })
+  it('identity revoked (and swept) AFTER the session was minted but BEFORE the decision write: the decision row does not land', async () => {
+    const f = await file()
+    const raced = envWithRaceBefore(/UPDATE elevation_requests\s+SET status = 'approved'/, revokeOwnerIdentityAndSweep)
+    const r = await handleApprovalBotUpdate(raced.env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect(raced.fired()).toBe(true)
+    expect(['refused', 'closed']).toContain(r.kind)
+    expect(status(f.requestId)).toMatchObject({ status: 'pending', decided_by_member_id: null })
+    expect(grants(f.requestId)).toBe(0)
+    expect(liveSessionsOnOwnerIdentity()).toBe(0)
+  })
+  it('the refused member is told to sign in again, and a later attempt on a live identity still works', async () => {
+    const f = await file()
+    const raced = envWithRaceBefore(/INSERT INTO web_sessions/, revokeOwnerIdentityAndSweep)
+    calls.length = 0
+    await handleApprovalBotUpdate(raced.env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('Sign in')
+    harness.sqlite.exec("UPDATE human_login_identities SET revoked_at = NULL WHERE id = 'hli-owner'")
+    expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).toBe('approved')
+  })
+})
+
+describe('#2106 P2: legacy owners and admins are offered requests they can decide', () => {
+  it('mayDecideElevation reads the member\'s capability rows when auth carries none (a verified legacy owner with an exact home-squad admin row)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('home-owner', 'dept', 'home-owner', 'Owner home', 'home');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-home', 'mem-owner', 'squad', 'home-owner', 'admin');
+    `)
+    const f = await file()
+    const { loadElevationRequestById } = await import('../src/auth/elevation')
+    const { buildAuth } = await import('../src/access/identity')
+    const { mayDecideElevation } = await import('../src/access/decision-core')
+    const req = await loadElevationRequestById(env, TENANT, f.requestId)
+    const onHome = { ...req!, requested_scope_type: 'squad' as const, requested_scope_id: 'home-owner' }
+    const ownerAuth = await buildAuth(env, 'mem-owner', undefined, { verifiedRole: true })
+    expect(ownerAuth.capabilities).toBeUndefined() // the premise: a verified legacy owner carries no rows in auth
+    expect(await mayDecideElevation(env, ownerAuth, onHome)).toBe(true)
+    const plainAuth = await buildAuth(env, 'mem-plain', undefined, { verifiedRole: true })
+    expect(await mayDecideElevation(env, plainAuth, onHome)).toBe(false) // no row on that home: still no
+  })
+})
+
+describe('#2106 P2: /murevoke replay marker is atomic with the sweep; unexpected failures are retryable', () => {
+  const failRevokeMarker = (): void => harness.sqlite.exec("CREATE TRIGGER no_revoke_marker BEFORE INSERT ON mutation_audit_entries WHEN NEW.operation = 'elevation_revoke' BEGIN SELECT RAISE(ABORT, 'audit down'); END")
+  it('if the replay marker cannot be written the sweep does not happen either (both or neither)', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    failRevokeMarker()
+    await expect(handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.owner }))).rejects.toThrow()
+    expect((await activeElevations()).some((g) => g.live)).toBe(true)
+    harness.sqlite.exec('DROP TRIGGER no_revoke_marker')
+    expect((await handleApprovalBotUpdate(env, cmdUpdate('/murevoke', { from: TG.owner }))).kind).toBe('revoked') // the retry then does it
+    expect((await activeElevations()).some((g) => g.live)).toBe(false)
+  })
+  it('a REPLAYED update revokes nothing new, even for a grant approved after the first run; the answer repeats the first count', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    const revokeUpdate = cmdUpdate('/murevoke', { from: TG.owner })
+    expect((await handleApprovalBotUpdate(env, revokeUpdate)).kind).toBe('revoked')
+    const g = await file({ actions: ['action:routine_policy'], reason: 'later' })
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${g.shortId}`, { from: TG.owner }))
+    calls.length = 0
+    expect((await handleApprovalBotUpdate(env, revokeUpdate)).kind).toBe('revoked') // Telegram redelivers the same update_id
+    expect((await activeElevations()).filter((x) => x.live).map((x) => x.action)).toEqual(['action:routine_policy'])
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('Revoked 1 live approval')
+  })
+  it('two deliveries of one update racing: the one that loses the marker sweeps NOTHING (the sweep is conditional on its own marker)', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    const revokeUpdate = cmdUpdate('/murevoke', { from: TG.owner })
+    const key = `approval-bot-revoke:${revokeUpdate.update_id}:mem-owner`
+    // The other delivery writes its marker (and, in this scenario, has already swept) after our precheck but before our batch.
+    const raced = envWithRaceBefore(/INSERT INTO mutation_audit_entries/, () => {
+      harness.sqlite.prepare(`INSERT INTO mutation_audit_entries (id, tenant, principal_kind, principal_id, member_id, origin, handler, operation, target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
+        VALUES (?, ?, 'member', 'mem-owner', 'mem-owner', 'admin_ui', 'approval_bot', 'elevation_revoke', 'member', 'mem-owner', ?, ?, '{"grants_revoked":0}', datetime('now'))`).run(crypto.randomUUID(), TENANT, key, key)
+    })
+    calls.length = 0
+    expect((await handleApprovalBotUpdate(raced.env, revokeUpdate)).kind).toBe('revoked')
+    expect(raced.fired()).toBe(true)
+    expect((await activeElevations()).some((g) => g.live)).toBe(true) // our grant was NOT swept by the loser
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('Nothing to revoke') // it answered from the winner's receipt
+  })
+  it('webhook: an unexpected processing failure is a retryable 503; a handled refusal stays 200', async () => {
+    const f = await file()
+    await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))
+    failRevokeMarker()
+    const failed = await post(WEBHOOK_SECRET, cmdUpdate('/murevoke', { from: TG.owner }))
+    expect(failed.status).toBe(503)
+    expect((await activeElevations()).some((g) => g.live)).toBe(true)
+    const refused = await post(WEBHOOK_SECRET, cmdUpdate('/muapprove abcd2345', { from: TG.stranger }))
+    expect(refused.status).toBe(200)
+    expect(await refused.json()).toMatchObject({ ok: true, result: 'refused' })
+  })
+})

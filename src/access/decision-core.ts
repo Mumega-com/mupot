@@ -218,8 +218,13 @@ export function elevationIsLive(req: ElevationRequestRecord, nowMs: number): boo
 
 /** Does this member hold the authority to decide THIS request (scope-local, the existing predicate). */
 export async function mayDecideElevation(env: Env, auth: AuthContext, req: ElevationRequestRecord): Promise<boolean> {
+  // A verified legacy owner/admin is built WITHOUT capability rows (assigning rows to a role-only owner would downgrade them), but an
+  // exact squad row they ALSO hold (the only authority on a member's HOME squad) must still count: read the rows here, exactly as the
+  // decision itself does below (decideElevation resolves them the same way when auth carries none). #2106.
+  const memberId = deciderMemberIdOf(auth)
+  const capabilities = auth.capabilities ?? (memberId ? await resolveCapabilities(env, memberId) : undefined)
   // canDecideElevationRequest = the scope predicate PLUS "a request from an attached chat is decided by the human who attached it".
-  return canDecideElevationRequest(env, auth, auth.capabilities, req, deciderMemberIdOf(auth))
+  return canDecideElevationRequest(env, auth, capabilities, req, memberId)
 }
 
 export async function elevationViewInner(env: Env, req: ElevationRequestRecord): Promise<string> {
@@ -318,6 +323,9 @@ export async function decideElevation(
     decidedByCapabilities: caps,
     decidedByIsOrgAdmin: admin,
     decidedByWebSessionHash: webSessionHash,
+    // The decision row is written only while this session AND its login identity are still live, checked in the write itself (#2106).
+    // (The pre-gate refusal pass below never writes, so the flag is inert there.)
+    requireLiveApproverSession: true,
     // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up. The approval bot
     // is the one exception: a tap is NOT a fresh reauth in general, so it satisfies the step-up only for BOT_STEP_UP_ACTIONS.
     recentReauthOk: proof.via === 'approval_bot' ? input.selectedActions.every((a) => BOT_STEP_UP_ACTIONS.includes(a)) : true,
