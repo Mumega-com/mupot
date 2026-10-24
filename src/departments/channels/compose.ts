@@ -68,6 +68,27 @@ export class ChannelComposeError extends Error {
 // Mirrors the depth of deepFreezeClone in registry.ts, applied to channels.
 // Returns the same array reference (mutated to frozen in place, then frozen).
 
+// Read every enumerable-or-not member reachable on the prototype chain so lazily
+// defined members (Zod >= 4.6) become own properties before the object is frozen.
+function materializeLazyMembers(obj: Record<string, unknown>): void {
+  const seen = new Set<string>()
+  for (
+    let proto: object | null = Object.getPrototypeOf(obj);
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key === 'constructor' || seen.has(key)) continue
+      seen.add(key)
+      try {
+        void obj[key]
+      } catch {
+        // A getter that cannot resolve eagerly is left lazy; it was not freezable-safe before either.
+      }
+    }
+  }
+}
+
 export function deepFreezeChannels(channels: ChannelDescriptor[]): readonly ChannelDescriptor[] {
   for (const ch of channels) {
     // Freeze each MetricDescriptor and its nested arrays.
@@ -125,8 +146,13 @@ export function deepFreezeChannels(channels: ChannelDescriptor[]): readonly Chan
     // internals) — this freeze is belt-and-suspenders defense so no future code
     // path can derive authority from a mutated schema._def.
     if (ch.configSchema !== undefined && ch.configSchema !== null && typeof ch.configSchema === 'object') {
-      Object.freeze(ch.configSchema)
       const schemaAsRecord = ch.configSchema as Record<string, unknown>
+      // Zod >= 4.6 materialises prototype members (parse, safeParse, shape, ...) as own
+      // properties on first read. Freezing first makes that later write throw
+      // "Cannot define property ..., object is not extensible", breaking every parse.
+      // Read every prototype-chain member once BEFORE freezing so they are all own data.
+      materializeLazyMembers(schemaAsRecord)
+      Object.freeze(ch.configSchema)
 
       // Freeze the `.shape` getter result if present (Zod ZodObject shape map).
       if (
