@@ -2,6 +2,8 @@
 // links another Google account to THIS member; a duplicate member's identity moves only on confirm; nothing links on an
 // email match or an unauthenticated login.
 
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
+import { GOOGLE_AUTH_MAX_AGE_SECONDS, LINK_PROOF_MAX_AGE_MS, linkProofHolds } from '../src/auth/index'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
@@ -216,7 +218,7 @@ describe('#1022 linked sign-ins', () => {
   // ── 3. freshness ───────────────────────────────────────────────────────────────────────────────
   it('a stale session cannot start a link: it is sent to re-authenticate first, and no state is written', async () => {
     const jar = await signIn('sub-main', 'main@example.test')
-    freshen('mem-main', 10 * 60 * 1000)
+    freshen('mem-main', RECENT_REAUTH_WINDOW_MS + 60 * 1000)
     const before = sessions.store.size
     const { res, state } = await startLink(jar)
     expect(state).toBeNull()
@@ -227,7 +229,7 @@ describe('#1022 linked sign-ins', () => {
   it('a session that went stale between start and callback links nothing', async () => {
     const jar = await mainSession()
     const { state } = await startLink(jar)
-    freshen('mem-main', 10 * 60 * 1000)
+    freshen('mem-main', RECENT_REAUTH_WINDOW_MS + 60 * 1000)
     const cb = await completeLink(jar, state!, 'sub-new')
     expect(cb.headers.get('location')).toBe('/account?signin=reauth_required')
     expect(identity('sub-new')).toBeUndefined()
@@ -258,21 +260,41 @@ describe('#1022 linked sign-ins', () => {
       expect(identity('sub-new')?.member_id).toBe('mem-main')
     })
 
-    it('a NEW start is still refused when the re-auth is older than five minutes (old sessions gain nothing)', async () => {
+    it('a NEW start is still refused when the re-auth is older than the step-up window (old sessions gain nothing)', async () => {
       const jar = await mainSession()
-      advance(6 * MIN)
+      advance(RECENT_REAUTH_WINDOW_MS + MIN)
       const { res, state } = await startLink(jar)
       expect(state).toBeNull()
       expect(res.headers.get('location')).toBe('/auth/reauth?return=/account')
     })
 
-    it('the start-time proof is capped: a callback more than re-auth window + state lifetime after the re-auth links nothing', async () => {
+    it('the start-time proof is capped: a callback more than one step-up window after the re-auth links nothing', async () => {
       const jar = await mainSession()
       const { state } = await startLink(jar)
-      advance(16 * MIN)
+      advance(RECENT_REAUTH_WINDOW_MS + MIN)
       const cb = await completeLink(jar, state!, 'sub-new', 'other@gmail.test')
       expect(cb.headers.get('location')).toBe('/account?signin=reauth_required')
       expect(identity('sub-new')).toBeUndefined()
+    })
+
+    it('boundary: a callback 29 min after the start-time re-auth links; 31 min does not (cap = step-up window)', async () => {
+      const jar = await mainSession()
+      const a = await startLink(jar)
+      advance(29 * MIN)
+      expect((await completeLink(jar, a.state!, 'sub-new', 'other@gmail.test')).headers.get('location')).toBe('/account?signin=linked')
+      const jar2 = await mainSession()
+      const b = await startLink(jar2)
+      advance(31 * MIN)
+      expect((await completeLink(jar2, b.state!, 'sub-new2', 'other2@gmail.test')).headers.get('location')).toBe('/account?signin=reauth_required')
+    })
+
+    it('pins the link proof cap: 30 min, not window + state lifetime (40 min)', () => {
+      expect(LINK_PROOF_MAX_AGE_MS).toBe(30 * 60 * 1000)
+      const t0 = 1_000_000_000_000
+      const session = { recent_reauth_at: new Date(t0).toISOString() }
+      expect(linkProofHolds(t0, session, t0 + 30 * 60 * 1000)).toBe(true)
+      expect(linkProofHolds(t0, session, t0 + 30 * 60 * 1000 + 1)).toBe(false)
+      expect(linkProofHolds(t0, session, t0 + 35 * 60 * 1000)).toBe(false)
     })
 
     it('a link state without the start-time proof (or with a non-number one) links nothing', async () => {
@@ -313,7 +335,7 @@ describe('#1022 linked sign-ins', () => {
 
     it('the move confirm refuses once the proof is older than the cap, and with no proof on the nonce record', async () => {
       const late = await reachMoveConfirm()
-      advance(16 * MIN)
+      advance(RECENT_REAUTH_WINDOW_MS + MIN)
       expect((await post(late.jar, '/auth/link-signin/confirm')).headers.get('location')).toBe('/account?signin=reauth_required')
       expect(identity('sub-dup')?.member_id).toBe('mem-dup')
       const bare = await reachMoveConfirm()
@@ -656,11 +678,25 @@ describe('#1022 linked sign-ins', () => {
     expect(ok.headers.get('location')).toBe('/account?signin=linked')
   })
 
+  it('Google auth_time boundary: 14 min old is accepted, 16 min old is refused (cap pinned at 15 min)', async () => {
+    expect(GOOGLE_AUTH_MAX_AGE_SECONDS).toBe(15 * 60)
+    const jar = await mainSession()
+    const first = await startLink(jar)
+    googleAuthTime = Math.floor(Date.now() / 1000) - 16 * 60
+    const stale = await completeLink(jar, first.state!, 'sub-new', 'other@gmail.test')
+    expect(stale.headers.get('location')).toBe('/account?signin=stale_google_signin')
+    expect(identity('sub-new')).toBeUndefined()
+    const second = await startLink(jar)
+    googleAuthTime = Math.floor(Date.now() / 1000) - 14 * 60
+    const ok = await completeLink(jar, second.state!, 'sub-new', 'other@gmail.test')
+    expect(ok.headers.get('location')).toBe('/account?signin=linked')
+  })
+
   it('redirects and form targets survive the /t/<slug> prefix choke point (#1975)', async () => {
     const { applyTenantPrefix } = await import('../src/platform/tenant-path')
     const prefix = '/t/local'
     const stale = await signIn('sub-main', 'main@example.test')
-    freshen('mem-main', 10 * 60 * 1000)
+    freshen('mem-main', RECENT_REAUTH_WINDOW_MS + 60 * 1000)
     const reauth = await applyTenantPrefix((await startLink(stale)).res, prefix)
     expect(reauth.headers.get('location')).toBe('/t/local/auth/reauth?return=/account')
     const jar = await mainSession()

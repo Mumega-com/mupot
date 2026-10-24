@@ -1,5 +1,6 @@
 // tests/dashboard-doorbells.test.ts — the human "Doorbells" dashboard page (src/dashboard/doorbells.ts): set / clear /
 // test ping through the REAL dashboardApp, real web sessions and the real migration chain. The key is write-only.
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
@@ -45,7 +46,7 @@ async function login(email: string): Promise<{ env: Env; cookie: string }> {
 const setReauth = (memberId: string, at: string | null) =>
   harness.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
 const freshNow = () => new Date().toISOString()
-const stale = () => new Date(Date.now() - 10 * 60 * 1000).toISOString()
+const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()
 
 function post(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = ORIGIN) {
   const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }

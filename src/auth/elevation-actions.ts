@@ -312,7 +312,7 @@ export function isValidElevationDuration(minutes: number): minutes is ElevationD
 }
 
 /** Actions requiring the approving human's web session to have proven a
- *  fresh (≤5min) reauthentication round-trip before the approval is
+ *  fresh (within RECENT_REAUTH_WINDOW_MS) reauthentication round-trip before the approval is
  *  admitted — design doc Approval Flow step 5. */
 export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:manage_access',

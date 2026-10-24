@@ -29,7 +29,8 @@ import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 export const IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000 // 24h inactivity
 export const ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1000 // 7d hard maximum
 export const LAST_SEEN_COALESCE_MS = 5 * 60 * 1000 // write last_seen_at at most every 5 min
-export const RECENT_REAUTH_WINDOW_MS = 5 * 60 * 1000 // step-up freshness window
+export const RECENT_REAUTH_WINDOW_MINUTES = 30
+export const RECENT_REAUTH_WINDOW_MS = RECENT_REAUTH_WINDOW_MINUTES * 60 * 1000 // step-up freshness window
 
 // ── shape ─────────────────────────────────────────────────────────────────────
 

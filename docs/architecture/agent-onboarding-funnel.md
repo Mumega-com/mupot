@@ -84,7 +84,7 @@ Two shapes, no onboarding doc for either in one place.
 
 1. Agent exists with a credential (door b step 1 first).
 2. Bot author builds a routine that peeks `inbox { peek: true }` and `task_list { status: "open" }` (doc, "Operator" step 1).
-3. A human admin registers URL + key at `/doorbells` (fresh session within 5 minutes). A human cannot do it over a bearer: `dashboard_only` (`src/mcp/webhook-doorbell.ts:89`); an agent-bound caller may set its own, but an attached chat may not (line 53).
+3. A human admin registers URL + key at `/doorbells` (fresh session within 30 minutes). A human cannot do it over a bearer: `dashboard_only` (`src/mcp/webhook-doorbell.ts:89`); an agent-bound caller may set its own, but an attached chat may not (line 53).
 4. "Send test ping" shows the HTTP status. Wake bodies carry ids only.
 5. Flag off: `webhook_doorbell_disabled` with detail "set WEBHOOK_DOORBELL=1 to enable" (line 117). That text addresses the *operator*; the agent that hits it is told to change server config it cannot touch, with no human named.
 

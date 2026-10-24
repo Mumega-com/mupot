@@ -2163,7 +2163,7 @@ function agentDesignationControl(agent: Agent, view: NonNullable<AgentOwnerView[
 }
 
 // POST /agents/:id/designation. Gate order: flag, form content type (cross-origin is csrf() on dashboardApp), a REAL web session of an active
-// human (Allow additionally needs a re-auth within five minutes: checkWebSession fresh:true, the dashboard's step-up rule;
+// human (Allow additionally needs a re-auth within the step-up window: checkWebSession fresh:true, the dashboard's step-up rule;
 // Stop only reduces authority so needs the real session, as operator revoke does), THEN the one door
 // (authorizeOwnerMemberChange, 'attach_designated_member_id': org floor, rank ceilings, no self waiver, seats/attached refused)
 // and the one compare-and-set write (updateAgentProfile with expect = the value the door read). No second authorization path.

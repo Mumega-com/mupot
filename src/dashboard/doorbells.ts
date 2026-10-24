@@ -7,7 +7,7 @@
 //   1. same-origin (Origin must equal the request origin; a missing Origin is refused);
 //   2. a REAL dashboard web session of an active human member (checkWebSession); an agent / bearer caller gets 403;
 //   3. admin over THE AGENT'S SQUAD (org admin covers every squad), re-derived per request;
-//   4. SET needs a fresh session (re-auth within five minutes: it stores a credential). Clear and Test need only the
+//   4. SET needs a fresh session (re-auth within the step-up window: it stores a credential). Clear and Test need only the
 //      real session (clearing reduces authority; a test ping sends a fixed non-secret body to a URL already stored).
 // The key is write-only: it is never rendered, never returned, never logged; only the last four characters show.
 
@@ -17,6 +17,7 @@ import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Env } from '../types'
 import { canOnSquadAuth } from '../auth/capability'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { RECENT_REAUTH_WINDOW_MINUTES } from '../auth/web-sessions'
 import {
   clearAgentWebhookDoorbell,
   listAgentWebhookDoorbells,
@@ -168,7 +169,7 @@ async function pageBody(env: Env, auth: AuthContext, savedAgentId: string | null
         <label class="ui-sub" for="db-key" style="display:block;margin-top:8px;">Sender key (bearer)</label>
         <input id="db-key" type="password" autocomplete="off" spellcheck="false" style="width:100%;" />
         <button class="btn" id="db-save" style="margin-top:10px;">Save doorbell</button>
-        <p class="ui-sub" style="margin-top:6px;">Saving needs a recent sign-in (within 5 minutes); you will be asked to confirm it is you if yours is older.</p>
+        <p class="ui-sub" style="margin-top:6px;">Saving needs a recent sign-in (within ${RECENT_REAUTH_WINDOW_MINUTES} minutes); you will be asked to confirm it is you if yours is older.</p>
       `
 
   const list = dataTable({

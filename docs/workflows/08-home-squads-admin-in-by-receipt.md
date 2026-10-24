@@ -64,7 +64,7 @@ session is refused before any scope check runs, see Known gaps), the **home squa
   standing authority, the grant stops working on the very next call even though the row is
   untouched.
 - **Sensitive-action step-up**: approving a `SENSITIVE_STEP_UP_ACTIONS` action requires the
-  decider's web session to have a fresh reauth within 5 minutes (`src/auth/index.ts:1047`
+  decider's web session to have a fresh reauth within 30 minutes (`src/auth/index.ts:1047`
   comment + `hasRecentReauth` call).
 
 ## Receipt(s) written

@@ -5,7 +5,7 @@
 // uses, so expected_status drift and every refusal (live execution claim, in-air flight, in-flight dispatch) are
 // archiveRow's own. This module adds only the gate on the POST, in order:
 //   1. same-origin (hono csrf() on dashboardApp for form posts, plus an explicit Origin check here: a missing Origin refuses);
-//   2. a REAL dashboard web session of an active human member, re-authenticated within five minutes
+//   2. a REAL dashboard web session of an active human member, re-authenticated within the step-up window
 //      (checkWebSession fresh:true, the dashboard's existing step-up freshness rule; there is no passkey step-up
 //      helper for dashboard actions today, same as /operators). Agent, bearer and OAuth callers have no web session;
 //   3. org-admin standing (hasWorkspaceAdmin).
