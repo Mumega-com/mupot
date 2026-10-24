@@ -363,6 +363,9 @@ export interface Env {
   // consent and the seat_select tool; anything else (including unset, the prod default) is a
   // total no-op. SEAT_MAX_PER_MEMBER caps live seats per human (default 16, clamped 1..256).
   SEAT_AUTO_ENROLL?: string
+  // Strict '1' adds keyed hashes of short _meta values and allowlisted header values (plus header names) to the
+  // sampled harness_identity_probe log line. Default off; raw values are never logged.
+  HARNESS_PROBE_VERBOSE?: string
   // Workspaces W1: strict '1' turns on worktree_open / worktree_list and grant-keyed OAuth harnesses.
   // Anything else (including unset, the default) is a total no-op: no tool advertised, no read, no write.
   WORKSPACES?: string

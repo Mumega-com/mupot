@@ -33,7 +33,55 @@ export interface ProbeInputs {
   clientInfoName: string | null
   hasMcpSessionId: boolean
   protocolVersionHeader: string | null
+  /** Present only for the verbose probe (HARNESS_PROBE_VERBOSE). Never consulted when the flag is off. */
+  verbose?: VerboseProbeInputs
 }
+
+/** Raw verbose facts as gathered at the call site. Reduced to keyed hashes before anything is logged. */
+export interface VerboseProbeInputs {
+  /** Top-level `_meta` entries whose value is a short string. */
+  metaValues: Array<[string, string]>
+  /** Request headers as [name, value]. Values are hashed only for allowlisted names. */
+  headers: Array<[string, string]>
+  clientInfoName: string | null
+  clientInfoVersion: string | null
+}
+
+// Hard denylist, applied to every `_meta` key and header name before anything is read or hashed.
+export const PROBE_DENY_RE = /authorization|cookie|token|secret|key|password/i
+// Header names whose values may be hashed (names of all non-denied headers are listed regardless).
+const PROBE_HEADER_HASH_ALLOW_RE = /^(user-agent|openai-.+|x-openai-.+|x-cursor-.+|x-client-.+)$/i
+const VERBOSE_VALUE_MAX = 256
+const VERBOSE_MAX_META = 24
+const VERBOSE_MAX_HEADER_NAMES = 40
+const VERBOSE_MAX_HEADER_HASHES = 16
+
+export function verboseProbeEnabled(env: Pick<Env, 'HARNESS_PROBE_VERBOSE'>): boolean {
+  return env.HARNESS_PROBE_VERBOSE === '1'
+}
+
+/** Collect the verbose facts from a `_meta` object. Denied keys are dropped here, before any further use. */
+export function extractVerboseMetaValues(meta: unknown): Array<[string, string]> {
+  const m = typeof meta === 'object' && meta !== null && !Array.isArray(meta) ? meta as Record<string, unknown> : {}
+  const out: Array<[string, string]> = []
+  for (const [k, v] of Object.entries(m)) {
+    if (out.length >= VERBOSE_MAX_META) break
+    if (PROBE_DENY_RE.test(k)) continue
+    if (typeof v === 'string' && v.length > 0 && v.length <= VERBOSE_VALUE_MAX) out.push([k, v])
+  }
+  return out
+}
+
+export function extractClientInfoVersion(meta: unknown): string | null {
+  const m = typeof meta === 'object' && meta !== null && !Array.isArray(meta) ? meta as Record<string, unknown> : {}
+  const raw = m['clientInfo'] ?? m['io.modelcontextprotocol/clientInfo']
+  const ci = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : null
+  return ci ? str(ci['version']) : null
+}
+
+const cleanName = (k: string): string => k.replace(/[^A-Za-z0-9_./:-]/g, '?').slice(0, META_KEY_LEN)
+const cleanLabel = (v: string | null, max: number): string | null =>
+  v === null ? null : v.replace(/[^A-Za-z0-9 ._/-]/g, '?').slice(0, max)
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null
@@ -78,13 +126,41 @@ export function resetHarnessProbeSampling(): void {
   lastLogged.clear()
 }
 
+async function buildVerbose(secret: string | undefined, vi: VerboseProbeInputs): Promise<Record<string, unknown>> {
+  const meta_h: Record<string, string | null> = {}
+  for (const [k, v] of vi.metaValues) {
+    if (PROBE_DENY_RE.test(k)) continue
+    meta_h[cleanName(k)] = await keyedHash(secret, v)
+  }
+  const header_names: string[] = []
+  const header_h: Record<string, string | null> = {}
+  let denied = 0
+  for (const [name, value] of vi.headers) {
+    if (PROBE_DENY_RE.test(name)) { denied++; continue }
+    if (header_names.length < VERBOSE_MAX_HEADER_NAMES) header_names.push(cleanName(name.toLowerCase()))
+    if (PROBE_HEADER_HASH_ALLOW_RE.test(name) && Object.keys(header_h).length < VERBOSE_MAX_HEADER_HASHES) {
+      header_h[cleanName(name.toLowerCase())] = await keyedHash(secret, value.slice(0, VERBOSE_VALUE_MAX))
+    }
+  }
+  return {
+    meta_h,
+    header_names,
+    header_h,
+    denied_headers: denied,
+    client_info_name: cleanLabel(vi.clientInfoName, 40),
+    client_info_version: cleanLabel(vi.clientInfoVersion, 24),
+  }
+}
+
 export async function maybeEmitHarnessIdentityProbe(
-  env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'CONNECTOR_MASTER_KEY'>,
+  env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'CONNECTOR_MASTER_KEY' | 'HARNESS_PROBE_VERBOSE'>,
   grantKey: string,
   inputs: ProbeInputs,
   nowMs: number = Date.now(),
 ): Promise<void> {
-  if (!seatAutoEnrollEnabled(env)) return
+  const verbose = verboseProbeEnabled(env)
+  // The verbose probe is its own flag: it runs with SEAT_AUTO_ENROLL off too.
+  if (!seatAutoEnrollEnabled(env) && !verbose) return
   try {
     const secret = env.CONNECTOR_MASTER_KEY
     // The sampling key never leaves the isolate; the logged `grant` field is the keyed hash (or null).
@@ -108,6 +184,7 @@ export async function maybeEmitHarnessIdentityProbe(
       mcp_session_id: inputs.hasMcpSessionId,
       protocol_version: inputs.protocolVersionHeader === null ? null : inputs.protocolVersionHeader.replace(/[^0-9A-Za-z.-]/g, '?').slice(0, 16),
       meta_keys: inputs.metaKeys,
+      ...(verbose && inputs.verbose ? { verbose: await buildVerbose(secret, inputs.verbose) } : {}),
     }))
   } catch {
     // Observability must never fail a request.

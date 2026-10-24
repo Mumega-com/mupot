@@ -70,7 +70,8 @@ import {
 import { notSeatAgentSql } from '../members/seat-agent'
 import { SEAT_HANDLE_PREFIX, seatHandleFromArgs } from '../members/seat-handle'
 import { applySeatForRequest } from '../members/seat-auto'
-import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
+import type { VerboseProbeInputs } from './harness-identity-probe'
+import { extractClientInfoVersion, extractMetaFacts, extractVerboseMetaValues, hintsFrom, maybeEmitHarnessIdentityProbe, verboseProbeEnabled } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import {
   getOrCreateAgentSession,
@@ -575,16 +576,57 @@ async function resolveAuth(c: {
   return bearerAuth
 }
 
+/** Gather the raw verbose facts (reduced to keyed hashes inside the probe). Only called with the flag on. */
+function verboseInputsFor(
+  c: { req: { raw?: { headers: Headers } } },
+  bodyMeta: SeatBodyMeta | undefined,
+  clientInfoName: string | null,
+): VerboseProbeInputs {
+  const headers: Array<[string, string]> = []
+  c.req.raw?.headers.forEach((value, name) => { headers.push([name, value]) })
+  return {
+    metaValues: extractVerboseMetaValues(bodyMeta?.paramsMeta),
+    headers,
+    clientInfoName,
+    clientInfoVersion: extractClientInfoVersion(bodyMeta?.paramsMeta),
+  }
+}
+
+async function emitVerboseProbeOnly(
+  c: { req: { header: (name: string) => string | undefined; raw?: { headers: Headers } }; env: Env },
+  auth: AuthContext,
+  bodyMeta: SeatBodyMeta | undefined,
+): Promise<void> {
+  const pf = extractMetaFacts(bodyMeta?.paramsMeta)
+  await maybeEmitHarnessIdentityProbe(c.env, auth.tokenId ?? auth.userId, {
+    headerSeat: c.req.header('x-mupot-seat')?.trim() || null,
+    metaSeat: pf.metaSeat,
+    openaiSession: pf.openaiSession,
+    openaiSubject: pf.openaiSubject,
+    codexThreadId: pf.codexThreadId,
+    metaKeys: pf.metaKeys,
+    clientInfoName: pf.clientInfoName,
+    hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
+    protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
+    verbose: verboseInputsFor(c, bodyMeta, pf.clientInfoName),
+  })
+}
+
 // mupot#1794 W2 — the ONE place a presented seat handle turns the human's unbound directory grant
 // into the seat agent's context (applySeatHandle holds all the checks; this just gathers inputs).
 // Flag off, or any non-(unbound directory + harness) context: returns `auth` untouched and reads
 // nothing — legacy agent-bound grants and workspace keys never reach the handle.
 async function resolveSeatSession(
-  c: { req: { header: (name: string) => string | undefined }; env: Env },
+  c: { req: { header: (name: string) => string | undefined; raw?: { headers: Headers } }; env: Env },
   auth: AuthContext,
   bodyMeta?: SeatBodyMeta,
 ): Promise<AuthContext> {
-  if (!seatAutoEnrollEnabled(c.env) || bodyMeta?.skipSeat) return auth
+  if (!seatAutoEnrollEnabled(c.env)) {
+    // HARNESS_PROBE_VERBOSE is its own flag: observability only, and the session still resolves exactly as before.
+    if (verboseProbeEnabled(c.env) && !bodyMeta?.skipSeat) await emitVerboseProbeOnly(c, auth, bodyMeta)
+    return auth
+  }
+  if (bodyMeta?.skipSeat) return auth
   if (auth.channel !== 'directory' || auth.boundAgentId || !auth.harnessId) return auth
   const paramsFacts = extractMetaFacts(bodyMeta?.paramsMeta)
   const argsFacts = extractMetaFacts(bodyMeta?.argsMeta)
@@ -604,6 +646,7 @@ async function resolveSeatSession(
     clientInfoName: paramsFacts.clientInfoName,
     hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
     protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
+    verbose: verboseProbeEnabled(c.env) ? verboseInputsFor(c, bodyMeta, paramsFacts.clientInfoName) : undefined,
   })
   // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
   // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
