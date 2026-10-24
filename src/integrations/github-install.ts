@@ -79,17 +79,39 @@ export function parseInstallCallback(
 
 export type InstallVerification =
   | { ok: true; accountLogin: string | null }
-  | { ok: false; reason: 'not_configured' | 'missing_code' | 'exchange_failed' | 'lookup_failed' | 'not_owned' }
+  | {
+      ok: false
+      reason:
+        | 'not_configured'
+        | 'missing_code'
+        | 'exchange_failed'
+        | 'bad_verification_code'
+        | 'lookup_failed'
+        | 'not_owned'
+        | 'org_admin_unverifiable'
+        | 'not_org_admin'
+        | 'not_account_owner'
+    }
 
 const GH_TIMEOUT_MS = 8000
 const MAX_INSTALL_PAGES = 10
 
+interface GhAccount {
+  id?: unknown
+  login?: unknown
+  type?: unknown
+}
+
 /**
- * Prove the authorizing GitHub user can access `installationId`. The setup callback carries a
- * one-time OAuth `code` (the App has "Request user authorization during installation" on); it is
- * exchanged for a user token, and the id must appear in that user's GET /user/installations.
- * The account login is taken from GitHub's answer, never from the query string.
- * Fails closed on missing config, missing code, any non-2xx, malformed JSON, or timeout.
+ * Prove the authorizing GitHub user OWNS (not merely can read) `installationId`. The setup
+ * callback carries a one-time OAuth `code`; it is exchanged for a user token, then:
+ *   1. the id must appear in GET /user/installations;
+ *   2. a User-account install must belong to the same user (GET /user id == account.id);
+ *   3. an Organization install requires GET /user/memberships/orgs/{login} role=admin, state=active
+ *      (needs the App permission "Members: read"; if GitHub refuses it we fail closed with
+ *      `org_admin_unverifiable` rather than accepting).
+ * The account login comes from GitHub's answer, never the query string. Every failure refuses.
+ * The user token is revoked afterwards (best effort, never blocks).
  */
 export async function verifyInstallationOwnership(
   env: Env,
@@ -114,32 +136,62 @@ export async function verifyInstallationOwnership(
     })
     if (!res.ok) return { ok: false, reason: 'exchange_failed' }
     const data: unknown = await res.json()
-    const t = (data as { access_token?: unknown } | null)?.access_token
-    if (typeof t !== 'string' || !t) return { ok: false, reason: 'exchange_failed' }
-    token = t
+    const d = data as { access_token?: unknown; error?: unknown } | null
+    // GitHub answers 200 with { error: 'bad_verification_code' } for a spent/forged code.
+    if (d && typeof d.error === 'string') return { ok: false, reason: 'bad_verification_code' }
+    if (typeof d?.access_token !== 'string' || !d.access_token) return { ok: false, reason: 'exchange_failed' }
+    token = d.access_token
   } catch {
     return { ok: false, reason: 'exchange_failed' }
   }
 
+  const api = (path: string) =>
+    doFetch(`https://api.github.com${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'mupot' },
+      signal: signal(),
+    })
+
   try {
-    for (let page = 1; page <= MAX_INSTALL_PAGES; page++) {
-      const res = await doFetch(`https://api.github.com/user/installations?per_page=100&page=${page}`, {
+    return await decide(api, installationId)
+  } finally {
+    // Best-effort revoke of the user-to-server token; failure must not block or leak.
+    try {
+      await doFetch(`https://api.github.com/applications/${encodeURIComponent(clientId)}/token`, {
+        method: 'DELETE',
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
           Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
           'User-Agent': 'mupot',
         },
+        body: JSON.stringify({ access_token: token }),
         signal: signal(),
       })
+    } catch {
+      // ignored on purpose
+    }
+  }
+}
+
+async function decide(
+  api: (path: string) => Promise<Response>,
+  installationId: string,
+): Promise<InstallVerification> {
+  let account: GhAccount | null = null
+  let found = false
+  try {
+    for (let page = 1; page <= MAX_INSTALL_PAGES && !found; page++) {
+      const res = await api(`/user/installations?per_page=100&page=${page}`)
       if (!res.ok) return { ok: false, reason: 'lookup_failed' }
       const data: unknown = await res.json()
       const list = (data as { installations?: unknown } | null)?.installations
       if (!Array.isArray(list)) return { ok: false, reason: 'lookup_failed' }
       for (const item of list) {
-        const inst = item as { id?: unknown; account?: { login?: unknown } | null }
+        const inst = item as { id?: unknown; account?: GhAccount | null }
         if (String(inst.id) === installationId) {
-          const login = inst.account?.login
-          return { ok: true, accountLogin: typeof login === 'string' ? login : null }
+          found = true
+          account = inst.account ?? null
+          break
         }
       }
       if (list.length < 100) break
@@ -147,5 +199,30 @@ export async function verifyInstallationOwnership(
   } catch {
     return { ok: false, reason: 'lookup_failed' }
   }
-  return { ok: false, reason: 'not_owned' }
+  if (!found) return { ok: false, reason: 'not_owned' }
+  const login = account?.login
+  if (typeof login !== 'string' || !login) return { ok: false, reason: 'lookup_failed' }
+
+  try {
+    if (account?.type === 'User') {
+      const res = await api('/user')
+      if (!res.ok) return { ok: false, reason: 'lookup_failed' }
+      const me = (await res.json()) as { id?: unknown } | null
+      if (me?.id === undefined || account.id === undefined || String(me.id) !== String(account.id)) {
+        return { ok: false, reason: 'not_account_owner' }
+      }
+      return { ok: true, accountLogin: login }
+    }
+    if (account?.type === 'Organization') {
+      const res = await api(`/user/memberships/orgs/${encodeURIComponent(login)}`)
+      if (res.status === 403 || res.status === 404) return { ok: false, reason: 'org_admin_unverifiable' }
+      if (!res.ok) return { ok: false, reason: 'lookup_failed' }
+      const m = (await res.json()) as { role?: unknown; state?: unknown } | null
+      if (m?.role !== 'admin' || m?.state !== 'active') return { ok: false, reason: 'not_org_admin' }
+      return { ok: true, accountLogin: login }
+    }
+  } catch {
+    return { ok: false, reason: 'lookup_failed' }
+  }
+  return { ok: false, reason: 'lookup_failed' } // unknown account type: fail closed
 }
