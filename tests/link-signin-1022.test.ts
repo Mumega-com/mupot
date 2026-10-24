@@ -3,7 +3,7 @@
 // email match or an unauthenticated login.
 
 import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
-import { GOOGLE_AUTH_MAX_AGE_SECONDS, LINK_PROOF_MAX_AGE_MS, linkProofHolds } from '../src/auth/index'
+import { GOOGLE_AUTH_MAX_AGE_SECONDS, GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS, GOOGLE_AUTH_TIME_REQUIRED, GOOGLE_AUTH_TIME_CLAIMS, googleAuthTimeVerdict, googleAuthTimeAllows, LINK_PROOF_MAX_AGE_MS, linkProofHolds } from '../src/auth/index'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
@@ -47,7 +47,7 @@ describe('#1022 linked sign-ins', () => {
     h = createSqliteD1()
     applyAllMigrations(h.sqlite)
     sessions = kv()
-    googleAuthTime = null
+    googleAuthTime = undefined
     env = {
       DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN, SESSIONS: sessions,
       OAUTH_PROVIDER: 'google', OAUTH_CLIENT_ID: 'cid', OAUTH_CLIENT_SECRET: 'sec',
@@ -97,12 +97,13 @@ describe('#1022 linked sign-ins', () => {
     absorb(jar, res)
     return res
   }
-  let googleAuthTime: number | null = null // seconds; null = Google returns no id_token
+  // seconds; undefined = a fresh sign-in just now (default), null = Google returns no id_token
+  let googleAuthTime: number | null | undefined = undefined
   const idTokenFor = (authTime: number) => `x.${btoa(JSON.stringify({ auth_time: authTime })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}.y`
   async function withGoogle<T>(sub: string, email: string | null, fn: () => Promise<T>): Promise<T> {
     const realFetch = globalThis.fetch
     globalThis.fetch = (async (u: string) => {
-      if (new URL(String(u)).pathname.includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer', ...(googleAuthTime === null ? {} : { id_token: idTokenFor(googleAuthTime) }) }))
+      if (new URL(String(u)).pathname.includes('token')) return new Response(JSON.stringify({ access_token: 'at', expires_in: 1, token_type: 'Bearer', ...(googleAuthTime === null ? {} : { id_token: idTokenFor(googleAuthTime ?? Math.floor(Date.now() / 1000) - 5) }) }))
       return new Response(JSON.stringify({ sub, ...(email ? { email, email_verified: true } : {}) }))
     }) as typeof fetch
     try { return await fn() } finally { globalThis.fetch = realFetch }
@@ -347,6 +348,78 @@ describe('#1022 linked sign-ins', () => {
       }
       expect((await post(bare.jar, '/auth/link-signin/confirm')).headers.get('location')).toBe('/account?signin=reauth_required')
       expect(identity('sub-dup')?.member_id).toBe('mem-dup')
+    })
+
+    describe('reauth demands a fresh credential (auth_time)', () => {
+      const recentReauthAt = () =>
+        (h.sqlite.prepare(`SELECT recent_reauth_at FROM web_sessions WHERE member_id = 'mem-main'`).get() as { recent_reauth_at: string | null }).recent_reauth_at
+      async function reauthWith(authTime: number | null) {
+        const jar = await signIn('sub-main', 'main@example.test')
+        const before = recentReauthAt()
+        const start = await visit(jar, '/auth/reauth?return=/operators')
+        const state = new URL(start.headers.get('location')!).searchParams.get('state')!
+        googleAuthTime = authTime
+        const back = await withGoogle('sub-main', 'main@example.test', () => visit(jar, `/auth/callback?code=c&state=${state}`))
+        return { back, before, after: recentReauthAt() }
+      }
+      const nowSec = () => Math.floor(Date.now() / 1000)
+
+      it('the reauth request asks Google to re-authenticate: max_age=0 and prompt includes login', async () => {
+        const jar = await signIn('sub-main', 'main@example.test')
+        const start = await visit(jar, '/auth/reauth?return=/operators')
+        const q = new URL(start.headers.get('location')!).searchParams
+        expect(q.get('max_age')).toBe('0')
+        expect(q.get('prompt')).toBe('login select_account')
+        expect(q.get('claims')).toBe('{"id_token":{"auth_time":{"essential":true}}}')
+        expect(GOOGLE_AUTH_TIME_CLAIMS).toBe('{"id_token":{"auth_time":{"essential":true}}}')
+      })
+      it('pins the skew constant at 60 s', () => {
+        expect(GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS).toBe(60)
+      })
+      it('auth_time 14 min old is accepted and stamps recent_reauth_at', async () => {
+        const r = await reauthWith(nowSec() - 14 * 60)
+        expect(r.back.headers.get('location')).toBe('/operators')
+        expect(r.after).not.toBeNull()
+        expect(r.after).not.toBe(r.before)
+      })
+      it('auth_time 16 min old is refused with a clear message and stamps nothing', async () => {
+        const r = await reauthWith(nowSec() - 16 * 60)
+        expect(r.back.status).toBe(302)
+        expect(r.back.headers.get('location')).toBe('/account?signin=reauth_stale&return=%2Foperators')
+        expect(r.after).toBe(r.before)
+      })
+      it('a missing auth_time is ACCEPTED (not required yet), stamps, and logs one structured line without PII', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        try {
+          const r = await reauthWith(null)
+          expect(r.back.headers.get('location')).toBe('/operators')
+          expect(r.after).not.toBe(r.before)
+          expect(warn.mock.calls.filter((c) => String(c[0]).includes('google_auth_time_absent')).map((c) => c[0])).toEqual([
+            JSON.stringify({ evt: 'google_auth_time_absent', flow: 'reauth' }),
+          ])
+        } finally { warn.mockRestore() }
+      })
+      it('a different Google sub is refused 403 reauth_identity_mismatch and stamps nothing', async () => {
+        const jar = await signIn('sub-main', 'main@example.test')
+        const before = recentReauthAt()
+        const start = await visit(jar, '/auth/reauth?return=/operators')
+        const state = new URL(start.headers.get('location')!).searchParams.get('state')!
+        const back = await withGoogle('sub-someone-else', 'main@example.test', () => visit(jar, `/auth/callback?code=c&state=${state}`))
+        expect(back.status).toBe(403)
+        expect(await back.json()).toEqual({ error: 'reauth_identity_mismatch' })
+        expect(recentReauthAt()).toBe(before)
+      })
+      it('a refused reauth keeps the safe return path on the redirect', async () => {
+        const r = await reauthWith(nowSec() - 16 * 60)
+        expect(r.back.headers.get('location')).toBe('/account?signin=reauth_stale&return=%2Foperators')
+      })
+      it('an auth_time 120 s in the future is refused; 30 s in the future is tolerated', async () => {
+        const bad = await reauthWith(nowSec() + 120)
+        expect(bad.back.headers.get('location')).toBe('/account?signin=reauth_stale&return=%2Foperators')
+        expect(bad.after).toBe(bad.before)
+        const ok = await reauthWith(nowSec() + 30)
+        expect(ok.back.headers.get('location')).toBe('/operators')
+      })
     })
 
     it('/auth/reauth?return= round-trips to the page the member was on, cookies respecting Path (RFC 6265)', async () => {
@@ -690,6 +763,53 @@ describe('#1022 linked sign-ins', () => {
     googleAuthTime = Math.floor(Date.now() / 1000) - 14 * 60
     const ok = await completeLink(jar, second.state!, 'sub-new', 'other@gmail.test')
     expect(ok.headers.get('location')).toBe('/account?signin=linked')
+  })
+
+  it('link with a missing auth_time is ACCEPTED while not required, and logs the absence', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const jar = await mainSession()
+      const first = await startLink(jar)
+      googleAuthTime = null
+      const res = await completeLink(jar, first.state!, 'sub-new', 'other@gmail.test')
+      expect(res.headers.get('location')).toBe('/account?signin=linked')
+      expect(warn.mock.calls.some((c) => c[0] === JSON.stringify({ evt: 'google_auth_time_absent', flow: 'link' }))).toBe(true)
+    } finally { warn.mockRestore() }
+  })
+
+  it('the link authorize request carries the auth_time claims request', async () => {
+    const jar = await mainSession()
+    const res = await post(jar, '/auth/link-signin/start')
+    expect(new URL(res.headers.get('location')!).searchParams.get('claims')).toBe('{"id_token":{"auth_time":{"essential":true}}}')
+  })
+
+  it('auth_time verdicts: fresh / stale / absent; absent refuses only when REQUIRED is forced true', () => {
+    const now = Date.parse('2026-10-24T12:00:00Z')
+    const sec = now / 1000
+    expect(GOOGLE_AUTH_TIME_REQUIRED).toBe(false)
+    expect(googleAuthTimeVerdict(sec - 14 * 60, now)).toBe('fresh')
+    expect(googleAuthTimeVerdict(sec - 16 * 60, now)).toBe('stale')
+    expect(googleAuthTimeVerdict(sec + 30, now)).toBe('fresh')
+    expect(googleAuthTimeVerdict(sec + 120, now)).toBe('stale')
+    expect(googleAuthTimeVerdict(null, now)).toBe('absent')
+    expect(googleAuthTimeVerdict(Number.NaN, now)).toBe('absent')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(googleAuthTimeAllows(null, 'link', now)).toBe(true)
+      expect(googleAuthTimeAllows(null, 'link', now, true)).toBe(false)
+      expect(googleAuthTimeAllows(null, 'reauth', now, true)).toBe(false)
+      expect(googleAuthTimeAllows(sec - 16 * 60, 'reauth', now)).toBe(false)
+      expect(googleAuthTimeAllows(sec - 14 * 60, 'reauth', now, true)).toBe(true)
+    } finally { warn.mockRestore() }
+  })
+
+  it('link with an auth_time 120 s in the future is refused', async () => {
+    const jar = await mainSession()
+    const first = await startLink(jar)
+    googleAuthTime = Math.floor(Date.now() / 1000) + 120
+    const res = await completeLink(jar, first.state!, 'sub-new', 'other@gmail.test')
+    expect(res.headers.get('location')).toBe('/account?signin=stale_google_signin')
+    expect(identity('sub-new')).toBeUndefined()
   })
 
   it('redirects and form targets survive the /t/<slug> prefix choke point (#1975)', async () => {

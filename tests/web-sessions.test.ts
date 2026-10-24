@@ -299,7 +299,7 @@ describe('web-session registry (D1, real migration chain)', () => {
     expect((await loadWebSession(env, TENANT, 'raw-logout')).ok).toBe(false)
   })
 
-  it('recent-reauth: unset by default, true only within the 5-minute window after markRecentReauth', async () => {
+  it('recent-reauth: unset by default, true only within the step-up window after markRecentReauth', async () => {
     const id1 = await seedMemberAndIdentity('m1', 'a@x.test')
     const created = await createWebSession(env, 'raw-reauth', { tenant: TENANT, memberId: 'm1', loginIdentityId: id1 })
     expect(hasRecentReauth(created)).toBe(false)
