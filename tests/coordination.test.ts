@@ -6,7 +6,9 @@ import { boardJourney, updateJourney, listJourneys, buildDepartureBoard, type Jo
 import { controlTowerBody } from '../src/dashboard/index'
 import type { Env } from '../src/types'
 
-vi.mock('../src/auth/member-bearer', () => ({
+vi.mock('../src/auth/member-bearer', async (importOriginal) => ({
+  // partial mock: other modules reachable from the coordination routes (e.g. flight routes) need the real exports
+  ...(await importOriginal<typeof import('../src/auth/member-bearer')>()),
   bearerToken: (h?: string) => (h && h.startsWith('Bearer ') ? h.slice(7) : null),
   resolveMemberByToken: async (_e: unknown, token: string | null) => {
     if (token === 'tok-code') return { memberId: 'm-code', displayName: 'code', email: null, boundAgentId: 'ag-code' }

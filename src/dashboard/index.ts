@@ -256,6 +256,7 @@ import {
   submittedRoutineFormValues,
 } from './routines'
 import { loadNeedsYouDashboard, needsYouBody } from './needs-you'
+import { loadStatusView, statusBody } from './status-view'
 import { routinePrincipal } from '../routines/access'
 import {
   archiveRoutine,
@@ -1204,6 +1205,12 @@ dashboardApp.get('/needs-you', async (c) => {
   } catch {
     return c.html(shell(c.env, 'Needs You', errorBody('Choose a valid Needs You page.')), 400)
   }
+})
+
+// GET /status — phone-readable board status (session auth; tenant + visibility scoped).
+dashboardApp.get('/status', async (c) => {
+  const view = await loadStatusView(c.env, c.get('auth'))
+  return c.html(shell(c.env, 'Status', statusBody(view)))
 })
 
 // GET /ops — owner/admin health and observability console.
@@ -4942,6 +4949,11 @@ export function shell(
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
             <span class="nav-label">Approvals</span>
             <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
+          <a class="nav-link" href="/status">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4 5h12M4 10h12M4 15h8"/></svg>
+            <span class="nav-label">Status</span>
           </a>
 
           <!-- Elevation (Delivery Sequence step 5, mumega-com#1173) -->
