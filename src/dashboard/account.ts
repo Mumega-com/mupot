@@ -597,7 +597,7 @@ const SIGNIN_NOTICES: Record<string, string> = {
   last_identity: 'You cannot unlink your last sign-in: you would lose access.',
   not_found: 'That sign-in was not found.',
   stale_google_signin: 'Google did not ask you to sign in again just now. Start again and complete the Google sign-in.',
-  reauth_stale: 'Google did not ask for your password just now, so nothing was unlocked. Please sign in again.',
+  reauth_stale: "Google didn't confirm a fresh sign-in, so nothing was unlocked. Try again.",
   reauth_required: 'Please confirm it is you again, then start linking from here.',
   expired: 'That link request expired. Start again.',
   changed: 'That Google account changed while you were confirming. Start again.',

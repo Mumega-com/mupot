@@ -574,15 +574,37 @@ function googleAuthTime(idToken: string | undefined): number | null {
 export const GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS = 60
 
 /**
- * The ONE gate for Google's auth_time, shared by the reauth and link callbacks. True only when the id_token carried a
- * readable auth_time, it is not further in the future than the skew allowance, and it is no older than
- * GOOGLE_AUTH_MAX_AGE_SECONDS, all measured on the server clock. A missing token or claim is NOT fresh (fails closed).
+ * When true, an id_token WITHOUT an auth_time is refused too. It is false because Google only includes auth_time when the
+ * request asks for it (the claims parameter) AND the console's session-age claims setting is on, and even then only when the
+ * information is available; flip this once the google_auth_time_absent log line shows the claim is reliably present.
  */
-export function googleAuthTimeIsFresh(authTimeSec: number | null, nowMs: number = Date.now()): boolean {
-  if (authTimeSec === null || !Number.isFinite(authTimeSec)) return false
+export const GOOGLE_AUTH_TIME_REQUIRED = false
+
+/** The claims request that asks Google to include auth_time in the id_token (sent on every authorize request that checks it). */
+export const GOOGLE_AUTH_TIME_CLAIMS = JSON.stringify({ id_token: { auth_time: { essential: true } } })
+
+export type GoogleAuthTimeVerdict = 'fresh' | 'stale' | 'absent'
+
+/**
+ * The ONE parser/gate for Google's auth_time, shared by the reauth and link callbacks, measured on the server clock.
+ * 'absent' = no readable auth_time. A PRESENT auth_time is 'fresh' only if it is no older than GOOGLE_AUTH_MAX_AGE_SECONDS
+ * and not further in the future than the skew allowance; anything else present is 'stale'.
+ */
+export function googleAuthTimeVerdict(authTimeSec: number | null, nowMs: number = Date.now()): GoogleAuthTimeVerdict {
+  if (authTimeSec === null || !Number.isFinite(authTimeSec)) return 'absent'
   const ageSec = nowMs / 1000 - authTimeSec
-  if (ageSec < -GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS) return false
-  return ageSec <= GOOGLE_AUTH_MAX_AGE_SECONDS
+  if (ageSec < -GOOGLE_AUTH_TIME_FUTURE_SKEW_SECONDS) return 'stale'
+  return ageSec <= GOOGLE_AUTH_MAX_AGE_SECONDS ? 'fresh' : 'stale'
+}
+
+/** Apply the verdict for one flow: true = proceed. 'absent' proceeds (logged once, no PII) unless GOOGLE_AUTH_TIME_REQUIRED. */
+export function googleAuthTimeAllows(authTimeSec: number | null, flow: 'reauth' | 'link', nowMs: number = Date.now(), required: boolean = GOOGLE_AUTH_TIME_REQUIRED): boolean {
+  const verdict = googleAuthTimeVerdict(authTimeSec, nowMs)
+  if (verdict === 'absent') {
+    console.warn(JSON.stringify({ evt: 'google_auth_time_absent', flow }))
+    return !required
+  }
+  return verdict === 'fresh'
 }
 
 interface GoogleUserInfo {
@@ -849,8 +871,8 @@ authApp.get('/callback', async (c) => {
     }
     // A reauth must prove a fresh credential, not a consent click: Google must report an auth_time within the allowed age.
     // Refusal stamps nothing and sends the member back with a clear message (never a 500).
-    if (!googleAuthTimeIsFresh(googleAuthTime(token.id_token))) {
-      return c.redirect('/account?signin=reauth_stale')
+    if (!googleAuthTimeAllows(googleAuthTime(token.id_token), 'reauth')) {
+      return c.redirect(`/account?signin=reauth_stale${returnPath ? `&return=${encodeURIComponent(returnPath)}` : ''}`)
     }
     await markRecentReauth(env, reauthTarget.webSessionIdHash)
     return c.redirect(returnPath ?? '/')
@@ -969,6 +991,7 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
     // then refuses unless the returned auth_time is fresh.
     prompt: 'login select_account',
     max_age: '0',
+    claims: GOOGLE_AUTH_TIME_CLAIMS,
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
@@ -1186,6 +1209,7 @@ authApp.post('/link-signin/start', async (c) => {
     // Link flow ONLY: demand a fresh Google credential so a still-logged-in account on a shared browser cannot be picked.
     prompt: 'login select_account',
     max_age: '0',
+    claims: GOOGLE_AUTH_TIME_CLAIMS,
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
@@ -1216,7 +1240,7 @@ async function finishLinkSignIn(
   if (!linkProofHolds(target.reauthProofAt, session.session)) return linkSigninRedirect(c, 'reauth_required')
   // The link flow forces a fresh Google sign-in (prompt=login, max_age=0). When Google says when the user last authenticated,
   // a stale auth_time means a still-logged-in Google account was picked, not proven: refuse.
-  if (!googleAuthTimeIsFresh(googleAuthTimeSec)) {
+  if (!googleAuthTimeAllows(googleAuthTimeSec, 'link')) {
     return linkSigninRedirect(c, 'stale_google_signin')
   }
   const input = { provider: 'google', subject, verifiedEmail: email }
