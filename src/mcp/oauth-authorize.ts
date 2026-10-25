@@ -1385,7 +1385,12 @@ async function buildAuthContextFromPropsInner(
   // thing that ends a session whose credential expires while it is open.
   // #2060: the bound agent's seat status rides this ONE query (no second read to fail open). Flag off: no join, no column, no 5th bind.
   const sf = seatFloorSql(env, 'COALESCE(t.agent_id, ?5)')
-  const tokenRow = await env.DB.prepare(
+  // PERF: the grants read below is keyed on props.memberId alone and does not depend on the token row, so it is issued in the
+  // SAME wave as the liveness read (one D1 round trip, not two in series). The token row stays the authority: if it is not
+  // live the speculative grants are discarded and the call returns null exactly as before. Nothing is cached across requests.
+  const grantsP = resolveCapabilities(env, props.memberId)
+  grantsP.catch(() => undefined) // an early return/throw below must not leave this promise rejected-unhandled; the awaited use re-throws
+  const tokenRowP = env.DB.prepare(
     `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id,
             t.harness_kind AS harness_kind${sf.select}
        FROM member_tokens t
@@ -1409,6 +1414,7 @@ async function buildAuthContextFromPropsInner(
     seat_status?: string | null
     seat_row_id?: string | null
   }>()
+  const tokenRow = await tokenRowP
 
   if (!tokenRow || tokenRow.status !== 'active') return null
 
@@ -1421,7 +1427,7 @@ async function buildAuthContextFromPropsInner(
   // Re-resolve capabilities every request (C2: revocation propagates immediately).
   // The resolved grants are NOT used for the directory channel — see B1 comment above —
   // but workspace/member API keys must preserve their live D1 grants.
-  const resolvedCapabilities = await resolveCapabilities(env, props.memberId)
+  const resolvedCapabilities = await grantsP // issued with the token read above
 
   const channel =
     isConnectionChannel(tokenRow.channel)

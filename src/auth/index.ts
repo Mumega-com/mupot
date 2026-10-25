@@ -2304,6 +2304,13 @@ async function loadAuthFromCookieInner(c: Context<AppEnv>): Promise<AuthContext 
   // admin logins with no members row, #1324) is unaffected — the `typeof
   // member?.status === 'string'` check still only fires on a REAL suspended
   // row, never on absence (see F3 below for the missing-member decision).
+  // PERF: the registry read below needs only the cookie value, not the members answer, so it is started here and runs in the
+  // SAME wave as the members status read (one D1 round trip instead of two in series). It is consumed exactly where it was
+  // awaited before, after the suspended-member refusal, so a refusal still returns before any of its result is used.
+  const webSessionP = record.webSessionRegistered && c.env.DB
+    ? loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
+    : null
+  webSessionP?.catch(() => undefined) // consumed below; a throw there still surfaces, never as an unhandled rejection
   if (record.email && c.env.DB) {
     try {
       // #1330 F-A: match legacy tenant IS NULL rows too (0040 adds the column
@@ -2344,11 +2351,12 @@ async function loadAuthFromCookieInner(c: Context<AppEnv>): Promise<AuthContext 
   //    today's behaviour, never an over-grant. members.email is UNIQUE so LIMIT 1 is
   //    deterministic; the bridge is purely ADDITIVE (only grants scope, never removes).
   if (record.webSessionRegistered && c.env.DB) {
-    const webSession = await loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
+    const webSession = await (webSessionP ?? loadWebSession(c.env, c.env.TENANT_SLUG, sessionId))
     if (webSession.ok) {
       auth.webSessionIdHash = webSession.session.id_hash
       auth.webSessionMemberId = webSession.session.member_id
-      await touchWebSession(c.env, webSession.session.id_hash)
+      // loadWebSession just read last_seen_at on this row; hand it over so the coalescing check costs no second SELECT.
+      await touchWebSession(c.env, webSession.session.id_hash, Date.now(), webSession.session.last_seen_at)
     } else if (webSession.reason !== 'not_found') {
       await c.env.SESSIONS.delete(sessionKey(sessionId))
       return null

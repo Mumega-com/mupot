@@ -216,15 +216,23 @@ export async function touchWebSession(
   env: Env,
   idHash: string,
   nowMs: number = Date.now(),
+  knownLastSeenAt?: string,
 ): Promise<void> {
   try {
-    const row = await env.DB.prepare(
-      `SELECT last_seen_at FROM web_sessions WHERE id_hash = ?1`,
-    )
-      .bind(idHash)
-      .first<{ last_seen_at: string }>()
-    if (!row) return
-    if (nowMs - Date.parse(row.last_seen_at) < LAST_SEEN_COALESCE_MS) return
+    // A caller that has JUST loaded this row (loadWebSession) passes its last_seen_at so the coalescing check needs no
+    // second SELECT. That value is only a hint for skipping the write: the UPDATE below still carries `revoked_at IS NULL`
+    // and never touches absolute_expires_at, so a session revoked in between is not revived and the 7d ceiling holds.
+    let lastSeenAt = knownLastSeenAt
+    if (lastSeenAt === undefined) {
+      const row = await env.DB.prepare(
+        `SELECT last_seen_at FROM web_sessions WHERE id_hash = ?1`,
+      )
+        .bind(idHash)
+        .first<{ last_seen_at: string }>()
+      if (!row) return
+      lastSeenAt = row.last_seen_at
+    }
+    if (nowMs - Date.parse(lastSeenAt) < LAST_SEEN_COALESCE_MS) return
 
     const nowIso = new Date(nowMs).toISOString()
     const idleExpiresAt = new Date(nowMs + IDLE_TIMEOUT_MS).toISOString()

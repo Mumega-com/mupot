@@ -464,7 +464,40 @@ async function resolveAuth(c: {
         // (the same trust level auth.boundAgentId already carries for a workspace
         // channel in the branch above, which is left untouched here).
         const knownNonDirectory = isChannel(auth.channel)
+        // PERF: for a known non-directory channel the live token re-read further down does not depend on the grants read
+        // (auth.boundAgentId is untouched between here and there on this branch), so both go out in ONE wave instead of two
+        // in series. Every other branch can change boundAgentId before the re-read, so it keeps the original order.
+        const sf = seatFloorSql(c.env, 'COALESCE(t.agent_id, ?5)')
+        const readLiveTokenRow = () => c.env.DB.prepare(
+          `SELECT t.id AS token_id, t.agent_id AS bound_agent_id, m.status AS member_status,
+                  t.harness_kind AS harness_kind${sf.select}
+             FROM member_tokens t
+             JOIN members m ON m.id = t.member_id
+             ${sf.join}
+            WHERE t.id = ?1
+              AND t.member_id = ?2
+              AND t.tenant = ?3
+              AND m.tenant = ?3
+              -- 0099: same shared liveness predicate authenticateMember (below) and
+              -- src/auth/member-bearer.ts execute. A hand-written revoked_at IS NULL
+              -- here would be a THIRD copy missing expiry — see token-lifecycle.ts's
+              -- header on why that is a live bypass door, not a stylistic nit.
+              AND ${TOKEN_LIVE_PREDICATE('?4')}
+            LIMIT 1`,
+        ).bind(...(sf.join ? [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc(), auth.boundAgentId ?? null] : [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc()])).first<{
+          token_id: string
+          bound_agent_id: string | null
+          member_status: Member['status']
+          harness_kind: string | null
+          seat_status?: string | null
+          seat_row_id?: string | null
+        }>()
+        let prefetchedToken: ReturnType<typeof readLiveTokenRow> | undefined
         if (knownNonDirectory) {
+          if (typeof auth.tokenId === 'string' && auth.tokenId.length > 0) {
+            prefetchedToken = readLiveTokenRow()
+            prefetchedToken.catch(() => undefined) // consumed below; a throw there is what surfaces, never an unhandled rejection
+          }
           auth.capabilities = await resolveCapabilities(c.env, auth.userId)
         } else if (auth.channel === 'directory' && auth.boundAgentId) {
           auth.capabilities = await resolveConsentedAgentCapabilities(
@@ -506,31 +539,7 @@ async function resolveAuth(c: {
         // #2060: the blob's seat status is never trusted; it is re-derived from the live token row below (same query, no second read).
         delete auth.seatAgentStatus
         if (typeof auth.tokenId === 'string' && auth.tokenId.length > 0) {
-          const sf = seatFloorSql(c.env, 'COALESCE(t.agent_id, ?5)')
-          const token = await c.env.DB.prepare(
-            `SELECT t.id AS token_id, t.agent_id AS bound_agent_id, m.status AS member_status,
-                    t.harness_kind AS harness_kind${sf.select}
-               FROM member_tokens t
-               JOIN members m ON m.id = t.member_id
-               ${sf.join}
-              WHERE t.id = ?1
-                AND t.member_id = ?2
-                AND t.tenant = ?3
-                AND m.tenant = ?3
-                -- 0099: same shared liveness predicate authenticateMember (below) and
-                -- src/auth/member-bearer.ts execute. A hand-written revoked_at IS NULL
-                -- here would be a THIRD copy missing expiry — see token-lifecycle.ts's
-                -- header on why that is a live bypass door, not a stylistic nit.
-                AND ${TOKEN_LIVE_PREDICATE('?4')}
-              LIMIT 1`,
-          ).bind(...(sf.join ? [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc(), auth.boundAgentId ?? null] : [auth.tokenId, auth.userId, c.env.TENANT_SLUG, nowSqlUtc()])).first<{
-            token_id: string
-            bound_agent_id: string | null
-            member_status: Member['status']
-            harness_kind: string | null
-            seat_status?: string | null
-            seat_row_id?: string | null
-          }>()
+          const token = await (prefetchedToken ?? readLiveTokenRow())
           // mupot#1794 W4: the token row says it is a harness credential -> ZERO capabilities, ZERO
           // latent capabilities, confined to the allowlist, whatever the blob claimed. Flag off: inert.
           if (token && token.harness_kind !== null && token.harness_kind !== undefined) {
