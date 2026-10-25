@@ -39,8 +39,11 @@ const MAX_BODY_BYTES = 8192
 // from the MCP/HTTP inbox surfaces on ordering or auth. It does NOT consume — consumption
 // stays with the inbox tool/route so delivery and ack remain separate (matches #622's
 // at-least-once framing: the stream is the notification, the consume is the ack).
-const DEFAULT_STREAM_POLL_MS = 1000
-const MIN_STREAM_POLL_MS = 250
+const DEFAULT_STREAM_POLL_MS = 10_000
+// 2026-10-25: 97% of prod D1 queries were this tick at 1 s x ~86 streams; clients asking lower are clamped up.
+const MIN_STREAM_POLL_MS = 5000
+// Bearer re-validation cadence (upper bound on how long a revoked token keeps a stream open, plus one tick).
+export const STREAM_REVALIDATE_MS = 60_000
 const MAX_STREAM_POLL_MS = 30_000
 
 export interface StreamMessage {
@@ -65,6 +68,8 @@ interface StreamOpts {
   sleep?: (ms: number) => Promise<void>
   /** AbortSignal: when aborted (client disconnect), the generator stops polling and ends. */
   signal?: AbortSignal
+  /** Clock (ms) for the revalidate cadence — injectable for tests. */
+  nowMs?: () => number
 }
 
 /** Poll the agent's unread inbox on a cadence, yielding new messages (seq > since) as events.
@@ -96,17 +101,23 @@ export async function* streamInboxEvents(
   }
 
   // Poll loop: re-read unread above the cursor, emit only rows newer than the last emitted seq.
+  // Per idle tick this is ONE statement (the peek SELECT): no unread COUNT(*) and no separate fence read —
+  // the stream consumes only `messages`, and the fence is enforced inside the SELECT's WHERE.
+  const nowMs = opts.nowMs ?? (() => Date.now())
+  let lastValidated = nowMs() // the connect handler just authenticated this token
   for (;;) {
     if (aborted()) return
-    // P0-2: the bearer credential is re-validated every poll. A revoked token or
-    // deactivated agent ends the stream rather than leaking the full inbox.
-    if (input.revalidate !== undefined) {
-      const stillValid = await input.revalidate()
-      if (!stillValid) return
-    }
     await sleep(pollMs)
     if (aborted()) return
-    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq, seat: input.seat })
+    // P0-2: the bearer credential is re-validated at most every STREAM_REVALIDATE_MS on IDLE ticks. Any tick that
+    // would DELIVER message bodies re-validates first (below), so a revoked/suspended credential never receives a
+    // body; the 60 s window only bounds how long an idle stream lingers.
+    if (input.revalidate !== undefined && nowMs() - lastValidated >= STREAM_REVALIDATE_MS) {
+      const stillValid = await input.revalidate()
+      if (!stillValid) return
+      lastValidated = nowMs()
+    }
+    const res = await readAgentInbox(env, { agent, peek: true, limit: 100, sinceSeq: lastSeq, seat: input.seat, skipRemaining: true })
     if (!res.ok) {
       // Transient DB failure — keep the stream alive; the client re-reads on reconnect.
       yield { type: 'heartbeat' }
@@ -116,6 +127,13 @@ export async function* streamInboxEvents(
     if (fresh.length === 0) {
       yield { type: 'heartbeat' }
       continue
+    }
+    // P1 (#2166 lens): bodies are about to leave — re-validate NOW regardless of cadence (cost only on delivery
+    // ticks). A failed check ends the stream and yields nothing.
+    if (input.revalidate !== undefined) {
+      const stillValid = await input.revalidate()
+      if (!stillValid) return
+      lastValidated = nowMs()
     }
     lastSeq = fresh[fresh.length - 1].seq
     for (const m of fresh) {
@@ -199,8 +217,9 @@ inboxApp.get('/stream', async (c) => {
       since,
       pollMs,
       seat,
-      // P0-2: re-validate the bearer credential on every poll so a revoked token or
-      // deactivated agent ends the stream instead of leaking the full inbox forever.
+      // P0-2: re-validate the bearer credential (every delivery tick + at most every 60 s idle) so a revoked or
+      // suspended-member token ends the stream. NOTE: resolveMemberByToken checks token liveness and the member,
+      // NOT agents.status, so this does not by itself end the stream for a deactivated agent row.
       revalidate: async () => {
         const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
         return current?.boundAgentId === id.boundAgentId

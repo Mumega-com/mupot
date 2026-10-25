@@ -145,6 +145,8 @@ async function annotateMessages(messages: InboxMessage[]): Promise<void> {
 export interface InboxResult {
   ok: true
   messages: InboxMessage[]
+  /** true ONLY when the caller passed skipRemaining: `remaining`/`complete` were NOT computed and must not be read. */
+  remainingSkipped?: true
   /**
    * Unread rows NOT in `messages`.
    *
@@ -896,7 +898,7 @@ function handledHideSql(attachmentId: string | undefined, binds: (string | numbe
 
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; handledByAttachment?: string },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; handledByAttachment?: string; skipRemaining?: boolean },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -1012,6 +1014,17 @@ async function readAgentInboxForReader(
       }
     }
 
+    // skipRemaining (peek only, SSE stream ticks): the peek SELECT above already enforces the fence inside its WHERE,
+    // so a fenced reader gets zero rows either way; the separate fence read and the unread COUNT(*) exist only to
+    // label the result (consumer_fenced / remaining) and the stream ignores both. Returns remaining: 0, NOT a count.
+    if (peek && input.skipRemaining === true) {
+      for (const m of messages) m.seq = Number(m.seq)
+      for (const m of messages) m.project_id = m.project_id ?? null
+      for (const m of messages) m.target_seat = m.target_seat ?? null
+      await annotateMessages(messages)
+      return { ok: true, messages, remaining: 0, complete: false, remainingSkipped: true }
+    }
+
     const fence = await env.DB.prepare(
       `SELECT mode, generation, key_fingerprint FROM agent_inbox_fences
         WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
@@ -1096,7 +1109,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; handledByAttachment?: string },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; handledByAttachment?: string; skipRemaining?: boolean },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)
