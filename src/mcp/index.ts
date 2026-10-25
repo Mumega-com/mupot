@@ -234,6 +234,7 @@ import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
+import { GARDENER_TOOLS } from './gardener'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { APPROVAL_EXPIRY_TOOLS } from './approval-expiry'
 import { isResubmitCapError } from '../gates/approval-expiry-rule'
@@ -7860,6 +7861,7 @@ export const TOOLS: ToolSpec[] = [
   toolTeamBootstrap,
   toolTeamBootstrapRelease,
   ...ARCHIVE_TOOLS,
+  ...GARDENER_TOOLS,
   ...INCIDENT_REVERT_TOOLS,
   ...APPROVAL_EXPIRY_TOOLS,
   ...EXECUTION_PAUSE_TOOLS,

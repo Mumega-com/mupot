@@ -184,6 +184,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   team_bootstrap_release: MUT('releaseTeamBootstrapSlugBase DELETE FROM projects (org/team-bootstrap.ts:1089)'),
   archive_row: MUT('archiveRow archives members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   // unarchive restores a previously archived row (the inverse of archive_row): changes state, destroys nothing.
+  gardener_preview: RO('SELECTs only (gardener/preview.ts): agents, tasks, submissions, verdicts, deployments, receipts, flights, routine_runs, execution_meter, gate_grants, decision_requests; no INSERT/UPDATE/DELETE, no model call, no archive'),
   archive_propose: ADD('proposeArchives INSERT archive_proposals only; never touches a task (hygiene/archive-proposals.ts)'),
   unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   approval_expiry_sweep: MUT('approval_expiry_sweep dry_run default; real run: guarded UPDATE tasks review->blocked + approval_expiry_receipts INSERT (gates/approval-expiry.ts); org-admin operator only'),
