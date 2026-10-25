@@ -423,6 +423,31 @@ describe('archive write: atomic expected-state, cutoff and standing guards', () 
     expect(archivedIds()).toEqual(['t-1'])
   })
 
+  it('decideProposals: an edit AFTER its pre-read and BEFORE the batch is refused task_changed (atomic expectedUpdatedAt), no archive row', async () => {
+    await propose(['t-1'])
+    harness.sqlite.exec(`UPDATE archive_proposals SET task_updated_at_proposal = (SELECT updated_at FROM tasks WHERE id = archive_proposals.task_id)`)
+    const ids = pendingIds().map((r) => String(r.id))
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z' WHERE id = 't-1'`)
+    const res = await decideProposals(env, adminAuth(), 'mem-admin', ids)
+    expect(res).toHaveLength(1)
+    expect(res[0]).toMatchObject({ result: 'refused', error: 'task_changed' })
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_task_changed' })
+    expect(rows(`SELECT 1 FROM tasks_archive_state WHERE task_id = 't-1'`)).toHaveLength(0)
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('decideProposals: a task retitled "[STANDING] ..." inside the race window is refused by the SQL LTRIM guard', async () => {
+    await propose(['t-1'])
+    harness.sqlite.exec(`UPDATE archive_proposals SET task_updated_at_proposal = (SELECT updated_at FROM tasks WHERE id = archive_proposals.task_id)`)
+    const ids = pendingIds().map((r) => String(r.id))
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET title = '[STANDING] weekly ops' WHERE id = 't-1'`)
+    const res = await decideProposals(env, adminAuth(), 'mem-admin', ids)
+    expect(res[0]).toMatchObject({ result: 'refused', error: 'standing_task' })
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_standing' })
+    expect(rows(`SELECT 1 FROM tasks_archive_state WHERE task_id = 't-1'`)).toHaveLength(0)
+    expect(archivedIds()).toEqual([])
+  })
+
   it('decideProposals refuses a standing task with a terminal refused_standing decision and continues the batch', async () => {
     await propose(['t-1', 't-2'])
     harness.sqlite.exec(`UPDATE tasks SET title = 'STANDING rota' WHERE id = 't-1'`)
