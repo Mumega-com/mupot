@@ -25,6 +25,8 @@ import {
   secretLast4,
 } from '../connectors/crypto'
 import { assertPublicHttpsUrl } from '../lib/ssrf'
+import { normalizeDoorbellHmacSecret } from './doorbell-signature'
+import { validateCallbackUrl } from '../mcp/events-webhook'
 
 export const DOORBELL_TIMEOUT_MS = 3000
 export const INBOX_WAKE_TYPE = 'mupot.inbox.wake'
@@ -39,6 +41,16 @@ export function dispatchDoorbellCorrelation(receiptId: string): string {
 /** Opt-in flag (`"1"` or `"true"`; unset = off). Off: no set, no POST, no DB read on the send path. */
 export function webhookDoorbellEnabled(env: Env): boolean {
   const v = env.WEBHOOK_DOORBELL?.trim().toLowerCase()
+  return v === '1' || v === 'true'
+}
+
+/**
+ * Signed doorbell flag (`"1"` or `"true"`; unset = off). Off: registrations stay
+ * legacy bearer and the send path does not read `delivery_version`. On: new
+ * registrations are signed and delivered on the events queue, one ring.
+ */
+export function webhookDoorbellSignedEnabled(env: Env): boolean {
+  const v = env.WEBHOOK_DOORBELL_SIGNED?.trim().toLowerCase()
   return v === '1' || v === 'true'
 }
 
@@ -78,6 +90,8 @@ export type PublicWebhookDoorbell = {
   webhook_url: string
   auth_last4: string
   updated_at: string
+  /** `legacy` keeps the bearer POST. `signed` is the queue + HMAC path. */
+  delivery_version: 'legacy' | 'signed'
 }
 
 export type DoorbellSetFailure =
@@ -213,26 +227,46 @@ export async function setAgentWebhookDoorbell(
   const url = validateHttpsWebhookUrl(input.webhookUrl)
   if (!url.ok) return { ok: false, error: 'invalid_webhook_url', detail: url.detail }
 
+  const signed = webhookDoorbellSignedEnabled(env)
+  if (signed) {
+    // Allowlist at registration. Send time checks it again (a host can be removed later).
+    const allow = validateCallbackUrl(url.url, env)
+    if (!allow.ok) return { ok: false, error: 'invalid_webhook_url', detail: allow.reason }
+  }
+
   const bearer = input.bearer.trim()
   if (!bearer) return { ok: false, error: 'invalid_bearer', detail: 'bearer required' }
-  if (bearer.length < MIN_BEARER_CHARS) return { ok: false, error: 'invalid_bearer', detail: `bearer must be at least ${MIN_BEARER_CHARS} characters` }
-  if (bearer.length > MAX_BEARER_CHARS) return { ok: false, error: 'invalid_bearer', detail: 'bearer too long' }
+  let storedSecret = bearer
+  let version: 'legacy' | 'signed' = 'legacy'
+  if (signed) {
+    const hmac = normalizeDoorbellHmacSecret(bearer)
+    if (!hmac.ok) return { ok: false, error: 'invalid_bearer', detail: hmac.detail }
+    storedSecret = hmac.secret
+    version = 'signed'
+  } else {
+    if (bearer.length < MIN_BEARER_CHARS) return { ok: false, error: 'invalid_bearer', detail: `bearer must be at least ${MIN_BEARER_CHARS} characters` }
+    if (bearer.length > MAX_BEARER_CHARS) return { ok: false, error: 'invalid_bearer', detail: 'bearer too long' }
+  }
 
-  const ciphertext = await encryptConnectorSecret(master, input.agentId, 'agent_doorbell', bearer, doorbellAad(input.agentId))
-  const last4 = secretLast4(bearer)
+  // Signed keys use their own HKDF domain and AAD = agent id. Legacy keeps `agent_doorbell` / `doorbell:<id>`.
+  const ciphertext = version === 'signed'
+    ? await encryptConnectorSecret(master, input.agentId, 'agent_doorbell_hmac', storedSecret, input.agentId)
+    : await encryptConnectorSecret(master, input.agentId, 'agent_doorbell', storedSecret, doorbellAad(input.agentId))
+  const last4 = secretLast4(storedSecret)
   const updatedAt = input.now ?? new Date().toISOString()
 
   await env.DB.prepare(
     `INSERT INTO agent_webhook_doorbells (
-        tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at, delivery_version
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
       ON CONFLICT(tenant, agent_id) DO UPDATE SET
         webhook_url = excluded.webhook_url,
         auth_ciphertext = excluded.auth_ciphertext,
         auth_last4 = excluded.auth_last4,
         created_by_member_id = excluded.created_by_member_id,
-        updated_at = excluded.updated_at`,
-  ).bind(tenant, input.agentId, url.url, ciphertext, last4, input.createdByMemberId, updatedAt).run()
+        updated_at = excluded.updated_at,
+        delivery_version = excluded.delivery_version`,
+  ).bind(tenant, input.agentId, url.url, ciphertext, last4, input.createdByMemberId, updatedAt, version).run()
 
   return {
     ok: true,
@@ -242,6 +276,7 @@ export async function setAgentWebhookDoorbell(
       webhook_url: redactWebhookUrl(url.url),
       auth_last4: last4,
       updated_at: updatedAt,
+      delivery_version: version,
     },
   }
 }
@@ -253,7 +288,7 @@ export async function getAgentWebhookDoorbell(
   const tenant = requireTenant(env)
   if (!tenant) return null
   const row = await env.DB.prepare(
-    `SELECT agent_id, webhook_url, auth_last4, updated_at
+    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version
        FROM agent_webhook_doorbells
       WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(tenant, agentId).first<{
@@ -261,6 +296,7 @@ export async function getAgentWebhookDoorbell(
     webhook_url: string
     auth_last4: string
     updated_at: string
+    delivery_version: string
   }>()
   if (!row) return null
   return {
@@ -269,6 +305,7 @@ export async function getAgentWebhookDoorbell(
     webhook_url: redactWebhookUrl(row.webhook_url),
     auth_last4: row.auth_last4,
     updated_at: row.updated_at,
+    delivery_version: row.delivery_version === 'signed' ? 'signed' : 'legacy',
   }
 }
 
@@ -290,8 +327,8 @@ export async function listAgentWebhookDoorbells(env: Env): Promise<Map<string, P
   const tenant = requireTenant(env)
   if (!tenant) return out
   const res = await env.DB.prepare(
-    `SELECT agent_id, webhook_url, auth_last4, updated_at FROM agent_webhook_doorbells WHERE tenant = ?1`,
-  ).bind(tenant).all<{ agent_id: string; webhook_url: string; auth_last4: string; updated_at: string }>()
+    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version FROM agent_webhook_doorbells WHERE tenant = ?1`,
+  ).bind(tenant).all<{ agent_id: string; webhook_url: string; auth_last4: string; updated_at: string; delivery_version: string }>()
   for (const row of res.results ?? []) {
     out.set(row.agent_id, {
       configured: true,
@@ -299,6 +336,7 @@ export async function listAgentWebhookDoorbells(env: Env): Promise<Map<string, P
       webhook_url: redactWebhookUrl(row.webhook_url),
       auth_last4: row.auth_last4,
       updated_at: row.updated_at,
+      delivery_version: row.delivery_version === 'signed' ? 'signed' : 'legacy',
     })
   }
   return out
@@ -378,18 +416,30 @@ async function deliverDoorbell(
   // agent has that id and the slug names exactly one agent. Only then look the doorbell up by exact id, so an
   // agent whose slug is shaped like another agent's id can never receive that agent's wakes (gate r2 on #1890).
   // ONE statement (the existence check for the whole send path): resolve to the canonical id, then join the row.
+  // delivery_version is read only while the signed flag is on, so a flag-off send keeps today's SELECT.
   const row = await env.DB.prepare(
     `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext
+            ${webhookDoorbellSignedEnabled(env) ? ', d.delivery_version AS delivery_version' : ''}
        FROM agent_webhook_doorbells d
       WHERE d.tenant = ?1
         AND d.agent_id = COALESCE(
           (SELECT a.id FROM agents a WHERE a.id = ?2),
           (SELECT a.id FROM agents a WHERE a.slug = ?2
             AND (SELECT count(*) FROM agents b WHERE b.slug = ?2) = 1))`,
-  ).bind(tenant, wake.agent_id).first<{ agent_id: string; webhook_url: string; auth_ciphertext: string }>()
+  ).bind(tenant, wake.agent_id).first<{
+    agent_id: string
+    webhook_url: string
+    auth_ciphertext: string
+    delivery_version?: string
+  }>()
   if (!row) return { outcome: 'no_doorbell' }
   // From here on the canonical id is the identity: receipts, AAD/salt and the payload all use it.
   const canonical: WebhookDoorbellWake = { ...wake, agent_id: row.agent_id }
+  if (webhookDoorbellSignedEnabled(env) && row.delivery_version === 'signed') {
+    // One ring: the queue worker POSTs. This path does not.
+    const { handoffSignedDoorbell } = await import('../bus/doorbell-delivery')
+    return handoffSignedDoorbell(env, canonical, opts.correlation, kind)
+  }
   const ref = wakeRef(canonical, opts.correlation)
 
   // Re-assert the guard at fire time: a row written before a rule tightened must not be trusted.
@@ -598,6 +648,41 @@ export async function scheduleTaskAssignedDoorbell(
     { type: TASK_ASSIGNED_TYPE, agent_id: agentId, task_id: taskId, ...(assignment ? { assignment } : {}) },
     fire,
   )
+}
+
+export type DoorbellReceiptView = {
+  event_type: string
+  agent_id: string
+  ref_id: string
+  attempt: number | null
+  outcome: string
+  http_status: number | null
+  error_class: string | null
+  signed_at: string | null
+  attempted_at: string
+}
+
+/**
+ * Metadata-only receipt read. Never returns the URL, the key, ciphertext, or a body.
+ * `error_class` falls back to the legacy `reason` code so older rows stay readable.
+ */
+export async function listAgentWebhookDoorbellReceipts(
+  env: Env,
+  agentId: string,
+  limit = 50,
+): Promise<DoorbellReceiptView[]> {
+  const tenant = requireTenant(env)
+  if (!tenant) return []
+  const cap = Math.min(Math.max(limit, 1), 100)
+  const res = await env.DB.prepare(
+    `SELECT event_type, agent_id, ref_id, attempt, outcome, http_status,
+            COALESCE(error_class, reason) AS error_class, signed_at, attempted_at
+       FROM agent_webhook_doorbell_receipts
+      WHERE tenant = ?1 AND agent_id = ?2
+      ORDER BY attempted_at DESC
+      LIMIT ?3`,
+  ).bind(tenant, agentId, cap).all<DoorbellReceiptView>()
+  return res.results ?? []
 }
 
 /** ctx.waitUntil from a Hono context; `c.executionCtx` throws outside a Worker request (tests), so guard it. */

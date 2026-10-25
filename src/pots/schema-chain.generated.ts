@@ -4507,9 +4507,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_seat_attachments_immutable" },
     ],
   },
+  {
+    file: "0256_signed_webhook_doorbell.sql",
+    sha256: "ed485703fa854a1435c6da91b64082d2eea93789f1f56824daeedf35e0c79a53",
+    statements: [
+      "-- 0256_signed_webhook_doorbell.sql — signed, body-free webhook doorbell.\n--\n-- APPLY THIS BEFORE the Worker that reads delivery_version. The signed flag\n-- (WEBHOOK_DOORBELL_SIGNED) ships OFF, so a deploy that has not flipped it keeps\n-- today's inline bearer POST. Once the column exists, a missing flag still does\n-- not SELECT it on the send path.\n--\n-- delivery_version\n--   'legacy'  existing rows (the DEFAULT) and any registration made while the\n--             signed flag is off. Inline Authorization: Bearer POST, unchanged.\n--   'signed'  registrations made while WEBHOOK_DOORBELL_SIGNED is on. One queue\n--             job on the events-delivery path (mcp.doorbell.delivery). Never both.\n--\n-- ADD COLUMN ... NOT NULL DEFAULT is the same shape as 0255: every existing row\n-- becomes 'legacy' without a table rebuild. The doorbells table is referenced by\n-- no child, but a rebuild is unnecessary and the DEFAULT is the dual-run switch.\n--\n-- Receipts: SQLite cannot widen a CHECK in place. This table has no inbound\n-- foreign keys and no triggers, so it is rebuilt forward-only. Legacy outcomes\n-- (claimed, posted, failed, skipped) stay valid. Signed attempts add retry and\n-- dead_letter, plus attempt / error_class / signed_at. Those new columns are\n-- metadata only: still no URL, key, ciphertext, or body. Copied rows get NULL\n-- for the new columns.\n\nALTER TABLE agent_webhook_doorbells ADD COLUMN delivery_version TEXT NOT NULL DEFAULT 'legacy'\n  CHECK (delivery_version IN ('legacy', 'signed'));",
+      "\n\nCREATE TABLE agent_webhook_doorbell_receipts_v2 (\n  id            TEXT PRIMARY KEY,\n  tenant        TEXT NOT NULL,\n  agent_id      TEXT NOT NULL,\n  event_type    TEXT NOT NULL CHECK (event_type IN ('mupot.inbox.wake', 'mupot.task.assigned', 'mupot.doorbell.test')),\n  ref_id        TEXT NOT NULL,\n  outcome       TEXT NOT NULL CHECK (outcome IN ('claimed', 'posted', 'failed', 'skipped', 'retry', 'dead_letter')),\n  http_status   INTEGER,\n  reason        TEXT,\n  attempted_at  TEXT NOT NULL,\n  -- NULL on rows copied from the legacy table (one updated claim row, no attempt counter).\n  attempt       INTEGER,\n  error_class   TEXT,\n  signed_at     TEXT\n);",
+      "\n\nINSERT INTO agent_webhook_doorbell_receipts_v2 (\n  id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at,\n  attempt, error_class, signed_at\n)\nSELECT\n  id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at,\n  NULL, NULL, NULL\nFROM agent_webhook_doorbell_receipts;",
+      "\n\nDROP TABLE agent_webhook_doorbell_receipts;",
+      "\nALTER TABLE agent_webhook_doorbell_receipts_v2 RENAME TO agent_webhook_doorbell_receipts;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_webhook_doorbell_receipts_agent\n  ON agent_webhook_doorbell_receipts (tenant, agent_id, attempted_at);",
+    ],
+    objects: [
+      { type: "table", name: "agent_webhook_doorbell_receipts_v2" },
+      { type: "index", name: "idx_agent_webhook_doorbell_receipts_agent" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "7bbac1006639390427f173fe62047015f9c162b7d1b03fddf871735e04495ad2"
+export const SCHEMA_CHAIN_DIGEST: string = "af97b8f1f5a58ca16a0b26a2d728d66c94b7f5df90a57740c42fa9fd0083ff63"

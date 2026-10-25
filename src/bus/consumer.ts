@@ -24,6 +24,7 @@ import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { isEventsEnabled } from '../mcp/events'
 import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './events-delivery'
+import { deliverSignedDoorbell, enqueueSignedInboxDoorbell } from './doorbell-delivery'
 import { redactSecretPatterns } from '../lib/redact'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
@@ -725,6 +726,18 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           })
         }
       }
+      // Signed doorbell (WEBHOOK_DOORBELL_SIGNED, default off). Flag off: the helper returns
+      // before any read. A failure here is fail-open — it must not retry the Hermes leg.
+      // Routine-fenced envelopes are excluded inside the helper, from the message row.
+      try {
+        await enqueueSignedInboxDoorbell(env, event)
+      } catch (err) {
+        console.error('bus: message.created — signed doorbell enqueue failed (fail-open, not retried)', {
+          tenant: event.tenant,
+          message_id: p?.message_id,
+          error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
+        })
+      }
       const outcome = await deliverMessageCreatedEvent(env, event as BusEvent<MessageCreatedPayload>)
       const logCtx = {
         tenant: event.tenant,
@@ -789,6 +802,12 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // mupot#1618 PR 2: one signed webhook attempt. Retries are scheduled by the delivery module
       // itself (own attempt counter + delaySeconds); this only throws on an infrastructure fault.
       await deliverSubscriptionEvent(env, event.payload)
+      return true
+    }
+    case 'mcp.doorbell.delivery': {
+      // Signed per-agent doorbell. Same queue, its own receipt table. Retries are delaySeconds
+      // jobs from the delivery module; this throws only when a receipt write or enqueue fails.
+      await deliverSignedDoorbell(env, event.payload)
       return true
     }
     case 'pot.self_serve_provisioning_incomplete': {

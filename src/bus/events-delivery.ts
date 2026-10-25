@@ -18,6 +18,11 @@
 //
 // BODY-FREE. The request body carries {message_id, seq, read_after_seq, kind, request_id} only (the
 // catalogue's payloadSchema) — never the message body. Receipts carry metadata only.
+//
+// The signed webhook doorbell is a second subscription kind on this same queue
+// (src/bus/doorbell-delivery.ts, job `mcp.doorbell.delivery`): re-derive, sign with the
+// same Standard Webhooks POST, write a receipt, retry with backoffDelaySec. It does not
+// go through event_subscriptions. WEBHOOK_DOORBELL_SIGNED defaults off.
 
 import type { BusEvent, Env, MessageCreatedPayload } from '../types'
 import { InvalidEventSeqError, isEventsEnabled, readAfterSeq } from '../mcp/events'

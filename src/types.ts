@@ -441,6 +441,12 @@ export interface Env {
   INSTALLER_WINDOW?: string
   /** Opt-in ("1"/"true"): outbound Grok Bot webhook doorbell (src/agents/webhook-doorbell.ts). Default off. */
   WEBHOOK_DOORBELL?: string
+  /**
+   * Opt-in ("1"/"true"): new doorbell registrations are signed HMAC wakes on the events
+   * queue (src/bus/doorbell-delivery.ts). Default off. Legacy rows keep the bearer POST
+   * until the agent re-registers. Requires migration 0256 (`delivery_version`).
+   */
+  WEBHOOK_DOORBELL_SIGNED?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
   // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
   // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.
@@ -946,6 +952,9 @@ export type BusEventType =
   // addon's /publish and /bridge and the /bus/emit allowlist all refuse it
   // (src/bus/internal-events.ts), and the consumer rebuilds every fact of the delivery from D1.
   | 'mcp.event.delivery'
+  // Signed webhook doorbell attempt (src/bus/doorbell-delivery.ts). Internal-only, same rule as
+  // mcp.event.delivery: the consumer rebuilds the wake from D1. Flag WEBHOOK_DOORBELL_SIGNED.
+  | 'mcp.doorbell.delivery'
   | 'assignment.wake' // INTERNAL job (src/agents/assignment-wake.ts): deliver this agent's queued assignment doorbells
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
