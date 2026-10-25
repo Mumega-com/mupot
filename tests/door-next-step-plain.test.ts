@@ -1,7 +1,7 @@
 // A plain next step per door state, and tool descriptions that say who they are for (agents must not need to research seat_select vs seat_attach).
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { buildWhoami, AGENT_DOOR_DOCS_URL, type WhoamiFacts } from '../src/mcp/whoami'
+import { attachConnectOrder, buildWhoami, seatAttachDoor, AGENT_DOOR_DOCS_URL, type WhoamiFacts } from '../src/mcp/whoami'
 import { advertisedTools } from '../src/mcp/index'
 import type { AuthContext, Env } from '../src/types'
 
@@ -88,6 +88,57 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     expect(w.state).toBe('no_agent')
     expect(w.next_step_plain).toMatch(/^You have no agent yet\./)
     for (const a of [authOf({ channel: 'workspace', boundAgentId: 'ag' }), authOf({ harnessId: 'h-1' })]) expect(run(a).docs).toBe(AGENT_DOOR_DOCS_URL)
+  })
+})
+
+describe('designation step follows SEAT_ATTACH_DESIGNATED (#2178)', () => {
+  const designated = { ...ENV, SEAT_ATTACH_DESIGNATED: '1' } as unknown as Env
+  const loose = { ...ENV, SEAT_ATTACH_DESIGNATED: 'true' } as unknown as Env
+  const attachOff = { ...ENV, SEAT_ATTACH: undefined, SEAT_ATTACH_DESIGNATED: '1' } as unknown as Env
+  const ownSeat = authOf({ boundAgentId: 'sa', seatBinding: SEAT })
+  const unseated = authOf({ harnessId: 'h-1' })
+  const ORDER_OFF = "Call seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+  const ORDER_ON = "Before seat_attach, your human opens that agent's page and presses 'Allow for me' (the box 'Allow my chats to become this agent'); seat_attach before that returns 409 agent_not_designated_for_you. Then call " + ORDER_OFF.slice('Call '.length)
+  const DOOR_TAIL = "seat_attach {agent}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
+
+  it('attach + auto-enroll on, designated off: connect order and the seat_attach door omit Allow for me', () => {
+    expect(attachConnectOrder(ENV)).toBe(ORDER_OFF)
+    expect(attachConnectOrder(loose)).toBe(ORDER_OFF) // strict '1'; 'true' is off
+    expect(seatAttachDoor(ENV)).toEqual({
+      does: 'act as an agent you already have. Call ' + DOOR_TAIL,
+      requires: 'the agent must be one your human administers; nothing is attached until they tap',
+    })
+    for (const auth of [ownSeat, unseated]) {
+      const plain = run(auth).next_step_plain
+      expect(plain).toContain(ORDER_OFF)
+      expect(plain).not.toContain('Allow for me')
+      expect(plain).not.toContain('agent_not_designated_for_you')
+    }
+  })
+
+  it('attach + auto-enroll + designated on: both texts name Allow for me and the 409', () => {
+    expect(attachConnectOrder(designated)).toBe(ORDER_ON)
+    expect(seatAttachDoor(designated)).toEqual({
+      does: "act as an agent you already have. First your human presses 'Allow for me' on that agent's page (otherwise seat_attach returns 409 agent_not_designated_for_you). Then call " + DOOR_TAIL,
+      requires: "the agent must be one your human administers, and they must have pressed Allow for me; nothing is attached until they tap",
+    })
+    for (const auth of [ownSeat, unseated]) {
+      const plain = run(auth, {}, designated).next_step_plain
+      expect(plain).toContain(ORDER_ON)
+      expect(plain).toContain("presses 'Allow for me'")
+      expect(plain).toContain('agent_not_designated_for_you')
+    }
+  })
+
+  it('attach off: the connect order is not offered, even when SEAT_ATTACH_DESIGNATED is set', () => {
+    expect(attachConnectOrder(attachOff)).toBe(ORDER_OFF)
+    expect(seatAttachDoor(attachOff).does).not.toContain('Allow for me')
+    for (const auth of [ownSeat, unseated]) {
+      const plain = run(auth, {}, attachOff).next_step_plain
+      expect(plain).not.toContain('seat_attach {agent}')
+      expect(plain).not.toContain('Allow for me')
+      expect(plain).not.toContain('agent_not_designated_for_you')
+    }
   })
 })
 

@@ -14,7 +14,7 @@ import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { canonicalHarness } from '../src/fleet/reported-values'
 import { sendAgentMessage } from '../src/agents/messages'
 import { setAgentWebhookDoorbell } from '../src/agents/webhook-doorbell'
-import { ATTACH_CONNECT_ORDER } from '../src/mcp/whoami'
+import { attachConnectOrder } from '../src/mcp/whoami'
 import { runRouterTick } from '../src/router/engine'
 import type { AuthContext, Env } from '../src/types'
 
@@ -360,7 +360,7 @@ describe('boot_context prints the connect order before seat_attach', () => {
     const cold = await rpc(env, g.ctx, 'boot_context', {})
     expect(whoamiOf(cold).state).toBe('harness_unseated')
     expect(whoamiOf(cold).next_step_plain).toContain('seat_select {project, folder, thread}')
-    expect(whoamiOf(cold).next_step_plain).toContain(ATTACH_CONNECT_ORDER)
+    expect(whoamiOf(cold).next_step_plain).toContain(attachConnectOrder(env))
 
     const selected = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', thread: 'grok-thread', squad: 'core' })
     const handle = selected.sc.seat_handle
@@ -369,7 +369,7 @@ describe('boot_context prints the connect order before seat_attach', () => {
 
     const seated = await rpc(env, g.ctx, 'boot_context', { seat: String(handle) })
     expect(whoamiOf(seated).state).toBe('own_seat')
-    expect(whoamiOf(seated).next_step_plain).toContain(ATTACH_CONNECT_ORDER)
+    expect(whoamiOf(seated).next_step_plain).toContain(attachConnectOrder(env))
     expect(String(seated.sc.next_step)).toContain('agent_not_designated_for_you')
     expect(String(seated.sc.next_step)).toContain('Allow for me')
     expect(String(seated.sc.next_step)).toContain('/connections')
@@ -378,6 +378,45 @@ describe('boot_context prints the connect order before seat_attach', () => {
       .find((d) => d.tool === 'seat_attach')
     expect(door?.does).toMatch(/Allow for me/)
     expect(door?.does).toMatch(/passkey/)
+  })
+
+  it('designated off: connect order and the seat_attach door omit Allow for me and still name admit', async () => {
+    const env = envFor(h, { SEAT_ATTACH_DESIGNATED: undefined })
+    const g = await grant(env, HUMAN)
+    const cold = await rpc(env, g.ctx, 'boot_context', {})
+    expect(whoamiOf(cold).next_step_plain).toContain(attachConnectOrder(env))
+    expect(whoamiOf(cold).next_step_plain).not.toContain('Allow for me')
+    expect(whoamiOf(cold).next_step_plain).not.toContain('agent_not_designated_for_you')
+
+    const selected = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', thread: 'grok-thread', squad: 'core' })
+    const seated = await rpc(env, g.ctx, 'boot_context', { seat: String(selected.sc.seat_handle) })
+    expect(whoamiOf(seated).state).toBe('own_seat')
+    expect(whoamiOf(seated).next_step_plain).toContain('seat_attach {agent}')
+    expect(whoamiOf(seated).next_step_plain).toContain('/connections')
+    expect(String(seated.sc.next_step)).not.toContain('Allow for me')
+    expect(String(seated.sc.next_step)).not.toContain('agent_not_designated_for_you')
+    expect(String(seated.sc.next_step)).toContain('/connections')
+    const door = (seated.sc.available_doors as Array<{ tool: string; does: string; requires: string }>)
+      .find((d) => d.tool === 'seat_attach')
+    expect(door?.does).toMatch(/passkey/)
+    expect(door?.does).not.toMatch(/Allow for me/)
+    expect(door?.does).not.toMatch(/agent_not_designated_for_you/)
+    expect(door?.requires).not.toMatch(/Allow for me/)
+    expect(door?.requires).toMatch(/nothing is attached until they tap/)
+  })
+
+  it('attach off: boot_context does not offer seat_attach or Allow for me', async () => {
+    const env = envFor(h, { SEAT_ATTACH: undefined, SEAT_ATTACH_DESIGNATED: '1' })
+    const g = await grant(env, HUMAN)
+    const cold = await rpc(env, g.ctx, 'boot_context', {})
+    expect(whoamiOf(cold).next_step_plain).toContain('seat_select {project, folder, thread}')
+    expect(whoamiOf(cold).next_step_plain).not.toContain('seat_attach {agent}')
+    expect(whoamiOf(cold).next_step_plain).not.toContain('Allow for me')
+    const selected = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', thread: 'grok-thread', squad: 'core' })
+    const seated = await rpc(env, g.ctx, 'boot_context', { seat: String(selected.sc.seat_handle) })
+    expect(String(seated.sc.next_step)).not.toContain('Allow for me')
+    expect(String(seated.sc.next_step)).not.toContain('seat_attach {agent}')
+    expect((seated.sc.available_doors as Array<{ tool: string }>).map((d) => d.tool)).not.toContain('seat_attach')
   })
 
   it('a held or observed seat is not offered seat_attach', async () => {
