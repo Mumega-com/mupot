@@ -67,6 +67,7 @@ import {
   isOrgAdmin,
   holdsCapabilityFloor,
   exceedsTargetRankCeiling,
+  exceedsTargetRankCeilingForMembers,
   loadSquadScope,
   planeCoversScope,
   CAPABILITY_LIVE_PREDICATE,
@@ -2130,9 +2131,16 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
     )
       .bind(env.TENANT_SLUG)
       .all<{ id: string; display_name: string | null; email: string | null }>()
+    // One batched ceiling check for the whole list (same rule as exceedsTargetRankCeiling); a per-member loop here
+    // was ~900 serial D1 round trips for 150 members and made this page take minutes.
+    const outranking = await exceedsTargetRankCeilingForMembers(
+      env,
+      auth,
+      (members.results ?? []).filter((m) => m.id !== auth.memberId).map((m) => m.id),
+    )
     for (const m of members.results ?? []) {
       if (m.id === auth.memberId) continue
-      if (await exceedsTargetRankCeiling(env, auth, m.id)) continue
+      if (outranking.has(m.id)) continue
       candidates.push({ id: m.id, label: [m.display_name, m.email].filter((v): v is string => !!v).join(' · ') || m.id })
     }
   }
