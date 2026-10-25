@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { makeBoardCleanupApp } from '../src/dashboard/board-cleanup'
-import { countPendingProposals, listPendingProposals, MAX_PENDING_PER_AGENT, PROPOSAL_TTL_MS } from '../src/hygiene/archive-proposals'
+import { archiveRow } from '../src/hygiene/archive'
+import { decideProposals, countPendingProposals, listPendingProposals, MAX_PENDING_PER_AGENT, PROPOSAL_TTL_MS } from '../src/hygiene/archive-proposals'
 import { invokeTool } from '../src/mcp/index'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -362,5 +363,99 @@ describe('POST gate: agent-bound session', () => {
     }, makeEnv('admin@x.test'))
     expect(res.status).toBe(403)
     expect(archivedIds()).toEqual([])
+  })
+})
+
+// Atomic expected-state guards on the archive WRITE itself. The pre-read is bypassed by editing the row
+// AFTER the pre-reads and BEFORE the guarded batch (the race window), via a DB wrapper.
+describe('archive write: atomic expected-state, cutoff and standing guards', () => {
+  function raced(env: Env, edit: string) {
+    let fired = false
+    const db = new Proxy(env.DB, {
+      get(target, prop, recv) {
+        if (prop === 'batch') {
+          return async (stmts: never[]) => {
+            if (!fired) { fired = true; harness.sqlite.exec(edit) }
+            return target.batch(stmts)
+          }
+        }
+        const v = Reflect.get(target, prop, recv)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+    return { ...env, DB: db } as Env
+  }
+  const adminAuth = () => adminToolAuth()
+  const T0 = () => String(rows(`SELECT updated_at AS u FROM tasks WHERE id = 't-1'`)[0]?.u)
+
+  it('a same-status edit between pre-read and write refuses the row (task_changed) and archives nothing', async () => {
+    const seen = T0()
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z' WHERE id = 't-1'`)
+    const out = await archiveRow(env, adminAuth(), { table: 'tasks', id: 't-1', reason: 'r', actorMemberId: 'mem-admin', expectedStatus: 'open', expectedUpdatedAt: seen })
+    expect(out).toMatchObject({ ok: false, error: 'task_changed' })
+    expect(archivedIds()).toEqual([])
+    expect(rows(`SELECT 1 FROM archive_receipts WHERE entity_id = 't-1'`)).toHaveLength(0)
+  })
+
+  it('a row edited after the cutoff is refused at the write (updated_after_cutoff)', async () => {
+    const cutoff = '2050-01-01T00:00:00.000Z'
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z' WHERE id = 't-1'`)
+    const out = await archiveRow(env, adminAuth(), { table: 'tasks', id: 't-1', reason: 'r', actorMemberId: 'mem-admin', updatedBefore: cutoff })
+    expect(out).toMatchObject({ ok: false, error: 'updated_after_cutoff' })
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('a task retitled STANDING between pre-read and write is refused at the write; a pre-existing one is refused up front', async () => {
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET title = 'STANDING: weekly ops' WHERE id = 't-1'`)
+    const out = await archiveRow(env, adminAuth(), { table: 'tasks', id: 't-1', reason: 'r', actorMemberId: 'mem-admin' })
+    expect(out).toMatchObject({ ok: false, error: 'standing_task' })
+    harness.sqlite.exec(`UPDATE tasks SET title = '[standing] x' WHERE id = 't-2'`)
+    const out2 = await archiveRow(makeEnv('admin@x.test'), adminAuth(), { table: 'tasks', id: 't-2', reason: 'r', actorMemberId: 'mem-admin' })
+    expect(out2).toMatchObject({ ok: false, error: 'standing_task' })
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('an untouched candidate with all guards set still archives', async () => {
+    const out = await archiveRow(makeEnv('admin@x.test'), adminAuth(), {
+      table: 'tasks', id: 't-1', reason: 'r', actorMemberId: 'mem-admin', expectedStatus: 'open', expectedUpdatedAt: T0(), updatedBefore: '2999-01-01T00:00:00.000Z',
+    })
+    expect(out).toMatchObject({ ok: true, status: 'archived' })
+    expect(archivedIds()).toEqual(['t-1'])
+  })
+
+  it('decideProposals: an edit AFTER its pre-read and BEFORE the batch is refused task_changed (atomic expectedUpdatedAt), no archive row', async () => {
+    await propose(['t-1'])
+    harness.sqlite.exec(`UPDATE archive_proposals SET task_updated_at_proposal = (SELECT updated_at FROM tasks WHERE id = archive_proposals.task_id)`)
+    const ids = pendingIds().map((r) => String(r.id))
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z' WHERE id = 't-1'`)
+    const res = await decideProposals(env, adminAuth(), 'mem-admin', ids)
+    expect(res).toHaveLength(1)
+    expect(res[0]).toMatchObject({ result: 'refused', error: 'task_changed' })
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_task_changed' })
+    expect(rows(`SELECT 1 FROM tasks_archive_state WHERE task_id = 't-1'`)).toHaveLength(0)
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('decideProposals: a task retitled "[STANDING] ..." inside the race window is refused by the SQL LTRIM guard', async () => {
+    await propose(['t-1'])
+    harness.sqlite.exec(`UPDATE archive_proposals SET task_updated_at_proposal = (SELECT updated_at FROM tasks WHERE id = archive_proposals.task_id)`)
+    const ids = pendingIds().map((r) => String(r.id))
+    const env = raced(makeEnv('admin@x.test'), `UPDATE tasks SET title = '[STANDING] weekly ops' WHERE id = 't-1'`)
+    const res = await decideProposals(env, adminAuth(), 'mem-admin', ids)
+    expect(res[0]).toMatchObject({ result: 'refused', error: 'standing_task' })
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_standing' })
+    expect(rows(`SELECT 1 FROM tasks_archive_state WHERE task_id = 't-1'`)).toHaveLength(0)
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('decideProposals refuses a standing task with a terminal refused_standing decision and continues the batch', async () => {
+    await propose(['t-1', 't-2'])
+    harness.sqlite.exec(`UPDATE tasks SET title = 'STANDING rota' WHERE id = 't-1'`)
+    harness.sqlite.exec(`UPDATE archive_proposals SET task_updated_at_proposal = (SELECT updated_at FROM tasks WHERE id = archive_proposals.task_id)`)
+    const ids = pendingIds().map((r) => String(r.id))
+    const res = await decideProposals(makeEnv('admin@x.test'), adminAuth(), 'mem-admin', ids)
+    expect(res.map((r) => r.error ?? r.result).sort()).toEqual(['archived', 'standing_task'])
+    expect(rows(`SELECT decision FROM archive_proposals WHERE task_id = 't-1'`)[0]).toEqual({ decision: 'refused_standing' })
+    expect(archivedIds()).toEqual(['t-2'])
   })
 })

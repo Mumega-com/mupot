@@ -140,6 +140,9 @@ export interface DecideRowResult {
 
 function terminalDecision(outcome: ArchiveOutcome): string | null {
   if (outcome.ok) return outcome.status === 'archived' ? 'archived' : 'already_archived'
+  if (outcome.error === 'task_changed') return 'refused_task_changed'
+  if (outcome.error === 'updated_after_cutoff') return 'refused_task_changed'
+  if (outcome.error === 'standing_task') return 'refused_standing'
   if (outcome.error === 'status_drift') return 'refused_status_drift'
   if (outcome.error === 'not_found') return 'refused_not_found'
   return null // transient refusal: stays pending so a later attempt can succeed
@@ -151,6 +154,8 @@ export async function decideProposals(
   auth: AuthContext,
   actorMemberId: string,
   proposalIds: string[],
+  /** Optional ISO cutoff: a task whose updated_at is no longer strictly before it is refused at the write. */
+  updatedBefore?: string,
 ): Promise<DecideRowResult[]> {
   const out: DecideRowResult[] = []
   for (const proposalId of Array.from(new Set(proposalIds))) {
@@ -176,6 +181,9 @@ export async function decideProposals(
       reason: `${p.reason} [archive_proposal:${p.id}]`.slice(0, 2000),
       actorMemberId,
       expectedStatus: p.status,
+      // Atomic at the write (the pre-read above is only a fast path): null = legacy proposal without a recorded stamp.
+      expectedUpdatedAt: p.updated_at ?? undefined,
+      updatedBefore,
     })
     const decision = terminalDecision(outcome)
     if (decision) {
