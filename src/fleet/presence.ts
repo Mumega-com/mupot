@@ -10,8 +10,10 @@ import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { classify, humanAge, type FleetLiveness } from '../dashboard/fleet'
 import type { AgentIdentity } from '../auth/member-bearer'
 import { listFlights } from '../flight/service'
-import { cleanReported, canonicalHarness } from './reported-values'
+import { cleanReported, canonicalHarness, SEVEN_AXIS_HARNESSES } from './reported-values'
 import { scheduleStates, attachSchedule, type ScheduleStatus } from './schedule-state'
+
+export { SEVEN_AXIS_HARNESSES }
 
 // Allowed runtime sources — an unknown/invalid value normalizes to 'unknown'
 // (never trusts the client's raw string into storage unbounded).
@@ -27,19 +29,6 @@ const SOURCES = new Set([
   'cursor-ide',
   'grokbot',
 ])
-
-export const SEVEN_AXIS_HARNESSES = [
-  'cursor-ide',
-  'cursor-cloud',
-  'antigravity-cli',
-  'claude-code',
-  'codex-cli',
-  'prime',
-  'hermes',
-  'grok-cli',
-  'grokbot',
-  'unknown',
-] as const
 
 export type SevenAxisHarness = (typeof SEVEN_AXIS_HARNESSES)[number]
 

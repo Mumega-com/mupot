@@ -4,7 +4,9 @@
 // Cursor Cloud seat is `river-cursor`.
 
 import { RIVER_CURSOR_SEAT } from '../agents/river-lead'
-import { cleanReported } from '../fleet/reported-values'
+import { cleanReported, SEVEN_AXIS_HARNESSES } from '../fleet/reported-values'
+
+export { SEVEN_AXIS_HARNESSES }
 
 export const SEVEN_AXIS_KEYS = [
   'seat',
@@ -17,18 +19,6 @@ export const SEVEN_AXIS_KEYS = [
 ] as const
 
 export type SevenAxisKey = (typeof SEVEN_AXIS_KEYS)[number]
-
-export const SEVEN_AXIS_HARNESSES = [
-  'cursor-ide',
-  'cursor-cloud',
-  'antigravity-cli',
-  'claude-code',
-  'codex-cli',
-  'prime',
-  'hermes',
-  'grok-cli',
-  'unknown',
-] as const
 
 export type SevenAxisHarness = (typeof SEVEN_AXIS_HARNESSES)[number]
 

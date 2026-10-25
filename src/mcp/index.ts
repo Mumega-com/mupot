@@ -6205,6 +6205,11 @@ const toolCheckIn: ToolSpec = {
     // check_in keeps working unmodified in either case (see
     // resolveAgentSessionContext's 'not_agent_session' and
     // getOrCreateAgentSession's missing-table guard).
+    // Attached seats still reach getOrCreateAgentSession here, which writes
+    // agent_sessions.seat from the caller-typed seat label. That write predates
+    // #2163. The router does not read agent_sessions.seat. An attached Grok Bot
+    // stays unroutable on purpose; that gap is the harness-port capability
+    // design (mumega-com #1537).
     let agentSessionResult: Awaited<ReturnType<typeof getOrCreateAgentSession>> = null
     const sessionContext = resolveAgentSessionContext(auth, seatLabel)
     if (sessionContext.ok) {

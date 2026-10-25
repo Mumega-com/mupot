@@ -20,8 +20,8 @@ import {
   CURSOR_CLOUD_EFFORT,
   CURSOR_CLOUD_MACHINE,
 } from '../src/cursor/seat-identity'
-import { listPresence, normalizeHarness, normalizeEffort } from '../src/fleet/presence'
-import { parseSevenAxisCheckin } from '../src/presence/seven-axis'
+import { listPresence, normalizeHarness, normalizeEffort, SEVEN_AXIS_HARNESSES as fleetHarnesses } from '../src/fleet/presence'
+import { parseSevenAxisCheckin, SEVEN_AXIS_HARNESSES as displayHarnesses } from '../src/presence/seven-axis'
 import { canonicalHarness } from '../src/fleet/reported-values'
 import { renderSevenAxisSeatRoster } from '../src/dashboard/mission-control-views'
 import type { AuthContext, Env } from '../src/types'
@@ -416,5 +416,13 @@ describe('7-axis normalizers and Cursor Cloud seat injection', () => {
     expect(html).toContain('grok-4.6')
     expect(html).toContain('extended-thinking-64k')
     expect(html).not.toContain('old-tmux')
+  })
+})
+
+describe('seven-axis harness vocabulary (mupot#2177)', () => {
+  it('the presence display list and the fleet list are one list, and it includes grokbot', () => {
+    expect(displayHarnesses).toEqual(fleetHarnesses)
+    expect(displayHarnesses).toBe(fleetHarnesses)
+    expect(displayHarnesses).toContain('grokbot')
   })
 })

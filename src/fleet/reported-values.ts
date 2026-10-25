@@ -27,6 +27,21 @@ export function cleanReported(v: string, max = MAX_REPORTED): string | null {
   return s.length > 0 ? s : null
 }
 
+// Suggested check_in harness names. Display vocabulary only — not a gate.
+// src/fleet/presence.ts and src/presence/seven-axis.ts both import this one list (mupot#2177).
+export const SEVEN_AXIS_HARNESSES = [
+  'cursor-ide',
+  'cursor-cloud',
+  'antigravity-cli',
+  'claude-code',
+  'codex-cli',
+  'prime',
+  'hermes',
+  'grok-cli',
+  'grokbot',
+  'unknown',
+] as const
+
 // Known harness spellings -> canonical name. Anything else is 'other'.
 const CANONICAL: Readonly<Record<string, string>> = {
   'claude-code': 'claude-code',
