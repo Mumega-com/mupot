@@ -1078,6 +1078,66 @@ export async function exceedsTargetRankCeiling(
   return exceedsTargetRankCeilingGivenRanks(auth.memberId ?? null, actorRank, targetMemberId, targetRank)
 }
 
+/**
+ * Bulk form of `exceedsTargetRankCeiling` for list surfaces (the dashboard "Set owner" candidate list): the SAME rule
+ * (target GLOBAL rank over live grants, home-squad grants excluded, unioned with the legacy role plane, against the
+ * ACTOR's org-scope-local rank, self exempt), computed in a fixed number of statements instead of ~4+k serial round trips
+ * per member. Returns the ids that EXCEED the ceiling. Legacy role: where two users rows share an email the per-member
+ * form takes an arbitrary `LIMIT 1`; this takes the highest, which can only refuse more, never admit more.
+ */
+export async function exceedsTargetRankCeilingForMembers(
+  env: Env,
+  auth: AuthContext,
+  targetMemberIds: readonly string[],
+): Promise<Set<string>> {
+  const ids = [...new Set(targetMemberIds)]
+  const exceeding = new Set<string>()
+  if (ids.length === 0) return exceeding
+  const [actorRank, grantsByMember] = await Promise.all([
+    actorRankOnScopeFor(env, auth, 'org', null),
+    resolveCapabilitiesForMembers(env, ids),
+  ])
+  const squadIds = new Set<string>()
+  for (const grants of grantsByMember.values()) {
+    for (const g of grants) if (g.scope_type === 'squad' && g.scope_id) squadIds.add(g.scope_id)
+  }
+  const homeSquads = new Set<string>()
+  await Promise.all(
+    chunkForD1InList([...squadIds]).map(async (chunk) => {
+      const ph = chunk.map((_, i) => `?${i + 1}`).join(', ')
+      const rows = await env.DB.prepare(`SELECT id FROM squads WHERE kind = 'home' AND id IN (${ph})`)
+        .bind(...chunk)
+        .all<{ id: string }>()
+      for (const r of rows.results ?? []) homeSquads.add(r.id)
+    }),
+  )
+  const roleRankByMember = new Map<string, number>()
+  await Promise.all(
+    chunkForD1InList(ids).map(async (chunk) => {
+      const ph = chunk.map((_, i) => `?${i + 1}`).join(', ')
+      const rows = await env.DB.prepare(
+        `SELECT m.id AS id, u.role AS role
+           FROM members m JOIN users u ON lower(u.email) = lower(m.email)
+          WHERE m.id IN (${ph}) AND m.email IS NOT NULL`,
+      )
+        .bind(...chunk)
+        .all<{ id: string; role: AuthContext['role'] }>()
+      for (const r of rows.results ?? []) {
+        roleRankByMember.set(r.id, Math.max(roleRankByMember.get(r.id) ?? 0, legacyRoleRank(r.role)))
+      }
+    }),
+  )
+  for (const id of ids) {
+    let max = roleRankByMember.get(id) ?? 0
+    for (const g of grantsByMember.get(id) ?? []) {
+      if (g.scope_type === 'squad' && g.scope_id && homeSquads.has(g.scope_id)) continue
+      max = Math.max(max, RANK[g.capability])
+    }
+    if (exceedsTargetRankCeilingGivenRanks(auth.memberId ?? null, actorRank, id, max)) exceeding.add(id)
+  }
+  return exceeding
+}
+
 // Highest-to-lowest so the first `hasCapability` hit is already the ceiling —
 // no need to scan every rank and take a max.
 const RANKS_DESC: Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
