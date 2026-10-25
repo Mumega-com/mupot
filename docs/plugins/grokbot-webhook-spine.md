@@ -8,7 +8,7 @@ Pot → Grok Bot **doorbell**. When agent A `send`s to agent B and B has a regis
 | Status | **scaffold** · DRAFT PR · mumega dogfood only |
 | Chair | Hadi — pot wakes Bot on inbox send; Bot peeks pot |
 | Seat kit | `grokbot-plugin-builder` (`60918ba5`) · flight `bc-990283cc` |
-| Plugin door | Cursor / Grok Bot install UX is [PR #1343](https://github.com/Mumega-com/mupot/pull/1343) — stays **DRAFT**, not this spine |
+| Plugin door | Connect order and the `grokbot` harness: [mupot-grokbot-plugin](mupot-grokbot-plugin.md). Cursor / Grok Bot install UX is [PR #1343](https://github.com/Mumega-com/mupot/pull/1343) — stays **DRAFT**, not this spine |
 
 ## Do not mix with these
 

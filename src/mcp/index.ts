@@ -54,7 +54,7 @@ import {
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { tenantHeaderNotice, TENANT_NOTICE_RESPONSE_HEADER, type TenantHeaderNotice } from './tenant-header-notice'
-import { buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
+import { ATTACH_CONNECT_ORDER, buildWhoami, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction, verdictAttribution } from '../auth/attached-ceiling'
@@ -341,7 +341,7 @@ import { consentChoiceLabels, consentLabels, refusalEnvelope, refusalGuidance, t
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
-import { cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
+import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
 import { selfReportAtBoot, readFleetBelief, type ConnectionKind } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
@@ -6244,6 +6244,36 @@ const toolCheckIn: ToolSpec = {
       ...(pollPresence ?? {}),
     }
 
+    // W2: an attached thread is not the host. The router joins `presence` on agent_id
+    // (src/router/engine.ts) and a row newer than 10 minutes is a live candidate. An attached
+    // chat cannot ack or lease, so that row would strand the task on an agent with no runtime.
+    //
+    // A seat may write that row only from a server-held fact: harness-adapter capabilities
+    // (src/harness/registry.ts) or the seat binding. HarnessCapabilities is the dispatch SPI
+    // (launch, status, cancel) and does not say an attached chat can take routed work. The
+    // seat binding names the OAuth harness row; it is not a registration that this chat is
+    // the host. The caller's harness string is display only (echo.harness_canonical). It is
+    // not a capability, and it is not read here. Return before the debounce key so a typed
+    // name cannot consume the host's check-in slot either.
+    //
+    // held_harness is the non-routing inventory of that server row (id, stored kind, and the
+    // same display canonical used everywhere else). It is not written to `presence`, and the
+    // caller's harness argument is not an input to it.
+    if (attachedAuthority(auth)) {
+      const binding = auth.seatBinding
+      const held = binding
+        ? await loadHarness(env, binding.humanMemberId, binding.harnessId).catch(() => null)
+        : null
+      return done({
+        ...echo,
+        debounced: false,
+        presence_recorded: false,
+        held_harness: held
+          ? { id: held.id, kind: held.kind, kind_canonical: canonicalHarness(held.kind) }
+          : null,
+      })
+    }
+
     try {
       if (await env.SESSIONS.get(dkey)) {
         return done({ ...echo, debounced: true })
@@ -6253,8 +6283,6 @@ const toolCheckIn: ToolSpec = {
       // KV unavailable — match /api/fleet/checkin and prefer recording presence.
     }
 
-    // W2: an attached thread is not the agent's host; its check_in never writes the agent's presence (the router reads it as 'online').
-    if (attachedAuthority(auth)) return done({ ...echo, debounced: false, presence_recorded: false })
     await recordCheckin(env, id, {
       source: args.source ?? axis.harness,
       label: seatLabel || args.label,
@@ -6266,7 +6294,7 @@ const toolCheckIn: ToolSpec = {
       effort: args.effort,
       flight_id: args.flight_id,
     })
-    return done({ ...echo, debounced: false })
+    return done({ ...echo, debounced: false, presence_recorded: true })
   },
 }
 
@@ -7237,12 +7265,12 @@ const toolBootContext: ToolSpec = {
     // A chat that HAS a seat (a ChatGPT conversation's auto seat, or a seat_select handle) and is not yet attached has one more
     // door, and until now only channel_limits.to_get_write_access (read last) named it: this session is 'bound' (to its seat
     // agent), so the doors above were just orient/status/boot_context. Same gate as that text and as seat_attach itself.
-    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory') {
+    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed') {
       // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
       availableDoors.splice(1, 0, {
         tool: 'seat_attach',
-        does: 'act as an agent you already have: your human approves once with their passkey (you get an approve_url to hand them, or are told to send them to their Connections page), then call seat_attach again and your NEXT request acts as that agent',
-        requires: 'the agent must be one your human administers; nothing is attached until they tap',
+        does: "act as an agent you already have. First your human presses 'Allow for me' on that agent's page (otherwise seat_attach returns 409 agent_not_designated_for_you). Then call seat_attach {agent}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease.",
+        requires: 'the agent must be one your human administers, and they must have pressed Allow for me; nothing is attached until they tap',
       })
     }
     const enrollHref = enrollUrl(
@@ -7348,11 +7376,14 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
+      // Same limit as whoami's own_seat branch: a held or observed seat is on the read floor, and seat_attach is refused there.
+      const limitedSeat = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
+      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached && !limitedSeat ? ` ${ATTACH_CONNECT_ORDER}` : ''
       nextStepOut = auth.seatBinding.attached
-        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you cannot ack or lease. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
-        ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
-        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).`
+        ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox.${attachOrder}`
+        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).${attachOrder}`
 
       // A silent downgrade (attach refused, handle rejected, auto seat refused) is said out loud, after the acting-as line.
       if (firstStep) nextStepOut = `${nextStepOut} ${firstStep.next_step}`

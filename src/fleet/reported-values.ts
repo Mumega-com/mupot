@@ -40,6 +40,10 @@ const CANONICAL: Readonly<Record<string, string>> = {
   grok: 'grok-cli',
   'grok-cli': 'grok-cli',
   'grok-tui': 'grok-cli',
+  // Grok Bot (xAI routines / webhook seat) is not the Grok CLI. mupot#1521.
+  grokbot: 'grokbot',
+  'grok-bot': 'grokbot',
+  'grok bot': 'grokbot',
   hermes: 'hermes',
   'hermes-cron': 'hermes',
   antigravity: 'antigravity',

@@ -65,7 +65,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - Required axes:
        check_in({
          seat: "<seat-id>",                 // e.g. "cursor-mac", "grok-desktop", "cursor-cloud-builder", "loom-hetzner"
-         harness: "<harness>",              // any harness name you run on, a short bounded string kept as reported (e.g. "claude-code", "codex-cli", "hermes", your own); authority is never derived from the name
+         harness: "<harness>",              // any harness name you run on, a short bounded string kept as reported (e.g. "claude-code", "codex-cli", "hermes", "grokbot", your own); authority is never derived from the name
          machine: "<machine>",              // e.g. "hadi-mac", "hetzner-ash-1", "cursor-cloud-vm"
          model: "<model>",                  // e.g. "claude-3-7-sonnet", "gemini-3.7-flash", "grok-4.6", "deepseek-v4-pro"
          provider: "<provider>",            // e.g. "anthropic", "google", "xai", "deepseek-ai", "cloudflare-ai"

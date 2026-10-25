@@ -113,6 +113,14 @@ export function bootstrapOffered(auth: AuthContext, facts: WhoamiFacts): boolean
 // The seat_select instruction is the refusal table's own sentence (one text, so boot and a refusal cannot disagree).
 const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet. ${TABLE_SEAT_SELECT_STEP} Lost the handle? Call seat_select again with the same project/folder/thread labels: you get your existing seat and a new handle.`
 
+/**
+ * The attach order, printed on an unattached seat BEFORE the first seat_attach (mupot#1521).
+ * A Grok Bot seat learned this only by hitting 409; boot_context/whoami says it up front.
+ * One string so boot's next_step and whoami.next_step_plain cannot drift.
+ */
+export const ATTACH_CONNECT_ORDER =
+  "Before seat_attach, your human opens that agent's page and presses 'Allow for me' (the box 'Allow my chats to become this agent'); seat_attach before that returns 409 agent_not_designated_for_you. Then call seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+
 /** The one-sentence answer per state (exported for the tests). It names whether the seat tools apply, so no agent has to read docs or
  *  source to learn seat_select vs seat_attach or whether a handle is needed. The state is the same derivation as `state`. */
 export function plainNextStep(
@@ -132,7 +140,7 @@ export function plainNextStep(
     const handle = auth.seatBinding?.source === 'handle'
       ? 'keep passing your seat handle with each request (this attachment is found through it)'
       : 'no seat handle needed'
-    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; ${handle}, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} or your open work with needs_you_list.`
+    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; ${handle}, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} (then inbox_mark_handled; you cannot ack or lease) or your open work with needs_you_list.`
   }
   if (state === 'acting_as') {
     return `You are ${as} (your human consented this connection to it). Nothing to set up; no seat handle needed; the seat tools (seat_select, seat_attach) do not apply. Next: read your inbox or your open work with needs_you_list.`
@@ -146,7 +154,7 @@ export function plainNextStep(
     const attach = limited
       ? `This seat is ${auth.seatAgentStatus}, so it is limited to the read floor until your human lifts it: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the limit.`
       : seatAttachEnabled(env)
-      ? 'To act as an existing agent your human administers, call seat_attach {agent}; do not call seat_select (you already have a seat).'
+      ? `${ATTACH_CONNECT_ORDER} do not call seat_select (you already have a seat).`
       : 'Attaching to an existing agent is not enabled on this pot; do not call seat_select (you already have a seat).'
     return `You are ${as} on this chat's own seat. ${handle} ${attach} Otherwise: read your inbox or your open work with needs_you_list.`
   }
@@ -154,8 +162,9 @@ export function plainNextStep(
     return `You are ${as}; the seat tools (seat_select, seat_attach) do not apply to a workspace-token agent. Next: read your inbox or your open work with needs_you_list.`
   }
   if (state === 'harness_unseated') {
+    const attach = seatSelectCallable && seatAttachEnabled(env) ? ` ${ATTACH_CONNECT_ORDER}` : ''
     return seatSelectCallable
-      ? 'You have no agent yet. To get your own seat call seat_select {project, folder, thread}. To act as an existing agent, get a seat first, then call seat_attach {agent} from it.'
+      ? `You have no agent yet. To get your own seat call seat_select {project, folder, thread} and pass the returned mseat_ handle as seat on every later call. To act as an existing agent, get a seat first.${attach}`
       : 'You have no agent yet and seats are not enabled for this connection. ' + (missing[0]?.next_step ?? 'Ask your human or an org admin.')
   }
   return `You have no agent yet. ${missing[0]?.next_step ?? 'Ask your human or an org admin to connect you to one.'}`

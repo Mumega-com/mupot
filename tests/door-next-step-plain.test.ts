@@ -66,6 +66,10 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     expect(w.state).toBe('harness_unseated')
     expect(w.next_step_plain).toContain('seat_select {project, folder, thread}')
     expect(w.next_step_plain).toContain('seat_attach {agent}')
+    const attachOff = run(authOf({ harnessId: 'h-1' }), {}, { ...ENV, SEAT_ATTACH: undefined } as unknown as Env)
+    expect(attachOff.state).toBe('harness_unseated')
+    expect(attachOff.next_step_plain).toContain('seat_select {project, folder, thread}')
+    expect(attachOff.next_step_plain).not.toContain('seat_attach {agent}')
     const off = run(authOf({ harnessId: 'h-1' }), {}, { ...ENV, SEAT_AUTO_ENROLL: undefined } as unknown as Env)
     expect(off.state).toBe('no_agent') // seats off: seat_select is not offered
     expect(off.next_step_plain).not.toContain('seat_select {project')
