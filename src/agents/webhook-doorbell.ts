@@ -120,8 +120,14 @@ type DoorbellFireOpts = {
   recipients?: ReadonlySet<string>
 }
 
-/** The receipt / dedupe ref of a wake: the shared correlation, else the event's own id (task wakes add their assignment occurrence). */
-function wakeRef(wake: WebhookDoorbellWake, correlation?: string): string {
+/**
+ * The receipt / dedupe ref of one event. A correlation shared by two wakes (a dispatch's
+ * task.assigned and the inbox.wake of its bridge letter, or an assignment and its letter)
+ * is one event, so exactly-once is on this ref and not on the wake type.
+ * A test ping has no id of its own; the legacy path uses the constant `test` and counts
+ * rows. The signed path passes a fresh id per ping (each ping is its own event).
+ */
+export function doorbellEventRef(wake: WebhookDoorbellWake, correlation?: string): string {
   if (correlation) return correlation
   if (wake.type === INBOX_WAKE_TYPE) return wake.message_id
   if (wake.type === TASK_ASSIGNED_TYPE) return wake.assignment ? `${wake.task_id}#${wake.assignment}` : wake.task_id
@@ -440,7 +446,7 @@ async function deliverDoorbell(
     const { handoffSignedDoorbell } = await import('../bus/doorbell-delivery')
     return handoffSignedDoorbell(env, canonical, opts.correlation, kind)
   }
-  const ref = wakeRef(canonical, opts.correlation)
+  const ref = doorbellEventRef(canonical, opts.correlation)
 
   // Re-assert the guard at fire time: a row written before a rule tightened must not be trusted.
   const url = validateHttpsWebhookUrl(row.webhook_url)
@@ -679,6 +685,7 @@ export async function listAgentWebhookDoorbellReceipts(
             COALESCE(error_class, reason) AS error_class, signed_at, attempted_at
        FROM agent_webhook_doorbell_receipts
       WHERE tenant = ?1 AND agent_id = ?2
+        AND NOT (outcome = 'claimed' AND reason = 'enqueued')
       ORDER BY attempted_at DESC
       LIMIT ?3`,
   ).bind(tenant, agentId, cap).all<DoorbellReceiptView>()

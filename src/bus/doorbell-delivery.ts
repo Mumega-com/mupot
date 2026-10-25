@@ -23,6 +23,7 @@ import {
   TEST_PING_WINDOW_MS,
   WAKE_BURST_LIMIT,
   dispatchDoorbellCorrelation,
+  doorbellEventRef,
   validateHttpsWebhookUrl,
   webhookDoorbellEnabled,
   webhookDoorbellSignedEnabled,
@@ -90,12 +91,49 @@ function toDoorbellDelivery(result: SignedDeliveryResult): DoorbellDelivery {
   return { outcome: 'failed', http_status: result.http_status, reason: result.reason ?? result.outcome }
 }
 
+/** Stable primary key of the enqueue lock for one event ref. Promotion keeps this id as attempt 1. */
+async function enqueueLockId(agentId: string, ref: string): Promise<string> {
+  const digest = await webhookIdFor(agentId, 'enqueue', ref)
+  return `enq_${digest.slice('msg_'.length)}`
+}
+
+/**
+ * One queue job per event ref. The lock row is the same receipt attempt 1 is promoted from,
+ * so a second caller (the send path and the message.created consumer, or task.assigned and
+ * the bridge letter) does not put a twin job on the queue. A twin would take the next attempt
+ * as soon as the first had recorded `retry`, and the receiver would see the backoff twice as fast.
+ * Returns false when this event already has a job. Retries call BUS.send directly: they are the
+ * one scheduled successor, not a second producer.
+ */
+async function claimDeliveryJob(
+  env: Env,
+  tenant: string,
+  agentId: string,
+  eventType: string,
+  ref: string,
+  nowIso: string,
+): Promise<boolean> {
+  const id = await enqueueLockId(agentId, ref)
+  const inserted = await env.DB.prepare(
+    `INSERT OR IGNORE INTO agent_webhook_doorbell_receipts
+       (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'claimed', NULL, 'enqueued', ?6, NULL, NULL, NULL)`,
+  ).bind(id, tenant, agentId, eventType, ref, nowIso).run()
+  return (inserted.meta?.changes ?? 0) === 1
+}
+
 /** Queue a signed wake. Direct BUS.send: createBus().emit refuses this internal type. */
 export async function enqueueSignedDoorbellJob(
   env: Env,
   wake: WebhookDoorbellWake,
   correlation?: string,
-): Promise<void> {
+): Promise<boolean> {
+  const tenant = typeof env.TENANT_SLUG === 'string' ? env.TENANT_SLUG : ''
+  if (!tenant) return false
+  const ref = doorbellEventRef(wake, correlation)
+  const nowIso = new Date().toISOString()
+  const won = await claimDeliveryJob(env, tenant, wake.agent_id, wake.type, ref, nowIso)
+  if (!won) return false
   const job: DoorbellDeliveryJob = {
     wake_type: wake.type,
     agent_id: wake.agent_id,
@@ -103,13 +141,42 @@ export async function enqueueSignedDoorbellJob(
     ...(wake.type === TASK_ASSIGNED_TYPE && wake.assignment ? { assignment: wake.assignment } : {}),
     ...(correlation ? { correlation } : {}),
   }
-  await env.BUS.send({
-    type: 'mcp.doorbell.delivery',
-    tenant: env.TENANT_SLUG,
-    agent_id: wake.agent_id,
-    payload: job,
-    ts: new Date().toISOString(),
-  })
+  try {
+    await env.BUS.send({
+      type: 'mcp.doorbell.delivery',
+      tenant,
+      agent_id: wake.agent_id,
+      payload: job,
+      ts: nowIso,
+    })
+  } catch (err) {
+    await env.DB.prepare(
+      `DELETE FROM agent_webhook_doorbell_receipts WHERE id = ?1 AND reason = 'enqueued'`,
+    ).bind(await enqueueLockId(wake.agent_id, ref)).run()
+    throw err
+  }
+  return true
+}
+
+/** The delayed successor of one attempt. Not an enqueue: the lock for this ref already exists. */
+async function scheduleDoorbellRetry(
+  env: Env,
+  tenant: string,
+  agentId: string,
+  job: DoorbellDeliveryJob,
+  delaySeconds: number,
+  nowIso: string,
+): Promise<void> {
+  await env.BUS.send(
+    {
+      type: 'mcp.doorbell.delivery',
+      tenant,
+      agent_id: agentId,
+      payload: job,
+      ts: nowIso,
+    },
+    { delaySeconds },
+  )
 }
 
 /**
@@ -123,10 +190,12 @@ export async function handoffSignedDoorbell(
   kind: 'wake' | 'test',
 ): Promise<DoorbellDelivery> {
   if (kind === 'test') {
+    // Each ping is its own event. A shared ref of `test` would make the first success
+    // terminal for every later ping.
     const result = await deliverSignedDoorbell(env, {
       wake_type: DOORBELL_TEST_TYPE,
       agent_id: wake.agent_id,
-      ref_id: 'test',
+      ref_id: crypto.randomUUID(),
     }, { timeoutMs: DOORBELL_TIMEOUT_MS })
     return toDoorbellDelivery(result)
   }
@@ -153,9 +222,10 @@ export async function enqueueSignedInboxDoorbell(env: Env, event: BusEvent): Pro
   const hint = event.payload as { message_id?: unknown; to_agent?: unknown } | null
   if (!hint || typeof hint.message_id !== 'string' || hint.message_id.length === 0) return 0
   const message = await env.DB.prepare(
-    `SELECT id, to_agent, from_agent, kind, request_id FROM agent_messages WHERE id = ?1 AND tenant = ?2`,
+    `SELECT id, seq, to_agent, from_agent, kind, request_id FROM agent_messages WHERE id = ?1 AND tenant = ?2`,
   ).bind(hint.message_id, tenant).first<{
     id: string
+    seq: number
     to_agent: string
     from_agent: string
     kind: string
@@ -167,14 +237,44 @@ export async function enqueueSignedInboxDoorbell(env: Env, event: BusEvent): Pro
     `SELECT agent_id, delivery_version FROM agent_webhook_doorbells WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(tenant, message.to_agent).first<{ agent_id: string; delivery_version: string }>()
   if (!bell || bell.delivery_version !== 'signed') return 0
-  await enqueueSignedDoorbellJob(env, {
+  const correlation = await inboxEventCorrelation(env, tenant, bell.agent_id, message)
+  // An assignment letter whose epoch is not visible yet must not claim a different ref
+  // (the message id). The send path already knows the epoch and owns that event.
+  if (correlation === null) return 0
+  const queued = await enqueueSignedDoorbellJob(env, {
     type: INBOX_WAKE_TYPE,
     agent_id: bell.agent_id,
     seq: 0,
     message_id: message.id,
     kind: message.kind,
-  })
-  return 1
+  }, correlation)
+  return queued ? 1 : 0
+}
+
+/**
+ * The event ref a second producer must use so it collides with the send path.
+ * `null` means "do not enqueue": this is an assignment letter and its epoch is not
+ * readable yet, so falling back to the message id would be a second event.
+ */
+async function inboxEventCorrelation(
+  env: Env,
+  tenant: string,
+  agentId: string,
+  message: { seq: number; from_agent: string; request_id: string | null },
+): Promise<string | undefined | null> {
+  if (typeof message.request_id === 'string' && message.request_id.startsWith(DISPATCH_INBOX_PREFIX)) {
+    return dispatchDoorbellCorrelation(message.request_id.slice(DISPATCH_INBOX_PREFIX.length))
+  }
+  if (message.from_agent !== ASSIGNMENT_WAKE_SENDER) return undefined
+  const wakes = await env.DB.prepare(
+    `SELECT task_id, epoch FROM task_assignment_wakes
+      WHERE tenant = ?1 AND agent_id = ?2
+        AND (message_seq = ?3 OR (message_seq IS NULL AND outcome IN ('pending', 'sent', 'queued')))`,
+  ).bind(tenant, agentId, message.seq).all<{ task_id: string; epoch: string }>()
+  const rows = wakes.results ?? []
+  if (rows.length === 1) return `${rows[0].task_id}#${rows[0].epoch}`
+  if (rows.length === 0) return null
+  return undefined
 }
 
 interface DoorbellRow {
@@ -201,12 +301,15 @@ type Facts =
   | { kind: 'wake'; eventType: DoorbellDeliveryJob['wake_type']; ref: string; fields: SignedDoorbellFields }
   | { kind: 'routine' }
   | { kind: 'refuse'; reason: string; ref: string; eventType: DoorbellDeliveryJob['wake_type'] }
+  | { kind: 'unconfirmed'; reason: string; ref: string; eventType: DoorbellDeliveryJob['wake_type'] }
 
-async function confirmedDispatchRef(env: Env, tenant: string, agentId: string, taskId: string, receiptId: string): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 AS x FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 AND agent_id = ?3 AND task_id = ?4`,
-  ).bind(tenant, receiptId, agentId, taskId).first<{ x: number }>()
-  return row !== null
+function taskWake(agentId: string, job: DoorbellDeliveryJob): WebhookDoorbellWake {
+  return {
+    type: TASK_ASSIGNED_TYPE,
+    agent_id: agentId,
+    task_id: job.ref_id,
+    ...(job.assignment ? { assignment: job.assignment } : {}),
+  }
 }
 
 async function loadFacts(env: Env, tenant: string, agentId: string, job: DoorbellDeliveryJob): Promise<Facts> {
@@ -214,7 +317,7 @@ async function loadFacts(env: Env, tenant: string, agentId: string, job: Doorbel
     return {
       kind: 'wake',
       eventType: DOORBELL_TEST_TYPE,
-      ref: 'test',
+      ref: job.ref_id,
       fields: { type: DOORBELL_TEST_TYPE, agent_id: agentId },
     }
   }
@@ -233,26 +336,13 @@ async function loadFacts(env: Env, tenant: string, agentId: string, job: Doorbel
       return { kind: 'refuse', reason: 'message_not_addressed', ref: job.ref_id, eventType: INBOX_WAKE_TYPE }
     }
     if (isRoutineEnvelope(message)) return { kind: 'routine' }
-    let ref = job.ref_id
-    if (typeof message.request_id === 'string' && message.request_id.startsWith(DISPATCH_INBOX_PREFIX)) {
-      const receiptId = message.request_id.slice(DISPATCH_INBOX_PREFIX.length)
-      // The bridge letter's request id is the receipt. Confirm that receipt names this agent,
-      // then share the ref task.assigned uses (`dispatch:<receiptId>`).
-      const owned = await env.DB.prepare(
-        `SELECT task_id FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 AND agent_id = ?3`,
-      ).bind(tenant, receiptId, agentId).first<{ task_id: string }>()
-      if (owned && await confirmedDispatchRef(env, tenant, agentId, owned.task_id, receiptId)) {
-        ref = dispatchDoorbellCorrelation(receiptId)
-      }
-    } else if (message.from_agent === ASSIGNMENT_WAKE_SENDER) {
-      const wakes = await env.DB.prepare(
-        `SELECT task_id, epoch FROM task_assignment_wakes
-          WHERE tenant = ?1 AND agent_id = ?2
-            AND (message_seq = ?3 OR (message_seq IS NULL AND outcome IN ('pending', 'sent', 'queued')))`,
-      ).bind(tenant, agentId, message.seq).all<{ task_id: string; epoch: string }>()
-      const rows = wakes.results ?? []
-      if (rows.length === 1) ref = `${rows[0].task_id}#${rows[0].epoch}`
-    }
+    // The job carries the ref its enqueue lock was taken on. Re-deriving it here, and
+    // only keeping a shared ref when a second row is visible, is what split one dispatch
+    // into two rings and what collapsed an unconfirmed release onto the bare task id.
+    const ref = doorbellEventRef(
+      { type: INBOX_WAKE_TYPE, agent_id: agentId, seq: Number(message.seq), message_id: job.ref_id, kind: message.kind },
+      job.correlation,
+    )
     return {
       kind: 'wake',
       eventType: INBOX_WAKE_TYPE,
@@ -266,21 +356,15 @@ async function loadFacts(env: Env, tenant: string, agentId: string, job: Doorbel
       },
     }
   }
+  const ref = doorbellEventRef(taskWake(agentId, job), job.correlation)
   const task = await env.DB.prepare(
-    `SELECT assignee_agent_id, updated_at FROM tasks WHERE id = ?1`,
-  ).bind(job.ref_id).first<{ assignee_agent_id: string | null; updated_at: string }>()
+    `SELECT assignee_agent_id FROM tasks WHERE id = ?1`,
+  ).bind(job.ref_id).first<{ assignee_agent_id: string | null }>()
+  // Not visible yet (release or reassign still committing, or the read raced the write)
+  // is not a terminal failure. A `failed` receipt on this ref would suppress the wake
+  // for good, including the retry that runs after the row is visible.
   if (!task || task.assignee_agent_id !== agentId) {
-    return { kind: 'refuse', reason: 'task_not_assigned', ref: job.ref_id, eventType: TASK_ASSIGNED_TYPE }
-  }
-  let ref = job.ref_id
-  if (job.correlation?.startsWith('dispatch:')) {
-    const receiptId = job.correlation.slice('dispatch:'.length)
-    if (await confirmedDispatchRef(env, tenant, agentId, job.ref_id, receiptId)) ref = job.correlation
-  } else if (job.assignment) {
-    const wake = await env.DB.prepare(
-      `SELECT 1 AS x FROM task_assignment_wakes WHERE tenant = ?1 AND task_id = ?2 AND agent_id = ?3 AND epoch = ?4`,
-    ).bind(tenant, job.ref_id, agentId, job.assignment).first<{ x: number }>()
-    if (wake || task.updated_at === job.assignment) ref = `${job.ref_id}#${job.assignment}`
+    return { kind: 'unconfirmed', reason: 'task_not_assigned', ref, eventType: TASK_ASSIGNED_TYPE }
   }
   return {
     kind: 'wake',
@@ -345,18 +429,27 @@ async function beginAttempt(
   nowMs: number,
 ): Promise<Claim> {
   const nowIso = new Date(nowMs).toISOString()
+  // Exactly-once is the event ref, shared by every wake type that announces it.
+  // Keying on event_type as well rang task.assigned and the bridge inbox.wake both.
   const terminal = await env.DB.prepare(
     `SELECT 1 AS x FROM agent_webhook_doorbell_receipts
-      WHERE tenant = ?1 AND agent_id = ?2 AND event_type = ?3 AND ref_id = ?4
+      WHERE tenant = ?1 AND agent_id = ?2 AND ref_id = ?3
         AND outcome IN ('posted', 'failed', 'dead_letter', 'skipped') LIMIT 1`,
-  ).bind(tenant, agentId, eventType, ref).first<{ x: number }>()
+  ).bind(tenant, agentId, ref).first<{ x: number }>()
   if (terminal) return { kind: 'stop', result: { outcome: 'skipped', reason: 'terminal' } }
+
+  const inflight = await env.DB.prepare(
+    `SELECT 1 AS x FROM agent_webhook_doorbell_receipts
+      WHERE tenant = ?1 AND agent_id = ?2 AND ref_id = ?3
+        AND outcome = 'claimed' AND attempt IS NOT NULL LIMIT 1`,
+  ).bind(tenant, agentId, ref).first<{ x: number }>()
+  if (inflight) return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
 
   const prior = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts
-      WHERE tenant = ?1 AND agent_id = ?2 AND event_type = ?3 AND ref_id = ?4
-        AND outcome IN ('retry', 'claimed')`,
-  ).bind(tenant, agentId, eventType, ref).first<{ n: number }>()
+      WHERE tenant = ?1 AND agent_id = ?2 AND ref_id = ?3
+        AND outcome IN ('retry', 'claimed') AND attempt IS NOT NULL`,
+  ).bind(tenant, agentId, ref).first<{ n: number }>()
   const attempt = Number(prior?.n ?? 0) + 1
   if (attempt > MAX_DELIVERY_ATTEMPTS) {
     return { kind: 'stop', result: { outcome: 'skipped', reason: 'terminal' } }
@@ -368,6 +461,7 @@ async function beginAttempt(
       `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts
         WHERE tenant = ?1 AND agent_id = ?2 AND event_type <> ?3
           AND outcome IN ('claimed', 'posted', 'failed', 'retry', 'dead_letter')
+          AND NOT (outcome = 'claimed' AND reason = 'enqueued')
           AND attempted_at > ?4`,
     ).bind(tenant, agentId, DOORBELL_TEST_TYPE, since).first<{ n: number }>()
     if (Number(burst?.n ?? 0) >= WAKE_BURST_LIMIT) {
@@ -387,6 +481,16 @@ async function beginAttempt(
     }
   }
 
+  if (attempt === 1) {
+    const promoted = await env.DB.prepare(
+      `UPDATE agent_webhook_doorbell_receipts
+          SET outcome = 'claimed', attempt = 1, reason = NULL, error_class = NULL,
+              event_type = ?1, attempted_at = ?2
+        WHERE id = ?3 AND reason = 'enqueued' AND attempt IS NULL`,
+    ).bind(eventType, nowIso, await enqueueLockId(agentId, ref)).run()
+    if ((promoted.meta?.changes ?? 0) === 1) return { kind: 'go', id: await enqueueLockId(agentId, ref), attempt: 1 }
+  }
+
   const id = crypto.randomUUID()
   const inserted = await env.DB.prepare(
     `INSERT INTO agent_webhook_doorbell_receipts
@@ -394,7 +498,7 @@ async function beginAttempt(
      SELECT ?1, ?2, ?3, ?4, ?5, 'claimed', NULL, NULL, ?6, ?7, NULL, NULL
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_webhook_doorbell_receipts
-         WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?4 AND ref_id = ?5
+         WHERE tenant = ?2 AND agent_id = ?3 AND ref_id = ?5
            AND (
              outcome IN ('posted', 'failed', 'dead_letter', 'skipped')
              OR attempt = ?7
@@ -405,6 +509,16 @@ async function beginAttempt(
     return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
   }
   return { kind: 'go', id, attempt }
+}
+
+function retryJob(job: DoorbellDeliveryJob, agentId: string): DoorbellDeliveryJob {
+  return {
+    wake_type: job.wake_type,
+    agent_id: agentId,
+    ref_id: job.ref_id,
+    ...(job.assignment ? { assignment: job.assignment } : {}),
+    ...(job.correlation ? { correlation: job.correlation } : {}),
+  }
 }
 
 /**
@@ -436,6 +550,19 @@ export async function deliverSignedDoorbell(
     if (claim.kind === 'stop') return claim.result
     await finishClaim(env, claim.id, 'failed', { errorClass: facts.reason })
     return { outcome: 'refused', reason: facts.reason }
+  }
+  if (facts.kind === 'unconfirmed') {
+    const claim = await beginAttempt(env, tenant, row.agent_id, facts.eventType, facts.ref, nowMs)
+    if (claim.kind === 'stop') return claim.result
+    if (claim.attempt >= MAX_DELIVERY_ATTEMPTS) {
+      await finishClaim(env, claim.id, 'dead_letter', { errorClass: facts.reason })
+      return { outcome: 'dead_letter', reason: facts.reason }
+    }
+    await finishClaim(env, claim.id, 'retry', { errorClass: facts.reason })
+    await scheduleDoorbellRetry(
+      env, tenant, row.agent_id, retryJob(job, row.agent_id), backoffDelaySec(claim.attempt), nowIso,
+    )
+    return { outcome: 'retry', reason: facts.reason }
   }
 
   const claim = await beginAttempt(env, tenant, row.agent_id, facts.eventType, facts.ref, nowMs)
@@ -492,24 +619,10 @@ export async function deliverSignedDoorbell(
     return { outcome: 'dead_letter', http_status: httpStatus, reason: errorClass }
   }
   await finishClaim(env, claim.id, 'retry', { httpStatus, errorClass, signedAt: signed.signedAtIso })
-  const delaySeconds = backoffDelaySec(claim.attempt)
-  // Resend the same hint. The next attempt re-derives the ref from D1 and counts receipts.
-  const retryJob: DoorbellDeliveryJob = {
-    wake_type: job.wake_type,
-    agent_id: row.agent_id,
-    ref_id: job.ref_id,
-    ...(job.assignment ? { assignment: job.assignment } : {}),
-    ...(job.correlation ? { correlation: job.correlation } : {}),
-  }
-  await env.BUS.send(
-    {
-      type: 'mcp.doorbell.delivery',
-      tenant,
-      agent_id: row.agent_id,
-      payload: retryJob,
-      ts: nowIso,
-    },
-    { delaySeconds },
+  // Resend the same hint. The next attempt re-reads D1 and counts receipts. Direct send:
+  // the enqueue lock for this ref is already the attempt-1 row.
+  await scheduleDoorbellRetry(
+    env, tenant, row.agent_id, retryJob(job, row.agent_id), backoffDelaySec(claim.attempt), nowIso,
   )
   return { outcome: 'retry', http_status: httpStatus, reason: errorClass }
 }

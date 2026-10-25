@@ -12,8 +12,14 @@ import {
   signedDoorbellBody,
   verifySignedDoorbell,
 } from '../src/agents/doorbell-signature'
-import { setAgentWebhookDoorbell } from '../src/agents/webhook-doorbell'
+import {
+  scheduleTaskAssignedDoorbell,
+  sendDoorbellTestPing,
+  setAgentWebhookDoorbell,
+  TEST_PING_LIMIT,
+} from '../src/agents/webhook-doorbell'
 import { deliverSignedDoorbell, enqueueSignedInboxDoorbell } from '../src/bus/doorbell-delivery'
+import { deliverDispatchToInbox } from '../src/bus/fleet-bridge'
 import { backoffDelaySec } from '../src/bus/events-delivery'
 import { handleQueue } from '../src/bus/consumer'
 import { createBus } from '../src/bus'
@@ -469,5 +475,112 @@ describe('signed webhook doorbell delivery', () => {
     await expect(createBus(off).emit({
       type: 'mcp.doorbell.delivery', tenant: TENANT, payload: {}, ts: T0,
     })).rejects.toThrow(/internal-only/)
+  })
+
+  it('rings each test ping until the per-agent window cap', async () => {
+    await register()
+    fetched.length = 0
+    const outcomes: string[] = []
+    for (let i = 0; i < TEST_PING_LIMIT; i++) {
+      outcomes.push((await sendDoorbellTestPing(env, AGENT_A)).outcome)
+    }
+    expect(outcomes).toEqual(Array.from({ length: TEST_PING_LIMIT }, () => 'posted'))
+    expect(fetched).toHaveLength(TEST_PING_LIMIT)
+    const blocked = await sendDoorbellTestPing(env, AGENT_A)
+    expect(blocked).toMatchObject({ outcome: 'rate_limited', reason: 'test_ping_rate_limited' })
+    expect(fetched).toHaveLength(TEST_PING_LIMIT)
+  })
+
+  it('a task dispatch rings the assignee once', async () => {
+    await register()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at)
+      VALUES ('t-dispatch', '${SQUAD_ID}', 'Dispatch once', 'body stays off the wire', 'done', 'open', '${AGENT_A}', '${T0}', '${T0}');
+    `)
+    const pending: Promise<unknown>[] = []
+    const out = await invokeTool(humanAdmin(), env, 'task_dispatch', { task_id: 't-dispatch' }, {
+      origin: 'https://pot.example',
+      transport: 'mcp',
+      waitUntil: (p: Promise<unknown>) => { pending.push(p) },
+    })
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    await Promise.all(pending)
+    const receipt = harness.sqlite.prepare(
+      `SELECT id FROM task_dispatch_receipts WHERE task_id = 't-dispatch'`,
+    ).get() as { id: string }
+    const bridge = await deliverDispatchToInbox(env, {
+      agentId: AGENT_A,
+      squadId: SQUAD_ID,
+      taskId: 't-dispatch',
+      receiptId: receipt.id,
+      dispatchedByMemberId: MEMBER_ID,
+      projectId: null,
+    })
+    expect(bridge.delivered).toBe(true)
+    const jobs = doorbellJobs()
+    expect(jobs).toHaveLength(1)
+    fetched.length = 0
+    for (const job of jobs) {
+      await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+    }
+    expect(fetched).toHaveLength(1)
+    expect(JSON.parse(String(fetched[0].init.body)).type).toBe('mupot.task.assigned')
+  })
+
+  it('does not permanently suppress a wake when a release or reassign cannot be confirmed yet', async () => {
+    await register()
+    const taskId = 't-release'
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at)
+      VALUES ('${taskId}', '${SQUAD_ID}', 'Release', 'b', 'done', 'open', '${AGENT_B}', '${T0}', '${T0}');
+    `)
+    // The reassign to A has been asked for, but the task row still names B.
+    await scheduleTaskAssignedDoorbell(env, AGENT_A, taskId, { assignment: 'epoch-reassign' })
+    const reassign = doorbellJobs().at(-1)
+    expect(reassign).toBeTruthy()
+    fetched.length = 0
+    const hidden = await deliverSignedDoorbell(env, reassign!.payload, { nowMs: Date.parse(T0) })
+    expect(hidden.outcome).toBe('retry')
+    expect(fetched).toHaveLength(0)
+    harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = ? WHERE id = ?`).run(AGENT_A, taskId)
+    const shown = await deliverSignedDoorbell(env, reassign!.payload, { nowMs: Date.parse(T0) + 1000 })
+    expect(shown.outcome).toBe('delivered')
+    expect(fetched).toHaveLength(1)
+
+    // A release token is not the task's updated_at and has no wake-ledger row. Each one is its own event.
+    fetched.length = 0
+    sent.length = 0
+    await scheduleTaskAssignedDoorbell(env, AGENT_A, taskId, { assignment: 'release:one' })
+    await scheduleTaskAssignedDoorbell(env, AGENT_A, taskId, { assignment: 'release:two' })
+    const releases = doorbellJobs()
+    expect(releases).toHaveLength(2)
+    for (const job of releases) {
+      expect((await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) + 5000 })).outcome).toBe('delivered')
+    }
+    expect(fetched).toHaveLength(2)
+  })
+
+  it('enqueues one delivery job per inbox message so a 5xx follows one backoff', async () => {
+    await register()
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      fetched.push({ url: String(url), init: init ?? {} })
+      return new Response('down', { status: 500 })
+    }) as typeof fetch
+    const sentMsg = await sendOne('rid-one-job')
+    expect(sentMsg.ok).toBe(true)
+    const created = sent.find((s) => s.body.type === 'message.created')
+    expect(created).toBeTruthy()
+    await handleQueue({
+      messages: [{ id: 'q-one-job', body: created!.body, attempts: 1, ack: vi.fn(), retry: vi.fn() }],
+    } as never, env)
+    const jobs = doorbellJobs()
+    expect(jobs).toHaveLength(1)
+    fetched.length = 0
+    const before = sent.length
+    for (const job of jobs) {
+      await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+    }
+    expect(fetched).toHaveLength(1)
+    expect(sent.slice(before).map((s) => s.delaySeconds)).toEqual([backoffDelaySec(1)])
   })
 })
