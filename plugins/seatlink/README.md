@@ -58,3 +58,6 @@ Key: `node bin/seatlink-hostkey-gen.mjs` (mode 600, refuses existing file / grou
 `public_key` with `register_agent_key`; a seat_event_grants row per seat is required (operator action).
 No automatic SSE fallback: while a grant is live the stream route returns 409 `notify_owned_by_fleet_host`.
 Rollback is operator-only: revoke the seat's grant, then remove `seat_events` from the seat.
+
+## Bridge in this repo
+`bridge/` is the installable bridge (seatlink.mjs + lib/). Install = copy `bridge/seatlink.mjs` and `bridge/lib/*.mjs` over the installed dir (seats.json, tokens, state stay in place). Seats opt in via seats.json `seat_events: true` (uses the seat's `mupot_agent_id` + `mupot_token_file`).

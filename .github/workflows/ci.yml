@@ -92,7 +92,7 @@ jobs:
         run: node --test 'scripts/provision/*.test.mjs'
       # seatlink discovery + 401 policy (S2). Same #745 rule: .test.mjs runs ONLY where wired.
       - name: Seatlink discovery tests
-        run: node --test 'plugins/seatlink/*.test.mjs'
+        run: node --test 'plugins/seatlink/*.test.mjs' 'plugins/seatlink/bridge/*.test.mjs'
       - name: Wrangler dry-run bundle check
         run: npx wrangler deploy --dry-run --config wrangler.example.toml
       - name: D1 migration chain check

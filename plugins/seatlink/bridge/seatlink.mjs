@@ -73,6 +73,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { reconcileBeforeDeliver } from "./lib/reconcile.mjs";
 import { createPaperclipHandler, isPaperclipSeat } from "./lib/paperclip.mjs";
+import { createSeatEventsClient, isOwnedByFleetHost, makePeekReader, parseSeatEventsConfig } from "./lib/seat-events-client.mjs";
 
 const HOME = os.homedir();
 const SOCK = process.env.HERDR_SOCK || path.join(HOME, ".config/herdr/herdr.sock");
@@ -602,7 +603,7 @@ export async function drainDeferred(herdrName) {
   for (const msg of toDeliver) await injectPotMail(herdrName, msg);
 }
 
-async function openInboxStream(entry, api) {
+export async function openInboxStream(entry, api) {
   const token = readTokenPath(entry.mupot_token_file);
   if (!token) {
     log(`${entry.herdr}: no token, skip SSE`);
@@ -620,7 +621,18 @@ async function openInboxStream(entry, api) {
         const res = await fetch(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: "text/event-stream" },
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          // 409 notify_owned_by_fleet_host: a seat_event_grants row owns this seat's push. Retrying cannot
+          // succeed and must not bypass the fence: stop this seat's SSE and say so once.
+          if (res.status === 409) {
+            const b = await res.json().catch(() => null);
+            if (isOwnedByFleetHost(409, b)) {
+              log(`SSE ${entry.herdr}: seat owned by fleet host ${b.host_agent_id ?? "?"} (push); SSE stopped, not retrying`);
+              return;
+            }
+          }
+          throw new Error(`HTTP ${res.status}`);
+        }
         backoff = 1000;
         log(`SSE open ${entry.herdr} since=${since}`);
         const reader = res.body.getReader();
@@ -646,8 +658,10 @@ async function openInboxStream(entry, api) {
               since = ev.message.seq ?? since;
               await routeMail(entry, ev.message);
             }
-            cursors[entry.herdr] = since;
-            writeJson(CURSOR_FILE, cursors);
+            // re-read before write: the push client keeps its own entries in the same file
+            const cur = readJson(CURSOR_FILE, {});
+            cur[entry.herdr] = since;
+            writeJson(CURSOR_FILE, cur);
           }
         }
       } catch (e) {
@@ -660,14 +674,47 @@ async function openInboxStream(entry, api) {
   run().catch((e) => log(`SSE fatal ${entry.herdr}:`, e.message));
 }
 
+// Which transport each seat uses. Pure: seats opted in via seats.json (`seat_events: true` + top-level
+// `seat_events` block) ride the SeatEventsDO push client; every other seat keeps its SSE stream.
+// No `seat_events` block => push is null and every seat is SSE, exactly as before.
+export function planInboxTransports(cfg) {
+  const push = parseSeatEventsConfig(cfg);
+  const pushHerdr = new Set((push?.seats ?? []).map((s) => s.herdr));
+  const sse = (cfg.seats || []).filter((e) => e.mupot_token_file && !pushHerdr.has(e.herdr));
+  return { push, sse };
+}
+
+// Build the push client for the opted-in seats. `over` is for tests (fake hub, clock, route spy).
+export function startPushClient(push, api, over = {}) {
+  for (const s of push.seats) seatMupotConfig.set(s.herdr, { token: readTokenPath(s.mupot_token_file), api }); // drainDeferred reconcile
+  const cursors = () => readJson(CURSOR_FILE, {});
+  const client = createSeatEventsClient({
+    api, tenant: push.tenant, hostId: push.hostId, keyFile: over.keyFile ?? expandHome(push.keyFile), seats: push.seats,
+    readFile: (p) => fs.readFileSync(p, "utf8"),
+    readInbox: makePeekReader({ api, readToken: (seat) => readTokenPath(seat.mupot_token_file), fetchImpl: over.inboxFetch ?? fetch }),
+    deliver: over.route ?? routeMail,
+    getCursor: (seat) => Number(cursors()[seat.herdr] || 0),
+    setCursor: (seat, n) => { const c = cursors(); c[seat.herdr] = n; writeJson(CURSOR_FILE, c); },
+    log,
+    ...(over.deps ?? {}),
+  });
+  return client;
+}
+
+const expandHome = (p) => (p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p);
+
 let inboxStreamsStarted = false;
 function startInboxStreams() {
   if (inboxStreamsStarted) return;
   inboxStreamsStarted = true;
   const cfg = readJson(SEATS_FILE, { seats: [] });
   const api = cfg.mupot_api_url || "https://mupot.mumega.com";
-  for (const entry of cfg.seats || []) {
-    if (!entry.mupot_token_file) continue;
+  const { push, sse } = planInboxTransports(cfg);
+  if (push) {
+    log(`seat-events push for: ${push.seats.map((s) => s.herdr).join(", ")}`);
+    startPushClient(push, api).start();
+  }
+  for (const entry of sse) {
     openInboxStream(entry, api);
     if (isPaperclipSeat(entry)) {
       setInterval(() => paperclipHandler.drainRetry(entry).catch((e) => log(`paperclip retry ${entry.herdr}:`, e.message)), 30000).unref?.();

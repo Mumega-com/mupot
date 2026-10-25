@@ -50,9 +50,13 @@ export function parseSeatEventsConfig(cfg) {
   const keyFile = typeof se.host_key_file === 'string' && se.host_key_file ? se.host_key_file : path.join(os.homedir(), '.fleet', 'agents', 'seatlink-host.key')
   if (typeof hostId !== 'string' || !hostId) return null
   if (typeof tenant !== 'string' || !tenant) return null // tenant slug is bound into the signature
-  const seats = (cfg.seats || []).filter((s) => s && s.seat_events === true && typeof s.agent_id === 'string' && s.agent_id)
+  // seats.json already names each seat's pot agent as `mupot_agent_id`; `agent_id` is accepted as an alias.
+  const seats = (cfg.seats || [])
+    .filter((s) => s && s.seat_events === true && s.mupot_token_file && (s.mupot_agent_id || s.agent_id))
+    .map((s) => ({ ...s, agent_id: s.mupot_agent_id || s.agent_id }))
+    .slice(0, MAX_AGENTS_PER_TICKET)
   if (seats.length === 0) return null
-  return { keyFile, hostId, tenant, seats: seats.slice(0, MAX_AGENTS_PER_TICKET) }
+  return { keyFile, hostId, tenant, seats }
 }
 
 /** The stream route's fence answer (inbox-routes.ts:162). A SSE opener that sees this must stop and

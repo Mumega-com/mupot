@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process'
 import {
   canonicalTicketMessage, createSeatEventsClient, isOwnedByFleetHost, parseSeatEventsConfig,
   SAFETY_RESYNC_MS, PING_EVERY_MS,
-} from './seat-events-client.mjs'
+} from './lib/seat-events-client.mjs'
 
 const TENANT = 'mumega'
 const HOST = 'muvps-host'
@@ -174,9 +174,9 @@ test('private key material never appears in logs; unreadable key gives a fixed m
 })
 
 test('config: absent seat_events => null (SSE path as today); per-seat opt-in; default key under ~/.fleet/agents', () => {
-  assert.equal(parseSeatEventsConfig({ seats: [{ herdr: 'k', agent_id: 'a', seat_events: true }] }), null)
-  assert.equal(parseSeatEventsConfig({ seat_events: { host_id: HOST, tenant: TENANT }, seats: [{ herdr: 'k', agent_id: 'a' }] }), null) // nobody opted in
-  const c = parseSeatEventsConfig({ seat_events: { host_id: HOST, tenant: TENANT }, seats: [{ herdr: 'k', agent_id: 'a', seat_events: true }, { herdr: 'x', agent_id: 'b' }] })
+  assert.equal(parseSeatEventsConfig({ seats: [{ herdr: 'k', mupot_agent_id: 'a', mupot_token_file: 't', seat_events: true }] }), null)
+  assert.equal(parseSeatEventsConfig({ seat_events: { host_id: HOST, tenant: TENANT }, seats: [{ herdr: 'k', mupot_agent_id: 'a', mupot_token_file: 't' }] }), null) // nobody opted in
+  const c = parseSeatEventsConfig({ seat_events: { host_id: HOST, tenant: TENANT }, seats: [{ herdr: 'k', mupot_agent_id: 'a', mupot_token_file: 't', seat_events: true }, { herdr: 'x', mupot_agent_id: 'b', mupot_token_file: 't' }] })
   assert.deepEqual(c.seats.map((s) => s.herdr), ['k'])
   assert.ok(c.keyFile.endsWith(path.join('.fleet', 'agents', 'seatlink-host.key')))
 })
@@ -187,7 +187,7 @@ test('canonical message matches the server layout (domain, tenant, host, sorted 
 
 test('hostkey-gen: mode 600, prints only pubkey+fingerprint, refuses existing file and writable parent', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kg-')); fs.chmodSync(dir, 0o700)
-  const bin = new URL('./bin/seatlink-hostkey-gen.mjs', import.meta.url).pathname
+  const bin = new URL('../bin/seatlink-hostkey-gen.mjs', import.meta.url).pathname
   const f = path.join(dir, 'h.key')
   const out = execFileSync('node', [bin, f], { encoding: 'utf8' })
   const j = JSON.parse(out); assert.deepEqual(Object.keys(j).sort(), ['fingerprint', 'public_key'])
