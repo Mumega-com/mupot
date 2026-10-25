@@ -20,7 +20,7 @@ import type { AuthContext, Env } from '../types'
 import { hasCapability } from '../auth/capability'
 import { HARNESS_SESSION_ALLOWED_TOOLS } from '../members/harness-credential'
 import { seatAutoEnrollEnabled } from '../members/harness'
-import { seatAttachEnabled } from '../members/seat-attach'
+import { seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { mcpEndpoint } from '../dashboard/connect'
 import { consentChoiceLabels, consentLabels, refusalGuidance, SEAT_SELECT_STEP as TABLE_SEAT_SELECT_STEP, type WhoActs as TableWhoActs } from './refusal-next-step'
@@ -116,10 +116,37 @@ const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet
 /**
  * The attach order, printed on an unattached seat BEFORE the first seat_attach (mupot#1521).
  * A Grok Bot seat learned this only by hitting 409; boot_context/whoami says it up front.
- * One string so boot's next_step and whoami.next_step_plain cannot drift.
+ * One function so boot's next_step and whoami.next_step_plain cannot drift.
+ *
+ * The 'Allow for me' designation step is included only when seatAttachDesignatedEnabled: that flag is what
+ * renders the dashboard button and makes seat_attach return 409 agent_not_designated_for_you. With attach on
+ * and designation off, attachDesignatedClause allows attach without that step and the button's endpoint 404s,
+ * so naming it would send the human to a dead end (#2178).
  */
-export const ATTACH_CONNECT_ORDER =
-  "Before seat_attach, your human opens that agent's page and presses 'Allow for me' (the box 'Allow my chats to become this agent'); seat_attach before that returns 409 agent_not_designated_for_you. Then call seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+const ATTACH_ADMIT =
+  "seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+
+export function attachConnectOrder(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>): string {
+  if (!seatAttachDesignatedEnabled(env)) return `Call ${ATTACH_ADMIT}`
+  return "Before seat_attach, your human opens that agent's page and presses 'Allow for me' (the box 'Allow my chats to become this agent'); seat_attach before that returns 409 agent_not_designated_for_you. Then call " + ATTACH_ADMIT
+}
+
+/** boot_context available_doors seat_attach copy. Same designation gate as attachConnectOrder (#2178). */
+const SEAT_ATTACH_DOOR_TAIL =
+  "seat_attach {agent}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
+
+export function seatAttachDoor(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>): { does: string; requires: string } {
+  if (seatAttachDesignatedEnabled(env)) {
+    return {
+      does: "act as an agent you already have. First your human presses 'Allow for me' on that agent's page (otherwise seat_attach returns 409 agent_not_designated_for_you). Then call " + SEAT_ATTACH_DOOR_TAIL,
+      requires: "the agent must be one your human administers, and they must have pressed Allow for me; nothing is attached until they tap",
+    }
+  }
+  return {
+    does: 'act as an agent you already have. Call ' + SEAT_ATTACH_DOOR_TAIL,
+    requires: 'the agent must be one your human administers; nothing is attached until they tap',
+  }
+}
 
 /** The one-sentence answer per state (exported for the tests). It names whether the seat tools apply, so no agent has to read docs or
  *  source to learn seat_select vs seat_attach or whether a handle is needed. The state is the same derivation as `state`. */
@@ -154,7 +181,7 @@ export function plainNextStep(
     const attach = limited
       ? `This seat is ${auth.seatAgentStatus}, so it is limited to the read floor until your human lifts it: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the limit.`
       : seatAttachEnabled(env)
-      ? `${ATTACH_CONNECT_ORDER} do not call seat_select (you already have a seat).`
+      ? `${attachConnectOrder(env)} do not call seat_select (you already have a seat).`
       : 'Attaching to an existing agent is not enabled on this pot; do not call seat_select (you already have a seat).'
     return `You are ${as} on this chat's own seat. ${handle} ${attach} Otherwise: read your inbox or your open work with needs_you_list.`
   }
@@ -162,7 +189,7 @@ export function plainNextStep(
     return `You are ${as}; the seat tools (seat_select, seat_attach) do not apply to a workspace-token agent. Next: read your inbox or your open work with needs_you_list.`
   }
   if (state === 'harness_unseated') {
-    const attach = seatSelectCallable && seatAttachEnabled(env) ? ` ${ATTACH_CONNECT_ORDER}` : ''
+    const attach = seatSelectCallable && seatAttachEnabled(env) ? ` ${attachConnectOrder(env)}` : ''
     return seatSelectCallable
       ? `You have no agent yet. To get your own seat call seat_select {project, folder, thread} and pass the returned mseat_ handle as seat on every later call. To act as an existing agent, get a seat first.${attach}`
       : 'You have no agent yet and seats are not enabled for this connection. ' + (missing[0]?.next_step ?? 'Ask your human or an org admin.')
