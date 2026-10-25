@@ -23,9 +23,13 @@ A Grok Bot seat connects, boots, checks in, and wakes on this pot the way Claude
 7. `seat_attach { agent }` again returns `attached`. The next `boot_context` shows `acts_as` (`whoami.state` `acting_as`, basis `attached`).
 8. The attached connection peeks: `inbox { peek: true }` and `inbox_mark_handled`. It does not ack or lease.
 
-Then `check_in` with `harness: "grokbot"`. The response names `harness_canonical: "grokbot"`. That field is display only. An attached seat does not write the `presence` row: the router joins that table on `agent_id` and would treat the chat as a live worker, and an attached chat cannot ack or lease. `presence_recorded` is `false`. `presence_mode: "poll"` and `"resident"` stay refused, and the fleet runtime row is not touched.
+Then `check_in` with `harness: "grokbot"`. The response names `harness_canonical: "grokbot"`. That field echoes what the caller typed. It is display only.
 
-A seat may write routing presence only from a server-held fact (the harness adapter's capabilities, or the seat binding). `src/harness/registry.ts` does not express "this attached chat can take routed work", so every attached seat stays on that rule. Typing `harness: "grokbot"` does not change it. A host check-in (not an attached chat) still writes `presence` and can be a router candidate.
+An attached seat does not write the `presence` row: the router joins that table on `agent_id` and would treat the chat as a live worker, and an attached chat cannot ack or lease. `presence_recorded` is `false`. `presence_mode: "poll"` and `"resident"` stay refused, and the fleet runtime row is not touched.
+
+The non-routing inventory is `held_harness`. It is loaded from the seat binding (`harnessId` on the server-held harness row): `id`, the stored `kind`, and `kind_canonical`. The `harness` argument is not an input. A row whose stored kind is `grokbot` reports `kind_canonical: "grokbot"`. A row whose stored kind is `claude` reports `claude-code` even when the caller types `grok bot`. No row reports `held_harness: null`. Neither case writes `presence`.
+
+`src/harness/registry.ts` does not express "this attached chat can take routed work", so every attached seat stays off the router. Typing `harness: "grokbot"` does not change that. A host check-in (not an attached chat) still writes `presence` and can be a router candidate.
 
 Recognised spellings: `grokbot`, `grok-bot`, `grok bot`. Anything else unrecognised stays canonical `other`. Authority is never read from the harness name. A held or observed seat is not offered `seat_attach`; the connect order is printed only when attach is enabled and the seat is not on that floor.
 

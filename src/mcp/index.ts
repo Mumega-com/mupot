@@ -341,7 +341,7 @@ import { consentChoiceLabels, consentLabels, refusalEnvelope, refusalGuidance, t
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
-import { cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
+import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL } from '../fleet/reported-values'
 import { selfReportAtBoot, readFleetBelief, type ConnectionKind } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
@@ -6246,8 +6246,23 @@ const toolCheckIn: ToolSpec = {
     // the host. The caller's harness string is display only (echo.harness_canonical). It is
     // not a capability, and it is not read here. Return before the debounce key so a typed
     // name cannot consume the host's check-in slot either.
+    //
+    // held_harness is the non-routing inventory of that server row (id, stored kind, and the
+    // same display canonical used everywhere else). It is not written to `presence`, and the
+    // caller's harness argument is not an input to it.
     if (attachedAuthority(auth)) {
-      return done({ ...echo, debounced: false, presence_recorded: false })
+      const binding = auth.seatBinding
+      const held = binding
+        ? await loadHarness(env, binding.humanMemberId, binding.harnessId).catch(() => null)
+        : null
+      return done({
+        ...echo,
+        debounced: false,
+        presence_recorded: false,
+        held_harness: held
+          ? { id: held.id, kind: held.kind, kind_canonical: canonicalHarness(held.kind) }
+          : null,
+      })
     }
 
     try {

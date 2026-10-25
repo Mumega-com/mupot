@@ -178,6 +178,8 @@ describe('check_in presence for harness grokbot', () => {
       harness_canonical: 'grokbot',
       presence_recorded: false,
       debounced: false,
+      // No harness row for this binding, so the typed name is not inventory.
+      held_harness: null,
     })
     expect(presence()).toBeUndefined()
     expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM presence WHERE agent_id = ?`).get(AGENT)).toEqual({ n: 0 })
@@ -280,7 +282,10 @@ describe('an attached seat that types harness grokbot is not a router candidate'
 
     const forged = await invokeTool(attached(), env, 'check_in', { seat: 'forged', harness: 'grok bot', source: 'claude-code' }, ORIGIN)
     expect(forged.ok).toBe(true)
-    if (forged.ok) expect(forged.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: false })
+    if (forged.ok) expect(forged.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: false, held_harness: null })
+    const forgedAgain = await invokeTool(attached(), env, 'check_in', { seat: 'forged', harness: 'GROKBOT', source: 'claude-code' }, ORIGIN)
+    expect(forgedAgain.ok).toBe(true)
+    if (forgedAgain.ok) expect(forgedAgain.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: false, debounced: false, held_harness: null })
     expect(candidateCount()).toBe(0)
     expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'unrouted', agent_id: null }])
 
@@ -289,6 +294,62 @@ describe('an attached seat that types harness grokbot is not a router candidate'
     if (live.ok) expect(live.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: true })
     expect(candidateCount()).toBe(1)
     expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'would_assign', agent_id: AGENT }])
+  })
+
+  it('held_harness follows the server row when two seats type the same harness', async () => {
+    h.sqlite.exec(`
+      INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, kind) VALUES
+        ('h-grokbot', '${TENANT}', '${HUMAN}', 'client-held-grokbot', 'held', 'grokbot'),
+        ('h-claude', '${TENANT}', '${HUMAN}', 'client-held-claude', 'held', 'claude');
+    `)
+    const env = envFor(h)
+    const bound = (harnessId: string): AuthContext => {
+      const base = attached()
+      return { ...base, seatBinding: { ...base.seatBinding!, harnessId } }
+    }
+    expect(candidateCount()).toBe(0)
+
+    for (const spelling of ['grok bot', 'grok-bot', 'GROKBOT']) {
+      const claimed = await invokeTool(bound('h-claude'), env, 'check_in', {
+        seat: `claim-${spelling}`,
+        harness: spelling,
+        source: 'claude-code',
+      }, ORIGIN)
+      expect(claimed.ok).toBe(true)
+      if (!claimed.ok) return
+      expect(claimed.result).toMatchObject({
+        harness_canonical: 'grokbot',
+        presence_recorded: false,
+        debounced: false,
+        held_harness: { id: 'h-claude', kind: 'claude', kind_canonical: 'claude-code' },
+      })
+      expect(candidateCount()).toBe(0)
+    }
+
+    const held = await invokeTool(bound('h-grokbot'), env, 'check_in', {
+      seat: 'held-grokbot',
+      harness: 'claude-code',
+      source: 'claude-code',
+    }, ORIGIN)
+    expect(held.ok).toBe(true)
+    if (!held.ok) return
+    expect(held.result).toMatchObject({
+      harness_canonical: 'claude-code',
+      presence_recorded: false,
+      debounced: false,
+      held_harness: { id: 'h-grokbot', kind: 'grokbot', kind_canonical: 'grokbot' },
+    })
+
+    const missing = await invokeTool(bound('h-missing'), env, 'check_in', {
+      seat: 'missing-row',
+      harness: 'grok bot',
+    }, ORIGIN)
+    expect(missing.ok).toBe(true)
+    if (missing.ok) expect(missing.result).toMatchObject({ presence_recorded: false, held_harness: null })
+
+    expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM presence`).get()).toEqual({ n: 0 })
+    expect(candidateCount()).toBe(0)
+    expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'unrouted', agent_id: null }])
   })
 })
 
