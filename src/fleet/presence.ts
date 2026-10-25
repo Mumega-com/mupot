@@ -25,6 +25,7 @@ const SOURCES = new Set([
   'unknown',
   'cursor-cloud',
   'cursor-ide',
+  'grokbot',
 ])
 
 export const SEVEN_AXIS_HARNESSES = [
@@ -36,6 +37,7 @@ export const SEVEN_AXIS_HARNESSES = [
   'prime',
   'hermes',
   'grok-cli',
+  'grokbot',
   'unknown',
 ] as const
 

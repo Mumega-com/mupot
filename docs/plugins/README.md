@@ -18,7 +18,8 @@ Read like a wiki: start here, open one page. Do not print tokens. Token **paths*
 | [grok-herdr-mupot](grok-herdr-mupot.md) | Grok Build skill + MCP weld | **live** on hadi-mac | `~/.grok/skills/grok-herdr-mupot` (this catalog mirrors the wiki page) |
 | [cursor-mupot-pager](cursor-mupot-pager.md) | Slack broker for Cursor Cloud | **live** (hadi-grok-desktop) | `dara/.grok/skills/cursor-mupot-pager` |
 | [prime-mupot-experience](prime-mupot-experience.md) | Prime-agent skill + bridges | **published** | [Mumega-com/prime-mupot-experience](https://github.com/Mumega-com/prime-mupot-experience) |
-| [grokbot-webhook-spine](grokbot-webhook-spine.md) | Pot → Grok Bot inbox wake | **scaffold** · DRAFT · mumega dogfood | this repo (`set_agent_webhook_doorbell`) |
+| [grokbot-webhook-spine](grokbot-webhook-spine.md) | Pot → Grok Bot inbox wake | **scaffold** · flag `WEBHOOK_DOORBELL` off until an operator sets it | this repo (`set_agent_webhook_doorbell`) |
+| [mupot-grokbot](mupot-grokbot-plugin.md) | Grok Bot seat (connect + wake) | **in this repo** · harness `grokbot` | this repo (`docs/plugins/mupot-grokbot-plugin.md`) |
 
 ## Layers (do not mix)
 
