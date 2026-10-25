@@ -62,6 +62,12 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
     case 'status_drift':
       // mupot#1571: the plan reviewed one status, the row now has another. Refused per row.
       return fail(409, 'status_drift', { expected: outcome.expected, actual: outcome.actual })
+    case 'task_changed':
+      return fail(409, 'task_changed', { expected: outcome.expected, actual: outcome.actual })
+    case 'updated_after_cutoff':
+      return fail(409, 'updated_after_cutoff', { cutoff: outcome.cutoff, actual: outcome.actual })
+    case 'standing_task':
+      return fail(409, 'standing_task')
     case 'invalid_expected_status':
       return fail(400, 'invalid_expected_status', { accepted: outcome.accepted })
     case 'owns_active_agent':

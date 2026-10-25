@@ -66,6 +66,12 @@ export interface ArchiveInput {
    *  the archive is refused for this row if tasks.status no longer matches — checked inside
    *  the guarded INSERT's own WHERE, not only in a pre-read. */
   expectedStatus?: string
+  /** tasks only: tasks.updated_at the reviewer saw (archive_proposals.task_updated_at_proposal). Any edit since,
+   *  even one that leaves status alone, refuses the row (task_changed) - asserted in the write's own WHERE. */
+  expectedUpdatedAt?: string
+  /** tasks only: ISO cutoff the batch was built against. A task whose updated_at is no longer strictly before it
+   *  was touched after the cutoff and is refused (updated_after_cutoff) - asserted in the write's own WHERE. */
+  updatedBefore?: string
 }
 
 export interface UnarchiveInput {
@@ -94,6 +100,10 @@ export type ArchiveOutcome =
   // mupot#1571: an unsettled dispatch receipt - the bus consumer would still deliver it.
   | { ok: false; error: 'in_flight_dispatch' }
   | { ok: false; error: 'status_drift'; expected: string; actual: string }
+  | { ok: false; error: 'task_changed'; expected: string; actual: string }
+  | { ok: false; error: 'updated_after_cutoff'; cutoff: string; actual: string }
+  // Standing records (title prefix STANDING) are never bulk-archived.
+  | { ok: false; error: 'standing_task' }
   | { ok: false; error: 'invalid_expected_status'; accepted: readonly string[] }
   | { ok: false; error: 'owns_active_agent'; counts: { active_agents: number } }
   | { ok: false; error: 'cannot_archive_self' }
@@ -809,18 +819,33 @@ async function unarchiveProject(env: Env, input: UnarchiveInput): Promise<Unarch
 // only landed/failed are terminal.
 const IN_AIR_FLIGHT_STATUSES_SQL = `f.status NOT IN ('landed','failed')`
 
+// A standing record is identified today ONLY by a title prefix (case-insensitive, optional leading bracket/space):
+// there is no retention_class column yet (later migration). The SQL and the JS predicate below must agree.
+const STANDING_TITLE_SQL = `UPPER(LTRIM(t.title, ' [(')) LIKE 'STANDING%'`
+export function isStandingTitle(title: string | null | undefined): boolean {
+  return (title ?? '').replace(/^[ [(]+/, '').toUpperCase().startsWith('STANDING')
+}
+
 async function taskArchivabilityBlocker(
   env: Env,
   taskId: string,
   expectedStatus: string | undefined,
+  guards: { expectedUpdatedAt?: string; updatedBefore?: string } = {},
 ): Promise<ArchiveOutcome | null> {
-  const row = await env.DB.prepare('SELECT status, execution_claim_expires_at FROM tasks WHERE id = ?1')
+  const row = await env.DB.prepare('SELECT status, title, updated_at, execution_claim_expires_at FROM tasks WHERE id = ?1')
     .bind(taskId)
-    .first<{ status: string; execution_claim_expires_at: number | null }>()
+    .first<{ status: string; title: string | null; updated_at: string; execution_claim_expires_at: number | null }>()
   if (!row) return { ok: false, error: 'not_found' }
   if (expectedStatus !== undefined && row.status !== expectedStatus) {
     return { ok: false, error: 'status_drift', expected: expectedStatus, actual: row.status }
   }
+  if (guards.expectedUpdatedAt !== undefined && row.updated_at !== guards.expectedUpdatedAt) {
+    return { ok: false, error: 'task_changed', expected: guards.expectedUpdatedAt, actual: row.updated_at }
+  }
+  if (guards.updatedBefore !== undefined && !(row.updated_at < guards.updatedBefore)) {
+    return { ok: false, error: 'updated_after_cutoff', cutoff: guards.updatedBefore, actual: row.updated_at }
+  }
+  if (isStandingTitle(row.title)) return { ok: false, error: 'standing_task' }
   if (row.status === 'in_progress' && row.execution_claim_expires_at !== null && row.execution_claim_expires_at > Date.now()) {
     return { ok: false, error: 'live_execution_claim' }
   }
@@ -846,6 +871,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
     return { ok: false, error: 'invalid_expected_status', accepted: ALL_TASK_STATUSES }
   }
   const expected = input.expectedStatus ?? null
+  const guards = { expectedUpdatedAt: input.expectedUpdatedAt, updatedBefore: input.updatedBefore }
 
   const exists = await env.DB.prepare('SELECT 1 FROM tasks WHERE id = ?1').bind(input.id).first()
   if (!exists) return { ok: false, error: 'not_found' }
@@ -857,7 +883,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
     return { ok: true, status: 'already_archived' }
   }
 
-  const blocker = await taskArchivabilityBlocker(env, input.id, input.expectedStatus)
+  const blocker = await taskArchivabilityBlocker(env, input.id, input.expectedStatus, guards)
   if (blocker) return blocker
 
   const now = nowIso()
@@ -873,6 +899,9 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
           FROM tasks t
          WHERE t.id = ?4
            AND (?6 IS NULL OR t.status = ?6)
+           AND (?8 IS NULL OR t.updated_at = ?8)
+           AND (?9 IS NULL OR t.updated_at < ?9)
+           AND NOT ${STANDING_TITLE_SQL}
            AND NOT (
              t.status = 'in_progress' AND t.execution_claim_expires_at IS NOT NULL
              AND t.execution_claim_expires_at > ?5
@@ -887,7 +916,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
                 )
            )
            AND NOT ${archiveBlockingDispatchExistsSql({ tenantParam: '?7', taskIdExpr: 't.id' })}`,
-    ).bind(now, input.reason, input.actorMemberId, input.id, Date.now(), expected, env.TENANT_SLUG),
+    ).bind(now, input.reason, input.actorMemberId, input.id, Date.now(), expected, env.TENANT_SLUG, input.expectedUpdatedAt ?? null, input.updatedBefore ?? null),
     env.DB.prepare(
       `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
         SELECT ?1, ?2, 'tasks', ?3, 'archive', ?4, ?5, s.prior_status, ?6
@@ -901,7 +930,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
       await backfillTaskReceiptIfMissing(env, input.id, input.reason, input.actorMemberId)
       return { ok: true, status: 'already_archived' }
     }
-    const fresh = await taskArchivabilityBlocker(env, input.id, input.expectedStatus)
+    const fresh = await taskArchivabilityBlocker(env, input.id, input.expectedStatus, guards)
     if (fresh) return fresh
     return { ok: false, error: 'archive_refused_conflict' }
   }
