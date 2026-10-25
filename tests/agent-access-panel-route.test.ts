@@ -25,6 +25,7 @@ vi.mock('../src/auth', () => ({
 }))
 
 const { dashboardApp } = await import('../src/dashboard')
+const { applyMoveOutOfHome } = await import('../src/dashboard/agent-access-panel')
 
 const TENANT = 'mumega'
 const ORIGIN = 'https://pot.test'
@@ -292,5 +293,90 @@ describe('the home squad row for its owner', () => {
     const res = await post(env, '/agents/rava/access', { squad_id: 'sq-home', capability: 'lead', expected_capability: 'member', expected_membership: 'member', action: 'set' })
     expect(await res.text()).toContain('Rava is now lead on Rava Home.')
     expect(rows(harness)).toEqual([{ action: 'change', prior_capability: 'member', new_capability: 'lead', actor_member_id: 'm-hadi' }])
+  })
+})
+
+describe('leaving the lobby: moving an agent out of its home squad', () => {
+  const ownerAuth = (): AuthContext => ({
+    userId: 'm-hadi', email: null, role: 'member', tenant: TENANT, memberId: 'm-hadi',
+    capabilities: [g('m-hadi', 'admin'), { member_id: 'm-hadi', scope_type: 'squad', scope_id: 'sq-home', capability: 'admin' } as CapabilityGrant],
+  })
+  const grantHome = (h: SqliteD1Harness): void => {
+    h.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-hadi-home', 'm-hadi', 'squad', 'sq-home', 'admin')")
+  }
+  const move = (env: Env, to: string, capability = 'member') =>
+    post(env, '/agents/rava/access', { action: 'move', from_squad_id: 'sq-home', to_squad_id: to, capability })
+  const bindingSquad = (h: SqliteD1Harness) => (h.sqlite.prepare("SELECT squad_id FROM agents WHERE id = 'rava'").get() as { squad_id: string }).squad_id
+  const audits = (h: SqliteD1Harness) => h.sqlite.prepare("SELECT action, actor_id FROM agent_audit WHERE agent_id = 'rava'").all()
+
+  it('the home owner moves the agent to a work squad: binding changes, receipt written, level as chosen', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    authState.current = ownerAuth()
+    const res = await move(env, 'sq-core', 'lead')
+    expect(await res.text()).toContain('moved out of its home squad')
+    expect(bindingSquad(harness)).toBe('sq-core')
+    expect(audits(harness)).toEqual([{ action: 'move_agent_squad', actor_id: 'm-hadi' }])
+    expect(harness.sqlite.prepare("SELECT capability FROM capabilities WHERE member_id = 'm-rava' AND scope_id = 'sq-core'").get()).toEqual({ capability: 'lead' })
+    expect(harness.sqlite.prepare("SELECT 1 AS x FROM capabilities WHERE member_id = 'm-rava' AND scope_id = 'sq-home'").get()).toBeUndefined()
+  })
+
+  it('the agent can be enrolled in a work squad while it is still bound to the home', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    authState.current = ownerAuth()
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-ops', capability: 'member', expected_capability: 'none', expected_membership: 'none', action: 'set' })
+    expect(await res.text()).toContain('Rava is now member on Ops Desk')
+    expect(bindingSquad(harness)).toBe('sq-home')
+  })
+
+  it('an org admin who does not own the home is refused; nothing moves', async () => {
+    const { harness, env } = setup()
+    authState.current = asHadi()
+    const res = await move(env, 'sq-core')
+    expect(res.status).toBe(403)
+    expect(bindingSquad(harness)).toBe('sq-home')
+    expect(audits(harness)).toEqual([])
+  })
+
+  it('a member without org admin (even holding home admin) is refused', async () => {
+    const { harness, env } = setup()
+    harness.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-obs-home', 'm-obs', 'squad', 'sq-home', 'admin')")
+    authState.current = { userId: 'm-obs', email: null, role: 'member', tenant: TENANT, memberId: 'm-obs', capabilities: [g('m-obs', 'observer'), { member_id: 'm-obs', scope_type: 'squad', scope_id: 'sq-home', capability: 'admin' } as CapabilityGrant] }
+    expect((await move(env, 'sq-core')).status).toBe(403)
+    expect(bindingSquad(harness)).toBe('sq-home')
+  })
+
+  it('refuses a move into another home, an archived squad, and a move of an agent that is not in a home', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('sq-home2', 'dept-eng', 'other-home', 'Other Home', 'home');
+      INSERT INTO squads (id, department_id, slug, name, kind, status) VALUES ('sq-old', 'dept-eng', 'old-desk', 'Old Desk', 'work', 'archived');`)
+    authState.current = ownerAuth()
+    expect((await move(env, 'sq-home2')).status).toBe(409)
+    expect((await move(env, 'sq-old')).status).toBe(409)
+    expect(bindingSquad(harness)).toBe('sq-home')
+    harness.sqlite.exec("UPDATE agents SET squad_id = 'sq-core' WHERE id = 'rava'")
+    expect((await move(env, 'sq-ops')).status).toBe(409)
+    expect(bindingSquad(harness)).toBe('sq-core')
+  })
+
+  it('shows the Move to squad control only to the home owner', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    authState.current = ownerAuth()
+    expect(await (await dashboardApp.request(`${ORIGIN}/agents/rava`, {}, env)).text()).toContain('data-move-out-of-home')
+    authState.current = asHadi()
+    expect(await (await dashboardApp.request(`${ORIGIN}/agents/rava`, {}, env)).text()).not.toContain('data-move-out-of-home')
+  })
+
+  it('the wrapper itself refuses a home admin who is not org admin, and an agent session', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    const nonAdmin: AuthContext = { userId: 'm-hadi', email: null, role: 'member', tenant: TENANT, memberId: 'm-hadi', capabilities: [{ member_id: 'm-hadi', scope_type: 'squad', scope_id: 'sq-home', capability: 'admin' } as CapabilityGrant] }
+    expect(await applyMoveOutOfHome(env, nonAdmin, { agentRef: 'rava', toSquadId: 'sq-core', capability: 'member', reason: '' })).toMatchObject({ ok: false, status: 403 })
+    expect(await applyMoveOutOfHome(env, { ...ownerAuth(), boundAgentId: 'rava' }, { agentRef: 'rava', toSquadId: 'sq-core', capability: 'member', reason: '' })).toMatchObject({ ok: false, status: 403 })
+    expect(bindingSquad(harness)).toBe('sq-home')
   })
 })

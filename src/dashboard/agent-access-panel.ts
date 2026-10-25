@@ -431,6 +431,53 @@ export async function applyAgentAccessChange(
   }
 }
 
+export type HomeMoveResult =
+  | { ok: true; message: string }
+  | { ok: false; message: string; status: 400 | 403 | 404 | 409 }
+
+/**
+ * Move an agent out of its HOME squad (the lobby) into a work squad. Not a new writer:
+ * this calls the existing move_agent_squad tool (#1433), so its own gates run unchanged:
+ * admin on the CURRENT squad (a home grants that only to the member holding it directly,
+ * never to org admin standing), admin on the destination, a level no higher than the
+ * actor's rank there, the dispatch/gate in-flight refusals, and the agent_audit receipt.
+ * This wrapper only adds what the panel promises: org admin, no agent session, and that
+ * it is used to LEAVE a home (the agent's binding squad is a home), never to shuffle work squads.
+ */
+export async function applyMoveOutOfHome(
+  env: Env,
+  auth: AuthContext,
+  input: { agentRef: string; toSquadId: string; capability: string; reason: string },
+): Promise<HomeMoveResult> {
+  const refuse = (error: AccessRefusal): HomeMoveResult => ({ ok: false, message: REFUSAL_TEXT[error], status: error === 'agent_not_found' ? 404 : 403 })
+  if (auth.boundAgentId) return refuse('agent_session_forbidden')
+  if (!isOrgAdmin(auth)) return refuse('org_admin_required')
+  if (!sessionMemberId(auth)) return refuse('actor_member_required')
+  if (!isAgentAccessCapability(input.capability)) return { ok: false, message: REFUSAL_TEXT.invalid_capability, status: 400 }
+  const agent = await resolveAgent(env, input.agentRef)
+  if (!agent) return refuse('agent_not_found')
+  const from = await env.DB.prepare('SELECT kind FROM squads WHERE id = ? LIMIT 1').bind(agent.squad_id).first<{ kind: string }>()
+  if (from?.kind !== 'home') return { ok: false, message: 'This agent is not in a home squad. Use the squad tools to move it between work squads.', status: 409 }
+  const to = await env.DB.prepare('SELECT kind, status FROM squads WHERE id = ? LIMIT 1').bind(input.toSquadId).first<{ kind: string; status: string }>()
+  if (!to) return refuse('squad_not_found' as AccessRefusal)
+  if (to.kind === 'home') return { ok: false, message: 'Choose a work squad, not another home.', status: 409 }
+  // Dynamic import: src/mcp/provision pulls in src/mcp/index, which would cycle with the dashboard at load time.
+  const { toolMoveAgentSquad } = await import('../mcp/provision')
+  const out = await toolMoveAgentSquad.run(auth, env, {
+    agent: agent.id,
+    to_squad: input.toSquadId,
+    capability: input.capability,
+    ...(input.reason.trim() ? { reason: input.reason.trim().slice(0, REASON_MAX_LENGTH) } : {}),
+  }, { origin: env.PUBLIC_ORIGIN ?? '', transport: 'rest', source: 'dashboard' })
+  if (out.ok) return { ok: true, message: `${agent.name} moved out of its home squad and is now ${input.capability} on the new squad. Effective on its next request.` }
+  const status = out.status === 404 ? 404 : out.status === 400 ? 400 : out.status === 403 ? 403 : 409
+  const detail = typeof out.detail === 'string' ? out.detail : ''
+  const text = out.error === 'forbidden' || out.error === 'cannot_grant_above_own_rank'
+    ? 'You need admin on the home squad and on the destination squad, and cannot grant above your own level there.'
+    : `The move was refused (${out.error}${detail ? `: ${detail}` : ''}). Nothing was changed.`
+  return { ok: false, message: text, status }
+}
+
 /** Plain-language confirmation. No token is ever shown or minted here. */
 export function accessChangeMessage(result: Extract<AccessChangeResult, { ok: true }>): string {
   return result.capability === null
@@ -492,6 +539,8 @@ export interface ChoosableSquad {
 
 export interface AgentAccessView {
   bound: boolean
+  /** The squad the agent is bound to (agents.squad_id): its binding squad. */
+  bindingSquadId: string | null
   agentMemberId: string | null
   rows: AccessRow[]
   choosable: ChoosableSquad[]
@@ -500,6 +549,7 @@ export interface AgentAccessView {
 export async function loadAgentAccessView(env: Env, agentId: string, auth: AuthContext): Promise<AgentAccessView> {
   const binding = await resolveAgentMemberBinding(env, agentId)
   const memberId = binding.kind === 'bound' ? binding.memberId : null
+  const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?').bind(agentId).first<{ squad_id: string }>()
   const [memberships, grants, squads] = await Promise.all([
     env.DB.prepare('SELECT squad_id, capability FROM memberships WHERE agent_id = ?')
       .bind(agentId).all<{ squad_id: string; capability: string }>(),
@@ -539,7 +589,7 @@ export async function loadAgentAccessView(env: Env, agentId: string, auth: AuthC
       choosable.push({ id: s.id, name: s.name, departmentName: s.department_name })
     }
   }
-  return { bound: memberId !== null, agentMemberId: memberId, rows, choosable }
+  return { bound: memberId !== null, bindingSquadId: agentRow?.squad_id ?? null, agentMemberId: memberId, rows, choosable }
 }
 
 type Html = HtmlEscapedString | Promise<HtmlEscapedString>
@@ -586,6 +636,17 @@ export function agentAccessPanel(
     return html`<li>${label}: <code>${preselect}</code>
       ${differs ? html`<p class="dim">Capability row: <code>${shownCapability}</code>, membership row:
         <code>${shownMembership}</code>. Rows disagree — saving will set both to the level you choose.</p>` : ''}
+      ${row.home && row.squadId === view.bindingSquadId && view.choosable.length > 0 ? html`<form method="post" action="${action}" autocomplete="off" class="inline" data-move-out-of-home>
+        <input type="hidden" name="action" value="move" />
+        <input type="hidden" name="from_squad_id" value="${row.squadId}" />
+        <label>Move to squad <select name="to_squad_id" required>
+          <option value="" selected disabled>Choose a squad</option>
+          ${view.choosable.map((sq) => html`<option value="${sq.id}">${sq.name} (department ${sq.departmentName ?? '—'})</option>`)}
+        </select></label>
+        <label>Level <select name="capability" required>${levelOptions('member')}</select></label>
+        <label>Reason <input name="reason" maxlength="${REASON_MAX_LENGTH}" placeholder="optional" /></label>
+        <button type="submit" class="btn">Move to squad</button>
+      </form>` : ''}
       <form method="post" action="${action}" autocomplete="off" class="inline">
         <input type="hidden" name="squad_id" value="${row.squadId}" />
         <input type="hidden" name="expected_capability" value="${shownCapability}" />

@@ -132,6 +132,7 @@ import {
   accessRefusalMessage,
   agentAccessPanel,
   applyAgentAccessChange,
+  applyMoveOutOfHome,
   loadAgentAccessView,
 } from './agent-access-panel'
 import { mintAgentBoundToken, isAgentTokenCapability, AgentInactiveError } from '../members/service'
@@ -2324,6 +2325,16 @@ dashboardApp.post('/agents/:id/access', async (c) => {
   const form = await c.req.parseBody()
   const field = (name: string): string => (typeof form[name] === 'string' ? form[name].trim() : '')
   const rawAction = field('action')
+  if (rawAction === 'move') {
+    const moved = await applyMoveOutOfHome(c.env, auth, {
+      agentRef: agent.id, toSquadId: field('to_squad_id'), capability: field('capability'), reason: field('reason'),
+    })
+    const mview = await loadAgentAccessView(c.env, agent.id, auth)
+    const mpage = html`<p class="crumbs"><a href="/">Overview</a> / <a href="/agents/${agent.id}">${agent.name}</a> / Access</p>
+      ${agentAccessPanel(agent, mview, moved.message)}
+      <p><a href="/agents/${agent.id}">Back to ${agent.name}</a></p>`
+    return c.html(shell(c.env, `Access · ${agent.name}`, mpage), moved.ok ? 200 : moved.status)
+  }
   const result = await applyAgentAccessChange(c.env, auth, {
     agentRef: agent.id,
     squadId: field('squad_id'),
