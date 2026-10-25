@@ -25,6 +25,7 @@ import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType
 import { hasActiveGateGrant } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
 import { attachedAuthority } from './attached-ceiling'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 // ── squad scope (mupot#1452 round 2 successor, G-FP1b point 1) ────────────────
 //
@@ -331,6 +332,42 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
     .bind(memberId, nowCapabilitySql())
     .all<CapabilityGrant>()
   return rows.results ?? []
+}
+
+/**
+ * Bulk form of resolveCapabilities: the SAME two-arm query, `member_id IN (...)` instead of `= ?1`, chunked
+ * for D1's bind ceiling. Returns one entry per requested member (empty array when none), each in the
+ * order the per-member query would have returned. Exists so list surfaces (the /enroll picker) do not pay
+ * one round trip per agent.
+ */
+export async function resolveCapabilitiesForMembers(
+  env: Env,
+  memberIds: readonly string[],
+): Promise<Map<string, CapabilityGrant[]>> {
+  const out = new Map<string, CapabilityGrant[]>()
+  const distinct = [...new Set(memberIds)]
+  for (const id of distinct) out.set(id, [])
+  const now = nowCapabilitySql()
+  const chunks = chunkForD1InList(distinct, undefined, 1)
+  const results = await Promise.all(chunks.map((chunk) => {
+    // ?1 = now; the list occupies ?2..; the second arm reuses the same list placeholders.
+    const ph = chunk.map((_, i) => `?${i + 2}`).join(', ')
+    return env.DB.prepare(
+      `SELECT member_id, scope_type, scope_id, capability
+         FROM capabilities
+        WHERE member_id IN (${ph})
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?1')}
+       UNION ALL
+       SELECT ccg.member_id, 'squad' AS scope_type, ccg.squad_id AS scope_id, ccg.capability
+         FROM channel_capability_grants ccg
+         JOIN squads s ON s.id = ccg.squad_id
+        WHERE ccg.member_id IN (${ph}) AND s.kind != 'home'`,
+    ).bind(now, ...chunk).all<CapabilityGrant>()
+  }))
+  for (const r of results) {
+    for (const g of r.results ?? []) out.get(g.member_id)?.push(g)
+  }
+  return out
 }
 
 // ── pure check ──────────────────────────────────────────────────────────────────
