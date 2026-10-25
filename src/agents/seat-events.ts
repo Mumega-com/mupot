@@ -436,15 +436,13 @@ const HOST_STANDING_SQL = `(
 /** The per-disclosure check. One indexed query: live grant for (host, agent), agent active,
  *  host key still bound to an active member, host still has standing in the agent's squad,
  *  project (if scoped) still reachable. */
-export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
-  try {
-    const row = await env.DB.prepare(
-      `SELECT 1 AS x
+export function seatDeliveryQuery(tenant: string, agent: string, host?: string): string {
+  return `SELECT 1 AS x
          FROM seat_event_grants g
          JOIN agents a ON a.id = g.agent_id AND a.status = 'active'
          JOIN agent_keys k ON k.tenant = g.tenant AND k.agent_id = g.host_agent_id AND k.member_id IS NOT NULL
          JOIN members m ON m.id = k.member_id AND m.tenant = k.tenant AND m.status = 'active'
-        WHERE g.tenant = ?1 AND g.host_agent_id = ?2 AND g.agent_id = ?3 AND g.revoked_at IS NULL
+        WHERE g.tenant = ${tenant} ${host ? `AND g.host_agent_id = ${host}` : ''} AND g.agent_id = ${agent} AND g.revoked_at IS NULL
           AND (g.project_id IS NULL OR EXISTS (
                 SELECT 1 FROM memberships ms
                   JOIN project_squad_access psa ON psa.squad_id = ms.squad_id
@@ -452,7 +450,13 @@ export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agent
                  WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'
                    AND ${CAPABILITY_LIVE_PREDICATE('ms', "datetime('now')")}))
           AND ${HOST_STANDING_SQL}
-        LIMIT 1`,
+        LIMIT 1`
+}
+
+export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
+  try {
+    const row = await env.DB.prepare(
+      seatDeliveryQuery('?1', '?3', '?2'),
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()
     return row !== null ? 'granted' : 'not_granted'
   } catch {
