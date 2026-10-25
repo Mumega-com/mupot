@@ -1082,8 +1082,7 @@ export async function exceedsTargetRankCeiling(
  * Bulk form of `exceedsTargetRankCeiling` for list surfaces (the dashboard "Set owner" candidate list): the SAME rule
  * (target GLOBAL rank over live grants, home-squad grants excluded, unioned with the legacy role plane, against the
  * ACTOR's org-scope-local rank, self exempt), computed in a fixed number of statements instead of ~4+k serial round trips
- * per member. Returns the ids that EXCEED the ceiling. Legacy role: where two users rows share an email the per-member
- * form takes an arbitrary `LIMIT 1`; this takes the highest, which can only refuse more, never admit more.
+ * per member. Returns the ids that EXCEED the ceiling.
  */
 export async function exceedsTargetRankCeilingForMembers(
   env: Env,
@@ -1111,20 +1110,19 @@ export async function exceedsTargetRankCeilingForMembers(
       for (const r of rows.results ?? []) homeSquads.add(r.id)
     }),
   )
+  // The role-plane bridge is the SAME fragment the other scalar readers use (legacyRoleRankSql), driven by a VALUES list of
+  // already-known member ids; requireEmail gives an empty or NULL email rank 0, as targetLegacyRoleRank does. Same
+  // scalar LIMIT 1 semantics as the per-member lookup.
   const roleRankByMember = new Map<string, number>()
   await Promise.all(
     chunkForD1InList(ids).map(async (chunk) => {
-      const ph = chunk.map((_, i) => `?${i + 1}`).join(', ')
+      const values = chunk.map((_, i) => `(?${i + 1})`).join(', ')
       const rows = await env.DB.prepare(
-        `SELECT m.id AS id, u.role AS role
-           FROM members m JOIN users u ON lower(u.email) = lower(m.email)
-          WHERE m.id IN (${ph}) AND m.email IS NOT NULL`,
+        `WITH ids(id) AS (VALUES ${values}) SELECT ids.id AS id, ${legacyRoleRankSql('ids.id', true)} AS rank FROM ids`,
       )
         .bind(...chunk)
-        .all<{ id: string; role: AuthContext['role'] }>()
-      for (const r of rows.results ?? []) {
-        roleRankByMember.set(r.id, Math.max(roleRankByMember.get(r.id) ?? 0, legacyRoleRank(r.role)))
-      }
+        .all<{ id: string; rank: number }>()
+      for (const r of rows.results ?? []) roleRankByMember.set(r.id, r.rank)
     }),
   )
   for (const id of ids) {
@@ -1218,14 +1216,14 @@ export async function currentMemberRankOnScope(
  *  below are built from it, so the scalar rank (legacyRoleRankSql) and the EXISTS
  *  ceiling (legacyRoleAboveSql) can never read two different definitions of the
  *  role plane. Inputs are `?N` placeholders chosen by the caller, never values. */
-const legacyRoleBridgeSql = (memberIdParam: string): string =>
+const legacyRoleBridgeSql = (memberIdParam: string, requireEmail = false): string =>
   `FROM members m2
         JOIN users u ON lower(u.email) = lower(m2.email)
-       WHERE m2.id = ${memberIdParam}`
+       WHERE m2.id = ${memberIdParam}${requireEmail ? " AND m2.email IS NOT NULL AND m2.email != ''" : ''}`
 
-const legacyRoleRankSql = (memberIdParam: string): string =>
+const legacyRoleRankSql = (memberIdParam: string, requireEmail = false): string =>
   `(CASE (
-      SELECT u.role ${legacyRoleBridgeSql(memberIdParam)}
+      SELECT u.role ${legacyRoleBridgeSql(memberIdParam, requireEmail)}
        LIMIT 1
     ) WHEN 'owner' THEN ${RANK.owner} WHEN 'admin' THEN ${RANK.admin} ELSE 0 END)`
 

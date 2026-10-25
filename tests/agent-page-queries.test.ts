@@ -95,12 +95,14 @@ describe('exceedsTargetRankCeilingForMembers matches the per-member predicate', 
   it('same verdict for every member across grant planes, home squads, legacy role, self', async () => {
     h.sqlite.exec(seed(40))
     h.sqlite.exec(`
-      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mh','mh@x.test','Home Admin','active','${TENANT}'),('mu','admin@x.test2','NoUser','active','${TENANT}'),('mn',NULL,'NoEmail','active','${TENANT}'),('mr','BOSS@x.test','RoleOnly','active','${TENANT}');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mh','mh@x.test','Home Admin','active','${TENANT}'),('mu','admin@x.test2','NoUser','active','${TENANT}'),('mn',NULL,'NoEmail','active','${TENANT}'),('me','','EmptyEmail','active','${TENANT}'),('md','Dup@x.test','DupCase','active','${TENANT}'),('mr','BOSS@x.test','RoleOnly','active','${TENANT}');
+      INSERT INTO users (id, email, role) VALUES ('u-empty','','owner'),('u-dup1','dup@x.test','member'),('u-dup2','DUP@x.test','admin');
       INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('SH','D1','home1','Home','home');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('ch','mh','squad','SH','owner'),('cd','mu','department','D1','admin'),('co','m3','squad','S4','owner');
     `)
     const env = { TENANT_SLUG: TENANT, DB: h.db } as unknown as Env
     const ids = [...(h.sqlite.prepare('SELECT id FROM members').all() as Array<{ id: string }>)].map((r) => r.id)
+    const EXPECTED_SIZE: Record<string, number> = { 'mem-admin': 3, 'mem-boss': 0, m1: 43 }
     for (const actor of [
       { role: 'admin' as const, memberId: 'mem-admin' },
       { role: 'owner' as const, memberId: 'mem-boss' },
@@ -111,7 +113,7 @@ describe('exceedsTargetRankCeilingForMembers matches the per-member predicate', 
       for (const id of ids) {
         expect(bulk.has(id), `${actor.memberId} vs ${id}`).toBe(await exceedsTargetRankCeiling(env, auth, id))
       }
-      expect(bulk.size).toBeGreaterThan(-1)
+      expect(bulk.size).toBe(EXPECTED_SIZE[actor.memberId])
     }
     const adminAuth = { role: 'admin', memberId: 'mem-admin' } as unknown as Parameters<typeof exceedsTargetRankCeiling>[1]
     const bulk = await exceedsTargetRankCeilingForMembers(env, adminAuth, ids)
@@ -120,5 +122,6 @@ describe('exceedsTargetRankCeilingForMembers matches the per-member predicate', 
     expect(bulk.has('mh')).toBe(false) // owner on a HOME squad only does not inflate global rank
     expect(bulk.has('m3')).toBe(true) // owner on a work squad
     expect(bulk.has('m1')).toBe(false)
+    expect(bulk.has('me')).toBe(false) // empty email: rank 0, like the per-member lookup
   })
 })
