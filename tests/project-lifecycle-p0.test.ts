@@ -73,6 +73,7 @@ function envFor(harness: SqliteD1Harness): Env {
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
+    PROJECT_BREAKER_KILL: '1',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
 }
@@ -644,6 +645,62 @@ describe('Slice 5: cycle creation (rollover only, NO auto-carry)', () => {
         .bind('task-incomplete')
         .first<{ status: string }>()
       expect(taskAfter?.status).toBe('open')
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+describe('#2170 breaker kill is opt-in (PROJECT_BREAKER_KILL)', () => {
+  const quietDeps = {
+    nowIso: () => NOW,
+    listActiveForCompletion: async () => [],
+    listActiveForStall: async () => [],
+    listStalePlanned: async () => [],
+  }
+
+  it('flag unset: elapsed boundary, no recommit -> stays active, boundary advances, no re-eval loop', async () => {
+    const harness = makeHarness()
+    try {
+      insertProject(harness, { id: 'nokill-1', status: 'active', boundary: '2026-07-22T00:00:00.000Z' })
+      const env = { ...envFor(harness), PROJECT_BREAKER_KILL: undefined } as Env
+      const first = await runProjectLoopTick(env, quietDeps)
+      expect(first.killed).toBe(0)
+      expect(first.cycles_advanced).toBeGreaterThanOrEqual(1)
+      const after = await getProject(env, 'nokill-1')
+      expect(after?.status).toBe('active')
+      expect(Date.parse(after?.cycle_boundary_at ?? '')).toBeGreaterThan(Date.parse(NOW))
+      expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM workflow_receipts WHERE step_name = 'recommit_or_kill'").get()).toEqual({ n: 0 })
+      // Next tick: boundary is in the future, so the breaker no longer evaluates it.
+      expect(await listProjectsDueAtBoundary(env, NOW)).toEqual([])
+      const second = await runProjectLoopTick(env, quietDeps)
+      expect(second.killed).toBe(0)
+      expect(second.cycles_advanced).toBe(0)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('flag "1": same setup is killed -> archived (today behaviour)', async () => {
+    const harness = makeHarness()
+    try {
+      insertProject(harness, { id: 'kill-1', status: 'active', boundary: '2026-07-22T00:00:00.000Z' })
+      const env = envFor(harness)
+      const result = await runProjectLoopTick(env, quietDeps)
+      expect(result.killed).toBe(1)
+      expect((await getProject(env, 'kill-1'))?.status).toBe('archived')
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('any value other than exact "1" does not kill', async () => {
+    const harness = makeHarness()
+    try {
+      insertProject(harness, { id: 'nokill-2', status: 'active', boundary: '2026-07-22T00:00:00.000Z' })
+      const env = { ...envFor(harness), PROJECT_BREAKER_KILL: 'true' } as Env
+      await runProjectLoopTick(env, quietDeps)
+      expect((await getProject(env, 'nokill-2'))?.status).toBe('active')
     } finally {
       harness.close()
     }

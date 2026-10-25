@@ -104,7 +104,7 @@ function makeHarness(): SqliteD1Harness {
 }
 
 function envFor(harness: SqliteD1Harness): Env {
-  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: TENANT } as unknown as Env
+  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: TENANT, PROJECT_BREAKER_KILL: '1' } as unknown as Env
 }
 
 function insertProject(harness: SqliteD1Harness, values: {

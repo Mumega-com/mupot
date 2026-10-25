@@ -178,6 +178,9 @@ export interface Env {
   // Set to "1" to let a ProjectOffice serve. Default off: with it off every office entry point
   // refuses and nothing in the request path or any cron routes to one.
   PROJECT_OFFICE?: string
+  // #2170: set to exactly "1" to let the project circuit breaker auto-archive (kill) a project at an
+  // elapsed cycle boundary with no recommit. Unset/anything else = never auto-archive.
+  PROJECT_BREAKER_KILL?: string
   // secrets (present at runtime only)
   // GitHub App user-authorization credentials (shared "mupot" App). Required to complete the
   // GitHub connect flow; when unset the connect callback refuses (fail closed).

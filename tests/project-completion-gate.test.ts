@@ -45,6 +45,7 @@ function envFor(harness: SqliteD1Harness): Env {
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
+    PROJECT_BREAKER_KILL: '1',
     BUS: { send: vi.fn(async () => undefined) },
   } as unknown as Env
 }
