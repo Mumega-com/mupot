@@ -109,8 +109,9 @@ export async function* streamInboxEvents(
     if (aborted()) return
     await sleep(pollMs)
     if (aborted()) return
-    // P0-2: the bearer credential is re-validated at most every STREAM_REVALIDATE_MS, BEFORE the read, so a
-    // revoked token or deactivated agent ends the stream (<= 60 s + one tick) rather than leaking the inbox.
+    // P0-2: the bearer credential is re-validated at most every STREAM_REVALIDATE_MS on IDLE ticks. Any tick that
+    // would DELIVER message bodies re-validates first (below), so a revoked/suspended credential never receives a
+    // body; the 60 s window only bounds how long an idle stream lingers.
     if (input.revalidate !== undefined && nowMs() - lastValidated >= STREAM_REVALIDATE_MS) {
       const stillValid = await input.revalidate()
       if (!stillValid) return
@@ -126,6 +127,13 @@ export async function* streamInboxEvents(
     if (fresh.length === 0) {
       yield { type: 'heartbeat' }
       continue
+    }
+    // P1 (#2166 lens): bodies are about to leave — re-validate NOW regardless of cadence (cost only on delivery
+    // ticks). A failed check ends the stream and yields nothing.
+    if (input.revalidate !== undefined) {
+      const stillValid = await input.revalidate()
+      if (!stillValid) return
+      lastValidated = nowMs()
     }
     lastSeq = fresh[fresh.length - 1].seq
     for (const m of fresh) {
@@ -209,8 +217,9 @@ inboxApp.get('/stream', async (c) => {
       since,
       pollMs,
       seat,
-      // P0-2: re-validate the bearer credential on every poll so a revoked token or
-      // deactivated agent ends the stream instead of leaking the full inbox forever.
+      // P0-2: re-validate the bearer credential (every delivery tick + at most every 60 s idle) so a revoked or
+      // suspended-member token ends the stream. NOTE: resolveMemberByToken checks token liveness and the member,
+      // NOT agents.status, so this does not by itself end the stream for a deactivated agent row.
       revalidate: async () => {
         const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
         return current?.boundAgentId === id.boundAgentId

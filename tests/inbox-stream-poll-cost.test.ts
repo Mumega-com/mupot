@@ -104,4 +104,41 @@ describe('inbox stream poll cost', () => {
       await gen.return(undefined)
     }
   })
+
+  async function insertMsg(id: string): Promise<void> {
+    await harness.db.prepare(
+      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+       VALUES (?1, ?2, ?3, 'ag-s', 'mem-s', 'message', 'secret body', datetime('now'))`,
+    ).bind(id, TENANT, AGENT).run()
+  }
+
+  it('P1: token revoked at t=1 s, message lands at t=15 s -> zero message events, stream ends', async () => {
+    const c = clock()
+    let valid = true
+    const gen = streamInboxEvents(env, { agent: AGENT, since: 0, revalidate: async () => valid }, { sleep: c.sleep, nowMs: c.nowMs })
+    expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat') // t=10 s
+    valid = false // revoked (~t=1 s relative to connect, well inside the 60 s idle window)
+    await insertMsg('late') // arrives before the t=20 s tick; far from the 60 s cadence
+    const events: string[] = []
+    for (let i = 0; i < 20; i++) {
+      const ev = await nextOf(gen)
+      if (ev.done) break
+      events.push((ev.value as InboxStreamEvent).type)
+    }
+    expect(events).not.toContain('message')
+    expect(events).toEqual([]) // the very next tick revalidates, fails, ends with no frames
+  })
+
+  it('P2: a signed_only fence row + unread message -> zero message events on the stream path', async () => {
+    await insertMsg('fenced')
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF') // fence FKs (agents/members) are irrelevant to the read predicate
+    await harness.db.prepare(
+      `INSERT INTO agent_inbox_fences (tenant, agent_id, mode, key_fingerprint, generation, updated_by_member_id, updated_at, reason)
+       VALUES (?1, ?2, 'signed_only', ?3, 1, 'mem-x', '2026-01-01T00:00:00.000Z', 'test')`,
+    ).bind(TENANT, AGENT, 'a'.repeat(64)).run()
+    const c = clock()
+    const gen = streamInboxEvents(env, { agent: AGENT, since: 0 }, { sleep: c.sleep, nowMs: c.nowMs })
+    for (let i = 0; i < 3; i++) expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat')
+    await gen.return(undefined)
+  })
 })

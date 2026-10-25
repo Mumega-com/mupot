@@ -145,6 +145,8 @@ async function annotateMessages(messages: InboxMessage[]): Promise<void> {
 export interface InboxResult {
   ok: true
   messages: InboxMessage[]
+  /** true ONLY when the caller passed skipRemaining: `remaining`/`complete` were NOT computed and must not be read. */
+  remainingSkipped?: true
   /**
    * Unread rows NOT in `messages`.
    *
@@ -1020,7 +1022,7 @@ async function readAgentInboxForReader(
       for (const m of messages) m.project_id = m.project_id ?? null
       for (const m of messages) m.target_seat = m.target_seat ?? null
       await annotateMessages(messages)
-      return { ok: true, messages, remaining: 0, complete: false }
+      return { ok: true, messages, remaining: 0, complete: false, remainingSkipped: true }
     }
 
     const fence = await env.DB.prepare(
