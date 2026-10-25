@@ -436,7 +436,7 @@ describe('idle warning clears through a REAL revival (PR #1532 recordStartGateAc
 
     harness = makeHarness()
     const T0 = '2026-06-01T00:00:00.000Z'
-    const OLD_BOUNDARY = '2026-06-15T00:00:00.000Z'
+    const OLD_BOUNDARY = '2026-07-31T00:00:00.000Z' // T0 + DEFAULT_CYCLE_DAYS (60)
     const REVIVE_NOW = '2026-09-15T00:00:00.000Z'
     insertPlannedProject(harness, 'proj-revival', T0)
     const env = envFor(harness)
