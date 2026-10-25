@@ -11,8 +11,8 @@ import type { Env, Project } from '../types'
 import { getProject } from './service'
 
 export const CYCLE_CREATION_PRINCIPAL = 'system:project-loop'
-/** Default cycle duration: 14 days (matches Shape Up / Linear practice). */
-export const DEFAULT_CYCLE_DAYS = 14
+/** Default cycle duration: 60 days (Hadi 2026-10-25, #2170: ~2 months; was 14). */
+export const DEFAULT_CYCLE_DAYS = 60
 
 export type CycleCreationOutcome = 'skipped' | 'scheduled' | 'advanced'
 

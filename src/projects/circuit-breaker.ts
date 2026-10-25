@@ -333,6 +333,11 @@ export async function proposeProjectRecommit(
   return { ok: true, detail }
 }
 
+/** Kill (auto-archive) is opt-in: only the exact string "1" enables it. */
+export function isBreakerKillEnabled(env: Pick<Env, 'PROJECT_BREAKER_KILL'>): boolean {
+  return env.PROJECT_BREAKER_KILL === '1'
+}
+
 export function defaultCircuitBreakerDeps(): CircuitBreakerDeps {
   return {
     writeReceipt: writeReceiptToD1,
@@ -361,6 +366,11 @@ export async function evaluateProjectCircuitBreaker(
   }
   const boundaryAt = project.cycle_boundary_at
   if (boundaryAt === null) return 'skipped'
+
+  // #2170: auto-archive is OFF unless PROJECT_BREAKER_KILL === "1". Disabled = no receipt, no
+  // status change; the loop's cycle creation (runs after the breaker, active projects only)
+  // advances the elapsed boundary so the next cycle starts normally.
+  if (!isBreakerKillEnabled(env)) return 'skipped'
 
   await recordRecommitOrKill(
     env,
