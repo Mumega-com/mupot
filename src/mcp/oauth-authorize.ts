@@ -27,7 +27,7 @@ import { SELECT_SEARCH_SCRIPT } from '../dashboard/select-search'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { suggestedConnectMode, type ConnectMode } from './consent-connect-mode'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank } from '../auth/capability'
+import { resolveCapabilities, resolveCapabilitiesForMembers, canOnSquad, hasCapability, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, brandSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank, type SquadScope } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
@@ -320,6 +320,9 @@ export async function humanMaxRankOnScope(
    *  optional: an optional flag on a rank predicate is the shape that lets one caller silently read capability rows
    *  alone (S2-0 finding 5). Pass 0 only when the plane is genuinely not in play. */
   legacyRoleRank: number,
+  /** Optional memoised squad-scope loader (a LOADER, not a policy flag: it must return exactly what loadSquadScope
+   *  returns). A list surface passes one so N agents share one load per squad; omitted = load fresh, as before. */
+  scopeLoader: (squadId: string) => Promise<SquadScope | null> = (id) => loadSquadScope(env, id),
 ): Promise<number> {
   // hasCapabilityOnDynamicScope (not a hand-branched squad/else split): the
   // prior version's `if (scopeType === 'squad' && scopeId)` fell through to
@@ -327,8 +330,17 @@ export async function humanMaxRankOnScope(
   // scopeId — walk the ladder top-down and stop at the first rank the human
   // actually clears, same as canOnSquad resolving department inheritance.
   let rows = 0
+  // Same decision as hasCapabilityOnDynamicScope; the squad arm resolves its scope through scopeLoader
+  // (fail closed on a missing squad row, identical to resolveSquadScopeArg).
+  const holds = async (cap: Capability): Promise<boolean> => {
+    if (scopeType === 'squad' && scopeId) {
+      const sc = await scopeLoader(scopeId)
+      return sc ? hasCapability(humanGrants, 'squad', sc, cap) : false
+    }
+    return hasCapabilityOnDynamicScope(env, humanGrants, scopeType, scopeId, cap)
+  }
   for (const cap of RANK_ORDER) {
-    if (await hasCapabilityOnDynamicScope(env, humanGrants, scopeType, scopeId, cap)) {
+    if (await holds(cap)) {
       rows = capabilityRank(cap)
       break
     }
@@ -340,7 +352,7 @@ export async function humanMaxRankOnScope(
   // ceiling still cap the result, so no one is widened beyond what the agent already holds.
   if (scopeType === 'squad') {
     if (!scopeId) return rows
-    const scope = await loadSquadScope(env, scopeId)
+    const scope = await scopeLoader(scopeId)
     if (!scope || !planeCoversScope('role', scope)) return rows
   }
   // The lift is CAPPED at member: a rank reached only through the role plane can never exceed 'member' (no lead/admin/owner
@@ -385,10 +397,74 @@ export async function humanMaxRankOnScope(
  *  e.g. resolveExternalToken's D1-only reconstruction, which has no such field to
  *  read) fails closed to [] rather than silently falling back to the agent's
  *  unclamped grant. */
+/** Request-scoped memo for resolving MANY agents under ONE consenting human (the /enroll picker). Every field is a
+ *  cache of a read the single-agent path would have issued itself, so results are identical; it only collapses
+ *  repeats. Never reuse across requests or across consenting members. */
+interface ConsentResolveMemo {
+  agentRows: Map<string, { status: string; squad_id: string; bound_member_id: string } | null>
+  agentGrants: Map<string, CapabilityGrant[]>
+  squadScopes: Map<string, Promise<SquadScope | null>>
+  human?: Promise<{ active: boolean; grants: CapabilityGrant[] }>
+  legacyRank?: Promise<number>
+  humanRanks: Map<string, Promise<number>>
+}
+
+function newConsentMemo(): ConsentResolveMemo {
+  return { agentRows: new Map(), agentGrants: new Map(), squadScopes: new Map(), humanRanks: new Map() }
+}
+
+function memoSquadScope(env: Env, memo: ConsentResolveMemo, squadId: string): Promise<SquadScope | null> {
+  let p = memo.squadScopes.get(squadId)
+  if (!p) {
+    p = loadSquadScope(env, squadId)
+    memo.squadScopes.set(squadId, p)
+  }
+  return p
+}
+
+/** One IN-list read of every distinct squad's authz shape; seeds the memo (a squad absent from the result resolves to null,
+ *  the same fail-closed answer loadSquadScope gives for a missing row). */
+async function preloadSquadScopes(env: Env, memo: ConsentResolveMemo, squadIds: readonly string[]): Promise<void> {
+  const ids = [...new Set(squadIds)].filter((id) => !memo.squadScopes.has(id))
+  const found = new Map<string, SquadScope>()
+  await Promise.all(chunkForD1InList(ids).map(async (chunk) => {
+    const ph = chunk.map((_, i) => `?${i + 1}`).join(', ')
+    const rows = await env.DB.prepare(`SELECT id, department_id, kind FROM squads WHERE id IN (${ph})`)
+      .bind(...chunk)
+      .all<{ id: string; department_id: string; kind: 'work' | 'home' }>()
+    for (const r of rows.results ?? []) found.set(r.id, brandSquadScope(r))
+  }))
+  for (const id of ids) memo.squadScopes.set(id, Promise.resolve(found.get(id) ?? null))
+}
+
+/** Bulk-load the agent rows resolveConsentedAgentCapabilities would read one at a time, plus the bound members' grants. */
+async function preloadConsentAgents(env: Env, memo: ConsentResolveMemo, agentIds: readonly string[]): Promise<void> {
+  const ids = [...new Set(agentIds)]
+  for (const id of ids) memo.agentRows.set(id, null)
+  await Promise.all(chunkForD1InList(ids, undefined, 1).map(async (chunk) => {
+    const ph = chunk.map((_, i) => `?${i + 2}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT a.id AS id, a.status AS status, a.squad_id AS squad_id, b.member_id AS bound_member_id
+         FROM agents a
+         JOIN agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
+        WHERE a.id IN (${ph})`,
+    ).bind(env.TENANT_SLUG, ...chunk).all<{ id: string; status: string; squad_id: string; bound_member_id: string }>()
+    for (const r of rows.results ?? []) {
+      // The single-agent query is LIMIT 1 over (agent, binding): keep the first row per agent.
+      if (memo.agentRows.get(r.id) === null) memo.agentRows.set(r.id, { status: r.status, squad_id: r.squad_id, bound_member_id: r.bound_member_id })
+    }
+  }))
+  const memberIds: string[] = []
+  for (const row of memo.agentRows.values()) if (row && row.status === 'active') memberIds.push(row.bound_member_id)
+  const grants = await resolveCapabilitiesForMembers(env, memberIds)
+  for (const [m, g] of grants) memo.agentGrants.set(m, g)
+}
+
 export async function resolveConsentedAgentCapabilities(
   env: Env,
   agentId: string,
   consentingMemberId: string | null,
+  memo?: ConsentResolveMemo,
 ): Promise<CapabilityGrant[]> {
   if (!consentingMemberId) return []
 
@@ -399,7 +475,7 @@ export async function resolveConsentedAgentCapabilities(
   // wherever available rather than lean on the org graph's implicit isolation).
   // This single query also folds in what used to be a separate
   // resolveAgentMemberBinding call — same tenant-scoped binding row either way.
-  const row = await env.DB.prepare(
+  const row = memo?.agentRows.has(agentId) ? memo.agentRows.get(agentId) ?? null : await env.DB.prepare(
     `SELECT a.status AS status, a.squad_id AS squad_id, b.member_id AS bound_member_id
        FROM agents a
        JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id
@@ -411,18 +487,28 @@ export async function resolveConsentedAgentCapabilities(
   // independently fails closed. 'paused' is deliberately excluded too — see the
   // selection-rule block above.
   if (!row || row.status !== 'active') return []
-  const agentGrants = await resolveCapabilities(env, row.bound_member_id)
+  const agentGrants = memo?.agentGrants.get(row.bound_member_id) ?? await resolveCapabilities(env, row.bound_member_id)
 
   // Re-validate the CONSENTING HUMAN, live, every call (P0-2). Floor is 'admin'
   // (P0-3) — the SAME bar mint_agent_token requires to create this class of weld
   // in the first place; a human demoted to 'member' (still eligible under the OLD
   // floor) must lose the session just as completely as one with zero access.
-  const human = await env.DB.prepare(
-    `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
-  ).bind(consentingMemberId, env.TENANT_SLUG).first<{ status: string }>()
-  if (!human || human.status !== 'active') return []
-  const humanGrants = await resolveCapabilities(env, consentingMemberId)
-  if (!(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) return []
+  // Human side (status, grants, legacy rank) is agent-independent: with a memo it is read once per list, not per agent.
+  const loadHuman = async () => {
+    const human = await env.DB.prepare(
+      `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
+    ).bind(consentingMemberId, env.TENANT_SLUG).first<{ status: string }>()
+    if (!human || human.status !== 'active') return { active: false, grants: [] as CapabilityGrant[] }
+    return { active: true, grants: await resolveCapabilities(env, consentingMemberId) }
+  }
+  let humanP: ReturnType<typeof loadHuman>
+  if (memo) { memo.human ??= loadHuman(); humanP = memo.human } else humanP = loadHuman()
+  const hs = await humanP
+  if (!hs.active) return []
+  const humanGrants = hs.grants
+  const scopeLoader = (id: string) => memo ? memoSquadScope(env, memo, id) : loadSquadScope(env, id)
+  const scope = await scopeLoader(row.squad_id)
+  if (!scope || !(await canOnSquad(env, humanGrants, scope, 'admin'))) return []
 
   // Clamp every grant to min(agent's own rank, human's own live rank) on that
   // SAME scope (P0-1). Never widen: a scope the human holds nothing on is
@@ -441,10 +527,16 @@ export async function resolveConsentedAgentCapabilities(
   // removing live protection, and so this file does not misdescribe which line
   // a passing test actually depends on (see this PR's own mutation-table history
   // for why that distinction matters).
-  const humanLegacyRank = await humanVerifiedLegacyRoleRank(env, consentingMemberId)
+  // Memoised as a PROMISE so concurrent agents share one read (a settled-value cache would let all of them race past it).
+  const legacyP = memo ? (memo.legacyRank ??= humanVerifiedLegacyRoleRank(env, consentingMemberId)) : humanVerifiedLegacyRoleRank(env, consentingMemberId)
+  const humanLegacyRank = await legacyP
   const clamped: CapabilityGrant[] = []
   for (const g of agentGrants) {
-    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, humanLegacyRank)
+    const rankKey = `${g.scope_type}|${g.scope_id ?? ''}`
+    const rankOf = () => humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id, humanLegacyRank, scopeLoader)
+    let rp = memo?.humanRanks.get(rankKey)
+    if (!rp) { rp = rankOf(); memo?.humanRanks.set(rankKey, rp) }
+    const humanRank = await rp
     const effectiveRank = Math.min(capabilityRank(g.capability), humanRank)
     if (effectiveRank <= 0) continue
     const clampedCapability = RANK_ORDER.find((c) => capabilityRank(c) === effectiveRank)
@@ -542,8 +634,15 @@ export async function listConsentableAgents(
       ORDER BY d.name ASC, sq.name ASC, a.name ASC`,
   ).bind(env.TENANT_SLUG).all<ConsentAgentRow>()
 
-  const out: ConsentableAgent[] = []
-  for (const row of rows.results ?? []) {
+  // Batched (/enroll latency): the per-agent loop used to cost ~9 serial D1 round trips each. Everything
+  // agent-independent is read once, the per-squad verdict is computed once per squad, and the per-agent
+  // capability resolution shares one memo. The admit/deny rule and the output order are unchanged.
+  const agentRows = rows.results ?? []
+  const memo = newConsentMemo()
+  await preloadSquadScopes(env, memo, agentRows.map((r) => r.squad_id))
+  const squadVerdict = new Map<string, Promise<boolean>>()
+  const admitted: ConsentAgentRow[] = []
+  const verdicts = await Promise.all(agentRows.map(async (row) => {
     // An org-wide admin/owner covers every scope by definition — the same rule
     // canOnSquad already applies to an org-scope GRANT. This adds only the legacy
     // role plane, so it can never admit a principal that isOrgAdmin would refuse.
@@ -551,16 +650,23 @@ export async function listConsentableAgents(
     // G-FP1b point 3/F: EXCEPT a kind='home' squad — org-wide standing must not
     // list another member's home agent in this consent picker. Fall through to
     // the real per-squad check, which an org grant alone never satisfies there.
-    const rowSquadScope = await loadSquadScope(env, row.squad_id)
+    const rowSquadScope = await memoSquadScope(env, memo, row.squad_id)
     const orgWideAdminAppliesHere = orgWideAdmin && rowSquadScope?.kind !== 'home'
-    if (!orgWideAdminAppliesHere && !(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
-    // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
-    // viewing/consenting human, so this is honest about exactly what the session
-    // would carry, never the agent's raw (possibly higher) grant.
-    const capabilities = await resolveConsentedAgentCapabilities(env, row.id, memberId)
-    out.push({ ...row, capabilities })
-  }
-  return out
+    if (orgWideAdminAppliesHere) return true
+    let v = squadVerdict.get(row.squad_id)
+    if (!v) {
+      v = rowSquadScope ? canOnSquad(env, humanGrants, rowSquadScope, 'admin') : Promise.resolve(false)
+      squadVerdict.set(row.squad_id, v)
+    }
+    return v
+  }))
+  agentRows.forEach((row, i) => { if (verdicts[i]) admitted.push(row) })
+  await preloadConsentAgents(env, memo, admitted.map((r) => r.id))
+  // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
+  // viewing/consenting human, so this is honest about exactly what the session
+  // would carry, never the agent's raw (possibly higher) grant.
+  const caps = await Promise.all(admitted.map((row) => resolveConsentedAgentCapabilities(env, row.id, memberId, memo)))
+  return admitted.map((row, i) => ({ ...row, capabilities: caps[i] }))
 }
 
 export interface ConsentableSquad {

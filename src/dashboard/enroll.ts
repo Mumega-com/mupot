@@ -311,7 +311,8 @@ export async function loadLiveKeysForAgents(
   // mupot#1774: an org admin sees every bound agent, so the list is chunked (2 fixed binds).
   const nowUtc = nowSqlUtc()
   const collected: Array<{ agent_id: string; label: string; channel: string; created_at: string }> = []
-  for (const chunk of chunkForD1InList(agentIds, undefined, 2)) {
+  // Chunks are independent reads: issue them concurrently (the global created_at sort below fixes the order).
+  const chunked = await Promise.all(chunkForD1InList(agentIds, undefined, 2).map(async (chunk) => {
     const placeholders = chunk.map((_, i) => `?${i + 3}`).join(', ')
     const rows = await env.DB.prepare(
       `SELECT t.agent_id AS agent_id, t.label AS label, t.channel AS channel, t.created_at AS created_at
@@ -323,8 +324,9 @@ export async function loadLiveKeysForAgents(
     )
       .bind(env.TENANT_SLUG, nowUtc, ...chunk)
       .all<{ agent_id: string; label: string; channel: string; created_at: string }>()
-    collected.push(...(rows.results ?? []))
-  }
+    return rows.results ?? []
+  }))
+  for (const rows of chunked) collected.push(...rows)
   // Chunks partition by agent, so a global created_at sort restores the single-statement order.
   collected.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
   for (const row of collected) {
