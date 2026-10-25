@@ -148,7 +148,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   project_wiki_upsert: MUTX('page_versions counter upsert + PagesPort.put -> PUT Inkwell wiki topic; overwrites an existing page of this port (pages/service.ts)'),
   project_wiki: ROX('getProjectWikiGraph GET to Inkwell wiki service (projects/wiki-client.ts:299)'),
   project_update: MUT('updateProject UPDATE projects (projects/service.ts:511) + start-gate receipts'),
-  project_recommit: MUT('proposeProjectRecommit recordRecommitOrKill can kill the project (projects/circuit-breaker.ts:317)'),
+  project_recommit: MUT('proposeProjectRecommit recordRecommitOrKill records a recommit receipt; kill is opt-in via PROJECT_BREAKER_KILL (projects/circuit-breaker.ts:317)'),
   project_squad_list: RO('SELECT only (mcp/projects.ts:567)'),
   project_squad_set: MUT('upsertProjectSquadAccess overwrites access_level (mcp/projects.ts:626)'),
   project_squad_remove: MUT('removeProjectSquadAccess DELETE (mcp/projects.ts:654)'),

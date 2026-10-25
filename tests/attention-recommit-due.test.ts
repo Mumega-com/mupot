@@ -104,7 +104,7 @@ function makeHarness(): SqliteD1Harness {
 }
 
 function envFor(harness: SqliteD1Harness): Env {
-  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: TENANT } as unknown as Env
+  return { DB: harness.db, SESSIONS: sessions(), TENANT_SLUG: TENANT, PROJECT_BREAKER_KILL: '1' } as unknown as Env
 }
 
 function insertProject(harness: SqliteD1Harness, values: {
@@ -436,7 +436,7 @@ describe('idle warning clears through a REAL revival (PR #1532 recordStartGateAc
 
     harness = makeHarness()
     const T0 = '2026-06-01T00:00:00.000Z'
-    const OLD_BOUNDARY = '2026-06-15T00:00:00.000Z'
+    const OLD_BOUNDARY = '2026-07-31T00:00:00.000Z' // T0 + DEFAULT_CYCLE_DAYS (60)
     const REVIVE_NOW = '2026-09-15T00:00:00.000Z'
     insertPlannedProject(harness, 'proj-revival', T0)
     const env = envFor(harness)
@@ -480,5 +480,26 @@ describe('idle warning clears through a REAL revival (PR #1532 recordStartGateAc
     const afterRevival = await listNeedsYou(envFor(harness), owner(), {}, REVIVE_NOW)
     expect(findItem(afterRevival, 'proj-revival')).toBeUndefined()
     expect((await getProject(env, 'proj-revival'))?.status).toBe('active')
+  })
+})
+
+describe('#2170 kill off: recommit_due emits nothing (no false "archived automatically" warning)', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('flag unset: zero project_recommit_due items for past-boundary active, paused, and idle-active projects', async () => {
+    harness = makeHarness()
+    insertProject(harness, { id: 'p-active', cycleBoundaryAt: isoPlusHours(-1) })
+    insertProject(harness, { id: 'p-paused', status: 'paused', cycleBoundaryAt: isoPlusHours(-1) })
+    insertProject(harness, { id: 'p-idle', cycleBoundaryAt: isoPlusHours(24 * 30), createdAt: isoPlusHours(-24 * 40) })
+    const env = { ...envFor(harness), PROJECT_BREAKER_KILL: undefined } as Env
+
+    const page = await listNeedsYou(env, owner(), {}, NOW)
+
+    expect(page.items.filter((i) => i.kind === 'project_recommit_due')).toEqual([])
   })
 })

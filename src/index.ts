@@ -508,7 +508,8 @@ export default {
     //     goal + idle online build capacity + zero advancing tasks. Heuristic MVP,
     //     no model call (model-seam left injectable for Sol later); idempotent by
     //     design (rank, never act-loop) — see src/concierge/service.ts.
-    //  9. Project lifecycle circuit breaker (slice 1) — at cycle_boundary_at, if
+    //  9. Project lifecycle circuit breaker (slice 1) — OPT-IN kill (#2170:
+    //     PROJECT_BREAKER_KILL="1"; off by default). When on, at cycle_boundary_at, if
     //     status ≠ completed and no receipted recommit, kill → archived (Shape Up
     //     inversion). Receipts go through workflow_receipts; see
     //     src/projects/circuit-breaker.ts + stall-detector.ts + loop.ts.

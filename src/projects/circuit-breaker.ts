@@ -2,7 +2,8 @@
 //
 // Design: docs/superpowers/specs/2026-07-23-project-lifecycle-control-loop-design.md
 //
-// At cycle_boundary_at, if status ≠ completed/archived and there is no receipted
+// OPT-IN (#2170): kill only runs when PROJECT_BREAKER_KILL === "1"; otherwise the breaker is a no-op.
+// When enabled: at cycle_boundary_at, if status ≠ completed/archived and there is no receipted
 // recommit for that boundary, default action is kill → archived. Continuation must
 // be justified via a recommit_or_kill receipt written through the EXISTING
 // workflow_receipts path (writeReceiptToD1) — no second decision store.
@@ -333,6 +334,11 @@ export async function proposeProjectRecommit(
   return { ok: true, detail }
 }
 
+/** Kill (auto-archive) is opt-in: only the exact string "1" enables it. */
+export function isBreakerKillEnabled(env: Pick<Env, 'PROJECT_BREAKER_KILL'>): boolean {
+  return env.PROJECT_BREAKER_KILL === '1'
+}
+
 export function defaultCircuitBreakerDeps(): CircuitBreakerDeps {
   return {
     writeReceipt: writeReceiptToD1,
@@ -361,6 +367,11 @@ export async function evaluateProjectCircuitBreaker(
   }
   const boundaryAt = project.cycle_boundary_at
   if (boundaryAt === null) return 'skipped'
+
+  // #2170: auto-archive is OFF unless PROJECT_BREAKER_KILL === "1". Disabled = no receipt, no
+  // status change; the loop's cycle creation (runs after the breaker, active projects only)
+  // advances the elapsed boundary so the next cycle starts normally.
+  if (!isBreakerKillEnabled(env)) return 'skipped'
 
   await recordRecommitOrKill(
     env,

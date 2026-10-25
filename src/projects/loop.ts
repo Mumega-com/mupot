@@ -304,7 +304,7 @@ export async function runProjectLoopTick(
   //   (...)` and then filters through shouldEvaluateBreaker(), which for a non-stalled project
   //   returns isAtCycleBoundary(cycleBoundaryAt, nowIso) — true only once the boundary has
   //   ELAPSED. Meanwhile scheduleCycleBoundary() advances any active project whose boundary is
-  //   <= now to boundary + 14d, a FUTURE timestamp.
+  //   <= now to boundary + 60d (DEFAULT_CYCLE_DAYS), a FUTURE timestamp.
   //
   // Run first, it pushes the boundary forward before the breaker is given the chance to look
   // at it, and isAtCycleBoundary then reads false. The recommit-or-kill evaluation that the

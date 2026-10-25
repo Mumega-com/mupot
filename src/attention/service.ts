@@ -2,7 +2,12 @@ import type { AuthContext, Env, OrgKind } from '../types'
 import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
-import { BREAKER_EXEMPT_STATUSES, CYCLE_INSTANCE_PREFIX, RECOMMIT_OR_KILL_STEP } from '../projects/circuit-breaker'
+import {
+  BREAKER_EXEMPT_STATUSES,
+  CYCLE_INSTANCE_PREFIX,
+  RECOMMIT_OR_KILL_STEP,
+  isBreakerKillEnabled,
+} from '../projects/circuit-breaker'
 import {
   DEFAULT_STALL_THRESHOLD_DAYS,
   idleDurationDays,
@@ -557,7 +562,9 @@ interface RecommitCandidateRow {
 }
 
 /**
- * Recommit-due warning (mupot lifecycle-warning): the circuit breaker
+ * Recommit-due warning (mupot lifecycle-warning): when kill is enabled
+ * (PROJECT_BREAKER_KILL="1", opt-in since #2170; otherwise this source emits
+ * nothing because no archive will happen), the circuit breaker
  * (src/projects/circuit-breaker.ts) archives any non-exempt project at
  * cycle_boundary_at unless a receipted recommit exists for that EXACT
  * boundary — silently, with no prior notice. This source surfaces that fate
@@ -626,6 +633,8 @@ async function recommitDueSource(
   cursor: NeedsYouCursor | null,
   nowIso: string,
 ): Promise<SourceResult> {
+  // #2170: with kill off nothing is archived automatically, so "will be archived" items would be false.
+  if (!isBreakerKillEnabled(env)) return { name: 'recommit_due', rows: [], truncated: false }
   const exemptPlaceholders = BREAKER_EXEMPT_STATUSES.map(() => '?').join(', ')
   const candidateResult = await env.DB.prepare(`
     SELECT p.id AS project_id, p.name AS project_name, p.cycle_boundary_at,
