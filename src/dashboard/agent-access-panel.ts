@@ -62,6 +62,7 @@ export type AccessRefusal =
   | 'agent_identity_unminted'
   | 'squad_not_found'
   | 'home_squad_immutable'
+  | 'home_owner_required'
   | 'squad_archived'
   | 'invalid_capability'
   | 'invalid_expected_prior'
@@ -182,8 +183,13 @@ function guardSql(plan: ReceiptPlan): string {
     orgAdmin,
     // (1)+(2)+(7) the actor's live rank ON THIS SQUAD covers admin and the granted level
     squadRank,
-    // (4) a work squad, not archived
-    `EXISTS (SELECT 1 FROM squads WHERE id = ?4 AND kind <> 'home' AND status = 'active')`,
+    // (4) a work squad, or a home squad for a level change only; never archived
+    // A HOME squad is reachable only to CHANGE an existing level (?7 = 'change'): never to
+    // enroll or revoke, and the agent's own binding squad (?13) is never a work-squad target.
+    // Who may change it is the squad-rank leaf above: squadRank has no org/department/role
+    // bypass on a home, so only the member holding the exact grant on that home passes.
+    `EXISTS (SELECT 1 FROM squads WHERE id = ?4 AND status = 'active'
+        AND ((kind <> 'home' AND id <> ?13) OR (kind = 'home' AND ?7 = 'change')))`,
     // (5) no agent-bound member can act: also covers an agent editing itself
     `NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE member_id = ?2)`,
     // the target identity is still the welded one we authorized
@@ -296,9 +302,15 @@ export async function applyAgentAccessChange(
     'SELECT id, name, kind, status FROM squads WHERE id = ? LIMIT 1',
   ).bind(input.squadId).first<SquadRow>()
   if (!squad) return fail('squad_not_found', 404)
-  // (4)
-  if (squad.kind === 'home' || squad.id === agent.squad_id) return fail('home_squad_immutable', 409)
+  // (4) A work squad that is the agent's binding squad stays immutable here. A HOME squad
+  // accepts one thing: changing the level of an access row that already exists. Enroll and
+  // revoke on a home stay refused (revoke on the agent's own home would sever its binding),
+  // and who may change it is the live squad rank below, which a home grants only to the
+  // member holding the exact grant on it (never to org admin standing).
+  const isHome = squad.kind === 'home'
+  if (!isHome && squad.id === agent.squad_id) return fail('home_squad_immutable', 409)
   if (squad.status !== 'active') return fail('squad_archived', 409)
+  if (isHome && input.action !== 'set') return fail('home_squad_immutable', 409)
 
   // level: required for set, never owner, never defaulted
   let next: AgentAccessCapability | null = null
@@ -318,6 +330,8 @@ export async function applyAgentAccessChange(
   if (priorCapability === 'owner' || priorMembership === 'owner') return fail('owner_access_untouchable', 403)
   if (priorCapability === 'invalid' || priorMembership === 'invalid') return fail('invalid_expected_prior', 400)
 
+  if (isHome && priorCapability === null && priorMembership === null) return fail('home_squad_immutable', 409)
+
   const reason = input.reason.trim()
   if (reason.length > REASON_MAX_LENGTH) return fail('invalid_reason', 400)
 
@@ -330,7 +344,7 @@ export async function applyAgentAccessChange(
     priorMembership ? capabilityRank(priorMembership) : 0,
   )
   const actorRank = await actorRankOnScopeFor(env, auth, 'squad', squad.id)
-  if (actorRank < requiredRank) return fail('insufficient_rank', 403)
+  if (actorRank < requiredRank) return fail(isHome ? 'home_owner_required' : 'insufficient_rank', 403)
   if (await exceedsTargetRankCeiling(env, auth, binding.memberId)) {
     return fail('target_outranks_actor', 403)
   }
@@ -433,7 +447,8 @@ const REFUSAL_TEXT: Record<AccessRefusal, string> = {
   agent_not_found: 'Agent not found.',
   agent_identity_unminted: 'This agent has no welded identity yet. Access cannot be set until it has one.',
   squad_not_found: 'Squad not found.',
-  home_squad_immutable: 'A home squad cannot be changed here.',
+  home_squad_immutable: 'A home squad cannot be changed here, except to change the level of access it already has.',
+  home_owner_required: 'Only the member who owns this home squad can change access on it.',
   squad_archived: 'That squad is archived.',
   invalid_capability: 'Choose an access level: observer, member, lead or admin.',
   invalid_expected_prior: 'The form is out of date. Reload and try again.',
@@ -460,6 +475,8 @@ export interface AccessRow {
   squadName: string
   departmentName: string | null
   home: boolean
+  /** A home squad whose level the viewer may change: the viewer holds admin or better on it directly. */
+  homeEditable: boolean
   archived: boolean
   /** What the capability plane says; the authoritative side. */
   capability: string | null
@@ -480,7 +497,7 @@ export interface AgentAccessView {
   choosable: ChoosableSquad[]
 }
 
-export async function loadAgentAccessView(env: Env, agentId: string): Promise<AgentAccessView> {
+export async function loadAgentAccessView(env: Env, agentId: string, auth: AuthContext): Promise<AgentAccessView> {
   const binding = await resolveAgentMemberBinding(env, agentId)
   const memberId = binding.kind === 'bound' ? binding.memberId : null
   const [memberships, grants, squads] = await Promise.all([
@@ -505,11 +522,15 @@ export async function loadAgentAccessView(env: Env, agentId: string): Promise<Ag
   for (const s of squads.results ?? []) {
     const held = mem.has(s.id) || cap.has(s.id)
     if (held) {
+      // Same rank source the write uses (actorRankOnScopeFor); the write re-checks it in SQL.
+      const homeEditable = s.kind === 'home' && s.status === 'active'
+        && (await actorRankOnScopeFor(env, auth, 'squad', s.id)) >= ACTOR_RANK_FLOOR
       rows.push({
         squadId: s.id,
         squadName: s.name,
         departmentName: s.department_name,
         home: s.kind === 'home',
+        homeEditable,
         archived: s.status !== 'active',
         capability: cap.get(s.id) ?? null,
         membership: mem.get(s.id) ?? null,
@@ -545,9 +566,10 @@ export function agentAccessPanel(
   const rowHtml = view.rows.map((row) => {
     const dept = row.departmentName ?? '—'
     const label = html`<strong>${row.squadName}</strong> <span class="dim">· department ${dept}</span>`
-    if (row.home) {
+    const isOwnerRow = row.capability === 'owner' || row.membership === 'owner'
+    if (row.home && !(row.homeEditable && !row.archived && !isOwnerRow)) {
       return html`<li>${label}: <code>${row.capability ?? row.membership ?? '—'}</code>
-        <span class="dim">home squad, not editable here</span></li>`
+        <span class="dim">home squad, only its owner can change this level</span></li>`
     }
     if (row.archived) {
       return html`<li>${label}: <code>${row.capability ?? row.membership ?? '—'}</code>
@@ -571,7 +593,7 @@ export function agentAccessPanel(
         <label>Level <select name="capability" required>${levelOptions(preselect)}</select></label>
         <label>Reason <input name="reason" maxlength="${REASON_MAX_LENGTH}" placeholder="optional" /></label>
         <button type="submit" name="action" value="set" class="btn">Change level</button>
-        <button type="submit" name="action" value="revoke" class="btn secondary">Revoke</button>
+        ${row.home ? '' : html`<button type="submit" name="action" value="revoke" class="btn secondary">Revoke</button>`}
       </form></li>`
   })
   const enroll = view.choosable.length === 0

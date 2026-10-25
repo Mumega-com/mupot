@@ -105,7 +105,7 @@ describe('GET /agents/:id — the Access panel', () => {
     expect(body).toContain('value="revoke"')
     expect(body).toContain('name="reason"')
     // home squad is listed but not editable
-    expect(body).toMatch(/Rava Home[\s\S]*home squad, not editable here/)
+    expect(body).toMatch(/Rava Home[\s\S]*home squad, only its owner can change this level/)
     // only OTHER work squads are offered for enrollment; the level select has no owner
     expect(body).toContain('<option value="sq-ops">Ops Desk (department Engineering)</option>')
     expect(body).not.toContain('value="owner"')
@@ -227,8 +227,12 @@ describe('POST /agents/:id/access', () => {
     const owner = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'owner', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })
     expect(owner.status).toBe(400)
     const home = await post(env, '/agents/rava/access', { squad_id: 'sq-home', capability: 'lead', expected_capability: 'member', expected_membership: 'member', action: 'set' })
-    expect(home.status).toBe(409)
-    expect(await home.text()).toContain('A home squad cannot be changed here.')
+    // an org admin without the grant on that home is refused as not-the-owner
+    expect(home.status).toBe(403)
+    expect(await home.text()).toContain('Only the member who owns this home squad can change access on it.')
+    const homeRevoke = await post(env, '/agents/rava/access', { squad_id: 'sq-home', expected_capability: 'member', expected_membership: 'member', action: 'revoke' })
+    expect(homeRevoke.status).toBe(409)
+    expect(await homeRevoke.text()).toContain('A home squad cannot be changed here')
     const stale = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_capability: 'admin', expected_membership: 'admin', action: 'set' })
     expect(stale.status).toBe(409)
     expect(rows(harness)).toHaveLength(0)
@@ -243,5 +247,50 @@ describe('POST /agents/:id/access', () => {
     expect(body).not.toContain('<img src=x')
     expect(body).not.toContain('<script>1')
     expect((rows(harness) as unknown[]).length).toBe(1)
+  })
+})
+
+// The <li> of the home squad inside the Access panel (rows sort by department then name).
+const homeRow = (body: string): string => {
+  const panel = body.slice(body.indexOf('<h2>Access</h2>'))
+  const at = panel.indexOf('Rava Home')
+  return panel.slice(at, panel.indexOf('</li>', at))
+}
+
+describe('the home squad row for its owner', () => {
+  const ownerAuth = (): AuthContext => ({
+    userId: 'm-hadi', email: null, role: 'member', tenant: TENANT, memberId: 'm-hadi',
+    capabilities: [g('m-hadi', 'admin'), { member_id: 'm-hadi', scope_type: 'squad', scope_id: 'sq-home', capability: 'admin' } as CapabilityGrant],
+  })
+  const grantHome = (h: SqliteD1Harness): void => {
+    h.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-hadi-home', 'm-hadi', 'squad', 'sq-home', 'admin')")
+  }
+
+  it('shows the owner a Change level form on the home row, without Revoke', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    authState.current = ownerAuth()
+    const body = await (await dashboardApp.request(`${ORIGIN}/agents/rava`, {}, env)).text()
+    const home = homeRow(body)
+    expect(home).toContain('name="squad_id" value="sq-home"')
+    expect(home).toContain('Change level')
+    expect(home).not.toContain('value="revoke"')
+    expect(home).not.toContain('only its owner can change')
+  })
+
+  it('does not show those controls to an org admin who does not own the home', async () => {
+    const { env } = setup()
+    authState.current = asHadi()
+    const body = await (await dashboardApp.request(`${ORIGIN}/agents/rava`, {}, env)).text()
+    expect(homeRow(body)).not.toContain('name="squad_id" value="sq-home"')
+  })
+
+  it('the owner changes the level over HTTP', async () => {
+    const { harness, env } = setup()
+    grantHome(harness)
+    authState.current = ownerAuth()
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-home', capability: 'lead', expected_capability: 'member', expected_membership: 'member', action: 'set' })
+    expect(await res.text()).toContain('Rava is now lead on Rava Home.')
+    expect(rows(harness)).toEqual([{ action: 'change', prior_capability: 'member', new_capability: 'lead', actor_member_id: 'm-hadi' }])
   })
 })

@@ -2088,7 +2088,7 @@ dashboardApp.get('/agents/:id', async (c) => {
   ])
   // The Access panel is org-admin only; POST /agents/:id/access re-checks every rule.
   const accessPanel = isOrgAdmin(auth) && !auth.boundAgentId
-    ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id), null)
+    ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id, auth), null)
     : null
   const ownerView = await loadAgentOwnerView(c.env, auth, agent)
   // Observed facts boot recorded (read-only on this page). A failed read renders "not reported yet",
@@ -2333,7 +2333,7 @@ dashboardApp.post('/agents/:id/access', async (c) => {
     expectedMembership: field('expected_membership'),
     reason: field('reason'),
   })
-  const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id) : null
+  const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id, auth) : null
   const page = (notice: string) => html`<p class="crumbs"><a href="/">Overview</a> / <a href="/agents/${agent.id}">${agent.name}</a> / Access</p>
     ${view ? agentAccessPanel(agent, view, notice) : html`<p class="empty">${notice}</p>`}
     <p><a href="/agents/${agent.id}">Back to ${agent.name}</a></p>`
