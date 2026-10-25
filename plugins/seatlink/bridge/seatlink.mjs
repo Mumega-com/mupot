@@ -2,40 +2,31 @@
 // mupot-seatlink v0.3.1 — event-driven seat link for Herdr.
 //
 // v0.3.1 (2026-09-09): Herdr 0.9 / protocol 22 — subscribe topology THEN snapshot THEN
-// per-pane subscribe on a replacement socket. 0.9 lifecycle subscribe is live-only (#1270);
+// per-pane subscribe on a replacement socket. 0.9 lifecycle subscribe is live-only;
 // a second events.subscribe on the same socket closes it (measured 0.9.0). Reconnect runs
 // serve() again, not a stale pane list. Keep 0.3.0 identity: reconcile-before-deliver,
-// formatPotMail expects_reply, byName-then-byLabel. Do not overwrite this tree with Mac 0.2.x.
+// formatPotMail expects_reply, byName-then-byLabel. Do not overwrite this tree with a 0.2.x copy.
 //
-// CANONICAL SOURCE NOTICE (added v0.3.0, 2026-09-03)
-// This file had drifted to a hand-deployed, untracked copy at
-// ~/.local/share/mupot-seatlink/bridge/seatlink.mjs — no git history, no tests, no review
-// trail. This repo (herdr-mupot-bridge) is the canonical home going forward: the deployed
-// copy on any host should be a byte-for-byte sync of this file, never hand-edited in place.
-// v0.3.0 is the live v0.2.0 script (reproduced here verbatim from the running host,
-// 2026-09-03) plus exactly two changes, both scoped to mumega-com#1179:
-//   1. drainDeferred() now reconciles its queue against the pot's CURRENT unread state
-//      before injecting anything (bridge/lib/reconcile.mjs) — see the WHY THIS EXISTS note
-//      on that module. This is the actual fix for the measured defect: a deferred message
-//      can be consumed through a different channel (direct inbox_ack, the Stop hook) while
-//      it sits in this queue, and drain used to deliver it anyway.
-//   2. formatPotMail() adopts mupot#1278 / #1280 (expects_reply && reply_basis === "request_id_field").
-//      Terminal kind:"ack" replies retain request_id as an idempotency key (migration 0032)
-//      but are annotated with expects_reply: false, so they no longer manufacture ACK-chain noise.
-// Everything else — the Herdr event-subscription transport, the sentinel/dedupe logic, the
-// SSE inbox client, the receipt log — is unchanged from the live v0.2.0 script. Deploying this
-// (rsync to the host + `systemctl --user restart mupot-seatlink`) is NOT part of this repo
-// change; that is a separate, ops-gated step.
+// CHANGE HISTORY (v0.3.0)
+// The live v0.2.0 script plus two changes:
+//   1. drainDeferred() reconciles its queue against the pot's CURRENT unread state before
+//      injecting anything (lib/reconcile.mjs): a deferred message can be consumed through a
+//      different channel (direct inbox_ack, the Stop hook) while it sits in this queue, and drain
+//      used to deliver it anyway.
+//   2. formatPotMail() adopts the expects_reply && reply_basis === "request_id_field" rule.
+//      Terminal kind:"ack" replies keep request_id as an idempotency key but carry
+//      expects_reply: false, so they no longer manufacture ACK-chain noise.
+// Everything else (the Herdr event-subscription transport, the sentinel/dedupe logic, the SSE
+// inbox client, the receipt log) is unchanged.
 //
 // WHY THIS EXISTS
-// The predecessor (~/.mupot-bridge/herdr-inbox-watch/watch.mjs, 243 lines) polls every
-// 5000ms and its entire steady-state output is "skip hadi-grok status=working". Herdr's
-// socket API has supported subscriptions since protocol 19, so the interval is unnecessary
+// The predecessor polled every 5000ms and its entire steady-state output was "skip <seat>
+// status=working". Herdr's socket API has supported subscriptions since protocol 19, so the interval is unnecessary
 // for anything local.
 //
 // TWO TRANSPORTS, DELIBERATELY SEPARATE
 //   1. seat <-> seat  : pure event. Both ends are Herdr panes on one host. No mupot, no SOS,
-//                       no launchd, no interval. This is the dara<->hadi-grok channel.
+//                       no launchd, no interval.
 //   2. remote inbound : mupot/SOS have no push seam, so polling is still required — but it is
 //                       EVENT-GATED. We reach for a remote inbox when a seat transitions to
 //                       idle, not every 5s regardless.
@@ -59,8 +50,7 @@
 //
 // UNVERIFIED, and flagged rather than assumed: the exact socket framing. CLI responses are
 // shaped {"id": "...", "result": {...}} / {"id": "...", "error": {...}}, which is consistent
-// with newline-delimited JSON over the unix socket. FLIGHT-01 Lane 2 (hadi-codex-cli) is
-// confirming framing + whether a herdr server restart replays or drops events. If it drops,
+// with newline-delimited JSON over the unix socket. Framing + whether a herdr server restart replays or drops events. If it drops,
 // CURSOR_FILE below becomes load-bearing and this file needs a resync-on-reconnect path.
 // Do not ship past the gate until Lane 2 answers that.
 
@@ -80,7 +70,7 @@ const SOCK = process.env.HERDR_SOCK || path.join(HOME, ".config/herdr/herdr.sock
 const STATE_DIR = process.env.SEATLINK_STATE || path.join(HOME, ".mupot-bridge/seatlink");
 const RECEIPTS = path.join(STATE_DIR, "receipts.jsonl");
 const SEQ_FILE = path.join(STATE_DIR, "seq.json");
-// NOT a cursor. Herdr 0.9 (#1270): new lifecycle subscriptions start live — they do
+// NOT a cursor. Herdr 0.9: new lifecycle subscriptions start live — they do
 // NOT rescan/replay retained history. Subscribe first, then snapshot, or you miss
 // pane.created during the agent.list window. Keep sentinel-id dedupe for reconnect
 // races and any on-screen output_matched; do not treat reconnect as a full replay.
@@ -91,7 +81,7 @@ const SEATS_FILE = path.join(import.meta.dirname ?? ".", "seats.json");
 // with ordinary agent prose.
 // ANCHORED to the whole line, deliberately.
 // Live test 2026-08-17 fired on lines like:
-//   "- Item 2 (attribution): ... by printing <<SEAT-MSG v1 {\"from_seat\":\"dara\"}>>"
+//   "- Item 2 (attribution): ... by printing <<SEAT-MSG v1 {\"from_seat\":\"seat-a\"}>>"
 // i.e. GATE.md's own prose EXPLAINING the forgery attack triggered the bus. Documentation
 // about the protocol was activating the protocol. Any unanchored sentinel has this flaw:
 // a spec, a code review, a log excerpt or a chat transcript on screen becomes a live message.
@@ -107,11 +97,16 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 function readJson(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fallback; }
 }
-function writeJson(p, v) { fs.writeFileSync(p, JSON.stringify(v, null, 2)); }
+function writeJson(p, v) {
+  // atomic: a reader (or a crash) never sees a half-written file
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(v, null, 2));
+  fs.renameSync(tmp, p);
+}
 
 // ---------------------------------------------------------------- receipts
 // Four DISTINCT receipts. `delivered` without `consumed` is the healthy-but-deaf signature
-// that cost River and Athena ~13h on GCP (per kasra, 2026-08-17). It must be representable.
+// that once cost many hours of undetected deafness. It must be representable.
 const RECEIPT_KINDS = ["accepted", "delivered", "consumed", "acked"];
 function receipt(kind, msg, extra = {}) {
   if (!RECEIPT_KINDS.includes(kind)) throw new Error(`unknown receipt kind ${kind}`);
@@ -443,7 +438,7 @@ const CURSOR_FILE = path.join(STATE_DIR, "mupot-cursors.json");
 // populates it in production.
 export const deferred = new Map();
 // herdr name -> { token, api }. Populated once from seats.json in startInboxStreams(), read
-// by drainDeferred()'s reconcile-before-deliver check (v0.3.0, mumega-com#1179). Deliberately
+// by drainDeferred()'s reconcile-before-deliver check (v0.3.0). Deliberately
 // NOT consulted on the immediate/first-attempt delivery path in injectPotMail — that path is
 // the common case and adding a round-trip to every delivery would add latency for no measured
 // benefit; the deferred queue is the one place staleness has unbounded time to accumulate.
@@ -467,7 +462,7 @@ function readTokenPath(p) {
 
 // formatPotMail formats the prompt text injected into a Herdr seat pane when mupot mail arrives.
 //
-// ADOPT expects_reply & reply_basis (mupot#1278 @ 51d12b6f, Athena Gate requirement):
+// ADOPT expects_reply & reply_basis (gate requirement):
 // - When annotated: require an ACK only if expects_reply === true AND reply_basis === "request_id_field".
 // - Do NOT require an ACK if reply_basis is "body_token" (prose quotes of prior requests must not trigger loops).
 // - Never require an ACK if expects_reply is false (e.g. kind:"ack" messages, which carry request_id
@@ -522,7 +517,7 @@ async function injectPotMail(herdrName, msg) {
 // peek surface the SSE stream itself is built on (GET /api/inbox?peek=1 — never consumes).
 // limit=100 is MAX_INBOX_LIMIT server-side and returns oldest-unread-first.
 //
-// DETERMINISTIC PAGINATION & COMPLETENESS (mupot#1280, v0.3.0):
+// DETERMINISTIC PAGINATION & COMPLETENESS (v0.3.0):
 // Returns { ids: Set<string>, complete: boolean }.
 // Completeness is guaranteed only when the producer explicitly signals complete: true, or
 // when an un-upgraded producer reports remaining: 0, or when the returned page is empty.
@@ -545,7 +540,7 @@ export async function fetchUnreadIds(herdrName) {
 
     for (const m of body.messages) {
       if (!m || typeof m.id !== "string" || !m.id || typeof m.seq !== "number") {
-        // Malformed message row (Athena P0): e.g. missing id or invalid seq.
+        // Malformed message row (review P0): e.g. missing id or invalid seq.
         // Fail open immediately — never allow malformed rows to masquerade as an empty complete set!
         return { ids: new Set(), complete: false };
       }
@@ -554,7 +549,7 @@ export async function fetchUnreadIds(herdrName) {
 
     const hasRemaining = typeof body.remaining === "number";
 
-    // Contradictory check (Athena P0): complete: true combined with remaining > 0 is contradictory.
+    // Contradictory check (review P0): complete: true combined with remaining > 0 is contradictory.
     if (body.complete === true && hasRemaining && body.remaining > 0) {
       break; // Fail open
     }
@@ -589,7 +584,7 @@ export async function drainDeferred(herdrName) {
   const q = deferred.get(herdrName);
   if (!q?.length) return;
   deferred.set(herdrName, []);
-  // Reconcile-before-deliver (mumega-com#1179, v0.3.0): a message queued here while the seat
+  // Reconcile-before-deliver (v0.3.0): a message queued here while the seat
   // was busy can have been consumed through an entirely different channel — a direct
   // inbox_ack MCP call, the Stop hook — before the seat goes idle and this drains. Re-check
   // against the pot's current unread state and drop anything already settled, rather than
@@ -603,7 +598,7 @@ export async function drainDeferred(herdrName) {
   for (const msg of toDeliver) await injectPotMail(herdrName, msg);
 }
 
-export async function openInboxStream(entry, api) {
+export async function openInboxStream(entry, api, { shouldContinue = () => true } = {}) {
   const token = readTokenPath(entry.mupot_token_file);
   if (!token) {
     log(`${entry.herdr}: no token, skip SSE`);
@@ -614,7 +609,7 @@ export async function openInboxStream(entry, api) {
   let since = Number(cursors[entry.herdr] || 0);
   let backoff = 1000;
   const run = async () => {
-    for (;;) {
+    while (shouldContinue()) {
       try {
         // poll_ms=5000 (server default 1000): each open stream re-reads D1 on this cadence. D1 load stopgap until real push (2026-10-25).
         const url = `${api.replace(/\/$/, "")}/api/inbox/stream?poll_ms=5000${since ? `&since=${since}` : ""}`;
@@ -693,6 +688,13 @@ export function startPushClient(push, api, over = {}) {
     readFile: (p) => fs.readFileSync(p, "utf8"),
     readInbox: makePeekReader({ api, readToken: (seat) => readTokenPath(seat.mupot_token_file), fetchImpl: over.inboxFetch ?? fetch }),
     deliver: over.route ?? routeMail,
+    // A seat the push channel cannot serve (no grant, revoked, refused) gets the normal SSE stream. A live
+    // grant still makes the server answer 409, which stops that stream (openInboxStream): not a bypass.
+    onDark: (seat) => {
+      if (darkSseOpened.has(seat.herdr)) return;
+      darkSseOpened.add(seat.herdr);
+      openInboxStream(seat, api);
+    },
     getCursor: (seat) => Number(cursors()[seat.herdr] || 0),
     setCursor: (seat, n) => { const c = cursors(); c[seat.herdr] = n; writeJson(CURSOR_FILE, c); },
     log,
@@ -701,6 +703,7 @@ export function startPushClient(push, api, over = {}) {
   return client;
 }
 
+const darkSseOpened = new Set();
 const expandHome = (p) => (p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p);
 
 let inboxStreamsStarted = false;
@@ -710,7 +713,8 @@ function startInboxStreams() {
   const cfg = readJson(SEATS_FILE, { seats: [] });
   const api = cfg.mupot_api_url || "https://mupot.mumega.com";
   const { push, sse } = planInboxTransports(cfg);
-  if (push) {
+  for (const sk of push?.skipped ?? []) log(`seat-events: ${sk.herdr}: ${sk.reason}; staying on SSE`);
+  if (push && push.seats.length) {
     log(`seat-events push for: ${push.seats.map((s) => s.herdr).join(", ")}`);
     startPushClient(push, api).start();
   }
@@ -762,7 +766,7 @@ async function doctor() {
   console.log("state:", STATE_DIR);
   console.log("\nRun `herdr api schema` to confirm protocol; this file targets protocol 22 (Herdr 0.9: subscribe then snapshot).");
   console.log("Predecessor still running? check: pgrep -fl 'watch.mjs'");
-  console.log("Known-failing services to check: launchctl list | grep -E 'hermes|mumega'");
+  console.log("Known-failing services to check: your service manager's failed-unit list");
 }
 
 // ---------------------------------------------------------------- main

@@ -11,8 +11,8 @@ import {
   SAFETY_RESYNC_MS, PING_EVERY_MS,
 } from './lib/seat-events-client.mjs'
 
-const TENANT = 'mumega'
-const HOST = 'muvps-host'
+const TENANT = 'tenant-x'
+const HOST = 'host-1'
 const tick = () => new Promise((r) => setImmediate(r))
 const flush = async () => { for (let i = 0; i < 8; i++) await tick() }
 
@@ -37,7 +37,7 @@ function clock() {
   }
 }
 
-function setup({ agents = ['a-kasra'], ticketStatus = 200 } = {}) {
+function setup({ agents = ['a-push'], ticketStatus = 200 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sl-'))
   const keyFile = path.join(dir, 'k.pem')
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519')
@@ -61,14 +61,15 @@ function setup({ agents = ['a-kasra'], ticketStatus = 200 } = {}) {
       const t = new URL(this.url).searchParams.get('ticket')
       assert.ok(hub.tickets.delete(t), 'ticket single-use')
       this.hello = f
-      queueMicrotask(() => this.emit('message', { data: JSON.stringify({ type: 'ready', protocol: 1, host: HOST, subscriptions: agents.map((agent) => ({ agent, ok: true })) }) }))
+      queueMicrotask(() => this.emit('message', { data: JSON.stringify({ type: 'ready', protocol: 1, host: HOST, subscriptions: (hub.readySubs || agents).map((agent) => ({ agent, ok: true })) }) }))
     }
     close(code = 1000) { queueMicrotask(() => this.emit('close', { code })) }
     push(frame) { this.emit('message', { data: JSON.stringify(frame) }) }
   }
   const fetchImpl = async (url, init) => {
     assert.ok(url.endsWith('/api/fleet/events/ticket'))
-    if (hub.ticketStatus !== 200) return { ok: false, status: hub.ticketStatus, json: async () => ({}) }
+    hub.attempts = (hub.attempts || 0) + 1
+    if (hub.ticketStatus !== 200) return { ok: false, status: hub.ticketStatus, json: async () => hub.errBody || {} }
     const b = JSON.parse(init.body)
     const msg = Buffer.from(['seat-events-ticket:v1', TENANT, b.host_agent_id, [...new Set(b.agents)].sort().join(','), String(b.ts), b.nonce].join('\n'))
     assert.ok(crypto.verify(null, msg, publicKey, Buffer.from(b.sig, 'base64url')), 'signature verifies over the server canonical message')
@@ -76,30 +77,32 @@ function setup({ agents = ['a-kasra'], ticketStatus = 200 } = {}) {
     hub.verified.push(b)
     const ticket = crypto.randomBytes(32).toString('base64url')
     hub.tickets.add(ticket)
-    return { ok: true, status: 200, json: async () => ({ ok: true, ticket }) }
+    return { ok: true, status: 200, json: async () => (hub.ticketReply ? hub.ticketReply(b, ticket) : { ok: true, ticket, agents: b.agents, refused: [] }) }
   }
   const seats = agents.map((a) => ({ herdr: a.replace('a-', ''), agent_id: a, seat_events: true }))
   const cursors = {}
-  const reads = []; const delivered = []; let nextSeq = 1; let pending = []
+  const reads = []; const delivered = []; const dark = []; let nextSeq = 1; let pending = []
+  const defaultRead = async (seat, since) => { reads.push([seat.herdr, since]); return pending.filter((x) => x.seq > since) }
   const c = createSeatEventsClient({
     api: 'https://pot.test', tenant: TENANT, hostId: HOST, keyFile, seats,
     readFile: (p) => fs.readFileSync(p, 'utf8'), fetchImpl, WebSocketImpl: FakeWS,
-    readInbox: async (seat, since) => { reads.push([seat.herdr, since]); const m = pending.filter((x) => x.seq > since); return m },
     deliver: async (seat, m) => { delivered.push([seat.herdr, m.id]) },
     getCursor: (s) => cursors[s.herdr] || 0, setCursor: (s, n) => { cursors[s.herdr] = n },
     log: (l) => logs.push(l), timers: ck, random: () => 0.5,
+    onDark: (seat, why) => dark.push([seat.herdr, why]),
+    readInbox: (...a) => (hub.readInbox ? hub.readInbox(...a) : defaultRead(...a)),
   })
-  return { c, ck, hub, reads, delivered, logs, pem, cursors, enqueue: (id) => { pending.push({ id, seq: nextSeq++ }) } }
+  return { c, ck, hub, reads, delivered, dark, logs, pem, cursors, defaultRead, enqueue: (id) => { pending.push({ id, seq: nextSeq++ }) } }
 }
 
 test('hello then exactly one resync read; hint triggers exactly one inbox read and unchanged inject', async () => {
   const t = setup(); t.c.start(); await flush()
   assert.equal(t.hub.sockets.length, 1)
-  assert.deepEqual(t.hub.sockets[0].hello.since, { 'a-kasra': 0 })
+  assert.deepEqual(t.hub.sockets[0].hello.since, { 'a-push': 0 })
   assert.equal(t.reads.length, 1) // resync on ready
-  t.enqueue('m1'); t.hub.sockets[0].push({ type: 'hint', agent: 'a-kasra', hint: { id: 'm1', seq: 1 } }); await flush()
-  assert.equal(t.reads.length, 2); assert.deepEqual(t.reads[1], ['kasra', 0])
-  assert.deepEqual(t.delivered, [['kasra', 'm1']]); assert.equal(t.cursors.kasra, 1)
+  t.enqueue('m1'); t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: { id: 'm1', seq: 1 } }); await flush()
+  assert.equal(t.reads.length, 2); assert.deepEqual(t.reads[1], ['push', 0])
+  assert.deepEqual(t.delivered, [['push', 'm1']]); assert.equal(t.cursors.push, 1)
 })
 
 test('idle period: zero reads (only pings) until the bounded safety resync', async () => {
@@ -111,18 +114,18 @@ test('idle period: zero reads (only pings) until the bounded safety resync', asy
 })
 
 test('safety resync: one cursor read per seat every 5 min with a healthy socket', async () => {
-  const t = setup({ agents: ['a-kasra', 'a-athena'] }); t.c.start(); await flush()
+  const t = setup({ agents: ['a-push', 'a-sse'] }); t.c.start(); await flush()
   const base = t.reads.length // 2 resync reads
   t.enqueue('lost'); // hint was lost: no frame sent
   await t.ck.advance(SAFETY_RESYNC_MS + 10)
   assert.equal(t.reads.length - base, 2)
-  assert.deepEqual(t.delivered, [['kasra', 'lost'], ['athena', 'lost']])
+  assert.deepEqual(t.delivered, [['push', 'lost'], ['sse', 'lost']])
   await t.ck.advance(SAFETY_RESYNC_MS)
   assert.equal(t.reads.length - base, 4)
 })
 
 test('reconnect with backoff and one resync read per seat; no SSE fallback ever', async () => {
-  const t = setup({ agents: ['a-kasra', 'a-athena'] }); t.c.start(); await flush()
+  const t = setup({ agents: ['a-push', 'a-sse'] }); t.c.start(); await flush()
   const before = t.reads.length
   t.hub.sockets[0].close(1006); await flush()
   assert.equal(t.hub.sockets.length, 1) // backoff not yet elapsed
@@ -150,11 +153,11 @@ test('409 notify_owned_by_fleet_host is "owned by host, do not fall back"', () =
 })
 
 test('refused subscription is logged and not worked around (no reads, no SSE)', async () => {
-  const t = setup({ agents: ['a-kasra', 'a-athena'] })
+  const t = setup({ agents: ['a-push', 'a-sse'] })
   t.c.start(); await flush()
-  t.hub.sockets[0].push({ type: 'revoked', agent: 'a-athena', reason: 'grant_revoked' }); await flush()
+  t.hub.sockets[0].push({ type: 'revoked', agent: 'a-sse', reason: 'grant_revoked' }); await flush()
   const base = t.reads.length
-  t.hub.sockets[0].push({ type: 'hint', agent: 'a-athena', hint: { id: 'x', seq: 9 } }); await flush()
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-sse', hint: { id: 'x', seq: 9 } }); await flush()
   assert.equal(t.reads.length, base)
   assert.ok(t.logs.some((l) => /revoked/.test(l)))
 })
@@ -199,4 +202,110 @@ test('hostkey-gen: mode 600, prints only pubkey+fingerprint, refuses existing fi
   fs.chmodSync(dir, 0o770)
   assert.throws(() => execFileSync('node', [bin, path.join(dir, 'g.key')], { stdio: 'pipe' }))
   assert.ok(!fs.existsSync(path.join(dir, 'g.key')))
+})
+
+// ---- dark seats: every refusal path hands the seat to SSE (onDark), once, with a reason ----
+test('pre-grant opt-in (403 no_granted_agents): every seat goes dark once; reconnect is slow, not a storm', async () => {
+  const t = setup({ agents: ['a-push', 'a-sse'] })
+  t.hub.ticketStatus = 403; t.hub.errBody = { error: 'no_granted_agents' }
+  t.c.start(); await flush()
+  assert.deepEqual(t.dark.map((d) => d[0]).sort(), ['push', 'sse'])
+  await t.ck.advance(5 * 60_000)
+  assert.equal(t.dark.length, 2, 'onDark fires once per seat, not per retry')
+  assert.ok(t.hub.attempts <= 6, `attempts ${t.hub.attempts}`)
+})
+
+test('partial grant: refused seat goes dark with the server reason; granted seat still push', async () => {
+  const t = setup({ agents: ['a-push', 'a-sse'] })
+  t.hub.readySubs = ['a-push']
+  t.hub.ticketReply = (b, ticket) => { t.hub.tickets.add(ticket); return { ok: true, ticket, agents: ['a-push'], refused: [{ agent: 'a-sse', reason: 'not_granted' }] } }
+  t.c.start(); await flush()
+  assert.deepEqual(t.dark, [['sse', 'no grant at ticket time (not_granted)']])
+  const base = t.reads.length
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-sse', hint: { id: 'x', seq: 1 } }); await flush()
+  assert.equal(t.reads.length, base, 'dark seat is not read over push')
+  t.enqueue('m1'); t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: { id: 'm1', seq: 1 } }); await flush()
+  assert.deepEqual(t.delivered, [['push', 'm1']])
+})
+
+test('mid-rollback revoke: seat goes dark on the revoked frame and stays out of the push reads', async () => {
+  const t = setup(); t.c.start(); await flush()
+  assert.equal(t.dark.length, 0)
+  t.hub.sockets[0].push({ type: 'revoked', agent: 'a-kasra'.replace('kasra', 'push'), reason: 'grant_revoked' }); await flush()
+  assert.deepEqual(t.dark.map((d) => d[0]), ['push'])
+  t.hub.sockets[0].push({ type: 'revoked', agent: 'a-push', reason: 'again' }); await flush()
+  assert.equal(t.dark.length, 1)
+  const base = t.reads.length
+  await t.ck.advance(SAFETY_RESYNC_MS + 10)
+  assert.equal(t.reads.length, base)
+})
+
+test('ready with a refused subscription also goes dark', async () => {
+  const t = setup({ agents: ['a-push', 'a-sse'] })
+  const orig = t.hub
+  t.hub.ticketReply = (b, ticket) => { orig.tickets.add(ticket); return { ok: true, ticket, agents: b.agents, refused: [] } }
+  t.c.start(); await flush()
+  t.hub.sockets[0].push({ type: 'ready', protocol: 1, host: 'h', subscriptions: [{ agent: 'a-push', ok: true }, { agent: 'a-sse', ok: false, reason: 'agent_already_claimed' }] }); await flush()
+  assert.deepEqual(t.dark, [['sse', 'subscription refused (agent_already_claimed)']])
+})
+
+test('ticket 400 does not retry every second', async () => {
+  const t = setup(); t.hub.ticketStatus = 400; t.hub.errBody = { error: 'bad_request', detail: 'agents' }
+  t.c.start(); await flush(); await t.ck.advance(30_000)
+  assert.ok(t.hub.attempts <= 2, `attempts ${t.hub.attempts}`)
+  assert.ok(t.logs.some((l) => /400/.test(l)))
+})
+
+// ---- config validation ----
+test('config: invalid agent id / paperclip seats are skipped (stay SSE); invalid host id disables push', () => {
+  const base = { seat_events: { host_id: HOST, tenant: TENANT } }
+  const c = parseSeatEventsConfig({ ...base, seats: [
+    { herdr: 'ok', mupot_agent_id: 'a-ok', mupot_token_file: 't', seat_events: true },
+    { herdr: 'bad', mupot_agent_id: 'Bad_ID', mupot_token_file: 't', seat_events: true },
+    { herdr: 'pc', mupot_agent_id: 'a-pc', mupot_token_file: 't', seat_events: true, target: { kind: 'paperclip' } },
+  ] })
+  assert.deepEqual(c.seats.map((s) => s.herdr), ['ok'])
+  assert.deepEqual(c.skipped.map((s) => [s.herdr, s.reason]), [['bad', 'agent id not a valid seat-events id'], ['pc', 'paperclip seats stay on SSE']])
+  assert.equal(parseSeatEventsConfig({ seat_events: { host_id: 'Bad Host', tenant: TENANT }, seats: [{ herdr: 'k', mupot_agent_id: 'a', mupot_token_file: 't', seat_events: true }] }), null)
+})
+
+// ---- reads ----
+test('readSeat pages while a page is full or complete=false, then stops', async () => {
+  const t = setup()
+  let page = 0
+  t.hub.readInbox = async (seat, since) => {
+    page++
+    if (page === 1) return { messages: [{ id: 'a', seq: 1 }], complete: true } // resync read: tiny page
+    if (page === 2) return { messages: [{ id: 'b', seq: 2 }], complete: false }
+    if (page === 3) return { messages: [{ id: 'c', seq: 3 }], complete: true }
+    return { messages: [], complete: true }
+  }
+  t.c.start(); await flush()
+  assert.equal(page, 1)
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: { id: 'b', seq: 2 } }); await flush()
+  assert.equal(page, 3) // incomplete page triggered exactly one more
+  assert.deepEqual(t.delivered.map((d) => d[1]), ['a', 'b', 'c'])
+})
+
+test('a hint arriving mid-read coalesces into exactly one rerun that sees the new mail', async () => {
+  const t = setup(); const gates = []; let n = 0
+  t.hub.readInbox = (seat, since) => { n++; if (n === 1) return Promise.resolve([]); return new Promise((res) => gates.push(() => res(n === 2 ? [{ id: 'one', seq: 1 }] : [{ id: 'two', seq: 2 }]))) }
+  t.c.start(); await flush() // read 1 (resync) done
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: {} }); await flush() // read 2 in flight
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: {} }); await flush() // coalesced: dirty
+  t.hub.sockets[0].push({ type: 'hint', agent: 'a-push', hint: {} }); await flush() // still just dirty
+  assert.equal(n, 2)
+  gates[0](); await flush() // finish read 2 -> exactly one rerun
+  assert.equal(n, 3)
+  gates[1](); await flush()
+  assert.equal(n, 3)
+  assert.deepEqual(t.delivered.map((d) => d[1]), ['one', 'two'])
+})
+
+test('malformed server frames are ignored, never throw', async () => {
+  const t = setup(); t.c.start(); await flush()
+  const s = t.hub.sockets[0]
+  for (const raw of ['null', '5', '"x"', '[]', '{"type":"ready","subscriptions":5}', '{"type":"ready","subscriptions":[null,3]}', '{"type":"hint"}', '{"type":"revoked"}']) s.emit('message', { data: raw })
+  await flush()
+  assert.equal(t.c._state().ready, true)
 })

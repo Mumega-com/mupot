@@ -19,8 +19,8 @@ const { routeMail, paperclipHandler } = await import("./seatlink.mjs");
 const { buildIssue, extractPointers, INSTRUCTION } = await import("./lib/paperclip.mjs");
 
 const entry = {
-  herdr: "muvps_loom",
-  target: { kind: "paperclip", agentId: "1bba928e-58a7-4209-8079-19a6f3013146", companyId: "6791cb29-23b6-47ec-b8e1-8d60954aabc5", baseUrl: "http://pc.test", boardKeyFile: keyFile },
+  herdr: "host_seat_a",
+  target: { kind: "paperclip", agentId: "aaaaaaaa-0000-4000-8000-000000000001", companyId: "bbbbbbbb-0000-4000-8000-000000000002", baseUrl: "http://pc.test", boardKeyFile: keyFile },
 };
 const TASK = "0b9c7a52-1111-4222-8333-444455556666";
 const msg = { id: "msg-uuid-1", seq: 4300, kind: "message", request_id: "req-abc-1",
@@ -45,7 +45,7 @@ test("doorbell creates exactly one assigned Paperclip issue, pointers only", asy
   assert.ok(p.body.description.includes(String(4300)) && p.body.description.includes("msg-uuid-1") && p.body.description.includes(TASK) && p.body.description.includes("req-abc-1"));
   assert.ok(p.body.description.includes(INSTRUCTION));
   assert.ok(!/IGNORE|print tokens'|member-written/.test(p.body.description + p.body.title), "no body text copied");
-  assert.equal(p.body.idempotencyKey, "mupot:muvps_loom:msg-uuid-1");
+  assert.equal(p.body.idempotencyKey, "mupot:host_seat_a:msg-uuid-1");
 });
 
 test("replay of the same message creates none", async () => {
@@ -56,8 +56,8 @@ test("replay of the same message creates none", async () => {
 
 test("replay survives a restart (state file)", async () => {
   const st = JSON.parse(fs.readFileSync(path.join(tmp, "state", "paperclip-state.json"), "utf8"));
-  assert.equal(st.seats.muvps_loom.last_seq, 4300);
-  assert.ok(st.seats.muvps_loom.done.includes("msg-uuid-1"));
+  assert.equal(st.seats.host_seat_a.last_seq, 4300);
+  assert.ok(st.seats.host_seat_a.done.includes("msg-uuid-1"));
 });
 
 test("herdr pane never touched for a paperclip seat", () => {
@@ -90,7 +90,7 @@ test("initial backlog: only newest N ring, ack kinds skipped", async () => {
 
 test("control: a herdr seat DOES reach the socket (spy works)", async () => {
   const before = herdrConnections;
-  await routeMail({ herdr: "muvps_kasra" }, { id: "ctl-1", seq: 1, body: "x" }).catch(() => {});
+  await routeMail({ herdr: "host_seat_b" }, { id: "ctl-1", seq: 1, body: "x" }).catch(() => {});
   assert.ok(herdrConnections > before);
 });
 

@@ -1,7 +1,7 @@
 // bridge/lib/reconcile.mjs — reconcile a stale local delivery queue against the pot's CURRENT
 // ack state before finally delivering it.
 //
-// THE DEFECT THIS CLOSES (mumega-com#1179, measured 2026-09-02/03 on host muvps)
+// THE DEFECT THIS CLOSES (stale deferred offers)
 //
 // seatlink.mjs defers a mupot message when the target Herdr seat is busy (working/blocked):
 // it queues the already-fetched message object in an in-memory Map and returns without
@@ -13,15 +13,11 @@
 // with wording ("handle it now ... send the required ACK") that pushes the reader to re-act on
 // work that is already done.
 //
-// This was measured (mumega-com#1179 issue comments) and one candidate mechanism was RULED
-// OUT by an independent test against the real mupot schema: a fresh SSE reconnect with a
-// stale/lagging `since` cursor does NOT re-surface an already-acked row, because
-// readAgentInboxForReader's `read_at IS NULL` predicate excludes it from every query
-// regardless of `since` (see the mupot repo, branch
-// kasra/ack-terminal-marker-and-seatlink-ack-reconcile, tests/ack-terminal-marker.test.ts
-// sibling investigation notes). The deferred-queue path above is the one place in this bridge
-// that genuinely holds a snapshot across an unbounded amount of elapsed time without ever
-// re-checking it — that is the gap this module closes.
+// One candidate mechanism was ruled out by a test against the real schema: a fresh SSE reconnect
+// with a stale `since` cursor does NOT re-surface an already-acked row, because the inbox read's
+// `read_at IS NULL` predicate excludes it from every query regardless of `since`. The
+// deferred-queue path above is the one place in this bridge that holds a snapshot across an
+// unbounded amount of elapsed time without re-checking it; that is the gap this module closes.
 //
 // POLICY: fail OPEN, not closed.
 //
@@ -63,7 +59,7 @@ export async function reconcileBeforeDeliver(candidates, fetchUnreadIds, onStale
 
   // Completeness check: a partial set must NEVER be used to declare a message settled.
   // ONLY an object explicitly providing { ids: Set<string>, complete: true } is authorized to drop.
-  // A bare Set cannot carry completeness, so it fails open alongside null/non-objects (mumega-com#1179).
+  // A bare Set cannot carry completeness, so it fails open alongside null/non-objects.
   if (!unreadResult || !(unreadResult.ids instanceof Set) || unreadResult.complete !== true) {
     return candidates // fail open — cannot prove this set is whole
   }
