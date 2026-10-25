@@ -2,7 +2,8 @@
 //
 // Design: docs/superpowers/specs/2026-07-23-project-lifecycle-control-loop-design.md
 //
-// At cycle_boundary_at, if status ≠ completed/archived and there is no receipted
+// OPT-IN (#2170): kill only runs when PROJECT_BREAKER_KILL === "1"; otherwise the breaker is a no-op.
+// When enabled: at cycle_boundary_at, if status ≠ completed/archived and there is no receipted
 // recommit for that boundary, default action is kill → archived. Continuation must
 // be justified via a recommit_or_kill receipt written through the EXISTING
 // workflow_receipts path (writeReceiptToD1) — no second decision store.

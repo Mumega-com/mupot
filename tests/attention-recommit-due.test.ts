@@ -482,3 +482,24 @@ describe('idle warning clears through a REAL revival (PR #1532 recordStartGateAc
     expect((await getProject(env, 'proj-revival'))?.status).toBe('active')
   })
 })
+
+describe('#2170 kill off: recommit_due emits nothing (no false "archived automatically" warning)', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('flag unset: zero project_recommit_due items for past-boundary active, paused, and idle-active projects', async () => {
+    harness = makeHarness()
+    insertProject(harness, { id: 'p-active', cycleBoundaryAt: isoPlusHours(-1) })
+    insertProject(harness, { id: 'p-paused', status: 'paused', cycleBoundaryAt: isoPlusHours(-1) })
+    insertProject(harness, { id: 'p-idle', cycleBoundaryAt: isoPlusHours(24 * 30), createdAt: isoPlusHours(-24 * 40) })
+    const env = { ...envFor(harness), PROJECT_BREAKER_KILL: undefined } as Env
+
+    const page = await listNeedsYou(env, owner(), {}, NOW)
+
+    expect(page.items.filter((i) => i.kind === 'project_recommit_due')).toEqual([])
+  })
+})
