@@ -10,7 +10,7 @@
 //  2. semantics    - the auth RESULT (who, which capabilities, which bound agent, 401 or not) for valid / expired /
 //                    revoked / wrong-tenant / suspended-member / unbound credentials, and for dashboard sessions,
 //                    must be identical to what main produced before the waves were collapsed.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -213,7 +213,90 @@ describe('MCP bearer auth semantics are unchanged by the batching', () => {
     const r = await resolveExternalToken(env, RAW)
     expect(r).not.toBeNull()
     h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-01-01 00:00:00' WHERE id = 't1'`)
-    expect(await buildAuthContextFromProps(env, r!.props)).toBeNull()
+    // Explicit refusal: the null must come from the `!tokenRow` guard, NOT from a TypeError swallowed by authLookupOrNull
+    // (which logs via console.error). A vacuous pass through the catch would show up as a logged lookup failure.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      expect(await buildAuthContextFromProps(env, r!.props)).toBeNull()
+      expect(errSpy).not.toHaveBeenCalled()
+    } finally { errSpy.mockRestore() }
+  })
+
+  it('member suspended between resolveExternalToken and buildAuthContextFromProps: context refused by the status guard', async () => {
+    await seedMcp()
+    const t = newTrace()
+    const env = mcpEnv(t)
+    const r = await resolveExternalToken(env, RAW)
+    expect(r).not.toBeNull()
+    // the token row stays live; only the member flips. The liveness query does not filter m.status, so the
+    // `tokenRow.status !== 'active'` arm is the ONLY thing that can refuse here.
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'm1'`)
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      expect(await buildAuthContextFromProps(env, r!.props)).toBeNull()
+      expect(errSpy).not.toHaveBeenCalled() // refused explicitly, not via a swallowed throw
+    } finally { errSpy.mockRestore() }
+  })
+
+  /** A D1 whose selected statements reject after a delay, everything else passes through to the real harness DB. */
+  function rejectingDb(match: (sql: string) => number | null): Env['DB'] {
+    return new Proxy(h.db, {
+      get(target, prop, recv) {
+        const v = Reflect.get(target, prop, recv)
+        if (prop !== 'prepare') return typeof v === 'function' ? v.bind(target) : v
+        return (sql: string) => {
+          const delay = match(sql)
+          if (delay === null) return v.call(target, sql)
+          const failing = { bind: () => failing, all: async () => { await new Promise((r) => setTimeout(r, delay)); throw new Error('boom: simulated D1 failure') }, first: async () => { await new Promise((r) => setTimeout(r, delay)); throw new Error('boom: simulated D1 failure') } }
+          return failing
+        }
+      },
+    })
+  }
+
+  /** Collect unhandledRejection events across `body` plus a few macrotask turns. */
+  async function unhandledDuring(body: () => Promise<void>): Promise<unknown[]> {
+    const seen: unknown[] = []
+    const onUnhandled = (reason: unknown) => { seen.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      await body()
+      for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      errSpy.mockRestore()
+    }
+    return seen
+  }
+
+  it('grantsP: speculative capabilities read rejects while the token row is gone (early return): null, no unhandled rejection', async () => {
+    await seedMcp()
+    const env = { ...mcpEnv(newTrace()), DB: rejectingDb((sql) => (sql.includes('FROM capabilities') ? 5 : null)) } as Env
+    const r = await resolveExternalToken(mcpEnv(newTrace()), RAW)
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-01-01 00:00:00' WHERE id = 't1'`)
+    let result: AuthContext | null | undefined
+    const unhandled = await unhandledDuring(async () => { result = await buildAuthContextFromProps(env, r!.props) })
+    expect(result).toBeNull()
+    expect(unhandled).toEqual([])
+  })
+
+  it('prefetchedToken: speculative token re-read rejects while the capabilities read throws first (early exit): no unhandled rejection', async () => {
+    await seedMcp()
+    const okEnv = mcpEnv(newTrace())
+    const r = await resolveExternalToken(okEnv, RAW)
+    const auth = await buildAuthContextFromProps(okEnv, r!.props)
+    expect(auth).not.toBeNull()
+    const env = {
+      ...okEnv,
+      DB: rejectingDb((sql) => (sql.startsWith('SELECT t.id AS token_id') ? 2 : sql.includes('FROM capabilities') ? 8 : null)),
+    } as Env
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } }) })
+    let status = 0
+    const unhandled = await unhandledDuring(async () => { status = (await mcpApp.fetch(mcpInternalRequest(req, auth!), env)).status })
+    // the internal hop threw before consuming the prefetched read; the request must fail closed, never serve as the member
+    expect(status).toBe(401)
+    expect(unhandled).toEqual([])
   })
 
   it('token revoked after the context build, before the mcpApp boundary: no tool runs', async () => {
@@ -232,7 +315,7 @@ describe('MCP bearer auth semantics are unchanged by the batching', () => {
     expect(payload?.result?.bound_agent_id ?? null).toBeNull()
   })
 
-  it('member suspended between context build and the boundary: no standing as the member', async () => {
+  it('member suspended between context build and the boundary: tokenId and the bound-agent weld are nulled (capabilities are NOT asserted here; see #2164 item 4)', async () => {
     await seedMcp()
     const t = newTrace()
     const env = mcpEnv(t)
@@ -259,6 +342,8 @@ interface DashSeed {
   idleExpired?: boolean
   lastSeenMsAgo?: number
   registered?: boolean
+  /** Email stamped on the KV session record. Defaults to the member's own; a different one makes the email->members guard miss. */
+  recordEmail?: string
 }
 
 async function seedDash(o: DashSeed = {}): Promise<Env> {
@@ -274,7 +359,7 @@ async function seedDash(o: DashSeed = {}): Promise<Env> {
   const iso = (ms: number) => new Date(ms).toISOString()
   h.sqlite.prepare(`INSERT INTO web_sessions (id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at, revoked_at) VALUES (?,?,?,?,?,?,?,?,?)`)
     .run(await hashWebSessionId(SID), TENANT, 'hm1', 'li1', iso(now - 3600_000), iso(now - (o.lastSeenMsAgo ?? 60_000)), iso(o.idleExpired ? now - 1000 : now + 3600_000), iso(now + 86_400_000), o.revoked ? iso(now - 1000) : null)
-  const record = { userId: 'u1', email: 'hm1@t', role, createdAt: iso(now), ...(o.registered === false ? {} : { webSessionRegistered: true }) }
+  const record = { userId: 'u1', email: o.recordEmail ?? 'hm1@t', role, createdAt: iso(now), ...(o.registered === false ? {} : { webSessionRegistered: true }) }
   return { DB: traced(h, dashTrace), TENANT_SLUG: TENANT, PUBLIC_ORIGIN: 'https://pot.test', SESSIONS: memoryKv({ [`sess:${SID}`]: JSON.stringify(record) }) } as unknown as Env
 }
 
@@ -356,8 +441,14 @@ describe('dashboard session auth semantics are unchanged by the batching', () =>
     expect(await env.SESSIONS.get(`sess:${SID}`)).toBeNull()
   })
 
-  it('suspended member: 401 and the KV session is deleted (both guards)', async () => {
-    const env = await seedDash({ role: 'owner', memberStatus: 'suspended' })
+  it('suspended member, unregistered session: 401 and KV deleted via the email->members status guard alone', async () => {
+    const env = await seedDash({ role: 'owner', memberStatus: 'suspended', registered: false })
+    expect((await dashGet(env)).status).toBe(401)
+    expect(await env.SESSIONS.get(`sess:${SID}`)).toBeNull()
+  })
+
+  it('suspended member, registered session whose email misses the members lookup: 401 and KV deleted via the web-session member_status guard alone', async () => {
+    const env = await seedDash({ role: 'owner', memberStatus: 'suspended', recordEmail: 'nobody@t' })
     expect((await dashGet(env)).status).toBe(401)
     expect(await env.SESSIONS.get(`sess:${SID}`)).toBeNull()
   })
