@@ -6235,6 +6235,21 @@ const toolCheckIn: ToolSpec = {
       ...(pollPresence ?? {}),
     }
 
+    // W2: an attached thread is not the host. The router joins `presence` on agent_id
+    // (src/router/engine.ts) and a row newer than 10 minutes is a live candidate. An attached
+    // chat cannot ack or lease, so that row would strand the task on an agent with no runtime.
+    //
+    // A seat may write that row only from a server-held fact: harness-adapter capabilities
+    // (src/harness/registry.ts) or the seat binding. HarnessCapabilities is the dispatch SPI
+    // (launch, status, cancel) and does not say an attached chat can take routed work. The
+    // seat binding names the OAuth harness row; it is not a registration that this chat is
+    // the host. The caller's harness string is display only (echo.harness_canonical). It is
+    // not a capability, and it is not read here. Return before the debounce key so a typed
+    // name cannot consume the host's check-in slot either.
+    if (attachedAuthority(auth)) {
+      return done({ ...echo, debounced: false, presence_recorded: false })
+    }
+
     try {
       if (await env.SESSIONS.get(dkey)) {
         return done({ ...echo, debounced: true })
@@ -6244,21 +6259,6 @@ const toolCheckIn: ToolSpec = {
       // KV unavailable — match /api/fleet/checkin and prefer recording presence.
     }
 
-    // W2: an attached thread is not the agent's host runtime. Fleet liveness (presence_mode
-    // poll/resident above, touchPollFleetPresence, persistSeatRuntimeFromHarness, module_registry)
-    // is what selectAgent and routeAgentWake read as live. Those writes stay refused for every
-    // attached thread, including Grok Bot.
-    //
-    // The flock `presence` row is a different inventory (peers / check-in). A plain attached
-    // check_in still does not write it: a Claude or Hermes chat must not make the host look
-    // checked-in. Grok Bot (mupot#1521) is the exception. The connect path that works is this
-    // attached OAuth seat; there is no separate host daemon, and check_in { harness: 'grokbot' }
-    // was returning presence_recorded:false before recordCheckin. The canonical hint is
-    // display-only: claiming the name does not grant a capability and this branch does not
-    // touch fleet_agents. 'grok' stays grok-cli; only the grokbot spellings take this path.
-    if (attachedAuthority(auth) && axis.harness_canonical !== 'grokbot') {
-      return done({ ...echo, debounced: false, presence_recorded: false })
-    }
     await recordCheckin(env, id, {
       source: args.source ?? axis.harness,
       label: seatLabel || args.label,
@@ -7241,7 +7241,7 @@ const toolBootContext: ToolSpec = {
     // A chat that HAS a seat (a ChatGPT conversation's auto seat, or a seat_select handle) and is not yet attached has one more
     // door, and until now only channel_limits.to_get_write_access (read last) named it: this session is 'bound' (to its seat
     // agent), so the doors above were just orient/status/boot_context. Same gate as that text and as seat_attach itself.
-    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory') {
+    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed') {
       // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
       availableDoors.splice(1, 0, {
         tool: 'seat_attach',
@@ -7352,7 +7352,9 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
-      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached ? ` ${ATTACH_CONNECT_ORDER}` : ''
+      // Same limit as whoami's own_seat branch: a held or observed seat is on the read floor, and seat_attach is refused there.
+      const limitedSeat = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
+      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached && !limitedSeat ? ` ${ATTACH_CONNECT_ORDER}` : ''
       nextStepOut = auth.seatBinding.attached
         ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you cannot ack or lease. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'

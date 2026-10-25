@@ -162,8 +162,9 @@ export function plainNextStep(
     return `You are ${as}; the seat tools (seat_select, seat_attach) do not apply to a workspace-token agent. Next: read your inbox or your open work with needs_you_list.`
   }
   if (state === 'harness_unseated') {
+    const attach = seatSelectCallable && seatAttachEnabled(env) ? ` ${ATTACH_CONNECT_ORDER}` : ''
     return seatSelectCallable
-      ? `You have no agent yet. To get your own seat call seat_select {project, folder, thread} and pass the returned mseat_ handle as seat on every later call. To act as an existing agent, get a seat first. ${ATTACH_CONNECT_ORDER}`
+      ? `You have no agent yet. To get your own seat call seat_select {project, folder, thread} and pass the returned mseat_ handle as seat on every later call. To act as an existing agent, get a seat first.${attach}`
       : 'You have no agent yet and seats are not enabled for this connection. ' + (missing[0]?.next_step ?? 'Ask your human or an org admin.')
   }
   return `You have no agent yet. ${missing[0]?.next_step ?? 'Ask your human or an org admin to connect you to one.'}`

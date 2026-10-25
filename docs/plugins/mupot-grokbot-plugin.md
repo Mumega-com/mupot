@@ -23,9 +23,11 @@ A Grok Bot seat connects, boots, checks in, and wakes on this pot the way Claude
 7. `seat_attach { agent }` again returns `attached`. The next `boot_context` shows `acts_as` (`whoami.state` `acting_as`, basis `attached`).
 8. The attached connection peeks: `inbox { peek: true }` and `inbox_mark_handled`. It does not ack or lease.
 
-Then `check_in` with `harness: "grokbot"`. An attached Grok Bot seat records flock presence: `presence_recorded: true` and `harness_canonical: "grokbot"`. That row is the check-in inventory. It does not register fleet liveness. `presence_mode: "poll"` and `"resident"` stay refused on an attached seat, and the fleet runtime row is not touched. An attached seat that checks in as any other harness still gets `presence_recorded: false` and writes no flock row.
+Then `check_in` with `harness: "grokbot"`. The response names `harness_canonical: "grokbot"`. That field is display only. An attached seat does not write the `presence` row: the router joins that table on `agent_id` and would treat the chat as a live worker, and an attached chat cannot ack or lease. `presence_recorded` is `false`. `presence_mode: "poll"` and `"resident"` stay refused, and the fleet runtime row is not touched.
 
-Recognised spellings: `grokbot`, `grok-bot`, `grok bot`. Anything else unrecognised stays canonical `other`. Authority is never read from the harness name.
+A seat may write routing presence only from a server-held fact (the harness adapter's capabilities, or the seat binding). `src/harness/registry.ts` does not express "this attached chat can take routed work", so every attached seat stays on that rule. Typing `harness: "grokbot"` does not change it. A host check-in (not an attached chat) still writes `presence` and can be a router candidate.
+
+Recognised spellings: `grokbot`, `grok-bot`, `grok bot`. Anything else unrecognised stays canonical `other`. Authority is never read from the harness name. A held or observed seat is not offered `seat_attach`; the connect order is printed only when attach is enabled and the seat is not on that floor.
 
 ## Wake
 
@@ -41,4 +43,5 @@ With the flag on (tests, or an operator deploy):
 
 - A separate install repo (Claude: `Mumega-com/mupot-claude-plugin`, Hermes: `Mumega-com/mupot-plugin`). Not created.
 - Enabling `WEBHOOK_DOORBELL`, minting tokens, changing grants, or deploying.
-- Treating the attached chat as the fleet-live host. Routine dispatch reads `fleet_agents`, not the flock check-in row.
+- Treating the attached chat as the fleet-live host. The router reads `presence.agent_id`; an attached seat does not write that row. A harness-adapter capability for "this registered seat may write routing presence" is not in `src/harness/registry.ts`. Do not add one by matching the caller's harness string.
+- Routine dispatch still reads `fleet_agents`.

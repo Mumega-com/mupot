@@ -1,4 +1,4 @@
-// Grok Bot seat (mupot#1521): connect order, harness 'grokbot', flock presence, wake behind the flag.
+// Grok Bot seat (mupot#1521): connect order, harness 'grokbot', no attached routing presence, wake behind the flag.
 //
 // Schema from the migration chain. MCP calls go through mcpApp / invokeTool, never spec.run().
 // WEBHOOK_DOORBELL is set only on the test env. This file does not touch a live flag.
@@ -15,6 +15,7 @@ import { canonicalHarness } from '../src/fleet/reported-values'
 import { sendAgentMessage } from '../src/agents/messages'
 import { setAgentWebhookDoorbell } from '../src/agents/webhook-doorbell'
 import { ATTACH_CONNECT_ORDER } from '../src/mcp/whoami'
+import { runRouterTick } from '../src/router/engine'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -160,7 +161,7 @@ describe('check_in presence for harness grokbot', () => {
   ).get() as { harness: string; harness_canonical: string; source: string } | undefined
   const lastReported = () => (h.sqlite.prepare(`SELECT last_reported_at AS t FROM fleet_agents WHERE agent_id = ?`).get(AGENT) as { t: string }).t
 
-  it('an attached grokbot check_in records flock presence and does not touch fleet liveness', async () => {
+  it('an attached grokbot check_in is recognised and writes no presence row', async () => {
     const env = envFor(h)
     const out = await invokeTool(attached(), env, 'check_in', {
       seat: 'grokbot-seat',
@@ -175,11 +176,17 @@ describe('check_in presence for harness grokbot', () => {
     expect(out.result).toMatchObject({
       harness: 'grokbot',
       harness_canonical: 'grokbot',
-      presence_recorded: true,
+      presence_recorded: false,
       debounced: false,
     })
-    expect(presence()).toEqual({ harness: 'grokbot', harness_canonical: 'grokbot', source: 'grokbot' })
+    expect(presence()).toBeUndefined()
+    expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM presence WHERE agent_id = ?`).get(AGENT)).toEqual({ n: 0 })
     expect(lastReported()).toBe('2026-01-01 00:00:00')
+    // The refusal is before the debounce key, so a repeat still says presence_recorded false.
+    const again = await invokeTool(attached(), env, 'check_in', { seat: 'grokbot-seat', harness: 'grok bot', source: 'claude-code' }, ORIGIN)
+    expect(again.ok).toBe(true)
+    if (again.ok) expect(again.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: false, debounced: false })
+    expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM presence`).get()).toEqual({ n: 0 })
     const poll = await invokeTool(attached(), env, 'check_in', { presence_mode: 'poll', poll_interval_sec: 30, harness: 'grokbot' }, ORIGIN)
     expect(JSON.stringify(poll)).toContain('attached_seat_cannot_set_presence_mode')
     expect(lastReported()).toBe('2026-01-01 00:00:00')
@@ -195,8 +202,6 @@ describe('check_in presence for harness grokbot', () => {
     if (!out.ok) return
     expect(out.result).toMatchObject({ harness_canonical: 'claude-code', presence_recorded: false })
     expect(presence()).toBeUndefined()
-    // A second check_in on the same seat label is debounced for 30s and omits presence_recorded.
-    // 'grok' (Grok CLI) must still record nothing, on its own seat, and stay grok-cli.
     const cli = await invokeTool(attached(), env, 'check_in', { seat: 'grok-cli-seat', harness: 'grok' }, ORIGIN)
     expect(cli.ok).toBe(true)
     if (cli.ok) expect(cli.result).toMatchObject({ harness_canonical: 'grok-cli', presence_recorded: false, debounced: false })
@@ -204,6 +209,86 @@ describe('check_in presence for harness grokbot', () => {
     const cliRow = h.sqlite.prepare(`SELECT harness FROM presence WHERE label = 'grok-cli-seat'`).get()
     expect(cliRow).toBeUndefined()
     expect(lastReported()).toBe('2026-01-01 00:00:00')
+  })
+})
+
+describe('an attached seat that types harness grokbot is not a router candidate', () => {
+  const attached = (): AuthContext => ({
+    userId: 'mem-agent',
+    email: 'a@e.test',
+    role: 'member',
+    tenant: TENANT,
+    memberId: 'mem-agent',
+    channel: 'directory',
+    capabilities: [],
+    boundAgentId: AGENT,
+    seatBinding: {
+      seatId: 'seat-1',
+      label: 'grokbot-thread',
+      harnessId: 'h1',
+      grantTokenId: 't1',
+      humanMemberId: HUMAN,
+      source: 'handle',
+      attached: {
+        attachmentId: 'att-1',
+        admissionId: 'adm-1',
+        agentId: AGENT,
+        seatAgentId: 'seat-agent',
+        ceiling: 'member',
+      },
+    },
+  }) as AuthContext
+
+  const host = (): AuthContext => ({
+    userId: 'mem-agent',
+    email: 'a@e.test',
+    role: 'member',
+    tenant: TENANT,
+    memberId: 'mem-agent',
+    channel: 'workspace',
+    capabilities: [],
+    boundAgentId: AGENT,
+  }) as AuthContext
+
+  beforeEach(() => {
+    h.sqlite.exec(`
+      INSERT INTO members (id, display_name, email, status, tenant) VALUES ('mem-agent', 'Grok Bot', 'a@e.test', 'active', '${TENANT}');
+      INSERT INTO tasks (id, squad_id, title, done_when, status, assignee_agent_id, created_at, updated_at)
+      VALUES ('task-route', 'squad-core', 'Route me', 'the work is done', 'open', NULL, datetime('now'), datetime('now'));
+    `)
+  })
+
+  const candidateCount = () => (h.sqlite.prepare(
+    `SELECT COUNT(DISTINCT a.id) AS n
+       FROM agents a
+       JOIN presence p ON p.agent_id = a.id AND p.tenant = ?
+      WHERE a.squad_id = 'squad-core' AND a.status = 'active'
+        AND p.last_seen_at >= datetime('now', '-10 minutes')`,
+  ).get(TENANT) as { n: number }).n
+
+  const dry = (env: Env) => runRouterTick(
+    env,
+    { ok: true, tenant: TENANT, squadId: 'squad-core', agentId: null, source: 'principal' },
+    { squadId: 'squad-core', dryRun: true },
+    { memberId: OWNER },
+  )
+
+  it('typing harness grokbot leaves the candidate count at 0; a host check-in is the candidate', async () => {
+    const env = envFor(h)
+    expect(candidateCount()).toBe(0)
+    expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'unrouted', agent_id: null }])
+
+    const forged = await invokeTool(attached(), env, 'check_in', { seat: 'forged', harness: 'grok bot', source: 'claude-code' }, ORIGIN)
+    expect(forged.ok).toBe(true)
+    if (forged.ok) expect(forged.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: false })
+    expect(candidateCount()).toBe(0)
+    expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'unrouted', agent_id: null }])
+
+    const live = await invokeTool(host(), env, 'check_in', { seat: 'host-seat', harness: 'grokbot' }, ORIGIN)
+    expect(live.ok).toBe(true)
+    if (live.ok) expect(live.result).toMatchObject({ harness_canonical: 'grokbot', presence_recorded: true })
+    expect(candidateCount()).toBe(1)
+    expect((await dry(env)).decisions).toEqual([{ task_id: 'task-route', outcome: 'would_assign', agent_id: AGENT }])
   })
 })
 
@@ -232,6 +317,40 @@ describe('boot_context prints the connect order before seat_attach', () => {
       .find((d) => d.tool === 'seat_attach')
     expect(door?.does).toMatch(/Allow for me/)
     expect(door?.does).toMatch(/passkey/)
+  })
+
+  it('a held or observed seat is not offered seat_attach', async () => {
+    const env = envFor(h)
+    const seat = {
+      seatId: 'seat-1',
+      label: 'grokbot-thread',
+      harnessId: 'h1',
+      grantTokenId: 't1',
+      humanMemberId: HUMAN,
+      source: 'handle' as const,
+    }
+    for (const status of ['held', 'observed'] as const) {
+      const out = await invokeTool({
+        userId: 'mem-agent',
+        email: 'a@e.test',
+        role: 'member',
+        tenant: TENANT,
+        memberId: HUMAN,
+        channel: 'directory',
+        capabilities: [],
+        boundAgentId: AGENT,
+        consentedByMemberId: HUMAN,
+        seatBinding: seat,
+        seatAgentStatus: status,
+      } as AuthContext, env, 'boot_context', {}, ORIGIN)
+      expect(out.ok).toBe(true)
+      if (!out.ok) return
+      const result = out.result as { next_step?: string; whoami?: { next_step_plain?: string }; available_doors?: Array<{ tool: string }> }
+      expect(result.next_step ?? '').not.toContain('Allow for me')
+      expect(result.next_step ?? '').not.toContain('seat_attach {agent}')
+      expect(result.whoami?.next_step_plain ?? '').toContain(`This seat is ${status}`)
+      expect((result.available_doors ?? []).map((d) => d.tool)).not.toContain('seat_attach')
+    }
   })
 
   it('an agent-bound boot records runtime grokbot with canonical grokbot', async () => {
