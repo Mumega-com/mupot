@@ -10,6 +10,7 @@
 // Real sqlite D1 + the full migration chain; requests go through mcpApp via the internal auth header, the same way
 // the OAuth provider dispatches. MUTATIONS proven: see the PR body.
 
+import { seedLiveToken } from './helpers/live-token'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -22,7 +23,19 @@ import type { AuthContext, Env } from '../src/types'
 const TENANT = 'mumega'
 
 let h: SqliteD1Harness
-beforeEach(() => { h = createSqliteD1(); applyAllMigrations(h.sqlite) })
+beforeEach(() => {
+  h = createSqliteD1(); applyAllMigrations(h.sqlite)
+  h.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'd', 'D');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-one', 'Squad One');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-a', 'squad-1', 'agent-a', 'A', 'member', 'test', 'active');
+  `)
+  // resolveAuth accepts an injected identity only against a live token row.
+  seedLiveToken(h.sqlite, { memberId: 'mem-a', tenant: TENANT, tokenId: 'tok-ws', channel: 'workspace', boundAgentId: 'agent-a' })
+  seedLiveToken(h.sqlite, { memberId: 'mem-a', tenant: TENANT, tokenId: 'tok-att', channel: 'directory', boundAgentId: 'agent-a' })
+  seedLiveToken(h.sqlite, { memberId: 'mem-h', tenant: TENANT, tokenId: 'tok-dir', channel: 'directory' })
+  seedLiveToken(h.sqlite, { memberId: 'mem-h', tenant: TENANT, tokenId: 'tok-hn', channel: 'directory', harnessKind: 'codex' })
+})
 afterEach(() => h.close())
 
 function envFor(extra: Record<string, unknown> = {}): Env {

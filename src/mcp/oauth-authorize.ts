@@ -553,7 +553,7 @@ export async function resolveConsentedAgentCapabilities(
  *  explicit-named-act escape hatch (`connect`) — it must reflect the HUMAN's own
  *  grants, never the agent's raw unclamped set (that would reopen P0-1 through a
  *  second door: `connect`'s claimGrants falls back to latentCapabilities). */
-async function resolveHumanStandingGrants(env: Env, memberId: string): Promise<CapabilityGrant[]> {
+export async function resolveHumanStandingGrants(env: Env, memberId: string): Promise<CapabilityGrant[]> {
   const human = await env.DB.prepare(
     `SELECT status FROM members WHERE id = ?1 AND tenant = ?2`,
   ).bind(memberId, env.TENANT_SLUG).first<{ status: string }>()

@@ -65,6 +65,9 @@ function memoryKv(initial: Record<string, string> = {}) {
   }
 }
 
+// Measured upper bound for the boundary waves of a consent-bound directory session (see the test that uses it).
+const BOUND_DIRECTORY_BOUNDARY_WAVES = 6
+
 let h: SqliteD1Harness
 beforeEach(() => { h = createSqliteD1(); applyAllMigrations(h.sqlite) })
 afterEach(() => h.close())
@@ -164,6 +167,37 @@ describe('MCP agent-bound bearer: D1 round trips before the handler', () => {
     expect(resolveAuthSql.some((s) => s.startsWith('SELECT t.id AS token_id'))).toBe(true)
     expect(t.waveOf[sqlAfterBuild]).toBe(3)
     expect(t.waveOf[sqlAfterBuild + 1]).toBe(3)
+  })
+})
+
+describe('MCP directory-channel session: the boundary re-derive stays parallel', () => {
+  async function runDirectory(o: { bound: boolean }): Promise<{ t: Trace; sqlAfterBuild: number; out: McpOutcome }> {
+    await seedMcp({ channel: 'directory', bound: o.bound })
+    const t = newTrace()
+    const env = mcpEnv(t)
+    let sqlAfterBuild = 0
+    const out = await mcpStatusCall(env, t, { afterExternal: () => {}, afterBuild: () => { sqlAfterBuild = t.sqls.length } })
+    return { t, sqlAfterBuild, out }
+  }
+
+  it('unbound directory: live token row and member grants are ONE wave at the boundary (no extra serial read)', async () => {
+    const { t, sqlAfterBuild, out } = await runDirectory({ bound: false })
+    expect(out.door).toBe('admitted')
+    expect(out.channel).toBe('directory')
+    expect(out.caps).toEqual([]) // ambient authority stays zero
+    expect(out.latent).toEqual(['squad:sq1:admin']) // latent grants are recomputed live
+    const first = t.sqls.slice(sqlAfterBuild, sqlAfterBuild + 2)
+    expect(first.some((q) => q.includes('FROM capabilities'))).toBe(true)
+    expect(first.some((q) => q.startsWith('SELECT t.id AS token_id'))).toBe(true)
+    expect(t.waveOf[sqlAfterBuild]).toBe(t.waveOf[sqlAfterBuild + 1])
+  })
+
+  it('bound directory: the consent check and the latent grants share one wave after the row read', async () => {
+    const { t, sqlAfterBuild, out } = await runDirectory({ bound: true })
+    expect(out.door).toBe('admitted')
+    const boundaryWaves = new Set(t.waveOf.slice(sqlAfterBuild)).size
+    // pinned at what was measured when the re-derive was parallelised: wave 1 row+grants, then the consent check batch
+    expect(boundaryWaves).toBeLessThanOrEqual(BOUND_DIRECTORY_BOUNDARY_WAVES)
   })
 })
 

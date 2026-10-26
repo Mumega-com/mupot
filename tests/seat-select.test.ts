@@ -10,6 +10,7 @@
 // production execution; the cross-isolate interleaving of two Workers is approximated by
 // Promise.all over async calls (each batch is atomic, the awaits between them interleave).
 
+import { seedLiveToken } from './helpers/live-token'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -851,15 +852,21 @@ describe('forged x-mupot-auth-context harnessId is stripped by resolveAuth (end 
     return body.result.structuredContent.identity_receipt.harness
   }
   const blob = (over: Record<string, unknown>) => ({
-    userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, capabilities: [], ...over,
+    userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, capabilities: [], tokenId: 'tok-live-blob', ...over,
   })
+  beforeEach(() => { seedLiveToken(h.sqlite, { memberId: HUMAN, tenant: TENANT, tokenId: 'tok-live-blob', channel: 'directory' }) })
 
   it('positive control: an unbound directory blob keeps its (verified) harness; a workspace-channel blob does not', async () => {
     const env = envFor(h)
     const hid = await harnessFor(env, HUMAN)
     expect(await receiptHarness(env, blob({ channel: 'directory', boundAgentId: null, harnessId: hid })))
       .toMatchObject({ id: hid, kind: 'cursor' })
-    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid }))).toBeNull()
+    // the channel is the live token row's, not the blob's: a workspace-channel session is a workspace token
+    seedLiveToken(h.sqlite, { memberId: HUMAN, tenant: TENANT, tokenId: 'tok-live-ws', channel: 'workspace' })
+    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid, tokenId: 'tok-live-ws' }))).toBeNull()
+    // and a directory token whose blob claims workspace is still a directory session
+    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid })))
+      .toMatchObject({ id: hid, kind: 'cursor' })
   })
 
   it('flag off: even an unbound directory blob carries no harness', async () => {

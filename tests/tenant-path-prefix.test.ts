@@ -564,7 +564,7 @@ describe('source ratchets', () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8')
   it('index.ts routes its default fetch through withTenantPrefix', () => {
     const src = read('../src/index.ts')
-    expect(src).toMatch(/fetch:[^\n]*withTenantPrefix\(req, env,/)
+    expect(src).toMatch(/fetch:[^\n]*withTenantPrefix\(stripInternalAuthContext\(req\), env,/)
   })
   it('credential sites use credentialBase and nothing derives them from a header', () => {
     expect(read('../src/auth/index.ts').match(/credentialBase\(/g)?.length).toBeGreaterThanOrEqual(2)
