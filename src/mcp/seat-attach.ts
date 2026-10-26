@@ -34,11 +34,12 @@ const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
   scope: 'Only for a chat on its own seat that wants to act as an existing agent its human administers. Never call it from a workspace-token agent; from an already-attached chat it only confirms the current attachment: self (attach THIS thread to an existing agent the human has admitted; seat session only)',
   min: 'authenticated',
-  args: '{ agent?: string }  // the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to',
+  args: '{ agent?: string, scope?: "seat" | "harness" }  // the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to. scope "harness" asks your human to approve ONCE for every chat of this app (later chats then attach with no new tap); the default asks for this chat only',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', description: 'The existing agent this thread should act as: id, slug or exact name. A label to look up, not an access request: the human decides.' },
+      scope: { type: 'string', enum: ['seat', 'harness'], description: 'Only used when filing a NEW ask. "seat" (default): the approval covers this chat only. "harness": the human is asked to approve once for every chat of this app, so a later chat can seat_attach to the same agent with no new tap. A request, not authority: the human sees the scope at the passkey tap and can refuse it.' },
     },
     additionalProperties: false,
   },
@@ -84,6 +85,7 @@ const toolSeatAttach: ToolSpec = {
       })
     }
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
+    if (args.scope !== undefined && args.scope !== 'seat' && args.scope !== 'harness') return fail(400, 'invalid_args', { field: 'scope' })
 
     const r = await attachSeatToAgent(env, {
       humanMemberId: seat.humanMemberId,
@@ -92,6 +94,7 @@ const toolSeatAttach: ToolSpec = {
       via: 'tool',
       requesterAgentId: auth.boundAgentId,
       grantTokenId: seat.grantTokenId,
+      scope: args.scope === 'harness' ? 'harness' : args.scope === 'seat' ? 'seat' : undefined,
     })
     if (r.ok && r.status === 'attached') {
       return done({
@@ -164,6 +167,8 @@ const toolSeatAttach: ToolSpec = {
         return fail(429, r.error, 'Your human already has too many pending admissions. Ask them to clear some on their Connections page.')
       case 'seat_not_found':
         return fail(409, r.error, 'This thread has no live seat.')
+      case 'admission_scope_mismatch':
+        return fail(409, r.error, 'This agent is already approved (or being asked) for a different scope than the one you requested. An approval is never widened silently: ask your human to revoke the old admission on their Connections page (or deny the old ask), then ask again with the scope you want.')
       case 'approval_bound_to_other_chat':
         return fail(409, r.error, 'This agent is approved for a different chat; ask the human to approve this one (they revoke the old admission on their Connections page, then this chat asks again and gets its own code).')
       case 'attach_code_mismatch':

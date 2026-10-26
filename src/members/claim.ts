@@ -213,7 +213,7 @@ export async function confirmClaimOnAgentPage(
 
 export type ReissueResult =
   | { ok: true; claimUrl: string | null; code: string | null; expiresAt: string | null }
-  | { ok: false; error: 'seat_attach_disabled' | 'nothing_to_reissue' | 'attach_refused' | 'too_many_pending_admissions' | 'approval_bound_to_other_chat' | 'attach_code_mismatch' }
+  | { ok: false; error: 'seat_attach_disabled' | 'nothing_to_reissue' | 'attach_refused' | 'too_many_pending_admissions' | 'approval_bound_to_other_chat' | 'attach_code_mismatch' | 'admission_scope_mismatch' }
 
 /**
  * "Issue a new claim link": a fresh pending ask for the SAME agent, SAME member, SAME harness and SAME thread as the expired one.
@@ -229,7 +229,7 @@ export async function reissueClaim(env: Env, p: { memberId: string; agentId: str
   const seat = await reissueSeat(env, old)
   if (!seat) return { ok: false, error: 'nothing_to_reissue' }
   const r = await ensureAdmission(env, {
-    agentId: p.agentId, humanMemberId: p.memberId, harnessId: old.harness_id, seatId: seat.seatId, via: 'tool', requesterAgentId: seat.seatAgentId,
+    agentId: p.agentId, humanMemberId: p.memberId, harnessId: old.harness_id, seatId: seat.seatId, via: 'tool', requesterAgentId: seat.seatAgentId, scope: old.scope, // a reissued ask keeps the scope the chat originally asked for
   }, nowMs)
   if (!r.ok) return { ok: false, error: r.error }
   if (r.state !== 'pending') return { ok: false, error: 'nothing_to_reissue' }

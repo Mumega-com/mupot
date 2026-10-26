@@ -59,6 +59,7 @@ export async function listLiveAttachmentsForEvents(
          JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
          JOIN harnesses hr ON hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id
         WHERE att.tenant = ?1 AND att.human_member_id = ?2 AND att.harness_id = ?3 AND att.detached_at IS NULL
+          AND (adm.scope = 'seat' OR (hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ?4)) -- R1: a harness-wide admission needs the caller's own grant
           ${attachDesignatedClause(env, 'a', 'att.human_member_id')}
           AND EXISTS (SELECT 1 FROM member_tokens t
                        WHERE t.id = att.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id AND t.tenant = ?1

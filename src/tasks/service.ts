@@ -2127,6 +2127,7 @@ export function buildVerdictStatements(
     ? ` AND EXISTS (SELECT 1 FROM ${LIVE_ATTACHMENT_FROM_SQL}
                     WHERE ${liveAttachmentConditionsSql(env, livePh)}
                       AND att.id = ${bindv(att.attachmentId)} AND att.agent_id = ${bindv(input.decidedBy)} AND adm.gate_authority = 1
+                      AND adm.requested_seat_id = att.seat_id -- R1: gate power is never inherited by a thread that reached the admission through grant continuity
                       AND EXISTS (SELECT 1 FROM member_tokens t WHERE ${seatTokenLiveSql(livePh)}))
        AND tasks.gate_owner = ${bindv(input.task.gate_owner)}
        AND EXISTS (SELECT 1 FROM gate_grants g_gg WHERE g_gg.capability = tasks.gate_owner AND g_gg.principal_type = 'agent' AND g_gg.principal_id = ${bindv(input.decidedBy)})
