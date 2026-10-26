@@ -176,6 +176,9 @@ describe('ratchet 3: the census of files that write structural tables can only s
     'src/org/team-bootstrap.ts', 'src/pots/service.ts', 'src/projects/client-bootstrap.ts', 'src/projects/service.ts',
     // seat_select grants gate:<own server-derived slug> in the same batch as seat creation (mint parity), #2089; reviewed kasra-review+Opus lens.
     'src/members/seat-select.ts',
+    // S1: the guarded project_repos writer. Its one agent-reachable door (project_update add_repo/remove_repo) asks the
+    // chokepoint for project_repo_set / project_repo_remove (refuse lane for agents) and then needs project WRITE.
+    'src/workspaces/project-repos.ts',
     // W0 itself: the delegation tables are not structural, but the chokepoint receipts/lookups name them
   ])
   const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|squads|departments|project_squad_access|gate_grants|project_repos)\b|INSERT( OR [A-Z]+)? INTO +agents\b|UPDATE +agents +SET[^;`]*squad_id/

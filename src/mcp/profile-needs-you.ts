@@ -74,7 +74,8 @@ export const NEEDS_YOU_PROFILE: readonly ProfileToolEntry[] = [
     // model). That is a state change under a readOnlyHint, and ChatGPT calls read-only-hinted
     // tools without confirmation — so the profile never forwards them (#1625 tracks the
     // stopped-row defect in selfReportAtBoot itself).
-    rejectArgs: ['host', 'model', 'runtime'],
+    // repo/branch (S1 repo_project) stay off the curated profile door: it keeps its reviewed three-argument surface.
+    rejectArgs: ['host', 'model', 'runtime', 'repo', 'branch'],
     args: '{ source?: string, seat?: string, label?: string }',
   },
   {

@@ -18,6 +18,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
 1. FIRST ACTION: ORIENTATION & BOOT CONTEXT
    - Always invoke 'boot_context' or 'orient' as your first MCP tool call. 'boot_context' always answers; 'orient' with no argument answers only once you act as an agent (orient { agent } also works for an agent you can observe), so a session with no agent yet should start with 'boot_context' and follow its next_step.
    - At boot pass what you are actually running on: boot_context { runtime, model, host } (any short strings, kept as reported). If the response has onboarding.next_step, do it or surface it to your human; an attached thread or member token records nothing and says so there.
+   - If you work in a git repository, also pass repo (the output of \`git remote get-url origin\`) and branch (your current branch): boot_context { repo, branch } answers repo_project, the one project you can read that owns that repo, or null with a reason (then ask your owner; never guess a project). worktree_open { repo, branch } then returns your clone_url and suggested_dir.
    - This returns your authenticated identity, assigned squad, active capability floor, and any unread high-priority inbox messages.
 
 2. ZERO-CAPABILITY DIRECTORY SESSIONS (B1 CEILING)
@@ -86,7 +87,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
 export const MUPOT_MCP_SEAT_INSTRUCTIONS = `
 
 SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "Me — auto per workspace")
-   - If boot_context reports a harness session with no bound agent, your FIRST step is 'seat_select' with { project: "<workspace name>", folder?: "<worktree path>", thread?: "<thread id>" }. Every value is a label that keys your seat; none of them grants authority.
+   - If boot_context reports a harness session with no bound agent, your FIRST step is 'seat_select' with { project: "<workspace name>", folder?: "<worktree path>", thread?: "<thread id>", repo?: "<git remote get-url origin>", branch?: "<current branch>" }. Every value is a label that keys your seat; none of them grants authority.
    - It returns a seat handle (prefix "mseat_"). Pass it as the "seat" argument on every later call (seat: "<the seat value>"); a harness that can set headers may send X-Mupot-Seat instead. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
    - Once a request carries a valid handle, boot_context shows an identity_receipt naming the agent you act as and how it was bound.`
 
