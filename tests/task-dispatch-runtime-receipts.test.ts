@@ -1170,7 +1170,13 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
         attempt: 1,
       })
 
-      expect(implicitResult).toEqual(explicitResult)
+      // Two fixtures are built a moment apart and created_at is the SQLite wall clock, so it can
+      // straddle a second boundary (flaked on CI). It is the one field that is not part of the
+      // receipt's identity; every other field must still match exactly.
+      const withoutWallClock = (r: typeof explicitResult) => (
+        'receipt' in r && r.receipt ? { ...r, receipt: { ...r.receipt, created_at: null } } : r
+      )
+      expect(withoutWallClock(implicitResult)).toEqual(withoutWallClock(explicitResult))
       expect(implicit.harness.sqlite.prepare(
         'SELECT message_id FROM task_dispatch_runtime_receipts LIMIT 1',
       ).get()).toEqual({ message_id: MESSAGE_ID })
