@@ -31,7 +31,7 @@ Everything below is a Hadi action (DNS, secrets, dashboard). Nothing here has be
    [[send_email]]
    name = "EMAIL"
    ```
-8. **Migration.** Apply `migrations/0259_email_decision_foundation.sql` to prod D1 BEFORE deploying.
+8. **Migration.** Apply `migrations/0260_email_decision_foundation.sql` to prod D1 BEFORE deploying.
 9. **Flag.** Set `EMAIL_DECISIONS = "1"` in `[vars]` only for the spike window, then remove it.
 
 ## Reading the spike receipts

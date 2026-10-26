@@ -1,4 +1,4 @@
--- 0259_email_decision_foundation.sql — email reply approvals, PR1 (foundation only; flag EMAIL_DECISIONS, off).
+-- 0260_email_decision_foundation.sql — email reply approvals, PR1 (foundation only; flag EMAIL_DECISIONS, off).
 -- Design: mumega.com agents/kasra/docs/design-email-reply-approvals-20261026.md.
 -- Nothing in this PR writes a verdict. Tables are created now so PR2/PR3 do not need a schema change mid-gate.
 --

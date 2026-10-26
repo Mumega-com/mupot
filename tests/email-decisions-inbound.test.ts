@@ -85,7 +85,7 @@ describe('spike handler', () => {
   })
 })
 
-describe('0259 schema', () => {
+describe('0260 schema', () => {
   it('task_verdict_channels is append-only and task_verdicts is untouched', () => {
     setup('1')
     const cols = (h!.sqlite.prepare('PRAGMA table_info(task_verdicts)').all() as { name: string }[]).map((c) => c.name)

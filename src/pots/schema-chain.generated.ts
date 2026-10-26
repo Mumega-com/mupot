@@ -4567,10 +4567,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0259_email_decision_foundation.sql",
-    sha256: "4bc1d7f078f7b79a3117c31bf2f72ccec70abec01b030de49521318ff4e49040",
+    file: "0260_email_decision_foundation.sql",
+    sha256: "6d62ef44904548348efc5ea1f1b9ecc125038eee483988ca72c41ab893297739",
     statements: [
-      "-- 0259_email_decision_foundation.sql — email reply approvals, PR1 (foundation only; flag EMAIL_DECISIONS, off).\n-- Design: mumega.com agents/kasra/docs/design-email-reply-approvals-20261026.md.\n-- Nothing in this PR writes a verdict. Tables are created now so PR2/PR3 do not need a schema change mid-gate.\n--\n-- task_verdicts is append-only and 0252's trigger pins every column on the update path (but not a new one). An\n-- ADD COLUMN decided_channel would therefore be silently MUTABLE on rows with project_id NULL. So the channel\n-- lives in a side table with its own no-update / no-delete triggers; task_verdicts is not touched at all.\n\nCREATE TABLE IF NOT EXISTS email_decision_tokens (\n  decision_id        TEXT PRIMARY KEY,                 -- random id, also the token's first segment\n  tenant             TEXT NOT NULL,\n  task_id            TEXT NOT NULL,\n  member_id          TEXT NOT NULL,\n  email_normalized   TEXT NOT NULL,\n  review_entered_at  TEXT NOT NULL,                    -- binds the token to the card's task revision\n  expires_at         TEXT NOT NULL,\n  state              TEXT NOT NULL DEFAULT 'issued' CHECK (state IN ('issued', 'used', 'revoked')),\n  used_at            TEXT,\n  created_at         TEXT NOT NULL\n);",
+      "-- 0260_email_decision_foundation.sql — email reply approvals, PR1 (foundation only; flag EMAIL_DECISIONS, off).\n-- Design: mumega.com agents/kasra/docs/design-email-reply-approvals-20261026.md.\n-- Nothing in this PR writes a verdict. Tables are created now so PR2/PR3 do not need a schema change mid-gate.\n--\n-- task_verdicts is append-only and 0252's trigger pins every column on the update path (but not a new one). An\n-- ADD COLUMN decided_channel would therefore be silently MUTABLE on rows with project_id NULL. So the channel\n-- lives in a side table with its own no-update / no-delete triggers; task_verdicts is not touched at all.\n\nCREATE TABLE IF NOT EXISTS email_decision_tokens (\n  decision_id        TEXT PRIMARY KEY,                 -- random id, also the token's first segment\n  tenant             TEXT NOT NULL,\n  task_id            TEXT NOT NULL,\n  member_id          TEXT NOT NULL,\n  email_normalized   TEXT NOT NULL,\n  review_entered_at  TEXT NOT NULL,                    -- binds the token to the card's task revision\n  expires_at         TEXT NOT NULL,\n  state              TEXT NOT NULL DEFAULT 'issued' CHECK (state IN ('issued', 'used', 'revoked')),\n  used_at            TEXT,\n  created_at         TEXT NOT NULL\n);",
       "\nCREATE INDEX IF NOT EXISTS idx_email_decision_tokens_task ON email_decision_tokens(task_id, state);",
       "\nCREATE INDEX IF NOT EXISTS idx_email_decision_tokens_member ON email_decision_tokens(member_id, state);",
       "\n\nCREATE TABLE IF NOT EXISTS email_decision_bindings (\n  id                 TEXT PRIMARY KEY,\n  tenant             TEXT NOT NULL,\n  member_id          TEXT NOT NULL,\n  email_normalized   TEXT NOT NULL,\n  verified_at        TEXT,                             -- NULL = never authorizes a decision\n  verified_via       TEXT,\n  unbound_at         TEXT,\n  created_at         TEXT NOT NULL\n);",
@@ -4601,4 +4601,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "df42065c714f66a5e202401f48a9c9314b8f04956cd36cbf7bc3ce2e647df12d"
+export const SCHEMA_CHAIN_DIGEST: string = "3b1842cec8a212ee669185ce022c4461835a02f2781b0ca1273b5a5eacf1e519"
