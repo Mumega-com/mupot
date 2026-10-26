@@ -22,11 +22,12 @@
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
-import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
+import { bearerToken, resolveMemberByToken, resolveStreamMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
-import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
+import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from './inbox-seat'
+import { openBearerPushStream } from './inbox-push-connect'
 import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from './seat-events'
 
 import { waitUntilFromContext } from './webhook-doorbell'
@@ -146,7 +147,10 @@ export const inboxApp = new Hono<{ Bindings: Env }>()
 
 // GET /api/inbox/stream — SSE stream of new inbox messages (recipient's own inbox only).
 inboxApp.get('/stream', async (c) => {
-  const id = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+  const push = c.env.INBOX_STREAM_PUSH === '1'
+  const resolved = push ? await resolveStreamMemberByToken(c.env, bearerToken(c.req.header('authorization'))) : null
+  if (resolved?.status === 'error') return c.json({ error: 'authorization_unavailable' }, 503)
+  const id = push ? (resolved?.status === 'valid' ? resolved.identity : null) : await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
   if (!id) return c.json({ error: 'unauthorized' }, 401) // generic — no auth oracle
   if (!id.boundAgentId) return c.json({ error: 'not_agent_bound' }, 403)
 
@@ -172,7 +176,9 @@ inboxApp.get('/stream', async (c) => {
   // already has an open-or-fenced answer waiting once D1 recovers), 'granted' fences (409,
   // unchanged from before), and only a DEFINITIVE 'not_granted' opens the legacy stream.
   if (isSeatEventsEnabled(c.env)) {
-    const grant = await activeSeatEventGrant(c.env, id.boundAgentId)
+    let grant: Awaited<ReturnType<typeof activeSeatEventGrant>>
+    try { grant = await activeSeatEventGrant(c.env, id.boundAgentId) }
+    catch { return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' }) }
     if (grant) {
       const status = await authorizeSeatDelivery(c.env, grant.host_agent_id, id.boundAgentId)
       if (status === 'error') {
@@ -186,11 +192,11 @@ inboxApp.get('/stream', async (c) => {
     }
   }
 
-  const sinceQ = c.req.query('since')
+  const sinceQ = c.req.query('since') ?? (push ? c.req.header('Last-Event-ID') : undefined)
   let since: number | undefined
   if (sinceQ !== undefined) {
     const n = Number(sinceQ)
-    if (!Number.isFinite(n) || n < 0) return c.json({ error: 'invalid_since' }, 400)
+    if (!Number.isFinite(n) || n < 0 || (push && (!Number.isSafeInteger(n) || sinceQ.trim() === ''))) return c.json({ error: 'invalid_since' }, 400)
     since = n
   }
   const pollMsQ = c.req.query('poll_ms')
@@ -205,10 +211,14 @@ inboxApp.get('/stream', async (c) => {
   // resolveInboxSeatArg), so the HTTP and MCP surfaces cannot diverge on this again.
   // An omitted ?seat gets the token's own bound seat (plus broadcasts); an explicit
   // ?seat is accepted only as a same-value echo, anything else refuses seat_mismatch.
-  const boundSeat = await resolveBoundSeat(c.env, id.tokenId)
+  const strictSeat = push ? await resolveBoundSeatStrict(c.env, id.tokenId, id.boundAgentId) : null
+  if (strictSeat && !strictSeat.ok) return c.json({ error: 'seat_resolution_failed' }, 503)
+  const boundSeat = strictSeat?.ok ? strictSeat.seat : await resolveBoundSeat(c.env, id.tokenId)
   const seatArg = resolveInboxSeatArg(c.req.query('seat')?.trim(), boundSeat)
   if (!seatArg.ok) return c.json({ error: seatArg.error, detail: seatArg.detail }, seatArg.status)
   const seat = seatArg.seat
+
+  if (push) return openBearerPushStream(c.env, { tokenId: id.tokenId, memberId: id.memberId, agentId: id.boundAgentId, seat: boundSeat }, since ?? 0, c.req.raw.signal)
 
   const events = streamInboxEvents(
     c.env,

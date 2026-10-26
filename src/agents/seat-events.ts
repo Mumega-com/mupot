@@ -345,6 +345,16 @@ export async function createSeatEventGrant(
     if (/UNIQUE/i.test(msg)) return { ok: false, reason: 'agent_already_granted' }
     return { ok: false, reason: 'db_error' }
   }
+  // Grant is committed first. This accelerates observer closure; the Worker
+  // reference revalidator and synchronous host claim remain the safety backstops.
+  if (env.INBOX_STREAM_PUSH === '1' && env.SEAT_EVENTS) {
+    try {
+      await env.SEAT_EVENTS.get(env.SEAT_EVENTS.idFromName(seatEventsChannelName(tenant))).fetch(new Request('https://seat-events/bearer-evict', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agent: input.agentId }), signal: AbortSignal.timeout(2000),
+      }))
+    } catch { /* best effort: never roll back or misreport a committed grant */ }
+  }
   return { ok: true, id }
 }
 
@@ -904,6 +914,9 @@ export interface RawAttachment {
 export function decodeSocketAttachment(raw: unknown): RawAttachment {
   if (!raw || typeof raw !== 'object') return {}
   const r = raw as Record<string, unknown>
+  // Explicit new socket kinds must never inherit the legacy host decoder.
+  if (r.kind !== undefined) return {}
+  if (r.sub && typeof r.sub === 'object' && (r.sub as Record<string, unknown>).kind !== undefined) return {}
   if (typeof r.host === 'string' && Array.isArray(r.agents) && r.sub === undefined && r.connectedAt === undefined) {
     return { sub: { host: r.host, agents: r.agents as string[] } }
   }
@@ -912,6 +925,8 @@ export function decodeSocketAttachment(raw: unknown): RawAttachment {
 
 export interface HubDeps {
   sockets: () => HubSocket[]
+  /** Synchronous after host state installation, before any await/disclosure. */
+  onHostClaim?: (agents: readonly string[]) => void
   tickets: TicketStore
   nowSec?: () => number
   /** Bounded memory of recently published hint ids; survives across calls while the DO is awake. */
@@ -1106,6 +1121,7 @@ export class SeatEventsHub {
       return
     }
     sock.setState({ host: rec.host, agents: mine })
+    this.deps.onHostClaim?.(mine)
     sock.send(encodeFrame({ type: 'ready', protocol: SEAT_EVENTS_PROTOCOL, host: rec.host, subscriptions: subs }))
     for (const agent of mine) {
       const s = Number(since[agent] ?? 0)

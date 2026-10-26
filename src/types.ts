@@ -175,6 +175,8 @@ export interface Env {
   // Set to "1" to enable /api/fleet/events (ticket + WebSocket), the message.created → SeatEventsDO
   // fan-out, and the /api/inbox/stream fence for agents with a live seat-events grant.
   REALTIME_SEAT_EVENTS?: string
+  /** Member-token inbox SSE push. Opt-in only; never enables OAuth or dashboards. */
+  INBOX_STREAM_PUSH?: string
   // Set to "1" to let a ProjectOffice serve. Default off: with it off every office entry point
   // refuses and nothing in the request path or any cron routes to one.
   PROJECT_OFFICE?: string

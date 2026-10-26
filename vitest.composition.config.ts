@@ -83,6 +83,8 @@ export default defineConfig({
   ],
   test: {
     include: ['tests/composition/**/*.test.ts'],
+    // Separate real DO binding/worker fixture; CI runs vitest.bearer.config.ts.
+    exclude: ['tests/composition/seat-events-bearer.test.ts'],
     testTimeout: 20_000,
   },
 })

@@ -54,6 +54,17 @@ export async function resolveMemberByToken(env: Env, raw: string | null): Promis
   return withAuthTiming(env, () => authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw)))
 }
 
+/** Stream entry must distinguish an unavailable authority from a bad credential.
+ * Keep ordinary callers' historical null behavior unchanged. */
+export async function resolveStreamMemberByToken(env: Env, raw: string | null): Promise<
+  { status: 'valid'; identity: AgentIdentity } | { status: 'invalid' | 'error' }
+> {
+  try {
+    const identity = await withAuthTiming(env, () => resolveMemberByTokenInner(env, raw))
+    return identity ? { status: 'valid', identity } : { status: 'invalid' }
+  } catch { return { status: 'error' } }
+}
+
 /** #2060 P1-c: the seat status rides the ONE token query (no second read that could fail open). VIP_LANE off = no join, no column read.
  *  A seat row that is observed/held (or any unknown value) floors the bearer; a non-seat agent (no seat row) and trusted/NULL are unaffected. */
 export function seatFloorSql(env: Env, agentExpr = 't.agent_id'): { select: string; join: string } {
