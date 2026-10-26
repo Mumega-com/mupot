@@ -290,7 +290,16 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
   // No bounded, agent-attributed read exists for these; reported, never guessed.
   gaps.add('substantive_task_note_activity')
   gaps.add('merge_receipt_agent_attribution')
-  gaps.add('cross_squad_assignments_not_read')
+
+  // Open work assigned to a squad agent in ANOTHER squad: boolean only (no ids), it exempts archival.
+  const workElsewhereRows = await selectChunked<{ agent_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT assignee_agent_id AS agent_id FROM tasks
+              WHERE assignee_agent_id IN (${ph}) AND (squad_id IS NULL OR squad_id <> ?1)
+                AND status IN ${NONTERMINAL_SQL} AND ${TASK_NOT_ARCHIVED_SQL()}`,
+    [squadId],
+  )
+  const workElsewhere = new Set(workElsewhereRows.rows.map((r) => r.agent_id))
 
   // ── waits and live work. In-squad scope: flight via project edge, routine run via the routine's
   //    responsible squad, approval via its task. Everything else is `elsewhere` (boolean). ────────
@@ -563,6 +572,7 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     const ex: Exception[] = []
     if (!activityKnown || !assignmentsKnown) ex.push({ reason: 'unknown_due_to_truncation', evidence: [{ table: 'agents', id: a.id }] })
     if (elsewhere.has(a.id)) ex.push({ reason: 'activity_elsewhere', evidence: [] })
+    if (workElsewhere.has(a.id)) ex.push({ reason: 'open_work_elsewhere', evidence: [] })
     const liveClaims = mine.filter((t) => (t.execution_claim_expires_at ?? 0) > nowMs)
     if (liveClaims.length) ex.push({ reason: 'live_claim', evidence: liveClaims.map((t) => ({ table: 'tasks', id: t.id })) })
     const live = flightsByAgent.get(a.id) ?? []

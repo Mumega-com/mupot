@@ -389,4 +389,33 @@ describe('gardener_preview (read-only)', () => {
       expect(seen.filter((q) => /FROM execution_meter/.test(q)).length).toBe(1)
     })
   })
+  // ── round 3 ─────────────────────────────────────────────────────────────────────────────────
+  describe('round 3', () => {
+    it('[Codex P2] open work assigned in ANOTHER squad exempts an otherwise dormant agent; no ids leak', async () => {
+      seedAgent('ag-away')
+      sqlRun(harness, `INSERT INTO tasks (id, squad_id, title, status, done_when, assignee_agent_id, created_at, updated_at) VALUES ('t-away-LEAK', 'sq-2', 't', 'in_progress', 'n/a', 'ag-away', ?, ?)`, ago(1), ago(1))
+      const p = await preview()
+      expect(agentCand(p, 'ag-away')).toMatchObject({ eligible: false, exceptions: [{ reason: 'open_work_elsewhere', evidence: [] }] })
+      expect(JSON.stringify(p)).not.toContain('t-away-LEAK')
+      // a terminal task elsewhere does not exempt
+      sqlRun(harness, `UPDATE tasks SET status = 'done' WHERE id = 't-away-LEAK'`)
+      expect(agentCand(await preview(), 'ag-away')).toMatchObject({ eligible: true })
+    })
+
+    it('[Codex P1] squad-member (no meter:read) gets no cost numbers; meter-authorized lead does', async () => {
+      const member = await preview(SQUAD_READER)
+      for (const a of member.agents) expect(a.cost).toBe('restricted')
+      expect(JSON.stringify(member)).not.toMatch(/1500|"tokens":900/)
+      expect(agent(await preview(SQUAD_LEAD), 'ag-active').cost).toMatchObject({ micro_usd: 1500, tokens: 900 })
+    })
+
+    it('[Codex P2] truncated reads leave the agent eligibility unknown (not eligible), for activity and tasks', async () => {
+      sqlRun(harness, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 505)
+        INSERT INTO tasks (id, squad_id, title, status, done_when, created_at, updated_at)
+        SELECT 'y-bulk-' || i, 'sq-1', 't', 'done', 'n/a', '${ago(60)}', '${ago(60)}' FROM n`)
+      const p = await preview()
+      expect(agentCand(p, 'ag-dormant')).toMatchObject({ eligible: false })
+      expect(agentCand(p, 'ag-dormant').exceptions.map((e: any) => e.reason)).toContain('unknown_due_to_truncation')
+    })
+  })
 })
