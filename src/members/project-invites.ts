@@ -626,8 +626,7 @@ export async function createProjectInvite(
     && !auth.boundAgentId && !auth.seatBinding && !attachedAuthority(auth)
   ) {
     selfService = true
-    // Capped at 'observer' regardless of the standing: the bind needs no authority, and a redeemed higher row would duplicate
-    // (and outlive) a department/org grant the member only inherits.
+    // Observer self-connect links the identity without changing capability grants at redemption.
     actorRank = Math.min(await actorRankOnSquad(env, auth, squadId, edge.department_id), capabilityRank('observer'))
     if (actorRank < capabilityRank('observer')) return { ok: false, error: 'forbidden' }
   }
@@ -886,6 +885,9 @@ export async function redeemTelegramProjectInvite(
   // a follow-up issue rather than fixed here; the fix (only the granting
   // squad owner, or an org owner, can act back) is a broader ceiling-design
   // question than this round's scope.
+  const identityOnly = invite.member_id !== null
+    && invite.minted_by_member_id === invite.member_id
+    && invite.capability === 'observer'
   let minterRank = 0
   if (invite.minted_by_member_id !== null) {
     const minter = await env.DB.prepare(
@@ -899,10 +901,8 @@ export async function redeemTelegramProjectInvite(
       : 0
     let baselineAuthorityLost =
       minterRank < capabilityRank('admin') || capabilityRank(invite.capability) > minterRank
-    // Mom-walk D3: a SELF-minted bind (the member minted it for their own id) was authorised by their standing on the
-    // invite's squad, not by org-admin standing, so it is re-checked the same way: still active, still holding at least
-    // the invited capability on that squad NOW (a revoked or lapsed grant fails here, so redemption cannot resurrect it).
-    if (baselineAuthorityLost && invite.member_id !== null && invite.minted_by_member_id === invite.member_id) {
+    // Only observer self-connect uses squad standing; higher-capability binds retain the org-admin floor.
+    if (baselineAuthorityLost && identityOnly) {
       const squadRank = minterActive ? await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id) : 0
       baselineAuthorityLost = squadRank < capabilityRank('observer') || capabilityRank(invite.capability) > squadRank
     }
@@ -1059,7 +1059,8 @@ export async function redeemTelegramProjectInvite(
       // SELECT's WHERE (the claim fence + bind-landed guard) is false, zero
       // source rows means the INSERT never fires and ON CONFLICT never
       // triggers either — a failed claim touches no pre-existing row.
-      env.DB.prepare(
+      // Self-connect preserves every existing grant, including its provenance and expiry.
+      ...(identityOnly ? [] : [env.DB.prepare(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, reason, granted_by, granted_via)
          SELECT ?, ?, 'squad', ?, ?, ?, ?, 'project_invite'
           WHERE EXISTS (
@@ -1086,7 +1087,7 @@ export async function redeemTelegramProjectInvite(
         capabilityRank(invite.capability),
         capabilityRank(invite.capability),
         capabilityRank(invite.capability),
-      ),
+      )]),
       env.DB.prepare(
         // mupot#1551 round 2: ALSO needs netNewMemberExistsGuard — without
         // it, this statement's own EXISTS(invites WHERE accepted_at=claimedAt)
@@ -1119,7 +1120,7 @@ export async function redeemTelegramProjectInvite(
       ),
     ])
 
-    if (results.length !== 4 || results.some((result) => rowsChanged(result) !== 1)) {
+    if (results.length !== (identityOnly ? 3 : 4) || results.some((result) => rowsChanged(result) !== 1)) {
       // mupot#1551 round 2 (adversarial P1-2): the net-new member INSERT's
       // NEW lower(email) guard (above) can now ALSO be why this batch wrote
       // fewer rows than expected — disambiguate it from every OTHER 0-row

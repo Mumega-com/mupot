@@ -15,6 +15,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
+import { resolveCapabilities } from '../src/auth/capability'
 import { dashboardApp } from '../src/dashboard/index'
 import { membersApp } from '../src/members'
 import {
@@ -25,6 +26,7 @@ import {
   telegramSectionBody,
 } from '../src/dashboard/account'
 import { createProjectInvite, redeemTelegramProjectInvite } from '../src/members/project-invites'
+import { readableProjectIdSet } from '../src/projects/access'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -757,6 +759,64 @@ describe('self-service Telegram connect (mom-walk D3): createProjectInvite below
     expect(await invite(asMember('m-mom', MOM), { member_id: 'm-other' })).toEqual({ ok: false, error: 'forbidden' })
     expect(await invite(asMember('m-mom', MOM), { member_id: 'm-admin' })).toEqual({ ok: false, error: 'forbidden' })
     expect((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM invites').get() as { n: number }).n).toBe(0)
+  })
+
+  it.each([
+    ['org', null, 'revoked'],
+    ['org', null, 'expired'],
+    ['department', 'dept-a', 'revoked'],
+    ['department', 'dept-a', 'expired'],
+  ] as const)('self-connect preserves inherited %s standing (%s) when later %s', async (scope, scopeId, end) => {
+    harness.sqlite.prepare("UPDATE capabilities SET scope_type = ?, scope_id = ?, expires_at = datetime('now', '+1 day') WHERE id = 'c-mom'")
+      .run(scope, scopeId)
+    const freshAuth = async () => ({ ...asMember('m-mom', []), capabilities: await resolveCapabilities(env, 'm-mom') })
+    expect(await readableProjectIdSet(env, await freshAuth(), ['project-a'])).toEqual(new Set(['project-a']))
+    const created = await invite(await freshAuth())
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    const before = harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-mom'").all()
+    harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, 'u-inherited', 'tg-mom', ?, 'processing', datetime('now'))`).run(TENANT, VALID_REQUEST_DIGEST)
+
+    const redeemed = await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: 'tg-mom', display_name: 'Mom', update_id: 'u-inherited', request_digest: VALID_REQUEST_DIGEST })
+    expect(redeemed.ok, JSON.stringify(redeemed)).toBe(true)
+    expect(harness.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id = 'm-mom'").get()).toEqual({ telegram_chat_id: 'tg-mom' })
+    expect(harness.sqlite.prepare("SELECT state, response_text FROM telegram_webhook_receipts WHERE update_id = 'u-inherited'").get())
+      .toEqual({ state: 'completed', response_text: JSON.stringify(redeemed.ok ? redeemed.value : null) })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id)).toMatchObject({ accepted_at: expect.any(String) })
+    expect(harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-mom'").all()).toEqual(before)
+
+    if (end === 'revoked') harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'c-mom'")
+    else harness.sqlite.exec("UPDATE capabilities SET expires_at = datetime('now', '-1 day') WHERE id = 'c-mom'")
+    expect(await readableProjectIdSet(env, await freshAuth(), ['project-a'])).toEqual(new Set())
+  })
+
+  it.each(['+1 day', '-1 day'])('self-connect leaves an existing direct grant and its %s horizon unchanged', async (horizon) => {
+    harness.sqlite.prepare("UPDATE capabilities SET capability = 'observer', expires_at = datetime('now', ?) WHERE id = 'c-mom'").run(horizon)
+    harness.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-mom-dept', 'm-mom', 'department', 'dept-a', 'member')")
+    const auth = { ...asMember('m-mom', []), capabilities: await resolveCapabilities(env, 'm-mom') }
+    const created = await invite(auth)
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    const before = harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-mom' ORDER BY id").all()
+    harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, 'u-direct', 'tg-mom', ?, 'processing', datetime('now'))`).run(TENANT, VALID_REQUEST_DIGEST)
+    const redeemed = await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: 'tg-mom', display_name: 'Mom', update_id: 'u-direct', request_digest: VALID_REQUEST_DIGEST })
+    expect(redeemed.ok, JSON.stringify(redeemed)).toBe(true)
+    expect(harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-mom' ORDER BY id").all()).toEqual(before)
+    harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'c-mom-dept'; UPDATE capabilities SET expires_at = datetime('now', '-1 day') WHERE id = 'c-mom'")
+    const afterAuth = { ...asMember('m-mom', []), capabilities: await resolveCapabilities(env, 'm-mom') }
+    expect(await readableProjectIdSet(env, afterAuth, ['project-a'])).toEqual(new Set())
+  })
+
+  it('an admin self-bind above observer still needs current org-admin standing at redemption', async () => {
+    const created = await invite(asMember('m-admin', [{ scope_type: 'org', scope_id: null, capability: 'admin' }]), { capability: 'admin' })
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    harness.sqlite.exec("UPDATE capabilities SET scope_type = 'department', scope_id = 'dept-a' WHERE id = 'c-admin'")
+    harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, 'u-admin', 'tg-admin', ?, 'processing', datetime('now'))`).run(TENANT, VALID_REQUEST_DIGEST)
+    const before = harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-admin'").all()
+    const redeemed = await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: 'tg-admin', display_name: 'Admin', update_id: 'u-admin', request_digest: VALID_REQUEST_DIGEST })
+    expect(redeemed).toEqual({ ok: false, error: 'invite_minter_authority_lost' })
+    expect(harness.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id = 'm-admin'").get()).toEqual({ telegram_chat_id: null })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id)).toEqual({ accepted_at: null })
+    expect(harness.sqlite.prepare("SELECT state FROM telegram_webhook_receipts WHERE update_id = 'u-admin'").get()).toEqual({ state: 'processing' })
+    expect(harness.sqlite.prepare("SELECT * FROM capabilities WHERE member_id = 'm-admin'").all()).toEqual(before)
   })
 
   it('the rank ceiling is unchanged: cannot request above their OWN standing on that squad, nor on a squad they have no standing on', async () => {
