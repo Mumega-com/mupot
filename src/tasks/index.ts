@@ -1770,7 +1770,10 @@ export async function evaluateVerdictGates(
       || (principal.type === 'member' && task.assignee_agent_id !== null
         && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache)))
     if (affiliated) {
-      if (!legacyOwnerAdmin(auth)) return { allowed: false, code: 'self_verdict', principal }
+      // isOrgAdmin (legacy owner/admin role OR an org-scope admin grant), the predicate the gate checks use. legacyOwnerAdmin
+      // reads auth.role only, which is always 'member' over MCP, so a grant-based org admin was refused here. The waiver is
+      // a HUMAN's: an agent-bound token that merely carries an admin member envelope never gets it.
+      if (!(principal.type === 'member' && isOrgAdmin(auth))) return { allowed: false, code: 'self_verdict', principal }
       independenceWaiver = 'admin_supervisory'
     }
   }
