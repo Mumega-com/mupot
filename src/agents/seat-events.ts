@@ -1020,6 +1020,25 @@ export class SeatEventsHub {
     this.junk = deps.junk ?? createJunkTracker()
   }
 
+  /** A retained socket attachment is not a live grant. Reconcile stale holders
+   * before the DO's final synchronous observer acceptance check. A transient
+   * authority failure leaves ownership intact and refuses the new observer. */
+  async reconcileHostClaims(agent: string): Promise<'checked' | 'error'> {
+    for (const sock of this.deps.sockets()) {
+      const before = sock.getState()
+      if (sock.isClosed() || !before?.agents.includes(agent)) continue
+      const status = await this.authorize(before.host, agent)
+      if (status === 'error') return 'error'
+      if (status === 'not_granted') {
+        const current = sock.getState()
+        if (current?.host === before.host && current.agents.includes(agent)) {
+          this.drop(sock, current, agent, { type: 'revoked', agent, reason: 'grant_revoked' })
+        }
+      }
+    }
+    return 'checked'
+  }
+
   /** Record that `sock` was just accepted, for enforceAuthDeadline (mupot#1589 P1-2). Call
    *  exactly once per socket, right after accept, before any message can arrive. mupot#1594
    *  P1-A: this now writes through `sock.markConnected`, which is backed by the socket's OWN

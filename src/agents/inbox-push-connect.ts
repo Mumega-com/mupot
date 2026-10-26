@@ -25,6 +25,7 @@ async function connect(env: Env, id: StreamIdentity): Promise<Connection> {
       }
       if (r.status === 503) {
         const data = await r.json().catch(() => null) as { error?: string } | null
+        if (data?.error === 'host_authorization_unavailable') return { kind: 'refused', status: 503 }
         if (data?.error?.startsWith('bearer_') && data.error.endsWith('_capacity')) return { kind: 'refused', status: 503 }
         return { kind: 'unavailable' }
       }

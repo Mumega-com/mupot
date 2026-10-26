@@ -65,6 +65,12 @@ describe('member-token push route', () => {
     env.SEAT_EVENTS = { idFromName: (n: string) => n, get: () => ({ fetch: async () => Response.json({ error: 'bearer_pot_capacity' }, { status: 503 }) }) } as unknown as DurableObjectNamespace
     expect((await request()).status).toBe(503)
   })
+  it('does not interpret a DO host-authorization error as an outage permitting fallback', async () => {
+    env.SEAT_EVENTS = { idFromName: (n: string) => n, get: () => ({ fetch: async () => Response.json({ error: 'host_authorization_unavailable' }, { status: 503 }) }) } as unknown as DurableObjectNamespace
+    const r = await request()
+    expect(r.status).toBe(503)
+    expect(r.headers.get('X-Mupot-Stream-Mode')).toBeNull()
+  })
   it('refuses a failed host fence lookup with 503, without opening the DO', async () => {
     h.sqlite.exec('DROP TABLE seat_event_grants') // simulate an unavailable authority table, not a missing grant
     expect((await request()).status).toBe(503)

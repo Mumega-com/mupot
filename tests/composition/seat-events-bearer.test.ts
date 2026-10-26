@@ -86,6 +86,21 @@ describe('SeatEvents bearer observers in workerd', () => {
     expect((await connect(s)).status).toBe(409)
     host.close()
   })
+  it.each(['grant', 'member'])('a stale host after %s revocation does not strand bearer reconnect', async kind => {
+    const s = stub(); const host = await hostConnect(s)
+    const db = (env as unknown as Env).DB
+    try {
+      if (kind === 'grant') await db.exec("UPDATE seat_event_grants SET revoked_at=datetime('now'),revoked_by_member_id='host-m' WHERE id='bg'")
+      else await db.exec("UPDATE members SET status='suspended' WHERE id='host-m'")
+      const r = await connect(s)
+      expect(r.status).toBe(101)
+      r.webSocket!.accept(); r.webSocket!.close()
+    } finally {
+      await db.exec("UPDATE seat_event_grants SET revoked_at=NULL,revoked_by_member_id=NULL WHERE id='bg'")
+      await db.exec("UPDATE members SET status='active' WHERE id='host-m'")
+      host.close()
+    }
+  })
   it('closes observer junk frames without entering the host hello protocol', async () => {
     const r = await connect(stub()); const ws = r.webSocket!; ws.accept()
     const closed = new Promise<number>(resolve => ws.addEventListener('close', e => resolve(e.code)))

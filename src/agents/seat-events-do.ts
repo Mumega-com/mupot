@@ -141,6 +141,10 @@ export class SeatEventsDO extends DurableObject<Env> {
       try { raw = JSON.parse(req.headers.get('x-mupot-bearer-subscription') ?? '') } catch { return Response.json({ error: 'invalid_observer' }, { status: 403 }) }
       const sub = decodeBearerSubscription(raw, this.env.TENANT_SLUG, Date.now())
       if (!sub) return Response.json({ error: 'invalid_observer' }, { status: 403 })
+      if (await this.hub().reconcileHostClaims(sub.agent) === 'error') {
+        return Response.json({ error: 'host_authorization_unavailable' }, { status: 503 })
+      }
+      if (Date.now() >= sub.not_after) return Response.json({ error: 'invalid_observer' }, { status: 403 })
       // No await from this check through acceptance. Host state installation invokes
       // evictBearers synchronously, providing the reverse side of the same exclusion.
       const observers = this.bearers()
