@@ -4,6 +4,8 @@
 
 export interface ParsedAddress {
   readonly local: string
+  /** Local part in its ORIGINAL case. Plus-tags carry case-sensitive base64url HMACs, so tag extraction must use this. */
+  readonly rawLocal: string
   readonly domain: string
   readonly normalized: string
 }
@@ -16,17 +18,21 @@ export function parseAddress(input: string): ParsedAddress | null {
   const angle = /<([^<>]*)>\s*$/.exec(trimmed)
   if (angle) {
     spec = angle[1].trim()
-    if (/[<>]/.test(trimmed.slice(0, angle.index))) return null
+    const display = trimmed.slice(0, angle.index)
+    if (/[<>]/.test(display)) return null
+    // A display name may not hide a second mailbox: `a@x.com, Bob <b@x.com>` is a list, not one address.
+    if (/[,;@]/.test(display.replace(/"(?:[^"\\]|\\.)*"/g, ''))) return null
   } else if (/[<>,;\s]/.test(trimmed)) {
     return null
   }
   if (/[<>,;\s"()\\]/.test(spec)) return null
   const at = spec.lastIndexOf('@')
   if (at < 1 || at === spec.length - 1 || spec.indexOf('@') !== at) return null
-  const local = spec.slice(0, at).toLowerCase()
+  const rawLocal = spec.slice(0, at)
+  const local = rawLocal.toLowerCase()
   const domain = spec.slice(at + 1).toLowerCase().replace(/\.$/, '')
   if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(domain) || !domain.includes('.') || domain.includes('..')) return null
-  return { local, domain, normalized: `${local}@${domain}` }
+  return { local, rawLocal, domain, normalized: `${local}@${domain}` }
 }
 
 export function normalizeAddress(input: string): string | null {
@@ -37,8 +43,8 @@ export function normalizeAddress(input: string): string | null {
 export function splitPlusTag(input: string): { base: string; tag: string | null; domain: string } | null {
   const parsed = parseAddress(input)
   if (!parsed) return null
-  const plus = parsed.local.indexOf('+')
+  const plus = parsed.rawLocal.indexOf('+')
   if (plus < 0) return { base: parsed.local, tag: null, domain: parsed.domain }
-  const tag = parsed.local.slice(plus + 1)
-  return { base: parsed.local.slice(0, plus), tag: tag === '' ? null : tag, domain: parsed.domain }
+  const tag = parsed.rawLocal.slice(plus + 1) // original case: the token MAC is case-sensitive
+  return { base: parsed.rawLocal.slice(0, plus).toLowerCase(), tag: tag === '' ? null : tag, domain: parsed.domain }
 }

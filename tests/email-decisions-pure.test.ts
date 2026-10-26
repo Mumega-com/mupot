@@ -77,6 +77,24 @@ describe('address normalizer', () => {
   it.each(['a@b.com, c@d.com', 'nope', '@x.com', 'a@', 'a@b', 'a@@b.com', 'a b@c.com', ''])('refuses %j', (v) => expect(parseAddress(v)).toBeNull())
   it('splits the plus token', () => {
     expect(splitPlusTag('approve+abc.123.xyz@Decide.Mumega.com')).toEqual({ base: 'approve', tag: 'abc.123.xyz', domain: 'decide.mumega.com' })
+    expect(splitPlusTag('Approve+AbC.1.xYz@Decide.Mumega.com')).toEqual({ base: 'approve', tag: 'AbC.1.xYz', domain: 'decide.mumega.com' })
     expect(splitPlusTag('approve@decide.mumega.com')).toEqual({ base: 'approve', tag: null, domain: 'decide.mumega.com' })
+  })
+})
+
+describe('address regressions (#2199 review)', () => {
+  it('plus-tag keeps case so a minted token verifies after parse; mixed-case mailbox still matches', async () => {
+    const m = (await mintDecisionToken(SECRET, BIND, NOW))!
+    const sp = splitPlusTag(`Approve+${m.token}@Decide.Example.com`)
+    expect(sp?.base).toBe('approve')
+    expect(sp?.tag).toBe(m.token)
+    expect((await verifyDecisionToken(SECRET, sp!.tag!, BIND, NOW + 1000)).ok).toBe(true)
+    expect(normalizeAddress('ALICE@Example.COM')).toBe('alice@example.com')
+  })
+  it('rejects a mailbox list hidden behind a display name', () => {
+    expect(parseAddress('alice@example.com, Bob <bob@example.com>')).toBeNull()
+    expect(parseAddress('alice@example.com; Bob <bob@example.com>')).toBeNull()
+    expect(parseAddress('"Doe, John" <j@example.com>')?.normalized).toBe('j@example.com')
+    expect(parseAddress('Bob <bob@example.com>')?.normalized).toBe('bob@example.com')
   })
 })
