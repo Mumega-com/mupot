@@ -65,6 +65,9 @@ export interface CreateOpts {
   // this create, when it ran under a bounded action:* elevation rather than
   // standing capability (migration 0166). Never a request-body field.
   createdViaElevationGrant?: string
+  // Initial ownership for a human creating their own agent during onboarding.
+  // Server-derived only; AgentInput deliberately has no such field.
+  ownerMemberId?: string
 }
 
 const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
@@ -927,9 +930,7 @@ export async function prepareAgentCreate(
     parent_agent_id,
     qnft_ref,
     death_condition,
-    // owner_member_id is never set at creation — an agent starts unowned and
-    // is attached to a member only via update_agent (admin-only), see 0155.
-    owner_member_id: null,
+    owner_member_id: opts.ownerMemberId ?? null,
   }
 
   // Prepare the agent AND its neutral home routing membership. The caller may
@@ -943,8 +944,8 @@ export async function prepareAgentCreate(
       (id, squad_id, slug, name, role, model, status, kind,
        okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
        created_at,
-       purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       purpose, owner, model_fallback, capabilities, skills, parent_agent_id, qnft_ref, death_condition, owner_member_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       agent.id,
       agent.squad_id,
@@ -970,6 +971,7 @@ export async function prepareAgentCreate(
       parent_agent_id,
       qnft_ref,
       death_condition,
+      agent.owner_member_id,
     ),
     env.DB.prepare(
       `INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES (?, ?, ?, 'member')`,

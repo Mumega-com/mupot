@@ -928,6 +928,9 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     expect(createdAgent.purpose).toBe('Cursor Agent seat on muvps')
 
     expect(call.props.boundAgentId).toBe(createdAgent.id)
+    expect(await memberMayConsentToBackgroundAgent(env, HUMAN, createdAgent.id)).toBe(true)
+    const reconnect = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(reconnect.html).toContain(`value="${createdAgent.id}"`)
 
     // Verify dedicated member was created and bound
     const binding = harness.sqlite.prepare(
@@ -1897,6 +1900,10 @@ describe('C10. a brand-new customer with no capabilities', () => {
     ).all()[0]
     expect(agent).toBeTruthy()
     expect(agent.name).toBe('Ada')
+    const human = harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(NEWCOMER) as { id: string }
+    expect(await memberMayConsentToBackgroundAgent(env, human.id, String(agent.id))).toBe(true)
+    const reconnect = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    expect(reconnect.html).toContain(`value="${agent.id}"`)
   })
 
   it('clamps the new agent to member on its own squad — never lead or above', async () => {

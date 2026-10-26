@@ -7,6 +7,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
 import { suggestedConnectMode } from '../src/mcp/consent-connect-mode'
+import { upsertHarness } from '../src/members/harness'
 import type { Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -158,14 +159,14 @@ function seedBackgroundAgent(id = 'athena', designated = true) {
       VALUES ('human-core', '${HUMAN}', 'squad', 'core', 'admin');
   `)
 }
-function pendingAgent(agent = 'athena', client = 'client-1', harnessId = 'h1', expired = false) {
+function pendingAgent(agent = 'athena', client = 'client-1', harnessId = 'h1', expired = false, scope = 'seat') {
   h.sqlite.prepare(`INSERT OR IGNORE INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, grant_id)
     VALUES (?, ?, ?, ?, 'Codex', ?)`).run(harnessId, TENANT, HUMAN, client, client.includes('#oauth:') ? client.split('#')[1] : null)
   h.sqlite.prepare(`INSERT INTO agent_seat_admissions
-    (id, tenant, agent_id, human_member_id, harness_id, status, requested_via, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, 'pending', 'tool', '2026-10-26T00:00:00Z', ?)`).run(
+    (id, tenant, agent_id, human_member_id, harness_id, status, requested_via, created_at, expires_at, scope)
+    VALUES (?, ?, ?, ?, ?, 'pending', 'tool', '2026-10-26T00:00:00Z', ?, ?)`).run(
     `pending-${agent}-${harnessId}`, TENANT, agent, HUMAN, harnessId,
-    expired ? '2000-01-01T00:00:00Z' : '2099-01-01T00:00:00Z')
+    expired ? '2000-01-01T00:00:00Z' : '2099-01-01T00:00:00Z', scope)
 }
 const checkedAgents = (html: string) => [...html.matchAll(/<input[^>]*type="radio"[^>]*checked[^>]*>/g)].map((m) => /value="([^"]*)"/.exec(m[0])?.[1])
 
@@ -202,6 +203,26 @@ describe('background agent consent defaults', () => {
     pendingAgent('athena', 'client-1#oauth:old-grant')
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
     expect(checkedAgents(html)).toEqual(['athena'])
+  })
+  it.each(['seat', 'harness'])('reuses an install with its previous client label and a %s admission', async (scope) => {
+    seedBackgroundAgent()
+    pendingAgent('athena', 'client-1#oauth:old-grant', 'h1', false, scope)
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, revoked_at)
+      VALUES ('old-grant', ?, 'hash-old', 'oauth:old', 'directory', datetime('now'), ?, datetime('now')),
+             ('new-grant', ?, 'hash-new', 'oauth:new', 'directory', datetime('now'), ?, NULL)`)
+      .run(HUMAN, TENANT, HUMAN, TENANT)
+    const env = { ...httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), WORKSPACES: '1' } as Env
+    const reused = await upsertHarness(env, HUMAN, 'client-1', 'Codex', 'new-grant')
+    expect(reused).toMatchObject({ id: 'h1', oauth_client_id: 'client-1#oauth:old-grant', grant_id: 'oauth:new-grant' })
+    const { html } = await reachConsent(env)
+    // #2217 revokes the old grant's harness-scoped pending request on adoption.
+    expect(checkedAgents(html)).toEqual(scope === 'seat' ? ['athena'] : [])
+  })
+  it('does not match a different client with the same prefix', async () => {
+    seedBackgroundAgent()
+    pendingAgent('athena', 'client-10#oauth:old-grant')
+    const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
+    expect(checkedAgents(html)).toEqual([])
   })
   it.each(['other-client', 'expired', 'not-designated', 'ambiguous'])('does not default from %s pending context', async (kind) => {
     seedBackgroundAgent('athena', kind !== 'not-designated')

@@ -584,6 +584,7 @@ describe('Step 8 — MCP OAuth consent, single-render happy path', () => {
         VALUES ('${CONSENT_AGENT.id}', '${CONSENT_AGENT.squad_id}', '${CONSENT_AGENT.slug}', '${CONSENT_AGENT.name}', 'active', 'execute', 5000, 'week');
       INSERT INTO members (id, email, display_name, status, tenant)
         VALUES ('${CONSENT_HUMAN}', 'consent-human@uc1.test', 'Consent Human', 'active', '${TENANT}');
+      UPDATE agents SET owner_member_id = '${CONSENT_HUMAN}' WHERE id = '${CONSENT_AGENT.id}';
       INSERT INTO members (id, email, display_name, status, tenant)
         VALUES ('${CONSENT_AGENT_MEMBER}', NULL, '${CONSENT_AGENT.name}', 'active', '${TENANT}');
       INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)

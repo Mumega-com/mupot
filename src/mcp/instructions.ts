@@ -36,6 +36,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
 5. BACKGROUND AGENT OAUTH
    - A background agent runs in its own harness (Orca, Codex, or Claude Code). The harness signs in once by OAuth AS that agent: its owner or designated human chooses "This connection is <Agent name> (runs in the background)" and reviews the access before continuing.
    - The harness keeps its own refresh token. The connection IS the agent, runs on its own, and can be woken. A chat you drive is the separate option for acting for the human, capped at their rights.
+   - For headless clients that use a workspace bearer instead, 'mint_agent_token' issues a mupot_ token for that client's own Authorization header on /mcp or /actions/. Holding this token does not help a connector session that authenticates through its own OAuth grant; reconnect that connector and choose the agent at consent.
 
 6. ERROR CODE DECODING GUIDE
    - 403 forbidden need=<cap>: Server-side authorization floor. Your session lacks the required capability for this tool. Grant capability or reconnect with bound agent.

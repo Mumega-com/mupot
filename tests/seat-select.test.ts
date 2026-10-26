@@ -656,6 +656,8 @@ describe('OAuth consent harness upsert', () => {
     const seat = await seatSelect(envSeat, authFor(HUMAN, hid), { project: 'p', folder: '/a' })
     if (!seat.ok) throw new Error(JSON.stringify(seat))
     const harnessesBefore = n(h, `SELECT COUNT(*) AS n FROM harnesses`)
+    // This background consent fixture also needs the human's ownership.
+    h.sqlite.prepare('UPDATE agents SET owner_member_id = ? WHERE id = ?').run(HUMAN, seat.agent.id)
     const p = stubOAuthProvider('Cursor')
     const env = httpEnv(p, { SEAT_AUTO_ENROLL: '1' })
     const res = await consent(env, seat.agent.id)

@@ -36,7 +36,8 @@ export async function defaultBackgroundAgent(
        JOIN harnesses h ON h.id = p.harness_id AND h.tenant = ?2 AND h.member_id = ?1
       WHERE p.tenant = ?2 AND p.human_member_id = ?1 AND p.status = 'pending'
         AND julianday(p.expires_at) > julianday('now') AND h.credential_kind = 'oauth'
-        AND (h.oauth_client_id = ?3 OR h.oauth_client_id = ?3 || '#' || h.grant_id)`,
+        AND (h.oauth_client_id = ?3
+          OR substr(h.oauth_client_id, 1, length(?3) + 7) = ?3 || '#oauth:')`,
   ).bind(memberId, env.TENANT_SLUG, clientId).all<{ id: string; harness_id: string }>()
   const pending = rows.results ?? []
   // Shared client names cannot distinguish two installs. Leave that choice to the human.

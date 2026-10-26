@@ -2060,7 +2060,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         role: 'member',
         model: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
         purpose,
-      })
+      }, { ownerMemberId: pending.memberId })
 
       if (!createRes.ok) {
         const rejected = new Response(
