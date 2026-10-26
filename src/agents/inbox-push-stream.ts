@@ -40,6 +40,7 @@ export function createInboxPushResponse(o: PushStreamOptions): Response {
   let authTimer: ReturnType<typeof setTimeout> | undefined
   let deadline: ReturnType<typeof setTimeout> | undefined
   let debounce: ReturnType<typeof setTimeout> | undefined
+  let lastResyncRequested = Date.now()
   const timers = new Set<ReturnType<typeof setTimeout>>()
   const pending = new Set<() => void>()
   const encoder = new TextEncoder()
@@ -71,12 +72,17 @@ export function createInboxPushResponse(o: PushStreamOptions): Response {
     deadline = after(() => close('authorization_deadline'), validUntil - Date.now())
     authTimer = after(() => { void scheduled(0) }, validatedAt + REFRESH - Date.now())
   }
-  async function timed<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+  async function timed<T>(fn: () => Promise<T>, fallback: T, disposeLate?: (value: T) => void): Promise<T> {
     let timeout: ReturnType<typeof setTimeout>
     let finish!: () => void
+    let settled = false
     const expiry = new Promise<T>(resolve => { finish = () => resolve(fallback); pending.add(finish); timeout = setTimeout(finish, TIMEOUT); timers.add(timeout) })
-    try { return await Promise.race([Promise.resolve().then(fn).catch(() => fallback), expiry]) }
-    finally { clear(timeout!); pending.delete(finish) }
+    const operation = Promise.resolve().then(fn).catch(() => fallback).then(value => {
+      if (settled || closed) { disposeLate?.(value); return fallback }
+      return value
+    })
+    try { return await Promise.race([operation, expiry]) }
+    finally { settled = true; clear(timeout!); pending.delete(finish) }
   }
   async function authorize(kind: 'scheduled' | 'retry' | 'disclosure'): Promise<boolean> {
     if (closed || Date.now() >= validUntil) { close('authorization_deadline'); return false }
@@ -145,6 +151,10 @@ export function createInboxPushResponse(o: PushStreamOptions): Response {
   }
   function queueRead(kind: 'connect' | 'hint' | 'resync') {
     if (closed) return
+    if (kind === 'resync') {
+      if (Date.now() - lastResyncRequested < RESYNC) return
+      lastResyncRequested = Date.now()
+    }
     if (reading) { dirty = true; return }
     if (debounce !== undefined) return
     debounce = after(() => {
@@ -169,7 +179,7 @@ export function createInboxPushResponse(o: PushStreamOptions): Response {
   function fallbackPoll() { o.metric?.('fallback_poll'); queueRead('hint'); after(fallbackPoll, 30_000) }
   async function renew() {
     if (!o.renewSocket || !await authorize('disclosure')) { close('observer_rotation'); return }
-    const next = await timed(o.renewSocket, null)
+    const next = await timed(o.renewSocket, null, late => { try { late?.close(1000, 'abandoned_renewal') } catch { /* already gone */ } })
     if (closed) { next?.close(); return }
     if (!next) { close('observer_rotation_failed'); return }
     const previous = socket; detach(previous); socket = next; attach(next); previous.close(1000, 'renewed')

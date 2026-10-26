@@ -22,6 +22,29 @@ function setup(options: { validate?: () => Promise<StreamAuthorization>; count?:
   return { socket, reader, pump, setCount: (n: number) => { count = n }, reads: () => reads, auths: () => auths, text: () => text, done: () => done }
 }
 describe('push stream lifecycle', () => {
+  it.each(['timeout', 'cancel'] as const)('disposes a renewal socket returned after %s', async mode => {
+    let resolve!: (s: Socket) => void
+    const original = new Socket(); const late = new Socket()
+    const r = createInboxPushResponse({ socket: original, authenticatedAt: Date.now(), since: 0,
+      validate: async () => 'valid', read: async () => ({ ok: true, messages: [] }),
+      renewSocket: () => new Promise(r => { resolve = r }) })
+    const reader = r.body!.getReader(); await reader.read()
+    await vi.advanceTimersByTimeAsync(840_001)
+    if (mode === 'cancel') await reader.cancel()
+    else await vi.advanceTimersByTimeAsync(5001)
+    resolve(late); await vi.advanceTimersByTimeAsync(1)
+    expect(original.closed).toBe(true); expect(late.closed).toBe(true)
+  })
+  it('observer renewal cannot insert an extra recovery read between 300s cycles', async () => {
+    const times: number[] = []; const start = Date.now()
+    const r = createInboxPushResponse({ socket: new Socket(), renewSocket: async () => new Socket(), authenticatedAt: start, since: 0, jitterMs: 0,
+      validate: async () => 'valid', read: async () => { times.push(Date.now() - start); return { ok: true, messages: [] } } })
+    await vi.advanceTimersByTimeAsync(910_000)
+    expect(times).toHaveLength(4)
+    expect(times[2]).toBeGreaterThanOrEqual(times[1] + 300_000)
+    expect(times[3]).toBeGreaterThanOrEqual(times[2] + 300_000)
+    await r.body!.cancel()
+  })
   it('closes after a failed read instead of turning auth refresh into inbox polling', async () => {
     const socket = new Socket(); let reads = 0
     const r = createInboxPushResponse({ socket, authenticatedAt: Date.now(), since: 0, validate: async () => 'valid', read: async () => { reads++; return { ok: false } } })

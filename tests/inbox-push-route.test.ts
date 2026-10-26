@@ -23,6 +23,13 @@ beforeEach(async () => {
 afterEach(() => { vi.useRealTimers(); h.close() })
 const request = (query = '', headers = {}) => inboxApp.request('/stream' + query, { headers: { authorization: 'Bearer secret-test-token', ...headers } }, env)
 describe('member-token push route', () => {
+  it('bounds a hanging entry authentication lookup to five seconds', async () => {
+    env.DB = { prepare() { return { bind() { return { first: () => new Promise(() => {}) } } } } } as unknown as D1Database
+    const pending = request()
+    await vi.advanceTimersByTimeAsync(5001)
+    expect((await pending).status).toBe(503)
+    expect(requests).toHaveLength(0)
+  })
   it('builds a private descriptor from authentication, not client headers', async () => {
     const r = await request('', { 'x-mupot-bearer-subscription': '{"agent":"foreign"}' })
     expect(r.headers.get('X-Mupot-Stream-Mode')).toBe('push')

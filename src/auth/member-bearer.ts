@@ -60,9 +60,17 @@ export async function resolveStreamMemberByToken(env: Env, raw: string | null): 
   { status: 'valid'; identity: AgentIdentity } | { status: 'invalid' | 'error' }
 > {
   try {
-    const identity = await withAuthTiming(env, () => resolveMemberByTokenInner(env, raw))
+    const identity = await boundedStreamLookup(() => withAuthTiming(env, () => resolveMemberByTokenInner(env, raw)))
     return identity ? { status: 'valid', identity } : { status: 'invalid' }
   } catch { return { status: 'error' } }
+}
+
+/** Connection-entry checks must not strand sockets/requests on a hung D1 call. */
+export async function boundedStreamLookup<T>(lookup: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>
+  const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('stream_lookup_timeout')), 5000) })
+  try { return await Promise.race([Promise.resolve().then(lookup), timeout]) }
+  finally { clearTimeout(timer!) }
 }
 
 /** #2060 P1-c: the seat status rides the ONE token query (no second read that could fail open). VIP_LANE off = no join, no column read.
