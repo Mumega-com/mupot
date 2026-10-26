@@ -40,6 +40,7 @@ export function liveAttachmentConditionsSql(env: Env, ph: LivePh): string {
         AND adm.human_member_id = att.human_member_id
         AND adm.harness_id = att.harness_id
         AND ${ADMISSION_BOUND_TO_SEAT_SQL}
+        AND (adm.scope = 'seat' OR (${ph('grantToken')} IS NOT NULL AND hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ${ph('grantToken')})) -- R1: a harness-wide admission needs THIS request's grant to be the install's own
         AND s.retired_at IS NULL
         AND s.member_id = att.human_member_id
         AND s.harness_id = att.harness_id
@@ -48,5 +49,5 @@ export function liveAttachmentConditionsSql(env: Env, ph: LivePh): string {
         AND (${ph('grantToken')} IS NULL OR EXISTS (SELECT 1 FROM member_tokens g
                      WHERE g.id = ${ph('grantToken')} AND g.member_id = ${ph('human')} AND g.tenant = ${ph('tenant')}
                        AND g.channel = 'directory' AND g.agent_id IS NULL
-                       AND ${TOKEN_LIVE_PREDICATE(ph('now')).replace(/\bt\./g, 'g.')}))`
+                       AND ${TOKEN_LIVE_PREDICATE(ph('now'), 'g')}))`
 }

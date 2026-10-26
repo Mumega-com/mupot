@@ -30,6 +30,24 @@ export function attachDesignatedClause(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO
 }
 
 
-/** The admission belongs to the chat that asked (#2056); NULL never matches. Shared by EVERY hand-copied attachment-liveness
- *  check (resolver, elevation origin, events) so they cannot drift apart. Needs aliases `adm` (admission) and `att` (attachment). */
-export const ADMISSION_BOUND_TO_SEAT_SQL = 'adm.requested_seat_id = att.seat_id'
+/**
+ * "This admission covers the seat in `seatCol`" -- THE one binding predicate, shared by EVERY attachment-liveness check
+ * (resolver, elevation origin, events, the attach INSERT). Needs the alias `adm` (admission).
+ *  - scope 'seat' (every legacy row, the default): the admission belongs to the chat that asked (#2056); NULL never matches.
+ *  - scope 'harness' (R1, mupot#1792): the human approved it for every chat of ONE install, so any seat may use it, but ONLY while
+ *    the install's own grant is proven live from the DB: the harness row is an OAuth harness whose `grant_id` is
+ *    'oauth:<consent token id>' and that consent token is a live, unbound directory token of the SAME human. A null / legacy /
+ *    token-kind anchor, or a revoked / expired / foreign token, matches nothing (the whole scope stops working at once).
+ *  Request metadata plays no part: everything here is read from rows.
+ */
+export function admissionBoundToSeatSql(seatCol: string): string {
+  return `((adm.scope = 'seat' AND adm.requested_seat_id = ${seatCol}) OR (adm.scope = 'harness' AND EXISTS (
+            SELECT 1 FROM harnesses hs JOIN member_tokens gs ON gs.id = substr(hs.grant_id, 7)
+             WHERE hs.id = adm.harness_id AND hs.tenant = adm.tenant AND hs.member_id = adm.human_member_id
+               AND hs.credential_kind = 'oauth' AND hs.grant_id LIKE 'oauth:_%'
+               AND gs.tenant = adm.tenant AND gs.member_id = adm.human_member_id AND gs.channel = 'directory' AND gs.agent_id IS NULL
+               AND gs.revoked_at IS NULL AND (gs.expires_at IS NULL OR julianday(gs.expires_at) > julianday('now')))))`
+}
+
+/** Needs aliases `adm` (admission) and `att` (attachment). */
+export const ADMISSION_BOUND_TO_SEAT_SQL = admissionBoundToSeatSql('att.seat_id')

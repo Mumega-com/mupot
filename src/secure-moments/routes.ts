@@ -440,8 +440,11 @@ momentsApp.get('/m/:id/:token', async (c) => {
 <h2>How much may ${escapeHtml(v.agentName)} do in your chats?</h2>
 <label class="choice"><input type="radio" name="ceiling" value="member" checked><span><strong>Member</strong>: everyday work (the default)</span></label>
 <label class="choice"><input type="radio" name="ceiling" value="lead"><span><strong>Lead</strong>: also lead-level work on what the agent leads</span></label>
-<label class="choice"><input type="radio" name="ceiling" value="full"><span><strong>Full</strong>: everything this agent itself may do, never more than you may</span></label>
-<h2>What approving does</h2><p>Lets chats from <strong>this connected app</strong> act as <strong>${escapeHtml(v.agentName)}</strong>, now and for later chats, until you revoke it on your Connections page. If this agent holds a review gate, approving also lets these chats review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own, and detaching a chat or revoking this ends that. They never hold more than you yourself may do. To change the level later you revoke and approve again.</p>`
+${subject.adm.scope === 'harness' ? '' : '<label class="choice"><input type="radio" name="ceiling" value="full"><span><strong>Full</strong>: everything this agent itself may do, never more than you may</span></label>'}
+${subject.adm.scope === 'harness'
+  ? `<h2>Scope: every chat of this app</h2><p>This one approval covers <strong>every chat, now and later, that comes through this same connection of this app</strong>. Each new chat still has to ask to become ${escapeHtml(v.agentName)} by name, and nothing else is opened: other agents need their own approval, and the Full level is not offered here. It stops for all chats at once when you revoke it or disconnect the app.</p>`
+  : '<h2>Scope: the chat that asked</h2><p>This approval is for the one chat shown above. A later chat needs its own approval.</p>'}
+<h2>What approving does</h2><p>Lets ${subject.adm.scope === 'harness' ? 'chats of <strong>this connected app</strong>' : 'the chat that asked'} act as <strong>${escapeHtml(v.agentName)}</strong>, until you revoke it on your Connections page. If this agent holds a review gate, approving also lets these chats review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own, and detaching a chat or revoking this ends that. They never hold more than you yourself may do. To change the level later you revoke and approve again.</p>`
     title = `Let ${v.agentName} work in your chat`
     approveLabel = 'Admit'
     promptBlock = agentPromptBlock({ agentName: v.agentName, agentSlug: v.agentSlug, agentId: subject.adm.agent_id })

@@ -262,6 +262,7 @@ const ATTACH_STATUS: Record<string, 400 | 403 | 404 | 409 | 429> = {
   attach_refused: 409,
   attach_code_mismatch: 403,
   approval_bound_to_other_chat: 409,
+  admission_scope_mismatch: 409,
 }
 
 export function makeConnectionsApp(shell: ShellFn) {

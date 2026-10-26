@@ -25,5 +25,8 @@ export async function attachedGateAgent(env: Env, auth: AuthContext): Promise<{ 
   if (!live) return null
   if (live.attachment_id !== att.attachmentId || live.agent_id !== att.agentId) return null
   if (Number(live.gate_authority) !== 1) return null
+  // R1: gate power belongs to the ONE chat the human approved it for. A thread reaching this admission through a harness-wide
+  // approval (grant continuity) never inherits it, whatever the admission's bit says.
+  if (live.requested_seat_id !== live.seat_id) return null
   return { agentId: live.agent_id, humanMemberId: binding.humanMemberId }
 }

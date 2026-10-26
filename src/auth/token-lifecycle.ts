@@ -39,11 +39,12 @@ import type { Env } from '../types'
  *     not (the dashboard toggle, a later mint) must not leave a live credential for a
  *     non-active agent, and re-activating the agent makes the same credential work again.
  *     Unbound tokens (agent_id NULL) are untouched. The subquery uses its own alias so the
- *     callers' `t.` -> `<alias>.` rewrites stay valid; a missing agent row fails CLOSED.
+ *     callers' legacy `t.` -> `<alias>.` rewrites stay valid; a missing agent row fails CLOSED.
+ *     New callers can supply a trusted SQL alias directly, without rewriting the time expression.
  */
-export const TOKEN_LIVE_PREDICATE = (nowParam: string): string =>
-  `t.revoked_at IS NULL AND (t.expires_at IS NULL OR julianday(t.expires_at) > julianday(${nowParam}))
-   AND (t.agent_id IS NULL OR EXISTS (SELECT 1 FROM agents ag_live WHERE ag_live.id = t.agent_id AND ag_live.status IN ('active', 'paused')))`
+export const TOKEN_LIVE_PREDICATE = (nowParam: string, alias = 't'): string =>
+  `${alias}.revoked_at IS NULL AND (${alias}.expires_at IS NULL OR julianday(${alias}.expires_at) > julianday(${nowParam}))
+   AND (${alias}.agent_id IS NULL OR EXISTS (SELECT 1 FROM agents ag_live WHERE ag_live.id = ${alias}.agent_id AND ag_live.status IN ('active', 'paused')))`
 
 /** Canonical `now` for the predicate above. Emitted in the same shape SQLite's own
  *  `datetime('now')` produces, so a value written by a migration and a value written by

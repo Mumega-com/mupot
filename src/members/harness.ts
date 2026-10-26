@@ -127,10 +127,23 @@ export async function upsertHarness(
       ).bind(env.TENANT_SLUG, memberId, clientId.length + 7, `${clientId}#oauth:`, `-${HARNESS_REUSE_DAYS} days`)
         .first<{ id: string; grant_id: string }>()
       if (reusable) {
-        const moved = await env.DB.prepare(
-          `UPDATE harnesses SET grant_id = ?1, client_name = ?2, kind = ?3
-            WHERE id = ?4 AND grant_id = ?5 AND tenant = ?6 AND member_id = ?7`,
-        ).bind(grant, clientName, kind, reusable.id, reusable.grant_id, env.TENANT_SLUG, memberId).run()
+        // Harness approvals belong to ONE consent, even when the install row is reused. Close both live and pending
+        // approvals BEFORE moving its anchor, atomically; the old anchor CAS also protects a concurrent winner's fresh
+        // approval. Existing revoke triggers detach attachments and revoke their tokens/dot keys; old approval links
+        // are refused by the admission status check.
+        // Seat-scoped approvals retain their existing semantics. No admission history is deleted or re-opened.
+        const [, moved] = await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = ?1, revoked_by_member_id = ?2
+              WHERE tenant = ?3 AND human_member_id = ?2 AND harness_id = ?4 AND scope = 'harness'
+                AND status IN ('pending', 'live')
+                AND EXISTS (SELECT 1 FROM harnesses h WHERE h.id = ?4 AND h.tenant = ?3 AND h.member_id = ?2 AND h.grant_id = ?5)`,
+          ).bind(new Date().toISOString(), memberId, env.TENANT_SLUG, reusable.id, reusable.grant_id),
+          env.DB.prepare(
+            `UPDATE harnesses SET grant_id = ?1, client_name = ?2, kind = ?3
+              WHERE id = ?4 AND grant_id = ?5 AND tenant = ?6 AND member_id = ?7`,
+          ).bind(grant, clientName, kind, reusable.id, reusable.grant_id, env.TENANT_SLUG, memberId),
+        ])
         if ((moved.meta?.changes ?? 0) > 0) {
           return env.DB.prepare(`SELECT ${HARNESS_COLUMNS} FROM harnesses WHERE id = ?1 LIMIT 1`).bind(reusable.id).first<HarnessRow>()
         }

@@ -12,9 +12,9 @@
 // The subscription then stores the ATTACHMENT's token (not the human's grant), so every delivery re-derives liveness from that token
 // (subscriberAccessLive) plus an explicit attachment/admission check: detach, revoke, retire or deactivate stops wakes at the next
 // message. The wake is body-free (message_id/seq only), so nothing about identity, retrieval or inbox content is shared.
-import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
+import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 import type { AuthContext, Env } from '../types'
-import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 
@@ -45,27 +45,16 @@ export async function listLiveAttachmentsForEvents(
   human: { memberId: string; harnessId: string; grantTokenId: string },
 ): Promise<EventsAttachment[]> {
   let rows: Row[]
+  // Events ranges over every attached seat of this harness; the shared predicate checks each candidate's own seat.
+  const ph: LivePh = (k) => ({ tenant: '?1', human: '?2', seat: 'att.seat_id', grantToken: '?4', now: '?5' })[k]
   try {
     rows = (await env.DB.prepare(
       `SELECT att.id AS attachment_id, a.id AS agent_id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
               b.member_id AS agent_member_id, att.seat_token_id AS seat_token_id
-         FROM agent_seat_attachments att
-         JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant AND adm.status = 'live' AND ${ADMISSION_BOUND_TO_SEAT_SQL}
-              AND adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id
-         JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL
-              AND s.member_id = att.human_member_id AND s.harness_id = att.harness_id
-         JOIN agents a ON a.id = att.agent_id AND a.status = 'active'
-         JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = a.id
-         JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
-         JOIN harnesses hr ON hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id
-        WHERE att.tenant = ?1 AND att.human_member_id = ?2 AND att.harness_id = ?3 AND att.detached_at IS NULL
-          ${attachDesignatedClause(env, 'a', 'att.human_member_id')}
-          AND EXISTS (SELECT 1 FROM member_tokens t
-                       WHERE t.id = att.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id AND t.tenant = ?1
-                         AND t.channel = 'directory' AND ${TOKEN_LIVE_PREDICATE('?5')})
-          AND EXISTS (SELECT 1 FROM member_tokens g
-                       WHERE g.id = ?4 AND g.member_id = ?2 AND g.tenant = ?1 AND g.channel = 'directory' AND g.agent_id IS NULL
-                         AND ${TOKEN_LIVE_PREDICATE('?5').replace(/\bt\./g, 'g.')})
+         FROM ${LIVE_ATTACHMENT_FROM_SQL}
+        WHERE ${liveAttachmentConditionsSql(env, ph)}
+          AND att.harness_id = ?3 AND ?4 IS NOT NULL
+          AND EXISTS (SELECT 1 FROM member_tokens t WHERE ${seatTokenLiveSql(ph)})
         ORDER BY att.created_at DESC
         LIMIT 400`, // same ceiling as the attachable-agent list: the per-agent dedupe and the admin floor run AFTER this, so a small cap could hide a real agent
     ).bind(env.TENANT_SLUG, human.memberId, human.harnessId, human.grantTokenId, nowSqlUtc()).all<Row>()).results ?? []
