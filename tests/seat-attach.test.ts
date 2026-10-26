@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { SoftAuthenticator } from './helpers/webauthn-authenticator'
+import { seedPasskey, throughGate } from './helpers/presence'
 import { upsertHarness } from '../src/members/harness'
 import { prepareConditionalIdentityWeld } from '../src/members/service'
 import { weldAudit } from '../src/members/seat-attach'
@@ -996,14 +997,24 @@ describe('dashboard: Connections', () => {
     const res = await authApp.request('/dev-login', {}, e)
     const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
     if (!m) throw new Error('no session cookie')
+    const member = h.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+    if (member) seedPasskey(h.sqlite, TENANT, member.id) // widening decisions need the member's passkey; the real ceremony is tests/human-presence.test.ts
     return `mupot_session=${m[1]}`
   }
-  async function dash(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = 'http://localhost'): Promise<Response> {
+  async function dash(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = 'http://localhost', gated = true): Promise<Response> {
     const { dashboardApp } = await import('../src/dashboard/index')
     const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }
     if (origin) headers.origin = origin
     const e = { ...env, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'x' } as unknown as Env
-    return dashboardApp.request(path, body === undefined && path.startsWith('/connections') && !path.includes('/attach') ? { headers: { cookie } } : { method: 'POST', headers, body: JSON.stringify(body ?? {}) }, e)
+    const isRead = body === undefined && path.startsWith('/connections') && !path.includes('/attach')
+    const call = (qs: string): Promise<Response> => Promise.resolve(dashboardApp.request(`${path}${qs ? `?${qs}` : ''}`, isRead ? { headers: { cookie } } : { method: 'POST', headers, body: JSON.stringify(body ?? {}) }, e))
+    // Attach now needs the passkey: pass the presence gate through the DB shortcut (gated=false: the session alone)
+    return isRead || !gated ? call('') : throughGate(h.sqlite, TENANT, call)
+  }
+  /** The decision the OLD dashboard Admit button made, called on the writer that remains (the claim routes reach it): same mapping. */
+  async function approveDirect(env: Env, adm: string, body: Record<string, unknown>): Promise<{ status: number; json: Record<string, unknown> }> {
+    const r = await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', ceiling: 'member', attachCode: body.attach_code })
+    return r.ok ? { status: 200, json: { ok: true } } : { status: r.error === 'admission_not_found' ? 404 : r.error === 'attach_code_mismatch' ? 403 : 409, json: { error: r.error } }
   }
   const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
   const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()) }
@@ -1045,7 +1056,10 @@ describe('dashboard: Connections', () => {
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
-    expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', attach_code: codeOf(one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id) })).status).toBe(200)
+    // A coded pending ask is decided on its passkey page (the dashboard Attach carries no code); a legacy NULL-code ask has no code to type.
+    h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_attach_code_immutable`) // fixture only: model a pre-0240 row
+    h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = NULL`).run()
+    expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava' })).status).toBe(200)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(1)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
   })
@@ -1106,8 +1120,11 @@ describe('dashboard: Connections', () => {
     expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'null')).status).toBe(403)
     expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {}, 'https://evil.test')).status).toBe(403)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
-    // the page origin (what a browser sends under same-origin) passes the guard
-    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) }, 'http://localhost')).status).toBe(200)
+    // the page origin (what a browser sends under same-origin) passes the guard: it reaches the passkey hand-off, not a decision
+    const handoff = await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) }, 'http://localhost')
+    expect(handoff.status).toBe(403)
+    expect(((await handoff.json()) as { error: string }).error).toBe('human_presence_required')
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
   })
 
   it('detach and revoke need only a real session (no fresh reauth) and work with SEAT_ATTACH off', async () => {
@@ -1130,7 +1147,7 @@ describe('dashboard: Connections', () => {
     expect((await dash(off, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(403)
   })
 
-  it('approve a pending admission on the dashboard (fresh), deny needs only a session', async () => {
+  it('Admit on the dashboard no longer decides (a fresh session is not a passkey): it hands back the passkey page, which admits; deny needs only a session', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await boot(env, g, 'conv-a')
@@ -1140,8 +1157,16 @@ describe('dashboard: Connections', () => {
     stale()
     expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBeGreaterThanOrEqual(401)
     fresh()
-    expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) })).status).toBe(200)
-    expect(one(`SELECT status, decided_via FROM agent_seat_admissions`)).toMatchObject({ status: 'live', decided_via: 'dashboard' })
+    const res = await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: codeOf(adm) })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as { error: string; approve_url: string }
+    expect(body.error).toBe('human_presence_required')
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
+    // the passkey page it points at is the existing seat_admit moment: tapping there admits
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, body.approve_url, key, 'approve', undefined, undefined, codeOf(adm))).status).toBe(200)
+    expect(one(`SELECT status, decided_via FROM agent_seat_admissions`)).toMatchObject({ status: 'live', decided_via: 'webauthn' })
   })
 
   // mupot#2054: the Admit card is tied to the asking chat by a short code.
@@ -1199,7 +1224,7 @@ describe('dashboard: Connections', () => {
       const cookie = await session(env, `${HUMAN}@example.test`)
       fresh()
       const typed = String(r.sc.attach_code).toLowerCase().replace('-', '')
-      expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, { attach_code: typed })).status).toBe(200)
+      expect((await approveDirect(env, adm, { attach_code: typed })).status).toBe(200)
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
     })
 
@@ -1211,9 +1236,9 @@ describe('dashboard: Connections', () => {
       const real = String(r.sc.attach_code)
       const wrong = real.startsWith('AA') ? 'BB-BB' : 'AA-AA'
       for (const body of [{ attach_code: wrong }, {}, { attach_code: '' }, { attach_code: 42 }, { attach_code: real.slice(0, 3) }]) {
-        const res = await dash(env, cookie, `/connections/admissions/${adm}/approve`, body)
+        const res = await approveDirect(env, adm, body)
         expect(res.status).toBe(403)
-        expect(await res.json()).toEqual({ error: 'attach_code_mismatch' })
+        expect(res.json).toEqual({ error: 'attach_code_mismatch' })
         expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
       }
       expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
@@ -1228,7 +1253,7 @@ describe('dashboard: Connections', () => {
       h.sqlite.prepare(`UPDATE agent_seat_admissions SET attach_code = NULL WHERE id = ?`).run(adm)
       const cookie = await session(env, `${HUMAN}@example.test`)
       fresh()
-      expect((await dash(env, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(200)
+      expect((await approveDirect(env, adm, {})).status).toBe(200)
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
     })
 
@@ -1250,7 +1275,7 @@ describe('dashboard: Connections', () => {
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('live')
     })
 
-    it('/connections/attach (dashboard Attach promoting a PENDING request): wrong or missing code refused, still pending; right code goes live', async () => {
+    it('/connections/attach (dashboard Attach over a PENDING coded request): refused whatever code is sent, still pending (the passkey page admits)', async () => {
       const env = envFor(h)
       const { r, adm } = await pendingFor(env)
       const cookie = await session(env, `${HUMAN}@example.test`)
@@ -1262,8 +1287,11 @@ describe('dashboard: Connections', () => {
         expect(await res.json()).toEqual({ error: 'attach_code_mismatch' })
         expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
       }
-      expect((await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', attach_code: String(r.sc.attach_code) })).status).toBe(200)
-      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('live')
+      // The dashboard Attach never carries the typed code any more (a coded ask is admitted on its passkey page), so even the right
+      // code in the body cannot promote it from here.
+      const typed = await dash(env, cookie, '/connections/attach', { seat_id: seatId, agent_id: 'agent-rava', attach_code: String(r.sc.attach_code) })
+      expect(typed.status).toBe(403)
+      expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('pending')
     })
 
     it('promoteAdmission itself refuses a wrong code (no caller can skip the check)', async () => {

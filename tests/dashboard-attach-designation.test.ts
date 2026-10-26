@@ -14,10 +14,11 @@ import { ensureAdmission } from '../src/members/seat-attach'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'local'
 const ORIGIN = 'http://localhost'
-const ON = { SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', SEAT_ATTACH_DESIGNATED: '1' }
+const ON = { SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', SEAT_ATTACH_DESIGNATED: '1', ...PRESENCE_ENV }
 
 function kv() {
   const store = new Map<string, string>()
@@ -38,6 +39,8 @@ async function login(email: string, extra?: Record<string, string>): Promise<{ e
   expect(res.status).toBe(302)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  const member = h.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+  if (member) seedPasskey(h.sqlite, TENANT, member.id) // widening decisions now need the member's passkey; this suite tests the OTHER behaviour (see tests/human-presence.test.ts)
   return { env, cookie: `mupot_session=${m[1]}` }
 }
 const setReauth = (memberId: string, at: string | null) => h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
@@ -47,7 +50,8 @@ const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000))
 function post(env: Env, cookie: string, action: string, origin: string | null = ORIGIN, agent = 'ag1') {
   const headers: Record<string, string> = { cookie, 'content-type': 'application/x-www-form-urlencoded' }
   if (origin) headers.origin = origin
-  return dashboardApp.request(`/agents/${agent}/designation`, { method: 'POST', headers, body: new URLSearchParams({ action }) }, env)
+  // Allow now needs the passkey: the presence gate is passed through the DB shortcut (the real ceremony is tests/human-presence.test.ts).
+  return throughGate(h.sqlite, TENANT, (qs) => dashboardApp.request(`/agents/${agent}/designation${qs ? `?${qs}` : ''}`, { method: 'POST', headers, body: new URLSearchParams({ action }) }, env))
 }
 const designee = (): string | null => (h.sqlite.prepare("SELECT attach_designated_member_id AS d FROM agents WHERE id = 'ag1'").get() as { d: string | null }).d
 const auditCount = (): number => (h.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE agent_id = 'ag1'").get() as { n: number }).n

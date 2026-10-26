@@ -57,6 +57,14 @@ export async function resetTrustedOnRejoin(env: Env, p: { humanMemberId: string;
   return applyTransition(env, { ...p, from: 'trusted', to: 'observed', action: 'rejoin_reset' })
 }
 
+/** The caller's own live seat's current admission status (null for another human's, a retired or a missing seat: no oracle). */
+export async function seatAdmissionStatus(env: Env, humanMemberId: string, seatId: string): Promise<SeatAdmissionStatus | null> {
+  const row = await env.DB.prepare(`SELECT admission_status AS s FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
+    .bind(seatId, env.TENANT_SLUG, humanMemberId).first<{ s: string | null }>()
+  const s = row?.s
+  return s === 'observed' || s === 'held' || s === 'trusted' ? s : null
+}
+
 /** `fresh` = the caller's web session was re-authenticated recently. Widening transitions are refused without it, here and not only in the route. */
 export async function changeSeatAdmission(
   env: Env, p: { humanMemberId: string; seatId: string; action: SeatHoldAction; fresh: boolean },

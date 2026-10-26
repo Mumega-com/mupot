@@ -10,7 +10,8 @@ import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as realDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_FLAGS, gatedApp } from './helpers/presence'
 import { mcpApp } from '../src/mcp'
 import {
   enrollUrl,
@@ -21,6 +22,10 @@ import {
 import { mintAgentBoundToken } from '../src/members/service'
 import type { Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
+
+// A mint hands an agent a credential and now needs the member's passkey; this suite tests the route's OTHER behaviour, so a POST that ends at
+// the passkey refusal is satisfied by the DB shortcut and repeated (the gate itself: tests/human-presence.test.ts).
+const dashboardApp = gatedApp(realDashboardApp)
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -104,7 +109,7 @@ function envFor(
     DB: harness.db,
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
-    PUBLIC_ORIGIN: ORIGIN,
+    PUBLIC_ORIGIN: ORIGIN, ...PRESENCE_FLAGS,
     SESSIONS: sessionsKv ?? statefulSessions(sessions).kv,
     OAUTH_KV: { get: async () => null, put: async () => undefined },
     VEC: { query: async () => ({ matches: [] }) },

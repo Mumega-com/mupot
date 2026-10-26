@@ -228,6 +228,22 @@ export async function checkEnrollMintRateLimit(
   }
 }
 
+/**
+ * Gives back the unit `checkEnrollMintRateLimit` took for a request that ended at the passkey page: nothing was coined, and the human
+ * needs a SECOND request (carrying the satisfied grant) to coin one, so charging both would halve the ceiling for no abuse prevented.
+ * Requests that never reach the passkey page (bad agent, no authority) keep paying. Best effort: the counter is already approximate.
+ */
+export async function refundEnrollMintRateLimit(env: Env, memberId: string): Promise<void> {
+  const key = `enroll-mint-rl:${memberId}`
+  try {
+    const raw = await env.SESSIONS.get(key)
+    const count = raw !== null ? parseInt(raw, 10) : 0
+    if (count > 0) await env.SESSIONS.put(key, String(count - 1), { expirationTtl: ENROLL_MINT_RL_TTL })
+  } catch {
+    // a refund that cannot be written leaves the unit charged: the safe direction
+  }
+}
+
 export function enrollThrottledBody(retryAfterSeconds: number) {
   const minutes = Math.max(1, Math.ceil(retryAfterSeconds / 60))
   return html`

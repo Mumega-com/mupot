@@ -45,6 +45,7 @@ import { requireAuth } from '../auth'
 import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertWritten } from '../lib/receipt'
+import { presenceGateJson } from '../approvals/gate'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import {
   requireCapability,
@@ -1608,6 +1609,25 @@ membersApp.post('/members/:id/tokens', requireAdminOrDelegated('mint_member_toke
   const label = body.label === undefined ? '' : body.label
   if (typeof label !== 'string' || label.length > 64) return c.json({ error: 'invalid_label' }, 400)
 
+  // A token authenticates AS the member: minting one from a signed-in browser (a web-session cookie) hands out standing, so it
+  // needs the acting member's passkey bound to exactly this mint, not just that cookie (which a program driving the browser also
+  // holds). The raw token is shown once on the dashboard's return page. Bearer callers (CLI, automation) are unchanged.
+  const mintAuth = c.get('auth')
+  if (mintAuth.webSessionIdHash) {
+    if (!mintAuth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
+    const tParams: Record<string, string | number | boolean> = { label }
+    if (typeof body.channel === 'string') tParams.channel = body.channel
+    if (typeof body.harness_kind === 'string') tParams.harness_kind = body.harness_kind
+    if (typeof body.expires_in_days === 'number') tParams.expires_in_days = body.expires_in_days
+    if (typeof body.non_expiring === 'boolean') tParams.non_expiring = body.non_expiring
+    const denied = await presenceGateJson(c, mintAuth.webSessionMemberId, {
+      kind: 'member_token_mint', subjectId: memberId, params: tParams,
+      summary: `Mint a token that signs in as member ${memberId}${label ? ` labelled "${label}"` : ''}`,
+      actionPath: `/api/members/${encodeURIComponent(memberId)}/tokens`, encoding: 'json', returnPath: '/admin/members',
+    })
+    if (denied) return denied
+  }
+
   // mupot#1794 W4 — harness token branch. It sits AFTER every gate above (org-admin floor via
   // requireCapability, member status/tenant, target-rank ceiling), so it is the SAME mint door with
   // the SAME authority checks, not a second one. It forces channel 'directory' (zero standing) itself;
@@ -1947,6 +1967,21 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
   // grant
   if (!isCapability(body.capability)) return c.json({ error: 'invalid_capability' }, 400)
   const capability: Capability = body.capability
+  // A grant WIDENS what a member (or an agent seat) may do. Made from a signed-in browser (a web-session cookie) it needs the
+  // member's own passkey: that cookie, even freshly re-authenticated, is also held by a program driving the browser. Bearer-token
+  // callers (CLI, automation, delegated agents already decided by the chokepoint above) are a different credential and unchanged.
+  const grantAuth = c.get('auth')
+  if (!delegatedWrite && grantAuth.webSessionIdHash) {
+    if (!grantAuth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
+    const gParams: Record<string, string> = { action: 'grant', scope_type: scopeType, capability }
+    if (scopeId !== null) gParams.scope_id = scopeId
+    const denied = await presenceGateJson(c, grantAuth.webSessionMemberId, {
+      kind: 'member_capability_grant', subjectId: memberId, params: gParams,
+      summary: `Grant ${capability} on ${scopeType}${scopeId ? ` ${scopeId}` : ''} to member ${memberId}`,
+      actionPath: `/api/members/${encodeURIComponent(memberId)}/capabilities`, encoding: 'json', returnPath: '/admin/members',
+    })
+    if (denied) return denied
+  }
   let agentCapability: AgentAccessCapability | null = null
   if (boundAgent) {
     if (!isAgentAccessCapability(capability)) {

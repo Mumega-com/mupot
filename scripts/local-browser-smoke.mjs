@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
 import { createHash } from 'node:crypto'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import { chromium } from 'playwright'
+import { LOCAL_PASSKEY_HOST } from './local-passkey-fixture.mjs'
 
 const baseUrl = (process.env.MUPOT_LOCAL_URL || process.argv[2] || 'http://127.0.0.1:8787').replace(/\/$/, '')
 const artifactsDir = path.resolve(process.env.MUPOT_SMOKE_ARTIFACTS || 'tmp/local-smoke')
@@ -31,6 +32,7 @@ const ownerProjectInitialGoal = 'Create a governed nested project through the da
 const ownerProjectEditedGoal = 'Prove the owner lifecycle is visible through the canonical Project situation.'
 const mcpOwnerToken = process.env.MUPOT_CONFORMANCE_OWNER_TOKEN
   || ['local', 'runtime', 'conformance', 'owner', 'token'].join('-')
+const passkeyOrigin = `https://${LOCAL_PASSKEY_HOST}`
 
 const pages = [
   '/',
@@ -121,6 +123,33 @@ const consoleErrors = []
 
 const results = []
 const workflows = []
+
+async function installLocalPasskey() {
+  const fixturePath = process.env.MUPOT_LOCAL_PASSKEY_FILE
+  if (!fixturePath) fail('local passkey fixture missing; run scripts/ci-local-evidence.sh')
+  const credential = JSON.parse(await readFile(fixturePath, 'utf8'))
+  const cdp = await context.newCDPSession(page)
+  await cdp.send('WebAuthn.enable')
+  const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
+    options: { protocol: 'ctap2', transport: 'internal', hasUserVerification: true,
+      isUserVerified: true, automaticPresenceSimulation: true },
+  })
+  await cdp.send('WebAuthn.addCredential', { authenticatorId, credential })
+  // Keep the browser's HTTPS origin/RP ID while forwarding transport to the isolated
+  // Wrangler listener. The real host gate, CSRF checks and assertion verifier still run.
+  await context.route(`${passkeyOrigin}/**`, async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    const headers = await request.allHeaders()
+    delete headers.cookie
+    headers.host = LOCAL_PASSKEY_HOST
+    const response = await context.request.fetch(`${baseUrl}${url.pathname}${url.search}`, {
+      method: request.method(), headers, data: request.postDataBuffer() ?? undefined,
+      maxRedirects: 0,
+    })
+    await route.fulfill({ response })
+  })
+}
 
 async function textSnippet(locator, limit = 240) {
   return (await locator.innerText({ timeout: 5_000 }).catch(() => '')).slice(0, limit)
@@ -743,16 +772,36 @@ async function runApprovalWorkflow() {
   }
 
   await card.locator('.appr-note').fill('Approved by local browser smoke.')
-  await card.locator('.appr-approve').click()
-  await page.waitForFunction(
-    (id) => document.querySelector(`[data-task="${id}"] .appr-status`)?.textContent?.includes('approved'),
-    taskId,
-    { timeout: 10_000 },
-  )
-  const approvedStatus = await textSnippet(card.locator('.appr-status'))
-  if (!approvedStatus.includes('approved')) {
-    fail('approval did not reach approved state', { approvedStatus })
+  const verdictPath = `/api/tasks/${encodeURIComponent(taskId)}/verdict`
+  const [refusal] = await Promise.all([
+    page.waitForResponse((r) => new URL(r.url()).pathname === verdictPath && r.request().method() === 'POST'),
+    card.locator('.appr-approve').click(),
+  ])
+  const presence = await refusal.json()
+  if (refusal.status() !== 403 || presence.error !== 'human_presence_required' || !presence.presence_grant) {
+    fail('session-only approval did not require a passkey', { status: refusal.status(), error: presence.error })
   }
+  const before = await context.request.get(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`)
+  if (before.status() !== 200 || (await before.json())?.task?.status !== 'review') fail('approval changed before passkey confirmation')
+  await page.waitForURL(`${passkeyOrigin}/m/presence/**`, { timeout: 10_000 })
+  const [confirmation] = await Promise.all([
+    page.waitForResponse((r) => r.url().startsWith(passkeyOrigin) && new URL(r.url()).pathname.endsWith('/decide')),
+    page.locator('[data-act="approve"]').click(),
+  ])
+  if (confirmation.status() !== 200 || (await confirmation.json()).ok !== true) fail('passkey confirmation failed')
+  await page.getByRole('link', { name: 'go back to the dashboard', exact: true }).click()
+  const [applied] = await Promise.all([
+    page.waitForResponse((r) => new URL(r.url()).pathname === verdictPath && r.request().method() === 'POST'),
+    page.locator('#presence-apply').click(),
+  ])
+  if (applied.status() !== 200) fail('passkey-approved decision was not applied', { status: applied.status() })
+  const after = await context.request.get(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`)
+  if (after.status() !== 200 || (await after.json())?.task?.status !== 'approved') fail('approval did not persist approved state')
+  const replay = await context.request.post(`${baseUrl}${verdictPath}?presence_grant=${encodeURIComponent(presence.presence_grant)}`, {
+    data: { verdict: 'approved', note: 'Approved by local browser smoke.' },
+  })
+  if (replay.ok()) fail('approval grant was reusable')
+  await page.waitForURL(`${baseUrl}/approvals`, { timeout: 10_000 })
 
   await page.screenshot({ path: path.join(artifactsDir, 'approvals-workflow.png'), fullPage: true })
   workflows.push({
@@ -761,6 +810,9 @@ async function runApprovalWorkflow() {
     taskId,
     title: approvalTaskTitle,
     verdict: 'approved',
+    presenceRequired: true,
+    passkeyConfirmed: true,
+    replayRefused: true,
   })
 }
 
@@ -1032,6 +1084,7 @@ export async function runLocalBrowserSmoke() {
   page.on('pageerror', (err) => consoleErrors.push(err.message))
 
   try {
+    await installLocalPasskey()
     const login = await page.goto(`${baseUrl}/auth/dev-login`, { waitUntil: 'networkidle', timeout: 20_000 })
     if (!login || login.status() >= 400) fail('dev login failed', { status: login?.status() })
     await runLoginWorkflow()

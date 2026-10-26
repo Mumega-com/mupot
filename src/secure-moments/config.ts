@@ -66,3 +66,10 @@ export function enrolUrl(env: Env, token: string): string | null {
   if (status.state !== 'on') return null
   return `${secureOrigin(status.host)}/m/enrol/${encodeURIComponent(token)}`
 }
+
+/** The link a human opens to prove presence for one dashboard decision (src/approvals/human-presence.ts). Null while off. */
+export function momentsPresenceUrl(env: Env, grantId: string, token: string): string | null {
+  const status = secureMomentsStatus(env)
+  if (status.state !== 'on') return null
+  return `${secureOrigin(status.host)}/m/presence/${encodeURIComponent(grantId)}/${encodeURIComponent(token)}`
+}

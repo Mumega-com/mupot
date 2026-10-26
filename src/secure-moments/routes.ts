@@ -13,6 +13,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
 import { secureMomentsStatus, secureOrigin } from './config'
+import { approveUrl } from '../access/config'
 import { issueBoundToken, verifyBoundToken } from '../access/csrf'
 import { buildAuth, memberIsActiveHuman, mintApproverSession } from '../access/identity'
 import { escapeHtml, messagePage, renderPage, untrustedBox } from '../access/page'
@@ -40,6 +41,10 @@ import { mountTelegramMiniapp } from './telegram-miniapp'
 import { isAttachCeiling, type AttachCeiling } from '../auth/attached-ceiling'
 import { loadSquadJoin, squadJoinIsPendingLive, squadJoinView, decideSquadJoin, type SquadJoinRow } from '../members/squad-join'
 import { admissionIsPendingLive, admissionView, decideSeatAdmission, loadAdmission, seatAttachEnabled, type AdmissionRow } from '../members/seat-attach'
+
+import {
+  dashboardUrl, loadPresenceGrant, presenceGrantIsPending, presenceLinkMatches, satisfyPresenceGrant, type PresenceGrantRow,
+} from '../approvals/human-presence'
 
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
 
@@ -134,6 +139,7 @@ async function jsonGuard(c: Context<AppEnv>, maxBytes = MAX_BODY_BYTES): Promise
 const str = (v: unknown, max = 4096): string | undefined => (typeof v === 'string' && v.length <= max ? v : undefined)
 const momentCsrfMessage = (id: string, linkHash: string): string => `mupot:secure-moment:v1|moment|${id}|${linkHash}`
 const enrolCsrfMessage = (id: string, linkHash: string): string => `mupot:secure-moment:v1|enrol|${id}|${linkHash}`
+const presenceCsrfMessage = (id: string, linkHash: string): string => `mupot:secure-moment:v1|presence|${id}|${linkHash}`
 
 async function checkCsrf(c: Context<AppEnv>, message: string, token: unknown): Promise<Response | null> {
   const r = await verifyBoundToken(c.env, CSRF_INFO, message, token)
@@ -384,6 +390,100 @@ momentsApp.post('/m/enrol/:token/finish', async (c) => {
   }
   await recordPasskeyAudit(c.env, { operation: 'passkey_enrol', memberId: e.t.member_id, passkeyId: done.passkeyId, evidence: { login_identity_id: e.t.login_identity_id ?? '' } })
   return json(c, 200, { ok: true, title: 'Passkey registered', message: 'You can close this page. Approvals you are asked to confirm will use this passkey.' })
+})
+
+// ── presence grants: one dashboard decision that widens authority, confirmed by a UV passkey assertion ──
+// The assertion's challenge is bound to (grant id, 'approve', sha256 of the canonical decision). The verifier, the
+// challenge store, the counter rule and the live-identity rule are the SAME ones the moments above use. The grant only
+// becomes `satisfied`; the dashboard route that performs the decision consumes it (src/approvals/human-presence.ts).
+async function resolvePresence(c: Context<AppEnv>): Promise<{ ok: true; g: PresenceGrantRow; token: string; linkHash: string } | { ok: false; res: Response }> {
+  const id = c.req.param('id') ?? ''
+  const token = c.req.param('token') ?? ''
+  const g = id.length <= 64 ? await loadPresenceGrant(c.env, id) : null
+  if (!g || !(await presenceLinkMatches(g, token))) return { ok: false, res: NOT_FOUND(c) }
+  if (!presenceGrantIsPending(g, Date.now())) {
+    return { ok: false, res: c.req.method === 'GET'
+      ? page(c, 410, 'Link closed', g.status === 'satisfied' ? 'Your passkey already confirmed this. Go back to the dashboard to apply it.' : 'This approval link has expired or was already used.', 'warn')
+      : fail(c, 409, 'This link is no longer usable.', 'Link closed') }
+  }
+  return { ok: true, g, token, linkHash: await tokenHash(token) }
+}
+
+momentsApp.get('/m/presence/:id/:token', async (c) => {
+  const r = await resolvePresence(c)
+  if (!r.ok) return r.res
+  const csrf = await issueBoundToken(c.env, CSRF_INFO, presenceCsrfMessage(r.g.id, r.linkHash))
+  if (!csrf) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for secure moments.')
+  // Dashboard decisions are applied from the dashboard's return page; the Access page's own Approve button is pressed again where it was.
+  const accessKind = r.g.kind === 'access_seed_approve' ? 'seed' : r.g.kind === 'access_elevation_approve' ? 'elevation' : null
+  const back = accessKind
+    ? ((base) => (base ? `${base}?presence_grant=${encodeURIComponent(r.g.id)}` : null))(approveUrl(c.env, accessKind, r.g.subject_id))
+    : dashboardUrl(c.env, `/presence/${encodeURIComponent(r.g.id)}`)
+  const body = `<h1>Confirm with your passkey</h1>
+<form id="decision-form" data-csrf="${csrf}"><div class="card"><p><strong>${escapeHtml(r.g.summary)}</strong></p>
+<p class="muted">This gives an agent or a chat more reach. Deciding needs your passkey; opening this page decided nothing. Expires ${escapeHtml(r.g.expires_at.slice(0, 16).replace('T', ' '))} UTC.</p></div>
+<div class="row"><button class="primary" type="button" data-act="approve">Approve with passkey</button></div></form>
+<div id="status" role="status"></div>
+${back ? `<p class="muted">After it says confirmed, <a href="${escapeHtml(back)}" rel="noopener">go back to the dashboard</a> and apply it.</p>` : ''}
+${decideHelpBlock(c.env)}`
+  secure(c, true)
+  return c.html(renderPage('Confirm with your passkey', body, { nonce: c.get('nonce'), code: DECIDE_SCRIPT }))
+})
+
+momentsApp.post('/m/presence/:id/:token/challenge', async (c) => {
+  const g = await jsonGuard(c)
+  if (!g.ok) return g.res
+  const r = await resolvePresence(c)
+  if (!r.ok) return r.res
+  const bad = await checkCsrf(c, presenceCsrfMessage(r.g.id, r.linkHash), g.body.csrf)
+  if (bad) return bad
+  const challenge = await mintDecideChallenge(c.env, { momentId: r.g.id, decision: 'approve', payloadSha256: r.g.params_sha256 })
+  if (!challenge) return fail(c, 409, 'Too many unfinished attempts on this link. Wait a few minutes.', 'Try later')
+  const allow = (await listMemberPasskeys(c.env, r.g.member_id)).map((k) => ({ type: 'public-key' as const, id: k.credential_id }))
+  return json(c, 200, { ok: true, publicKey: { challenge, rpId: c.get('host'), timeout: 120000, userVerification: 'required', allowCredentials: allow } })
+})
+
+momentsApp.post('/m/presence/:id/:token/decide', async (c) => {
+  const g = await jsonGuard(c)
+  if (!g.ok) return g.res
+  const r = await resolvePresence(c)
+  if (!r.ok) return r.res
+  const bad = await checkCsrf(c, presenceCsrfMessage(r.g.id, r.linkHash), g.body.csrf)
+  if (bad) return bad
+  const cred = g.body.credential
+  if (typeof cred !== 'object' || cred === null) return fail(c, 400, 'Missing credential.', 'Bad request')
+  const rawId = 'rawId' in cred ? str(cred.rawId, 2048) : undefined
+  const resp = 'response' in cred ? cred.response : undefined
+  if (!rawId || typeof resp !== 'object' || resp === null) return fail(c, 400, 'Malformed credential.', 'Bad request')
+  const clientDataJSON = 'clientDataJSON' in resp ? resp.clientDataJSON : undefined
+  const authenticatorData = 'authenticatorData' in resp ? resp.authenticatorData : undefined
+  const signature = 'signature' in resp ? resp.signature : undefined
+  const challenge = challengeOf(clientDataJSON)
+  if (!challenge) return fail(c, 400, 'Malformed credential.', 'Bad request')
+  const now = Date.now()
+  // 1. Single-use challenge bound to THIS grant and THIS decision's parameter digest; a challenge minted for any other
+  //    grant (so any other decision) consumes nothing here.
+  if (!(await consumeDecideChallenge(c.env, challenge, { momentId: r.g.id, decision: 'approve', payloadSha256: r.g.params_sha256 }, now))) {
+    return fail(c, 403, 'The passkey challenge is invalid, expired, already used, or was issued for a different decision. Reload and try again.')
+  }
+  // 2. Whose credential: it must be the passkey of the member the decision belongs to.
+  const passkey = await loadPasskeyByCredential(c.env, rawId)
+  if (!passkey || passkey.revoked_at !== null || passkey.member_id !== r.g.member_id) return fail(c, 403, 'This passkey is not recognised.')
+  // 3. The assertion: origin, RP ID, user presence AND user verification, signature over the exact challenge.
+  const host = c.get('host')
+  const v = await verifyAssertion({ clientDataJSON, authenticatorData, signature }, { challenge, origin: secureOrigin(host), rpId: host }, passkey.public_key)
+  if (!v.ok) return fail(c, 403, `The passkey could not be verified (${v.reason}).`)
+  if (!(await memberIsActiveHuman(c.env, passkey.member_id))) return fail(c, 403, 'This passkey is not recognised.')
+  if (!(await advancePasskeyCounter(c.env, passkey.id, v.signCount, now))) {
+    return fail(c, 403, 'This passkey reported a counter that did not advance. It may have been cloned; remove it and register again.')
+  }
+  if (!(await liveIdentityFor(c.env, passkey.member_id, passkey.login_identity_id))) {
+    return fail(c, 409, 'This passkey is not bound to a live login identity, so it cannot decide. Sign in and add a passkey again.', 'Not decided')
+  }
+  if (!(await satisfyPresenceGrant(c.env, { id: r.g.id, token: r.token, memberId: passkey.member_id, passkeyId: passkey.id }, Date.now()))) {
+    return fail(c, 409, 'This approval was already confirmed, closed, or could not be completed.', 'Not confirmed')
+  }
+  return json(c, 200, { ok: true, title: 'Confirmed', message: 'Your passkey confirmed this decision. Go back to the dashboard and apply it; it is valid for a few minutes.' })
 })
 
 // ── the vendored sealer (secure drops) ──────────────────────────────────────────────────────────

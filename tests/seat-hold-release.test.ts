@@ -18,6 +18,7 @@ import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
 import { HELD_FLOOR_TOOLS, OBSERVED_FLOOR_TOOLS, instantObservedJoin, observedFloorRefusal } from '../src/members/vip-lane'
 import { changeSeatAdmission } from '../src/members/seat-hold-release'
 import type { AuthContext, Env } from '../src/types'
+import { seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'mumega'
 const OWNER = 'member-owner' // admin on squad-target + admin on its own home squad (squad-core hosts its seat agents)
@@ -108,17 +109,22 @@ async function session(e: Env, email: string): Promise<string> {
   const res = await authApp.request('/dev-login', {}, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: email } as unknown as Env)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  const member = h.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+  if (member) seedPasskey(h.sqlite, TENANT, member.id) // widening transitions need the member's passkey; this suite tests the OTHER behaviour (tests/human-presence.test.ts has the real ceremony)
   return `mupot_session=${m[1]}`
 }
-async function dash(e: Env, cookie: string, path: string, origin: string | null = 'http://localhost'): Promise<Response> {
+async function dash(e: Env, cookie: string, path: string, origin: string | null = 'http://localhost', gated = true): Promise<Response> {
   const { dashboardApp } = await import('../src/dashboard/index')
   const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }
   if (origin) headers.origin = origin
-  return dashboardApp.request(path, { method: 'POST', headers, body: '{}' }, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'x' } as unknown as Env)
+  const call = (qs: string): Promise<Response> => Promise.resolve(dashboardApp.request(`${path}${qs ? `?${qs}` : ''}`, { method: 'POST', headers, body: '{}' }, { ...e, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'x' } as unknown as Env))
+  return gated ? throughGate(h.sqlite, TENANT, call) : call('') // gated=false: the session alone, no passkey
 }
 const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
 const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()) }
 const post = (cookie: string, seatId: string, action: string, e: Env = env): Promise<Response> => dash(e, cookie, `/connections/seats/${seatId}/${action}`)
+/** The session alone (no passkey): what a program driving the browser has. */
+const postSessionOnly = (cookie: string, seatId: string, action: string): Promise<Response> => dash(env, cookie, `/connections/seats/${seatId}/${action}`, 'http://localhost', false)
 
 describe('transitions by the owner', () => {
   it('hold, return and release each move the status and write one audit row (who, from, to, at)', async () => {
@@ -161,7 +167,7 @@ describe('transitions by the owner', () => {
     }
   })
 
-  it('trusted is not a one-way door: hold and return from trusted work on a STALE session (they reduce reach); held -> observed does not', async () => {
+  it('trusted is not a one-way door: hold and return from trusted work on a STALE session (they reduce reach); held -> observed needs the passkey', async () => {
     const s = await seatFor(OWNER)
     const cookie = await session(env, `${OWNER}@example.test`)
     stale()
@@ -172,7 +178,7 @@ describe('transitions by the owner', () => {
     expect((await post(cookie, s.seatId, 'return')).status).toBe(200)
     expect(status(s.seatId)).toBe('observed')
     setStatus(s.seatId, 'held')
-    expect((await post(cookie, s.seatId, 'return')).status).toBe(403)
+    expect((await postSessionOnly(cookie, s.seatId, 'return')).status).toBe(403)
     expect(status(s.seatId)).toBe('held')
     // the writer enforces freshness itself, not only the route
     expect(await changeSeatAdmission(env, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: false })).toEqual({ ok: false, error: 'reauth_required' })
@@ -192,15 +198,17 @@ describe('transitions by the owner', () => {
     expect(status(s.seatId)).toBe('observed')
   })
 
-  it('release and return need a FRESH reauth; hold does not; a cross-origin POST is refused', async () => {
+  it('release and return need the passkey, not a session (fresh or stale); hold does not; a cross-origin POST is refused', async () => {
     const s = await seatFor(OWNER)
     const cookie = await session(env, `${OWNER}@example.test`)
     stale()
     setStatus(s.seatId, 'held')
-    expect((await post(cookie, s.seatId, 'release')).status).toBe(403)
-    expect((await post(cookie, s.seatId, 'return')).status).toBe(403)
+    expect((await postSessionOnly(cookie, s.seatId, 'release')).status).toBe(403)
+    expect((await postSessionOnly(cookie, s.seatId, 'return')).status).toBe(403)
     expect(status(s.seatId)).toBe('held')
     fresh()
+    expect((await postSessionOnly(cookie, s.seatId, 'release')).status).toBe(403) // a fresh sign-in is not the passkey either
+    expect(status(s.seatId)).toBe('held')
     expect((await dash(env, cookie, `/connections/seats/${s.seatId}/return`, 'http://evil.test')).status).toBe(403)
     expect(status(s.seatId)).toBe('held')
   })

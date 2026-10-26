@@ -22,6 +22,10 @@ FLEET_CONSUMER_AGENT = "agent-conformance"
 FLEET_PANEL_SK = '{"key_ops":["sign"],"ext":true,"crv":"Ed25519","d":"A_6puAn1tqVfizGWw7do9ziWz2cqDv4QLW3mLgjV43k","x":"bqjg1QCM1_F1Oe4xxjDidrEkNzkgwbAUk65dJUYFaLI","kty":"OKP"}'
 LOCAL_TEST_AUTH = "1"
 LOCAL_TEST_AUTH_EMAIL = "local-owner@mupot.test"
+# Local-only ceremony fixtures. No deployed credentials are used by this harness.
+SECURE_MOMENTS = "1"
+SECURE_MOMENTS_HOST = "passkeys.mupot.test"
+CONNECTOR_MASTER_KEY = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 IM_WEBHOOK_SECRET = "local-im-secret"
 GITHUB_PLAN_TIER = "team"
 

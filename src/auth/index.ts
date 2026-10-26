@@ -33,6 +33,7 @@ import { decideIdentitylessAttach } from '../members/exclusive-control'
 import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
 import { linkSignIn, planLinkSignIn, unlinkSignIn } from './link-signin'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { presenceGateJson } from '../approvals/gate'
 import {
   createWebSession,
   evaluateWebSession,
@@ -1997,7 +1998,27 @@ authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
 
   const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
   const currentWebSession = await loadWebSessionByHash(c.env, c.env.TENANT_SLUG, auth.webSessionIdHash)
-  const recentReauthOk = currentWebSession ? hasRecentReauth(currentWebSession) : false
+  let recentReauthOk = currentWebSession ? hasRecentReauth(currentWebSession) : false
+
+  // Approving WIDENS an agent's reach. A web session, even freshly re-authenticated, is something a program driving the browser
+  // also holds, so an approve needs the member's passkey bound to exactly these parameters (a deny stays session-only). The
+  // passkey's user verification is also the step-up the sensitive actions ask for, so a redeemed grant counts as recent reauth.
+  if (decision === 'approve') {
+    const pParams: Record<string, string | number | string[]> = { decision: 'approve' }
+    if (Array.isArray(body.actions)) pParams.actions = body.actions.filter((a): a is string => typeof a === 'string').sort()
+    if (typeof body.scope_type === 'string') pParams.scope_type = body.scope_type
+    if (typeof body.scope_id === 'string') pParams.scope_id = body.scope_id
+    if (typeof body.duration_minutes === 'number') pParams.duration_minutes = body.duration_minutes
+    if (typeof body.note === 'string') pParams.note = body.note
+    const requestId = c.req.param('id')
+    const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+      kind: 'elevation_approve', subjectId: requestId, params: pParams,
+      summary: `Approve elevation request ${requestId.slice(0, 8)}: ${Array.isArray(pParams.actions) ? pParams.actions.join(', ') : 'the requested actions'}`,
+      actionPath: `/auth/elevation/requests/${encodeURIComponent(requestId)}/decide`, encoding: 'json', returnPath: '/elevation',
+    })
+    if (denied) return denied
+    recentReauthOk = true
+  }
 
   const result = await decideElevationRequest(c.env, {
     tenant: c.env.TENANT_SLUG,

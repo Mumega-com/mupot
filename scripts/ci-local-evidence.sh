@@ -224,6 +224,14 @@ say "Seeding local D1 fixtures"
   --persist-to "${STATE_DIR}" \
   --file scripts/local-test-seed.sql
 
+say "Preparing the local browser passkey"
+node scripts/local-passkey-fixture.mjs "${STATE_DIR}"
+"${WRANGLER[@]}" d1 execute mupot-local-test \
+  --local \
+  --config wrangler-local-test.toml \
+  --persist-to "${STATE_DIR}" \
+  --file "${STATE_DIR}/passkey.sql"
+
 say "Starting local Wrangler server at ${BASE_URL}"
 : >"${WRANGLER_LOG}"
 start_wrangler
@@ -234,6 +242,7 @@ say "Running browser workflow smoke"
 assert_dev_process_alive
 MUPOT_LOCAL_URL="${BASE_URL}" \
 MUPOT_SMOKE_ARTIFACTS="${SMOKE_DIR}" \
+MUPOT_LOCAL_PASSKEY_FILE="${STATE_DIR}/passkey.json" \
   npm run smoke:local
 
 say "Running runtime adapter conformance"

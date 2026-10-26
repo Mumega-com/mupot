@@ -15,6 +15,7 @@ import { makeOperatorsApp } from '../src/dashboard/operators'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'local'
 const ORIGIN = 'http://localhost'
@@ -40,6 +41,7 @@ function makeEnv(email: string): Env {
     SESSIONS: kv(),
     DB: harness.db,
     DELEGATED_OPERATORS: flag,
+    ...PRESENCE_ENV,
   } as unknown as Env
 }
 
@@ -49,6 +51,8 @@ async function login(email: string): Promise<{ env: Env; cookie: string }> {
   expect(res.status).toBe(302)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  const member = harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+  if (member) seedPasskey(harness.sqlite, TENANT, member.id) // creating a delegation needs the member's passkey; the real ceremony is tests/human-presence.test.ts
   return { env, cookie: `mupot_session=${m[1]}` }
 }
 
@@ -59,10 +63,11 @@ function setReauth(memberId: string, at: string | null): void {
 const freshNow = () => new Date().toISOString()
 const stale = () => new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()
 
-function post(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = ORIGIN) {
+function post(env: Env, cookie: string, path: string, body?: unknown, origin: string | null = ORIGIN, gated = true) {
   const headers: Record<string, string> = { cookie, 'content-type': 'application/json' }
   if (origin) headers.origin = origin
-  return dashboardApp.request(path, { method: 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body) }, env)
+  const call = (qs: string): Promise<Response> => Promise.resolve(dashboardApp.request(`${path}${qs ? `?${qs}` : ''}`, { method: 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body) }, env))
+  return gated ? throughGate(harness.sqlite, TENANT, call) : call('') // gated=false: the session alone, no passkey
 }
 
 const DELEGATE = { agent_id: 'agent-A', scope_type: 'squad', scope_id: 'S1', max_grant: 'member' }

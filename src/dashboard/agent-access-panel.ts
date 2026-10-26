@@ -277,6 +277,17 @@ async function currentCapability(
   return row?.capability ?? null
 }
 
+/**
+ * Does this 'set' give the agent MORE reach on the squad than the admin saw it hold? Only then is it a widening decision that
+ * needs the member's passkey; keeping or lowering a level (and every revoke) stays session-only. `expected*` are what the admin
+ * SAW; the writer compares them to the live rows at write time, so a misstated prior can only make the write fail, never widen.
+ * An unreadable level counts as widening (fail closed).
+ */
+export function accessSetWidens(input: Pick<AccessChangeInput, 'capability' | 'expectedCapability' | 'expectedMembership'>): boolean {
+  const rank = (v: string): number => (v === 'none' ? 0 : isAgentAccessCapability(v) ? capabilityRank(v) : Number.MAX_SAFE_INTEGER)
+  return rank(input.capability) > Math.max(rank(input.expectedCapability), rank(input.expectedMembership))
+}
+
 export async function applyAgentAccessChange(
   env: Env,
   auth: AuthContext,

@@ -16,13 +16,18 @@ import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as realDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_FLAGS, gatedApp } from './helpers/presence'
 import { mcpApp } from '../src/mcp'
 import { AgentInactiveError, mintAgentBoundToken, prepareAgentBoundTokenMint, prepareDirectoryTokenInsert } from '../src/members/service'
 import { resolveMemberByToken } from '../src/auth/member-bearer'
 import { resolveExternalToken } from '../src/mcp/oauth-authorize'
 import type { Env } from '../src/types'
 import { mcpRequest, callToolOutcome } from './helpers/mcp-call'
+
+// A mint hands an agent a credential and now needs the member's passkey; this suite tests the route's OTHER behaviour, so a POST that ends at
+// the passkey refusal is satisfied by the DB shortcut and repeated (the gate itself: tests/human-presence.test.ts).
+const dashboardApp = gatedApp(realDashboardApp)
 
 const TENANT = 'pot-1961'
 const ORIGIN = 'https://pot.test'
@@ -40,7 +45,9 @@ function setup(): { env: Env; q: (sql: string) => Array<Record<string, unknown>>
     INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-a', 'dept-a', 'sq-a', 'Squad A');
     INSERT INTO members (id, email, display_name, status, tenant) VALUES
       ('m-admin', 'admin@pot.test', 'Admin', 'active', '${TENANT}'),
-      ('m-op', 'op@pot.test', 'Operator', 'active', '${TENANT}');
+      ('m-op', 'op@pot.test', 'Operator', 'active', '${TENANT}'),
+      ('m-owner', 'owner@pot.test', 'Owner', 'active', '${TENANT}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-owner-org', 'm-owner', 'org', NULL, 'owner');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
       ('c-admin', 'm-admin', 'squad', 'sq-a', 'admin'),
       ('c-op', 'm-op', 'squad', 'sq-a', 'admin'),
@@ -59,7 +66,7 @@ function setup(): { env: Env; q: (sql: string) => Array<Record<string, unknown>>
   ])
   const kv = new Map<string, string>()
   const env = {
-    DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'T', PUBLIC_ORIGIN: ORIGIN,
+    DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'T', PUBLIC_ORIGIN: ORIGIN, ...PRESENCE_FLAGS,
     SESSIONS: { get: async (k: string) => store.get(k) ?? null, put: async (k: string, v: string) => { store.set(k, v) }, delete: async (k: string) => { store.delete(k) } },
     OAUTH_KV: { get: async (k: string) => kv.get(k) ?? null, put: async (k: string, v: string) => { kv.set(k, v) }, delete: async (k: string) => { kv.delete(k) } },
     VEC: { query: async () => ({ matches: [] }) }, BUS: { send: async () => {} }, BLOBS: {}, AI: {}, AGENT: {}, SQUAD: {},

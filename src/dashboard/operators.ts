@@ -26,6 +26,7 @@ import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Env } from '../types'
 import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { presenceGateJson } from '../approvals/gate'
 import { RECENT_REAUTH_WINDOW_MINUTES } from '../auth/web-sessions'
 import {
   createDelegation,
@@ -152,7 +153,9 @@ function operatorsScript(): Html {
             var res = await fetch('/operators/delegate', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
             var data = await res.json().catch(function () { return {}; });
             if (res.ok) { window.location.reload(); return; }
-            if (data.error === 'reauth_required') reauthLink();
+            if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); return; }
+            if (data.error === 'human_presence_unavailable' || data.error === 'passkey_enrolment_required' || data.error === 'presence_grant_invalid' || data.error === 'too_many_pending') say(data.message || 'This needs your passkey.');
+            else if (data.error === 'reauth_required') reauthLink();
             else say('Could not create (' + (data.error || res.status) + ').');
           } catch (e) { say('Network error — try again.'); }
           add.disabled = false;
@@ -282,6 +285,19 @@ export function makeOperatorsApp(shell: ShellFn) {
       return c.json({ error: 'bad_request' }, 400)
     }
     if (typeof body.agent_id !== 'string' || body.agent_id.trim().length === 0) return c.json({ error: 'bad_request' }, 400)
+    // Delegating an operator hands an agent standing to act: it widens an agent's authority, so it needs the member's passkey
+    // (revoke below stays session-only). Only plain-string fields can be re-posted; anything else is not a valid delegation anyway.
+    if (typeof body.scope_type !== 'string' || typeof body.max_grant !== 'string' || (body.scope_id !== undefined && body.scope_id !== null && typeof body.scope_id !== 'string')) {
+      return c.json({ error: 'bad_request' }, 400)
+    }
+    const dParams: Record<string, string> = { agent_id: body.agent_id.trim(), scope_type: body.scope_type, max_grant: body.max_grant }
+    if (typeof body.scope_id === 'string') dParams.scope_id = body.scope_id
+    const denied = await presenceGateJson(c, session.memberId, {
+      kind: 'operator_delegate', subjectId: dParams.agent_id, params: dParams,
+      summary: `Let agent ${dParams.agent_id} act as a delegated operator on ${dParams.scope_type}${dParams.scope_id ? ` ${dParams.scope_id}` : ''} up to ${dParams.max_grant}`,
+      actionPath: '/operators/delegate', encoding: 'json', returnPath: '/operators',
+    })
+    if (denied) return denied
     const result = await createDelegation(c.env, auth, {
       agentId: body.agent_id.trim(),
       scopeType: body.scope_type,

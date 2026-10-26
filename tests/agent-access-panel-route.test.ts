@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -72,7 +73,11 @@ function setup(): { harness: SqliteD1Harness; env: Env } {
     OAUTH_KV: { get: async () => null, put: async () => undefined },
     VEC: { query: async () => ({ matches: [] }) }, BUS: { send: async () => {} },
     BLOBS: {}, AI: {}, AGENT: {}, SQUAD: {},
+    ...PRESENCE_ENV, PUBLIC_ORIGIN: ORIGIN,
   } as unknown as Env
+  // Raising an agent's access needs the acting member's passkey; this suite tests the OTHER behaviour, so members have a passkey row
+  // and the gate is passed through the DB shortcut (the real ceremony: tests/human-presence.test.ts).
+  for (const m of harness.sqlite.prepare('SELECT id FROM members WHERE tenant = ?').all(TENANT) as Array<{ id: string }>) seedPasskey(harness.sqlite, TENANT, m.id)
   return { harness, env }
 }
 
@@ -83,11 +88,11 @@ const asHadi = (): AuthContext =>
   ({ userId: 'm-hadi', email: null, role: 'member', tenant: TENANT, memberId: 'm-hadi', capabilities: [g('m-hadi', 'admin')] })
 
 function post(env: Env, path: string, values: Record<string, string>, origin: string = ORIGIN): Promise<Response> {
-  return Promise.resolve(dashboardApp.request(`${ORIGIN}${path}`, {
+  return throughGate(open?.sqlite as never, TENANT, (qs) => Promise.resolve(dashboardApp.request(`${ORIGIN}${path}${qs ? `?${qs}` : ''}`, { // as: throughGate takes the minimal Sqlite shape the harness satisfies
     method: 'POST',
     headers: { Origin: origin, 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(values),
-  }, env))
+  }, env)))
 }
 
 const rows = (h: SqliteD1Harness) =>
@@ -188,6 +193,7 @@ describe('POST /agents/:id/access', () => {
         ('c-own', 'm-own', 'org', NULL, 'owner'),
         ('c-rava-owner', 'm-rava', 'squad', 'sq-ops', 'owner');
     `)
+    seedPasskey(harness.sqlite, TENANT, 'm-own')
     authState.current = { userId: 'm-own', email: null, role: 'member', tenant: TENANT, memberId: 'm-own', capabilities: [g('m-own', 'owner')] }
     const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })
     const body = await res.text()

@@ -23,6 +23,7 @@ import { REFERRER_POLICY } from '../src/access/routes'
 import { SUBMIT_ONCE_SCRIPT } from '../src/access/page'
 import { advertisedTools } from '../src/mcp/index'
 import * as seedApply from '../src/seeds/apply'
+import { PRESENCE_ENV, enrolPasskey, presenceRefusal, realTap, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'tenant-a'
 const TEAM = 'acme.cloudflareaccess.com'
@@ -201,6 +202,7 @@ function setupDb(): void {
 async function link(sub: string, memberId: string, email: string): Promise<void> {
   const r = await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: sub, verifiedEmail: email, memberId })
   if (!r.ok) throw new Error(`link failed ${JSON.stringify(r)}`)
+  seedPasskey(harness.sqlite, TENANT, memberId) // an APPROVE here needs the member's passkey; the real ceremony and the refusals are in the 'approve needs the passkey' describe below
 }
 // Access identities are linked EXPLICITLY (the page never links anything); the fixture does what the owner's one-time ceremony does.
 beforeEach(async () => {
@@ -214,8 +216,15 @@ function stubJwks(keys: TestKey[] = [key]): void {
   vi.stubGlobal('fetch', vi.fn(async () => jwksResponse(keys)))
 }
 
-interface Req { method?: string; jwt?: string | null; origin?: string | null; host?: string; form?: Record<string, string | string[]>; extra?: Record<string, string> }
+interface Req { method?: string; jwt?: string | null; origin?: string | null; host?: string; form?: Record<string, string | string[]>; extra?: Record<string, string>; /** false: the Access login alone, no passkey */ gated?: boolean }
+/** A POST passes the presence gate through the DB shortcut (the session/Access login alone is refused: see 'approve needs the passkey'). */
 async function hit(path: string, r: Req = {}, e: Env = env, ctx?: ExecutionContext): Promise<Response> {
+  if (r.method !== 'POST' || r.gated === false) return rawHit(path, r, e, ctx)
+  // secure moments are switched on for the approving POST only: the tool/GET tests above pin the Access-only wiring
+  const withSecure = { ...e, SECURE_MOMENTS: PRESENCE_ENV.SECURE_MOMENTS, SECURE_MOMENTS_HOST: PRESENCE_ENV.SECURE_MOMENTS_HOST } as Env
+  return throughGate(harness.sqlite, TENANT, (qs) => rawHit(qs ? `${path}?${qs}` : path, r, withSecure, ctx))
+}
+async function rawHit(path: string, r: Req = {}, e: Env = env, ctx?: ExecutionContext): Promise<Response> {
   stubJwks()
   const headers = new Headers(r.extra)
   const jwt = r.jwt === undefined ? await sign() : r.jwt
@@ -518,6 +527,91 @@ describe('approve page: seed', () => {
     expect((await hit(`/approve/seed/${id}`, { jwt: plain })).status).toBe(404)
     expect((await hit(`/approve/seed/${id}`, { jwt: plain, method: 'POST', form: { csrf: 'x'.repeat(64), decision: 'approve' } })).status).toBe(403) // CSRF first
     expect(count('project_seeds')).toBe(0)
+  })
+})
+
+// ── an APPROVE needs the member's passkey, not the Access login ───────────────────────────────────
+// A Cloudflare Access login (even a fresh one) is also held by a program driving the human's browser. The Access page therefore answers an
+// approve with the passkey page for that exact decision; the Approve button decides only when the page is reached again with a grant a REAL
+// user-verified assertion satisfied for these parameters. Deny stays on the Access login alone (it reduces authority).
+describe('approve needs the passkey (Access page)', () => {
+  const secureEnv = (): Env => ({ ...env, SECURE_MOMENTS: PRESENCE_ENV.SECURE_MOMENTS, SECURE_MOMENTS_HOST: PRESENCE_ENV.SECURE_MOMENTS_HOST }) as Env
+
+  it('seed: the Access login alone is refused; nothing is applied; a pending grant and a passkey link are given', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const res = await rawHit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } }, secureEnv())
+    expect(res.status).toBe(403)
+    const refusal = await presenceRefusal(res)
+    expect(refusal?.approveUrl).toMatch(/^https:\/\/secure\.example\.test\/m\/presence\//)
+    expect(count('project_seeds')).toBe(0)
+    expect(count('presence_grants', "kind = 'access_seed_approve' AND status = 'pending'")).toBe(1)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'pending' })
+  })
+
+  it('seed: after a real UV tap the same Approve decides, once; a second use of the grant is refused', async () => {
+    const e = secureEnv()
+    const authn = await enrolPasskey(e, harness.sqlite, 'mem-owner')
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const refused = await rawHit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } }, e)
+    const { grantId, approveUrl } = (await presenceRefusal(refused)) ?? { grantId: '', approveUrl: null }
+    expect(approveUrl).not.toBeNull()
+    expect((await realTap(e, authn, approveUrl ?? '')).status).toBe(200)
+    // the passkey page sends the human back to this Approve button, which now carries the grant
+    const back = await rawHit(`/approve/seed/${id}?presence_grant=${grantId}`, {}, e)
+    expect(await back.text()).toContain(`action="/approve/seed/${id}?presence_grant=${grantId}"`)
+    const done = await rawHit(`/approve/seed/${id}?presence_grant=${grantId}`, { method: 'POST', form: { csrf, decision: 'approve' } }, e)
+    expect(done.status, await done.clone().text()).toBe(200)
+    expect(count('project_seeds', "status = 'applied'")).toBe(1)
+    const replay = await rawHit(`/approve/seed/${id}?presence_grant=${grantId}`, { method: 'POST', form: { csrf, decision: 'approve' } }, e)
+    expect(count('project_seeds', "status = 'applied'")).toBe(1)
+    expect(replay.status).not.toBe(500)
+  })
+
+  it('elevation: refused on the login alone; a grant for a NARROWER selection cannot be spent on a wider one', async () => {
+    const e = secureEnv()
+    const authn = await enrolPasskey(e, harness.sqlite, 'mem-owner')
+    const id = await pendingElevation(['action:manage_access', 'action:project_status'], 60)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const narrow = { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' }
+    const wide = { csrf, decision: 'approve', actions: ['action:project_status', 'action:manage_access'], duration_minutes: '60' }
+    const first = await rawHit(`/approve/elevation/${id}`, { method: 'POST', form: narrow }, e)
+    expect(first.status).toBe(403)
+    expect(count('elevation_grants')).toBe(0)
+    expect(count('presence_grants', "kind = 'access_elevation_approve' AND status = 'pending'")).toBe(1)
+    const { grantId, approveUrl } = (await presenceRefusal(first)) ?? { grantId: '', approveUrl: null }
+    expect((await realTap(e, authn, approveUrl ?? '')).status).toBe(200)
+    // the grant was satisfied for [project_status]; spending it on [project_status, manage_access] is refused and grants nothing
+    const widened = await rawHit(`/approve/elevation/${id}?presence_grant=${grantId}`, { method: 'POST', form: wide }, e)
+    expect(widened.status).toBe(403)
+    expect(count('elevation_grants')).toBe(0)
+    const ok = await rawHit(`/approve/elevation/${id}?presence_grant=${grantId}`, { method: 'POST', form: narrow }, e)
+    expect(ok.status, await ok.clone().text()).toBe(200)
+    expect(count('elevation_grants')).toBe(1)
+  })
+
+  it('with secure moments off or no passkey enrolled the approve fails closed, not open', async () => {
+    const id = await pendingElevation(['action:project_status'], 60)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const form = { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' }
+    const off = await rawHit(`/approve/elevation/${id}`, { method: 'POST', form }, env) // no SECURE_MOMENTS in the base env
+    expect(off.status).toBe(403)
+    expect(await off.text()).toContain('passkeys are not available')
+    harness.sqlite.exec("DELETE FROM member_passkeys WHERE member_id = 'mem-owner'")
+    const none = await rawHit(`/approve/elevation/${id}`, { method: 'POST', form }, secureEnv())
+    expect(none.status).toBe(403)
+    expect(await none.text()).toContain('you have none yet')
+    expect(count('elevation_grants')).toBe(0)
+  })
+
+  it('deny still decides on the Access login alone (it reduces authority)', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const res = await rawHit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'deny' } }, secureEnv())
+    expect(res.status).toBe(200)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'denied' })
+    expect(count('presence_grants')).toBe(0)
   })
 })
 
