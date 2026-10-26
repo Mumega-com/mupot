@@ -173,13 +173,18 @@ function utcDateKey(): string {
  * Flat squad list for the add-agent form picker, each carrying the parent
  * department name so the <option> label can read "Dept / Squad".
  */
-export async function loadSquadOptions(env: Env): Promise<SquadOption[]> {
-  const rows = await env.DB.prepare(
+export async function loadSquadOptions(env: Env, squadIds?: string[]): Promise<SquadOption[]> {
+  if (squadIds?.length === 0) return []
+  const scope = squadIds === undefined ? '' : ' AND s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+  const statement = env.DB.prepare(
     `SELECT s.id AS id, s.name AS name, d.name AS dept_name
        FROM squads s
        LEFT JOIN departments d ON d.id = s.department_id
-      WHERE s.kind != 'home'
+      WHERE s.kind != 'home'${scope}
       ORDER BY d.name ASC, s.name ASC`,
-  ).all<SquadOption>()
+  )
+  const rows = squadIds === undefined
+    ? await statement.all<SquadOption>()
+    : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<SquadOption>()
   return rows.results ?? []
 }
