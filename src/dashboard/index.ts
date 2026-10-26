@@ -2100,7 +2100,7 @@ dashboardApp.get('/agents/:id', async (c) => {
   const freshNow = auth.webSessionIdHash ? (await checkWebSession(c.env, auth, { fresh: true })).ok : false
   const claimCard = await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, claimCard, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1', reissued: c.req.query('reissued') === '1' })),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, claimCard, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
   )
 })
 
@@ -2213,7 +2213,12 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
   if (!session.ok) {
     // ONE redirect: sign in again, land back on this agent's page (resume=allow) where the same button is the single Confirm click.
     // The write is never performed by the returning GET, and freshness is not weakened: the retry is checked again.
-    if (session.error === 'reauth_required') return c.redirect(reauthRedirectUrl(`/agents/${c.req.param('id')}?resume=allow`), 303)
+    if (session.error === 'reauth_required') {
+      // Use the DB-validated id (not the raw route param) in the return path.
+      const target = await resolveAgentRef(c.env, c.req.param('id'))
+      if (!target.ok) return deny(404, 'Agent not found.')
+      return c.redirect(reauthRedirectUrl(`/agents/${target.value.id}?resume=allow`), 303)
+    }
     return c.html(shell(c.env, 'Attach designation', errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
   }
   if (auth.boundAgentId || !isOrgAdmin(auth)) return deny(403, 'Only an org admin can change an attach designation.')
@@ -6099,7 +6104,7 @@ function agentConsoleBody(
   ownerView: AgentOwnerView | null = null,
   liveRuntime: FleetBelief | null = null,
   onboardingCard: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
-  flash: { resume: 'claim' | 'allow' | null; fresh: boolean; claimed: boolean; reissued: boolean } = { resume: null, fresh: false, claimed: false, reissued: false },
+  flash: { resume: 'claim' | 'allow' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -6156,7 +6161,8 @@ function agentConsoleBody(
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
       ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation, flash) : ''}
     </div>
-    ${flash.claimed ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
+    ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
+    ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
     ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}
     ${onboardingCard ?? ''}
     ${liveRuntimeCard(liveRuntime)}

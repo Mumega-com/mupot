@@ -476,3 +476,63 @@ describe('"Allow for me" no longer dead-ends on a stale sign-in', () => {
     expect(one<{ d: string | null }>("SELECT attach_designated_member_id AS d FROM agents WHERE id = 'ag2'")?.d).toBe('mem-admin')
   })
 })
+
+describe('Codex/gate round: honest outcome when the chat cannot be attached; resolved id in the redirect', () => {
+  const retireSeat = (admissionId: string) => {
+    const seat = one<{ requested_seat_id: string }>('SELECT requested_seat_id FROM agent_seat_admissions WHERE id = ?', admissionId)?.requested_seat_id
+    h.sqlite.prepare("UPDATE agent_seats SET retired_at = '2026-10-10T00:00:00.000Z' WHERE id = ?").run(seat)
+  }
+
+  it('link: the thread was retired before Confirm -> admission live but the result says NOT attached (claimed=partial), never "Claimed"', async () => {
+    const p = await fileAsk()
+    retireSeat(p.admissionId)
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    const res = await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+    expect(liveAttachments()).toBe(0)
+    const page = await (await get('/agents/ag1?claimed=partial', a)).text()
+    expect(page).toContain('not attached yet')
+    expect(page).not.toContain('The chat is now acting as')
+  })
+
+  it('agent-page click: same honesty when the thread is gone', async () => {
+    const p = await fileAsk()
+    retireSeat(p.admissionId)
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    const res = await post('/agents/ag1/claim', a, { admission_id: p.admissionId })
+    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+  })
+
+  it('the thread already attached to ANOTHER agent via a different admission: the second claim is partial (outcome is per admission)', async () => {
+    const p1 = await fileAsk()
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    expect((await post('/agents/ag2/designation', a, { action: 'allow' })).status).toBe(303)
+    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag2' }, 'thread-1')
+    const adm2 = one<{ id: string }>("SELECT id FROM agent_seat_admissions WHERE agent_id = 'ag2'")!.id
+    expect((await post(`/claim/${String(out.attach_code)}`, a, { admission_id: adm2, agent_id: 'ag2' })).headers.get('location')).toBe('/agents/ag2?claimed=1')
+    const res = await post(`/claim/${p1.code}`, a, { admission_id: p1.admissionId, agent_id: 'ag1' })
+    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+    expect(liveAttachments()).toBe(1)
+  })
+
+  it('a normal claim still says attached (claimed=1) and the page says the chat is acting', async () => {
+    const p = await fileAsk()
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    expect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).headers.get('location')).toBe('/agents/ag1?claimed=1')
+    expect(await (await get('/agents/ag1?claimed=1', a)).text()).toContain('The chat is now acting as')
+  })
+
+  it('Allow for me, stale: the return path carries the DB-resolved agent id even when addressed by slug', async () => {
+    h.sqlite.exec("INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agid-xyz', 'S1', 'myslug', 'Slugged', 'member', 'test', 'active')")
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', stale())
+    const res = await post('/agents/myslug/designation', a, { action: 'allow' })
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toBe(`/auth/reauth?return=${encodeURIComponent('/agents/agid-xyz?resume=allow')}`)
+  })
+})

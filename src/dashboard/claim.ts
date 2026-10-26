@@ -182,7 +182,7 @@ export function makeClaimApp(shell: ShellFn) {
     const form = await c.req.parseBody()
     const r = await confirmClaimByCode(c.env, { memberId: s.memberId, code, shownAdmissionId: form.admission_id, shownAgentId: form.agent_id })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: '/connections', label: 'Open Connections' }), REFUSAL_STATUS[r.error])
-    return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?claimed=1`, 303)
+    return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
   })
 
   // POST /agents/:id/claim — "Own this agent", no code. The server finds this member's pending ask for THIS agent.
@@ -195,7 +195,7 @@ export function makeClaimApp(shell: ShellFn) {
     const form = await c.req.parseBody()
     const r = await confirmClaimOnAgentPage(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[r.error])
-    return c.redirect(`/agents/${encodeURIComponent(agentId)}?claimed=1`, 303)
+    return c.redirect(`/agents/${encodeURIComponent(agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
   })
 
   // POST /agents/:id/claim/reissue — a fresh pending ask for the same agent/member/app/thread. Grants nothing, so a real

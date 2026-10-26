@@ -111,8 +111,17 @@ export async function lookupClaim(env: Env, memberId: string, rawCode: unknown, 
   return { state, view: await viewOf(env, adm), adm }
 }
 
+/** Did the claim produce a live attachment for the asking chat? (promote can make the admission live with no attachment: seat_gone / seat_already_attached.) */
+async function seatIsAttachedVia(env: Env, admissionId: string): Promise<boolean> {
+  const r = await env.DB.prepare(
+    'SELECT 1 AS x FROM agent_seat_attachments WHERE tenant = ?1 AND admission_id = ?2 AND detached_at IS NULL LIMIT 1',
+  ).bind(env.TENANT_SLUG, admissionId).first<{ x: number }>()
+  return r !== null
+}
+
 export type ConfirmClaimResult =
-  | { ok: true; agentId: string }
+  /** attached=false: the admission went live but the asking chat could not be attached (seat gone, or already acting as another agent). */
+  | { ok: true; agentId: string; attached: boolean }
   | { ok: false; error: 'seat_attach_disabled' | 'claim_not_found' | 'claim_not_pending' | 'claim_changed' | 'attach_refused' | 'attach_code_mismatch' }
 
 /** Claim by link: the code, and the admission + agent the page showed, must still all name one live pending ask of this member. */
@@ -134,7 +143,7 @@ export async function confirmClaimByCode(
     if (r.error === 'admission_not_found') return { ok: false, error: 'claim_not_found' }
     return { ok: false, error: r.error }
   }
-  return { ok: true, agentId: found.adm.agent_id }
+  return { ok: true, agentId: found.adm.agent_id, attached: await seatIsAttachedVia(env, found.adm.id) }
 }
 
 export interface AgentClaims {
@@ -199,7 +208,7 @@ export async function confirmClaimOnAgentPage(
     if (r.error === 'admission_not_found') return { ok: false, error: 'claim_not_found' }
     return { ok: false, error: r.error }
   }
-  return { ok: true, agentId: p.agentId }
+  return { ok: true, agentId: p.agentId, attached: await seatIsAttachedVia(env, adm.id) }
 }
 
 export type ReissueResult =
