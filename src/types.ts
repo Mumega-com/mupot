@@ -42,6 +42,10 @@ export interface WorkflowBinding<PARAMS = unknown> {
 // ── Cloudflare bindings (must match wrangler.toml) ──
 export interface Env {
   DB: D1Database
+  // Email reply approvals (design-email-reply-approvals-20261026). '1' enables the log-only spike handler; off otherwise.
+  EMAIL_DECISIONS?: string
+  // Secret (wrangler secret put). Absent => token mint/verify fail closed.
+  EMAIL_DECISION_HMAC_KEY?: string
   VEC: VectorizeIndex
   BUS: Queue<BusEvent>
   SESSIONS: KVNamespace
