@@ -228,3 +228,108 @@ describe('agent page control', () => {
     expect(await page(p.env, p.cookie)).not.toContain('Allow for me')
   })
 })
+
+// Mom-walk D2 (mupot task 7ae27377): an agent's OWNER may designate THEMSELVES for their own agent without org admin.
+// Self only, own agents only; everything else keeps the admin floor.
+describe('owner self-designation (mom-walk D2)', () => {
+  const ownBy = (member: string) => h.sqlite.exec(`UPDATE agents SET owner_member_id = '${member}' WHERE id = 'ag1'`)
+  const door = async (env: Env, memberId: string, target: string | null, extra: Record<string, unknown> = {}) => {
+    const { authorizeOwnerMemberChange } = await import('../src/org/agent-owner')
+    const { resolveCapabilities } = await import('../src/auth/capability')
+    const auth = {
+      userId: memberId, email: null, role: 'member', tenant: TENANT, memberId,
+      capabilities: await resolveCapabilities(env, memberId), boundAgentId: null, ...extra,
+    } as unknown as import('../src/types').AuthContext
+    return authorizeOwnerMemberChange(env, auth, 'ag1', target, 'attach_designated_member_id')
+  }
+
+  it('the OWNER (plain member, no org admin) designates themselves: column set, audit attributed to them', async () => {
+    ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    const res = await post(env, cookie, 'allow')
+    expect(res.status, await res.clone().text()).toBe(303)
+    expect(designee()).toBe('mem-plain')
+    const audit = h.sqlite.prepare("SELECT actor_id FROM agent_audit WHERE agent_id = 'ag1' ORDER BY rowid DESC LIMIT 1").get()
+    expect(audit).toEqual({ actor_id: 'mem-plain' })
+  })
+
+  it('a member who does NOT own the agent is refused, even with a fresh session', async () => {
+    ownBy('mem-admin')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('a member who merely holds a KEY for the agent (a token minter, not the owner) is refused', async () => {
+    ownBy('mem-admin')
+    h.sqlite.prepare("INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'ag1', 'pk', 'mem-plain', unixepoch())").run(TENANT)
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('the owner still needs the fresh-session step-up (no weaker than the admin path)', async () => {
+    ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', stale())
+    const res = await post(env, cookie, 'allow')
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toContain('/auth/reauth')
+    expect(designee()).toBeNull()
+  })
+
+  it('the owner cannot Stop (admin only), and the door refuses clearing or designating someone else', async () => {
+    ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(303)
+    expect((await post(env, cookie, 'stop')).status).toBe(403)
+    expect(designee()).toBe('mem-plain')
+    expect(await door(env, 'mem-plain', 'mem-admin')).toMatchObject({ ok: false, error: 'forbidden' })
+    expect(await door(env, 'mem-plain', null)).toMatchObject({ ok: false, error: 'forbidden' })
+  })
+
+  it('door: the owner may designate only themselves; a non-owner self-target, another member and a bound agent session are refused', async () => {
+    ownBy('mem-plain')
+    const { env } = await login('plain@x.test')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: true })
+    expect(await door(env, 'mem-plain', 'mem-boss')).toMatchObject({ ok: false })
+    ownBy('mem-admin')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'forbidden' })
+    ownBy('mem-plain')
+    expect(await door(env, 'mem-plain', 'mem-plain', { boundAgentId: 'ag1' })).toMatchObject({ ok: false })
+    expect(await door(env, 'mem-plain', 'mem-plain', { seatBinding: { seatId: 's', label: 'l', harnessId: 'h', grantTokenId: 'g', humanMemberId: 'mem-plain', source: 'handle' } }))
+      .toMatchObject({ ok: false, error: 'seat_session_forbidden' })
+  })
+
+  it('the agent ceiling still applies to an owner: an agent bound to a higher-ranked member is refused', async () => {
+    ownBy('mem-plain')
+    h.sqlite.prepare("INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, 'ag1', 'mem-boss', datetime('now'))").run(TENANT)
+    const { env } = await login('plain@x.test')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'agent_rank_exceeds_ceiling' })
+  })
+
+  it('the outgoing designee ceiling still applies: a boss designation cannot be replaced by the owner', async () => {
+    ownBy('mem-plain')
+    h.sqlite.exec("UPDATE agents SET attach_designated_member_id = 'mem-boss' WHERE id = 'ag1'")
+    const { env } = await login('plain@x.test')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'target_rank_exceeds_ceiling' })
+  })
+
+  it('page: the owner sees Allow for me (never Stop); a non-owner member still sees nothing', async () => {
+    ownBy('mem-plain')
+    const page = async (env: Env, cookie: string) => (await dashboardApp.request('/agents/ag1', { headers: { cookie } }, env)).text()
+    const o = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect(await page(o.env, o.cookie)).toContain('Allow for me')
+    await post(o.env, o.cookie, 'allow')
+    const after = await page(o.env, o.cookie)
+    expect(after).toContain('Currently allowed')
+    expect(after).not.toContain('>Stop<')
+    ownBy('mem-admin')
+    expect(await page(o.env, o.cookie)).not.toContain('Allow for me')
+  })
+})

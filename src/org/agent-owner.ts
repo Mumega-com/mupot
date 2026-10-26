@@ -54,7 +54,19 @@ export async function authorizeOwnerMemberChange(
       return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: currentOwnerMemberId } }
     }
   }
-  if (designation && ownerMemberId !== undefined) {
+  // Mom-walk D2: an agent's OWNER may designate THEMSELVES for their own agent, with no org-admin floor. Narrow on purpose:
+  // the target must be the caller, the caller must be the agent's CURRENT agents.owner_member_id (read fresh here, never a
+  // token minter or a bound member), and the caller must be a real member session (the seat / attached / agent-bound refusals
+  // above and the route's boundAgentId refusal already exclude chats and agents). Designating someone else, clearing a
+  // designation, or acting on an agent the caller does not own keeps the admin floor below. The outgoing-designee rank
+  // ceiling above and the AGENT ceiling at the bottom (owner OR bound member outranking the caller) still apply.
+  let ownerSelfDesignation = false
+  if (designation && typeof ownerMemberId === 'string' && ownerMemberId.length > 0 && auth.memberId != null
+    && auth.memberId === ownerMemberId && !auth.boundAgentId) {
+    const ownerRow = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string | null }>()
+    ownerSelfDesignation = ownerRow?.owner_member_id === auth.memberId
+  }
+  if (designation && ownerMemberId !== undefined && !ownerSelfDesignation) {
     // Clearing a designation disables every attached chat of the agent, so it needs the same org floor as setting one.
     const floorRank = await actorRankOnScopeFor(env, auth, 'org', null)
     if (floorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
@@ -67,11 +79,13 @@ export async function authorizeOwnerMemberChange(
   }
   const isSelfTarget = !designation && auth.memberId != null && auth.memberId === ownerMemberId
   if (isSelfTarget) return { ok: true, current: currentOwnerMemberId }
-  const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-  if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
-    return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
+  if (!ownerSelfDesignation) {
+    const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
+    if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
+      return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
+    }
   }
-  if (await exceedsTargetRankCeiling(env, auth, ownerMemberId)) {
+  if (!ownerSelfDesignation && await exceedsTargetRankCeiling(env, auth, ownerMemberId)) {
     return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: ownerMemberId } }
   }
   // AGENT ceiling (designation only): a chat that becomes the agent acts with the agent's standing, so the actor may not

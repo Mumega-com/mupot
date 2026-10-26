@@ -2132,7 +2132,7 @@ interface AgentOwnerView {
   candidates: Array<{ id: string; label: string }>
   callerMemberId: string | null
   /** Attach designation (SEAT_ATTACH_DESIGNATED on only): null = control hidden. */
-  designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean } | null
+  designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean; /** Stop is org-admin only; the agent's owner gets Allow-for-me alone. */ canStop: boolean } | null
 }
 
 // First letter of each word then ***: enough to recognise yourself or a colleague, not enough to read a name off a shared screen.
@@ -2176,7 +2176,9 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
     }
   }
   let designation: AgentOwnerView['designation'] = null
-  if (seatAttachDesignatedEnabled(env) && isOrgAdmin(auth) && !auth.boundAgentId && auth.memberId) {
+  // Mom-walk D2: shown to an org admin, AND to the agent's own owner (who can designate only themselves, see the route below).
+  const callerOwnsAgent = auth.memberId != null && agent.owner_member_id === auth.memberId
+  if (seatAttachDesignatedEnabled(env) && (isOrgAdmin(auth) || callerOwnsAgent) && !auth.boundAgentId && auth.memberId) {
     let designeeLabel: string | null = null
     if (agent.attach_designated_member_id) {
       const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ? AND tenant = ?')
@@ -2184,7 +2186,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
         .first<{ display_name: string | null }>()
       designeeLabel = row?.display_name ? maskName(row.display_name) : 'a member'
     }
-    designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId }
+    designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId, canStop: isOrgAdmin(auth) }
   }
   return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation }
 }
@@ -2203,7 +2205,7 @@ function agentDesignationControl(
       <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
       <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
       <button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>
-      ${agent.attach_designated_member_id ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
+      ${agent.attach_designated_member_id && view.canStop ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
     </form>`
 }
 
@@ -2239,11 +2241,15 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
     }
     return c.html(shell(c.env, 'Attach designation', errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
   }
-  if (auth.boundAgentId || !isOrgAdmin(auth)) return deny(403, 'Only an org admin can change an attach designation.')
+  if (auth.boundAgentId) return deny(403, 'Only an org admin can change an attach designation.')
   const resolved = await resolveAgentRef(c.env, c.req.param('id'))
   if (!resolved.ok) return deny(404, 'Agent not found.')
   const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
   if (!agent) return deny(404, 'Agent not found.')
+  // Mom-walk D2: besides an org admin, the agent's OWN owner may Allow-for-me (themselves, never Stop, never someone else).
+  // authorizeOwnerMemberChange below re-reads the owner and is the actual gate; this only stops a stranger early.
+  const ownerAllowingSelf = action === 'allow' && agent.owner_member_id != null && agent.owner_member_id === session.memberId
+  if (!isOrgAdmin(auth) && !ownerAllowingSelf) return deny(403, 'Only an org admin, or the agent\'s owner for themselves, can change an attach designation.')
   const target: string | null = action === 'allow' ? session.memberId : null
   const gate = await authorizeOwnerMemberChange(c.env, auth, agent.id, target, 'attach_designated_member_id')
   if (!gate.ok) {
