@@ -10,8 +10,13 @@ import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as realDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_FLAGS, gatedApp } from './helpers/presence'
 import type { Env } from '../src/types'
+
+// A mint hands an agent a credential and now needs the member's passkey; this suite tests the route's OTHER behaviour, so a POST that ends at
+// the passkey refusal is satisfied by the DB shortcut and repeated (the gate itself: tests/human-presence.test.ts).
+const dashboardApp = gatedApp(realDashboardApp)
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -66,7 +71,7 @@ function envFor(harness: SqliteD1Harness, sessions: Record<string, string> = {})
     DB: harness.db,
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
-    PUBLIC_ORIGIN: ORIGIN,
+    PUBLIC_ORIGIN: ORIGIN, ...PRESENCE_FLAGS,
     // Writable, because the mint throttle fails CLOSED: a read-only KV mock
     // makes every mint here 429 and the CSRF boundary untestable.
     SESSIONS: (() => {

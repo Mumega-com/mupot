@@ -122,6 +122,7 @@ import {
   enrollThrottledBody,
   enrollUnavailableBody,
   checkEnrollMintRateLimit,
+  refundEnrollMintRateLimit,
   loadEnrollView,
   normalizeEnrollSeat,
 } from './enroll'
@@ -132,6 +133,7 @@ import {
   accessRefusalMessage,
   agentAccessPanel,
   applyAgentAccessChange,
+  accessSetWidens,
   applyMoveOutOfHome,
   loadAgentAccessView,
 } from './agent-access-panel'
@@ -319,6 +321,7 @@ import { makeChangesApp } from './changes'
 import { makeDoorbellsApp } from './doorbells'
 import { makeConnectionsApp } from './connections'
 import { makeClaimApp, loadAgentClaimCard, reauthRedirectUrl } from './claim'
+import { makePresenceApp, presenceGate } from './presence'
 import { makeWakeApp, loadAgentWakeCard } from './wake-card'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
@@ -1744,6 +1747,7 @@ dashboardApp.route('/', makeChangesApp(shell))
 dashboardApp.route('/', makeDoorbellsApp(shell))
 dashboardApp.route('/', makeConnectionsApp(shell))
 dashboardApp.route('/', makeClaimApp(shell))
+dashboardApp.route('/', makePresenceApp(shell))
 dashboardApp.route('/', makeWakeApp(shell))
 
 // Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
@@ -2252,6 +2256,14 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
         ? 'This agent, or its current designee, outranks you.'
         : 'That is not allowed from this session.')
   }
+  if (action === 'allow') {
+    // Letting this member's chats become the agent widens reach: the member's passkey, not just this session (Stop stays session-only).
+    const denied = await presenceGate(c, shell, session.memberId, {
+      kind: 'designation_allow', subjectId: agent.id, params: { action: 'allow' }, summary: `Allow your chats to become agent ${agent.name}`,
+      actionPath: `/agents/${agent.id}/designation`, encoding: 'form', returnPath: `/agents/${agent.id}`,
+    })
+    if (denied) return denied
+  }
   const result = await updateAgentProfile(c.env, agent.id, { attach_designated_member_id: target }, { id: session.memberId, type: 'user' },
     { attach_designated_member_id: gate.current ?? null })
   if (!result.ok) {
@@ -2306,6 +2318,15 @@ dashboardApp.post('/agents/:id/owner', async (c) => {
         : 'That member id is not valid.'
     return c.html(shell(c.env, 'Agent owner', errorBody(msg)), gate.status)
   }
+  if (target !== null) {
+    // Making a member the agent's owner widens what that member (and any harness it attests for) may do as the agent: it needs
+    // the acting member's passkey. Clearing the owner reduces authority and stays session-only.
+    const denied = await presenceGate(c, shell, auth.memberId, {
+      kind: 'agent_owner_set', subjectId: agent.id, params: { action: 'set', owner_member_id: target }, summary: `Make member ${target} the owner of agent ${agent.name}`,
+      actionPath: `/agents/${agent.id}/owner`, encoding: 'form', returnPath: `/agents/${agent.id}`,
+    })
+    if (denied) return denied
+  }
   const result = await updateAgentProfile(c.env, agent.id, { owner_member_id: target }, { id: auth.memberId, type: 'user' })
   if (!result.ok) {
     if (result.error === 'owner_member_inactive') {
@@ -2338,6 +2359,22 @@ dashboardApp.post('/agents/:id/access', async (c) => {
   const form = await c.req.parseBody()
   const field = (name: string): string => (typeof form[name] === 'string' ? form[name].trim() : '')
   const rawAction = field('action')
+  // Giving an agent MORE reach on a squad (a higher level, or a move out of its home) needs the acting member's passkey. A revoke,
+  // or keeping/lowering a level, reduces authority and stays session-only.
+  if (rawAction === 'move' || (rawAction !== 'revoke' && accessSetWidens({
+    capability: field('capability'), expectedCapability: field('expected_capability'), expectedMembership: field('expected_membership'),
+  }))) {
+    if (!auth.memberId) return c.html(shell(c.env, 'Agent access', errorBody(accessRefusalMessage('actor_member_required'))), 403)
+    const params: Record<string, string> = rawAction === 'move'
+      ? { action: 'move', to_squad_id: field('to_squad_id'), capability: field('capability'), reason: field('reason') }
+      : { action: 'set', squad_id: field('squad_id'), capability: field('capability'), expected_capability: field('expected_capability'), expected_membership: field('expected_membership'), reason: field('reason') }
+    const denied = await presenceGate(c, shell, auth.memberId, {
+      kind: 'agent_access_set', subjectId: agent.id, params,
+      summary: rawAction === 'move' ? `Move agent ${agent.name} out of its home squad as ${field('capability')}` : `Give agent ${agent.name} ${field('capability')} access on a squad`,
+      actionPath: `/agents/${agent.id}/access`, encoding: 'form', returnPath: `/agents/${agent.id}`,
+    })
+    if (denied) return denied
+  }
   if (rawAction === 'move') {
     const moved = await applyMoveOutOfHome(c.env, auth, {
       agentRef: agent.id, toSquadId: field('to_squad_id'), capability: field('capability'), reason: field('reason'),
@@ -2477,6 +2514,17 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, 'Pick a member.')),
       400,
     )
+  }
+
+  // Minting a scoped key gives its holder standing: the acting member's passkey, not just this session.
+  {
+    const denied = await presenceGate(c, shell, auth.memberId, {
+      kind: 'scoped_key_mint', subjectId: memberIdRaw,
+      params: { preset_id: presetIdRaw, member_id: memberIdRaw, ...(scopeIdRaw ? { scope_id: scopeIdRaw } : {}) },
+      summary: `Mint a "${presetIdRaw}" key for member ${memberIdRaw}${scopeIdRaw ? ` on ${scopeIdRaw}` : ''}`,
+      actionPath: '/admin/keys/mint', encoding: 'form', returnPath: '/admin/keys',
+    })
+    if (denied) return denied
   }
 
   // Resolve the minter's effective rank on the org scope.
@@ -2692,6 +2740,18 @@ dashboardApp.post('/admin/agent-token/mint', async (c) => {
   }
   const expiresAt = expiry.expiresAt
 
+  // Minting a token hands an agent a credential: the acting member's passkey, not just this session. The Apply button on the
+  // return page is a real form post, so the show-once token page below is what the human sees.
+  {
+    const denied = await presenceGate(c, shell, auth.memberId, {
+      kind: 'agent_token_mint', subjectId: agent.id,
+      params: { agent_id: agent.id, label: labelRaw, capability: capabilityRaw, ...(typeof form.expires_in_days === 'string' ? { expires_in_days: form.expires_in_days } : {}) },
+      summary: `Mint a ${capabilityRaw} token for agent ${agent.name}${labelRaw ? ` labelled "${labelRaw}"` : ''}`,
+      actionPath: '/admin/agent-token/mint', encoding: 'form', returnPath: '/admin/agent-token',
+    })
+    if (denied) return denied
+  }
+
   // Delegate to the shared atomic-mint helper. A first mint creates the member,
   // binding, home capability, and welded token; later mints add only the token.
   // This is the same path the MCP mint_agent_token tool uses.
@@ -2829,6 +2889,20 @@ dashboardApp.post('/enroll/mint', async (c) => {
       shell(c.env, 'Enroll seat', enrollForbiddenBody(auth, agent.name, squadRow?.name ?? null)),
       403,
     )
+  }
+
+  // Coining a seat key hands an agent a credential: it needs the member's passkey, not just this session. The Apply button on the
+  // return page is a real form post, so the show-once key page below is what the human sees.
+  {
+    const denied = await presenceGate(c, shell, actorMemberId, {
+      kind: 'seat_key_mint', subjectId: agent.id, params: { agent_id: agent.id, seat },
+      summary: `Coin a seat key for agent ${agent.name} (${seat})`,
+      actionPath: '/enroll/mint', encoding: 'form', returnPath: '/enroll',
+    })
+    if (denied) {
+      await refundEnrollMintRateLimit(c.env, actorMemberId) // nothing was coined: the retry with the grant is the mint
+      return denied
+    }
   }
 
   // issuedBy puts the issuance row in the same batch as the token (0139), so
@@ -3563,6 +3637,16 @@ dashboardApp.post('/squads/:id/agents/join', async (c) => {
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody('Agent not found.')), 404)
 
+  // Joining an existing agent to a squad widens that agent's reach: the acting member's passkey, not just this session.
+  {
+    if (!auth.memberId) return c.html(shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent needs a signed-in member.')), 403)
+    const denied = await presenceGate(c, shell, auth.memberId, {
+      kind: 'squad_agent_join', subjectId: squadId, params: { agent_id: agentId, capability },
+      summary: `Add agent ${agent.name} to squad ${squad.name} as ${capability}`,
+      actionPath: `/squads/${squadId}/agents/join`, encoding: 'form', returnPath: `/squads/${squadId}`,
+    })
+    if (denied) return denied
+  }
   const outcome = await confirmJoin(c.env, squad, agentId, capability, c.get('auth').memberId ?? null)
   if (!outcome.ok) {
     const msg =
@@ -5895,8 +5979,11 @@ function obsQueueScript(): string {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved' : 'rejected';
                 card.classList.add('decided');
+              } else if (r.data && r.data.error === 'human_presence_required' && r.data.approve_url) {
+                status.textContent = 'Approving needs your passkey. Opening the passkey page…';
+                window.location.assign(r.data.approve_url);
               } else {
-                status.textContent = (r.data && r.data.error) || 'failed';
+                status.textContent = (r.data && (r.data.message || r.data.error)) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
               }
             }).catch(function () {
@@ -7042,8 +7129,11 @@ function approvalsScript() {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved ✓' : 'rejected ✗';
                 card.classList.add('decided');
+              } else if (r.data && r.data.error === 'human_presence_required' && r.data.approve_url) {
+                status.textContent = 'Approving needs your passkey. Opening the passkey page…';
+                window.location.assign(r.data.approve_url);
               } else {
-                status.textContent = (r.data && r.data.error) || 'failed';
+                status.textContent = (r.data && (r.data.message || r.data.error)) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
               }
             }).catch(function () {
@@ -7696,6 +7786,8 @@ function membersAdminScript(scopeOptions: string) {
               var res = await postJSON(API + '/members/' + encodeURIComponent(currentMember) + '/capabilities', 'POST', payload);
               var data = await res.json().catch(function () { return {}; });
               if (res.ok) { grantStatus.textContent = 'Granted.'; reloadSoon(); }
+              else if (data.error === 'human_presence_required' && data.approve_url) { grantStatus.textContent = 'This needs your passkey. Opening the passkey page…'; window.location.assign(data.approve_url); }
+              else if (data.error === 'human_presence_unavailable' || data.error === 'passkey_enrolment_required' || data.error === 'presence_grant_invalid' || data.error === 'too_many_pending') { grantStatus.textContent = data.message || 'This needs your passkey.'; }
               else if (res.status === 403) { grantStatus.textContent = 'Forbidden — admin required on this scope.'; }
               else { grantStatus.textContent = 'Grant failed: ' + (data.error || res.status); }
             } catch (err) { grantStatus.textContent = 'Grant request errored.'; }

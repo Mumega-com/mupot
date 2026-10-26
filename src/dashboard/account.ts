@@ -47,6 +47,7 @@ import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { checkEnrolmentSession, mintEnrolmentLink } from '../secure-moments/enrol-mint'
+import { presenceGateJson } from '../approvals/gate'
 import { requestEnrolDelivery } from '../secure-moments/telegram-miniapp-enrol-delivery'
 import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
 import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
@@ -449,7 +450,9 @@ function passkeyScript(): Html {
             var res = await fetch('/account/passkey/enrol', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
             var data = await res.json().catch(function () { return {}; });
             if (res.ok && data.url) { window.location.assign(data.url); return; }
-            if (data.error === 'reauth_required') {
+            if (data.error === 'human_presence_required' && data.approve_url) { if (status) status.textContent = 'Adding another passkey needs one you already have. Opening the passkey page…'; window.location.assign(data.approve_url); return; }
+            if (data.error === 'human_presence_unavailable' || data.error === 'presence_grant_invalid' || data.error === 'too_many_pending') { if (status) status.textContent = data.message || 'This needs your passkey.'; }
+            else if (data.error === 'reauth_required') {
               if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth?return=/account'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
             } else if (status) { status.textContent = 'Could not start (' + (data.error || res.status) + ').'; }
           } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
@@ -656,7 +659,18 @@ export function makeAccountApp(shell: ShellFn) {
   // re-authenticated web session only; adds no authority.
   app.post('/account/passkey/enrol', async (c) => {
     if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
-    const r = await mintEnrolmentLink(c.env, c.get('auth'))
+    const enrolAuth = c.get('auth')
+    // The FIRST passkey can only rest on the real, freshly re-authenticated session (there is nothing else to rest on; residual risk
+    // in the PR). Every LATER one needs a passkey the member already holds, so a program driving the browser cannot enrol its own.
+    const sess = await checkEnrolmentSession(c.env, enrolAuth)
+    if (sess.ok && (await listMemberPasskeys(c.env, sess.memberId)).length > 0) {
+      const denied = await presenceGateJson(c, sess.memberId, {
+        kind: 'passkey_enrol', subjectId: sess.memberId, params: { action: 'enrol' }, summary: 'Add another passkey to your account',
+        actionPath: '/account/passkey/enrol', encoding: 'json', returnPath: '/account',
+      })
+      if (denied) return denied
+    }
+    const r = await mintEnrolmentLink(c.env, enrolAuth)
     c.header('Cache-Control', 'no-store')
     return r.ok ? c.json({ url: r.url, expires_at: r.expiresAt }) : c.json({ error: r.error }, r.status)
   })

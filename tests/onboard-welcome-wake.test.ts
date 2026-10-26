@@ -20,6 +20,7 @@ import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'local'
 const ORIGIN = 'http://localhost'
@@ -42,6 +43,7 @@ function envFor(email: string): Env {
     SESSIONS: memoryKv(), DB: h.db,
     OAUTH_KV: { get: async () => null, put: async () => undefined }, OAUTH_CLIENT_ID: 'cid', PUBLIC_ORIGIN: COLONY,
     SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', SEAT_ATTACH_DESIGNATED: '1', SEAT_MAX_PER_MEMBER: '100', SEAT_MAX_TOTAL_PER_MEMBER: '200', SEAT_MAX_TOTAL_PER_HARNESS: '200',
+    ...PRESENCE_ENV,
     ...extraEnv,
   } as unknown as Env
 }
@@ -50,6 +52,8 @@ async function login(email: string): Promise<{ env: Env; cookie: string }> {
   const res = await authApp.request('/dev-login', {}, env)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  const member = h.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+  if (member) seedPasskey(h.sqlite, TENANT, member.id) // claiming/designating need the member's passkey; the real ceremony is tests/human-presence.test.ts
   return { env, cookie: `mupot_session=${m[1]}` }
 }
 const setReauth = (memberId: string, at: string | null) => h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
@@ -60,7 +64,7 @@ const count = (sql: string, ...p: unknown[]): number => Number((h.sqlite.prepare
 
 function get(path: string, u: { env: Env; cookie: string }) { return dashboardApp.request(path, { headers: { cookie: u.cookie } }, u.env) }
 function post(path: string, u: { env: Env; cookie: string }, data: Record<string, string>) {
-  return dashboardApp.request(path, { method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) }, u.env)
+  return throughGate(h.sqlite, TENANT, (qs) => Promise.resolve(dashboardApp.request(`${path}${qs ? `?${qs}` : ''}`, { method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(data) }, u.env)))
 }
 async function postJson(path: string, u: { env: Env; cookie: string }, data: unknown) {
   return dashboardApp.request(path, { method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': 'application/json' }, body: JSON.stringify(data) }, u.env)
@@ -172,14 +176,15 @@ describe('auto-welcome', () => {
     expect(welcomes()).toBe(1)
   })
 
-  it('the Connections door (typed code) sends the same single welcome', async () => {
+  it('the Connections Admit button no longer decides (it hands back the passkey page), so it sends no welcome; the claim doors above send the one welcome', async () => {
     const p = await fileAsk()
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     const res = await postJson(`/connections/admissions/${p.admissionId}/approve`, a, { ceiling: 'member', attach_code: p.code })
-    expect(res.status, await res.clone().text()).toBe(200)
-    expect(welcomes()).toBe(1)
-    expect(one<{ request_id: string }>("SELECT request_id FROM agent_messages WHERE from_agent = 'mupot-onboarding'")?.request_id).toBe(`welcome:${p.admissionId}`)
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { error: string }).error).toBe('human_presence_required')
+    expect(welcomes()).toBe(0)
+    expect(one<{ status: string }>('SELECT status FROM agent_seat_admissions WHERE id = ?', p.admissionId)?.status).toBe('pending')
   })
 
   it('no welcome when the claim is refused (wrong member, stale session, expired, wrong code)', async () => {

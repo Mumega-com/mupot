@@ -7,7 +7,8 @@
 // dev-login), never a bare MCP bearer call — that is the whole point of
 // routing decide_elevation through authApp instead of a tool.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { authApp } from '../src/auth'
+import { authApp as realAuthApp } from '../src/auth'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -39,7 +40,20 @@ function makeEnv(email: string): Env {
     LOCAL_TEST_AUTH: '1',
     LOCAL_TEST_AUTH_EMAIL: email,
     SESSIONS: kv(),
+    ...PRESENCE_ENV,
   } as unknown as Env
+}
+
+// Approving an elevation widens an agent's reach and now needs the member's passkey. This suite tests the OTHER behaviour of the route
+// (authority, narrowing, grants, the session binding), so an approve is passed through the presence gate by the DB shortcut; the
+// real ceremony, and every refusal of a session-only approve, is tests/human-presence.test.ts.
+let gateDb: SqliteD1Harness | null = null
+const authApp = {
+  request(path: string, init: RequestInit | undefined, env: Env): Promise<Response> {
+    const approve = init?.method === 'POST' && /^\/elevation\/requests\/[^/]+\/decide$/.test(path)
+    const call = (qs: string): Promise<Response> => Promise.resolve(realAuthApp.request(`${path}${qs ? `?${qs}` : ''}`, init, env))
+    return approve && gateDb ? throughGate(gateDb.sqlite, TENANT, call) : call('')
+  },
 }
 
 describe('elevation approval — integration through authApp (real D1)', () => {
@@ -47,6 +61,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
 
   beforeEach(async () => {
     harness = createSqliteD1()
+    gateDb = harness
     applyAllMigrations(harness.sqlite)
   })
 
@@ -146,6 +161,8 @@ describe('elevation approval — integration through authApp (real D1)', () => {
   async function devLogin(env: Env): Promise<string> {
     const res = await authApp.request('/dev-login', {}, env)
     expect(res.status).toBe(302)
+    const member = gateDb?.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(env.LOCAL_TEST_AUTH_EMAIL) as { id: string } | undefined
+    if (member && gateDb) seedPasskey(gateDb.sqlite, TENANT, member.id)
     return cookieFrom(res)
   }
 
@@ -280,7 +297,7 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     expect(body.ok).toBe(false)
   })
 
-  it('a sensitive action requires a fresh reauth on the deciding web session — a plain dev-login (no reauth) is refused', async () => {
+  it('a sensitive action: a plain dev-login (no reauth) is refused for want of the passkey; the passkey itself is the step-up', async () => {
     const env = makeEnv('admin@x.test')
     const { session } = await seedFixture(env)
     // action:mint_token, not action:register_key: both are in
@@ -288,19 +305,21 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     // register_key is not enforced by any tool yet and so cannot be requested.
     const request = await seedPendingRequest(env, session.id, ['action:mint_token'])
     const cookie = await devLogin(env)
+    const decide = {
+      method: 'POST',
+      headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve', actions: ['action:mint_token'] }),
+    }
 
-    const res = await authApp.request(
-      `/elevation/requests/${request.id}/decide`,
-      {
-        method: 'POST',
-        headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ decision: 'approve', actions: ['action:mint_token'] }),
-      },
-      env,
-    )
-    const body = (await res.json()) as { ok: boolean; reason?: string }
-    expect(body.ok).toBe(false)
-    expect(body.reason).toBe('reauth_required')
+    // the session alone (no passkey, no reauth): refused before anything is decided
+    const res = await realAuthApp.request(`/elevation/requests/${request.id}/decide`, decide, env)
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { error: string }).error).toBe('human_presence_required')
+
+    // with the member's passkey the same call is decided: the passkey's user verification is the step-up the sensitive action asks for
+    const done = await authApp.request(`/elevation/requests/${request.id}/decide`, decide, env)
+    expect(done.status).toBe(200)
+    expect(((await done.json()) as { ok: boolean }).ok).toBe(true)
   })
 
   it('a caller without a bridged web session (no matching members row) is forbidden from deciding', async () => {

@@ -24,6 +24,8 @@ import { resolveApprover, mintApproverSession, type ApproverFailure } from './id
 import { escapeHtml, messagePage, renderPage, SUBMIT_ONCE_SCRIPT } from './page'
 import { loadSeedRequest, seedRequestIsLive } from './seed-request'
 import { b64uEncode } from '../secure-moments/webauthn'
+import { PRESENCE_MESSAGES, presenceCheck } from '../approvals/gate'
+import type { PresenceSpec } from '../approvals/human-presence'
 import { loadElevationRequestById } from '../auth/elevation'
 import {
   closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
@@ -139,10 +141,31 @@ async function formHtml(c: Context<AppEnv>, kind: string, id: string, inner: str
   const { claims } = c.get('access')
   const csrf = await issueCsrfToken(c.env, kind, id, claims.sub, claims.iat)
   if (!csrf) return null
-  return `<form method="post" data-once="1" action="/approve/${kind}/${encodeURIComponent(id)}">
+  const grant = c.req.query('presence_grant')
+  const carried = grant && /^[0-9a-f-]{36}$/.test(grant) ? `?presence_grant=${grant}` : '' // the passkey page sent the human back with this
+  return `<form method="post" data-once="1" action="/approve/${kind}/${encodeURIComponent(id)}${carried}">
 <input type="hidden" name="csrf" value="${csrf}">${inner}
 <div class="row"><button class="primary" type="submit" name="decision" value="approve">${escapeHtml(approveLabel)}</button>
 <button class="danger" type="submit" name="decision" value="deny">Deny</button></div><p id="progress" class="muted" role="status"></p></form>`
+}
+
+
+/**
+ * An APPROVE here widens an agent's reach, and a Cloudflare Access login (even a fresh one) is something a program driving the
+ * human's browser also holds. So approve needs the member's passkey bound to exactly this decision (src/approvals/human-presence.ts):
+ * without a satisfied grant this answers 403 with the passkey page; the passkey page sends the human back here with the grant and
+ * the same Approve button then decides. Deny still decides on the Access login alone (it reduces authority).
+ * Returns null when the decision may proceed.
+ */
+async function presenceFor(c: Context<AppEnv>, memberId: string, spec: PresenceSpec): Promise<Response | null> {
+  const o = await presenceCheck(c.env, memberId, spec, c.req.query('presence_grant'))
+  if (o.proceed) return null
+  if (o.grantId) c.header('X-Presence-Grant', o.grantId)
+  secure(c)
+  const message = PRESENCE_MESSAGES[o.error]
+  const link = o.approveUrl ? ` Passkey page: ${o.approveUrl}` : ''
+  return c.html(messagePage('Your passkey is needed', `${message}${link}`, 'warn').replace(
+    o.approveUrl ? escapeHtml(o.approveUrl) : '\u0000', o.approveUrl ? `<a href="${escapeHtml(o.approveUrl)}" rel="noopener">${escapeHtml(o.approveUrl)}</a>` : ''), o.status)
 }
 
 // ── seed ────────────────────────────────────────────────────────────────────────────────────────
@@ -191,6 +214,13 @@ approveApp.post('/seed/:id', async (c) => {
   if (!row) return NOT_FOUND(c)
   const now = Date.now()
   if (!seedRequestIsLive(row, now)) return outcomePage(c, closedSeedOutcome(row))
+  if (decision === 'approve') {
+    const denied = await presenceFor(c, actor.memberId, {
+      kind: 'access_seed_approve', subjectId: row.id, params: { decision: 'approve' }, summary: 'Approve a project seed an agent filed',
+      actionPath: `/approve/seed/${row.id}`, encoding: 'form', returnPath: `/approve/seed/${row.id}`,
+    })
+    if (denied) return denied
+  }
   const proof: HumanProof = { memberId: actor.memberId, via: VIA, evidence: { access_sub: claims.sub } }
   return outcomePage(c, await decideSeed(c.env, { row, decision, auth: actor.auth, proof, waitUntil: waitUntilOf(c) }, now))
 })
@@ -230,6 +260,22 @@ approveApp.post('/elevation/:id', async (c) => {
   const selected = (Array.isArray(rawActions) ? rawActions : rawActions === undefined ? [] : [rawActions]).filter((a): a is string => typeof a === 'string')
   const durationRaw = one(guard.form.duration_minutes)
   const duration = durationRaw !== undefined && /^\d{1,5}$/.test(durationRaw) ? Number(durationRaw) : undefined
+  if (decision === 'approve') {
+    // Same non-oracle gate as the GET: an unknown id and an out-of-authority request read identically, before anything is filed.
+    const req = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, id)
+    if (!req || !(await mayDecideElevation(c.env, who.approver.auth, req))) return NOT_FOUND(c)
+    // A closed request needs no passkey: it is refused by the core below, exactly as before. Only a live one is gated.
+    if (elevationIsLive(req, Date.now())) {
+      const chosen = [...new Set(selected)].sort()
+      const denied = await presenceFor(c, who.approver.memberId, {
+        kind: 'access_elevation_approve', subjectId: req.id,
+        params: { decision: 'approve', actions: chosen, ...(duration !== undefined ? { duration_minutes: String(duration) } : {}) },
+        summary: `Approve an elevation: ${chosen.join(', ') || 'no action chosen'}${duration !== undefined ? ` for ${duration} minutes` : ''}`,
+        actionPath: `/approve/elevation/${req.id}`, encoding: 'form', returnPath: `/approve/elevation/${req.id}`,
+      })
+      if (denied) return denied
+    }
+  }
   const proof: HumanProof = { memberId: who.approver.memberId, via: VIA, evidence: { access_sub: claims.sub } }
   const outcome = await decideElevation(c.env, {
     id, decision, selectedActions: selected, durationMinutes: duration, auth: who.approver.auth, proof, waitUntil: waitUntilOf(c),

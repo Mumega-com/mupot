@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -61,7 +62,12 @@ function setup(): { harness: SqliteD1Harness; env: Env } {
     OAUTH_KV: { get: async () => null, put: async () => undefined },
     VEC: { query: async () => ({ matches: [] }) }, BUS: { send: async () => {} },
     BLOBS: {}, AI: {}, AGENT: {}, SQUAD: {},
+    ...PRESENCE_ENV, PUBLIC_ORIGIN: ORIGIN,
   } as unknown as Env
+  // Setting an owner widens reach and needs the acting member's passkey; this suite tests the OTHER behaviour (the ceiling, the
+  // door, the write), so every active member has a passkey row and the gate is passed through the DB shortcut. The real ceremony
+  // is tests/human-presence.test.ts.
+  for (const m of harness.sqlite.prepare("SELECT id FROM members WHERE tenant = ?").all(TENANT) as Array<{ id: string }>) seedPasskey(harness.sqlite, TENANT, m.id)
   return { harness, env }
 }
 
@@ -73,7 +79,7 @@ const as = (id: string, cap: CapabilityGrant['capability']): AuthContext =>
 function post(env: Env, values: Record<string, string>, origin: string | null = ORIGIN): Promise<Response> {
   const headers: Record<string, string> = { 'content-type': 'application/x-www-form-urlencoded' }
   if (origin) headers.Origin = origin
-  return Promise.resolve(dashboardApp.request(`${ORIGIN}/agents/ag1/owner`, { method: 'POST', headers, body: new URLSearchParams(values) }, env))
+  return throughGate(open?.sqlite as never, TENANT, (qs) => Promise.resolve(dashboardApp.request(`${ORIGIN}/agents/ag1/owner${qs ? `?${qs}` : ''}`, { method: 'POST', headers, body: new URLSearchParams(values) }, env))) // as: throughGate takes the minimal Sqlite shape the harness satisfies
 }
 const owner = (h: SqliteD1Harness) =>
   (h.sqlite.prepare("SELECT owner_member_id AS o FROM agents WHERE id = 'ag1'").get() as { o: string | null }).o

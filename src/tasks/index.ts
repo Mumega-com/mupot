@@ -13,6 +13,7 @@
 // a token minted for another tenant can never touch this pot. Mutations are RBAC
 // gated. The GitHub token is read from env only — it is never echoed or logged.
 
+import { presenceGateJson } from '../approvals/gate'
 import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { scheduleTaskAssignedDoorbell, waitUntilFromContext } from '../agents/webhook-doorbell'
@@ -1878,6 +1879,24 @@ tasksApp.post('/:id/verdict', async (c) => {
     const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
     note = note ? `${overrideNote} ${note}` : overrideNote
     independenceWaiver = 'owner_override'
+  }
+
+  // An APPROVE made from a signed-in browser (a web-session cookie) clears a gate and so widens what an agent may do next. That cookie,
+  // even freshly re-authenticated, is also held by a program driving the browser: it needs the member's passkey bound to exactly this
+  // verdict. A reject only holds work back and stays session-only. Bearer/MCP callers are other credentials; the Telegram human-origin
+  // channel (task_verdict) is its own proof and is unchanged.
+  if (body.verdict === 'approved' && auth.webSessionIdHash) {
+    if (!auth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
+    const vParams: Record<string, string | boolean> = { verdict: 'approved' }
+    if (typeof body.note === 'string') vParams.note = body.note
+    if (typeof expectedSubmissionId === 'string') vParams.expected_submission_id = expectedSubmissionId
+    if (body.override_self_verdict === true) vParams.override_self_verdict = true
+    const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+      kind: 'task_verdict_approve', subjectId: task.id, params: vParams,
+      summary: `Approve the work on task ${task.title ? `"${task.title.slice(0, 80)}"` : task.id}`,
+      actionPath: `/api/tasks/${encodeURIComponent(task.id)}/verdict`, encoding: 'json', returnPath: '/approvals',
+    })
+    if (denied) return denied
   }
 
   // Write verdict with conditional UPDATE guard (K5 race protection).

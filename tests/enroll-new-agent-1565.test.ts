@@ -6,11 +6,16 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as realDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_FLAGS, gatedApp } from './helpers/presence'
 import { loadEnrollView } from '../src/dashboard/enroll'
 import { listConsentableAgents } from '../src/mcp/oauth-authorize'
 import { createHomeForMember } from '../src/org/service'
 import type { AuthContext, Env } from '../src/types'
+
+// A mint hands an agent a credential and now needs the member's passkey; this suite tests the route's OTHER behaviour, so a POST that ends at
+// the passkey refusal is satisfied by the DB shortcut and repeated (the gate itself: tests/human-presence.test.ts).
+const dashboardApp = gatedApp(realDashboardApp)
 
 const TENANT = 'pot-new'
 const ORIGIN = 'https://pot.test'
@@ -42,7 +47,7 @@ function setup(): { env: Env; store: Map<string, string> } {
     store.set(`sess:${id}`, JSON.stringify({ userId: `u-${id}`, email, role, createdAt: '2026-01-01T00:00:00Z' }))
   }
   const env = {
-    DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'T', PUBLIC_ORIGIN: ORIGIN,
+    DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'T', PUBLIC_ORIGIN: ORIGIN, ...PRESENCE_FLAGS,
     SESSIONS: { get: async (k: string) => store.get(k) ?? null, put: async (k: string, v: string) => { store.set(k, v) }, delete: async (k: string) => { store.delete(k) } },
     OAUTH_KV: { get: async () => null, put: async () => undefined }, VEC: { query: async () => ({ matches: [] }) },
     BUS: { send: async () => {} }, BLOBS: {}, AI: {}, AGENT: {}, SQUAD: {},

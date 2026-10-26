@@ -28,6 +28,7 @@ import {
 } from '../members/claim'
 import { seatAttachEnabled } from '../members/seat-attach'
 import { pageHeader, sectionPanel, type Html } from './ui'
+import { presenceGate } from './presence'
 
 type ShellFn = (
   env: Env,
@@ -180,6 +181,21 @@ export function makeClaimApp(shell: ShellFn) {
     const s = await formSession(c, here)
     if (!s.ok) return s.res
     const form = await c.req.parseBody()
+    // Claiming binds a chat to an agent: it widens that chat's reach, so it needs the member's passkey, not just this session
+    // (a signed-in browser, even freshly re-authenticated, is something a program driving that browser also holds).
+    const found = await lookupClaim(c.env, s.memberId, code)
+    if (found.state !== 'pending') {
+      const why = found.state === 'not_found' || found.state === 'ambiguous' ? 'claim_not_found' : 'claim_not_pending'
+      return page(c, 'Claim', note(REFUSAL_TEXT[why], { href: '/connections', label: 'Open Connections' }), REFUSAL_STATUS[why])
+    }
+    const shownAdmission = typeof form.admission_id === 'string' ? form.admission_id : ''
+    const shownAgent = typeof form.agent_id === 'string' ? form.agent_id : ''
+    const denied = await presenceGate(c, shell, s.memberId, {
+      kind: 'claim_confirm', subjectId: shownAdmission, params: { admission_id: shownAdmission, agent_id: shownAgent },
+      summary: `Let the chat from ${found.view.harnessName || 'your connected app'} act as agent ${found.view.agentName}`,
+      actionPath: here, encoding: 'form', returnPath: '/connections',
+    })
+    if (denied) return denied
     const r = await confirmClaimByCode(c.env, { memberId: s.memberId, code, shownAdmissionId: form.admission_id, shownAgentId: form.agent_id })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: '/connections', label: 'Open Connections' }), REFUSAL_STATUS[r.error])
     return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
@@ -193,6 +209,18 @@ export function makeClaimApp(shell: ShellFn) {
     const s = await formSession(c, `/agents/${agentId}?resume=claim`)
     if (!s.ok) return s.res
     const form = await c.req.parseBody()
+    const mine = await claimsForAgent(c.env, s.memberId, agentId)
+    const hit = mine.pending.find((cl) => cl.admissionId === form.admission_id)
+    if (!hit) {
+      const why = mine.pending.length > 0 ? 'claim_changed' : 'claim_not_found'
+      return page(c, 'Claim', note(REFUSAL_TEXT[why], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[why])
+    }
+    const denied = await presenceGate(c, shell, s.memberId, {
+      kind: 'claim_own', subjectId: hit.admissionId, params: { admission_id: hit.admissionId },
+      summary: `Let the chat from ${hit.harnessName || 'your connected app'} act as agent ${hit.agentName}`,
+      actionPath: `/agents/${agentId}/claim`, encoding: 'form', returnPath: `/agents/${agentId}`,
+    })
+    if (denied) return denied
     const r = await confirmClaimOnAgentPage(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[r.error])
     return c.redirect(`/agents/${encodeURIComponent(agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)

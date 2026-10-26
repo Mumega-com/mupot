@@ -19,7 +19,12 @@ import { isAttachCeiling } from '../auth/attached-ceiling'
 import {
   attachSeatToAgent, decideAdmissionDirect, detachAttachment, listAttachableAgents, loadConnections, renameThread, revokeAdmission, seatAttachEnabled, ATTACH_IDLE_DAYS,
 } from '../members/seat-attach'
-import { changeSeatAdmission, isSeatHoldAction, listObservedSeats, SEAT_TRANSITIONS } from '../members/seat-hold-release'
+import { changeSeatAdmission, isSeatHoldAction, listObservedSeats, seatAdmissionStatus, SEAT_TRANSITIONS, wideningTransition } from '../members/seat-hold-release'
+import { admissionIsPendingLive, loadAdmission } from '../members/seat-attach'
+import { issueMomentLink } from '../secure-moments/issue'
+import { listMemberPasskeys } from '../secure-moments/store'
+import { secureMomentsStatus } from '../secure-moments/config'
+import { presenceGate } from './presence'
 import { vipLaneEnabled } from '../members/vip-lane'
 import { pageHeader, sectionPanel, pill, emptyState, dataTable, type Html } from './ui'
 
@@ -77,7 +82,9 @@ function connectionsScript(): Html {
             var res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
             var data = await res.json().catch(function () { return {}; });
             if (res.ok) { window.location.reload(); return; }
-            if (data.error === 'reauth_required') reauthLink();
+            if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); return; }
+            if (data.error === 'human_presence_unavailable' || data.error === 'passkey_enrolment_required' || data.error === 'presence_grant_invalid' || data.error === 'too_many_pending') say(data.message || 'This needs your passkey.');
+            else if (data.error === 'reauth_required') reauthLink();
             else if (data.error === 'attach_code_mismatch') say('That code does not match. A chat asked for this agent: use Admit on the Waiting for your decision card and type the code the chat showed you.');
             else if (data.error === 'approval_bound_to_other_chat') say('This agent is approved (or requested) for a different chat. Revoke or deny that first, then have this chat ask again.');
             else say('Could not do that (' + (data.error || res.status) + ').');
@@ -299,8 +306,19 @@ export function makeConnectionsApp(shell: ShellFn) {
     if (typeof body.seat_id !== 'string' || typeof body.agent_id !== 'string' || !body.seat_id.trim() || !body.agent_id.trim()) {
       return c.json({ error: 'bad_request' }, 400)
     }
+    // Attaching a chat to an agent widens that chat's reach: it needs the member's passkey, not just this session. The typed
+    // attach code is never stored in a grant, so a pending ask that needs the code is decided on its passkey page instead.
+    const attachCeiling = isAttachCeiling(body.ceiling) ? body.ceiling : 'member'
+    const attachSeat = body.seat_id.trim()
+    const attachAgent = body.agent_id.trim()
+    const denied = await presenceGate(c, shell, g.memberId, {
+      kind: 'seat_attach', subjectId: attachSeat, params: { seat_id: attachSeat, agent_id: attachAgent, ceiling: attachCeiling },
+      summary: `Let one of your chats act as agent ${attachAgent} at level ${attachCeiling}`,
+      actionPath: '/connections/attach', encoding: 'json', returnPath: '/connections',
+    })
+    if (denied) return denied
     const r = await attachSeatToAgent(c.env, {
-      humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member', attachCode: body.attach_code,
+      humanMemberId: g.memberId, seatId: attachSeat, agentRef: attachAgent, via: 'dashboard', moveIfAttached: true, ceiling: attachCeiling, attachCode: undefined,
     })
     if (!r.ok) return c.json({ error: r.error }, ATTACH_STATUS[r.error] ?? 400)
     return c.json(r)
@@ -333,8 +351,23 @@ export function makeConnectionsApp(shell: ShellFn) {
     // reach (release; held -> observed) need it. Hold, and trusted -> held / observed, reduce reach and work on a real session alone.
     const g = await guard(c, false)
     if (!g.ok) return g.res
-    const fresh = (await checkWebSession(c.env, c.get('auth'), { fresh: true })).ok
-    const r = await changeSeatAdmission(c.env, { humanMemberId: g.memberId, seatId: c.req.param('id').trim(), action, fresh })
+    const seatId = c.req.param('id').trim()
+    // A transition that WIDENS the chat's reach (release; held -> observed) needs the member's passkey, which also stands in for
+    // the old fresh-sign-in step. Hold, and trusted -> observed, reduce reach and stay session-only.
+    let fresh = false
+    if (vipLaneEnabled(c.env)) {
+      const from = await seatAdmissionStatus(c.env, g.memberId, seatId)
+      if (from && wideningTransition(action, from)) {
+        const denied = await presenceGate(c, shell, g.memberId, {
+          kind: action === 'release' ? 'seat_release' : 'seat_return_from_held', subjectId: seatId, params: { action, seat_id: seatId },
+          summary: action === 'release' ? 'Release one of your chats to trusted: the observed limits stop applying to it' : 'Return a held chat to observed: it can act again',
+          actionPath: `/connections/seats/${encodeURIComponent(seatId)}/${action}`, encoding: 'json', returnPath: '/connections',
+        })
+        if (denied) return denied
+        fresh = true
+      }
+    }
+    const r = await changeSeatAdmission(c.env, { humanMemberId: g.memberId, seatId, action, fresh })
     if (r.ok) return c.json({ ok: true, from: r.from, to: r.to, allowed_from: SEAT_TRANSITIONS[action].from })
     return c.json({ error: r.error }, r.error === 'vip_lane_disabled' || r.error === 'member_ineligible' || r.error === 'reauth_required' ? 403 : r.error === 'seat_not_found' ? 404 : 409)
   })
@@ -343,11 +376,20 @@ export function makeConnectionsApp(shell: ShellFn) {
     const g = await guard(c, true)
     if (!g.ok) return g.res
     if (!seatAttachEnabled(c.env)) return c.json({ error: 'seat_attach_disabled' }, 403)
-    const body: unknown = await c.req.json().catch(() => ({}))
-    const rawCeiling = typeof body === 'object' && body !== null && 'ceiling' in body ? body.ceiling : undefined
-    const attachCode = typeof body === 'object' && body !== null && 'attach_code' in body ? body.attach_code : undefined
-    const r = await decideAdmissionDirect(c.env, { admissionId: c.req.param('id').trim(), humanMemberId: g.memberId, decision: 'approve', ceiling: isAttachCeiling(rawCeiling) ? rawCeiling : 'member', attachCode })
-    return r.ok ? c.json({ ok: true }) : c.json({ error: r.error }, r.error === 'admission_not_found' ? 404 : r.error === 'attach_code_mismatch' ? 403 : 409)
+    // Admitting a chat widens its reach. The decision is made on the secure host with the member's passkey (the existing seat_admit
+    // moment, where the attach code is typed and the level chosen); this session, even freshly signed in, cannot make it.
+    const adm = await loadAdmission(c.env, c.req.param('id').trim())
+    if (!adm || adm.human_member_id !== g.memberId) return c.json({ error: 'admission_not_found' }, 404)
+    if (!admissionIsPendingLive(adm, Date.now()) || !adm.expires_at) return c.json({ error: 'not_pending' }, 409)
+    if (secureMomentsStatus(c.env).state !== 'on') {
+      return c.json({ error: 'human_presence_unavailable', message: 'Admitting a chat needs your passkey, and passkeys are not available on this workspace. Ask the workspace owner to enable secure moments. Nothing was changed.' }, 403)
+    }
+    if ((await listMemberPasskeys(c.env, g.memberId)).length === 0) {
+      return c.json({ error: 'passkey_enrolment_required', message: 'Admitting a chat needs your passkey, and you have none yet. Add one under My Account, then try again. Nothing was changed.' }, 403)
+    }
+    const link = await issueMomentLink(c.env, { kind: 'seat_admit', subjectId: adm.id, requesterAgentId: null, subjectExpiresAtIso: adm.expires_at })
+    if (!link) return c.json({ error: 'human_presence_unavailable', message: 'The passkey page could not be prepared. Nothing was changed.' }, 403)
+    return c.json({ error: 'human_presence_required', message: 'Admitting a chat needs your passkey. Approve it on the passkey page.', approve_url: link.url }, 403)
   })
 
   app.post('/connections/admissions/:id/deny', async (c) => {

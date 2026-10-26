@@ -16,6 +16,7 @@ import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'local'
 const ORIGIN = 'http://localhost'
@@ -37,6 +38,7 @@ function envFor(email: string): Env {
     TENANT_SLUG: TENANT, BRAND: 'Test Pot', LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: email, SESSIONS: memoryKv(), DB: h.db,
     OAUTH_KV: { get: async () => null, put: async () => undefined }, OAUTH_CLIENT_ID: 'cid', PUBLIC_ORIGIN: COLONY,
     SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', SEAT_ATTACH_DESIGNATED: '1', SEAT_MAX_PER_MEMBER: '100', SEAT_MAX_TOTAL_PER_MEMBER: '200', SEAT_MAX_TOTAL_PER_HARNESS: '200',
+    ...PRESENCE_ENV,
   } as unknown as Env
 }
 async function login(email: string): Promise<{ env: Env; cookie: string }> {
@@ -45,6 +47,8 @@ async function login(email: string): Promise<{ env: Env; cookie: string }> {
   expect(res.status).toBe(302)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  const member = h.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string } | undefined
+  if (member) seedPasskey(h.sqlite, TENANT, member.id) // claiming/designating now need the member's passkey; this suite tests the OTHER behaviour (the real ceremony: tests/human-presence.test.ts)
   return { env, cookie: `mupot_session=${m[1]}` }
 }
 const setReauth = (memberId: string, at: string | null) => h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ? WHERE member_id = ?').run(at, memberId)
@@ -58,7 +62,8 @@ function get(path: string, u: { env: Env; cookie: string }) {
 }
 function post(path: string, u: { env: Env; cookie: string }, data: Record<string, string>) {
   const f = form(data)
-  return dashboardApp.request(path, { method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': f['content-type'] }, body: f.body }, u.env)
+  // The widening decisions (claim, Allow for me) pass the presence gate through the DB shortcut here.
+  return throughGate(h.sqlite, TENANT, (qs) => Promise.resolve(dashboardApp.request(`${path}${qs ? `?${qs}` : ''}`, { method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': f['content-type'] }, body: new URLSearchParams(data) }, u.env)))
 }
 
 // ── the chat side: a real OAuth harness grant, a real auto seat, the real seat_attach tool ─────────────────────────

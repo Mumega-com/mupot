@@ -13,6 +13,14 @@
 //  10. tsc strict — validated by build step
 
 import { describe, it, expect, vi } from 'vitest'
+
+// This suite drives the mint route against a hand-rolled SQL-matching DB double that knows nothing of presence_grants or passkeys.
+// Its subject is the mint itself (the weld, show-once, the escalation guard), so the presence check is stubbed to "a satisfied grant was
+// presented". The gate is tested against a real schema in tests/human-presence.test.ts (kind agent_token_mint).
+vi.mock('../src/approvals/gate', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../src/approvals/gate')>()
+  return { ...real, presenceCheck: async () => ({ proceed: true as const }) }
+})
 import {
   activateAgentTokenReplacement,
   cancelAgentTokenReplacementReservation,
@@ -28,7 +36,8 @@ import { loadAgentTokenView } from '../src/dashboard/agent-token'
 import { enrollPageBody, enrollMintedBody, enrollClientSnippet } from '../src/dashboard/enroll'
 import { tokenSurfaceLinks } from '../src/dashboard/token-surfaces'
 import { withTenantPrefix } from '../src/platform/tenant-path'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as realDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_FLAGS, gatedApp } from './helpers/presence'
 import { mcpApp } from '../src/mcp'
 import { revealCredentialClaim } from '../src/auth/credential-claim'
 import type { Env } from '../src/types'
@@ -36,6 +45,10 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { mcpRequest } from './helpers/mcp-call'
+
+// A mint hands an agent a credential and now needs the member's passkey; this suite tests the route's OTHER behaviour, so a POST that ends at
+// the passkey refusal is satisfied by the DB shortcut and repeated (the gate itself: tests/human-presence.test.ts).
+const dashboardApp = gatedApp(realDashboardApp)
 
 // ── test fixtures ─────────────────────────────────────────────────────────────
 
@@ -369,7 +382,7 @@ function createReplacementSurfaceEnv(opts: {
           return db.batch(statements)
         },
       },
-      PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+      PUBLIC_ORIGIN: 'https://mupot.mumega.com', ...PRESENCE_FLAGS,
       BUS: {
         send: async (event: unknown) => {
           if (opts.busFails?.value) throw new Error('bus unavailable')
@@ -1376,7 +1389,7 @@ function makeRouteEnv(role: 'owner' | 'admin' | 'member', opts: {
     TENANT_SLUG: 'test',
     BRAND: 'Test',
     OAUTH_PROVIDER: 'google',
-    PUBLIC_ORIGIN: 'https://test.mupot.app',
+    PUBLIC_ORIGIN: 'https://test.mupot.app', ...PRESENCE_FLAGS,
     DB: {
       prepare,
       async batch(stmts: { sql: string; args: unknown[] }[]) {

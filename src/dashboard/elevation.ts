@@ -445,6 +445,12 @@ function decideScript(requestId: string): Html {
                 : 'Denied. No access was granted.';
               setBusy(true);
               setTimeout(function () { window.location.href = '/elevation'; }, 1200);
+            } else if (data.error === 'human_presence_required' && data.approve_url) {
+              status.textContent = 'Approving gives the agent more reach, so it needs your passkey. Opening the passkey page…';
+              window.location.assign(data.approve_url);
+            } else if (data.error === 'human_presence_unavailable' || data.error === 'passkey_enrolment_required' || data.error === 'presence_grant_invalid' || data.error === 'too_many_pending') {
+              status.textContent = data.message || 'This needs your passkey.';
+              setBusy(false);
             } else if (data.reason === 'reauth_required') {
               status.innerHTML = 'Your identity check has expired — this includes a sensitive action. ' +
                 '<a href="/auth/reauth?return=/elevation/${requestId}">Step up now</a>, then come back to this page and try again.';

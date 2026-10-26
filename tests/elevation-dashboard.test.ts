@@ -12,7 +12,8 @@
 // have to reject anyway) and the STRUCTURAL human-only gate.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { authApp } from '../src/auth'
+import { authApp as realAuthApp } from '../src/auth'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -48,7 +49,20 @@ function makeEnv(email: string): Env {
     LOCAL_TEST_AUTH: '1',
     LOCAL_TEST_AUTH_EMAIL: email,
     SESSIONS: kv(),
+    ...PRESENCE_ENV,
   } as unknown as Env
+}
+
+// Approving an elevation widens an agent's reach and now needs the member's passkey. This suite tests the OTHER behaviour of the route
+// (authority, narrowing, grants, the session binding), so an approve is passed through the presence gate by the DB shortcut; the
+// real ceremony, and every refusal of a session-only approve, is tests/human-presence.test.ts.
+let gateDb: SqliteD1Harness | null = null
+const authApp = {
+  request(path: string, init: RequestInit | undefined, env: Env): Promise<Response> {
+    const approve = init?.method === 'POST' && /^\/elevation\/requests\/[^/]+\/decide$/.test(path)
+    const call = (qs: string): Promise<Response> => Promise.resolve(realAuthApp.request(`${path}${qs ? `?${qs}` : ''}`, init, env))
+    return approve && gateDb ? throughGate(gateDb.sqlite, TENANT, call) : call('')
+  },
 }
 
 describe('elevation dashboard screens — integration through dashboardApp (real D1)', () => {
@@ -56,6 +70,7 @@ describe('elevation dashboard screens — integration through dashboardApp (real
 
   beforeEach(async () => {
     harness = createSqliteD1()
+    gateDb = harness
     applyAllMigrations(harness.sqlite)
   })
 
@@ -185,6 +200,8 @@ describe('elevation dashboard screens — integration through dashboardApp (real
   async function devLogin(env: Env): Promise<string> {
     const res = await authApp.request('/dev-login', {}, env)
     expect(res.status).toBe(302)
+    const member = gateDb?.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(env.LOCAL_TEST_AUTH_EMAIL) as { id: string } | undefined
+    if (member && gateDb) seedPasskey(gateDb.sqlite, TENANT, member.id)
     return cookieFrom(res)
   }
 

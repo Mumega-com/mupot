@@ -4596,9 +4596,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdict_channels_no_delete" },
     ],
   },
+  {
+    file: "0261_presence_grants.sql",
+    sha256: "28ef14b52930f534ecf4dfab8de7aa71d376581ab951910be52bfd5758def678",
+    statements: [
+      "-- 0261_presence_grants.sql — user-verified passkey presence for human decisions that WIDEN authority.\n--\n-- A presence grant is a single-use, short-lived record that ONE exact decision (kind + subject + a digest of its\n-- parameters) was confirmed by the named member with a WebAuthn assertion carrying user verification. It is minted\n-- pending when a dashboard route refuses a session-only widening decision, satisfied on the dedicated secure host by\n-- a passkey assertion whose challenge is bound to (grant id, parameter digest), and consumed once by the route that\n-- performs the decision. The link token is stored only as a sha256. A session, a fresh sign-in or a bearer never\n-- produces one. Additive: one new table, no existing row touched.\nCREATE TABLE IF NOT EXISTS presence_grants (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,\n  kind TEXT NOT NULL,\n  subject_id TEXT NOT NULL,\n  params_sha256 TEXT NOT NULL CHECK (\n    length(params_sha256) = 64 AND params_sha256 = lower(params_sha256) AND params_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  summary TEXT NOT NULL,\n  action_path TEXT NOT NULL,\n  fields_json TEXT NOT NULL,\n  encoding TEXT NOT NULL CHECK (encoding IN ('form', 'json')),\n  return_path TEXT NOT NULL,\n  link_token_sha256 TEXT NOT NULL CHECK (\n    length(link_token_sha256) = 64 AND link_token_sha256 = lower(link_token_sha256) AND link_token_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'satisfied', 'consumed', 'expired')),\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  satisfied_at TEXT,\n  satisfied_passkey_id TEXT,\n  consumed_at TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_presence_grants_member\n  ON presence_grants(tenant, member_id, status, expires_at);",
+    ],
+    objects: [
+      { type: "table", name: "presence_grants" },
+      { type: "index", name: "idx_presence_grants_member" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "3b1842cec8a212ee669185ce022c4461835a02f2781b0ca1273b5a5eacf1e519"
+export const SCHEMA_CHAIN_DIGEST: string = "429f990f4dd4ba3f57ca3c0c8387299c58ec45affe637d092f5b816b6e30445e"
