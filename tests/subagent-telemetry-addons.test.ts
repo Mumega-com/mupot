@@ -44,6 +44,7 @@ beforeEach(() => {
     SOS_SECRET: 'test-sos-secret',
     MIRROR_SECRET: 'test-mirror-secret',
     INKWELL_SECRET: 'test-inkwell-secret',
+    INKWELL_PUBLISH_TOKEN: 'test-outbound-publish-credential',
   } as Env
 })
 
@@ -478,7 +479,8 @@ describe('Inkwell Publishing Sub-App (src/addons/inkwell.ts)', () => {
     expect(res.status).toBe(500)
     const body = await res.json() as Record<string, unknown>
     expect(body.error).toBe('publishing_failed')
-    expect(body.detail).toContain('Inkwell worker unreachable')
+    expect(body.detail).toBe('Inkwell publishing failed.')
+    expect(body.next_step).toBe('Retry publishing; if it persists, ask an admin to check Inkwell.')
   })
 })
 

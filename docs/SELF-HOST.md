@@ -63,6 +63,13 @@ Secrets are Worker secrets (`wrangler secret put`), never in the toml.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — optional MCP OAuth 2.1
   provider credentials when exposing the Google-backed OAuth flow.
 - Per-integration (optional): `GHL_API_KEY` / `GHL_LOCATION_ID` / `GHL_WEBHOOK_SECRET`.
+- `INKWELL_PUBLISH_TOKEN` — outbound Inkwell addon publishing credential; must match
+  `PUBLISH_TOKEN` on Inkwell. Ask an admin to set it as a Worker secret when using
+  Inkwell publishing. Missing configuration returns `inkwell_publish_token_unconfigured`
+  without calling Inkwell; an upstream 401 returns `inkwell_publish_unauthorized`,
+  and an upstream 503 returns `inkwell_publish_unconfigured`, each with a next step.
+  This is separate from the addon ingress secret (`INKWELL_SECRET`) and the per-pot
+  connector credentials used by `/api/internal/content/*` and `/api/internal/wiki/*`.
 - **BYO MCP credentials** for a loop: `LOOP_SECRET_<name>` (the token) + a
   `LOOP_SECRET_<name>_HOST` var (the only host it may travel to). See
   [loop-manifest-contract.md](./loop-manifest-contract.md). Platform secrets are outside

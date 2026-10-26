@@ -14,6 +14,35 @@ export interface InkwellPublishPayload {
   tags?: string[]
 }
 
+export interface InkwellPublishError {
+  error: 'inkwell_publish_token_unconfigured' | 'inkwell_publish_unauthorized' | 'inkwell_publish_unconfigured' | 'publishing_failed'
+  detail: string
+  next_step: string
+}
+
+const publishErrors = {
+  tokenUnconfigured: {
+    error: 'inkwell_publish_token_unconfigured',
+    detail: 'Inkwell publishing requires an outbound publish token.',
+    next_step: 'Ask an admin to set INKWELL_PUBLISH_TOKEN.',
+  },
+  unauthorized: {
+    error: 'inkwell_publish_unauthorized',
+    detail: 'Inkwell rejected the publish credential (HTTP 401).',
+    next_step: 'Ask an admin to match INKWELL_PUBLISH_TOKEN to Inkwell PUBLISH_TOKEN.',
+  },
+  unconfigured: {
+    error: 'inkwell_publish_unconfigured',
+    detail: 'Inkwell publishing is unconfigured (HTTP 503).',
+    next_step: 'Ask an admin to set PUBLISH_TOKEN on Inkwell.',
+  },
+  failed: {
+    error: 'publishing_failed',
+    detail: 'Inkwell publishing failed.',
+    next_step: 'Retry publishing; if it persists, ask an admin to check Inkwell.',
+  },
+} satisfies Record<string, InkwellPublishError>
+
 // Authentication middleware for Inkwell sub-app
 inkwellApp.use('*', async (c, next) => {
   if (c.req.path.endsWith('/health')) return next()
@@ -62,6 +91,9 @@ const handlePublishing = async (c: import('hono').Context<{ Bindings: Env }>, de
     return c.json({ error: 'invalid_payload', detail: 'content string is required' }, 400)
   }
 
+  const publishToken = c.env.INKWELL_PUBLISH_TOKEN
+  if (!publishToken) return c.json(publishErrors.tokenUnconfigured, 503)
+
   const title = body.title.trim()
   const slug = body.slug.trim().toLowerCase().replace(/[^a-z0-9-/]/g, '-')
   const content = body.content.trim()
@@ -76,18 +108,16 @@ const handlePublishing = async (c: import('hono').Context<{ Bindings: Env }>, de
     try {
       const res = await c.env.INKWELL_SVC.fetch('http://inkwell-api.internal/api/publish', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${publishToken}` },
+        redirect: 'manual',
         body: JSON.stringify({ id: publicationId, title, slug, content, status, targetSite, author, tags: body.tags }),
       })
-      if (!res.ok) {
-        return c.json({ error: 'publishing_failed', detail: `Inkwell service returned HTTP ${res.status}` }, 500)
-      }
-    } catch (err) {
-      // Fail-closed discipline: return 500 on service binding error
-      return c.json({
-        error: 'publishing_failed',
-        detail: err instanceof Error ? err.message : String(err),
-      }, 500)
+      if (res.status === 401) return c.json(publishErrors.unauthorized, 502)
+      if (res.status === 503) return c.json(publishErrors.unconfigured, 503)
+      if (!res.ok) return c.json(publishErrors.failed, 500)
+    } catch {
+      // Fetch exceptions may contain request headers; expose only fixed diagnostics.
+      return c.json(publishErrors.failed, 500)
     }
   }
 
