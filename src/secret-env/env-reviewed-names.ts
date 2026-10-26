@@ -185,6 +185,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'VEC',
   'VIP_LANE', // #2035 VIP lane (join_squad + observed floor): opt-in flag (non-secret)
   'WEBHOOK_DOORBELL', // Grok Bot webhook doorbell: opt-in flag (non-secret)
+  'WEBHOOK_DOORBELL_SIGNED', // signed doorbell (HMAC + events queue): opt-in flag, default off (non-secret)
   'WORKSPACES', // workspaces W1: opt-in flag (non-secret)
 ])
 

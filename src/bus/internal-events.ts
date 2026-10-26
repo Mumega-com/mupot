@@ -6,7 +6,11 @@
 // the delivery from D1 (src/bus/events-delivery.ts) — the queue is not a trust boundary.
 // `assignment.wake` (wake-on-assign) is the same class: a payload-free job that only says "look at this agent's ledger".
 
-export const INTERNAL_ONLY_EVENT_TYPES: ReadonlySet<string> = new Set(['mcp.event.delivery', 'assignment.wake'])
+export const INTERNAL_ONLY_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'mcp.event.delivery',
+  'mcp.doorbell.delivery',
+  'assignment.wake',
+])
 
 export function isInternalOnlyEventType(type: unknown): boolean {
   return typeof type === 'string' && INTERNAL_ONLY_EVENT_TYPES.has(type)

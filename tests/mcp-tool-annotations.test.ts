@@ -133,7 +133,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'archive_plan_expand', 'athena_review_pr', 'cursor_run_status', 'elevation_status',
     'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
     'get_agent_profile', 'get_agent_webhook_doorbell', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
-    'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
+    'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'list_agent_webhook_doorbell_receipts', 'loop_list',
     'memory_get', 'memory_recent', 'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'operator_list', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
     'project_wiki', 'project_wiki_get', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',

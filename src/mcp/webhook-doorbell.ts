@@ -12,6 +12,7 @@ import { authorizeStructuralWrite } from '../operators/chokepoint'
 import {
   clearAgentWebhookDoorbell,
   getAgentWebhookDoorbell,
+  listAgentWebhookDoorbellReceipts,
   setAgentWebhookDoorbell,
 } from '../agents/webhook-doorbell'
 import { type ToolSpec, fail, done, str, memberCanOnSquadAuth } from './index'
@@ -142,7 +143,36 @@ const toolGetAgentWebhookDoorbell: ToolSpec = {
   },
 }
 
+const toolListAgentWebhookDoorbellReceipts: ToolSpec = {
+  name: 'list_agent_webhook_doorbell_receipts',
+  scope: "self (own agent) or admin of the agent's squad — metadata-only doorbell delivery receipts",
+  min: 'authenticated',
+  args: '{ agent?: string, limit?: number }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent: STRING_SCHEMA,
+      limit: { type: 'integer', minimum: 1, maximum: 100 },
+    },
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const target = await resolveDoorbellTarget(auth, env, args.agent, null)
+    if (!target.ok) return target
+    let limit = 50
+    if (args.limit !== undefined) {
+      if (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100) {
+        return fail(400, 'invalid_args', 'limit must be an integer from 1 to 100')
+      }
+      limit = args.limit
+    }
+    const receipts = await listAgentWebhookDoorbellReceipts(env, target.agentId, limit)
+    return done({ agent_id: target.agentId, receipts })
+  },
+}
+
 export const WEBHOOK_DOORBELL_TOOLS: ToolSpec[] = [
   toolSetAgentWebhookDoorbell,
   toolGetAgentWebhookDoorbell,
+  toolListAgentWebhookDoorbellReceipts,
 ]

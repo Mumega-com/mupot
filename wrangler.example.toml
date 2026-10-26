@@ -56,6 +56,8 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 #                                 # values) to the append-only seat_tape and scored; whoami gains admission:{status,reason_class} for a seat
 #                                 # with a status. Never blocks a call or changes a status. Needs migration 0237. Unset = total no-op.
 # WEBHOOK_DOORBELL = "1"          # outbound per-agent wake webhook for bot endpoints (/doorbells, set_agent_webhook_doorbell).
+# WEBHOOK_DOORBELL_SIGNED = "1"   # new registrations use a signed body-free wake on the events queue (migration 0256).
+                                  # Default off: unset keeps the legacy bearer POST. Needs EVENTS_CALLBACK_HOSTS.
 # ── Approval bot ("/muapprove"; docs/architecture/approval-bot.md) — OFF unless APPROVAL_BOT_TOKEN is set ───────────────────
 # A DEDICATED Telegram bot the worker owns (never the notification bot, the Mini App bot or the Hermes/IM bot). An agent's
 # request_elevation reaches the human as ONE message with Approve / Deny buttons (or /muapprove <id>, /mudeny <id>, /murevoke).

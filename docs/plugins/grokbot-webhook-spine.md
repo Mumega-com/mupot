@@ -44,6 +44,42 @@ Header: `Authorization: Bearer <doorbell key>`. Timeout ~3s. Fire-and-forget via
 
 Routine-fenced dispatch envelopes (`routineRunFence` on `sendAgentMessage`) do **not** ring the doorbell. The project-routines cron already runs scheduler + dispatch in one invocation under the D1 50-statement cap; an extra SELECT there overflows the budget. Routine dispatch has its own wake. This doorbell is for agent/human `send`.
 
+## Signed doorbell (flag `WEBHOOK_DOORBELL_SIGNED`, default OFF)
+
+Migration `0256_signed_webhook_doorbell.sql` adds `agent_webhook_doorbells.delivery_version`
+(`legacy` | `signed`, existing rows default to `legacy`) and widens doorbell receipts with
+`attempt`, `error_class`, and `signed_at` (outcomes `retry` and `dead_letter`). Apply it
+before a worker that registers or reads signed rows. Do not flip the flag in production
+from this change; unset means the legacy bearer POST is the only ring.
+
+While the flag is on, a new registration stores an HMAC key (`whsec_` + base64 of at least
+32 bytes) under `CONNECTOR_MASTER_KEY`, vault domain `agent_doorbell_hmac`, AAD = the agent
+id. The key is write-only: get/list return `auth_last4` and `delivery_version`, never the
+key. The callback host must be on `EVENTS_CALLBACK_HOSTS` at registration and again at send
+time (`assertPublicHttpsUrl` still refuses private and link-local hosts; redirects are not
+followed).
+
+Delivery is one `mcp.doorbell.delivery` job on the existing events queue
+(`src/bus/doorbell-delivery.ts`). The worker re-reads D1, signs, POSTs, writes one receipt
+per attempt, and retries with `delaySeconds`. Five transient failures (5xx, timeout, 3xx,
+408, 429) end in `dead_letter`. Other 4xx fail. A legacy row is not also posted inline.
+
+### Verifier
+
+Receivers use `verifySignedDoorbell` in `src/agents/doorbell-signature.ts`.
+
+Headers: `webhook-id`, `webhook-timestamp` (unix seconds), `webhook-signature` (`v1,<base64 HMAC-SHA256>` over `"<id>.<timestamp>.<body>"`). The body is today's doorbell JSON plus `nonce`. Reject when `|now - timestamp| > 300` seconds. Reject a repeated `(webhook-id, nonce)` — pass a `DoorbellReplayStore` (see `memoryDoorbellReplayStore` for a single isolate). Compare signatures with the helper; it uses `timingSafeEqual`. A key encrypted for a different agent id does not decrypt (GCM AAD).
+
+Wire bodies (no `from_agent`, no message body):
+
+```json
+{ "type": "mupot.inbox.wake", "agent_id": "…", "seq": 0, "message_id": "…", "kind": "message", "nonce": "…" }
+{ "type": "mupot.task.assigned", "agent_id": "…", "task_id": "…", "nonce": "…" }
+{ "type": "mupot.doorbell.test", "agent_id": "…", "nonce": "…" }
+```
+
+Receipts (`list_agent_webhook_doorbell_receipts`, self or squad admin): `event_type`, `agent_id`, `ref_id`, `attempt`, `outcome`, `http_status`, `error_class`, `signed_at`. Never the URL, the key, or a body.
+
 ## Safety (flag `WEBHOOK_DOORBELL`, default OFF)
 
 - Off: no register, no POST, no D1 read on the send path. Set `WEBHOOK_DOORBELL=1` (or `true`) to enable. Clear and remove keep working with the flag off.

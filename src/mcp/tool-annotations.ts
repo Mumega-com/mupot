@@ -176,6 +176,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   deactivate_agent: MUT('UPDATE agents status=inactive + DELETE agent_keys/fleet_agents + revoke tokens (mcp/provision.ts:2555+)'),
   set_agent_webhook_doorbell: MUT('setAgentWebhookDoorbell upsert/DELETE agent_webhook_doorbells (agents/webhook-doorbell.ts)'),
   get_agent_webhook_doorbell: RO('getAgentWebhookDoorbell SELECT only (agents/webhook-doorbell.ts)'),
+  list_agent_webhook_doorbell_receipts: RO('listAgentWebhookDoorbellReceipts SELECT metadata only (agents/webhook-doorbell.ts)'),
   update_agent: MUT('updateAgentProfile UPDATE agents + agent_audit (org/service.ts:1676)'),
   move_agent_squad: MUT('UPDATE agents.squad_id + DELETE memberships/capabilities (org/service.ts:1866-1872)'),
   update_squad: MUT('updateUnitConfig UPDATE squads (org/service.ts:1265)'),

@@ -47,7 +47,7 @@ export type ConnectorType =
   | 'supabase'
   | 'custom'
 /** HKDF domain for a secret the vault protects that is NOT a connector row (distinct `info`). */
-export type VaultDomain = ConnectorType | 'mcp_events' | 'agent_doorbell'
+export type VaultDomain = ConnectorType | 'mcp_events' | 'agent_doorbell' | 'agent_doorbell_hmac'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
 const VALID_TYPES: readonly ConnectorType[] = [
