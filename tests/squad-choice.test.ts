@@ -134,6 +134,34 @@ describe('choosing', () => {
   })
 })
 
+describe('in-flight work guard (same check as move_agent_squad fleet_dispatch_active)', () => {
+  const unchanged = () => {
+    expect(squadOf()).toBe('sq-home')
+    expect(one("SELECT capability FROM capabilities WHERE member_id = 'mem-a1' AND scope_id = 'sq-home'")).toEqual({ capability: 'member' })
+    expect(one("SELECT 1 AS x FROM memberships WHERE agent_id = 'a1' AND squad_id = 'sq-home'")).toBeDefined()
+    expect(audits()).toHaveLength(0)
+  }
+  it('refuses with an unconsumed dispatch receipt; membership unchanged', async () => {
+    h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at)
+      VALUES ('r1', '${TENANT}', 't-live', 'sq-home', 'a1', 'member', 'm-owner', '2026-10-01T00:00:00.000Z')`)
+    const r = await choose({ squad_id: 'sq-a' })
+    expect(errOf(r)).toBe('in_flight_work')
+    unchanged()
+  })
+  it('refuses with an in-progress task assigned to the agent', async () => {
+    h.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id) VALUES ('t-ip', 'sq-home', 'Busy', 'in_progress', 'a1')`)
+    expect(errOf(await choose({ squad_id: 'sq-a' }))).toBe('in_flight_work')
+    unchanged()
+  })
+  it('an idle agent (consumed receipt, done task) still succeeds', async () => {
+    h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at)
+      VALUES ('r2', '${TENANT}', 't-old', 'sq-home', 'a1', 'member', 'm-owner', '2026-10-01T00:00:00.000Z', '2026-10-01T01:00:00.000Z');
+      INSERT INTO tasks (id, squad_id, title, status, assignee_agent_id) VALUES ('t-done', 'sq-home', 'Done', 'done', 'a1')`)
+    expect((await choose({ squad_id: 'sq-a' })).ok).toBe(true)
+    expect(squadOf()).toBe('sq-a')
+  })
+})
+
 describe('who may call it', () => {
   it('refuses a session that is not a direct agent credential', async () => {
     const human: AuthContext = { userId: 'm-owner', email: '', role: 'owner', tenant: TENANT, channel: 'workspace', memberId: 'm-owner', capabilities: [] }

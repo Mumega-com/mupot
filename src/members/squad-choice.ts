@@ -23,6 +23,7 @@ import { brandSquadScope, canOnSquad, CAPABILITY_LIVE_PREDICATE, capabilityRank,
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { moveAgentSquad } from '../org/service'
 import type { AuthContext, Capability, Env } from '../types'
+import { findInFlightWork } from '../fleet/in-flight-work'
 import { resolveAgentMemberBinding } from './service'
 
 export const SQUAD_CHOICE_LEVELS = ['observer', 'member'] as const
@@ -97,6 +98,7 @@ export type SquadChoiceError =
   | 'invalid_level'
   | 'invalid_reason'
   | 'standing_lost'
+  | 'in_flight_work'
   | 'choice_refused'
 
 /** The human whose standing bounds the choice: agents.owner_member_id, else the ONE human holding a direct
@@ -214,7 +216,7 @@ async function explicitCandidate(env: Env, ctx: Extract<ChoiceContext, { ok: tru
 
 export type ChooseSquadResult =
   | { ok: true; already: boolean; squad: { id: string; slug: string; name: string }; level: SquadChoiceLevel; audit_id: string | null }
-  | { ok: false; error: SquadChoiceError }
+  | { ok: false; error: SquadChoiceError; in_flight?: { flight_id: string | null; task_id: string | null; dispatch_receipt_id: string | null } }
 
 export async function chooseSquad(
   env: Env,
@@ -251,6 +253,11 @@ export async function chooseSquad(
   const scope = brandSquadScope({ id: chosen.id, department_id: chosen.department_id, kind: 'work' })
   if (!(await canOnSquad(env, grants, scope, level as Capability))) return { ok: false, error: 'standing_lost' }
   if (capabilityRank(level as Capability) > capabilityRank('member')) return { ok: false, error: 'invalid_level' }
+
+  // Same check as move_agent_squad's fleet_dispatch_active: leaving the lobby severs home-squad membership,
+  // which must not happen under a live flight, in-progress task, or unconsumed dispatch. Finish or release it first.
+  const inFlight = await findInFlightWork(env, ctx.agent.id)
+  if (inFlight) return { ok: false, error: 'in_flight_work', in_flight: { flight_id: inFlight.flight?.id ?? null, task_id: inFlight.taskId, dispatch_receipt_id: inFlight.dispatchReceiptId } }
 
   const moved = await moveAgentSquad(env, {
     agentId: ctx.agent.id,

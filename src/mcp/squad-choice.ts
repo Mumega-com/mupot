@@ -23,6 +23,7 @@ const STATUS: Record<SquadChoiceError, 400 | 403 | 404 | 409> = {
   invalid_level: 400,
   invalid_reason: 400,
   standing_lost: 403,
+  in_flight_work: 409,
   choice_refused: 409,
 }
 
@@ -48,7 +49,11 @@ const toolSquadChoose: ToolSpec = {
       return done({ in_lobby: ctx.inLobby, candidates: await listSquadCandidates(env, ctx) })
     }
     const res = await chooseSquad(env, auth, { squadId, level: args.level, reason: args.reason })
-    if (!res.ok) return fail(STATUS[res.error], res.error)
+    if (!res.ok) {
+      return res.in_flight
+        ? fail(STATUS[res.error], res.error, { reason: 'finish or release your in-progress task, active dispatch or flight before choosing a squad', ...res.in_flight })
+        : fail(STATUS[res.error], res.error)
+    }
     return done({ already: res.already, squad: res.squad, level: res.level, audit_id: res.audit_id, effective: 'on your next request' })
   },
 }

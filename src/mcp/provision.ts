@@ -31,6 +31,7 @@
 //                        through Jev with a decline-on-low-confidence gate. Adds
 //                        no authorization of its own.
 
+import { findInFlightWork } from '../fleet/in-flight-work'
 import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
@@ -2631,30 +2632,13 @@ export const toolMoveAgentSquad: ToolSpec = {
     // 6th hard block layer 1 (Athena REQUIRED): refuse when the target still
     // has an in-air flight or an in-flight dispatched task. Severing old-squad
     // grants mid-flight can break a live dispatch/receipt path.
-    const [liveFlight, liveTask, liveDispatch] = await Promise.all([
-      env.DB.prepare(
-        `SELECT id, status FROM flights
-          WHERE tenant = ?1 AND agent = ?2
-            AND status IN ('preflight', 'running', 'waiting', 'sleeping')
-          LIMIT 1`,
-      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; status: string }>(),
-      env.DB.prepare(
-        `SELECT id FROM tasks
-          WHERE assignee_agent_id = ?1 AND status = 'in_progress'
-          LIMIT 1`,
-      ).bind(agent.id).first<{ id: string }>(),
-      env.DB.prepare(
-        `SELECT id, task_id FROM task_dispatch_receipts
-          WHERE tenant = ?1 AND agent_id = ?2 AND consumed_at IS NULL
-          LIMIT 1`,
-      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; task_id: string }>(),
-    ])
-    if (liveFlight || liveTask || liveDispatch) {
+    const inFlight = await findInFlightWork(env, agent.id)
+    if (inFlight) {
       return fail(409, 'fleet_dispatch_active', {
-        flight_id: liveFlight?.id ?? null,
-        flight_status: liveFlight?.status ?? null,
-        task_id: liveTask?.id ?? liveDispatch?.task_id ?? null,
-        dispatch_receipt_id: liveDispatch?.id ?? null,
+        flight_id: inFlight.flight?.id ?? null,
+        flight_status: inFlight.flight?.status ?? null,
+        task_id: inFlight.taskId,
+        dispatch_receipt_id: inFlight.dispatchReceiptId,
       })
     }
 
