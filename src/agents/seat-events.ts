@@ -345,6 +345,16 @@ export async function createSeatEventGrant(
     if (/UNIQUE/i.test(msg)) return { ok: false, reason: 'agent_already_granted' }
     return { ok: false, reason: 'db_error' }
   }
+  // Grant is committed first. This accelerates observer closure; the Worker
+  // reference revalidator and synchronous host claim remain the safety backstops.
+  if (env.INBOX_STREAM_PUSH === '1' && env.SEAT_EVENTS) {
+    try {
+      await env.SEAT_EVENTS.get(env.SEAT_EVENTS.idFromName(seatEventsChannelName(tenant))).fetch(new Request('https://seat-events/bearer-evict', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agent: input.agentId }), signal: AbortSignal.timeout(2000),
+      }))
+    } catch { /* best effort: never roll back or misreport a committed grant */ }
+  }
   return { ok: true, id }
 }
 
@@ -436,15 +446,13 @@ const HOST_STANDING_SQL = `(
 /** The per-disclosure check. One indexed query: live grant for (host, agent), agent active,
  *  host key still bound to an active member, host still has standing in the agent's squad,
  *  project (if scoped) still reachable. */
-export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
-  try {
-    const row = await env.DB.prepare(
-      `SELECT 1 AS x
+export function seatDeliveryQuery(tenant: string, agent: string, host?: string): string {
+  return `SELECT 1 AS x
          FROM seat_event_grants g
          JOIN agents a ON a.id = g.agent_id AND a.status = 'active'
          JOIN agent_keys k ON k.tenant = g.tenant AND k.agent_id = g.host_agent_id AND k.member_id IS NOT NULL
          JOIN members m ON m.id = k.member_id AND m.tenant = k.tenant AND m.status = 'active'
-        WHERE g.tenant = ?1 AND g.host_agent_id = ?2 AND g.agent_id = ?3 AND g.revoked_at IS NULL
+        WHERE g.tenant = ${tenant} ${host ? `AND g.host_agent_id = ${host}` : ''} AND g.agent_id = ${agent} AND g.revoked_at IS NULL
           AND (g.project_id IS NULL OR EXISTS (
                 SELECT 1 FROM memberships ms
                   JOIN project_squad_access psa ON psa.squad_id = ms.squad_id
@@ -452,7 +460,13 @@ export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agent
                  WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'
                    AND ${CAPABILITY_LIVE_PREDICATE('ms', "datetime('now')")}))
           AND ${HOST_STANDING_SQL}
-        LIMIT 1`,
+        LIMIT 1`
+}
+
+export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
+  try {
+    const row = await env.DB.prepare(
+      seatDeliveryQuery('?1', '?3', '?2'),
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()
     return row !== null ? 'granted' : 'not_granted'
   } catch {
@@ -900,6 +914,9 @@ export interface RawAttachment {
 export function decodeSocketAttachment(raw: unknown): RawAttachment {
   if (!raw || typeof raw !== 'object') return {}
   const r = raw as Record<string, unknown>
+  // Explicit new socket kinds must never inherit the legacy host decoder.
+  if (r.kind !== undefined) return {}
+  if (r.sub && typeof r.sub === 'object' && (r.sub as Record<string, unknown>).kind !== undefined) return {}
   if (typeof r.host === 'string' && Array.isArray(r.agents) && r.sub === undefined && r.connectedAt === undefined) {
     return { sub: { host: r.host, agents: r.agents as string[] } }
   }
@@ -908,6 +925,8 @@ export function decodeSocketAttachment(raw: unknown): RawAttachment {
 
 export interface HubDeps {
   sockets: () => HubSocket[]
+  /** Synchronous after host state installation, before any await/disclosure. */
+  onHostClaim?: (agents: readonly string[]) => void
   tickets: TicketStore
   nowSec?: () => number
   /** Bounded memory of recently published hint ids; survives across calls while the DO is awake. */
@@ -999,6 +1018,25 @@ export class SeatEventsHub {
     this.recent = deps.recent ?? new RecentIds()
     this.authorize = deps.authorize ?? ((host, agent) => authorizeSeatDelivery(env, host, agent))
     this.junk = deps.junk ?? createJunkTracker()
+  }
+
+  /** A retained socket attachment is not a live grant. Reconcile stale holders
+   * before the DO's final synchronous observer acceptance check. A transient
+   * authority failure leaves ownership intact and refuses the new observer. */
+  async reconcileHostClaims(agent: string): Promise<'checked' | 'error'> {
+    for (const sock of this.deps.sockets()) {
+      const before = sock.getState()
+      if (sock.isClosed() || !before?.agents.includes(agent)) continue
+      const status = await this.authorize(before.host, agent)
+      if (status === 'error') return 'error'
+      if (status === 'not_granted') {
+        const current = sock.getState()
+        if (current?.host === before.host && current.agents.includes(agent)) {
+          this.drop(sock, current, agent, { type: 'revoked', agent, reason: 'grant_revoked' })
+        }
+      }
+    }
+    return 'checked'
   }
 
   /** Record that `sock` was just accepted, for enforceAuthDeadline (mupot#1589 P1-2). Call
@@ -1102,6 +1140,7 @@ export class SeatEventsHub {
       return
     }
     sock.setState({ host: rec.host, agents: mine })
+    this.deps.onHostClaim?.(mine)
     sock.send(encodeFrame({ type: 'ready', protocol: SEAT_EVENTS_PROTOCOL, host: rec.host, subscriptions: subs }))
     for (const agent of mine) {
       const s = Number(since[agent] ?? 0)

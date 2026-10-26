@@ -77,6 +77,8 @@ jobs:
       # ever deleted, the composition is back to shipping untested.
       - name: Composition tests (workerd)
         run: npx vitest run --config vitest.composition.config.ts
+      - name: Bearer push Durable Object tests (workerd)
+        run: npx vitest run --config vitest.bearer.config.ts
       - name: Fleet runtime tests
         run: node --test 'fleet-runtime/**/*.test.mjs'
       # Router routing-rule tests. Wired here rather than left to vitest because

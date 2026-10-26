@@ -12,6 +12,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../types'
 import { reciprocateWebSocketClose } from '../registry/realtime'
+import { bearerAcceptRefusal, bearerHintVisible, decodeBearerSubscription, type BearerSubscription } from './seat-events-bearer'
 import {
   AUTH_DEADLINE_SEC,
   createJunkTracker,
@@ -80,6 +81,7 @@ export class SeatEventsDO extends DurableObject<Env> {
       nowSec: this.nowSec,
       recent: this.recent,
       junk: this.junk,
+      onHostClaim: agents => this.evictBearers(agents),
     })
   }
 
@@ -93,7 +95,27 @@ export class SeatEventsDO extends DurableObject<Env> {
   private wrapped(): HubSocket[] {
     return this.ctx.getWebSockets()
       .filter((ws) => ws.readyState === WebSocket.OPEN)
+      .filter((ws) => !(ws.deserializeAttachment() as { kind?: unknown } | null)?.kind)
       .map((ws) => this.wrapOnce(ws))
+  }
+
+  private bearers(): { ws: WebSocket; sub: BearerSubscription }[] {
+    const result: { ws: WebSocket; sub: BearerSubscription }[] = []
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const raw = ws.deserializeAttachment() as { kind?: unknown } | null
+      if (!raw?.kind) continue
+      const sub = decodeBearerSubscription(raw, this.env.TENANT_SLUG, Date.now())
+      if (!sub) { ws.close(4401, 'observer_expired_or_invalid'); continue }
+      result.push({ ws, sub })
+    }
+    return result
+  }
+
+  private evictBearers(agents: readonly string[]): void {
+    for (const { ws, sub } of this.bearers()) {
+      if (agents.includes(sub.agent)) ws.close(4409, 'notify_owned_by_fleet_host')
+    }
   }
   private wrapOnce(ws: WebSocket): HubSocket {
     let w = this.cache.get(ws)
@@ -106,6 +128,34 @@ export class SeatEventsDO extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
+    if (url.pathname === '/bearer-evict' && req.method === 'POST') {
+      const body = await req.json() as { agent?: unknown }
+      if (typeof body.agent !== 'string' || !body.agent) return Response.json({ error: 'invalid_agent' }, { status: 400 })
+      this.evictBearers([body.agent])
+      return Response.json({ ok: true })
+    }
+    // This path is reachable only through the Worker binding, never routed publicly.
+    // Descriptor headers MUST be constructed anew after member-token authentication.
+    if (url.pathname === '/bearer-connect' && req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+      let raw: unknown
+      try { raw = JSON.parse(req.headers.get('x-mupot-bearer-subscription') ?? '') } catch { return Response.json({ error: 'invalid_observer' }, { status: 403 }) }
+      const sub = decodeBearerSubscription(raw, this.env.TENANT_SLUG, Date.now())
+      if (!sub) return Response.json({ error: 'invalid_observer' }, { status: 403 })
+      if (await this.hub().reconcileHostClaims(sub.agent) === 'error') {
+        return Response.json({ error: 'host_authorization_unavailable' }, { status: 503 })
+      }
+      if (Date.now() >= sub.not_after) return Response.json({ error: 'invalid_observer' }, { status: 403 })
+      // No await from this check through acceptance. Host state installation invokes
+      // evictBearers synchronously, providing the reverse side of the same exclusion.
+      const observers = this.bearers()
+      const hostHolds = this.wrapped().some(s => s.getState()?.agents.includes(sub.agent))
+      const reason = bearerAcceptRefusal(sub, observers.map(o => o.sub), hostHolds)
+      if (reason) return Response.json({ error: reason }, { status: hostHolds ? 409 : 503 })
+      const pair = new WebSocketPair()
+      this.ctx.acceptWebSocket(pair[1])
+      pair[1].serializeAttachment(sub)
+      return new Response(null, { status: 101, webSocket: pair[0] })
+    }
     if (url.pathname === '/ticket' && req.method === 'POST') {
       const b = (await req.json()) as { hash?: unknown; host?: unknown; agents?: unknown; expires_at?: unknown }
       if (typeof b.hash !== 'string' || typeof b.host !== 'string' || !Array.isArray(b.agents) || typeof b.expires_at !== 'number') {
@@ -118,7 +168,19 @@ export class SeatEventsDO extends DurableObject<Env> {
     if (url.pathname === '/hint' && req.method === 'POST') {
       const hint = normalizeHint(await req.json())
       if (!hint) return Response.json({ error: 'bad_hint' }, { status: 400 })
-      return Response.json({ ok: true, ...(await this.hub().publish(hint)) })
+      const hostResult = await this.hub().publish(hint)
+      let observersSent = 0
+      if (!hostResult.duplicate) {
+        for (const { ws, sub } of this.bearers()) {
+          if (!bearerHintVisible(sub, hint, Date.now())) continue
+          try {
+            // Only a dirty/cursor signal reaches the Worker; message fields stay in D1.
+            ws.send(JSON.stringify({ type: 'hint', id: hint.id, seq: hint.seq }))
+            observersSent++
+          } catch { /* disconnect; bounded reconnect resync recovers */ }
+        }
+      }
+      return Response.json({ ok: true, ...hostResult, sent: hostResult.sent + observersSent })
     }
     if (url.pathname === '/connect' && req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       // mupot#1589 P1-2 / mupot#1594 P1-A: bound how many sockets this DO will hold open,
@@ -171,6 +233,10 @@ export class SeatEventsDO extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if ((ws.deserializeAttachment() as { kind?: unknown } | null)?.kind !== undefined) {
+      ws.close(4400, 'observer_frames_not_allowed')
+      return
+    }
     await this.hub().onMessage(this.wrapOnce(ws), message)
   }
 
