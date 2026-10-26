@@ -22,7 +22,7 @@ function env(opts: { task?: { id: string; status: string } | null; token?: strin
     }),
   }
   return {
-    env: { TENANT_SLUG: 't', DB, GITHUB_TOKEN: 'token' in opts ? opts.token : 'ghp_x', GITHUB_PLAN_TIER: 'free' } as unknown as Env,
+    env: { TENANT_SLUG: 't', DB, GITHUB_TOKEN: 'token' in opts ? opts.token : 'ghp_x', GITHUB_PLAN_TIER: 'free', GITHUB_REPO: 'o/r' } as unknown as Env,
     updates,
   }
 }
@@ -77,7 +77,7 @@ describe('executeTaskAsPR', () => {
         }),
       }),
     }
-    const e = { TENANT_SLUG: 't', DB, GITHUB_TOKEN: 'ghp_x', GITHUB_PLAN_TIER: 'free' } as unknown as Env
+    const e = { TENANT_SLUG: 't', DB, GITHUB_TOKEN: 'ghp_x', GITHUB_PLAN_TIER: 'free', GITHUB_REPO: 'o/r' } as unknown as Env
     let authorSeen: unknown = null
     const impl = (async (url: string, init?: RequestInit) => {
       const u = String(url)
@@ -112,7 +112,7 @@ describe('executeTaskAsPR', () => {
       TENANT_SLUG: 't',
       DB,
       GITHUB_TOKEN: 'ghp_x',
-      GITHUB_PLAN_TIER: 'free',
+      GITHUB_PLAN_TIER: 'free', GITHUB_REPO: 'o/r',
       AGENT_COMMIT_EMAIL_DOMAIN: 'agents.forkedpot.example',
     } as unknown as Env
     let authorSeen: unknown = null

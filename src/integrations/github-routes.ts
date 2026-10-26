@@ -16,9 +16,11 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
-import { createTask, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
+import { createTask, TaskProjectError, syncTaskStatusFromIssue, syncCiResultToTask, closeGitHubPrMirrorTasks } from '../tasks/service'
 import { syncGitHubProject } from './github-projects'
 import { recordMergedPr } from '../agents/kpi-sources'
+import { repoKeyFromUrl } from '../workspaces/repo-key'
+import { resolveRepoProject } from '../projects/office-intake'
 import { routeGitHubNoticeToOffice } from '../projects/office-intake'
 
 interface GitHubRouteEnv {
@@ -135,6 +137,42 @@ function safeField(s: unknown, max = 120): string {
 }
 
 const TITLE_MAX = 200
+
+/**
+ * The project that owns the payload's repository, or null. Reuses resolveRepoProject's rule: exactly
+ * one live owner resolves; none or several (ambiguous) is null, and so is a lookup failure — a
+ * webhook never guesses a project and never fails because attribution was unavailable.
+ */
+async function projectIdForPayload(env: Env, payload: Record<string, unknown>): Promise<string | null> {
+  const full = (payload.repository as { full_name?: unknown } | undefined)?.full_name
+  if (typeof full !== 'string') return null
+  const key = repoKeyFromUrl(`https://github.com/${full}`)
+  if (!key) return null
+  try {
+    const r = await resolveRepoProject(env, key)
+    return r.ok ? r.projectId : null
+  } catch {
+    return null
+  }
+}
+
+/** createTask with the resolved project; if that project refuses the inbound squad, create it unattributed. */
+async function createInboundTask(
+  env: Env,
+  input: Parameters<typeof createTask>[1],
+  options: Parameters<typeof createTask>[2],
+  projectId: string | null,
+): Promise<void> {
+  if (projectId) {
+    try {
+      await createTask(env, { ...input, project_id: projectId }, options)
+      return
+    } catch (e) {
+      if (!(e instanceof TaskProjectError)) throw e
+    }
+  }
+  await createTask(env, input, options)
+}
 
 export function taskFromGitHubEvent(
   eventType: string,
@@ -303,7 +341,7 @@ githubInboundApp.post('/', async (c) => {
       const num = Number.isInteger(issue.number) ? issue.number : '?'
       const squadId = await resolveInboundSquad(c.env, eventLabels(payload))
       if (!squadId) return c.json({ ok: true, skipped: true, reason: 'no_squad' })
-      await createTask(
+      await createInboundTask(
         c.env,
         {
           squad_id: squadId,
@@ -323,6 +361,7 @@ githubInboundApp.post('/', async (c) => {
           // without it this task was indistinguishable from a trusted local one.
           externalSource: 'github-webhook:issues',
         },
+        await projectIdForPayload(c.env, payload),
       )
       return c.json({ ok: true, routed: squadId })
     }
@@ -368,6 +407,7 @@ githubInboundApp.post('/', async (c) => {
             repo,
             prNumber: pr.number as number,
             title: prTitle,
+            projectId: await projectIdForPayload(c.env, payload),
           })
         } catch {
           // best-effort — webhook must always ack even if the record fails
@@ -391,10 +431,11 @@ githubInboundApp.post('/', async (c) => {
   // PR #659 P0 fix, widened: externalSource marks this (already-unassigned) task as
   // untrusted-external-origin — see the issues.opened call site above for the full
   // rationale (same untrusted-writer class, same #404/#659 unassigned-auto-pickup hole).
-  await createTask(
+  await createInboundTask(
     c.env,
     { squad_id: squadId, title: mapped.title, body: mapped.body, done_when: `GitHub event ${eventType} resolved`, status: 'open' },
     { skipMirror: true, externalSource: `github-webhook:${eventType}` },
+    await projectIdForPayload(c.env, payload),
   )
 
   return c.json({ ok: true })

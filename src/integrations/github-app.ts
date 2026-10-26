@@ -269,15 +269,41 @@ export async function resolveGitHubAppCreds(env: Env): Promise<GitHubAppCreds | 
  *
  * `nowMsOverride` and `fetchImpl` are injectable for tests.
  */
+export interface InstallationTokenOpts {
+  nowMsOverride?: number
+  fetchImpl?: typeof fetch
+  timeoutMs?: number
+  /**
+   * Repo-scoped mint: repository NAMES (no owner) the token may touch. Omitted = the legacy
+   * whole-installation token. A scoped token is cached under its own key and is never served to
+   * an unscoped caller (or the reverse).
+   */
+  repositories?: string[]
+  /** Permissions requested for a scoped token (e.g. { issues: 'write' }). Ignored when unscoped. */
+  permissions?: Record<string, 'read' | 'write'>
+  /**
+   * Scoped mint only: the owner the repositories must belong to. GitHub resolves `repositories` by
+   * name inside the installation's own account, so the response is checked against owner/name and a
+   * token for a different owner's same-named repo is discarded.
+   */
+  owner?: string
+}
+
 export async function getInstallationToken(
   env: Env,
-  opts?: { nowMsOverride?: number; fetchImpl?: typeof fetch; timeoutMs?: number },
+  opts?: InstallationTokenOpts,
 ): Promise<string | null> {
   const creds = await resolveGitHubAppCreds(env)
   if (!creds) return null
 
+  const scopedRepos = opts?.repositories && opts.repositories.length > 0 ? [...opts.repositories].sort() : null
+  const scopedPerms = scopedRepos ? opts?.permissions ?? {} : null
+  const cacheKey = scopedRepos
+    ? `${creds.installationId}|${JSON.stringify([opts?.owner?.toLowerCase() ?? '', scopedRepos, Object.entries(scopedPerms ?? {}).sort()])}`
+    : creds.installationId
+
   const nowMs = opts?.nowMsOverride ?? Date.now()
-  const cached = cacheGet(creds.installationId, nowMs)
+  const cached = cacheGet(cacheKey, nowMs)
   if (cached) return cached
 
   const jwt = await createAppJwt(creds.appId, creds.privateKeyPem, Math.floor(nowMs / 1000))
@@ -300,7 +326,9 @@ export async function getInstallationToken(
           Accept: 'application/vnd.github+json',
           'X-GitHub-Api-Version': '2022-11-28',
           'User-Agent': 'mupot',
+          ...(scopedRepos ? { 'Content-Type': 'application/json' } : {}),
         },
+        ...(scopedRepos ? { body: JSON.stringify({ repositories: scopedRepos, permissions: scopedPerms }) } : {}),
         signal: controller.signal,
       },
     )
@@ -308,12 +336,22 @@ export async function getInstallationToken(
 
     // Keep the deadline armed through body parsing too. A peer that sends headers
     // but never completes its body must not pin a task-creation request.
-    const body = (await res.json()) as { token?: string; expires_at?: string }
+    const body = (await res.json()) as { token?: string; expires_at?: string; repositories?: Array<{ full_name?: string }> }
     if (!body.token || !body.expires_at) return null
+    if (scopedRepos) {
+      // Fail closed unless GitHub confirms the token covers exactly the requested repos (and, when
+      // an owner is named, that owner's repos).
+      const got = (body.repositories ?? []).map((r) => (typeof r.full_name === 'string' ? r.full_name.toLowerCase() : ''))
+      const want = scopedRepos.map((n) => `${opts?.owner ?? ''}/${n}`.toLowerCase())
+      const ownerOk = opts?.owner
+        ? want.every((w) => got.includes(w))
+        : scopedRepos.every((n) => got.some((g) => g.endsWith(`/${n.toLowerCase()}`)))
+      if (!ownerOk || got.length !== scopedRepos.length) return null
+    }
 
     const expiresAtMs = Date.parse(body.expires_at)
     if (Number.isFinite(expiresAtMs)) {
-      tokenCache.set(creds.installationId, { token: body.token, expiresAtMs })
+      tokenCache.set(cacheKey, { token: body.token, expiresAtMs })
     }
     return body.token
   } catch {
@@ -321,6 +359,22 @@ export async function getInstallationToken(
   } finally {
     clearTimeout(timer)
   }
+}
+
+/**
+ * Mint a token scoped to ONE repository ("owner/name") with the given permissions. Server-side
+ * only: the caller uses it for its own GitHub request and never returns or logs it. Null when the
+ * App is not configured or the installation cannot reach that repo (GitHub refuses the mint).
+ */
+export async function getRepoScopedInstallationToken(
+  env: Env,
+  fullName: string,
+  permissions: Record<string, 'read' | 'write'>,
+  opts?: Pick<InstallationTokenOpts, 'nowMsOverride' | 'fetchImpl' | 'timeoutMs'>,
+): Promise<string | null> {
+  const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(fullName)
+  if (!m) return null
+  return getInstallationToken(env, { ...opts, repositories: [m[2] as string], permissions, owner: m[1] as string })
 }
 
 /**

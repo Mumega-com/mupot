@@ -64,6 +64,8 @@ function toBase64(s: string): string {
 
 interface ActionOpts {
   fetchImpl?: typeof fetch
+  /** A pre-minted repo-scoped token (server-side only). Absent = the legacy whole-install resolution. */
+  token?: string
 }
 
 /** A commit author/committer identity — so a named pot agent authors its own commits. */
@@ -105,7 +107,7 @@ export async function createBranch(
   if (!isValidBranch(fromBranch) || !isValidBranch(newBranch)) return { ok: false, error: 'invalid_branch' }
   if (!(await githubCan(env, 'repo_file_write'))) return { ok: false, error: 'capability_disabled' }
 
-  const token = await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined)
+  const token = opts.token ?? (await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined))
   if (!token) return { ok: false, error: 'no_token' }
   const doFetch = opts.fetchImpl ?? fetch
 
@@ -159,7 +161,7 @@ export async function putFile(
   if (content.length > 1_000_000) return { ok: false, error: 'content_too_large' }
   if (!(await githubCan(env, 'repo_file_write'))) return { ok: false, error: 'capability_disabled' }
 
-  const token = await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined)
+  const token = opts.token ?? (await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined))
   if (!token) return { ok: false, error: 'no_token' }
   const doFetch = opts.fetchImpl ?? fetch
   const url = `${GITHUB_API}/repos/${repo}/contents/${path}`
@@ -215,7 +217,7 @@ export async function openPullRequest(
   if (title.length > 256) return { ok: false, error: 'title_too_long' }
   if (!(await githubCan(env, 'repo_file_write'))) return { ok: false, error: 'capability_disabled' }
 
-  const token = await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined)
+  const token = opts.token ?? (await resolveOutboundGitHubToken(env, opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined))
   if (!token) return { ok: false, error: 'no_token' }
   const doFetch = opts.fetchImpl ?? fetch
 

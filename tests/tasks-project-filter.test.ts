@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env, Task } from '../src/types'
 import { createTask } from '../src/tasks/service'
@@ -284,12 +285,20 @@ describe('task project attribution', () => {
     harness = makeHarness()
     let resolveMirror: ((response: Response) => void) | undefined
     const mirrorResponse = new Promise<Response>((resolve) => { resolveMirror = resolve })
-    const fetchMock = vi.fn(() => mirrorResponse)
+    // The project owns acme/widgets, so the mirror first mints a repo-scoped App token (immediate),
+    // then posts the issue (the delayed receipt under test).
+    harness.sqlite.exec("UPDATE projects SET repo_key = 'github:acme/widgets' WHERE id = 'project-write'")
+    const fetchMock = vi.fn((url: unknown) => String(url).includes('/access_tokens')
+      ? Promise.resolve(new Response(JSON.stringify({
+          token: 'ghs_scoped', expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          repositories: [{ full_name: 'acme/widgets' }],
+        }), { status: 201 }))
+      : mirrorResponse)
     vi.stubGlobal('fetch', fetchMock)
     const events: unknown[] = []
     const env = envFor(harness)
-    env.GITHUB_TOKEN = 'gh-token'
-    env.GITHUB_REPO = 'acme/widgets'
+    const pem = /const TEST_PKCS8_PEM = `([^`]*)`/.exec(readFileSync(new URL('./github-app.test.ts', import.meta.url), 'utf8'))?.[1]
+    Object.assign(env, { GITHUB_APP_ID: '1', GITHUB_APP_PRIVATE_KEY: pem, GITHUB_APP_INSTALLATION_ID: '789' })
     env.BUS = { send: vi.fn(async (event: unknown) => { events.push(event) }) } as Env['BUS']
 
     const pending = createTask(env, {
@@ -298,7 +307,7 @@ describe('task project attribution', () => {
       title: 'Mirror race',
       done_when: 'the GitHub receipt is linked once',
     })
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     harness.sqlite.exec(`
       DELETE FROM project_squad_access
        WHERE project_id = 'project-write' AND squad_id = 'squad-a'

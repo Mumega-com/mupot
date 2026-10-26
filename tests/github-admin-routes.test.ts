@@ -167,6 +167,27 @@ describe('POST /admin/github/execute-task', () => {
     expect(res.status).toBe(400)
     expect(((await res.json()) as { stage: string }).stage).toBe('validate')
   })
+  it('admin, repo the task does not own → 403 repo stage (no GitHub call)', async () => {
+    const env = envForRole('admin', { GITHUB_REPO: 'o/r' })
+    // task exists, no project: only GITHUB_REPO is allowed
+    const base = (env.DB as unknown as { prepare: (sql: string) => { bind: (...a: unknown[]) => unknown } }).prepare
+    ;(env.DB as unknown as { prepare: unknown }).prepare = vi.fn((sql: string) => {
+      if (!/FROM tasks\b/.test(sql)) return base(sql)
+      const stmt = {
+        bind: (..._a: unknown[]) => stmt,
+        first: vi.fn(async () => ({ id: 'T1', status: 'open', assignee_agent_id: null, project_id: null, unresolved: 0 })),
+        all: vi.fn(async () => ({ results: [] })),
+        run: vi.fn(async () => ({ meta: { changes: 1 } })),
+      }
+      return stmt
+    })
+    const res = await dashboardApp.fetch(
+      req('/admin/github/execute-task', 'POST', { taskId: 'T1', repo: 'other/place', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
+      env,
+    )
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { stage: string }).stage).toBe('repo')
+  })
 })
 
 describe('POST /admin/github/assign-copilot', () => {

@@ -188,6 +188,7 @@ export interface RecordMergedPrInput {
   repo: string    // "owner/repo" (already safeField-sanitized by github-routes)
   prNumber: number
   title: string | null
+  projectId?: string | null // the single project owning `repo` (resolveRepoProject), else null
   nowMs?: number  // injectable for tests
 }
 
@@ -215,10 +216,10 @@ export async function recordMergedPr(
 
     const result = await env.DB.prepare(
       `INSERT OR IGNORE INTO github_prs_merged
-         (id, tenant_id, repo, pr_number, title, merged_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (id, tenant_id, repo, pr_number, title, merged_at, created_at, project_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(id, env.TENANT_SLUG, input.repo, input.prNumber, input.title, nowMs, nowMs)
+      .bind(id, env.TENANT_SLUG, input.repo, input.prNumber, input.title, nowMs, nowMs, input.projectId ?? null)
       .run()
 
     return { ok: true, inserted: (result.meta?.changes ?? 0) > 0 }

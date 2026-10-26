@@ -4523,9 +4523,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_webhook_doorbell_receipts_agent" },
     ],
   },
+  {
+    file: "0257_github_prs_merged_project_id.sql",
+    sha256: "c64be496b5d903d1407dcffd6a3ee50b00477ce3166ac33c593c8501fb7b3c56",
+    statements: [
+      "-- 0257: attribute a merged-PR observation to the project that owns its repo.\n-- Nullable: NULL = no project owns the repo, or more than one does (resolveRepoProject's rule), or\n-- the row predates this column. No backfill: old rows keep NULL, never a guess.\n-- Apply BEFORE deploying the worker that writes it (recordMergedPr binds this column).\nALTER TABLE github_prs_merged ADD COLUMN project_id TEXT;",
+      "\nCREATE INDEX IF NOT EXISTS idx_github_prs_merged_project\n  ON github_prs_merged (tenant_id, project_id, merged_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_github_prs_merged_project" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "af97b8f1f5a58ca16a0b26a2d728d66c94b7f5df90a57740c42fa9fd0083ff63"
+export const SCHEMA_CHAIN_DIGEST: string = "7cb19f514c7c14e9f476ff37a862616ee0fa7556a1df80b4477cb123248fabfa"
