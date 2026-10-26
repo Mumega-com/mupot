@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
+import { FakePagesPort } from './helpers/fake-pages-port'
 import { FakeInternalWiki } from './helpers/fake-internal-wiki'
 import { getProjectWikiTopic } from '../src/projects/wiki-client'
 import { createInkwellPagesPort, decodeEnvelope, encodeEnvelopeTags } from '../src/pages/inkwell-adapter'
@@ -20,30 +21,11 @@ const PROJECT = 'proj-a-id'
 const CONNECTOR_ID = 'connector-inkwell-pages'
 const MASTER_KEY = '55'.repeat(32)
 
-/** A provider-agnostic in-memory adapter: proves nothing in the contract is Inkwell-shaped. */
-export class FakePagesPort implements PagesPort {
-  readonly id = 'fake-memory'
-  readonly store = new Map<string, PagePutInput>()
-  async get(projectId: string, slug: string): Promise<PageRecord | null> {
-    const hit = this.store.get(`${projectId}/${slug}`)
-    if (!hit) return null
-    return { slug: hit.slug, title: hit.title, summary: hit.summary, tags: hit.tags, links: hit.links, envelope: hit.envelope }
-  }
-  async put(projectId: string, input: PagePutInput) {
-    for (const l of input.links) {
-      if (!this.store.has(`${projectId}/${l.toSlug}`)) throw new PagesPortError('rejected', 'edge_target_invalid')
-    }
-    const key = `${projectId}/${input.slug}`
-    const created = !this.store.has(key)
-    // links are ADDITIVE and identified by (to, relation), exactly like the Inkwell store (contract note on PagesPort.put)
-    const prior = this.store.get(key)?.links ?? []
-    const rel = (l: { toSlug: string; relation?: string }) => `${l.toSlug}|${l.relation ?? 'related'}`
-    const incoming = input.links.map((l) => ({ toSlug: l.toSlug, relation: l.relation ?? 'related' }))
-    const merged = [...prior.filter((p) => !incoming.some((n) => rel(n) === rel(p))), ...incoming]
-    this.store.set(key, { ...input, links: merged })
-    return { slug: input.slug, created, linksWritten: input.links.length }
-  }
-}
+export { FakePagesPort }
+
+// The service requires the caller's squad access explicitly (fail closed); these older tests are not about it.
+const write = (env: Env, port: PagesPort, a: Omit<Parameters<typeof writePage>[2], 'canSeeSquadPages'> & { canSeeSquadPages?: boolean }) =>
+  writePage(env, port, { canSeeSquadPages: true, ...a })
 
 const env0 = (): PageEnvelope => ({ owner: 'agent-1', writer: 'agent-1', tier: 'project', purpose: 'decision', version: 1, writtenAt: '2026-10-15T00:00:00.000Z' })
 const input = (slug: string, over: Partial<PagePutInput> = {}): PagePutInput => ({
@@ -301,9 +283,9 @@ describe('writePage over a fake port (stamping, versions, ownership)', () => {
 
   it('stamps writer/owner/version/writtenAt from the server and counts versions up', async () => {
     const { env, port } = mk()
-    const a = await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid(), now: t('2026-10-15T01:00:00.000Z') })
+    const a = await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid(), now: t('2026-10-15T01:00:00.000Z') })
     expect(a).toMatchObject({ ok: true, created: true, version: 1, envelope: { owner: 'agent-a', writer: 'agent-a', writtenAt: '2026-10-15T01:00:00.000Z' } })
-    const b = await writePage(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ title: 'Doc v2' }), now: t('2026-10-15T02:00:00.000Z') })
+    const b = await write(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ title: 'Doc v2' }), now: t('2026-10-15T02:00:00.000Z') })
     expect(b).toMatchObject({ ok: true, created: false, version: 2, envelope: { owner: 'agent-a', writer: 'agent-b', writtenAt: '2026-10-15T02:00:00.000Z' } })
     const row = await env.DB.prepare('SELECT version FROM page_versions WHERE project_id = ? AND slug = ?').bind(PROJECT, 'doc-one').first<{ version: number }>()
     expect(row).toEqual({ version: 2 })
@@ -312,31 +294,31 @@ describe('writePage over a fake port (stamping, versions, ownership)', () => {
   it('a visible page WITHOUT our stamp (dashboard card / admin content) is refused', async () => {
     const { env, port } = mk()
     port.store.set(`${PROJECT}/doc-two`, { ...input('doc-two'), envelope: undefined as unknown as PageEnvelope })
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ slug: 'doc-two' }) })).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ slug: 'doc-two' }) })).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
   })
 
   it('REBUILD: owner and version come from the stamped TEXT when the counter row is missing', async () => {
     const { env, port } = mk()
     port.store.set(`${PROJECT}/doc-one`, input('doc-one', { envelope: { ...env0(), owner: 'agent-a', version: 40 } }))
-    const r = await writePage(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid() })
+    const r = await write(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid() })
     expect(r).toMatchObject({ ok: true, created: false, version: 41, envelope: { owner: 'agent-a', writer: 'agent-b' } })
   })
 
   it('version = MAX(counter, text) + 1 in both directions', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() }) // text v1, counter 1
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() }) // text v1, counter 1
     await env.DB.prepare('UPDATE page_versions SET version = 10').run() // counter ahead of text
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 11 })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 11 })
     const rec = port.store.get(`${PROJECT}/doc-one`)
     if (rec) port.store.set(`${PROJECT}/doc-one`, { ...rec, envelope: { ...rec.envelope, version: 50 } }) // text ahead of counter
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 51 })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 51 })
   })
 
   it('the counter row carries NO ownership: deleting it changes nothing about who owns the page', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
     await env.DB.prepare('DELETE FROM page_versions').run()
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: true, envelope: { owner: 'agent-a' } })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: true, envelope: { owner: 'agent-a' } })
     const cols = await env.DB.prepare("SELECT name FROM pragma_table_info('page_versions')").all<{ name: string }>()
     expect((cols.results ?? []).map((c) => c.name).sort()).toEqual(['project_id', 'slug', 'version'])
   })
@@ -344,60 +326,60 @@ describe('writePage over a fake port (stamping, versions, ownership)', () => {
   it('P1-A: a failed put leaves NO row, so a refused write cannot squat ownership', async () => {
     const { env, port } = mk()
     const failing: PagesPort = { id: 'f', get: async () => null, put: async () => { throw new PagesPortError('rejected', 'edge_target_invalid') } }
-    expect(await writePage(env, failing, { projectId: PROJECT, writer: 'attacker', input: valid() })).toMatchObject({ ok: false, status: 400 })
+    expect(await write(env, failing, { projectId: PROJECT, writer: 'attacker', input: valid() })).toMatchObject({ ok: false, status: 400 })
     const n = await env.DB.prepare('SELECT COUNT(*) AS n FROM page_versions').first<{ n: number }>()
     expect(n?.n).toBe(0)
-    const v = await writePage(env, port, { projectId: PROJECT, writer: 'victim', input: valid() })
+    const v = await write(env, port, { projectId: PROJECT, writer: 'victim', input: valid() })
     expect(v).toMatchObject({ ok: true, created: true, version: 1, envelope: { owner: 'victim' } })
     expect((await port.get(PROJECT, 'doc-one'))?.envelope?.owner).toBe('victim')
   })
 
   it('P1-A: a failed UPDATE changes no row (version and writer stay)', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
     const failing: PagesPort = { id: 'f', get: (p, s) => port.get(p, s), put: async () => { throw new PagesPortError('unavailable', 'wiki_unavailable') } }
-    expect(await writePage(env, failing, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: false, status: 503 })
+    expect(await write(env, failing, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: false, status: 503 })
     const row = await env.DB.prepare('SELECT version FROM page_versions WHERE slug = ?').bind('doc-one').first<{ version: number }>()
     expect(row).toEqual({ version: 1 })
   })
 
   it('racing writers that stamped the same version still advance the counter, so the next stamp is distinct', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
     const stale: PagesPort = { id: 'stale', get: async () => port.get(PROJECT, 'doc-one'), put: async () => ({ slug: 'doc-one', created: false, linksWritten: 0 }) }
     await Promise.all([
-      writePage(env, stale, { projectId: PROJECT, writer: 'agent-b', input: valid() }),
-      writePage(env, stale, { projectId: PROJECT, writer: 'agent-c', input: valid() }),
+      write(env, stale, { projectId: PROJECT, writer: 'agent-b', input: valid() }),
+      write(env, stale, { projectId: PROJECT, writer: 'agent-c', input: valid() }),
     ])
     const row = await env.DB.prepare('SELECT version FROM page_versions WHERE slug = ?').bind('doc-one').first<{ version: number }>()
     expect(row?.version).toBe(3)
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 4 })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })).toMatchObject({ ok: true, version: 4 })
   })
 
   it('P2-1: a page of ours that the store no longer shows is refused, never re-put (no silent republish)', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid() })
     port.store.clear()
     let puts = 0
     const spy: PagesPort = { id: 's', get: (p, s) => port.get(p, s), put: async (p, i) => { puts++; return port.put(p, i) } }
-    expect(await writePage(env, spy, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
+    expect(await write(env, spy, { projectId: PROJECT, writer: 'agent-b', input: valid() })).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
     expect(puts).toBe(0)
   })
 
   it('only the owner may change the tier', async () => {
     const { env, port } = mk()
-    await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ tier: 'squad' }) })
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ tier: 'project' }) })).toMatchObject({ ok: false, status: 403, error: 'tier_change_owner_only' })
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ tier: 'squad' }) })).toMatchObject({ ok: true })
-    expect(await writePage(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ tier: 'project' }) })).toMatchObject({ ok: true })
+    await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ tier: 'squad' }) })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ tier: 'project' }) })).toMatchObject({ ok: false, status: 403, error: 'tier_change_owner_only' })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-b', input: valid({ tier: 'squad' }) })).toMatchObject({ ok: true })
+    expect(await write(env, port, { projectId: PROJECT, writer: 'agent-a', input: valid({ tier: 'project' }) })).toMatchObject({ ok: true })
   })
 
   it('maps port failures to typed statuses without leaking detail', async () => {
     const { env } = mk()
     const boom = (kind: 'conflict' | 'rejected' | 'unavailable', code: string): PagesPort => ({ id: 'x', get: async () => null, put: async () => { throw new PagesPortError(kind, code) } })
-    expect(await writePage(env, boom('conflict', 'slug_unavailable'), { projectId: PROJECT, writer: 'w', input: valid() })).toMatchObject({ status: 409, error: 'slug_unavailable' })
-    expect(await writePage(env, boom('rejected', 'edge_target_invalid'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-two' }) })).toMatchObject({ status: 400, error: 'edge_target_invalid' })
-    expect(await writePage(env, boom('rejected', 'request_rejected'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-three' }) })).toMatchObject({ status: 502 })
-    expect(await writePage(env, boom('unavailable', 'wiki_unavailable'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-four' }) })).toMatchObject({ status: 503 })
+    expect(await write(env, boom('conflict', 'slug_unavailable'), { projectId: PROJECT, writer: 'w', input: valid() })).toMatchObject({ status: 409, error: 'slug_unavailable' })
+    expect(await write(env, boom('rejected', 'edge_target_invalid'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-two' }) })).toMatchObject({ status: 400, error: 'edge_target_invalid' })
+    expect(await write(env, boom('rejected', 'request_rejected'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-three' }) })).toMatchObject({ status: 502 })
+    expect(await write(env, boom('unavailable', 'wiki_unavailable'), { projectId: PROJECT, writer: 'w', input: valid({ slug: 'doc-four' }) })).toMatchObject({ status: 503 })
   })
 })

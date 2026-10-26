@@ -16,6 +16,7 @@ import { canViewTaskReceipts } from '../tasks/index'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canReadTask, resolveVisibleTaskScope } from '../tasks/visibility'
 import { observedFloorDecision } from '../members/vip-lane'
+import { callerHasSquadAccessToProject } from '../projects/access'
 import { done, fail, projectMemoryScope, str, type ToolSpec } from './index'
 import { readAccess, readableProject } from './projects'
 import { visibleFlight, visibleObjective } from './flight-spine'
@@ -107,6 +108,7 @@ export const toolTaskBrief: ToolSpec = {
       scope,
       canViewReceipts,
       flooredSeat,
+      canSeeSquadPages: project ? await callerHasSquadAccessToProject(env, readAccess(auth), project.id) : false,
       // Each source's OWN visibility function (the class rule): the flight check is flight-spine's visibleFlight
       // (observer on every squad of the flight + project read), the objective check its visibleObjective.
       visible: {

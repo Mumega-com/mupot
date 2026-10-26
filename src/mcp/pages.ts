@@ -11,9 +11,9 @@
 
 import { done, fail, str, type ToolSpec } from './index'
 import { readAccess, readableProject } from './projects'
-import { callerCanWriteProject } from '../projects/access'
+import { callerCanWriteProject, callerHasSquadAccessToProject } from '../projects/access'
 import { createInkwellPagesPort } from '../pages/inkwell-adapter'
-import { validatePageWrite, writePage } from '../pages/service'
+import { filterBacklinks, readPage, validatePageWrite, writePage } from '../pages/service'
 import { isReservedSlug, PAGE_SLUG_RE, PagesPortError, type PagesPort } from '../pages/port'
 import type { AuthContext } from '../types'
 
@@ -39,10 +39,10 @@ async function writerId(auth: AuthContext): Promise<string> {
 
 const toolProjectWikiUpsert: ToolSpec = {
   name: 'project_wiki_upsert',
-  scope: "project wiki (write). tier 'squad' is a label, not access control yet: every project reader sees every page. Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max",
+  scope: "project wiki (write). tier 'squad' pages are readable and writable only by members of a squad with access to the project (org admins too); tier 'project' pages are visible to every project reader. Optional markdown body (<=65536 bytes; refused over the cap, never truncated; a store that cannot hold bodies answers 501 body_unsupported). Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max",
   min: 'member',
   args:
-    '{ project_id: string, slug: string, title: string, summary: string(<=500), purpose: string, tier: "project"|"squad", tags?: string[], links?: [{to_slug, relation?}] }',
+    '{ project_id: string, slug: string, title: string, summary: string(<=500), body?: string(markdown, <=65536 bytes), purpose: string, tier: "project"|"squad", tags?: string[], links?: [{to_slug, relation?}] }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -50,6 +50,7 @@ const toolProjectWikiUpsert: ToolSpec = {
       slug: STRING_SCHEMA,
       title: STRING_SCHEMA,
       summary: STRING_SCHEMA,
+      body: STRING_SCHEMA,
       purpose: STRING_SCHEMA,
       tier: { type: 'string', enum: ['project', 'squad'] },
       tags: { type: 'array', items: STRING_SCHEMA },
@@ -70,7 +71,7 @@ const toolProjectWikiUpsert: ToolSpec = {
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_args', 'project_id required')
     const checked = validatePageWrite({
-      slug: args.slug, title: args.title, summary: args.summary, purpose: args.purpose,
+      slug: args.slug, title: args.title, summary: args.summary, body: args.body, purpose: args.purpose,
       tier: args.tier, tags: args.tags, links: args.links,
     })
     if (!checked.ok) return fail(checked.status, checked.error, checked.detail)
@@ -85,6 +86,7 @@ const toolProjectWikiUpsert: ToolSpec = {
       projectId: project.id,
       writer: await writerId(auth),
       input: checked.value,
+      canSeeSquadPages: await callerHasSquadAccessToProject(env, readAccess(auth), project.id),
     })
     if (!out.ok) return fail(out.status, out.error, out.detail)
     return done({
@@ -104,7 +106,7 @@ const toolProjectWikiUpsert: ToolSpec = {
 
 const toolProjectWikiGet: ToolSpec = {
   name: 'project_wiki_get',
-  scope: 'visible workspace project',
+  scope: "visible workspace project; squad-tier pages are returned only to members of a squad with access to the project. Returns the markdown body (null when none) and the pages linking to this slug",
   min: 'observer',
   args: '{ project_id: string, slug: string }',
   inputSchema: {
@@ -121,18 +123,24 @@ const toolProjectWikiGet: ToolSpec = {
     const project = await readableProject(env, projectId, readAccess(auth))
     if (!project) return fail(404, 'project_not_found')
     try {
-      const page = await pagesPortFactory.create(env).get(project.id, slug)
+      const port = pagesPortFactory.create(env)
+      // Squad-tier visibility is decided in the service BEFORE anything is returned; a hidden page is page_not_found.
+      const canSeeSquadPages = await callerHasSquadAccessToProject(env, readAccess(auth), project.id)
+      const page = await readPage(port, { projectId: project.id, slug, canSeeSquadPages })
       if (!page) return fail(404, 'page_not_found')
+      const backlinks = filterBacklinks(await port.listBacklinks(project.id, slug), canSeeSquadPages)
       return done({
         project_id: project.id,
         page: {
           slug: page.slug,
           title: page.title,
           summary: page.summary,
+          body: page.body ?? null,
           tags: page.tags,
           links: page.links.map((l) => ({ to_slug: l.toSlug, relation: l.relation })),
           envelope: page.envelope,
           reserved: isReservedSlug(page.slug),
+          backlinks: backlinks.map((b) => ({ slug: b.slug, title: b.title, relation: b.relation, tier: b.tier })),
         },
       })
     } catch (e) {

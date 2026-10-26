@@ -38,6 +38,8 @@
 // test/mutation, since a slug rendered here is upstream-sourced data this
 // module does not re-validate against Inkwell's own slug shape.
 import { html, raw } from 'hono/html'
+import { filterWikiGraphForCaller } from '../pages/inkwell-adapter'
+import { callerHasSquadAccessToProject } from '../projects/access'
 import type { AuthContext, Env, Project } from '../types'
 import type { Html } from './ui'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
@@ -135,7 +137,10 @@ export async function loadProjectWikiView(
 ): Promise<ProjectWikiView> {
   const liveSquadNames = await liveReadableSquadNames(env, auth, project.id)
   try {
-    const graph = await getProjectWikiGraph(env, project.id)
+    const graph = filterWikiGraphForCaller(
+      await getProjectWikiGraph(env, project.id),
+      await callerHasSquadAccessToProject(env, await projectAccess(env, auth), project.id),
+    )
     return { project, canManage, liveSquadNames, status: 'ok', graph }
   } catch (e) {
     if (e instanceof WikiRequestError) return { project, canManage, liveSquadNames, status: 'rejected', graph: null }

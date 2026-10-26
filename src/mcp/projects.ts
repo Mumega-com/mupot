@@ -27,6 +27,7 @@ import {
   recommitPrincipalFromAuth,
 } from '../projects/circuit-breaker'
 import {
+  callerHasSquadAccessToProject,
   projectReadAccessFromGrants,
   projectVisibilityClause,
   unrestrictedProjectRead,
@@ -41,6 +42,7 @@ import { listProjectBindings } from '../projects/providers/bindings'
 import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
 import { authorizeStructuralWrite, finishDelegatedReceipt } from '../operators/chokepoint'
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
+import { filterWikiGraphForCaller } from '../pages/inkwell-adapter'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -379,7 +381,11 @@ const toolProjectWiki: ToolSpec = {
     const project = await readableProject(env, projectId, access)
     if (!project) return fail(404, 'project_not_found')
     try {
-      const wiki = await getProjectWikiGraph(env, project.id)
+      // Squad-tier pages (and their edges) are dropped for a caller without squad access to the project.
+      const wiki = filterWikiGraphForCaller(
+        await getProjectWikiGraph(env, project.id),
+        await callerHasSquadAccessToProject(env, access, project.id),
+      )
       return done({ project_id: project.id, wiki })
     } catch (e) {
       // A well-formed call the upstream rejected as invalid (P2-B) is

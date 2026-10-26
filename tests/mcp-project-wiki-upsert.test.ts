@@ -339,10 +339,11 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     expect(bodies.size).toBe(1)
   })
 
-  it('P2-3: the tool description says tier squad is a label, not access control', async () => {
+  it('P2-3 (superseded by squad-tier enforcement): the tool description no longer calls tier squad a label', async () => {
     const { PAGES_TOOLS } = await import('../src/mcp/pages')
     const spec = PAGES_TOOLS.find((t) => t.name === 'project_wiki_upsert')
-    expect(spec?.scope).toContain("tier 'squad' is a label, not access control yet")
+    expect(spec?.scope).not.toContain('label, not access control')
+    expect(spec?.scope).toContain("tier 'squad' pages are readable and writable only by members of a squad")
   })
 
   it('P2-4: an id longer than the stamp budget is hashed, so the owner/by tags never exceed 48 chars', async () => {
