@@ -114,7 +114,8 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from './index'
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { evaluateVerdictGates } from '../tasks/index'
-import { findVerdictIndependenceConflict } from '../tasks/verdict-independence'
+import { findVerdictIndependenceConflict, holdsOwnerSelfVerdictAuthority } from '../tasks/verdict-independence'
+import type { VerdictIndependenceWaiver } from '../tasks/service'
 import { assertExpectedSubmission, emitGateVerdictReceipt, resolveGateVerdictScope, resolveVerdictSubmission, type GateVerdictReceiptOutcome } from '../tasks/verdict-binding'
 import { isGateAskExpired } from '../gates/approval-expiry-rule'
 import {
@@ -345,18 +346,25 @@ async function hasConflictOfInterest(
   // evaluateVerdictGates enforces): the member who consented to a submission on this task, or who owns / is bound /
   // keyed / attached / admitted (live or revoked) to a party agent, would be refused at write time as verdict_race;
   // report it up front as assignee_conflict instead.
-  if ((await findVerdictIndependenceConflict(env, memberId, taskId)) !== null) return true
+  const conflict = await findVerdictIndependenceConflict(env, memberId, taskId)
+  if (conflict === 'direct') return true
+  // Mom-walk D1: the stamped member is the OWNER of the calling agent. Owning the ASSIGNEE agent (and every other party
+  // agent it is affiliated with) plus two independent passing lenses on the CURRENT submission is the owner-self exemption, the same predicate evaluateVerdictGates and the verdict
+  // write re-assert. A key minter who is not the owner, or a bound member, is still refused.
+  if (conflict === 'affiliated' && !(await holdsOwnerSelfVerdictAuthority(env, memberId, taskId, await resolveVerdictSubmission(env, taskId)))) return true
+  // The calling agent can never be a party itself: it would be approving its own work using a stamp it wrote.
+  if ((await findVerdictIndependenceConflict(env, boundAgentId, taskId)) === 'direct') return true
   if (!assigneeAgentId) return false
   if (assigneeAgentId === boundAgentId) return true
   const assignee = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?')
     .bind(assigneeAgentId)
     .first<{ owner_member_id: string | null }>()
-  if (assignee?.owner_member_id === memberId) return true
+  if (assignee?.owner_member_id === memberId) return false // owner-self, proven above (conflict is null or owner-self)
   return memberOwnsAssigneeAgent(env, memberId, assigneeAgentId)
 }
 
 type DryRunResult =
-  | { ok: true; owner: Member; auth: AuthContext }
+  | { ok: true; owner: Member; auth: AuthContext; independenceWaiver?: VerdictIndependenceWaiver }
   | { ok: false; reason: HumanOriginFailureReason }
 
 /**
@@ -467,7 +475,9 @@ async function dryRunAuthorize(
     throw err
   }
 
-  return { ok: true, owner, auth: candidateAuth }
+  return gateResult.independenceWaiver
+    ? { ok: true, owner, auth: candidateAuth, independenceWaiver: gateResult.independenceWaiver }
+    : { ok: true, owner, auth: candidateAuth }
 }
 
 /**
@@ -511,6 +521,7 @@ async function commitOriginDecision(
   note: string | null,
   auth: AuthContext,
   expectedSubmissionId?: string | null,
+  independenceWaiver?: VerdictIndependenceWaiver,
 ): Promise<HumanOriginResolution> {
   const updateId = `origin:telegram:${origin.chat_id}:${origin.message_id}`
   // text_hash (round 4 addendum): the digest binds not just WHO and WHICH
@@ -558,6 +569,7 @@ async function commitOriginDecision(
     {
       task, verdict, note, decidedBy: owner.id, decidedVia: 'agent_attested_origin',
       originAgentId: boundAgentId, proposalId, submission, receiptActorKind,
+      ...(independenceWaiver ? { independenceWaiver } : {}),
     },
     {
       sql: `${ownershipGuardSql} AND ${chatEligibleGuardSql} AND ${reservationLandedGuardSql}`,
@@ -709,5 +721,5 @@ export async function resolveHarnessAttestedOrigin(
   const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task, gateOwner)
   if (!dryRun.ok) return { replayed: false, applied: false, reason: dryRun.reason }
 
-  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.auth, expectedSubmissionId)
+  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.auth, expectedSubmissionId, dryRun.independenceWaiver)
 }

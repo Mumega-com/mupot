@@ -129,7 +129,8 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     ['the assignee agent (A)', () => agentAuth('A')],
     ['an agent that SUBMITTED a result and was reassigned off (S)', () => agentAuth('S')],
     ['an agent recorded as RUNNING the task (R)', () => agentAuth('R')],
-    ['the member who OWNS the assignee agent (MA)', () => memberAuth('MA')],
+    // MA (the OWNER of A, bound to nothing) is NOT here since mom-walk D1: an owner may give the verdict on their own
+    // agent's work (waiver 'owner_self', tests/verdict-owner-self.test.ts). MB (bound) and MK (key minter) stay refused.
     ['the member BOUND to the assignee agent (MB)', () => memberAuth('MB')],
     ['the member whose KEY the assignee agent authenticates as (MK)', () => memberAuth('MK')],
     ['the member whose credential RAN the task (MR)', () => memberAuth('MR')],
@@ -464,7 +465,7 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
 
     it('writeVerdict throws VerdictIndependenceError for each party, with no waiver', async () => {
       seedWorld(harness.sqlite)
-      for (const decidedBy of ['A', 'S', 'R', 'MA', 'MB', 'MK', 'MR']) {
+      for (const decidedBy of ['A', 'S', 'R', 'MA', 'MB', 'MK', 'MR']) { // MA: refused unless the caller carries the owner_self waiver
         await expect(writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy }), decidedBy)
           .rejects.toBeInstanceOf(VerdictIndependenceError)
       }

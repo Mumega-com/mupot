@@ -812,6 +812,8 @@ export interface TaskVerdict {
   // receipt_actor_kind (0252, seed B4): non-null iff the task was in receipt-chain scope when the verdict was written = "a
   // gate.verdict receipt is owed". Doubles as the pending marker the reconcile sweep reads and the actor kind it replays with.
   receipt_actor_kind?: 'member' | 'agent' | null
+  // independence_waiver (0258): which verdict-independence exemption admitted the decider; NULL = none was needed.
+  independence_waiver?: 'admin_supervisory' | 'owner_override' | 'owner_self' | null
   reversed_at: string | null
 }
 

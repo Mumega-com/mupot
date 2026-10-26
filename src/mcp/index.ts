@@ -38,6 +38,7 @@ import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityF
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { recordReviewLens } from '../tasks/lenses'
 import { resolveDyadGateDefault } from '../gates/dyad'
 import { isSubsystemReservedLane } from '../gates/lanes'
 import { deliverDecisionCard, type DecisionCardOutcome } from '../gates/decision-card'
@@ -2983,6 +2984,42 @@ const toolTaskVerdictReverse: ToolSpec = {
       gate_owner: args.gate_owner,
       gate_owner_reason: args.gate_owner_reason,
     }, ctx)
+  },
+}
+
+// task_review_lens — record ONE independent review lens on a task's CURRENT submission (mom-walk D1). An owner may later
+// decide their own agent's result only when two independent passing lenses sit on that submission. The caller must hold the
+// task's gate lane and be independent of the task (the same predicate task_verdict uses); it names the submission it reviewed.
+const toolTaskReviewLens: ToolSpec = {
+  name: 'task_review_lens',
+  scope: 'squad (of the task)',
+  min: 'member',
+  args: '{ task_id: string, lens: string (<=64 chars, e.g. "correctness"|"adversarial"), outcome: "pass"|"fail", expected_submission_id: string (task_get -> current_submission.id), note?: string }' +
+    ' -- append-only; your latest row per lens wins, so a later "fail" withdraws a pass. A lens counts toward an owner-self verdict only while it' +
+    ' is on the CURRENT submission and lane, and you still hold the lane, stay independent, and are not owned by the deciding owner.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      lens: STRING_SCHEMA,
+      outcome: { type: 'string', enum: ['pass', 'fail'] },
+      expected_submission_id: STRING_SCHEMA,
+      note: STRING_SCHEMA,
+    },
+    required: ['task_id', 'lens', 'outcome', 'expected_submission_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskRef = str(args.task_id)
+    const expected = str(args.expected_submission_id)
+    if (!taskRef || !expected) return fail(400, 'invalid_args', 'task_id and expected_submission_id required')
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const res = await recordReviewLens(env, auth, {
+      taskId: taskRes.task.id, lens: args.lens, outcome: args.outcome, note: str(args.note), expectedSubmissionId: expected,
+    })
+    if (!res.ok) return fail(res.status, res.error)
+    return done(res.lens)
   },
 }
 
@@ -7818,6 +7855,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskUpdate,
   toolTaskVerdict,
   toolTaskVerdictReverse,
+  toolTaskReviewLens,
   toolTaskDispatch,
   toolTaskDispatchRuntimeReceipt,
   toolTaskSubmitResult,

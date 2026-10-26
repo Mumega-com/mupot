@@ -258,6 +258,8 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
       null,
       null,
       null,
+      // independence_waiver (0258, mom-walk D1): NULL, no exemption was needed.
+      null,
       // the landed-proof EXISTS params: task.id, newStatus, now
       task.id,
       'approved',

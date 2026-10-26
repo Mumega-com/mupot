@@ -20,7 +20,7 @@ import { chunkForD1InList } from '../lib/d1-in-list'
 import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import type { VerdictAttribution } from '../auth/attached-ceiling'
-import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
+import { compileOwnerSelfAuthoritySql, compileOwnerSelfLensesSql, compileVerdictIndependenceSql, findVerdictIndependenceConflict, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
 import { enqueueAssignmentWake, isWakeableTaskStatus, type AssignmentWakeContext } from '../agents/assignment-wake'
 import {
   assertAgentNamedSubmission,
@@ -1851,6 +1851,9 @@ export interface WriteVerdictInput {
    *   'admin_supervisory' — an org owner/admin who is merely AFFILIATED with the assignee (the
    *                         existing supervisory path); never waives a direct party;
    *   'owner_override'    — the org owner's explicit, audited override_self_verdict:true.
+   *   'owner_self'        — a MEMBER who OWNS the agent (agents.owner_member_id) giving the verdict on its work
+   *                         (mom-walk D1): re-checked in the UPDATE's WHERE by compileOwnerSelfAuthoritySql, never waives
+   *                         a direct party, a non-owner key minter or a bound member.
    * The `gate:agent-self-completion` lane exempts ONLY the agent that produced the task's current
    * result while it is also the CURRENT assignee (both re-read inside the UPDATE's WHERE, together
    * with the lane itself) and needs no waiver for that. An AGENT decider on that lane passes only
@@ -1871,7 +1874,7 @@ export interface WriteVerdictInput {
   attribution?: VerdictAttribution | null
 }
 
-export type VerdictIndependenceWaiver = 'admin_supervisory' | 'owner_override'
+export type VerdictIndependenceWaiver = 'admin_supervisory' | 'owner_override' | 'owner_self'
 
 export class VerdictIndependenceError extends Error {
   constructor(taskId: string, readonly kind: VerdictConflictKind) {
@@ -2174,6 +2177,7 @@ export function buildVerdictStatements(
     submission_id: input.submission ? input.submission.submissionId : null,
     result_digest: input.submission ? input.submission.resultDigest : null,
     receipt_actor_kind: input.receiptActorKind,
+    independence_waiver: input.independenceWaiver ?? null,
     reversed_at: null,
   }
 
@@ -2186,10 +2190,25 @@ export function buildVerdictStatements(
   const selfCompletionLane = input.task.gate_owner === 'gate:agent-self-completion'
   const independenceKinds: VerdictConflictKind[] = input.independenceWaiver === 'owner_override'
     ? []
-    : input.independenceWaiver === 'admin_supervisory' ? ['direct'] : ['direct', 'affiliated']
-  const independence = independenceKinds.length > 0
+    : input.independenceWaiver === 'admin_supervisory' || input.independenceWaiver === 'owner_self' ? ['direct'] : ['direct', 'affiliated']
+  const independenceBase = independenceKinds.length > 0
     ? compileVerdictIndependenceSql(independenceKinds, input.decidedBy, { column: 'tasks.id' })
     : null
+  // 'owner_self' waives ONLY the affiliated kind, and only while the decider still owns every party agent it is affiliated
+  // with: the owner-self predicate is OR-ed into the conflict fragment's negation, so the conflict is "direct, OR NOT owner-self".
+  // The guard is live ownership AND two independent passing lenses on the CURRENT submission (the one the UPDATE's own
+  // latestSubmissionGuard binds). No bound submission = no lens evidence = the waiver never holds (fails closed, SQL FALSE).
+  const ownerSelfGuard = input.independenceWaiver === 'owner_self'
+    ? (() => {
+        const own = compileOwnerSelfAuthoritySql(input.decidedBy, { column: 'tasks.id' })
+        if (!input.submission) return { sql: '(0)', params: [] as string[] }
+        const lens = compileOwnerSelfLensesSql(input.decidedBy, { taskIdExpr: 'tasks.id', gateOwnerExpr: 'tasks.gate_owner' }, input.submission)
+        return { sql: `(${own.sql} AND ${lens.sql})`, params: [...own.params, ...lens.params] }
+      })()
+    : null
+  const independence = independenceBase && ownerSelfGuard
+    ? { sql: `(${independenceBase.sql} OR NOT ${ownerSelfGuard.sql})`, params: [...independenceBase.params, ...ownerSelfGuard.params] }
+    : independenceBase
   // Self-completion lane. Facts re-read INSIDE the UPDATE's WHERE (never trusted from the caller's
   // snapshot):
   //   1. the lane itself: tasks.gate_owner must STILL be the lane (an owner re-gate between the
@@ -2243,8 +2262,8 @@ export function buildVerdictStatements(
       `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()} AND ${GATE_ASK_LIVE_PREDICATE('tasks', "datetime('now')")}${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, attachment_id, consenting_member_id, submission_id, result_digest, receipt_actor_kind)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, attachment_id, consenting_member_id, submission_id, result_digest, receipt_actor_kind, independence_waiver)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       verdictRow.id,
@@ -2261,6 +2280,7 @@ export function buildVerdictStatements(
       verdictRow.submission_id ?? null,
       verdictRow.result_digest ?? null,
       input.receiptActorKind,
+      input.independenceWaiver ?? null,
       input.task.id,
       newStatus,
       now,
@@ -2393,7 +2413,13 @@ export async function writeVerdict(
     // Distinguish a refused self-verdict from a lost race so the caller can say which it was.
     if (input.independenceWaiver !== 'owner_override' && !(await isCurrentSelfCompletionProducer(env, input))) {
       const conflict = await findVerdictIndependenceConflict(env, input.decidedBy, input.task.id)
-      if (conflict === 'direct' || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory')) {
+      if (
+        conflict === 'direct'
+        || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory'
+          // owner_self only explains the refusal when the decider no longer holds owner-self authority; otherwise the
+          // zero-row UPDATE was an ordinary lost race (status moved), reported as such below.
+          && !(input.independenceWaiver === 'owner_self' && await holdsOwnerSelfVerdictAuthority(env, input.decidedBy, input.task.id, submission)))
+      ) {
         throw new VerdictIndependenceError(input.task.id, conflict)
       }
     }
