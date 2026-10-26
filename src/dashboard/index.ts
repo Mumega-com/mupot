@@ -317,6 +317,7 @@ import { makeChangesApp } from './changes'
 import { makeDoorbellsApp } from './doorbells'
 import { makeConnectionsApp } from './connections'
 import { makeClaimApp, loadAgentClaimCard, reauthRedirectUrl } from './claim'
+import { makeWakeApp, loadAgentWakeCard } from './wake-card'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
@@ -1733,6 +1734,7 @@ dashboardApp.route('/', makeChangesApp(shell))
 dashboardApp.route('/', makeDoorbellsApp(shell))
 dashboardApp.route('/', makeConnectionsApp(shell))
 dashboardApp.route('/', makeClaimApp(shell))
+dashboardApp.route('/', makeWakeApp(shell))
 
 // Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
 // post-setup edit surface for org_settings.im_bot_username (mupot#1420
@@ -2099,11 +2101,13 @@ dashboardApp.get('/agents/:id', async (c) => {
   // One-click onboarding card: only for a real human session, and only claims THIS viewer's own OAuth connection filed for THIS agent
   // (loadAgentClaimCard scopes by the session member). A failed read degrades to "no card", never an error page.
   const resumeParam = c.req.query('resume')
-  const resume = resumeParam === 'claim' || resumeParam === 'allow' ? resumeParam : null
+  const resume = resumeParam === 'claim' || resumeParam === 'allow' || resumeParam === 'push' ? resumeParam : null
   const freshNow = auth.webSessionIdHash ? (await checkWebSession(c.env, auth, { fresh: true })).ok : false
   const claimCard = await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
+  const wakeCard = await loadAgentWakeCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
+  const onboardingCards = claimCard || wakeCard ? html`${claimCard ?? ''}${wakeCard ?? ''}` : null
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, claimCard, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
   )
 })
 
@@ -2179,7 +2183,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
 function agentDesignationControl(
   agent: Agent,
   view: NonNullable<AgentOwnerView['designation']>,
-  flash: { resume: 'claim' | 'allow' | null; fresh: boolean } = { resume: null, fresh: false },
+  flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean } = { resume: null, fresh: false },
 ) {
   // Back from the one sign-in redirect (resume=allow, session now fresh): the same button, labelled as the single remaining click.
   const allowLabel = flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me'
@@ -6112,7 +6116,7 @@ function agentConsoleBody(
   ownerView: AgentOwnerView | null = null,
   liveRuntime: FleetBelief | null = null,
   onboardingCard: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
-  flash: { resume: 'claim' | 'allow' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
+  flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).

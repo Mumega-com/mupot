@@ -287,7 +287,7 @@ export function ownerAdminStandingSql(
   )`
 }
 
-async function hostHasStandingInSquad(
+export async function hostHasStandingInSquad(
   env: Env,
   hostAgentId: string,
   squadId: string,

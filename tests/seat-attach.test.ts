@@ -2448,6 +2448,9 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     const { invokeTool } = await import('../src/mcp/index')
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
+    // TEST SCAFFOLDING: claiming sends the agent one welcome (tests/onboard-welcome-wake.test.ts owns that behaviour). These tests count
+    // the inbox rows THEY insert, so the welcome row is cleared here.
+    h.sqlite.exec(`DELETE FROM agent_messages WHERE from_agent = 'mupot-onboarding'`)
     const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
     expect(att.seatBinding?.attached).toBeTruthy()
     const label = one<{ label: string }>(`SELECT t.label AS label FROM agent_seat_attachments a JOIN member_tokens t ON t.id = a.seat_token_id WHERE a.detached_at IS NULL`)!.label
