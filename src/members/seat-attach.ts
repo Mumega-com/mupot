@@ -167,6 +167,17 @@ export async function humanHasDesignationStanding(env: Env, humanMemberId: strin
   return true
 }
 
+/**
+ * Can this human press the "Allow for me" control at all (org-scope MEMBER_BIND_MINT_FLOOR, the same floor humanHasDesignationStanding
+ * applies first)? Used ONLY to pick honest next-step copy: it grants nothing and writes nothing.
+ */
+export async function humanCanDesignateAtAll(env: Env, humanMemberId: string): Promise<boolean> {
+  const live = await env.DB.prepare(`SELECT 1 AS x FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active' LIMIT 1`)
+    .bind(humanMemberId, env.TENANT_SLUG).first<{ x: number }>()
+  if (!live) return false
+  return (await currentMemberRankOnScope(env, humanMemberId, 'org', null)) >= capabilityRank(MEMBER_BIND_MINT_FLOOR)
+}
+
 /** Active, non-seat, UNDESIGNATED agents matching `ref` that this human could designate for themselves and administers.
  *  Another human's designation is never a match. Anyone else reads as not found. */
 async function listDesignatableAgents(env: Env, humanMemberId: string, ref: string): Promise<AttachableAgent[]> {

@@ -147,8 +147,10 @@ describe('auto-welcome', () => {
     const m = one<{ request_id: string; body: string; from_agent: string; kind: string }>("SELECT request_id, body, from_agent, kind FROM agent_messages WHERE to_agent = 'ag1' AND from_agent = 'mupot-onboarding'")!
     expect(m.request_id).toBe(`welcome:${p.admissionId}`)
     expect(m.body).toContain('"Ada Admin"')
-    expect(m.body).toContain('squad_choose')
-    expect(m.body).toContain('Set up wake')
+    // the claimed seat is an ATTACHED chat: squad_choose and the wake card cannot work for it, so they are not offered
+    expect(m.body).not.toContain('Call squad_choose when')
+    expect(m.body).toContain('do not call squad_choose')
+    expect(m.body).not.toContain('Set up wake')
     expect(m.kind).toBe('message')
   })
 

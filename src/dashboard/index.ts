@@ -26,7 +26,7 @@ import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { Hono, type Context } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
-import { getCookie } from 'hono/cookie'
+import { getCookie, setCookie } from 'hono/cookie'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import { TASK_SELECT_COLUMNS, actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 import { markApprovedTaskDoneFromGate, OFFICE_PUBLISH_UNRESOLVED_MESSAGE } from '../tasks/service'
@@ -47,7 +47,7 @@ import type {
   OrgKind,
 } from '../types'
 
-import { requireAuth } from '../auth'
+import { LOGIN_RETURN_COOKIE, requireAuth, safeReturnPath } from '../auth'
 // mupot#1445: the signed-out '/' landing reuses invite.ts's unauthenticated-
 // safe pageShell/esc (same shape as the /invite/:id page) instead of a second
 // copy, and the pending-invite cookie name from its single source of truth —
@@ -391,7 +391,7 @@ function unauthenticatedRootWantsJson(c: Context<AppEnv>): boolean {
  * /auth/login (untouched) is what actually binds the pending marker into
  * OAuth state.
  */
-function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
+function signedOutLandingBody(env: Env, hasPendingInvite: boolean, returnPath: string | null = null) {
   const brand = esc(env.BRAND)
   const emailEnabled = isEmailLoginEnabled(env)
   // Mumega-specific newcomer copy/links: only the mumega tenant's pot, never the invite variant.
@@ -422,7 +422,7 @@ function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
     env.BRAND,
     hasPendingInvite ? 'Finish joining' : 'Sign in',
     `${intro}
-    <p><a class="btn" href="/auth/login">Sign in with Google</a></p>
+    <p><a class="btn" href="${returnPath ? `/auth/login?return=${encodeURIComponent(returnPath)}` : '/auth/login'}">Sign in with Google</a></p>
     ${emailForm}
     <p class="muted">Have an invite? Open the link you were sent — it looks like <code>/invite/…</code>.</p>
     ${startLinks}`,
@@ -458,13 +458,19 @@ dashboardApp.use('*', async (c, next) => {
       // plain redirect below, same as every other path.
       if (c.req.method === 'GET') {
         const hasPendingInvite = Boolean(getCookie(c, PENDING_INVITE_COOKIE))
-        return c.html(signedOutLandingBody(c.env, hasPendingInvite))
+        // A validated `return` (set by the claim-link resume below) rides the Google button and, for email sign-in, a short-lived cookie.
+        const returnPath = safeReturnPath(c.req.query('return'))
+        if (returnPath) {
+          setCookie(c, LOGIN_RETURN_COOKIE, returnPath, { httpOnly: true, secure: new URL(c.req.url).protocol === 'https:', sameSite: 'Lax', path: '/', maxAge: 900 })
+        }
+        return c.html(signedOutLandingBody(c.env, hasPendingInvite, returnPath))
       }
     }
     // A claim link opened while signed out: sign in, then come back to the SAME link (the intent is the URL itself).
-    // Only GET /claim/<code> resumes; the return path is re-validated by /auth/login (safeReturnPath).
+    // Only GET /claim/<code> resumes. It goes through the landing chooser (Google or, when enabled, email), which keeps `return`
+    // and validates it with the same safeReturnPath /auth/login uses.
     if (c.req.method === 'GET' && /^\/claim\/[A-Za-z0-9-]{4,16}$/.test(c.req.path)) {
-      return c.redirect(`/auth/login?return=${encodeURIComponent(c.req.path)}`)
+      return c.redirect(`/?return=${encodeURIComponent(c.req.path)}`)
     }
     // Unauthenticated → send the browser to the login flow.
     return c.redirect('/auth/login')

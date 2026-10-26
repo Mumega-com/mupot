@@ -56,7 +56,7 @@ import { findExistingBootstrap } from '../members/bootstrap-self'
 import { tenantHeaderNotice, TENANT_NOTICE_RESPONSE_HEADER, type TenantHeaderNotice } from './tenant-header-notice'
 import { attachConnectOrder, buildWhoami, seatAttachDoor, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
-import { connectionName, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
+import { connectionName, humanCanDesignateAtAll, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction, verdictAttribution } from '../auth/attached-ceiling'
 import { nativeWakeState } from '../bus/events-delivery'
 import { eventsAuthForAttachment, listLiveAttachmentsForEvents, pickAttachment } from './events-attached'
@@ -6812,7 +6812,11 @@ async function gatherWhoamiFacts(
     unboundDirectory ? anyAgentExists(env) : false,
   ])
   const admission = await gatherAdmission(env, auth)
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}) }
+  // Honest designate copy: only a seat session of a known human, and only while the designation step exists at all.
+  const humanCanDesignate = auth.seatBinding && seatAttachDesignatedEnabled(env)
+    ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
+    : undefined
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -7286,7 +7290,7 @@ const toolBootContext: ToolSpec = {
     if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed') {
       // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
       // Designation copy follows SEAT_ATTACH_DESIGNATED (seatAttachDoor). The door is inserted only while attach itself is on.
-      const door = seatAttachDoor(env)
+      const door = seatAttachDoor(env, whoamiFacts.humanCanDesignate)
       availableDoors.splice(1, 0, { tool: 'seat_attach', does: door.does, requires: door.requires })
     }
     const enrollHref = enrollUrl(
@@ -7394,7 +7398,7 @@ const toolBootContext: ToolSpec = {
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
       // Same limit as whoami's own_seat branch: a held or observed seat is on the read floor, and seat_attach is refused there.
       const limitedSeat = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
-      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached && !limitedSeat ? ` ${attachConnectOrder(env)}` : ''
+      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached && !limitedSeat ? ` ${attachConnectOrder(env, whoamiFacts.humanCanDesignate)}` : ''
       nextStepOut = auth.seatBinding.attached
         ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you cannot ack or lease. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'

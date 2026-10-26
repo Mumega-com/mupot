@@ -171,11 +171,11 @@ describe('GET /claim/:code', () => {
     expect((await get(`/claim/${p.code.replace('-', '').toLowerCase()}`, a)).status).toBe(200)
   })
 
-  it('signed out: one redirect to login that carries the claim path so sign-in resumes back to it', async () => {
+  it('signed out: one redirect to the sign-in chooser that carries the claim path so sign-in resumes back to it', async () => {
     const p = await fileAsk()
     const res = await dashboardApp.request(`/claim/${p.code}`, {}, envFor('admin@x.test'))
     expect(res.status).toBe(302)
-    expect(res.headers.get('location')).toBe(`/auth/login?return=${encodeURIComponent(`/claim/${p.code}`)}`)
+    expect(res.headers.get('location')).toBe(`/?return=${encodeURIComponent(`/claim/${p.code}`)}`)
   })
 
   it('/auth/login keeps that return path in its state so the callback lands back on the claim', async () => {
