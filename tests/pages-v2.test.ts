@@ -3,8 +3,6 @@
 // Real SQL (all migrations); the Inkwell store is the FakeInternalWiki double; the body-capable store is
 // FakePagesPort (the Inkwell adapter refuses bodies until inkwell-api stores them).
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool, mcpApp } from '../src/mcp'
 import { pagesPortFactory } from '../src/mcp/pages'
@@ -17,6 +15,7 @@ import type { AuthContext, Env } from '../src/types'
 import { FakeInternalWiki } from './helpers/fake-internal-wiki'
 import { FakePagesPort } from './helpers/fake-pages-port'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'pot-a'
 const MASTER_KEY = '77'.repeat(32)
@@ -36,9 +35,7 @@ let inkwellFactory: typeof pagesPortFactory.create
 
 beforeAll(async () => {
   shared = createSqliteD1()
-  for (const f of readdirSync(join(__dirname, '..', 'migrations')).filter((n) => n.endsWith('.sql')).sort()) {
-    shared.sqlite.exec(readFileSync(join(__dirname, '..', 'migrations', f), 'utf8'))
-  }
+  applyAllMigrations(shared.sqlite)
   shared.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQ_W}', 'dept-a', 'squad-w', 'W'), ('${SQ_R}', 'dept-a', 'squad-r', 'R'), ('${SQ_O}', 'dept-a', 'squad-o', 'O');
