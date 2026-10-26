@@ -13,12 +13,22 @@
 // the human's passkey tap; nothing is attached. Once admitted, the thread attaches immediately and its NEXT request
 // acts as that agent.
 
+import type { Env } from '../types'
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { attachSeatToAgent, seatAttachEnabled } from '../members/seat-attach'
 import { attachedAuthority } from '../auth/attached-ceiling'
+import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
+
+/** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
+function claimFields(env: Env, code: string): { claim_url?: string; tell_the_person: string } {
+  const url = claimUrl(env, code)
+  return url
+    ? { claim_url: url, tell_the_person: `Show the person this link: ${url} . They open it while signed in and press Confirm; nothing to type. (Fallback: your attach code is ${code}; press Admit only on the card showing it.)` }
+    : { tell_the_person: `Tell the person: your attach code is ${code}. Press Admit only on the card showing this code.` }
+}
 
 const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
@@ -86,7 +96,7 @@ const toolSeatAttach: ToolSpec = {
         admission_id: r.admission_id,
         expires_at: r.expires_at,
         attach_code: r.attach_code,
-        tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.`,
+        ...claimFields(env, r.attach_code),
         note: 'Your request is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page and type your code. After they approve, call seat_attach again.',
       })
     }
@@ -96,7 +106,7 @@ const toolSeatAttach: ToolSpec = {
         admission_id: r.admission_id,
         approve_url: r.approve_url,
         expires_at: r.expires_at,
-        ...(r.attach_code ? { attach_code: r.attach_code, tell_the_person: `Tell the person: your attach code is ${r.attach_code}. Press Admit only on the card showing this code.` } : {}),
+        ...(r.attach_code ? { attach_code: r.attach_code, ...claimFields(env, r.attach_code) } : {}),
         note: r.approve_url
           ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let chats from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
           : 'Pending. Your human can approve this on their Connections page (no secure-moment link is available on this pot). Nothing is attached until then; after they approve, call seat_attach again.',
