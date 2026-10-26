@@ -225,6 +225,26 @@ name = "mupot-task-workflow"
 binding = "TASK_WORKFLOW"
 class_name = "TaskWorkflow"
 
+# ── nightly off-site D1 backup -> R2 (docs/operations/restore-from-backup.md) ──
+# Inert unless NIGHTLY_BACKUP = "1" under [vars]. Prerequisites, in order (none are run by the repo):
+#   npx wrangler r2 bucket create mupot-backups     # then uncomment the BACKUPS binding below
+#   npx wrangler secret put BACKUP_CF_API_TOKEN     # dedicated token, scopes in the restore doc
+#   set BACKUP_ACCOUNT_ID and BACKUP_D1_ID under [vars]; then NIGHTLY_BACKUP = "1"
+#   append "17 3 * * *" (03:17 UTC daily) to the crons list below. The two existing entries stay byte-for-byte as they
+#   are (tests/routine-scheduler.test.ts and docs/production-runbook.md grep for that exact assignment), so a pot that
+#   enables the backup writes: crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *", "17 3 * * *"]
+# A missing credential is recorded in backup_runs as skipped:no_credential and alerted; it never fails silently.
+[[workflows]]
+name = "mupot-nightly-backup"
+binding = "BACKUP_WORKFLOW"
+class_name = "BackupWorkflow"
+
+# Uncomment AFTER `wrangler r2 bucket create mupot-backups` (deploy fails on a binding to a missing bucket, and
+# scripts/setup.sh copies this file for every new pot, so it ships commented out).
+# [[r2_buckets]]
+# binding = "BACKUPS"
+# bucket_name = "mupot-backups"
+
 # Project Routines and maintenance use separate triggers so their D1/subrequest
 # budgets cannot combine in one invocation. Maintenance jobs remain staggered.
 [triggers]

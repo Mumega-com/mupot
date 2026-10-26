@@ -29,7 +29,7 @@ export interface WorkflowBinding<PARAMS = unknown> {
    * The full CF type also accepts `id?` and `retention?` in opts — we surface
    * only `params` because that is what the pipeline uses.
    */
-  create(opts: { params: PARAMS }): Promise<{ id: string }>
+  create(opts: { id?: string; params: PARAMS }): Promise<{ id: string }>
   /**
    * Get a handle to an existing instance by id, for sendEvent on resume.
    */
@@ -76,6 +76,15 @@ export interface Env {
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
   // startTaskPipeline helper which handles the absent-binding case gracefully.
   TASK_WORKFLOW?: WorkflowBinding<import('./workflows/pipeline').TaskPipelineParams>
+  // Nightly off-site D1 backup (src/backup/nightly.ts). Inert unless NIGHTLY_BACKUP=1.
+  // BACKUPS is a NEW R2 bucket (see docs/operations/restore-from-backup.md); BACKUP_CF_API_TOKEN is a
+  // dedicated narrowly scoped secret; a missing one is recorded + alerted as skipped:no_credential.
+  BACKUP_WORKFLOW?: WorkflowBinding<import('./backup/nightly').BackupParams>
+  BACKUPS?: R2Bucket
+  NIGHTLY_BACKUP?: string
+  BACKUP_CF_API_TOKEN?: string
+  BACKUP_ACCOUNT_ID?: string
+  BACKUP_D1_ID?: string
   // vars
   TENANT_SLUG: string
   // The tenant slug that owns THIS deployment's Worker-level operator secrets/config (as
