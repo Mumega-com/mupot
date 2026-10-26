@@ -64,10 +64,11 @@ export function formatTelegram(n: TaskNotification): string {
     'task.created': '📋',
     'task.completed': '✅',
   }
-  const icon = icons[n.type] || '📌'
-  const label = n.type.replace('task.', '')
+  const isBackup = n.type.startsWith('backup.')
+  const icon = isBackup ? '⚠️' : icons[n.type] || '📌'
+  const label = n.type.replace('task.', '').replace('backup.', '')
 
-  const lines: string[] = [`${icon} *Task ${label}*`]
+  const lines: string[] = [isBackup ? `${icon} *Backup ${label}*` : `${icon} *Task ${label}*`]
   if (n.title) lines.push(`${n.title}`)
   if (n.task_id) lines.push('`' + n.task_id + '`')
   if (n.agent_id) lines.push('👤 agent: `' + n.agent_id + '`')

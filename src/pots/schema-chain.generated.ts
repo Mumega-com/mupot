@@ -4554,9 +4554,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_board_inbound_observations_task" },
     ],
   },
+  {
+    file: "0259_backup_runs.sql",
+    sha256: "405e31e711e99bca024ec3a7cb003cce2072018a39aa3ff5fce6b59d42e2978b",
+    statements: [
+      "-- 0259_backup_runs.sql -- one row per nightly D1 backup run (src/backup/nightly.ts). Additive: a new table, nothing else.\n-- Migration numbers 0256-0258 are held by open PRs (#2184, #2189, #2193); 0259 is the next free number.\n--\n-- status:\n--   running                 the run started and has not finished (a row stuck here > 2h is marked failed by the next run)\n--   ok                      dump stored, verified (size > 0 and sha256 equals the manifest), retention applied\n--   failed                  export / store / verify failed; an alert was attempted (alerted records whether it was delivered)\n--   skipped:no_credential   BACKUP_CF_API_TOKEN / BACKUP_ACCOUNT_ID / BACKUP_D1_ID / BACKUPS binding missing; alerted\n-- The row is the audit record. The dump itself lives in R2 (key d1/mupot/YYYY-MM-DD.sql.gz) and is NOT referenced for restore\n-- by this table: restore works from R2 alone, because this table lives in the database being backed up.\nCREATE TABLE IF NOT EXISTS backup_runs (\n  id            TEXT PRIMARY KEY,\n  run_date      TEXT NOT NULL,\n  status        TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed', 'skipped:no_credential')),\n  r2_key        TEXT,\n  sha256        TEXT,\n  size_bytes    INTEGER,\n  bookmark      TEXT,\n  error         TEXT,\n  alerted       INTEGER NOT NULL DEFAULT 0,\n  started_at    TEXT NOT NULL,\n  finished_at   TEXT\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_backup_runs_date ON backup_runs (run_date DESC);",
+    ],
+    objects: [
+      { type: "table", name: "backup_runs" },
+      { type: "index", name: "idx_backup_runs_date" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0db49657e3155471166cdbad5bf092159dc77701dc39a56620fa2b260ec86ea9"
+export const SCHEMA_CHAIN_DIGEST: string = "1b2bacfd93826a7e1493031804beeb2a1792ed8e72f58007484e804e8acb0c3f"

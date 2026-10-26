@@ -100,7 +100,7 @@ export { PresenceChannelDO } from './registry/presence-channel-do'
 export { SeatEventsDO } from './agents/seat-events-do'
 // Workflow class — the CF Workflows runtime discovers it via this named export.
 // The class_name in [[workflows]] must match: "TaskWorkflow".
-export { TaskWorkflow } from './workflows/task-workflow'
+export { TaskWorkflow, BackupWorkflow } from './workflows/task-workflow'
 // OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
 export { McpOAuthApiHandler }
 
@@ -355,6 +355,7 @@ import { dispatchRoutineRun } from './routines/dispatch'
 import { MAINTENANCE_CRON, maintenanceSlot } from './scheduled/slots'
 import { healProjectRepoKeys, REPO_KEY_HEAL_PER_TICK } from './projects/repo-key-heal'
 import { reconcileGateVerdictReceipts } from './tasks/verdict-binding'
+import { BACKUP_CRON, startNightlyBackup } from './backup/nightly'
 
 const ROUTINE_CRON = '* * * * *'
 const scheduledObservationBuckets = new Map<string, number>()
@@ -482,6 +483,12 @@ export default {
           },
         ),
       )
+      return
+    }
+
+    if (controller.cron === BACKUP_CRON) {
+      // Nightly D1 -> R2 backup. Off unless NIGHTLY_BACKUP=1 (startNightlyBackup returns at once). Starts a Workflow.
+      waitFor('nightly-backup', startNightlyBackup(env, scheduledAt))
       return
     }
 
