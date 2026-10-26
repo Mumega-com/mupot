@@ -173,13 +173,14 @@ describe('eligible: instant observed seat', () => {
       ['task_verdict', { task_id: 'x', verdict: 'approve' }],
       ['request_elevation', {}],
       ['project_squad_set', { project_id: 'p', squad_id: 'squad-target', access_level: 'admin' }],
-      ['seat_attach', { agent: 'x' }],
       ['mint_agent_token', {}],
     ] as const
     for (const [tool, args] of refused) {
       const r = await rpc(s.ctx, tool, { ...args }, s.session)
       expect(r.text, tool).toContain('observed_floor')
     }
+    // seat_attach is on the floor on purpose (it only FILES a request; see observed-seat-request-admission.test.ts)
+    expect((await rpc(s.ctx, 'seat_attach', { agent: 'x' }, s.session)).text).not.toContain('observed_floor')
     for (const tool of ['status', 'task_list', 'recall']) {
       expect((await rpc(s.ctx, tool, tool === 'recall' ? { query: 'x' } : {}, s.session)).text, tool).not.toContain('observed_floor')
     }

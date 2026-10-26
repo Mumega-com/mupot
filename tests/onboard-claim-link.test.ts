@@ -388,14 +388,14 @@ describe('agent page: "Own this agent" (no code) and "Issue a new claim link"', 
     const a = await login('admin@x.test')
     setReauth('mem-admin', stale())
     const stalePage = await (await get('/agents/ag1', a)).text()
-    expect(stalePage).toContain('Sign in again to own this agent')
-    expect(stalePage).not.toContain('class="btn">Own this agent<')
+    expect(stalePage).toContain('Sign in again to approve')
+    expect(stalePage).not.toContain('class="btn">Approve<')
     const res = await post('/agents/ag1/claim', a, { admission_id: p.admissionId })
     expect(res.status).toBe(303)
     expect(res.headers.get('location')).toBe(`/auth/reauth?return=${encodeURIComponent('/agents/ag1?resume=claim')}`)
     expect(admStatus(p.admissionId)).toBe('pending')
     setReauth('mem-admin', fresh())
-    expect(await (await get('/agents/ag1?resume=claim', a)).text()).toContain('Confirm: own this agent')
+    expect(await (await get('/agents/ag1?resume=claim', a)).text()).toContain('Confirm: Approve')
   })
 
   it('EXPIRED: the page offers "Issue a new claim link"; reissue makes a fresh ask for the SAME agent, app and thread; the agent\'s boot_context shows the new link; the old link is dead', async () => {

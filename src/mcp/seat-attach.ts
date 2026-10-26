@@ -20,6 +20,7 @@ import { attachSeatToAgent, humanCanDesignateAtAll, listAttachableAgents, seatAt
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
+import { runConnectionCheck } from '../members/connection-check'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
 
 /** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
@@ -214,4 +215,24 @@ const toolInboxMarkHandled: ToolSpec = {
   },
 }
 
-export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach, toolInboxMarkHandled]
+// connection_check — the full-duplex check (SEND, RECEIVE, WAKE) an attached chat runs on request. See members/connection-check.ts.
+const toolConnectionCheck: ToolSpec = {
+  name: 'connection_check',
+  scope: 'self (an ATTACHED chat checks its own connection to mupot: send, receive, wake; writes one probe message to its own agent inbox and one audit row)',
+  min: 'authenticated',
+  args: '{ fresh?: boolean }  // fresh:true starts a new receive round after one completed',
+  inputSchema: { type: 'object', properties: { fresh: { type: 'boolean', description: 'Start a new receive round after the previous one completed.' } }, additionalProperties: false },
+  async run(auth, env, args) {
+    const att = attachedAuthority(auth)
+    if (!att) {
+      return fail(409, 'not_attached', {
+        message: 'connection_check runs from an attached chat. This chat is not attached to an agent yet.',
+        next_step: "Call seat_attach {agent:'<slug>'}, show your human the approval code you get back, and wait while they approve it. Then call boot_context and run connection_check.",
+      })
+    }
+    const r = await runConnectionCheck(env, { attachmentId: att.attachmentId, agentId: att.agentId, humanMemberId: att.humanMemberId, fresh: args.fresh === true })
+    return done({ ...r, tell_your_human: r.summary })
+  },
+}
+
+export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach, toolInboxMarkHandled, toolConnectionCheck]

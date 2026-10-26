@@ -227,7 +227,8 @@ import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
-import { joinNextSteps, observedFloorDecision, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
+import { attachedOnboarding } from '../members/attached-onboarding'
+import { connectionsLink, joinNextSteps, observedFloorDecision, observedFloorMessage, observedFloorNextStep, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
 import { SQUAD_JOIN_TOOLS } from './squad-join'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
@@ -7324,7 +7325,7 @@ const toolBootContext: ToolSpec = {
     // A chat that HAS a seat (a ChatGPT conversation's auto seat, or a seat_select handle) and is not yet attached has one more
     // door, and until now only channel_limits.to_get_write_access (read last) named it: this session is 'bound' (to its seat
     // agent), so the doors above were just orient/status/boot_context. Same gate as that text and as seat_attach itself.
-    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed') {
+    if (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached && auth.channel === 'directory' && auth.seatAgentStatus !== 'held') {
       // Position 1, after orient (doors[0] stays the summary next_step already gives: call orient).
       // Designation copy follows SEAT_ATTACH_DESIGNATED (seatAttachDoor). The door is inserted only while attach itself is on.
       const door = seatAttachDoor(env, whoamiFacts.humanCanDesignate)
@@ -7433,9 +7434,13 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
-      // Same limit as whoami's own_seat branch: a held or observed seat is on the read floor, and seat_attach is refused there.
-      const limitedSeat = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
-      const attachOrder = seatAttachEnabled(env) && !auth.seatBinding.attached && !limitedSeat ? ` ${attachConnectOrder(env, whoamiFacts.humanCanDesignate)}` : ''
+      // Same split as whoami's own_seat branch: a held seat gets no attach advice (it cannot file); an observed seat is told the one step that works.
+      const observedSeat = auth.seatAgentStatus === 'observed'
+      const attachOrder = !seatAttachEnabled(env) || auth.seatBinding.attached || auth.seatAgentStatus === 'held'
+        ? ''
+        : observedSeat
+          ? " You are observed: request admission with seat_attach {agent:'<slug>'}; your human approves it. Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use)."
+          : ` ${attachConnectOrder(env, whoamiFacts.humanCanDesignate)}`
       nextStepOut = auth.seatBinding.attached
         ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you cannot ack or lease. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
@@ -7455,6 +7460,11 @@ const toolBootContext: ToolSpec = {
     if (pendingClaim) {
       nextStepOut = `${nextStepOut} SHOW YOUR HUMAN THIS LINK to claim ${pendingClaim.agent}: ${pendingClaim.claim_url ?? `attach code ${pendingClaim.attach_code} (on their Connections page)`} (valid until ${pendingClaim.expires_at}). After they press Confirm, call seat_attach again.`
     }
+
+    // First-steps from mupot itself for a freshly ATTACHED chat (server rows only; absent once the attachment is older than the window). A failed read degrades to "no block".
+    const attachedOnboardingBlock = auth.seatBinding?.attached && !ctx?.sideEffectFree
+      ? await attachedOnboarding(env, { attachmentId: auth.seatBinding.attached.attachmentId, agentId: auth.seatBinding.attached.agentId }).catch(() => null)
+      : null
 
     // Which project am I part of? Only when the agent passed its repo. Read-only; boot must always answer.
     const repoProject = typeof args.repo === 'string' && args.repo.trim() !== ''
@@ -7489,6 +7499,7 @@ const toolBootContext: ToolSpec = {
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
       ...(nativeWake ? { native_wake: nativeWake } : {}),
       ...(identityReceipt ? { identity_receipt: identityReceipt } : {}),
+      ...(attachedOnboardingBlock ? { attached_onboarding: attachedOnboardingBlock } : {}),
       ...(pendingClaim ? { pending_claim: { ...pendingClaim, tell_the_person: 'Show your human the claim_url (they open it signed in and press Confirm). No typing.' } } : {}),
       // Emitted ONCE, top level (the receipt exists only with SEAT_AUTO_ENROLL; detection has its own flag).
       ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
@@ -8358,6 +8369,9 @@ async function invokeToolInner(
   // the pre-floor exits (harness-session / flag refusals). The observed-floor block below only applies it.
   const floorDecision = await observedFloorDecision(env, auth, spec.name)
   if (floorDecision.status === 'held') { ctx.heldSeat = true; if (heldOut) heldOut.seat = true }
+  // An auto seat resolved per request carries no status on its context; the floor read above is the authoritative one, so hand it to the
+  // text builders (whoami / boot_context) that tell the chat what it may do. Unattached seats only: an attached chat's floor is lifted.
+  if (auth.seatAgentStatus === undefined && floorDecision.status !== null && auth.seatBinding && !auth.seatBinding.attached) auth.seatAgentStatus = floorDecision.status
 
   // mupot#1794 W4 — THE harness-session chokepoint. Every tool call from every door (/mcp tools/call,
   // the profile door, /actions/:tool, the legacy {tool,args} body) reaches here. A session authenticated
@@ -8388,7 +8402,7 @@ async function invokeToolInner(
     const decision = floorDecision
     const floor = decision.refusal
     if (floor) {
-      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: `This seat is ${floor.status}: ${spec.name} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). The seat's own human lifts it, from Connections.` }), tool: spec.name }
+      return { ...fail(403, 'observed_floor', { seat_status: floor.status, message: observedFloorMessage(env, floor.status, spec.name), next_step: observedFloorNextStep(env, floor.status), connections_url: connectionsLink(env) }), tool: spec.name }
     }
   }
 

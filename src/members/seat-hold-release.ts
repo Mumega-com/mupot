@@ -61,9 +61,11 @@ export async function resetTrustedOnRejoin(env: Env, p: { humanMemberId: string;
 export async function changeSeatAdmission(
   env: Env, p: { humanMemberId: string; seatId: string; action: SeatHoldAction; fresh: boolean },
 ): Promise<SeatHoldResult> {
-  if (!vipLaneEnabled(env)) return { ok: false, error: 'vip_lane_disabled' }
   const t = SEAT_TRANSITIONS[p.action]
   if (!t) return { ok: false, error: 'invalid_transition' }
+  // VIP_LANE off: the floor is not enforced, so hold / return would promise a restriction nothing applies. Only RELEASE (clear the stale
+  // observed/held label) is allowed then; it widens nothing in effect and keeps its fresh-reauth rule below.
+  if (!vipLaneEnabled(env) && p.action !== 'release') return { ok: false, error: 'vip_lane_disabled' }
   if (!(await memberIsActiveHuman(env, p.humanMemberId))) return { ok: false, error: 'member_ineligible' }
   // Scoped read: another human's seat is indistinguishable from a missing one.
   const row = await env.DB.prepare(`SELECT admission_status AS s FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
@@ -79,9 +81,10 @@ export async function changeSeatAdmission(
 
 export interface ObservedSeatRow { seat_id: string; label: string; agent_name: string; status: 'observed' | 'held' | 'trusted'; last_used_at: string }
 
-/** The human's OWN live seats that are observed, held or trusted (trusted rows can still be held or returned). Never another human's. Empty with the flag off (reads nothing). */
+/** The human's OWN live seats that are observed, held or trusted (trusted rows can still be held or returned). Never another human's.
+ *  Read with the flag off too (agent_seats.admission_status is an old column): a stale observed/held label must stay visible and clearable. */
 export async function listObservedSeats(env: Env, humanMemberId: string): Promise<ObservedSeatRow[]> {
-  if (!vipLaneEnabled(env)) return []
+  try {
   const r = await env.DB.prepare(
     `SELECT s.id AS seat_id, s.label_basename AS label, a.name AS agent_name, s.admission_status AS status, COALESCE(s.last_used_at, s.created_at) AS last_used_at
        FROM agent_seats s JOIN agents a ON a.id = s.agent_id
@@ -89,4 +92,7 @@ export async function listObservedSeats(env: Env, humanMemberId: string): Promis
       ORDER BY s.created_at DESC LIMIT 100`,
   ).bind(env.TENANT_SLUG, humanMemberId).all<ObservedSeatRow>()
   return r.results ?? []
+  } catch {
+    return [] // a pot whose schema predates the column: nothing to show, never a broken page
+  }
 }
