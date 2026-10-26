@@ -313,6 +313,7 @@ import { makeElevationApp } from './elevation'
 import { makeAccountApp } from './account'
 import { makeOperatorsApp } from './operators'
 import { makeBoardCleanupApp } from './board-cleanup'
+import { makeChangesApp } from './changes'
 import { makeDoorbellsApp } from './doorbells'
 import { makeConnectionsApp } from './connections'
 import { makeClaimApp, loadAgentClaimCard, reauthRedirectUrl } from './claim'
@@ -1727,6 +1728,8 @@ dashboardApp.route('/', makeAccountApp(shell))
 dashboardApp.route('/', makeOperatorsApp(shell))
 // Board cleanup: agents propose archives (archive_propose), a human org admin archives here through archiveRow.
 dashboardApp.route('/', makeBoardCleanupApp(shell))
+// Recent changes: every reversible change with a one-tap Undo, through the existing inverse tools (src/dashboard/changes.ts).
+dashboardApp.route('/', makeChangesApp(shell))
 dashboardApp.route('/', makeDoorbellsApp(shell))
 dashboardApp.route('/', makeConnectionsApp(shell))
 dashboardApp.route('/', makeClaimApp(shell))
@@ -4987,6 +4990,11 @@ export function shell(
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3 4.5 5.2v4.3c0 3.4 2.3 5.8 5.5 7 3.2-1.2 5.5-3.6 5.5-7V5.2z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
             <span class="nav-label">Approvals</span>
             <span class="nav-badge" id="approvals-badge" style="display:none;">0</span>
+          </a>
+
+          <a class="nav-link" href="/changes">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M4 10a6 6 0 1 0 2-4.5"/><path d="M4 3.8v3.4h3.4"/><path d="M10 6.8V10l2.2 1.4"/></svg>
+            <span class="nav-label">Recent changes</span>
           </a>
 
           <a class="nav-link" href="/status">
