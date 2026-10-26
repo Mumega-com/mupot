@@ -25,7 +25,9 @@ describe('#1474 reauth links carry a return path', () => {
       ['operators.ts', '/auth/reauth?return=/operators'],
       ['doorbells.ts', '/auth/reauth?return=/doorbells'],
       ['elevation.ts', '/auth/reauth?return=/elevation/'],
-      ['index.ts', '/auth/reauth?return=/agents/'],
+      // The designation stale-session path (and the claim pages) build the link in ONE helper that always carries the return path.
+      ['index.ts', 'reauthRedirectUrl(`/agents/'],
+      ['claim.ts', '/auth/reauth?return=${encodeURIComponent(returnPath)}'],
     ]
     for (const [f, needle] of want) expect(readFileSync(join(DIR, f), 'utf8')).toContain(needle)
   })

@@ -1157,7 +1157,9 @@ describe('dashboard: Connections', () => {
       const code = String(r.sc.attach_code)
       expect(code).toMatch(/^[A-HJ-KM-NP-Z2-9]{2}-[A-HJ-KM-NP-Z2-9]{2}$/)
       expect(codeOf(adm)).toBe(code)
-      expect(r.sc.tell_the_person).toBe(`Tell the person: your attach code is ${code}. Press Admit only on the card showing this code.`)
+      // One-click onboarding: the claim link leads, the code stays as the /connections fallback.
+      expect(r.sc.claim_url).toBe(`https://${COLONY}/claim/${code}`)
+      expect(r.sc.tell_the_person).toBe(`Show the person this link: https://${COLONY}/claim/${code} . They open it while signed in and press Confirm; nothing to type. (Fallback: your attach code is ${code}; press Admit only on the card showing it.)`)
       // never in an audit field another agent can read
       expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE fields_changed LIKE ? OR before_state LIKE ? OR after_state LIKE ?`, `%${code}%`, `%${code}%`, `%${code}%`)).toBe(0)
     })

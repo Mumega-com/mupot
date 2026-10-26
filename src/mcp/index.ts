@@ -222,6 +222,7 @@ import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
 import { joinNextSteps, observedFloorDecision, observedTaskCreateRefusal, observedTaskUpdateRefusal, vipLaneEnabled } from '../members/vip-lane'
 import { admissionTapeEnabled, gatherAdmission, tapToolCall } from '../admission/tape-store'
@@ -7392,6 +7393,16 @@ const toolBootContext: ToolSpec = {
       if (firstStep) nextStepOut = `${nextStepOut} ${firstStep.next_step}`
     }
 
+    // The claim this seat's own chat filed and its human has not decided: surfaced here so a chat that lost the seat_attach reply
+    // (or a human who reissued an expired link from the agent page) still shows the CURRENT link. Server-derived from the seat
+    // binding; another seat's claim is never read. A failed read degrades to "no field".
+    const pendingClaim = auth.seatBinding && !auth.seatBinding.attached && seatAttachEnabled(env)
+      ? await pendingClaimForSeat(env, { seatId: auth.seatBinding.seatId, humanMemberId: auth.seatBinding.humanMemberId }).catch(() => null)
+      : null
+    if (pendingClaim) {
+      nextStepOut = `${nextStepOut} SHOW YOUR HUMAN THIS LINK to claim ${pendingClaim.agent}: ${pendingClaim.claim_url ?? `attach code ${pendingClaim.attach_code} (on their Connections page)`} (valid until ${pendingClaim.expires_at}). After they press Confirm, call seat_attach again.`
+    }
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -7419,6 +7430,7 @@ const toolBootContext: ToolSpec = {
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
       ...(nativeWake ? { native_wake: nativeWake } : {}),
       ...(identityReceipt ? { identity_receipt: identityReceipt } : {}),
+      ...(pendingClaim ? { pending_claim: { ...pendingClaim, tell_the_person: 'Show your human the claim_url (they open it signed in and press Confirm). No typing.' } } : {}),
       // Emitted ONCE, top level (the receipt exists only with SEAT_AUTO_ENROLL; detection has its own flag).
       ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
     })

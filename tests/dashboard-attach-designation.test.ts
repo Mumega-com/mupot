@@ -97,13 +97,14 @@ describe('POST /agents/:id/designation', () => {
     expect(designee()).toBeNull()
   })
 
-  it('no step-up (stale or never re-authenticated) is refused with a reauth link, no write', async () => {
+  it('no step-up (stale or never re-authenticated) redirects once to reauth and back to the agent page, no write', async () => {
     const { env, cookie } = await login('admin@x.test')
     for (const at of [stale(), null]) {
       setReauth('mem-admin', at)
       const res = await post(env, cookie, 'allow')
-      expect(res.status).toBe(403)
-      expect(await res.text()).toContain('/auth/reauth')
+      // One redirect through sign-in that lands back on this agent's page (resume=allow); the write is never done by the redirect.
+      expect(res.status).toBe(303)
+      expect(res.headers.get('location')).toBe(`/auth/reauth?return=${encodeURIComponent('/agents/ag1?resume=allow')}`)
     }
     expect(designee()).toBeNull()
   })

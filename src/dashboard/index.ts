@@ -315,6 +315,7 @@ import { makeOperatorsApp } from './operators'
 import { makeBoardCleanupApp } from './board-cleanup'
 import { makeDoorbellsApp } from './doorbells'
 import { makeConnectionsApp } from './connections'
+import { makeClaimApp, loadAgentClaimCard, reauthRedirectUrl } from './claim'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
@@ -456,6 +457,11 @@ dashboardApp.use('*', async (c, next) => {
         const hasPendingInvite = Boolean(getCookie(c, PENDING_INVITE_COOKIE))
         return c.html(signedOutLandingBody(c.env, hasPendingInvite))
       }
+    }
+    // A claim link opened while signed out: sign in, then come back to the SAME link (the intent is the URL itself).
+    // Only GET /claim/<code> resumes; the return path is re-validated by /auth/login (safeReturnPath).
+    if (c.req.method === 'GET' && /^\/claim\/[A-Za-z0-9-]{4,16}$/.test(c.req.path)) {
+      return c.redirect(`/auth/login?return=${encodeURIComponent(c.req.path)}`)
     }
     // Unauthenticated → send the browser to the login flow.
     return c.redirect('/auth/login')
@@ -1723,6 +1729,7 @@ dashboardApp.route('/', makeOperatorsApp(shell))
 dashboardApp.route('/', makeBoardCleanupApp(shell))
 dashboardApp.route('/', makeDoorbellsApp(shell))
 dashboardApp.route('/', makeConnectionsApp(shell))
+dashboardApp.route('/', makeClaimApp(shell))
 
 // Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
 // post-setup edit surface for org_settings.im_bot_username (mupot#1420
@@ -2086,8 +2093,14 @@ dashboardApp.get('/agents/:id', async (c) => {
   const liveRuntime = await readFleetAgentRow(c.env, agent.id)
     .then((row) => (row ? readFleetBelief(c.env, row.agent_id) : null))
     .catch(() => null)
+  // One-click onboarding card: only for a real human session, and only claims THIS viewer's own OAuth connection filed for THIS agent
+  // (loadAgentClaimCard scopes by the session member). A failed read degrades to "no card", never an error page.
+  const resumeParam = c.req.query('resume')
+  const resume = resumeParam === 'claim' || resumeParam === 'allow' ? resumeParam : null
+  const freshNow = auth.webSessionIdHash ? (await checkWebSession(c.env, auth, { fresh: true })).ok : false
+  const claimCard = await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, claimCard, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
   )
 })
 
@@ -2160,12 +2173,18 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
 
 // "Allow my chats to become this agent" (attach designation). Plain form posts; the write is the SAME door and the SAME
 // compare-and-set as MCP update_agent (POST /agents/:id/designation below).
-function agentDesignationControl(agent: Agent, view: NonNullable<AgentOwnerView['designation']>) {
+function agentDesignationControl(
+  agent: Agent,
+  view: NonNullable<AgentOwnerView['designation']>,
+  flash: { resume: 'claim' | 'allow' | null; fresh: boolean } = { resume: null, fresh: false },
+) {
+  // Back from the one sign-in redirect (resume=allow, session now fresh): the same button, labelled as the single remaining click.
+  const allowLabel = flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me'
   return html`<form method="post" action="/agents/${agent.id}/designation" class="inline-form" data-attach-designation>
       <strong>Allow my chats to become this agent</strong>
       <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
       <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
-      <button type="submit" name="action" value="allow" class="btn">Allow for me</button>
+      <button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>
       ${agent.attach_designated_member_id ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
     </form>`
 }
@@ -2192,9 +2211,15 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
   if (action !== 'allow' && action !== 'stop') return deny(400, 'Unknown action.')
   const session = await checkWebSession(c.env, auth, { fresh: action === 'allow' })
   if (!session.ok) {
-    return c.html(shell(c.env, 'Attach designation', session.error === 'reauth_required'
-      ? html`<div class="card"><p>Confirm it is you first. <a href="/auth/reauth?return=/agents/${encodeURIComponent(c.req.param('id'))}">Confirm it is you</a>, then come back to this page and try again.</p></div>`
-      : errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
+    // ONE redirect: sign in again, land back on this agent's page (resume=allow) where the same button is the single Confirm click.
+    // The write is never performed by the returning GET, and freshness is not weakened: the retry is checked again.
+    if (session.error === 'reauth_required') {
+      // Use the DB-validated id (not the raw route param) in the return path.
+      const target = await resolveAgentRef(c.env, c.req.param('id'))
+      if (!target.ok) return deny(404, 'Agent not found.')
+      return c.redirect(reauthRedirectUrl(`/agents/${target.value.id}?resume=allow`), 303)
+    }
+    return c.html(shell(c.env, 'Attach designation', errorBody(`This needs a signed-in human session (${session.error}).`)), 403)
   }
   if (auth.boundAgentId || !isOrgAdmin(auth)) return deny(403, 'Only an org admin can change an attach designation.')
   const resolved = await resolveAgentRef(c.env, c.req.param('id'))
@@ -6078,6 +6103,8 @@ function agentConsoleBody(
   accessPanel: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
   ownerView: AgentOwnerView | null = null,
   liveRuntime: FleetBelief | null = null,
+  onboardingCard: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
+  flash: { resume: 'claim' | 'allow' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -6132,8 +6159,12 @@ function agentConsoleBody(
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
-      ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation) : ''}
+      ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation, flash) : ''}
     </div>
+    ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
+    ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
+    ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}
+    ${onboardingCard ?? ''}
     ${liveRuntimeCard(liveRuntime)}
     ${accessPanel ?? ''}
     <h2>Flights</h2>
