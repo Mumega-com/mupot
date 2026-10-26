@@ -46,6 +46,17 @@ async function claimDelivery(env: Env, provider: string, id: string): Promise<Cl
   }
 }
 
+/** Give the delivery id back so a provider redelivery is processed again (a failed handler must not eat the event). */
+async function releaseDelivery(env: Env, provider: string, id: string): Promise<void> {
+  try {
+    await env.DB.prepare(`DELETE FROM board_webhook_deliveries WHERE tenant = ?1 AND provider = ?2 AND delivery_id = ?3`)
+      .bind(env.TENANT_SLUG, provider, id)
+      .run()
+  } catch {
+    // nothing more to do; the retention sweep eventually frees it
+  }
+}
+
 boardWebhookApp.post('/:provider', async (c) => {
   const provider = c.req.param('provider')
   if (!isProjectBoardProvider(provider)) return c.json({ error: 'not_found' }, 404)
@@ -74,28 +85,39 @@ boardWebhookApp.post('/:provider', async (c) => {
   if (claim === 'duplicate') return c.json({ ok: true, duplicate: true })
   if (claim === 'unavailable') return c.json({ error: 'delivery_ledger_unavailable' }, 503)
 
-  const parsed = port.parseWebhook(rawBody)
-  if (!parsed || parsed.event.kind === 'ignored') return c.json({ ok: true, ignored: true })
-
-  const rows = await c.env.DB.prepare(
-    `SELECT project_id, provider, external_id, connector_id, meta_json, synced_at, created_at, updated_at
-       FROM project_provider_bindings
-      WHERE provider = ?1 AND external_id = ?2 AND connector_id IS NOT NULL
-      LIMIT ?3`,
-  )
-    .bind(provider, parsed.bindingExternalId, MAX_BINDINGS_PER_EVENT)
-    .all<ProjectProviderBinding>()
-
   let imported = 0
   let noted = 0
-  for (const binding of rows.results ?? []) {
-    try {
-      const out = await port.webhook(binding, parsed.event)
-      imported += out.imported ?? 0
-      noted += out.noted ?? 0
-    } catch {
-      // one binding's failure must not drop the others; the delivery is already claimed
+  try {
+    const parsed = port.parseWebhook(rawBody)
+    if (!parsed || parsed.event.kind === 'ignored') return c.json({ ok: true, ignored: true })
+
+    const rows = await c.env.DB.prepare(
+      `SELECT project_id, provider, external_id, connector_id, meta_json, synced_at, created_at, updated_at
+         FROM project_provider_bindings
+        WHERE provider = ?1 AND external_id = ?2 AND connector_id IS NOT NULL
+        LIMIT ?3`,
+    )
+      .bind(provider, parsed.bindingExternalId, MAX_BINDINGS_PER_EVENT)
+      .all<ProjectProviderBinding>()
+
+    let failed = false
+    for (const binding of rows.results ?? []) {
+      try {
+        const out = await port.webhook(binding, parsed.event)
+        if (!out.ok) failed = true
+        imported += out.imported ?? 0
+        noted += out.noted ?? 0
+      } catch {
+        failed = true // keep going so other bindings are served, but the delivery is retried below
+      }
     }
+    if (failed) {
+      await releaseDelivery(c.env, provider, verified.deliveryId)
+      return c.json({ error: 'handler_failed' }, 503)
+    }
+  } catch {
+    await releaseDelivery(c.env, provider, verified.deliveryId)
+    return c.json({ error: 'handler_failed' }, 503)
   }
   return c.json({ ok: true, imported, noted })
 })

@@ -23,7 +23,6 @@ import { defaultSquadIdFromMeta, importOneLinearIssue } from './linear-issues'
 
 const LINEAR_TIMESTAMP_WINDOW_MS = 60_000
 const TEAM_KEY_RE = /^[A-Za-z0-9]{1,10}$/
-const DELIVERY_ID_RE = /^[A-Za-z0-9-]{1,128}$/
 
 interface LinearWebhookEnv {
   LINEAR_WEBHOOK_SECRET?: string
@@ -58,9 +57,11 @@ export async function verifyLinearWebhook(
   if (typeof ts !== 'number' || !Number.isFinite(ts) || Math.abs(now - ts) > LINEAR_TIMESTAMP_WINDOW_MS) {
     return { ok: false, reason: 'stale' }
   }
-  const supplied = (headers.get('linear-delivery') ?? '').trim()
-  // Fall back to the verified signature: identical signed bodies are one delivery.
-  return { ok: true, deliveryId: DELIVERY_ID_RE.test(supplied) ? supplied : `sig:${provided}` }
+  // Replay identity comes from AUTHENTICATED content only: the unsigned `linear-delivery` header is attacker-
+  // controllable, so it must not decide whether a signed body is "new". Identical signed bytes are one delivery.
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawBody))
+  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
+  return { ok: true, deliveryId: `body:${hex}` }
 }
 
 function str(v: unknown, max: number): string | null {

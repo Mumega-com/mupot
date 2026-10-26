@@ -161,6 +161,14 @@ export async function runBoardWriteback(env: Env, taskId: string): Promise<Write
   if (port.capabilities.has('pushStatus') && port.pushStatus) {
     if ((await claim(env, taskId, derived.key, 'status', link.provider)) === 'duplicate') {
       actions.push({ action: 'status', result: 'duplicate' })
+      // A prior refusal (human cancel, wrong team, any unsettled/failed status) stays a refusal on redelivery:
+      // only a status row that settled 'done' and was not a human cancel lets the comment path run.
+      const prior = await env.DB.prepare(
+        `SELECT status, detail FROM board_writeback_ledger WHERE tenant = ?1 AND task_id = ?2 AND transition_key = ?3 AND action = 'status'`,
+      )
+        .bind(env.TENANT_SLUG, taskId, derived.key)
+        .first<{ status: string; detail: string | null }>()
+      statusOk = prior !== null && prior.status === 'done' && prior.detail !== 'human_canceled'
     } else {
       const res = await port.pushStatus(binding, taskRef, derived.receipt)
       await settle(env, taskId, derived.key, 'status', res)

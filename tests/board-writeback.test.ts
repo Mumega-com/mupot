@@ -1,10 +1,11 @@
 // S3 board two-way: capability dispatch, receipt-gated Linear write-back, idempotency, flag/opt-in, inbound webhook,
 // and secret hygiene. Real migrations on sqlite-backed D1; Linear is a fake fetch against a GraphQL stub.
 
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
 import { runBoardWriteback, writebackForBusEvent, retryFailedWritebacks } from '../src/projects/board-writeback'
 import { linearPushStatus, stateMapFromMeta } from '../src/integrations/linear-writeback'
@@ -14,7 +15,6 @@ import { runBoardSyncTick } from '../src/projects/board-sync'
 import type { BoardCapability, ProjectProviderBinding, TaskBoardPort, TransitionReceipt } from '../src/projects/providers/port'
 import type { BusEvent, Env } from '../src/types'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const SRC_DIR = join(__dirname, '..', 'src')
 const MASTER_KEY = '22'.repeat(32)
 const TENANT = 'tenant-a'
@@ -57,9 +57,7 @@ function linearStub(opts: { teamKey?: string; current?: string; failMutations?: 
 
 async function makeEnv(extra: Record<string, unknown> = {}) {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((n) => n.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
@@ -312,6 +310,30 @@ describe('status mapping', () => {
     expect(stub.mutations().filter((c) => c.kind === 'update')).toHaveLength(0)
   })
 
+  it('a prior human cancel stays a refusal on redelivery: no comment is ever posted', async () => {
+    const { env, harness } = await makeEnv()
+    bindLinear(harness)
+    const t = insertTask(harness, 'approved'); verdict(harness, t, 'approved'); link(harness, t)
+    stub = linearStub({ current: 'S-canc' }); vi.stubGlobal('fetch', stub.fetchFn)
+    await runBoardWriteback(env, t)
+    const again = await runBoardWriteback(env, t)
+    expect(again.outcome === 'ran' && again.actions).toEqual([{ action: 'status', result: 'duplicate' }])
+    expect(stub.mutations()).toHaveLength(0)
+    expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM board_writeback_ledger WHERE action = 'comment'`).get()).toEqual({ n: 0 })
+  })
+
+  it('team_mismatch exhausted then a new event posts nothing to that issue', async () => {
+    const { env, harness } = await makeEnv()
+    bindLinear(harness)
+    const t = insertTask(harness, 'approved'); verdict(harness, t, 'approved'); link(harness, t, 'linear', 'I-OTHER')
+    stub = linearStub({ teamKey: 'OPS' }); vi.stubGlobal('fetch', stub.fetchFn)
+    for (let i = 0; i < 7; i++) await runBoardWriteback(env, t)
+    const last = await runBoardWriteback(env, t)
+    expect(last.outcome === 'ran' && last.actions).toEqual([{ action: 'status', result: 'duplicate' }])
+    expect(stub.mutations()).toHaveLength(0)
+    expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM board_writeback_ledger WHERE action = 'comment'`).get()).toEqual({ n: 0 })
+  })
+
   it('only ever sends issueUpdate{stateId} and commentCreate (no delete/assign)', async () => {
     const src = readFileSync(join(SRC_DIR, 'integrations', 'linear-writeback.ts'), 'utf8')
     const ops = [...src.matchAll(/mutation\(([^)]*)\)\s*\{\s*(\w+)/g)].map((m) => m[2]).sort()
@@ -444,6 +466,27 @@ describe('inbound webhook', () => {
     const old = issueBody({}, Date.now() - 5 * 60_000)
     expect((await post(env, old, await signed(old, { 'linear-delivery': 'd-old' }))).status).toBe(401)
     expect(count(harness, 'tasks')).toBe(1)
+  })
+
+  it('dedupes on the signed body, not the unsigned delivery header', async () => {
+    const { env, harness } = await makeEnv(); bindLinear(harness)
+    const body = issueBody()
+    expect((await post(env, body, await signed(body, { 'linear-delivery': 'one' }))).status).toBe(200)
+    const again = await post(env, body, await signed(body, { 'linear-delivery': 'two' }))
+    expect(await again.json()).toEqual({ ok: true, duplicate: true })
+    expect(count(harness, 'tasks')).toBe(1)
+  })
+
+  it('releases the delivery claim when the handler fails so a redelivery retries', async () => {
+    const { env, harness } = await makeEnv(); bindLinear(harness)
+    const body = issueBody()
+    harness.sqlite.exec(`CREATE TRIGGER boom BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT, 'boom'); END;`)
+    const failed = await post(env, body, await signed(body))
+    expect(failed.status).toBe(503)
+    expect(count(harness, 'board_webhook_deliveries')).toBe(0)
+    harness.sqlite.exec(`DROP TRIGGER boom`)
+    const retry = await post(env, body, await signed(body))
+    expect(await retry.json()).toMatchObject({ ok: true, imported: 1 })
   })
 
   it('caps the body size before verifying', async () => {
