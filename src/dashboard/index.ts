@@ -6195,6 +6195,12 @@ function agentConsoleBody(
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
       ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation, flash) : ''}
     </div>
+    <div class="card" data-agent-connect>
+      <h2>Connect</h2>
+      <p>Copy this into the agent's app:</p>
+      <pre style="white-space:pre-wrap"><code id="background-connect-prompt">${`You are ${agent.slug}. Connect to mupot by OAuth as ${agent.slug} (choose 'This connection is ${agent.name}'), then run connection_check.`}</code></pre>
+      <button type="button" class="btn secondary" onclick="navigator.clipboard.writeText(document.getElementById('background-connect-prompt').textContent).then(() => { this.textContent = 'Copied'; })">Copy</button>
+    </div>
     ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
     ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
     ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}

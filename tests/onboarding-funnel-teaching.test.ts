@@ -125,7 +125,7 @@ describe('refusalNextStep (pure)', () => {
     expect(refusalNextStep('not_agent_bound', 403, 'x')).toContain('mint_agent_token')
     expect(refusalNextStep('seat_required', 403, undefined)).toContain('workspace bearer')
     // Agrees with connect DOOR A: seat_select only when a harness is present, otherwise re-consent with "Many chats".
-    expect(refusalNextStep('seat_required', 403, undefined, undefined, { choiceLabels: true })).toContain('Many chats')
+    expect(refusalNextStep('seat_required', 403, undefined, undefined, { choiceLabels: true })).toContain('A chat you drive')
     expect(refusalNextStep('seat_required', 403, undefined)).not.toContain('Do not call seat_select')
     expect(refusalNextStep('seat_attach_disabled', 403, undefined)).toMatch(/not enabled/)
     expect(refusalNextStep('rate_limited', 429, undefined)).toMatch(/wait/)
@@ -345,9 +345,9 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     expect(refusalGuidance('forbidden', 403, { need: 'admin', hint: 'x' })).toEqual({ who_acts: 'admin' })
     const dir = refusalGuidance('forbidden', 403, { reason: 'directory_channel_zero_capability', need: 'workspace-channel token' })
     expect(dir.who_acts).toBe('owner') // connect-after-bootstrap: the human binds; the reason no longer suppresses the step
-    expect(dir.next_step).toMatch(/Existing agent.*Me \(auto\)/) // SEAT_ATTACH off (prod): the labels the consent page actually shows
+    expect(dir.next_step).toMatch(/Existing agent.*A chat you drive/) // SEAT_ATTACH off (prod): the labels the consent page actually shows
     expect(dir.next_step).not.toMatch(/Many chats|One agent/)
-    expect(refusalGuidance('forbidden', 403, { reason: 'directory_channel_zero_capability', need: 'x' }, undefined, { choiceLabels: true }).next_step).toMatch(/One agent.*Many chats/)
+    expect(refusalGuidance('forbidden', 403, { reason: 'directory_channel_zero_capability', need: 'x' }, undefined, { choiceLabels: true }).next_step).toMatch(/Background agent.*A chat you drive/)
     expect(dir.next_step).toContain('mint_agent_token')
     expect(refusalGuidance('forbidden', 403, { reason: 'no_squad_access', need: 'member' }).who_acts).toBe('org_admin')
     expect(refusalGuidance('some_unknown_code', 409, undefined).who_acts).toBe('self')
@@ -361,14 +361,14 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
       ['harness_session_seat_required', 403, 'msg', undefined, undefined, 'self', /seat_select \{ project/],
       ['not_unbound_directory_session', 403, 'msg', 'seat_select', 'chat_bound', 'self', /already an agent/],
       ['not_unbound_directory_session', 403, 'msg', 'seat_select', 'bearer_unbound', 'admin', /mint_agent_token/],
-      ['harness_required', 403, 'msg', 'seat_select', 'chat_plain', 'owner', /Many chats/],
+      ['harness_required', 403, 'msg', 'seat_select', 'chat_plain', 'owner', /A chat you drive/],
       ['member_not_active', 403, undefined, 'seat_select', undefined, 'org_admin', /reactivates/],
       ['seat_cap_reached', 409, { cap: 3 }, 'seat_select', undefined, 'self', /same project/],
       ['seat_agent_inactive', 409, { reason: 'seat_retired' }, 'seat_select', undefined, 'self', /different thread label/],
       ['seat_key_source_conflict', 409, 'x', 'seat_select', undefined, 'self', /different project or thread/],
       ['provisioning_failed', 500, undefined, 'seat_select', undefined, 'self', /Retry seat_select once/],
       ['seat_required', 403, undefined, 'seat_attach', 'chat_harness', 'self', /seat_select \{ project/],
-      ['seat_required', 403, undefined, 'seat_attach', 'chat_plain', 'owner', /re-consents.*Many chats/],
+      ['seat_required', 403, undefined, 'seat_attach', 'chat_plain', 'owner', /re-consents.*A chat you drive/],
       ['seat_required', 403, undefined, 'seat_attach', 'chat_bound', 'self', /already that agent|already is that agent/],
       ['seat_required', 403, undefined, 'seat_attach', 'bearer_unbound', 'admin', /mint_agent_token/],
       ['rate_limited', 429, undefined, 'bootstrap_self', undefined, 'self', /bootstrap rate limit/],
@@ -408,7 +408,7 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     ] as Array<[string, unknown, string | undefined]>) {
       const t = String(refusalGuidance(error, 403, detail, tool, off).next_step)
       expect(t, `${tool}:${error}`).not.toMatch(/Many chats|One agent/)
-      expect(t, `${tool}:${error}`).toMatch(/Me \(auto\)|Existing agent/)
+      expect(t, `${tool}:${error}`).toMatch(/A chat you drive|Existing agent/)
     }
   })
 
@@ -439,7 +439,7 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     if (!ctx) throw new Error('ctx null')
     const r = await rpc(env, ctx, 'seat_select', { project: 'p' }, null)
     expect(r.sc).toMatchObject({ ok: false, error: 'harness_required', who_acts: 'owner' })
-    expect(String(r.sc.next_step)).toContain('Many chats')
+    expect(String(r.sc.next_step)).toContain('A chat you drive')
   })
 
   it('DE8: verify_agent_connection from a seat session says it needs a workspace token an admin mints', async () => {
@@ -484,7 +484,7 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     if (!ctx) throw new Error('ctx null')
     const r = await rpc(env, ctx, 'connect', { agent_name: 'rava' }, null)
     const text = JSON.stringify(r.sc)
-    expect(text).toContain('Many chats')
+    expect(text).toContain('A chat you drive')
     expect(text).not.toMatch(/Claude \(web\) calls seat_select and sends the handle/)
   })
 
@@ -495,7 +495,7 @@ describe('one refusal envelope: who_acts + next_step on every door code (lane B)
     const r = await rpc(env, g.ctx, 'connect', { agent_name: 'rava' }, null)
     expect(r.sc).toMatchObject({ ok: false, error: 'forbidden', status: 403, who_acts: 'owner' })
     expect((r.sc.detail as { reason?: string }).reason).toBe('directory_channel_zero_capability')
-    expect(String(r.sc.next_step)).toMatch(/Existing agent.*Me \(auto\)/) // prod labels (SEAT_ATTACH off), P1-1
+    expect(String(r.sc.next_step)).toMatch(/Existing agent.*A chat you drive/) // prod labels (SEAT_ATTACH off), P1-1
     expect(String(r.sc.next_step)).not.toMatch(/Many chats|One agent/)
     expect(String(r.sc.next_step)).toContain('mint_agent_token')
     expect(JSON.stringify(r.sc)).not.toContain('seat_attach') // flag off: nothing may advertise it

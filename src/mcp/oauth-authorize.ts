@@ -25,7 +25,8 @@
 
 import { SELECT_SEARCH_SCRIPT } from '../dashboard/select-search'
 import { seatAttachEnabled } from '../members/seat-attach'
-import { suggestedConnectMode, type ConnectMode } from './consent-connect-mode'
+import { CHAT_CONSENT_LABEL, BACKGROUND_CONSENT_LABEL, suggestedConnectMode, type ConnectMode } from './consent-connect-mode'
+import { backgroundAgentIdsForHuman, defaultBackgroundAgent } from './background-agent-consent'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, resolveCapabilitiesForMembers, canOnSquad, hasCapability, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, brandSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank, type SquadScope } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
@@ -586,6 +587,13 @@ export async function memberMayConsentToAgent(env: Env, memberId: string, agentI
   return canOnSquad(env, humanGrants, agent.squad_id, 'admin')
 }
 
+/** Selecting an existing background agent also requires its owner or designated human.
+ * Creation within this consent keeps its existing independent checks. */
+export async function memberMayConsentToBackgroundAgent(env: Env, memberId: string, agentId: string): Promise<boolean> {
+  const permitted = await backgroundAgentIdsForHuman(env, memberId)
+  return permitted.has(agentId) && await memberMayConsentToAgent(env, memberId, agentId)
+}
+
 /** The full selectable list for the consent screen, each with its capability preview
  *  — "a parameter that grants capability without showing it is a phishing surface".
  *  Floor is 'admin' (P0-3) — see memberMayConsentToAgent. */
@@ -675,7 +683,7 @@ export interface ConsentableSquad {
   slug: string
 }
 
-/** Lists squads where the human holds admin capability, allowing them to mint a new agent seat directly. */
+/** Lists squads where the human holds admin capability, allowing them to mint a new agent directly. */
 export async function listConsentableSquads(env: Env, memberId: string): Promise<ConsentableSquad[]> {
   const humanGrants = await resolveCapabilities(env, memberId)
   const rows = await env.DB.prepare(
@@ -856,17 +864,20 @@ function renderConsentPage(
   squads: ConsentableSquad[] = [],
   scopeNames: ScopeNames = { squads: new Map(), departments: new Map(), org: '' },
   // mupot#1794 W3: true ONLY when SEAT_AUTO_ENROLL === '1' (the caller decides). False renders the
-  // page byte-identically to before this option existed.
+  // page without the chat option.
   harnessOption = false,
   // The suggested answer to "How will this app connect?" (consent-connect-mode.ts). Only read when harnessOption is on.
   connectMode: ConnectMode = 'many',
   // True ONLY when SEAT_ATTACH is on (with the harness option): the 'How will this app connect?' wording, the suggested
-  // tab and the plain-language panel. False renders the pre-W2 page byte-identically.
+  // tab suggestion. The background-agent choice is available independently of these flags.
   connectChoice = false,
   // mupot#1022: true when THIS login just created the member row (shown once, because the page is only rendered once).
   memberJustCreated = false,
+  defaultAgentId: string | null = null,
 ): Response {
   const choice = harnessOption && connectChoice
+  const defaultAgent = agents.find((a) => a.id === defaultAgentId)
+  const chatTabFirst = harnessOption && !defaultAgent && (!choice || connectMode === 'many')
   const rows = agents.map((a) => {
     const groups = summarizeGrants(a.capabilities, scopeNames)
     const orgAdmin = carriesOrgAdmin(a.capabilities)
@@ -889,11 +900,11 @@ function renderConsentPage(
 
     return `
         <label class="agent-option${orgAdmin ? ' is-org-admin' : ''}" data-haystack="${escapeHtml(haystack)}" data-top="${escapeHtml(top ?? 'none')}">
-          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required
+          <input type="radio" name="agent_id" value="${escapeHtml(a.id)}" required${a.id === defaultAgent?.id ? ' checked' : ''}
                  data-label="${escapeHtml(a.name)}" data-top="${escapeHtml(top ?? 'no standing capability')}">
           <div class="opt-body">
             <div class="agent-title">
-              <strong>${escapeHtml(a.name)}</strong>
+              <strong>This connection is ${escapeHtml(a.name)} (runs in the background)</strong>
               <code>${escapeHtml(a.slug)}</code>
               ${orgAdmin ? '<span class="badge-org">organisation admin</span>' : ''}
             </div>
@@ -927,9 +938,9 @@ function renderConsentPage(
 
   const mintPanel = squads.length > 0 ? `
         <label class="agent-option mint">
-          <input type="radio" name="agent_id" value="__mint_new__" required data-label="a new agent seat" data-top="member on its home squad">
+          <input type="radio" name="agent_id" value="__mint_new__" required data-label="a new agent" data-top="member on its home squad">
           <div class="opt-body">
-            <div class="agent-title"><strong>Create a new agent seat</strong></div>
+            <div class="agent-title"><strong>Create a new agent</strong></div>
             <div class="agent-meta">It starts with member capability on the squad you choose.</div>
             <div class="fields">
               <div class="field">
@@ -953,21 +964,21 @@ function renderConsentPage(
             </div>
           </div>
         </label>` : `
-        <p class="empty-hint">You do not hold admin on any squad, so you cannot create a new seat here. Ask someone who administers the squad to create it, then reconnect.</p>`
+        <p class="empty-hint">You do not hold admin on any squad, so you cannot create a new agent here. Ask someone who administers the squad to create it, then reconnect.</p>`
 
   // mupot#1794 W3 — the harness option. Posts the sentinel `__harness__`, which the consent handler
   // maps (flag on only) onto the EXISTING unbound path: no agent bound, a harness row upserted, and
   // each thread/worktree then picks its own agent through seat_select. Nothing here grants authority.
   const harnessPanel = harnessOption ? `
-    <p class="panel-title">${choice ? 'Many chats: each chat picks its agent' : 'Let each thread pick its own agent'}</p>
+    <p class="panel-title">${CHAT_CONSENT_LABEL}</p>
     <div class="panel" id="p-harness">
       <label class="agent-option harness-option">
-        <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required data-label="${choice ? 'Many chats: each chat picks its agent' : 'Me — auto per workspace (harness)'}" data-top="member capability, capped at your own access">
+        <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required data-chat-choice data-label="${CHAT_CONSENT_LABEL}" data-top="member capability, capped at your own access">
         <div class="opt-body">
-          <div class="agent-title"><strong>${choice ? 'Many chats: each chat picks its agent' : 'Me — auto per workspace (harness)'}</strong>${choice && connectMode === 'many' ? ' <span class="suggested">Suggested for this app</span>' : ''}</div>
+          <div class="agent-title"><strong>${CHAT_CONSENT_LABEL}</strong>${choice && !defaultAgent && connectMode === 'many' ? ' <span class="suggested">Suggested for this app</span>' : ''}</div>
           ${choice
-    ? `<div class="agent-meta">Best for chat apps and coding tools with many threads (ChatGPT, Claude, Cursor, Grok). This connection is not tied to one agent. Each chat gets its own agent, or you can attach it to one you already have from your Connections page. Until then a chat has no standing access. Whatever a chat does is capped at your own access.</div>`
-    : `<div class="agent-meta">Recommended for a coding tool or chat app you use across several projects. This connection is not tied to one agent. Each thread or worktree picks its own agent by calling <code>seat_select</code> and gets a seat handle to send with later requests. Until a thread does that, it has no agent and no standing capability. Each seat agent is capped at member level, and your own access is always the ceiling: a seat can never do more than you can.</div>`}
+    ? `<div class="agent-meta">Acts for you and is capped at your rights. Each chat can ask to act as an agent; you approve it from your Connections page. Until then a chat has no standing access.</div>`
+    : `<div class="agent-meta">Acts for you and is capped at your rights. Each chat picks its own agent. Until then it has no standing access. Its access is capped at member level; your own access is always the ceiling.</div>`}
         </div>
       </label>
     </div>
@@ -1080,13 +1091,13 @@ function renderConsentPage(
 <h1>Connect to mupot</h1>
 <p class="who">Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
 ${choice ? `<h2 class="how">How will this app connect?</h2>
-<p class="who"><strong>Many chats</strong>: each chat picks its agent (ChatGPT, Claude, Cursor, Grok). <strong>One agent</strong>: this whole app is one agent (for example Muse, or a single bot).${connectMode === 'one' ? ' We suggest <strong>One agent</strong> for this app.' : ' We suggest <strong>Many chats</strong> for this app.'} You choose below; nothing is selected for you.</p>` : ''}
+<p class="who"><strong>Background agent</strong>: this connection is the agent, runs on its own and can be woken. <strong>${CHAT_CONSENT_LABEL}</strong>: acts for you and is capped at your rights.${defaultAgent ? ` Selected for this connection: <strong>${escapeHtml(defaultAgent.name)}</strong>. Review its access below, or choose a chat you drive.` : connectMode === 'one' ? ' We suggest <strong>Background agent</strong> for this app. Choose an agent below.' : ` We suggest <strong>${CHAT_CONSENT_LABEL}</strong> for this app.`} Continue to approve your choice.</p>` : ''}
 
 <form method="POST" action="/oauth/consent" id="consent-form">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
 
   <div class="tabbar" role="tablist">
-    ${harnessOption ? `<button type="button" class="tab" role="tab" data-panel="p-harness" aria-selected="${!choice || connectMode === 'many' ? 'true' : 'false'}">${choice ? 'Many chats' : 'Me (auto)'}</button>\n    ` : ''}<button type="button" class="tab" role="tab" data-panel="p-existing" aria-selected="${harnessOption && (!choice || connectMode === 'many') ? 'false' : 'true'}">${choice ? 'One agent: ' : ''}Existing agent${agents.length > 0 ? ` (${agents.length})` : ''}</button>
+    ${harnessOption ? `<button type="button" class="tab" role="tab" data-panel="p-harness" aria-selected="${chatTabFirst ? 'true' : 'false'}">${CHAT_CONSENT_LABEL}</button>\n    ` : ''}<button type="button" class="tab" role="tab" data-panel="p-existing" aria-selected="${chatTabFirst ? 'false' : 'true'}">${choice ? BACKGROUND_CONSENT_LABEL : 'Existing agent'}${agents.length > 0 ? ` (${agents.length})` : ''}</button>
     <button type="button" class="tab" role="tab" data-panel="p-new" aria-selected="false">New agent</button>
     <button type="button" class="tab" role="tab" data-panel="p-none" aria-selected="false">No agent</button>
   </div>
@@ -1096,14 +1107,14 @@ ${choice ? `<h2 class="how">How will this app connect?</h2>
       ${agentsListed && agents.length === 0 ? unlinkedSignInHint(maskConsentEmail(email), memberJustCreated) : ''}
       ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
       ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
-      ${choice ? `<p class="panel-help"><strong>One agent: this whole app is one agent.</strong>${connectMode === 'one' ? ' <span class="suggested">Suggested for this app</span>' : ''} Every chat in this app will act as the agent you pick, so they all share one identity. Use it for a single-purpose app or bot.</p>` : ''}
+      <p class="panel-help"><strong>Background agent:</strong> this connection is the agent you choose. It runs on its own and can be woken. Its access is capped at your rights.</p>
       ${agents.length > 0 ? `<input class="filter" type="search" id="agent-filter" placeholder="Filter by name, squad, or capability — try &quot;admin&quot;" autocomplete="off">
       <p class="count-line" id="filter-count"></p>` : ''}
 ${rows}
       <p class="no-match" id="no-match">No agent matches that filter.</p>
     </div>
 
-    <p class="panel-title">Create a new agent seat</p>
+    <p class="panel-title">Create a new agent</p>
     <div class="panel" id="p-new">
 ${firstAgentPanel}
 ${mintPanel}
@@ -1114,15 +1125,15 @@ ${mintPanel}
       <label class="agent-option">
         <input type="radio" name="agent_id" value="" required data-label="no agent" data-top="no standing capability">
         <div class="opt-body">
-          <div class="agent-title"><strong>Continue unbound</strong></div>
-          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.${harnessOption ? ' This connection cannot pick seat agents; choose &ldquo;Me (auto)&rdquo; for that.' : ''}</div>
+          <div class="agent-title"><strong>Continue without an agent</strong></div>
+          <div class="agent-meta">No standing access. You can look up agents and squads.${harnessOption ? ' Choose a chat you drive to ask to act as an agent later.' : ''}</div>
         </div>
       </label>
     </div>
   </div>
 
   <div class="summary" id="summary">
-    <div class="summary-text" id="summary-text">Nothing selected yet.</div>
+    <div class="summary-text" id="summary-text">${defaultAgent ? `This connection will act as <strong>${escapeHtml(defaultAgent.name)}</strong>. Review its access above before continuing.` : 'Nothing selected yet.'}</div>
     <div class="actions">
       <button type="submit" name="action" value="continue">Continue</button>
       <button type="submit" name="action" value="decline">Decline</button>
@@ -1170,9 +1181,9 @@ ${mintPanel}
     var row = picked.closest('.agent-option')
     var orgAdmin = row && row.classList.contains('is-org-admin')
     summary.classList.toggle('danger', !!orgAdmin)
-    summaryText.innerHTML = orgAdmin
-      ? 'This connection will act as <b>' + label + '</b> and carry <b>administrator control of the whole organisation</b>.'
-      : 'This connection will act as <b>' + label + '</b>, carrying <b>' + top + '</b>.'
+    summaryText.textContent = orgAdmin
+      ? 'This connection will act as ' + label + ' and carry administrator control of the whole organisation.'
+      : 'This connection will act as ' + label + ', carrying ' + top + '.'
   }
 
   // Tabs are enabled only now, once scripting is known to work. Until this runs
@@ -1189,11 +1200,22 @@ ${mintPanel}
 
   document.body.classList.add('tabs-on')
   tabs.forEach(function (t) {
-    t.addEventListener('click', function () { selectTab(t.getAttribute('data-panel')) })
+    t.addEventListener('click', function () {
+      var panelId = t.getAttribute('data-panel')
+      selectTab(panelId)
+      var picked = form.querySelector('input[name="agent_id"]:checked')
+      var target = document.getElementById(panelId)
+      if (picked && target && !target.contains(picked)) {
+        picked.checked = false
+        var chatChoice = target.querySelector('input[data-chat-choice]')
+        if (chatChoice) chatChoice.checked = true
+        updateSummary()
+      }
+    })
   })
   // Land on the tab that actually has something in it. A newcomer whose only
   // option is to create their first agent should not have to find that tab.
-  selectTab(${harnessOption && (!choice || connectMode === 'many') ? `'p-harness'` : `document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
+  selectTab(${chatTabFirst ? `'p-harness'` : defaultAgent ? `'p-existing'` : `document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
     ? 'p-new'
     : 'p-existing'`})
 
@@ -1656,6 +1678,11 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       return new Response('Invalid OAuth request: missing client_id', { status: 400 })
     }
 
+    // The provider parses standard OAuth fields only. Preserve the optional agent id/slug
+    // separately through the Google round trip; it affects presentation, never authority.
+    const agentHint = (url.searchParams.get('agent') ?? url.searchParams.get('agent_id') ?? '').trim()
+    if (agentHint) oauthReqInfo.backgroundAgentHint = agentHint.slice(0, 129)
+
     const nonce = crypto.randomUUID()
     await env.SESSIONS.put(
       `oauth-req:${nonce}`,
@@ -1797,6 +1824,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     let agentsListed = true
     try {
       agents = await listConsentableAgents(env, memberId)
+      const ownedOrDesignated = await backgroundAgentIdsForHuman(env, memberId)
+      agents = agents.filter((a) => ownedOrDesignated.has(a.id))
     } catch (err) {
       console.error('[oauth-authorize] listConsentableAgents failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       // Fail closed on the LISTING, not on the flow: an admin/D1 hiccup here must not
@@ -1828,8 +1857,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         // cosmetic: the suggestion falls back to the redirect host alone
       }
     }
+    let defaultAgentId: string | null = null
+    try {
+      defaultAgentId = await defaultBackgroundAgent(env, memberId, stored.clientId, stored.backgroundAgentHint, agents)
+    } catch {
+      // A failed suggestion lookup leaves the explicit choices available.
+    }
     const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames, seatAutoEnrollEnabled(env),
-      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env), memberJustCreated)
+      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env), memberJustCreated, defaultAgentId)
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
@@ -2056,7 +2091,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       boundAgentId = newAgent.id
       mintMemberId = minted.memberId
     } else if (agentIdRaw) {
-      const eligible = await memberMayConsentToAgent(env, pending.memberId, agentIdRaw)
+      const eligible = await memberMayConsentToBackgroundAgent(env, pending.memberId, agentIdRaw)
       if (!eligible) {
         const rejected = new Response(
           'The selected agent is no longer available for this connection. Please sign in again.',
@@ -2205,7 +2240,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const oauthProvider = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER
 
-    // mupot#1794 W1/W3 — harness upsert, ONLY for the explicit "Me — auto per workspace" choice (flag on).
+    // mupot#1794 W1/W3 — harness upsert, ONLY for the explicit "A chat you drive" choice (flag on).
     // A plain "continue unbound" ('') stays a pure unbound grant with no harness, so it cannot seat_select.
     // (W1 originally upserted for any unbound consent; W3 narrows that to an explicit choice.)
     // Original W1 note: UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag

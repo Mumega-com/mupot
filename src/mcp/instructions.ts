@@ -33,9 +33,9 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
      a. An admin must grant your capability floor ('grant_agent_capability' or dashboard).
      b. Then, RECONNECT THE MCP CONNECTOR (re-authenticate OAuth) and select your agent profile at the consent screen.
 
-5. MINTED TOKENS VS CONNECTOR SESSIONS
-   - Headless background workers, systemd daemons, and cron jobs MUST use agent-bound bearer tokens ('mupot_<token>') minted via 'mint_agent_token' or provisioned keys, rather than interactive OAuth connector sessions.
-   - A minted token does not help a connector session: the connector authenticates itself and never presents that bearer. Either consent-bind the agent, or call REST /actions/<tool> directly with the minted bearer.
+5. BACKGROUND AGENT OAUTH
+   - A background agent runs in its own harness (Orca, Codex, or Claude Code). The harness signs in once by OAuth AS that agent: its owner or designated human chooses "This connection is <Agent name> (runs in the background)" and reviews the access before continuing.
+   - The harness keeps its own refresh token. The connection IS the agent, runs on its own, and can be woken. A chat you drive is the separate option for acting for the human, capped at their rights.
 
 6. ERROR CODE DECODING GUIDE
    - 403 forbidden need=<cap>: Server-side authorization floor. Your session lacks the required capability for this tool. Grant capability or reconnect with bound agent.
@@ -86,7 +86,7 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
 // constant above, byte-identical to before this section existed.
 export const MUPOT_MCP_SEAT_INSTRUCTIONS = `
 
-SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "Me — auto per workspace")
+SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "A chat you drive")
    - If boot_context reports a harness session with no bound agent, your FIRST step is 'seat_select' with { project: "<workspace name>", folder?: "<worktree path>", thread?: "<thread id>", repo?: "<git remote get-url origin>", branch?: "<current branch>" }. Every value is a label that keys your seat; none of them grants authority.
    - It returns a seat handle (prefix "mseat_"). Pass it as the "seat" argument on every later call (seat: "<the seat value>"); a harness that can set headers may send X-Mupot-Seat instead. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
    - Once a request carries a valid handle, boot_context shows an identity_receipt naming the agent you act as and how it was bound.`
@@ -101,8 +101,8 @@ ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when bo
    - First time, it returns status "pending_admission". If it includes an approve_url, give that URL to your human: they tap their passkey once. If it has none (the pot has no approval links), your human approves on their Connections page instead; the note in the result says which. Nothing attaches before that, and you cannot approve it yourself.
    - If your human has never registered a passkey, they must first add one in My Account (the dashboard /account page, while signed in). The approve link cannot enrol one for them.
    - After they approve, call 'seat_attach' again. It attaches immediately; your NEXT request acts as that agent (boot_context shows the identity_receipt).
-   - A harness TOKEN session with no seat yet (a bearer minted for a harness, not an OAuth connector) can call only seat_select, boot_context and worktree_open: call seat_select first, then seat_attach. An OAuth connector consented as "Many chats" with no seat yet can call seat_select to get one (a ChatGPT conversation is seated automatically); until it has a seat, seat_attach answers seat_required.
-   - A fixed CLI or daemon agent with no human in the chat does not use this: it connects with a workspace token an org admin mints for it.`
+   - A harness TOKEN session with no seat yet (a bearer minted for a harness, not an OAuth connector) can call only seat_select, boot_context and worktree_open: call seat_select first, then seat_attach. An OAuth connector consented as "A chat you drive" with no seat yet can call seat_select to get one (a ChatGPT conversation is seated automatically); until it has a seat, seat_attach answers seat_required.
+   - A background agent with its own harness signs in once by OAuth as that agent: choose "This connection is <Agent name> (runs in the background)". The harness keeps its own refresh token. This connection IS the agent, runs on its own and can be woken.`
 
 export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string }): string {
   if (env.SEAT_AUTO_ENROLL !== '1') return MUPOT_MCP_INITIALIZE_INSTRUCTIONS

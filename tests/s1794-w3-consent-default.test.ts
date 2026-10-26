@@ -14,7 +14,7 @@ import type { AuthContext, Env } from '../src/types'
 const TENANT = 'mumega'
 const HUMAN = 'member-human-1'
 const ORIGIN = 'https://pot.test'
-const MARKERS = ['__harness__', 'harness-option', 'p-harness', 'seat_select', 'Me — auto per workspace', 'How will this app connect?', 'Many chats']
+const MARKERS = ['__harness__', 'harness-option', 'p-harness', 'A chat you drive', 'How will this app connect?']
 
 let h: SqliteD1Harness
 beforeEach(() => {
@@ -104,19 +104,19 @@ describe('W3 consent page', () => {
 
   it('flag on: shows the harness option, explains it, lands on its tab, and pre-checks NOTHING', async () => {
     const { html } = await reachConsent(httpEnv(stubProvider(), '1'))
-    expect(html).toContain('Me — auto per workspace (harness)')
+    expect(html).toContain('A chat you drive')
     // explicit consent: no radio is ever pre-checked, and every radio stays required
     expect(html).not.toMatch(/<input[^>]*type="radio"[^>]*checked/)
     const radios = html.match(/<input[^>]*type="radio"[^>]*>/g) ?? []
     expect(radios.length).toBeGreaterThan(1)
     for (const r of radios) expect(r).toContain('required')
     expect(radios.some((r) => r.includes('value="__harness__"'))).toBe(true)
-    expect(html).toContain('seat_select')
+    expect(html).not.toContain('seat_select')
     expect(html).toMatch(/capped at member/)
     expect(html).toMatch(/your own access is always the ceiling/)
     expect(html).toContain(`selectTab('p-harness')`)
     // the plain unbound option and the existing-agent panel are still offered
-    expect(html).toContain('Continue unbound')
+    expect(html).toContain('Continue without an agent')
     expect(html).toContain('id="p-existing"')
   })
 
@@ -242,9 +242,19 @@ describe('W3 initialize instructions', () => {
     const t = mcpInitializeInstructions({ SEAT_AUTO_ENROLL: '1' })
     expect(t.startsWith(MUPOT_MCP_INITIALIZE_INSTRUCTIONS)).toBe(true)
     expect(t).toContain('seat_select')
+    expect(t).toContain('A chat you drive')
     expect(t).toContain('mseat_')
     expect(t).toContain('X-Mupot-Seat')
     expect(t).toContain('"seat" argument')
     expect(t).toContain('identity_receipt')
   })
+})
+
+
+it('teaches background agents to connect once by OAuth with their own refresh token', () => {
+  expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('BACKGROUND AGENT OAUTH')
+  expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('signs in once by OAuth AS that agent')
+  expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('This connection is <Agent name> (runs in the background)')
+  expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('harness keeps its own refresh token')
+  expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).not.toContain('MUST use agent-bound bearer tokens')
 })

@@ -83,7 +83,7 @@ describe('real handler: each reachable state', () => {
       expect(wh.missing).toEqual([{
         code: 'no_agent',
         who_acts: 'owner',
-        next_step: expect.stringContaining('"Me (auto)"'), // the label prod's consent screen shows with SEAT_ATTACH off
+        next_step: expect.stringContaining('"A chat you drive"'), // the label prod's consent screen shows with SEAT_ATTACH off
         link: mcpEndpoint(originOf(w)),
       }])
       expect(wh.missing[0].next_step).toContain('"Existing agent"')
@@ -356,7 +356,7 @@ describe('auto_seat_refused: the step names the actor who can clear the reason (
     const m = only('harness_required')
     expect(m).toMatchObject({ who_acts: 'owner', link: mcpEndpoint(ORIGIN) })
     expect(m.next_tool).toBeUndefined()
-    expect(m.next_step).toContain('"Me (auto)"')
+    expect(m.next_step).toContain('"A chat you drive"')
   })
   it('seat_cap_reached and rate_limited (auto pool): self, seat_select with the same labels (the select pool has its own cap and window), text from the table row', () => {
     for (const reason of ['seat_cap_reached', 'rate_limited']) {

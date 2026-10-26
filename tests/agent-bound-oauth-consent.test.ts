@@ -33,8 +33,10 @@ import {
   listConsentableAgents,
   listConsentableSquads,
   memberMayConsentToAgent,
+  memberMayConsentToBackgroundAgent,
 } from '../src/mcp/oauth-authorize'
 import { invokeTool, mcpApp } from '../src/mcp/index'
+import { callerHoldsGateCapability, evaluateVerdictGates } from '../src/tasks'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
@@ -115,6 +117,8 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
       VALUES ('${TENANT}', '${AGENT_D.id}', '${MEMBER_AGENT_D}', '2026-08-01T00:00:00.000Z');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${AGENT_E.id}', '${MEMBER_AGENT_E}', '2026-08-01T00:00:00.000Z');
+
+    UPDATE agents SET owner_member_id = '${HUMAN}';
 
     -- Each agent's OWN capability set — the escalation-guarded home-squad grant,
     -- exactly what prepareAgentBoundTokenMintForBinding would have written.
@@ -2076,4 +2080,51 @@ describe('H. offboarded / demoted consenter or inactive agent: no latent authori
       expect(key(r.latent).some((g) => g.endsWith(':org:null:admin'))).toBe(false)
     })
   }
+})
+
+describe('background OAuth authority parity', () => {
+  it('pins the existing gate lane: OAuth and workspace callers use the same agent grant', async () => {
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-gate', MEMBER_AGENT_A, AGENT_A.id)
+    const oauth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-gate', email: 'human@example.test', consentedByMemberId: HUMAN,
+    })
+    expect(oauth!.capabilities).toEqual([
+      { member_id: MEMBER_AGENT_A, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'member' },
+    ])
+    const workspace = { ...oauth!, channel: 'workspace' as const, consentedByMemberId: null }
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('human-gate', 'gate:athena', 'member', '${HUMAN}', '${HUMAN}', '2026-10-26T00:00:00Z')`)
+    for (const auth of [oauth!, workspace]) {
+      expect(await callerHoldsGateCapability(env, auth, 'squad-a', 'gate:athena')).toBe(false)
+    }
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-agent', 'gate:athena', 'agent', '${AGENT_A.id}', '${HUMAN}', '2026-10-26T00:00:00Z')`)
+    for (const auth of [oauth!, workspace]) {
+      expect(await callerHoldsGateCapability(env, auth, 'squad-a', 'gate:athena')).toBe(true)
+      const result = await evaluateVerdictGates(env, auth, {
+        id: 'independent-task', squad_id: 'squad-a', gate_owner: 'gate:athena', assignee_agent_id: AGENT_B.id,
+      }, 'approved')
+      expect(result.allowed).toBe(true)
+      expect(result.principal).toMatchObject({ id: AGENT_A.id, type: 'agent' })
+      const taskId = `gate-check-${auth.channel}`
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, done_when, status, gate_owner, assignee_agent_id)
+        VALUES (?, 'squad-a', 'Independent review', 'reviewed', 'review', 'gate:athena', ?)`).run(taskId, AGENT_B.id)
+      const verdict = await invokeTool(auth, env, 'task_verdict', { task_id: taskId, verdict: 'approved' }, 'https://pot.test')
+      expect(verdict).toMatchObject({ ok: true, result: { verdict: { decided_by: AGENT_A.id } } })
+    }
+    harness.sqlite.exec("DELETE FROM gate_grants WHERE id = 'gate-agent'")
+    expect(await callerHoldsGateCapability(env, oauth!, 'squad-a', 'gate:athena')).toBe(false)
+  })
+  it('designation never replaces the admin floor', async () => {
+    harness.sqlite.exec(`UPDATE agents SET attach_designated_member_id = '${HUMAN}' WHERE id = '${AGENT_A.id}';
+      UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
+  })
+  it('requires an owner or designated human even when squad admin is present', async () => {
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL WHERE id = '${AGENT_A.id}'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = '${HUMAN}' WHERE id = '${AGENT_A.id}'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(true)
+  })
 })
