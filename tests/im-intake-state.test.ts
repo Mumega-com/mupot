@@ -254,6 +254,7 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
         DROP INDEX IF EXISTS idx_task_verdicts_proposal;
         DROP TRIGGER IF EXISTS task_verdicts_no_update;
         DROP TRIGGER IF EXISTS task_verdicts_no_update_0252;
+        DROP TRIGGER IF EXISTS task_verdicts_no_update_0262;
         ALTER TABLE task_verdicts DROP COLUMN proposal_id;
       `)
 

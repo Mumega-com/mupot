@@ -7,6 +7,7 @@
 // (lane still held, active, independent of the task, not owned by / bound to the deciding owner).
 
 import type { AuthContext, Env } from '../types'
+import { canOnSquad } from '../auth/capability'
 import { evaluateVerdictGates } from './index'
 import { resolveVerdictSubmission } from './verdict-binding'
 
@@ -36,6 +37,10 @@ export async function recordReviewLens(
     .bind(input.taskId)
     .first<{ id: string; squad_id: string; status: string; gate_owner: string | null; assignee_agent_id: string | null }>()
   if (!task) return { ok: false, status: 404, error: 'task_not_found' }
+  // Gate-lane authority also requires member access to the task's squad, as task_verdict does.
+  if (!(await canOnSquad(env, auth.capabilities ?? [], task.squad_id, 'member'))) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
   if (!task.gate_owner) return { ok: false, status: 409, error: 'no_gate' }
   if (task.status !== 'review') return { ok: false, status: 409, error: 'not_in_review' }
   // The self-completion lane and dedicated-predicate lanes have their own deciders; lenses are not their evidence.

@@ -399,6 +399,36 @@ describe('mom-walk D1: owner_self verdict waiver', () => {
       expect(lensRows()).toBe(before + 1)
     })
 
+    it.each([
+      ['member', 'pass'], ['member', 'fail'], ['agent', 'pass'], ['agent', 'fail'],
+    ] as const)('requires task-squad membership for a %s recording a %s lens', async (kind, outcome) => {
+      dropLenses()
+      sql().prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('other-squad', 'dept-1', 'other', 'Other')`).run()
+      const auth = kind === 'member' ? memberAuth('STRANGER') : agentAuth('G')
+      auth.capabilities = floor(auth.memberId!).map((grant) => ({ ...grant, scope_id: 'other-squad' }))
+      expect(await record(auth, { outcome })).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+      expect(lensRows()).toBe(0)
+      expect(await decide(memberAuth('OWN'))).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(rows()).toBe(0)
+      expect(status()).toBe('review')
+    })
+
+    it('requires member access on the task squad even for an independent lane holder with observer access', async () => {
+      const auth = memberAuth('STRANGER')
+      auth.capabilities = floor('STRANGER').map((grant) => ({ ...grant, capability: 'observer' }))
+      const before = lensRows()
+      expect(await record(auth)).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+      expect(lensRows()).toBe(before)
+    })
+
+    it.each(['department', 'org'] as const)('accepts task-squad member access inherited from %s', async (scopeType) => {
+      const auth = memberAuth('STRANGER')
+      auth.capabilities = [{ member_id: 'STRANGER', scope_type: scopeType, scope_id: scopeType === 'org' ? null : 'dept-1', capability: 'member' }]
+      const before = lensRows()
+      expect(await record(auth)).toMatchObject({ ok: true })
+      expect(lensRows()).toBe(before + 1)
+    })
+
     it('refuses: a party to the task (the producing agent, a key minter), a non-holder, a stale submission id, a task not in review', async () => {
       const before = lensRows()
       expect((await record(agentAuth('A'))).ok).toBe(false)

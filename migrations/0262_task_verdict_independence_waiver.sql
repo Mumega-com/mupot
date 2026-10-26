@@ -1,6 +1,6 @@
--- 0258 a verdict records WHICH independence exemption let its decider through (mom-walk D1, mupot task 7ae27377).
+-- 0262 a verdict records WHICH independence exemption let its decider through (mom-walk D1, mupot task 7ae27377).
 --
--- independence_waiver: NULL for an ordinary independent verdict (and every pre-0258 verdict); otherwise the
+-- independence_waiver: NULL for an ordinary independent verdict (and every pre-0262 verdict); otherwise the
 -- VerdictIndependenceWaiver the write carried: 'admin_supervisory', 'owner_override', or 'owner_self' (a member who OWNS
 -- the assignee agent giving the verdict on its work). Written in the verdict INSERT, atomic with it, so an owner's own-agent
 -- approval is auditable apart from an admin's supervisory one. Additive, no backfill, no FK.
@@ -34,7 +34,7 @@ BEGIN SELECT RAISE(ABORT, 'task_review_lenses are append-only: DELETE is forbidd
 
 ALTER TABLE task_verdicts ADD COLUMN independence_waiver TEXT CHECK (independence_waiver IS NULL OR independence_waiver IN ('admin_supervisory', 'owner_override', 'owner_self'));
 
-CREATE TRIGGER IF NOT EXISTS task_verdicts_no_update_0258
+CREATE TRIGGER IF NOT EXISTS task_verdicts_no_update_0262
 BEFORE UPDATE ON task_verdicts
 WHEN NOT (
   (
