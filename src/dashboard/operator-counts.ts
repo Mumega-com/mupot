@@ -148,14 +148,16 @@ interface TaskStatusRow {
 /** The ONE grouped tasks-by-status count. Callers that need the raw breakdown (e.g.
  *  Health's "Task queues" check, which also shows open/in_progress in its detail text)
  *  call this directly instead of hand-writing a second GROUP BY. */
-export async function loadTaskStatusCounts(env: Env): Promise<Map<string, number>> {
+export async function loadTaskStatusCounts(env: Env, squadIds?: string[]): Promise<Map<string, number>> {
+  if (squadIds?.length === 0) return new Map()
+  const scope = squadIds === undefined ? '' : ' AND tasks.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
   // mupot#1821: released routine control orphans (pause-race leftovers) are inert, not failures.
   const rs = await env.DB.prepare(
     `SELECT status, COUNT(*) AS count FROM tasks
       WHERE ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
-        AND ${TASK_NOT_ARCHIVED_SQL()}
+        AND ${TASK_NOT_ARCHIVED_SQL()}${scope}
       GROUP BY status`,
-  ).bind(env.TENANT_SLUG).all<TaskStatusRow>()
+  ).bind(...(squadIds === undefined ? [env.TENANT_SLUG] : [env.TENANT_SLUG, JSON.stringify([...new Set(squadIds)])])).all<TaskStatusRow>()
   const map = new Map<string, number>()
   for (const row of rs.results ?? []) {
     const n = typeof row.count === 'number' ? row.count : Number(row.count)

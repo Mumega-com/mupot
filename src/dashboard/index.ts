@@ -223,6 +223,7 @@ import { formatBurn, formatUsd } from '../agents/cost'
 import {
   canManageProject,
   canManageProjects,
+  projectAccess,
   getReadableProject,
   loadProjectDetail,
   projectManageAccessContext,
@@ -660,12 +661,13 @@ dashboardApp.get('/', async (c) => {
   //   - loadTodaySpendScalar: ONE D1 round trip (today's sum + an EXISTS check),
   //     vs loadEconomy's 5 parallel queries — see economy.ts for why "configured"
   //     is defined identically so the two never disagree.
+  const overviewScope = (await resolveAccessibleSquadIds(c.env, auth)) ?? undefined
   const [obsData, approvalsQueue, physics, spend, taskStatusCounts] = await Promise.all([
-    loadObservatory(c.env),
+    loadObservatory(c.env, Date.now(), overviewScope),
     loadApprovals(c.env, auth),
     loadBrainPhysics(c.env),
     loadTodaySpendScalar(c.env),
-    loadTaskStatusCounts(c.env),
+    loadTaskStatusCounts(c.env, overviewScope),
   ])
   // Flight-008 Slice 1 (mupot#1060): the hero KPI strip (Configured agents, Live
   // runtimes, In flight, Needs decision) is derived through the SAME pure helper
@@ -1090,9 +1092,11 @@ dashboardApp.get('/send', async (c) => {
       context.taskableSquadIdsTruncated,
     )))
   }
+  // Same taskable-squad scope the project_id branch uses; null = org admin (all).
+  const taskable = (await projectAccess(c.env, c.get('auth'))).taskableSquadIds ?? undefined
   const [agents, dispatchable] = await Promise.all([
-    loadActiveAgentsWithSquad(c.env),
-    loadDispatchableAgents(c.env),
+    loadActiveAgentsWithSquad(c.env, taskable),
+    loadDispatchableAgents(c.env, taskable),
   ])
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents, dispatchable, pickDispatchDefault(dispatchable))))
 })
@@ -1875,7 +1879,7 @@ dashboardApp.get('/agents', async (c) => {
   // one-row D1 scalar, not the full loadBrainView/loadEconomy).
   const [agents, squadOptions, physics, spend] = await Promise.all([
     loadAllAgents(c.env, auth),
-    loadSquadOptions(c.env),
+    loadSquadOptions(c.env, (await resolveAccessibleSquadIds(c.env, auth)) ?? undefined),
     loadBrainPhysics(c.env),
     loadTodaySpendScalar(c.env),
   ])

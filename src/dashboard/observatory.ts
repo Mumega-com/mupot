@@ -218,8 +218,10 @@ export interface RecentTask {
 }
 
 /** Last 10 tasks across all squads, ordered by most recent update first. */
-export async function loadRecentTasks(env: Env): Promise<RecentTask[]> {
-  const rows = await env.DB.prepare(
+export async function loadRecentTasks(env: Env, squadIds?: string[]): Promise<RecentTask[]> {
+  if (squadIds?.length === 0) return []
+  const scope = squadIds === undefined ? '' : ' AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+  const statement = env.DB.prepare(
     `SELECT t.id, t.title, t.status,
             t.assignee_agent_id AS agent_id, a.name AS agent_name,
             s.name AS squad_name,
@@ -228,10 +230,13 @@ export async function loadRecentTasks(env: Env): Promise<RecentTask[]> {
        FROM tasks t
        LEFT JOIN agents a ON a.id = t.assignee_agent_id
        LEFT JOIN squads s ON s.id = t.squad_id
-      WHERE ${TASK_NOT_ARCHIVED_SQL('t')}
+      WHERE ${TASK_NOT_ARCHIVED_SQL('t')}${scope}
       ORDER BY t.updated_at DESC
       LIMIT 10`,
-  ).all<RecentTask>()
+  )
+  const rows = squadIds === undefined
+    ? await statement.all<RecentTask>()
+    : await statement.bind(JSON.stringify([...new Set(squadIds)])).all<RecentTask>()
   return rows.results ?? []
 }
 
@@ -316,22 +321,36 @@ export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Prom
  * on a code change. A count helper whose three consumers cannot all be pinned to
  * one clock is not actually single-source; this closes that last gap.
  */
-export async function loadObservatory(env: Env, nowMs = Date.now()): Promise<ObservatoryData> {
+export async function loadObservatory(env: Env, nowMs = Date.now(), squadIds?: string[]): Promise<ObservatoryData> {
+  // squadIds undefined = whole pot (org admin); otherwise only those squads.
+  const scoped = squadIds !== undefined
   const [agentRows, statsMap, runtimeStates, bars, recentTasks] = await Promise.all([
-    env.DB.prepare(
-      'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents ORDER BY created_at ASC, name ASC',
-    ).all<Agent>(),
+    scoped && squadIds.length === 0
+      ? Promise.resolve({ results: [] as Agent[] })
+      : scoped
+        ? env.DB.prepare(
+            `SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents
+              WHERE squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
+              ORDER BY created_at ASC, name ASC`,
+          ).bind(JSON.stringify([...new Set(squadIds)])).all<Agent>()
+        : env.DB.prepare(
+            'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents ORDER BY created_at ASC, name ASC',
+          ).all<Agent>(),
     loadAgentStats(env),
     loadAgentRuntimeStates(env, nowMs),
     loadSwimlaneBars(env),
-    loadRecentTasks(env),
+    loadRecentTasks(env, squadIds),
   ])
+  const agents = agentRows.results ?? []
+  const visible = new Set(agents.map((a) => a.id))
+  const keep = <V>(m: Map<string, V>): Map<string, V> =>
+    scoped ? new Map([...m].filter(([id]) => visible.has(id))) : m
 
   return {
-    agents: agentRows.results ?? [],
-    stats: statsMap,
-    runtimeStates,
-    bars,
+    agents,
+    stats: keep(statsMap),
+    runtimeStates: keep(runtimeStates),
+    bars: scoped ? bars.filter((b) => visible.has(b.agent_id)) : bars,
     ticks: buildHourlyTicks(),
     recentTasks,
   }
