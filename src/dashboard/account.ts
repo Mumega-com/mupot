@@ -14,23 +14,13 @@
 // (loadConnectableSquads) to populate a picker from data the caller could
 // already see through other admin surfaces.
 //
-// AUTHZ — NO NEW PREDICATE, and this is a real, load-bearing constraint, not
-// a simplification: createProjectInvite's member-bind path (member_id set)
-// requires the ACTOR to hold ORG-scope admin+ standing
-// (actorRankOnScopeFor(env, auth, 'org', null) — see project-invites.ts's
-// P0-1 comment). Self-exemption (exceedsTargetRankCeiling) only ever waives
-// the TARGET ceiling for a self-bind, never that org-admin mint floor. So an
-// ordinary member with no org-scope grant CANNOT self-connect Telegram via
-// this route today, full stop — that is the existing design, not a bug this
-// page works around. This page reflects that honestly: it renders the
-// interactive Connect flow only once the viewer's own org rank already
-// clears the mint floor, and otherwise shows a plain "ask an admin" state —
-// never a button wired to a request the server is guaranteed to refuse. The
-// self-only restriction on WHO the invite targets is a UI convenience, not
-// the security boundary: the member_id sent is always the viewer's own
-// server-rendered auth.memberId (never client-suppliable), but even a
-// tampered request is still fully re-checked server-side by
-// createProjectInvite's existing ceiling — this page adds no new trust.
+// AUTHZ — NO NEW ROUTE, one narrow service path. createProjectInvite's member-bind path requires the ACTOR to hold
+// ORG-scope admin+ standing (actorRankOnScopeFor(env, auth, 'org', null)) for any target but themselves. Since mom-walk D3
+// (mupot task 7ae27377) a member below that floor may mint the invite for THEIR OWN member id only (a real member session:
+// not an agent-bound token, seat or attached chat), requested at no more than their own current standing on that squad;
+// redemption re-checks that standing, and the private-chat fence and chat->member fence are untouched. Unbind was already
+// self-service. The member_id sent is always the viewer's own server-rendered auth.memberId, and even a tampered request is
+// fully re-checked server-side by createProjectInvite: this page adds no trust.
 //
 // EXPLAIN, NEVER OMIT (defect #1162, same standard as elevation.ts): a
 // member below the mint floor, a login with no bridged member row, and a
@@ -181,6 +171,9 @@ export async function loadConnectableSquads(
   env: Env,
   auth: AuthContext,
   orgRank: number,
+  /** Mom-walk D3: a viewer below the mint floor. Only squads they hold standing on, each requested at 'observer' (the lowest
+   *  capability: the self-bind grants nothing they do not already have; the server caps it at their squad rank anyway). */
+  selfService = false,
 ): Promise<ConnectableSquad[]> {
   const rows = await env.DB.prepare(
     `SELECT p.id AS project_id, p.name AS project_name, s.id AS squad_id, s.name AS squad_name
@@ -193,6 +186,10 @@ export async function loadConnectableSquads(
   const out: ConnectableSquad[] = []
   for (const row of rows.results ?? []) {
     const squadRank = await actorRankOnScopeFor(env, auth, 'squad', row.squad_id)
+    if (selfService) {
+      if (squadRank >= capabilityRank('observer')) out.push({ ...row, capability: 'observer' })
+      continue
+    }
     out.push({
       ...row,
       capability: capabilityAtRank(Math.min(squadRank, orgRank, capabilityRank(MEMBER_BIND_MINT_FLOOR))),
@@ -327,7 +324,7 @@ function connectScript(): Html {
  *  2. member row missing/inactive -> explain, no controls
  *  3. already bound -> "Connected" + Disconnect (self-unbind needs no rank
  *     at all — src/members/index.ts's requireAdminOrSelfForTelegramUnbind)
- *  4. not bound, below the org-admin mint floor -> explain ("ask an admin"),
+ *  4. not bound, below the org-admin mint floor -> self-service Connect for squads they hold (D3), else explain,
  *     no doomed-to-403 button
  *  5. not bound, no active project/squad exists -> explain
  *  6. not bound, eligible -> the real Connect form
@@ -373,19 +370,18 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   }
 
   const orgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-  if (orgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
-    return emptyState({
-      title: 'Telegram not connected',
-      detail: 'Connecting your own Telegram currently needs org-admin standing.',
-      hint: 'Ask an org admin to send you a Telegram connect invite.',
-    })
-  }
-
-  const squads = await loadConnectableSquads(env, auth, orgRank)
+  // Mom-walk D3: below the org-admin floor a member may still connect THEIR OWN Telegram (target = self, capped at their own
+  // standing on a squad: createProjectInvite's self-service path). They need a real member session with at least one
+  // squad they can see; otherwise explain, never a button wired to a guaranteed refusal.
+  const selfService = orgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)
+  const squads = await loadConnectableSquads(env, auth, orgRank, selfService)
   if (squads.length === 0) {
     return emptyState({
       title: 'Telegram not connected',
-      detail: 'No active project is linked to a squad yet, so there is nothing to bind Telegram access to.',
+      detail: selfService
+        ? 'Connecting Telegram needs access to at least one active project squad, and you have none yet.'
+        : 'No active project is linked to a squad yet, so there is nothing to bind Telegram access to.',
+      ...(selfService ? { hint: 'Ask an org admin to add you to a project squad.' } : {}),
     })
   }
 

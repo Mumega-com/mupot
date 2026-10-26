@@ -175,27 +175,49 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).toContain('No active project is linked to a squad yet')
   })
 
-  it('a plain member (no org-scope grant) sees the "ask an admin" explain state, not a button wired to a guaranteed refusal', async () => {
+  // Mom-walk D3 (supersedes "ask an admin"): below the org-admin floor a member connects THEIR OWN Telegram through the
+  // squads they hold; with no squad they get an honest explain state.
+  it('a plain member (squad-a member grant, no org-scope grant) now sees the Connect form for THEIR squad only, at observer', async () => {
     const env = makeEnv('plain@x.test')
     env.DB = harness.db
     const cookie = await devLogin(env)
     const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).not.toContain('id="tg-connect"')
-    expect(body).toContain('org-admin standing')
-    expect(body).toContain('Ask an org admin')
+    expect(body).toContain('id="tg-connect"')
+    expect(body).toContain('data-member-id="member-plain"')
+    expect(body).toContain('Project A / Squad Alpha')
+    expect(body).not.toContain('Squad Bravo') // no standing there
+    expect(body).toContain('data-capability="observer"')
+    expect(body).not.toContain('Ask an org admin to send you')
   })
 
-  it('an org-scope LEAD member (one rank below the mint floor) is also refused — pins the floor exactly at admin (kasra-review AMBER P2)', async () => {
-    const env = makeEnv('lead@x.test')
+  it('a member whose only squad has no project link sees an explain state, not a button wired to a guaranteed refusal', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-c', 'dept-a', 'charlie', 'Squad Charlie');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-nobody', 'nobody@x.test', 'Nobody', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-nobody-c', 'member-nobody', 'squad', 'squad-c', 'member');
+    `)
+    const env = makeEnv('nobody@x.test')
     env.DB = harness.db
     const cookie = await devLogin(env)
     const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).not.toContain('id="tg-connect"')
-    expect(body).toContain('org-admin standing')
+    expect(body).toContain('Ask an org admin to add you to a project squad')
+  })
+
+  it('an org-scope LEAD member (one rank below the mint floor) self-connects at observer, never at lead (the floor still stops any other target)', async () => {
+    const env = makeEnv('lead@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('id="tg-connect"')
+    expect(body).toContain('data-capability="observer"')
+    expect(body).not.toContain('data-capability="lead"')
   })
 
   it('a member with an already-bound Telegram identity sees Connected + Disconnect, never the Connect form', async () => {
@@ -683,3 +705,117 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     })
   })
 })
+
+// Mom-walk D3 — the SERVICE path under the page: createProjectInvite / redeemTelegramProjectInvite for a member below the floor.
+describe('self-service Telegram connect (mom-walk D3): createProjectInvite below the org-admin floor', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+  const asMember = (memberId: string, caps: Array<{ scope_type: 'org' | 'squad'; scope_id: string | null; capability: 'observer' | 'member' | 'lead' | 'admin' }>, extra: Record<string, unknown> = {}): AuthContext => ({
+    userId: memberId, email: `${memberId}@x.test`, role: 'member', tenant: TENANT, memberId,
+    capabilities: caps.map((c) => ({ member_id: memberId, ...c })), ...extra,
+  } as AuthContext)
+  const invite = (auth: AuthContext, over: Partial<Parameters<typeof createProjectInvite>[2]> = {}) =>
+    createProjectInvite(env, auth, { member_id: auth.memberId ?? 'x', project_id: 'project-a', squad_id: 'squad-a', capability: 'observer', expires_in_seconds: 3600, ...over })
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'delivery', 'Delivery');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'alpha', 'Squad Alpha');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', 'dept-a', 'bravo', 'Squad Bravo');
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'proj-a', 'Project A', 'active');
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-b', 'proj-b', 'Project B', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-a', 'squad-a', 'write');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-b', 'squad-b', 'write');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-mom', 'mom@x.test', 'Mom', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-mom', 'm-mom', 'squad', 'squad-a', 'member');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-other', 'other@x.test', 'Other', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-other', 'm-other', 'squad', 'squad-a', 'member');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('m-admin', 'admin@x.test', 'Admin', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-admin', 'm-admin', 'org', NULL, 'admin');
+    `)
+  })
+  afterEach(() => harness.close())
+
+  const MOM = [{ scope_type: 'squad' as const, scope_id: 'squad-a', capability: 'member' as const }]
+
+  it('an ordinary member can mint their OWN pairing link, redeem it from Telegram, and is bound', async () => {
+    const created = await invite(asMember('m-mom', MOM))
+    expect(created.ok, JSON.stringify(created)).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, 'u-mom', 'tg-mom', ?, 'processing', datetime('now'))`).run(TENANT, VALID_REQUEST_DIGEST)
+    const redeemed = await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: 'tg-mom', display_name: 'Mom', update_id: 'u-mom', request_digest: VALID_REQUEST_DIGEST })
+    expect(redeemed).toEqual({ ok: true, value: { member_id: 'm-mom', project_id: 'project-a', squad_id: 'squad-a', capability: 'observer' } })
+    expect((harness.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id = 'm-mom'").get() as { telegram_chat_id: string }).telegram_chat_id).toBe('tg-mom')
+    // Nothing was granted beyond what she held: still exactly her one 'member' squad-a row.
+    expect(harness.sqlite.prepare("SELECT scope_id, capability FROM capabilities WHERE member_id = 'm-mom'").all()).toEqual([{ scope_id: 'squad-a', capability: 'member' }])
+  })
+
+  it('cannot target ANOTHER member (the org-admin floor still applies)', async () => {
+    expect(await invite(asMember('m-mom', MOM), { member_id: 'm-other' })).toEqual({ ok: false, error: 'forbidden' })
+    expect(await invite(asMember('m-mom', MOM), { member_id: 'm-admin' })).toEqual({ ok: false, error: 'forbidden' })
+    expect((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM invites').get() as { n: number }).n).toBe(0)
+  })
+
+  it('the rank ceiling is unchanged: cannot request above their OWN standing on that squad, nor on a squad they have no standing on', async () => {
+    // Self-service is capped at 'observer' (the bind needs no authority; a redeemed higher row would outlive an inherited grant).
+    expect(await invite(asMember('m-mom', MOM), { capability: 'member' })).toEqual({ ok: false, error: 'cannot_grant_above_own_rank' })
+    expect(await invite(asMember('m-mom', MOM), { capability: 'lead' })).toEqual({ ok: false, error: 'cannot_grant_above_own_rank' })
+    expect(await invite(asMember('m-mom', MOM), { capability: 'admin' })).toEqual({ ok: false, error: 'cannot_grant_above_own_rank' })
+    expect(await invite(asMember('m-mom', MOM), { project_id: 'project-b', squad_id: 'squad-b' })).toEqual({ ok: false, error: 'forbidden' })
+    expect((await invite(asMember('m-mom', MOM))).ok).toBe(true)
+  })
+
+  it('an ORG-scope lead grant does not raise the self-service cap above observer', async () => {
+    // org 'lead' (rank 3, below the floor) bubbles down to every squad, but the self-service request is still capped at observer.
+    const orgLead = asMember('m-mom', [{ scope_type: 'org', scope_id: null, capability: 'lead' }])
+    expect(await invite(orgLead, { capability: 'lead' })).toEqual({ ok: false, error: 'cannot_grant_above_own_rank' })
+    expect((await invite(orgLead)).ok).toBe(true)
+  })
+
+  it('an agent-bound token (whose memberId is whoever minted it), a seat session and an attached chat get no self-service', async () => {
+    expect(await invite(asMember('m-mom', MOM, { boundAgentId: 'some-agent' }))).toEqual({ ok: false, error: 'forbidden' })
+    const seat = { seatId: 's', label: 'l', harnessId: 'h', grantTokenId: 'g', humanMemberId: 'm-mom', source: 'handle', attached: { attachmentId: 'a', admissionId: 'ad', agentId: 'some-agent', seatAgentId: 'sa', ceiling: 'member' } }
+    expect(await invite(asMember('m-mom', MOM, { seatBinding: seat }))).toEqual({ ok: false, error: 'forbidden' })
+  })
+
+  it('a suspended member cannot self-connect (member_not_active), and a squad outside any linked project edge is refused', async () => {
+    harness.sqlite.exec("UPDATE members SET status = 'suspended' WHERE id = 'm-mom'")
+    expect(await invite(asMember('m-mom', MOM))).toEqual({ ok: false, error: 'member_not_active' })
+    expect(await invite(asMember('m-other', [{ scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }]), { project_id: 'project-b', squad_id: 'squad-a' }))
+      .toEqual({ ok: false, error: 'project_squad_not_linked' })
+  })
+
+  it('redemption re-checks the standing: a self-minted invite whose squad grant was revoked in between fails (invite_minter_authority_lost)', async () => {
+    const created = await invite(asMember('m-mom', MOM))
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.exec("DELETE FROM capabilities WHERE member_id = 'm-mom'")
+    harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, 'u-mom2', 'tg-mom', ?, 'processing', datetime('now'))`).run(TENANT, VALID_REQUEST_DIGEST)
+    const redeemed = await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: 'tg-mom', display_name: 'Mom', update_id: 'u-mom2', request_digest: VALID_REQUEST_DIGEST })
+    expect(redeemed).toMatchObject({ ok: false, error: 'invite_minter_authority_lost' })
+    expect((harness.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id = 'm-mom'").get() as { telegram_chat_id: string | null }).telegram_chat_id).toBeNull()
+  })
+
+  it('redemption by a DIFFERENT Telegram account cannot hijack: the chat to member fence (one chat, one member) still holds', async () => {
+    const mom = await invite(asMember('m-mom', MOM))
+    if (!mom.ok) throw new Error('mint failed')
+    const other = await invite(asMember('m-other', [{ scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }]))
+    if (!other.ok) throw new Error('mint failed')
+    for (const [u, tg, code] of [['u-1', 'tg-shared', mom.value.pairing_code], ['u-2', 'tg-shared', other.value.pairing_code]] as const) {
+      harness.sqlite.prepare(`INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at) VALUES (?, ?, ?, ?, 'processing', datetime('now'))`).run(TENANT, u, tg, VALID_REQUEST_DIGEST)
+      await redeemTelegramProjectInvite(env, { pairing_code: code, telegram_user_id: tg, display_name: 'x', update_id: u, request_digest: VALID_REQUEST_DIGEST })
+    }
+    const bound = harness.sqlite.prepare("SELECT id FROM members WHERE telegram_chat_id = 'tg-shared'").all()
+    expect(bound).toHaveLength(1)
+  })
+
+  it('an org admin is unaffected: still mints for themselves at admin and for another member', async () => {
+    const admin = asMember('m-admin', [{ scope_type: 'org', scope_id: null, capability: 'admin' }])
+    expect((await invite(admin, { capability: 'admin' })).ok).toBe(true)
+    expect((await invite(admin, { member_id: 'm-mom', capability: 'member' })).ok).toBe(true)
+  })
+})
+

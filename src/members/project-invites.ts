@@ -20,6 +20,7 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 // normalizer POST /invites uses — see createProjectInvite's own email
 // handling below and redeemTelegramProjectInvite's member-mint guard.
 import { normalizeInviteEmail } from '../auth/pending-invite-link'
+import { attachedAuthority } from '../auth/attached-ceiling'
 
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -610,10 +611,27 @@ export async function createProjectInvite(
   // the target member row, so this can run first: a zero-standing caller now
   // gets the exact same 'forbidden' refusal regardless of what the target
   // member id resolves to.
-  const actorRank = hasMemberId
+  let actorRank = hasMemberId
     ? await actorRankOnScopeFor(env, auth, 'org', null)
     : await actorRankOnSquad(env, auth, squadId, edge.department_id)
-  if (actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) return { ok: false, error: 'forbidden' }
+  // Mom-walk D3: SELF-SERVICE Telegram connect. A member below the org-admin mint floor may mint the pairing invite for
+  // THEIR OWN member id (target = self, which is the case the floor's rationale does not cover: nobody is taken over), at
+  // 'observer' and only on a squad where they hold standing NOW (never their org rank: the cannot_grant_above_own_rank
+  // ceiling below still applies, and redemption re-checks it). It is a real human member session only: no agent-bound token
+  // (whose memberId is whoever minted it), no seat, no attached chat. Any other target keeps the org-admin floor.
+  let selfService = false
+  if (
+    hasMemberId && memberId !== null && actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)
+    && auth.memberId != null && memberId === auth.memberId
+    && !auth.boundAgentId && !auth.seatBinding && !attachedAuthority(auth)
+  ) {
+    selfService = true
+    // Capped at 'observer' regardless of the standing: the bind needs no authority, and a redeemed higher row would duplicate
+    // (and outlive) a department/org grant the member only inherits.
+    actorRank = Math.min(await actorRankOnSquad(env, auth, squadId, edge.department_id), capabilityRank('observer'))
+    if (actorRank < capabilityRank('observer')) return { ok: false, error: 'forbidden' }
+  }
+  if (!selfService && actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) return { ok: false, error: 'forbidden' }
 
   if (hasMemberId) {
     // mupot#1411 N4 round 4 (Athena, 2026-09-15): deliberately EXACT tenant
@@ -879,8 +897,15 @@ export async function redeemTelegramProjectInvite(
         ? await currentMemberOrgRank(env, invite.minted_by_member_id)
         : await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id)
       : 0
-    const baselineAuthorityLost =
+    let baselineAuthorityLost =
       minterRank < capabilityRank('admin') || capabilityRank(invite.capability) > minterRank
+    // Mom-walk D3: a SELF-minted bind (the member minted it for their own id) was authorised by their standing on the
+    // invite's squad, not by org-admin standing, so it is re-checked the same way: still active, still holding at least
+    // the invited capability on that squad NOW (a revoked or lapsed grant fails here, so redemption cannot resurrect it).
+    if (baselineAuthorityLost && invite.member_id !== null && invite.minted_by_member_id === invite.member_id) {
+      const squadRank = minterActive ? await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id) : 0
+      baselineAuthorityLost = squadRank < capabilityRank('observer') || capabilityRank(invite.capability) > squadRank
+    }
     if (baselineAuthorityLost) {
       return { ok: false, error: 'invite_minter_authority_lost' }
     }
