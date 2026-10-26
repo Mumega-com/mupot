@@ -28,6 +28,7 @@ import { applySeatForRequest, resetAutoSeatRefusalCache } from '../src/members/s
 import { callerHoldsGateCapability } from '../src/tasks/index'
 import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
+import { seedLiveToken } from './helpers/live-token'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import {
   attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, promoteAdmissionDetailed, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
@@ -583,7 +584,9 @@ describe('who may be attached, and who may call', () => {
     // bare unbound grant, no client key -> no seat
     expect(errOf(await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }))).toBe('seat_required')
     // a legacy consent-bound directory session (no seatBinding)
-    const bound: AuthContext = { ...g.ctx, boundAgentId: 'agent-rava', memberId: 'mem-agent-rava', userId: 'mem-agent-rava', consentedByMemberId: HUMAN, harnessId: undefined }
+    // Live agent-member token row the header hop re-reads (a blob alone never authenticates).
+    seedLiveToken(h.sqlite, { memberId: 'mem-agent-rava', tenant: TENANT, tokenId: 'tok-legacy-bound', channel: 'directory', boundAgentId: 'agent-rava' })
+    const bound: AuthContext = { ...g.ctx, boundAgentId: 'agent-rava', memberId: 'mem-agent-rava', userId: 'mem-agent-rava', consentedByMemberId: HUMAN, harnessId: undefined, tokenId: 'tok-legacy-bound' }
     const r = await rpc(env, bound, 'seat_attach', { agent: 'hadi-admin' }, { meta: thread('conv-z') })
     expect(r.sc.status).not.toBe('pending_admission')
     expect(JSON.stringify(r.body)).toContain('seat_required')

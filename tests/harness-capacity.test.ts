@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { seedLiveToken } from './helpers/live-token'
 import { mcpApp } from '../src/mcp/index'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { dispatchFlight } from '../src/flight/dispatch'
@@ -28,12 +29,15 @@ function setup(): { h: SqliteD1Harness; env: Env } {
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
       ('mumega', 'agent-a', 'm-agent-a', datetime('now')), ('mumega', 'agent-b', 'm-agent-b', datetime('now'));
   `)
+  for (const [m, a] of [['m-agent-a', 'agent-a'], ['m-agent-b', 'agent-b'], ['m-none', null]] as const) {
+    seedLiveToken(h.sqlite, { memberId: m, tenant: 'mumega', tokenId: `tok-live-${m}`, boundAgentId: a })
+  }
   harness = h
   return { h, env: { DB: h.db, TENANT_SLUG: 'mumega' } as unknown as Env }
 }
 
 const authFor = (agent: string | undefined): AuthContext => ({
-  userId: agent ? `m-${agent}` : 'm-none', tenant: 'mumega', channel: 'workspace', memberId: agent ? `m-${agent}` : 'm-none', role: 'member',
+  userId: agent ? `m-${agent}` : 'm-none', tenant: 'mumega', channel: 'workspace', memberId: agent ? `m-${agent}` : 'm-none', role: 'member', tokenId: `tok-live-${agent ? `m-${agent}` : 'm-none'}`,
   ...(agent ? { boundAgentId: agent } : {}),
   capabilities: [{ scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
 })

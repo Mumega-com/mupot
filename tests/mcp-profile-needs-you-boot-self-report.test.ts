@@ -7,6 +7,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { mcpApp } from '../src/mcp'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
+import { seedLiveToken } from './helpers/live-token'
 import { getFleetAgentLiveness } from '../src/fleet/registry'
 import type { AuthContext, Env } from '../src/types'
 
@@ -20,6 +21,12 @@ beforeEach(() => {
   env = { DB: harness.db, TENANT_SLUG: 'mumega', BUS: { send: async () => {} } } as unknown as Env
   // An operator-STOPPED poll-mode agent, last reported two days ago.
   harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'd', 'D');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-one', 'Squad One');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${AGENT}', 'squad-1', 'poller', 'Poller', 'member', 'test', 'active');
+  `)
+  seedLiveToken(harness.sqlite, { memberId: 'mem-1', tenant: 'mumega', tokenId: 'tok-live-1', boundAgentId: AGENT })
+  harness.sqlite.exec(`
     INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status, reported_by, presence_mode, presence_ttl_sec, last_reported_at)
     VALUES ('${AGENT}', 'mumega', 'codex', 'orig-model', 'stopped', 'operator', 'poll', 300, datetime('now', '-2 days'));
   `)
@@ -28,7 +35,7 @@ afterEach(() => harness.close())
 
 const auth: AuthContext = {
   userId: 'mem-1', email: 'a@e.test', role: 'member', tenant: 'mumega', memberId: 'mem-1',
-  channel: 'workspace', capabilities: [], boundAgentId: AGENT,
+  channel: 'workspace', capabilities: [], boundAgentId: AGENT, tokenId: 'tok-live-1',
 } as AuthContext
 
 async function call(path: string, name: string, args: Record<string, unknown>) {

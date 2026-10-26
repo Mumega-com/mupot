@@ -10,6 +10,7 @@
 // buildAuthContextFromProps -> internal header -> mcpApp, mcpApp bearer, /actions, legacy {tool,args},
 // events, profile door). Not proven: the cloudflare:workers entrypoint; real D1 interleaving.
 
+import { seedLiveToken } from './helpers/live-token'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -182,7 +183,11 @@ describe('1. zero standing is decided by the token ROW and fails closed', () => 
 
   it('RACE scope: the fail-closed return applies ONLY to a token-harness pointer; a plain unbound directory session (or an OAuth harness) keeps main\'s zero-capability semantics', async () => {
     const env = envFor(h)
-    const plain: AuthContext = { userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, channel: 'directory', capabilities: [], boundAgentId: null, tokenId: 'gone-token' }
+    seedLiveToken(h.sqlite, { memberId: HUMAN, tenant: TENANT, tokenId: 'tok-live-plain', channel: 'directory' })
+    const plain: AuthContext = { userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, channel: 'directory', capabilities: [], boundAgentId: null, tokenId: 'tok-live-plain' }
+    // A token that is gone by the time of the re-read is unauthenticated (no tokenless identity is accepted).
+    const rg = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, tokenId: 'gone-token' }) })
+    expect(rg.status).toBe(401)
     const rp = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify(plain) })
     expect(rp.status).toBe(200)
     expect(sc(rp).capabilities).toEqual([])
@@ -192,7 +197,7 @@ describe('1. zero standing is decided by the token ROW and fails closed', () => 
     const ro = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, harnessId: oh!.id }) })
     expect(ro.status).toBe(200)
     // an unknown / unreadable harness pointer fails closed
-    const rx = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, harnessId: 'no-such-harness' }) })
+    const rx = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, tokenId: 'gone-token', harnessId: 'no-such-harness' }) })
     expect(rx.status).toBe(401)
   })
 

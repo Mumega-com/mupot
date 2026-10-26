@@ -72,7 +72,7 @@ import { SEAT_HANDLE_PREFIX, seatHandleFromArgs } from '../members/seat-handle'
 import { applySeatForRequest } from '../members/seat-auto'
 import type { VerboseProbeInputs } from './harness-identity-probe'
 import { extractClientInfoVersion, extractMetaFacts, extractVerboseMetaValues, hintsFrom, maybeEmitHarnessIdentityProbe, verboseProbeEnabled } from './harness-identity-probe'
-import { resolveConsentedAgentCapabilities } from './oauth-authorize'
+import { resolveConsentedAgentCapabilities, resolveHumanStandingGrants } from './oauth-authorize'
 import {
   getOrCreateAgentSession,
   resolveAgentSessionContext,
@@ -430,6 +430,11 @@ async function resolveAuth(c: {
       delete auth.ownerSudoVerifiedRole
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
+        // Defense in depth: the blob is an identity assertion only. The real handler always sends
+        // role 'member' (buildAuthContextFromProps), so never accept anything else, and require a
+        // token id (a live token row is verified below).
+        auth.role = 'member'
+        if (typeof auth.tokenId !== 'string' || auth.tokenId.length === 0) return null
         // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in
         // buildAuthContextFromProps now lets workspace/im channels carry the
         // member's real standing grants through this header (previously it was
@@ -469,6 +474,12 @@ async function resolveAuth(c: {
         // (the same trust level auth.boundAgentId already carries for a workspace
         // channel in the branch above, which is left untouched here).
         const knownNonDirectory = isChannel(auth.channel)
+        // Fields the blob names but that the live checks below must not take on its word: the principal is the token
+        // owner (the real handler sets memberId = userId), and the latent grants are recomputed, never carried.
+        auth.memberId = auth.userId
+        const blobBoundAgentId = auth.boundAgentId
+        const blobConsentedBy = auth.consentedByMemberId
+        auth.latentCapabilities = []
         // PERF: for a known non-directory channel the live token re-read further down does not depend on the grants read
         // (auth.boundAgentId is untouched between here and there on this branch), so both go out in ONE wave instead of two
         // in series. Every other branch can change boundAgentId before the re-read, so it keeps the original order.
@@ -522,6 +533,13 @@ async function resolveAuth(c: {
           auth.capabilities = []
           auth.boundAgentId = null
         }
+        // Mirror of buildAuthContextFromProps' latentCapabilities, recomputed live (a harness credential zeroes it below).
+        if (knownNonDirectory) auth.latentCapabilities = auth.capabilities
+        else if (auth.channel === 'directory') {
+          auth.latentCapabilities = blobBoundAgentId
+            ? (blobConsentedBy ? await resolveHumanStandingGrants(c.env, blobConsentedBy) : [])
+            : await resolveCapabilities(c.env, auth.userId)
+        }
 
         // mupot#1794 W1: a harness pointer is meaningful ONLY on an unbound directory session
         // while SEAT_AUTO_ENROLL is on; the blob cannot smuggle it onto any other session shape.
@@ -564,17 +582,14 @@ async function resolveAuth(c: {
             const hr = await loadHarness(c.env, auth.userId, auth.harnessId).catch(() => 'error' as const)
             if (hr === 'error' || hr === null || hr.credential_kind === 'token') return null
           }
-          if (!token || token.member_status !== 'active') {
-            auth.tokenId = null
-            if (knownNonDirectory) auth.boundAgentId = null
-          } else {
+          // A missing/inactive live token row is unauthenticated (no tokenless identity is accepted).
+          if (!token || token.member_status !== 'active') return null
+          {
             auth.tokenId = token.token_id
             if (knownNonDirectory) auth.boundAgentId = token.bound_agent_id ?? null
             const st = seatAgentStatusFromRow(c.env, token)
             if (auth.boundAgentId && st !== undefined) auth.seatAgentStatus = st
           }
-        } else {
-          auth.tokenId = null
         }
         return await resolveSeatSession(c, auth, bodyMeta)
       }

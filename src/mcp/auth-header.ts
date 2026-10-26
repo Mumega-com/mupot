@@ -11,3 +11,15 @@
 // directly without going through the OAuthProvider.
 
 export const AUTH_CONTEXT_HEADER = 'x-mupot-auth-context'
+
+/**
+ * Remove the internal header from an externally received request. Called at the Worker's
+ * outermost fetch entry, so only mcpInternalRequest (src/mcp/internal-dispatch.ts) can add it
+ * afterwards. Returns the same request when the header is absent.
+ */
+export function stripInternalAuthContext(request: Request): Request {
+  if (!request.headers.has(AUTH_CONTEXT_HEADER)) return request
+  const headers = new Headers(request.headers)
+  headers.delete(AUTH_CONTEXT_HEADER)
+  return new Request(request, { headers })
+}

@@ -30,13 +30,15 @@ import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { seedLiveToken } from './helpers/live-token'
 import type { AuthContext, Env } from '../src/types'
 
-const auth = { userId: 'm', memberId: 'm', email: null, role: 'member', tenant: 'mumega', capabilities: [], boundAgentId: null, channel: 'directory', tokenId: 't' } as unknown as AuthContext
+const auth = { userId: 'm', memberId: 'm', email: null, role: 'member', tenant: 'mumega', capabilities: [], boundAgentId: null, channel: 'directory', tokenId: 'tok-live-m' } as unknown as AuthContext
 let h: SqliteD1Harness
 let env: Env
 beforeEach(() => {
   h = createSqliteD1(); applyAllMigrations(h.sqlite)
+  seedLiveToken(h.sqlite, { memberId: 'm', tenant: 'mumega', channel: 'directory' })
   env = { TENANT_SLUG: 'mumega', PUBLIC_ORIGIN: 'https://pot.test', DB: h.db, SESSIONS: { get: async () => null, put: async () => undefined, delete: async () => undefined }, OAUTH_KV: { get: async () => null, put: async () => undefined } } as unknown as Env
 })
 afterEach(() => h.close())

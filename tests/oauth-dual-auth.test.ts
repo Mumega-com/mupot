@@ -79,7 +79,8 @@ function makeEnvOAuth(grants: CapabilityGrant[] = []): Env {
               async first() {
                 // McpOAuthApiHandler pre-resolves auth; mcpApp should NOT call member_tokens
                 // for the OAuth path (the injected header is used instead).
-                // If it does reach DB, return nothing (test will fail → exposes a regression).
+                // The live token re-read (resolveAuth) is answered with an active row; anything else returns nothing.
+                if (sql.includes('FROM member_tokens')) return { token_id: 'tok-live-oauth', bound_agent_id: null, member_status: 'active', harness_kind: null }
                 return null
               },
               async all() {
@@ -107,6 +108,7 @@ function oauthAuthHeader(overrides: Partial<AuthContext> = {}): Record<string, s
     channel: 'directory',
     capabilities: [], // C6: zero by default
     boundAgentId: null,
+    tokenId: 'tok-live-oauth',
     ...overrides,
   }
   return { [AUTH_CONTEXT_HEADER]: JSON.stringify(auth) }
@@ -654,6 +656,7 @@ describe('TEST-1 — forged auth-context: McpOAuthApiHandler rejects revoked/mis
       channel: 'directory',
       capabilities: [], // zero — no harm even if accepted (C6 ceiling)
       boundAgentId: null,
+      tokenId: 'tok-live-oauth',
     }
 
     // POST to mcpApp directly (simulating McpOAuthApiHandler's internal dispatch).
@@ -904,6 +907,7 @@ describe('TEST-3 — zero-cap with real squad: 403 forbidden (not 404)', () => {
             bind() {
               return {
                 async first() {
+                  if (sql.includes('FROM member_tokens')) return { token_id: 'tok-live-oauth', bound_agent_id: null, member_status: 'active', harness_kind: null }
                   // Squad lookup by id → return a real squad row.
                   if (sql.includes('FROM squads WHERE id = ?1')) {
                     return {

@@ -1493,6 +1493,7 @@ describe('F. resolveAuth header re-derivation — real dispatch, not invokeTool 
       capabilities: [], // WRONG on purpose
       boundAgentId: AGENT_A.id,
       consentedByMemberId: HUMAN,
+      tokenId: 'tok-http-1',
     }
 
     const res = await mcpApp.request('https://pot.test/', {
@@ -1569,6 +1570,7 @@ describe('F. resolveAuth header re-derivation — real dispatch, not invokeTool 
       capabilities: [{ member_id: MEMBER_AGENT_A, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'admin' }], // forged, stale, wrong
       boundAgentId: AGENT_A.id, // still claims the weld — the exact pre-site-2 shape
       consentedByMemberId: HUMAN,
+      tokenId: 'tok-http-inbox-2',
     }
 
     const res = await mcpApp.request('https://pot.test/', {

@@ -1306,7 +1306,8 @@ describe('seat argument: round 2 pins', () => {
     // expired-but-authenticated grant: the handle must not redeem against a dead grant token
     h.sqlite.exec(`UPDATE member_tokens SET expires_at = '2020-01-01 00:00:00' WHERE id = '${g.tokenId}'`)
     const dead = await rpc(env, g.ctx, 'boot_context', { seat: a.handle })
-    expect(dead.sc.bound_agent_id).toBeNull()
-    // (the dead grant never even reaches the handle lookup: no tokenId, so the handle is not read at all)
+    // a dead grant token is unauthenticated: it never reaches the handle lookup, and no seat binds
+    expect(dead.sc?.bound_agent_id ?? null).toBeNull()
+    expect(JSON.stringify(dead.body)).toContain('unauthenticated')
   })
 })

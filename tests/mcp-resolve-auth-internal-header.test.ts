@@ -191,11 +191,10 @@ describe('resolveAuth internal-header hop — workspace-channel token re-read (P
 
     const { status, body } = await statusVia(makeEnv(harness, TENANT), injected)
 
-    expect(status).toBe(200)
-    expect(body.ok).toBe(true)
-    // The cross-tenant token row must not resolve at all — boundAgentId falls back
-    // to null exactly like an unbound/missing token, never the foreign tenant's weld.
-    expect(body.result?.bound_agent_id).toBeNull()
+    // The cross-tenant token row must not resolve at all: no live row means the caller is
+    // unauthenticated, never the foreign tenant's weld.
+    expect(status).toBe(401)
+    expect(body.result?.bound_agent_id ?? null).toBeNull()
   })
 
   // Fix 1 (P2-1) itself was unwitnessed until now: replacing the hand-written
@@ -234,11 +233,10 @@ describe('resolveAuth internal-header hop — workspace-channel token re-read (P
 
     const { status, body } = await statusVia(makeEnv(harness, TENANT), injected)
 
-    expect(status).toBe(200)
-    expect(body.ok).toBe(true)
-    // An expired-but-unrevoked token must resolve to nothing — exactly like a
+    // An expired-but-unrevoked token is not a live row: unauthenticated, exactly like a
     // missing or revoked token, never the agent it names.
-    expect(body.result?.bound_agent_id).toBeNull()
+    expect(status).toBe(401)
+    expect(body.result?.bound_agent_id ?? null).toBeNull()
   })
 
   // Companion positive case: without this, a predicate that rejects EVERY token

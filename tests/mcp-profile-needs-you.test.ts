@@ -9,6 +9,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { mcpApp, TOOLS, wireName } from '../src/mcp'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
+import { seedLiveToken } from './helpers/live-token'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { NEEDS_YOU_PROFILE, NEEDS_YOU_PROFILE_PATH, profileEntry } from '../src/mcp/profile-needs-you'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
@@ -31,6 +32,7 @@ function makeEnv(grants: CapabilityGrant[] = []): Env {
   for (const id of new Set([ADMIN_MEMBER, 'mbr-dir', ...grants.map((g) => g.member_id)])) {
     harness.sqlite.prepare(`INSERT INTO members (id, display_name, status, tenant) VALUES (?, ?, 'active', ?)`).run(id, id, TENANT)
   }
+  for (const id of [ADMIN_MEMBER, 'mbr-dir']) seedLiveToken(harness.sqlite, { memberId: id, tenant: TENANT })
   for (const [i, g] of grants.entries()) {
     harness.sqlite
       .prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)`)
@@ -53,6 +55,7 @@ function header(overrides: Partial<AuthContext> = {}): Record<string, string> {
     channel: 'workspace',
     capabilities: [],
     boundAgentId: null,
+    tokenId: `tok-live-${overrides.userId ?? ADMIN_MEMBER}`,
     ...overrides,
   }
   return { [AUTH_CONTEXT_HEADER]: JSON.stringify(auth) }

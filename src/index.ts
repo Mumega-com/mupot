@@ -82,6 +82,7 @@ import { attentionApp } from './attention/routes'
 import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { withTenantPrefix } from './platform/tenant-path'
+import { stripInternalAuthContext } from './mcp/auth-header'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
@@ -448,7 +449,9 @@ async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Pro
 
 export default {
   // mupot#1928 choke point: strip a forged prefix header, then re-root a path-routed tenant's response.
-  fetch: (req: Request, env: Env, ctx: ExecutionContext) => withTenantPrefix(req, env, (r) => handleRequest(r, env, ctx)),
+  // The internal auth-context header is Worker-internal: drop it from every external request first.
+  fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
+    withTenantPrefix(stripInternalAuthContext(req), env, (r) => handleRequest(r, env, ctx)),
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,

@@ -10,6 +10,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { mcpApp } from '../src/mcp'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
+import { seedLiveToken } from './helpers/live-token'
 import { NEEDS_YOU_PROFILE } from '../src/mcp/profile-needs-you'
 import type { AuthContext, Env } from '../src/types'
 
@@ -45,6 +46,7 @@ beforeEach(async () => {
       VALUES ('${AGENT}', '${TENANT}', 'Poller', 'codex', 'orig-model', '[]', 'on_demand', 'running', '${AGENT}', 'generic',
               'poll', 600, '${STALE}', '${STALE}');
   `)
+  seedLiveToken(harness.sqlite, { memberId: MEMBER, tenant: TENANT, tokenId: 'tok-live-1', boundAgentId: AGENT })
   // project_wiki reads an Inkwell wiki through a service binding: seed a real encrypted
   // connector row + the repo's wiki double so that tool actually succeeds (a refused call
   // proves nothing about side effects).
@@ -83,7 +85,7 @@ afterEach(() => harness.close())
 
 const auth: AuthContext = {
   userId: MEMBER, email: 'm@example.test', role: 'member', tenant: TENANT, memberId: MEMBER,
-  channel: 'workspace', capabilities: [], boundAgentId: AGENT,
+  channel: 'workspace', capabilities: [], boundAgentId: AGENT, tokenId: 'tok-live-1',
 } as AuthContext
 
 /** Every row of every table + the KV, as one comparable string. */

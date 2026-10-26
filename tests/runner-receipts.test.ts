@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { seedLiveToken } from './helpers/live-token'
 import { recordRunner, listRunners } from '../src/runners/service'
 import { canonicalRunnerReceiptMessage } from '../src/runners/signature'
 import { registerAgentPublicKey } from '../src/fleet/agent-keys'
@@ -43,6 +44,9 @@ async function makeHarness(): Promise<SqliteD1Harness> {
       ('mumega', 'agent-a', 'member-squad-a', datetime('now')),
       ('mumega', 'agent-b', 'member-squad-b', datetime('now'));
   `)
+  for (const [m, a] of [['member-zero', null], ['member-squad-a', 'agent-a'], ['member-squad-b', 'agent-b'], ['member-org', null]] as const) {
+    seedLiveToken(harness.sqlite, { memberId: m, tenant: 'mumega', tokenId: `tok-live-${m}`, boundAgentId: a })
+  }
 
   return harness
 }
@@ -152,6 +156,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       tenant: 'mumega',
       channel: 'workspace',
       memberId: 'member-squad-a',
+      tokenId: 'tok-live-member-squad-a',
       role: 'member',
       boundAgentId: 'agent-a',
       capabilities: [{ scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
@@ -162,6 +167,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       tenant: 'mumega',
       channel: 'workspace',
       memberId: 'member-squad-b',
+      tokenId: 'tok-live-member-squad-b',
       role: 'member',
       boundAgentId: 'agent-b',
       capabilities: [{ scope_type: 'squad', scope_id: 'squad-b', capability: 'member' }],
@@ -172,6 +178,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       tenant: 'mumega',
       channel: 'workspace',
       memberId: 'member-org',
+      tokenId: 'tok-live-member-org',
       role: 'admin',
       capabilities: [{ scope_type: 'org', scope_id: null, capability: 'admin' }],
     }
@@ -231,6 +238,7 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
       tenant: 'mumega',
       channel: 'workspace',
       memberId: 'member-zero',
+      tokenId: 'tok-live-member-zero',
       role: 'member',
       capabilities: [],
     }
@@ -339,11 +347,13 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     const harness = await makeHarness()
     const env = envFor(harness)
 
+    seedLiveToken(harness.sqlite, { memberId: 'member-a', tenant: 'mumega', tokenId: 'tok-live-member-a' })
     const authSquadA: AuthContext = {
       userId: 'member-a',
       tenant: 'mumega',
       channel: 'workspace',
       memberId: 'member-a',
+      tokenId: 'tok-live-member-a',
       role: 'member',
       capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
     }
