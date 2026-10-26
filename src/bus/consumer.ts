@@ -19,6 +19,7 @@ import { postAgentActivity } from '../channels'
 import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
 import { processAssignmentWakes } from '../agents/assignment-wake'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DispatchBrakeRefusedError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
+import { writebackForBusEvent } from '../projects/board-writeback'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
@@ -335,6 +336,8 @@ async function claimFlightEvent(env: Env, event: BusEvent): Promise<boolean> {
 }
 
 async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
+  // Board write-back doorbell (BOARD_WRITEBACK=1 only; never throws, never changes the routing below).
+  await writebackForBusEvent(env, event)
   switch (event.type) {
     case 'agent.wake': {
       if (!event.agent_id) {

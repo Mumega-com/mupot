@@ -6,6 +6,7 @@ import type {
   TaskBoardPort,
   TaskBoardSyncResult,
 } from './port'
+import { registerBoardProvider } from './registry-core'
 
 /**
  * Notion board adapter.
@@ -15,6 +16,7 @@ import type {
 export function createNotionBoardPort(_env: Env): TaskBoardPort {
   return {
     provider: 'notion',
+    capabilities: new Set(),
     async listItems(_binding: ProjectProviderBinding): Promise<TaskBoardListResult | TaskBoardError> {
       return { ok: false, error: 'notion_adapter_pending_credentials' }
     },
@@ -26,3 +28,5 @@ export function createNotionBoardPort(_env: Env): TaskBoardPort {
     },
   }
 }
+
+registerBoardProvider('notion', createNotionBoardPort)

@@ -24,10 +24,18 @@
 //   4. Creates tasks with `skipMirror: true` — never writes a GitHub issue mirror from
 //      Linear-sourced (external, less-trusted) title/body text, for the same reason
 //      GitHub webhook-origin tasks skip the mirror (src/tasks/service.ts).
-//   5. Issues ONLY read (query) GraphQL operations against Linear — LINEAR_ISSUES_QUERY
-//      below contains no `mutation`. The vault connector type 'linear' has no write-back
-//      caller anywhere in the codebase; there is no tool that could turn a resolved
-//      Linear credential into a write against Linear.
+//   5. MUPOT WRITES TO LINEAR ONLY WHAT MUPOT'S OWN RECORDS PROVE. (Evolved 2026-10-26 from "propose,
+//      never authorize": inbound is still propose-only, outbound is now receipt-bound.)
+//      - This file stays QUERY-ONLY (LINEAR_ISSUES_QUERY contains no `mutation`).
+//      - Every Linear write lives in linear-writeback.ts, behind BOARD_WRITEBACK=1 and the per-binding
+//        meta.writeback flag, and only for a transition that has a mupot receipt: submitted -> In Review
+//        (a task_result_submissions row), approved verdict -> Done and rejected verdict -> In Progress (a
+//        live, unreversed task_verdicts row on a gated task). A PR/artifact link goes in as a comment.
+//      - mupot never closes or approves a Linear item without that gated verdict receipt, and never
+//        deletes or reassigns anything in Linear (the only mutations are issueUpdate{stateId} and
+//        commentCreate).
+//      - Linear data still never becomes a verdict: webhook status changes land as notes
+//        (board_inbound_observations), never as task status, approval or verdict.
 //
 // Credentials: connector type 'linear' (vault, src/connectors/service.ts). The
 // decrypted key is used only inside useConnectorById's one-shot authenticatedFetch
@@ -36,6 +44,7 @@
 import type { Env } from '../types'
 import { useConnectorById } from '../connectors/service'
 import { createTask } from '../tasks/service'
+import { recordItemLink } from '../projects/providers/board-links'
 
 const LINEAR_API = 'https://api.linear.app/graphql'
 const LINEAR_TIMEOUT_MS = 8_000
@@ -200,66 +209,81 @@ export async function importLinearIssues(
     }
   }
 
-  const kv = (env as unknown as LinearMetaEnv).SESSIONS
   const result: LinearImportResult = { ok: true, imported: 0, skipped: 0, items: [] }
 
   for (const it of fetched.items) {
-    const dedupKey = `linearitem:${it.id}`
-    if (kv) {
-      try {
-        if (await kv.get(dedupKey)) {
-          result.skipped++
-          result.items.push({ title: it.title, status: 'skipped' })
-          continue
-        }
-      } catch {
-        // ignore — proceed to import (best-effort dedup, same as GitHub bridge)
-      }
-    }
-    if (!params.dryRun) {
-      try {
-        await createTask(
-          env,
-          {
-            squad_id: params.defaultSquadId,
-            project_id: params.projectId ?? null,
-            title: it.title,
-            body: [it.url, `from Linear (${it.identifier})`].filter(Boolean).join('\n'),
-            done_when: `Linear issue ${it.identifier} resolved`,
-            status: 'open',
-            // Structural enforcement, not a default: NEVER set from Linear data.
-            assignee_agent_id: null,
-          },
-          {
-            // No task.created bus event → bus/consumer.ts dispatchSquad() never runs
-            // for a Linear-origin task. No GitHub issue mirror of external text either.
-            skipEvent: true,
-            skipMirror: true,
-            // PR #659 P0 fix (diverse-model adversarial gate BLOCK): skipEvent/skipMirror
-            // only suppress the EVENT wake — they were never a marker a status-POLLING
-            // reader (canAgentExecuteTask's unassigned branch, the concierge's
-            // routeUnassignedWork cron) could see. This is the structural fix: every
-            // Linear-imported task now carries external_source (migrations/0077), the
-            // same NULL-vs-non-NULL trust boundary source_pot already established for
-            // cross-pot tasks. teamKey is bounded/validated by TEAM_KEY_RE (fetchLinearIssues)
-            // before this call, so the marker itself is bounded too.
-            externalSource: `linear:${params.teamKey}`,
-          },
-        )
-      } catch {
-        result.items.push({ title: it.title, status: 'error' })
-        continue
-      }
-      if (kv) {
-        try {
-          await kv.put(dedupKey, '1', { expirationTtl: 60 * 60 * 24 * 30 })
-        } catch {
-          // ignore
-        }
-      }
-    }
-    result.imported++
-    result.items.push({ title: it.title, status: 'created' })
+    const status = await importOneLinearIssue(env, it, {
+      teamKey: params.teamKey,
+      defaultSquadId: params.defaultSquadId,
+      dryRun: params.dryRun === true,
+      projectId: params.projectId ?? null,
+    })
+    if (status === 'skipped') result.skipped++
+    if (status === 'created') result.imported++
+    result.items.push({ title: it.title, status })
   }
   return result
+}
+
+/**
+ * Import ONE Linear issue as an UNASSIGNED mupot task (the loop body of importLinearIssues, shared with the
+ * webhook receiver so both paths carry the identical safety contract above). KV-deduped on `linearitem:<id>`;
+ * records the task<->item link that outbound write-back reads.
+ */
+export async function importOneLinearIssue(
+  env: Env,
+  it: LinearIssueItem,
+  params: { teamKey: string; defaultSquadId: string; dryRun: boolean; projectId: string | null },
+): Promise<'created' | 'skipped' | 'error'> {
+  const kv = (env as unknown as LinearMetaEnv).SESSIONS
+  const dedupKey = `linearitem:${it.id}`
+  if (kv) {
+    try {
+      if (await kv.get(dedupKey)) return 'skipped'
+    } catch {
+      // ignore — proceed to import (best-effort dedup, same as GitHub bridge)
+    }
+  }
+  if (params.dryRun) return 'created'
+  try {
+    const task = await createTask(
+      env,
+      {
+        squad_id: params.defaultSquadId,
+        project_id: params.projectId,
+        title: it.title,
+        body: [it.url, `from Linear (${it.identifier})`].filter(Boolean).join('\n'),
+        done_when: `Linear issue ${it.identifier} resolved`,
+        status: 'open',
+        // Structural enforcement, not a default: NEVER set from Linear data.
+        assignee_agent_id: null,
+      },
+      {
+        // No task.created bus event -> bus/consumer.ts dispatchSquad() never runs for a Linear-origin task.
+        // No GitHub issue mirror of external text either.
+        skipEvent: true,
+        skipMirror: true,
+        // PR #659 P0 fix: external_source (migrations/0077) is the marker status-POLLING readers see;
+        // teamKey is validated by TEAM_KEY_RE (fetchLinearIssues) before this call.
+        externalSource: `linear:${params.teamKey}`,
+      },
+    )
+    if (params.projectId) {
+      try {
+        await recordItemLink(env, { taskId: task.id, projectId: params.projectId, provider: 'linear', nativeId: it.id, ref: it.identifier })
+      } catch {
+        // The task exists; a missing link only means no write-back for it. Never report the import as failed.
+      }
+    }
+  } catch {
+    return 'error'
+  }
+  if (kv) {
+    try {
+      await kv.put(dedupKey, '1', { expirationTtl: 60 * 60 * 24 * 30 })
+    } catch {
+      // ignore
+    }
+  }
+  return 'created'
 }

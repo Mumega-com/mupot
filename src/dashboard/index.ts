@@ -1061,9 +1061,8 @@ dashboardApp.post('/projects/:id/boards/sync', async (c) => {
   const view = await loadProjectDetail(c.env, auth, projectId)
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   const form = await c.req.parseBody()
-  const { isProjectBoardProvider } = await import('../projects/providers/port')
   const { getProjectBinding } = await import('../projects/providers/bindings')
-  const { getTaskBoardPort } = await import('../projects/providers/registry')
+  const { getTaskBoardPort, isProjectBoardProvider } = await import('../projects/providers/registry')
   const providerRaw = typeof form.provider === 'string' ? form.provider : ''
   if (!isProjectBoardProvider(providerRaw)) {
     return c.redirect(`/projects/${encodeURIComponent(projectId)}#board`)

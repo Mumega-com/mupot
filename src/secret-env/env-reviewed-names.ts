@@ -31,6 +31,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'APPROVAL_EXPIRY_ENFORCE',
   'BILLING_PLAN_SECRET',
   'BLOBS',
+  'BOARD_WRITEBACK',
   'BOOTSTRAP_OWNER_TOKEN',
   'BOUNTY_INGEST_SECRET',
   'BRAND',
@@ -106,6 +107,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'INKWELL_TOKEN',
   'INSTALLER_WINDOW', // installer window (design S1): opt-in flag for the time-boxed operator bundle (non-secret)
   'LAND_REQUIRES_EVIDENCE',
+  'LINEAR_WEBHOOK_SECRET',
   'LOCAL_TEST_AUTH',
   'LOCAL_TEST_AUTH_EMAIL',
   'MCP_URL_ELICITATION',

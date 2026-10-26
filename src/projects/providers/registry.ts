@@ -1,20 +1,13 @@
-import type { Env } from '../../types'
-import { createGitHubProjectsBoardPort } from './github'
-import { createLinearBoardPort } from './linear'
-import { createNotionBoardPort } from './notion'
-import type { ProjectBoardProvider, TaskBoardPort } from './port'
+// mupot — board provider registry. Importing this module loads every provider, and each registers itself
+// (registry-core.ts). To add a provider (Jira, Asana, ...): write src/projects/providers/<name>.ts that calls
+// registerBoardProvider(), and add its import line below. Nothing else changes: no switch, no union, no caller.
+import './github'
+import './linear'
+import './notion'
 
-export function getTaskBoardPort(env: Env, provider: ProjectBoardProvider): TaskBoardPort {
-  switch (provider) {
-    case 'github_projects':
-      return createGitHubProjectsBoardPort(env)
-    case 'linear':
-      return createLinearBoardPort(env)
-    case 'notion':
-      return createNotionBoardPort(env)
-    default: {
-      const _exhaustive: never = provider
-      throw new Error(`unknown project board provider: ${String(_exhaustive)}`)
-    }
-  }
-}
+export {
+  getTaskBoardPort,
+  isProjectBoardProvider,
+  listBoardProviders,
+  registerBoardProvider,
+} from './registry-core'

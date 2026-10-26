@@ -45,6 +45,7 @@ import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
 import { githubInboundApp } from './integrations/github-routes'
+import { boardWebhookApp } from './integrations/board-webhook-routes'
 import { athenaWebhookApp } from './athena/routes'
 import { eventIngestApp } from './events/ingest'
 import { prospectsApp } from './loops/prospects-routes'
@@ -140,6 +141,8 @@ app.route('/api/integrations/ghl', ghlInboundApp)
 app.route('/api/events', eventIngestApp)
 // GitHub weave: inbound webhook (HMAC-verified by GITHUB_WEBHOOK_SECRET) → work units.
 app.route('/api/integrations/github', githubInboundApp)
+// Board providers (Linear first): inbound webhook, HMAC-verified by the provider's own secret, delivery-ledgered.
+app.route('/api/integrations/board', boardWebhookApp)
 // Athena PR gate: inbound GitHub pull_request webhook → review + comment + status + D1 receipt.
 app.route('/api/webhooks/github', athenaWebhookApp)
 // Supabase Database Webhook Ingest: database triggers → BusEvents & autonomous tasks.
@@ -487,7 +490,7 @@ export default {
       return
     }
 
-    // Seventeen independent maintenance heartbeats, staggered across each 15-minute
+    // Eighteen independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -542,6 +545,11 @@ export default {
     // 17. Repo-key heal (migration 0253) - canonicalize projects.repo_key for rows that never got one, REPO_KEY_HEAL_PER_TICK
     //     rows per run, compare-and-set on repo_url, idempotent. The request paths never write the key; this and
     //     scripts/backfill-repo-key.mjs are the healers. Fail-soft by contract (the cron wrapper catches).
+    // 18. Board sync + write-back retry (S3) - the existing per-binding import on a rate limit (3 bindings per run, at most
+    //     one attempt per binding per 15 min), then a bounded retry of failed outbound write-backs. Write-back retry is a
+    //     no-op unless BOARD_WRITEBACK=1. Fail-soft by contract (the cron wrapper catches).
+    const { runBoardSyncTick } = await import('./projects/board-sync')
+    const { retryFailedWritebacks } = await import('./projects/board-writeback')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -560,6 +568,7 @@ export default {
       ['assignment-wake', () => sweepAssignmentWakes(env)],
       ['gate-verdict-receipts', () => reconcileGateVerdictReceipts(env)],
       ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
+      ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

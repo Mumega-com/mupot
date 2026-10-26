@@ -183,6 +183,11 @@ export interface Env {
   // #2170: set to exactly "1" to let the project circuit breaker auto-archive (kill) a project at an
   // elapsed cycle boundary with no recommit. Unset/anything else = never auto-archive.
   PROJECT_BREAKER_KILL?: string
+  // Set to exactly "1" to let mupot WRITE to a linked external board (Linear status/comment) for a task transition that
+  // has a mupot receipt. Default off. Also requires binding meta.writeback === true. Inbound import is unaffected.
+  BOARD_WRITEBACK?: string
+  // Linear webhook signing secret (wrangler secret). Unset = the Linear webhook route answers 503.
+  LINEAR_WEBHOOK_SECRET?: string
   // secrets (present at runtime only)
   // GitHub App user-authorization credentials (shared "mupot" App). Required to complete the
   // GitHub connect flow; when unset the connect callback refuses (fail closed).

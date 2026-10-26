@@ -1,11 +1,8 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import type { Env } from '../../types'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
-import {
-  isProjectBoardProvider,
-  type ProjectBoardProvider,
-  type ProjectProviderBinding,
-} from './port'
+import type { ProjectBoardProvider, ProjectProviderBinding } from './port'
+import { isProjectBoardProvider } from './registry'
 
 export type BindingMutationError =
   | 'invalid_provider'
