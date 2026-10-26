@@ -48,15 +48,29 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     }
   })
 
-  it('own seat held / observed: seat_attach is NOT suggested (the floor refuses it) and the sentence says what they can do', () => {
-    for (const status of ['held', 'observed'] as const) {
-      const w = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: status }))
-      expect(w.state).toBe('own_seat')
-      expect(w.next_step_plain).toContain(`This seat is ${status}`)
-      expect(w.next_step_plain).toContain('inbox {peek:true}')
-      expect(w.next_step_plain).toContain('ask your human to lift')
-      expect(w.next_step_plain).not.toContain('seat_attach {agent}')
-    }
+  it('a held seat remains read-only and points to the human who can lift the hold', () => {
+    const w = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'held' }))
+    expect(w.state).toBe('own_seat')
+    expect(w.next_step_plain).toContain('This chat is held')
+    expect(w.next_step_plain).toContain('inbox {peek:true}')
+    expect(w.next_step_plain).toContain('ask your human to lift the hold')
+    expect(w.next_step_plain).toContain('do not call seat_attach or seat_select')
+    expect(w.next_step_plain).not.toContain('seat_attach {agent}')
+  })
+
+  it('an observed seat can request admission and must wait for human approval', () => {
+    const observed = authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'observed' })
+    const w = run(observed)
+    expect(w.state).toBe('own_seat')
+    expect(w.next_step_plain).toContain("request admission with seat_attach {agent:'<slug>'}")
+    expect(w.next_step_plain).toContain('Show them the approval code')
+    expect(w.next_step_plain).toContain('wait while they approve it')
+    expect(w.next_step_plain).toContain('until then you stay limited to the observed tools')
+    expect(w.next_step_plain).toContain('Use mupot tools only (no browser or computer use)')
+    expect(w.next_step_plain).toContain('do not call seat_select')
+    const off = run(observed, {}, { ...ENV, SEAT_ATTACH: undefined } as unknown as Env)
+    expect(off.next_step_plain).toContain('attaching to an existing agent is not enabled')
+    expect(off.next_step_plain).not.toContain('seat_attach {agent')
     const trusted = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'trusted' }))
     expect(trusted.next_step_plain).toContain('seat_attach {agent}')
   })

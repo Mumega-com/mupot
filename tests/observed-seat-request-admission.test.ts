@@ -307,8 +307,17 @@ describe('agent page: Connect a chat checklist', () => {
     expect(p).toContain(`data-cx-deny="${String(r.sc.admission_id)}"`)
     expect(p).toContain('>Approve<')
     expect(p).not.toContain('No chat has asked yet')
-    const panel = p.slice(p.indexOf('data-agent-connect'), p.indexOf('</section>', p.indexOf('data-agent-connect')))
-    const visible = panel.replace(/<script[\s\S]*?<\/script>/g, '').replace(/<textarea[\s\S]*?<\/textarea>/g, '').replace(/<[^>]+>/g, ' ')
+    // Inspect the generated panel's text, including the copy prompt. Its inline
+    // script follows all UI markup; no HTML is rewritten or used as sanitized output.
+    const start = p.indexOf('data-agent-connect')
+    const end = p.indexOf('<script>', start)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    const visible = [...p.slice(start, end).matchAll(/>([^<>]*)</g)]
+      .map((match) => match[1]).join(' ')
+    expect(visible).toContain('Requests from your chats')
+    expect(visible).toContain('Approve')
+    expect(visible).toContain('Reject')
     expect(visible.toLowerCase()).not.toMatch(/admission|\bseat\b/)
   })
 
