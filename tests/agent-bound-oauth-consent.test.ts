@@ -36,6 +36,7 @@ import {
 } from '../src/mcp/oauth-authorize'
 import { invokeTool, mcpApp } from '../src/mcp/index'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
+import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -2018,4 +2019,61 @@ describe('C11. the agent was created but this session could not be bound', () =>
     // No token is issued for a session that could not be bound.
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
   })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// H. latent grants of a consent-bound seat through the REAL chain
+//    buildAuthContextFromProps -> mcpInternalRequest -> mcpApp.fetch (resolveAuth's hop).
+//
+// The producer exposes boundAgentId = null once the seat's clamped capabilities hit zero. The hop must NOT
+// read that as "unbound" and fall back to the member's own grants: on a bound seat the member is the AGENT,
+// whose raw unclamped grants must never become the seat's latent authority. `connect` is the latent reader.
+// ════════════════════════════════════════════════════════════════════════════
+describe('H. offboarded / demoted consenter or inactive agent: no latent authority from the agent\'s raw grants', () => {
+  async function connectVia(env: Env, tokenId: string, afterBuild?: string): Promise<{ status: number; text: string; latent: CapabilityGrant[] }> {
+    const ctx = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId, email: 'human@example.test', consentedByMemberId: HUMAN,
+    })
+    if (!ctx) throw new Error('producer refused')
+    if (afterBuild) harness.sqlite.exec(afterBuild) // the state changes between the producer and the hop
+    const req = new Request('https://pot.test/mcp', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tool: 'connect', args: { agent_name: AGENT_B.slug } }),
+    })
+    const res = await mcpApp.fetch(mcpInternalRequest(req, ctx), env)
+    return { status: res.status, text: await res.text(), latent: ctx.latentCapabilities ?? [] }
+  }
+  const key = (g: CapabilityGrant[]) => g.map((c) => `${c.member_id}:${c.scope_type}:${c.scope_id}:${c.capability}`).sort()
+
+  beforeEach(() => {
+    // The agent's OWN raw grant is org-admin (an operator misconfiguration the clamp exists to contain).
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-a-raw-org', '${MEMBER_AGENT_A}', 'org', NULL, 'admin')`)
+  })
+
+  it('positive control: a live consent still lets connect reach a squad the consenter holds', async () => {
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-human-b', '${HUMAN}', 'squad', '${AGENT_B.squad_id}', 'member')`)
+    insertDirectoryToken(harness.sqlite, 'tok-h-live', MEMBER_AGENT_A, AGENT_A.id)
+    const r = await connectVia(envFor(harness), 'tok-h-live')
+    expect(r.status).toBe(200)
+  })
+
+  const INACTIVE = `UPDATE agents SET status = 'inactive' WHERE id = '${AGENT_A.id}'`
+  for (const [label, mutate, late] of [
+    ['consenting human suspended', `UPDATE members SET status = 'suspended' WHERE id = '${HUMAN}'`, false],
+    ['consenting human demoted below the floor', `DELETE FROM capabilities WHERE id = 'cap-human-squad-a'`, false],
+    ['bound agent inactive (between producer and hop)', INACTIVE, true],
+  ] as const) {
+    it(`${label}: connect is refused and latent equals the producer's value (never the agent's raw org-admin)`, async () => {
+      insertDirectoryToken(harness.sqlite, 'tok-h-dead', MEMBER_AGENT_A, AGENT_A.id)
+      if (!late) harness.sqlite.exec(mutate)
+      const env = envFor(harness)
+      const r = await connectVia(env, 'tok-h-dead', late ? mutate : undefined)
+      // refused either at the zero-capability gate (403) or as an unauthenticated session (401, agent gone)
+      expect(late ? [401, 403] : [403]).toContain(r.status)
+      if (r.status === 403) expect(r.text).toContain('directory_channel_zero_capability')
+      // The producer's latent set is the CONSENTER's live standing (status-gated), never the agent's own grants.
+      expect(key(r.latent).some((g) => g.includes(MEMBER_AGENT_A))).toBe(false)
+      expect(key(r.latent).some((g) => g.endsWith(':org:null:admin'))).toBe(false)
+    })
+  }
 })

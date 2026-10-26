@@ -104,7 +104,7 @@ const OLD_ISO = '2020-01-01T00:00:00.000Z'
 async function fixture(st: string | null): Promise<{ s: Seat; auth: AuthContext; e: Env }> {
   const s = await seatFor(OWNER)
   setStatus(s.seatId, st)
-  const auth = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
+  const auth = s.ctx // the seat binds from the presented session; a blob naming an unwelded agent is refused (resolveAuth)
   h.sqlite.prepare(`INSERT OR REPLACE INTO fleet_agents (agent_id, tenant, presence_mode, status, last_reported_at, updated_at) VALUES (?, ?, 'poll', 'running', ?, ?)`).run(s.agentId, TENANT, OLD, OLD)
   h.sqlite.prepare(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, body) VALUES ('m1', ?, ?, 'someone', ?, 'hello')`).run(TENANT, s.agentId, PLAIN)
   h.sqlite.prepare(`DELETE FROM presence`).run()

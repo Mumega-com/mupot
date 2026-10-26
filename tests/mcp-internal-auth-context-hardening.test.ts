@@ -103,12 +103,60 @@ describe('an accepted blob is an identity assertion only', () => {
     expect(res.status).toBe(401)
   })
 
-  it('a blob cannot carry latent capabilities or another member id', async () => {
+  // connect is the only reader of latent grants: it authorizes the NAMED claim against them.
+  const connectCall = { tool: 'connect', args: { agent_name: 'agent-h' } }
+  function seedDirectoryMember(id: string, tokenId: string): void {
+    seedLiveToken(h.sqlite, { memberId: id, tenant: TENANT, tokenId, channel: 'directory' })
+  }
+  const FORGED_LATENT = [{ member_id: 'x', scope_type: 'org', scope_id: null, capability: 'owner' }]
+
+  it('a blob cannot carry latent grants: connect (the only latent reader) refuses a member who holds none', async () => {
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-h', 'squad-h', 'agent-h', 'H', 'member', 'test', 'active')`)
+    seedDirectoryMember('mem-nogrants', 'tok-dir-none')
     const res = await viaMcpApp(blob({
-      memberId: 'someone-else',
-      latentCapabilities: [{ member_id: MEMBER, scope_type: 'org', scope_id: null, capability: 'owner' }],
-    }))
+      userId: 'mem-nogrants', memberId: 'mem-nogrants', channel: 'directory', tokenId: 'tok-dir-none',
+      latentCapabilities: FORGED_LATENT as never, // forged claim, typed loosely on purpose
+    }), connectCall)
     expect(res.status).toBe(403)
+    expect(await res.text()).toContain('directory_channel_zero_capability')
+  })
+
+  it('positive control: connect passes for a directory member whose latent grants are really held', async () => {
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-h', 'squad-h', 'agent-h', 'H', 'member', 'test', 'active')`)
+    seedDirectoryMember('mem-real', 'tok-dir-real')
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-real', 'mem-real', 'org', NULL, 'admin')`)
+    const res = await viaMcpApp(blob({ userId: 'mem-real', memberId: 'mem-real', channel: 'directory', tokenId: 'tok-dir-real' }), connectCall)
+    expect(res.status).toBe(200)
+  })
+
+  it('the channel comes from the live token row: a directory token cannot present as workspace', async () => {
+    seedDirectoryMember('mem-chan', 'tok-dir-chan')
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-chan', 'mem-chan', 'squad', 'squad-h', 'member');
+    `)
+    const res = await viaMcpApp(blob({
+      userId: 'mem-chan', memberId: 'mem-chan', channel: 'workspace', tokenId: 'tok-dir-chan',
+      capabilities: [{ member_id: 'mem-chan', scope_type: 'squad', scope_id: 'squad-h', capability: 'member' }],
+    }), { tool: 'task_update', args: { task_id: 'task-h', title: 'retitled' } })
+    // a workspace session holding squad member could edit the task; a directory session holds no ambient standing
+    expect(res.status).toBe(403)
+  })
+
+  it('a blob naming an agent weld the token row does not carry is unauthenticated', async () => {
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-h', 'squad-h', 'agent-h', 'H', 'member', 'test', 'active')`)
+    seedDirectoryMember('mem-weld', 'tok-dir-weld')
+    expect((await viaMcpApp(blob({ userId: 'mem-weld', memberId: 'mem-weld', channel: 'directory', tokenId: 'tok-dir-weld', boundAgentId: 'agent-h' }), { tool: 'status', args: {} })).status).toBe(401)
+    // and on a workspace token welded to one agent, naming another is refused too
+    seedLiveToken(h.sqlite, { memberId: 'mem-ws', tenant: TENANT, tokenId: 'tok-ws-weld', channel: 'directory', boundAgentId: 'agent-h' })
+    expect((await viaMcpApp(blob({ userId: 'mem-ws', memberId: 'mem-ws', channel: 'directory', tokenId: 'tok-ws-weld', boundAgentId: 'agent-other' }), { tool: 'status', args: {} })).status).toBe(401)
+  })
+
+  it('email comes from the live member row, not the blob', async () => {
+    const res = await viaMcpApp(blob({ email: 'forged@example.test' }), { tool: 'status', args: {} })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).not.toContain('forged@example.test')
+    expect(text).toContain(`${MEMBER}@example.test`)
   })
 
   it('a well-formed blob for a live token still authenticates', async () => {

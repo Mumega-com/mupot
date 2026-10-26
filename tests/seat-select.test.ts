@@ -861,7 +861,12 @@ describe('forged x-mupot-auth-context harnessId is stripped by resolveAuth (end 
     const hid = await harnessFor(env, HUMAN)
     expect(await receiptHarness(env, blob({ channel: 'directory', boundAgentId: null, harnessId: hid })))
       .toMatchObject({ id: hid, kind: 'cursor' })
-    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid }))).toBeNull()
+    // the channel is the live token row's, not the blob's: a workspace-channel session is a workspace token
+    seedLiveToken(h.sqlite, { memberId: HUMAN, tenant: TENANT, tokenId: 'tok-live-ws', channel: 'workspace' })
+    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid, tokenId: 'tok-live-ws' }))).toBeNull()
+    // and a directory token whose blob claims workspace is still a directory session
+    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid })))
+      .toMatchObject({ id: hid, kind: 'cursor' })
   })
 
   it('flag off: even an unbound directory blob carries no harness', async () => {
