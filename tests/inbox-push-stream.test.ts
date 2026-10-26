@@ -4,7 +4,8 @@ import type { StreamAuthorization } from '../src/agents/inbox-stream-auth'
 
 class Socket extends EventTarget {
   closed = false
-  close() { this.closed = true; this.dispatchEvent(new Event('close')) }
+  readyState = 1
+  close() { this.closed = true; this.readyState = 3; this.dispatchEvent(new Event('close')) }
   hint(seq = 1) { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'hint', id: `m${seq}`, seq }) })) }
 }
 const message = (seq: number) => ({ id: `m${seq}`, seq, from_agent: 'sender', kind: 'message', body: `body${seq}`, request_id: null, in_reply_to: null, created_at: '2026-10-25' })
@@ -22,6 +23,23 @@ function setup(options: { validate?: () => Promise<StreamAuthorization>; count?:
   return { socket, reader, pump, setCount: (n: number) => { count = n }, reads: () => reads, auths: () => auths, text: () => text, done: () => done }
 }
 describe('push stream lifecycle', () => {
+  it('closes when a replacement socket is already closed before its listeners can attach', async () => {
+    const original = new Socket(); const replacement = new Socket(); replacement.close()
+    const r = createInboxPushResponse({ socket: original, authenticatedAt: Date.now(), since: 0,
+      validate: async () => 'valid', read: async () => ({ ok: true, messages: [] }), renewSocket: async () => replacement })
+    const reader = r.body!.getReader(); let done = false
+    const pump = (async () => { while (!(await reader.read()).done) {} done = true })()
+    await vi.advanceTimersByTimeAsync(840_100)
+    expect(done).toBe(true); expect(original.closed).toBe(true)
+    await pump
+  })
+  it('refuses an upstream that closed before stream construction', async () => {
+    const socket = new Socket(); socket.close(); let reads = 0
+    const r = createInboxPushResponse({ socket, authenticatedAt: Date.now(), since: 0, validate: async () => 'valid', read: async () => { reads++; return { ok: true, messages: [] } } })
+    await vi.advanceTimersByTimeAsync(100)
+    expect(reads).toBe(0)
+    expect((await r.body!.getReader().read()).done).toBe(true)
+  })
   it.each(['timeout', 'cancel'] as const)('disposes a renewal socket returned after %s', async mode => {
     let resolve!: (s: Socket) => void
     const original = new Socket(); const late = new Socket()

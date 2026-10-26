@@ -35,7 +35,7 @@ async function connect(env: Env, id: StreamIdentity): Promise<Connection> {
   try { return await Promise.race([request, timeout]) } finally { clearTimeout(timer!) }
 }
 
-class FallbackSocket extends EventTarget implements PushSocket { close() {} }
+class FallbackSocket extends EventTarget implements PushSocket { readyState = 1; close() { this.readyState = 3 } }
 
 async function validateBounded(env: Env, id: StreamIdentity): Promise<StreamAuthorization> {
   let timer: ReturnType<typeof setTimeout>
@@ -55,6 +55,10 @@ export async function openBearerPushStream(env: Env, id: StreamIdentity, since: 
     if (connection.kind === 'connected') connection.socket.close()
     return Response.json({ error: auth === 'error' ? 'authorization_unavailable' : 'authorization_invalid' }, { status: auth === 'error' ? 503 : 403 })
   }
+  if (connection.kind === 'connected' && connection.socket.readyState !== 1) {
+    connection.socket.close()
+    return Response.json({ error: 'push_upstream_closed' }, { status: 503 })
+  }
   // auth is a fresh proof of BOTH the exact credential and definitive no eligible grant.
   const fallback = connection.kind === 'unavailable'
   return createInboxPushResponse({
@@ -69,7 +73,7 @@ export async function openBearerPushStream(env: Env, id: StreamIdentity, since: 
       const next = await connect(env, id)
       if (next.kind !== 'connected') return null
       const valid = await validateBounded(env, id)
-      if (valid !== 'valid') { next.socket.close(); return null }
+      if (valid !== 'valid' || next.socket.readyState !== 1) { next.socket.close(); return null }
       return next.socket
     },
     metric: kind => console.info('[inbox-stream]', { mode: fallback ? 'fallback' : 'push', operation: kind }),

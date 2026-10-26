@@ -4,7 +4,8 @@ import { hashMemberToken } from '../src/auth/member-bearer'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
-class Socket extends EventTarget { closed = false; accept() {} close() { this.closed = true } }
+import * as streamAuth from '../src/agents/inbox-stream-auth'
+class Socket extends EventTarget { closed = false; readyState = 1; accept() {} close() { this.closed = true; this.readyState = 3 } }
 let h: SqliteD1Harness; let env: Env; let requests: Request[]; let sockets: Socket[]
 beforeEach(async () => {
   h = createSqliteD1(); applyAllMigrations(h.sqlite); requests = []; sockets = []
@@ -20,9 +21,19 @@ beforeEach(async () => {
   } } as unknown as Env
   vi.useFakeTimers()
 })
-afterEach(() => { vi.useRealTimers(); h.close() })
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); h.close() })
 const request = (query = '', headers = {}) => inboxApp.request('/stream' + query, { headers: { authorization: 'Bearer secret-test-token', ...headers } }, env)
 describe('member-token push route', () => {
+  it('refuses a socket that closes during subscribe-then-verify instead of returning a deaf stream', async () => {
+    const validate = streamAuth.validateInboxStreamIdentity
+    vi.spyOn(streamAuth, 'validateInboxStreamIdentity').mockImplementation(async (...args) => {
+      sockets[0].close() // close event happened before the stream listeners existed
+      return validate(...args)
+    })
+    const r = await request()
+    expect(r.status).toBe(503)
+    expect(r.headers.get('X-Mupot-Stream-Mode')).toBeNull()
+  })
   it('bounds a hanging entry authentication lookup to five seconds', async () => {
     env.DB = { prepare() { return { bind() { return { first: () => new Promise(() => {}) } } } } } as unknown as D1Database
     const pending = request()

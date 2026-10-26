@@ -1,7 +1,7 @@
 import type { StreamAuthorization } from './inbox-stream-auth'
 import type { StreamMessage } from './inbox-routes'
 
-export interface PushSocket extends EventTarget { close(code?: number, reason?: string): void }
+export interface PushSocket extends EventTarget { readonly readyState: number; close(code?: number, reason?: string): void }
 export interface PushStreamOptions {
   socket: PushSocket
   authenticatedAt: number
@@ -181,14 +181,14 @@ export function createInboxPushResponse(o: PushStreamOptions): Response {
     if (!o.renewSocket || !await authorize('disclosure')) { close('observer_rotation'); return }
     const next = await timed(o.renewSocket, null, late => { try { late?.close(1000, 'abandoned_renewal') } catch { /* already gone */ } })
     if (closed) { next?.close(); return }
-    if (!next) { close('observer_rotation_failed'); return }
+    if (!next || next.readyState !== 1) { next?.close(); close('observer_rotation_failed'); return }
     const previous = socket; detach(previous); socket = next; attach(next); previous.close(1000, 'renewed')
     queueRead('resync'); after(() => { void renew() }, 14 * 60_000)
   }
   const body = new ReadableStream<Uint8Array>({
     start(c) {
       controller = c; attach(socket); o.signal?.addEventListener('abort', onAbort, { once: true })
-      if (o.signal?.aborted || Date.now() >= validUntil) { close('expired_at_start'); return }
+      if (o.signal?.aborted || Date.now() >= validUntil || socket.readyState !== 1) { close('expired_or_closed_at_start'); return }
       armLease(); enqueue('retry: 3000\n\n'); queueRead('connect')
       after(heartbeat, HEARTBEAT)
       if (o.fallback) after(fallbackPoll, 30_000)

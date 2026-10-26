@@ -3,7 +3,7 @@ import { createInboxPushResponse } from '../src/agents/inbox-push-stream'
 // @ts-expect-error vendored JavaScript client deliberately remains unmodified
 import { seatlinkSseFixture } from './fixtures/seatlink-bridge/open-inbox-stream.mjs'
 
-class Socket extends EventTarget { close() {} }
+class Socket extends EventTarget { readyState = 1; close() { this.readyState = 3 } }
 afterEach(() => vi.useRealTimers())
 it('the actual seatlink SSE parser resumes after server rotation using its saved since cursor', async () => {
   vi.useFakeTimers(); vi.setSystemTime(1_800_000_000_000)
