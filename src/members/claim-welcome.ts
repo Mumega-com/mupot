@@ -39,7 +39,8 @@ export async function sendClaimWelcome(
     .bind(adm.human_member_id, env.TENANT_SLUG).first<{ display_name: string | null; email: string | null }>()
   const agent = await env.DB.prepare('SELECT name, slug FROM agents WHERE id = ?1 LIMIT 1')
     .bind(adm.agent_id).first<{ name: string; slug: string }>()
-  const humanLabel = cleanReported(human?.display_name || human?.email || 'your human', 64) ?? 'your human'
+  // Quote characters are removed so a name cannot close the quotation and continue in the sentence's own voice.
+  const humanLabel = cleanReported((human?.display_name || human?.email || 'your human').replace(/["'`\u201c\u201d]/g, ''), 64) ?? 'your human'
   const agentLabel = cleanReported(agent?.slug || agent?.name || 'this agent', 64) ?? 'this agent'
   const res = await sendAgentMessage(
     env,

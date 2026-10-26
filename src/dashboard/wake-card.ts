@@ -40,6 +40,8 @@ export async function loadAgentWakeCard(
   }
   if (card.push?.state === 'on') {
     lines.push(html`<p><strong>Push is on</strong>${card.push.hostName ? html` from ${card.push.hostName}` : ''}.</p>`)
+  } else if (card.push?.state === 'broken') {
+    lines.push(html`<p><strong>Push needs repair.</strong> A grant exists${card.push.hostName ? html` for ${card.push.hostName}` : ''}, but the host can no longer receive this agent's hints (its key was removed, or it lost standing). Revoke the grant and set it up again.</p>`)
   } else if (card.push?.state === 'available') {
     lines.push(html`<form method="post" action="/agents/${agent.id}/wake-setup/push" class="inline-form" data-wake-push>
       <p>${card.push.hostName} is a host you own and it reports ${agent.name}. Allow it to receive ${agent.name}'s inbox hints (no message bodies) so the agent is woken instead of polled.</p>

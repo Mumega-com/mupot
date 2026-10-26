@@ -19,14 +19,14 @@
 import type { AuthContext, Env } from '../types'
 import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
-import { activeSeatEventGrant, authorizeSeatGrantTarget, createSeatEventGrant, isSeatEventsEnabled } from '../agents/seat-events'
+import { activeSeatEventGrant, authorizeSeatDelivery, authorizeSeatGrantTarget, createSeatEventGrant, hostHasStandingInSquad, isSeatEventsEnabled } from '../agents/seat-events'
 import { getAgentWebhookDoorbell, webhookDoorbellEnabled } from '../agents/webhook-doorbell'
 
 export interface WakeFacts {
   attached: boolean
   seatEventsEnabled: boolean
   /** The live grant for this agent, if any. */
-  grant: { id: string; hostAgentId: string; hostName: string | null } | null
+  grant: { id: string; hostAgentId: string; hostName: string | null; /** the delivery predicate (key, member, standing, project) still passes */ delivers: boolean } | null
   /** A host the viewing member owns that reports this agent and could be granted push. */
   hostCandidate: { id: string; name: string } | null
   doorbellEnabled: boolean
@@ -38,7 +38,7 @@ export type WakeCard =
   | {
       show: true
       nudgeOnly: boolean
-      push: { state: 'on'; hostName: string | null } | { state: 'available'; hostId: string; hostName: string } | null
+      push: { state: 'on'; hostName: string | null } | { state: 'broken'; hostName: string | null } | { state: 'available'; hostId: string; hostName: string } | null
       webhook: { configured: boolean; last4: string | null; lastOutcome: string | null; lastAt: string | null } | null
     }
 
@@ -47,7 +47,7 @@ export function deriveWakeCard(f: WakeFacts): WakeCard {
   const push: NonNullable<Extract<WakeCard, { show: true }>['push']> | null = !f.seatEventsEnabled
     ? null
     : f.grant
-      ? { state: 'on', hostName: f.grant.hostName }
+      ? { state: f.grant.delivers ? 'on' : 'broken', hostName: f.grant.hostName }
       : f.hostCandidate
         ? { state: 'available', hostId: f.hostCandidate.id, hostName: f.hostCandidate.name }
         : null
@@ -81,7 +81,7 @@ async function ownedHostWithKey(env: Env, memberId: string, hostId: string, agen
 export async function loadWakeCard(env: Env, auth: AuthContext, memberId: string, agentId: string): Promise<WakeCard> {
   if (!(await viewerClaimedAgent(env, memberId, agentId))) return { show: false }
   // Offer the push button only to someone the write would accept (org admin, or lead on the agent's squad): never a button that 403s.
-  const mayGrant = (await authorizeSeatGrantTarget(env, { grants: auth.capabilities ?? (await resolveCapabilities(env, memberId)), orgAdmin: isOrgAdmin(auth) }, agentId)).ok
+  const target = (await authorizeSeatGrantTarget(env, { grants: auth.capabilities ?? (await resolveCapabilities(env, memberId)), orgAdmin: isOrgAdmin(auth) }, agentId))
   const attached = (await env.DB.prepare(
     `SELECT 1 AS x FROM agent_seat_attachments WHERE tenant = ?1 AND agent_id = ?2 AND detached_at IS NULL LIMIT 1`,
   ).bind(env.TENANT_SLUG, agentId).first<{ x: number }>()) !== null
@@ -93,11 +93,16 @@ export async function loadWakeCard(env: Env, auth: AuthContext, memberId: string
     const g = await activeSeatEventGrant(env, agentId)
     if (g) {
       const hn = await env.DB.prepare('SELECT name FROM agents WHERE id = ?1 LIMIT 1').bind(g.host_agent_id).first<{ name: string }>()
-      grant = { id: g.id, hostAgentId: g.host_agent_id, hostName: hn?.name ?? null }
+      // The row existing is not the same as delivery working: re-run the delivery predicate (key removed, standing lost...).
+      grant = { id: g.id, hostAgentId: g.host_agent_id, hostName: hn?.name ?? null, delivers: (await authorizeSeatDelivery(env, g.host_agent_id, agentId)) === 'granted' }
     } else {
       const rep = await env.DB.prepare('SELECT reported_by FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1')
         .bind(env.TENANT_SLUG, agentId).first<{ reported_by: string }>()
-      if (mayGrant && rep?.reported_by) hostCandidate = await ownedHostWithKey(env, memberId, rep.reported_by, agentId)
+      if (target.ok && rep?.reported_by) {
+        const cand = await ownedHostWithKey(env, memberId, rep.reported_by, agentId)
+        // Offer only a host the writer would accept: it must also have standing in the agent's squad (never a button that 403s).
+        if (cand && (await hostHasStandingInSquad(env, cand.id, target.squadId, memberId))) hostCandidate = cand
+      }
     }
   }
 
