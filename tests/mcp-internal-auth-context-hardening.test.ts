@@ -151,6 +151,22 @@ describe('an accepted blob is an identity assertion only', () => {
     expect((await viaMcpApp(blob({ userId: 'mem-ws', memberId: 'mem-ws', channel: 'directory', tokenId: 'tok-ws-weld', boundAgentId: 'agent-other' }), { tool: 'status', args: {} })).status).toBe(401)
   })
 
+  it('the acting member id is the token owner, never the blob\'s memberId (observable in the status echo)', async () => {
+    const res = await viaMcpApp(blob({ memberId: 'someone-else' }), { tool: 'status', args: {} })
+    expect(res.status).toBe(200)
+    const text = await res.text()
+    expect(text).toContain(MEMBER)
+    expect(text).not.toContain('someone-else')
+  })
+
+  it('a non-directory session keeps its real grants as latent (connect passes for a held org-admin grant)', async () => {
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-h', 'squad-h', 'agent-h', 'H', 'member', 'test', 'active')`)
+    seedLiveToken(h.sqlite, { memberId: 'mem-wsadmin', tenant: TENANT, tokenId: 'tok-wsadmin', channel: 'workspace' })
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-wsadmin', 'mem-wsadmin', 'org', NULL, 'admin')`)
+    const res = await viaMcpApp(blob({ userId: 'mem-wsadmin', memberId: 'mem-wsadmin', tokenId: 'tok-wsadmin' }), connectCall)
+    expect(res.status).toBe(200)
+  })
+
   it('email comes from the live member row, not the blob', async () => {
     const res = await viaMcpApp(blob({ email: 'forged@example.test' }), { tool: 'status', args: {} })
     expect(res.status).toBe(200)
