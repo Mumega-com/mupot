@@ -117,7 +117,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
     'recall', 'squad_recall', 'project_recall', 'task_get', 'task_board', 'kanban_board', 'task_intake_audit', 'flight_get',
     'message_get', 'peers', 'status', 'fleet_agent_get', 'needs_you_list', 'project_list', 'project_get', 'project_context',
     'list_agent_tokens', 'list_agent_sessions', 'get_agent_profile', 'presence_list', 'routine_list', 'routine_get',
-    'routine_run_list', 'routine_run_get', 'get_circuit_state', 'athena_review_pr', 'archive_plan_expand', 'elevation_status',
+    'routine_run_list', 'routine_run_get', 'get_circuit_state', 'athena_review_pr', 'archive_plan_expand', 'elevation_status', 'gardener_preview',
   ]
   it.each(KNOWN_PURE_READS)('%s is readOnly and closed-world', (name) => {
     expect(TOOL_ANNOTATION_ROWS[name]?.readOnlyHint, name).toBe(true)
@@ -131,7 +131,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
 describe('full-table pin: every readOnly / destructive / openWorld label is explicit', () => {
   const ALL_READ_ONLY = [
     'archive_plan_expand', 'athena_review_pr', 'cursor_run_status', 'elevation_status',
-    'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
+    'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list', 'gardener_preview',
     'get_agent_profile', 'get_agent_webhook_doorbell', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'list_agent_webhook_doorbell_receipts', 'loop_list',
     'memory_get', 'memory_recent', 'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'operator_list', 'peers', 'pot_list',
