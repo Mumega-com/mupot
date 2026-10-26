@@ -24,6 +24,8 @@ vi.mock('../src/auth', () => ({
   },
 }))
 
+// The move control reaches move_agent_squad through a registry that provision.ts fills at load (via src/mcp, the worker's own entry order).
+await import('../src/mcp')
 const { dashboardApp } = await import('../src/dashboard')
 const { applyMoveOutOfHome } = await import('../src/dashboard/agent-access-panel')
 

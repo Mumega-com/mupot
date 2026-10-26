@@ -20,6 +20,7 @@
 // outcome reported to the admin is read back from the receipt row.
 
 import { html } from 'hono/html'
+import { getMoveAgentSquad } from './move-agent-squad-port'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import {
   actorRankOnScopeFor,
@@ -461,9 +462,9 @@ export async function applyMoveOutOfHome(
   const to = await env.DB.prepare('SELECT kind, status FROM squads WHERE id = ? LIMIT 1').bind(input.toSquadId).first<{ kind: string; status: string }>()
   if (!to) return refuse('squad_not_found' as AccessRefusal)
   if (to.kind === 'home') return { ok: false, message: 'Choose a work squad, not another home.', status: 409 }
-  // Dynamic import: src/mcp/provision pulls in src/mcp/index, which would cycle with the dashboard at load time.
-  const { toolMoveAgentSquad } = await import('../mcp/provision')
-  const out = await toolMoveAgentSquad.run(auth, env, {
+  const moveAgentSquad = getMoveAgentSquad()
+  if (!moveAgentSquad) return { ok: false, message: 'Moving agents is unavailable right now. Nothing was changed.', status: 409 }
+  const out = await moveAgentSquad(auth, env, {
     agent: agent.id,
     to_squad: input.toSquadId,
     capability: input.capability,

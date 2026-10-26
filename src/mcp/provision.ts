@@ -116,6 +116,7 @@ import {
   revokeAllAgentSessionsForAgent,
 } from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
+import { registerMoveAgentSquad } from '../dashboard/move-agent-squad-port'
 import { isSlugBaseReserved, slugBaseFromSquadSlug } from '../org/team-bootstrap'
 import { isSquadArchived } from '../hygiene/filters'
 import {
@@ -3352,3 +3353,6 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolMoveAgentSquad,
   toolUpdateSquad,
 ]
+
+// Dashboard Access panel's "move out of home" calls this tool through a leaf port (see move-agent-squad-port.ts for why).
+registerMoveAgentSquad(toolMoveAgentSquad.run)
