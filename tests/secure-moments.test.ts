@@ -241,7 +241,7 @@ describe('host gate', () => {
   it('is wired as the first statement of fetch and the moments app is never mounted on the main app', () => {
     const src = readFileSync(join(__dirname, '..', 'src', 'index.ts'), 'utf8')
     // #1928: the entry is `fetch -> withTenantPrefix -> handleRequest`; the gates stay the first statements of handleRequest.
-    expect(src).toMatch(/fetch:[^\n]*withTenantPrefix\(req, env, \(r\) => handleRequest\(r, env, ctx\)\)/)
+    expect(src).toMatch(/fetch:[^\n]*withTenantPrefix\(stripInternalAuthContext\(req\), env, \(r\) => handleRequest\(r, env, ctx\)\)/)
     const fetchAt = src.indexOf('async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {')
     expect(fetchAt).toBeGreaterThan(0)
     const body = src.slice(fetchAt)
