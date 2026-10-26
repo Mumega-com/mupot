@@ -177,7 +177,8 @@ function payloadFromBody(body: string): SignedDoorbellPayload | null {
  * several space-separated during a rotation). Comparison is constant-time.
  * Timestamp skew is checked before the signature so a stale delivery does not
  * depend on the key. Replay is checked only after the signature matches, and
- * the nonce is remembered only on success, so a bad signature cannot burn it.
+ * the webhook-id is remembered only on success, so a bad signature cannot burn
+ * it. The nonce is not part of the key: a retry mints a new one.
  */
 export async function verifySignedDoorbell(input: {
   secret: string
