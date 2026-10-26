@@ -212,6 +212,8 @@ import {
 } from '../fleet/registry'
 import { hasRegisteredDeliverySurface, resolveDispatchDeliveryMode } from '../bus/consumer'
 import { agentKeyFingerprint, hasRegisteredKey, loadActiveAgentKey } from '../fleet/agent-keys'
+import { SQUAD_CHOICE_TOOLS } from './squad-choice'
+import { squadChoiceStep } from '../members/squad-choice'
 import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
@@ -7136,6 +7138,13 @@ function writeAccessHint(env: Env, w: Whoami, firstStep: string | undefined): st
   }
 }
 
+/** The lobby's way out: present ONLY for a direct agent session still in a home squad with at least one candidate. Advisory: boot must always answer. */
+async function squadChoiceField(env: Env, auth: AuthContext): Promise<{ choose_squad?: Record<string, unknown> }> {
+  if (!auth.boundAgentId) return {}
+  const step = await squadChoiceStep(env, auth).catch(() => null)
+  return step ? { choose_squad: step } : {}
+}
+
 async function joinNextStepsField(env: Env, auth: AuthContext): Promise<{ next_steps?: { join: NonNullable<Awaited<ReturnType<typeof joinNextSteps>>> } }> {
   const join = await joinNextSteps(env, auth)
   return join ? { next_steps: { join } } : {}
@@ -7433,6 +7442,7 @@ const toolBootContext: ToolSpec = {
       available_doors: availableDoors,
       next_step: nextStepOut,
       ...(ctx?.sideEffectFree ? {} : await joinNextStepsField(env, auth)),
+      ...(ctx?.sideEffectFree ? {} : await squadChoiceField(env, auth)),
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
@@ -7525,7 +7535,7 @@ const toolOrient: ToolSpec = {
       { recordInduction: !ctx.sideEffectFree && !ctx.heldSeat },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
-    return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : await joinNextStepsField(env, auth)), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
+    return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : await joinNextStepsField(env, auth)), ...(ctx.sideEffectFree ? {} : await squadChoiceField(env, auth)), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
   },
 }
 
@@ -7857,6 +7867,7 @@ export const TOOLS: ToolSpec[] = [
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
+  ...SQUAD_CHOICE_TOOLS,
   ...SEAT_ATTACH_TOOLS,
   ...VIP_LANE_TOOLS,
   ...SQUAD_JOIN_TOOLS,

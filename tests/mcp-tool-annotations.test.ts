@@ -93,7 +93,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
 
   const KNOWN_DESTRUCTIVE = [
     'revoke_agent_token', 'revoke_agent_session', 'archive_row', 'task_incident_revert', 'deactivate_agent', 'routine_archive', 'task_verdict',
-    'task_verdict_reverse', 'pot_release', 'revoke_gate_capability', 'task_update', 'update_agent', 'move_agent_squad',
+    'task_verdict_reverse', 'pot_release', 'revoke_gate_capability', 'task_update', 'update_agent', 'move_agent_squad', 'squad_choose',
     'squad_member_remove', 'project_squad_remove', 'end_agent_session', 'reveal_credential_claim', 'secret_env_request',
     'addon_disable', 'addon_archive', 'supabase_mutate', 'office.publish_post', 'task_dispatch_lease_reset',
     'set_agent_inbox_consumer', 'team_bootstrap_release', 'loop_set_status', 'routine_run_cancel', 'register_agent_key',
@@ -149,7 +149,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'project_update', 'project_wiki_upsert', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
     'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
-    'set_agent_webhook_doorbell', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
+    'set_agent_webhook_doorbell', 'squad_choose', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
     'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
     'update_agent', 'update_department', 'update_squad',
   ]

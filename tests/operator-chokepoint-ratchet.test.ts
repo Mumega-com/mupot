@@ -213,13 +213,14 @@ describe('ratchet 3b: the census of files that CALL a structural service writer 
     // services and human-only or consent-bound callers (reviewed 2026-10-13)
     'src/dashboard/agent-access-panel.ts', 'src/dashboard/index.ts', 'src/dashboard/join-agent.ts', 'src/dashboard/wizard.ts',
     'src/gates/grants.ts', 'src/mcp/oauth-authorize.ts', 'src/members/agent-access.ts', 'src/members/bootstrap-self.ts',
-    'src/members/service.ts', 'src/members/squad-join.ts', 'src/members/squad-membership.ts', 'src/members/vip-lane.ts', 'src/org/service.ts', 'src/org/team-bootstrap.ts',
+    'src/members/service.ts', 'src/members/squad-choice.ts', 'src/members/squad-join.ts', 'src/members/squad-membership.ts', 'src/members/vip-lane.ts', 'src/org/service.ts', 'src/org/team-bootstrap.ts',
     'src/projects/client-bootstrap.ts', 'src/projects/service.ts', 'src/projects/start-gate.ts',
     // W0.1: addon activation (MCP tools + HTTP route ask 'activate_addon'; the service and registry are the writers) and
     // squad-pack seeding (human dashboard route; seedSquadPack itself asks 'create_squad' and refuses any agent)
     'src/addons/routes.ts', 'src/addons/service.ts', 'src/mcp/addons.ts',
     'src/org/squad-packs.ts', 'src/loops/outreach-pack.ts', 'src/loops/routes.ts',
     // vip-lane.ts (join_squad, VIP_LANE): the write runs AS the verified human after canOnSquad(admin) over that human's own effective grants; raise-only, member tier, own seat only
+    // squad-choice.ts (squad_choose): an agent still in its owner's HOME squad moves itself once, into a work squad where its human OWNER holds lead+ (live grants); level capped at member; bound to the lobby squad in the write
     // squad_join_request approval: consent-bound (a passkey of a human who is admin on the TARGET squad decides it; the agent only asks)
   ])
   // A writer is found by NAME ANYWHERE in the code, not only as `name(`: an aliased import (`createSquad as makeSquad`), a
