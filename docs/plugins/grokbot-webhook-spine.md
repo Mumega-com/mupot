@@ -68,7 +68,13 @@ per attempt, and retries with `delaySeconds`. Five transient failures (5xx, time
 
 Receivers use `verifySignedDoorbell` in `src/agents/doorbell-signature.ts`.
 
-Headers: `webhook-id`, `webhook-timestamp` (unix seconds), `webhook-signature` (`v1,<base64 HMAC-SHA256>` over `"<id>.<timestamp>.<body>"`). The body is today's doorbell JSON plus `nonce`. Reject when `|now - timestamp| > 300` seconds. Reject a repeated `(webhook-id, nonce)` — pass a `DoorbellReplayStore` (see `memoryDoorbellReplayStore` for a single isolate). Compare signatures with the helper; it uses `timingSafeEqual`. A key encrypted for a different agent id does not decrypt (GCM AAD).
+Headers: `webhook-id`, `webhook-timestamp` (unix seconds), `webhook-signature` (`v1,<base64 HMAC-SHA256>` over `"<id>.<timestamp>.<body>"`). The body is today's doorbell JSON plus `nonce`. Reject when `|now - timestamp| > 300` seconds. Dedupe on `webhook-id` alone — pass a `DoorbellReplayStore` (see `memoryDoorbellReplayStore` for a single isolate). The nonce is a new value on every attempt, including a retry of the same event, so a store keyed on `(webhook-id, nonce)` would accept that retry as a different delivery. Compare signatures with the helper; it uses `timingSafeEqual`.
+
+The HMAC key is the base64-decoded bytes after the `whsec_` prefix (32 to 64 bytes). Do not HMAC the `whsec_` string itself. A key encrypted for a different agent id does not decrypt (GCM AAD).
+
+## Flag rollback
+
+`WEBHOOK_DOORBELL_SIGNED` defaults off and stays off until a canary passes. Turning it off after agents have registered as `signed` does not restore the legacy bearer POST for those rows. Their ciphertext is an HMAC key (`agent_doorbell_hmac`, AAD = the agent id), not a bearer. The signed worker returns disabled, and the legacy path cannot decrypt that ciphertext, so delivery fails closed: no POST, and the send response does not say the flag moved. Wakes stop until the flag is turned back on, or the doorbell is registered again while the flag is off (that stores a bearer and sets `delivery_version` back to `legacy`).
 
 Wire bodies (no `from_agent`, no message body):
 

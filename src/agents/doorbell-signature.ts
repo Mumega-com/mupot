@@ -8,9 +8,11 @@
 // Reject when:
 //   - |now - webhook-timestamp| > 300s (DOORBELL_MAX_SKEW_SEC)
 //   - the signature does not match (constant-time, src/lib/crypto timingSafeEqual)
-//   - the pair (webhook-id, nonce) was already accepted (the caller-supplied store)
+//   - this webhook-id was already accepted (the caller-supplied store).
+//     The nonce changes on every attempt, including a retry, so it is not part of the dedupe key.
 //
-// The HMAC key is a `whsec_` secret of at least 32 raw bytes, stored encrypted
+// The HMAC key is the base64-decoded bytes after the `whsec_` prefix (at least
+// 32 bytes), not the ASCII of the prefixed string. It is stored encrypted
 // (vault domain agent_doorbell_hmac, AAD = the agent id). This helper never
 // sees ciphertext. A wrong key fails the signature. A ciphertext decrypted with
 // another agent's id fails in decryptConnectorSecret, before a signature exists.
@@ -41,7 +43,10 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 export type SignedDoorbellFields = DistributiveOmit<SignedDoorbellPayload, 'nonce'>
 
 export interface DoorbellReplayStore {
-  /** True when this (webhook-id, nonce) was already accepted. */
+  /**
+   * True when this webhook-id was already accepted. `nonce` is the attempt's
+   * nonce (it changes on retry) and is not part of the dedupe key.
+   */
   seen(webhookId: string, nonce: string): boolean
   remember(webhookId: string, nonce: string): void
 }
@@ -54,19 +59,20 @@ export type DoorbellVerifyResult =
 export function memoryDoorbellReplayStore(): DoorbellReplayStore {
   const seen = new Set<string>()
   return {
-    seen(webhookId, nonce) {
-      return seen.has(`${webhookId}\n${nonce}`)
+    seen(webhookId) {
+      return seen.has(webhookId)
     },
-    remember(webhookId, nonce) {
-      seen.add(`${webhookId}\n${nonce}`)
+    remember(webhookId) {
+      seen.add(webhookId)
     },
   }
 }
 
 /**
  * Accept a caller-supplied signing secret only when it is `whsec_` + base64 of
- * 32..64 bytes. The canonical string is what gets encrypted and what the
- * receiver configures. Shorter keys are refused so last4 cannot reveal the key.
+ * 32..64 bytes. HMAC uses those decoded bytes, not the `whsec_` text.
+ * The canonical string is what gets encrypted and what the receiver configures.
+ * Shorter keys are refused so last4 cannot reveal the key.
  */
 export function normalizeDoorbellHmacSecret(raw: string): { ok: true; secret: string } | { ok: false; detail: string } {
   const trimmed = raw.trim()
