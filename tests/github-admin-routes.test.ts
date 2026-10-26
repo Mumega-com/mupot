@@ -11,6 +11,9 @@
 import { describe, it, expect, vi } from 'vitest'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
+import { createTask } from '../src/tasks/service'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 function envForRole(role: 'owner' | 'admin' | 'member', extra: Record<string, unknown> = {}): Env {
   const stmt = {
@@ -168,21 +171,19 @@ describe('POST /admin/github/execute-task', () => {
     expect(((await res.json()) as { stage: string }).stage).toBe('validate')
   })
   it('admin, repo the task does not own → 403 repo stage (no GitHub call)', async () => {
-    const env = envForRole('admin', { GITHUB_REPO: 'o/r' })
+    // Real migration-backed D1: the route runs the genuine task lookup against a genuine task row.
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-core', 'dept-a', 'squad-core', 'Core');
+    `)
+    const base = envForRole('admin', { GITHUB_REPO: 'o/r' })
+    const env = { ...base, DB: h.db } as Env
     // task exists, no project: only GITHUB_REPO is allowed
-    const base = (env.DB as unknown as { prepare: (sql: string) => { bind: (...a: unknown[]) => unknown } }).prepare
-    ;(env.DB as unknown as { prepare: unknown }).prepare = vi.fn((sql: string) => {
-      if (!/FROM tasks\b/.test(sql)) return base(sql)
-      const stmt = {
-        bind: (..._a: unknown[]) => stmt,
-        first: vi.fn(async () => ({ id: 'T1', status: 'open', assignee_agent_id: null, project_id: null, unresolved: 0 })),
-        all: vi.fn(async () => ({ results: [] })),
-        run: vi.fn(async () => ({ meta: { changes: 1 } })),
-      }
-      return stmt
-    })
+    const task = await createTask(env, { squad_id: 'squad-core', project_id: null, title: 'T', body: 'B', done_when: 'the thing is done', status: 'open' }, { skipMirror: true })
     const res = await dashboardApp.fetch(
-      req('/admin/github/execute-task', 'POST', { taskId: 'T1', repo: 'other/place', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
+      req('/admin/github/execute-task', 'POST', { taskId: task.id, repo: 'other/place', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
       env,
     )
     expect(res.status).toBe(403)

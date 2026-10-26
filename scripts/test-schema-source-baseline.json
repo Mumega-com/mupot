@@ -88,7 +88,6 @@
     "tests/flight-service.test.ts",
     "tests/gate-propose-worktype.test.ts",
     "tests/ghl-integration.test.ts",
-    "tests/github-admin-routes.test.ts",
     "tests/github-app.test.ts",
     "tests/github-capabilities.test.ts",
     "tests/github-execute.test.ts",

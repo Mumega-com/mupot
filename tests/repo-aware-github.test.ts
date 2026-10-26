@@ -76,7 +76,7 @@ function fixture(extra: Record<string, unknown> = {}) {
 
 let calls: Call[]
 /** reachable: full_names the installation can reach. Token response echoes the requested repo only if reachable. */
-function stubGitHub(reachable: string[], opts: { echoOwner?: string } = {}) {
+function stubGitHub(reachable: string[], opts: { echoOwner?: string; extraRepos?: string[] } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url: unknown, init?: RequestInit) => {
     const u = String(url)
     const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null
@@ -90,7 +90,7 @@ function stubGitHub(reachable: string[], opts: { echoOwner?: string } = {}) {
       return new Response(JSON.stringify({
         token: body ? `ghs_scoped_${names.join(',')}` : 'ghs_whole',
         expires_at: new Date(Date.now() + 3_600_000).toISOString(),
-        repositories: names.map((n) => ({ full_name: `${owner}/${n}` })),
+        repositories: [...names, ...(opts.extraRepos ?? [])].map((n) => ({ full_name: `${owner}/${n}` })),
       }), { status: 201 })
     }
     if (u.includes('/git/ref/heads/')) return new Response(JSON.stringify({ object: { sha: 'S' } }), { status: 200 })
@@ -195,6 +195,12 @@ describe('repo-scoped installation token', () => {
     stubGitHub(['acme/mupot'], { echoOwner: 'evil' })
     expect(await getRepoScopedInstallationToken(env, 'acme/mupot', { issues: 'write' })).toBeNull()
   })
+  it('discards a token that also covers a repo beyond the one requested (surplus-repo guard)', async () => {
+    const { env } = fixture()
+    stubGitHub(['acme/mupot'], { extraRepos: ['secret'] })
+    expect(await getRepoScopedInstallationToken(env, 'acme/mupot', { issues: 'write' })).toBeNull()
+    expect(calls.filter((c) => c.url.includes('/access_tokens'))).toHaveLength(1)
+  })
   it('refuses a malformed full name without calling GitHub', async () => {
     const { env } = fixture()
     stubGitHub([])
@@ -234,6 +240,22 @@ describe('execute-task repo validation', () => {
     const api = calls.filter((c) => !c.url.includes('/access_tokens'))
     expect(api.length).toBeGreaterThan(0)
     for (const c of api) expect(c.auth).toBe('Bearer ghs_scoped_mupot')
+  })
+  it('fails closed when the project-repo ownership lookup errors (DB failure), before any GitHub call', async () => {
+    const f = fixture(); stubGitHub(['acme/mupot'])
+    const id = await seedTask(f, 'p-mupot')
+    const real = f.harness.db
+    // Only the ownership read (db.batch) fails; the task lookup (prepare/first) still runs for real.
+    const failing = new Proxy(real, {
+      get(target, prop, recv) {
+        if (prop === 'batch') return async () => { throw new Error('d1 unavailable') }
+        const v = Reflect.get(target, prop, recv)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+    const res = await executeTaskAsPR({ ...f.env, DB: failing } as Env, { ...params('acme/mupot'), taskId: id })
+    expect(res).toEqual({ ok: false, error: 'repo_not_task_repo', stage: 'repo' })
+    expect(calls).toHaveLength(0)
   })
   it('an owned repo the installation cannot reach is refused', async () => {
     const f = fixture(); stubGitHub([])
