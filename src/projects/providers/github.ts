@@ -7,6 +7,7 @@ import type {
   TaskBoardPort,
   TaskBoardSyncResult,
 } from './port'
+import { registerBoardProvider } from './registry-core'
 import { touchProjectBindingSync } from './bindings'
 
 function parseExternalId(externalId: string): { owner: string; projectNumber: number } | null {
@@ -27,6 +28,7 @@ function agentFieldFromMeta(metaJson: string): string {
 export function createGitHubProjectsBoardPort(env: Env): TaskBoardPort {
   return {
     provider: 'github_projects',
+    capabilities: new Set(),
 
     async listItems(binding: ProjectProviderBinding): Promise<TaskBoardListResult | TaskBoardError> {
       const parsed = parseExternalId(binding.external_id)
@@ -90,3 +92,5 @@ export function createGitHubProjectsBoardPort(env: Env): TaskBoardPort {
 
 // Keep GraphQL symbols re-exported for adapter tests that want pure parsers.
 export { parseProjectItems, PROJECT_ITEMS_QUERY }
+
+registerBoardProvider('github_projects', createGitHubProjectsBoardPort)

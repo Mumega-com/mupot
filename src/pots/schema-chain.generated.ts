@@ -4534,9 +4534,29 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_github_prs_merged_project" },
     ],
   },
+  {
+    file: "0258_board_two_way.sql",
+    sha256: "b3435e23120103f50694c3b1a170ed89856050ffa6bee598b179cd5c55720e7d",
+    statements: [
+      "-- 0258 board two-way (Linear first): task<->board-item links, the write-back idempotency ledger,\n-- the inbound webhook delivery ledger, and append-only inbound observations.\n--\n-- Numbering: 0256 is taken by PR #2184 (signed webhook doorbell); 0257 is left free for S2 (repo-aware github).\n-- No secret is stored in any of these tables. The credential stays in the vault connector.\n\n-- Which board item a mupot task is bound to. Written by the import paths (sync + webhook), never from a verdict surface.\nCREATE TABLE IF NOT EXISTS board_item_links (\n  tenant         TEXT NOT NULL,\n  task_id        TEXT NOT NULL,\n  project_id     TEXT NOT NULL,\n  provider       TEXT NOT NULL,\n  item_native_id TEXT NOT NULL,   -- the provider's stable id (Linear issue uuid)\n  item_ref       TEXT NOT NULL,   -- human handle (Linear identifier, e.g. ENG-12)\n  created_at     TEXT NOT NULL,\n  PRIMARY KEY (tenant, task_id),\n  UNIQUE (tenant, provider, item_native_id)\n);",
+      "\n\n-- One row per (task, transition receipt, action): the outbound write is claimed here BEFORE it is sent.\n-- transition_key embeds the receipt id (submitted:<submission id>, approved:<verdict id>, rejected:<verdict id>), so a\n-- resubmission after a rejection is a new transition while a redelivered event for the same receipt is a no-op.\nCREATE TABLE IF NOT EXISTS board_writeback_ledger (\n  tenant         TEXT NOT NULL,\n  task_id        TEXT NOT NULL,\n  transition_key TEXT NOT NULL,\n  action         TEXT NOT NULL CHECK (action IN ('status', 'comment')),\n  provider       TEXT NOT NULL,\n  status         TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed')),\n  attempts       INTEGER NOT NULL DEFAULT 1,\n  detail         TEXT,\n  created_at     TEXT NOT NULL,\n  updated_at     TEXT NOT NULL,\n  PRIMARY KEY (tenant, task_id, transition_key, action)\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_board_writeback_ledger_failed\n  ON board_writeback_ledger (tenant, status, updated_at) WHERE status <> 'done';",
+      "\n\n-- Inbound webhook delivery ledger (replay guard), same shape as github_webhook_deliveries.\nCREATE TABLE IF NOT EXISTS board_webhook_deliveries (\n  tenant      TEXT NOT NULL,\n  provider    TEXT NOT NULL,\n  delivery_id TEXT NOT NULL,\n  received_at INTEGER NOT NULL,\n  PRIMARY KEY (tenant, provider, delivery_id)\n);",
+      "\n\n-- What the board said happened to a linked item. A note, never a verdict: nothing reads this to change a task status.\nCREATE TABLE IF NOT EXISTS board_inbound_observations (\n  id             TEXT NOT NULL PRIMARY KEY,\n  tenant         TEXT NOT NULL,\n  task_id        TEXT NOT NULL,\n  provider       TEXT NOT NULL,\n  item_native_id TEXT NOT NULL,\n  from_status    TEXT,\n  to_status      TEXT,\n  observed_at    TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_board_inbound_observations_task\n  ON board_inbound_observations (tenant, task_id, observed_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "board_item_links" },
+      { type: "table", name: "board_writeback_ledger" },
+      { type: "index", name: "idx_board_writeback_ledger_failed" },
+      { type: "table", name: "board_webhook_deliveries" },
+      { type: "table", name: "board_inbound_observations" },
+      { type: "index", name: "idx_board_inbound_observations_task" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "7cb19f514c7c14e9f476ff37a862616ee0fa7556a1df80b4477cb123248fabfa"
+export const SCHEMA_CHAIN_DIGEST: string = "0db49657e3155471166cdbad5bf092159dc77701dc39a56620fa2b260ec86ea9"

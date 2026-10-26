@@ -9,7 +9,7 @@ import {
   upsertProjectBinding,
   type BindingActorContext,
 } from '../src/projects/providers/bindings'
-import { isProjectBoardProvider, PROJECT_BOARD_PROVIDERS } from '../src/projects/providers/port'
+import { isProjectBoardProvider, listBoardProviders } from '../src/projects/providers/registry'
 import { isConnectorType } from '../src/connectors/crypto'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
@@ -25,7 +25,7 @@ function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string):
 
 describe('project provider bindings', () => {
   it('exposes github_projects, linear, and notion as board providers', () => {
-    expect(PROJECT_BOARD_PROVIDERS).toEqual(['github_projects', 'linear', 'notion'])
+    expect(listBoardProviders()).toEqual(['github_projects', 'linear', 'notion'])
     expect(isProjectBoardProvider('notion')).toBe(true)
     expect(isConnectorType('notion')).toBe(true)
     expect(isConnectorType('linear')).toBe(true)
