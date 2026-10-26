@@ -104,7 +104,7 @@ npx wrangler d1 execute mupot-restored-$DATE --remote --command "SELECT COUNT(*)
 npx wrangler d1 execute mupot-restored-$DATE --remote --command "SELECT COUNT(*) AS members FROM members"
 ```
 
-Then point the Worker at it: put the new `database_id` in the live `wrangler.toml` `[[d1_databases]]` block, re-run `npx wrangler deploy`, and
+Then point the Worker at it: put the new `database_id` in the live `wrangler.toml` `[[d1_databases]]` block, deploy with `npm run deploy` (runs `scripts/deploy.mjs`: refuses a dirty tree and stamps `RELEASE_SHA`; never run `wrangler deploy` directly), and
 check `/health`. A full `d1 execute --file` of a large dump can hit the per-statement size limit; if wrangler reports `Statement too long`,
 see https://developers.cloudflare.com/d1/best-practices/import-export-data/ (troubleshooting).
 

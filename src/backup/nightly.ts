@@ -191,8 +191,13 @@ async function storeDump(bucket: R2Bucket, signedUrl: string, key: string): Prom
   const res = await fetch(signedUrl) // signed URL: deliberately NO Authorization header
   if (!res.ok || !res.body) throw new Error(`dump_download_http_${res.status}`)
   let raw = 0
+  let sawContent = false // any byte that is not ASCII whitespace
   const counter = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) { raw += chunk.byteLength; controller.enqueue(chunk) },
+    transform(chunk, controller) {
+      raw += chunk.byteLength
+      if (!sawContent) sawContent = chunk.some((b) => b !== 0x20 && (b < 0x09 || b > 0x0d))
+      controller.enqueue(chunk)
+    },
   })
   const gz = res.body.pipeThrough(counter).pipeThrough(new CompressionStream('gzip'))
 
@@ -222,6 +227,9 @@ async function storeDump(bucket: R2Bucket, signedUrl: string, key: string): Prom
       buffered += value.byteLength
       if (buffered >= PART_BYTES) await flush()
     }
+    // An empty / whitespace-only export gzips to ~20 bytes and would pass the size check; refuse it before it is
+    // completed in R2 (the multipart upload is aborted below, so nothing is stored).
+    if (!sawContent) throw new Error('dump_empty_sql')
     await flush()
     if (size === 0) throw new Error('dump_empty')
     await upload.complete(parts)
@@ -271,7 +279,10 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
   if (env.NIGHTLY_BACKUP !== '1') return { status: 'disabled' }
   const date = params.runDate
 
-  const begin = await step.do('begin', async () => {
+  interface Begin { id: string; startedAt: string; skip: string | null }
+  let begin: Begin
+  try {
+    begin = await step.do('begin', async (): Promise<Begin> => {
     const missing = [
       !env.BACKUP_CF_API_TOKEN && 'BACKUP_CF_API_TOKEN',
       !env.BACKUP_ACCOUNT_ID && 'BACKUP_ACCOUNT_ID',
@@ -298,8 +309,20 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
       startedAt, new Date(Date.now() - STALE_RUNNING_HOURS * 3_600_000).toISOString(),
     )
     await record(env, `INSERT INTO backup_runs (id, run_date, status, started_at) VALUES (?, ?, 'running', ?)`, id, date, startedAt)
-    return { id, startedAt, skip: null as string | null }
+    return { id, startedAt, skip: null }
   })
+  } catch (err) {
+    // Initialization (D1 unavailable, init writes) must reach the same failure path: alert first, then best-effort row.
+    const message = redact(err instanceof Error ? err.message : String(err))
+    const alerted = await alert(env, 'failed', date, `begin failed: ${message}`)
+    const now = new Date().toISOString()
+    await record(
+      env,
+      `INSERT INTO backup_runs (id, run_date, status, error, alerted, started_at, finished_at) VALUES (?, ?, 'failed', ?, ?, ?, ?)`,
+      `bk-${date}-${crypto.randomUUID().slice(0, 8)}`, date, `begin failed: ${message}`, alerted ? 1 : 0, now, now,
+    ).catch((e) => console.error('[backup] failure row not written', redact(String(e))))
+    return { status: 'failed', error: `begin failed: ${message}` }
+  }
   if (begin.skip) return { status: 'skipped:no_credential', error: begin.skip }
 
   // as: begin.skip === null proved BACKUPS is set above (the missing-list check); narrowing does not cross the step.
@@ -339,7 +362,12 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
     // Only past this line, with a verified dump, may anything old be deleted.
     const deleted = await step.do('retention', async () => {
       const byDate = await listDatedKeys(bucket)
-      const { remove } = selectRetention([...byDate.keys()], date)
+      // Only dates with BOTH a dump and its manifest count as backups; orphans from failed runs neither occupy a
+      // retention slot nor get deleted here (they may be the only copy of something).
+      const complete = [...byDate.entries()]
+        .filter(([d, ks]) => ks.includes(backupKey(d)) && ks.includes(manifestKey(d)))
+        .map(([d]) => d)
+      const { remove } = selectRetention(complete, date)
       const keys = remove.flatMap((d) => byDate.get(d) ?? [])
       if (keys.length > 0) await bucket.delete(keys)
       return keys

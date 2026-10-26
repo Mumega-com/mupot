@@ -161,6 +161,35 @@ describe('nightly backup', () => {
     expect(r2.deletes).toEqual([])
   })
 
+  it('an HTTP 200 with an empty or whitespace-only SQL body is a failed run: nothing stored, one alert', async () => {
+    for (const body of ['', ' \n\t\r\n  ']) {
+      r2 = new FakeR2()
+      const calls = stubFetch([COMPLETE])
+      const fetchStub = globalThis.fetch
+      vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) =>
+        String(input) === SIGNED ? new Response(body, { status: 200 }) : fetchStub(input, init))
+      const out = await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+      expect(out.status).toBe('failed')
+      expect(out.error).toContain('dump_empty_sql')
+      expect(r2.objects.has(backupKey(TODAY))).toBe(false)
+      expect(r2.objects.has(manifestKey(TODAY))).toBe(false)
+      expect(calls.telegram).toHaveLength(1)
+      h.sqlite.prepare('DELETE FROM backup_runs').run()
+    }
+  })
+
+  it('a failure in the begin step (D1 unavailable) still alerts and returns failed', async () => {
+    const calls = stubFetch([])
+    const broken = { prepare: () => { throw new Error('D1 unavailable') } }
+    // as: only DB.prepare is exercised by the backup; a throwing stub stands in for an unavailable database.
+    const out = await runNightlyBackup(envOf({ DB: broken as unknown as Env['DB'] }), { runDate: TODAY }, step)
+    expect(out.status).toBe('failed')
+    expect(out.error).toContain('begin failed')
+    expect(calls.telegram).toHaveLength(1)
+    expect(calls.telegram[0]).toContain('D1 unavailable')
+    expect(calls.urls.filter((u) => u.includes('/export'))).toEqual([])
+  })
+
   it('alert text never carries the signed URL or the API token', async () => {
     const calls = stubFetch([COMPLETE])
     r2.corruptKeySuffix = '.sql.gz' // forces verify_failed after the signed URL was used
@@ -201,6 +230,22 @@ describe('nightly backup', () => {
       expect(r2.objects.has(manifestKey('2025-10-01'))).toBe(false) // manifests go with their dump
       expect(r2.objects.has('d1/mupot/README.txt')).toBe(true)
       expect(r2.objects.has('other/2020-01-02.sql.gz')).toBe(true)
+    })
+
+    it('orphaned dumps (no manifest) do not count toward retention and are not deleted', async () => {
+      const complete: string[] = []
+      for (let i = 1; i <= 28; i++) complete.push(iso(new Date(Date.UTC(2026, 9, 26 - i))))
+      for (const d of complete) { r2.objects.set(backupKey(d), new Uint8Array([1])); r2.objects.set(manifestKey(d), new Uint8Array([1])) }
+      // 5 orphan dumps from failed runs sit newer than 2026-09-15; if counted they would push it past the 30-date window
+      const orphans = ['2026-09-20', '2026-09-19', '2026-09-18', '2026-09-17', '2026-09-16']
+      for (const d of orphans) r2.objects.set(backupKey(d), new Uint8Array([1]))
+      // today + 28 + this = 30 complete dates: this one is the 30th and must survive because orphans take no slot
+      r2.objects.set(backupKey('2026-09-15'), new Uint8Array([1])); r2.objects.set(manifestKey('2026-09-15'), new Uint8Array([1]))
+      stubFetch([COMPLETE])
+      const out = await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+      expect(out.status).toBe('ok')
+      expect(r2.objects.has(backupKey('2026-09-15'))).toBe(true)
+      for (const d of orphans) expect(r2.objects.has(backupKey(d))).toBe(true)
     })
 
     it('a dump that fails verification deletes NOTHING and alerts', async () => {
