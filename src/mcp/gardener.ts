@@ -46,12 +46,13 @@ export const toolGardenerPreview: ToolSpec = {
       }
       windowDays = w
     }
-    let nowMs = Date.now()
+    const realNowMs = Date.now() // one clock read for both the default snapshot and the as_of range check
+    let nowMs = realNowMs
     if (args.as_of !== undefined) {
       const raw = str(args.as_of)
       const t = raw ? Date.parse(raw) : Number.NaN
       if (Number.isNaN(t)) return fail(400, 'invalid_args', 'as_of must be an ISO-8601 timestamp')
-      if (!asOfInRange(t, Date.now())) {
+      if (!asOfInRange(t, realNowMs)) {
         return fail(400, 'invalid_args', `as_of must not be in the future or more than ${MAX_AS_OF_AGE_DAYS} days old`)
       }
       nowMs = t

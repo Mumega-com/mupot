@@ -826,6 +826,21 @@ export function isStandingTitle(title: string | null | undefined): boolean {
   return (title ?? '').replace(/^[ [(]+/, '').toUpperCase().startsWith('STANDING')
 }
 
+/**
+ * The ONE definition of "flight `flightAlias` is in the air for task `taskIdExpr`": a non-terminal
+ * flight linked to the task by lane, by assignment, or by `meta.task_ids`. Used by the archive
+ * blocker, the archive INSERT guard, and the read-only gardener preview so they cannot drift.
+ * `flightAlias` must be `f` (IN_AIR_FLIGHT_STATUSES_SQL names it).
+ */
+export function inAirFlightForTaskSql(taskIdExpr: string): string {
+  return `${IN_AIR_FLIGHT_STATUSES_SQL}
+        AND (
+          EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = ${taskIdExpr})
+          OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = ${taskIdExpr})
+          OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = ${taskIdExpr}))
+        )`
+}
+
 async function taskArchivabilityBlocker(
   env: Env,
   taskId: string,
@@ -851,12 +866,7 @@ async function taskArchivabilityBlocker(
   }
   const inAirRow = await env.DB.prepare(
     `SELECT 1 FROM flights f
-      WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
-        AND (
-          EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = ?1)
-          OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = ?1)
-          OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = ?1))
-        )
+      WHERE ${inAirFlightForTaskSql('?1')}
       LIMIT 1`,
   ).bind(taskId).first()
   if (inAirRow) return { ok: false, error: 'in_air_flight' }
@@ -908,12 +918,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
            )
            AND NOT EXISTS (
              SELECT 1 FROM flights f
-              WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
-                AND (
-                  EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = t.id)
-                  OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = t.id)
-                  OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = t.id))
-                )
+              WHERE ${inAirFlightForTaskSql('t.id')}
            )
            AND NOT ${archiveBlockingDispatchExistsSql({ tenantParam: '?7', taskIdExpr: 't.id' })}`,
     ).bind(now, input.reason, input.actorMemberId, input.id, Date.now(), expected, env.TENANT_SLUG, input.expectedUpdatedAt ?? null, input.updatedBefore ?? null),

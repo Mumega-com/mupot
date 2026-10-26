@@ -335,4 +335,58 @@ describe('gardener_preview (read-only)', () => {
       expect(Math.max(...counts)).toBeLessThanOrEqual(100)
     })
   })
+
+  // ── round 2 ─────────────────────────────────────────────────────────────────────────────────
+  describe('round 2', () => {
+    it('[Codex P2] a truncated read withholds eligibility from an agent whose own facts are not in the page', async () => {
+      seedAgent('ag-older'); seedSubmission('sub-older', 'ag-older', 20) // recent activity, but hidden by truncation
+      sqlRun(harness, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 501)
+        INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, created_at)
+        SELECT 'bulk-' || i, '${TENANT}', 'x', 'sq-1', 'ag-active', 'a.md', '${'a'.repeat(64)}', '${'b'.repeat(64)}', '${ago(1)}' FROM n`)
+      const p = await preview()
+      expect(agentCand(p, 'ag-older')).toMatchObject({ eligible: false })
+      expect(agent(p, 'ag-older')).toMatchObject({ activity_known: false })
+    })
+
+    it('[Codex P2] a settled dispatch whose inbox envelope is still unread blocks archival (canonical predicate)', async () => {
+      seedTask('t-env', null, 'open', 45)
+      sqlRun(harness, `INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at, settled_at) VALUES ('dr-env', ?, 't-env', 'sq-1', 'ag-active', 'member', 'mem-hadi', ?, ?, ?)`, TENANT, ago(44), ago(43), ago(43))
+      sqlRun(harness, `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, body, request_id, created_at) VALUES ('msg-env', ?, 'ag-active', 'mupot-dispatch', 'mem-hadi', 'b', 'dispatch-inbox:dr-env', ?)`, TENANT, ago(44))
+      const p = await preview()
+      expect(taskCand(p, 't-env').exceptions.map((e: any) => e.reason)).toEqual(['live_dispatch'])
+      sqlRun(harness, `UPDATE agent_messages SET read_at = ? WHERE id = 'msg-env'`, ago(43))
+      expect(taskCand(await preview(), 't-env')).toMatchObject({ eligible: true })
+    })
+
+    it('[Codex P2] an assigned waiting routine run exempts an otherwise dormant agent from archival', async () => {
+      seedAgent('ag-run')
+      sqlRun(harness, `INSERT INTO routines (id, tenant, project_id, name, objective, trigger_kind, responsible_squad_id, created_by) VALUES ('rt-in', ?, 'proj-1', 'n', 'o', 'manual', 'sq-1', 'x')`, TENANT)
+      sqlRun(harness, `INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key, trigger_kind, status, waiting_reason, assigned_agent_id) VALUES ('rr-in', ?, 'proj-1', 'rt-in', 1, '{}', 'k', 'manual', 'waiting', 'agent', 'ag-run')`, TENANT)
+      const p = await preview()
+      expect(agent(p, 'ag-run').recommendation).toMatchObject({ action: 'ask', rule: 'blocked_on_wait' })
+      expect(agentCand(p, 'ag-run')).toMatchObject({ eligible: false, exceptions: [{ reason: 'waiting_routine_run', evidence: [{ table: 'routine_runs', id: 'rr-in' }] }] })
+    })
+
+    it('[Codex P2] cost never includes the as_of UTC day (a mutable whole-day bucket); full prior days are summed', async () => {
+      const today = AS_OF.slice(0, 10)
+      sqlRun(harness, `INSERT INTO execution_meter (id, window_key, count, tokens, window_start, cost_micro_usd) VALUES ('m-today', ?, 1, 123, ?, 999)`, `${TENANT}:ag-active:${today}`, AS_OF)
+      const p = await preview()
+      expect(agent(p, 'ag-active').cost).toMatchObject({ micro_usd: 1500, tokens: 900 })
+      expect(p.gaps).toContain('cost_excludes_as_of_utc_day')
+    })
+
+    it('[Codex P2] a stale task linked to a live flight only via meta.task_ids is exempt (canonical in-air linkage)', async () => {
+      seedTask('t-meta', null, 'open', 45)
+      sqlRun(harness, `INSERT INTO flights (id, tenant, project_id, agent, goal, status, meta) VALUES ('fl-meta', ?, 'proj-1', 'ag-flying', 'g', 'running', '{"task_ids":["t-meta"]}')`, TENANT)
+      const p = await preview()
+      expect(taskCand(p, 't-meta').exceptions).toEqual([{ reason: 'live_flight', evidence: [{ table: 'flights', id: 'fl-meta' }] }])
+    })
+
+    it('[Opus P1-2] the meter is read with ONE statement however many agents there are', async () => {
+      for (let i = 0; i < 150; i += 1) seedAgent(`ag-m${String(i).padStart(3, '0')}`)
+      seen.length = 0
+      await preview()
+      expect(seen.filter((q) => /FROM execution_meter/.test(q)).length).toBe(1)
+    })
+  })
 })

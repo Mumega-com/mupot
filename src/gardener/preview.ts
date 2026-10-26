@@ -23,6 +23,7 @@ import type { Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { archiveBlockingDispatchExistsSql } from '../tasks/runtime-receipts'
+import { inAirFlightForTaskSql } from '../hygiene/archive'
 
 export const GARDENER_SCHEMA = 'mupot.gardener_preview/v1'
 export const ARCHIVE_AFTER_DAYS = 30
@@ -333,11 +334,16 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
   // ── measured cost: execution_meter keys are '<tenant>:<agent_id>:<YYYY-MM-DD>'. Only agents the
   //    caller is authorized to meter-read (same authorization as execution_meter_status). ────────
   const costIds = agentIds.filter((id) => costScope.all || (costScope.agentId !== null && id === costScope.agentId))
+  // Meter rows are whole-UTC-day counters that keep growing after the snapshot, so the as_of day
+  // itself is excluded: only the windowDays full days BEFORE it are summed (gap named below).
   const days: string[] = []
-  for (let d = 0; d < windowDays; d += 1) days.push(iso(nowMs - d * DAY_MS).slice(0, 10))
+  for (let d = 1; d <= windowDays; d += 1) days.push(iso(nowMs - d * DAY_MS).slice(0, 10))
+  gaps.add('cost_excludes_as_of_utc_day')
   const meterRows: { window_key: string; cost_micro_usd: number; tokens: number }[] = []
-  // 3 binds per statement (tenant, agent-id JSON, day JSON); the ids ride inside one JSON bind.
-  for (const chunk of chunkForD1InList(costIds, undefined, 3)) {
+  // ONE statement, 3 binds (tenant, agent-id JSON, day JSON): the ids ride inside a JSON bind,
+  // so there is no per-id bind count to chunk (agents are capped at MAX_AGENTS).
+  if (costIds.length > 0) {
+    const chunk = costIds
     const res = await env.DB.prepare(
       `SELECT window_key, cost_micro_usd, tokens FROM execution_meter
         WHERE window_key IN (SELECT ?1 || ':' || a.value || ':' || d.value
@@ -408,10 +414,10 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
   const staleIds = staleTasks.map((t) => t.id)
   const taskFlights = (await selectChunked<{ task_id: string; flight_id: string }>(
     env, staleIds,
-    (ph) => `SELECT DISTINCT a.task_id, f.id AS flight_id
-               FROM flight_task_assignments a JOIN flights f ON f.id = a.flight_id
-              WHERE f.tenant = ?1 AND a.task_id IN (${ph}) AND f.status IN ${LIVE_FLIGHT_SQL} ORDER BY a.task_id, f.id`,
-    [tenant],
+    // Canonical in-air linkage (lane OR assignment OR meta.task_ids), shared with archiveRow.
+    (ph) => `SELECT DISTINCT t.id AS task_id, f.id AS flight_id
+               FROM tasks t JOIN flights f ON ${inAirFlightForTaskSql('t.id')}
+              WHERE t.id IN (${ph}) ORDER BY t.id, f.id`,
   )).rows
   const taskHolds = (await selectChunked<{ task_id: string }>(
     env, staleIds,
@@ -565,6 +571,8 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     if (appr.length || inReview.length) {
       ex.push({ reason: 'unresolved_approval', evidence: [...appr.map((r) => ({ table: 'decision_requests', id: r.id })), ...inReview.map((t) => ({ table: 'tasks', id: t.id }))] })
     }
+    const waitingRuns2 = runsByAgent.get(a.id) ?? []
+    if (waitingRuns2.length) ex.push({ reason: 'waiting_routine_run', evidence: waitingRuns2.map((r) => ({ table: 'routine_runs', id: r.id })) })
     if (a.kind === 'home') ex.push({ reason: 'standing_record', evidence: [{ table: 'agents', id: a.id }] })
     const sole = soleCaps.get(a.id) ?? []
     if (sole.length) ex.push({ reason: 'sole_gate_holder', evidence: sole.sort().map((c) => ({ table: 'gate_grants', id: c })) })
