@@ -48,6 +48,11 @@ export function webhookDoorbellEnabled(env: Env): boolean {
  * Signed doorbell flag (`"1"` or `"true"`; unset = off). Off: registrations stay
  * legacy bearer and the send path does not read `delivery_version`. On: new
  * registrations are signed and delivered on the events queue, one ring.
+ *
+ * A rollback (flag was on, now off) fails closed for rows that registered as
+ * `signed`: this path does not POST them, and the legacy bearer path cannot
+ * decrypt an HMAC ciphertext. Re-register, or turn the flag back on. See
+ * docs/plugins/grokbot-webhook-spine.md (Flag rollback).
  */
 export function webhookDoorbellSignedEnabled(env: Env): boolean {
   const v = env.WEBHOOK_DOORBELL_SIGNED?.trim().toLowerCase()

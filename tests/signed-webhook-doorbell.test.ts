@@ -1,24 +1,31 @@
 // Signed, body-free webhook doorbell. Failing cases are the gate's list:
 // signature, replay, AAD, 5xx dead-letter + backoff, 3xx not followed, allowlist,
 // payload shape, receipt authz, one ring per version, flag off.
+// Issue #2186 follow-ups are in this file too.
+
+import { readFileSync } from 'node:fs'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sendAgentMessage } from '../src/agents/messages'
+import { ASSIGNMENT_WAKE_ACTOR, ASSIGNMENT_WAKE_SENDER } from '../src/agents/assignment-wake'
 import {
   memoryDoorbellReplayStore,
+  normalizeDoorbellHmacSecret,
   signDoorbellAttempt,
   SIGNED_DOORBELL_PAYLOAD_KEYS,
   signedDoorbellBody,
   verifySignedDoorbell,
 } from '../src/agents/doorbell-signature'
 import {
+  RECEIPT_RETENTION_MS,
   scheduleTaskAssignedDoorbell,
   sendDoorbellTestPing,
   setAgentWebhookDoorbell,
   TEST_PING_LIMIT,
+  WAKE_BURST_LIMIT,
 } from '../src/agents/webhook-doorbell'
-import { deliverSignedDoorbell, enqueueSignedInboxDoorbell } from '../src/bus/doorbell-delivery'
+import { deliverSignedDoorbell, DOORBELL_CLAIM_LEASE_MS, enqueueSignedInboxDoorbell } from '../src/bus/doorbell-delivery'
 import { deliverDispatchToInbox } from '../src/bus/fleet-bridge'
 import { backoffDelaySec } from '../src/bus/events-delivery'
 import { handleQueue } from '../src/bus/consumer'
@@ -139,6 +146,50 @@ describe('signed doorbell verifier', () => {
     const ct = await encryptConnectorSecret(MASTER, AGENT_A, 'agent_doorbell_hmac', SIGNING_SECRET, AGENT_A)
     await expect(decryptConnectorSecret(MASTER, AGENT_A, 'agent_doorbell_hmac', ct, AGENT_B)).rejects.toThrow()
     await expect(decryptConnectorSecret(MASTER, AGENT_A, 'agent_doorbell_hmac', ct, AGENT_A)).resolves.toBe(SIGNING_SECRET)
+  })
+
+  it('dedupes a retry on webhook-id when the nonce changes', async () => {
+    const fields = { type: 'mupot.inbox.wake' as const, agent_id: AGENT_A, seq: 4, message_id: 'm-1', kind: 'message' }
+    const nowMs = Date.parse('2026-10-25T12:00:00.000Z')
+    const replay = memoryDoorbellReplayStore()
+    const firstBody = signedDoorbellBody(fields, 'nonce-attempt-1')
+    const first = await signDoorbellAttempt(SIGNING_SECRET, 'msg_same', firstBody, nowMs)
+    expect(await verifySignedDoorbell({
+      secret: SIGNING_SECRET,
+      webhookId: 'msg_same',
+      timestampSec: first.timestampSec,
+      signature: first.headers['webhook-signature'],
+      body: firstBody,
+      nowSec: first.timestampSec,
+      replay,
+    })).toMatchObject({ ok: true })
+    const retryBody = signedDoorbellBody(fields, 'nonce-attempt-2')
+    const retry = await signDoorbellAttempt(SIGNING_SECRET, 'msg_same', retryBody, nowMs + 1000)
+    expect(await verifySignedDoorbell({
+      secret: SIGNING_SECRET,
+      webhookId: 'msg_same',
+      timestampSec: retry.timestampSec,
+      signature: retry.headers['webhook-signature'],
+      body: retryBody,
+      nowSec: retry.timestampSec,
+      replay,
+    })).toEqual({ ok: false, reason: 'replayed' })
+  })
+
+  it('refuses an HMAC key shorter than 32 decoded bytes', () => {
+    const short = whsec(Uint8Array.from({ length: 31 }, () => 7))
+    const exact = whsec(Uint8Array.from({ length: 32 }, () => 7))
+    expect(normalizeDoorbellHmacSecret(short).ok).toBe(false)
+    expect(normalizeDoorbellHmacSecret(exact)).toEqual({ ok: true, secret: exact })
+    expect(normalizeDoorbellHmacSecret('whsec_' + Buffer.alloc(24, 3).toString('base64')).ok).toBe(false)
+  })
+
+  it('documents webhook-id dedupe, the decoded whsec_ key, and a silent flag rollback', () => {
+    const doc = readFileSync('docs/plugins/grokbot-webhook-spine.md', 'utf8')
+    expect(doc).toContain('Dedupe on `webhook-id` alone')
+    expect(doc).toContain('base64-decoded bytes after the `whsec_` prefix')
+    expect(doc).toContain('## Flag rollback')
+    expect(doc).toMatch(/fails closed/i)
   })
 })
 
@@ -330,8 +381,10 @@ describe('signed webhook doorbell delivery', () => {
     }) as typeof fetch
     fetched.length = 0
     const before = sent.length
+    let now = Date.parse(T0)
     for (let i = 0; i < 5; i++) {
-      await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) + i * 1000 })
+      await deliverSignedDoorbell(env, job.payload, { nowMs: now })
+      now += backoffDelaySec(i + 1) * 1000
     }
     expect(fetched).toHaveLength(5)
     const receipts = harness.sqlite.prepare(
@@ -543,7 +596,7 @@ describe('signed webhook doorbell delivery', () => {
     expect(hidden.outcome).toBe('retry')
     expect(fetched).toHaveLength(0)
     harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = ? WHERE id = ?`).run(AGENT_A, taskId)
-    const shown = await deliverSignedDoorbell(env, reassign!.payload, { nowMs: Date.parse(T0) + 1000 })
+    const shown = await deliverSignedDoorbell(env, reassign!.payload, { nowMs: Date.parse(T0) + backoffDelaySec(1) * 1000 })
     expect(shown.outcome).toBe('delivered')
     expect(fetched).toHaveLength(1)
 
@@ -582,5 +635,378 @@ describe('signed webhook doorbell delivery', () => {
     }
     expect(fetched).toHaveLength(1)
     expect(sent.slice(before).map((s) => s.delaySeconds)).toEqual([backoffDelaySec(1)])
+  })
+
+  it('an assignment letter does not ring twice when another assignment for the same agent is in flight', async () => {
+    await register()
+    harness.sqlite.prepare(
+      `INSERT INTO task_assignment_wakes
+         (id, tenant, task_id, agent_id, epoch, outcome, message_seq, created_at, updated_at)
+       VALUES ('wake-other', ?, 'task-other', ?, 'epoch-other', 'pending', NULL, ?, ?)`,
+    ).run(TENANT, AGENT_A, T0, T0)
+    const sentMsg = await sendAgentMessage(env, {
+      fromAgent: ASSIGNMENT_WAKE_SENDER,
+      fromMember: ASSIGNMENT_WAKE_ACTOR,
+      toAgent: AGENT_A,
+      body: 'assignment letter body stays off the wire',
+      kind: 'message',
+      requestId: 'assign:this',
+    }, { system: true, reason: 'test: assignment letter' }, {
+      now: () => T0,
+      idGen: () => 'msg-assign-this',
+      doorbellCorrelation: 'task-this#epoch-this',
+    })
+    expect(sentMsg.ok).toBe(true)
+    if (!sentMsg.ok) throw new Error('assignment letter failed')
+    const created = sent.find((s) => s.body.type === 'message.created')
+    expect(created).toBeTruthy()
+    const owned = doorbellJobs()
+    expect(owned).toHaveLength(1)
+    expect(owned[0].payload).toMatchObject({ correlation: 'task-this#epoch-this' })
+
+    // The letter's seq is not on a wake row yet. The in-flight row must not be claimed.
+    await handleQueue({
+      messages: [{ id: 'q-assign', body: created!.body, attempts: 1, ack: vi.fn(), retry: vi.fn() }],
+    } as never, env)
+    expect(doorbellJobs()).toHaveLength(1)
+    expect(doorbellJobs().some((job) => (job.payload as { correlation?: string }).correlation === 'task-other#epoch-other')).toBe(false)
+
+    harness.sqlite.prepare(
+      `INSERT INTO task_assignment_wakes
+         (id, tenant, task_id, agent_id, epoch, outcome, message_seq, created_at, updated_at)
+       VALUES ('wake-this', ?, 'task-this', ?, 'epoch-this', 'sent', ?, ?, ?)`,
+    ).run(TENANT, AGENT_A, sentMsg.seq, T0, T0)
+    expect(await enqueueSignedInboxDoorbell(env, created!.body)).toBe(0)
+    expect(doorbellJobs()).toHaveLength(1)
+
+    fetched.length = 0
+    for (const job of doorbellJobs()) {
+      expect((await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })).outcome).toBe('delivered')
+    }
+    expect(fetched).toHaveLength(1)
+    const payload = JSON.parse(String(fetched[0].init.body)) as Record<string, unknown>
+    expect(payload).not.toHaveProperty('from_agent')
+    expect(payload).not.toHaveProperty('body')
+    expect(JSON.stringify(payload)).not.toContain('assignment letter body')
+    expect(payload).toMatchObject({ type: 'mupot.inbox.wake', message_id: sentMsg.id })
+    const ids = fetched.map((call) => (call.init.headers as Record<string, string>)['webhook-id'])
+    expect(new Set(ids).size).toBe(1)
+  })
+
+  it('12 parallel test pings send at most the cap', async () => {
+    await register()
+    fetched.length = 0
+    const results = await Promise.all(Array.from({ length: 12 }, () => sendDoorbellTestPing(env, AGENT_A)))
+    expect(fetched.length).toBeLessThanOrEqual(TEST_PING_LIMIT)
+    expect(results.filter((r) => r.outcome === 'rate_limited').length).toBeGreaterThanOrEqual(12 - TEST_PING_LIMIT)
+    expect(fetched.every((call) => call.init.redirect === 'manual')).toBe(true)
+  })
+
+  it('reclaims a stale delivery claim and refuses a claim still inside the lease', async () => {
+    await register()
+    const sentMsg = await sendOne('rid-stale-claim')
+    expect(sentMsg.ok).toBe(true)
+    if (!sentMsg.ok) throw new Error('send failed')
+    const job = doorbellJobs()[0]
+    const staleAt = new Date(Date.parse(T0) - DOORBELL_CLAIM_LEASE_MS - 1000).toISOString()
+    harness.sqlite.prepare(
+      `INSERT INTO agent_webhook_doorbell_receipts
+         (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
+       VALUES ('claim-stale', ?, ?, 'mupot.inbox.wake', ?, 'claimed', NULL, NULL, ?, 1, NULL, NULL)`,
+    ).run(TENANT, AGENT_A, sentMsg.id, staleAt)
+    fetched.length = 0
+    const reclaimed = await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+    expect(reclaimed.outcome).toBe('delivered')
+    expect(fetched).toHaveLength(1)
+    const row = harness.sqlite.prepare(
+      `SELECT id, outcome, attempt FROM agent_webhook_doorbell_receipts WHERE id = 'claim-stale'`,
+    ).get() as { id: string; outcome: string; attempt: number }
+    expect(row).toMatchObject({ outcome: 'posted', attempt: 1 })
+
+    const freshMsg = await sendOne('rid-fresh-claim')
+    expect(freshMsg.ok).toBe(true)
+    if (!freshMsg.ok) throw new Error('send failed')
+    const freshJob = doorbellJobs().at(-1)
+    const freshAt = new Date(Date.parse(T0)).toISOString()
+    harness.sqlite.prepare(
+      `INSERT INTO agent_webhook_doorbell_receipts
+         (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
+       VALUES ('claim-fresh', ?, ?, 'mupot.inbox.wake', ?, 'claimed', NULL, NULL, ?, 1, NULL, NULL)`,
+    ).run(TENANT, AGENT_A, freshMsg.id, freshAt)
+    fetched.length = 0
+    const blocked = await deliverSignedDoorbell(env, freshJob!.payload, { nowMs: Date.parse(T0) + 1000 })
+    expect(blocked).toMatchObject({ outcome: 'skipped', reason: 'duplicate' })
+    expect(fetched).toHaveLength(0)
+  })
+
+  it('a queue redelivery after a recorded retry waits out the backoff', async () => {
+    await register()
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      fetched.push({ url: String(url), init: init ?? {} })
+      return new Response('down', { status: 500 })
+    }) as typeof fetch
+    const sentMsg = await sendOne('rid-backoff')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs()[0]
+    fetched.length = 0
+    const t0 = Date.parse(T0)
+    const first = await deliverSignedDoorbell(env, job.payload, { nowMs: t0 })
+    expect(first.outcome).toBe('retry')
+    expect(fetched).toHaveLength(1)
+    const early = await deliverSignedDoorbell(env, job.payload, { nowMs: t0 + 1000 })
+    expect(early).toMatchObject({ outcome: 'skipped', reason: 'backoff' })
+    expect(fetched).toHaveLength(1)
+    const due = t0 + backoffDelaySec(1) * 1000
+    const second = await deliverSignedDoorbell(env, job.payload, { nowMs: due })
+    expect(second.outcome).toBe('retry')
+    expect(fetched).toHaveLength(2)
+    const attempts = harness.sqlite.prepare(
+      `SELECT attempt, outcome FROM agent_webhook_doorbell_receipts WHERE ref_id = ? AND attempt IS NOT NULL ORDER BY attempt`,
+    ).all(sentMsg.ok ? sentMsg.id : '') as Array<{ attempt: number; outcome: string }>
+    expect(attempts.map((r) => r.attempt)).toEqual([1, 2])
+  })
+
+  it('still rings once when the queue send fails and the other producer already lost the claim', async () => {
+    await register()
+    env.BUS = {
+      send: async (body: BusEvent, opts?: { delaySeconds?: number }) => {
+        if (body.type === 'mcp.doorbell.delivery') throw new Error('queue down')
+        sent.push({ body, delaySeconds: opts?.delaySeconds })
+      },
+    } as Env['BUS']
+    const sentMsg = await sendOne('rid-lost-ring', 'lost-ring body stays in the inbox')
+    expect(sentMsg.ok).toBe(true)
+    if (!sentMsg.ok) throw new Error('send failed')
+    expect(fetched).toHaveLength(1)
+    const payload = JSON.parse(String(fetched[0].init.body)) as Record<string, unknown>
+    expect(payload).not.toHaveProperty('from_agent')
+    expect(payload).not.toHaveProperty('body')
+    expect(JSON.stringify(payload)).not.toContain('lost-ring body')
+    expect(fetched[0].init.redirect).toBe('manual')
+    const created = sent.find((s) => s.body.type === 'message.created')
+    expect(created).toBeTruthy()
+    await expect(enqueueSignedInboxDoorbell(env, created!.body)).resolves.toBe(0)
+    expect(fetched).toHaveLength(1)
+    const posted = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts WHERE outcome = 'posted'`,
+    ).get() as { n: number }
+    expect(posted.n).toBe(1)
+  })
+
+  it('does not let unconfirmed assignment retries fill the burst cap', async () => {
+    await register()
+    const recent = new Date(Date.parse(T0) - 1000).toISOString()
+    for (let i = 0; i < WAKE_BURST_LIMIT; i++) {
+      harness.sqlite.prepare(
+        `INSERT INTO agent_webhook_doorbell_receipts
+           (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
+         VALUES (?, ?, ?, 'mupot.task.assigned', ?, 'retry', NULL, NULL, ?, 1, 'task_not_assigned', NULL)`,
+      ).run(`unconf-${i}`, TENANT, AGENT_A, `unconf-ref-${i}`, recent)
+    }
+    const sentMsg = await sendOne('rid-unconf-burst')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs().at(-1)
+    fetched.length = 0
+    const result = await deliverSignedDoorbell(env, job!.payload, { nowMs: Date.parse(T0) })
+    expect(result.outcome).toBe('delivered')
+    expect(fetched).toHaveLength(1)
+    const skipped = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts WHERE ref_id = ? AND outcome = 'skipped'`,
+    ).get(sentMsg.ok ? sentMsg.id : '') as { n: number }
+    expect(skipped.n).toBe(0)
+  })
+
+  it('prunes expired receipts and enqueue locks when a signed doorbell rings', async () => {
+    await register()
+    const old = new Date(Date.parse(T0) - RECEIPT_RETENTION_MS - 60_000).toISOString()
+    const fresh = new Date(Date.parse(T0) - 1000).toISOString()
+    const insert = harness.sqlite.prepare(
+      `INSERT INTO agent_webhook_doorbell_receipts
+         (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
+       VALUES (?, ?, ?, 'mupot.inbox.wake', ?, ?, NULL, ?, ?, ?, NULL, NULL)`,
+    )
+    insert.run('old-receipt', TENANT, AGENT_A, 'old-receipt', 'posted', null, old, 1)
+    insert.run('old-lock', TENANT, AGENT_A, 'old-lock', 'claimed', 'enqueued', old, null)
+    insert.run('fresh-receipt', TENANT, AGENT_A, 'fresh-receipt', 'posted', null, fresh, 1)
+    const sentMsg = await sendOne('rid-prune')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs().at(-1)
+    await deliverSignedDoorbell(env, job!.payload, { nowMs: Date.parse(T0) })
+    const refs = harness.sqlite.prepare(
+      `SELECT ref_id FROM agent_webhook_doorbell_receipts`,
+    ).all() as Array<{ ref_id: string }>
+    const ids = refs.map((r) => r.ref_id)
+    expect(ids).not.toContain('old-receipt')
+    expect(ids).not.toContain('old-lock')
+    expect(ids).toContain('fresh-receipt')
+  })
+
+  it('a flag rollback does not POST the signed key', async () => {
+    await register()
+    const off = { ...env, WEBHOOK_DOORBELL_SIGNED: undefined } as Env
+    const pending: Promise<unknown>[] = []
+    fetched.length = 0
+    const res = await sendAgentMessage(off, {
+      fromAgent: AGENT_B,
+      fromMember: MEMBER_ID,
+      toAgent: AGENT_A,
+      body: 'rollback body stays in the inbox',
+      kind: 'message',
+      requestId: 'rid-rollback',
+    }, AUTHZ, {
+      now: () => T0,
+      fetch: globalThis.fetch,
+      waitUntil: (p) => { pending.push(p) },
+    })
+    expect(res.ok).toBe(true)
+    await Promise.all(pending)
+    expect(fetched).toHaveLength(0)
+    const packed = JSON.stringify(fetched)
+    expect(packed).not.toContain(SIGNING_SECRET)
+    const posted = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts WHERE outcome = 'posted'`,
+    ).get() as { n: number }
+    expect(posted.n).toBe(0)
+  })
+
+  it('the consumer keeps a dispatch letter on the dispatch correlation (one ring)', async () => {
+    await register()
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at)
+      VALUES ('t-n5', '${SQUAD_ID}', 'Dispatch correlation', 'body stays off the wire', 'done', 'open', '${AGENT_A}', '${T0}', '${T0}');
+    `)
+    const pending: Promise<unknown>[] = []
+    const out = await invokeTool(humanAdmin(), env, 'task_dispatch', { task_id: 't-n5' }, {
+      origin: 'https://pot.example',
+      transport: 'mcp',
+      waitUntil: (p: Promise<unknown>) => { pending.push(p) },
+    })
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    await Promise.all(pending)
+    const receipt = harness.sqlite.prepare(
+      `SELECT id FROM task_dispatch_receipts WHERE task_id = 't-n5'`,
+    ).get() as { id: string }
+    const bridge = await deliverDispatchToInbox(env, {
+      agentId: AGENT_A,
+      squadId: SQUAD_ID,
+      taskId: 't-n5',
+      receiptId: receipt.id,
+      dispatchedByMemberId: MEMBER_ID,
+      projectId: null,
+    })
+    expect(bridge.delivered).toBe(true)
+    expect(doorbellJobs()).toHaveLength(1)
+    expect(doorbellJobs()[0].payload).toMatchObject({ correlation: `dispatch:${receipt.id}` })
+    const created = sent.find((s) => s.body.type === 'message.created')
+    expect(created).toBeTruthy()
+    await handleQueue({
+      messages: [{ id: 'q-n5', body: created!.body, attempts: 1, ack: vi.fn(), retry: vi.fn() }],
+    } as never, env)
+    expect(doorbellJobs()).toHaveLength(1)
+    fetched.length = 0
+    expect((await deliverSignedDoorbell(env, doorbellJobs()[0].payload, { nowMs: Date.parse(T0) })).outcome).toBe('delivered')
+    expect(fetched).toHaveLength(1)
+    expect(JSON.parse(String(fetched[0].init.body))).not.toHaveProperty('from_agent')
+  })
+
+  it('a fresh in-flight claim blocks a second POST', async () => {
+    await register()
+    const sentMsg = await sendOne('rid-inflight')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs()[0]
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      fetched.push({ url: String(url), init: init ?? {} })
+      await gate
+      return new Response(null, { status: 204 })
+    }) as typeof fetch
+    fetched.length = 0
+    const first = deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+    await vi.waitFor(() => { expect(fetched).toHaveLength(1) })
+    const second = await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) + 500 })
+    expect(second).toMatchObject({ outcome: 'skipped', reason: 'duplicate' })
+    expect(fetched).toHaveLength(1)
+    release()
+    expect((await first).outcome).toBe('delivered')
+    expect(fetched).toHaveLength(1)
+  })
+
+  it('two racers claim one attempt', async () => {
+    await register()
+    const sentMsg = await sendOne('rid-claim-dedupe')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs()[0]
+    fetched.length = 0
+    const [a, b] = await Promise.all([
+      deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) }),
+      deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) }),
+    ])
+    const outcomes = [a.outcome, b.outcome].sort()
+    expect(outcomes).toEqual(['delivered', 'skipped'])
+    expect(fetched).toHaveLength(1)
+    expect(fetched[0].init.redirect).toBe('manual')
+    const claims = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts WHERE ref_id = ? AND attempt IS NOT NULL`,
+    ).get(sentMsg.ok ? sentMsg.id : '') as { n: number }
+    expect(claims.n).toBe(1)
+  })
+
+  it('retries 408 and 429 and fails other 4xx without another POST', async () => {
+    await register()
+    for (const status of [408, 429] as const) {
+      fetched.length = 0
+      sent.length = 0
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        fetched.push({ url: String(url), init: init ?? {} })
+        return new Response('later', { status })
+      }) as typeof fetch
+      const sentMsg = await sendOne(`rid-${status}`)
+      expect(sentMsg.ok).toBe(true)
+      const job = doorbellJobs()[0]
+      const before = sent.length
+      const result = await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+      expect(result).toMatchObject({ outcome: 'retry', http_status: status })
+      expect(fetched).toHaveLength(1)
+      expect(sent[before].delaySeconds).toBe(backoffDelaySec(1))
+      expect(fetched[0].init.redirect).toBe('manual')
+    }
+    fetched.length = 0
+    sent.length = 0
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      fetched.push({ url: String(url), init: init ?? {} })
+      return new Response('no', { status: 400 })
+    }) as typeof fetch
+    const sentMsg = await sendOne('rid-400')
+    expect(sentMsg.ok).toBe(true)
+    const job = doorbellJobs()[0]
+    const before = sent.length
+    const failed = await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })
+    expect(failed).toMatchObject({ outcome: 'failed', http_status: 400 })
+    expect(sent.slice(before).filter((s) => s.body.type === 'mcp.doorbell.delivery')).toHaveLength(0)
+    const again = await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) + 60_000 })
+    expect(again).toMatchObject({ outcome: 'skipped', reason: 'terminal' })
+    expect(fetched).toHaveLength(1)
+  })
+
+  it('rings distinct wakes up to the burst cap and does not retry the skipped one', async () => {
+    await register()
+    const jobs = []
+    for (let i = 0; i < WAKE_BURST_LIMIT + 1; i++) {
+      const sentMsg = await sendOne(`rid-cap-${i}`)
+      expect(sentMsg.ok).toBe(true)
+      jobs.push(doorbellJobs().at(-1)!)
+    }
+    fetched.length = 0
+    const outcomes = []
+    for (const job of jobs) {
+      outcomes.push((await deliverSignedDoorbell(env, job.payload, { nowMs: Date.parse(T0) })).outcome)
+    }
+    expect(outcomes.slice(0, WAKE_BURST_LIMIT)).toEqual(Array.from({ length: WAKE_BURST_LIMIT }, () => 'delivered'))
+    expect(outcomes[WAKE_BURST_LIMIT]).toBe('skipped')
+    expect(fetched).toHaveLength(WAKE_BURST_LIMIT)
+    const again = await deliverSignedDoorbell(env, jobs[WAKE_BURST_LIMIT].payload, { nowMs: Date.parse(T0) + 1000 })
+    expect(again).toMatchObject({ outcome: 'skipped', reason: 'terminal' })
+    expect(fetched).toHaveLength(WAKE_BURST_LIMIT)
   })
 })

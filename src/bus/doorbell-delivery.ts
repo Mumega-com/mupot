@@ -19,6 +19,7 @@ import {
   DOORBELL_TIMEOUT_MS,
   INBOX_WAKE_TYPE,
   TASK_ASSIGNED_TYPE,
+  RECEIPT_RETENTION_MS,
   TEST_PING_LIMIT,
   TEST_PING_WINDOW_MS,
   WAKE_BURST_LIMIT,
@@ -53,6 +54,15 @@ export type SignedDeliveryResult = {
 }
 
 const WAKE_TYPES = new Set<string>([INBOX_WAKE_TYPE, TASK_ASSIGNED_TYPE, DOORBELL_TEST_TYPE])
+
+/**
+ * A `claimed` attempt older than this is a crashed worker and may be reclaimed.
+ * Longer than the POST timeout so a live request is not double-sent. Shorter than
+ * a queue visibility timeout so a crash redelivery finds the claim stale.
+ */
+export const DOORBELL_CLAIM_LEASE_MS = 15_000
+/** error_class on a task.assigned retry whose assignee row is not visible yet. Not a ring. */
+const UNCONFIRMED_ASSIGNMENT = 'task_not_assigned'
 
 function parseJob(v: unknown): DoorbellDeliveryJob | null {
   if (typeof v !== 'object' || v === null) return null
@@ -122,6 +132,95 @@ async function claimDeliveryJob(
   return (inserted.meta?.changes ?? 0) === 1
 }
 
+function doorbellJob(wake: WebhookDoorbellWake, correlation: string | undefined): DoorbellDeliveryJob {
+  return {
+    wake_type: wake.type,
+    agent_id: wake.agent_id,
+    ref_id: wake.type === INBOX_WAKE_TYPE ? wake.message_id : wake.type === TASK_ASSIGNED_TYPE ? wake.task_id : 'test',
+    ...(wake.type === TASK_ASSIGNED_TYPE && wake.assignment ? { assignment: wake.assignment } : {}),
+    ...(correlation ? { correlation } : {}),
+  }
+}
+
+/** Best-effort. Signed receipts and enqueue locks share one table; both age out here. */
+async function pruneSignedReceipts(env: Env, tenant: string, agentId: string, nowMs: number): Promise<void> {
+  try {
+    const cutoff = new Date(nowMs - RECEIPT_RETENTION_MS).toISOString()
+    await env.DB.prepare(
+      `DELETE FROM agent_webhook_doorbell_receipts
+        WHERE tenant = ?1 AND agent_id = ?2 AND attempted_at < ?3`,
+    ).bind(tenant, agentId, cutoff).run()
+  } catch {
+    // retention is best-effort
+  }
+}
+
+/**
+ * Put one job on the queue. If the send fails, deliver on the claim instead of
+ * deleting it: the producer that lost the claim has already returned false, so
+ * deleting the lock drops the ring.
+ */
+async function publishDoorbellJob(
+  env: Env,
+  tenant: string,
+  agentId: string,
+  job: DoorbellDeliveryJob,
+  nowIso: string,
+): Promise<boolean> {
+  try {
+    await env.BUS.send({
+      type: 'mcp.doorbell.delivery',
+      tenant,
+      agent_id: agentId,
+      payload: job,
+      ts: nowIso,
+    })
+    return true
+  } catch {
+    try {
+      await deliverSignedDoorbell(env, job)
+    } catch (deliverErr) {
+      console.error('[doorbell] queue send failed and the claim was left for reclaim', {
+        agent_id: agentId,
+        error: deliverErr instanceof Error ? deliverErr.message : String(deliverErr),
+      })
+      return false
+    }
+    return true
+  }
+}
+
+/**
+ * The claim already exists. A fresh enqueue lock belongs to the winner (it is
+ * mid-send). A stale one is a crash between claim and send: take it and publish.
+ */
+async function reclaimStaleEnqueue(
+  env: Env,
+  agentId: string,
+  ref: string,
+  job: DoorbellDeliveryJob,
+  nowMs: number,
+): Promise<boolean> {
+  const id = await enqueueLockId(agentId, ref)
+  const row = await env.DB.prepare(
+    `SELECT attempted_at FROM agent_webhook_doorbell_receipts
+      WHERE id = ?1 AND reason = 'enqueued' AND attempt IS NULL`,
+  ).bind(id).first<{ attempted_at: string }>()
+  if (!row) return false
+  const age = nowMs - Date.parse(row.attempted_at)
+  if (!Number.isFinite(age) || age < DOORBELL_CLAIM_LEASE_MS) return false
+  const nowIso = new Date(nowMs).toISOString()
+  const bumped = await env.DB.prepare(
+    `UPDATE agent_webhook_doorbell_receipts
+        SET attempted_at = ?1
+      WHERE id = ?2 AND reason = 'enqueued' AND attempt IS NULL AND attempted_at = ?3`,
+  ).bind(nowIso, id, row.attempted_at).run()
+  if ((bumped.meta?.changes ?? 0) !== 1) return false
+  const tenant = typeof env.TENANT_SLUG === 'string' ? env.TENANT_SLUG : ''
+  if (!tenant) return false
+  return publishDoorbellJob(env, tenant, agentId, job, nowIso)
+}
+
 /** Queue a signed wake. Direct BUS.send: createBus().emit refuses this internal type. */
 export async function enqueueSignedDoorbellJob(
   env: Env,
@@ -131,31 +230,13 @@ export async function enqueueSignedDoorbellJob(
   const tenant = typeof env.TENANT_SLUG === 'string' ? env.TENANT_SLUG : ''
   if (!tenant) return false
   const ref = doorbellEventRef(wake, correlation)
-  const nowIso = new Date().toISOString()
+  const nowMs = Date.now()
+  const nowIso = new Date(nowMs).toISOString()
+  await pruneSignedReceipts(env, tenant, wake.agent_id, nowMs)
   const won = await claimDeliveryJob(env, tenant, wake.agent_id, wake.type, ref, nowIso)
-  if (!won) return false
-  const job: DoorbellDeliveryJob = {
-    wake_type: wake.type,
-    agent_id: wake.agent_id,
-    ref_id: wake.type === INBOX_WAKE_TYPE ? wake.message_id : wake.type === TASK_ASSIGNED_TYPE ? wake.task_id : 'test',
-    ...(wake.type === TASK_ASSIGNED_TYPE && wake.assignment ? { assignment: wake.assignment } : {}),
-    ...(correlation ? { correlation } : {}),
-  }
-  try {
-    await env.BUS.send({
-      type: 'mcp.doorbell.delivery',
-      tenant,
-      agent_id: wake.agent_id,
-      payload: job,
-      ts: nowIso,
-    })
-  } catch (err) {
-    await env.DB.prepare(
-      `DELETE FROM agent_webhook_doorbell_receipts WHERE id = ?1 AND reason = 'enqueued'`,
-    ).bind(await enqueueLockId(wake.agent_id, ref)).run()
-    throw err
-  }
-  return true
+  const job = doorbellJob(wake, correlation)
+  if (!won) return reclaimStaleEnqueue(env, wake.agent_id, ref, job, nowMs)
+  return publishDoorbellJob(env, tenant, wake.agent_id, job, nowIso)
 }
 
 /** The delayed successor of one attempt. Not an enqueue: the lock for this ref already exists. */
@@ -253,8 +334,10 @@ export async function enqueueSignedInboxDoorbell(env: Env, event: BusEvent): Pro
 
 /**
  * The event ref a second producer must use so it collides with the send path.
- * `null` means "do not enqueue": this is an assignment letter and its epoch is not
- * readable yet, so falling back to the message id would be a second event.
+ * `null` means "do not enqueue". An assignment letter matches `message_seq = seq`
+ * only. Nothing else is a match: an in-flight wake for another task must not be
+ * claimed, and falling back to the message id (or to any other row) is a second
+ * event that can also steal that row's ref. The send path already owns the letter.
  */
 async function inboxEventCorrelation(
   env: Env,
@@ -268,13 +351,11 @@ async function inboxEventCorrelation(
   if (message.from_agent !== ASSIGNMENT_WAKE_SENDER) return undefined
   const wakes = await env.DB.prepare(
     `SELECT task_id, epoch FROM task_assignment_wakes
-      WHERE tenant = ?1 AND agent_id = ?2
-        AND (message_seq = ?3 OR (message_seq IS NULL AND outcome IN ('pending', 'sent', 'queued')))`,
+      WHERE tenant = ?1 AND agent_id = ?2 AND message_seq = ?3`,
   ).bind(tenant, agentId, message.seq).all<{ task_id: string; epoch: string }>()
   const rows = wakes.results ?? []
-  if (rows.length === 1) return `${rows[0].task_id}#${rows[0].epoch}`
-  if (rows.length === 0) return null
-  return undefined
+  if (rows.length !== 1) return null
+  return `${rows[0].task_id}#${rows[0].epoch}`
 }
 
 interface DoorbellRow {
@@ -364,7 +445,7 @@ async function loadFacts(env: Env, tenant: string, agentId: string, job: Doorbel
   // is not a terminal failure. A `failed` receipt on this ref would suppress the wake
   // for good, including the retry that runs after the row is visible.
   if (!task || task.assignee_agent_id !== agentId) {
-    return { kind: 'unconfirmed', reason: 'task_not_assigned', ref, eventType: TASK_ASSIGNED_TYPE }
+    return { kind: 'unconfirmed', reason: UNCONFIRMED_ASSIGNMENT, ref, eventType: TASK_ASSIGNED_TYPE }
   }
   return {
     kind: 'wake',
@@ -438,12 +519,43 @@ async function beginAttempt(
   ).bind(tenant, agentId, ref).first<{ x: number }>()
   if (terminal) return { kind: 'stop', result: { outcome: 'skipped', reason: 'terminal' } }
 
-  const inflight = await env.DB.prepare(
-    `SELECT 1 AS x FROM agent_webhook_doorbell_receipts
+  // A queue redelivery of a job that already recorded `retry` must not start the
+  // next attempt until that attempt's delaySeconds has elapsed. The scheduled
+  // successor is the one that runs; this one is a duplicate of the original.
+  const lastRetry = await env.DB.prepare(
+    `SELECT attempt, attempted_at FROM agent_webhook_doorbell_receipts
       WHERE tenant = ?1 AND agent_id = ?2 AND ref_id = ?3
-        AND outcome = 'claimed' AND attempt IS NOT NULL LIMIT 1`,
-  ).bind(tenant, agentId, ref).first<{ x: number }>()
-  if (inflight) return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
+        AND outcome = 'retry' AND attempt IS NOT NULL
+      ORDER BY attempt DESC LIMIT 1`,
+  ).bind(tenant, agentId, ref).first<{ attempt: number; attempted_at: string }>()
+  if (lastRetry) {
+    const due = Date.parse(lastRetry.attempted_at) + backoffDelaySec(Number(lastRetry.attempt)) * 1000
+    if (Number.isFinite(due) && nowMs < due) {
+      return { kind: 'stop', result: { outcome: 'skipped', reason: 'backoff' } }
+    }
+  }
+
+  const inflight = await env.DB.prepare(
+    `SELECT id, attempt, attempted_at FROM agent_webhook_doorbell_receipts
+      WHERE tenant = ?1 AND agent_id = ?2 AND ref_id = ?3
+        AND outcome = 'claimed' AND attempt IS NOT NULL
+      ORDER BY attempted_at ASC LIMIT 1`,
+  ).bind(tenant, agentId, ref).first<{ id: string; attempt: number; attempted_at: string }>()
+  if (inflight) {
+    const age = nowMs - Date.parse(inflight.attempted_at)
+    if (!Number.isFinite(age) || age < DOORBELL_CLAIM_LEASE_MS) {
+      return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
+    }
+    const reclaimed = await env.DB.prepare(
+      `UPDATE agent_webhook_doorbell_receipts
+          SET attempted_at = ?1
+        WHERE id = ?2 AND outcome = 'claimed' AND attempted_at = ?3`,
+    ).bind(nowIso, inflight.id, inflight.attempted_at).run()
+    if ((reclaimed.meta?.changes ?? 0) !== 1) {
+      return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
+    }
+    return { kind: 'go', id: inflight.id, attempt: Number(inflight.attempt) }
+  }
 
   const prior = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts
@@ -462,22 +574,12 @@ async function beginAttempt(
         WHERE tenant = ?1 AND agent_id = ?2 AND event_type <> ?3
           AND outcome IN ('claimed', 'posted', 'failed', 'retry', 'dead_letter')
           AND NOT (outcome = 'claimed' AND reason = 'enqueued')
+          AND NOT (outcome = 'retry' AND error_class = ?5)
           AND attempted_at > ?4`,
-    ).bind(tenant, agentId, DOORBELL_TEST_TYPE, since).first<{ n: number }>()
+    ).bind(tenant, agentId, DOORBELL_TEST_TYPE, since, UNCONFIRMED_ASSIGNMENT).first<{ n: number }>()
     if (Number(burst?.n ?? 0) >= WAKE_BURST_LIMIT) {
       await insertReceipt(env, tenant, agentId, eventType, ref, 'skipped', { errorClass: 'coalesced', attempt: 1 }, nowIso)
       return { kind: 'stop', result: { outcome: 'skipped', reason: 'coalesced' } }
-    }
-  }
-
-  if (eventType === DOORBELL_TEST_TYPE) {
-    const since = new Date(nowMs - TEST_PING_WINDOW_MS).toISOString()
-    const n = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts
-        WHERE tenant = ?1 AND agent_id = ?2 AND event_type = ?3 AND attempted_at > ?4`,
-    ).bind(tenant, agentId, DOORBELL_TEST_TYPE, since).first<{ n: number }>()
-    if (Number(n?.n ?? 0) >= TEST_PING_LIMIT) {
-      return { kind: 'stop', result: { outcome: 'rate_limited', reason: 'test_ping_rate_limited' } }
     }
   }
 
@@ -492,6 +594,9 @@ async function beginAttempt(
   }
 
   const id = crypto.randomUUID()
+  const testSince = new Date(nowMs - TEST_PING_WINDOW_MS).toISOString()
+  // Test pings: the cap is inside this INSERT, the same shape as the legacy path.
+  // A count-then-insert lets every parallel ping pass the read and POST.
   const inserted = await env.DB.prepare(
     `INSERT INTO agent_webhook_doorbell_receipts
        (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at, attempt, error_class, signed_at)
@@ -503,9 +608,28 @@ async function beginAttempt(
              outcome IN ('posted', 'failed', 'dead_letter', 'skipped')
              OR attempt = ?7
            )
-      )`,
-  ).bind(id, tenant, agentId, eventType, ref, nowIso, attempt).run()
+      )
+        AND (
+          ?4 <> ?8
+          OR (
+            SELECT COUNT(*) FROM agent_webhook_doorbell_receipts
+             WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?8 AND attempted_at > ?9
+          ) < ?10
+        )`,
+  ).bind(
+    id, tenant, agentId, eventType, ref, nowIso, attempt,
+    DOORBELL_TEST_TYPE, testSince, TEST_PING_LIMIT,
+  ).run()
   if ((inserted.meta?.changes ?? 0) !== 1) {
+    if (eventType === DOORBELL_TEST_TYPE) {
+      const n = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM agent_webhook_doorbell_receipts
+          WHERE tenant = ?1 AND agent_id = ?2 AND event_type = ?3 AND attempted_at > ?4`,
+      ).bind(tenant, agentId, DOORBELL_TEST_TYPE, testSince).first<{ n: number }>()
+      if (Number(n?.n ?? 0) >= TEST_PING_LIMIT) {
+        return { kind: 'stop', result: { outcome: 'rate_limited', reason: 'test_ping_rate_limited' } }
+      }
+    }
     return { kind: 'stop', result: { outcome: 'skipped', reason: 'duplicate' } }
   }
   return { kind: 'go', id, attempt }
@@ -542,6 +666,7 @@ export async function deliverSignedDoorbell(
 
   const row = await loadDoorbell(env, tenant, job.agent_id)
   if (!row || row.delivery_version !== 'signed') return { outcome: 'skipped', reason: 'no_doorbell' }
+  await pruneSignedReceipts(env, tenant, row.agent_id, nowMs)
 
   const facts = await loadFacts(env, tenant, row.agent_id, job)
   if (facts.kind === 'routine') return { outcome: 'skipped', reason: 'routine_fence' }
