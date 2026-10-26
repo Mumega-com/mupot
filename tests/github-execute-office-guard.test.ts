@@ -33,7 +33,7 @@ function seed(status: string, gateOwner: string | null, claimed: boolean) {
 }
 
 function env(): Env {
-  return { TENANT_SLUG: 't', DB: harness.db, GITHUB_TOKEN: 'ghp_x', GITHUB_PLAN_TIER: 'free' } as unknown as Env
+  return { TENANT_SLUG: 't', DB: harness.db, GITHUB_TOKEN: 'ghp_x', GITHUB_PLAN_TIER: 'free', GITHUB_REPO: 'o/r' } as unknown as Env
 }
 
 function happyFetch() {

@@ -11,6 +11,9 @@
 import { describe, it, expect, vi } from 'vitest'
 import { dashboardApp } from '../src/dashboard/index'
 import type { Env } from '../src/types'
+import { createTask } from '../src/tasks/service'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 function envForRole(role: 'owner' | 'admin' | 'member', extra: Record<string, unknown> = {}): Env {
   const stmt = {
@@ -166,6 +169,25 @@ describe('POST /admin/github/execute-task', () => {
     )
     expect(res.status).toBe(400)
     expect(((await res.json()) as { stage: string }).stage).toBe('validate')
+  })
+  it('admin, repo the task does not own → 403 repo stage (no GitHub call)', async () => {
+    // Real migration-backed D1: the route runs the genuine task lookup against a genuine task row.
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-core', 'dept-a', 'squad-core', 'Core');
+    `)
+    const base = envForRole('admin', { GITHUB_REPO: 'o/r' })
+    const env = { ...base, DB: h.db } as Env
+    // task exists, no project: only GITHUB_REPO is allowed
+    const task = await createTask(env, { squad_id: 'squad-core', project_id: null, title: 'T', body: 'B', done_when: 'the thing is done', status: 'open' }, { skipMirror: true })
+    const res = await dashboardApp.fetch(
+      req('/admin/github/execute-task', 'POST', { taskId: task.id, repo: 'other/place', branchName: 'b', files: [{ path: 'a.ts', content: 'x' }], title: 'T' }),
+      env,
+    )
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { stage: string }).stage).toBe('repo')
   })
 })
 

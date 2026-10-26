@@ -14,6 +14,9 @@ import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIde
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
 import { officePublishUnresolvedSql } from '../tasks/service'
+import { getRepoScopedInstallationToken } from './github-app'
+import { repoKeyFromUrl } from '../workspaces/repo-key'
+import { reposOwnedByProject } from '../projects/office-repo-owner'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 /** Statuses execute-task may move to 'review' (work in flight). Never approved/done/review/etc. */
@@ -48,7 +51,7 @@ export interface ExecuteFile {
 
 export type ExecuteTaskResult =
   | { ok: true; prNumber: number; prUrl: string; filesWritten: number }
-  | { ok: false; error: string; stage: 'validate' | 'capability' | 'task' | 'branch' | 'file' | 'pr' }
+  | { ok: false; error: string; stage: 'validate' | 'capability' | 'task' | 'repo' | 'branch' | 'file' | 'pr' }
 
 export async function executeTaskAsPR(
   env: Env,
@@ -82,10 +85,10 @@ export async function executeTaskAsPR(
 
   // ── task must exist (this pot's D1) ───────────────────────────────────────────
   const task = await env.DB.prepare(
-    `SELECT id, status, assignee_agent_id, ${officePublishUnresolvedSql('tasks.id')} AS unresolved FROM tasks WHERE id = ?1 LIMIT 1`,
+    `SELECT id, status, assignee_agent_id, project_id, ${officePublishUnresolvedSql('tasks.id')} AS unresolved FROM tasks WHERE id = ?1 LIMIT 1`,
   )
     .bind(taskId)
-    .first<{ id: string; status: string; assignee_agent_id: string | null; unresolved?: number }>()
+    .first<{ id: string; status: string; assignee_agent_id: string | null; project_id?: string | null; unresolved?: number }>()
   if (!task) return { ok: false, error: 'task_not_found', stage: 'task' }
   // Fail BEFORE any GitHub side effect (branch/PR). The final UPDATE's WHERE re-enforces both
   // (this read can go stale) — the writer's WHERE is the invariant, this is the early refusal.
@@ -96,11 +99,43 @@ export async function executeTaskAsPR(
     return { ok: false, error: 'invalid_transition', stage: 'task' }
   }
 
+  // ── repo must belong to the task ─────────────────────────────────────────────────
+  // The caller NAMES the repo, so it is untrusted input: it must be one the task's project owns
+  // (repo_key / project_repos). A task with no project may only target the tenant's GITHUB_REPO.
+  // Refused before any branch/file/PR side effect and before a token is minted.
+  const repoKey = repoKeyFromUrl(`https://github.com/${repo}`)
+  if (!repoKey) return { ok: false, error: 'repo_not_task_repo', stage: 'repo' }
+  if (task.project_id) {
+    const owned = await reposOwnedByProject(env.DB, task.project_id)
+    if (!owned.ok || !owned.keys.has(repoKey)) return { ok: false, error: 'repo_not_task_repo', stage: 'repo' }
+  } else {
+    const fallback = (env as unknown as { GITHUB_REPO?: string }).GITHUB_REPO
+    if (typeof fallback !== 'string' || repoKeyFromUrl(`https://github.com/${fallback.trim()}`) !== repoKey) {
+      return { ok: false, error: 'repo_not_task_repo', stage: 'repo' }
+    }
+  }
+  // Repo-scoped token, server-side only (never returned or logged). A project repo the App cannot
+  // reach is refused (a PAT cannot prove reach); the no-project GITHUB_REPO path keeps the legacy token.
+  let scopedToken: string | undefined
+  if (task.project_id) {
+    const t = await getRepoScopedInstallationToken(
+      env,
+      repo,
+      { contents: 'write', pull_requests: 'write' },
+      opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : undefined,
+    )
+    if (!t) return { ok: false, error: 'repo_unreachable', stage: 'repo' }
+    scopedToken = t
+  }
+
   // Per-agent authorship (#21): the task's assigned agent authors the commits as itself.
   // Falls back to the App identity if the task has no agent or it can't be resolved.
   const author = task.assignee_agent_id ? await resolveAgentIdentity(env, task.assignee_agent_id) : undefined
 
-  const fetchOpt = opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}
+  const fetchOpt = {
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    ...(scopedToken ? { token: scopedToken } : {}),
+  }
 
   // ── branch ────────────────────────────────────────────────────────────────────
   const br = await createBranch(env, { repo, fromBranch: baseBranch, newBranch: branchName }, fetchOpt)

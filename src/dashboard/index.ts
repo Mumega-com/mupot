@@ -3152,7 +3152,9 @@ dashboardApp.post('/admin/github/execute-task', async (c) => {
     body: typeof body.bodyText === 'string' ? body.bodyText : undefined,
   })
   const refused = !result.ok && (result.error === 'office_publish_unresolved' || result.error === 'invalid_transition')
-  return c.json(result, result.ok ? 200 : refused ? 409 : 400)
+  // A repo the task's project does not own is an authorization refusal, not a malformed request.
+  const forbidden = !result.ok && result.stage === 'repo'
+  return c.json(result, result.ok ? 200 : forbidden ? 403 : refused ? 409 : 400)
 })
 
 // POST /admin/github/import-project — Projects v2 ↔ pot bridge: import board items assigned to

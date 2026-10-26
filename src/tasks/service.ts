@@ -9,7 +9,8 @@ import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
 import { claimTimestamp } from '../lib/claim-timestamp'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
-import { resolveOutboundGitHubToken } from '../integrations/github-app'
+import { resolveOutboundGitHubToken, getRepoScopedInstallationToken } from '../integrations/github-app'
+import { repoKeyFromUrl } from '../workspaces/repo-key'
 import { isBlankProvenance, isReservedProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
@@ -1008,18 +1009,94 @@ async function requestGitHubIssue(
   }
 }
 
-export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | null> {
-  const repo = githubRepo(env)
-  if (!repo) return null
-  // App-first: prefer a short-lived installation token; fall back to the static PAT.
-  const token = await resolveOutboundGitHubToken(env)
-  if (!token) return null
+// ── repo-aware mirror target ────────────────────────────────────────────────
+//
+// Where a task's issue lives is DATA, not code: the project's repo_key prefix names the host
+// (`github:owner/repo`). Only prefixes in MIRROR_HOSTS have an issue API wired; any other prefix is
+// a recorded skip, never a post to some default repo. The tenant-wide GITHUB_REPO var is the target
+// ONLY for a task with no project at all.
 
-  return requestGitHubIssue(`https://api.github.com/repos/${repo}/issues`, {
+const MIRROR_HOSTS: Record<string, { toFullName: (rest: string) => string | null }> = {
+  'github:': { toFullName: (rest) => (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rest) ? rest : null) },
+}
+
+export type MirrorSkipReason =
+  | 'project_has_no_repo'
+  | 'repo_host_unsupported'
+  | 'repo_unreachable'
+  | 'no_github_repo_configured'
+  | 'no_token'
+  | 'project_lookup_failed'
+
+export type MirrorTarget =
+  | { ok: true; repo: string; scoped: boolean }
+  | { ok: false; reason: MirrorSkipReason }
+
+/** The repo_key a task's project points at, or the reason it has none. */
+async function projectRepoKey(env: Env, projectId: string): Promise<{ ok: true; key: string } | { ok: false; reason: MirrorSkipReason }> {
+  let row: { repo_key: string | null; repo_url: string | null } | null
+  try {
+    row = await env.DB.prepare(
+      `SELECT repo_key, repo_url FROM projects WHERE id = ?1 AND archived_at IS NULL LIMIT 1`,
+    ).bind(projectId).first<{ repo_key: string | null; repo_url: string | null }>()
+  } catch {
+    return { ok: false, reason: 'project_lookup_failed' }
+  }
+  if (!row) return { ok: false, reason: 'project_has_no_repo' }
+  // Pending rows (repo_url set, key not yet backfilled): canonicalise at read time, write nothing.
+  // repo_key '' (NO_REPO_IDENTITY) means the url never settled to one repo: also no repo.
+  const key = row.repo_key ?? repoKeyFromUrl(row.repo_url)
+  if (!key) return { ok: false, reason: 'project_has_no_repo' }
+  return { ok: true, key }
+}
+
+/** `github:o/r` → `o/r` by prefix table; null when the prefix has no mirror host. */
+function fullNameFromRepoKey(key: string): string | null {
+  for (const [prefix, host] of Object.entries(MIRROR_HOSTS)) {
+    if (key.startsWith(prefix)) return host.toFullName(key.slice(prefix.length))
+  }
+  return null
+}
+
+export async function resolveMirrorTarget(env: Env, task: Task): Promise<MirrorTarget> {
+  if (task.project_id) {
+    const pk = await projectRepoKey(env, task.project_id)
+    if (!pk.ok) return pk
+    const repo = fullNameFromRepoKey(pk.key)
+    if (!repo) return { ok: false, reason: 'repo_host_unsupported' }
+    return { ok: true, repo, scoped: true }
+  }
+  const fallback = githubRepo(env)
+  if (!fallback) return { ok: false, reason: 'no_github_repo_configured' }
+  return { ok: true, repo: fallback, scoped: false }
+}
+
+/** Token for a resolved target: repo-scoped App token for a project repo (no PAT fallback: a PAT cannot prove reach), legacy for the fallback repo. */
+async function mirrorToken(env: Env, target: Extract<MirrorTarget, { ok: true }>): Promise<string | null> {
+  if (target.scoped) return getRepoScopedInstallationToken(env, target.repo, { issues: 'write' })
+  return resolveOutboundGitHubToken(env)
+}
+
+export async function mirrorTaskCreateDetailed(
+  env: Env,
+  task: Task,
+): Promise<{ url: string | null; skipped?: MirrorSkipReason }> {
+  const target = await resolveMirrorTarget(env, task)
+  if (!target.ok) return { url: null, skipped: target.reason }
+  // App-first for the fallback repo (static PAT allowed there); a project repo needs a scoped App token.
+  const token = await mirrorToken(env, target)
+  if (!token) return { url: null, skipped: target.scoped ? 'repo_unreachable' : 'no_token' }
+
+  const url = await requestGitHubIssue(`https://api.github.com/repos/${target.repo}/issues`, {
     method: 'POST',
     headers: githubHeaders(token),
     body: JSON.stringify({ title: task.title, body: issueBody(task) }),
   })
+  return { url }
+}
+
+export async function mirrorTaskCreate(env: Env, task: Task): Promise<string | null> {
+  return (await mirrorTaskCreateDetailed(env, task)).url
 }
 
 export async function mirrorTaskUpdate(
@@ -1027,11 +1104,6 @@ export async function mirrorTaskUpdate(
   task: Task,
   opts?: { statusChanged?: boolean },
 ): Promise<string | null> {
-  const repo = githubRepo(env)
-  if (!repo) return task.github_issue_url
-  const token = await resolveOutboundGitHubToken(env)
-  if (!token) return task.github_issue_url
-
   const issueNumber = parseIssueNumber(task.github_issue_url)
   if (issueNumber === null) {
     // Update NEVER creates. A null issue here means the task was never mirrored — either
@@ -1040,6 +1112,20 @@ export async function mirrorTaskUpdate(
     // token (the P1 side-door). Creation is createTask's job alone, which honors skipMirror.
     return task.github_issue_url
   }
+  // The issue already lives somewhere: PATCH THAT repo (from its own URL), never a re-derived one.
+  // Existing issue URLs are left as they are; a URL whose repo is neither the task's project repo
+  // nor the legacy GITHUB_REPO is not ours to write.
+  const urlRepo = repoFromIssueUrl(task.github_issue_url)
+  if (!urlRepo) return task.github_issue_url
+  const target = await resolveMirrorTarget(env, task)
+  let token: string | null = null
+  if (target.ok && target.repo.toLowerCase() === urlRepo.toLowerCase()) {
+    token = await mirrorToken(env, target)
+  } else {
+    const legacy = githubRepo(env)
+    if (legacy && legacy.toLowerCase() === urlRepo.toLowerCase()) token = await resolveOutboundGitHubToken(env)
+  }
+  if (!token) return task.github_issue_url
 
   // Defect #1040: Only include `state` in the GitHub PATCH payload if the task status actually changed
   // or is terminal (`done`). If status was not modified in this update (e.g. title/body/assignee edit),
@@ -1052,11 +1138,17 @@ export async function mirrorTaskUpdate(
     payload.state = issueState(task.status)
   }
 
-  return (await requestGitHubIssue(`https://api.github.com/repos/${repo}/issues/${issueNumber}`, {
+  return (await requestGitHubIssue(`https://api.github.com/repos/${urlRepo}/issues/${issueNumber}`, {
     method: 'PATCH',
     headers: githubHeaders(token),
     body: JSON.stringify(payload),
   })) ?? task.github_issue_url
+}
+
+function repoFromIssueUrl(url: string | null): string | null {
+  if (!url) return null
+  const m = url.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/\d+/)
+  return m ? (m[1] as string) : null
 }
 
 function parseIssueNumber(url: string | null): number | null {
@@ -1236,6 +1328,7 @@ export async function emitTaskEvent(
   type: 'task.created' | 'task.updated',
   task: Task,
   actor?: TaskActor,
+  extraPayload?: Record<string, string>,
 ): Promise<void> {
   await createBus(env).emit({
     type,
@@ -1243,7 +1336,7 @@ export async function emitTaskEvent(
     squad_id: task.squad_id,
     agent_id: eventAgentId(task, actor),
     actor,
-    payload: { task_id: task.id, project_id: task.project_id, status: task.status, title: task.title },
+    payload: { task_id: task.id, project_id: task.project_id, status: task.status, title: task.title, ...extraPayload },
     ts: new Date().toISOString(),
   })
 }
@@ -1655,8 +1748,11 @@ export async function createTask(
   // while providing none — the same "exemption justified by a case that cannot occur"
   // shape found in the #847 dashboard capability floor. If a caller-supplied issue URL is
   // ever wanted, it needs a real input on CreateTaskOptions, not a dead disjunct here.
+  let mirrorSkipped: MirrorSkipReason | null = null
   if (!options.skipMirror && externalSource === null) {
-    const issueUrl = await mirrorTaskCreate(env, task)
+    const mirrored = await mirrorTaskCreateDetailed(env, task)
+    mirrorSkipped = mirrored.skipped ?? null
+    const issueUrl = mirrored.url
     if (issueUrl) {
       const linkUpdate = await env.DB.prepare(
         `UPDATE tasks SET github_issue_url = ?1 WHERE id = ?2 AND github_issue_url IS NULL`,
@@ -1668,7 +1764,7 @@ export async function createTask(
     }
   }
 
-  if (!options.skipEvent) await emitTaskEvent(env, 'task.created', task, options.actor)
+  if (!options.skipEvent) await emitTaskEvent(env, 'task.created', task, options.actor, mirrorSkipped ? { github_mirror_skipped: mirrorSkipped } : undefined)
   return task
 }
 
