@@ -49,5 +49,5 @@ export function liveAttachmentConditionsSql(env: Env, ph: LivePh): string {
         AND (${ph('grantToken')} IS NULL OR EXISTS (SELECT 1 FROM member_tokens g
                      WHERE g.id = ${ph('grantToken')} AND g.member_id = ${ph('human')} AND g.tenant = ${ph('tenant')}
                        AND g.channel = 'directory' AND g.agent_id IS NULL
-                       AND ${TOKEN_LIVE_PREDICATE(ph('now')).replace(/\bt\./g, 'g.')}))`
+                       AND ${TOKEN_LIVE_PREDICATE(ph('now'), 'g')}))`
 }

@@ -41,7 +41,7 @@ export function attachDesignatedClause(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO
  *  Request metadata plays no part: everything here is read from rows.
  */
 export function admissionBoundToSeatSql(seatCol: string): string {
-  return `(adm.requested_seat_id = ${seatCol} OR (adm.scope = 'harness' AND EXISTS (
+  return `((adm.scope = 'seat' AND adm.requested_seat_id = ${seatCol}) OR (adm.scope = 'harness' AND EXISTS (
             SELECT 1 FROM harnesses hs JOIN member_tokens gs ON gs.id = substr(hs.grant_id, 7)
              WHERE hs.id = adm.harness_id AND hs.tenant = adm.tenant AND hs.member_id = adm.human_member_id
                AND hs.credential_kind = 'oauth' AND hs.grant_id LIKE 'oauth:_%'

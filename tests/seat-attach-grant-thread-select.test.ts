@@ -28,8 +28,9 @@ import { callerHoldsGateCapability } from '../src/tasks/index'
 import { momentsApp } from '../src/secure-moments/routes'
 import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { linkLoginIdentity } from '../src/auth/login-identity'
-import { attachSeatToAgent, decideAdmissionDirect, detachAttachment, ensureAdmission, findLiveAttachment, loadAdmission, revokeAdmission } from '../src/members/seat-attach'
+import { attachSeatToAgent, decideAdmissionDirect, detachAttachment, ensureAdmission, findLiveAttachment, loadAdmission, promoteAdmissionDetailed, revokeAdmission } from '../src/members/seat-attach'
 import { listLiveAttachmentsForEvents } from '../src/mcp/events-attached'
+import { TOKEN_LIVE_PREDICATE } from '../src/auth/token-lifecycle'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -174,6 +175,199 @@ const tamperHarness = (sql: string): void => {
 const attachments = (): Array<{ id: string; seat_id: string; agent_id: string; admission_id: string; seat_token_id: string; detached_at: string | null }> =>
   h.sqlite.prepare(`SELECT id, seat_id, agent_id, admission_id, seat_token_id, detached_at FROM agent_seat_attachments ORDER BY created_at, rowid`).all() as never
 const liveSeatIds = (): string[] => (h.sqlite.prepare(`SELECT seat_id FROM agent_seat_attachments WHERE detached_at IS NULL ORDER BY created_at, rowid`).all() as Array<{ seat_id: string }>).map((r) => r.seat_id)
+
+describe('R1 round 2: grant replacement and approval boundaries', () => {
+  it('revoke and re-consent on the same client requires a fresh harness approval', async () => {
+    const env = envFor(h)
+    const old = await grant(env, HUMAN)
+    const key = await admitForAllChats(env, old, 'before-consent')
+    const oldAdmission = attachments()[0].admission_id
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(old.tokenId)
+    const replacement = await grant(env, HUMAN)
+    expect(replacement.harnessId).toBe(old.harnessId)
+    expect(replacement.tokenId).not.toBe(old.tokenId)
+    await boot(env, replacement, 'after-consent')
+    const ask = await attach(env, replacement, 'after-consent', 'rava', 'harness')
+    expect(ask.sc.status, errOf(ask)).toBe('pending_admission')
+    expect(await loadAdmission(env, oldAdmission)).toMatchObject({ status: 'revoked', scope: 'harness' })
+    expect(await findLiveAttachment(env, { memberId: HUMAN, tokenId: replacement.tokenId }, attachments()[0].seat_id)).toBeNull()
+    expect(await listLiveAttachmentsForEvents(env, { memberId: HUMAN, harnessId: replacement.harnessId, grantTokenId: replacement.tokenId })).toEqual([])
+    expect((await decideMoment(env, String(ask.sc.approve_url), key)).status).toBe(200)
+    expect((await attach(env, replacement, 'after-consent', 'rava')).sc.status).toBe('attached')
+    expect(attachments().at(-1)!.admission_id).not.toBe(oldAdmission)
+    // A repeat upsert of this same grant must preserve the fresh approval.
+    await upsertHarness(env, HUMAN, 'client-chatgpt', 'ChatGPT', replacement.tokenId)
+    expect((await boot(env, replacement, 'after-consent')).sc.bound_agent_id).toBe('agent-rava')
+  })
+
+  it('re-consent cancels a pending harness approval and its old passkey link', async () => {
+    const env = envFor(h)
+    const old = await grant(env, HUMAN)
+    await boot(env, old, 'pending-consent')
+    const ask = await attach(env, old, 'pending-consent', 'rava', 'harness')
+    const key = await enrolPasskey(env, HUMAN)
+    const path = new URL(String(ask.sc.approve_url)).pathname
+    const csrf = csrfOf(await (await hit(path, env)).text())
+    const attach_code = one<{ attach_code: string }>(`SELECT attach_code FROM agent_seat_admissions`)!.attach_code
+    const ch = await (await hit(`${path}/challenge`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code } })).json() as J
+    const credential = await key.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey!.challenge })
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(old.tokenId)
+    const replacement = await grant(env, HUMAN)
+    expect(replacement.harnessId).toBe(old.harnessId)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)!.status).toBe('revoked')
+    expect((await hit(`${path}/decide`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code, credential } })).status).not.toBe(200)
+    expect(attachments()).toHaveLength(0)
+  })
+
+  it('failed harness re-anchor rolls back admission revocation and attachment/token cascades', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'rollback')
+    const a = attachments()[0]
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(g.tokenId)
+    h.sqlite.exec(`CREATE TRIGGER reject_reanchor BEFORE UPDATE OF grant_id ON harnesses BEGIN SELECT RAISE(ABORT, 'test_reanchor_failure'); END`)
+    await expect(grant(env, HUMAN)).rejects.toThrow('test_reanchor_failure')
+    expect(await loadAdmission(env, a.admission_id)).toMatchObject({ status: 'live', revoked_at: null })
+    expect(one(`SELECT grant_id FROM harnesses WHERE id = ?`, g.harnessId)).toEqual({ grant_id: `oauth:${g.tokenId}` })
+    expect(attachments()[0].detached_at).toBeNull()
+    expect(one(`SELECT revoked_at FROM member_tokens WHERE id = ?`, a.seat_token_id)).toEqual({ revoked_at: null })
+  })
+
+  it('passkey promotion pins its grant snapshot when the harness changes before the INSERT', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'tap-race')
+    const ask = await attach(env, g, 'tap-race', 'rava', 'harness')
+    const key = await enrolPasskey(env, HUMAN)
+    const other = { tokenId: 'other-tap-grant' }
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES (?, ?, ?, 'replacement', 'directory', datetime('now'), ?)`).run(other.tokenId, HUMAN, other.tokenId, TENANT)
+    const batch = env.DB.batch.bind(env.DB)
+    let changed = false
+    env.DB.batch = (async (stmts: Parameters<typeof batch>[0]) => {
+      // Isolate the INSERT proof: simulate a changed anchor without admission invalidation.
+      if (!changed && stmts.some((s) => String((s as unknown as { sql: string }).sql).includes('UPDATE agent_seat_admissions SET status = \'live\''))) {
+        changed = true
+        tamperHarness(`UPDATE harnesses SET grant_id = 'oauth:${other.tokenId}' WHERE id = '${g.harnessId}'`)
+      }
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    expect((await decideMoment(env, String(ask.sc.approve_url), key)).status).toBe(200)
+    expect(changed).toBe(true)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)!.status).toBe('live')
+    expect(attachments()).toHaveLength(0)
+  })
+
+  it('re-anchor revokes only harness-scoped approvals on the reused harness', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const key = await admitForAllChats(env, g, 'scoped-harness')
+    await boot(env, g, 'scoped-seat')
+    const ask = await attach(env, g, 'scoped-seat', 'hadi-dev')
+    expect((await decideMoment(env, String(ask.sc.approve_url), key)).status).toBe(200)
+    const other = await grant(env, HUMAN, 'other-install')
+    await admitForAllChats(env, other, 'other-harness')
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(g.tokenId)
+    expect((await grant(env, HUMAN)).harnessId).toBe(g.harnessId)
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE harness_id = ? AND scope = 'harness'`, g.harnessId)).toEqual({ status: 'revoked' })
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE harness_id = ? AND scope = 'seat'`, g.harnessId)).toEqual({ status: 'live' })
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE harness_id = ?`, other.harnessId)).toEqual({ status: 'live' })
+  })
+
+  it('a losing re-anchor CAS preserves the winning consent and its fresh approval', async () => {
+    const env = envFor(h)
+    const old = await grant(env, HUMAN)
+    await admitForAllChats(env, old, 'cas-old')
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(old.tokenId)
+    const batch = env.DB.batch.bind(env.DB)
+    const winnerEnv = { ...env, DB: { ...env.DB, batch } } as Env
+    let winner: Grant | undefined
+    let raced = false
+    env.DB.batch = (async (stmts: Parameters<typeof batch>[0]) => {
+      if (!raced) {
+        raced = true
+        winner = await grant(winnerEnv, HUMAN)
+        await admitForAllChats(winnerEnv, winner, 'cas-winner')
+      }
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    await grant(env, HUMAN)
+    expect(raced).toBe(true)
+    expect(winner!.harnessId).toBe(old.harnessId)
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE harness_id = ? AND status = 'live'`, old.harnessId)).toEqual({ status: 'live' })
+    expect((await boot(winnerEnv, winner!, 'cas-winner')).sc.bound_agent_id).toBe('agent-rava')
+  })
+
+  it('passkey promotion under a revoked grant cannot attach even its original asking seat', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'tap-revoked')
+    await attach(env, g, 'tap-revoked', 'rava', 'harness')
+    const adm = (await loadAdmission(env, one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id))!
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(g.tokenId)
+    const result = await promoteAdmissionDetailed(env, adm, HUMAN, 'webauthn', new Date().toISOString(), 'member', adm.attach_code)
+    expect(result.landed).toBe(true)
+    expect(result.attachmentId).toBeNull()
+    expect(attachments()).toHaveLength(0)
+  })
+
+  it.each(['original', 'later'])('dashboard reuse of a %s seat requires grant proof', async (which) => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'dashboard-original')
+    const original = attachments()[0]
+    await detachAttachment(env, { attachmentId: original.id, humanMemberId: HUMAN })
+    await boot(env, g, 'dashboard-later')
+    const seatId = which === 'original' ? original.seat_id : one<{ id: string }>(`SELECT id FROM agent_seats WHERE id != ?`, original.seat_id)!.id
+    const p = { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'dashboard' as const }
+    expect(await ensureAdmission(env, p)).toEqual({ ok: false, error: 'attach_refused' })
+    expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId, agentRef: 'rava', via: 'dashboard' })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId, agentRef: 'rava', via: 'dashboard', grantTokenId: g.tokenId })).toMatchObject({ ok: true, status: 'attached' })
+  })
+
+  it('dashboard INSERT rechecks the supplied grant against a changed harness', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'dashboard-a')
+    await boot(env, g, 'dashboard-b')
+    const seatId = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id NOT IN (SELECT seat_id FROM agent_seat_attachments)`)!.id
+    const other = { tokenId: 'other-dashboard-grant' }
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES (?, ?, ?, 'replacement', 'directory', datetime('now'), ?)`).run(other.tokenId, HUMAN, other.tokenId, TENANT)
+    const batch = env.DB.batch.bind(env.DB)
+    env.DB.batch = (async (stmts: Parameters<typeof batch>[0]) => {
+      tamperHarness(`UPDATE harnesses SET grant_id = 'oauth:${other.tokenId}' WHERE id = '${g.harnessId}'`)
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId, agentRef: 'rava', via: 'dashboard', grantTokenId: g.tokenId })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(attachments().filter((a) => a.seat_id === seatId)).toHaveLength(0)
+  })
+
+  it.each([
+    ['retired seat', `UPDATE agent_seats SET retired_at = datetime('now')`],
+    ['suspended welded member', `UPDATE members SET status = 'suspended' WHERE id = 'mem-agent-rava'`],
+    ['detached attachment with token cascade defeated', `DROP TRIGGER agent_seat_attachments_revoke_token; UPDATE agent_seat_attachments SET detached_at = datetime('now')`],
+  ])('events and resolver share liveness for a %s', async (_name, flip) => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'events-shared')
+    const a = attachments()[0]
+    const events = () => listLiveAttachmentsForEvents(env, { memberId: HUMAN, harnessId: g.harnessId, grantTokenId: g.tokenId })
+    const resolved = () => findLiveAttachment(env, { memberId: HUMAN, tokenId: g.tokenId }, a.seat_id)
+    expect(await events()).toHaveLength(1)
+    expect(await resolved()).not.toBeNull()
+    h.sqlite.exec(flip)
+    expect(await events()).toEqual([])
+    expect(await resolved()).toBeNull()
+  })
+
+  it('token alias parameter preserves the supplied time expression verbatim', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    // Replacing t. across the completed fragment would corrupt this literal as well as the alias.
+    const now = `CASE WHEN 't.' = char(116, 46) THEN datetime('now') ELSE '9999-01-01' END`
+    h.sqlite.prepare(`UPDATE member_tokens SET expires_at = datetime('now', '+1 day') WHERE id = ?`).run(g.tokenId)
+    expect(one(`SELECT g.id FROM member_tokens g WHERE g.id = ? AND ${TOKEN_LIVE_PREDICATE(now, 'g')}`, g.tokenId)).toEqual({ id: g.tokenId })
+  })
+})
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('selection: a later thread explicitly attaches with no new tap (the headline)', () => {
@@ -578,6 +772,35 @@ describe('openai/subject is an auxiliary signal only', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('gate authority is not inherited through grant continuity', () => {
+  it('verdict write guard itself denies a reused harness admission even with gate_authority forced on', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-write', 'gate:review', 'agent', 'agent-rava', 'x', '2026-01-01')`)
+    await admitForAllChats(env, g, 'verdict-original')
+    await boot(env, g, 'verdict-reused')
+    expect((await attach(env, g, 'verdict-reused', 'rava')).sc.status).toBe('attached')
+    h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_gate_authority_immutable; UPDATE agent_seat_admissions SET gate_authority = 1`)
+    const { writeVerdict, VerdictRaceError } = await import('../src/tasks/service')
+    const mkTask = (id: string) => h.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, created_at, updated_at)
+      VALUES (?, 'squad-core', 't', 'b', 'p', 'review', 'gate:review', 'agent-hadi-dev', '2026-10-01', '2026-10-01')`).run(id)
+    const write = (id: string, a: ReturnType<typeof attachments>[number]) => writeVerdict(env, {
+      task: one<Record<string, unknown>>(`SELECT * FROM tasks WHERE id = ?`, id) as never,
+      verdict: 'approved', note: null, decidedBy: 'agent-rava',
+      attribution: { attachmentId: a.id, consentingMemberId: HUMAN, seatId: a.seat_id, grantTokenId: g.tokenId },
+    })
+    const [original, reused] = attachments()
+    // Direct service calls bypass attachedGateAgent: only the atomic write guard can deny this.
+    expect(await findLiveAttachment(env, { memberId: HUMAN, tokenId: g.tokenId }, reused.seat_id)).not.toBeNull()
+    mkTask('verdict-reused')
+    await expect(write('verdict-reused', reused)).rejects.toBeInstanceOf(VerdictRaceError)
+    expect(n(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'verdict-reused'`)).toBe(0)
+    expect(one<{ status: string }>(`SELECT status FROM tasks WHERE id = 'verdict-reused'`)!.status).toBe('review')
+    // Positive control isolates the requested-seat guard from every other verdict condition.
+    mkTask('verdict-original')
+    await write('verdict-original', original)
+    expect(n(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'verdict-original'`)).toBe(1)
+  })
+
   it('a reused thread never holds the agent\'s gate, even if the agent holds a live gate grant and the admission bit is forced on', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)

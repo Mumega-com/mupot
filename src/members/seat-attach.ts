@@ -46,7 +46,7 @@ import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding
 import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
-import { sanitizeLabel } from './harness'
+import { loadHarness, sanitizeLabel } from './harness'
 import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 import { sendClaimWelcome } from './claim-welcome'
 
@@ -323,16 +323,16 @@ export type EnsureAdmissionResult =
   | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch' }
 
 /**
- * A LIVE admission seen by a chat that asked for it. The asking chat always gets it. Another chat gets it ONLY when the human approved
- * it with scope 'harness' (R1) and, on the tool path, this request carries the install's grant token (the final proof is the
+ * A LIVE seat-scoped admission is returned only to the chat that asked for it. A harness-scoped admission (R1) covers
+ * any chat of the install, including the asking chat, only when this request carries its grant token (the final proof is the
  * attach INSERT, which re-reads the harness anchor and the live grant atomically). A seat-scoped admission, which every legacy row is,
  * stays bound to its one chat; asking for the wider scope on top of it is an upgrade the human must make explicitly (revoke, re-ask).
  */
 function liveAdmissionFor(open: AdmissionRow, p: { seatId: string; via: 'tool' | 'dashboard'; scope?: AdmissionScope; grantTokenId?: string | null }): EnsureAdmissionResult {
   if (p.scope === 'harness' && open.scope !== 'harness') return { ok: false, error: 'admission_scope_mismatch' }
+  if (open.scope === 'harness' && !p.grantTokenId) return { ok: false, error: 'attach_refused' }
   if (open.requested_seat_id === p.seatId) return { ok: true, state: 'live', admission: open }
   if (open.scope !== 'harness') return { ok: false, error: 'approval_bound_to_other_chat' }
-  if (p.via === 'tool' && !p.grantTokenId) return { ok: false, error: 'attach_refused' }
   return { ok: true, state: 'live', admission: open }
 }
 
@@ -523,11 +523,17 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id, a.slug AS slug FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string; slug: string }>()
   const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : null
+  // Pin the consent the human is approving. The INSERT re-reads this exact anchor in the batch; a changed/revoked grant
+  // cannot attach the asking chat. Re-consent also revokes this pending admission in the harness re-anchor transaction.
+  const harness = adm.scope === 'harness' ? await loadHarness(env, adm.human_member_id, adm.harness_id) : null
+  const grantTokenId = harness?.credential_kind === 'oauth' && harness.grant_id?.startsWith('oauth:')
+    ? harness.grant_id.slice(6) : null
   const attachmentId = adm.requested_seat_id && agent ? crypto.randomUUID() : null
   const attach = attachmentId && adm.requested_seat_id && agent && seatAttachEnabled(env)
     ? prepareAttachStatements(env, {
         attachmentId, tokenId: crypto.randomUUID(), tokenHash: await sha256Hex(mintRawToken()), nowIso, admissionId: adm.id,
         agent: { id: adm.agent_id, slug: agent.slug }, seat: { id: adm.requested_seat_id, harnessId: adm.harness_id }, humanMemberId: adm.human_member_id, requireNoLiveAttachment: true, promotedAt: nowIso,
+        grantTokenId,
       })
     : []
   const out = await env.DB.batch([
@@ -778,7 +784,7 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
  */
 function prepareAttachStatements(
   env: Env,
-  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string; grantTokenId?: string | null },
+  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string; grantTokenId: string | null },
 ): D1PreparedStatement[] {
   // R1: for a harness-wide admission the INSERT itself re-proves the request's grant is the install's own (null -> NULL -> no row).
   const grantIdx = p.promotedAt !== undefined ? 10 : 9
@@ -795,14 +801,14 @@ function prepareAttachStatements(
          JOIN members am ON am.id = b.member_id AND am.tenant = s.tenant AND am.status = 'active'
          JOIN harnesses hr ON hr.id = s.harness_id AND hr.tenant = s.tenant AND hr.member_id = s.member_id
         WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
-          ${p.grantTokenId !== undefined ? `AND (adm.scope = 'seat' OR (hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ?${grantIdx}))` : ''}
+          AND (adm.scope = 'seat' OR (hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ?${grantIdx}))
           AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
           ${p.promotedAt !== undefined ? 'AND adm.decided_at = ?9' : ''} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
           ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
           ${attachDesignatedClause(env, 'a', '?8')}`,
     ).bind(...[p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId,
       ...(p.promotedAt !== undefined ? [p.promotedAt] : []),
-      ...(p.grantTokenId !== undefined ? [p.grantTokenId] : [])]),
+      p.grantTokenId]),
     env.DB.prepare(
       `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
        SELECT ?1, b.member_id, ?2, ?3, 'directory', datetime('now'), b.agent_id, ?4
@@ -898,8 +904,8 @@ export async function attachSeatToAgent(
   statements.push(...prepareAttachStatements(env, {
     attachmentId, tokenId, tokenHash, nowIso, admissionId: admission.admission.id, agent: { id: agent.id, slug: agent.slug },
     seat: { id: seat.id, harnessId: seat.harness_id }, humanMemberId: p.humanMemberId, requireNoLiveAttachment: false,
-    // The tool path proves the request's own grant in the INSERT (null fails closed for a harness-wide admission); the dashboard is the human present.
-    grantTokenId: p.via === 'tool' ? (p.grantTokenId ?? null) : undefined,
+    // Every path proves the request's own grant in the INSERT; null fails closed for a harness-wide admission.
+    grantTokenId: p.grantTokenId ?? null,
   }))
 
   try {
