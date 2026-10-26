@@ -263,6 +263,7 @@ import { secureDropFlag } from '../secure-drop/config'
 import { TELEGRAM_MINIAPP_TOOLS } from './telegram-miniapp'
 import { WORKTREE_TOOLS } from './worktrees'
 import { workspacesEnabled } from '../workspaces/flag'
+import { repoProjectAnswer } from './repo-project'
 import { telegramMiniappFlag } from '../secure-moments/telegram-miniapp-config'
 import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
@@ -7144,13 +7145,15 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string, repo?: string, branch?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot. repo/branch: `git remote get-url origin` and your current branch; the answer names the project you are part of',
   inputSchema: {
     type: 'object',
     properties: {
       source: STRING_SCHEMA,
       seat: STRING_SCHEMA,
       label: STRING_SCHEMA,
+      repo: { type: 'string', description: 'Output of `git remote get-url origin` for the repository you work in. Optional. Answers repo_project: the one project you can read that owns it, or null with a reason.' },
+      branch: { type: 'string', description: 'Your current git branch. Optional; echoed back in repo_project.' },
       runtime: STRING_SCHEMA,
       model: STRING_SCHEMA,
       host: STRING_SCHEMA,
@@ -7403,6 +7406,11 @@ const toolBootContext: ToolSpec = {
       nextStepOut = `${nextStepOut} SHOW YOUR HUMAN THIS LINK to claim ${pendingClaim.agent}: ${pendingClaim.claim_url ?? `attach code ${pendingClaim.attach_code} (on their Connections page)`} (valid until ${pendingClaim.expires_at}). After they press Confirm, call seat_attach again.`
     }
 
+    // Which project am I part of? Only when the agent passed its repo. Read-only; boot must always answer.
+    const repoProject = typeof args.repo === 'string' && args.repo.trim() !== ''
+      ? await repoProjectAnswer(env, auth, args.repo, args.branch)
+      : null
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -7433,6 +7441,7 @@ const toolBootContext: ToolSpec = {
       ...(pendingClaim ? { pending_claim: { ...pendingClaim, tell_the_person: 'Show your human the claim_url (they open it signed in and press Confirm). No typing.' } } : {}),
       // Emitted ONCE, top level (the receipt exists only with SEAT_AUTO_ENROLL; detection has its own flag).
       ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
+      ...(repoProject ? { repo_project: repoProject } : {}),
     })
   },
 }

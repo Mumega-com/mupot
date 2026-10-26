@@ -10,6 +10,8 @@ import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { seatSelect } from '../members/seat-select'
 import { seatAttachEnabled } from '../members/seat-attach'
+import { humanReadAuth } from '../workspaces/repo-project'
+import { repoProjectAnswer } from './repo-project'
 import { consentChoiceLabels, consentLabels } from './refusal-next-step'
 
 /** The thread has no header or _meta: it carries its seat as an ordinary argument on every call. */
@@ -19,13 +21,15 @@ const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
   scope: 'Only for a chat with no agent yet (an unbound directory chat). Never call it from an attached chat or from an agent that already has a seat: self (find-or-create the agent seat for this harness + workspace)',
   min: 'authenticated',
-  args: '{ project: string, folder?: string, thread?: string, squad?: string }  // all values are LABELS that key the seat; none grants authority',
+  args: '{ project: string, folder?: string, thread?: string, squad?: string, repo?: string, branch?: string }  // all values are LABELS that key the seat; none grants authority',
   inputSchema: {
     type: 'object',
     properties: {
       project: { type: 'string', description: 'Project / workspace name for this seat. Required. A label, not an access request.' },
       folder: { type: 'string', description: 'Working folder or worktree path. Normalised server-side; only a hash and the last segment are stored.' },
       thread: { type: 'string', description: 'Thread / conversation / bot identifier inside the harness, if the seat is per-thread.' },
+      repo: { type: 'string', description: 'Output of `git remote get-url origin`. Optional. Answers repo_project: the one project your human can read that owns it, or null with a reason.' },
+      branch: { type: 'string', description: 'Your current git branch. Optional.' },
       squad: { type: 'string', description: 'Squad label. Part of the seat key only; it never places the agent.' },
     },
     required: ['project'],
@@ -40,7 +44,18 @@ const toolSeatSelect: ToolSpec = {
     })
 
     if (result.ok) {
+      // Which project does this repo belong to? Read with the HUMAN's grants (a seat session carries none of its own).
+      let repoProject: Record<string, unknown> | null = null
+      if (typeof args.repo === 'string' && args.repo.trim() !== '' && auth.memberId) {
+        try {
+          // auth.memberId is the HUMAN behind the session; result.member_id is the new seat agent's own member.
+          repoProject = await repoProjectAnswer(env, await humanReadAuth(env, auth.memberId), args.repo, args.branch)
+        } catch {
+          repoProject = { project: null, reason: 'unavailable' } // the seat is already made: never fail it over a read
+        }
+      }
       return done({
+        ...(repoProject ? { repo_project: repoProject } : {}),
         disposition: result.disposition,
         // `seat` is THE value to pass back as the `seat` argument (the mseat_ handle); the DB row is `seat_row`
         // (a model that read `seat.id` as the thing to pass got a generic refusal).

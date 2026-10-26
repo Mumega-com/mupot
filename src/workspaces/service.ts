@@ -30,6 +30,7 @@ import { isHarnessCredentialSession } from '../members/harness-credential'
 import { readAccess, readableProject } from '../mcp/projects'
 import { repoKeyFromUrl } from './repo-key'
 import { workspacesEnabled } from './flag'
+import { cloneSpecFor, resolveCallerRepoProject, type CloneSpec, type RepoProjectReason } from './repo-project'
 
 export { workspacesEnabled }
 
@@ -190,6 +191,7 @@ export type OpenFailure =
   | { ok: false; error: 'principal_required' }
   | { ok: false; error: 'invalid_args'; detail: string }
   | { ok: false; error: 'project_not_found' }
+  | { ok: false; error: 'project_unresolved'; detail: { reason: RepoProjectReason; hint: string } }
   | { ok: false; error: 'forbidden'; detail: { need: 'project_write'; scope: 'project' } }
   | { ok: false; error: 'repo_not_in_project'; detail: string }
   | { ok: false; error: 'harness_required' }
@@ -197,13 +199,13 @@ export type OpenFailure =
   | { ok: false; error: 'worktree_cap_reached' }
   | { ok: false; error: 'write_failed' }
 
-export type OpenResult = { ok: true; created: boolean; worktree: WorktreeRow } | OpenFailure
+export type OpenResult = { ok: true; created: boolean; worktree: WorktreeRow; clone: CloneSpec | null } | OpenFailure
 
 export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs): Promise<OpenResult> {
   if (!workspacesEnabled(env)) return { ok: false, error: 'workspaces_disabled' }
 
-  const projectRef = typeof args.project === 'string' ? args.project.trim() : ''
-  if (!projectRef || projectRef.length > 200) return { ok: false, error: 'invalid_args', detail: 'project required' }
+  let projectRef = typeof args.project === 'string' ? args.project.trim() : ''
+  if (projectRef.length > 200) return { ok: false, error: 'invalid_args', detail: 'project required' }
   const kindRaw = args.kind === undefined || args.kind === null ? 'git_branch' : args.kind
   if (typeof kindRaw !== 'string' || !(WORKTREE_KINDS as readonly string[]).includes(kindRaw)) {
     return { ok: false, error: 'invalid_args', detail: `kind must be one of ${WORKTREE_KINDS.join(', ')}` }
@@ -246,8 +248,17 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
     headSha = h
   }
 
+  // `project` is optional for git_branch: the repo names it when exactly one project the principal can read owns it.
+  if (!projectRef && (kind !== 'git_branch' || !has(args.repo))) return { ok: false, error: 'invalid_args', detail: 'project required' }
+
   const principal = await resolvePrincipal(env, auth, { harnessDoor: true })
   if (!principal) return { ok: false, error: 'principal_required' }
+
+  if (!projectRef) {
+    const resolved = await resolveCallerRepoProject(env, principal.authz, args.repo)
+    if (resolved.project === null) return { ok: false, error: 'project_unresolved', detail: { reason: resolved.reason, hint: resolved.hint } }
+    projectRef = resolved.project.id
+  }
 
   // 404 for a project the principal cannot even see; 403 for one it can read but not write.
   const project = await findProject(env, projectRef, principal.authz)
@@ -314,7 +325,9 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
   ).bind(found.id, headSha).run()
   if ((stamped.meta?.changes ?? 0) === 0) return { ok: false, error: 'write_failed' }
   const row = await env.DB.prepare(`SELECT ${WORKTREE_COLUMNS} FROM worktrees WHERE id = ?1`).bind(found.id).first<WorktreeRow>()
-  return { ok: true, created, worktree: row ?? found }
+  const worktree = row ?? found
+  const clone = kind === 'git_branch' ? cloneSpecFor(repoKey, project.slug, refName ?? '') : null
+  return { ok: true, created, worktree, clone }
 }
 
 // ── worktree_list ───────────────────────────────────────────────────────────────────────

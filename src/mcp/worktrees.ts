@@ -19,6 +19,8 @@ function refusal(error: string, detail?: unknown): ToolOutcome {
       return fail(400, error, detail)
     case 'project_not_found':
       return fail(404, error)
+    case 'project_unresolved':
+      return fail(404, error, detail)
     case 'forbidden':
       return fail(403, error, detail)
     case 'repo_not_in_project':
@@ -38,11 +40,11 @@ const toolWorktreeOpen: ToolSpec = {
   name: 'worktree_open',
   scope: 'project workspace (find-or-create); authorised against the underlying human / the calling agent\'s own project write access',
   min: 'authenticated',
-  args: '{ project: string, repo?: string, branch?: string, kind?: "git_branch"|"folder"|"thread", slug?: string, thread?: string, head_sha?: string }',
+  args: '{ project?: string, repo?: string, branch?: string, kind?: "git_branch"|"folder"|"thread", slug?: string, thread?: string, head_sha?: string }',
   inputSchema: {
     type: 'object',
     properties: {
-      project: { type: 'string', description: 'Project id or slug.' },
+      project: { type: 'string', description: 'Project id or slug. Optional for git_branch: omit it and pass repo, and the project is the one you can read that owns the repo (ambiguous or unknown answers project_unresolved; ask your owner).' },
       kind: { type: 'string', enum: [...WORKTREE_KINDS], description: 'git_branch (default): project + repo + branch. folder: a named non-git workspace (slug). thread: a chat thread id inside this harness.' },
       repo: { type: 'string', description: 'git_branch: the repository URL in any spelling. Must be the project\'s repo or one on its allow-list.' },
       branch: { type: 'string', description: 'git_branch: the branch (refs/heads/x or x). A detached HEAD has no workspace identity.' },
@@ -50,7 +52,6 @@ const toolWorktreeOpen: ToolSpec = {
       thread: { type: 'string', description: 'thread: the thread id inside this harness. Needs a verified harness (SEAT_AUTO_ENROLL on); only its owner can list it.' },
       head_sha: { type: 'string', description: 'Optional current HEAD, recorded for display only. Never authority.' },
     },
-    required: ['project'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -68,6 +69,8 @@ const toolWorktreeOpen: ToolSpec = {
       ref_name: r.worktree.ref_name,
       last_head_sha: r.worktree.last_head_sha,
       last_seen_at: r.worktree.last_seen_at,
+      // git_branch only: where to clone and what to name the folder. A URL, never a credential.
+      ...(r.clone ? { clone_url: r.clone.clone_url, default_branch: r.clone.default_branch, suggested_dir: r.clone.suggested_dir } : {}),
     })
   },
 }

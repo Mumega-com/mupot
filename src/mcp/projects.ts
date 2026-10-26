@@ -35,6 +35,7 @@ import {
 import { resolveReadableSquadIds } from '../projects/readable-squads'
 import { loadProjectSituation } from '../projects/situation'
 import { resolveVisibleTaskScope } from '../tasks/visibility'
+import { setProjectRepo } from '../workspaces/project-repos'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
@@ -508,11 +509,13 @@ const toolProjectUpdate: ToolSpec = {
   name: 'project_update',
   scope: 'workspace project lifecycle, including archive and restore (an agent holding a live action:project_status elevation grant may change status only)',
   min: 'admin',
-  args: '{ project_id: string, slug?: string, name?: string, description?: string, goal?: string, status?: "planned"|"active"|"paused"|"completed"|"archived", parent_project_id?: string|null, target_date?: string|null }',
+  args: '{ project_id: string, slug?: string, name?: string, description?: string, goal?: string, status?: "planned"|"active"|"paused"|"completed"|"archived", parent_project_id?: string|null, target_date?: string|null, add_repo?: string, remove_repo?: string }  // add_repo/remove_repo edit the project\'s repository allow-list (project_repos) and cannot be combined with other fields',
   inputSchema: {
     type: 'object',
     properties: {
       project_id: STRING_SCHEMA,
+      add_repo: { type: 'string', description: 'A git remote URL (any spelling) to add to this project\'s repository allow-list. Needs write access on the project. Refused when another project already owns the repo.' },
+      remove_repo: { type: 'string', description: 'A git remote URL to remove from this project\'s repository allow-list.' },
       slug: STRING_SCHEMA,
       name: STRING_SCHEMA,
       description: STRING_SCHEMA,
@@ -536,9 +539,26 @@ const toolProjectUpdate: ToolSpec = {
     }
     const projectId = str(args.project_id)?.trim() ?? null // canonical id, same value the elevation check used
     if (!projectId) return fail(400, 'invalid_project_id')
-    const { project_id: _projectId, ...rawInput } = args
+    const { project_id: _projectId, add_repo: addRepo, remove_repo: removeRepo, ...rawInput } = args
     // Strip internal lifecycle flags even though schema forbids them — class coverage.
     const input = stripExternalLifecycleFields(rawInput as Record<string, unknown>)
+
+    // Repository allow-list edit: a structural write of its own (never rides along with other fields, never elevated).
+    if (addRepo !== undefined || removeRepo !== undefined) {
+      if (elevationGrant) return denied ?? fail(403, 'forbidden')
+      // The structural chokepoint: project_repos is a structural table. Not delegable; an agent-bound caller is refused.
+      const repoGate = await authorizeStructuralWrite(env, auth, addRepo !== undefined ? 'project_repo_set' : 'project_repo_remove', {})
+      if (repoGate.kind === 'refused') return fail(repoGate.status, repoGate.error, repoGate.detail)
+      if ((addRepo !== undefined && removeRepo !== undefined) || Object.keys(input).length > 0) return fail(400, 'repo_edit_standalone')
+      const edited = await setProjectRepo(env, auth, {
+        project_id: projectId,
+        op: addRepo !== undefined ? 'add' : 'remove',
+        repo: addRepo !== undefined ? addRepo : removeRepo,
+      })
+      if (!edited.ok) return fail(edited.status, edited.error)
+      await emitProjectMutation(env, auth.memberId as string, 'updated', projectId)
+      return done({ project_id: projectId, repo_key: edited.repo_key, changed: edited.changed, project_repos: edited.repos, receipt_id: edited.receipt_id })
+    }
 
     // Slice 3: planned→active must go through start-gate (authorize + provision).
     if (str(input.status) === 'active') {
