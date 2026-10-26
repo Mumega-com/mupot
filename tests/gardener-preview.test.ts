@@ -14,13 +14,14 @@ const AS_OF = '2026-10-25T12:00:00.000Z'
 const NOW = Date.parse(AS_OF)
 const ago = (days: number): string => new Date(NOW - days * 86_400_000).toISOString()
 
-function caller(capabilities: CapabilityGrant[]): AuthContext {
+function caller(capabilities: CapabilityGrant[], memberId = 'mem-caller'): AuthContext {
   return {
     userId: 'caller', email: 'c@example.com', role: 'member', tenant: TENANT, channel: 'workspace',
-    memberId: 'mem-caller', capabilities, boundAgentId: null,
+    memberId, capabilities, boundAgentId: null,
   } as AuthContext
 }
 const SQUAD_READER = caller([{ member_id: 'mem-caller', scope_type: 'squad', scope_id: 'sq-1', capability: 'member' }])
+const SQUAD_LEAD = caller([{ member_id: 'mem-lead', scope_type: 'squad', scope_id: 'sq-1', capability: 'lead' }], 'mem-lead')
 const OTHER_SQUAD_ONLY = caller([{ member_id: 'mem-caller', scope_type: 'squad', scope_id: 'sq-2', capability: 'member' }])
 
 describe('gardener_preview (read-only)', () => {
@@ -51,9 +52,13 @@ describe('gardener_preview (read-only)', () => {
     env = { TENANT_SLUG: TENANT, DB: interceptDb(harness.db, /./, 'observe', seen) } as unknown as Env
     sqlRun(harness, `INSERT INTO members (id, tenant, email, display_name, status) VALUES ('mem-caller', ?, 'c@example.com', 'Caller', 'active')`, TENANT)
     sqlRun(harness, `INSERT INTO members (id, tenant, email, display_name, status) VALUES ('mem-hadi', ?, 'h@example.com', 'Hadi', 'active')`, TENANT)
+    sqlRun(harness, `INSERT INTO members (id, tenant, email, display_name, status) VALUES ('mem-lead', ?, 'l@example.com', 'Lead', 'active')`, TENANT)
     sqlRun(harness, `INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept')`)
     sqlRun(harness, `INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-1', 'dept-1', 'one-sqd', 'One'), ('sq-2', 'dept-1', 'two-sqd', 'Two')`)
 
+    sqlRun(harness, `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead', 'mem-lead', 'squad', 'sq-1', 'lead')`)
+    sqlRun(harness, `INSERT INTO projects (id, slug, name) VALUES ('proj-1', 'p1', 'P1'), ('proj-2', 'p2', 'P2')`)
+    sqlRun(harness, `INSERT INTO project_squad_access (project_id, squad_id) VALUES ('proj-1', 'sq-1'), ('proj-2', 'sq-2')`)
     // Active agent: submitted 2 days ago, two fresh open tasks, metered spend yesterday.
     seedAgent('ag-active'); seedSubmission('sub-active', 'ag-active', 2)
     seedTask('t-a1', 'ag-active', 'in_progress', 1); seedTask('t-a2', 'ag-active', 'open', 1)
@@ -67,14 +72,14 @@ describe('gardener_preview (read-only)', () => {
     seedAgent('ag-feed'); seedSubmission('sub-feed', 'ag-feed', 3)
     // Waiting agent: a flight waiting for 5 days.
     seedAgent('ag-wait')
-    sqlRun(harness, `INSERT INTO flights (id, tenant, agent, goal, status, waiting_since) VALUES ('fl-wait', ?, 'ag-wait', 'g', 'waiting', ?)`, TENANT, NOW - 5 * 86_400_000)
+    sqlRun(harness, `INSERT INTO flights (id, tenant, project_id, agent, goal, status, waiting_since) VALUES ('fl-wait', ?, 'proj-1', 'ag-wait', 'g', 'waiting', ?)`, TENANT, NOW - 5 * 86_400_000)
     // Dormant, nothing holding it: eligible agent archive candidate.
     seedAgent('ag-dormant')
     // Dormant but exempt, one reason each.
     seedAgent('ag-gate'); sqlRun(harness, `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg1', 'gate:hadi', 'agent', 'ag-gate', 'mem-hadi', ?)`, ago(90))
     seedAgent('ag-designated'); sqlRun(harness, `UPDATE agents SET attach_designated_member_id = 'mem-hadi' WHERE id = 'ag-designated'`)
     seedAgent('ag-flying')
-    sqlRun(harness, `INSERT INTO flights (id, tenant, agent, goal, status) VALUES ('fl-run', ?, 'ag-flying', 'g', 'running')`, TENANT)
+    sqlRun(harness, `INSERT INTO flights (id, tenant, project_id, agent, goal, status) VALUES ('fl-run', ?, 'proj-1', 'ag-flying', 'g', 'running')`, TENANT)
     seedAgent('ag-home'); sqlRun(harness, `UPDATE agents SET kind = 'home' WHERE id = 'ag-home'`)
     // A sole gate holder is NOT sole when a second principal holds the capability.
     seedAgent('ag-shared'); sqlRun(harness, `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg2', 'gate:shared', 'agent', 'ag-shared', 'mem-hadi', ?), ('gg3', 'gate:shared', 'member', 'mem-hadi', 'mem-hadi', ?)`, ago(90), ago(90))
@@ -90,7 +95,7 @@ describe('gardener_preview (read-only)', () => {
   })
   afterEach(() => harness.close())
 
-  const preview = async (a = SQUAD_READER, args: Record<string, unknown> = { squad_id: 'sq-1' }) => {
+  const preview = async (a = SQUAD_LEAD, args: Record<string, unknown> = { squad_id: 'sq-1' }) => {
     const res = await call(a, args)
     if (!res.ok) throw new Error(`tool failed: ${JSON.stringify(res)}`)
     return res.result as Record<string, any> // test-only: JSON shape asserted field by field below
@@ -161,7 +166,10 @@ describe('gardener_preview (read-only)', () => {
     seen.length = 0
     await preview()
     expect(seen.length).toBeGreaterThan(5)
-    for (const sql of seen) expect(sql.trimStart(), sql).toMatch(/^SELECT\b/i)
+    for (const sql of seen) {
+      expect(sql.trimStart(), sql).toMatch(/^(SELECT|WITH)\b/i)
+      expect(sql, sql).not.toMatch(/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i)
+    }
     expect(Number(sqlGet(harness, 'SELECT total_changes() AS c')?.c)).toBe(before)
   })
 
@@ -188,6 +196,143 @@ describe('gardener_preview (read-only)', () => {
     expect(await call(SQUAD_READER, {})).toMatchObject({ ok: false, status: 400 })
     expect(await call(SQUAD_READER, { squad_id: 'sq-1', window_days: 5 })).toMatchObject({ ok: false, status: 400 })
     expect(await call(SQUAD_READER, { squad_id: 'sq-1', as_of: 'not-a-date' })).toMatchObject({ ok: false, status: 400 })
+    // as_of: not in the future, not older than 365 days
+    expect(await call(SQUAD_READER, { squad_id: 'sq-1', as_of: new Date(Date.now() + 86_400_000).toISOString() })).toMatchObject({ ok: false, status: 400 })
+    expect(await call(SQUAD_READER, { squad_id: 'sq-1', as_of: new Date(Date.now() - 366 * 86_400_000).toISOString() })).toMatchObject({ ok: false, status: 400 })
     expect(await call(SQUAD_READER, { squad_id: 'nope' })).toMatchObject({ ok: false, status: 404 })
+  })
+
+  // ── round-1 fixes ───────────────────────────────────────────────────────────────────────────
+  describe('round 1', () => {
+    const iso = (d: number) => ago(d)
+
+    it('[P1-1 Codex] cost is "restricted" without meter:read; visible to a squad lead', async () => {
+      const member = await preview(SQUAD_READER)
+      for (const a of member.agents) expect(a.cost).toBe('restricted')
+      expect(JSON.stringify(member)).not.toContain('1500')
+      const lead = await preview(SQUAD_LEAD)
+      expect(agent(lead, 'ag-active').cost).toMatchObject({ micro_usd: 1500 })
+    })
+
+    it('[P1-2 gate] other-squad work shows only as activity_elsewhere: no ids, no timestamps, no waits', async () => {
+      sqlRun(harness, `INSERT INTO tasks (id, squad_id, title, status, done_when, created_at, updated_at) VALUES ('t-other', 'sq-2', 't', 'done', 'n/a', ?, ?)`, iso(1), iso(1))
+      seedAgent('ag-x')
+      const stamp = iso(4.5)
+      sqlRun(harness, `INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at) VALUES ('v-LEAK', 't-other', 'approved', 'ag-x', ?)`, stamp)
+      sqlRun(harness, `INSERT INTO project_deployments (id, project_id, deployment_id, status, dispatched_by, created_at) VALUES ('dep-LEAK', 'proj-2', 'd1', 'healthy', 'ag-x', ?)`, stamp)
+      sqlRun(harness, `INSERT INTO flights (id, tenant, project_id, agent, goal, status, waiting_since) VALUES ('fl-LEAK', ?, 'proj-2', 'ag-x', 'g', 'waiting', ?)`, TENANT, NOW - 9 * 86_400_000)
+      sqlRun(harness, `INSERT INTO routines (id, tenant, project_id, name, objective, trigger_kind, responsible_squad_id, created_by) VALUES ('rt-LEAK', ?, 'proj-2', 'n', 'o', 'manual', 'sq-2', 'x')`, TENANT)
+      sqlRun(harness, `INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key, trigger_kind, status, waiting_reason, assigned_agent_id) VALUES ('rr-LEAK', ?, 'proj-2', 'rt-LEAK', 1, '{}', 'k', 'manual', 'waiting', 'agent', 'ag-x')`, TENANT)
+      sqlRun(harness, `INSERT INTO decision_requests (id, tenant, decision_class, decision_cause, dedupe_key, exact_authority_required, question, options_json, consequences_json, evidence_json, task_id, requested_by_principal_kind, requested_by_principal_id, expires_at, created_at) VALUES ('dr-LEAK', ?, 'spend', 'spend.increase', 'dk', 'x', 'q', '[]', '{}', '{}', 't-other', 'agent', 'ag-x', ?, ?)`, TENANT, iso(-5), stamp)
+      const p = await preview()
+      const card = agent(p, 'ag-x')
+      expect(card.last_meaningful_activity).toBeNull()
+      expect(card.waits).toEqual([])
+      expect(card.activity_elsewhere).toBe(true)
+      expect(agentCand(p, 'ag-x').exceptions).toContainEqual({ reason: 'activity_elsewhere', evidence: [] })
+      expect(agentCand(p, 'ag-x').eligible).toBe(false)
+      const out = JSON.stringify(p)
+      for (const leak of ['LEAK', stamp.slice(0, 16), 'proj-2', 't-other']) expect(out, leak).not.toContain(leak)
+    })
+
+    it('[P1-3 tenant] flights, routine_runs and decision_requests of another tenant never count', async () => {
+      seedAgent('ag-t')
+      sqlRun(harness, `INSERT INTO flights (id, tenant, project_id, agent, goal, status, waiting_since) VALUES ('fl-ot', 'other-tenant', 'proj-1', 'ag-t', 'g', 'waiting', ?)`, NOW - 86_400_000)
+      sqlRun(harness, `INSERT INTO routines (id, tenant, project_id, name, objective, trigger_kind, responsible_squad_id, created_by) VALUES ('rt-ot', 'other-tenant', 'proj-1', 'n', 'o', 'manual', 'sq-1', 'x')`)
+      sqlRun(harness, `INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key, trigger_kind, status, waiting_reason, assigned_agent_id) VALUES ('rr-ot', 'other-tenant', 'proj-1', 'rt-ot', 1, '{}', 'k', 'manual', 'waiting', 'agent', 'ag-t')`)
+      sqlRun(harness, `INSERT INTO tasks (id, squad_id, title, status, done_when, created_at, updated_at) VALUES ('t-ot', 'sq-1', 't', 'open', 'n/a', ?, ?)`, iso(1), iso(1))
+      sqlRun(harness, `INSERT INTO decision_requests (id, tenant, decision_class, decision_cause, dedupe_key, exact_authority_required, question, options_json, consequences_json, evidence_json, task_id, requested_by_principal_kind, requested_by_principal_id, expires_at, created_at) VALUES ('dr-ot', 'other-tenant', 'spend', 'spend.increase', 'dk', 'x', 'q', '[]', '{}', '{}', 't-ot', 'agent', 'ag-t', ?, ?)`, iso(-5), iso(2))
+      const p = await preview()
+      expect(agent(p, 'ag-t').waits).toEqual([])
+      expect(agent(p, 'ag-t').activity_elsewhere).toBe(false)
+      expect(agentCand(p, 'ag-t')).toMatchObject({ eligible: true, exceptions: [] })
+    })
+
+    it('[P2 gate holder] only LIVE, visible principals count toward "sole"', async () => {
+      // gate:dual: ag-a plus a SUSPENDED member and an INACTIVE agent -> ag-a is still the sole live holder.
+      seedAgent('ag-a'); seedAgent('ag-dead'); sqlRun(harness, `UPDATE agents SET status = 'inactive' WHERE id = 'ag-dead'`)
+      sqlRun(harness, `INSERT INTO members (id, tenant, email, display_name, status) VALUES ('mem-susp', ?, 's@example.com', 'S', 'suspended')`, TENANT)
+      sqlRun(harness, `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('d1', 'gate:dual', 'agent', 'ag-a', 'mem-hadi', ?), ('d2', 'gate:dual', 'member', 'mem-susp', 'mem-hadi', ?), ('d3', 'gate:dual', 'agent', 'ag-dead', 'mem-hadi', ?)`, iso(90), iso(90), iso(90))
+      // gate:hidden: ag-b plus a live agent in a squad the caller cannot read -> still sole for the caller.
+      seedAgent('ag-b')
+      sqlRun(harness, `INSERT INTO agents (id, squad_id, slug, name, status, created_at) VALUES ('ag-hidden', 'sq-2', 'ag-hidden', 'h', 'active', '2026-01-01 00:00:00')`)
+      sqlRun(harness, `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('h1', 'gate:hidden', 'agent', 'ag-b', 'mem-hadi', ?), ('h2', 'gate:hidden', 'agent', 'ag-hidden', 'mem-hadi', ?)`, iso(90), iso(90))
+      const p = await preview()
+      expect(agentCand(p, 'ag-a').exceptions.map((e: any) => e.reason)).toEqual(['sole_gate_holder'])
+      expect(agentCand(p, 'ag-b').exceptions.map((e: any) => e.reason)).toEqual(['sole_gate_holder'])
+      // A second LIVE, visible agent holder ends soleness.
+      sqlRun(harness, `UPDATE agents SET squad_id = 'sq-1' WHERE id = 'ag-hidden'`)
+      const p2 = await preview()
+      expect(agentCand(p2, 'ag-b')).toMatchObject({ eligible: true })
+    })
+
+    it('[P2 as_of] activity after as_of is ignored', async () => {
+      seedAgent('ag-late'); seedSubmission('sub-late', 'ag-late', -1) // one day AFTER as_of
+      const p = await preview()
+      expect(agent(p, 'ag-late').last_meaningful_activity).toBeNull()
+      expect(agent(p, 'ag-late').meaningful_activity_count).toBe(0)
+      sqlRun(harness, `INSERT INTO tasks (id, squad_id, title, status, done_when, created_at, updated_at) VALUES ('t-v', 'sq-1', 't', 'done', 'n/a', ?, ?)`, iso(50), iso(50))
+      sqlRun(harness, `INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at) VALUES ('v-late', 't-v', 'approved', 'ag-late', ?)`, iso(-1))
+      sqlRun(harness, `INSERT INTO project_deployments (id, project_id, deployment_id, status, dispatched_by, created_at) VALUES ('dep-late', 'proj-1', 'd', 'healthy', 'ag-late', ?)`, iso(-1))
+      sqlRun(harness, `INSERT INTO execution_receipts (id, tenant, type, issuer_kind, issuer_id, actor_kind, actor_id, task_id, idempotency_key, claims_json, canonical_payload, payload_digest, receipt_hash, server_timestamp) VALUES ('rc-late', ?, 'result.reported', 'mupot', 'x', 'agent', 'ag-late', 't-v', 'k', '{}', '{}', ?, ?, ?)`, TENANT, 'a'.repeat(64), 'b'.repeat(64), iso(-1))
+      const p2 = await preview()
+      expect(agent(p2, 'ag-late').meaningful_activity_count).toBe(0)
+      expect(agent(p2, 'ag-late').activity_elsewhere).toBe(false)
+    })
+
+    it('[P2 truncation] a truncated activity read makes affected facts unknown and nothing archive-eligible', async () => {
+      sqlRun(harness, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 501)
+        INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, created_at)
+        SELECT 'bulk-' || i, '${TENANT}', 'x', 'sq-1', 'ag-active', 'a.md', '${'a'.repeat(64)}', '${'b'.repeat(64)}', '${ago(1)}' FROM n`)
+      const p = await preview()
+      expect(p.truncated.events).toBe(true)
+      expect(p.gaps).toContain('activity_events_truncated')
+      expect(agent(p, 'ag-dormant')).toMatchObject({ activity_known: false })
+      expect(agent(p, 'ag-dormant').recommendation.rule).toBe('unknown_due_to_truncation')
+      expect(agentCand(p, 'ag-dormant')).toMatchObject({ eligible: false, days_without_meaningful_activity: 'unknown' })
+      expect(agentCand(p, 'ag-dormant').exceptions.map((e: any) => e.reason)).toContain('unknown_due_to_truncation')
+      for (const c of p.archive_candidates.agents) expect(c.eligible).toBe(false)
+    })
+
+    it('[P2 truncation] a truncated task read makes assignments unknown and no task archive-eligible', async () => {
+      sqlRun(harness, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 505)
+        INSERT INTO tasks (id, squad_id, title, status, done_when, created_at, updated_at)
+        SELECT 'z-bulk-' || i, 'sq-1', 't', 'done', 'n/a', '${ago(60)}', '${ago(60)}' FROM n`)
+      const p = await preview()
+      expect(p.truncated.tasks).toBe(true)
+      expect(agent(p, 'ag-active').open_assignments).toMatchObject({ count: 'unknown', stale_count: 'unknown' })
+      expect(agent(p, 'ag-active').recommendation.rule).toBe('unknown_due_to_truncation')
+      expect(p.archive_candidates.tasks.length).toBeGreaterThan(0)
+      for (const c of p.archive_candidates.tasks) expect(c.eligible, c.task_id).toBe(false)
+      for (const c of p.archive_candidates.agents) expect(c.eligible, c.agent_id).toBe(false)
+    })
+
+    it('[P2 dispatch] the canonical archive-blocking dispatch predicate exempts a task with an unsettled dispatch', async () => {
+      seedTask('t-disp', null, 'open', 45); seedTask('t-settled', null, 'open', 45)
+      sqlRun(harness, `INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at) VALUES ('dr1', ?, 't-disp', 'sq-1', 'ag-active', 'member', 'mem-hadi', ?)`, TENANT, ago(44))
+      sqlRun(harness, `INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at, settled_at) VALUES ('dr2', ?, 't-settled', 'sq-1', 'ag-active', 'member', 'mem-hadi', ?, ?, ?)`, TENANT, ago(44), ago(43), ago(43))
+      const p = await preview()
+      expect(taskCand(p, 't-disp').exceptions.map((e: any) => e.reason)).toEqual(['live_dispatch'])
+      expect(taskCand(p, 't-settled')).toMatchObject({ eligible: true, exceptions: [] })
+    })
+
+    it('[P2 binds] no statement binds more than 100 parameters, even with the 200-agent cap', async () => {
+      for (let i = 0; i < 230; i += 1) seedAgent(`ag-b${String(i).padStart(3, '0')}`)
+      const counts: number[] = []
+      const real = env.DB
+      env = { ...env, DB: new Proxy(real, { get(t, k, r) {
+        if (k !== 'prepare') return Reflect.get(t, k, r)
+        return (sql: string) => {
+          const st = t.prepare(sql)
+          return new Proxy(st, { get(st2, k2, r2) {
+            if (k2 !== 'bind') return Reflect.get(st2, k2, r2)
+            return (...args: unknown[]) => { counts.push(args.length); return st2.bind(...args) }
+          } })
+        }
+      } }) } as unknown as Env
+      const p = await preview()
+      expect(p.truncated.agents).toBe(true)
+      expect(Math.max(...counts)).toBeLessThanOrEqual(100)
+    })
   })
 })

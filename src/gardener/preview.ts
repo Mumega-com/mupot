@@ -22,6 +22,7 @@
 import type { Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { archiveBlockingDispatchExistsSql } from '../tasks/runtime-receipts'
 
 export const GARDENER_SCHEMA = 'mupot.gardener_preview/v1'
 export const ARCHIVE_AFTER_DAYS = 30
@@ -30,6 +31,8 @@ export const REVIEW_WAIT_HOURS = 72
 export const MIN_WINDOW_DAYS = 30
 export const MAX_WINDOW_DAYS = 90
 export const DEFAULT_WINDOW_DAYS = 30
+/** as_of may not be in the future and may not reach back further than this. */
+export const MAX_AS_OF_AGE_DAYS = 365
 const MAX_AGENTS = 200
 const MAX_TASKS = 500
 const MAX_EVENT_ROWS = 500
@@ -57,9 +60,14 @@ export interface AgentCard {
   status: string
   last_meaningful_activity: Activity | null
   meaningful_activity_count: number
-  open_assignments: { count: number; stale_count: number; listed: { task_id: string; status: string; age_days: number; priority: string | null }[] }
+  open_assignments: { count: number | 'unknown'; stale_count: number | 'unknown'; listed: { task_id: string; status: string; age_days: number; priority: string | null }[] }
   waits: Wait[]
-  cost: { micro_usd: number | 'unknown'; tokens: number | 'unknown'; source: 'execution_meter'; window_keys: string[]; gap: string | null }
+  /** 'restricted' = the caller lacks meter:read on this agent (same authorization as execution_meter_status). */
+  cost: 'restricted' | { micro_usd: number | 'unknown'; tokens: number | 'unknown'; source: 'execution_meter'; window_keys: string[]; gap: string | null }
+  /** true when this agent has activity/live work in squads outside this preview. Boolean only: no ids, no timestamps. */
+  activity_elsewhere: boolean
+  /** false when an activity read was truncated: last_meaningful_activity is then unknown, not absent. */
+  activity_known: boolean
   recommendation: { action: Recommendation; rule: string; evidence: Evidence[] }
 }
 
@@ -101,27 +109,55 @@ export function parseTs(v: string | number | null | undefined): number | null {
 const iso = (ms: number): string => new Date(ms).toISOString()
 const ageDays = (nowMs: number, ts: number): number => Math.max(0, Math.floor((nowMs - ts) / DAY_MS))
 
+interface Chunked<T> { rows: T[]; truncated: Set<string> }
+
+/**
+ * Run `build(placeholders)` once per chunk of `ids`. Every fixed bind counts against the 100-bind
+ * ceiling (chunkForD1InList fixedParams). When `limit` is given the SQL must LIMIT limit+1; a chunk
+ * that returns more than `limit` rows is trimmed and its ids are reported in `truncated`.
+ */
 async function selectChunked<T>(
   env: Env,
   ids: readonly string[],
   build: (placeholders: string) => string,
   extraBinds: readonly unknown[] = [],
-): Promise<T[]> {
-  // Placeholders are numbered after the fixed binds so the same fixed params serve every chunk.
-  const out: T[] = []
+  limit?: number,
+): Promise<Chunked<T>> {
+  const rows: T[] = []
+  const truncated = new Set<string>()
   for (const chunk of chunkForD1InList(ids, undefined, extraBinds.length)) {
     const placeholders = chunk.map((_, i) => `?${extraBinds.length + i + 1}`).join(',')
     const res = await env.DB.prepare(build(placeholders)).bind(...extraBinds, ...chunk).all<T>()
-    out.push(...(res.results ?? []))
+    let got = res.results ?? []
+    if (limit !== undefined && got.length > limit) {
+      got = got.slice(0, limit)
+      for (const id of chunk) truncated.add(id)
+    }
+    rows.push(...got)
   }
-  return out
+  return { rows, truncated }
 }
 
-export interface PreviewInput { squadId: string; tenant: string; nowMs: number; windowDays: number }
+export interface PreviewInput {
+  squadId: string
+  tenant: string
+  nowMs: number
+  windowDays: number
+  /** Squads the caller may read (resolveVisibleTaskScope). Gate holders are judged against these only. */
+  visibleSquadIds: readonly string[]
+  /** Result of the execution_meter_status authorization (meter:read), resolved by the tool. */
+  costScope: { all: boolean; agentId: string | null }
+}
+
+/** Validate a caller-supplied snapshot time: not in the future, not older than MAX_AS_OF_AGE_DAYS. */
+export function asOfInRange(asOfMs: number, realNowMs: number): boolean {
+  return asOfMs <= realNowMs && asOfMs >= realNowMs - MAX_AS_OF_AGE_DAYS * DAY_MS
+}
 
 export async function buildGardenerPreview(env: Env, input: PreviewInput): Promise<GardenerPreview> {
-  const { squadId, tenant, nowMs, windowDays } = input
+  const { squadId, tenant, nowMs, windowDays, visibleSquadIds, costScope } = input
   const windowFrom = iso(nowMs - windowDays * DAY_MS)
+  const asOfIso = iso(nowMs)
   const archiveCutoff = iso(nowMs - ARCHIVE_AFTER_DAYS * DAY_MS)
   const recentFromMs = nowMs - RECENT_ACTIVITY_DAYS * DAY_MS
   const gaps = new Set<string>()
@@ -151,80 +187,157 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
   const tasks = allTasks.slice(0, MAX_TASKS)
   if (tasksTruncated) gaps.add('tasks_truncated')
 
-  // ── meaningful activity (all SELECT, chunked by agent) ──────────────────────────────────────
+  // ── meaningful activity: ONLY work inside this squad is described. Anything the agent did in
+  //    other squads is reduced to a boolean (`activity_elsewhere`): no ids, no timestamps. ───────
   const activity = new Map<string, Activity[]>()
   const addActivity = (agentId: string, a: Activity): void => {
     const list = activity.get(agentId) ?? []
     list.push(a)
     activity.set(agentId, list)
   }
-  let eventsTruncated = false
-  const capRows = <T>(rows: T[]): T[] => {
-    if (rows.length > MAX_EVENT_ROWS) { eventsTruncated = true; return rows.slice(0, MAX_EVENT_ROWS) }
-    return rows
-  }
+  const activityUnknown = new Set<string>() // agents whose activity read was truncated
+  const elsewhere = new Set<string>()
+  const agentIdSet = new Set(agentIds)
+  const win = (col: string): string => `datetime(${col}) >= datetime(?2) AND datetime(${col}) <= datetime(?3)`
 
-  const subs = capRows((await env.DB.prepare(
+  // Submissions carry squad_id; the squad-wide read is one statement.
+  const subs = (await env.DB.prepare(
     `SELECT id, submitted_by_agent_id AS agent_id, created_at AS at
        FROM task_result_submissions
-      WHERE squad_id = ?1 AND datetime(created_at) >= datetime(?2)
-      ORDER BY created_at DESC, id LIMIT ?3`,
-  ).bind(squadId, windowFrom, MAX_EVENT_ROWS + 1).all<{ id: string; agent_id: string; at: string }>()).results ?? [])
-  const agentIdSet = new Set(agentIds)
-  for (const r of subs) {
+      WHERE tenant = ?1 AND squad_id = ?4 AND ${win('created_at')}
+      ORDER BY created_at DESC, id LIMIT ?5`,
+  ).bind(tenant, windowFrom, asOfIso, squadId, MAX_EVENT_ROWS + 1).all<{ id: string; agent_id: string; at: string }>()).results ?? []
+  if (subs.length > MAX_EVENT_ROWS) for (const id of agentIds) activityUnknown.add(id)
+  for (const r of subs.slice(0, MAX_EVENT_ROWS)) {
     if (agentIdSet.has(r.agent_id)) addActivity(r.agent_id, { at: r.at, kind: 'result_submission', evidence: { table: 'task_result_submissions', id: r.id } })
   }
-
-  const verdicts = capRows(await selectChunked<{ id: string; agent_id: string; at: string }>(
+  // fixed binds below: ?1 tenant, ?2 from, ?3 as_of, ?4 squad
+  const FIXED = [tenant, windowFrom, asOfIso, squadId]
+  const subsElsewhere = await selectChunked<{ agent_id: string }>(
     env, agentIds,
-    (ph) => `SELECT id, decided_by AS agent_id, decided_at AS at FROM task_verdicts
-              WHERE decided_by IN (${ph}) AND reversed_at IS NULL AND datetime(decided_at) >= datetime(?1)
-              ORDER BY decided_at DESC, id LIMIT ${MAX_EVENT_ROWS + 1}`,
-    [windowFrom],
-  ))
-  for (const r of verdicts) addActivity(r.agent_id, { at: r.at, kind: 'verdict', evidence: { table: 'task_verdicts', id: r.id } })
+    (ph) => `SELECT DISTINCT submitted_by_agent_id AS agent_id FROM task_result_submissions
+              WHERE tenant = ?1 AND squad_id <> ?4 AND ${win('created_at')} AND submitted_by_agent_id IN (${ph})`,
+    FIXED,
+  )
+  for (const r of subsElsewhere.rows) elsewhere.add(r.agent_id)
 
-  const deploys = capRows(await selectChunked<{ id: string; agent_id: string; at: string }>(
+  const verdicts = await selectChunked<{ id: string; agent_id: string; at: string }>(
     env, agentIds,
-    (ph) => `SELECT id, dispatched_by AS agent_id, created_at AS at FROM project_deployments
-              WHERE dispatched_by IN (${ph}) AND status = 'healthy' AND datetime(created_at) >= datetime(?1)
-              ORDER BY created_at DESC, id LIMIT ${MAX_EVENT_ROWS + 1}`,
-    [windowFrom],
-  ))
-  for (const r of deploys) addActivity(r.agent_id, { at: r.at, kind: 'deployment_healthy', evidence: { table: 'project_deployments', id: r.id } })
+    (ph) => `SELECT v.id, v.decided_by AS agent_id, v.decided_at AS at
+               FROM task_verdicts v JOIN tasks t ON t.id = v.task_id
+              WHERE v.decided_by IN (${ph}) AND v.reversed_at IS NULL AND t.squad_id = ?4
+                AND ${win('v.decided_at')}
+              ORDER BY v.decided_at DESC, v.id LIMIT ${MAX_EVENT_ROWS + 1}`,
+    FIXED, MAX_EVENT_ROWS,
+  )
+  for (const id of verdicts.truncated) activityUnknown.add(id)
+  for (const r of verdicts.rows) addActivity(r.agent_id, { at: r.at, kind: 'verdict', evidence: { table: 'task_verdicts', id: r.id } })
+  const verdictsElsewhere = await selectChunked<{ agent_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT v.decided_by AS agent_id
+               FROM task_verdicts v LEFT JOIN tasks t ON t.id = v.task_id
+              WHERE v.decided_by IN (${ph}) AND v.reversed_at IS NULL
+                AND (t.id IS NULL OR t.squad_id <> ?4) AND ${win('v.decided_at')}`,
+    FIXED,
+  )
+  for (const r of verdictsElsewhere.rows) elsewhere.add(r.agent_id)
 
-  const receipts = capRows(await selectChunked<{ id: string; agent_id: string; at: string }>(
+  // A deployment belongs to this squad iff its project has a project_squad_access edge to it.
+  const deploys = await selectChunked<{ id: string; agent_id: string; at: string }>(
     env, agentIds,
-    (ph) => `SELECT id, actor_id AS agent_id, server_timestamp AS at FROM execution_receipts
-              WHERE tenant = ?1 AND actor_kind = 'agent' AND type IN ${MEANINGFUL_RECEIPT_TYPES_SQL}
-                AND actor_id IN (${ph}) AND datetime(server_timestamp) >= datetime(?2)
-              ORDER BY server_timestamp DESC, id LIMIT ${MAX_EVENT_ROWS + 1}`,
-    [tenant, windowFrom],
-  ))
-  for (const r of receipts) addActivity(r.agent_id, { at: r.at, kind: 'execution_receipt', evidence: { table: 'execution_receipts', id: r.id } })
-  if (eventsTruncated) gaps.add('activity_events_truncated')
+    (ph) => `SELECT d.id, d.dispatched_by AS agent_id, d.created_at AS at
+               FROM project_deployments d
+              WHERE d.dispatched_by IN (${ph}) AND d.status = 'healthy' AND ${win('d.created_at')}
+                AND EXISTS (SELECT 1 FROM project_squad_access psa WHERE psa.project_id = d.project_id AND psa.squad_id = ?4)
+              ORDER BY d.created_at DESC, d.id LIMIT ${MAX_EVENT_ROWS + 1}`,
+    FIXED, MAX_EVENT_ROWS,
+  )
+  for (const id of deploys.truncated) activityUnknown.add(id)
+  for (const r of deploys.rows) addActivity(r.agent_id, { at: r.at, kind: 'deployment_healthy', evidence: { table: 'project_deployments', id: r.id } })
+  const deploysElsewhere = await selectChunked<{ agent_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT d.dispatched_by AS agent_id
+               FROM project_deployments d
+              WHERE d.dispatched_by IN (${ph}) AND d.status = 'healthy' AND ${win('d.created_at')}
+                AND NOT EXISTS (SELECT 1 FROM project_squad_access psa WHERE psa.project_id = d.project_id AND psa.squad_id = ?4)`,
+    FIXED,
+  )
+  for (const r of deploysElsewhere.rows) elsewhere.add(r.agent_id)
+
+  // A receipt belongs to this squad iff its task does; a receipt with no task is "elsewhere".
+  const receipts = await selectChunked<{ id: string; agent_id: string; at: string }>(
+    env, agentIds,
+    (ph) => `SELECT r.id, r.actor_id AS agent_id, r.server_timestamp AS at
+               FROM execution_receipts r JOIN tasks t ON t.id = r.task_id
+              WHERE r.tenant = ?1 AND r.actor_kind = 'agent' AND r.type IN ${MEANINGFUL_RECEIPT_TYPES_SQL}
+                AND r.actor_id IN (${ph}) AND t.squad_id = ?4 AND ${win('r.server_timestamp')}
+              ORDER BY r.server_timestamp DESC, r.id LIMIT ${MAX_EVENT_ROWS + 1}`,
+    FIXED, MAX_EVENT_ROWS,
+  )
+  for (const id of receipts.truncated) activityUnknown.add(id)
+  for (const r of receipts.rows) addActivity(r.agent_id, { at: r.at, kind: 'execution_receipt', evidence: { table: 'execution_receipts', id: r.id } })
+  const receiptsElsewhere = await selectChunked<{ agent_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT r.actor_id AS agent_id
+               FROM execution_receipts r LEFT JOIN tasks t ON t.id = r.task_id
+              WHERE r.tenant = ?1 AND r.actor_kind = 'agent' AND r.type IN ${MEANINGFUL_RECEIPT_TYPES_SQL}
+                AND r.actor_id IN (${ph}) AND (t.id IS NULL OR t.squad_id <> ?4) AND ${win('r.server_timestamp')}`,
+    FIXED,
+  )
+  for (const r of receiptsElsewhere.rows) elsewhere.add(r.agent_id)
+  if (activityUnknown.size) gaps.add('activity_events_truncated')
   // No bounded, agent-attributed read exists for these; reported, never guessed.
   gaps.add('substantive_task_note_activity')
   gaps.add('merge_receipt_agent_attribution')
   gaps.add('cross_squad_assignments_not_read')
 
-  // ── waits ───────────────────────────────────────────────────────────────────────────────────
+  // ── waits and live work. In-squad scope: flight via project edge, routine run via the routine's
+  //    responsible squad, approval via its task. Everything else is `elsewhere` (boolean). ────────
+  const LIVE_FIXED = [tenant, squadId]
   const liveFlights = await selectChunked<{ id: string; agent: string; status: string; waiting_since: number | null }>(
     env, agentIds,
-    (ph) => `SELECT id, agent, status, waiting_since FROM flights
-              WHERE agent IN (${ph}) AND status IN ${LIVE_FLIGHT_SQL} ORDER BY id`,
+    (ph) => `SELECT f.id, f.agent, f.status, f.waiting_since FROM flights f
+              WHERE f.tenant = ?1 AND f.agent IN (${ph}) AND f.status IN ${LIVE_FLIGHT_SQL}
+                AND EXISTS (SELECT 1 FROM project_squad_access psa WHERE psa.project_id = f.project_id AND psa.squad_id = ?2)
+              ORDER BY f.id`,
+    LIVE_FIXED,
   )
+  const flightsElsewhere = await selectChunked<{ agent: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT f.agent FROM flights f
+              WHERE f.tenant = ?1 AND f.agent IN (${ph}) AND f.status IN ${LIVE_FLIGHT_SQL}
+                AND NOT EXISTS (SELECT 1 FROM project_squad_access psa WHERE psa.project_id = f.project_id AND psa.squad_id = ?2)`,
+    LIVE_FIXED,
+  )
+  for (const r of flightsElsewhere.rows) elsewhere.add(r.agent)
+
   const waitingRuns = await selectChunked<{ id: string; assigned_agent_id: string; waiting_reason: string | null; updated_at: string }>(
     env, agentIds,
-    (ph) => `SELECT id, assigned_agent_id, waiting_reason, updated_at FROM routine_runs
-              WHERE assigned_agent_id IN (${ph}) AND status = 'waiting' ORDER BY id`,
+    (ph) => `SELECT rr.id, rr.assigned_agent_id, rr.waiting_reason, rr.updated_at
+               FROM routine_runs rr JOIN routines r ON r.id = rr.routine_id
+              WHERE rr.tenant = ?1 AND rr.assigned_agent_id IN (${ph}) AND rr.status = 'waiting'
+                AND r.responsible_squad_id = ?2
+              ORDER BY rr.id`,
+    LIVE_FIXED,
   )
+  const runsElsewhere = await selectChunked<{ agent_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT rr.assigned_agent_id AS agent_id
+               FROM routine_runs rr JOIN routines r ON r.id = rr.routine_id
+              WHERE rr.tenant = ?1 AND rr.assigned_agent_id IN (${ph}) AND rr.status = 'waiting'
+                AND r.responsible_squad_id <> ?2`,
+    LIVE_FIXED,
+  )
+  for (const r of runsElsewhere.rows) elsewhere.add(r.agent_id)
 
-  // ── measured cost: execution_meter keys are '<tenant>:<agent_id>:<YYYY-MM-DD>' ───────────────
+  // ── measured cost: execution_meter keys are '<tenant>:<agent_id>:<YYYY-MM-DD>'. Only agents the
+  //    caller is authorized to meter-read (same authorization as execution_meter_status). ────────
+  const costIds = agentIds.filter((id) => costScope.all || (costScope.agentId !== null && id === costScope.agentId))
   const days: string[] = []
   for (let d = 0; d < windowDays; d += 1) days.push(iso(nowMs - d * DAY_MS).slice(0, 10))
   const meterRows: { window_key: string; cost_micro_usd: number; tokens: number }[] = []
-  for (const chunk of chunkForD1InList(agentIds, undefined, 2)) {
+  // 3 binds per statement (tenant, agent-id JSON, day JSON); the ids ride inside one JSON bind.
+  for (const chunk of chunkForD1InList(costIds, undefined, 3)) {
     const res = await env.DB.prepare(
       `SELECT window_key, cost_micro_usd, tokens FROM execution_meter
         WHERE window_key IN (SELECT ?1 || ':' || a.value || ':' || d.value
@@ -234,21 +347,30 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     meterRows.push(...(res.results ?? []))
   }
 
-  // ── sole gate holders ───────────────────────────────────────────────────────────────────────
-  const gateRows = await selectChunked<{ id: string; capability: string; principal_type: string; principal_id: string }>(
+  // ── sole gate holders: judged over LIVE principals the caller can see (active, non-archived
+  //    agents in readable squads; active, non-archived members). A holder the caller cannot see,
+  //    or one that is not live, never changes the answer. ──────────────────────────────────────
+  const gateRows = (await selectChunked<{ capability: string; principal_type: string; principal_id: string }>(
     env, agentIds,
-    (ph) => `SELECT g.id, g.capability, g.principal_type, g.principal_id
+    (ph) => `SELECT g.capability, g.principal_type, g.principal_id
                FROM gate_grants g
+               LEFT JOIN agents a ON g.principal_type = 'agent' AND a.id = g.principal_id
+               LEFT JOIN members m ON g.principal_type = 'member' AND m.id = g.principal_id
               WHERE g.capability IN (SELECT capability FROM gate_grants
                                       WHERE principal_type = 'agent' AND principal_id IN (${ph}))
+                AND (
+                  (g.principal_type = 'agent' AND a.status = 'active' AND a.archived_at IS NULL
+                     AND a.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1)))
+                  OR (g.principal_type = 'member' AND m.status = 'active' AND m.archived_at IS NULL)
+                )
               ORDER BY g.capability, g.principal_type, g.principal_id`,
-  )
+    [JSON.stringify([...visibleSquadIds, squadId])],
+  )).rows
   const holdersByCap = new Map<string, Set<string>>()
   for (const g of gateRows) {
-    const key = g.capability
-    const set = holdersByCap.get(key) ?? new Set<string>()
+    const set = holdersByCap.get(g.capability) ?? new Set<string>()
     set.add(`${g.principal_type}:${g.principal_id}`)
-    holdersByCap.set(key, set)
+    holdersByCap.set(g.capability, set)
   }
   const soleCaps = new Map<string, string[]>() // agent id -> capabilities it alone holds
   for (const [cap, set] of holdersByCap) {
@@ -259,13 +381,24 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     soleCaps.set(id, [...(soleCaps.get(id) ?? []), cap])
   }
 
-  // ── agent-level unresolved approvals ────────────────────────────────────────────────────────
+  // ── agent-level unresolved approvals: in-squad (via task) are described; the rest is boolean ──
   const agentApprovals = await selectChunked<{ id: string; requested_by_principal_id: string }>(
     env, agentIds,
-    (ph) => `SELECT id, requested_by_principal_id FROM decision_requests
-              WHERE status = 'open' AND requested_by_principal_kind = 'agent'
-                AND requested_by_principal_id IN (${ph}) ORDER BY id`,
+    (ph) => `SELECT d.id, d.requested_by_principal_id FROM decision_requests d
+               JOIN tasks t ON t.id = d.task_id
+              WHERE d.tenant = ?1 AND d.status = 'open' AND d.requested_by_principal_kind = 'agent'
+                AND d.requested_by_principal_id IN (${ph}) AND t.squad_id = ?2 ORDER BY d.id`,
+    LIVE_FIXED,
   )
+  const approvalsElsewhere = await selectChunked<{ requested_by_principal_id: string }>(
+    env, agentIds,
+    (ph) => `SELECT DISTINCT d.requested_by_principal_id FROM decision_requests d
+               LEFT JOIN tasks t ON t.id = d.task_id
+              WHERE d.tenant = ?1 AND d.status = 'open' AND d.requested_by_principal_kind = 'agent'
+                AND d.requested_by_principal_id IN (${ph}) AND (t.id IS NULL OR t.squad_id <> ?2)`,
+    LIVE_FIXED,
+  )
+  for (const r of approvalsElsewhere.rows) elsewhere.add(r.requested_by_principal_id)
 
   // ── per-task exemption facts for archive candidates, chunked by task ─────────────────────────
   const staleTasks = tasks.filter((t) => {
@@ -273,30 +406,36 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     return ts !== null && ts < nowMs - ARCHIVE_AFTER_DAYS * DAY_MS
   })
   const staleIds = staleTasks.map((t) => t.id)
-  const taskFlights = await selectChunked<{ task_id: string; flight_id: string }>(
+  const taskFlights = (await selectChunked<{ task_id: string; flight_id: string }>(
     env, staleIds,
     (ph) => `SELECT DISTINCT a.task_id, f.id AS flight_id
                FROM flight_task_assignments a JOIN flights f ON f.id = a.flight_id
-              WHERE a.task_id IN (${ph}) AND f.status IN ${LIVE_FLIGHT_SQL} ORDER BY a.task_id, f.id`,
-  )
-  const taskHolds = await selectChunked<{ task_id: string }>(
+              WHERE f.tenant = ?1 AND a.task_id IN (${ph}) AND f.status IN ${LIVE_FLIGHT_SQL} ORDER BY a.task_id, f.id`,
+    [tenant],
+  )).rows
+  const taskHolds = (await selectChunked<{ task_id: string }>(
     env, staleIds,
     (ph) => `SELECT task_id FROM execution_holds WHERE task_id IN (${ph}) AND released_at IS NULL ORDER BY task_id`,
-  )
-  const taskApprovals = await selectChunked<{ id: string; task_id: string }>(
+  )).rows
+  const taskApprovals = (await selectChunked<{ id: string; task_id: string }>(
     env, staleIds,
-    (ph) => `SELECT id, task_id FROM decision_requests WHERE task_id IN (${ph}) AND status = 'open' ORDER BY id`,
-  )
-  const openChildren = await selectChunked<{ id: string; parent_task_id: string }>(
+    (ph) => `SELECT id, task_id FROM decision_requests WHERE tenant = ?1 AND task_id IN (${ph}) AND status = 'open' ORDER BY id`,
+    [tenant],
+  )).rows
+  const openChildren = (await selectChunked<{ id: string; parent_task_id: string }>(
     env, staleIds,
     (ph) => `SELECT id, parent_task_id FROM tasks
               WHERE parent_task_id IN (${ph}) AND status IN ${NONTERMINAL_SQL} AND ${TASK_NOT_ARCHIVED_SQL()} ORDER BY id`,
-  )
-  const unsettledDispatch = await selectChunked<{ id: string; task_id: string }>(
+  )).rows
+  // The canonical archive-blocking dispatch predicate (src/tasks/runtime-receipts.ts), the one
+  // archiveRow consults via hasArchiveBlockingDispatch. Not re-implemented here.
+  const blockedByDispatch = (await selectChunked<{ task_id: string }>(
     env, staleIds,
-    (ph) => `SELECT id, task_id FROM task_dispatch_receipts
-              WHERE task_id IN (${ph}) AND consumed_at IS NULL AND settled_at IS NULL ORDER BY id`,
-  )
+    (ph) => `SELECT t.id AS task_id FROM tasks t
+              WHERE t.id IN (${ph}) AND ${archiveBlockingDispatchExistsSql({ tenantParam: '?1', taskIdExpr: 't.id' })}
+              ORDER BY t.id`,
+    [tenant],
+  )).rows
 
   const group = <T>(rows: T[], key: (r: T) => string): Map<string, T[]> => {
     const m = new Map<string, T[]>()
@@ -307,13 +446,13 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
   const holdsByTask = group(taskHolds, (r) => r.task_id)
   const approvalsByTask = group(taskApprovals, (r) => r.task_id)
   const childrenByParent = group(openChildren, (r) => r.parent_task_id)
-  const dispatchByTask = group(unsettledDispatch, (r) => r.task_id)
+  const dispatchBlocked = new Set(blockedByDispatch.map((r) => r.task_id))
 
   // ── agent cards ─────────────────────────────────────────────────────────────────────────────
   const tasksByAgent = group(tasks.filter((t) => t.assignee_agent_id !== null), (t) => t.assignee_agent_id as string) // as: filtered non-null just above
-  const flightsByAgent = group(liveFlights, (f) => f.agent)
-  const runsByAgent = group(waitingRuns, (r) => r.assigned_agent_id)
-  const approvalsByAgent = group(agentApprovals, (r) => r.requested_by_principal_id)
+  const flightsByAgent = group(liveFlights.rows, (f) => f.agent)
+  const runsByAgent = group(waitingRuns.rows, (r) => r.assigned_agent_id)
+  const approvalsByAgent = group(agentApprovals.rows, (r) => r.requested_by_principal_id)
   const meterByAgent = new Map<string, { cost: number; tokens: number; keys: string[] }>()
   for (const m of meterRows) {
     const agentId = m.window_key.slice(tenant.length + 1, m.window_key.lastIndexOf(':'))
@@ -360,9 +499,15 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     waits.sort((x, y) => (x.kind + x.id).localeCompare(y.kind + y.id))
 
     const meter = meterByAgent.get(a.id)
-    const cost: AgentCard['cost'] = meter
+    const costAllowed = costScope.all || (costScope.agentId !== null && costScope.agentId === a.id)
+    const cost: AgentCard['cost'] = !costAllowed
+      ? 'restricted'
+      : meter
       ? { micro_usd: meter.cost, tokens: meter.tokens, source: 'execution_meter', window_keys: meter.keys.sort(), gap: null }
       : { micro_usd: 'unknown', tokens: 'unknown', source: 'execution_meter', window_keys: [], gap: 'execution_meter_no_rows_in_window' }
+
+    const activityKnown = !activityUnknown.has(a.id)
+    const assignmentsKnown = !tasksTruncated
 
     // ── recommendation: first matching rule wins; the rule is named ───────────────────────────
     let rec: AgentCard['recommendation']
@@ -370,6 +515,8 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
       rec = { action: 'rest', rule: 'agent_not_active', evidence: [{ table: 'agents', id: a.id }] }
     } else if (waits.length > 0) {
       rec = { action: 'ask', rule: 'blocked_on_wait', evidence: waits.map((w) => ({ table: w.kind === 'flight_waiting' ? 'flights' : w.kind === 'routine_run_waiting' ? 'routine_runs' : 'tasks', id: w.id })) }
+    } else if (!activityKnown || !assignmentsKnown) {
+      rec = { action: 'ask', rule: 'unknown_due_to_truncation', evidence: [{ table: 'agents', id: a.id }] }
     } else if (staleActive.length > 0 && (lastMs === null || lastMs < nowMs - ARCHIVE_AFTER_DAYS * DAY_MS)) {
       rec = { action: 'shrink', rule: 'stale_backlog_no_recent_output', evidence: staleActive.map((t) => ({ table: 'tasks', id: t.id })) }
     } else if (active.length === 0 && lastMs !== null && lastMs >= recentFromMs) {
@@ -388,9 +535,11 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
       status: a.status,
       last_meaningful_activity: last,
       meaningful_activity_count: acts.length,
+      activity_known: activityKnown,
+      activity_elsewhere: elsewhere.has(a.id),
       open_assignments: {
-        count: active.length,
-        stale_count: staleActive.length,
+        count: assignmentsKnown ? active.length : 'unknown',
+        stale_count: assignmentsKnown ? staleActive.length : 'unknown',
         listed: active
           .slice().sort((x, y) => x.id.localeCompare(y.id)).slice(0, MAX_LISTED_ASSIGNMENTS)
           .map((t) => ({ task_id: t.id, status: t.status, age_days: ageDays(nowMs, parseTs(t.updated_at) ?? nowMs), priority: t.priority })),
@@ -406,6 +555,8 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     const quiet = lastMs === null || lastMs < nowMs - ARCHIVE_AFTER_DAYS * DAY_MS
     if (!quiet || newerThanCutoff || createdMs === null) continue
     const ex: Exception[] = []
+    if (!activityKnown || !assignmentsKnown) ex.push({ reason: 'unknown_due_to_truncation', evidence: [{ table: 'agents', id: a.id }] })
+    if (elsewhere.has(a.id)) ex.push({ reason: 'activity_elsewhere', evidence: [] })
     const liveClaims = mine.filter((t) => (t.execution_claim_expires_at ?? 0) > nowMs)
     if (liveClaims.length) ex.push({ reason: 'live_claim', evidence: liveClaims.map((t) => ({ table: 'tasks', id: t.id })) })
     const live = flightsByAgent.get(a.id) ?? []
@@ -421,7 +572,7 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     if (active.length) ex.push({ reason: 'owns_open_tasks', evidence: active.map((t) => ({ table: 'tasks', id: t.id })) })
     agentCandidates.push({
       agent_id: a.id,
-      days_without_meaningful_activity: lastMs === null ? 'unknown' : ageDays(nowMs, lastMs),
+      days_without_meaningful_activity: !activityKnown || lastMs === null ? 'unknown' : ageDays(nowMs, lastMs),
       eligible: ex.length === 0,
       exceptions: ex,
     })
@@ -435,8 +586,8 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
     const fl = flightsByTask.get(t.id) ?? []
     if (fl.length) ex.push({ reason: 'live_flight', evidence: fl.map((f) => ({ table: 'flights', id: f.flight_id })) })
     if (holdsByTask.has(t.id)) ex.push({ reason: 'execution_hold', evidence: [{ table: 'execution_holds', id: t.id }] })
-    const disp = dispatchByTask.get(t.id) ?? []
-    if (disp.length) ex.push({ reason: 'live_dispatch', evidence: disp.map((d) => ({ table: 'task_dispatch_receipts', id: d.id })) })
+    if (dispatchBlocked.has(t.id)) ex.push({ reason: 'live_dispatch', evidence: [{ table: 'tasks', id: t.id }] })
+    if (tasksTruncated) ex.push({ reason: 'unknown_due_to_truncation', evidence: [{ table: 'tasks', id: t.id }] })
     const ap = approvalsByTask.get(t.id) ?? []
     if (ap.length || t.status === 'review') {
       ex.push({ reason: 'unresolved_approval', evidence: [...ap.map((r) => ({ table: 'decision_requests', id: r.id })), ...(t.status === 'review' ? [{ table: 'tasks', id: t.id }] : [])] })
@@ -463,7 +614,7 @@ export async function buildGardenerPreview(env: Env, input: PreviewInput): Promi
       agents: agentCandidates.sort((x, y) => x.agent_id.localeCompare(y.agent_id)),
     },
     gaps: [...gaps].sort(),
-    truncated: { agents: agentsTruncated, tasks: tasksTruncated, events: eventsTruncated },
+    truncated: { agents: agentsTruncated, tasks: tasksTruncated, events: activityUnknown.size > 0 },
   }
 }
 
@@ -478,7 +629,7 @@ export function renderGardenerCard(p: GardenerPreview): string {
   ]
   for (const a of p.agents) {
     const last = a.last_meaningful_activity ? `${a.last_meaningful_activity.kind} ${a.last_meaningful_activity.at}` : 'none in window'
-    lines.push(`| ${a.slug} | ${a.recommendation.action} | ${a.recommendation.rule} | ${last} | ${a.open_assignments.count} (${a.open_assignments.stale_count} stale) | ${a.waits.length} | ${a.cost.micro_usd} |`)
+    lines.push(`| ${a.slug} | ${a.recommendation.action} | ${a.recommendation.rule} | ${last} | ${a.open_assignments.count} (${a.open_assignments.stale_count} stale) | ${a.waits.length} | ${a.cost === 'restricted' ? 'restricted' : a.cost.micro_usd} |`)
   }
   const eligT = p.archive_candidates.tasks.filter((t) => t.eligible).length
   const exT = p.archive_candidates.tasks.length - eligT

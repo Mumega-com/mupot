@@ -3,13 +3,16 @@
 // (canReadSquadTasks, src/tasks/visibility.ts) — the caller must be able to read the squad.
 
 import { type ToolSpec, fail, done, str, getSquad } from './index'
-import { canReadSquadTasks } from '../tasks/visibility'
+import { canReadSquadTasks, resolveVisibleTaskScope } from '../tasks/visibility'
+import { authorizeExecutionScope } from '../auth/execution-scope'
 import {
   buildGardenerPreview,
   renderGardenerCard,
   DEFAULT_WINDOW_DAYS,
   MIN_WINDOW_DAYS,
   MAX_WINDOW_DAYS,
+  asOfInRange,
+  MAX_AS_OF_AGE_DAYS,
 } from '../gardener/preview'
 
 export const toolGardenerPreview: ToolSpec = {
@@ -48,6 +51,9 @@ export const toolGardenerPreview: ToolSpec = {
       const raw = str(args.as_of)
       const t = raw ? Date.parse(raw) : Number.NaN
       if (Number.isNaN(t)) return fail(400, 'invalid_args', 'as_of must be an ISO-8601 timestamp')
+      if (!asOfInRange(t, Date.now())) {
+        return fail(400, 'invalid_args', `as_of must not be in the future or more than ${MAX_AS_OF_AGE_DAYS} days old`)
+      }
       nowMs = t
     }
     const squadRes = await getSquad(env, ref)
@@ -55,7 +61,26 @@ export const toolGardenerPreview: ToolSpec = {
     if (!(await canReadSquadTasks(env, auth, squadRes.squad.id))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
+    // Cost visibility = the execution_meter_status authorization (meter:read), resolved ONCE here:
+    // a bound agent may read only itself; anyone else is judged on the squad via a probe agent
+    // (lead/org-admin authority is squad-scoped, so one decision covers every agent in it).
+    let costScope: { all: boolean; agentId: string | null } = { all: false, agentId: null }
+    if (auth.boundAgentId) {
+      const self = await authorizeExecutionScope(env, auth, { action: 'meter:read', agentId: auth.boundAgentId })
+      if (self.ok) costScope = { all: false, agentId: auth.boundAgentId }
+    } else {
+      const probe = await env.DB.prepare(
+        'SELECT id FROM agents WHERE squad_id = ?1 AND archived_at IS NULL ORDER BY id LIMIT 1',
+      ).bind(squadRes.squad.id).first<{ id: string }>()
+      if (probe) {
+        const d = await authorizeExecutionScope(env, auth, { action: 'meter:read', agentId: probe.id })
+        if (d.ok) costScope = { all: true, agentId: null }
+      }
+    }
+    const visible = await resolveVisibleTaskScope(env, auth)
     const preview = await buildGardenerPreview(env, {
+      visibleSquadIds: visible.squadIds,
+      costScope,
       squadId: squadRes.squad.id,
       tenant: env.TENANT_SLUG,
       nowMs,
