@@ -97,6 +97,7 @@ export interface CloneSpec {
 
 export function cloneSpecFor(repoKey: string, projectSlug: string, branch: string): CloneSpec {
   const row = CLONE_URL_PREFIX.find(([prefix]) => repoKey.startsWith(prefix))
-  const clone = row ? `${row[1]}${repoKey.slice(row[0].length)}.git` : null
+  // The key holds DECODED path segments: re-encode each so a reserved character (# ? %) cannot turn into a fragment/query.
+  const clone = row ? `${row[1]}${repoKey.slice(row[0].length).split('/').map((seg, i) => (row[0] === 'url:' && i === 0 ? seg : encodeURIComponent(seg))).join('/')}.git` : null
   return { repo_key: repoKey, clone_url: clone, default_branch: null, suggested_dir: `${projectSlug}/${branch}` }
 }

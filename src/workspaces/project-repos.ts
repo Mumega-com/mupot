@@ -60,10 +60,21 @@ export async function setProjectRepo(
     const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_repos WHERE project_id = ?1').bind(project.id).first<{ n: number }>()
     if (Number(count?.n ?? 0) >= PROJECT_REPOS_CAP) return { ok: false, status: 409, error: 'project_repos_cap_reached' }
     const results = await env.DB.batch([
-      env.DB.prepare('INSERT OR IGNORE INTO project_repos (project_id, repo_key, added_by_member_id) VALUES (?1, ?2, ?3)').bind(project.id, repoKey, memberId),
+      // The ownership predicate rides in the INSERT itself (one statement, atomic): two concurrent adds of one fresh repo
+      // to different projects cannot both pass a preflight read and both insert.
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO project_repos (project_id, repo_key, added_by_member_id)
+         SELECT ?1, ?2, ?3
+          WHERE NOT EXISTS (SELECT 1 FROM project_repos WHERE repo_key = ?2 AND project_id != ?1)
+            AND NOT EXISTS (SELECT 1 FROM projects WHERE repo_key = ?2 AND id != ?1 AND archived_at IS NULL AND status != 'archived')`,
+      ).bind(project.id, repoKey, memberId),
       receipt,
     ])
     changed = (results[0]?.meta as { changes?: number } | undefined)?.changes === 1
+    if (!changed) {
+      const mine = await env.DB.prepare('SELECT 1 AS ok FROM project_repos WHERE project_id = ?1 AND repo_key = ?2').bind(project.id, repoKey).first<{ ok: number }>()
+      if (!mine) return { ok: false, status: 409, error: 'repo_already_owned' } // lost the race to another project
+    }
   } else {
     const results = await env.DB.batch([
       env.DB.prepare('DELETE FROM project_repos WHERE project_id = ?1 AND repo_key = ?2').bind(project.id, repoKey),

@@ -178,6 +178,7 @@ describe('worktree_open without `project`', () => {
   it('clone spec is derived from the key prefix as data', () => {
     expect(cloneSpecFor('github:a/b', 's', 'main')).toMatchObject({ clone_url: 'https://github.com/a/b.git', suggested_dir: 's/main' })
     expect(cloneSpecFor('url:git.example.com:8443/T/R', 's', 'x')).toMatchObject({ clone_url: 'https://git.example.com:8443/T/R.git' })
+    expect(cloneSpecFor('url:git.example.com/Team/Repo#one', 's', 'x').clone_url).toBe('https://git.example.com/Team/Repo%23one.git')
     expect(cloneSpecFor('weird:thing', 's', 'x').clone_url).toBeNull()
   })
 })
@@ -208,6 +209,25 @@ describe('project_repos writer (project_update add_repo / remove_repo)', () => {
     expect(await setProjectRepo(env, w, { project_id: 'P3', op: 'add', repo: '/home/me/code' })).toMatchObject({ ok: false, status: 400, error: 'invalid_repo' })
     expect(await setProjectRepo(env, w, { project_id: 'P3', op: 'add', repo: REPO })).toMatchObject({ ok: false, status: 409, error: 'repo_already_owned' })
     expect(await setProjectRepo(env, w, { project_id: 'P3', op: 'add', repo: REPO_OTHER })).toMatchObject({ ok: false, status: 409, error: 'repo_already_owned' })
+    expect(n('SELECT COUNT(*) AS n FROM project_repos WHERE project_id = ?', 'P3')).toBe(0)
+  })
+  it('two concurrent adds of one fresh repo to different projects: exactly one wins, the other is repo_already_owned', async () => {
+    const env = envFor(); const w = await humanCtx(env, W)
+    const fresh = 'https://github.com/Mumega-com/fresh.git'
+    const [a, b] = await Promise.all([
+      setProjectRepo(env, w, { project_id: 'P3', op: 'add', repo: fresh }),
+      setProjectRepo(env, w, { project_id: 'P5', op: 'add', repo: fresh }),
+    ])
+    expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1)
+    expect(n("SELECT COUNT(*) AS n FROM project_repos WHERE repo_key = 'github:mumega-com/fresh'")).toBe(1)
+    expect(n("SELECT COUNT(*) AS n FROM mutation_audit_entries WHERE handler = 'project_repos'")).toBe(1)
+  })
+  it('the atomic guard alone refuses an owner the preflight missed (keyed owner inserted after the read)', async () => {
+    const env = envFor(); const w = await humanCtx(env, W)
+    h.sqlite.exec("UPDATE projects SET repo_key = 'github:other-org/other' WHERE id = 'P2'") // keyed owner (heal done)
+    // P2 owns it by key; wrap DB so projectsOwningRepo's batch is blind (simulates the race window).
+    const blind = { ...env, DB: new Proxy(env.DB, { get: (t, k) => (k === 'batch' ? async (st: unknown[]) => (st.length === 3 ? [{ results: [] }, { results: [] }, { results: [] }] : t.batch(st as never)) : (t as never)[k]?.bind?.(t) ?? (t as never)[k]) }) } as unknown as Env
+    expect(await setProjectRepo(blind, w, { project_id: 'P3', op: 'add', repo: 'https://github.com/Other-Org/other.git' })).toMatchObject({ ok: false, status: 409, error: 'repo_already_owned' })
     expect(n('SELECT COUNT(*) AS n FROM project_repos WHERE project_id = ?', 'P3')).toBe(0)
   })
   it('through project_update: an org admin edits; add_repo cannot ride along with other fields', async () => {
