@@ -20,6 +20,7 @@
 // outcome reported to the admin is read back from the receipt row.
 
 import { html } from 'hono/html'
+import { getMoveAgentSquad } from './move-agent-squad-port'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import {
   actorRankOnScopeFor,
@@ -62,6 +63,7 @@ export type AccessRefusal =
   | 'agent_identity_unminted'
   | 'squad_not_found'
   | 'home_squad_immutable'
+  | 'home_owner_required'
   | 'squad_archived'
   | 'invalid_capability'
   | 'invalid_expected_prior'
@@ -182,8 +184,13 @@ function guardSql(plan: ReceiptPlan): string {
     orgAdmin,
     // (1)+(2)+(7) the actor's live rank ON THIS SQUAD covers admin and the granted level
     squadRank,
-    // (4) a work squad, not archived
-    `EXISTS (SELECT 1 FROM squads WHERE id = ?4 AND kind <> 'home' AND status = 'active')`,
+    // (4) a work squad, or a home squad for a level change only; never archived
+    // A HOME squad is reachable only to CHANGE an existing level (?7 = 'change'): never to
+    // enroll or revoke, and the agent's own binding squad (?13) is never a work-squad target.
+    // Who may change it is the squad-rank leaf above: squadRank has no org/department/role
+    // bypass on a home, so only the member holding the exact grant on that home passes.
+    `EXISTS (SELECT 1 FROM squads WHERE id = ?4 AND status = 'active'
+        AND ((kind <> 'home' AND id <> ?13) OR (kind = 'home' AND ?7 = 'change')))`,
     // (5) no agent-bound member can act: also covers an agent editing itself
     `NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE member_id = ?2)`,
     // the target identity is still the welded one we authorized
@@ -296,9 +303,15 @@ export async function applyAgentAccessChange(
     'SELECT id, name, kind, status FROM squads WHERE id = ? LIMIT 1',
   ).bind(input.squadId).first<SquadRow>()
   if (!squad) return fail('squad_not_found', 404)
-  // (4)
-  if (squad.kind === 'home' || squad.id === agent.squad_id) return fail('home_squad_immutable', 409)
+  // (4) A work squad that is the agent's binding squad stays immutable here. A HOME squad
+  // accepts one thing: changing the level of an access row that already exists. Enroll and
+  // revoke on a home stay refused (revoke on the agent's own home would sever its binding),
+  // and who may change it is the live squad rank below, which a home grants only to the
+  // member holding the exact grant on it (never to org admin standing).
+  const isHome = squad.kind === 'home'
+  if (!isHome && squad.id === agent.squad_id) return fail('home_squad_immutable', 409)
   if (squad.status !== 'active') return fail('squad_archived', 409)
+  if (isHome && input.action !== 'set') return fail('home_squad_immutable', 409)
 
   // level: required for set, never owner, never defaulted
   let next: AgentAccessCapability | null = null
@@ -318,6 +331,8 @@ export async function applyAgentAccessChange(
   if (priorCapability === 'owner' || priorMembership === 'owner') return fail('owner_access_untouchable', 403)
   if (priorCapability === 'invalid' || priorMembership === 'invalid') return fail('invalid_expected_prior', 400)
 
+  if (isHome && priorCapability === null && priorMembership === null) return fail('home_squad_immutable', 409)
+
   const reason = input.reason.trim()
   if (reason.length > REASON_MAX_LENGTH) return fail('invalid_reason', 400)
 
@@ -330,7 +345,7 @@ export async function applyAgentAccessChange(
     priorMembership ? capabilityRank(priorMembership) : 0,
   )
   const actorRank = await actorRankOnScopeFor(env, auth, 'squad', squad.id)
-  if (actorRank < requiredRank) return fail('insufficient_rank', 403)
+  if (actorRank < requiredRank) return fail(isHome ? 'home_owner_required' : 'insufficient_rank', 403)
   if (await exceedsTargetRankCeiling(env, auth, binding.memberId)) {
     return fail('target_outranks_actor', 403)
   }
@@ -417,6 +432,53 @@ export async function applyAgentAccessChange(
   }
 }
 
+export type HomeMoveResult =
+  | { ok: true; message: string }
+  | { ok: false; message: string; status: 400 | 403 | 404 | 409 }
+
+/**
+ * Move an agent out of its HOME squad (the lobby) into a work squad. Not a new writer:
+ * this calls the existing move_agent_squad tool (#1433), so its own gates run unchanged:
+ * admin on the CURRENT squad (a home grants that only to the member holding it directly,
+ * never to org admin standing), admin on the destination, a level no higher than the
+ * actor's rank there, the dispatch/gate in-flight refusals, and the agent_audit receipt.
+ * This wrapper only adds what the panel promises: org admin, no agent session, and that
+ * it is used to LEAVE a home (the agent's binding squad is a home), never to shuffle work squads.
+ */
+export async function applyMoveOutOfHome(
+  env: Env,
+  auth: AuthContext,
+  input: { agentRef: string; toSquadId: string; capability: string; reason: string },
+): Promise<HomeMoveResult> {
+  const refuse = (error: AccessRefusal): HomeMoveResult => ({ ok: false, message: REFUSAL_TEXT[error], status: error === 'agent_not_found' ? 404 : 403 })
+  if (auth.boundAgentId) return refuse('agent_session_forbidden')
+  if (!isOrgAdmin(auth)) return refuse('org_admin_required')
+  if (!sessionMemberId(auth)) return refuse('actor_member_required')
+  if (!isAgentAccessCapability(input.capability)) return { ok: false, message: REFUSAL_TEXT.invalid_capability, status: 400 }
+  const agent = await resolveAgent(env, input.agentRef)
+  if (!agent) return refuse('agent_not_found')
+  const from = await env.DB.prepare('SELECT kind FROM squads WHERE id = ? LIMIT 1').bind(agent.squad_id).first<{ kind: string }>()
+  if (from?.kind !== 'home') return { ok: false, message: 'This agent is not in a home squad. Use the squad tools to move it between work squads.', status: 409 }
+  const to = await env.DB.prepare('SELECT kind, status FROM squads WHERE id = ? LIMIT 1').bind(input.toSquadId).first<{ kind: string; status: string }>()
+  if (!to) return refuse('squad_not_found' as AccessRefusal)
+  if (to.kind === 'home') return { ok: false, message: 'Choose a work squad, not another home.', status: 409 }
+  const moveAgentSquad = getMoveAgentSquad()
+  if (!moveAgentSquad) return { ok: false, message: 'Moving agents is unavailable right now. Nothing was changed.', status: 409 }
+  const out = await moveAgentSquad(auth, env, {
+    agent: agent.id,
+    to_squad: input.toSquadId,
+    capability: input.capability,
+    ...(input.reason.trim() ? { reason: input.reason.trim().slice(0, REASON_MAX_LENGTH) } : {}),
+  }, { origin: env.PUBLIC_ORIGIN ?? '', transport: 'rest', source: 'dashboard' })
+  if (out.ok) return { ok: true, message: `${agent.name} moved out of its home squad and is now ${input.capability} on the new squad. Effective on its next request.` }
+  const status = out.status === 404 ? 404 : out.status === 400 ? 400 : out.status === 403 ? 403 : 409
+  const detail = typeof out.detail === 'string' ? out.detail : ''
+  const text = out.error === 'forbidden' || out.error === 'cannot_grant_above_own_rank'
+    ? 'You need admin on the home squad and on the destination squad, and cannot grant above your own level there.'
+    : `The move was refused (${out.error}${detail ? `: ${detail}` : ''}). Nothing was changed.`
+  return { ok: false, message: text, status }
+}
+
 /** Plain-language confirmation. No token is ever shown or minted here. */
 export function accessChangeMessage(result: Extract<AccessChangeResult, { ok: true }>): string {
   return result.capability === null
@@ -433,7 +495,8 @@ const REFUSAL_TEXT: Record<AccessRefusal, string> = {
   agent_not_found: 'Agent not found.',
   agent_identity_unminted: 'This agent has no welded identity yet. Access cannot be set until it has one.',
   squad_not_found: 'Squad not found.',
-  home_squad_immutable: 'A home squad cannot be changed here.',
+  home_squad_immutable: 'A home squad cannot be changed here, except to change the level of access it already has.',
+  home_owner_required: 'Only the member who owns this home squad can change access on it.',
   squad_archived: 'That squad is archived.',
   invalid_capability: 'Choose an access level: observer, member, lead or admin.',
   invalid_expected_prior: 'The form is out of date. Reload and try again.',
@@ -460,6 +523,8 @@ export interface AccessRow {
   squadName: string
   departmentName: string | null
   home: boolean
+  /** A home squad whose level the viewer may change: the viewer holds admin or better on it directly. */
+  homeEditable: boolean
   archived: boolean
   /** What the capability plane says; the authoritative side. */
   capability: string | null
@@ -475,14 +540,17 @@ export interface ChoosableSquad {
 
 export interface AgentAccessView {
   bound: boolean
+  /** The squad the agent is bound to (agents.squad_id): its binding squad. */
+  bindingSquadId: string | null
   agentMemberId: string | null
   rows: AccessRow[]
   choosable: ChoosableSquad[]
 }
 
-export async function loadAgentAccessView(env: Env, agentId: string): Promise<AgentAccessView> {
+export async function loadAgentAccessView(env: Env, agentId: string, auth: AuthContext): Promise<AgentAccessView> {
   const binding = await resolveAgentMemberBinding(env, agentId)
   const memberId = binding.kind === 'bound' ? binding.memberId : null
+  const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?').bind(agentId).first<{ squad_id: string }>()
   const [memberships, grants, squads] = await Promise.all([
     env.DB.prepare('SELECT squad_id, capability FROM memberships WHERE agent_id = ?')
       .bind(agentId).all<{ squad_id: string; capability: string }>(),
@@ -505,11 +573,15 @@ export async function loadAgentAccessView(env: Env, agentId: string): Promise<Ag
   for (const s of squads.results ?? []) {
     const held = mem.has(s.id) || cap.has(s.id)
     if (held) {
+      // Same rank source the write uses (actorRankOnScopeFor); the write re-checks it in SQL.
+      const homeEditable = s.kind === 'home' && s.status === 'active'
+        && (await actorRankOnScopeFor(env, auth, 'squad', s.id)) >= ACTOR_RANK_FLOOR
       rows.push({
         squadId: s.id,
         squadName: s.name,
         departmentName: s.department_name,
         home: s.kind === 'home',
+        homeEditable,
         archived: s.status !== 'active',
         capability: cap.get(s.id) ?? null,
         membership: mem.get(s.id) ?? null,
@@ -518,7 +590,7 @@ export async function loadAgentAccessView(env: Env, agentId: string): Promise<Ag
       choosable.push({ id: s.id, name: s.name, departmentName: s.department_name })
     }
   }
-  return { bound: memberId !== null, agentMemberId: memberId, rows, choosable }
+  return { bound: memberId !== null, bindingSquadId: agentRow?.squad_id ?? null, agentMemberId: memberId, rows, choosable }
 }
 
 type Html = HtmlEscapedString | Promise<HtmlEscapedString>
@@ -545,9 +617,10 @@ export function agentAccessPanel(
   const rowHtml = view.rows.map((row) => {
     const dept = row.departmentName ?? '—'
     const label = html`<strong>${row.squadName}</strong> <span class="dim">· department ${dept}</span>`
-    if (row.home) {
+    const isOwnerRow = row.capability === 'owner' || row.membership === 'owner'
+    if (row.home && !(row.homeEditable && !row.archived && !isOwnerRow)) {
       return html`<li>${label}: <code>${row.capability ?? row.membership ?? '—'}</code>
-        <span class="dim">home squad, not editable here</span></li>`
+        <span class="dim">home squad, only its owner can change this level</span></li>`
     }
     if (row.archived) {
       return html`<li>${label}: <code>${row.capability ?? row.membership ?? '—'}</code>
@@ -564,6 +637,17 @@ export function agentAccessPanel(
     return html`<li>${label}: <code>${preselect}</code>
       ${differs ? html`<p class="dim">Capability row: <code>${shownCapability}</code>, membership row:
         <code>${shownMembership}</code>. Rows disagree — saving will set both to the level you choose.</p>` : ''}
+      ${row.home && row.squadId === view.bindingSquadId && view.choosable.length > 0 ? html`<form method="post" action="${action}" autocomplete="off" class="inline" data-move-out-of-home>
+        <input type="hidden" name="action" value="move" />
+        <input type="hidden" name="from_squad_id" value="${row.squadId}" />
+        <label>Move to squad <select name="to_squad_id" required>
+          <option value="" selected disabled>Choose a squad</option>
+          ${view.choosable.map((sq) => html`<option value="${sq.id}">${sq.name} (department ${sq.departmentName ?? '—'})</option>`)}
+        </select></label>
+        <label>Level <select name="capability" required>${levelOptions('member')}</select></label>
+        <label>Reason <input name="reason" maxlength="${REASON_MAX_LENGTH}" placeholder="optional" /></label>
+        <button type="submit" class="btn">Move to squad</button>
+      </form>` : ''}
       <form method="post" action="${action}" autocomplete="off" class="inline">
         <input type="hidden" name="squad_id" value="${row.squadId}" />
         <input type="hidden" name="expected_capability" value="${shownCapability}" />
@@ -571,7 +655,7 @@ export function agentAccessPanel(
         <label>Level <select name="capability" required>${levelOptions(preselect)}</select></label>
         <label>Reason <input name="reason" maxlength="${REASON_MAX_LENGTH}" placeholder="optional" /></label>
         <button type="submit" name="action" value="set" class="btn">Change level</button>
-        <button type="submit" name="action" value="revoke" class="btn secondary">Revoke</button>
+        ${row.home ? '' : html`<button type="submit" name="action" value="revoke" class="btn secondary">Revoke</button>`}
       </form></li>`
   })
   const enroll = view.choosable.length === 0

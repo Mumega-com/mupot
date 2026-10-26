@@ -259,6 +259,92 @@ describe('invariants at the route layer', () => {
     expect(receipts(harness)).toHaveLength(0)
   })
 
+  describe('a home squad: its owner may change a level, nobody else, nothing else', () => {
+    // m-hadi is org admin AND holds the exact admin grant on his own home (what home provisioning writes).
+    const withHomeGrant = (h: SqliteD1Harness, member: string, squad = 'sq-home'): void => {
+      h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-own-${member}-${squad}', '${member}', 'squad', '${squad}', 'admin')`)
+    }
+    const homeOwner = (): AuthContext =>
+      humanAuth('m-hadi', [grant('m-hadi', 'org', null, 'admin'), grant('m-hadi', 'squad', 'sq-home', 'admin')])
+
+    it('the home owner changes the agent level on the agent\'s own home; a receipt is written', async () => {
+      const { harness, env } = makeEnv()
+      withHomeGrant(harness, 'm-hadi')
+      const out = await applyAgentAccessChange(env, homeOwner(), change({ squadId: 'sq-home', capability: 'lead', expectedPrior: 'member' }))
+      expect(out).toMatchObject({ ok: true, action: 'change', capability: 'lead' })
+      expect(rava(harness, 'sq-home')).toEqual({ cap: 'lead', mem: 'lead' })
+      expect(receipts(harness)).toHaveLength(1)
+    })
+
+    it('the home owner changes the level on a home it owns that is not the agent\'s own', async () => {
+      const { harness, env } = makeEnv()
+      withHomeGrant(harness, 'm-hadi', 'sq-home2')
+      seedRava(harness, 'observer', 'sq-home2')
+      const auth = humanAuth('m-hadi', [grant('m-hadi', 'org', null, 'admin'), grant('m-hadi', 'squad', 'sq-home2', 'admin')])
+      const out = await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home2', capability: 'member', expectedPrior: 'observer' }))
+      expect(out).toMatchObject({ ok: true, capability: 'member' })
+      expect(rava(harness, 'sq-home2')).toEqual({ cap: 'member', mem: 'member' })
+    })
+
+    it('an org admin or org owner with no grant on that home is refused (a home is its member\'s alone)', async () => {
+      const { harness, env } = makeEnv()
+      for (const who of [hadi(), owner()]) {
+        expect(await applyAgentAccessChange(env, who, change({ squadId: 'sq-home', expectedPrior: 'member' })))
+          .toMatchObject({ ok: false, error: 'home_owner_required', status: 403 })
+      }
+      expect(rava(harness, 'sq-home')).toEqual({ cap: 'member', mem: 'member' })
+      expect(receipts(harness)).toHaveLength(0)
+    })
+
+    it('a different member (not org admin) is refused even holding admin on the home', async () => {
+      const { harness, env } = makeEnv()
+      withHomeGrant(harness, 'm-sqadmin')
+      const auth = humanAuth('m-sqadmin', [grant('m-sqadmin', 'squad', 'sq-home', 'admin')])
+      expect(await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home', expectedPrior: 'member' })))
+        .toMatchObject({ ok: false, error: 'org_admin_required' })
+      expect(rava(harness, 'sq-home')).toEqual({ cap: 'member', mem: 'member' })
+    })
+
+    it('protected: revoke, enroll, an owner row and a level above the actor stay refused', async () => {
+      const { harness, env } = makeEnv()
+      withHomeGrant(harness, 'm-hadi')
+      withHomeGrant(harness, 'm-hadi', 'sq-home2')
+      const auth = homeOwner()
+      expect(await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home', action: 'revoke', expectedPrior: 'member' })))
+        .toMatchObject({ ok: false, error: 'home_squad_immutable' })
+      expect(await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home2', expectedPrior: 'none' })))
+        .toMatchObject({ ok: false, error: 'home_squad_immutable' })
+      expect(await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home', capability: 'owner', expectedPrior: 'member' })))
+        .toMatchObject({ ok: false, error: 'invalid_capability' })
+      harness.sqlite.exec("UPDATE capabilities SET capability = 'owner' WHERE id = 'cap-rava-home'")
+      expect(await applyAgentAccessChange(env, auth, change({ squadId: 'sq-home', capability: 'lead', expectedCapability: 'owner', expectedMembership: 'member' })))
+        .toMatchObject({ ok: false, error: 'owner_access_untouchable' })
+      expect(receipts(harness)).toHaveLength(0)
+    })
+
+    it('in-batch: revoke / enroll on a home roll back even for the owner; a non-owner change rolls back', async () => {
+      const { harness, env } = makeEnv()
+      withHomeGrant(harness, 'm-hadi')
+      expect(await driveRevoke(env, plan({ squadId: 'sq-home', prior: 'member', next: null, action: 'revoke' }))).toBe('threw')
+      expect(await driveSet(env, plan({ squadId: 'sq-home', action: 'enroll' }))).toBe('threw')
+      expect(rava(harness, 'sq-home')).toEqual({ cap: 'member', mem: 'member' })
+      // control: the owner's change commits
+      expect(await driveSet(env, plan({ squadId: 'sq-home', prior: 'member', action: 'change' }))).toBe('committed')
+      // org admin without the home grant: the SQL rank leaf refuses (m-owner has org owner only)
+      const p = plan({ squadId: 'sq-home', prior: 'lead', action: 'change', actorMemberId: 'm-owner', next: 'admin' })
+      expect(await driveSet(env, p)).toBe('threw')
+      expect(rava(harness, 'sq-home')).toEqual({ cap: 'lead', mem: 'lead' })
+    })
+
+    it('a work squad that is the agent\'s binding squad stays immutable', async () => {
+      const { harness, env } = makeEnv()
+      harness.sqlite.exec("UPDATE agents SET squad_id = 'sq-core' WHERE id = 'rava'")
+      seedRava(harness, 'member')
+      expect(await applyAgentAccessChange(env, owner(), change({ expectedPrior: 'member' }))).toMatchObject({ ok: false, error: 'home_squad_immutable' })
+      expect(await driveSet(env, plan({ prior: 'member', action: 'change', homeSquadId: 'sq-core' }))).toBe('threw')
+    })
+  })
+
   it('(5) an agent can never change its own access: the actor is the target agent\'s own member', async () => {
     const { harness, env } = makeEnv()
     const selfActor = humanAuth('m-rava', [grant('m-rava', 'org', null, 'admin')])

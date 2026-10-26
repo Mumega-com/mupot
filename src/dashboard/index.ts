@@ -132,6 +132,7 @@ import {
   accessRefusalMessage,
   agentAccessPanel,
   applyAgentAccessChange,
+  applyMoveOutOfHome,
   loadAgentAccessView,
 } from './agent-access-panel'
 import { mintAgentBoundToken, isAgentTokenCapability, AgentInactiveError } from '../members/service'
@@ -2090,7 +2091,7 @@ dashboardApp.get('/agents/:id', async (c) => {
   ])
   // The Access panel is org-admin only; POST /agents/:id/access re-checks every rule.
   const accessPanel = isOrgAdmin(auth) && !auth.boundAgentId
-    ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id), null)
+    ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id, auth), null)
     : null
   const ownerView = await loadAgentOwnerView(c.env, auth, agent)
   // Observed facts boot recorded (read-only on this page). A failed read renders "not reported yet",
@@ -2328,6 +2329,16 @@ dashboardApp.post('/agents/:id/access', async (c) => {
   const form = await c.req.parseBody()
   const field = (name: string): string => (typeof form[name] === 'string' ? form[name].trim() : '')
   const rawAction = field('action')
+  if (rawAction === 'move') {
+    const moved = await applyMoveOutOfHome(c.env, auth, {
+      agentRef: agent.id, toSquadId: field('to_squad_id'), capability: field('capability'), reason: field('reason'),
+    })
+    const mview = await loadAgentAccessView(c.env, agent.id, auth)
+    const mpage = html`<p class="crumbs"><a href="/">Overview</a> / <a href="/agents/${agent.id}">${agent.name}</a> / Access</p>
+      ${agentAccessPanel(agent, mview, moved.message)}
+      <p><a href="/agents/${agent.id}">Back to ${agent.name}</a></p>`
+    return c.html(shell(c.env, `Access · ${agent.name}`, mpage), moved.ok ? 200 : moved.status)
+  }
   const result = await applyAgentAccessChange(c.env, auth, {
     agentRef: agent.id,
     squadId: field('squad_id'),
@@ -2337,7 +2348,7 @@ dashboardApp.post('/agents/:id/access', async (c) => {
     expectedMembership: field('expected_membership'),
     reason: field('reason'),
   })
-  const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id) : null
+  const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id, auth) : null
   const page = (notice: string) => html`<p class="crumbs"><a href="/">Overview</a> / <a href="/agents/${agent.id}">${agent.name}</a> / Access</p>
     ${view ? agentAccessPanel(agent, view, notice) : html`<p class="empty">${notice}</p>`}
     <p><a href="/agents/${agent.id}">Back to ${agent.name}</a></p>`
