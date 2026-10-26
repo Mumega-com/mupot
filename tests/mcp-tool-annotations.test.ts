@@ -148,7 +148,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'operator_revoke', 'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
     'project_update', 'project_wiki_upsert', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
-    'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
+    'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'security_bar', 'set_agent_inbox_consumer',
     'set_agent_webhook_doorbell', 'squad_choose', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
     'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
     'update_agent', 'update_department', 'update_squad',

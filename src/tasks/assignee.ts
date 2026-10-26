@@ -1,6 +1,21 @@
-import { hasCapability, loadSquadScope, resolveCapabilities } from '../auth/capability'
+import { canOnSquadAuth, hasCapability, loadSquadScope, resolveCapabilities } from '../auth/capability'
 import { resolveActiveAgentMember } from '../members/service'
-import type { Agent, Env } from '../types'
+import { actorOf, relaxes } from '../policy/bar'
+import type { Agent, AuthContext, Env } from '../types'
+
+/**
+ * Security Bar context for an assignment (rules task.assign.*). Pass it from a caller that has an authenticated
+ * principal; without it the resolver is exactly today's strict behaviour (system callers: dispatch, concierge,
+ * runtime receipts). FLOORS the bar cannot move, enforced below regardless of level: the id must exist
+ * (invalid_assignee), an agent outside the task's squad must be one the CALLER can see (member on its home
+ * squad), and an agent with no minted/unambiguous member identity is never assignable. Tenant is structural:
+ * one pot = one DB, ids resolve only inside it.
+ */
+export interface AssignBar {
+  auth: AuthContext
+  /** 'task:<id>' or 'squad:<id>' - ids only. */
+  scopeRef: string
+}
 
 export interface AssigneeResult {
   value: string | null
@@ -12,6 +27,7 @@ export async function resolveTaskAssignee(
   env: Env,
   raw: unknown,
   squadId: string,
+  bar?: AssignBar,
 ): Promise<AssigneeResult> {
   if (raw === undefined || raw === null) return { value: null }
   if (typeof raw !== 'string' || raw.length === 0) {
@@ -25,7 +41,17 @@ export async function resolveTaskAssignee(
     .first<Pick<Agent, 'id' | 'squad_id' | 'status'>>()
 
   if (!agent) return { value: null, error: 'invalid_assignee' }
-  if (agent.status !== 'active') return { value: null, error: 'assignee_not_in_squad' }
+  // FLOOR (task.assign.agent-not-visible): through the bar, an agent homed on ANOTHER squad is assignable only if the
+  // caller can see that squad. Checked before any relaxation below so no level can widen it.
+  const visibleToCaller = async (): Promise<boolean> =>
+    !bar || agent.squad_id === squadId || (await canOnSquadAuth(env, bar.auth, agent.squad_id, 'member'))
+  if (agent.status !== 'active') {
+    // task.create.assignee-agent-resolvable.inactive: onboarding lets work wait for a paused agent.
+    if (!bar || !(await visibleToCaller())) return { value: null, error: 'assignee_not_in_squad' }
+    if (!(await relaxes(env, 'task.create.assignee-agent-resolvable.inactive', { actor: actorOf(bar.auth), scopeRef: bar.scopeRef, detail: 'agent inactive' }))) {
+      return { value: null, error: 'assignee_not_in_squad' }
+    }
+  }
   if (agent.squad_id === squadId) return { value: agent.id }
 
   const memberId = await resolveActiveAgentMember(env, agent.id)
@@ -37,9 +63,13 @@ export async function resolveTaskAssignee(
   if (!scope) return { value: null, error: 'assignee_not_in_squad' }
 
   const grants = await resolveCapabilities(env, memberId)
-  return hasCapability(grants, 'squad', scope, 'member')
-    ? { value: agent.id }
-    : { value: null, error: 'assignee_not_in_squad' }
+  if (hasCapability(grants, 'squad', scope, 'member')) return { value: agent.id }
+  // task.create.assignee-agent-resolvable.cross-squad: relaxed below under_attack, and only for an agent the caller can see (floor above).
+  if (bar && (await visibleToCaller())
+    && (await relaxes(env, 'task.create.assignee-agent-resolvable.cross-squad', { actor: actorOf(bar.auth), scopeRef: bar.scopeRef, detail: 'cross-squad agent' }))) {
+    return { value: agent.id }
+  }
+  return { value: null, error: 'assignee_not_in_squad' }
 }
 
 /**
@@ -68,6 +98,7 @@ export async function resolveTaskAssigneeMember(
   env: Env,
   raw: unknown,
   squadId: string,
+  bar?: AssignBar,
 ): Promise<AssigneeResult> {
   if (raw === undefined || raw === null) return { value: null }
   if (typeof raw !== 'string' || raw.length === 0) {
@@ -92,7 +123,10 @@ export async function resolveTaskAssigneeMember(
   if (!scope) return { value: null, error: 'assignee_not_in_squad' }
 
   const grants = await resolveCapabilities(env, member.id)
-  return hasCapability(grants, 'squad', scope, 'member')
-    ? { value: member.id }
-    : { value: null, error: 'assignee_not_in_squad' }
+  if (hasCapability(grants, 'squad', scope, 'member')) return { value: member.id }
+  // task.create.assignee-member-resolvable: onboarding lets an active tenant member be named before their grant exists.
+  if (bar && (await relaxes(env, 'task.create.assignee-member-resolvable', { actor: actorOf(bar.auth), scopeRef: bar.scopeRef, detail: 'member no squad grant' }))) {
+    return { value: member.id }
+  }
+  return { value: null, error: 'assignee_not_in_squad' }
 }

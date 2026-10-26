@@ -32,11 +32,12 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertIntakeWithBar, checkTransitionWithBar, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
-import { verifyTaskArtifactShape } from './artifact-verification'
+import { verifyTaskEvidence } from './evidence'
+import { actorOf } from '../policy/bar'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, ownsTaskPartyAgent, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
 import { resolveVerdictSubmission, VerdictSubmissionMismatchError, VerdictSubmissionRequiredError, type GateVerdictReceiptOutcome } from './verdict-binding'
@@ -623,7 +624,7 @@ tasksApp.post('/', async (c) => {
   const status: TaskStatus = rawStatus
 
   // assignee, if provided, must resolve to an agent assignable on this task squad.
-  const assigneeCheck = await resolveTaskAssignee(c.env, body.assignee_agent_id, squad.id)
+  const assigneeCheck = await resolveTaskAssignee(c.env, body.assignee_agent_id, squad.id, { auth: c.get('auth'), scopeRef: `squad:${squad.id}` })
   if (assigneeCheck.error) return c.json({ error: assigneeCheck.error }, 400)
   const assigneeAgentId = assigneeCheck.value
   // migrations/0150: the human axis, same bar. One owner only — refused by name
@@ -641,7 +642,7 @@ tasksApp.post('/', async (c) => {
       400,
     )
   }
-  const assigneeMemberCheck = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, squad.id)
+  const assigneeMemberCheck = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, squad.id, { auth: c.get('auth'), scopeRef: `squad:${squad.id}` })
   if (assigneeMemberCheck.error) return c.json({ error: assigneeMemberCheck.error }, 400)
   const assigneeMemberId = assigneeMemberCheck.value
 
@@ -890,8 +891,14 @@ tasksApp.patch('/:id', async (c) => {
       reversesVerdict = true
     } else {
       // Enforce the transition matrix.
-      const transitionErr = checkTransition(existing.status, body.status)
+      const transitionErr = await checkTransitionWithBar(c.env, existing.status, body.status, {
+        actor: actorOf(c.get('auth')), scopeRef: `task:${existing.id}`, reason: body.reason,
+      })
       if (transitionErr) return c.json(transitionErr, 400)
+      // Security Bar open->blocked: the reason becomes part of the task body (the audit trail on the task itself).
+      if (existing.status === 'open' && body.status === 'blocked' && typeof body.reason === 'string') {
+        next.body = next.body ? `${next.body}\n\n${body.reason.trim()}` : body.reason.trim()
+      }
     }
     // gate_owner may be set in this same PATCH (existing.status is pre-review,
     // so the gate isn't locked yet), so evaluate the EFFECTIVE value after
@@ -971,14 +978,14 @@ tasksApp.patch('/:id', async (c) => {
     const entersReview = body.status === 'review'
     const ungatedDirectDone = body.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
     if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
-      const artifactCheck = verifyTaskArtifactShape(existing.result)
+      const artifactCheck = await verifyTaskEvidence(c.env, existing.result, { actor: actorOf(c.get('auth')), scopeRef: `task:${existing.id}` })
       if (!artifactCheck.verified) {
         return c.json(
           {
             error: 'artifact_verification_failed',
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-            detail: 'an agent-assigned task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (required at the strictest level), or a repository/PR URL with a full commit id, or a "Snapshot: <label>" with content',
           },
           409,
         )
@@ -1077,7 +1084,7 @@ tasksApp.patch('/:id', async (c) => {
       if (body.assignee_agent_id === null) {
         next.assignee_agent_id = null
       } else {
-        const check = await resolveTaskAssignee(c.env, body.assignee_agent_id, existing.squad_id)
+        const check = await resolveTaskAssignee(c.env, body.assignee_agent_id, existing.squad_id, { auth: c.get('auth'), scopeRef: `task:${existing.id}` })
         if (check.error) return c.json({ error: check.error }, 400)
         next.assignee_agent_id = check.value
         // Naming an agent owner clears any human owner. Without this, setting the
@@ -1092,7 +1099,7 @@ tasksApp.patch('/:id', async (c) => {
       if (body.assignee_member_id === null) {
         next.assignee_member_id = null
       } else {
-        const check = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, existing.squad_id)
+        const check = await resolveTaskAssigneeMember(c.env, body.assignee_member_id, existing.squad_id, { auth: c.get('auth'), scopeRef: `task:${existing.id}` })
         if (check.error) return c.json({ error: check.error }, 400)
         next.assignee_member_id = check.value
         next.assignee_agent_id = null
@@ -1183,7 +1190,7 @@ tasksApp.patch('/:id', async (c) => {
   // If priority is explicitly modified to P0/P1, validate intake contract requirements
   if (body.priority !== undefined && (next.priority === 'P0' || next.priority === 'P1')) {
     try {
-      assertValidIntakeContract(next, { allowDeferredPredicate: true })
+      await assertIntakeWithBar(c.env, next, { allowDeferredPredicate: true }, actorOf(c.get('auth')))
     } catch (error) {
       if (error instanceof TaskIntakeContractError) {
         return c.json({ error: error.code, detail: error.message }, 400)

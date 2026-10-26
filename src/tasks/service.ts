@@ -7,6 +7,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
 import { claimTimestamp } from '../lib/claim-timestamp'
+import { policy, relaxes } from '../policy/bar'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken, getRepoScopedInstallationToken } from '../integrations/github-app'
@@ -115,6 +116,35 @@ export function checkTransition(
   if (!allowed || !(allowed as readonly string[]).includes(to)) {
     return { error: 'invalid_transition', from, to }
   }
+  return null
+}
+
+/**
+ * checkTransition + the Security Bar (rule task.update.transition-matrix). The matrix above is today's behaviour
+ * and is the FLOOR for every other move (review exits only via verdict, done is terminal, gated tasks have no
+ * direct done are enforced elsewhere and are not touched). The one operational move the bar can relax is
+ * open -> blocked: allowed at onboarding/operating with a non-empty reason, and every use is written to
+ * policy_events (actor + task id; the reason text itself lands on the task body, not in the audit row, so the
+ * audit row never carries free text). At under_attack, or if the bar cannot be read or the audit cannot be
+ * written, the answer is today's invalid_transition.
+ */
+export async function checkTransitionWithBar(
+  env: Env,
+  from: TaskStatus,
+  to: TaskStatus,
+  ctx: { actor: string; scopeRef: string; reason?: unknown },
+): Promise<{ error: 'invalid_transition' | 'transition_reason_required'; from: TaskStatus; to: TaskStatus } | null> {
+  const err = checkTransition(from, to)
+  if (!err) return null
+  if (from !== 'open' || to !== 'blocked') return err
+  // Ask the bar only for the one move it governs. Reason first: a relaxed rule still needs it, and a refusal for a
+  // missing reason must not write a would_block row for a move that did not happen.
+  const d = await policy(env, {}, 'task.update.transition-matrix')
+  if (!d.relaxed) return err
+  if (typeof ctx.reason !== 'string' || ctx.reason.trim().length < 3) {
+    return { error: 'transition_reason_required', from, to }
+  }
+  if (!(await relaxes(env, 'task.update.transition-matrix', { actor: ctx.actor, scopeRef: ctx.scopeRef, detail: 'open->blocked' }))) return err
   return null
 }
 
@@ -626,7 +656,7 @@ export async function persistTaskUpdate(
   // Chokepoint enforcement for priority discipline (Issue #1040 Phase 2):
   // When a task is escalated or mutated to P0/P1, validate intake contract requirements
   if ((existing.priority !== next.priority || existing.body !== next.body || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id) && (next.priority === 'P0' || next.priority === 'P1')) {
-    assertValidIntakeContract(next, { allowDeferredPredicate: true })
+    await assertIntakeWithBar(env, next, { allowDeferredPredicate: true }, 'system:task-update')
   }
 
   if (assigneeChangesInReview(existing, next)) throw new TaskUpdateConflictError('assignee_frozen_in_review')
@@ -877,7 +907,7 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
         || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id)
       && (next.priority === 'P0' || next.priority === 'P1')
     ) {
-      assertValidIntakeContract(next, { allowDeferredPredicate: true })
+      await assertIntakeWithBar(env, next, { allowDeferredPredicate: true }, 'system:task-update')
     }
     let result
     try {
@@ -1426,7 +1456,7 @@ export class TaskIntakeContractError extends Error {
 
 export function assertValidIntakeContract(
   input: TaskIntakePayload,
-  options: { allowDeferredPredicate?: boolean } = {},
+  options: { allowDeferredPredicate?: boolean; relaxP1Linkage?: boolean } = {},
 ): void {
   if (!isDoneWhenValid(input.done_when)) {
     throw new TaskIntakeContractError(
@@ -1471,7 +1501,9 @@ export function assertValidIntakeContract(
   // Gated rule: A task at priority P1 requires either:
   // 1. Direct linkage to a Project (input.project_id) or Parent Task (input.parent_task_id), OR
   // 2. Escape Hatch: Explicit named owner + review TTL stated in body/metadata (e.g. "[owner: @kasra, ttl: 7d]").
-  if (input.priority === 'P1') {
+  // Security Bar rule task.intake.p1-linkage: the caller (prepareGuardedTaskInsert, the one async create
+  // chokepoint) passes relaxP1Linkage only after the bar relaxed it AND the would_block row was written.
+  if (input.priority === 'P1' && !options.relaxP1Linkage) {
     const hasLinkage = isNonEmptyString(input.project_id) || isNonEmptyString(input.parent_task_id)
     if (!hasLinkage) {
       const bodyText = input.body ?? ''
@@ -1520,13 +1552,34 @@ export function evaluateTaskIntakeContract(
   }
 }
 
+/**
+ * assertValidIntakeContract + the Security Bar. The ONE intake rule on the bar is p1_linkage_required
+ * (task.intake.p1-linkage); every other intake refusal rethrows untouched. Relaxed only when the bar says so AND
+ * the would_block row was written, so the log cannot miss a relaxation.
+ */
+export async function assertIntakeWithBar(
+  env: Env,
+  input: TaskIntakePayload & { squad_id?: string; id?: string },
+  options: { allowDeferredPredicate?: boolean },
+  actor: string,
+): Promise<void> {
+  try {
+    assertValidIntakeContract(input, options)
+  } catch (err) {
+    if (!(err instanceof TaskIntakeContractError) || err.code !== 'p1_linkage_required') throw err
+    const scopeRef = input.id ? `task:${input.id}` : `squad:${input.squad_id ?? 'unknown'}`
+    if (!(await relaxes(env, 'task.intake.p1-linkage', { actor, scopeRef, detail: 'p1 without linkage' }))) throw err
+    assertValidIntakeContract(input, { ...options, relaxP1Linkage: true })
+  }
+}
+
 export async function prepareGuardedTaskInsert(
   env: Env,
   input: CreateTaskInput,
   options: CreateTaskOptions = {},
 ): Promise<PreparedGuardedTaskInsert> {
   // Enforce Point-of-Capture Intake Contract before touching the DB.
-  assertValidIntakeContract(input, { allowDeferredPredicate: options.allowDeferredPredicate })
+  await assertIntakeWithBar(env, input, { allowDeferredPredicate: options.allowDeferredPredicate }, options.actor ? `${options.actor.kind}:${options.actor.id}` : 'system:task-create')
 
   const projectId = input.project_id ?? null
   await validateTaskProjectAttribution(env, projectId, input.squad_id)

@@ -321,6 +321,7 @@ import { makeConnectionsApp } from './connections'
 import { makeClaimApp, loadAgentClaimCard, reauthRedirectUrl } from './claim'
 import { makeWakeApp, loadAgentWakeCard } from './wake-card'
 import { makeImSettingsApp } from './im-settings'
+import { makeSecurityBarApp } from './security-bar'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject, isDeployPolicyError } from '../projects/deploy'
@@ -1753,6 +1754,8 @@ dashboardApp.route('/', makeWakeApp(shell))
 // set or change the decision bot's @username after go-live — see
 // src/dashboard/im-settings.ts's module header.
 dashboardApp.route('/', makeImSettingsApp(shell))
+// Security Bar settings: GET (read view) / POST (owner-only raise, two-step lowering) — see src/dashboard/security-bar.ts.
+dashboardApp.route('/', makeSecurityBarApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
