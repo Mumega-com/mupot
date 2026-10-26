@@ -30,7 +30,10 @@ export type SquadChoiceLevel = (typeof SQUAD_CHOICE_LEVELS)[number]
 /** An owner needs at least this on a squad for it to be offered at all. */
 export const SQUAD_CHOICE_OWNER_FLOOR: Capability = 'lead'
 export const SQUAD_CHOICE_REASON_MAX = 300
-const CANDIDATE_LIMIT = 200
+/** Squads are scanned in pages and filtered by the owner's standing BEFORE any cap, so unrelated squads can never hide an eligible one. */
+const SCAN_PAGE = 200
+const SCAN_MAX = 5000
+const CANDIDATES_MAX = 25
 
 export interface ChoiceAgent {
   id: string
@@ -78,7 +81,7 @@ export interface SquadCandidate {
 }
 
 export type ChoiceContext =
-  | { ok: true; agent: ChoiceAgent; ownerMemberId: string; agentMemberId: string; inLobby: boolean }
+  | { ok: true; agent: ChoiceAgent; ownerMemberId: string | null; agentMemberId: string; inLobby: boolean }
   | { ok: false; error: SquadChoiceError }
 
 export type SquadChoiceError =
@@ -137,49 +140,76 @@ export async function loadChoiceContext(env: Env, auth: AuthContext): Promise<Ch
   if (binding.kind !== 'bound') return { ok: false, error: 'agent_identity_unminted' }
   const home = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1').bind(agent.squad_id).first<{ kind: string }>()
   const inLobby = home?.kind === 'home'
-  const ownerMemberId = await resolveChoiceOwner(env, agent)
-  if (!ownerMemberId) return { ok: false, error: 'owner_unknown' }
+  // The owner matters only while the agent can still choose. A placed agent has no lobby to derive it from, and must still reach
+  // the idempotent / already_placed answers instead of owner_unknown.
+  const ownerMemberId = inLobby ? await resolveChoiceOwner(env, agent) : null
+  if (inLobby && !ownerMemberId) return { ok: false, error: 'owner_unknown' }
   return { ok: true, agent, ownerMemberId, agentMemberId: binding.memberId, inLobby }
 }
 
 interface SquadRow { id: string; department_id: string; slug: string; name: string; charter: string | null }
 
-/** Candidate squads for this agent, best suggestion first. Empty unless the agent is in the lobby. */
+/** Facts + score for one squad the owner is eligible for (project names and activity are read only for eligible squads). */
+async function candidateFor(env: Env, ctx: Extract<ChoiceContext, { ok: true }>, sq: SquadRow, scorer: SquadScorer): Promise<SquadCandidate> {
+  const [projects, activity] = await Promise.all([
+    env.DB.prepare(
+      `SELECT p.name FROM project_squad_access a JOIN projects p ON p.id = a.project_id
+        WHERE a.squad_id = ?1 AND p.status = 'active' ORDER BY p.name LIMIT 5`,
+    ).bind(sq.id).all<{ name: string }>(),
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE squad_id = ?1 AND updated_at >= datetime('now', '-30 days')`)
+      .bind(sq.id).first<{ n: number }>(),
+  ])
+  const facts: SquadFacts = {
+    id: sq.id, slug: sq.slug, name: sq.name, charter: sq.charter,
+    projects: (projects.results ?? []).map((p) => p.name),
+    recent_tasks: Number(activity?.n ?? 0),
+  }
+  const { score, matched } = scorer.score(ctx.agent, facts)
+  return {
+    squad_id: sq.id, slug: sq.slug, name: sq.name, score,
+    reason: { purpose: sq.charter, active_projects: facts.projects, matching_skills: matched, recent_tasks: facts.recent_tasks },
+  }
+}
+
+const ownerMayLead = async (env: Env, grants: Awaited<ReturnType<typeof resolveCapabilities>>, sq: SquadRow): Promise<boolean> =>
+  canOnSquad(env, grants, brandSquadScope({ id: sq.id, department_id: sq.department_id, kind: 'work' }), SQUAD_CHOICE_OWNER_FLOOR)
+
+/** Candidate squads for this agent, best suggestion first (at most CANDIDATES_MAX). Empty unless the agent is in the lobby. */
 export async function listSquadCandidates(
   env: Env,
   ctx: Extract<ChoiceContext, { ok: true }>,
   scorer: SquadScorer = deterministicScorer,
 ): Promise<SquadCandidate[]> {
-  if (!ctx.inLobby) return []
+  if (!ctx.inLobby || !ctx.ownerMemberId) return []
   const grants = await resolveCapabilities(env, ctx.ownerMemberId)
-  const squads = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter FROM squads
-      WHERE kind = 'work' AND status = 'active' AND id <> ?1 ORDER BY name LIMIT ${CANDIDATE_LIMIT}`,
-  ).bind(ctx.agent.squad_id).all<SquadRow>()
   const out: SquadCandidate[] = []
-  for (const sq of squads.results ?? []) {
-    const scope = brandSquadScope({ id: sq.id, department_id: sq.department_id, kind: 'work' })
-    if (!(await canOnSquad(env, grants, scope, SQUAD_CHOICE_OWNER_FLOOR))) continue
-    const [projects, activity] = await Promise.all([
-      env.DB.prepare(
-        `SELECT p.name FROM project_squad_access a JOIN projects p ON p.id = a.project_id
-          WHERE a.squad_id = ?1 AND p.status = 'active' ORDER BY p.name LIMIT 5`,
-      ).bind(sq.id).all<{ name: string }>(),
-      env.DB.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE squad_id = ?1 AND updated_at >= datetime('now', '-30 days')`)
-        .bind(sq.id).first<{ n: number }>(),
-    ])
-    const facts: SquadFacts = {
-      id: sq.id, slug: sq.slug, name: sq.name, charter: sq.charter,
-      projects: (projects.results ?? []).map((p) => p.name),
-      recent_tasks: Number(activity?.n ?? 0),
+  // Keyset pages over id: eligibility is decided per squad BEFORE the cap, so 5000 unrelated squads cannot starve an eligible one.
+  let after = ''
+  for (let scanned = 0; scanned < SCAN_MAX && out.length < CANDIDATES_MAX; scanned += SCAN_PAGE) {
+    const page = await env.DB.prepare(
+      `SELECT id, department_id, slug, name, charter FROM squads
+        WHERE kind = 'work' AND status = 'active' AND id <> ?1 AND id > ?2 ORDER BY id LIMIT ${SCAN_PAGE}`,
+    ).bind(ctx.agent.squad_id, after).all<SquadRow>()
+    const rows = page.results ?? []
+    for (const sq of rows) {
+      if (out.length >= CANDIDATES_MAX) break
+      if (await ownerMayLead(env, grants, sq)) out.push(await candidateFor(env, ctx, sq, scorer))
     }
-    const { score, matched } = scorer.score(ctx.agent, facts)
-    out.push({
-      squad_id: sq.id, slug: sq.slug, name: sq.name, score,
-      reason: { purpose: sq.charter, active_projects: facts.projects, matching_skills: matched, recent_tasks: facts.recent_tasks },
-    })
+    if (rows.length < SCAN_PAGE) break
+    after = rows[rows.length - 1]!.id
   }
   return out.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+}
+
+/** One explicit target, checked directly (never through the possibly-capped list): work, active, not the lobby, owner >= lead. */
+async function explicitCandidate(env: Env, ctx: Extract<ChoiceContext, { ok: true }>, squadId: string): Promise<SquadRow | null> {
+  if (!ctx.inLobby || !ctx.ownerMemberId || squadId === ctx.agent.squad_id) return null
+  const sq = await env.DB.prepare(
+    `SELECT id, department_id, slug, name, charter FROM squads WHERE id = ?1 AND kind = 'work' AND status = 'active'`,
+  ).bind(squadId).first<SquadRow>()
+  if (!sq) return null
+  const grants = await resolveCapabilities(env, ctx.ownerMemberId)
+  return (await ownerMayLead(env, grants, sq)) ? sq : null
 }
 
 export type ChooseSquadResult =
@@ -200,27 +230,26 @@ export async function chooseSquad(
   const reasonRaw = input.reason === undefined || input.reason === null ? '' : input.reason
   if (typeof reasonRaw !== 'string' || reasonRaw.length > SQUAD_CHOICE_REASON_MAX) return { ok: false, error: 'invalid_reason' }
 
-  // Idempotent: already sitting in exactly this (work) squad. Nothing is written or re-granted.
+  // Idempotent: already sitting in exactly this (work) squad. Nothing is written or re-granted; the level reported is the STORED one.
   if (!ctx.inLobby) {
     if (ctx.agent.squad_id === squadId) {
       const sq = await env.DB.prepare('SELECT id, slug, name FROM squads WHERE id = ?1').bind(squadId).first<{ id: string; slug: string; name: string }>()
-      if (sq) return { ok: true, already: true, squad: sq, level: level as SquadChoiceLevel, audit_id: null }
+      const held = await env.DB.prepare(
+        `SELECT capability FROM capabilities WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('', '?3')} LIMIT 1`,
+      ).bind(ctx.agentMemberId, squadId, nowCapabilitySql()).first<{ capability: string }>()
+      if (sq) return { ok: true, already: true, squad: sq, level: held?.capability === 'observer' ? 'observer' : 'member', audit_id: null }
     }
     return { ok: false, error: 'already_placed' }
   }
 
-  const candidates = await listSquadCandidates(env, ctx)
-  const chosen = candidates.find((c) => c.squad_id === squadId)
+  const chosen = await explicitCandidate(env, ctx, squadId)
   if (!chosen) return { ok: false, error: 'squad_not_a_candidate' }
+  const ownerId = ctx.ownerMemberId as string // non-null: inLobby implies loadChoiceContext resolved an owner
 
-  // Re-derive the owner's standing NOW, at the write, and cap the level by it (never above what the owner holds).
-  const grants = await resolveCapabilities(env, ctx.ownerMemberId)
-  const row = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1').bind(squadId).first<{ department_id: string }>()
-  if (!row) return { ok: false, error: 'invalid_squad' }
-  const scope = brandSquadScope({ id: squadId, department_id: row.department_id, kind: 'work' })
-  if (!(await canOnSquad(env, grants, scope, SQUAD_CHOICE_OWNER_FLOOR)) || !(await canOnSquad(env, grants, scope, level as Capability))) {
-    return { ok: false, error: 'standing_lost' }
-  }
+  // The level is also bounded by the owner's standing on this squad, read again here at the write.
+  const grants = await resolveCapabilities(env, ownerId)
+  const scope = brandSquadScope({ id: chosen.id, department_id: chosen.department_id, kind: 'work' })
+  if (!(await canOnSquad(env, grants, scope, level as Capability))) return { ok: false, error: 'standing_lost' }
   if (capabilityRank(level as Capability) > capabilityRank('member')) return { ok: false, error: 'invalid_level' }
 
   const moved = await moveAgentSquad(env, {
@@ -230,10 +259,10 @@ export async function chooseSquad(
     memberId: ctx.agentMemberId,
     capability: level as SquadChoiceLevel,
     actor: { id: ctx.agentMemberId, type: 'agent' },
-    reason: `squad_choose by agent under owner ${ctx.ownerMemberId}${reasonRaw.trim() ? `: ${reasonRaw.trim()}` : ''}`,
+    reason: `squad_choose by agent under owner ${ownerId}${reasonRaw.trim() ? `: ${reasonRaw.trim()}` : ''}`,
   })
   if (!moved.ok) return { ok: false, error: moved.error === 'source_squad_changed' ? 'already_placed' : 'choice_refused' }
-  return { ok: true, already: false, squad: { id: chosen.squad_id, slug: chosen.slug, name: chosen.name }, level: level as SquadChoiceLevel, audit_id: moved.auditId }
+  return { ok: true, already: false, squad: { id: chosen.id, slug: chosen.slug, name: chosen.name }, level: level as SquadChoiceLevel, audit_id: moved.auditId }
 }
 
 /** What boot_context / seat_select show an agent that is still in the lobby. null = nothing to choose. */

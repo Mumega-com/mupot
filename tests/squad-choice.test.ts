@@ -159,4 +159,45 @@ describe('who may call it', () => {
     h.sqlite.exec("UPDATE agents SET owner_member_id = 'mem-a1' WHERE id = 'a1'")
     expect(errOf(await choose({ squad_id: 'sq-a' }))).toBe('owner_unknown')
   })
+
+  it('a fallback-owner placement is retry-safe: the same squad answers idempotently, listing says in_lobby false', async () => {
+    h.sqlite.exec("UPDATE agents SET owner_member_id = NULL WHERE id = 'a1'")
+    expect((await choose({ squad_id: 'sq-a' })).ok).toBe(true)
+    const again = await choose({ squad_id: 'sq-a' })
+    expect(again.ok && (again.result as { already: boolean }).already).toBe(true)
+    expect(errOf(await choose({ squad_id: 'sq-c' }))).toBe('already_placed')
+    const list = await choose({})
+    expect(list.ok && (list.result as { in_lobby: boolean }).in_lobby).toBe(false)
+    expect(audits()).toHaveLength(1)
+  })
+
+  it('the idempotent answer reports the STORED level, not the requested one', async () => {
+    expect((await choose({ squad_id: 'sq-a', level: 'observer' })).ok).toBe(true)
+    const again = await choose({ squad_id: 'sq-a', level: 'member' })
+    expect(again.ok && (again.result as { level: string }).level).toBe('observer')
+    expect(one("SELECT capability FROM capabilities WHERE member_id = 'mem-a1' AND scope_id = 'sq-a'")).toEqual({ capability: 'observer' })
+  })
+
+  it('many unrelated squads cannot hide an eligible one (list and explicit choice)', async () => {
+    const ins = h.sqlite.prepare("INSERT INTO squads (id, department_id, slug, name, kind) VALUES (?, 'd1', ?, ?, 'work')")
+    for (let i = 0; i < 450; i++) ins.run(`a-noise-${String(i).padStart(4, '0')}`, `noise-${i}`, `Noise ${i}`)
+    const list = await choose({})
+    const ids = (list as { result: { candidates: Array<{ squad_id: string }> } }).result.candidates.map((c) => c.squad_id)
+    expect(ids).toEqual(expect.arrayContaining(['sq-a', 'sq-c']))
+    expect((await choose({ squad_id: 'sq-a' })).ok).toBe(true)
+  })
+
+  it('refuses an inactive agent and an agent with no minted identity', async () => {
+    h.sqlite.exec("UPDATE agents SET status = 'inactive' WHERE id = 'a1'")
+    expect(errOf(await choose({ squad_id: 'sq-a' }))).toBe('agent_inactive')
+    h.sqlite.exec("UPDATE agents SET status = 'active' WHERE id = 'a1'")
+    h.sqlite.exec("DELETE FROM agent_member_bindings WHERE agent_id = 'a1'")
+    expect(errOf(await choose({ squad_id: 'sq-a' }))).toBe('agent_identity_unminted')
+    expect(squadOf()).toBe('sq-home')
+  })
+
+  it('refuses an ATTACHED seat session too', async () => {
+    const seat: AuthContext = { ...agentCtx(), seatBinding: { seatId: 's', label: 'l', harnessId: 'h', grantTokenId: 't', humanMemberId: 'm-owner', source: 'handle', attached: true } as AuthContext['seatBinding'] }
+    expect(errOf(await choose({ squad_id: 'sq-a' }, seat))).toBe('attached_session_forbidden')
+  })
 })
