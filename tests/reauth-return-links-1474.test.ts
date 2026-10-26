@@ -25,6 +25,7 @@ describe('#1474 reauth links carry a return path', () => {
       ['operators.ts', '/auth/reauth?return=/operators'],
       ['doorbells.ts', '/auth/reauth?return=/doorbells'],
       ['elevation.ts', '/auth/reauth?return=/elevation/'],
+      ['security-bar.ts', '/auth/reauth?return=/admin/security-bar'],
       // The designation stale-session path (and the claim pages) build the link in ONE helper that always carries the return path.
       ['index.ts', 'reauthRedirectUrl(`/agents/'],
       ['claim.ts', '/auth/reauth?return=${encodeURIComponent(returnPath)}'],

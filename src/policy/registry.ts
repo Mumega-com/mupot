@@ -160,6 +160,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
   floor('task.artifact.placeholder-evidence', 'Placeholder, refusal-prose and disallowed-path evidence is refused at every level; plain prose is never evidence.', ['src/tasks/evidence.ts']),
 
   // ── baseline FLOORS (E3): never off at any level ─────────────────────────────────────────────
+  floor('board.webhook.handler-success', 'A failed board webhook handler returns a retryable error and releases the delivery claim.', ['src/integrations/board-webhook-routes.ts'], ['handler_failed']),
   floor('tenant.isolation', 'Tenant scoping on every read and write.', ['src/**']),
   floor('authz.admission', 'Authorization and admission checks (capability, rank ceilings, verified identity).', ['src/auth/capability.ts', 'src/admission/**']),
   floor('identity.step-up-sensitive', 'Credential and identity step-up for sensitive actions (passkey/device enrolment, link-signin, operator creation, token mint/rotation).', ['src/secure-moments/enrol-mint.ts', 'src/auth/index.ts']),

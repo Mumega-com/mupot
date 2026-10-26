@@ -1,9 +1,8 @@
 -- 0263 — the Security Bar (Hadi, 2026-10-26: "move the restriction settings to a security bar
 -- that can have onboarding, operating, under attack").
 --
--- Numbering: origin/main's highest at authoring time was 0256; open PRs hold 0257-0259
--- (#2189, #2193, #2196, #2199), so this takes 0260 to avoid a collision. Renumber on rebase if
--- the guard (scripts/check-migration-numbering.mjs) says another PR landed first.
+-- Numbering: rebased above origin/main's migration chain; 0263 is reserved for this change.
+-- Renumber on rebase if the migration-numbering guard reports a later applied head.
 --
 -- THREE TABLES, ONE CONCERN
 --   security_bar_state          the level per scope (only the tenant row is writable in this PR).

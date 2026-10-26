@@ -4,7 +4,7 @@
 //      marked read-only). The change forms render only for the owner.
 // POST owner only (the SAME `isOwner` predicate the wizard and /admin/im-settings use):
 //        { action: 'set',            level }   raise only; always allowed for the owner
-//        { action: 'request_lower',  level }   needs a fresh re-auth (this page links /auth/reauth)
+//        { action: 'request_lower',  level }   needs a fresh re-auth (this page links /auth/reauth?return=/admin/security-bar)
 //        { action: 'confirm_lower' }           second owner, or the same owner after the delay
 // Lowering is two explicit calls; nothing here downgrades on a timer (src/policy/admin.ts).
 
