@@ -355,6 +355,8 @@ describe('#1022 linked sign-ins', () => {
         (h.sqlite.prepare(`SELECT recent_reauth_at FROM web_sessions WHERE member_id = 'mem-main'`).get() as { recent_reauth_at: string | null }).recent_reauth_at
       async function reauthWith(authTime: number | null) {
         const jar = await signIn('sub-main', 'main@example.test')
+        // a fresh sign-in now stamps recent_reauth_at itself; reset so these tests isolate the reauth callback
+        h.sqlite.prepare(`UPDATE web_sessions SET recent_reauth_at = NULL WHERE member_id = 'mem-main'`).run()
         const before = recentReauthAt()
         const start = await visit(jar, '/auth/reauth?return=/operators')
         const state = new URL(start.headers.get('location')!).searchParams.get('state')!

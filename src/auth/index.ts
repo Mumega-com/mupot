@@ -378,6 +378,7 @@ async function registerWebSession(
   sessionId: string,
   email: string | null,
   loginIdentity: { provider: string; subject: string } | undefined,
+  freshCredential: boolean = false,
 ): Promise<{ registered: boolean; memberId?: string }> {
   if (!loginIdentity || !email || !env.DB) return { registered: false }
   try {
@@ -442,11 +443,14 @@ async function registerWebSession(
       loginIdentityId = linked.identity.id
     }
 
-    await createWebSession(env, sessionId, {
+    const created = await createWebSession(env, sessionId, {
       tenant,
       memberId,
       loginIdentityId,
     })
+    // A sign-in whose provider just proved a fresh credential counts as a recent reauth (no second login for Confirm).
+    // Only the Google callback sets freshCredential, and only from a verified-fresh auth_time.
+    if (freshCredential) await markRecentReauth(env, created.id_hash)
     return { registered: true, memberId }
   } catch (err) {
     // Best-effort: the D1 registry write failed, but the KV+cookie session
@@ -465,10 +469,10 @@ async function mintSession(
   userId: string,
   email: string | null,
   role: OrgRole,
-  opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string }; tgLinkNonce?: string } = {},
+  opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string }; tgLinkNonce?: string; freshCredential?: boolean } = {},
 ): Promise<void> {
   const sessionId = randomId(32)
-  const registration = await registerWebSession(c.env, sessionId, email, opts.loginIdentity)
+  const registration = await registerWebSession(c.env, sessionId, email, opts.loginIdentity, opts.freshCredential === true)
   const record: SessionRecord = {
     userId,
     email,
@@ -700,6 +704,8 @@ authApp.get('/login', async (c) => {
     state,
     access_type: 'online',
     prompt: 'select_account',
+    // Ask for auth_time so a sign-in that was just performed can count as a recent reauth (verified at the callback).
+    claims: GOOGLE_AUTH_TIME_CLAIMS,
   })
   return c.redirect(`${GOOGLE_AUTH}?${params.toString()}`)
 })
@@ -933,9 +939,13 @@ authApp.get('/callback', async (c) => {
   const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
 
   // Mint the session: random opaque id → server-side record in KV.
+  // Fresh only on a PRESENT auth_time inside the reauth window (same verdict fn as reauth). Absent/stale/forged -> not fresh.
+  // The claim is read from the id_token returned by Google's token endpoint for OUR code, never from the request.
+  const freshCredential = googleAuthTimeVerdict(googleAuthTime(token.id_token)) === 'fresh'
   await mintSession(c, userId, email, role, {
     loginIdentity: { provider: 'google', subject: info.sub },
     ...(tgLinkNonce ? { tgLinkNonce } : {}),
+    ...(freshCredential ? { freshCredential: true } : {}),
   })
   return c.redirect(returnPath ?? '/')
 })
