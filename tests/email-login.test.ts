@@ -450,6 +450,19 @@ describe('GET/POST /auth/email/verify', () => {
     expect(postRes.status).toBe(302)
   })
 
+  it('confirm POST resumes a validated return path from the landing cookie (claim link), and drops an invalid one', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, memoryKv())
+    const a = await startAndCapture(env, 'resume@example.com')
+    const ok = await confirmToken(env, a.token, a.attemptId, 'mupot_login_return=%2Fclaim%2FAB-CD')
+    expect(ok.status).toBe(302)
+    expect(ok.headers.get('location')).toBe('/claim/AB-CD')
+    const b = await startAndCapture(env, 'resume2@example.com')
+    const bad = await confirmToken(env, b.token, b.attemptId, 'mupot_login_return=%2F%2Fevil.example%2Fx')
+    expect(bad.status).toBe(302)
+    expect(bad.headers.get('location')).toBe('/')
+  })
+
   it('confirm POST refuses a wrong token with a matching attempt id', async () => {
     harness = makeHarness()
     const env = envFor(harness, memoryKv())

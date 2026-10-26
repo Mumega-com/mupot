@@ -16,7 +16,7 @@
 import type { Env } from '../types'
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
-import { attachSeatToAgent, seatAttachEnabled } from '../members/seat-attach'
+import { attachSeatToAgent, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
@@ -34,13 +34,12 @@ const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
   scope: 'Only for a chat on its own seat that wants to act as an existing agent its human administers. Never call it from a workspace-token agent; from an already-attached chat it only confirms the current attachment: self (attach THIS thread to an existing agent the human has admitted; seat session only)',
   min: 'authenticated',
-  args: '{ agent: string }  // the agent id, slug or exact name; resolved only among agents your human administers',
+  args: '{ agent?: string }  // the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', description: 'The existing agent this thread should act as: id, slug or exact name. A label to look up, not an access request: the human decides.' },
     },
-    required: ['agent'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -63,6 +62,27 @@ const toolSeatAttach: ToolSpec = {
       }
     }
     const agentRef = typeof args.agent === 'string' ? args.agent.trim() : ''
+    // No `agent` at all: list the choices. Same predicate seat_attach itself resolves through (listAttachableAgents), so the list never
+    // shows an agent attach would refuse. A present-but-bad value stays invalid_args.
+    if (args.agent === undefined || args.agent === null) {
+      const choices = await listAttachableAgents(env, seat.humanMemberId)
+      const agents = choices.map((a) => ({ id: a.id, slug: a.slug, name: a.name, squad: a.squad_name }))
+      if (agents.length === 0) {
+        const canDesignate = seatAttachDesignatedEnabled(env) ? await humanCanDesignateAtAll(env, seat.humanMemberId) : true
+        return done({
+          status: 'no_choices',
+          agents,
+          note: seatAttachDesignatedEnabled(env) && !canDesignate
+            ? 'No agents are available for your human to attach to yet. An org admin must designate your human for an agent (update_agent, attach_designated_member_id) and your human must administer its squad; then call seat_attach again.'
+            : 'No agents are available for your human to attach to yet (they need admin on the agent\'s squad, and it must be a normal agent).',
+        })
+      }
+      return done({
+        status: 'choose_agent',
+        agents,
+        note: 'These are the agents your human can attach this thread to. Pick one (ask your human if there is more than one) and call seat_attach { agent: "<id>" }.',
+      })
+    }
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
 
     const r = await attachSeatToAgent(env, {
@@ -116,14 +136,22 @@ const toolSeatAttach: ToolSpec = {
       case 'seat_attach_disabled':
         return fail(403, r.error)
       case 'agent_not_found':
-        return fail(404, r.error, 'No agent by that name is available for your human to admit.')
+        // One generic text for every miss (no existence oracle). When designation is on, the usual reason for a miss is that an org admin has
+        // not designated this human for the agent yet, so say who can.
+        return fail(404, r.error, seatAttachDesignatedEnabled(env)
+          ? 'No agent by that name is available for your human to admit. If it exists, an org admin has to designate your human for it first (update_agent, attach_designated_member_id); call seat_attach with no agent to list what is available now.'
+          : 'No agent by that name is available for your human to admit.')
       case 'agent_not_designated_for_you': {
+        // The 'Allow for me' control renders (and its POST works) only for org admins. A human without that standing is told who can act.
+        const canPress = await humanCanDesignateAtAll(env, seat.humanMemberId)
         return fail(409, r.error, {
-          who_acts: 'owner',
+          who_acts: canPress ? 'owner' : 'admin',
           agent: r.agent,
           // Static text (#2081): the agent is named in the structured `agent` field, never interpolated here. The control
           // lives on the agent's own page, not on Connections.
-          next_step: "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again.",
+          next_step: canPress
+            ? "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again."
+            : "This agent isn't set up for you yet, and only an org admin can do that: the 'Allow for me' button on the agent's page is shown to org admins only. Ask your human to ask an org admin to designate them for this agent (an org admin does it with update_agent, setting attach_designated_member_id to your human's member id), then ask me to attach again.",
         })
       }
       case 'agent_ambiguous':

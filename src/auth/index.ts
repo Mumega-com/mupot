@@ -223,8 +223,11 @@ function cookieSecure(reqUrl: string): boolean {
   return new URL(reqUrl).protocol === 'https:'
 }
 
+/** A signed-out landing page that was given a validated `return` plants it here, so the EMAIL sign-in (which has no OAuth state to carry it) can resume it. */
+export const LOGIN_RETURN_COOKIE = 'mupot_login_return'
+
 /** Same-origin relative path only: never a scheme, host, protocol-relative or backslash form. */
-function safeReturnPath(raw: unknown): string | null {
+export function safeReturnPath(raw: unknown): string | null {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 256) return null
   if (!/^\/[A-Za-z0-9/_.~%?=&-]*$/.test(raw)) return null
   if (raw.startsWith('//') || raw.includes('..')) return null
@@ -1634,7 +1637,10 @@ async function finishEmailLoginSuccess(
   await mintSession(c, userId, emailNormalized, role, {
     loginIdentity: { provider: 'email', subject: emailNormalized },
   })
-  return c.redirect('/')
+  // Resume the page the person was sent to sign in for (e.g. a claim link). Re-validated here exactly as /auth/login validates it.
+  const resume = safeReturnPath(getCookie(c, LOGIN_RETURN_COOKIE))
+  deleteCookie(c, LOGIN_RETURN_COOKIE, { path: '/' })
+  return c.redirect(resume ?? '/')
 }
 
 function emailVerifyFailureStatus(kind: 'invalid' | 'expired' | 'too_many_attempts' | 'rate_limited'): 401 | 410 | 429 {
