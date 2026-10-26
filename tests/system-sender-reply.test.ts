@@ -20,10 +20,11 @@ const EXPECTED_VIA: Record<string, string | null> = {
   'mupot-secure-drop': null,
   'mupot-wake-router': null,
   'mupot-assignment-wake': null,
+  'mupot-onboarding': null,
 }
 
 describe('registry', () => {
-  it('registers exactly the eight known literals with the right response tool', () => {
+  it('registers exactly the nine known literals with the right response tool', () => {
     expect({ ...SYSTEM_SENDERS }).toEqual(EXPECTED_VIA)
   })
   it('does not treat prototype keys or lookalikes as system senders', () => {

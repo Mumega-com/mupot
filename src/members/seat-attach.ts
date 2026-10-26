@@ -48,6 +48,7 @@ import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-co
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import { sanitizeLabel } from './harness'
 import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
+import { sendClaimWelcome } from './claim-welcome'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
@@ -509,6 +510,8 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
   ])
   const base = weld ? weld.statements.length : 0
   if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null }
+  // The claim landed (and only then): the agent hears it once. Best effort, after the batch; a failure never undoes the claim.
+  try { await sendClaimWelcome(env, adm) } catch { /* the claim stands; the welcome is a nicety */ }
   if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat' }
   if (out[base + 2].meta.changes === 1) return { landed: true, attachmentId }
   // The admission is live but the guarded INSERT wrote nothing: name the guard, so the human/chat is told why seat_attach is still needed.
