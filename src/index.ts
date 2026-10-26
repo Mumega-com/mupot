@@ -458,6 +458,11 @@ export default {
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,
+  // Inbound Email Routing (decide.<domain>). PR1 is a log-only spike behind EMAIL_DECISIONS=1; it never writes a verdict.
+  async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
+    const { handleInboundEmail } = await import('./email-decisions/inbound')
+    await handleInboundEmail(message, env)
+  },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const scheduledAt = new Date(controller.scheduledTime)
     const waitFor = (label: string, work: Promise<unknown>) => {

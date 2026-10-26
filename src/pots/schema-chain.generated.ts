@@ -4566,9 +4566,39 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_backup_runs_date" },
     ],
   },
+  {
+    file: "0260_email_decision_foundation.sql",
+    sha256: "6d62ef44904548348efc5ea1f1b9ecc125038eee483988ca72c41ab893297739",
+    statements: [
+      "-- 0260_email_decision_foundation.sql — email reply approvals, PR1 (foundation only; flag EMAIL_DECISIONS, off).\n-- Design: mumega.com agents/kasra/docs/design-email-reply-approvals-20261026.md.\n-- Nothing in this PR writes a verdict. Tables are created now so PR2/PR3 do not need a schema change mid-gate.\n--\n-- task_verdicts is append-only and 0252's trigger pins every column on the update path (but not a new one). An\n-- ADD COLUMN decided_channel would therefore be silently MUTABLE on rows with project_id NULL. So the channel\n-- lives in a side table with its own no-update / no-delete triggers; task_verdicts is not touched at all.\n\nCREATE TABLE IF NOT EXISTS email_decision_tokens (\n  decision_id        TEXT PRIMARY KEY,                 -- random id, also the token's first segment\n  tenant             TEXT NOT NULL,\n  task_id            TEXT NOT NULL,\n  member_id          TEXT NOT NULL,\n  email_normalized   TEXT NOT NULL,\n  review_entered_at  TEXT NOT NULL,                    -- binds the token to the card's task revision\n  expires_at         TEXT NOT NULL,\n  state              TEXT NOT NULL DEFAULT 'issued' CHECK (state IN ('issued', 'used', 'revoked')),\n  used_at            TEXT,\n  created_at         TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_email_decision_tokens_task ON email_decision_tokens(task_id, state);",
+      "\nCREATE INDEX IF NOT EXISTS idx_email_decision_tokens_member ON email_decision_tokens(member_id, state);",
+      "\n\nCREATE TABLE IF NOT EXISTS email_decision_bindings (\n  id                 TEXT PRIMARY KEY,\n  tenant             TEXT NOT NULL,\n  member_id          TEXT NOT NULL,\n  email_normalized   TEXT NOT NULL,\n  verified_at        TEXT,                             -- NULL = never authorizes a decision\n  verified_via       TEXT,\n  unbound_at         TEXT,\n  created_at         TEXT NOT NULL\n);",
+      "\n-- One live binding per mailbox per tenant: two members cannot share an approving address.\nCREATE UNIQUE INDEX IF NOT EXISTS uq_email_decision_bindings_live\n  ON email_decision_bindings(tenant, email_normalized) WHERE unbound_at IS NULL;",
+      "\nCREATE INDEX IF NOT EXISTS idx_email_decision_bindings_member ON email_decision_bindings(member_id);",
+      "\n\n-- Spike receipts: envelope + header NAMES + whitelisted header values + size. Never a body.\nCREATE TABLE IF NOT EXISTS email_inbound_receipts (\n  id                 TEXT PRIMARY KEY,\n  received_at        TEXT NOT NULL,\n  envelope_from      TEXT NOT NULL,\n  envelope_to        TEXT NOT NULL,                    -- as received, +token kept\n  header_names       TEXT NOT NULL,                    -- JSON array of header names\n  header_values      TEXT NOT NULL,                    -- JSON object, whitelisted headers only\n  raw_size           INTEGER NOT NULL,\n  outcome            TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_email_inbound_receipts_received ON email_inbound_receipts(received_at);",
+      "\n\nCREATE TABLE IF NOT EXISTS task_verdict_channels (\n  verdict_id         TEXT PRIMARY KEY REFERENCES task_verdicts(id),\n  channel            TEXT NOT NULL CHECK (channel IN ('email_reply')),\n  created_at         TEXT NOT NULL\n);",
+      "\nCREATE TRIGGER IF NOT EXISTS task_verdict_channels_no_update\nBEFORE UPDATE ON task_verdict_channels\nBEGIN SELECT RAISE(ABORT, 'task_verdict_channels is append-only'); END;",
+      "\nCREATE TRIGGER IF NOT EXISTS task_verdict_channels_no_delete\nBEFORE DELETE ON task_verdict_channels\nBEGIN SELECT RAISE(ABORT, 'task_verdict_channels is append-only'); END;",
+    ],
+    objects: [
+      { type: "table", name: "email_decision_tokens" },
+      { type: "index", name: "idx_email_decision_tokens_task" },
+      { type: "index", name: "idx_email_decision_tokens_member" },
+      { type: "table", name: "email_decision_bindings" },
+      { type: "index", name: "uq_email_decision_bindings_live" },
+      { type: "index", name: "idx_email_decision_bindings_member" },
+      { type: "table", name: "email_inbound_receipts" },
+      { type: "index", name: "idx_email_inbound_receipts_received" },
+      { type: "table", name: "task_verdict_channels" },
+      { type: "trigger", name: "task_verdict_channels_no_update" },
+      { type: "trigger", name: "task_verdict_channels_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "1b2bacfd93826a7e1493031804beeb2a1792ed8e72f58007484e804e8acb0c3f"
+export const SCHEMA_CHAIN_DIGEST: string = "3b1842cec8a212ee669185ce022c4461835a02f2781b0ca1273b5a5eacf1e519"
