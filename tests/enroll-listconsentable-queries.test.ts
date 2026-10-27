@@ -3,20 +3,16 @@
 //  (1) the query count no longer grows with the agent count, and
 //  (2) the exact admitted list + capabilities + order, so the batching cannot change who is admitted.
 import { describe, expect, it, afterEach } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { listConsentableAgents } from '../src/mcp/oauth-authorize'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const TENANT = 'local'
-const MIGRATIONS = join(__dirname, '..', 'migrations')
 
 function build(extraAgents: number): SqliteD1Harness {
   const h = createSqliteD1()
-  for (const f of readdirSync(MIGRATIONS).filter((n) => n.endsWith('.sql')).sort()) {
-    h.sqlite.exec(readFileSync(join(MIGRATIONS, f), 'utf8'))
-  }
+  applyAllMigrations(h.sqlite)
   h.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('d1','d1','Alpha'),('d2','d2','Beta');
     INSERT INTO squads (id, department_id, slug, name, kind) VALUES
@@ -144,5 +140,93 @@ describe('listConsentableAgents query count and semantics', () => {
         "a3|sqC|",
       ]
     `)
+  })
+})
+
+// #2161 mutation gaps from the #2160 gates: live-predicate, home-squad channel arm, rank memo key, home-squad clamp,
+// and the 90-item chunk boundary. Separate rows from build() so the inline snapshots above stay untouched.
+function addGrantRows(h: SqliteD1Harness): void {
+  h.sqlite.exec(`
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('m-g1','g1@t','G1','active','${TENANT}'),('m-g2','g2@t','G2','active','${TENANT}'),
+      ('m-g3','g3@t','G3','active','${TENANT}'),('m-two','two@t','Two','active','${TENANT}'),
+      ('m-home','home@t','HomeOwner','active','${TENANT}');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+      ('g1x','sqA','g1x','G1 agent','member','t','active'),
+      ('g2x','sqA','g2x','G2 agent','member','t','active'),
+      ('g3x','sqA','g3x','G3 agent','member','t','active');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
+      ('${TENANT}','g1x','m-g1','2026-01-01T00:00:00.000Z'),
+      ('${TENANT}','g2x','m-g2','2026-01-01T00:00:00.000Z'),
+      ('${TENANT}','g3x','m-g3','2026-01-01T00:00:00.000Z');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES
+      ('e1','m-g1','squad','sqB','admin','2020-01-01 00:00:00'),
+      ('e2','m-g1','squad','sqC','lead','2099-01-01 00:00:00'),
+      ('e3','m-g2','squad','sqH','admin',NULL),
+      ('e4','m-g2','squad','sqA','member',NULL),
+      ('e5','m-g3','squad','sqA','admin',NULL),
+      ('e6','m-g3','squad','sqB','admin',NULL),
+      ('t1','m-two','squad','sqA','admin',NULL),
+      ('t2','m-two','squad','sqB','member',NULL),
+      ('h1','m-home','squad','sqA','admin',NULL),
+      ('h2','m-home','squad','sqH','admin',NULL);
+    INSERT INTO channel_bindings (id, platform, external_channel_id, squad_id) VALUES
+      ('cb1','discord','ch1','sqB'),('cb2','discord','ch2','sqH');
+    INSERT INTO channel_capability_grants (id, binding_id, member_id, squad_id, capability) VALUES
+      ('cg1','cb1','m-g1','sqB','observer'),
+      ('cg2','cb2','m-g1','sqH','admin');
+  `)
+}
+
+describe('listConsentableAgents grant-resolution guards (#2161)', () => {
+  let h: SqliteD1Harness | undefined
+  afterEach(() => { h?.close(); h = undefined })
+  const only = (rows: Awaited<ReturnType<typeof listConsentableAgents>>, ids: string[]) =>
+    summarize(rows.filter((r) => ids.includes(r.id)))
+
+  it('drops expired grants, keeps future-expiring ones, (live predicate); live channel grant kept', async () => {
+    h = build(0); addGrantRows(h)
+    const { env } = counted(h)
+    const rows = await listConsentableAgents(env, 'm-org', false, false)
+    // e1 (expired sqB admin) absent; e2 (future-expiring sqC lead) present; cg1 (channel sqB observer) present; cg2 (channel on home sqH) absent.
+    expect(only(rows, ['g1x'])).toEqual(['g1x|sqA|squad:sqC:lead,squad:sqB:observer'])
+  })
+
+  it('a channel grant on a home squad is never a live agent grant, even for a human who really holds that home squad (resolver arm kind != home)', async () => {
+    h = build(0); addGrantRows(h)
+    const { env } = counted(h)
+    // m-home holds sqA admin (admits g1x) AND sqH admin, so the human-side clamp would let a leaked sqH grant through:
+    // only the resolver's own `s.kind != 'home'` filter keeps cg2 out. The org-owner case above cannot see this
+    // (the clamp zeroes it anyway). sqC lead / sqB observer are dropped by the clamp (human holds neither).
+    const rows = await listConsentableAgents(env, 'm-home', false, false)
+    expect(only(rows, ['g1x'])).toEqual(['g1x|sqA|'])
+  })
+
+  it('clamps an agent grant on a home squad to 0 for an org-owner human (org grant never covers a home squad)', async () => {
+    h = build(0); addGrantRows(h)
+    const { env } = counted(h)
+    const rows = await listConsentableAgents(env, 'm-org', false, false)
+    // g2x holds sqH admin (home) and sqA member: the sqH grant must be dropped, sqA member kept.
+    expect(only(rows, ['g2x'])).toEqual(['g2x|sqA|squad:sqA:member'])
+  })
+
+  it('clamps per scope id for a human with two squad grants at different ranks (rank memo key includes scope_id)', async () => {
+    h = build(0); addGrantRows(h)
+    const { env } = counted(h)
+    const rows = await listConsentableAgents(env, 'm-two', false, false)
+    expect(only(rows, ['g3x'])).toEqual(['g3x|sqA|squad:sqA:admin,squad:sqB:member'])
+  })
+
+  it('crosses the 90-item chunk boundary: 110 extra agents all resolve, none lost in a later chunk', async () => {
+    h = build(110)
+    const { env } = counted(h)
+    const rows = await listConsentableAgents(env, 'm-org', false, false)
+    const xs = rows.filter((r) => r.id.startsWith('x'))
+    expect(xs).toHaveLength(110)
+    // every extra agent carries exactly its own-squad admin grant, including the ones past index 90
+    for (let i = 0; i < 110; i++) {
+      const r = xs.find((x) => x.id === `x${i}`)
+      expect(r?.capabilities.map((c) => `${c.scope_type}:${c.scope_id}:${c.capability}`)).toEqual([`squad:${['sqA', 'sqB', 'sqC'][i % 3]}:admin`])
+    }
   })
 })
