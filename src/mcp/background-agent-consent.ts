@@ -1,8 +1,8 @@
 import type { Env } from '../types'
 
-/** An additional consent condition, never a substitute for the existing squad-admin floor. */
-export function backgroundAgentHumanClause(agent: string, human: string): string {
-  return `(${agent}.owner_member_id = ${human} OR ${agent}.attach_designated_member_id = ${human})`
+/** The admin floor is checked separately. Only wholly unassigned agents use the legacy rule. */
+export function backgroundAgentHumanClause(agent: string, human: string, allowLegacy = true): string {
+  return `(${agent}.owner_member_id = ${human} OR ${agent}.attach_designated_member_id = ${human}${allowLegacy ? ` OR (${agent}.owner_member_id IS NULL AND ${agent}.attach_designated_member_id IS NULL)` : ''})`
 }
 
 export async function backgroundAgentIdsForHuman(env: Env, memberId: string): Promise<Set<string>> {
@@ -14,8 +14,16 @@ export async function backgroundAgentIdsForHuman(env: Env, memberId: string): Pr
   return new Set((rows.results ?? []).map((r) => r.id))
 }
 
-/** Hints and pending requests suggest a choice; the ordinary consent POST still validates it live. */
-export async function defaultBackgroundAgent(
+export async function backgroundAgentConsentPolicy(env: Env, memberId: string, agentId: string): Promise<{ assigned: number } | null> {
+  return env.DB.prepare(
+    `SELECT (a.owner_member_id IS NOT NULL OR a.attach_designated_member_id IS NOT NULL) AS assigned
+       FROM agents a JOIN members h ON h.id = ?1 AND h.tenant = ?2 AND h.status = 'active'
+      WHERE a.id = ?3 AND ${backgroundAgentHumanClause('a', '?1')}`,
+  ).bind(memberId, env.TENANT_SLUG, agentId).first<{ assigned: number }>()
+}
+
+/** Presentation hint only: never check a radio or submit it on the human's behalf. */
+export async function suggestedBackgroundAgent(
   env: Env,
   memberId: string,
   clientId: unknown,

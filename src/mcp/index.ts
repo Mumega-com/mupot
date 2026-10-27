@@ -539,7 +539,7 @@ async function resolveAuth(c: {
           // mupot#903b: re-run the FULL live consent check (agent status, the consenting human's status and
           // continued eligibility, the P0-1 clamp) in parallel with the human's standing grants (latent only).
           const [consented, humanGrants] = await Promise.all([
-            resolveConsentedAgentCapabilities(c.env, rowBoundAgentId, auth.consentedByMemberId ?? null),
+            resolveConsentedAgentCapabilities(c.env, rowBoundAgentId, auth.consentedByMemberId ?? null, undefined, auth.backgroundAgentHumanRequired === true),
             auth.consentedByMemberId ? resolveHumanStandingGrants(c.env, auth.consentedByMemberId) : Promise.resolve([]),
           ])
           auth.capabilities = consented

@@ -1,6 +1,6 @@
 // tests/consent-connect-mode.test.ts — the consent screen's first question, "How will this app connect?":
 // the suggestion (one allowlist in src/mcp/consent-connect-mode.ts) only steers wording and which tab opens first.
-// Without an agent hint or eligible pending request, no radio is preselected.
+// Hints and pending requests never preselect a radio.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -19,6 +19,7 @@ beforeEach(() => {
   applyAllMigrations(h.sqlite)
   h.sqlite.exec(`
     INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', '{"tier":"scale"}', '2026-08-01T00:00:00.000Z');
+    INSERT INTO members (id, display_name, status, tenant) VALUES ('another-human', 'Another human', 'active', '${TENANT}');
     INSERT INTO members (id, email, display_name, status, created_at, tenant)
       VALUES ('${HUMAN}', 'human@example.test', 'Human', 'active', '2026-08-01T00:00:00.000Z', '${TENANT}');
   `)
@@ -171,38 +172,42 @@ function pendingAgent(agent = 'athena', client = 'client-1', harnessId = 'h1', e
 const checkedAgents = (html: string) => [...html.matchAll(/<input[^>]*type="radio"[^>]*checked[^>]*>/g)].map((m) => /value="([^"]*)"/.exec(m[0])?.[1])
 
 describe('background agent consent defaults', () => {
-  it.each(['&agent=athena', '&agent_id=athena'])('preserves the authorize hint %s across the Google callback and selects that agent', async (hint) => {
+  it.each(['&agent=athena', '&agent_id=athena'])('preserves the authorize hint %s across the Google callback without selecting that agent', async (hint) => {
     seedBackgroundAgent()
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), hint)
-    expect(checkedAgents(html)).toEqual(['athena'])
+    expect(checkedAgents(html)).toEqual([])
     expect(html).toContain('This connection is Athena (runs in the background)')
+    expect(html).toContain('Suggested for this connection')
+    expect(html).not.toContain('Selected for this connection')
+    expect(html).toContain('id="summary-text">Nothing selected yet.')
     expect(html).toContain('data-panel="p-existing" aria-selected="true"')
     expect(html).toContain('A chat you drive')
     expect(html).toContain('value="__harness__"')
     expect(html).toContain('runs on its own and can be woken')
+    expect(html).toContain('Its ranked access is capped at your rights; its own gate grants also apply.')
   })
-  it('also defaults an eligible hinted agent when the chat feature flags are off', async () => {
+  it('leaves an eligible hinted agent unselected when the chat feature flags are off', async () => {
     seedBackgroundAgent()
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), undefined), '&agent=athena')
-    expect(checkedAgents(html)).toEqual(['athena'])
+    expect(checkedAgents(html)).toEqual([])
   })
   it('accepts an agent id as well as a slug', async () => {
     seedBackgroundAgent('id-athena')
     h.sqlite.exec("UPDATE agents SET slug = 'athena' WHERE id = 'id-athena'")
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), '&agent=athena')
-    expect(checkedAgents(html)).toEqual(['id-athena'])
+    expect(checkedAgents(html)).toEqual([])
   })
-  it('defaults the one designated pending agent for this OAuth client', async () => {
+  it('highlights without selecting the one designated pending agent for this OAuth client', async () => {
     seedBackgroundAgent()
     pendingAgent()
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
-    expect(checkedAgents(html)).toEqual(['athena'])
+    expect(checkedAgents(html)).toEqual([])
   })
   it('matches the stored per-install OAuth client label as well', async () => {
     seedBackgroundAgent()
     pendingAgent('athena', 'client-1#oauth:old-grant')
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
-    expect(checkedAgents(html)).toEqual(['athena'])
+    expect(checkedAgents(html)).toEqual([])
   })
   it.each(['seat', 'harness'])('reuses an install with its previous client label and a %s admission', async (scope) => {
     seedBackgroundAgent()
@@ -216,7 +221,7 @@ describe('background agent consent defaults', () => {
     expect(reused).toMatchObject({ id: 'h1', oauth_client_id: 'client-1#oauth:old-grant', grant_id: 'oauth:new-grant' })
     const { html } = await reachConsent(env)
     // #2217 revokes the old grant's harness-scoped pending request on adoption.
-    expect(checkedAgents(html)).toEqual(scope === 'seat' ? ['athena'] : [])
+    expect(checkedAgents(html)).toEqual([])
   })
   it('does not match a different client with the same prefix', async () => {
     seedBackgroundAgent()
@@ -231,10 +236,10 @@ describe('background agent consent defaults', () => {
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
     expect(checkedAgents(html)).toEqual([])
   })
-  it('an explicit eligible hint wins over another pending agent', async () => {
+  it('an explicit hint highlights an agent without choosing it', async () => {
     seedBackgroundAgent(); seedBackgroundAgent('loom'); pendingAgent('loom')
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), '&agent=athena')
-    expect(checkedAgents(html)).toEqual(['athena'])
+    expect(checkedAgents(html)).toEqual([])
   })
   it('an unavailable hint never silently defaults to a different pending agent', async () => {
     seedBackgroundAgent(); pendingAgent()
@@ -248,6 +253,14 @@ describe('background agent consent defaults', () => {
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
     expect(checkedAgents(html)).toEqual([])
   })
+  it('M9: leaves the same agent unselected across two installs', async () => {
+    seedBackgroundAgent()
+    pendingAgent('athena', 'client-1#oauth:first', 'h1')
+    pendingAgent('athena', 'client-1#oauth:second', 'h2')
+    const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'))
+    expect(checkedAgents(html)).toEqual([])
+    expect(html).not.toContain('Suggested for this connection')
+  })
   it('does not guess when an eligible slug is ambiguous', async () => {
     seedBackgroundAgent(); seedBackgroundAgent('loom')
     h.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('other', 'eng', 'other', 'Other');
@@ -257,32 +270,37 @@ describe('background agent consent defaults', () => {
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), '&agent=athena')
     expect(checkedAgents(html)).toEqual([])
   })
-  it('rechecks designation at POST after rendering a default', async () => {
+  it('rechecks designation at POST after highlighting an agent', async () => {
     seedBackgroundAgent()
     const provider = stubProvider('Codex', 'https://client.test/cb')
     const env = httpEnv(provider, '1')
     const { html, nonce } = await reachConsent(env, '&agent=athena')
-    expect(checkedAgents(html)).toEqual(['athena'])
-    h.sqlite.exec("UPDATE agents SET attach_designated_member_id = NULL WHERE id = 'athena'")
+    expect(checkedAgents(html)).toEqual([])
+    h.sqlite.exec("UPDATE agents SET owner_member_id = 'another-human', attach_designated_member_id = NULL WHERE id = 'athena'")
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${nonce}=1` },
       body: new URLSearchParams({ consent_nonce: nonce, action: 'continue', agent_id: 'athena' }),
     }), env)
     expect(res.status).toBe(403)
+    expect(await res.text()).toContain('Ask an org admin to set you as owner or designate you')
     expect(provider.completeAuthorization).not.toHaveBeenCalled()
   })
   it("admin rights alone do not offer or bind another human's agent", async () => {
     seedBackgroundAgent('athena', false)
+    h.sqlite.exec("UPDATE agents SET owner_member_id = 'another-human' WHERE id = 'athena'")
     const provider = stubProvider('Codex', 'https://client.test/cb')
     const env = httpEnv(provider, '1')
     const { html, nonce } = await reachConsent(env, '&agent=athena')
     expect(checkedAgents(html)).toEqual([])
     expect(html).not.toContain('value="athena"')
+    expect(html).toContain('set you as owner or designate you')
+    expect(html).not.toContain('bootstrap_self')
     const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${nonce}=1` },
       body: new URLSearchParams({ consent_nonce: nonce, action: 'continue', agent_id: 'athena' }),
     }), env)
     expect(res.status).toBe(403)
+    expect(await res.text()).toContain('Ask an org admin to set you as owner or designate you')
     expect(provider.completeAuthorization).not.toHaveBeenCalled()
   })
   it('the human can choose the attached chat instead of the suggested background agent', async () => {
@@ -295,6 +313,9 @@ describe('background agent consent defaults', () => {
       body: new URLSearchParams({ consent_nonce: nonce, action: 'continue', agent_id: '__harness__' }),
     }), env)
     expect(res.status).toBe(302)
-    expect((provider.completeAuthorization.mock.calls as unknown as Array<[{ props: { boundAgentId: string | null } }]>)[0][0].props.boundAgentId).toBeNull()
+    const completed = (provider.completeAuthorization.mock.calls as unknown as Array<[{ request: Record<string, unknown>; props: { boundAgentId: string | null } }]>)[0][0]
+    expect(completed.props.boundAgentId).toBeNull()
+    expect(completed.request).not.toHaveProperty('backgroundAgentHint')
+    expect(completed.request).toMatchObject({ clientId: 'client-1', scope: ['mcp:read', 'mcp:write'] })
   })
 })
