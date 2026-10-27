@@ -105,6 +105,19 @@ export { McpOAuthApiHandler }
 
 export const app = new Hono<{ Bindings: Env }>()
 
+// Keep Mirror unmounted until principal access is defined. Normalize only for
+// retirement detection; never rewrite a request into another live route.
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname
+    // Decode bytes independently so malformed escapes in a suffix cannot defeat
+    // the guard. Only ASCII namespace characters and separators matter here.
+    .replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/;[^/]*/g, '')
+    .replace(/\/{2,}/g, '/')
+  if (/^\/api\/(?:addons\/)?mirror(?:\/|$)/i.test(path)) return c.notFound()
+  await next()
+})
+
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
 // The zero-dependency mupot CLI, exact file bytes (public; see src/cli/serve.ts, docs/cli.md).
 app.get('/cli', () => cliResponse())
@@ -241,13 +254,6 @@ app.route('/api/torivers', toriversAddonApp)
 app.route('/api/addons/sos', sosApp)
 app.route('/api/addons/inkwell', inkwellApp)
 app.route('/api/addons/torivers', toriversAddonApp)
-
-// Keep Mirror unmounted until principal access is defined. Stop these retired
-// namespaces before addon auth and the dashboard catch-all can handle them.
-for (const prefix of ['/api/mirror', '/api/addons/mirror']) {
-  app.all(prefix, (c) => c.notFound())
-  app.all(`${prefix}/*`, (c) => c.notFound())
-}
 
 // Native addon catalog and lifecycle commands. Before the dashboard catch-all.
 app.route('/api/addons', addonsApp)
