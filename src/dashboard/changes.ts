@@ -38,6 +38,11 @@ import { checkWebSession } from '../secure-moments/enrol-mint'
 import { taskArchiveEnabled } from '../hygiene/archive'
 import { hasDedicatedGatePredicate } from '../tasks/service'
 import { invokeTool, isOrgOwnerAdmin } from '../mcp'
+import {
+  CHANGES_PAGE_SIZE, CHANGE_KINDS, ARCHIVE_TABLES, SEARCH_MAX_LENGTH,
+  changeFilters, changeCursor, changesLink, changeSourceQuery,
+  type ChangeFilters, type ChangeCursor,
+} from './changes-query'
 import { emptyState, pageHeader, pill, sectionPanel, type Html } from './ui'
 
 type ShellFn = (
@@ -47,9 +52,6 @@ type ShellFn = (
 ) => HtmlEscapedString | Promise<HtmlEscapedString>
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
-
-const PER_SOURCE_LIMIT = 100
-const SHOWN_PER_GROUP = 50
 
 /** The tables whose archive has an inverse reachable from here. Everything else is a sentence only. */
 const UNDOABLE_ARCHIVE_TABLES = ['tasks', 'projects', 'squads'] as const
@@ -116,7 +118,7 @@ const ARCHIVE_SELECT = `
          END AS target_name
     FROM archive_receipts r
     LEFT JOIN members m ON m.id = r.actor_member_id
-   WHERE r.tenant = ?1`
+`
 
 interface VerdictRecord {
   id: string
@@ -225,16 +227,38 @@ function viewerIds(auth: AuthContext): string[] {
   return [auth.memberId, auth.boundAgentId].filter((x): x is string => typeof x === 'string' && x.length > 0)
 }
 
-export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<RecentChange[]> {
+async function recentCandidates(env: Env, auth: AuthContext, filters: ChangeFilters, cursor: ChangeCursor | null): Promise<RecentChange[]> {
   if (!auth.memberId) return []
   const me = new Set(viewerIds(auth))
-  const org = seesOrg(auth)
+  const org = seesOrg(auth) && filters.actor !== 'me'
   const out: RecentChange[] = []
 
-  // 1. archives + restores
-  const archives = await env.DB.prepare(
-    `${ARCHIVE_SELECT}${org ? '' : ' AND r.actor_member_id = ?2'} ORDER BY r.created_at DESC, r.id DESC LIMIT ${PER_SOURCE_LIMIT}`,
-  ).bind(...(org ? [env.TENANT_SLUG] : [env.TENANT_SLUG, auth.memberId])).all<ArchiveRecord>()
+  // 1. archives + restores. Visibility is always the first predicate, before search.
+  const archiveExtra: string[] = []
+  const archiveValues = org ? [env.TENANT_SLUG] : [env.TENANT_SLUG, auth.memberId]
+  if (filters.kind !== 'all') {
+    archiveExtra.push(['archive', 'unarchive'].includes(filters.kind) ? `r.action = ?${archiveValues.push(filters.kind)}` : '0')
+  }
+  if (filters.table !== 'all') archiveExtra.push(`r.entity_table = ?${archiveValues.push(filters.table)}`)
+  if (filters.undoable) {
+    // Mirrors classifyArchive; the classifier still determines the displayed state.
+    archiveExtra.push(mayRunUnarchive(auth) ? `r.action = 'archive'
+      AND r.id = (SELECT id FROM archive_receipts latest
+        WHERE latest.tenant = r.tenant AND latest.entity_table = r.entity_table AND latest.entity_id = r.entity_id
+        ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
+      AND ((r.entity_table = 'projects' AND EXISTS (SELECT 1 FROM projects p WHERE p.id = r.entity_id AND p.status = 'archived' AND p.archived_at = r.created_at))
+        OR (r.entity_table = 'squads' AND EXISTS (SELECT 1 FROM squads s WHERE s.id = r.entity_id AND s.status = 'archived' AND s.archived_at = r.created_at))
+        ${taskArchiveEnabled(env) ? "OR (r.entity_table = 'tasks' AND EXISTS (SELECT 1 FROM tasks_archive_state s JOIN tasks t ON t.id = s.task_id WHERE s.task_id = r.entity_id AND s.archived_at = r.created_at AND t.updated_at <= r.created_at))" : ''})` : '0')
+  }
+  const archiveQuery = changeSourceQuery({
+    select: ARCHIVE_SELECT, visibility: ['r.tenant = ?1', ...(org ? [] : ['r.actor_member_id = ?2'])],
+    values: archiveValues, filters, cursor, prefix: 'archive:', at: 'r.created_at', id: 'r.id', extra: archiveExtra,
+    search: ['r.entity_id', 'target_name', `CASE r.entity_table
+      WHEN 'projects' THEN (SELECT slug FROM projects WHERE id = r.entity_id)
+      WHEN 'squads' THEN (SELECT slug FROM squads WHERE id = r.entity_id)
+      WHEN 'agents' THEN (SELECT slug FROM agents WHERE id = r.entity_id) END`],
+  })
+  const archives = await env.DB.prepare(archiveQuery.sql).bind(...archiveQuery.values).all<ArchiveRecord>()
   for (const r of archives.results ?? []) {
     const mine = me.has(r.actor_member_id)
     out.push({
@@ -249,10 +273,21 @@ export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<Re
   }
 
   // 2. verdicts
-  const verdicts = await env.DB.prepare(
-    `${VERDICT_SELECT}${org ? '' : ` WHERE v.decided_by IN (${[...me].map((_, i) => `?${i + 1}`).join(', ')})`}
-      ORDER BY v.decided_at DESC, v.id DESC LIMIT ${PER_SOURCE_LIMIT}`,
-  ).bind(...(org ? [] : [...me])).all<VerdictRecord>()
+  const verdictExtra = filters.kind === 'all' || filters.kind === 'verdict' ? [] : ['0']
+  if (filters.undoable) {
+    // Same state checks as classifyVerdict, including the dedicated gate exclusions.
+    verdictExtra.push(mayReverseVerdict(auth) ? `v.reversed_at IS NULL AND v.proposal_id IS NULL
+      AND (t.gate_owner IS NULL OR t.gate_owner NOT IN ('gate:office', 'gate:routines'))
+      AND v.id = (SELECT id FROM task_verdicts latest WHERE latest.task_id = v.task_id ORDER BY latest.decided_at DESC, latest.id DESC LIMIT 1)
+      AND t.status = v.verdict AND t.updated_at = v.decided_at
+      AND NOT EXISTS (SELECT 1 FROM tasks_archive_state s WHERE s.task_id = v.task_id)` : '0')
+  }
+  const verdictQuery = changeSourceQuery({
+    select: VERDICT_SELECT, visibility: org ? [] : [`v.decided_by IN (${[...me].map((_, i) => `?${i + 1}`).join(', ')})`],
+    values: org ? [] : [...me], filters, cursor, prefix: 'verdict:', at: 'v.decided_at', id: 'v.id',
+    search: ['v.task_id', 't.title'], extra: verdictExtra,
+  })
+  const verdicts = await env.DB.prepare(verdictQuery.sql).bind(...verdictQuery.values).all<VerdictRecord>()
   for (const v of verdicts.results ?? []) {
     const mine = me.has(v.decided_by)
     out.push({
@@ -267,14 +302,17 @@ export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<Re
   }
 
   // 3. verdict undo receipts (information only)
-  const reversals = await env.DB.prepare(
-    `SELECT vr.id, vr.task_id, vr.prior_verdict, vr.actor_id, vr.created_at, t.title, m.display_name AS actor_name
+  const reversalQuery = changeSourceQuery({
+    select: `SELECT vr.id, vr.task_id, vr.prior_verdict, vr.actor_id, vr.created_at, t.title, m.display_name AS actor_name
        FROM verdict_reversals vr
        LEFT JOIN tasks t ON t.id = vr.task_id
-       LEFT JOIN members m ON m.id = vr.actor_id
-      WHERE vr.tenant = ?1${org ? '' : ' AND vr.actor_id = ?2'}
-      ORDER BY vr.seq DESC LIMIT ${PER_SOURCE_LIMIT}`,
-  ).bind(...(org ? [env.TENANT_SLUG] : [env.TENANT_SLUG, auth.memberId])).all<{
+       LEFT JOIN members m ON m.id = vr.actor_id`,
+    visibility: ['vr.tenant = ?1', ...(org ? [] : ['vr.actor_id = ?2'])],
+    values: org ? [env.TENANT_SLUG] : [env.TENANT_SLUG, auth.memberId],
+    filters, cursor, prefix: 'info:reversal:', at: 'vr.created_at', id: 'vr.id', search: ['vr.task_id', 't.title'],
+    extra: filters.undoable || !['all', 'verdict_reversal'].includes(filters.kind) ? ['0'] : [],
+  })
+  const reversals = await env.DB.prepare(reversalQuery.sql).bind(...reversalQuery.values).all<{
     id: string; task_id: string; prior_verdict: string | null; actor_id: string; created_at: string; title: string | null; actor_name: string | null
   }>()
   for (const r of reversals.results ?? []) {
@@ -292,14 +330,16 @@ export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<Re
   }
 
   // 4. agent audit: a sentence only, nothing here can be undone
-  const audits = await env.DB.prepare(
-    `SELECT a.id, a.agent_id, a.actor_id, a.action, a.created_at, g.name AS agent_name, u.display_name AS actor_name
+  const auditQuery = changeSourceQuery({
+    select: `SELECT a.id, a.agent_id, a.actor_id, a.action, a.created_at, g.name AS agent_name, u.display_name AS actor_name
        FROM agent_audit a
        LEFT JOIN agents g ON g.id = a.agent_id
-       LEFT JOIN members u ON u.id = a.actor_id
-      ${org ? '' : 'WHERE a.actor_id = ?1'}
-      ORDER BY a.seq DESC LIMIT ${PER_SOURCE_LIMIT}`,
-  ).bind(...(org ? [] : [auth.memberId])).all<{
+       LEFT JOIN members u ON u.id = a.actor_id`,
+    visibility: org ? [] : ['a.actor_id = ?1'], values: org ? [] : [auth.memberId],
+    filters, cursor, prefix: 'info:agent_audit:', at: 'a.created_at', id: 'a.id', search: ['a.agent_id', 'g.name', 'g.slug'],
+    extra: filters.undoable || !['all', 'agent_change'].includes(filters.kind) ? ['0'] : [],
+  })
+  const audits = await env.DB.prepare(auditQuery.sql).bind(...auditQuery.values).all<{
     id: string; agent_id: string; actor_id: string; action: string; created_at: string; agent_name: string | null; actor_name: string | null
   }>()
   for (const r of audits.results ?? []) {
@@ -317,8 +357,43 @@ export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<Re
     })
   }
 
-  out.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.id < b.id ? 1 : -1))
+  out.sort((a, b) => compareChanges(a, b) * (cursor?.direction === 'previous' ? -1 : 1))
   return out
+}
+
+function compareChanges(a: RecentChange, b: RecentChange): number {
+  return a.at < b.at ? 1 : a.at > b.at ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+}
+
+export interface RecentChangesPage {
+  changes: RecentChange[]
+  filters: ChangeFilters
+  start: number
+  previous?: string
+  next?: string
+}
+
+export async function loadRecentChangesPage(env: Env, auth: AuthContext, params = new URLSearchParams()): Promise<RecentChangesPage> {
+  const filters = changeFilters(params)
+  const cursor = changeCursor(params, filters)
+  const candidates = await recentCandidates(env, auth, filters, cursor)
+  const more = candidates.length > CHANGES_PAGE_SIZE
+  const changes = candidates.slice(0, CHANGES_PAGE_SIZE)
+  if (cursor?.direction === 'previous') changes.reverse()
+  const start = cursor ? (cursor.direction === 'previous' ? Math.max(0, cursor.position - changes.length) : cursor.position) : 0
+  const first = changes[0]
+  const last = changes[changes.length - 1]
+  return {
+    changes, filters, start,
+    previous: first && (cursor?.direction === 'previous' ? more : Boolean(cursor))
+      ? changesLink(filters, { at: first.at, id: first.id, position: start, direction: 'previous' }) : undefined,
+    next: last && (cursor?.direction === 'previous' ? true : more)
+      ? changesLink(filters, { at: last.at, id: last.id, position: start + changes.length, direction: 'next' }) : undefined,
+  }
+}
+
+export async function loadRecentChanges(env: Env, auth: AuthContext): Promise<RecentChange[]> {
+  return (await loadRecentChangesPage(env, auth)).changes
 }
 
 /** Re-derive ONE record from its id and its current undo state (used by the POST; never trusts the page). */
@@ -329,7 +404,7 @@ export async function loadChange(env: Env, auth: AuthContext, changeId: string):
   if (!recordId) return null
   const me = new Set(viewerIds(auth))
   if (kind === 'archive') {
-    const r = await env.DB.prepare(`${ARCHIVE_SELECT} AND r.id = ?2`).bind(env.TENANT_SLUG, recordId).first<ArchiveRecord>()
+    const r = await env.DB.prepare(`${ARCHIVE_SELECT} WHERE r.tenant = ?1 AND r.id = ?2`).bind(env.TENANT_SLUG, recordId).first<ArchiveRecord>()
     if (!r || !isUndoableArchiveTable(r.entity_table)) return null
     const mine = me.has(r.actor_member_id)
     // A non-admin only ever sees (and so may only name) their own records.
@@ -397,21 +472,47 @@ function changeRow(c: RecentChange, nowMs: number): Html {
   </div>`
 }
 
-export function changesBody(changes: RecentChange[], admin: boolean, extra: Html | '' = '', nowMs: number = Date.now()): Html {
-  const mine = changes.filter((c) => c.mine).slice(0, SHOWN_PER_GROUP)
-  const others = changes.filter((c) => !c.mine).slice(0, SHOWN_PER_GROUP)
+function filterForm(filters: ChangeFilters): Html {
+  const labels: Record<string, string> = { all: 'All', archive: 'Archive', unarchive: 'Unarchive', verdict: 'Verdict', verdict_reversal: 'Verdict reversal', agent_change: 'Agent change' }
+  return sectionPanel({ body: html`<form method="get" action="/changes" style="display:flex;flex-wrap:wrap;gap:var(--s3,12px);align-items:end">
+    <label>Kind <select name="kind">${CHANGE_KINDS.map((kind) => html`<option value="${kind}" ${kind === filters.kind ? html`selected` : ''}>${labels[kind]}</option>`)}</select></label>
+    <label>Archive table <select name="table">${ARCHIVE_TABLES.map((table) => html`<option value="${table}" ${table === filters.table ? html`selected` : ''}>${table === 'all' ? 'All' : table}</option>`)}</select></label>
+    <label>Actor <select name="actor"><option value="anyone" ${filters.actor === 'anyone' ? html`selected` : ''}>Anyone</option><option value="me" ${filters.actor === 'me' ? html`selected` : ''}>Me</option></select></label>
+    <label>Search <input type="search" name="q" value="${filters.q}" maxlength="${SEARCH_MAX_LENGTH}" placeholder="Target id, slug or name"></label>
+    <label>From <input type="date" name="from" value="${filters.from}"></label>
+    <label>To <input type="date" name="to" value="${filters.to}"></label>
+    <label><input type="checkbox" name="undoable" value="1" ${filters.undoable ? html`checked` : ''}> Undoable only</label>
+    <button class="btn" type="submit">Apply filters</button><a class="ui-link" href="/changes">Clear filters</a>
+    <span class="ui-panel-sub">Apply filters to find changes; clear them to see recent activity.</span>
+  </form>` })
+}
+
+function pageLinks(page: RecentChangesPage): Html {
+  const end = page.start + page.changes.length
+  return html`<nav aria-label="Recent changes pages" style="display:flex;gap:var(--s3,12px);align-items:center">
+    <span role="status">Showing ${page.changes.length ? page.start + 1 : 0}–${end}${page.next ? ' · More changes exist' : ' · No more older changes'}</span>
+    ${page.previous ? html`<a class="btn" rel="prev" href="${page.previous}">Previous</a>` : ''}
+    ${page.next ? html`<a class="btn" rel="next" href="${page.next}">Next</a>` : ''}
+  </nav>`
+}
+
+export function changesBody(changes: RecentChange[], admin: boolean, extra: Html | '' = '', nowMs: number = Date.now(), page?: RecentChangesPage): Html {
+  const mine = changes.filter((c) => c.mine)
+  const others = changes.filter((c) => !c.mine)
+  const filters = filterForm(page?.filters ?? changeFilters())
+  const paging = page ? pageLinks(page) : ''
   const header = pageHeader({
     crumbs: 'Workspace / Activity',
     title: 'Recent changes',
     sub: 'Nothing here is permanent. Where a change can be safely taken back, there is an Undo.',
   })
   if (changes.length === 0) {
-    return html`${header}${extra}${emptyState({ title: 'No changes yet', detail: 'Changes you make will show up here.' })}`
+    return html`${header}${extra}${filters}${emptyState({ title: 'No changes found', detail: 'No visible changes match these filters.', hint: 'Clear filters or widen the date range to try again.' })}<a class="ui-link" href="/changes">Clear filters</a>`
   }
   const list = (rows: RecentChange[]): Html => html`<div class="ui-table">${rows.map((c) => changeRow(c, nowMs))}</div>`
-  return html`${header}${extra}
+  return html`${header}${extra}${filters}${paging}
     ${sectionPanel({ title: 'Your changes', body: mine.length ? list(mine) : html`<p class="ui-panel-sub">You have not changed anything recently.</p>` })}
-    ${admin ? sectionPanel({ title: 'Changes by everyone else', body: others.length ? list(others) : html`<p class="ui-panel-sub">Nobody else has changed anything recently.</p>` }) : ''}`
+    ${admin ? sectionPanel({ title: 'Changes by everyone else', body: others.length ? list(others) : html`<p class="ui-panel-sub">Nobody else has changed anything recently.</p>` }) : ''}${paging}`
 }
 
 function reauthNotice(): Html {
@@ -421,7 +522,7 @@ function reauthNotice(): Html {
 }
 
 function notice(text: string): Html {
-  return sectionPanel({ body: html`<p role="status">${text}</p>` })
+  return sectionPanel({ body: html`<p role="status">${text}</p><p class="ui-panel-sub">Review the changes below or adjust the filters to continue.</p>` })
 }
 
 function undoFailureText(error: string): string {
@@ -444,14 +545,17 @@ export function makeChangesApp(shell: ShellFn) {
   app.get('/changes', async (c) => {
     c.header('Cache-Control', 'no-store')
     const auth = c.get('auth')
-    return c.html(shell(c.env, 'Recent changes', changesBody(await loadRecentChanges(c.env, auth), seesOrg(auth))))
+    const page = await loadRecentChangesPage(c.env, auth, new URL(c.req.url).searchParams)
+    return c.html(shell(c.env, 'Recent changes', changesBody(page.changes, seesOrg(auth), '', Date.now(), page)))
   })
 
   app.post('/changes/undo', async (c) => {
     c.header('Cache-Control', 'no-store')
     const auth = c.get('auth')
-    const page = async (status: 200 | 400 | 403 | 404, extra: Html) =>
-      c.html(shell(c.env, 'Recent changes', changesBody(await loadRecentChanges(c.env, auth), seesOrg(auth), extra)), status)
+    const page = async (status: 200 | 400 | 403 | 404, extra: Html) => {
+      const result = await loadRecentChangesPage(c.env, auth)
+      return c.html(shell(c.env, 'Recent changes', changesBody(result.changes, seesOrg(auth), extra, Date.now(), result)), status)
+    }
 
     if (c.req.header('origin') !== new URL(c.req.url).origin) {
       return c.html(shell(c.env, 'Recent changes', notice('Cross-origin request refused.')), 403)
