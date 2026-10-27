@@ -6,8 +6,8 @@
 // Agents (bound tokens) can read nothing here beyond the level and can never write.
 
 import { type ToolSpec, fail, done, str } from './index'
-import { raiseLevel, requestLower, authIsOwner } from '../policy/admin'
-import { barView } from '../policy/bar'
+import { raiseLevel, logEvent, authIsOwner } from '../policy/admin'
+import { actorOf, barView } from '../policy/bar'
 import { LEVEL_RANK, POLICY_LEVELS, isPolicyLevel } from '../policy/registry'
 
 export const toolSecurityBar: ToolSpec = {
@@ -24,15 +24,15 @@ export const toolSecurityBar: ToolSpec = {
   async run(auth, env, args) {
     if (args.set_level === undefined) {
       const v = await barView(env)
-      return done({ level: v.level, source: v.source, version: v.version, pending_lower: v.pending_lower })
+      return done(auth.boundAgentId ? { level: v.level } : { level: v.level, source: v.source, version: v.version, pending_lower: v.pending_lower })
     }
     const target = str(args.set_level)
     if (!isPolicyLevel(target)) return fail(400, 'invalid_level', { accepted: POLICY_LEVELS })
     if (!(await authIsOwner(env, auth))) return fail(403, 'forbidden', { need: 'org:owner' })
     const current = await barView(env)
     if (LEVEL_RANK[target] < LEVEL_RANK[current.level]) {
-      // Audited refusal: requestLower logs lower_refused when the re-auth is absent (it always is over MCP).
-      await requestLower(env, auth, target)
+      // MCP lowering always refuses, including when invoked with a fresh web session.
+      await logEvent(env, 'lower_refused', target, actorOf(auth), env.TENANT_SLUG, 'step_up_required')
       return fail(403, 'step_up_required', {
         detail: 'lowering the Security Bar needs a fresh re-auth and a second owner (or a delay): do it on the dashboard',
         next: '/admin/security-bar',

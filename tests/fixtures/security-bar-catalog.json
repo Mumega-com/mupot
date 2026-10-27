@@ -1,0 +1,132 @@
+[
+  {
+    "id": "task.create.assignee-agent-resolvable",
+    "file_line": "src/mcp/index.ts:1316-1317",
+    "code": "assignee_not_in_squad",
+    "blocks": "assigning an agent that is missing, inactive, unminted/ambiguous, or lacks member on the task squad",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "assigning work to an agent outside the squad's authority (cross-squad execution)",
+    "class": "FLOOR",
+    "bar": null,
+    "duplicates": [
+      "src/tasks/assignee.ts:18-42",
+      "src/tasks/index.ts:627",
+      "src/mcp/index.ts:2112",
+      "src/mcp/index.ts:3039"
+    ],
+    "detail_surfaced": false,
+    "friction": 2
+  },
+  {
+    "id": "task.create.assignee-member-resolvable",
+    "file_line": "src/mcp/index.ts:1326-1327",
+    "code": "assignee_not_in_squad",
+    "blocks": "assigning a human member who is missing, inactive, or lacks member on the task squad",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "putting work under a named human who cannot see the board (fake provenance/invisibility)",
+    "class": "FLOOR",
+    "bar": null,
+    "duplicates": [
+      "src/tasks/assignee.ts:74-97",
+      "src/tasks/index.ts:645",
+      "src/mcp/index.ts:2134"
+    ],
+    "detail_surfaced": false,
+    "friction": 1
+  },
+  {
+    "id": "task.create.gate-owner-creator-is-assignee",
+    "file_line": "src/mcp/index.ts:1367-1372",
+    "code": "gate_owner_creator_is_assignee",
+    "blocks": "a creator who is also the assignee naming the gate at create",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "self-close loop: worker picks its own reviewer",
+    "class": "FLOOR",
+    "bar": null,
+    "duplicates": [
+      "NOT mirrored in task_update (an assignee may set gate_owner on its own open/in_progress task when none is set)"
+    ],
+    "detail_surfaced": true,
+    "friction": 2
+  },
+  {
+    "id": "task.intake.p1-linkage",
+    "file_line": "src/tasks/service.ts:1381-1394",
+    "code": "p1_linkage_required",
+    "blocks": "P1 task with no project_id/parent_task_id and no '[owner: @x, ttl: Nd]' escape hatch in body",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "unowned urgent work with no review deadline",
+    "class": "BAR",
+    "bar": {
+      "current": "project/parent link or escape-hatch regex",
+      "onboarding": "allow P1 without linkage, warn",
+      "operating": "require linkage or hatch",
+      "under_attack": "require linkage"
+    },
+    "duplicates": [
+      "src/mcp/index.ts:2270-2276",
+      "src/tasks/service.ts:627-628",
+      "src/tasks/service.ts:874-880",
+      "src/tasks/index.ts:1184-1192"
+    ],
+    "detail_surfaced": true,
+    "friction": 3
+  },
+  {
+    "id": "task.update.transition-matrix",
+    "file_line": "src/mcp/index.ts:1973-1976",
+    "code": "invalid_transition",
+    "blocks": "illegal status moves: open->in_progress only; in_progress->review|blocked|done; approved->done; rejected->in_progress|done; blocked->in_progress; done terminal; review exits only by verdict",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "state forging around the gate (the review/approved/done edges); other edges are workflow friction",
+    "class": "BAR",
+    "bar": {
+      "current": "fixed matrix (open cannot go to done/blocked; blocked cannot go to open; no reopen of done)",
+      "onboarding": "allow open->done and open->blocked for UNGATED tasks; blocked->open",
+      "operating": "same as onboarding",
+      "under_attack": "current"
+    },
+    "duplicates": [
+      "src/tasks/service.ts:94-118",
+      "src/tasks/index.ts:892-895"
+    ],
+    "detail_surfaced": false,
+    "friction": 4
+  },
+  {
+    "id": "task.update.artifact-shape-gate",
+    "file_line": "src/mcp/index.ts:2048-2059",
+    "code": "artifact_verification_failed",
+    "blocks": "an agent-assigned task entering review, or going ungated straight to done, without 'Artifact: <path>' + 'SHA256: <64-hex>' in tasks.result",
+    "who": [
+      "human-non-admin",
+      "agent"
+    ],
+    "threat": "fabricated agent completion evidence accepted as real",
+    "class": "FLOOR",
+    "bar": null,
+    "duplicates": [
+      "src/tasks/index.ts:971-986",
+      "src/mcp/index.ts:3514-3521",
+      "src/tasks/runtime-receipts.ts:1327-1338 (only when done_when mentions Artifact:/SHA256:)",
+      "src/tasks/artifact-verification.ts:223-261"
+    ],
+    "detail_surfaced": true,
+    "friction": 4
+  }
+]

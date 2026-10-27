@@ -2063,7 +2063,7 @@ const toolTaskUpdate: ToolSpec = {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (stricter levels require exactly this), or a repository/PR URL with a full commit id, or a "Snapshot: <label>" with content',
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (operating and under_attack require exactly this), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
           })
         }
       }
@@ -3562,7 +3562,7 @@ const toolTaskSubmitResult: ToolSpec = {
       return fail(409, 'artifact_verification_failed', {
         reason: artifactCheck.reason,
         ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-        detail: 'a completion result must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>", or (below the strictest level) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with content — prose describing intended work is not evidence of work done',
+        detail: 'a completion result must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>", or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference — prose describing intended work is not evidence of work done',
       })
     }
 

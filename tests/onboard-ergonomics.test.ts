@@ -187,10 +187,12 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
       if (!selfMember.ok) expect(selfMember.error).toBe('gate_owner_creator_is_assignee')
     })
 
-    it('gate_owner at create: creator=assignee naming a lane someone ELSE holds is allowed below under_attack (Security Bar) and refused at under_attack', async () => {
+    it('gate_owner at create: creator=assignee naming a lane someone ELSE holds is allowed only at onboarding (Security Bar) and refused by default', async () => {
+      expect(await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })).toMatchObject({ ok: false, error: 'gate_owner_creator_is_assignee' })
+      await run(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?1, 'onboarding', 1, 'test')`, TENANT)
       const relaxed = await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })
       expect(relaxed.ok, JSON.stringify(relaxed)).toBe(true)
-      await run(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?1, 'under_attack', 1, 'test')`, TENANT)
+      await run(`UPDATE security_bar_state SET level = 'under_attack' WHERE scope_kind = 'tenant' AND scope_id = ?1`, TENANT)
       const strict = await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })
       expect(strict.ok).toBe(false)
       if (!strict.ok) expect(strict.error).toBe('gate_owner_creator_is_assignee')

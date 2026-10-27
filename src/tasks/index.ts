@@ -985,7 +985,7 @@ tasksApp.patch('/:id', async (c) => {
             error: 'artifact_verification_failed',
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (required at the strictest level), or a repository/PR URL with a full commit id, or a "Snapshot: <label>" with content',
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (required at operating and under_attack), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
           },
           409,
         )

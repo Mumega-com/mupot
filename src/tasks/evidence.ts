@@ -2,17 +2,17 @@
 // Security Bar rule `task.update.artifact-shape-gate`.
 //
 // What changed vs. verifyTaskArtifactShape (src/tasks/artifact-verification.ts, which is UNCHANGED and is still
-// the whole answer at under_attack): at onboarding/operating a result may ALSO be one of these explicit kinds.
+// the whole answer at operating/under_attack): only at onboarding a result may ALSO be one of these explicit kinds.
 // Kinds are explicit, never a silent default: prose with none of them is refused at every level.
 //
 //   file      "Artifact: <path>" + "SHA256: <64-hex>"  (the existing shape; the digest is CLAIMED, not verified)
 //   repo      a repository/PR/commit URL naming owner/repo, plus a FULL commit id (40 or 64 hex) in the text
-//   snapshot  an explicit "Snapshot: <label>" line; the digest is computed BY THE SERVER over the result text
+//   snapshot  an explicit "Snapshot: <label>" line plus an http(s) reference; the digest is computed BY THE SERVER over the result text
 //
 // Approval binding is unchanged at every level: a verdict binds to the exact submission id and the SERVER
 // digest (task_result_submissions.result_digest). For repo/snapshot kinds the receipt's artifact_sha256 column
 // carries that same server-computed digest (the column needs 64 hex and a commit id may be 40), and artifact_path
-// carries "<url>@<commit>" / "snapshot:<label>". Placeholder, refusal-prose and disallowed-path evidence stays
+// carries "<url>@<commit>" / the snapshot reference URL. Placeholder, refusal-prose and disallowed-path evidence stays
 // refused (floor task.evidence.no-placeholder).
 
 import type { Env } from '../types'
@@ -29,8 +29,8 @@ export type TaskEvidence =
 /** Reasons that mean "no usable evidence of ANY kind": relaxing the rule must not rescue these (floor). */
 const NEVER_RESCUED: ReadonlySet<string> = new Set(['no_result', 'refusal_prose', 'disallowed_path', 'artifact_placeholder', 'sha256_placeholder'])
 
-const REPO_URL_RE = /https:\/\/(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/(?:pull\/\d+|commit\/([0-9a-f]{40}|[0-9a-f]{64})|tree\/([0-9a-f]{40}|[0-9a-f]{64})|-\/merge_requests\/\d+))?/i
-const COMMIT_RE = /(?<![0-9a-fA-F])([0-9a-f]{40}|[0-9a-f]{64})(?![0-9a-fA-F])/g
+const REPO_URL_RE = /https:\/\/(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/(?:pull\/\d+|commit\/([0-9a-f]{64}|[0-9a-f]{40})(?![A-Za-z0-9_-])|tree\/([0-9a-f]{64}|[0-9a-f]{40})(?![A-Za-z0-9_-])|-\/merge_requests\/\d+))?/i
+const COMMIT_RE = /(?<![0-9a-fA-F])([0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-fA-F])/g
 const SNAPSHOT_RE = /^[ \t>*_`-]*Snapshot:[ \t]*(\S[^\r\n]{0,199})$/im
 
 function isPlaceholderHex(h: string): boolean {
@@ -77,8 +77,13 @@ export async function verifyTaskEvidence(
   if (repo) found = { kind: 'repo', path: repo.path }
   else {
     const snap = SNAPSHOT_RE.exec(resultBody)
-    // A snapshot label alone is not evidence: the result must carry content beyond the label line.
-    if (snap && resultBody.replace(snap[0], '').trim().length >= 20) found = { kind: 'snapshot', path: `snapshot:${(snap[1] ?? '').trim()}` }
+    // The reference can be checked by the server; a prose description alone is never evidence.
+    const reference = resultBody.match(/https?:\/\/[^\s<>"`]+/i)?.[0]
+    let url: URL | null = null
+    try { if (reference) url = new URL(reference) } catch { /* malformed reference */ }
+    if (snap && url?.hostname && (url.protocol === 'https:' || url.protocol === 'http:')) {
+      found = { kind: 'snapshot', path: url.href }
+    }
   }
   if (!found) return { verified: false, reason: strict.reason === 'sha256_malformed' ? 'sha256_malformed' : 'evidence_kind_missing', ...(strict.path ? { path: strict.path } : {}) }
 

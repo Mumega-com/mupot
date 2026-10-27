@@ -146,8 +146,8 @@ export function actorOf(auth: AuthContext): string {
 
 /**
  * Call ONLY when the strict check would have refused. Returns true iff the bar relaxes the rule at the
- * current level AND the record was written. At onboarding the record is kind 'would_block' (the log the
- * later "pave" proposals learn from); at operating it is 'relaxed_applied' (the audit trail). If the
+ * current level AND the record was written. Onboarding uses 'would_block' (the log the later
+ * "pave" proposals learn from). Every wired rule stays strict at operating. If the
  * record cannot be written the answer is false: an unaudited relaxation never happens.
  */
 export async function relaxes(env: Env, ruleId: string, ctx: RelaxContext): Promise<boolean> {
@@ -223,7 +223,7 @@ export async function securityBarField(env: Env): Promise<{ security_bar: { leve
   const v = await barView(env)
   const note =
     v.level === 'onboarding' ? 'onboarding: friction rules are relaxed and relaxed uses are logged (would_block); the owner raises the bar when ready'
-    : v.level === 'operating' ? 'operating: normal rules'
-    : 'under_attack: strictest rules; extra proof is required for several actions'
+    : v.level === 'operating' ? "operating: all rules strict, exactly today's behaviour; choose onboarding to opt in to friction relaxations"
+    : 'under_attack: all rules strict; floors remain enforced'
   return { security_bar: { level: v.level, pending_lower: v.pending_lower !== null, note } }
 }

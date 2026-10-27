@@ -8,6 +8,7 @@
 
 import type { AuthContext, Env } from '../types'
 import { hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { memberIsActiveHuman } from '../access/identity'
 import { checkWebSession } from '../secure-moments/enrol-mint'
 import { LEVEL_RANK, isPolicyLevel, type PolicyLevel } from './registry'
 import { clip, actorOf, getPendingLower, resolveLevel, BAR_REAUTH_WINDOW_MS, LOWER_DELAY_MS, type PendingLower, type ResolvedLevel } from './bar'
@@ -43,16 +44,33 @@ export async function strongReauth(env: Env, auth: AuthContext, nowMs: number = 
 }
 
 async function otherOwnerCount(env: Env, exceptMemberId: string): Promise<number> {
-  const row = await env.DB.prepare(
-    `SELECT COUNT(DISTINCT c.member_id) AS n
-       FROM capabilities c JOIN members m ON m.id = c.member_id
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT c.member_id FROM capabilities c
       WHERE c.scope_type = 'org' AND c.scope_id IS NULL AND c.capability = 'owner'
-        AND m.status = 'active' AND c.member_id != ?1
-        AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}`,
-  )
-    .bind(exceptMemberId, nowCapabilitySql())
-    .first<{ n: number }>()
-  return Number(row?.n ?? 0)
+        AND c.member_id != ?1 AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}`,
+  ).bind(exceptMemberId, nowCapabilitySql()).all<{ member_id: string }>()
+  let count = 0
+  for (const row of rows.results ?? []) if (await memberIsActiveHuman(env, row.member_id)) count++
+  return count
+}
+
+/** A confirming peer must already have been a human org owner when the request was made.
+ * Grant events also cover promotions and legacy created_at values rounded to the second. */
+async function ownerBeforeRequest(env: Env, memberId: string, requestedAt: string): Promise<boolean> {
+  if (!(await memberIsActiveHuman(env, memberId))) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok FROM capabilities c
+      WHERE c.member_id = ?1 AND c.scope_type = 'org' AND c.scope_id IS NULL AND c.capability = 'owner'
+        AND julianday(c.created_at) < julianday(?2)
+        AND NOT EXISTS (
+          SELECT 1 FROM grant_events e WHERE e.grant_table = 'capabilities' AND e.grant_id = c.id
+            AND e.event = 'granted' AND julianday(e.at) >= julianday(?2)
+            AND (json_extract(e.snapshot_json, '$.previous_capability') IS NULL
+              OR json_extract(e.snapshot_json, '$.previous_capability') != 'owner')
+        )
+        AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}`,
+  ).bind(memberId, requestedAt, nowCapabilitySql()).first<{ ok: number }>()
+  return row !== null
 }
 
 // ── level changes ───────────────────────────────────────────────────────────────────────────────
@@ -73,7 +91,7 @@ export type ChangeResult =
   | { ok: true; level: PolicyLevel; version: number; applied: boolean; pending?: PendingLower }
   | { ok: false; error: ChangeRefusal; retry_after?: string }
 
-async function logEvent(env: Env, kind: string, level: PolicyLevel | null, actor: string, scope: string, detail?: string): Promise<void> {
+export async function logEvent(env: Env, kind: string, level: PolicyLevel | null, actor: string, scope: string, detail?: string): Promise<void> {
   try {
     await env.DB.prepare(`INSERT INTO policy_events (id, kind, rule_id, level, actor, scope, detail) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)`)
       .bind(crypto.randomUUID(), kind, level, clip(actor, 200), clip(scope, 200), detail ? clip(detail, 200) : null)
@@ -83,30 +101,38 @@ async function logEvent(env: Env, kind: string, level: PolicyLevel | null, actor
   }
 }
 
-/** One batch: write the tenant row at expectedVersion -> expectedVersion+1, the audit row (conditional on the
- *  write having landed), and cancel any pending lowering. Returns the new version or null on a lost race. */
+/** One batch: compare-and-set the state, then audit and resolve/cancel only if THIS write landed. */
 async function writeTenantLevel(
-  env: Env, target: PolicyLevel, current: ResolvedLevel, actor: string, detail: string, extra: D1PreparedStatement[] = [],
+  env: Env, target: PolicyLevel, current: ResolvedLevel, actor: string, detail: string, pendingId: string | null = null,
 ): Promise<number | null> {
   const nextVersion = (current.version ?? 0) + 1
   const now = new Date().toISOString()
+  const eventId = crypto.randomUUID()
+  const pendingGuard = `(?6 IS NULL OR EXISTS (SELECT 1 FROM security_bar_lower_requests WHERE id = ?6 AND status = 'pending'))`
   const upsert =
     current.version === null
       ? env.DB.prepare(
           `INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_at, updated_by)
            SELECT 'tenant', ?1, ?2, 1, ?3, ?4
-            WHERE NOT EXISTS (SELECT 1 FROM security_bar_state WHERE scope_kind = 'tenant' AND scope_id = ?1)`,
-        ).bind(env.TENANT_SLUG, target, now, clip(actor, 200))
+            WHERE NOT EXISTS (SELECT 1 FROM security_bar_state WHERE scope_kind = 'tenant' AND scope_id = ?1)
+              AND ${pendingGuard}`,
+        ).bind(env.TENANT_SLUG, target, now, clip(actor, 200), current.version, pendingId)
       : env.DB.prepare(
           `UPDATE security_bar_state SET level = ?2, version = version + 1, updated_at = ?3, updated_by = ?4
-            WHERE scope_kind = 'tenant' AND scope_id = ?1 AND version = ?5`,
-        ).bind(env.TENANT_SLUG, target, now, clip(actor, 200), current.version)
+            WHERE scope_kind = 'tenant' AND scope_id = ?1 AND version = ?5 AND ${pendingGuard}`,
+        ).bind(env.TENANT_SLUG, target, now, clip(actor, 200), current.version, pendingId)
+  // changes() refers to the immediately preceding statement in this sequential, atomic batch.
+  // A matching version/level alone could have been written by a different winner.
   const audit = env.DB.prepare(
     `INSERT INTO policy_events (id, kind, rule_id, level, actor, scope, detail)
-     SELECT ?1, 'level_change', NULL, ?2, ?3, ?4, ?5
-      WHERE EXISTS (SELECT 1 FROM security_bar_state WHERE scope_kind = 'tenant' AND scope_id = ?4 AND version = ?6 AND level = ?2)`,
-  ).bind(crypto.randomUUID(), target, clip(actor, 200), env.TENANT_SLUG, clip(detail, 200), nextVersion)
-  const results = await env.DB.batch([upsert, audit, ...extra])
+     SELECT ?1, 'level_change', NULL, ?2, ?3, ?4, ?5 WHERE changes() = 1`,
+  ).bind(eventId, target, clip(actor, 200), env.TENANT_SLUG, clip(detail, 200))
+  const resolve = env.DB.prepare(
+    `UPDATE security_bar_lower_requests SET status = ?1, resolved_by = ?2, resolved_at = ?3
+      WHERE status = 'pending' AND (?4 IS NULL OR id = ?4)
+        AND EXISTS (SELECT 1 FROM policy_events WHERE id = ?5)`,
+  ).bind(pendingId ? 'applied' : 'cancelled', clip(actor, 200), now, pendingId, eventId)
+  const results = await env.DB.batch([upsert, audit, resolve])
   return results[0]?.meta?.changes ? nextVersion : null
 }
 
@@ -118,10 +144,7 @@ export async function raiseLevel(env: Env, auth: AuthContext, target: unknown): 
   if (current.source === 'read_failed') return { ok: false, error: 'state_unreadable' }
   if (LEVEL_RANK[target] <= LEVEL_RANK[current.level] && current.source !== 'malformed') return { ok: false, error: 'not_a_raise' }
   const actor = actorOf(auth)
-  const cancel = env.DB.prepare(
-    `UPDATE security_bar_lower_requests SET status = 'cancelled', resolved_by = ?1, resolved_at = ?2 WHERE status = 'pending'`,
-  ).bind(clip(actor, 200), new Date().toISOString())
-  const v = await writeTenantLevel(env, target, current, actor, `raise ${current.level}->${target}`, [cancel])
+  const v = await writeTenantLevel(env, target, current, actor, `raise ${current.level}->${target}`)
   if (v === null) return { ok: false, error: 'conflict' }
   return { ok: true, level: target, version: v, applied: true }
 }
@@ -169,10 +192,10 @@ export async function confirmLower(env: Env, auth: AuthContext, nowMs: number = 
   const pending = await getPendingLower(env)
   if (!pending) return { ok: false, error: 'no_pending_request' }
   const memberId = auth.memberId as string
-  // Re-evaluate who else is an owner NOW: a second owner who appeared after the request still counts.
+  // Re-evaluate active human owners; a newly granted peer cannot bypass the sole-owner delay.
   const secondExists = (await otherOwnerCount(env, memberId)) > 0
   if (pending.needs_second_owner || secondExists) {
-    if (pending.requested_by === actor) {
+    if (pending.requested_by === actor || !(await ownerBeforeRequest(env, memberId, pending.requested_at))) {
       await logEvent(env, 'lower_refused', pending.target_level, actor, env.TENANT_SLUG, 'second_owner_required')
       return { ok: false, error: 'second_owner_required' }
     }
@@ -183,10 +206,7 @@ export async function confirmLower(env: Env, auth: AuthContext, nowMs: number = 
   const current = await resolveLevel(env)
   if (current.source === 'read_failed') return { ok: false, error: 'state_unreadable' }
   if (LEVEL_RANK[pending.target_level] >= LEVEL_RANK[current.level]) return { ok: false, error: 'not_a_lowering' }
-  const resolve = env.DB.prepare(
-    `UPDATE security_bar_lower_requests SET status = 'applied', resolved_by = ?1, resolved_at = ?2 WHERE id = ?3 AND status = 'pending'`,
-  ).bind(clip(actor, 200), new Date(nowMs).toISOString(), pending.id)
-  const v = await writeTenantLevel(env, pending.target_level, current, actor, `lower ${current.level}->${pending.target_level} req ${pending.id.slice(0, 8)}`, [resolve])
+  const v = await writeTenantLevel(env, pending.target_level, current, actor, `lower ${current.level}->${pending.target_level} req ${pending.id.slice(0, 8)}`, pending.id)
   if (v === null) return { ok: false, error: 'conflict' }
   return { ok: true, level: pending.target_level, version: v, applied: true }
 }

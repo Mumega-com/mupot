@@ -52,7 +52,6 @@ export interface PolicyRule {
 }
 
 const STRICT = { onboarding: 'strict', operating: 'strict', under_attack: 'strict' } as const
-const LOOSE_BELOW_ATTACK = { onboarding: 'relaxed', operating: 'relaxed', under_attack: 'strict' } as const
 const ONBOARDING_ONLY = { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' } as const
 
 function floor(id: string, description: string, sites: readonly string[], refusalCodes?: readonly string[]): PolicyRule {
@@ -70,7 +69,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
     description:
       'task_create refuses gate_owner whenever creator = assignee. Relaxed: naming a gate lane the creator does NOT hold is allowed; only the creator\'s own lane is still refused (task.create.gate-owner-own-lane).',
     floor: false,
-    values: LOOSE_BELOW_ATTACK,
+    values: ONBOARDING_ONLY,
     sites: ['src/mcp/index.ts:toolTaskCreate'],
     refusalCodes: ['gate_owner_creator_is_assignee'],
   },
@@ -89,24 +88,27 @@ export const POLICY_RULES: readonly PolicyRule[] = [
   {
     id: 'task.create.assignee-agent-resolvable.cross-squad',
     description:
-      'Assigning an agent whose home squad is not the task\'s squad needs the agent\'s member to hold member on the task squad. Relaxed: allowed when the caller can see the agent\'s home squad.',
-    floor: false,
-    values: LOOSE_BELOW_ATTACK,
+      'Assigning an agent whose home squad is not the task\'s squad needs the agent\'s member to hold member on the task squad.',
+    class: 'FLOOR',
+    floor: true,
+    values: STRICT,
     sites: ['src/tasks/assignee.ts:resolveTaskAssignee'],
     refusalCodes: ['assignee_not_in_squad'],
   },
   {
     id: 'task.create.assignee-agent-resolvable.inactive',
-    description: 'Assigning a task to a paused/inactive agent is refused. Relaxed at onboarding: the task waits for the agent.',
-    floor: false,
-    values: ONBOARDING_ONLY,
+    description: 'Assigning a task to a paused/inactive agent is refused.',
+    class: 'FLOOR',
+    floor: true,
+    values: STRICT,
     sites: ['src/tasks/assignee.ts:resolveTaskAssignee'],
   },
   {
     id: 'task.create.assignee-member-resolvable',
-    description: 'Assigning a task to a human who holds no member capability on the task squad is refused. Relaxed at onboarding: an active tenant member may be named.',
-    floor: false,
-    values: ONBOARDING_ONLY,
+    description: 'Assigning a task to a human who holds no member capability on the task squad is refused.',
+    class: 'FLOOR',
+    floor: true,
+    values: STRICT,
     sites: ['src/tasks/assignee.ts:resolveTaskAssigneeMember'],
   },
   {
@@ -117,7 +119,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
     fileLine: 'src/tasks/service.ts:checkTransition',
     description: 'The transition matrix refuses open -> blocked. Relaxed: allowed with a non-empty reason; every use is audited. (blocked -> in_progress is already legal and stays so.)',
     floor: false,
-    values: LOOSE_BELOW_ATTACK,
+    values: ONBOARDING_ONLY,
     sites: ['src/tasks/service.ts:checkTransition', 'src/mcp/index.ts:toolTaskUpdate', 'src/tasks/index.ts:PATCH /:id'],
     refusalCodes: ['invalid_transition', 'transition_reason_required'],
   },
@@ -128,9 +130,9 @@ export const POLICY_RULES: readonly PolicyRule[] = [
     threat: 'prose "I did it" with no work (a5e45082); shape-only, the digest was never verified',
     fileLine: 'src/tasks/artifact-verification.ts:verifyTaskArtifactShape',
     description:
-      'A result entering review/done must carry "Artifact: <path>" + "SHA256: <64-hex>". Relaxed: also accepts a file with a claimed digest, a repository/PR URL with a FULL commit id and repo identity, or a labelled snapshot whose digest the SERVER computes. Plain prose is still refused at every level.',
+      'A result entering review/done must carry "Artifact: <path>" + "SHA256: <64-hex>". At onboarding only: also accepts a file with a claimed digest, a repository/PR URL with a FULL commit id and repo identity, or a labelled snapshot with an http(s) reference whose digest the SERVER computes. Plain prose is still refused at every level.',
     floor: false,
-    values: LOOSE_BELOW_ATTACK,
+    values: ONBOARDING_ONLY,
     sites: [
       'src/tasks/evidence.ts:verifyTaskEvidence',
       'src/mcp/index.ts:toolTaskUpdate',

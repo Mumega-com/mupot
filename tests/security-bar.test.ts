@@ -5,7 +5,9 @@
 // resolve a failed read to onboarding; drop the strongReauth check in requestLower/confirmLower; skip the
 // would_block write in relaxes(); let the nearer scope loosen the tenant level.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import * as barModule from '../src/policy/bar'
+import catalogFixture from './fixtures/security-bar-catalog.json'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
 import { createWebSession } from '../src/auth/web-sessions'
 import { markRecentReauth } from '../src/auth/web-sessions'
@@ -82,7 +84,7 @@ beforeEach(() => {
       ('c1', '${OWNER1}', 'org', NULL, 'owner'), ('c3', '${MEM_A}', 'squad', '${SQ1}', 'member');
   `)
 })
-afterEach(() => harness.close())
+afterEach(() => { vi.restoreAllMocks(); harness.close() })
 
 describe('registry', () => {
   it('ids are unique area.verb.what and every floor is strict at every level', () => {
@@ -142,9 +144,42 @@ describe('catalog alignment (receipts/policy-catalog-20261026.json)', () => {
     for (const l of POLICY_LEVELS) expect(bar.values[l]).toBe('strict')
     expect(catalogRule(rec('BAR'), { values: { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' } }).values.onboarding).toBe('relaxed')
   })
-  it('the wired rules use the catalog ids', () => {
-    for (const id of ['task.create.gate-owner-creator-is-assignee', 'task.intake.p1-linkage', 'task.update.transition-matrix', 'task.update.artifact-shape-gate', 'task.create.assignee-member-resolvable']) {
-      expect(getRule(id)?.floor, id).toBe(false)
+  it('matches catalog classes in both directions for every wired catalog rule', () => {
+    // These two class changes were explicitly approved for this batch; other catalog classes stay intact.
+    const overrides: Record<string, string> = {
+      'task.create.gate-owner-creator-is-assignee': 'BAR',
+      'task.update.artifact-shape-gate': 'BAR',
+    }
+    const wiredIds = [
+      'task.create.gate-owner-creator-is-assignee', 'task.intake.p1-linkage',
+      'task.create.assignee-agent-resolvable.cross-squad', 'task.create.assignee-agent-resolvable.inactive',
+      'task.create.assignee-member-resolvable', 'task.update.transition-matrix', 'task.update.artifact-shape-gate',
+    ]
+    const expanded = catalogFixture.flatMap(rec => rec.id === 'task.create.assignee-agent-resolvable'
+      ? ['cross-squad', 'inactive'].map(suffix => ({ ...rec, id: rec.id + '.' + suffix })) : [rec])
+    expect(expanded.map(r => r.id).sort()).toEqual([...wiredIds].sort())
+    expect(POLICY_RULES.filter(r => r.class && r.sites.some(site => /(?:resolveTaskAssignee|verifyTaskEvidence|checkTransition|assertValidIntakeContract|toolTaskCreate)/.test(site))).map(r => r.id).sort()).toEqual([...wiredIds].sort())
+    for (const rec of expanded) {
+      const cls = overrides[rec.id] ?? rec.class
+      expect(getRule(rec.id)?.class, rec.id).toBe(cls)
+      expect(getRule(rec.id)?.floor, rec.id).toBe(cls === 'FLOOR')
+    }
+  })
+
+  it('pins literal values per level, and every rule is strict at operating and with no row', async () => {
+    const expected: Record<string, { onboarding: string; operating: string; under_attack: string }> = {
+      'task.create.gate-owner-creator-is-assignee': { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' },
+      'task.intake.p1-linkage': { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' },
+      'task.create.assignee-agent-resolvable.cross-squad': { onboarding: 'strict', operating: 'strict', under_attack: 'strict' },
+      'task.create.assignee-agent-resolvable.inactive': { onboarding: 'strict', operating: 'strict', under_attack: 'strict' },
+      'task.create.assignee-member-resolvable': { onboarding: 'strict', operating: 'strict', under_attack: 'strict' },
+      'task.update.transition-matrix': { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' },
+      'task.update.artifact-shape-gate': { onboarding: 'relaxed', operating: 'strict', under_attack: 'strict' },
+    }
+    for (const [id, values] of Object.entries(expected)) expect(getRule(id)?.values, id).toEqual(values)
+    for (const level of [null, 'operating']) {
+      setLevel(level)
+      for (const rule of POLICY_RULES) expect((await policy(env, {}, rule.id)).value, rule.id).toBe('strict')
     }
   })
 })
@@ -204,16 +239,16 @@ describe('level resolution fails closed', () => {
 })
 
 describe('would_block / relaxed_applied records', () => {
-  it('onboarding writes would_block; operating writes relaxed_applied; under_attack refuses and writes nothing', async () => {
+  it('only onboarding writes would_block; operating and under_attack refuse and write nothing', async () => {
     setLevel('onboarding')
     expect(await relaxes(env, 'task.intake.p1-linkage', { actor: 'member:m1', scopeRef: 'task:t1', detail: 'p1 without linkage' })).toBe(true)
     expect(events('would_block')).toHaveLength(1)
     setLevel('operating')
-    expect(await relaxes(env, 'task.update.transition-matrix', { actor: 'member:m1', scopeRef: 'task:t1' })).toBe(true)
-    expect(events('relaxed_applied')).toHaveLength(1)
+    expect(await relaxes(env, 'task.update.transition-matrix', { actor: 'member:m1', scopeRef: 'task:t1' })).toBe(false)
+    expect(events('relaxed_applied')).toHaveLength(0)
     setLevel('under_attack')
     expect(await relaxes(env, 'task.update.transition-matrix', { actor: 'member:m1', scopeRef: 'task:t1' })).toBe(false)
-    expect(events()).toHaveLength(2)
+    expect(events()).toHaveLength(1)
   })
 
   it('a record is rule id, actor, scope, time only: free text and secrets are neutralised and truncated', async () => {
@@ -284,14 +319,15 @@ describe('changing the level', () => {
     harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c2', '${OWNER2}', 'org', NULL, 'owner')`)
     setLevel('under_attack')
     const s1 = await webSession(OWNER1, 1000)
-    const req = await requestLower(env, owner1(s1), 'operating')
+    const now = Date.now() + 10
+    const req = await requestLower(env, owner1(s1), 'operating', now)
     expect(req).toMatchObject({ ok: true, applied: false, pending: { needs_second_owner: true, target_level: 'operating' } })
     expect((await resolveLevel(env)).level).toBe('under_attack') // a request is not a change
-    expect(await confirmLower(env, owner1(s1))).toEqual({ ok: false, error: 'second_owner_required' })
+    expect(await confirmLower(env, owner1(s1), now + 1)).toEqual({ ok: false, error: 'second_owner_required' })
     const s2 = await webSession(OWNER2, 1000)
     const stale2 = await webSession(OWNER2, 10 * 60 * 1000)
-    expect(await confirmLower(env, owner2(stale2))).toEqual({ ok: false, error: 'reauth_required' })
-    const done = await confirmLower(env, owner2(s2))
+    expect(await confirmLower(env, owner2(stale2), now + 1)).toEqual({ ok: false, error: 'reauth_required' })
+    const done = await confirmLower(env, owner2(s2), now + 1)
     expect(done).toMatchObject({ ok: true, applied: true, level: 'operating', version: 2 })
     expect(one('SELECT status, resolved_by FROM security_bar_lower_requests')).toEqual({ status: 'applied', resolved_by: `member:${OWNER2}` })
     expect(events('lower_requested')).toHaveLength(1)
@@ -338,6 +374,136 @@ describe('changing the level', () => {
   })
 })
 
+describe('Round 2 owner and write interleavings', () => {
+  const grantSecond = (at: string) => harness.sqlite.prepare(
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES ('c2', ?, 'org', NULL, 'owner', ?)`,
+  ).run(OWNER2, at)
+
+  for (const [label, offset, allowed] of [['before', -1000, true], ['equal', 0, false], ['after', 1000, false]] as const) {
+    it(`M22: confirm-time second-owner grant ${label} the request`, async () => {
+      setLevel('under_attack')
+      const s1 = await webSession(OWNER1, 1000)
+      const s2 = await webSession(OWNER2, 1000)
+      const now = Date.now() + 10
+      grantSecond(new Date(now + offset).toISOString())
+      await requestLower(env, owner1(s1), 'operating', now)
+      const out = await confirmLower(env, owner2(s2), now + 2000)
+      if (allowed) expect(out).toMatchObject({ ok: true, applied: true })
+      else {
+        expect(out).toEqual({ ok: false, error: 'second_owner_required' })
+        expect(one('SELECT status FROM security_bar_lower_requests').status).toBe('pending')
+        expect((await resolveLevel(env)).level).toBe('under_attack')
+      }
+    })
+  }
+
+  for (const kind of ['archived', 'agent-bound', 'other-tenant', 'inactive'] as const) {
+    it(`sole-owner delay excludes ${kind} owners at request and confirm time`, async () => {
+      setLevel('under_attack')
+      grantSecond('2026-01-01T00:00:00.000Z')
+      if (kind === 'archived') harness.sqlite.prepare('UPDATE members SET archived_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', OWNER2)
+      if (kind === 'agent-bound') harness.sqlite.prepare("INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')").run(TENANT, AG_A, OWNER2)
+      if (kind === 'other-tenant') harness.sqlite.prepare('UPDATE members SET tenant = ? WHERE id = ?').run('another', OWNER2)
+      if (kind === 'inactive') harness.sqlite.prepare('UPDATE members SET status = ? WHERE id = ?').run('suspended', OWNER2)
+      const s1 = await webSession(OWNER1, 1000)
+      const now = Date.now()
+      expect(await requestLower(env, owner1(s1), 'operating', now)).toMatchObject({ ok: true, pending: { needs_second_owner: false } })
+      expect(await confirmLower(env, owner1(s1), now + 1000)).toMatchObject({ ok: false, error: 'delay_not_elapsed' })
+      harness.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(now + LOWER_DELAY_MS_FOR_TESTS).toISOString())
+      expect(await confirmLower(env, owner1(s1), now + LOWER_DELAY_MS_FOR_TESTS + 1000)).toMatchObject({ ok: true, applied: true })
+    })
+  }
+
+  it('M22: a new owner grant with a rounded creation timestamp still cannot confirm', async () => {
+    setLevel('under_attack')
+    const s1 = await webSession(OWNER1, 1000)
+    const s2 = await webSession(OWNER2, 1000)
+    const now = Date.now()
+    await requestLower(env, owner1(s1), 'operating', now)
+    // Legacy writers use second precision; the append-only grant event records when ownership began.
+    grantSecond(new Date(now - 1).toISOString().slice(0, 19).replace('T', ' '))
+    expect(await confirmLower(env, owner2(s2))).toEqual({ ok: false, error: 'second_owner_required' })
+    expect((await resolveLevel(env)).level).toBe('under_attack')
+  })
+
+  it('M22: promoting an older org grant after the request cannot supply the second owner', async () => {
+    setLevel('under_attack')
+    harness.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES ('c2', ?, 'org', NULL, 'admin', '2026-01-01T00:00:00.000Z')`).run(OWNER2)
+    const s1 = await webSession(OWNER1, 1000)
+    const s2 = await webSession(OWNER2, 1000)
+    await requestLower(env, owner1(s1), 'operating')
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'owner' WHERE id = 'c2'`)
+    expect(await confirmLower(env, owner2(s2))).toEqual({ ok: false, error: 'second_owner_required' })
+    expect((await resolveLevel(env)).level).toBe('under_attack')
+  })
+
+  it('a confirming owner must still be an active human even with cached owner capabilities', async () => {
+    setLevel('under_attack')
+    grantSecond('2026-01-01T00:00:00.000Z')
+    const s1 = await webSession(OWNER1, 1000)
+    const s2 = await webSession(OWNER2, 1000)
+    const now = Date.now() + 10
+    await requestLower(env, owner1(s1), 'operating', now)
+    const getPending = barModule.getPendingLower
+    vi.spyOn(barModule, 'getPendingLower').mockImplementationOnce(async currentEnv => {
+      const pending = await getPending(currentEnv)
+      harness.sqlite.prepare(`UPDATE members SET archived_at = '2026-01-01T00:00:00.000Z' WHERE id = ?`).run(OWNER2)
+      return pending
+    })
+    expect(await confirmLower(env, owner2(s2), now + 1)).toEqual({ ok: false, error: 'second_owner_required' })
+    expect((await resolveLevel(env)).level).toBe('under_attack')
+  })
+
+  async function pendingForSecond() {
+    setLevel('under_attack')
+    grantSecond('2026-01-01T00:00:00.000Z')
+    const s1 = await webSession(OWNER1, 1000)
+    const s2 = await webSession(OWNER2, 1000)
+    const now = Date.now() + 10
+    await requestLower(env, owner1(s1), 'onboarding', now)
+    return { session: s2, now: now + 1 }
+  }
+
+  it('M20: a lost confirmation version leaves the request pending and emits no change audit', async () => {
+    const { session: s2, now } = await pendingForSecond()
+    const batch = env.DB.batch.bind(env.DB)
+    vi.spyOn(env.DB, 'batch').mockImplementationOnce(async statements => {
+      harness.sqlite.exec('UPDATE security_bar_state SET version = version + 1')
+      return batch(statements)
+    })
+    expect(await confirmLower(env, owner2(s2), now)).toEqual({ ok: false, error: 'conflict' })
+    expect(one('SELECT status FROM security_bar_lower_requests').status).toBe('pending')
+    expect((await resolveLevel(env)).level).toBe('under_attack')
+    expect(events('level_change')).toHaveLength(0)
+  })
+
+  it('M21: a lost raise version cannot cancel a pending request or attribute the winning write to itself', async () => {
+    await pendingForSecond()
+    setLevel('onboarding')
+    const batch = env.DB.batch.bind(env.DB)
+    vi.spyOn(env.DB, 'batch').mockImplementationOnce(async statements => {
+      harness.sqlite.exec(`UPDATE security_bar_state SET level = 'under_attack', version = version + 1, updated_by = 'other-writer'`)
+      return batch(statements)
+    })
+    expect(await raiseLevel(env, owner1(), 'under_attack')).toEqual({ ok: false, error: 'conflict' })
+    expect(one('SELECT status FROM security_bar_lower_requests').status).toBe('pending')
+    expect(events('level_change')).toHaveLength(0)
+  })
+
+  it('M26: a cancelled request cannot change the level even if confirmation already read it', async () => {
+    const { session: s2, now } = await pendingForSecond()
+    const batch = env.DB.batch.bind(env.DB)
+    vi.spyOn(env.DB, 'batch').mockImplementationOnce(async statements => {
+      harness.sqlite.exec(`UPDATE security_bar_lower_requests SET status = 'cancelled'`)
+      return batch(statements)
+    })
+    expect(await confirmLower(env, owner2(s2), now)).toEqual({ ok: false, error: 'conflict' })
+    expect((await resolveLevel(env)).level).toBe('under_attack')
+    expect(one('SELECT status FROM security_bar_lower_requests').status).toBe('cancelled')
+    expect(events('level_change')).toHaveLength(0)
+  })
+})
+
 describe('MCP security_bar tool', () => {
   it('reads the level; the owner raises; a lowering over MCP is step_up_required (and audited); agents cannot write', async () => {
     setLevel('operating')
@@ -355,6 +521,23 @@ describe('MCP security_bar tool', () => {
     expect((await invokeTool(owner1(), env, 'security_bar', { set_level: 'bogus' }, ORIGIN)).ok).toBe(false)
   })
 
+  it('MCP lowering refuses even with a fresh owner web session and never creates a request', async () => {
+    setLevel('under_attack')
+    const session = await webSession(OWNER1, 1000)
+    expect(await invokeTool(owner1(session), env, 'security_bar', { set_level: 'onboarding' }, ORIGIN)).toMatchObject({ ok: false, error: 'step_up_required' })
+    expect(rows('SELECT * FROM security_bar_lower_requests')).toHaveLength(0)
+    expect(events('lower_requested')).toHaveLength(0)
+    expect(events('lower_refused')).toHaveLength(1)
+  })
+
+  it('agent reads expose only the level while an owner lowering is pending', async () => {
+    setLevel('under_attack')
+    await requestLower(env, owner1(await webSession(OWNER1, 1000)), 'operating')
+    const out = await invokeTool(agentAuth(), env, 'security_bar', {}, ORIGIN)
+    expect(out).toMatchObject({ ok: true, result: { level: 'under_attack' } })
+    if (out.ok) expect(out.result).toEqual({ level: 'under_attack' })
+  })
+
   it('boot_context and orient carry the level for agents', async () => {
     setLevel('onboarding')
     const boot = await invokeTool(agentAuth(), env, 'boot_context', {}, ORIGIN)
@@ -365,11 +548,16 @@ describe('MCP security_bar tool', () => {
 
 // ── the wired rules, each at each level ────────────────────────────────────────────────────────────────
 const LEVELS: PolicyLevel[] = ['onboarding', 'operating', 'under_attack']
-const relaxedAt = (ruleId: string): Record<PolicyLevel, boolean> => {
-  const r = getRule(ruleId)
-  if (!r) throw new Error(ruleId)
-  return { onboarding: r.values.onboarding === 'relaxed', operating: r.values.operating === 'relaxed', under_attack: r.values.under_attack === 'relaxed' }
+const EXPECTED_RELAXED: Record<string, Record<PolicyLevel, boolean>> = {
+  'task.create.gate-owner-creator-is-assignee': { onboarding: true, operating: false, under_attack: false },
+  'task.intake.p1-linkage': { onboarding: true, operating: false, under_attack: false },
+  'task.create.assignee-agent-resolvable.inactive': { onboarding: false, operating: false, under_attack: false },
+  'task.create.assignee-agent-resolvable.cross-squad': { onboarding: false, operating: false, under_attack: false },
+  'task.create.assignee-member-resolvable': { onboarding: false, operating: false, under_attack: false },
+  'task.update.transition-matrix': { onboarding: true, operating: false, under_attack: false },
+  'task.update.artifact-shape-gate': { onboarding: true, operating: false, under_attack: false },
 }
+const relaxedAt = (ruleId: string) => EXPECTED_RELAXED[ruleId]!
 
 describe('task.create.gate-owner-creator-is-assignee (task_create)', () => {
   const create = (args: Record<string, unknown>) =>
@@ -497,7 +685,7 @@ describe('task.update.transition-matrix (task_update)', () => {
   }
 
   it('relaxed levels still require a reason (and write no record for the refused move)', async () => {
-    setLevel('operating')
+    setLevel('onboarding')
     expect(await upd({ status: 'blocked' })).toMatchObject({ ok: false, error: 'transition_reason_required' })
     expect(await upd({ status: 'blocked', reason: ' ' })).toMatchObject({ ok: false, error: 'transition_reason_required' })
     expect(events()).toHaveLength(0)
@@ -519,7 +707,7 @@ describe('task.update.artifact-shape-gate (verifyTaskEvidence)', () => {
   const ctx = { actor: 'agent:a', scopeRef: 'task:t1' }
   const FILE = `Done.\nArtifact: out/report.md\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88`
   const PR = `Merged https://github.com/Mumega-com/mupot/pull/2200 at commit ${SHA40}.`
-  const SNAP = 'Snapshot: board export 2026-10-26\nColumns: 12, rows: 340, nothing pending after the import finished.'
+  const SNAP = 'Snapshot: board export 2026-10-26\nhttps://example.com/exports/board.json'
 
   it('file evidence (the strict shape) passes at every level and writes no record', async () => {
     for (const level of LEVELS) {
@@ -547,14 +735,14 @@ describe('task.update.artifact-shape-gate (verifyTaskEvidence)', () => {
       }
     })
 
-    it(`${level}: snapshot with content -> ${relaxed ? 'accepted' : 'refused'}`, async () => {
+    it(`${level}: snapshot with an http(s) reference -> ${relaxed ? 'accepted' : 'refused'}`, async () => {
       setLevel(level)
       expect((await verifyTaskEvidence(env, SNAP, ctx)).verified).toBe(relaxed)
     })
   }
 
   it('the server digest is computed over the exact text: a one-character change moves it', async () => {
-    setLevel('operating')
+    setLevel('onboarding')
     const a = await verifyTaskEvidence(env, PR, ctx)
     const b = await verifyTaskEvidence(env, PR + ' ', ctx)
     expect(a.verified && b.verified && a.sha256Claimed !== b.sha256Claimed).toBe(true)
@@ -568,6 +756,9 @@ describe('task.update.artifact-shape-gate (verifyTaskEvidence)', () => {
       `PR https://github.com/Mumega-com/mupot/pull/2200 merged at ${'0'.repeat(40)}`,
       `PR https://github.com/Mumega-com/mupot/pull/2200 merged at ${'ab'.repeat(20)}`,
       'Snapshot: x',
+      'Snapshot: board export\nColumns: 12, rows: 340, nothing pending after import.',
+      'Snapshot: export\nReference: file:///tmp/board.json',
+      'Snapshot: export\nReference: https://',
       `commit ${SHA40} with no repository named`,
       `https://example.com/not-a-forge/thing ${SHA40}`,
       'I cannot complete this task; I am unable to access the repository.',
@@ -578,6 +769,20 @@ describe('task.update.artifact-shape-gate (verifyTaskEvidence)', () => {
     expect(events()).toHaveLength(0)
   })
 
+  it('repo URLs retain full 40/64 character commits and refuse partial or overlong ids', async () => {
+    setLevel('onboarding')
+    for (const kind of ['commit', 'tree']) {
+      for (const size of [40, 64]) {
+        const sha = (SHA40 + '1234567890abcdef12345678').slice(0, size)
+        expect(await verifyTaskEvidence(env, `https://github.com/Mumega-com/mupot/${kind}/${sha}`, ctx)).toMatchObject({ verified: true, path: `https://github.com/Mumega-com/mupot/${kind}/${sha}@${sha}` })
+      }
+      for (const size of [39, 41, 50, 63, 65]) {
+        const sha = (SHA40 + '1234567890abcdef1234567890').slice(0, size)
+        expect((await verifyTaskEvidence(env, `https://github.com/Mumega-com/mupot/${kind}/${sha}`, ctx)).verified).toBe(false)
+      }
+    }
+  })
+
   it('a placeholder SHA256 stays refused even when a real PR url + commit is also present (floor)', async () => {
     setLevel('onboarding')
     const text = `Artifact: out/x.md\nSHA256: ${'0'.repeat(64)}\n${PR}`
@@ -585,21 +790,21 @@ describe('task.update.artifact-shape-gate (verifyTaskEvidence)', () => {
   })
 
   it('the git-sha-in-SHA256-label case that used to be sha256_malformed is accepted when a repo + full commit is stated', async () => {
-    setLevel('operating')
+    setLevel('onboarding')
     const text = `Artifact: https://github.com/Mumega-com/mupot/pull/2200\nSHA256: ${SHA40}`
     expect(await verifyTaskEvidence(env, text, ctx)).toMatchObject({ verified: true, kind: 'repo' })
     setLevel('under_attack')
     expect(await verifyTaskEvidence(env, text, ctx)).toMatchObject({ verified: false, reason: 'sha256_malformed' })
   })
 
-  it('end to end: task_update to review accepts a PR+commit result at operating and refuses it at under_attack', async () => {
+  it('end to end: task_update to review accepts a PR+commit result at onboarding and refuses it at under_attack', async () => {
     harness.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner, result)
       VALUES ('t-rev', '${SQ1}', 'T', 'b', 'tests pass and merged', 'in_progress', '${AG_B}', 'gate:athena', '${PR}')`)
     const admin = humanAuth(PLAIN, [cap(PLAIN, 'org', null, 'admin')])
     setLevel('under_attack')
     expect(await invokeTool(admin, env, 'task_update', { task_id: 't-rev', status: 'review' }, ORIGIN)).toMatchObject({ ok: false, error: 'artifact_verification_failed' })
     expect(one(`SELECT status FROM tasks WHERE id = 't-rev'`).status).toBe('in_progress')
-    setLevel('operating')
+    setLevel('onboarding')
     const ok = await invokeTool(admin, env, 'task_update', { task_id: 't-rev', status: 'review' }, ORIGIN)
     expect(ok.ok, JSON.stringify(ok)).toBe(true)
     expect(one(`SELECT status FROM tasks WHERE id = 't-rev'`).status).toBe('review')

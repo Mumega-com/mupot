@@ -9,7 +9,7 @@
 // Lowering is two explicit calls; nothing here downgrades on a timer (src/policy/admin.ts).
 
 import { Hono } from 'hono'
-import { html } from 'hono/html'
+import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Env } from '../types'
 import { isOwner, type AppEnv } from './wizard'
@@ -34,6 +34,25 @@ export function renderBarYaml(level: PolicyLevel, source: string, version: numbe
   return lines.join('\n')
 }
 
+/** Shared by the browser and tests so every outcome gives the owner a concrete next step. */
+export function barResultMessage(data: { applied?: boolean; unchanged?: boolean; pending?: { needs_second_owner: boolean; effective_after: string }; error?: string; retry_after?: string }): string {
+  if (data.unchanged) return 'Already at this level. Choose another level to change it.'
+  if (data.applied) return 'Applied. Review the current level and rules below.'
+  if (data.pending) return data.pending.needs_second_owner
+    ? 'Lowering requested. Ask a different owner who held ownership before the request to sign in and confirm.'
+    : 'Lowering requested. Reauthenticate and confirm after ' + data.pending.effective_after + '.'
+  switch (data.error) {
+    case 'delay_not_elapsed': return 'Wait until ' + data.retry_after + ', then reauthenticate and confirm the pending lowering.'
+    case 'second_owner_required': return 'Ask a different owner who held ownership before the request to sign in and confirm.'
+    case 'reauth_required': return 'Confirm it is you, then return and try again.'
+    case 'conflict': return 'The level or request changed. Reload this page and retry.'
+    case 'no_pending_request': return 'No pending lowering. Reload this page and request a lowering first.'
+    case 'owner_required': return 'Sign in as an org owner to change the level.'
+    case 'state_unreadable': return 'The current level could not be read. Retry after service is restored.'
+    default: return 'Not applied: ' + (data.error || 'request failed') + '. Reload this page and retry.'
+  }
+}
+
 export async function securityBarBody(env: Env, owner: boolean): Promise<Html> {
   const v = await barView(env)
   const yaml = renderBarYaml(v.level, v.source, v.version)
@@ -44,7 +63,7 @@ export async function securityBarBody(env: Env, owner: boolean): Promise<Html> {
       title: 'Level',
       body: html`
         <p class="ui-sub">
-          <b>onboarding</b>: friction rules relaxed and every relaxed use is logged. <b>operating</b>: today's rules.
+          <b>onboarding</b>: opt in to friction relaxations; every relaxed use is logged. <b>operating</b>: all rules strict, exactly today's behaviour (also the default when no level is set).
           <b>under_attack</b>: strictest. Raising is immediate; lowering needs a fresh sign-in check plus a second owner (or a 24-hour wait).
         </p>
         ${pending
@@ -63,13 +82,14 @@ export async function securityBarBody(env: Env, owner: boolean): Promise<Html> {
             <script>
               (function () {
                 var form = document.getElementById('form-bar'); var status = document.getElementById('bar-status');
+                var resultMessage = ${raw(barResultMessage.toString())};
                 var rank = { onboarding: 0, operating: 1, under_attack: 2 }; var current = '${v.level}';
                 async function send(payload) {
                   var res = await fetch('/admin/security-bar', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
                   var data = await res.json().catch(function () { return {}; });
-                  if (res.ok) { status.textContent = data.applied ? 'Applied.' : 'Lowering requested. See the pending note above.'; status.className = 'status-line ok'; setTimeout(function () { location.reload(); }, 800); }
+                  if (res.ok) { status.textContent = resultMessage(data); status.className = 'status-line ok'; setTimeout(function () { location.reload(); }, 800); }
                   else if (data.error === 'reauth_required') { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth?return=/admin/security-bar'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
-                  else { status.textContent = 'Not applied: ' + (data.error || res.status); status.className = 'status-line err'; }
+                  else { status.textContent = resultMessage(data); status.className = 'status-line err'; }
                 }
                 form.addEventListener('submit', function (e) { e.preventDefault(); var level = form.querySelector('[name=level]').value; send({ action: rank[level] < rank[current] ? 'request_lower' : 'set', level: level }); });
                 var c = document.getElementById('bar-confirm'); if (c) c.addEventListener('click', function () { send({ action: 'confirm_lower' }); });
@@ -101,9 +121,13 @@ export function makeSecurityBarApp(shell: ShellFn) {
     }
     if (body.action === 'set' || body.action === 'request_lower') {
       if (!isPolicyLevel(body.level)) return c.json({ error: 'invalid_level' }, 400)
-      const current = (await barView(c.env)).level
+      const view = await barView(c.env)
+      const current = view.level
+      if (body.level === current && view.source !== 'malformed' && view.source !== 'read_failed') {
+        return c.json({ ok: true, level: current, version: view.version, applied: false, unchanged: true })
+      }
       // The server decides raise vs lower from the stored level; the client's action label never selects the weaker path.
-      const out = LEVEL_RANK[body.level] > LEVEL_RANK[current] ? await raiseLevel(c.env, auth, body.level) : await requestLower(c.env, auth, body.level)
+      const out = LEVEL_RANK[body.level] >= LEVEL_RANK[current] ? await raiseLevel(c.env, auth, body.level) : await requestLower(c.env, auth, body.level)
       return out.ok ? c.json(out) : c.json({ error: out.error }, out.error === 'reauth_required' || out.error === 'owner_required' ? 403 : 409)
     }
     if (body.action === 'confirm_lower') {

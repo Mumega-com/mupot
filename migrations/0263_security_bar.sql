@@ -7,7 +7,8 @@
 -- THREE TABLES, ONE CONCERN
 --   security_bar_state          the level per scope (only the tenant row is writable in this PR).
 --                               A missing row is NOT a level: the reader maps it to 'operating'
---                               (today's behaviour); a malformed row or a failed read maps to
+--                               (all rules strict, exactly today's behaviour). Only explicit
+--                               onboarding opts in to friction relaxations. A malformed row or failed read maps to
 --                               'under_attack' (src/policy/bar.ts).
 --   policy_events               append-only audit: would_block records (a relaxed check that
 --                               would have refused), level changes, lowering requests. NO bodies,

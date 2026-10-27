@@ -170,12 +170,14 @@ describe('dyad gate default', () => {
     const bad = await create(agentAuth('x'), { gate_owner: 'gate:office' })
     expect((bad as Out).ok).toBe(false)
     expect((bad as Out).error).toBe('gate_owner_reserved')
-    // Security Bar: below under_attack, creator=assignee may name a lane someone else holds (ybot is AY's)...
+    // Security Bar: only explicit onboarding permits an independent lane (ybot is AY's).
+    expect(await create(agentAuth('x'), { gate_owner: 'ybot', assignee_agent_id: AX })).toMatchObject({ ok: false, error: 'gate_owner_creator_is_assignee' })
+    harness.sqlite.prepare(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?, 'onboarding', 1, 'test')`).run(TENANT)
     expect(gateOf(await create(agentAuth('x'), { gate_owner: 'ybot', assignee_agent_id: AX }))).toBe('gate:ybot')
     // ...but never its own lane (floor), and at under_attack the old refusal returns.
     await grant('gate:xbot', 'agent', AX)
     expect(((await create(agentAuth('x'), { gate_owner: 'xbot', assignee_agent_id: AX })) as Out).error).toBe('gate_owner_creator_is_assignee')
-    await run(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?1, 'under_attack', 1, 'test')`, TENANT)
+    await run(`UPDATE security_bar_state SET level = 'under_attack' WHERE scope_kind = 'tenant' AND scope_id = ?1`, TENANT)
     expect(((await create(agentAuth('x'), { gate_owner: 'ybot', assignee_agent_id: AX })) as Out).error).toBe('gate_owner_creator_is_assignee')
   })
 
