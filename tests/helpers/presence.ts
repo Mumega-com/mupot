@@ -73,7 +73,7 @@ export const presencePath = (approveUrl: string): string => new URL(approveUrl).
 
 export interface TapOver {
   /** Sign with these ceremony flags (uv:false = an assertion without user verification). */
-  sign?: { uv?: boolean; up?: boolean; counter?: number }
+  sign?: { uv?: boolean; up?: boolean; counter?: number; hashRpId?: string }
   /** Use this challenge instead of asking the server for one for THIS grant (cross-decision / replay attacks). */
   challenge?: string
   csrf?: string

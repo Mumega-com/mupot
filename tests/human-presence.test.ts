@@ -11,21 +11,25 @@
 // Mutations proven (PR body): requestPresence returning ok without a passkey; redeemPresence dropping the digest / kind / member
 // term; the UV flag check removed; the challenge binding removed; the status='satisfied' guard; the per-route presenceGate call
 // removed (each path's test goes red on its own).
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { Hono } from 'hono'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { dashboardApp } from '../src/dashboard/index'
 import { membersApp } from '../src/members'
-import { tasksApp } from '../src/tasks'
+import { tasksApp, gatesApp } from '../src/tasks'
+import { seatEventsApp } from '../src/agents/seat-events-routes'
+import { orgApp } from '../src/org'
+import { channelsAdminApp } from '../src/channels/admin'
 import { upsertHarness } from '../src/members/harness'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest } from '../src/auth/elevation'
-import { PRESENCE_DECISION_KINDS, humanPresenceRequired, type PresenceDecisionKind } from '../src/approvals/human-presence'
+import { PRESENCE_DECISION_KINDS, PRESENCE_REDEEM_TTL_MS, redeemPresence, humanPresenceRequired, type PresenceDecisionKind } from '../src/approvals/human-presence'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -287,6 +291,47 @@ describe('the gate itself, on "Allow for me" (designation)', () => {
     expect(designee()).toBeNull()
   })
 
+  it('redeem TTL is exactly five minutes after the real tap, accepted just before and refused at the boundary', async () => {
+    expect(PRESENCE_REDEEM_TTL_MS).toBe(300_000)
+    const first = await expectRefused(await allow(admin))
+    expect((await realTap(admin.env, adminAuthn, first.approveUrl)).status).toBe(200)
+    const row = one<{ satisfied_at: string; expires_at: string }>('SELECT satisfied_at, expires_at FROM presence_grants WHERE id = ?', first.grantId)!
+    expect(Date.parse(row.expires_at) - Date.parse(row.satisfied_at)).toBe(300_000)
+    const spec = { kind: 'designation_allow' as const, subjectId: 'ag1', params: { action: 'allow' } }
+    expect(await redeemPresence(admin.env, admin.memberId, spec, first.grantId, Date.parse(row.expires_at) - 1)).toBe(true)
+    const second = await expectRefused(await allow(admin))
+    expect((await realTap(admin.env, adminAuthn, second.approveUrl)).status).toBe(200)
+    const boundary = one<{ expires_at: string }>('SELECT expires_at FROM presence_grants WHERE id = ?', second.grantId)!
+    expect(await redeemPresence(admin.env, admin.memberId, spec, second.grantId, Date.parse(boundary.expires_at))).toBe(false)
+  })
+
+  it('a signed assertion for the wrong rpId is refused without satisfying or applying the decision', async () => {
+    const { grantId, approveUrl } = await expectRefused(await allow(admin))
+    const tap = await realTap(admin.env, adminAuthn, approveUrl, { sign: { hashRpId: 'other.example.test' } })
+    expect(tap.status).toBe(403)
+    expect(await tap.text()).toContain('rp_id')
+    expect(one<{ status: string }>('SELECT status FROM presence_grants WHERE id = ?', grantId)?.status).toBe('pending')
+    expect((await allow(admin, `presence_grant=${grantId}`)).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('the passkey page names the agent, squad and each approved parameter', async () => {
+    const { approveUrl, grantId } = await expectRefused(await json(admin, '/operators/delegate', {
+      agent_id: 'ag3', scope_type: 'squad', scope_id: 'S1', max_grant: 'member',
+    }))
+    const { momentsApp } = await import('../src/secure-moments/routes')
+    const page = await momentsApp.fetch(new Request(approveUrl), admin.env)
+    const body = await page.text()
+    expect(body).toContain('Agent Three (ag3)')
+    expect(body).toContain('Squad One (S1)')
+    expect(body).toContain('Max grant: member')
+    const row = one<{ fields_json: string; summary: string }>('SELECT fields_json, summary FROM presence_grants WHERE id = ?', grantId)!
+    for (const key of Object.keys(JSON.parse(row.fields_json))) {
+      const label = key.replace(/_/g, ' ').replace(/\bid\b/g, 'identifier')
+      expect(row.summary).toContain(`${label.charAt(0).toUpperCase()}${label.slice(1)}:`)
+    }
+  })
+
   it('a member with NO passkey is told to enrol one; no grant is filed and nothing is written', async () => {
     const other = await login('other@x.test', 'mem-other')
     setReauth('mem-other', fresh())
@@ -400,6 +445,38 @@ describe('every authority-widening path needs the passkey, and performs once it 
         call: (qs) => json(admin, '/operators/delegate', { agent_id: 'ag3', scope_type: 'squad', scope_id: 'S1', max_grant: 'member' }, qs),
       },
       {
+        kind: 'agent_membership_grant', ok: 201,
+        applied: () => count("SELECT COUNT(*) AS n FROM memberships WHERE agent_id = 'ag3' AND squad_id = 'S2'") === 1,
+        call: (qs) => json(admin, '/agents/ag3/memberships', { squad_id: 'S2', capability: 'member' }, qs, orgApp),
+      },
+      {
+        kind: 'channel_binding', ok: 201,
+        applied: () => count("SELECT COUNT(*) AS n FROM channel_bindings WHERE external_channel_id = 'room-1'") === 1,
+        call: (qs) => json(admin, '/bindings', { platform: 'telegram', external_channel_id: 'room-1', squad_id: 'S1', max_capability: 'member' }, qs, channelsAdminApp),
+      },
+      {
+        kind: 'im_settings_set', ok: 200,
+        setup: async () => {
+          h.sqlite.prepare("UPDATE users SET role = 'owner' WHERE email = 'admin@x.test'").run()
+          admin = await login('admin@x.test', 'mem-admin')
+        },
+        applied: () => count("SELECT COUNT(*) AS n FROM org_settings WHERE key = 'im_bot_username' AND value = 'decision_bot'") === 1,
+        call: (qs) => json(admin, '/admin/im-settings', { bot_username: 'decision_bot' }, qs),
+      },
+      {
+        kind: 'telegram_bind', ok: 201,
+        setup: () => {
+          h.sqlite.exec("INSERT INTO projects (id, slug, name, status) VALUES ('project-bind', 'bind', 'Bind project', 'active'); INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-bind', 'S1', 'write')")
+        },
+        applied: () => count("SELECT COUNT(*) AS n FROM invites WHERE member_id = 'mem-admin' AND project_id = 'project-bind'") === 1,
+        call: (qs) => json(admin, '/invites', { member_id: 'mem-admin', project_id: 'project-bind', squad_id: 'S1', capability: 'member', expires_in_seconds: 3600 }, qs, membersApp),
+      },
+      {
+        kind: 'gate_grant', ok: 201,
+        applied: () => count("SELECT COUNT(*) AS n FROM gate_grants WHERE capability = 'gate:hadi' AND principal_id = 'mem-other'") === 1,
+        call: (qs) => json(admin, '/grants', { capability: 'gate:hadi', principal_type: 'member', principal_id: 'mem-other' }, qs, gatesApp),
+      },
+      {
         kind: 'member_capability_grant', ok: 201, applied: () => count("SELECT COUNT(*) AS n FROM capabilities WHERE member_id = 'mem-plain' AND scope_type = 'squad' AND scope_id = 'S2'") === 1,
         call: (qs) => json(admin, '/members/mem-plain/capabilities', { action: 'grant', scope_type: 'squad', scope_id: 'S2', capability: 'member' }, qs, membersApp),
       },
@@ -458,10 +535,15 @@ describe('every authority-widening path needs the passkey, and performs once it 
     ]
   })
 
-  const KINDS_WITH_OWN_TESTS: PresenceDecisionKind[] = ['seat_attach', 'seat_release', 'seat_return_from_held']
+  const KINDS_WITH_OWN_TESTS: PresenceDecisionKind[] = ['seat_attach', 'seat_release', 'seat_return_from_held', 'seat_event_grant']
   /** Kinds whose route needs a different harness (the Cloudflare Access JWT); the test lives in that file and names the kind. */
   const KINDS_TESTED_ELSEWHERE: Partial<Record<PresenceDecisionKind, string>> = {
     access_seed_approve: 'tests/access-approve.test.ts', access_elevation_approve: 'tests/access-approve.test.ts',
+    oauth_consent: 'tests/agent-bound-oauth-consent.test.ts',
+    telegram_device_enrol: 'tests/human-presence-account.test.ts',
+    telegram_device_window: 'tests/human-presence-account.test.ts',
+    passkey_revoke: 'tests/human-presence-account.test.ts',
+    login_identity_revoke: 'tests/human-presence-account.test.ts',
   }
 
   for (const kind of PRESENCE_DECISION_KINDS) {
@@ -586,6 +668,79 @@ describe('every authority-widening path needs the passkey, and performs once it 
     expect(count("SELECT COUNT(*) AS n FROM presence_grants WHERE kind = 'task_verdict_approve'")).toBe(0)
   })
 
+  it('setup writes to the decision bot use the same im_settings_set confirmation', async () => {
+    h.sqlite.prepare("UPDATE users SET role = 'owner' WHERE email = 'admin@x.test'").run()
+    admin = await login('admin@x.test', 'mem-admin')
+    const call = (qs = '', channel = '123') => json(admin, '/setup/im', { provider: 'telegram', channel, bot_username: 'decision_bot' }, qs)
+    const pending = await expectRefused(await call())
+    expect(count("SELECT COUNT(*) AS n FROM org_settings WHERE key = 'im_bot_username'")).toBe(0)
+    expect((await realTap(admin.env, adminAuthn, pending.approveUrl)).status).toBe(200)
+    expect((await call(`presence_grant=${pending.grantId}`, '456')).status).toBe(403)
+    expect((await call(`presence_grant=${pending.grantId}`)).status).toBe(200)
+    expect(one<{ value: string }>("SELECT value FROM org_settings WHERE key = 'im_bot_username'")?.value).toBe('decision_bot')
+    expect((await call(`presence_grant=${pending.grantId}`)).status).toBe(403)
+  })
+
+  it('an older cookie without a D1 session binding never takes the bearer exemption', async () => {
+    const kv = admin.env.SESSIONS as unknown as { store: Map<string, string> }
+    for (const [key, raw] of kv.store) {
+      const record = JSON.parse(raw) as Record<string, unknown>
+      if (record.email !== 'admin@x.test') continue
+      delete record.loginIdentity
+      record.webSessionRegistered = false
+      kv.store.set(key, JSON.stringify(record))
+    }
+    const minted = await json(admin, '/members/mem-plain/tokens', { label: 'legacy-cookie' }, '', membersApp)
+    expect(minted.status).toBe(403)
+    expect(count("SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'legacy-cookie'")).toBe(0)
+  })
+
+  it('the JSON member token grant replays to the actual mounted API writer', async () => {
+    const api = new Hono().route('/api/members', membersApp)
+    const url = '/api/members/members/mem-plain/tokens'
+    const init = { method: 'POST', headers: { cookie: admin.cookie, origin: ORIGIN, 'content-type': 'application/json' }, body: JSON.stringify({ label: 'mounted' }) }
+    const r = await api.request(url, init, admin.env)
+    const pending = await expectRefused(r)
+    const grant = one<{ action_path: string; fields_json: string }>('SELECT action_path, fields_json FROM presence_grants WHERE id = ?', pending.grantId)!
+    expect(grant.action_path).toBe(url)
+    expect((await realTap(admin.env, adminAuthn, pending.approveUrl)).status).toBe(200)
+    const done = await api.request(`${grant.action_path}?presence_grant=${pending.grantId}`, { ...init, body: grant.fields_json }, admin.env)
+    expect(done.status).toBe(201)
+  })
+
+  it('the HTML member token form requires the same ceremony as the JSON mint', async () => {
+    const mint = (qs = '', channel = 'workspace') => form(admin, '/members/mem-plain/tokens', { label: 'console', channel }, qs)
+    const pending = await expectRefused(await mint())
+    expect(count("SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'console'")).toBe(0)
+    expect((await realTap(admin.env, adminAuthn, pending.approveUrl)).status).toBe(200)
+    expect((await mint(`presence_grant=${pending.grantId}`, 'im')).status).toBe(403)
+    const done = await mint(`presence_grant=${pending.grantId}`)
+    expect(done.status, await done.clone().text()).toBe(200)
+    expect(count("SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'console' AND channel = 'workspace'")).toBe(1)
+    expect((await mint(`presence_grant=${pending.grantId}`)).status).toBe(403)
+  })
+
+  it('a bearer minted behind presence can call gated JSON writers without another browser ceremony', async () => {
+    covered.add('seat_event_grant')
+    const mint = (qs = '') => json(admin, '/members/mem-admin/tokens', { label: 'issued-with-presence' }, qs, membersApp)
+    const refusal = await expectRefused(await mint())
+    expect(count("SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'issued-with-presence'")).toBe(0)
+    expect((await realTap(admin.env, adminAuthn, refusal.approveUrl)).status).toBe(200)
+    const minted = await mint(`presence_grant=${refusal.grantId}`)
+    expect(minted.status).toBe(201)
+    const { token: { raw: token } } = await minted.json() as { token: { raw: string } }
+    const grants = count('SELECT COUNT(*) AS n FROM presence_grants')
+    h.sqlite.prepare("INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, 'ag2', ?, 'Ed25519', 'mem-admin', ?)")
+      .run(TENANT, 'a'.repeat(43), Math.floor(Date.now() / 1000))
+    const result = await seatEventsApp.request('/grants', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ host_agent_id: 'ag2', agent_id: 'ag1', reason: 'presence-issued bearer' }),
+    }, admin.env)
+    expect(result.status, await result.clone().text()).toBe(200)
+    expect(count('SELECT COUNT(*) AS n FROM presence_grants')).toBe(grants)
+    expect(count("SELECT COUNT(*) AS n FROM seat_event_grants WHERE agent_id = 'ag1'")).toBe(1)
+  })
+
   it('a bearer-style / sessionless caller never reaches the gate with authority (the route refuses first)', async () => {
     const res = await dashboardApp.request('/agents/ag1/designation', {
       method: 'POST', headers: { origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ action: 'allow' }),
@@ -603,17 +758,4 @@ describe('every authority-widening path needs the passkey, and performs once it 
     }
   })
 
-  it('RATCHET: every dashboard/api route file that performs a widening write calls the gate', () => {
-    const root = join(__dirname, '..', 'src')
-    const gated = [
-      'dashboard/index.ts', 'dashboard/claim.ts', 'dashboard/connections.ts', 'dashboard/operators.ts', 'dashboard/account.ts',
-      'members/index.ts', 'auth/index.ts',
-    ]
-    for (const f of gated) expect(readFileSync(join(root, f), 'utf8'), f).toMatch(/presenceGate(Json)?\(/)
-    // decideAdmissionDirect('approve') is only reachable from the claim routes, which gate it; the connections approve route no longer calls it.
-    const approvers = readdirSync(join(root, 'dashboard')).filter((f) => f.endsWith('.ts') && /decideAdmissionDirect\([\s\S]{0,200}'approve'/.test(readFileSync(join(root, 'dashboard', f), 'utf8')))
-    expect(approvers).toEqual([])
-    expect(readFileSync(join(root, 'members/claim.ts'), 'utf8')).toMatch(/decision: 'approve'/)
-    expect(readFileSync(join(root, 'dashboard/claim.ts'), 'utf8')).toMatch(/presenceGate\(/)
-  })
 })

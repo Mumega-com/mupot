@@ -31,6 +31,7 @@ import type { Env } from '../types'
 import { isOwner, type AppEnv } from './wizard'
 import { SETTINGS_KEYS, getSetting, setSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, emptyState, type Html } from './ui'
+import { presenceGateJson } from '../approvals/gate'
 
 type ShellFn = (
   env: Env,
@@ -67,6 +68,8 @@ function saveScript(): Html {
               next.textContent = 'Next: connect your Telegram on My Account →';
               status.appendChild(next);
             }
+          } else if (data.error === 'human_presence_required' && typeof data.approve_url === 'string') {
+            window.location.assign(data.approve_url);
           } else {
             status.textContent = 'Failed: ' + (data.error || res.status);
             status.className = 'status-line err';
@@ -90,7 +93,7 @@ export async function imSettingsBody(env: Env): Promise<Html> {
     ${pageHeader({
       crumbs: 'Overview / IM settings',
       title: 'IM settings',
-      sub: 'The bot your members actually talk to for decisions — display only, grants no authority.',
+      sub: 'Choose the decision bot your members connect to.',
     })}
     ${sectionPanel({
       title: 'Decision bot username',
@@ -155,6 +158,14 @@ export function makeImSettingsApp(shell: ShellFn) {
     if (trimmed.length > 0 && !isValidBotUsername(trimmed)) {
       return c.json({ error: 'invalid_bot_username' }, 400)
     }
+    const denied = await presenceGateJson(c, c.get('auth').memberId, {
+      kind: 'im_settings_set',
+      subjectId: c.env.TENANT_SLUG,
+      params: { bot_username: trimmed },
+      summary: trimmed ? `Set the decision bot username to @${trimmed}` : 'Clear the decision bot username',
+      actionPath: '/admin/im-settings', encoding: 'json', returnPath: '/admin/im-settings',
+    })
+    if (denied) return denied
     await setSetting(c.env, SETTINGS_KEYS.imBotUsername, trimmed)
     return c.json({ ok: true, bot_username: trimmed || null })
   })

@@ -44,6 +44,7 @@ import { createDepartment, createSquad, createAgent } from './service'
 import { hasElevatedAction, recordGrantUsage, type ElevationGrantRecord } from '../auth/elevation'
 import { agentMustHoldMatchingGrant, authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
+import { browserSessionCaller, presenceGateJson } from '../approvals/gate'
 import {
   setAgentSquadAccess,
   type AgentAccessCapability,
@@ -419,6 +420,20 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     if (!hasCapability(grants, 'squad', brandSquadScope(squad), capability)) {
       return c.json({ error: 'cannot_grant_above_own_rank' }, 403)
     }
+  }
+
+  // Bearers are minted through a presence-gated credential door and cannot
+  // redeem a browser grant here. A web session is not a substitute for that
+  // ceremony, so its widening request must prove presence for these exact rows.
+  if (browserSessionCaller(c, auth)) {
+    const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+      kind: 'agent_membership_grant',
+      subjectId: agentId,
+      params: { agent_id: agentId, squad_id: squad.id, capability },
+      summary: 'Grant an agent membership in a squad',
+      actionPath: `/api/org/agents/${encodeURIComponent(agentId)}/memberships`, encoding: 'json', returnPath: `/agents/${encodeURIComponent(agentId)}`,
+    })
+    if (denied) return denied
   }
 
   const binding = await resolveAgentMemberBinding(c.env, agentId)

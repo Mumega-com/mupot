@@ -298,27 +298,28 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     expect((await me(env, cookie)).status).toBe(401)
   })
 
-  it('identity revoke stays retryable: a transient passkey failure never leaves the identity\'s sessions usable, and a retry finishes the cutoff', async () => {
+  it('identity revoke stays retryable: a transient Telegram-device cutoff failure never leaves the identity\'s sessions usable, and a retry finishes the cutoff', async () => {
     const env = makeEnv('owner@x.test')
     env.DB = harness.db
     await seedMember(env, 'm1', 'owner@x.test')
     const cookie = await devLogin(env)
     const listed = (await (await authApp.request('/identities', { headers: { cookie: `mupot_session=${cookie}` } }, env)).json()) as { identities: Array<{ id: string }> }
     const identityId = listed.identities[0]!.id
-    // A live passkey enrolled under this identity (the cutoff must reach it too).
+    // A live Telegram device enrolled under this identity: this dependent cutoff
+    // must remain retryable without bypassing the new passkey-last-key rule.
     harness.sqlite.prepare(
-      `INSERT INTO member_passkeys (id, tenant, member_id, login_identity_id, credential_id, public_key, sign_count, created_at)
-       VALUES ('pk1', ?, 'm1', ?, 'cred-1', 'spki', 0, datetime('now'))`,
+      `INSERT INTO tg_miniapp_devices (id, tenant, member_id, telegram_user_id, login_identity_id, enrolment_token_id, secret_sha256, created_at)
+       VALUES ('dev1', ?, 'm1', '123', ?, 'enrol-1', '${'a'.repeat(64)}', datetime('now'))`,
     ).run(TENANT, identityId)
 
-    // Inject a transient failure on the passkey UPDATE only (first call), as D1 might.
+    // Inject a transient failure on the device UPDATE only (first call), as D1 might.
     const realPrepare = harness.db.prepare.bind(harness.db)
     let failOnce = true
     const flaky = {
       ...harness.db,
       prepare: (sql: string) => {
         const stmt = realPrepare(sql)
-        if (failOnce && /UPDATE member_passkeys SET revoked_at/.test(sql)) {
+        if (failOnce && /UPDATE tg_miniapp_devices SET revoked_at/.test(sql)) {
           failOnce = false
           return { ...stmt, bind: (...a: unknown[]) => ({ ...stmt.bind(...a), run: async () => { throw new Error('D1_ERROR: transient') } }) }
         }
@@ -331,13 +332,13 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     env.DB = harness.db
     // Even though the call failed, the sessions bound to the identity are already dead (sessions are cut first).
     expect((await me(env, cookie)).status).toBe(401)
-    expect(harness.sqlite.prepare("SELECT revoked_at FROM member_passkeys WHERE id = 'pk1'").get()).toEqual({ revoked_at: null })
+    expect(harness.sqlite.prepare("SELECT revoked_at FROM tg_miniapp_devices WHERE id = 'dev1'").get()).toEqual({ revoked_at: null })
 
     // A retry (identity already revoked) still runs the dependent cutoff and finishes it.
     // (the revoked identity cannot sign in again, so the retry goes through the same chokepoint the route calls)
     const retry = await revokeLoginIdentity(env, TENANT, 'm1', identityId)
     expect(retry.revoked).toBe(false)
-    expect((harness.sqlite.prepare("SELECT revoked_at FROM member_passkeys WHERE id = 'pk1'").get() as { revoked_at: string | null }).revoked_at).not.toBeNull()
+    expect((harness.sqlite.prepare("SELECT revoked_at FROM tg_miniapp_devices WHERE id = 'dev1'").get() as { revoked_at: string | null }).revoked_at).not.toBeNull()
   })
 
   it('a member can NEVER revoke a DIFFERENT member\'s identity by naming its id', async () => {

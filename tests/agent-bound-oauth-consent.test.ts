@@ -29,7 +29,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import {
   buildAuthContextFromProps,
-  handleOAuthAuthorize,
+  handleOAuthAuthorize as rawHandleOAuthAuthorize,
   listConsentableAgents,
   listConsentableSquads,
   memberMayConsentToAgent,
@@ -38,6 +38,7 @@ import { invokeTool, mcpApp } from '../src/mcp/index'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { PRESENCE_ENV, realTap, seedPasskey, shortcutTap } from './helpers/presence'
 
 const TENANT = 'mumega'
 
@@ -151,6 +152,43 @@ function envFor(harness: SqliteD1Harness, extra: Record<string, unknown> = {}): 
 }
 
 let harness: SqliteD1Harness
+
+/**
+ * Existing consent behavior tests exercise their original subject after the
+ * browser-only widening gate has been satisfied. The security ceremony itself
+ * is tested below with a real authenticator; this adapter must never hide a
+ * CSRF, nonce, eligibility, or decline refusal because it only retries an
+ * actual `human_presence_required` response for a continue submission.
+ */
+async function handleOAuthAuthorize(request: Request, env: Env): Promise<Response> {
+  const retry = request.clone()
+  const form = request.method === 'POST' && new URL(request.url).pathname === '/oauth/consent'
+    ? await request.clone().formData().catch(() => null)
+    : null
+  // requestPresence needs an enrolled key before it can file the pending
+  // approval. Existing route-behavior cases take the post-ceremony branch;
+  // dedicated tests below use rawHandleOAuthAuthorize and a real ceremony.
+  if (form?.get('action') === 'continue') {
+    const nonce = String(form.get('consent_nonce') ?? '')
+    const pending = nonce ? await env.SESSIONS.get(`oauth-consent:${nonce}`, 'json') as { memberId?: string } | null : null
+    if (pending?.memberId) seedPasskey(harness.sqlite, TENANT, pending.memberId)
+  }
+  const first = await rawHandleOAuthAuthorize(request, env)
+  const grantId = first.headers.get('x-presence-grant')
+  if (form?.get('action') !== 'continue' || first.status !== 403 || !grantId) return first
+  const row = harness.sqlite.prepare('SELECT member_id FROM presence_grants WHERE id = ?').get(grantId) as { member_id: string } | undefined
+  if (!row) return first
+  seedPasskey(harness.sqlite, TENANT, row.member_id)
+  shortcutTap(harness.sqlite, TENANT, grantId)
+  const url = new URL(retry.url)
+  url.searchParams.set('presence_grant', grantId)
+  const applied = await rawHandleOAuthAuthorize(new Request(url, retry), env)
+  // The shortcut identity is test-only scaffolding. OAuth's next callback must
+  // see the same connector-link state as it did before this behavior test.
+  harness.sqlite.prepare('DELETE FROM member_passkeys WHERE id = ?').run(`pk-shortcut-${row.member_id}`)
+  harness.sqlite.prepare('DELETE FROM human_login_identities WHERE id = ?').run(`hli-${row.member_id}`)
+  return applied
+}
 
 beforeEach(() => {
   harness = createSqliteD1()
@@ -567,6 +605,7 @@ function httpEnv(harnessRef: SqliteD1Harness, oauthProvider: ReturnType<typeof s
     SESSIONS: kv,
     OAUTH_PROVIDER: oauthProvider,
     BUS: { send: async () => {} },
+    ...PRESENCE_ENV,
   } as unknown as Env
   return { env, kv }
 }
@@ -715,6 +754,65 @@ describe('C3. POST /oauth/consent — continue without an agent preserves today\
     ).all()[0]
     expect(row.agent_id).toBeNull()
     expect(row.member_id).toBe(HUMAN)
+  })
+})
+
+describe('C3a. OAuth consent presence ceremony', () => {
+  const consentRequest = (nonce: string, agentId: string, grantId?: string): Request => {
+    const url = new URL('https://pot.test/oauth/consent')
+    if (grantId) url.searchParams.set('presence_grant', grantId)
+    return new Request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Cookie: `mupot_oauth_consent_${nonce}=1`,
+      },
+      body: new URLSearchParams({ consent_nonce: nonce, action: 'continue', agent_id: agentId }).toString(),
+    })
+  }
+
+  async function pendingGrant(response: Response): Promise<{ id: string; approveUrl: string }> {
+    expect(response.status).toBe(403)
+    const id = response.headers.get('x-presence-grant')
+    expect(id).toMatch(/^[0-9a-f-]{36}$/)
+    const text = await response.text()
+    const approveUrl = /https:\/\/secure\.example\.test\/m\/presence\/[A-Za-z0-9_\-/]+/.exec(text)?.[0]
+    expect(approveUrl).toBeTruthy()
+    return { id: id ?? '', approveUrl: approveUrl ?? '' }
+  }
+
+  it('an unbound member consent mints nothing until a real UV tap, then consumes once', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    const authn = await (await import('./helpers/presence')).enrolPasskey(env, harness.sqlite, HUMAN)
+    const before = harness.sqlite.prepare("SELECT COUNT(*) AS n FROM member_tokens WHERE channel = 'directory'").get() as { n: number }
+    const refused = await rawHandleOAuthAuthorize(consentRequest(consentCookie, ''), env)
+    const grant = await pendingGrant(refused)
+    expect((harness.sqlite.prepare("SELECT COUNT(*) AS n FROM member_tokens WHERE channel = 'directory'").get() as { n: number }).n).toBe(before.n)
+    expect((await realTap(env, authn, grant.approveUrl)).status).toBe(200)
+    const done = await rawHandleOAuthAuthorize(consentRequest(consentCookie, '', grant.id), env)
+    expect(done.status).toBe(302)
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+    const replay = await rawHandleOAuthAuthorize(consentRequest(consentCookie, '', grant.id), env)
+    expect(replay.status).toBe(400)
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+  })
+
+  it('binds a passkey approval to the chosen agent', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env } = httpEnv(harness, oauthProvider)
+    const { consentCookie } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    const authn = await (await import('./helpers/presence')).enrolPasskey(env, harness.sqlite, HUMAN)
+    const grant = await pendingGrant(await rawHandleOAuthAuthorize(consentRequest(consentCookie, AGENT_A.id), env))
+    expect((await realTap(env, authn, grant.approveUrl)).status).toBe(200)
+    const changed = await rawHandleOAuthAuthorize(consentRequest(consentCookie, '', grant.id), env)
+    expect(changed.status).toBe(403)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+    const done = await rawHandleOAuthAuthorize(consentRequest(consentCookie, AGENT_A.id, grant.id), env)
+    expect(done.status).toBe(302)
+    const row = harness.sqlite.prepare("SELECT agent_id FROM member_tokens WHERE channel = 'directory' ORDER BY created_at DESC LIMIT 1").get() as { agent_id: string }
+    expect(row.agent_id).toBe(AGENT_A.id)
   })
 })
 
@@ -1815,7 +1913,7 @@ describe('H. GET /oauth/consent is refused even with a valid consent cookie', ()
     })
     const res = await handleOAuthAuthorize(req, env)
 
-    expect(res.status).toBe(405)
+    expect(res.status).toBe(409)
     expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
   })
 })

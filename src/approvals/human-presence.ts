@@ -11,7 +11,8 @@
 // Proof (b) (a decision arriving from the member's bound private Telegram chat) already exists as its own channel
 // (src/im, src/approval-bot, the harness-attested human_origin on task_verdict) and is left exactly as it is.
 //
-// Decisions that REDUCE authority (deny, revoke, hold, detach, stop, clear) never call into this module.
+// Reducing authority normally needs no presence. Removing a passkey is an exception: it could reopen first enrolment,
+// so it requires a different live passkey and must preserve at least one live passkey.
 //
 // POLICY FLOOR: `approval.human-presence-required` has the same value at every policy level.
 // TODO(#2216): when src/policy/registry.ts lands, register APPROVAL_HUMAN_PRESENCE_FLOOR there as a FLOOR and make
@@ -54,6 +55,17 @@ export const PRESENCE_DECISION_KINDS = [
   'elevation_approve', // POST /auth/elevation/requests/:id/decide decision=approve
   'access_seed_approve', // POST /approve/seed/:id decision=approve, on the Cloudflare Access page
   'access_elevation_approve', // POST /approve/elevation/:id decision=approve, on the Cloudflare Access page
+  'oauth_consent', // OAuth member/agent grant consent
+  'telegram_bind', // bind a private Telegram channel to a member
+  'telegram_device_enrol', // enrol a trusted Telegram device
+  'telegram_device_window', // lengthen a trusted-device window
+  'passkey_revoke', // remove a passkey using another live passkey
+  'login_identity_revoke', // remove an identity and its passkeys
+  'gate_grant', // grant verdict authority
+  'agent_membership_grant', // add or widen an agent membership
+  'channel_binding', // add or widen a channel binding
+  'seat_event_grant', // grant fleet event delivery
+  'im_settings_set', // widen IM routing settings
   'passkey_enrol', // POST /account/passkey/enrol when the member already holds a passkey
 ] as const
 export type PresenceDecisionKind = (typeof PRESENCE_DECISION_KINDS)[number]
@@ -63,7 +75,7 @@ export const PRESENCE_PENDING_TTL_MS = 10 * 60 * 1000
 export const PRESENCE_REDEEM_TTL_MS = 5 * 60 * 1000
 export const PRESENCE_MAX_PENDING_PER_MEMBER = 20
 
-export type PresenceValue = string | number | boolean | readonly string[]
+export type PresenceValue = string | number | boolean | null | readonly string[]
 
 /** The decision, exactly as the route will perform it. `params` are the fields that are reposted and digested. */
 export interface PresenceSpec {
@@ -112,6 +124,32 @@ export type PresenceRequest =
   | { ok: true; grantId: string; approveUrl: string }
   | { ok: false; error: 'human_presence_unavailable' | 'passkey_enrolment_required' | 'too_many_pending' }
 
+/** Show every bound field on the passkey page, including optional/default choices. Resolve entity names server-side. */
+export async function presenceSummary(env: Env, spec: PresenceSpec): Promise<string> {
+  const details: string[] = []
+  for (const [key, value] of Object.entries(spec.params)) {
+    let shown = Array.isArray(value) ? value.join(', ') || '(none)' : String(value)
+    if (typeof value === 'string' && value) {
+      if (key === 'agent_id' || key === 'agent' || key.endsWith('_agent_id')) {
+        const row = await env.DB.prepare('SELECT name FROM agents WHERE id = ?1').bind(value).first<{ name: string }>()
+        if (row) shown = `${row.name} (${value})`
+        else if (value === '__harness__') shown = 'This connected app (harness)'
+        else if (value === '__bootstrap__') shown = 'Create your first agent'
+      } else if (key === 'squad_id' || key.endsWith('_squad_id') || (key === 'scope_id' && spec.params.scope_type === 'squad')) {
+        const row = await env.DB.prepare('SELECT name FROM squads WHERE id = ?1').bind(value).first<{ name: string }>()
+        if (row) shown = `${row.name} (${value})`
+      } else if (key === 'member_id' || key === 'owner_member_id') {
+        const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)')
+          .bind(value, env.TENANT_SLUG).first<{ display_name: string }>()
+        if (row) shown = `${row.display_name} (${value})`
+      }
+    }
+    const label = key.replace(/_/g, ' ').replace(/\bid\b/g, 'identifier')
+    details.push(`${label.charAt(0).toUpperCase()}${label.slice(1)}: ${shown || '(empty)'}`)
+  }
+  return `${spec.summary}${details.length ? ` — ${details.join('; ')}` : ''}`
+}
+
 /**
  * File a pending grant for exactly this decision and return the secure-host link. Fails CLOSED: with secure moments off or
  * misconfigured there is no way to prove presence, so the widening decision is refused rather than allowed. A member with no
@@ -129,7 +167,7 @@ export async function requestPresence(env: Env, memberId: string, spec: Presence
        (id, tenant, member_id, kind, subject_id, params_sha256, summary, action_path, fields_json, encoding, return_path, link_token_sha256, status, created_at, expires_at)
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', ?13, ?14
       WHERE (SELECT COUNT(*) FROM presence_grants WHERE tenant = ?2 AND member_id = ?3 AND status = 'pending' AND expires_at > ?13) < ?15`,
-  ).bind(id, env.TENANT_SLUG, memberId, spec.kind, spec.subjectId, digest, spec.summary.slice(0, 600), spec.actionPath, canonicalJson(spec.params),
+  ).bind(id, env.TENANT_SLUG, memberId, spec.kind, spec.subjectId, digest, await presenceSummary(env, spec), spec.actionPath, canonicalJson(spec.params),
     spec.encoding, spec.returnPath, await tokenHash(token), nowIso, new Date(nowMs + PRESENCE_PENDING_TTL_MS).toISOString(), PRESENCE_MAX_PENDING_PER_MEMBER).run()
   if (r.meta.changes !== 1) return { ok: false, error: 'too_many_pending' }
   const url = momentsPresenceUrl(env, id, token)
@@ -163,7 +201,9 @@ export async function satisfyPresenceGrant(
         AND EXISTS (SELECT 1 FROM member_passkeys p
                       JOIN human_login_identities i
                         ON i.id = p.login_identity_id AND i.tenant = p.tenant AND i.member_id = p.member_id AND i.revoked_at IS NULL
-                     WHERE p.id = ?5 AND p.tenant = ?2 AND p.member_id = ?4 AND p.revoked_at IS NULL)`,
+                     WHERE p.id = ?5 AND p.tenant = ?2 AND p.member_id = ?4 AND p.revoked_at IS NULL
+                       AND (presence_grants.kind != 'passkey_revoke' OR p.id != presence_grants.subject_id)
+                       AND (presence_grants.kind != 'login_identity_revoke' OR p.login_identity_id != presence_grants.subject_id))`,
   ).bind(input.id, env.TENANT_SLUG, nowIso, input.memberId, input.passkeyId, await tokenHash(input.token),
     new Date(nowMs + PRESENCE_REDEEM_TTL_MS).toISOString()).run()
   return r.meta.changes === 1
@@ -184,7 +224,9 @@ export async function redeemPresence(env: Env, memberId: string, spec: Pick<Pres
         AND EXISTS (SELECT 1 FROM member_passkeys p
                       JOIN human_login_identities i
                         ON i.id = p.login_identity_id AND i.tenant = p.tenant AND i.member_id = p.member_id AND i.revoked_at IS NULL
-                     WHERE p.id = presence_grants.satisfied_passkey_id AND p.tenant = ?2 AND p.member_id = ?4 AND p.revoked_at IS NULL)`,
+                     WHERE p.id = presence_grants.satisfied_passkey_id AND p.tenant = ?2 AND p.member_id = ?4 AND p.revoked_at IS NULL
+                       AND (presence_grants.kind != 'passkey_revoke' OR p.id != presence_grants.subject_id)
+                       AND (presence_grants.kind != 'login_identity_revoke' OR p.login_identity_id != presence_grants.subject_id))`,
   ).bind(grantId, env.TENANT_SLUG, nowIso, memberId, spec.kind, spec.subjectId, await presenceDigest(memberId, spec)).run()
   return r.meta.changes === 1
 }

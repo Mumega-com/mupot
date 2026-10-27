@@ -2,8 +2,13 @@
 // before its write. No UI and no dashboard imports (the auth, members and account apps use it too); the dashboard form pages
 // wrap it in src/dashboard/presence.ts. See src/approvals/human-presence.ts for the rule and the grant lifecycle.
 import type { Context } from 'hono'
-import type { Env } from '../types'
+import type { AuthContext, Env } from '../types'
 import { redeemPresence, requestPresence, type PresenceSpec } from './human-presence'
+
+/** A legacy cookie lacking a D1 session binding is still a browser credential, never a bearer exemption. */
+export function browserSessionCaller(c: Context, auth: AuthContext): boolean {
+  return !!auth.webSessionIdHash || /(?:^|;\s*)mupot_session=/.test(c.req.header('cookie') ?? '')
+}
 
 export type PresenceRefusal = 'human_presence_required' | 'human_presence_unavailable' | 'passkey_enrolment_required' | 'too_many_pending' | 'presence_grant_invalid'
 

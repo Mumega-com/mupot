@@ -1,136 +1,48 @@
-import { describe, expect, it } from 'vitest'
-import { membersApp } from '../src/members'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard'
+import { membersApp } from '../src/members'
 import { assertNoRawToken } from './helpers/assert-no-raw-token'
+import { applyAllMigrations } from './helpers/migrations'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import type { Env } from '../src/types'
 
-function makeEnv(options: {
-  publicOrigin?: string
-  writes?: string[]
-} = {}): Env {
-  const session = JSON.stringify({
-    userId: 'owner-user',
-    email: 'owner@example.test',
-    role: 'owner',
-    createdAt: '2026-07-10T00:00:00.000Z',
-  })
+const TENANT = 'test-tenant'
+const ORIGIN = 'https://pot.example'
+let harness: SqliteD1Harness
 
-  const db = {
-    prepare(sql: string) {
-      const statement = {
-        // Exposed so `batch()` below can inspect which statements it was
-        // handed — acceptInvite's own token insert goes through
-        // `env.DB.batch(writes)`, never a standalone `.run()`, so a mock that
-        // only watched `.run()` calls (as this one used to) would never see
-        // it and the `writes` assertion below would pass vacuously.
-        __sql: sql,
-        bind(..._values: unknown[]) {
-          return statement
-        },
-        async first<T>() {
-          if (sql.includes('SELECT status FROM members') && sql.includes('lower(email)')) {
-            return { status: 'active' } as T
-          }
-          if (sql.includes('FROM invites')) {
-            return {
-              id: 'invite-1',
-              email: 'operator@example.test',
-              department_id: null,
-              project_id: null,
-              squad_id: null,
-              pairing_hash: null,
-              pairing_expires_at: null,
-              capability: 'admin',
-              invited_by: 'owner-user',
-              accepted_at: null,
-              created_at: '2026-07-10T00:00:00.000Z',
-            } as T
-          }
-          if (sql.includes('SELECT id, status FROM members')) return { id: 'member-1', status: 'active' } as T
-          // mupot#1551 slice 1: acceptInvite's new inviter re-check
-          // (INVITER_ACTIVE_MEMBER_SQL, src/members/index.ts) — this
-          // fixture's invite is invited_by: 'owner-user', so the re-check
-          // must resolve it to a live, active row or the previously-201
-          // mint below would now 409. Matched on a substring unique to that
-          // query so it can never collide with the `lower(email)` branch
-          // below.
-          if (sql.includes('FROM members') && sql.includes("status = 'active'")) {
-            return { id: 'owner-user' } as T
-          }
-          if (sql.includes('SELECT id, display_name FROM members')) {
-            return { id: 'member-1', display_name: 'Operator' } as T
-          }
-          // mupot#1411 P0-A round 4 (kasra-review, 2026-09-15):
-          // targetMaxRankAcrossScopes now also folds in the target's
-          // role-plane rank via targetLegacyRoleRank, bridged by email
-          // (members.email -> users.role) — a new `.first()` this stub must
-          // declare. `email: null` = "no bridge, no role-plane standing",
-          // matching this test's [] capability-grants fixture (target holds
-          // nothing anywhere; its subject is response headers, not authz).
-          if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
-          throw new Error(`unexpected first query: ${sql}`)
-        },
-        // mupot#1411 P0-1 (kasra-review, 2026-09-15): the mint route's
-        // targetRankCeiling now consults the TARGET's standing across EVERY
-        // scope (targetMaxRankAcrossScopes, via the SAME resolveCapabilities
-        // query every capability check reuses), not one (scope_type,
-        // scope_id) row via `.first()` — so the ceiling's own lookup is now
-        // an `.all()` call. This stub is an exact-sequence allowlist, so the
-        // new query shape has to be declared here or every mint 500s.
-        //
-        // Returning [] = "target holds no grant anywhere", which is the
-        // right fixture for THIS test: its subject is caching/referrer
-        // headers on a successful mint, not authorization. The ceiling
-        // itself is covered against the real migration chain in
-        // tests/members-agent-capability-route.test.ts.
-        async all<T>() {
-          if (sql.includes('SELECT member_id, scope_type, scope_id, capability') && sql.includes('FROM capabilities')) {
-            // mupot#1551 slice 1: this same resolveCapabilities query now
-            // also runs for the invite's INVITER ('owner-user') inside
-            // currentMemberRankOnScope, in addition to the pre-existing
-            // mint-ceiling TARGET lookup this fixture was built for. bind()
-            // above is a no-op (args discarded), so both calls hit this one
-            // branch regardless of which member id they asked for — an
-            // org-admin row here satisfies the inviter re-check (the
-            // fixture's invite is capability:'admin' on org scope) without
-            // changing the mint-ceiling test's own outcome: the mint actor
-            // is a session-role 'owner' there (rank 5), which this grant
-            // (rank 4) still never exceeds.
-            return { results: [{ member_id: 'owner-user', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
-          }
-          throw new Error(`unexpected all query: ${sql}`)
-        },
-        async run() {
-          if (sql.includes('UPDATE invites SET accepted_at')) return { meta: { changes: 1 } }
-          if (sql.includes('INSERT INTO member_tokens')) {
-            options.writes?.push(sql)
-            return { meta: { changes: 1 } }
-          }
-          throw new Error(`unexpected run query: ${sql}`)
-        },
-      }
-      return statement
-    },
-    async batch(statements: { __sql: string }[]) {
-      for (const stmt of statements) {
-        if (stmt.__sql.includes('INSERT INTO member_tokens')) options.writes?.push(stmt.__sql)
-      }
-      return statements.map(() => ({ meta: { changes: 1 } }))
-    },
-  }
-
+function sessions() {
+  const values = new Map<string, string>()
   return {
-    TENANT_SLUG: 'test-tenant',
-    BRAND: 'Test',
-    OAUTH_PROVIDER: 'google',
-    PUBLIC_ORIGIN: options.publicOrigin,
-    DB: db,
-    SESSIONS: {
-      get: async (key: string) => (key === 'sess:owner-session' ? session : null),
-      put: async () => undefined,
-      delete: async () => undefined,
-    },
+    get: async (key: string) => values.get(key) ?? null,
+    put: async (key: string, value: string) => { values.set(key, value) },
+    delete: async (key: string) => { values.delete(key) },
+  }
+}
+
+function envFor(publicOrigin: string | undefined = ORIGIN): Env {
+  return {
+    DB: harness.db, TENANT_SLUG: TENANT, BRAND: 'Test',
+    LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'owner@example.test', SESSIONS: sessions(),
+    OAUTH_KV: { get: async () => null, put: async () => undefined },
+    VEC: { query: async () => ({ matches: [] }) }, BUS: { send: async () => {} },
+    BLOBS: {}, AI: {}, AGENT: {}, SQUAD: {}, ...PRESENCE_ENV, PUBLIC_ORIGIN: publicOrigin,
   } as unknown as Env
+}
+
+async function login(env: Env): Promise<string> {
+  const response = await authApp.request('/dev-login', {}, env)
+  expect(response.status).toBe(302)
+  const cookie = /mupot_session=([^;]+)/.exec(response.headers.get('set-cookie') ?? '')?.[1]
+  if (!cookie) throw new Error('no authenticated browser session')
+  return `mupot_session=${cookie}`
+}
+
+function tokenCount(memberId?: string): number {
+  const sql = memberId ? 'SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?' : 'SELECT COUNT(*) AS n FROM member_tokens'
+  const row = memberId ? harness.sqlite.prepare(sql).get(memberId) : harness.sqlite.prepare(sql).get()
+  return Number((row as { n: number }).n)
 }
 
 function expectSensitiveTokenHeaders(res: Response) {
@@ -138,97 +50,76 @@ function expectSensitiveTokenHeaders(res: Response) {
   expect(res.headers.get('referrer-policy')).toBe('no-referrer')
 }
 
-describe('member token responses', () => {
-  it('mints NO bearer when an invite is redeemed over the public JSON route (mupot#1551)', async () => {
-    const writes: string[] = []
-    const res = await membersApp.request(
-      '/invites/invite-1/accept',
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ display_name: 'Operator' }),
-      },
-      makeEnv({ writes }),
-    )
+beforeEach(() => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  harness.sqlite.exec(`
+    INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('owner-member', 'owner@example.test', 'Owner', 'active', '${TENANT}'),
+      ('member-1', 'operator@example.test', 'Operator', 'active', '${TENANT}');
+    INSERT INTO users (id, email, role) VALUES ('owner-user', 'owner@example.test', 'owner');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+      ('owner-dept-admin', 'owner-member', 'department', 'dept-1', 'admin');
+    INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id)
+      VALUES ('identity-owner', '${TENANT}', 'local-test', 'owner@example.test', 'owner@example.test', 'owner-member');
+    INSERT INTO invites (id, email, department_id, capability, invited_by)
+      VALUES ('invite-1', 'new-operator@example.test', 'dept-1', 'member', 'owner-member');
+  `)
+  seedPasskey(harness.sqlite, TENANT, 'owner-member')
+})
 
-    expect(res.status).toBe(201)
+afterEach(() => harness.close())
+
+describe('member token responses', () => {
+  it('mints no bearer when a public invite is redeemed', async () => {
+    const res = await membersApp.request('/invites/invite-1/accept', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ display_name: 'New Operator' }),
+    }, envFor())
+    expect(res.status, await res.clone().text()).toBe(201)
     expectSensitiveTokenHeaders(res)
-    // mupot#1551 (Athena's ruling, 2026-09-26): this route no longer hands a
-    // raw token back at all — an unauthenticated, id-only redemption must
-    // never mint a bearer for an email nobody has proven they control.
-    // allowedInBody: 0 (the default) — a regression here means a bearer
-    // leaked back into this response.
     await assertNoRawToken(res)
-    const body = (await res.json()) as { member_id: string; token: unknown; next: string }
+    const body = await res.json() as { member_id: string; token: unknown; next: string }
     expect(body.token).toBeNull()
     expect(body.next).toBe('sign_in')
-    // `writes` only ever records an `INSERT INTO member_tokens` statement
-    // handed to `db.batch(...)` (see makeEnv's `batch()` stub above, which
-    // inspects every statement in the array it's called with) — its length
-    // IS the member_tokens row count for this accept. Zero here is the
-    // table-count assertion; the mock has no real member_tokens table to
-    // COUNT(*) against.
-    expect(writes).toHaveLength(0)
+    expect(tokenCount(body.member_id)).toBe(0)
   })
 
   it('prevents caching or referrer leakage when an administrator mints a token', async () => {
-    const res = await membersApp.request(
-      '/members/member-1/tokens',
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          cookie: 'mupot_session=owner-session',
-        },
-        body: JSON.stringify({ label: 'host', channel: 'workspace' }),
-      },
-      makeEnv(),
-    )
-
-    expect(res.status).toBe(201)
+    const env = envFor()
+    const cookie = await login(env)
+    const res = await throughGate(harness.sqlite, TENANT, (qs) => membersApp.request(`/members/member-1/tokens${qs ? `?${qs}` : ''}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie }, body: JSON.stringify({ label: 'host', channel: 'workspace' }),
+    }, env))
+    expect(res.status, await res.clone().text()).toBe(201)
     expectSensitiveTokenHeaders(res)
     expect(((await res.json()) as { token: { raw: string } }).token.raw).toMatch(/^mupot_/)
+    expect(tokenCount('member-1')).toBe(1)
   })
 
-  it('pins every rendered endpoint despite a malicious request host', async () => {
-    const writes: string[] = []
-    const res = await dashboardApp.fetch(
-      new Request('https://evil.example/members/member-1/tokens', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded',
-          cookie: 'mupot_session=owner-session',
-          origin: 'https://evil.example',
-        },
-        body: new URLSearchParams({ label: 'host', channel: 'workspace' }),
-      }),
-      makeEnv({ publicOrigin: 'https://pot.example', writes }),
-    )
-
-    expect(res.status).toBe(200)
+  it('pins rendered endpoints despite a malicious request host', async () => {
+    const env = envFor(ORIGIN)
+    const cookie = await login(env)
+    const res = await throughGate(harness.sqlite, TENANT, (qs) => dashboardApp.fetch(new Request(`https://evil.example/members/member-1/tokens${qs ? `?${qs}` : ''}`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', cookie, origin: 'https://evil.example' },
+      body: new URLSearchParams({ label: 'host', channel: 'workspace' }),
+    }), env))
+    expect(res.status, await res.clone().text()).toBe(200)
     const body = await res.text()
     expect(body).toContain('https://pot.example/mcp')
     expect(body).not.toContain('evil.example')
-    expect(writes).toHaveLength(1)
+    expect(tokenCount('member-1')).toBe(1)
   })
 
   it('fails before minting when PUBLIC_ORIGIN is absent', async () => {
-    const writes: string[] = []
-    const res = await dashboardApp.fetch(
-      new Request('https://evil.example/members/member-1/tokens', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded',
-          cookie: 'mupot_session=owner-session',
-          origin: 'https://evil.example',
-        },
-        body: new URLSearchParams({ label: 'host', channel: 'workspace' }),
-      }),
-      makeEnv({ writes }),
-    )
-
-    expect(res.status).toBe(503)
+    const env = envFor('')
+    const cookie = await login(env)
+    const res = await throughGate(harness.sqlite, TENANT, (qs) => dashboardApp.fetch(new Request(`https://evil.example/members/member-1/tokens${qs ? `?${qs}` : ''}`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', cookie, origin: 'https://evil.example' },
+      body: new URLSearchParams({ label: 'host', channel: 'workspace' }),
+    }), env))
+    expect(res.status, await res.clone().text()).toBe(503)
     expect(await res.text()).toContain('public origin')
-    expect(writes).toEqual([])
+    expect(tokenCount('member-1')).toBe(0)
   })
 })

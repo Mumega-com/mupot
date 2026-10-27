@@ -460,6 +460,23 @@ describe('enrolment', () => {
     expect(res.map((r) => r.status).sort()).toEqual([200, 409])
     expect(count('member_passkeys')).toBe(1)
   })
+  it('a stale first-enrol link cannot add a passkey after history changes', async () => {
+    const stale = await mintEnrolmentToken(env, 'mem-owner', identities.owner)
+    const staleId = one<{ id: string }>('SELECT id FROM passkey_enrolment_tokens WHERE token_sha256 = ?', await tokenHash(stale.token))?.id
+    await enrol('mem-owner', identities.owner)
+    // Model two first-link mints racing before either one observes history.
+    harness.sqlite.prepare('UPDATE passkey_enrolment_tokens SET consumed_at = NULL WHERE id = ?').run(staleId)
+    const page = await hit(`/m/enrol/${stale.token}`)
+    expect(page.status).toBe(200)
+    const csrf = csrfOf(await page.text())
+    const opts = await jbody(await hit(`/m/enrol/${stale.token}/options`, { method: 'POST', json: { csrf } }))
+    const a = await SoftAuthenticator.create()
+    const credential = await a.register({ rpId: HOST, origin: ORIGIN, challenge: opts.publicKey?.challenge ?? '' })
+    const finish = await hit(`/m/enrol/${stale.token}/finish`, { method: 'POST', json: { csrf, credential } })
+    expect(finish.status).toBe(409)
+    expect(await finish.text()).toContain('already has passkey history')
+    expect(count('member_passkeys', "member_id = 'mem-owner'")).toBe(1)
+  })
   it('a challenge minted for one enrolment link cannot finish another member\'s link', async () => {
     const { token: tOwner } = await mintEnrolmentToken(env, 'mem-owner', identities.owner)
     const { token: tPlain } = await mintEnrolmentToken(env, 'mem-plain', identities.plain)
@@ -1154,28 +1171,26 @@ describe('round 2 P1-1: nothing refusable after the link is consumed', () => {
   })
 })
 
-describe('round 2 P1-2: a passkey cannot outlive the levers that cut a human off', () => {
+describe('passkey lifecycle after identity and session revocation', () => {
   const live = (): number => count('member_passkeys', 'revoked_at IS NULL')
-  it('revoking the login identity revokes its passkeys, and the passkey then decides nothing (seed)', async () => {
+  it('revoking a login identity refuses in-band when it would remove the final effective passkey', async () => {
     const owner = await enrol('mem-owner', identities.owner)
     const m = await fileSeed()
     expect(live()).toBe(1)
-    expect((await revokeLoginIdentity(env, TENANT, 'mem-owner', identities.owner)).revoked).toBe(true)
-    expect(live()).toBe(0)
-    const res = await decide(m, owner, { decision: 'approve' })
-    expect(res.status).toBe(403)
-    expect(status(m.id)).toBe('pending')
-    expect(count('projects')).toBe(0)
+    const revoked = await revokeLoginIdentity(env, TENANT, 'mem-owner', identities.owner)
+    expect(revoked.revoked).toBe(false)
+    expect(revoked.passkeyRecoveryRequired).toBe(true)
+    expect(live()).toBe(1)
+    expect((await decide(m, owner, { decision: 'approve' })).status).toBe(200)
   })
-  it('sign-out-all-devices (both variants) revokes the member\'s passkeys; other members keep theirs', async () => {
+  it('sign-out-all-devices leaves passkeys enrolled; other members remain independent', async () => {
     await enrol('mem-owner', identities.owner)
     await enrol('mem-sqadmin', identities.sqadmin)
     await revokeAllWebSessions(env, TENANT, 'mem-owner', 'human_revoke_all', 'some-current-session')
-    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(0)
+    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(1)
     expect(count('member_passkeys', "member_id = 'mem-sqadmin' AND revoked_at IS NULL")).toBe(1)
-    await enrol('mem-owner', identities.owner)
     await revokeAllWebSessions(env, TENANT, 'mem-owner', 'human_revoke_all')
-    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(0)
+    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(1)
   })
   it('the decision itself requires a live identity, independent of any revoke hook (raw revoke: seed AND elevation, approve AND deny)', async () => {
     const owner = await enrol('mem-owner', identities.owner)
@@ -1277,22 +1292,19 @@ describe('round 2 #1860: durable decisions on the secure page and the lazy recon
 })
 
 describe('round 2 P2/P3', () => {
-  it('passkey enrol and owner revoke each write a mutation_audit_entries row (identity surface)', async () => {
+  it('a direct passkey revoke is refused even when another key exists', async () => {
     await enrol('mem-owner', identities.owner)
-    const pk = one<{ id: string }>("SELECT id FROM member_passkeys WHERE member_id = 'mem-owner'")
-    expect(count('mutation_audit_entries', "operation = 'passkey_enrol' AND target_kind = 'member_passkey' AND member_id = 'mem-owner'")).toBe(1)
-    expect(await revokeOwnPasskey(env, 'mem-owner', pk?.id ?? '')).toBe(true)
-    const row = one<{ evidence_json: string; target_id: string }>("SELECT evidence_json, target_id FROM mutation_audit_entries WHERE operation = 'passkey_revoke'")
-    expect(row?.target_id).toBe(pk?.id)
-    expect(JSON.parse(row?.evidence_json ?? '{}')).toMatchObject({ reason: 'owner_revoke' })
-    expect(await revokeOwnPasskey(env, 'mem-owner', pk?.id ?? '')).toBe(false)
-    expect(count('mutation_audit_entries', "operation = 'passkey_revoke'")).toBe(1) // a no-op revoke writes nothing
+    await enrol('mem-owner', identities.owner)
+    const pk = one<{ id: string }>("SELECT id FROM member_passkeys WHERE member_id = 'mem-owner' ORDER BY created_at LIMIT 1")
+    expect(count('mutation_audit_entries', "operation = 'passkey_enrol' AND target_kind = 'member_passkey' AND member_id = 'mem-owner'")).toBe(2)
+    expect(await revokeOwnPasskey(env, 'mem-owner', pk?.id ?? '', undefined)).toBe(false)
+    expect(count('mutation_audit_entries', "operation = 'passkey_revoke'")).toBe(0)
   })
-  it('identity revoke and sign-out-all receipt the passkeys they kill (count in evidence)', async () => {
+  it('identity revoke leaves the passkey row as durable history', async () => {
     await enrol('mem-owner', identities.owner)
     await revokeLoginIdentity(env, TENANT, 'mem-owner', identities.owner)
-    const row = one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'passkey_revoke'")
-    expect(JSON.parse(row?.evidence_json ?? '{}')).toMatchObject({ reason: 'login_identity_revoked', count: '1', login_identity_id: identities.owner })
+    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(1)
+    expect(count('mutation_audit_entries', "operation = 'passkey_revoke' AND member_id = 'mem-owner'")).toBe(0)
   })
   it('a port in SECURE_MOMENTS_HOST is refused (RP ID and origin carry none)', () => {
     for (const h of [`${HOST}:8443`, `${HOST}:443`, 'localhost:8787']) {

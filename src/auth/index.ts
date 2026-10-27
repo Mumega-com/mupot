@@ -23,6 +23,8 @@ import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../
 import { verifyHandoffClaim } from './handoff-verify'
 import { isOrgAdmin, resolveCapabilities } from './capability'
 import {
+  identityHasLivePasskeys,
+  identityRemovalNeedsRecovery,
   linkLoginIdentity,
   listLoginIdentities,
   resolveLoginIdentity,
@@ -60,6 +62,7 @@ import {
   elevationUsageOutcomeLabel,
   listPendingElevationRequests,
   loadElevationGrantById,
+  loadElevationRequestById,
   revokeElevationGrant,
 } from './elevation'
 import { ELEVATION_ACTIONS } from './elevation-actions'
@@ -1331,10 +1334,19 @@ authApp.post('/link-signin/:id/unlink', async (c) => {
   c.header('Cache-Control', 'no-store')
   const auth = await peekSessionAuth(c)
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
-  // Unlinking only reduces access, so a real web session is enough (the revoke-device bar), no fresh re-auth.
+  // Identity removal may retire passkeys, so it must preserve a confirmed live credential on another identity.
   const session = await checkWebSession(c.env, auth, { fresh: false })
   if (!session.ok) return c.json({ error: session.error }, session.status)
-  const result = await unlinkSignIn(c.env, auth, c.req.param('id'))
+  const identityId = c.req.param('id')
+  if (auth.memberId && await identityRemovalNeedsRecovery(c.env, c.env.TENANT_SLUG, auth.memberId, identityId)) return c.json({ error: 'last_passkey_recovery_required', message: 'Ask an organization owner to start recovery.' }, 409)
+  if (auth.memberId && await identityHasLivePasskeys(c.env, c.env.TENANT_SLUG, auth.memberId, identityId)) {
+    const denied = await presenceGateJson(c, auth.memberId, {
+      kind: 'login_identity_revoke', subjectId: identityId, params: { identity_id: identityId, action: 'unlink' },
+      summary: 'Unlink this login identity and its passkey access', actionPath: `/auth/link-signin/${encodeURIComponent(identityId)}/unlink`, encoding: 'json', returnPath: '/account',
+    })
+    if (denied) return denied
+  }
+  const result = await unlinkSignIn(c.env, auth, identityId, c.req.query('presence_grant'))
   return linkSigninRedirect(c, result.ok ? 'unlinked' : result.error)
 })
 
@@ -2004,7 +2016,14 @@ authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
   // also holds, so an approve needs the member's passkey bound to exactly these parameters (a deny stays session-only). The
   // passkey's user verification is also the step-up the sensitive actions ask for, so a redeemed grant counts as recent reauth.
   if (decision === 'approve') {
-    const pParams: Record<string, string | number | string[]> = { decision: 'approve' }
+    const requested = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
+    if (!requested) return c.json({ error: 'not_found' }, 404)
+    const pParams: Record<string, string | number | string[]> = {
+      decision: 'approve', agent_id: requested.agent_id,
+      actions: JSON.parse(requested.requested_actions_json) as string[],
+      scope_type: requested.requested_scope_type, scope_id: requested.requested_scope_id,
+      duration_minutes: requested.requested_duration_minutes,
+    }
     if (Array.isArray(body.actions)) pParams.actions = body.actions.filter((a): a is string => typeof a === 'string').sort()
     if (typeof body.scope_type === 'string') pParams.scope_type = body.scope_type
     if (typeof body.scope_id === 'string') pParams.scope_id = body.scope_id
@@ -2013,7 +2032,7 @@ authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
     const requestId = c.req.param('id')
     const denied = await presenceGateJson(c, auth.webSessionMemberId, {
       kind: 'elevation_approve', subjectId: requestId, params: pParams,
-      summary: `Approve elevation request ${requestId.slice(0, 8)}: ${Array.isArray(pParams.actions) ? pParams.actions.join(', ') : 'the requested actions'}`,
+      summary: `Approve elevation request ${requestId.slice(0, 8)}: ${Array.isArray(pParams.actions) ? pParams.actions.join(', ') : ''}`,
       actionPath: `/auth/elevation/requests/${encodeURIComponent(requestId)}/decide`, encoding: 'json', returnPath: '/elevation',
     })
     if (denied) return denied
@@ -2063,14 +2082,25 @@ authApp.post('/identities/:id/revoke', requireAuthMw(), async (c) => {
   const auth = c.get('auth')
   if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
   const identityId = c.req.param('id')
+  if (await identityRemovalNeedsRecovery(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId, identityId)) return c.json({ error: 'last_passkey_recovery_required', message: 'Ask an organization owner to start recovery.' }, 409)
+  if (await identityHasLivePasskeys(c.env, c.env.TENANT_SLUG, auth.webSessionMemberId, identityId)) {
+    const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+      kind: 'login_identity_revoke', subjectId: identityId, params: { identity_id: identityId, action: 'revoke' },
+      summary: 'Remove this login identity and its passkey access', actionPath: `/auth/identities/${encodeURIComponent(identityId)}/revoke`, encoding: 'json', returnPath: '/account',
+    })
+    if (denied) return denied
+  }
   // revokeLoginIdentity is the one chokepoint for the cutoff (identity, then its sessions, then its passkeys), and it
   // re-runs the dependent cutoff on every call for a revoked identity, so a retry after a partial failure completes it.
-  const { revoked, sessionsRevoked } = await revokeLoginIdentity(
+  const { revoked, sessionsRevoked, passkeyRecoveryRequired, presenceRequired } = await revokeLoginIdentity(
     c.env,
     c.env.TENANT_SLUG,
     auth.webSessionMemberId,
     identityId,
+    c.req.query('presence_grant'),
   )
+  if (passkeyRecoveryRequired) return c.json({ error: 'last_passkey_recovery_required' }, 409)
+  if (presenceRequired) return c.json({ error: 'human_presence_required' }, 403)
   return c.json({ revoked, sessions_revoked: sessionsRevoked })
 })
 

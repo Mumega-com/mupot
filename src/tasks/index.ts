@@ -13,7 +13,7 @@
 // a token minted for another tenant can never touch this pot. Mutations are RBAC
 // gated. The GitHub token is read from env only — it is never echoed or logged.
 
-import { presenceGateJson } from '../approvals/gate'
+import { browserSessionCaller, presenceGateJson } from '../approvals/gate'
 import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { scheduleTaskAssignedDoorbell, waitUntilFromContext } from '../agents/webhook-doorbell'
@@ -1883,13 +1883,29 @@ tasksApp.post('/:id/verdict', async (c) => {
 
   // An APPROVE made from a signed-in browser (a web-session cookie) clears a gate and so widens what an agent may do next. That cookie,
   // even freshly re-authenticated, is also held by a program driving the browser: it needs the member's passkey bound to exactly this
-  // verdict. A reject only holds work back and stays session-only. Bearer/MCP callers are other credentials; the Telegram human-origin
-  // channel (task_verdict) is its own proof and is unchanged.
-  if (body.verdict === 'approved' && auth.webSessionIdHash) {
+  // verdict. A reject only holds work back and stays session-only. A bearer/MCP caller bypasses this browser-session gate only when
+  // its credential was itself minted through a presence-gated widening route; that credential-mint invariant is covered by the
+  // member-token tests. The Telegram human-origin channel (task_verdict) is its own proof and is unchanged.
+  // Defined only for a web approval. The server-resolved value must travel
+  // through to writeVerdict: otherwise a submission that lands after grant
+  // redemption but before the verdict batch could inherit an approval for the
+  // earlier submission.
+  let presenceExpectedSubmissionId: string | null | undefined
+  if (body.verdict === 'approved' && browserSessionCaller(c, auth)) {
     if (!auth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
-    const vParams: Record<string, string | boolean> = { verdict: 'approved' }
+    // The submission is approval context. Resolve it here rather than trusting
+    // the client's assertion; writeVerdict resolves and atomically reasserts it
+    // again, so a newer submission cannot inherit this approval.
+    const currentSubmission = await resolveVerdictSubmission(c.env, task.id)
+    if (expectedSubmissionId !== undefined && expectedSubmissionId !== (currentSubmission?.submissionId ?? null)) {
+      return c.json({ error: 'submission_mismatch' }, 409)
+    }
+    presenceExpectedSubmissionId = currentSubmission?.submissionId ?? null
+    const vParams: Record<string, string | boolean | null> = {
+      verdict: 'approved',
+      expected_submission_id: currentSubmission?.submissionId ?? null,
+    }
     if (typeof body.note === 'string') vParams.note = body.note
-    if (typeof expectedSubmissionId === 'string') vParams.expected_submission_id = expectedSubmissionId
     if (body.override_self_verdict === true) vParams.override_self_verdict = true
     const denied = await presenceGateJson(c, auth.webSessionMemberId, {
       kind: 'task_verdict_approve', subjectId: task.id, params: vParams,
@@ -1901,10 +1917,13 @@ tasksApp.post('/:id/verdict', async (c) => {
 
   // Write verdict with conditional UPDATE guard (K5 race protection).
   const decidedBy = principal.id
+  const writeExpectedSubmissionId = presenceExpectedSubmissionId !== undefined
+    ? presenceExpectedSubmissionId
+    : expectedSubmissionId
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), ...(expectedSubmissionId !== undefined ? { expectedSubmissionId } : {}), attribution: verdictAttribution(c.get('auth')) },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}), ...(writeExpectedSubmissionId !== undefined ? { expectedSubmissionId: writeExpectedSubmissionId } : {}), attribution: verdictAttribution(c.get('auth')) },
       principal.actor,
     )
 
@@ -2081,6 +2100,24 @@ gatesApp.post('/grants', async (c) => {
     }
     return c.json({ error: parsed.error }, 400)
   }
+
+  // A gate grant gives its target authority to decide later work. This HTTP
+  // writer therefore always consumes a grant bound to the exact lane, target
+  // kind, and target id before it can widen that authority.
+  const denied = await presenceGateJson(c, auth.webSessionMemberId ?? auth.memberId, {
+    kind: 'gate_grant',
+    subjectId: parsed.principalId,
+    params: {
+      capability: parsed.capability,
+      principal_type: parsed.principalType,
+      principal_id: parsed.principalId,
+    },
+    summary: `Grant gate ${parsed.capability} to ${parsed.principalType} ${parsed.principalId}`,
+    actionPath: '/api/gates/grants',
+    encoding: 'json',
+    returnPath: '/approvals',
+  })
+  if (denied) return denied
 
   const grantedBy = auth.memberId ?? auth.userId
   const grant = await grantGateCapability(c.env, {

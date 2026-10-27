@@ -25,7 +25,7 @@ import { escapeHtml, messagePage, renderPage, SUBMIT_ONCE_SCRIPT } from './page'
 import { loadSeedRequest, seedRequestIsLive } from './seed-request'
 import { b64uEncode } from '../secure-moments/webauthn'
 import { PRESENCE_MESSAGES, presenceCheck } from '../approvals/gate'
-import type { PresenceSpec } from '../approvals/human-presence'
+import { loadPresenceGrant, type PresenceSpec } from '../approvals/human-presence'
 import { loadElevationRequestById } from '../auth/elevation'
 import {
   closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
@@ -237,7 +237,17 @@ approveApp.get('/elevation/:id', async (c) => {
   if (!elevationIsLive(req, Date.now())) {
     return page(c, 410, 'Request closed', req.status === 'pending' ? 'This request has expired.' : `This request is already ${req.status}.`, 'warn')
   }
-  const inner = `${await elevationViewInner(c.env, req)}
+  let approved: { actions: string[]; durationMinutes?: number } | undefined
+  const grantId = c.req.query('presence_grant')
+  if (grantId) {
+    const grant = await loadPresenceGrant(c.env, grantId)
+    if (!grant || grant.member_id !== who.approver.memberId || grant.kind !== 'access_elevation_approve'
+      || grant.subject_id !== req.id || grant.status !== 'satisfied' || Date.parse(grant.expires_at) <= Date.now()) return NOT_FOUND(c)
+    const fields = JSON.parse(grant.fields_json) as Record<string, unknown>
+    if (!Array.isArray(fields.actions) || !fields.actions.every((a) => typeof a === 'string')) return NOT_FOUND(c)
+    approved = { actions: fields.actions, ...(typeof fields.duration_minutes === 'string' ? { durationMinutes: Number(fields.duration_minutes) } : {}) }
+  }
+  const inner = `${await elevationViewInner(c.env, req, approved)}
 <p class="muted">Approving counts as your fresh step-up. The grant is bound to a session created for this sign-in and ends when it does.</p>`
   const form = await formHtml(c, 'elevation', req.id, inner, 'Approve selected')
   if (!form) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for approvals.')
@@ -269,7 +279,7 @@ approveApp.post('/elevation/:id', async (c) => {
       const chosen = [...new Set(selected)].sort()
       const denied = await presenceFor(c, who.approver.memberId, {
         kind: 'access_elevation_approve', subjectId: req.id,
-        params: { decision: 'approve', actions: chosen, ...(duration !== undefined ? { duration_minutes: String(duration) } : {}) },
+        params: { decision: 'approve', agent_id: req.agent_id, scope_type: req.requested_scope_type, scope_id: req.requested_scope_id, actions: chosen, duration_minutes: String(duration ?? req.requested_duration_minutes) },
         summary: `Approve an elevation: ${chosen.join(', ') || 'no action chosen'}${duration !== undefined ? ` for ${duration} minutes` : ''}`,
         actionPath: `/approve/elevation/${req.id}`, encoding: 'form', returnPath: `/approve/elevation/${req.id}`,
       })

@@ -249,7 +249,7 @@ export async function revokeOwnTgDevice(env: Env, memberId: string, deviceId: st
 
 /**
  * The "cut this human off" levers (sign out everywhere, revoke a login identity) kill the Telegram devices too, from
- * revokeMemberPasskeys, so a device can never be the surviving door. A pot that has not applied 0214 has none.
+ * the identity/session cut-off paths, so a device can never be the surviving door. A pot that has not applied 0214 has none.
  */
 export async function revokeMemberTgDevices(
   env: Env, memberId: string, reason: string, opts: { loginIdentityId?: string } = {}, nowMs: number = Date.now(),

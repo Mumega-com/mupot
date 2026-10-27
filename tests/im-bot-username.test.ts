@@ -16,7 +16,9 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
-import { dashboardApp } from '../src/dashboard/index'
+import { dashboardApp as rawDashboardApp } from '../src/dashboard/index'
+import { PRESENCE_ENV, gatedApp } from './helpers/presence'
+const dashboardApp = gatedApp(rawDashboardApp)
 import { SETTINGS_KEYS, getSetting, isValidBotUsername } from '../src/dashboard/settings'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -40,6 +42,7 @@ function makeEnv(email: string): Env {
     LOCAL_TEST_AUTH: '1',
     LOCAL_TEST_AUTH_EMAIL: email,
     SESSIONS: kv(),
+    ...PRESENCE_ENV,
   } as unknown as Env
 }
 

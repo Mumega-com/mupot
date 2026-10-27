@@ -9,6 +9,8 @@ import {
   redeemTelegramProjectInvite,
 } from '../src/members/project-invites'
 import { membersApp } from '../src/members'
+import { authApp } from '../src/auth'
+import { PRESENCE_ENV, throughGate, seedPasskey } from './helpers/presence'
 import { handleImMessage, imApp } from '../src/im'
 import { requireCapability } from '../src/auth/capability'
 import type { AuthContext, Env } from '../src/types'
@@ -3042,19 +3044,19 @@ describe('Telegram project invite — bind existing member', () => {
     }
 
     it('mints a project invite for an existing member as admin/owner (201)', async () => {
-      const response = await membersApp.request('/invites', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
-        body: JSON.stringify({
-          kind: 'project',
-          member_id: 'member-existing',
-          project_id: 'project-bind',
-          squad_id: 'squad-bind',
-          capability: 'member',
-          expires_in_seconds: 3600,
-        }),
-      }, ownerSession())
-
+      const values = new Map<string, string>()
+      const live = { ...env, ...PRESENCE_ENV, LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: 'bind-owner@example.test',
+        SESSIONS: { get: async (key: string) => values.get(key) ?? null,
+          put: async (key: string, value: string) => void values.set(key, value), delete: async (key: string) => void values.delete(key) },
+      } as unknown as Env
+      const login = await authApp.request('/dev-login', {}, live)
+      const cookie = login.headers.get('set-cookie')!.split(';')[0]
+      seedPasskey(harness.sqlite, TENANT, 'member-bind-owner')
+      const response = await throughGate(harness.sqlite, TENANT, (qs) => membersApp.request(`/invites${qs ? `?${qs}` : ''}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie },
+        body: JSON.stringify({ kind: 'project', member_id: 'member-existing', project_id: 'project-bind',
+          squad_id: 'squad-bind', capability: 'member', expires_in_seconds: 3600 }),
+      }, live))
       expect(response.status, await response.clone().text()).toBe(201)
       const body = await response.json() as { invite: { email: string; id: string } }
       expect(body.invite.email).toBe('existing-human@example.test')

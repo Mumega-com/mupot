@@ -13,8 +13,7 @@ the decision's canonical parameters. The challenge is single use and lives five 
 (b) A decision that arrives through the existing Telegram human-origin channel from the member's bound private chat (`src/im`,
 `src/approval-bot`, the harness-attested `human_origin` on `task_verdict`). That channel is a different device and is unchanged.
 
-Decisions that **reduce** authority (deny, revoke, hold, detach, stop, clear, lower a level) never call into this module and stay
-session-only. Nothing here makes it harder to stop something.
+Decisions that **reduce** authority (deny, hold, detach, stop, clear, lower a level) stay session-only. Passkey and login-identity removal require confirmation from another live passkey and must preserve a live passkey; the last credential needs organization-owner recovery. Signing out browser sessions preserves passkeys.
 
 ## Mechanism
 
@@ -53,13 +52,25 @@ It fails **closed**: with secure moments off, or no passkey enrolled, a widening
 | `member_token_mint` | `POST /api/members/:id/tokens`, from a web-session cookie (the token is shown once on the return page) |
 | `elevation_approve` | `POST /auth/elevation/requests/:id/decide` decision=approve |
 | `access_seed_approve`, `access_elevation_approve` | `POST /approve/seed/:id`, `POST /approve/elevation/:id` on the Cloudflare Access page |
-| `passkey_enrol` | `POST /account/passkey/enrol` once the member already holds a passkey |
+| `passkey_enrol` | `POST /account/passkey/enrol` after any previous enrolment, including revoked credentials |
+| `passkey_revoke` | `POST /account/passkey/:id/revoke` using a different live passkey |
+| `login_identity_revoke` | identity removal when passkeys depend on that identity |
+| `oauth_consent` | `POST /oauth/consent` for member or agent-bound connection grants |
+| `telegram_bind` | member bind invites and account Connect Telegram |
+| `telegram_device_enrol` | `POST /account/telegram-device/enrol` |
+| `telegram_device_window` | `POST /account/telegram-device/:id/window` when lengthening |
+| `gate_grant` | `POST /api/gates/grants` |
+| `agent_membership_grant` | `POST /api/org/agents/:id/memberships` |
+| `channel_binding` | `POST /api/channels/bindings` |
+| `seat_event_grant` | `POST /api/fleet/events/grants` when using browser auth |
+| `im_settings_set` | `POST /admin/im-settings` |
+
+Dashboard `POST /members/:id/tokens` uses the same `member_token_mint` kind as the JSON API. The route-shaped inventory in `tests/human-presence-routes.test.ts` checks router registration and gate coverage in both directions. Migration 0264 pins whether an enrolment link belongs to the first-enrolment ceremony; stale first-enrolment links cannot register a second credential.
 
 Squad-join approvals, seed approvals, elevation approvals and credential provide/deny already go through `/m/:id/:token` (passkey).
 
 ## Known limits
 
 * The **first** passkey of a member rests on the real, freshly re-authenticated session (there is nothing else to rest on). Every later
-  one needs a passkey the member already holds.
-* Bearer-token callers of the HTTP API (CLI, automation) are a different credential and are not asked for a passkey; the rule applies to
-  web-session cookies.
+  one needs a passkey the member already holds. Revoked rows remain durable history and do not restore first enrolment.
+* Bearer-token callers of gated JSON routes inherit the presence checked when the credential was issued. All browser-reachable token minting, including OAuth consent, requires presence. Cookie sessions never substitute for that issuance ceremony.

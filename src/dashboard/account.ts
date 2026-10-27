@@ -52,7 +52,7 @@ import { requestEnrolDelivery } from '../secure-moments/telegram-miniapp-enrol-d
 import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
 import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
 import { changeTrustWindow, currentTrustWindow, listMemberTgDevicesPw, parseTrustWindow, pinWindowOn, TRUST_WINDOW_PRESETS } from '../secure-moments/telegram-miniapp-pin-window'
-import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
+import { listMemberPasskeys, memberHasPasskeyHistory, revokeOwnPasskey } from '../secure-moments/store'
 import { listLinkedSignIns } from '../auth/link-signin'
 
 type ShellFn = (
@@ -308,6 +308,8 @@ function connectScript(): Html {
                 expiryP.textContent = expiresAt ? ('Expires ' + expiresAt) : 'Expires in 24 hours.';
                 result.appendChild(expiryP);
               }
+            } else if (data.error === 'human_presence_required' && typeof data.approve_url === 'string') {
+              window.location.assign(data.approve_url);
             } else {
               if (status) status.textContent = 'Could not connect (' + (data.error || res.status) + ').';
               btn.disabled = false;
@@ -660,10 +662,11 @@ export function makeAccountApp(shell: ShellFn) {
   app.post('/account/passkey/enrol', async (c) => {
     if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
     const enrolAuth = c.get('auth')
-    // The FIRST passkey can only rest on the real, freshly re-authenticated session (there is nothing else to rest on; residual risk
-    // in the PR). Every LATER one needs a passkey the member already holds, so a program driving the browser cannot enrol its own.
+    // The FIRST passkey can only rest on the real, freshly re-authenticated session. Every later enrolment needs a
+    // passkey confirmation; revoked credentials remain durable history and never reopen the first-enrol exception.
     const sess = await checkEnrolmentSession(c.env, enrolAuth)
-    if (sess.ok && (await listMemberPasskeys(c.env, sess.memberId)).length > 0) {
+    if (sess.ok && await memberHasPasskeyHistory(c.env, sess.memberId)) {
+      if ((await listMemberPasskeys(c.env, sess.memberId)).length === 0) return c.json({ error: 'last_passkey_recovery_required', message: 'Ask an organization owner to start recovery.' }, 409)
       const denied = await presenceGateJson(c, sess.memberId, {
         kind: 'passkey_enrol', subjectId: sess.memberId, params: { action: 'enrol' }, summary: 'Add another passkey to your account',
         actionPath: '/account/passkey/enrol', encoding: 'json', returnPath: '/account',
@@ -680,7 +683,15 @@ export function makeAccountApp(shell: ShellFn) {
   // private chat; no link or URL is ever returned here. Same-origin only.
   app.post('/account/telegram-device/enrol', async (c) => {
     if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
-    const r = await requestEnrolDelivery(c.env, c.get('auth'))
+    const auth = c.get('auth')
+    const session = await checkEnrolmentSession(c.env, auth)
+    if (!session.ok) return c.json({ error: session.error }, session.status)
+    const denied = await presenceGateJson(c, session.memberId, {
+      kind: 'telegram_device_enrol', subjectId: session.memberId, params: { action: 'enrol' },
+      summary: 'Set up a Telegram approval device', actionPath: '/account/telegram-device/enrol', encoding: 'json', returnPath: '/account',
+    })
+    if (denied) return denied
+    const r = await requestEnrolDelivery(c.env, auth)
     c.header('Cache-Control', 'no-store')
     return r.ok ? c.json({ sent: true, delivery_id: r.delivery_id, sent_at: r.sent_at }) : c.json({ error: r.error }, r.status)
   })
@@ -725,6 +736,11 @@ export function makeAccountApp(shell: ShellFn) {
     if (to >= current) {
       const session = await checkEnrolmentSession(c.env, auth)
       if (!session.ok) return c.json({ error: session.error }, session.status)
+      const denied = await presenceGateJson(c, session.memberId, {
+        kind: 'telegram_device_window', subjectId: c.req.param('id'), params: { device_id: c.req.param('id'), seconds: to },
+        summary: `Lengthen this Telegram device trust window to ${to} seconds`, actionPath: `/account/telegram-device/${encodeURIComponent(c.req.param('id'))}/window`, encoding: 'json', returnPath: '/account',
+      })
+      if (denied) return denied
     }
     const r = await changeTrustWindow(c.env, auth.memberId, c.req.param('id'), to)
     if (!r.ok) return r.reason === 'bad_window' ? c.json({ error: 'bad_window' }, 400) : c.json({ error: 'not_found' }, 404)
@@ -739,9 +755,18 @@ export function makeAccountApp(shell: ShellFn) {
     if (!auth.webSessionIdHash || !auth.webSessionMemberId || auth.webSessionMemberId !== auth.memberId || !auth.memberId) {
       return c.json({ error: 'not_a_web_session' }, 403)
     }
-    return (await revokeOwnPasskey(c.env, auth.memberId, c.req.param('id')))
+    const passkeyId = c.req.param('id')
+    const live = await listMemberPasskeys(c.env, auth.memberId)
+    if (!live.some((p) => p.id === passkeyId)) return c.json({ error: 'not_found' }, 404)
+    if (live.length < 2) return c.json({ error: 'last_passkey_recovery_required', message: 'The last passkey cannot be removed here. Ask an organization owner to start recovery.' }, 409)
+    const denied = await presenceGateJson(c, auth.memberId, {
+      kind: 'passkey_revoke', subjectId: passkeyId, params: { action: 'revoke', passkey_id: passkeyId },
+      summary: 'Remove this passkey using another registered passkey', actionPath: `/account/passkey/${encodeURIComponent(passkeyId)}/revoke`, encoding: 'json', returnPath: '/account',
+    })
+    if (denied) return denied
+    return (await revokeOwnPasskey(c.env, auth.memberId, passkeyId, c.req.query('presence_grant')))
       ? c.json({ revoked: true })
-      : c.json({ error: 'not_found' }, 404)
+      : c.json({ error: 'last_passkey_recovery_required', message: 'The last passkey cannot be removed here. Ask an organization owner to start recovery.' }, 409)
   })
 
   return app

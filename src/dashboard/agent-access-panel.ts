@@ -285,7 +285,11 @@ async function currentCapability(
  */
 export function accessSetWidens(input: Pick<AccessChangeInput, 'capability' | 'expectedCapability' | 'expectedMembership'>): boolean {
   const rank = (v: string): number => (v === 'none' ? 0 : isAgentAccessCapability(v) ? capabilityRank(v) : Number.MAX_SAFE_INTEGER)
-  return rank(input.capability) > Math.max(rank(input.expectedCapability), rank(input.expectedMembership))
+  // The two rows authorize independently. A higher capability row cannot
+  // mask a widening membership row (or vice versa): both prior planes must be
+  // at least as strong as the level this write will set.
+  return rank(input.capability) > rank(input.expectedCapability)
+    || rank(input.capability) > rank(input.expectedMembership)
 }
 
 export async function applyAgentAccessChange(

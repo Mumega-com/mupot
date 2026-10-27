@@ -45,7 +45,7 @@ import { requireAuth } from '../auth'
 import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertWritten } from '../lib/receipt'
-import { presenceGateJson } from '../approvals/gate'
+import { browserSessionCaller, presenceGateJson } from '../approvals/gate'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import {
   requireCapability,
@@ -69,7 +69,7 @@ import {
   upsertCapabilityGrant,
   provisionHomeForMember,
 } from './service'
-import { createProjectInvite, type CreateProjectInviteError } from './project-invites'
+import { createProjectInvite, validateProjectInvite, type CreateProjectInviteError } from './project-invites'
 // mupot#1551 slice 1: the SAME live-token predicate every bearer lookup in
 // this codebase already shares (see that module's header) — reused here so
 // "does this member hold a live token" can never drift into a second,
@@ -1241,14 +1241,30 @@ membersApp.post(
       if (await isSquadArchived(c.env, body.squad_id)) {
         return c.json({ error: 'squad_archived' }, 409)
       }
-      const result = await createProjectInvite(c.env, auth, {
+      const inviteInput = {
         email: body.member_id ? undefined : body.email,
         member_id: body.member_id ?? undefined,
-        project_id: body.project_id,
-        squad_id: body.squad_id,
-        capability: body.capability,
-        expires_in_seconds: body.expires_in_seconds,
-      })
+        project_id: body.project_id, squad_id: body.squad_id,
+        capability: body.capability, expires_in_seconds: body.expires_in_seconds,
+      }
+      const eligibility = await validateProjectInvite(c.env, auth, inviteInput)
+      if (!eligibility.ok) return c.json({ error: eligibility.error }, projectInviteErrorStatus(eligibility.error))
+      // A member-bind invite mints a Telegram credential for the target. The
+      // decision belongs to the authenticated administrator who is widening
+      // that target's channel reach; never trust a body member_id as the
+      // approving principal.
+      if (body.member_id && browserSessionCaller(c, auth)) {
+        const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+          kind: 'telegram_bind', subjectId: body.member_id,
+          params: {
+            member_id: body.member_id, project_id: body.project_id, squad_id: body.squad_id,
+            capability: body.capability, expires_in_seconds: body.expires_in_seconds,
+          },
+          summary: 'Bind a Telegram chat to this member account', actionPath: '/api/members/invites', encoding: 'json', returnPath: '/account',
+        })
+        if (denied) return denied
+      }
+      const result = await createProjectInvite(c.env, auth, inviteInput, c.req.query('presence_grant'))
       if (!result.ok) return c.json({ error: result.error }, projectInviteErrorStatus(result.error))
       protectRawTokenResponse(c)
       return c.json(result.value, 201)
@@ -1611,9 +1627,11 @@ membersApp.post('/members/:id/tokens', requireAdminOrDelegated('mint_member_toke
 
   // A token authenticates AS the member: minting one from a signed-in browser (a web-session cookie) hands out standing, so it
   // needs the acting member's passkey bound to exactly this mint, not just that cookie (which a program driving the browser also
-  // holds). The raw token is shown once on the dashboard's return page. Bearer callers (CLI, automation) are unchanged.
+  // holds). The raw token is shown once on the dashboard's return page.
+  // INVARIANT: bearer callers on gated JSON routes inherit the presence checked at credential issuance; they do not
+  // get a browser-session exemption. Every browser-reachable bearer mint (including OAuth consent) must enforce presence.
   const mintAuth = c.get('auth')
-  if (mintAuth.webSessionIdHash) {
+  if (browserSessionCaller(c, mintAuth)) {
     if (!mintAuth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
     const tParams: Record<string, string | number | boolean> = { label }
     if (typeof body.channel === 'string') tParams.channel = body.channel
@@ -1623,7 +1641,7 @@ membersApp.post('/members/:id/tokens', requireAdminOrDelegated('mint_member_toke
     const denied = await presenceGateJson(c, mintAuth.webSessionMemberId, {
       kind: 'member_token_mint', subjectId: memberId, params: tParams,
       summary: `Mint a token that signs in as member ${memberId}${label ? ` labelled "${label}"` : ''}`,
-      actionPath: `/api/members/${encodeURIComponent(memberId)}/tokens`, encoding: 'json', returnPath: '/admin/members',
+      actionPath: `/api/members/members/${encodeURIComponent(memberId)}/tokens`, encoding: 'json', returnPath: '/admin/members',
     })
     if (denied) return denied
   }
@@ -1971,14 +1989,14 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
   // member's own passkey: that cookie, even freshly re-authenticated, is also held by a program driving the browser. Bearer-token
   // callers (CLI, automation, delegated agents already decided by the chokepoint above) are a different credential and unchanged.
   const grantAuth = c.get('auth')
-  if (!delegatedWrite && grantAuth.webSessionIdHash) {
+  if (!delegatedWrite && browserSessionCaller(c, grantAuth)) {
     if (!grantAuth.webSessionMemberId) return c.json({ error: 'not_a_web_session' }, 403)
     const gParams: Record<string, string> = { action: 'grant', scope_type: scopeType, capability }
     if (scopeId !== null) gParams.scope_id = scopeId
     const denied = await presenceGateJson(c, grantAuth.webSessionMemberId, {
       kind: 'member_capability_grant', subjectId: memberId, params: gParams,
       summary: `Grant ${capability} on ${scopeType}${scopeId ? ` ${scopeId}` : ''} to member ${memberId}`,
-      actionPath: `/api/members/${encodeURIComponent(memberId)}/capabilities`, encoding: 'json', returnPath: '/admin/members',
+      actionPath: `/api/members/members/${encodeURIComponent(memberId)}/capabilities`, encoding: 'json', returnPath: '/admin/members',
     })
     if (denied) return denied
   }

@@ -3406,6 +3406,20 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }
 
+  // A browser session can be driven by an agent.  The JSON sibling gates web
+  // sessions before minting; this form is the same credential-minting door and
+  // must consume a grant bound to the target, label, and connection channel.
+  const denied = await presenceGate(c, shell, auth.memberId, {
+    kind: 'member_token_mint',
+    subjectId: memberId,
+    params: { member_id: memberId, label: labelRaw, channel: channelRaw },
+    summary: `Mint a token that signs in as ${member.display_name}`,
+    actionPath: `/members/${encodeURIComponent(memberId)}/tokens`,
+    encoding: 'form',
+    returnPath: '/members',
+  })
+  if (denied) return denied
+
   const canonical = requiredCanonicalOrigin(c.env)
   if (!canonical.ok) {
     return c.html(

@@ -591,6 +591,26 @@ describe('approve needs the passkey (Access page)', () => {
     expect(count('elevation_grants')).toBe(1)
   })
 
+  it('restores the exact narrowed actions and duration on the passkey return form', async () => {
+    const e = secureEnv()
+    const authn = await enrolPasskey(e, harness.sqlite, 'mem-owner')
+    const id = await pendingElevation(['action:manage_access', 'action:project_status'], 60)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const narrow = { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '15' }
+    const refused = await rawHit(`/approve/elevation/${id}`, { method: 'POST', form: narrow }, e)
+    const { grantId, approveUrl } = (await presenceRefusal(refused))!
+    expect((await realTap(e, authn, approveUrl!)).status).toBe(200)
+    const back = await rawHit(`/approve/elevation/${id}?presence_grant=${grantId}`, {}, e)
+    const body = await back.text()
+    expect(body).toContain('value="action:project_status" checked')
+    expect(body).toContain('value="action:manage_access"><')
+    expect(body).toContain('<option value="15" selected>')
+    expect(body).not.toContain('<option value="60" selected>')
+    const done = await rawHit(`/approve/elevation/${id}?presence_grant=${grantId}`, { method: 'POST', form: narrow }, e)
+    expect(done.status).toBe(200)
+    expect(count('elevation_grants')).toBe(1)
+  })
+
   it('with secure moments off or no passkey enrolled the approve fails closed, not open', async () => {
     const id = await pendingElevation(['action:project_status'], 60)
     const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())

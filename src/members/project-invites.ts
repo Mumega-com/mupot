@@ -16,6 +16,7 @@ import {
 } from '../auth/capability'
 import { sha256Hex } from './service'
 import { claimTimestamp } from '../lib/claim-timestamp'
+import { presenceDigest } from '../approvals/human-presence'
 // mupot#1551 round 2 (adversarial P1-2, same class as #1558): the SAME
 // normalizer POST /invites uses — see createProjectInvite's own email
 // handling below and redeemTelegramProjectInvite's member-mint guard.
@@ -510,11 +511,9 @@ function parseStoredRedemption(text: string | null): RedeemedProjectInvite | nul
  * project-linked squad. The raw pairing code is returned once and only its
  * SHA-256 digest is stored.
  */
-export async function createProjectInvite(
-  env: Env,
-  auth: AuthContext,
-  input: CreateProjectInviteInput,
-): Promise<CreateProjectInviteResult> {
+export async function validateProjectInvite(
+  env: Env, auth: AuthContext, input: CreateProjectInviteInput,
+): Promise<{ ok: true; memberId: string | null; email: string; projectId: string; squadId: string } | Extract<CreateProjectInviteResult, { ok: false }>> {
   if (auth.tenant !== env.TENANT_SLUG) return { ok: false, error: 'tenant_scope' }
 
   // member_id and a caller-supplied email are mutually exclusive: the bind
@@ -649,6 +648,32 @@ export async function createProjectInvite(
     return { ok: false, error: 'forbidden' }
   }
 
+  return { ok: true, memberId, email, projectId, squadId }
+}
+
+export async function createProjectInvite(
+  env: Env,
+  auth: AuthContext,
+  input: CreateProjectInviteInput,
+  presenceGrantId?: string,
+): Promise<CreateProjectInviteResult> {
+  const checked = await validateProjectInvite(env, auth, input)
+  if (!checked.ok) return checked
+  const { memberId, email, projectId, squadId } = checked
+
+  // A browser-origin member bind must carry the exact grant consumed by the
+  // route. Keep this check at the shared writer as well as the HTTP gate.
+  const browserBind = memberId !== null && !!auth.webSessionIdHash
+  const approvingMember = auth.webSessionMemberId ?? null
+  const digest = browserBind && approvingMember ? await presenceDigest(approvingMember, {
+    kind: 'telegram_bind', subjectId: memberId!, params: {
+      member_id: input.member_id!, project_id: input.project_id, squad_id: input.squad_id,
+      capability: input.capability, expires_in_seconds: input.expires_in_seconds,
+    },
+  }) : null
+  if (browserBind && (!presenceGrantId || !approvingMember || !digest)) return { ok: false, error: 'forbidden' }
+  if (browserBind && await env.DB.prepare('SELECT 1 AS used FROM invites WHERE id = ?1').bind(presenceGrantId).first()) return { ok: false, error: 'forbidden' }
+
   let pairingCode = ''
   let pairingHash = ''
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -663,7 +688,7 @@ export async function createProjectInvite(
   }
   if (!pairingCode || !pairingHash) return { ok: false, error: 'pairing_code_collision' }
 
-  const id = crypto.randomUUID()
+  const id = browserBind ? presenceGrantId! : crypto.randomUUID()
   const createdAt = new Date().toISOString()
   const expiresAt = new Date(Date.now() + input.expires_in_seconds * 1000).toISOString()
   const invitedBy = auth.memberId ?? auth.userId
@@ -674,11 +699,18 @@ export async function createProjectInvite(
   // so redemption can re-check it (see redeemTelegramProjectInvite).
   const mintedByMemberId = auth.memberId ?? null
 
-  await env.DB.prepare(
+  const inserted = await env.DB.prepare(
     `INSERT INTO invites (
        id, email, department_id, capability, invited_by, accepted_at, created_at,
        project_id, squad_id, pairing_hash, pairing_expires_at, member_id, minted_by_member_id
-     ) VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+     ) SELECT ?1, ?2, NULL, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+       WHERE ?12 = 0 OR EXISTS (
+         SELECT 1 FROM presence_grants g
+          JOIN member_passkeys p ON p.id = g.satisfied_passkey_id AND p.tenant = g.tenant AND p.member_id = g.member_id AND p.revoked_at IS NULL
+          JOIN human_login_identities live ON live.id = p.login_identity_id AND live.tenant = p.tenant AND live.member_id = p.member_id AND live.revoked_at IS NULL
+         WHERE g.id = ?13 AND g.tenant = ?14 AND g.member_id = ?15 AND g.kind = 'telegram_bind'
+           AND g.subject_id = ?10 AND g.params_sha256 = ?16 AND g.status = 'consumed' AND g.expires_at > ?5
+       )`,
   ).bind(
     id,
     email,
@@ -691,7 +723,9 @@ export async function createProjectInvite(
     expiresAt,
     memberId,
     mintedByMemberId,
+    browserBind ? 1 : 0, presenceGrantId ?? null, env.TENANT_SLUG, approvingMember, digest,
   ).run()
+  if (Number(inserted.meta?.changes ?? 0) !== 1) return { ok: false, error: 'forbidden' }
 
   return {
     ok: true,

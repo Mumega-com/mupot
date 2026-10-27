@@ -19,7 +19,6 @@
 // subject) → member_id join once a member already exists to bind to.
 
 import type { Env } from '../types'
-import { revokeMemberPasskeys } from '../secure-moments/store'
 import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 import { revokeWebSessionsForLoginIdentity } from './web-sessions'
 import { nowSqlUtc } from './token-lifecycle'
@@ -41,6 +40,55 @@ export interface LoginIdentityRecord {
   linked_by_member_id: string | null
   created_at: string
   revoked_at: string | null
+}
+
+/** Atomic write predicate shared by every path making an identity ineffective. */
+export function identityRemovalWriteGuard(tenant: string, member: string, identity: string, grant: string, now: string): string {
+  return `(NOT EXISTS (SELECT 1 FROM member_passkeys doomed
+    WHERE doomed.tenant = ${tenant} AND doomed.member_id = ${member} AND doomed.login_identity_id = ${identity} AND doomed.revoked_at IS NULL)
+    OR EXISTS (SELECT 1 FROM presence_grants g
+      JOIN member_passkeys p ON p.id = g.satisfied_passkey_id AND p.tenant = g.tenant AND p.member_id = g.member_id AND p.revoked_at IS NULL
+      JOIN human_login_identities live ON live.id = p.login_identity_id AND live.tenant = p.tenant AND live.member_id = p.member_id AND live.revoked_at IS NULL
+      WHERE g.id = ${grant} AND g.tenant = ${tenant} AND g.member_id = ${member} AND g.kind = 'login_identity_revoke'
+        AND g.subject_id = ${identity} AND g.status = 'consumed' AND g.expires_at > ${now} AND p.login_identity_id != ${identity}))`
+}
+
+export async function identityRemovalNeedsRecovery(env: Env, tenant: string, member: string, identity: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS blocked FROM member_passkeys p
+    JOIN human_login_identities own ON own.id = p.login_identity_id AND own.tenant = p.tenant AND own.member_id = p.member_id AND own.revoked_at IS NULL
+    WHERE p.tenant = ?1 AND p.member_id = ?2 AND p.login_identity_id = ?3 AND p.revoked_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM member_passkeys other JOIN human_login_identities live
+        ON live.id = other.login_identity_id AND live.tenant = other.tenant AND live.member_id = other.member_id AND live.revoked_at IS NULL
+        WHERE other.tenant = ?1 AND other.member_id = ?2 AND other.revoked_at IS NULL AND other.login_identity_id != ?3) LIMIT 1`)
+    .bind(tenant, member, identity).first()
+  return row !== null
+}
+
+/** A consumed grant can remove an identity only when another live passkey confirmed it. */
+export async function identityRemovalPresenceSatisfied(
+  env: Env, tenant: string, memberId: string, identityId: string, presenceGrantId: string | undefined, nowMs: number = Date.now(),
+): Promise<boolean> {
+  if (!presenceGrantId || presenceGrantId.length > 64) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 AS present FROM presence_grants g
+      JOIN member_passkeys confirmer ON confirmer.id = g.satisfied_passkey_id AND confirmer.tenant = g.tenant
+       AND confirmer.member_id = g.member_id AND confirmer.revoked_at IS NULL
+      JOIN human_login_identities live ON live.id = confirmer.login_identity_id AND live.tenant = confirmer.tenant
+       AND live.member_id = confirmer.member_id AND live.revoked_at IS NULL
+      WHERE g.id = ?1 AND g.tenant = ?2 AND g.member_id = ?3 AND g.kind = 'login_identity_revoke'
+       AND g.subject_id = ?4 AND g.status = 'consumed' AND g.expires_at > ?5
+       AND confirmer.login_identity_id != ?4 LIMIT 1`,
+  ).bind(presenceGrantId, tenant, memberId, identityId, new Date(nowMs).toISOString()).first<{ present: number }>()
+  return row !== null
+}
+
+export async function identityHasLivePasskeys(env: Env, tenant: string, memberId: string, identityId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS present FROM member_passkeys p JOIN human_login_identities i
+       ON i.id = p.login_identity_id AND i.tenant = p.tenant AND i.member_id = p.member_id AND i.revoked_at IS NULL
+      WHERE p.tenant = ?1 AND p.member_id = ?2 AND p.login_identity_id = ?3 AND p.revoked_at IS NULL LIMIT 1`,
+  ).bind(tenant, memberId, identityId).first<{ present: number }>()
+  return row !== null
 }
 
 export type LinkLoginIdentityResult =
@@ -286,9 +334,9 @@ export async function listLoginIdentities(
  * tenant + owning member, and cut off everything that identity issued. The
  * identity write is idempotent (already revoked => { revoked: false }), and the
  * dependent cutoff runs whenever the identity IS revoked, not only on the call
- * that revoked it: web sessions bound to it first, then passkeys enrolled under
- * it. So a transient failure part-way (e.g. the passkey UPDATE) is repaired by
- * simply retrying, and can never leave the identity's sessions usable. A revoked
+ * that revoked it: web sessions bound to it first. Passkeys remain durable
+ * history and their live-identity check makes one enrolled under this identity
+ * unusable. A revoked
  * identity will not resolve and will not silently re-link (identity_revoked).
  */
 export async function revokeLoginIdentity(
@@ -296,14 +344,48 @@ export async function revokeLoginIdentity(
   tenant: string,
   memberId: string,
   identityId: string,
+  presenceGrantId?: string,
   nowMs: number = Date.now(),
-): Promise<{ revoked: boolean; identity: LoginIdentityRecord | null; sessionsRevoked: number }> {
+): Promise<{ revoked: boolean; identity: LoginIdentityRecord | null; sessionsRevoked: number; passkeyRecoveryRequired: boolean; presenceRequired: boolean }> {
   const nowIso = new Date(nowMs).toISOString()
+  // An identity makes every passkey enrolled under it ineffective. Do not let
+  // this indirect path remove the member's final live passkey; recovery is an
+  // organization-owner operation. The same predicate is repeated in UPDATE so
+  // a concurrent identity/passkey change cannot race the preflight.
+  const wouldRemoveLastLivePasskey = await env.DB.prepare(
+    `SELECT 1 AS blocked
+       FROM member_passkeys doomed
+      WHERE doomed.tenant = ?1 AND doomed.member_id = ?2 AND doomed.login_identity_id = ?3 AND doomed.revoked_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM member_passkeys survivor
+            JOIN human_login_identities live ON live.id = survivor.login_identity_id
+             AND live.tenant = survivor.tenant AND live.member_id = survivor.member_id AND live.revoked_at IS NULL
+           WHERE survivor.tenant = ?1 AND survivor.member_id = ?2 AND survivor.revoked_at IS NULL
+             AND survivor.login_identity_id != ?3
+        ) LIMIT 1`,
+  ).bind(tenant, memberId, identityId).first<{ blocked: number }>()
+  if (wouldRemoveLastLivePasskey) return { revoked: false, identity: null, sessionsRevoked: 0, passkeyRecoveryRequired: true, presenceRequired: false }
+  const hasDependent = await identityHasLivePasskeys(env, tenant, memberId, identityId)
+  if (hasDependent && !(await identityRemovalPresenceSatisfied(env, tenant, memberId, identityId, presenceGrantId, nowMs))) {
+    return { revoked: false, identity: null, sessionsRevoked: 0, passkeyRecoveryRequired: false, presenceRequired: true }
+  }
   const result = await env.DB.prepare(
     `UPDATE human_login_identities SET revoked_at = ?1
-      WHERE id = ?2 AND tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+      WHERE id = ?2 AND tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL
+        AND ${identityRemovalWriteGuard('?3', '?4', '?2', '?5', '?1')}
+        AND NOT EXISTS (
+          SELECT 1 FROM member_passkeys doomed
+           WHERE doomed.tenant = ?3 AND doomed.member_id = ?4 AND doomed.login_identity_id = ?2 AND doomed.revoked_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM member_passkeys survivor
+                 JOIN human_login_identities live ON live.id = survivor.login_identity_id
+                  AND live.tenant = survivor.tenant AND live.member_id = survivor.member_id AND live.revoked_at IS NULL
+                WHERE survivor.tenant = ?3 AND survivor.member_id = ?4 AND survivor.revoked_at IS NULL
+                  AND survivor.login_identity_id != ?2
+             )
+        )`,
   )
-    .bind(nowIso, identityId, tenant, memberId)
+    .bind(nowIso, identityId, tenant, memberId, presenceGrantId ?? null)
     .run()
   const changes = Number(result.meta?.changes ?? 0)
   const identity = await env.DB.prepare(
@@ -317,11 +399,11 @@ export async function revokeLoginIdentity(
     .first<LoginIdentityRecord>()
   let sessionsRevoked = 0
   if (identity && identity.revoked_at) {
-    // Sessions FIRST: they are the live door. Then passkeys (the decision path also refuses a passkey whose identity
-    // is not live). Both are idempotent, so a retry after any partial failure finishes the cutoff.
+    // Sessions are the live browser door. A passkey bound to this identity is
+    // already refused by the decision path's live-identity check; do not delete
+    // it here because passkey removal requires another live passkey's grant.
     sessionsRevoked = (await revokeWebSessionsForLoginIdentity(env, tenant, memberId, identityId, 'identity_revoked', nowMs)).revokedCount
-    await revokeMemberPasskeys(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
     await revokeMemberTgDevices(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
   }
-  return { revoked: changes > 0, identity: identity ?? null, sessionsRevoked }
+  return { revoked: changes > 0, identity: identity ?? null, sessionsRevoked, passkeyRecoveryRequired: false, presenceRequired: false }
 }

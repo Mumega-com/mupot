@@ -15,6 +15,7 @@ import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
 import { getAdapter } from './registry'
 import { discordGet, createGuildRole, getDiscordAdminToken } from './adapters/discord'
 import { projectMemberCapabilitiesToDiscord, MANAGED_DISCORD_ROLES } from './discord-cap-sync'
+import { browserSessionCaller, presenceGateJson } from '../approvals/gate'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -81,6 +82,26 @@ channelsAdminApp.post('/bindings', requireOrgCapability('admin'), async (c) => {
   // channel member — a SECOND standing-grant table besides `capabilities`.
   // No standing grant path into a home squad may exist through it either.
   if (squad.kind === 'home') return c.json({ error: 'home_scope_not_grantable' }, 403)
+
+  // A bearer credential is issued through a presence-gated mint door and has
+  // no browser ceremony to redeem here. A web session must prove presence for
+  // this exact binding before it reaches the INSERT.
+  const auth = c.get('auth')
+  if (browserSessionCaller(c, auth)) {
+    const denied = await presenceGateJson(c, auth.webSessionMemberId, {
+      kind: 'channel_binding',
+      subjectId: `${body.platform.trim()}:${body.external_channel_id.trim()}`,
+      params: {
+        platform: body.platform.trim(),
+        external_channel_id: body.external_channel_id.trim(),
+        squad_id: squad.id,
+        max_capability: maxCap,
+      },
+      summary: `Bind a ${body.platform.trim()} channel to a squad`,
+      actionPath: '/api/channels/bindings', encoding: 'json', returnPath: '/admin/channels',
+    })
+    if (denied) return denied
+  }
 
   const id = crypto.randomUUID()
   try {

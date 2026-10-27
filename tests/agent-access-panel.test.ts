@@ -10,7 +10,7 @@
 // Full committed migration chain (tests/helpers/migrations.ts) — no hand-built schema.
 import { afterEach, describe, expect, it } from 'vitest'
 import { exceedsTargetRankCeiling } from '../src/auth/capability'
-import { applyAgentAccessChange, receiptStatement } from '../src/dashboard/agent-access-panel'
+import { accessSetWidens, applyAgentAccessChange, receiptStatement } from '../src/dashboard/agent-access-panel'
 import type { AccessChangeInput, ReceiptPlan } from '../src/dashboard/agent-access-panel'
 import { commitAgentSquadAccess, commitRemoveAgentSquadAccess } from '../src/members/agent-access'
 import type { AgentAccessCapability } from '../src/members/agent-access'
@@ -77,6 +77,16 @@ function humanAuth(memberId: string, grants: CapabilityGrant[], role: AuthContex
 
 const hadi = (): AuthContext => humanAuth('m-hadi', [grant('m-hadi', 'org', null, 'admin')])
 const owner = (): AuthContext => humanAuth('m-owner', [grant('m-owner', 'org', null, 'owner')])
+
+describe('accessSetWidens', () => {
+  it('requires presence when a set widens either prior authority plane', () => {
+    // An admin capability row cannot mask a lower membership row: setting lead
+    // widens that membership plane even though it is below the capability plane.
+    expect(accessSetWidens({
+      capability: 'lead', expectedCapability: 'admin', expectedMembership: 'observer',
+    })).toBe(true)
+  })
+})
 
 /** `expectedPrior` is shorthand for "both tables held this"; the two expectations can also be given separately. */
 function change(overrides: Partial<AccessChangeInput> & { expectedPrior?: string } = {}): AccessChangeInput {

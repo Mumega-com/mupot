@@ -11,10 +11,11 @@
 
 import { Hono } from 'hono'
 import type { Context } from 'hono'
-import type { CapabilityGrant, Env } from '../types'
+import type { AuthContext, CapabilityGrant, Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, currentMemberRankOnScope } from '../auth/capability'
 import { presenceLiveDoUpgradeRequest } from '../registry/realtime'
+import { browserSessionCaller, presenceGateJson } from '../approvals/gate'
 import {
   activeSeatEventGrant,
   authorizeSeatGrantTarget,
@@ -39,7 +40,7 @@ import {
 const MAX_BODY_BYTES = 8192
 const NO_STORE = { 'Cache-Control': 'no-store' }
 
-type Ctx = Context<{ Bindings: Env }>
+type Ctx = Context<{ Bindings: Env; Variables: { auth?: AuthContext } }>
 
 async function readJson(c: Ctx): Promise<Record<string, unknown> | null> {
   const declared = Number(c.req.header('content-length') ?? '0')
@@ -103,7 +104,7 @@ function stub(env: Env) {
   return ns.get(ns.idFromName(seatEventsChannelName(env.TENANT_SLUG)))
 }
 
-export const seatEventsApp = new Hono<{ Bindings: Env }>()
+export const seatEventsApp = new Hono<{ Bindings: Env; Variables: { auth?: AuthContext } }>()
 
 seatEventsApp.post('/ticket', async (c) => {
   if (!isSeatEventsEnabled(c.env)) return c.json({ error: 'seat_events_disabled' }, 404)
@@ -189,6 +190,26 @@ seatEventsApp.post('/grants', async (c) => {
   const agentId = typeof b.agent_id === 'string' ? b.agent_id : ''
   const target = await authorizeGrantTarget(c, principal, agentId)
   if (!target.ok) return c.json({ error: target.error }, target.status)
+  // This surface presently resolves bearer credentials only. Those credentials
+  // are minted through presence-gated token doors, so they cannot redeem a
+  // browser grant here. If the route is ever mounted behind browser auth, it
+  // must not inherit that bearer exemption: gate the exact host, agent, project
+  // and reason before creating the delivery grant.
+  const web = c.get('auth')
+  if (web && browserSessionCaller(c, web)) {
+    const denied = await presenceGateJson(c, web.webSessionMemberId, {
+      kind: 'seat_event_grant', subjectId: agentId,
+      params: {
+        agent_id: agentId,
+        host_agent_id: typeof b.host_agent_id === 'string' ? b.host_agent_id : '',
+        project_id: typeof b.project_id === 'string' ? b.project_id : '',
+        reason: typeof b.reason === 'string' ? b.reason : '',
+      },
+      summary: 'Grant a fleet host event delivery for an agent',
+      actionPath: '/api/fleet/events/grants', encoding: 'json', returnPath: '/fleet',
+    })
+    if (denied) return denied
+  }
   const res = await createSeatEventGrant(c.env, {
     hostAgentId: typeof b.host_agent_id === 'string' ? b.host_agent_id : '',
     agentId,

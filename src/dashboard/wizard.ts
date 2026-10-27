@@ -34,6 +34,7 @@
 
 import { SELECT_SEARCH_SCRIPT } from './select-search'
 import { Hono } from 'hono'
+import { presenceGateJson } from '../approvals/gate'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -325,6 +326,15 @@ wizardApp.post('/im', requireOwner, blockIfComplete, async (c) => {
     settingsToWrite[SETTINGS_KEYS.imBotUsername] = botUsername
   }
 
+  if (body.bot_username !== undefined) {
+    const denied = await presenceGateJson(c, c.get('auth').webSessionMemberId, {
+      kind: 'im_settings_set', subjectId: c.env.TENANT_SLUG,
+      params: { provider, channel, bot_username: botUsername ?? '' },
+      summary: 'Set the decision bot and its notification channel',
+      actionPath: '/setup/im', encoding: 'json', returnPath: '/setup',
+    })
+    if (denied) return denied
+  }
   await setSettings(c.env, settingsToWrite)
 
   // Echo the ACTUAL current value, not merely what this request happened to
@@ -1162,6 +1172,7 @@ function wizardScript(startStep: number) {
                 setStatus(st, 'Added.', 'ok');
               } else if (res.status === 403) { setStatus(st, 'Forbidden — owner/admin required.', 'err'); }
               else if (res.status === 409) { setStatus(st, 'That slug is taken.', 'err'); }
+              else if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); }
               else { setStatus(st, 'Failed: ' + (data.error || res.status), 'err'); }
             } catch (err) { setStatus(st, 'Request errored.', 'err'); }
           });
@@ -1195,6 +1206,7 @@ function wizardScript(startStep: number) {
                 setStatus(st, 'Added.', 'ok');
               } else if (res.status === 403) { setStatus(st, 'Forbidden — admin on that department required.', 'err'); }
               else if (res.status === 409) { setStatus(st, 'That slug is taken in this department.', 'err'); }
+              else if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); }
               else { setStatus(st, 'Failed: ' + (data.error || res.status), 'err'); }
             } catch (err) { setStatus(st, 'Request errored.', 'err'); }
           });
@@ -1222,6 +1234,7 @@ function wizardScript(startStep: number) {
                 inviteForm.querySelector('[name=email]').value = '';
                 setStatus(st, 'Invite created — share the accept link from Members.', 'ok');
               } else if (res.status === 403) { setStatus(st, 'Forbidden — admin on this scope required.', 'err'); }
+              else if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); }
               else { setStatus(st, 'Failed: ' + (data.error || res.status), 'err'); }
             } catch (err) { setStatus(st, 'Request errored.', 'err'); }
           });
@@ -1282,6 +1295,7 @@ function wizardScript(startStep: number) {
               var res = await postJSON(SETUP_API + '/im', 'POST', payload);
               var data = await res.json().catch(function(){return{};});
               if (res.ok) { imSaved = true; setStatus(st, data.needs_secret ? 'Saved. Set TELEGRAM_BOT_TOKEN as a secret.' : 'Saved.', 'ok'); }
+              else if (data.error === 'human_presence_required' && data.approve_url) { window.location.assign(data.approve_url); }
               else { setStatus(st, 'Failed: ' + (data.error || res.status), 'err'); }
             } catch (err) { setStatus(st, 'Request errored.', 'err'); }
           });

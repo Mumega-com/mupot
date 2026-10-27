@@ -4608,9 +4608,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_presence_grants_member" },
     ],
   },
+  {
+    file: "0264_passkey_enrolment_history.sql",
+    sha256: "73507aad6688eb934e9bde86e633ec867dd00a0a87071ed8fe4dbc50c0e16f6b",
+    statements: [
+      "-- Preserve whether an enrolment link was minted before any passkey existed.\n-- A revoked credential remains history; stale first-enrol links cannot become\n-- a second session-only registration after another credential lands.\nALTER TABLE passkey_enrolment_tokens\n  ADD COLUMN requires_prior_passkey INTEGER NOT NULL DEFAULT 0\n  CHECK (requires_prior_passkey IN (0, 1));",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "429f990f4dd4ba3f57ca3c0c8387299c58ec45affe637d092f5b816b6e30445e"
+export const SCHEMA_CHAIN_DIGEST: string = "8763f3b9089c2f9c68558e084cc78cbcb4086a6a4f43858b14a7e5bf86ba3523"

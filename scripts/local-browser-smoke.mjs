@@ -773,13 +773,26 @@ async function runApprovalWorkflow() {
 
   await card.locator('.appr-note').fill('Approved by local browser smoke.')
   const verdictPath = `/api/tasks/${encodeURIComponent(taskId)}/verdict`
-  const [refusal] = await Promise.all([
-    page.waitForResponse((r) => new URL(r.url()).pathname === verdictPath && r.request().method() === 'POST'),
-    card.locator('.appr-approve').click(),
-  ])
-  const presence = await refusal.json()
-  if (refusal.status() !== 403 || presence.error !== 'human_presence_required' || !presence.presence_grant) {
-    fail('session-only approval did not require a passkey', { status: refusal.status(), error: presence.error })
+  // Capture the refusal before delivering it to the page: the app immediately navigates to the secure host,
+  // which can invalidate CDP's response body handle before waitForResponse().json() reads it.
+  let presence
+  let refusalStatus
+  const captureRefusal = async (route) => {
+    if (route.request().method() !== 'POST') return route.continue()
+    const response = await route.fetch()
+    refusalStatus = response.status()
+    presence = await response.json()
+    await route.fulfill({ response })
+  }
+  await page.route(`**${verdictPath}`, captureRefusal)
+  try {
+    await card.locator('.appr-approve').click()
+    await page.waitForURL(`${passkeyOrigin}/m/presence/**`, { timeout: 10_000 })
+  } finally {
+    await page.unroute(`**${verdictPath}`, captureRefusal)
+  }
+  if (refusalStatus !== 403 || presence?.error !== 'human_presence_required' || !presence.presence_grant) {
+    fail('session-only approval did not require a passkey', { status: refusalStatus, error: presence?.error })
   }
   const before = await context.request.get(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`)
   if (before.status() !== 200 || (await before.json())?.task?.status !== 'review') fail('approval changed before passkey confirmation')
@@ -794,7 +807,7 @@ async function runApprovalWorkflow() {
     page.waitForResponse((r) => new URL(r.url()).pathname === verdictPath && r.request().method() === 'POST'),
     page.locator('#presence-apply').click(),
   ])
-  if (applied.status() !== 200) fail('passkey-approved decision was not applied', { status: applied.status() })
+  if (applied.status() !== 201) fail('passkey-approved decision was not applied', { status: applied.status() })
   const after = await context.request.get(`${baseUrl}/api/tasks/${encodeURIComponent(taskId)}`)
   if (after.status() !== 200 || (await after.json())?.task?.status !== 'approved') fail('approval did not persist approved state')
   const replay = await context.request.post(`${baseUrl}${verdictPath}?presence_grant=${encodeURIComponent(presence.presence_grant)}`, {
@@ -1013,6 +1026,18 @@ async function runAccountTelegramConnectWorkflow() {
   }
 
   await page.locator('#tg-connect').click()
+  await page.waitForURL(`${passkeyOrigin}/m/presence/**`, { timeout: 10_000 })
+  const [confirmed] = await Promise.all([
+    page.waitForResponse((r) => r.url().startsWith(passkeyOrigin) && new URL(r.url()).pathname.endsWith('/decide')),
+    page.locator('[data-act="approve"]').click(),
+  ])
+  if (confirmed.status() !== 200) fail('Telegram bind passkey confirmation failed')
+  await page.getByRole('link', { name: 'go back to the dashboard', exact: true }).click()
+  const [paired] = await Promise.all([
+    page.waitForResponse((r) => new URL(r.url()).pathname === '/api/members/invites' && r.request().method() === 'POST'),
+    page.locator('#presence-apply').click(),
+  ])
+  if (paired.status() !== 201) fail('Telegram bind approval did not create the invite', { status: paired.status() })
   await page.waitForSelector('#tg-result:not([hidden])', { timeout: 10_000 })
   const pairingText = await textSnippet(page.locator('#tg-result'), 500)
   const codeMatch = /Pairing code: (\S+)/.exec(pairingText)

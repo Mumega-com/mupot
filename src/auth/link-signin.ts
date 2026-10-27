@@ -21,11 +21,10 @@
 
 import type { AuthContext, Env } from '../types'
 import { actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, exceedsTargetRankCeiling, nowCapabilitySql, resolveCapabilities } from './capability'
-import { linkLoginIdentity, resolveLoginIdentity, type LoginIdentityRecord } from './login-identity'
+import { identityHasLivePasskeys, identityRemovalNeedsRecovery, identityRemovalWriteGuard, identityRemovalPresenceSatisfied, linkLoginIdentity, resolveLoginIdentity, type LoginIdentityRecord } from './login-identity'
 import { maskEmail } from './telegram-login-link'
 import { nowSqlUtc } from './token-lifecycle'
 import { revokeWebSessionsForLoginIdentity } from './web-sessions'
-import { revokeMemberPasskeys } from '../secure-moments/store'
 import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 import { auditMutation, prepareMutationAudit } from '../flight-spine/audit'
 import {
@@ -287,16 +286,24 @@ export async function linkSignIn(
                 tenant: '?4', member: '?5', exemptLabel: '?8', exemptChannel: '?9', directoryChannel: '?10', now: '?11',
               })}
             )`
+      // Moving this identity would make its old member's dependent passkeys
+      // ineffective. This confirmation flow has no old-member passkey grant,
+      // so recovery must be initiated by an organization owner instead.
+      const passkeySafeGuard = `AND NOT EXISTS (
+        SELECT 1 FROM member_passkeys p JOIN human_login_identities pi
+          ON pi.id = p.login_identity_id AND pi.tenant = p.tenant AND pi.member_id = p.member_id AND pi.revoked_at IS NULL
+         WHERE p.tenant = ?4 AND p.member_id = ?5 AND p.login_identity_id = ?3 AND p.revoked_at IS NULL
+      )`
       const baseBinds = [
         me, input.verifiedEmail, identityId, env.TENANT_SLUG, oldMemberId, input.provider, input.subject,
         PROVISIONING_EXEMPT_TOKEN_LABEL, PROVISIONING_EXEMPT_TOKEN_CHANNEL, PROVISIONING_EXEMPT_DIRECTORY_CHANNEL, nowSql, actorRank, nowCapabilitySql(),
       ]
       const claim = env.DB.prepare(
         `INSERT INTO login_identity_move_claims (stamp, tenant, identity_id, from_member_id, to_member_id, claimed_at)
-         SELECT ?14, ?4, ?3, ?5, ?1, ?15 FROM human_login_identities WHERE ${guard}`,
+         SELECT ?14, ?4, ?3, ?5, ?1, ?15 FROM human_login_identities WHERE ${guard} ${passkeySafeGuard}`,
       ).bind(...baseBinds, requestId, nowIso)
       const move = env.DB.prepare(
-        `UPDATE human_login_identities SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2 WHERE ${guard}`,
+        `UPDATE human_login_identities SET member_id = ?1, linked_by_member_id = ?1, verified_email = ?2 WHERE ${guard} ${passkeySafeGuard}`,
       ).bind(...baseBinds)
       // Everything after the move lands only if THIS request's claim landed (stamp = requestId, the #1979 consumed_at pattern)
       // AND the identity now belongs to the actor; the cutoffs anchor on the audit row.
@@ -327,10 +334,9 @@ export async function linkSignIn(
         `UPDATE web_sessions SET revoked_at = ?3, revoke_reason = 'identity_moved'
           WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
-      // Passkeys / phones enrolled under the old owner stay with the old member and are cut off in the same batch.
-      const passkeys = env.DB.prepare(
-        `UPDATE member_passkeys SET revoked_at = ?3 WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
-      ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId, identityId)
+      // A moved identity makes its old member's passkeys unusable through the
+      // live-identity predicate. Keep the rows as durable enrolment history:
+      // passkey removal itself requires another live passkey confirmation.
       const phones = env.DB.prepare(
         `UPDATE tg_miniapp_devices SET revoked_at = ?3, revoked_reason = 'login_identity_moved'
           WHERE tenant = ?1 AND member_id = ?4 AND login_identity_id = ?5 AND revoked_at IS NULL AND ${anchored}`,
@@ -360,7 +366,7 @@ export async function linkSignIn(
       ).bind(env.TENANT_SLUG, requestId, nowIso, oldMemberId)
       let results: Awaited<ReturnType<typeof env.DB.batch>>
       try {
-        results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones, supersede, connectors, telegram])
+        results = await env.DB.batch([claim, move, audit, cutoff, phones, supersede, connectors, telegram])
       } catch (err) {
         console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }
@@ -373,13 +379,13 @@ export async function linkSignIn(
 
 export type UnlinkSignInResult =
   | { ok: true }
-  | { ok: false; error: 'last_identity' | 'not_found' }
+  | { ok: false; error: 'last_identity' | 'not_found' | 'presence_required' | 'passkey_recovery_required' }
 
 /**
  * Unlink one of the member's OWN live identities. The "never the last one" guard lives inside the UPDATE, so two
  * concurrent unlinks cannot both pass a read-then-write check and leave the member with no way in.
  */
-export async function unlinkSignIn(env: Env, auth: AuthContext, identityId: string): Promise<UnlinkSignInResult> {
+export async function unlinkSignIn(env: Env, auth: AuthContext, identityId: string, presenceGrantId?: string): Promise<UnlinkSignInResult> {
   const me = auth.memberId
   if (!me) return { ok: false, error: 'not_found' }
   const target = await env.DB.prepare(
@@ -387,18 +393,23 @@ export async function unlinkSignIn(env: Env, auth: AuthContext, identityId: stri
       WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL LIMIT 1`,
   ).bind(identityId, env.TENANT_SLUG, me).first<{ provider: string; verified_email: string | null }>()
   if (!target) return { ok: false, error: 'not_found' }
+  if (await identityRemovalNeedsRecovery(env, env.TENANT_SLUG, me, identityId)) return { ok: false, error: 'passkey_recovery_required' }
+  if (await identityHasLivePasskeys(env, env.TENANT_SLUG, me, identityId)
+    && !(await identityRemovalPresenceSatisfied(env, env.TENANT_SLUG, me, identityId, presenceGrantId))) {
+    return { ok: false, error: 'presence_required' }
+  }
   const nowIso = new Date().toISOString()
   const res = await env.DB.prepare(
     `UPDATE human_login_identities SET revoked_at = ?1
       WHERE id = ?2 AND tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL
+        AND ${identityRemovalWriteGuard('?3', '?4', '?2', '?5', '?1')}
         AND EXISTS (
           SELECT 1 FROM human_login_identities o
            WHERE o.tenant = ?3 AND o.member_id = ?4 AND o.revoked_at IS NULL AND o.id != ?2
         )`,
-  ).bind(nowIso, identityId, env.TENANT_SLUG, me).run()
+  ).bind(nowIso, identityId, env.TENANT_SLUG, me, presenceGrantId ?? null).run()
   if (Number(res.meta?.changes ?? 0) === 0) return { ok: false, error: 'last_identity' }
   await revokeWebSessionsForLoginIdentity(env, env.TENANT_SLUG, me, identityId, 'identity_unlinked')
-  await revokeMemberPasskeys(env, me, 'login_identity_unlinked', { loginIdentityId: identityId })
   await revokeMemberTgDevices(env, me, 'login_identity_unlinked', { loginIdentityId: identityId })
   await auditLink(env, auth, 'unlink', identityId, {
     provider: target.provider, maskedEmail: target.verified_email ? maskEmail(target.verified_email) : null,

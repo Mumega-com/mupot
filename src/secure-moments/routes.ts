@@ -385,6 +385,7 @@ momentsApp.post('/m/enrol/:token/finish', async (c) => {
   if (!done.ok) {
     const msg = done.reason === 'duplicate_credential' ? 'This passkey is already registered.'
       : done.reason === 'too_many_passkeys' ? 'You have the maximum number of passkeys. Remove one first.'
+        : done.reason === 'enrolment_state_changed' ? 'Your account already has passkey history. Start again from My Account and confirm with an existing passkey.'
         : 'This enrolment link was already used.'
     return fail(c, 409, msg, 'Not registered')
   }
@@ -416,7 +417,12 @@ momentsApp.get('/m/presence/:id/:token', async (c) => {
   if (!csrf) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for secure moments.')
   // Dashboard decisions are applied from the dashboard's return page; the Access page's own Approve button is pressed again where it was.
   const accessKind = r.g.kind === 'access_seed_approve' ? 'seed' : r.g.kind === 'access_elevation_approve' ? 'elevation' : null
-  const back = accessKind
+  // OAuth consent uses its own nonce cookie rather than a dashboard web
+  // session. Return its satisfied grant to the OAuth reapply page, which will
+  // preserve and re-check that nonce before it consumes the grant.
+  const back = r.g.kind === 'oauth_consent'
+    ? dashboardUrl(c.env, `/oauth/consent?presence_grant=${encodeURIComponent(r.g.id)}`)
+    : accessKind
     ? ((base) => (base ? `${base}?presence_grant=${encodeURIComponent(r.g.id)}` : null))(approveUrl(c.env, accessKind, r.g.subject_id))
     : dashboardUrl(c.env, `/presence/${encodeURIComponent(r.g.id)}`)
   const body = `<h1>Confirm with your passkey</h1>

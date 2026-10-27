@@ -18,6 +18,7 @@ import { checkWebSession } from '../secure-moments/enrol-mint'
 import { loadPresenceGrant, type PresenceSpec, type PresenceValue } from '../approvals/human-presence'
 import { PRESENCE_MESSAGES, presenceCheck, presenceGateJson } from '../approvals/gate'
 import { pageHeader, sectionPanel, type Html } from './ui'
+import { getSetting, SETTINGS_KEYS, isValidBotUsername } from './settings'
 
 type ShellFn = (env: Env, title: string, body: HtmlEscapedString | Promise<HtmlEscapedString>) => HtmlEscapedString | Promise<HtmlEscapedString>
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -65,21 +66,28 @@ export function makePresenceApp(shell: ShellFn) {
     try {
       const parsed: unknown = JSON.parse(g.fields_json)
       if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        const isValue = (v: unknown): v is PresenceValue => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || (Array.isArray(v) && v.every((x) => typeof x === 'string'))
+        const isValue = (v: unknown): v is PresenceValue => v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || (Array.isArray(v) && v.every((x) => typeof x === 'string'))
         fields = Object.fromEntries(Object.entries(parsed).filter((e): e is [string, PresenceValue] => isValue(e[1])))
       }
     } catch { /* an unreadable field set applies nothing: the form below is simply empty and the route refuses it */ }
     const target = `${g.action_path}?presence_grant=${encodeURIComponent(g.id)}`
+    const configuredBot = g.kind === 'telegram_bind' ? await getSetting(c.env, SETTINGS_KEYS.imBotUsername) : null
+    const bot = isValidBotUsername(configuredBot) ? configuredBot : ''
     const body = g.encoding === 'form'
       ? html`<form method="post" action="${target}" class="inline-form">${fieldInputs(fields)}<button type="submit" class="btn">Apply: ${g.summary}</button></form>`
       : html`<div><button type="button" class="btn" id="presence-apply">Apply: ${g.summary}</button><div class="status-line" id="presence-status"></div></div>
         ${raw(`<script>(function(){var b=document.getElementById('presence-apply'),s=document.getElementById('presence-status');
-          var url=${JSON.stringify(target)},fields=${JSON.stringify(fields).replace(/</g, '\\u003c')},back=${JSON.stringify(g.return_path)};
+          var url=${JSON.stringify(target)},fields=${JSON.stringify(fields).replace(/</g, '\\u003c')},back=${JSON.stringify(g.return_path)},bot=${JSON.stringify(bot).replace(/</g, '\\u003c')};
           b.addEventListener('click',async function(){b.disabled=true;s.textContent='applying…';
             try{var r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify(fields)});
               var d=await r.json().catch(function(){return {}});
               if(r.ok){if(d&&typeof d.url==='string'){window.location.assign(d.url);return}
-                if(d&&typeof d.token==='string'){s.textContent='Copy this token now. It is shown once and is not stored: ';var pre=document.createElement('pre');pre.textContent=d.token;s.appendChild(pre);return}
+                var issued=d&&(typeof d.token==='string'?d.token:d.token&&typeof d.token.raw==='string'?d.token.raw:null);
+                if(issued){s.textContent='Copy this token now. It is shown once and is not stored: ';var pre=document.createElement('pre');pre.textContent=issued;s.appendChild(pre);return}
+                if(d&&typeof d.pairing_code==='string'){s.textContent='';var result=document.createElement('div');result.id='tg-result';
+                  var p=document.createElement('p');p.textContent='Pairing code: '+d.pairing_code;result.appendChild(p);
+                  if(bot){var a=document.createElement('a');a.href='https://t.me/'+bot+'?start='+encodeURIComponent(d.pairing_code);a.textContent='Open in Telegram →';a.target='_blank';a.rel='noopener noreferrer';result.appendChild(a)}
+                  var next=document.createElement('p');next.textContent='Tap Start in Telegram, then send /muneeds to see what is waiting, or send /start '+d.pairing_code+' to your decision bot.';result.appendChild(next);s.appendChild(result);return}
                 window.location.assign(back);return}
               s.textContent='Could not apply ('+(d.error||r.status)+').';b.disabled=false}
             catch(e){s.textContent='Network error — try again.';b.disabled=false}});})();</script>`)}`

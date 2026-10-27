@@ -48,6 +48,8 @@ import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
 import { decideHarnessBearer } from '../members/harness-credential'
+import { presenceCheck, PRESENCE_MESSAGES } from '../approvals/gate'
+import { loadPresenceGrant, type PresenceValue } from '../approvals/human-presence'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -1842,6 +1844,31 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
   // ── /oauth/consent — re-validate the choice, mint, complete (mupot#903b) ───
   if (url.pathname === '/oauth/consent') {
+    // A satisfied OAuth-consent grant returns here instead of the dashboard.
+    // OAuth has its own nonce cookie and no dashboard web session, so forcing
+    // this replay through /presence/:id would make a valid passkey proof
+    // impossible to apply. The POST below still re-checks this cookie and
+    // consumes the exact decision digest.
+    if (request.method === 'GET') {
+      const grantId = url.searchParams.get('presence_grant') ?? ''
+      const grant = grantId ? await loadPresenceGrant(env, grantId) : null
+      if (!grant || grant.kind !== 'oauth_consent' || grant.status !== 'satisfied' || Date.parse(grant.expires_at) <= Date.now()) {
+        return new Response('This approval is unavailable or expired. Start the connection again.', { status: 409 })
+      }
+      let values: Record<string, PresenceValue>
+      try { values = JSON.parse(grant.fields_json) as Record<string, PresenceValue> } catch { return new Response('This approval cannot be applied.', { status: 409 }) }
+      const consentNonce = typeof values.consent_nonce === 'string' ? values.consent_nonce : ''
+      const pending = consentNonce ? await env.SESSIONS.get(`oauth-consent:${consentNonce}`, 'json') as PendingConsent | null : null
+      if (!pending || pending.memberId !== grant.member_id || !hasNonceCookie(request.headers.get('Cookie') ?? '', CONSENT_COOKIE_NAME, consentNonce)) {
+        return new Response('This approval is unavailable or expired. Start the connection again.', { status: 409 })
+      }
+      const hidden = Object.entries(values).flatMap(([key, value]) => (Array.isArray(value) ? value : [value]).map((one) =>
+        `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(String(one))}">`,
+      )).join('')
+      return new Response(`<!doctype html><title>Apply passkey approval</title><main><h1>Passkey confirmed</h1><p>${escapeHtml(grant.summary)}</p><form method="post" action="/oauth/consent?presence_grant=${encodeURIComponent(grant.id)}">${hidden}<button type="submit">Continue connection</button></form></main>`, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' },
+      })
+    }
     if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 })
 
     const form = await request.formData()
@@ -1852,6 +1879,9 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       return new Response('Missing agent_id: explicit consent choice is required', { status: 400 })
     }
     let agentIdRaw = String(form.get('agent_id') ?? '').trim()
+    // Preserve the submitted sentinel in the grant digest and reapply form.
+    // `harnessChosen` normalises it only for the local decision branches.
+    const submittedAgentId = agentIdRaw
     // mupot#1794 W3: the harness option is the EXISTING unbound path under another name. Flag on, the
     // sentinel is normalised to '' here — before any other branch — so it reuses the unbound mint, the
     // W1 harness upsert and every gate unchanged. Flag off the sentinel is left as-is and falls into
@@ -1871,6 +1901,37 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const pending = await env.SESSIONS.get(`oauth-consent:${consentNonce}`, 'json') as PendingConsent | null
     if (!pending) {
       return new Response('Consent session expired or invalid. Please sign in again.', { status: 400 })
+    }
+    // OAuth has a cookie proving the browser session and a fresh Google sign-in,
+    // both of which browser-driving software can perform. Minting either the
+    // member or agent-bound directory grant therefore needs a UV passkey grant
+    // bound to every form value which can affect this consent.
+    if (action === 'continue') {
+      const consentParams: Record<string, PresenceValue> = {
+        action,
+        consent_nonce: consentNonce,
+        agent_id: submittedAgentId,
+        first_agent_name: String(form.get('first_agent_name') ?? ''),
+        new_agent_name: String(form.get('new_agent_name') ?? ''),
+        new_agent_slug: String(form.get('new_agent_slug') ?? ''),
+        new_agent_squad_id: String(form.get('new_agent_squad_id') ?? ''),
+        new_agent_purpose: String(form.get('new_agent_purpose') ?? ''),
+        oauth_client_id: String(pending.stored.clientId ?? ''),
+        oauth_redirect_uri: String(pending.stored.redirectUri ?? ''),
+        oauth_scope: String(pending.stored.scope ?? ''),
+        oauth_response_type: String(pending.stored.responseType ?? ''),
+      }
+      const presence = await presenceCheck(env, pending.memberId, {
+        kind: 'oauth_consent', subjectId: pending.memberId, params: consentParams,
+        summary: 'Authorize this OAuth connection to mint a directory grant',
+        actionPath: '/oauth/consent', encoding: 'form', returnPath: '/oauth/consent',
+      }, url.searchParams.get('presence_grant') ?? undefined)
+      if (!presence.proceed) {
+        const headers = new Headers({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
+        if (presence.grantId) headers.set('X-Presence-Grant', presence.grantId)
+        const link = presence.approveUrl ? ` Open ${presence.approveUrl} to approve with your passkey, then return here.` : ''
+        return new Response(`${PRESENCE_MESSAGES[presence.error]}${link}`, { status: presence.status, headers })
+      }
     }
     // Single-use: consumed here regardless of outcome (continue, decline, or a
     // rejected agent_id) so a replayed POST can never re-run this step.

@@ -198,6 +198,7 @@ export interface PasskeyRow {
 }
 
 const PASSKEY_COLUMNS = 'id, tenant, member_id, login_identity_id, credential_id, public_key, sign_count, created_at, last_used_at, revoked_at'
+const PASSKEY_COLUMNS_QUALIFIED = PASSKEY_COLUMNS.split(', ').map((column) => `p.${column}`).join(', ')
 
 export async function loadPasskeyByCredential(env: Env, credentialId: string): Promise<PasskeyRow | null> {
   const row = await env.DB.prepare(`SELECT ${PASSKEY_COLUMNS} FROM member_passkeys WHERE tenant = ?1 AND credential_id = ?2 LIMIT 1`)
@@ -207,9 +208,19 @@ export async function loadPasskeyByCredential(env: Env, credentialId: string): P
 
 export async function listMemberPasskeys(env: Env, memberId: string): Promise<PasskeyRow[]> {
   const rows = await env.DB.prepare(
-    `SELECT ${PASSKEY_COLUMNS} FROM member_passkeys WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL ORDER BY created_at ASC`,
+    `SELECT ${PASSKEY_COLUMNS_QUALIFIED} FROM member_passkeys p
+      JOIN human_login_identities i ON i.id = p.login_identity_id AND i.tenant = p.tenant AND i.member_id = p.member_id AND i.revoked_at IS NULL
+      WHERE p.tenant = ?1 AND p.member_id = ?2 AND p.revoked_at IS NULL ORDER BY p.created_at ASC`,
   ).bind(env.TENANT_SLUG, memberId).all<PasskeyRow>()
   return rows.results ?? []
+}
+
+/** Revoked passkeys still count: their existence prevents session-only first enrolment. */
+export async function memberHasPasskeyHistory(env: Env, memberId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS present FROM member_passkeys WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, memberId).first<{ present: number }>()
+  return row !== null
 }
 
 /**
@@ -226,41 +237,36 @@ export async function advancePasskeyCounter(env: Env, passkeyId: string, newCoun
   return r.meta.changes === 1
 }
 
-export async function revokeOwnPasskey(env: Env, memberId: string, passkeyId: string, nowMs: number = Date.now()): Promise<boolean> {
+/**
+ * Revoke only with a just-consumed grant whose confirming passkey is another
+ * live credential. This is the service choke: callers cannot bypass the
+ * dashboard route and turn a session into a revoke→re-enrol bootstrap.
+ */
+export async function revokeOwnPasskey(env: Env, memberId: string, passkeyId: string, presenceGrantId: string | undefined, nowMs: number = Date.now()): Promise<boolean> {
+  if (!presenceGrantId || presenceGrantId.length > 64) return false
+  const nowIso = new Date(nowMs).toISOString()
   const r = await env.DB.prepare(
-    `UPDATE member_passkeys SET revoked_at = ?4 WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
-  ).bind(passkeyId, env.TENANT_SLUG, memberId, new Date(nowMs).toISOString()).run()
+    `UPDATE member_passkeys SET revoked_at = ?4 WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL
+       AND EXISTS (SELECT 1 FROM human_login_identities own WHERE own.id = member_passkeys.login_identity_id
+                   AND own.tenant = member_passkeys.tenant AND own.member_id = member_passkeys.member_id AND own.revoked_at IS NULL)
+       AND EXISTS (
+         SELECT 1 FROM member_passkeys other JOIN human_login_identities live ON live.id = other.login_identity_id
+           AND live.tenant = other.tenant AND live.member_id = other.member_id AND live.revoked_at IS NULL
+          WHERE other.tenant = ?2 AND other.member_id = ?3 AND other.revoked_at IS NULL AND other.id != ?1
+       )
+       AND EXISTS (
+         SELECT 1 FROM presence_grants g
+          JOIN member_passkeys confirmer ON confirmer.id = g.satisfied_passkey_id AND confirmer.tenant = ?2
+           AND confirmer.member_id = ?3 AND confirmer.revoked_at IS NULL
+          JOIN human_login_identities live ON live.id = confirmer.login_identity_id AND live.tenant = confirmer.tenant
+           AND live.member_id = confirmer.member_id AND live.revoked_at IS NULL
+          WHERE g.id = ?5 AND g.tenant = ?2 AND g.member_id = ?3 AND g.kind = 'passkey_revoke'
+            AND g.subject_id = ?1 AND g.status = 'consumed' AND g.satisfied_passkey_id != ?1
+            AND g.consumed_at IS NOT NULL AND g.expires_at > ?4
+       )`,
+  ).bind(passkeyId, env.TENANT_SLUG, memberId, nowIso, presenceGrantId).run()
   if (r.meta.changes === 1) await recordPasskeyAudit(env, { operation: 'passkey_revoke', memberId, passkeyId, evidence: { reason: 'owner_revoke' } }, nowMs)
   return r.meta.changes === 1
-}
-
-/**
- * "Cut this human off" levers kill the passkeys too: every unrevoked passkey of the member (all of them), or only
- * those enrolled under one login identity. Called from revokeAllWebSessions and revokeLoginIdentity so a passkey
- * can never be the surviving door. Receipted once per call when anything was revoked.
- */
-export async function revokeMemberPasskeys(
-  env: Env, memberId: string, reason: string, opts: { loginIdentityId?: string } = {}, nowMs: number = Date.now(),
-): Promise<number> {
-  const nowIso = new Date(nowMs).toISOString()
-  const tenant = env.TENANT_SLUG
-  let r: Awaited<ReturnType<ReturnType<Env['DB']['prepare']>['run']>>
-  try {
-    r = opts.loginIdentityId
-      ? await env.DB.prepare(
-          `UPDATE member_passkeys SET revoked_at = ?4 WHERE tenant = ?1 AND member_id = ?2 AND login_identity_id = ?3 AND revoked_at IS NULL`,
-        ).bind(tenant, memberId, opts.loginIdentityId, nowIso).run()
-      : await env.DB.prepare(
-          `UPDATE member_passkeys SET revoked_at = ?3 WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL`,
-        ).bind(tenant, memberId, nowIso).run()
-  } catch (err) {
-    // A pot that has not applied migration 0212 has no passkeys to revoke; sign-out and identity revoke must still work.
-    if (err instanceof Error && /no such table/i.test(err.message)) return 0
-    throw err
-  }
-  const n = Number(r.meta?.changes ?? 0)
-  if (n > 0) await recordPasskeyAudit(env, { operation: 'passkey_revoke', memberId, passkeyId: null, evidence: { reason, count: String(n), ...(opts.loginIdentityId ? { login_identity_id: opts.loginIdentityId } : {}) } }, nowMs)
-  return n
 }
 
 /**
@@ -297,19 +303,27 @@ export interface EnrolmentTokenRow {
   consumed_at: string | null
 }
 
-/** Mint a single-use 10-minute enrolment token for a member; any earlier unconsumed token is superseded. */
+/** Mint a single-use 10-minute enrolment token for a member; any earlier unconsumed token is superseded.
+ *
+ * `requires_prior_passkey` snapshots the only ungated enrolment case. A token
+ * minted before a member has ever registered a passkey can finish only while
+ * that history is still empty. Revoked credentials remain durable history.
+ */
 export async function mintEnrolmentToken(env: Env, memberId: string, loginIdentityId: string | null, nowMs: number = Date.now()): Promise<{ token: string; expiresAt: string }> {
   const tenant = env.TENANT_SLUG
   const nowIso = new Date(nowMs).toISOString()
+  const prior = await env.DB.prepare(
+    `SELECT 1 AS present FROM member_passkeys WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`,
+  ).bind(tenant, memberId).first<{ present: number }>()
   await env.DB.prepare(
     `UPDATE passkey_enrolment_tokens SET consumed_at = ?3 WHERE tenant = ?1 AND member_id = ?2 AND consumed_at IS NULL`,
   ).bind(tenant, memberId, nowIso).run()
   const token = randomToken()
   const expiresAt = new Date(nowMs + ENROLMENT_TTL_MS).toISOString()
   await env.DB.prepare(
-    `INSERT INTO passkey_enrolment_tokens (id, tenant, member_id, login_identity_id, token_sha256, created_at, expires_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-  ).bind(crypto.randomUUID(), tenant, memberId, loginIdentityId, await tokenHash(token), nowIso, expiresAt).run()
+    `INSERT INTO passkey_enrolment_tokens (id, tenant, member_id, login_identity_id, token_sha256, requires_prior_passkey, created_at, expires_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+  ).bind(crypto.randomUUID(), tenant, memberId, loginIdentityId, await tokenHash(token), prior ? 1 : 0, nowIso, expiresAt).run()
   return { token, expiresAt }
 }
 
@@ -320,7 +334,7 @@ export async function loadEnrolmentToken(env: Env, token: string): Promise<Enrol
   return row ?? null
 }
 
-export type FinishEnrolmentResult = { ok: true; passkeyId: string } | { ok: false; reason: 'token_spent' | 'duplicate_credential' | 'too_many_passkeys' }
+export type FinishEnrolmentResult = { ok: true; passkeyId: string } | { ok: false; reason: 'token_spent' | 'enrolment_state_changed' | 'duplicate_credential' | 'too_many_passkeys' }
 
 /**
  * Consume the token AND store the passkey in one batch. The INSERT runs only if the UPDATE won
@@ -342,7 +356,10 @@ export async function finishEnrolment(
       env.DB.prepare(
         `UPDATE passkey_enrolment_tokens SET consumed_at = ?4
           WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND consumed_at IS NULL AND expires_at > ?4
-            AND (SELECT COUNT(*) FROM member_passkeys WHERE tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL) < ?5`,
+            AND (SELECT COUNT(*) FROM member_passkeys WHERE tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL) < ?5
+            AND (requires_prior_passkey = 1 OR NOT EXISTS (
+              SELECT 1 FROM member_passkeys WHERE tenant = ?2 AND member_id = ?3
+            ))`,
       ).bind(input.tokenId, tenant, input.memberId, nowIso, PASSKEY_MAX_PER_MEMBER),
       env.DB.prepare(
         `INSERT INTO member_passkeys
@@ -359,7 +376,17 @@ export async function finishEnrolment(
     const n = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM member_passkeys WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL`,
     ).bind(tenant, input.memberId).first<{ n: number }>()
-    return { ok: false, reason: (n?.n ?? 0) >= PASSKEY_MAX_PER_MEMBER ? 'too_many_passkeys' : 'token_spent' }
+    if ((n?.n ?? 0) >= PASSKEY_MAX_PER_MEMBER) return { ok: false, reason: 'too_many_passkeys' }
+    const token = await env.DB.prepare(
+      `SELECT requires_prior_passkey FROM passkey_enrolment_tokens WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 LIMIT 1`,
+    ).bind(input.tokenId, tenant, input.memberId).first<{ requires_prior_passkey: number }>()
+    if (token?.requires_prior_passkey === 0) {
+      const history = await env.DB.prepare(
+        `SELECT 1 AS present FROM member_passkeys WHERE tenant = ?1 AND member_id = ?2 LIMIT 1`,
+      ).bind(tenant, input.memberId).first<{ present: number }>()
+      if (history) return { ok: false, reason: 'enrolment_state_changed' }
+    }
+    return { ok: false, reason: 'token_spent' }
   }
   return { ok: true, passkeyId }
 }

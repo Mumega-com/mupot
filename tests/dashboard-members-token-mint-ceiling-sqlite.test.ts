@@ -20,14 +20,16 @@
 // hand-built schema.
 import { afterEach, describe, expect, it } from 'vitest'
 import { dashboardApp } from '../src/dashboard/index'
+import { authApp } from '../src/auth'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { PRESENCE_ENV, seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'f1-ceiling-tenant'
 const ORIGIN = 'https://pot.test'
 
-function envFor(harness: SqliteD1Harness, sessions: Record<string, string>): Env {
+function envFor(harness: SqliteD1Harness, sessions: Record<string, string>, localTestEmail?: string): Env {
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
@@ -48,7 +50,17 @@ function envFor(harness: SqliteD1Harness, sessions: Record<string, string>): Env
     AI: {},
     AGENT: {},
     SQUAD: {},
+    ...(localTestEmail ? { LOCAL_TEST_AUTH: '1', LOCAL_TEST_AUTH_EMAIL: localTestEmail } : {}),
+    ...PRESENCE_ENV,
   } as unknown as Env
+}
+
+async function browserCookie(env: Env): Promise<string> {
+  const login = await authApp.request('/dev-login', {}, env)
+  expect(login.status).toBe(302)
+  const value = /mupot_session=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')?.[1]
+  if (!value) throw new Error('dev login did not create a session cookie')
+  return value
 }
 
 function adminSession(email: string): string {
@@ -144,14 +156,20 @@ describe('POST /members/:id/tokens — target-rank ceiling + tenant/status filte
       INSERT INTO members (id, tenant, email, display_name, status, created_at) VALUES
         ('admin-4', '${TENANT}', 'admin4@f1.test', 'Admin', 'active', datetime('now')),
         ('target-member', '${TENANT}', 'member@f1.test', 'Target Member', 'active', datetime('now'));
+      INSERT INTO users (id, email, role) VALUES ('user-admin-4', 'admin4@f1.test', 'admin');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-member', 'target-member', 'squad', 'squad-f1', 'member');
     `)
-    const env = envFor(harness, { 'sess:s-admin': adminSession('admin4@f1.test') })
+    const env = envFor(harness, {}, 'admin4@f1.test')
+    const cookie = await browserCookie(env)
+    seedPasskey(harness.sqlite, TENANT, 'admin-4')
 
-    const res = await dashboardApp.fetch(mintPost('s-admin', 'target-member'), env)
+    const res = await throughGate(harness.sqlite, TENANT, (qs) => dashboardApp.fetch(
+      new Request(`${ORIGIN}/members/target-member/tokens${qs ? `?${qs}` : ''}`, mintPost(cookie, 'target-member')),
+      env,
+    ))
 
-    expect(res.status).toBe(200)
+    expect(res.status, await res.clone().text()).toBe(200)
     const body = await res.text()
     expect(body).toMatch(/mupot_[0-9a-f]{64}/)
     expect(tokenCountFor(harness, 'target-member')).toBe(1)
@@ -169,16 +187,22 @@ describe('POST /members/:id/tokens — target-rank ceiling + tenant/status filte
       INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-self', 'dept-self', 'squad-self', 'Squad');
       INSERT INTO members (id, tenant, email, display_name, status, created_at) VALUES
         ('self-admin', '${TENANT}', 'self@f1.test', 'Self Admin', 'active', datetime('now'));
+      INSERT INTO users (id, email, role) VALUES ('user-self-admin', 'self@f1.test', 'admin');
       -- Unrelated squad-scope OWNER grant (rank 5) — globally outranks the
       -- org-scope-local admin standing (rank 4) this session authenticates at.
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-self-owner', 'self-admin', 'squad', 'squad-self', 'owner');
     `)
-    const env = envFor(harness, { 'sess:s-self': adminSession('self@f1.test') })
+    const env = envFor(harness, {}, 'self@f1.test')
+    const cookie = await browserCookie(env)
+    seedPasskey(harness.sqlite, TENANT, 'self-admin')
 
-    const res = await dashboardApp.fetch(mintPost('s-self', 'self-admin'), env)
+    const res = await throughGate(harness.sqlite, TENANT, (qs) => dashboardApp.fetch(
+      new Request(`${ORIGIN}/members/self-admin/tokens${qs ? `?${qs}` : ''}`, mintPost(cookie, 'self-admin')),
+      env,
+    ))
 
-    expect(res.status).toBe(200)
+    expect(res.status, await res.clone().text()).toBe(200)
     const body = await res.text()
     expect(body).toMatch(/mupot_[0-9a-f]{64}/)
     expect(tokenCountFor(harness, 'self-admin')).toBe(1)

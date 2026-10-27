@@ -115,7 +115,6 @@
     "tests/mcp-task-tools.test.ts",
     "tests/member-bearer.test.ts",
     "tests/members-capability-service.test.ts",
-    "tests/members-sensitive-response.test.ts",
     "tests/oauth-dual-auth.test.ts",
     "tests/org-create-limits.test.ts",
     "tests/orient-tool.test.ts",

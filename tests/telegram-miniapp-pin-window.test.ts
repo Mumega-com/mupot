@@ -26,6 +26,7 @@ import { TELEGRAM_PASSKEY_ONLY_EXTRA } from '../src/secure-moments/telegram-mini
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { createWebSession, markRecentReauth, revokeAllWebSessions } from '../src/auth/web-sessions'
 import * as cryptoLib from '../src/lib/crypto'
+import { seedPasskey, throughGate } from './helpers/presence'
 
 const TENANT = 'tenant-a'
 const HOST = 'secure.example.test'
@@ -969,8 +970,8 @@ describe('changing the window (changeTrustWindow and the /account route)', () =>
   })
 
   describe('the /account route: lengthening needs the SAME fresh session as enrolment, shortening only a real session', () => {
-    const post = (app: Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>, id: string, body: unknown, origin = 'http://localhost'): Promise<Response> =>
-      Promise.resolve(app.request(`/account/telegram-device/${id}/window`, { method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: JSON.stringify(body) }, env))
+    const post = (app: Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>, id: string, body: unknown, origin = 'http://localhost', query = ''): Promise<Response> =>
+      Promise.resolve(app.request(`/account/telegram-device/${id}/window${query ? `?${query}` : ''}`, { method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: JSON.stringify(body) }, env))
     it('stale session: lengthening and re-saving are reauth_required, shortening works; agent, cross-origin, bad values and other members are refused; a fresh session may lengthen', async () => {
       const p = await warmDevice() // 86400
       const { app, setAuth } = accountApp(env)
@@ -995,9 +996,13 @@ describe('changing the window (changeTrustWindow and the /account route)', () =>
       expect(short.status).toBe(200)
       expect(devRow(p).trust_window_seconds).toBe(7200)
       expect(count('mutation_audit_entries', "operation = 'tg_device_window_change'")).toBe(1)
-      // lengthening with a fresh session: allowed
+      // Lengthening with a fresh session also needs the presence proof. This
+      // suite is about the window mechanics, so pass the common gate with its
+      // DB shortcut; human-presence-account.test.ts exercises the ceremony.
       setAuth(await webAuth('mem-sqadmin', identities.sqadmin, true))
-      expect((await post(app, deviceId(p), { seconds: 28800 })).status).toBe(200)
+      seedPasskey(harness.sqlite, TENANT, 'mem-sqadmin')
+      const lengthened = await throughGate(harness.sqlite, TENANT, (q) => post(app, deviceId(p), { seconds: 28800 }, 'http://localhost', q))
+      expect(lengthened.status).toBe(200)
       expect(devRow(p).trust_window_seconds).toBe(28800)
       // another member's fresh session cannot touch it
       setAuth(await webAuth('mem-owner', identities.owner, true))
