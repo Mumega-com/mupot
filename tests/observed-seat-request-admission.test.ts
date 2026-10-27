@@ -414,11 +414,12 @@ describe('agent page: Connect a chat checklist', () => {
     h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES ('panel-bearer', ?, ?, 'panel test', 'workspace', ?)`).run(HUMAN, await sha256Hex(raw), TENANT)
     const { dashboardApp } = await import('../src/dashboard/index')
     const bearer = await dashboardApp.request('/agents/agent-coo', { headers: { authorization: `Bearer ${raw}` } }, env)
-    expect(await bearer.text()).not.toContain('data-agent-connect')
+    expect(await bearer.text()).not.toContain('data-connect-prompt')
     // An agent member's real cookie still cannot be a human viewer.
     h.sqlite.prepare(`UPDATE members SET email = 'agent@example.test' WHERE id = 'mem-agent-coo'`).run()
     const agentPage = await get(env, await session(env, 'agent@example.test'), '/agents/agent-coo')
-    expect(agentPage).not.toContain('data-agent-connect')
+    expect(agentPage).not.toContain('data-connect-prompt')
+    expect(agentPage).toContain('id="background-connect-prompt"')
   })
 
   it('a pending request shows with Approve and Reject; plain words only', async () => {
