@@ -202,6 +202,28 @@ describe('GET /projects/:id/wiki — read gate', () => {
     expect(filledBody).toContain('Overview Topic')
   })
 
+  it('an org observer renders project topics without squad page slugs or titles', async () => {
+    const harness = makeHarness()
+    try {
+      const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+      const env = await envFor(harness, fake)
+      fake.seed({ tenantSlug: TENANT, project: PROJECT_ID, slug: 'public-overview', title: 'Public Overview' })
+      fake.seed({ tenantSlug: TENANT, project: PROJECT_ID, slug: 'squad-secret', title: 'Squad Secret Title', tags: ['tier:squad'] })
+      as(actor({ memberId: 'observer', capabilities: [{ member_id: 'observer', scope_type: 'org', scope_id: null, capability: 'observer' }] }))
+      const res = await dashboardApp.fetch(new Request(`https://pot.test/projects/${PROJECT_ID}/wiki`), env)
+      expect(res.status).toBe(200)
+      const html = await res.text()
+      expect(html).toContain('Public Overview')
+      expect(html).not.toContain('squad-secret')
+      expect(html).not.toContain('Squad Secret Title')
+      as(writerMember())
+      const shown = await dashboardApp.fetch(new Request(`https://pot.test/projects/${PROJECT_ID}/wiki`), env)
+      expect(await shown.text()).toContain('Squad Secret Title')
+    } finally {
+      harness.close()
+    }
+  })
+
   it('XSS: a topic title/description containing <script> renders escaped, never executable', async () => {
     const harness = makeHarness()
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
