@@ -20,7 +20,7 @@ import { chunkForD1InList } from '../lib/d1-in-list'
 import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import type { VerdictAttribution } from '../auth/attached-ceiling'
-import { compileOwnerSelfAuthoritySql, compileOwnerSelfLensesSql, compileVerdictIndependenceSql, findVerdictIndependenceConflict, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
+import { compilePartyAgentOwnershipSql, ownsTaskPartyAgent, compileOwnerSelfAuthoritySql, compileOwnerSelfLensesSql, compileVerdictIndependenceSql, findVerdictIndependenceConflict, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
 import { enqueueAssignmentWake, isWakeableTaskStatus, type AssignmentWakeContext } from '../agents/assignment-wake'
 import {
   assertAgentNamedSubmission,
@@ -2206,9 +2206,14 @@ export function buildVerdictStatements(
         return { sql: `(${own.sql} AND ${lens.sql})`, params: [...own.params, ...lens.params] }
       })()
     : null
+  const supervisoryConflict = input.independenceWaiver === 'admin_supervisory'
+    ? compilePartyAgentOwnershipSql(input.decidedBy, { column: 'tasks.id' })
+    : null
   const independence = independenceBase && ownerSelfGuard
     ? { sql: `(${independenceBase.sql} OR NOT ${ownerSelfGuard.sql})`, params: [...independenceBase.params, ...ownerSelfGuard.params] }
-    : independenceBase
+    : independenceBase && supervisoryConflict
+      ? { sql: `(${independenceBase.sql} OR ${supervisoryConflict.sql})`, params: [...independenceBase.params, ...supervisoryConflict.params] }
+      : independenceBase
   // Self-completion lane. Facts re-read INSIDE the UPDATE's WHERE (never trusted from the caller's
   // snapshot):
   //   1. the lane itself: tasks.gate_owner must STILL be the lane (an owner re-gate between the
@@ -2415,7 +2420,7 @@ export async function writeVerdict(
       const conflict = await findVerdictIndependenceConflict(env, input.decidedBy, input.task.id)
       if (
         conflict === 'direct'
-        || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory'
+        || (conflict === 'affiliated' && (input.independenceWaiver !== 'admin_supervisory' || await ownsTaskPartyAgent(env, input.decidedBy, input.task.id))
           // owner_self only explains the refusal when the decider no longer holds owner-self authority; otherwise the
           // zero-row UPDATE was an ordinary lost race (status moved), reported as such below.
           && !(input.independenceWaiver === 'owner_self' && await holdsOwnerSelfVerdictAuthority(env, input.decidedBy, input.task.id, submission)))

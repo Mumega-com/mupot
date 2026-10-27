@@ -107,6 +107,28 @@ function partyAgentSources(): Array<{ from: string; agentCol: string }> {
   ]
 }
 
+/** Ownership of ANY party agent excludes the supervisory waiver, including former submitters and runners. */
+export function compilePartyAgentOwnershipSql(
+  deciderId: string,
+  task: { bind: string } | { column: string },
+): { sql: string; params: string[] } {
+  const raw = partyAgentSources().map((src) => `EXISTS (SELECT 1 FROM ${src.from}
+    AND EXISTS (SELECT 1 FROM agents po WHERE po.id = ${src.agentCol} AND po.owner_member_id = @D))`).join(' OR ')
+  const params: string[] = []
+  const sql = raw.replace(/@D|@T/g, (marker) => {
+    if (marker === '@D') { params.push(deciderId); return '?' }
+    if ('column' in task) return task.column
+    params.push(task.bind); return '?'
+  })
+  return { sql: `(${sql})`, params }
+}
+
+export async function ownsTaskPartyAgent(env: Env, deciderId: string, taskId: string): Promise<boolean> {
+  const own = compilePartyAgentOwnershipSql(deciderId, { bind: taskId })
+  const row = await env.DB.prepare(`SELECT ${own.sql} AS c`).bind(...own.params).first<{ c: number }>()
+  return row !== null && Number(row.c) === 1
+}
+
 /**
  * agentLinkedToMemberSql (mupot#2009) — TRUE iff the AGENT is owned by, bound to, or keyed to the member.
  * ONE copy shared by the verdict check (directConflictSqlRaw: an agent decider linked to the submission's
@@ -207,7 +229,7 @@ export function compileOwnerSelfAuthoritySql(
  */
 function ownerSelfLensesSqlRaw(): string {
   const latest = `l.rowid = (SELECT MAX(l2.rowid) FROM task_review_lenses l2
-          WHERE l2.task_id = l.task_id AND l2.submission_id = l.submission_id AND l2.reviewer_id = l.reviewer_id AND l2.lens = l.lens)`
+          WHERE l2.task_id = l.task_id AND l2.submission_id = l.submission_id AND l2.reviewer_id = l.reviewer_id AND LOWER(l2.lens) = LOWER(l.lens))`
   const bound = `l.task_id = @T AND l.submission_id = @SUB AND l.result_digest = @DIG AND l.gate_owner = @GATE AND ${latest}`
   const independent = compileVerdictIndependenceSql(['direct', 'affiliated'], { column: 'l.reviewer_id' }, { column: '@T' })
   const eligible = `(
@@ -224,7 +246,7 @@ function ownerSelfLensesSqlRaw(): string {
     )`
   return `(
     (SELECT COUNT(DISTINCT l.reviewer_id) FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'pass' AND ${eligible}) >= 2
-    AND (SELECT COUNT(DISTINCT l.lens) FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'pass' AND ${eligible}) >= 2
+    AND (SELECT COUNT(DISTINCT LOWER(l.lens)) FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'pass' AND ${eligible}) >= 2
     AND NOT EXISTS (SELECT 1 FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'fail' AND ${eligible})
   )`
 }
@@ -263,13 +285,6 @@ export async function holdsOwnerSelfVerdictAuthority(
   const lens = compileOwnerSelfLensesSql(deciderId, { taskIdExpr: 'tasks.id', gateOwnerExpr: 'tasks.gate_owner' }, submission)
   const row = await env.DB.prepare(`SELECT ${own.sql} AND ${lens.sql} AS c FROM tasks WHERE tasks.id = ?`)
     .bind(...own.params, ...lens.params, taskId).first<{ c: number }>()
-  return row !== null && Number(row.c) === 1
-}
-
-/** JS form of ownerSelfSqlRaw (one predicate, two call shapes). Call only after 'direct' has been ruled out. */
-export async function holdsOwnerSelfAuthority(env: Env, deciderId: string, taskId: string): Promise<boolean> {
-  const c = compileOwnerSelfAuthoritySql(deciderId, { bind: taskId })
-  const row = await env.DB.prepare(`SELECT ${c.sql} AS c`).bind(...c.params).first<{ c: number }>()
   return row !== null && Number(row.c) === 1
 }
 

@@ -38,7 +38,7 @@ import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
-import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
+import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, ownsTaskPartyAgent, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
 import { resolveVerdictSubmission, VerdictSubmissionMismatchError, VerdictSubmissionRequiredError, type GateVerdictReceiptOutcome } from './verdict-binding'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
@@ -1793,18 +1793,12 @@ export async function evaluateVerdictGates(
       || (principal.type === 'member' && task.assignee_agent_id !== null
         && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache)))
     if (affiliated) {
-      // isOrgAdmin (legacy owner/admin role OR an org-scope admin grant), the predicate the gate checks use. legacyOwnerAdmin
-      // reads auth.role only, which is always 'member' over MCP, so a grant-based org admin was refused here. The waiver is
-      // a HUMAN's: an agent-bound token that merely carries an admin member envelope never gets it.
-      if (principal.type === 'member' && isOrgAdmin(auth)) {
-        independenceWaiver = 'admin_supervisory'
-      } else if (
-        // Mom-walk D1: a plain MEMBER who OWNS the agent may give the verdict on its work, once two independent passing
-        // lenses sit on the task's CURRENT submission. Members only (an agent decider never reaches this), never an
-        // attached seat (refused above), never a non-owner key minter or bound member.
-        principal.type === 'member' && await ownerSelfAuthority(env, principal.id, task.id, cache)
-      ) {
+      // Ownership takes precedence over org-admin standing on every verdict surface. The owner needs the same
+      // current, independent lenses as any other member; supervisory standing only covers non-owner affiliations.
+      if (principal.type === 'member' && await ownerSelfAuthority(env, principal.id, task.id, cache)) {
         independenceWaiver = 'owner_self'
+      } else if (principal.type === 'member' && isOrgAdmin(auth) && !(await ownsTaskPartyAgent(env, principal.id, task.id))) {
+        independenceWaiver = 'admin_supervisory'
       } else {
         return { allowed: false, code: 'self_verdict', principal }
       }

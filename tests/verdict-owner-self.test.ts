@@ -270,6 +270,13 @@ describe('mom-walk D1: owner_self verdict waiver', () => {
     it('only ONE passing lens', async () => { dropLenses(); lens('L1', 'correctness'); await refusedAndUntouched() })
     it('two lenses from the SAME reviewer do not count as two reviewers', async () => { dropLenses(); lens('L1', 'correctness'); lens('L1', 'adversarial'); await refusedAndUntouched() })
     it('two reviewers under the SAME lens name do not count as two lenses', async () => { dropLenses(); lens('L1', 'correctness'); lens('L2', 'correctness'); await refusedAndUntouched() })
+    it('lens names differing only by case count as one lens', async () => {
+      dropLenses(); lens('L1', 'Correctness'); lens('L2', 'correctness'); await refusedAndUntouched()
+    })
+    it('a later pass with different casing replaces the same reviewer lens failure', async () => {
+      lens('L1', 'correctness', 'fail'); lens('L1', 'Correctness', 'pass')
+      expect((await decide(memberAuth('OWN'))).ok).toBe(true)
+    })
     it('a later FAIL by a reviewer withdraws their earlier pass', async () => { lens('L1', 'correctness', 'fail'); await refusedAndUntouched() })
     it('a fail from any eligible reviewer blocks, even with two passes', async () => { lens('G', 'security', 'fail'); await refusedAndUntouched() })
     it('a later pass after a fail restores that reviewer (latest row per reviewer+lens wins)', async () => {

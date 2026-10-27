@@ -20,6 +20,8 @@ import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
 import { invokeTool, mcpApp } from '../src/mcp/index'
 import { mintMemberToken } from '../src/members/service'
+import { holdsOwnerSelfVerdictAuthority } from '../src/tasks/verdict-independence'
+import { resolveVerdictSubmission } from '../src/tasks/verdict-binding'
 import { listTaskDispatchReceiptTimeline } from '../src/tasks/runtime-receipts'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -698,7 +700,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
   // Mom-walk D1: this was an assignee_conflict refusal. The resolved member OWNS the assignee agent (and the calling
   // agent), is chat-bound, holds the lane: the verdict now lands AS the owner with the 'owner_self' waiver recorded.
-  it('owner_self (mom-walk D1) — the resolved member owns the ASSIGNEE agent (a DIFFERENT agent than the caller): applied, waiver recorded on the verdict row', async () => {
+  it.each(['member', 'admin', 'admin-race', 'past-submitter'])('owner_self %s — respects current lenses and calling-agent independence', async (mode) => {
     seedAgent(harness.sqlite, 'agent-conflict-harness-2')
     seedAgent(harness.sqlite, 'agent-conflict-assignee-2')
     seedGateGrant(harness.sqlite, 'agent', 'agent-conflict-harness-2')
@@ -708,12 +710,41 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedSquadMemberCapability(harness.sqlite, 'member-conflict-2')
     seedGateGrant(harness.sqlite, 'member', 'member-conflict-2')
     seedReviewTask(harness.sqlite, 'task-conflict-2', 'agent-conflict-assignee-2')
+    if (mode === 'past-submitter') {
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, created_at)
+        VALUES ('past-caller', ?, 'task-conflict-2', ?, 'agent-conflict-harness-2', '/tmp/past', ?, ?, '2026-10-19T00:00:00.000Z')`).run(TENANT, SQUAD, 'ab'.repeat(32), 'cd'.repeat(32))
+    }
     seedOwnerSelfLenses(harness.sqlite, 'task-conflict-2', 'agent-conflict-assignee-2')
     const auth = harnessAuth('agent-conflict-harness-2', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' }])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-conflict-2', verdict: 'approved', human_origin: origin({ text: 'approve task-conflict-2' }) }))
-    expect(result.human_origin).toEqual({ applied: true })
-    expect(result.verdict.decided_by).toBe('member-conflict-2')
+    if (mode.startsWith('admin')) {
+      harness.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('admin', 'member-conflict-2', 'org', NULL, 'admin')`).run()
+    }
+    // The latest submission is ordered by ledger seq, not created_at: the caller's past result must precede it.
+    expect(await holdsOwnerSelfVerdictAuthority(env, 'member-conflict-2', 'task-conflict-2',
+      await resolveVerdictSubmission(env, 'task-conflict-2'))).toBe(true)
+    let batched = false
+    const decisionEnv = mode === 'admin-race' ? { ...env, DB: {
+      ...env.DB, prepare: env.DB.prepare.bind(env.DB),
+      batch: async (statements: D1PreparedStatement[]) => {
+        batched = true
+        harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id = 'lens-task-conflict-2-0'`).run()
+        return env.DB.batch(statements)
+      },
+    } } as Env : env
+    const result = await invokeVerdict(decisionEnv, auth, { task_id: 'task-conflict-2', verdict: 'approved', human_origin: origin({ text: 'approve task-conflict-2' }) })
+    if (mode === 'past-submitter' || mode === 'admin-race') {
+      expect(result).toMatchObject({ ok: false, error: mode === 'past-submitter' ? 'self_verdict' : 'verdict_race' })
+      expect(harness.sqlite.prepare('SELECT * FROM task_verdicts').all()).toHaveLength(0)
+      expect(harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = 'task-conflict-2'`).get()).toMatchObject({ status: 'review' })
+      if (mode === 'past-submitter') expect(harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts').all()).toHaveLength(0)
+      if (mode === 'admin-race') expect(batched).toBe(true)
+      return
+    }
+    expect(result).toMatchObject({ ok: true })
+    const applied = expectApplied(result)
+    expect(applied.human_origin).toEqual({ applied: true })
+    expect(applied.verdict.decided_by).toBe('member-conflict-2')
     const row = harness.sqlite.prepare('SELECT independence_waiver FROM task_verdicts WHERE task_id = ?').get('task-conflict-2') as { independence_waiver: string | null }
     expect(row.independence_waiver).toBe('owner_self')
   })
