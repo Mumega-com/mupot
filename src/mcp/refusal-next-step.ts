@@ -1,3 +1,4 @@
+import { CHAT_CONSENT_LABEL, BACKGROUND_CONSENT_LABEL } from './consent-connect-mode'
 // src/mcp/refusal-next-step.ts — ONE refusal envelope for every refusal on the MCP door.
 //
 // WHY. The refusals every new agent hits first, on every door, arrived as a bare code or as prose that
@@ -74,7 +75,7 @@ const CHAT_KINDS: readonly ConnKind[] = ['chat_plain', 'chat_harness', 'chat_bou
 
 /** The labels the consent page actually shows: the choice wording needs SEAT_AUTO_ENROLL and SEAT_ATTACH both on. */
 export function consentLabels(choiceLabels: boolean): { many: string; one: string } {
-  return choiceLabels ? { many: '"Many chats"', one: '"One agent"' } : { many: '"Me (auto)"', one: '"Existing agent"' }
+  return { many: `"${CHAT_CONSENT_LABEL}"`, one: choiceLabels ? `"${BACKGROUND_CONSENT_LABEL}"` : '"Existing agent"' }
 }
 
 export function consentChoiceLabels(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string }): boolean {

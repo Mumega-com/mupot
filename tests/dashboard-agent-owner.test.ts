@@ -78,6 +78,14 @@ function post(env: Env, values: Record<string, string>, origin: string | null = 
 const owner = (h: SqliteD1Harness) =>
   (h.sqlite.prepare("SELECT owner_member_id AS o FROM agents WHERE id = 'ag1'").get() as { o: string | null }).o
 
+it('offers the background OAuth copy from the agent record', async () => {
+  const { env } = setup()
+  authState.current = as('m-admin', 'admin')
+  const body = await (await dashboardApp.request(`${ORIGIN}/agents/ag1`, {}, env)).text()
+  expect(body).toContain('Connect')
+  expect(body).toContain("You are ag1. Connect to mupot by OAuth as ag1 (choose &#39;This connection is Agent One&#39;), then run connection_check.")
+})
+
 describe('agent Owner row + POST /agents/:id/owner', () => {
   it('shows No owner, then the owner name; admin sees the control', async () => {
     const { harness, env } = setup()

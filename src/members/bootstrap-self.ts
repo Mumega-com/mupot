@@ -229,7 +229,7 @@ import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
 export const AGENT_SNAPSHOT_FIELDS = [
   'squad_id', 'slug', 'name', 'role', 'status', 'model', 'model_fallback',
   'purpose', 'owner', 'capabilities', 'skills', 'parent_agent_id', 'qnft_ref',
-  'budget_cap_cents', 'budget_window',
+  'budget_cap_cents', 'budget_window', 'owner_member_id',
 ] as const
 
 /** The honest "this agent did not exist" image — every audited field null. Not
@@ -261,6 +261,7 @@ export function createdAgentSnapshot(agent: Agent): Record<string, unknown> {
     qnft_ref: agent.qnft_ref,
     budget_cap_cents: agent.budget_cap_cents,
     budget_window: agent.budget_window,
+    owner_member_id: agent.owner_member_id,
   }
 }
 
@@ -695,7 +696,9 @@ export async function bootstrapSelf(
   }
 
   // ── agent + member + weld + capability + token + audit: ONE atomic batch ───
-  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName }, { kind: 'home' })
+  const preparedAgent = await deps.prepareAgentCreate(env, squad.id, { slug: agentSlug, name: agentName }, {
+    kind: 'home', ownerMemberId: consentingMemberId,
+  })
   if (!preparedAgent.ok) {
     if (isEntitlementLimitReason(preparedAgent.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
     await compensateCreatedRows(

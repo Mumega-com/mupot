@@ -1,13 +1,10 @@
-// The consent screen's first question: "How will this app connect?" This module holds the ONE place that decides which
-// answer to SUGGEST. It is wording/ordering only: nothing here grants anything, and the human still has to choose
-// explicitly (the radio is never pre-checked: tests/agent-bound-oauth-consent.test.ts "zero silent welds").
-//
-//   many : "Many chats: each chat picks its agent"  -> the harness path (HARNESS_CONSENT_VALUE)
-//   one  : "One agent: this whole app is one agent" -> the bound path (e.g. Muse, a single bot)
-//
-// Multi-thread clients (a chat app / coding tool with many simultaneous threads) default to `many`; everything else
-// defaults to `one`. The client NAME and redirect host are attacker-chosen at DCR time, so this is a suggestion that
-// can only steer which tab opens first, never what is granted.
+// Client-only fallback for the consent screen when no eligible agent hint or unique pending request exists.
+// `many` suggests "A chat you drive"; `one` suggests "Background agent". This function only
+// chooses the first tab; background-agent-consent.ts owns agent defaults and the POST validates consent.
+// Client names and redirect hosts are presentation hints, never authority.
+
+export const CHAT_CONSENT_LABEL = 'A chat you drive'
+export const BACKGROUND_CONSENT_LABEL = 'Background agent'
 
 export type ConnectMode = 'many' | 'one'
 

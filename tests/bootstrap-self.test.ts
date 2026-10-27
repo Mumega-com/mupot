@@ -185,9 +185,10 @@ describe('success path', () => {
     expect(out.token.capability).toBe('member')
 
     const agentRow = harness.sqlite
-      .prepare('SELECT * FROM agents WHERE id = ?').get(out.agent.id) as { squad_id: string; status: string }
+      .prepare('SELECT * FROM agents WHERE id = ?').get(out.agent.id) as { squad_id: string; status: string; owner_member_id: string }
     expect(agentRow.squad_id).toBe(out.squad.id)
     expect(agentRow.status).toBe('active')
+    expect(agentRow.owner_member_id).toBe(HUMAN)
 
     const squadRow = harness.sqlite
       .prepare('SELECT department_id FROM squads WHERE id = ?').get(out.squad.id) as { department_id: string }

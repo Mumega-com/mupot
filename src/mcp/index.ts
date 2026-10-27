@@ -540,7 +540,7 @@ async function resolveAuth(c: {
           // mupot#903b: re-run the FULL live consent check (agent status, the consenting human's status and
           // continued eligibility, the P0-1 clamp) in parallel with the human's standing grants (latent only).
           const [consented, humanGrants] = await Promise.all([
-            resolveConsentedAgentCapabilities(c.env, rowBoundAgentId, auth.consentedByMemberId ?? null),
+            resolveConsentedAgentCapabilities(c.env, rowBoundAgentId, auth.consentedByMemberId ?? null, undefined, auth.backgroundAgentHumanRequired === true),
             auth.consentedByMemberId ? resolveHumanStandingGrants(c.env, auth.consentedByMemberId) : Promise.resolve([]),
           ])
           auth.capabilities = consented
@@ -7800,7 +7800,7 @@ const toolConnect: ToolSpec = {
       } else {
         let how: string
         if (!seatAttachEnabled(env)) {
-          how = `Becoming ${agentRef.slug} from this chat is not enabled on this pot (seat_attach is off). Ask your human; a Codex/CLI host uses a workspace token an admin mints on /admin/agent-token.`
+          how = `Becoming ${agentRef.slug} from this chat is not enabled on this pot (seat_attach is off). Ask your human; a background Codex/CLI host signs in once by OAuth as this agent, choosing "This connection is ${agentRef.name}". Its harness keeps the refresh token.`
         } else if (auth.seatBinding.attached) {
           how = `This chat is attached to ${actingLabel} and stays so; ask your human to move or detach it on their Connections page.`
         } else if (seatAttachDesignatedEnabled(env) && !(await env.DB.prepare(`SELECT 1 AS x FROM agents a WHERE a.id = ?1 ${attachDesignatedClause(env, 'a', '?2')}`).bind(agentRef.id, auth.seatBinding.humanMemberId).first<{ x: number }>())) {
@@ -7828,7 +7828,7 @@ const toolConnect: ToolSpec = {
         : auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
             ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`
-            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a Claude Code / CLI session uses a workspace token an admin mints on /admin/agent-token. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`)
+            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a background Claude Code / CLI harness signs in once by OAuth as ${agentRef.slug}, choosing "This connection is ${agentRef.name}", and keeps its own refresh token. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`)
         : durable
           ? 'You are now hot. Call orient {} (or rely on this packet) for your full briefing.'
           : `You are now hot (this claim is session-local). For your agent's briefing call orient { agent: "${agentRef.slug}" }, or rely on this packet.`,

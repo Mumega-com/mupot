@@ -33,8 +33,10 @@ import {
   listConsentableAgents,
   listConsentableSquads,
   memberMayConsentToAgent,
+  memberMayConsentToBackgroundAgent,
 } from '../src/mcp/oauth-authorize'
 import { invokeTool, mcpApp } from '../src/mcp/index'
+import { callerHoldsGateCapability, evaluateVerdictGates } from '../src/tasks'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
@@ -106,6 +108,8 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
     INSERT INTO members (id, email, display_name, status, created_at, tenant)
       VALUES ('${MEMBER_AGENT_E}', NULL, '${AGENT_E.name}', 'active', '2026-08-01T00:00:00.000Z', '${TENANT}');
 
+    INSERT INTO members (id, display_name, status, tenant) VALUES ('another-human', 'Another human', 'active', '${TENANT}');
+
     -- agent-c has NO binding row — unminted, nothing to consent to.
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${AGENT_A.id}', '${MEMBER_AGENT_A}', '2026-08-01T00:00:00.000Z');
@@ -115,6 +119,8 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
       VALUES ('${TENANT}', '${AGENT_D.id}', '${MEMBER_AGENT_D}', '2026-08-01T00:00:00.000Z');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${AGENT_E.id}', '${MEMBER_AGENT_E}', '2026-08-01T00:00:00.000Z');
+
+    UPDATE agents SET owner_member_id = '${HUMAN}';
 
     -- Each agent's OWN capability set — the escalation-guarded home-squad grant,
     -- exactly what prepareAgentBoundTokenMintForBinding would have written.
@@ -924,6 +930,9 @@ describe('C4c. POST /oauth/consent — Mint-in-Chooser (__mint_new__)', () => {
     expect(createdAgent.purpose).toBe('Cursor Agent seat on muvps')
 
     expect(call.props.boundAgentId).toBe(createdAgent.id)
+    expect(await memberMayConsentToBackgroundAgent(env, HUMAN, createdAgent.id)).toBe(true)
+    const reconnect = await reachConsentScreen(env, oauthProvider, 'human@example.test')
+    expect(reconnect.html).toContain(`value="${createdAgent.id}"`)
 
     // Verify dedicated member was created and bound
     const binding = harness.sqlite.prepare(
@@ -1893,6 +1902,10 @@ describe('C10. a brand-new customer with no capabilities', () => {
     ).all()[0]
     expect(agent).toBeTruthy()
     expect(agent.name).toBe('Ada')
+    const human = harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(NEWCOMER) as { id: string }
+    expect(await memberMayConsentToBackgroundAgent(env, human.id, String(agent.id))).toBe(true)
+    const reconnect = await reachConsentScreen(env, oauthProvider, NEWCOMER)
+    expect(reconnect.html).toContain(`value="${agent.id}"`)
   })
 
   it('clamps the new agent to member on its own squad — never lead or above', async () => {
@@ -2076,4 +2089,166 @@ describe('H. offboarded / demoted consenter or inactive agent: no latent authori
       expect(key(r.latent).some((g) => g.endsWith(':org:null:admin'))).toBe(false)
     })
   }
+})
+
+describe('background OAuth authority parity', () => {
+  it('pins the existing gate lane: OAuth and workspace callers use the same agent grant', async () => {
+    const env = envFor(harness)
+    insertDirectoryToken(harness.sqlite, 'tok-gate', MEMBER_AGENT_A, AGENT_A.id)
+    const oauth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A, tokenId: 'tok-gate', email: 'human@example.test', consentedByMemberId: HUMAN,
+    })
+    expect(oauth!.capabilities).toEqual([
+      { member_id: MEMBER_AGENT_A, scope_type: 'squad', scope_id: AGENT_A.squad_id, capability: 'member' },
+    ])
+    const workspace = { ...oauth!, channel: 'workspace' as const, consentedByMemberId: null }
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('human-gate', 'gate:athena', 'member', '${HUMAN}', '${HUMAN}', '2026-10-26T00:00:00Z')`)
+    for (const auth of [oauth!, workspace]) {
+      expect(await callerHoldsGateCapability(env, auth, 'squad-a', 'gate:athena')).toBe(false)
+    }
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-agent', 'gate:athena', 'agent', '${AGENT_A.id}', '${HUMAN}', '2026-10-26T00:00:00Z')`)
+    for (const auth of [oauth!, workspace]) {
+      expect(await callerHoldsGateCapability(env, auth, 'squad-a', 'gate:athena')).toBe(true)
+      const result = await evaluateVerdictGates(env, auth, {
+        id: 'independent-task', squad_id: 'squad-a', gate_owner: 'gate:athena', assignee_agent_id: AGENT_B.id,
+      }, 'approved')
+      expect(result.allowed).toBe(true)
+      expect(result.principal).toMatchObject({ id: AGENT_A.id, type: 'agent' })
+      const taskId = `gate-check-${auth.channel}`
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, done_when, status, gate_owner, assignee_agent_id)
+        VALUES (?, 'squad-a', 'Independent review', 'reviewed', 'review', 'gate:athena', ?)`).run(taskId, AGENT_B.id)
+      const verdict = await invokeTool(auth, env, 'task_verdict', { task_id: taskId, verdict: 'approved' }, 'https://pot.test')
+      expect(verdict).toMatchObject({ ok: true, result: { verdict: { decided_by: AGENT_A.id } } })
+    }
+    harness.sqlite.exec("DELETE FROM gate_grants WHERE id = 'gate-agent'")
+    expect(await callerHoldsGateCapability(env, oauth!, 'squad-a', 'gate:athena')).toBe(false)
+  })
+  it('designation never replaces the admin floor', async () => {
+    harness.sqlite.exec(`UPDATE agents SET attach_designated_member_id = '${HUMAN}' WHERE id = '${AGENT_A.id}';
+      UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
+  })
+  it('requires an owner or designated human even when squad admin is present', async () => {
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = 'another-human' WHERE id = '${AGENT_A.id}'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = '${HUMAN}' WHERE id = '${AGENT_A.id}'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(true)
+  })
+})
+
+describe('background consent live assignment and legacy reconnect', () => {
+  async function consent() {
+    const provider = stubOAuthProvider()
+    const { env } = httpEnv(harness, provider)
+    const { consentCookie, html } = await reachConsentScreen(env, provider, 'human@example.test')
+    expect(html).toContain(`value="${AGENT_A.id}"`)
+    const response = await handleOAuthAuthorize(new Request('https://pot.test/oauth/consent', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent_${consentCookie}=1` },
+      body: new URLSearchParams({ consent_nonce: consentCookie, action: 'continue', agent_id: AGENT_A.id }),
+    }), env)
+    expect(response.status).toBe(302)
+    const props = (provider.completeAuthorization.mock.calls as unknown as Array<[{ props: import('../src/mcp/oauth-authorize').OAuthMemberProps }]>)[0][0].props
+    return { env, props }
+  }
+
+  it.each(['owner transfer', 'designation cleared'])('%s ends the next request and a refreshed grant\'s access', async (change) => {
+    if (change === 'designation cleared') harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL, attach_designated_member_id = '${HUMAN}' WHERE id = '${AGENT_A.id}'`)
+    const { env, props } = await consent()
+    expect(props.backgroundAgentHumanRequired).toBe(true)
+    const live = await buildAuthContextFromProps(env, props)
+    expect(live!.boundAgentId).toBe(AGENT_A.id)
+    expect(live!.backgroundAgentHumanRequired).toBe(true)
+    expect(live!.capabilities!.length).toBeGreaterThan(0)
+    harness.sqlite.exec(change === 'owner transfer'
+      ? `UPDATE agents SET owner_member_id = 'another-human' WHERE id = '${AGENT_A.id}'`
+      : `UPDATE agents SET attach_designated_member_id = NULL WHERE id = '${AGENT_A.id}'`)
+    // The provider carries grant props into refreshed access tokens; neither token may retain authority.
+    for (const tokenProps of [props, JSON.parse(JSON.stringify(props))]) {
+      const after = await buildAuthContextFromProps(env, tokenProps)
+      expect(after!.boundAgentId).toBeNull()
+      expect(after!.capabilities).toEqual([])
+      expect(await invokeTool(after!, env, 'inbox', { peek: true }, 'https://pot.test')).toMatchObject({ error: 'not_agent_bound' })
+    }
+    // Revalidation also happens at the internal hop if assignment changes after context construction.
+    const req = new Request('https://pot.test/mcp', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tool: 'inbox', args: { peek: true } }),
+    })
+    const response = await mcpApp.fetch(mcpInternalRequest(req, live!), env)
+    expect(await response.text()).toContain('not_agent_bound')
+  })
+
+  it('legacy agents with neither assignment reconnect using the existing admin floor', async () => {
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL, attach_designated_member_id = NULL WHERE id = '${AGENT_A.id}'`)
+    const { env, props } = await consent()
+    expect(props.backgroundAgentHumanRequired).toBeUndefined()
+    expect((await buildAuthContextFromProps(env, props))!.boundAgentId).toBe(AGENT_A.id)
+    expect(await memberMayConsentToBackgroundAgent(env, HUMAN, AGENT_A.id)).toBe(true)
+    harness.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE id = 'cap-human-squad-a'`)
+    expect(await memberMayConsentToBackgroundAgent(env, HUMAN, AGENT_A.id)).toBe(false)
+    expect((await buildAuthContextFromProps(env, props))!.boundAgentId).toBeNull()
+  })
+
+  it.each([
+    ['another-human', null], [null, 'another-human'], ['another-human', 'another-human'],
+  ])('an assignment to someone else never uses legacy fallback (owner=%s, designated=%s)', async (owner, designated) => {
+    harness.sqlite.prepare('UPDATE agents SET owner_member_id = ?, attach_designated_member_id = ? WHERE id = ?').run(owner, designated, AGENT_A.id)
+    const env = envFor(harness)
+    expect(await memberMayConsentToBackgroundAgent(env, HUMAN, AGENT_A.id)).toBe(false)
+    insertDirectoryToken(harness.sqlite, 'tok-other-owner', MEMBER_AGENT_A, AGENT_A.id)
+    const auth = await buildAuthContextFromProps(env, { memberId: MEMBER_AGENT_A, tokenId: 'tok-other-owner', email: 'human@example.test', consentedByMemberId: HUMAN })
+    expect(auth!.boundAgentId).toBeNull()
+    // The memoized preview uses the same assignment rule as the single-agent path.
+    const preview = (await listConsentableAgents(env, HUMAN)).find((a) => a.id === AGENT_A.id)
+    expect(preview?.capabilities ?? []).toEqual([])
+  })
+
+  it.each(['owner', 'designated'])('either the %s human may consent while the other assignment belongs to someone else', async (kind) => {
+    harness.sqlite.prepare('UPDATE agents SET owner_member_id = ?, attach_designated_member_id = ? WHERE id = ?')
+      .run(kind === 'owner' ? HUMAN : 'another-human', kind === 'designated' ? HUMAN : 'another-human', AGENT_A.id)
+    const { env, props } = await consent()
+    expect((await buildAuthContextFromProps(env, props))!.boundAgentId).toBe(AGENT_A.id)
+    const preview = (await listConsentableAgents(env, HUMAN)).find((a) => a.id === AGENT_A.id)
+    expect(preview!.capabilities.length).toBeGreaterThan(0)
+  })
+})
+
+
+describe('consent reconnect recovery', () => {
+  it('does not offer bootstrap again after a bootstrapped human loses squad access', async () => {
+    harness.sqlite.exec(`INSERT INTO agent_audit (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
+      VALUES ('bootstrap-history', '${AGENT_A.id}', '${HUMAN}', 'user', 'bootstrap_self', '[]', '{}', '{}');
+      DELETE FROM capabilities WHERE member_id = '${HUMAN}'`)
+    const provider = stubOAuthProvider()
+    const { env } = httpEnv(harness, provider)
+    const { html } = await reachConsentScreen(env, provider, 'human@example.test')
+    expect(html).not.toContain('value="__bootstrap__"')
+    expect(html).not.toContain('bootstrap_self')
+    expect(html).not.toContain('You do not have an agent yet')
+    expect(html).toContain('set you as owner or designate you')
+  })
+})
+
+describe('background consent recovery reads', () => {
+  it('does not offer first-run creation when bootstrap history is inaccessible', async () => {
+    harness.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${HUMAN}'`)
+    const provider = stubOAuthProvider()
+    const { env } = httpEnv(harness, provider)
+    const originalPrepare = env.DB.prepare.bind(env.DB)
+    env.DB.prepare = ((sql: string) => {
+      if (sql.includes("action = 'bootstrap_self'")) throw new Error('bootstrap history unavailable')
+      return originalPrepare(sql)
+    }) as typeof env.DB.prepare
+    const { html } = await reachConsentScreen(env, provider, 'human@example.test')
+    expect(html).not.toContain('value="__bootstrap__"')
+    expect(html).toContain('set you as owner or designate you')
+  })
+
+  it('a suspended consenting human cannot reconnect a legacy agent', async () => {
+    harness.sqlite.exec(`UPDATE agents SET owner_member_id = NULL, attach_designated_member_id = NULL WHERE id = '${AGENT_A.id}';
+      UPDATE members SET status = 'suspended' WHERE id = '${HUMAN}'`)
+    expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
+  })
 })

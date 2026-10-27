@@ -854,6 +854,8 @@ export interface AuthContext {
    * authority even though the AGENT stays untouched).
    */
   consentedByMemberId?: string | null
+  /** Assigned background consent cannot fall back to legacy consent after assignment is cleared. */
+  backgroundAgentHumanRequired?: boolean
   tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
   /**
    * mupot#1794 W1: the harness (OAuth client install) this UNBOUND directory grant was consented
