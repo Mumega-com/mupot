@@ -107,11 +107,8 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'IDP_PROVIDER',
   'IM_WEBHOOK_SECRET',
   'INBOX_STREAM_PUSH',
-  'INKWELL_API_TOKEN',
   'INKWELL_API_URL',
-  'INKWELL_SECRET',
   'INKWELL_SVC',
-  'INKWELL_TOKEN',
   'INSTALLER_WINDOW', // installer window (design S1): opt-in flag for the time-boxed operator bundle (non-secret)
   'LAND_REQUIRES_EVIDENCE',
   'LINEAR_WEBHOOK_SECRET',

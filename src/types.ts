@@ -234,10 +234,7 @@ export interface Env {
   MIRROR_SECRET?: string // shared secret for Mirror 16D RRF memory sub-app
   SOS_SECRET?: string // shared secret for SOS event bus bridge sub-app
   SOS_TOKEN?: string // token for SOS event bus bridge
-  INKWELL_SECRET?: string // shared secret for Inkwell publishing sub-app
   TORIVERS_SECRET?: string // shared secret for ToRivers v2 deterministic automation sub-app
-  INKWELL_TOKEN?: string // token for Inkwell publishing
-  INKWELL_API_TOKEN?: string // API token for Inkwell publishing
   AI_GATEWAY_TOKEN?: string
   // Telegram bridge: Mupot bus consumer notifies Hadi of task events
   // via HMAC-signed POST to Hermes webhook deliver_only route.
