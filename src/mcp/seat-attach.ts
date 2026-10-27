@@ -142,8 +142,8 @@ const toolSeatAttach: ToolSpec = {
           ? 'No agent by that name is available for your human to admit. If it exists, an org admin has to designate your human for it first (update_agent, attach_designated_member_id); call seat_attach with no agent to list what is available now.'
           : 'No agent by that name is available for your human to admit.')
       case 'agent_not_designated_for_you': {
-        // The 'Allow for me' control renders (and its POST works) only for org admins. A human without that standing is told who can act.
-        const canPress = await humanCanDesignateAtAll(env, seat.humanMemberId)
+        // Guide this human using the target agent's current designation standing.
+        const canPress = r.agent ? await humanCanDesignateAtAll(env, seat.humanMemberId, r.agent.id) : false
         return fail(409, r.error, {
           who_acts: canPress ? 'owner' : 'admin',
           agent: r.agent,
@@ -151,7 +151,7 @@ const toolSeatAttach: ToolSpec = {
           // lives on the agent's own page, not on Connections.
           next_step: canPress
             ? "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again."
-            : "This agent isn't set up for you yet, and only an org admin can do that: the 'Allow for me' button on the agent's page is shown to org admins only. Ask your human to ask an org admin to designate them for this agent (an org admin does it with update_agent, setting attach_designated_member_id to your human's member id), then ask me to attach again.",
+            : "This agent isn't set up for you yet. The 'Allow for me' button is available to org admins and independently assigned owners after fresh dashboard sign-in. Ask your human to ask an org admin to designate them for this agent (an org admin does it with update_agent, setting attach_designated_member_id to your human's member id), then ask me to attach again.",
         })
       }
       case 'agent_ambiguous':

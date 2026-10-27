@@ -16,8 +16,8 @@
 //
 // AUTHZ — NO NEW ROUTE, one narrow service path. createProjectInvite's member-bind path requires the ACTOR to hold
 // ORG-scope admin+ standing (actorRankOnScopeFor(env, auth, 'org', null)) for any target but themselves. Since mom-walk D3
-// (mupot task 7ae27377) a member below that floor may mint the invite for THEIR OWN member id only (a real member session:
-// not an agent-bound token, seat or attached chat), requested at no more than their own current standing on that squad;
+// (mupot task 7ae27377) a member below that floor may mint the invite for THEIR OWN member id only (a fresh dashboard web session,
+// never an agent-bound token, seat, attached chat or member bearer), requested at no more than their own current standing on that squad;
 // redemption re-checks that standing, and the private-chat fence and chat->member fence are untouched. Unbind was already
 // self-service. The member_id sent is always the viewer's own server-rendered auth.memberId, and even a tampered request is
 // fully re-checked server-side by createProjectInvite: this page adds no trust.
@@ -180,7 +180,7 @@ export async function loadConnectableSquads(
        FROM project_squad_access a
        JOIN projects p ON p.id = a.project_id
        JOIN squads s ON s.id = a.squad_id
-      WHERE p.status = 'active'
+      WHERE p.status = 'active' AND s.kind != 'home'
       ORDER BY p.name ASC, s.name ASC`,
   ).all<{ project_id: string; project_name: string; squad_id: string; squad_name: string }>()
   const out: ConnectableSquad[] = []
@@ -304,6 +304,8 @@ function connectScript(): Html {
                 expiryP.textContent = expiresAt ? ('Expires ' + expiresAt) : 'Expires in 24 hours.';
                 result.appendChild(expiryP);
               }
+            } else if (data.error === 'reauth_required') {
+              window.location.assign('/auth/reauth?return=' + encodeURIComponent('/account'));
             } else {
               if (status) status.textContent = 'Could not connect (' + (data.error || res.status) + ').';
               btn.disabled = false;
@@ -371,7 +373,7 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
 
   const orgRank = await actorRankOnScopeFor(env, auth, 'org', null)
   // Mom-walk D3: below the org-admin floor a member may still connect THEIR OWN Telegram (target = self, capped at their own
-  // standing on a squad: createProjectInvite's self-service path). They need a real member session with at least one
+  // standing on a squad: createProjectInvite's self-service path). They need a fresh dashboard session with at least one
   // squad they can see; otherwise explain, never a button wired to a guaranteed refusal.
   const selfService = orgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)
   const squads = await loadConnectableSquads(env, auth, orgRank, selfService)

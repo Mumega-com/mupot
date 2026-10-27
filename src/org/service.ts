@@ -19,6 +19,7 @@ import { prepareAgentSquadAccess, type AgentAccessCapability } from '../members/
 // this exact shape; update_agent's model/model_fallback fields must accept exactly
 // the same values or the two self-report paths silently diverge.
 import { MODEL_RE } from '../fleet/boot-self-report'
+import { LAST_OWNER_CHANGE_SQL } from './owner-provenance'
 
 // ── kind (migration 0093, mupot#925 P0-N1; UNSETTABLE-BY-BODY fix, mupot#925
 // P0-N3 / PR #928) ──────────────────────────────────────────────────────────
@@ -1384,6 +1385,8 @@ export type UpdateAgentProfileResult =
 export interface AuditActor {
   id: string
   type: 'agent' | 'user' | 'system'
+  /** Server authorization result, never copied from request arguments. Recorded with the owner change. */
+  ownerAssignmentOrgAdmin?: boolean
 }
 
 // A call that supplies no actor is a system-initiated correction — migrations,
@@ -1550,8 +1553,8 @@ export async function updateAgentProfile(
   patch: AgentProfilePatch,
   actor: AuditActor = SYSTEM_ACTOR,
   // When set, the write lands ONLY if agents.attach_designated_member_id still equals this value (the one the authorization read),
-  // so an owner door check and its write cannot interleave with another designation change. undefined = unguarded (every other caller).
-  expect?: { attach_designated_member_id: string | null },
+  // D2 also carries the owner and assignment audit. undefined = unguarded (other profile callers).
+  expect?: { attach_designated_member_id: string | null; owner_member_id?: string | null; ownerAuditId?: string },
 ): Promise<UpdateAgentProfileResult> {
   const sets: string[] = []
   const binds: (string | number | null)[] = []
@@ -1706,8 +1709,15 @@ export async function updateAgentProfile(
   const auditId = crypto.randomUUID()
   const fieldsChanged = JSON.stringify(Object.keys(patch).filter((k) => patch[k as UpdatableAgentField] !== undefined))
 
-  const expectSql = expect ? ' AND attach_designated_member_id IS ?' : ''
-  const expectBinds: (string | null)[] = expect ? [expect.attach_designated_member_id] : []
+  const expectSql = expect ? ' AND attach_designated_member_id IS ?'
+    + (expect.owner_member_id !== undefined ? ' AND owner_member_id IS ?' : '')
+    + (expect.ownerAuditId !== undefined ? ` AND (${LAST_OWNER_CHANGE_SQL}) IS ?` : '') : ''
+  const expectBinds: (string | null)[] = expect ? [expect.attach_designated_member_id,
+    ...(expect.owner_member_id !== undefined ? [expect.owner_member_id] : []),
+    ...(expect.ownerAuditId !== undefined ? [expect.ownerAuditId] : [])] : []
+  const afterSnapshot = patch.owner_member_id !== undefined
+    ? `json_set(${AGENT_SNAPSHOT_JSON}, '$._owner_assignment_org_admin', ${actor.ownerAssignmentOrgAdmin === true && actor.type === 'user' ? 1 : 0})`
+    : AGENT_SNAPSHOT_JSON
   let changes = 0
   try {
     // No updated_at column on `agents` — 0049 rebuilt the table without one and
@@ -1744,7 +1754,7 @@ export async function updateAgentProfile(
       env.DB.prepare(`UPDATE agents SET ${sets.join(', ')} WHERE id = ?${expectSql}`).bind(...binds, agentId, ...expectBinds),
       env.DB.prepare(
         `UPDATE agent_audit
-            SET after_state = (SELECT ${AGENT_SNAPSHOT_JSON} FROM agents WHERE id = ?)
+            SET after_state = (SELECT ${afterSnapshot} FROM agents WHERE id = ?)
           WHERE id = ?`,
       ).bind(agentId, auditId),
     ])

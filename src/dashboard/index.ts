@@ -2132,7 +2132,7 @@ interface AgentOwnerView {
   candidates: Array<{ id: string; label: string }>
   callerMemberId: string | null
   /** Attach designation (SEAT_ATTACH_DESIGNATED on only): null = control hidden. */
-  designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean; /** Stop is org-admin only; the agent's owner gets Allow-for-me alone. */ canStop: boolean } | null
+  designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean; /** Each control follows the shared authorization result. */ canStop: boolean; canAllow: boolean } | null
 }
 
 // First letter of each word then ***: enough to recognise yourself or a colleague, not enough to read a name off a shared screen.
@@ -2176,9 +2176,12 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
     }
   }
   let designation: AgentOwnerView['designation'] = null
-  // Mom-walk D2: shown to an org admin, AND to the agent's own owner (who can designate only themselves, see the route below).
-  const callerOwnsAgent = auth.memberId != null && agent.owner_member_id === auth.memberId
-  if (seatAttachDesignatedEnabled(env) && (isOrgAdmin(auth) || callerOwnsAgent) && !auth.boundAgentId && auth.memberId) {
+  const allowGate = seatAttachDesignatedEnabled(env) && auth.memberId && !auth.boundAgentId
+    ? await authorizeOwnerMemberChange(env, auth, agent.id, auth.memberId, 'attach_designated_member_id') : null
+  const stopGate = agent.attach_designated_member_id && seatAttachDesignatedEnabled(env) && auth.memberId && !auth.boundAgentId
+    ? await authorizeOwnerMemberChange(env, auth, agent.id, null, 'attach_designated_member_id') : null
+  const canAllow = allowGate?.ok === true || allowGate?.error === 'reauth_required'
+  if (canAllow || stopGate?.ok) {
     let designeeLabel: string | null = null
     if (agent.attach_designated_member_id) {
       const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ? AND tenant = ?')
@@ -2186,7 +2189,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
         .first<{ display_name: string | null }>()
       designeeLabel = row?.display_name ? maskName(row.display_name) : 'a member'
     }
-    designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId, canStop: isOrgAdmin(auth) }
+    designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId, canStop: stopGate?.ok === true, canAllow }
   }
   return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation }
 }
@@ -2204,7 +2207,7 @@ function agentDesignationControl(
       <strong>Allow my chats to become this agent</strong>
       <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
       <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
-      <button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>
+      ${view.canAllow ? html`<button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>` : ''}
       ${agent.attach_designated_member_id && view.canStop ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
     </form>`
 }
@@ -2212,7 +2215,7 @@ function agentDesignationControl(
 // POST /agents/:id/designation. Gate order: flag, form content type (cross-origin is csrf() on dashboardApp), a REAL web session of an active
 // human (Allow additionally needs a re-auth within the step-up window: checkWebSession fresh:true, the dashboard's step-up rule;
 // Stop only reduces authority so needs the real session, as operator revoke does), THEN the one door
-// (authorizeOwnerMemberChange, 'attach_designated_member_id': org floor, rank ceilings, no self waiver, seats/attached refused)
+// (authorizeOwnerMemberChange, 'attach_designated_member_id': org floor or verified owner, rank ceilings, seats/attached refused)
 // and the one compare-and-set write (updateAgentProfile with expect = the value the door read). No second authorization path.
 dashboardApp.post('/agents/:id/designation', async (c) => {
   c.header('Cache-Control', 'no-store')
@@ -2246,9 +2249,9 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
   if (!resolved.ok) return deny(404, 'Agent not found.')
   const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
   if (!agent) return deny(404, 'Agent not found.')
-  // Mom-walk D2: besides an org admin, the agent's OWN owner may Allow-for-me (themselves, never Stop, never someone else).
+  // Mom-walk D2: besides an org admin, the independently assigned owner may Allow-for-me, and an owner may Stop their own designation.
   // authorizeOwnerMemberChange below re-reads the owner and is the actual gate; this only stops a stranger early.
-  const ownerAllowingSelf = action === 'allow' && agent.owner_member_id != null && agent.owner_member_id === session.memberId
+  const ownerAllowingSelf = agent.owner_member_id === session.memberId && (action === 'allow' || agent.attach_designated_member_id === session.memberId)
   if (!isOrgAdmin(auth) && !ownerAllowingSelf) return deny(403, 'Only an org admin, or the agent\'s owner for themselves, can change an attach designation.')
   const target: string | null = action === 'allow' ? session.memberId : null
   const gate = await authorizeOwnerMemberChange(c.env, auth, agent.id, target, 'attach_designated_member_id')
@@ -2260,7 +2263,7 @@ dashboardApp.post('/agents/:id/designation', async (c) => {
         : 'That is not allowed from this session.')
   }
   const result = await updateAgentProfile(c.env, agent.id, { attach_designated_member_id: target }, { id: session.memberId, type: 'user' },
-    { attach_designated_member_id: gate.current ?? null })
+    { attach_designated_member_id: gate.current ?? null, owner_member_id: gate.expectedOwner, ownerAuditId: gate.expectedOwnerAuditId })
   if (!result.ok) {
     if (result.error === 'designation_changed') return deny(409, 'The designation changed while you were deciding. Reload and try again.')
     if (result.error === 'owner_member_inactive' || result.error === 'owner_member_not_found') return deny(409, 'Your member record is not eligible.')
@@ -2313,7 +2316,7 @@ dashboardApp.post('/agents/:id/owner', async (c) => {
         : 'That member id is not valid.'
     return c.html(shell(c.env, 'Agent owner', errorBody(msg)), gate.status)
   }
-  const result = await updateAgentProfile(c.env, agent.id, { owner_member_id: target }, { id: auth.memberId, type: 'user' })
+  const result = await updateAgentProfile(c.env, agent.id, { owner_member_id: target }, { id: auth.memberId, type: 'user', ownerAssignmentOrgAdmin: gate.ownerAssignmentOrgAdmin })
   if (!result.ok) {
     if (result.error === 'owner_member_inactive') {
       return c.html(shell(c.env, 'Agent owner', errorBody('owner_member_inactive: that member is suspended or archived.')), 409)

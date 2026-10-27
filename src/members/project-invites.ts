@@ -21,6 +21,7 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 // handling below and redeemTelegramProjectInvite's member-mint guard.
 import { normalizeInviteEmail } from '../auth/pending-invite-link'
 import { attachedAuthority } from '../auth/attached-ceiling'
+import { checkWebSession } from '../secure-moments/enrol-mint'
 
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -116,6 +117,7 @@ export type CreateProjectInviteError =
   | 'member_missing_email'
   | 'forbidden'
   | 'cannot_grant_above_own_rank'
+  | 'reauth_required'
   | 'pairing_code_collision'
 
 export type CreateProjectInviteResult =
@@ -625,6 +627,9 @@ export async function createProjectInvite(
     && auth.memberId != null && memberId === auth.memberId
     && !auth.boundAgentId && !auth.seatBinding && !attachedAuthority(auth)
   ) {
+    if (auth.channel !== 'dashboard') return { ok: false, error: 'forbidden' }
+    const session = await checkWebSession(env, auth, { fresh: true })
+    if (!session.ok) return { ok: false, error: session.error === 'reauth_required' ? 'reauth_required' : 'forbidden' }
     selfService = true
     // Observer self-connect links the identity without changing capability grants at redemption.
     actorRank = Math.min(await actorRankOnSquad(env, auth, squadId, edge.department_id), capabilityRank('observer'))

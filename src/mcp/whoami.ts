@@ -128,9 +128,9 @@ const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet
 const ATTACH_ADMIT =
   "seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
 
-/** The designation step for a human who is NOT an org admin: the 'Allow for me' control is not rendered for them, so name who can act and where. */
+/** Next step for a human without current designation standing. */
 export const ASK_ADMIN_TO_DESIGNATE =
-  "ask an org admin to designate your human for that agent (an org admin does this with update_agent, setting attach_designated_member_id to your human's member id; the 'Allow for me' button on the agent page only appears for org admins and designates the admin themself)"
+  "ask an org admin to designate your human for that agent (an org admin does this with update_agent, setting attach_designated_member_id to your human's member id; the 'Allow for me' button on the agent page is available to org admins and independently assigned owners after fresh dashboard sign-in)"
 
 export function attachConnectOrder(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>, humanCanDesignate?: boolean): string {
   if (!seatAttachDesignatedEnabled(env)) return `Call ${ATTACH_ADMIT}`
