@@ -1,8 +1,8 @@
 // Per-request D1 cost of authentication, BEFORE a tool / page handler runs (task: authenticated requests are slow).
 //
 // A tracing proxy over the node:sqlite D1 harness counts every executed statement and, more importantly, the number
-// of SERIAL WAVES (each statement takes a simulated 4 ms so overlapping statements really overlap): a wave starts whenever a statement begins while nothing else is in flight. Two statements issued
-// together (Promise.all) are one wave; a statement that waits for the previous answer is a new wave. Real D1 latency
+// of SERIAL WAVES: statements are held behind a gate until all ready microtasks have issued their reads.
+// The gate releases the whole batch together; only a read depending on an answer starts a new wave. Real D1 latency
 // is not measurable here, but each wave is one network round trip from the Worker, so waves are what multiply it.
 //
 // Two halves:
@@ -10,7 +10,9 @@
 //  2. semantics    - the auth RESULT (who, which capabilities, which bound agent, 401 or not) for valid / expired /
 //                    revoked / wrong-tenant / suspended-member / unbound credentials, and for dashboard sessions,
 //                    must be identical to what main produced before the waves were collapsed.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import { setImmediate } from 'node:timers'
 import { Hono } from 'hono'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -25,19 +27,34 @@ import type { AuthContext, Env } from '../src/types'
 const TENANT = 'mumega'
 const RAW = 'mupot_' + 'a'.repeat(64)
 
-interface Trace { sqls: string[]; waveOf: number[]; inflight: number; waves: number }
-const newTrace = (): Trace => ({ sqls: [], waveOf: [], inflight: 0, waves: 0 })
+interface Trace { sqls: string[]; waveOf: number[]; waves: number }
+const newTrace = (): Trace => ({ sqls: [], waveOf: [], waves: 0 })
 
 function traced(h: SqliteD1Harness, t: Trace): Env['DB'] {
-  const begin = (label: string) => { if (t.inflight === 0) t.waves++; t.inflight++; t.sqls.push(label); t.waveOf.push(t.waves) }
+  let pending: Array<() => void> = []
+  const begin = (label: string): Promise<void> => {
+    if (pending.length === 0) {
+      t.waves++
+      // A check-phase gate, not a duration: exhaust the ready microtask graph before returning
+      // ANY D1 answer. Dependent reads cannot issue until the next gate, regardless of CPU load.
+      setImmediate(() => {
+        const batch = pending
+        pending = []
+        for (const release of batch) release()
+      })
+    }
+    t.sqls.push(label)
+    t.waveOf.push(t.waves)
+    return new Promise((release) => pending.push(release))
+  }
   const wrapStmt = (stmt: any): any => new Proxy(stmt, { // eslint-disable-line @typescript-eslint/no-explicit-any -- test-only tracer over a structural D1 statement
     get(target, prop, recv) {
       const v = Reflect.get(target, prop, recv)
       if (prop === 'bind') return (...a: unknown[]) => wrapStmt(v.apply(target, a))
       if (prop === 'first' || prop === 'all' || prop === 'run' || prop === 'raw') {
         return async (...a: unknown[]) => {
-          begin(String(target.sql).replace(/\s+/g, ' ').trim().slice(0, 100))
-          try { await new Promise((r) => setTimeout(r, 4)); return await v.apply(target, a) } finally { t.inflight-- }
+          await begin(String(target.sql).replace(/\s+/g, ' ').trim().slice(0, 100))
+          return v.apply(target, a)
         }
       }
       return typeof v === 'function' ? v.bind(target) : v
@@ -48,8 +65,8 @@ function traced(h: SqliteD1Harness, t: Trace): Env['DB'] {
       const v = Reflect.get(target, prop, recv)
       if (prop === 'prepare') return (sql: string) => wrapStmt(v.call(target, sql))
       if (prop === 'batch') return async (stmts: unknown[]) => {
-        begin(`BATCH(${stmts.length})`)
-        try { await new Promise((r) => setTimeout(r, 4)); return await v.call(target, stmts) } finally { t.inflight-- }
+        await begin(`BATCH(${stmts.length})`)
+        return v.call(target, stmts)
       }
       return typeof v === 'function' ? v.bind(target) : v
     },
@@ -69,8 +86,37 @@ function memoryKv(initial: Record<string, string> = {}) {
 const BOUND_DIRECTORY_BOUNDARY_WAVES = 6
 
 let h: SqliteD1Harness
-beforeEach(() => { h = createSqliteD1(); applyAllMigrations(h.sqlite) })
-afterEach(() => h.close())
+beforeEach(() => {
+  h = createSqliteD1()
+  applyAllMigrations(h.sqlite)
+  // Native WebCrypto uses a worker pool: an independent hash could finish after a D1 gate.
+  // Keep the real SHA-256 bytes, but deliver them via microtasks so only D1 answers define
+  // dependency steps. This suite measures D1 round trips, not crypto worker scheduling.
+  vi.spyOn(crypto.subtle, 'digest').mockImplementation(async (algorithm, data) => {
+    expect(algorithm).toBe('SHA-256')
+    const bytes = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      : new Uint8Array(data)
+    return Uint8Array.from(createHash('sha256').update(bytes).digest()).buffer
+  })
+})
+afterEach(() => { h.close(); vi.restoreAllMocks() })
+
+it('the tracer groups independent reads across microtasks, but separates awaited reads and batches', async () => {
+  const t = newTrace()
+  const db = traced(h, t)
+  await Promise.all([
+    db.prepare('SELECT 1').first(),
+    (async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      return db.prepare('SELECT 2').first()
+    })(),
+  ])
+  await db.prepare('SELECT 3').first()
+  await db.batch([db.prepare('SELECT 4'), db.prepare('SELECT 5')])
+  expect(t.waveOf).toEqual([1, 1, 2, 3])
+  expect(t.waves).toBe(3)
+})
 
 // ══════════════════════════════════════════════════════════════════════════════
 // (a) agent-bound bearer on POST /mcp: resolveExternalToken -> buildAuthContextFromProps -> internal header -> mcpApp
