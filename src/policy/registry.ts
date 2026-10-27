@@ -189,6 +189,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
     sites: ['src/members/seat-attach.ts'],
     todo: 'TODO(R1 builder PR): wire onto the bar when the thread-attach PR lands; values here are placeholders (strict) until then.',
   },
+  floor('seat.connection-check.attached-only', 'connection_check runs only from an attached chat; an unattached chat is refused with the seat_attach next step.', ['src/mcp/seat-attach.ts:toolConnectionCheck'], ['not_attached']),
 ]
 
 /** The shape of one record in receipts/policy-catalog-20261026.json. */
