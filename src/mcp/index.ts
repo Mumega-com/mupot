@@ -381,6 +381,8 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext; tenantNotice?: Te
 /** mupot#1794 W2: request-borne seat inputs that live in the JSON-RPC body (`params._meta`,
  *  `params.arguments._meta`). Header inputs are read from `c` directly. */
 interface SeatBodyMeta {
+  /** Resolve an existing seat for catalog inspection without provisioning or touching it. */
+  readOnlySeat?: boolean
   /** The curated profile door: never resolves a seat handle (it stays the human's own view). */
   skipSeat?: boolean
   /** The tool a tools/call names. seat_select is exempt from auto-binding so a client that always sends a
@@ -677,6 +679,7 @@ async function resolveSeatSession(
   // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
   // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
   return applySeatForRequest(c.env, auth, {
+    readOnly: bodyMeta?.readOnlySeat,
     headerHandle: headerSeat,
     metaHandle: metaSeat,
     argHandle: bodyMeta?.argSeat ?? null,
@@ -8739,7 +8742,16 @@ async function handleJsonRpc(
     }
     // 2026-07-28 (SEP-2549): tools/list is a CacheableResult — ttlMs + cacheScope REQUIRED. 0/private =
     // "do not reuse", the conservative value (no freshness claim is made for the registry).
-    return ok(id, { tools: advertisedTools(c.env).map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
+    let listed = advertisedTools(c.env)
+    if (vipLaneEnabled(c.env)) {
+      const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+      const auth = await resolveAuth(c, { paramsMeta: params._meta, readOnlySeat: true })
+      // A held chat's hard stop also hides the request action; other registry entries retain their shared catalog.
+      if (auth && (await observedFloorDecision(c.env, auth, 'seat_attach')).status === 'held') {
+        listed = listed.filter(spec => spec.name !== 'seat_attach')
+      }
+    }
+    return ok(id, { tools: listed.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
   }
 
   if (method === 'tools/call') {

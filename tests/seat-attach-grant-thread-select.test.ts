@@ -371,6 +371,46 @@ describe('R1 round 2: grant replacement and approval boundaries', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('selection: a later thread explicitly attaches with no new tap (the headline)', () => {
+  it.each(['observed', 'trusted', 'held'] as const)('a %s chat needs its own human Release before reusing an earlier install approval', async (initial) => {
+    const env = envFor(h, { VIP_LANE: '1' })
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'approved-chat')
+    await boot(env, g, 'later-chat')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1`)!
+    h.sqlite.prepare(`UPDATE agent_seats SET admission_status = ? WHERE id = ?`).run(initial, seat.id)
+    const { changeSeatAdmission } = await import('../src/members/seat-hold-release')
+    if (initial !== 'observed') expect(await changeSeatAdmission(env, { humanMemberId: HUMAN, seatId: seat.id, action: 'return', fresh: true })).toMatchObject({ ok: true, to: 'observed' })
+    // Exercise both the public tool and the shared admission resolver.
+    expect(await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId: seat.id, via: 'tool', grantTokenId: g.tokenId })).toMatchObject({ ok: true, state: 'pending' })
+    const pending = await attach(env, g, 'later-chat', 'rava')
+    expect(pending.sc.status, errOf(pending)).toBe('pending_admission')
+    expect(pending.sc.attach_code).toBeUndefined()
+    expect(JSON.stringify(pending.sc)).toContain('Release')
+    expect(attachments()).toHaveLength(1)
+    expect((await boot(env, g, 'later-chat')).sc.bound_agent_id).not.toBe('agent-rava')
+    expect(await changeSeatAdmission(env, { humanMemberId: HUMAN, seatId: seat.id, action: 'release', fresh: true })).toMatchObject({ ok: true })
+    expect((await attach(env, g, 'later-chat', 'rava')).sc.status).toBe('attached')
+  })
+
+  it('the attach INSERT rechecks an observed status set after admission resolution', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'approved-chat')
+    await boot(env, g, 'later-chat')
+    const seat = one<{ id: string }>(`SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1`)!
+    const db = env.DB
+    const proxy = new Proxy(db, { get(t, key) {
+      if (key === 'batch') return async (statements: Parameters<typeof db.batch>[0]) => {
+        h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'observed' WHERE id = ?`).run(seat.id)
+        return t.batch(statements)
+      }
+      const value = Reflect.get(t, key)
+      return typeof value === 'function' ? value.bind(t) : value
+    } })
+    expect(await attachSeatToAgent({ ...env, DB: proxy }, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'rava', via: 'tool', grantTokenId: g.tokenId })).toEqual({ ok: false, error: 'attach_refused' })
+    expect(attachments()).toHaveLength(1)
+  })
+
   it('day-2 thread (new openai/session) attaches to Rava with NO new admission, NO new moment, its own attachment id', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
@@ -433,10 +473,12 @@ describe('consent scope: reuse only inside what the human recorded; never silent
 
     await boot(env, g, 'conv-b')
     expect(errOf(await attach(env, g, 'conv-b', 'rava'))).toContain('approval_bound_to_other_chat')
-    // the SAME thread (detached by its human) asking for the wider scope is refused too: an upgrade is the human's explicit revoke + re-ask
+    // Human Detach revokes the seat approval. Asking for a wider scope creates a NEW pending ask, never a live upgrade.
     expect(await detachAttachment(env, { attachmentId: attachments()[0].id, humanMemberId: HUMAN })).toEqual({ ok: true })
-    expect(errOf(await attach(env, g, 'conv-a', 'rava', 'harness'))).toContain('admission_scope_mismatch')
-    expect(one<{ scope: string }>(`SELECT scope FROM agent_seat_admissions`)!.scope).toBe('seat')
+    const wider = await attach(env, g, 'conv-a', 'rava', 'harness')
+    expect(wider.sc.status).toBe('pending_admission')
+    expect(one(`SELECT scope, status FROM agent_seat_admissions WHERE id = ?`, pend.sc.admission_id)).toEqual({ scope: 'seat', status: 'revoked' })
+    expect(one(`SELECT scope, status FROM agent_seat_admissions WHERE id = ?`, wider.sc.admission_id)).toEqual({ scope: 'harness', status: 'pending' })
     expect(attachments()).toHaveLength(1)
   })
 

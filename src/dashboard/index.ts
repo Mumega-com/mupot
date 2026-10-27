@@ -2184,7 +2184,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
   const stopGate = agent.attach_designated_member_id && seatAttachDesignatedEnabled(env) && auth.memberId && !auth.boundAgentId
     ? await authorizeOwnerMemberChange(env, auth, agent.id, null, 'attach_designated_member_id') : null
   const canAllow = allowGate?.ok === true || allowGate?.error === 'reauth_required'
-  if (canAllow || stopGate?.ok) {
+  if (seatAttachDesignatedEnabled(env) && !auth.boundAgentId && auth.memberId) {
     let designeeLabel: string | null = null
     if (agent.attach_designated_member_id) {
       const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ? AND tenant = ?')
@@ -2194,7 +2194,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
     }
     designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId, canStop: stopGate?.ok === true, canAllow }
   }
-  const connect = auth.memberId && !auth.boundAgentId && auth.webSessionIdHash
+  const connect = auth.memberId && !auth.boundAgentId && (await checkWebSession(env, auth, { fresh: false })).ok
     ? await loadAgentConnectView(env, auth.memberId, agent).catch(() => null)
     : null
   return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation, connect }
@@ -2207,12 +2207,13 @@ function agentDesignationControl(
   view: NonNullable<AgentOwnerView['designation']>,
   flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean } = { resume: null, fresh: false },
 ) {
+  if (!view.canAllow && !view.canStop) return html`<p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>`
   // Back from the one sign-in redirect (resume=allow, session now fresh): the same button, labelled as the single remaining click.
   const allowLabel = flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me'
   return html`<form method="post" action="/agents/${agent.id}/designation" class="inline-form" data-attach-designation>
       <strong>Allow my chats to become this agent</strong>
       <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
-      <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
+      <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; approve each request with the code shown on its card. Stopping ends all of them now.</p>
       ${view.canAllow ? html`<button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>` : ''}
       ${agent.attach_designated_member_id && view.canStop ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
     </form>`
@@ -6213,7 +6214,8 @@ function agentConsoleBody(
     </div>
     ${ownerView?.connect ? renderAgentConnectPanel(agent, ownerView.connect, {
       allowLabel: flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me',
-      canManage: ownerView.designation !== null,
+      canAllow: ownerView.designation?.canAllow === true,
+      canStop: ownerView.designation?.canStop === true,
       resumeClaim: flash.resume === 'claim',
       designeeText: ownerView.designation?.designeeLabel ? `${ownerView.designation.designeeLabel}${ownerView.designation.designeeIsCaller ? ' (you)' : ''}` : null,
     }, flash.fresh) : ''}
@@ -6223,7 +6225,6 @@ function agentConsoleBody(
       <pre style="white-space:pre-wrap"><code id="background-connect-prompt">${`You are ${agent.slug}. Connect to mupot by OAuth as ${agent.slug} (choose 'This connection is ${agent.name}'), then run connection_check.`}</code></pre>
       <button type="button" class="btn secondary" onclick="navigator.clipboard.writeText(document.getElementById('background-connect-prompt').textContent).then(() => { this.textContent = 'Copied'; })">Copy</button>
     </div>
-
     ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
     ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
     ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}

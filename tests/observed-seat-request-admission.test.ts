@@ -10,7 +10,7 @@ import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
 import { resetAutoSeatRefusalCache } from '../src/members/seat-auto'
-import { decideAdmissionDirect } from '../src/members/seat-attach'
+import { decideAdmissionDirect, detachAttachment } from '../src/members/seat-attach'
 import { agentConnectPrompt } from '../src/dashboard/agent-connect-panel'
 import type { AuthContext, Env } from '../src/types'
 
@@ -179,6 +179,66 @@ async function attachedChat(): Promise<Chat> {
   return c
 }
 
+
+describe('chat approval boundaries', () => {
+  it('human Detach ends the approval and the same observed chat must ask again', async () => {
+    const c = await attachedChat()
+    const att = one<{ id: string; admission_id: string }>(`SELECT id, admission_id FROM agent_seat_attachments WHERE detached_at IS NULL`)!
+    expect(await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).toEqual({ ok: true })
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, att.admission_id)?.status).toBe('revoked')
+    const again = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    expect(again.sc.status).toBe('pending_admission')
+    expect(again.sc.admission_id).not.toBe(att.admission_id)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
+    expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
+    expect(await decideAdmissionDirect(env, { admissionId: String(again.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: again.sc.attach_code })).toEqual({ ok: true })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
+  })
+
+  it('an observed chat detached by the idle sweep also needs a new human action', async () => {
+    const c = await attachedChat()
+    h.sqlite.exec(`UPDATE agent_seat_attachments SET detached_at = datetime('now'), detach_reason = 'idle_expired'`)
+    const again = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    expect(again.sc.status).toBe('pending_admission')
+    expect(again.text).toContain('Release')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
+  })
+
+  it('a held chat does not advertise seat_attach in tools/list', async () => {
+    const c = await chat('held')
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: { 'openai/session': c.session } } }) })
+    const changes = n('SELECT total_changes() AS n')
+    const res = await mcpApp.fetch(mcpInternalRequest(req, c.ctx), env)
+    expect(n('SELECT total_changes() AS n')).toBe(changes)
+    const body = await res.json() as { result: { tools: Array<{ name: string }> } }
+    expect(body.result.tools.map(t => t.name)).not.toContain('seat_attach')
+  })
+
+  it('tools/list for a new conversation does not create a seat', async () => {
+    const c = await chat('observed')
+    const changes = n('SELECT total_changes() AS n')
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: { 'openai/session': 'unseen-conversation' } } }) })
+    const res = await mcpApp.fetch(mcpInternalRequest(req, c.ctx), env)
+    expect(res.status).toBe(200)
+    expect(n('SELECT total_changes() AS n')).toBe(changes)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seats')).toBe(1)
+  })
+
+  it('a connection older than 24h gets no onboarding block', async () => {
+    const c = await attachedChat()
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 25 * 60 * 60 * 1000)
+    expect((await rpc(c.ctx, 'boot_context', {}, c.session)).sc.attached_onboarding).toBeUndefined()
+  })
+
+  it('onboarding skips an archived assignment in favor of a current task', async () => {
+    const c = await attachedChat()
+    h.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, done_when, created_at) VALUES ('archived-task', 'squad-core', 'Old', '', 'open', 'agent-coo', 'read', '2020-01-01'), ('current-task', 'squad-core', 'Current', '', 'open', 'agent-coo', 'read', '2026-10-01')`)
+    h.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_by_member_id, archived_reason, prior_status) VALUES ('archived-task', '2026-10-27', '${HUMAN}', 'finished', 'open')`)
+    const ob = (await rpc(c.ctx, 'boot_context', {}, c.session)).sc.attached_onboarding as { first_task: { id: string } }
+    expect(ob.first_task.id).toBe('current-task')
+  })
+})
+
 describe('connection_check (full-duplex)', () => {
   it('refused for an unattached chat with the attach next step (own seat, and observed via the floor)', async () => {
     const plain = await chat(null)
@@ -210,6 +270,29 @@ describe('connection_check (full-duplex)', () => {
     expect(r2.summary.startsWith('send ✓ receive ✓ wake: none')).toBe(true)
     const rec = one<{ a: string }>(`SELECT after_state AS a FROM agent_audit WHERE action = 'connection_check' ORDER BY seq DESC LIMIT 1`)
     expect(JSON.parse(rec!.a).summary).toBe(r2.summary)
+  })
+
+  it.each([false, true])('replaces a host-consumed receive probe (fresh=%s)', async (fresh) => {
+    const c = await attachedChat()
+    const first = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { receive: { message_id: string } }
+    h.sqlite.prepare(`UPDATE agent_messages SET read_at = datetime('now') WHERE id = ?`).run(first.receive.message_id)
+    const next = (await rpc(c.ctx, 'connection_check', { fresh }, c.session)).sc as { receive: { message_id: string; state: string } }
+    expect(next.receive.state).toBe('pending')
+    expect(next.receive.message_id).not.toBe(first.receive.message_id)
+    expect(one(`SELECT read_at FROM agent_messages WHERE id = ?`, next.receive.message_id)).toEqual({ read_at: null })
+    expect((await rpc(c.ctx, 'inbox_mark_handled', { ids: [next.receive.message_id] }, c.session)).sc).toMatchObject({ handled: [next.receive.message_id], not_visible: [] })
+    expect((await rpc(c.ctx, 'connection_check', {}, c.session)).sc.receive).toMatchObject({ state: 'ok', message_id: next.receive.message_id })
+  })
+
+  it('completed receive proof survives host consumption; fresh starts a new round', async () => {
+    const c = await attachedChat()
+    const first = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { receive: { message_id: string } }
+    await rpc(c.ctx, 'inbox_mark_handled', { ids: [first.receive.message_id] }, c.session)
+    h.sqlite.prepare(`UPDATE agent_messages SET read_at = datetime('now') WHERE id = ?`).run(first.receive.message_id)
+    expect((await rpc(c.ctx, 'connection_check', {}, c.session)).sc.receive).toMatchObject({ state: 'ok', message_id: first.receive.message_id })
+    const next = (await rpc(c.ctx, 'connection_check', { fresh: true }, c.session)).sc as { receive: { message_id: string; state: string } }
+    expect(next.receive.state).toBe('pending')
+    expect(next.receive.message_id).not.toBe(first.receive.message_id)
   })
 
   it('attached with a live wake path (webhook doorbell) reports it', async () => {
@@ -273,6 +356,11 @@ describe('/connections with VIP_LANE off', () => {
     expect(page).toContain(`data-cx-release="${c.seatId}"`)
     expect(page).not.toContain(`data-cx-hold="${c.seatId}"`)
     expect((await postJson(off, cookie, `/connections/seats/${c.seatId}/hold`)).status).toBe(403)
+    h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(c.seatId)
+    fresh()
+    expect((await postJson(off, cookie, `/connections/seats/${c.seatId}/return`)).status).toBe(403)
+    expect(seatStatus(c.seatId)).toBe('held')
+    h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'observed' WHERE id = ?`).run(c.seatId)
     h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run('2020-01-01T00:00:00.000Z')
     expect((await postJson(off, cookie, `/connections/seats/${c.seatId}/release`)).status).toBe(403) // reauth still required
     expect(seatStatus(c.seatId)).toBe('observed')
@@ -298,6 +386,41 @@ describe('agent page: Connect a chat checklist', () => {
     expect(p).not.toContain('Connected. Mupot takes it from here.')
   })
 
+
+  it('a second human sees none of the first human’s requests, connections, checks or limited chats', async () => {
+    const c = await attachedChat()
+    await rpc(c.ctx, 'connection_check', {}, c.session)
+    await chat('observed', 'private-chat')
+    seedAgent('agent-other', 'other', 'Other', 'squad-core')
+    const other = await chat('observed', 'private-pending')
+    const pending = await rpc(other.ctx, 'seat_attach', { agent: 'other' }, other.session)
+    h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('human-two', 'two@example.test', 'Two', 'active', '${TENANT}'); INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-two', 'human-two', 'squad', 'squad-core', 'admin')`)
+    const cookie = await session(env, 'two@example.test')
+    const p = await get(env, cookie, '/agents/agent-coo')
+    expect(p).toContain('data-agent-connect')
+    expect(p).not.toContain('data-cx-detach=')
+    expect(p).not.toContain('data-cx-release=')
+    expect(p).not.toContain('Last connection check')
+    const second = await get(env, cookie, '/agents/agent-other')
+    expect(second).not.toContain(String(pending.sc.admission_id))
+    expect(second).not.toContain(String(pending.sc.attach_code))
+    expect(second).toContain('No chat has asked yet')
+  })
+
+  it('bearer and agent-bound viewers get no Connect a chat panel', async () => {
+    await attachedChat()
+    const { sha256Hex } = await import('../src/members/service')
+    const raw = 'test-panel-bearer-only'
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES ('panel-bearer', ?, ?, 'panel test', 'workspace', ?)`).run(HUMAN, await sha256Hex(raw), TENANT)
+    const { dashboardApp } = await import('../src/dashboard/index')
+    const bearer = await dashboardApp.request('/agents/agent-coo', { headers: { authorization: `Bearer ${raw}` } }, env)
+    expect(await bearer.text()).not.toContain('data-agent-connect')
+    // An agent member's real cookie still cannot be a human viewer.
+    h.sqlite.prepare(`UPDATE members SET email = 'agent@example.test' WHERE id = 'mem-agent-coo'`).run()
+    const agentPage = await get(env, await session(env, 'agent@example.test'), '/agents/agent-coo')
+    expect(agentPage).not.toContain('data-agent-connect')
+  })
+
   it('a pending request shows with Approve and Reject; plain words only', async () => {
     const c = await chat('observed')
     const r = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
@@ -319,6 +442,37 @@ describe('agent page: Connect a chat checklist', () => {
     expect(visible).toContain('Approve')
     expect(visible).toContain('Reject')
     expect(visible.toLowerCase()).not.toMatch(/admission|\bseat\b/)
+  })
+
+  it('a request for all chats opens passkey approval, scoped to a fresh human session', async () => {
+    const c = await chat('observed')
+    const ask = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo', scope: 'harness' }, c.session)
+    const cookie = await session(env, `${HUMAN}@example.test`)
+    fresh()
+    const p = await get(env, cookie, '/agents/agent-coo')
+    expect(p).toContain('Open passkey approval')
+    expect(p).toContain(String(ask.sc.attach_code))
+    expect(p).not.toContain('data-claim-own')
+    const { dashboardApp } = await import('../src/dashboard/index')
+    const post = (cookie: string, admissionId: string, agent = 'agent-coo') => dashboardApp.request(`/agents/${agent}/claim/passkey`, { method: 'POST', headers: { cookie, origin: 'http://localhost', 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ admission_id: admissionId }) }, { ...env, LOCAL_TEST_AUTH: '1' } as unknown as Env)
+    const admissionId = String(ask.sc.admission_id)
+    expect((await post(cookie, 'another-admission')).status).toBe(409)
+    seedAgent('other-agent', 'other-agent', 'Other', 'squad-core')
+    expect((await post(cookie, admissionId, 'other-agent')).status).toBe(404)
+    h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('other-human', 'other@example.test', 'Other', 'active', '${TENANT}'); INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('other-cap', 'other-human', 'squad', 'squad-core', 'admin')`)
+    const otherCookie = await session(env, 'other@example.test')
+    fresh()
+    expect((await post(otherCookie, admissionId)).status).toBe(404)
+    h.sqlite.prepare(`UPDATE web_sessions SET recent_reauth_at = '2020-01-01'`).run()
+    const stale = await post(cookie, admissionId)
+    expect(stale.status).toBe(303)
+    expect(stale.headers.get('location')).toContain('/auth/')
+    fresh()
+    const done = await post(cookie, admissionId)
+    expect(done.status).toBe(303)
+    expect(new URL(done.headers.get('location')!).host).toBe('secure.example.test')
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE id = ?`, admissionId)).toEqual({ status: 'pending' })
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
   })
 
   it('an attached chat shows Connected and Detach', async () => {

@@ -6,7 +6,7 @@
 //
 // ONE guarded statement per transition: UPDATE ... WHERE seat belongs to THIS human (agent_seats.member_id) AND tenant AND not retired
 // AND current status = the exact `from` the audit row records. The audit row is inserted in the SAME D1 batch, guarded by the identical
-// predicate, so no change without a row and no row without a change. VIP_LANE off = inert (refuses; nothing read or written).
+// predicate, so no change without a row and no row without a change. VIP_LANE off refuses Hold/Return; Release clears a stale label with fresh reauth.
 
 import type { Env } from '../types'
 import { memberIsActiveHuman } from '../access/identity'

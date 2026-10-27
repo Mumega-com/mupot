@@ -53,12 +53,12 @@ export async function loadAgentConnectView(env: Env, memberId: string, agent: { 
   const anySeat = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE tenant = ?1 AND member_id = ?2 AND retired_at IS NULL LIMIT 1`)
     .bind(env.TENANT_SLUG, memberId).first<{ x: number }>().catch(() => null)
   const observed = (await listObservedSeats(env, memberId)).filter((o) => o.status === 'observed' || o.status === 'held')
-  return { endpoint: origin.ok ? mcpEndpoint(origin.origin) : null, connectorKnown: anySeat !== null, pending: claims.pending, connected, lastCheck: await latestConnectionCheck(env, agent.id), observed, vipOn: vipLaneEnabled(env), designationOn: seatAttachDesignatedEnabled(env), allowedForViewer: agent.attach_designated_member_id === memberId }
+  return { endpoint: origin.ok ? mcpEndpoint(origin.origin) : null, connectorKnown: anySeat !== null, pending: claims.pending, connected, lastCheck: await latestConnectionCheck(env, agent.id, memberId), observed, vipOn: vipLaneEnabled(env), designationOn: seatAttachDesignatedEnabled(env), allowedForViewer: agent.attach_designated_member_id === memberId }
 }
 
 const when = (iso: string): string => `${iso.slice(0, 16).replace('T', ' ')} UTC`
 
-export interface DesignationState { allowLabel: string; /** Org admin: may press Allow / Stop (the POST re-checks every rule). */ canManage: boolean; /** Back from the one sign-in redirect for an approval: the same button, labelled as the single remaining click. */ resumeClaim: boolean; /** Masked name of the current designee, or null. */ designeeText: string | null }
+export interface DesignationState { allowLabel: string; /** Each control follows the shared authorization result (the POST re-checks every rule). */ canAllow: boolean; canStop: boolean; /** Back from the one sign-in redirect for an approval: the same button, labelled as the single remaining click. */ resumeClaim: boolean; /** Masked name of the current designee, or null. */ designeeText: string | null }
 
 export function renderAgentConnectPanel(
   agent: { id: string; slug: string; name: string },
@@ -67,12 +67,12 @@ export function renderAgentConnectPanel(
   fresh: boolean,
 ): Html {
   const prompt = agentConnectPrompt({ slug: agent.slug })
-  const warn = html`<p class="ui-sub">Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>`
-  const allowForm = des.canManage
+  const warn = html`<p class="ui-sub">Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; approve each request with the code shown below. Stopping ends all of them now.</p>`
+  const allowForm = des.canAllow || des.canStop
     ? html`<form method="post" action="/agents/${agent.id}/designation" class="inline-form" data-attach-designation>
-        <button type="submit" name="action" value="allow" class="btn">${des.allowLabel}</button>
-        ${des.designeeText ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}</form>`
-    : html`<p class="ui-sub">Only an org admin can allow this. Ask one to allow your chats for ${agent.name}.</p>`
+        ${des.canAllow ? html`<button type="submit" name="action" value="allow" class="btn">${des.allowLabel}</button>` : ''}
+        ${des.designeeText && des.canStop ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}</form>`
+    : v.allowedForViewer ? html`` : html`<p class="ui-sub">Only an org admin can allow this. Ask one to allow your chats for ${agent.name}.</p>`
   const step1 = !v.designationOn
     ? html`<li><strong>1. Allowed for you</strong> ${pill('done', 'ok')}</li>`
     : html`<li><strong>1. ${v.allowedForViewer ? 'Allowed for you' : `Allow your chats to become ${agent.name}`}</strong> ${v.allowedForViewer ? pill('done', 'ok') : ''}
@@ -81,13 +81,24 @@ export function renderAgentConnectPanel(
     ? html`<p class="ui-sub" data-connect-none>No chat has asked yet. This updates when one does.</p>`
     : html`${v.pending.map((c) => html`<div class="card" data-connect-request>
         <p><strong>${c.harnessName || 'A chat app'}</strong>${c.seatLabel ? html` · chat ${c.seatLabel}` : ''} asked ${when(c.requestedAt)} to act as ${agent.name}.</p>
-        <form method="post" action="/agents/${agent.id}/claim" class="inline-form" data-claim-own>
+        <p>Approval code <code>${c.attachCode ?? 'unavailable'}</code></p>
+        ${c.scope === 'harness'
+          ? html`<form method="post" action="/agents/${agent.id}/claim/passkey" class="inline-form" data-claim-passkey>
+              <input type="hidden" name="admission_id" value="${c.admissionId}">
+              <p class="ui-sub">This request covers chats in this app and needs a passkey approval.</p>
+              ${fresh ? html`<button type="submit" class="btn">Open passkey approval</button>` : html`<a class="btn" href="${reauthRedirectUrl(`/agents/${agent.id}?resume=claim`)}">Sign in again to open passkey approval</a>`}
+              <button type="button" class="btn danger" data-cx-deny="${c.admissionId}">Reject</button>
+            </form>`
+          : html`<form method="post" action="/agents/${agent.id}/claim" class="inline-form" data-claim-own>
           <input type="hidden" name="admission_id" value="${c.admissionId}">
+          <label>Enter the approval code
+            <input name="attach_code" inputmode="text" autocomplete="off" maxlength="8" required aria-label="Approval code">
+          </label>
           ${fresh
             ? html`<button type="submit" class="btn">${des.resumeClaim ? 'Confirm: Approve' : 'Approve'}</button>`
             : html`<a class="btn" href="${reauthRedirectUrl(`/agents/${agent.id}?resume=claim`)}">Sign in again to approve</a>`}
           <button type="button" class="btn danger" data-cx-deny="${c.admissionId}">Reject</button>
-        </form></div>`)}`
+        </form>`}</div>`)}`
   const connected = v.connected.length === 0
     ? ''
     : html`<p data-connect-done><strong>Connected. Mupot takes it from here.</strong> It sends the agent its tasks and instructions directly; you do not need to relay anything.</p>
@@ -123,8 +134,8 @@ export function renderAgentConnectPanel(
       function post(url,confirmText){if(confirmText&&!window.confirm(confirmText))return;say('saving…');
         fetch(url,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:'{}'}).then(function(r){return r.json().catch(function(){return {};}).then(function(d){
           if(r.ok){window.location.reload();return;}
-          if(d.error==='reauth_required'){say('Confirm it is you first (sign in again), then try again.');}else{say('Could not do that ('+(d.error||r.status)+').');}});}).catch(function(){say('Network error. Try again.');});}
-      [['data-cx-deny','/connections/admissions/','/deny',null],['data-cx-detach','/connections/attachments/','/detach','Detach this chat? It goes back to being a plain chat on its next request.'],
+          if(d.error==='reauth_required'){window.location.href='${reauthRedirectUrl(`/agents/${agent.id}`)}';return;}else{say('Could not do that ('+(d.error||r.status)+').');}});}).catch(function(){say('Network error. Try again.');});}
+      [['data-cx-deny','/connections/admissions/','/deny',null],['data-cx-detach','/connections/attachments/','/detach','Detach this chat? It returns to its own identity. Approval for this chat alone is revoked. Approval for every chat of the app stays active; an observed chat needs Release before attaching again.'],
        ['data-cx-hold','/connections/seats/','/hold','Hold this chat? It can then only read.'],['data-cx-return','/connections/seats/','/return',null],
        ['data-cx-release','/connections/seats/','/release','Release this chat? The limits no longer apply to it.']].forEach(function(s){
         document.querySelectorAll('button['+s[0]+']').forEach(function(b){b.addEventListener('click',function(){post(s[1]+encodeURIComponent(b.getAttribute(s[0]))+s[2],s[3]);});});});

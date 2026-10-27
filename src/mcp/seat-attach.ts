@@ -17,6 +17,7 @@ import type { Env } from '../types'
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { attachSeatToAgent, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
+import { connectionsLink } from '../members/vip-lane'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
@@ -104,6 +105,13 @@ const toolSeatAttach: ToolSpec = {
         admission_id: r.admission_id,
         agent: r.agent,
         note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
+      })
+    }
+    if (r.ok && r.status === 'pending_admission' && r.requires_human_release) {
+      return done({
+        status: 'pending_admission', admission_id: r.admission_id,
+        connections_url: connectionsLink(env),
+        note: 'Pending. This chat is observed. The earlier approval cannot attach it. Your human must select Release for THIS chat on Connections, then call seat_attach again.',
       })
     }
     if (r.ok && r.already_pending) {

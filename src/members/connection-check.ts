@@ -72,14 +72,15 @@ export async function runConnectionCheck(
     const row = await env.DB.prepare(`SELECT id FROM agent_messages WHERE id = ?1 AND tenant = ?2 AND from_agent = ?3 LIMIT 1`).bind(sendRes.id, env.TENANT_SLUG, p.agentId).first<{ id: string }>()
     sendId = row?.id ?? null
   }
-  // RECEIVE: reuse the newest open probe; once handled, report ok (fresh:true starts a new round).
+  // RECEIVE: reuse a handled probe for the completed round. A host-consumed probe can no longer be
+  // marked handled by this attachment, so it must never be returned as a pending next step.
   const like = `check-recv:${p.attachmentId}:%`
-  const latest = await env.DB.prepare(`SELECT id FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND request_id LIKE ?4 ORDER BY seq DESC LIMIT 1`)
-    .bind(env.TENANT_SLUG, p.agentId, ONBOARDING_SENDER, like).first<{ id: string }>()
+  const latest = await env.DB.prepare(`SELECT id, read_at FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND request_id LIKE ?4 ORDER BY seq DESC LIMIT 1`)
+    .bind(env.TENANT_SLUG, p.agentId, ONBOARDING_SENDER, like).first<{ id: string; read_at: string | null }>()
   const handled = async (id: string): Promise<boolean> => (await env.DB.prepare(`SELECT 1 AS x FROM agent_attachment_handled WHERE attachment_id = ?1 AND message_id = ?2 LIMIT 1`).bind(p.attachmentId, id).first<{ x: number }>()) !== null
   let recvId = latest?.id ?? null
   let recvOk = recvId !== null && (await handled(recvId))
-  if (recvId === null || (recvOk && p.fresh === true)) {
+  if (recvId === null || (!recvOk && latest?.read_at != null) || (recvOk && p.fresh === true)) {
     const round = recvId === null ? 1 : Number((await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND request_id LIKE ?4`).bind(env.TENANT_SLUG, p.agentId, ONBOARDING_SENDER, like).first<{ n: number }>())?.n ?? 0) + 1
     const r = await sendAgentMessage(
       env,
@@ -106,10 +107,10 @@ export async function runConnectionCheck(
   return result
 }
 
-/** The newest recorded check for this agent (panel). */
-export async function latestConnectionCheck(env: Env, agentId: string): Promise<{ summary: string; at: string } | null> {
-  const row = await env.DB.prepare(`SELECT after_state AS s, created_at AS at FROM agent_audit WHERE agent_id = ?1 AND action = 'connection_check' ORDER BY seq DESC LIMIT 1`)
-    .bind(agentId).first<{ s: string; at: string }>().catch(() => null)
+/** The newest recorded check for this agent by this viewer's attached chat (panel). */
+export async function latestConnectionCheck(env: Env, agentId: string, humanMemberId: string): Promise<{ summary: string; at: string } | null> {
+  const row = await env.DB.prepare(`SELECT after_state AS s, created_at AS at FROM agent_audit WHERE agent_id = ?1 AND actor_id = ?2 AND action = 'connection_check' ORDER BY seq DESC LIMIT 1`)
+    .bind(agentId, humanMemberId).first<{ s: string; at: string }>().catch(() => null)
   if (!row) return null
   try {
     const j: unknown = JSON.parse(row.s)

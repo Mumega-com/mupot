@@ -6,6 +6,7 @@
 // inbox stays as the durable copy. Member-authored text (task titles, names) is bounded and control-stripped: data, not instruction.
 
 import type { Env } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { cleanReported } from '../fleet/reported-values'
 
 export const ONBOARDING_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -40,7 +41,7 @@ export async function attachedOnboarding(
     ? ((await env.DB.prepare(`SELECT pr.slug AS slug, pr.name AS name FROM project_squad_access pa JOIN projects pr ON pr.id = pa.project_id
           WHERE pa.squad_id = ?1 AND pr.status = 'active' ORDER BY pr.name LIMIT 5`).bind(agent.squad_id).all<{ slug: string; name: string }>().catch(() => null))?.results ?? [])
     : []
-  const task = await env.DB.prepare(`SELECT id, title, status FROM tasks WHERE assignee_agent_id = ?1 AND status IN ('open','in_progress','blocked','review') ORDER BY created_at ASC LIMIT 1`)
+  const task = await env.DB.prepare(`SELECT t.id, t.title, t.status FROM tasks t WHERE t.assignee_agent_id = ?1 AND t.status IN ('open','in_progress','blocked','review') AND ${TASK_NOT_ARCHIVED_SQL('t')} ORDER BY t.created_at ASC LIMIT 1`)
     .bind(p.agentId).first<{ id: string; title: string; status: string }>()
   return {
     who_you_are: { name: clean(agent.name, 64), slug: clean(agent.slug, 64), role: clean(agent.role, 64) },
