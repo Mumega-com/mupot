@@ -16,13 +16,24 @@
 
 ## Squad tier (enforced in mupot, not the adapter)
 
-A `tier: "squad"` page is readable and writable only by workspace admins and members of a squad that has access to
-the project (`callerHasSquadAccessToProject`, built on `projectVisibilityClause`). Org-wide observers and
-department-only readers can read the project but not its squad pages. The check runs in the service layer on the
-adapter's result, before anything reaches a caller, on `project_wiki_get`, backlinks, link lists, and every
+A `tier: "squad"` page is visible only to workspace admins and callers with a grant on any squad that has access to
+the project (squad observer grants and project read edges included). This uses
+`callerHasSquadAccessToProject`, built on `projectVisibilityClause`. Writes additionally require the existing
+project-write floor. Org-wide observers and department-only readers can read the project but not its squad pages.
+The check runs in the service layer on the adapter's result, before anything reaches a caller, on `project_wiki_get`, backlinks, link lists, and every
 surface that renders the raw graph (`project_wiki`, the dashboard wiki tab, `task_brief`). A hidden page answers
-exactly like an absent one. The tier lives in the stamped envelope in the text record, so the service must ask the
-adapter for the page to learn its tier; it never returns the raw result.
+exactly like an absent one. The tier lives in the text record; raw `tier:squad` stamps restrict visibility
+even when the rest of the envelope is incomplete. The adapter preserves raw stamps for these checks while
+keeping caller tags separate. Adapters without raw stamps use their decoded envelope tier.
 
 Tests: `tests/pages-v2.test.ts` (fake body-capable store, `tests/helpers/fake-pages-port.ts`) and
 `tests/pages-port-contract.test.ts`.
+
+## Current limitations
+
+- The MCP transport's 64 KiB request check inspects only `Content-Length`; requests without that header
+  (including chunked bodies) bypass this early check. Page body validation separately enforces 64 KiB after parsing.
+  A bounded transport reader is deferred as a separate transport change affecting all tools.
+- A non-squad page read probes up to 40 link targets concurrently, in addition to its initial fetch and
+  the backlink fetch. Batching/caching needs a separate adapter design; this change preserves the existing bound.
+- Version stamps are counters and provenance, not stored revisions. Revision history/retrieval is not implemented.

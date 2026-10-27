@@ -42,6 +42,8 @@ export interface PageRecord {
   body?: string
   /** Caller tags only (envelope stamps are NOT mixed in). */
   tags: string[]
+  /** Raw store stamps, including incomplete envelopes, for fail-closed visibility checks. */
+  rawTags?: string[]
   links: PageLink[]
   /** null = a page this port did not write (no envelope), e.g. the dashboard card or admin content. */
   envelope: PageEnvelope | null

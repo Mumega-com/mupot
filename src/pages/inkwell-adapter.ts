@@ -102,6 +102,7 @@ function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: str
     title: topic.title,
     summary: topic.description,
     tags: tags.filter((t) => ![...stamped].some((p) => t.startsWith(p))),
+    rawTags: tags,
     links,
     envelope: decodeEnvelope(tags, topic.topic_type),
   }

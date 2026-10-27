@@ -6,6 +6,7 @@
 // an adapter stores and returns text and never decides who may see it.
 
 import type { Env } from '../types'
+import { isSquadTierTags } from './inkwell-adapter'
 import {
   ENVELOPE_TAG_PREFIXES,
   isPageTier,
@@ -221,12 +222,12 @@ export async function readPage(port: PagesPort, args: { projectId: string; slug:
   const page = await port.get(args.projectId, args.slug)
   if (!page) return null
   if (args.canSeeSquadPages) return page
-  if (page.envelope?.tier === 'squad') return null
+  if (isSquadTierTags(page.rawTags ?? [`tier:${page.envelope?.tier}`])) return null
   // A visible page may link to a squad page; naming its slug would leak its existence. Probe each target's tier
   // (bounded; past the bound the extra links are dropped, fail closed).
   const probe = page.links.slice(0, MAX_LINK_TIER_PROBES)
   const targets = await Promise.all(probe.map((l) => port.get(args.projectId, l.toSlug)))
-  const links = probe.filter((_, i) => targets[i]?.envelope?.tier !== 'squad')
+  const links = probe.filter((_, i) => !isSquadTierTags(targets[i]?.rawTags ?? [`tier:${targets[i]?.envelope?.tier}`]))
   return { ...page, links }
 }
 
@@ -235,7 +236,7 @@ export async function readBacklinks(port: PagesPort, args: { projectId: string; 
   // The target is checked first: whether a hidden squad page has inbound links is itself a leak.
   const target = await port.get(args.projectId, args.slug)
   if (!target) return null
-  if (!args.canSeeSquadPages && target.envelope?.tier === 'squad') return null
+  if (!args.canSeeSquadPages && isSquadTierTags(target.rawTags ?? [`tier:${target.envelope?.tier}`])) return null
   return filterBacklinks(await port.listBacklinks(args.projectId, args.slug), args.canSeeSquadPages)
 }
 

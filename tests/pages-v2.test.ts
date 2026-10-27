@@ -204,6 +204,32 @@ describe('squad-tier access (real): allowed and refused, plus backlink and graph
     expect(JSON.stringify(hidden)).toBe(JSON.stringify(absent))
   })
 
+  it.each(['org', 'department'] as const)('%s project readers with an unrelated squad grant still get 404', async (scope) => {
+    await seed()
+    const reader: AuthContext = {
+      ...orgObserver,
+      capabilities: [
+        { member_id: 'obs', scope_type: scope, scope_id: scope === 'org' ? null : 'dept-a', capability: 'observer' },
+        { member_id: 'obs', scope_type: 'squad', scope_id: SQ_O, capability: 'observer' },
+      ],
+    }
+    expect((await get(reader, 'open-target')).ok).toBe(true)
+    expect(await get(reader, 'squad-secret')).toEqual(await get(reader, 'no-such-page'))
+    expect(status(await get(reader, 'squad-secret'))).toBe(404)
+  })
+
+  it('raw squad stamps hide partially stamped pages, their links, and backlinks', async () => {
+    fake.seed({ tenantSlug: TENANT, project: PROJ, slug: 'squad-secret', title: 'Partial secret', tags: ['tier:squad'], requiredKeys: ['mupot:project'] })
+    await upsert(squadAuth(SQ_W), { slug: 'open-target' })
+    expect((await upsert(squadAuth(SQ_W), { slug: 'open-page', links: [{ to_slug: 'squad-secret' }, { to_slug: 'open-target' }] })).ok).toBe(true)
+    const port = createInkwellPagesPort(env)
+    expect((await port.get(PROJ, 'squad-secret'))?.envelope).toBeNull()
+    expect(await readPage(port, { projectId: PROJ, slug: 'squad-secret', canSeeSquadPages: false })).toBeNull()
+    expect(await readBacklinks(port, { projectId: PROJ, slug: 'squad-secret', canSeeSquadPages: false })).toBeNull()
+    expect(pageOf(await get(orgObserver, 'open-page')).links.map((l) => l.to_slug)).toEqual(['open-target'])
+    expect((await readPage(port, { projectId: PROJ, slug: 'squad-secret', canSeeSquadPages: true }))?.title).toBe('Partial secret')
+  })
+
   it('REFUSED: an org observer cannot write a squad page (project write floor) and the page is untouched', async () => {
     await seed()
     const before = fake.requests.length

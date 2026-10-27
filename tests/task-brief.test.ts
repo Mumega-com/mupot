@@ -18,6 +18,8 @@
 //   SECRETS         bearer tokens / mupot_ tokens in free text are redacted; forged headings are flattened.
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { FakeInternalWiki } from './helpers/fake-internal-wiki'
+import { encryptConnectorSecret } from '../src/connectors/crypto'
 import { invokeTool, TOOLS } from '../src/mcp'
 import { resolveCapabilities } from '../src/auth/capability'
 import { createMemory } from '../src/memory'
@@ -665,6 +667,35 @@ describe('task_brief: wiki leg', () => {
     const shown = await buildTaskBrief(strict.env, { ...(await baseInput()), canSeeSquadPages: true }, { wiki: async () => squadWiki })
     expect(shown.sources).toContain('wiki:squad-receipts-plan')
   })
+  it('through invokeTool, an org observer gets project wiki context without squad slugs or titles', async () => {
+    const key = '88'.repeat(32)
+    const connector = 'brief-wiki-connector'
+    const secret = 'brief-wiki-secret'
+    const encrypted = await encryptConnectorSecret(key, connector, 'inkwell', secret)
+    harness.sqlite.prepare(`INSERT INTO connectors (id, tenant, type, label, encrypted_secret, scope_type, created_by, created_at)
+      VALUES (?, ?, 'inkwell', 'wiki', ?, 'pot', 'test', '2026-01-01T00:00:00Z')`).run(connector, TENANT, encrypted)
+    try {
+      const fake = new FakeInternalWiki({ [TENANT]: secret })
+      fake.seed({ tenantSlug: TENANT, project: P1, slug: 'open-receipts', title: 'Dispatch receipts retry ceiling public', description: 'dispatch receipts retry ceiling', requiredKeys: ['mupot:project'] })
+      fake.seed({ tenantSlug: TENANT, project: P1, slug: 'squad-secret-receipts', title: 'Dispatch receipts secret squad plan', description: 'dispatch receipts retry ceiling', tags: ['tier:squad'], requiredKeys: ['mupot:project'] })
+      const env = { ...strict.env, CONNECTOR_MASTER_KEY: key, INKWELL_API_URL: 'https://inkwell-api.test', INKWELL_SVC: fake.asFetcher() } as Env
+      // task_brief has a member floor: membership of the task's squad admits the call,
+      // but that squad has no edge to P1. Only org:observer grants project read.
+      const observer = authFor('m-b', [
+        { member_id: 'm-b', scope_type: 'org', scope_id: null, capability: 'observer' },
+        { member_id: 'm-b', scope_type: 'squad', scope_id: SQ_B, capability: 'member' },
+      ])
+      const hidden = pack(await invokeTool(observer, env, 'task_brief', { task_id: T_NOPROJ_READ }, ORIGIN))
+      expect(hidden.sources).toContain('wiki:open-receipts')
+      expect(JSON.stringify(hidden)).not.toContain('squad-secret-receipts')
+      expect(JSON.stringify(hidden)).not.toContain('Dispatch receipts secret squad plan')
+      const shown = pack(await invokeTool(await real('m-a'), env, 'task_brief', { task_id: T_MAIN }, ORIGIN))
+      expect(shown.sources).toContain('wiki:squad-secret-receipts')
+    } finally {
+      harness.sqlite.prepare('DELETE FROM connectors WHERE id = ?').run(connector)
+    }
+  })
+
   it('a wiki that errors is an empty leg, not a failure', async () => {
     const out = await buildTaskBrief(strict.env, await baseInput(), { wiki: async () => { throw new Error('upstream 500') } })
     expect(out.sections).toContain('task')
