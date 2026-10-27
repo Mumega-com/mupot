@@ -120,10 +120,10 @@ describe('(a) the designate hint depends on whether the human can press it', () 
     expect(boot).not.toContain('ask an org admin to designate')
   })
   it('seat_attach on an agent the human is not designated for names who can designate (same text for any unknown name: no oracle)', async () => {
-    const out = JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { agent: 'ag2' }, 'mom-thread'))
+    const out = JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag2' }, 'mom-thread'))
     expect(out).toContain('agent_not_found')
     expect(out).toContain('org admin')
-    const other = JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { agent: 'does-not-exist' }, 'mom-thread'))
+    const other = JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'does-not-exist' }, 'mom-thread'))
     expect(other).toContain('org admin')
   })
 })
@@ -140,7 +140,7 @@ describe('(b) the claim welcome to an attached chat drops steps that cannot work
     expect(runtime).toContain('Set up wake')
   })
   it('sendClaimWelcome keeps the runtime text when the admission has no live attachment', async () => {
-    const out = await rpc(momEnv, momCtx, 'seat_attach', { agent: 'ag1' }, 'mom-thread')
+    const out = await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag1' }, 'mom-thread')
     expect(out.status, JSON.stringify(out)).toBe('pending_admission')
     const adm = h.sqlite.prepare("SELECT id, agent_id, human_member_id FROM agent_seat_admissions WHERE status = 'pending'").get() as { id: string; agent_id: string; human_member_id: string }
     expect(await sendClaimWelcome(momEnv, adm)).toBe('sent')
@@ -156,9 +156,9 @@ describe('(c) seat_attach with no agent lists the choices', () => {
     const agents = out.agents as { id: string; slug: string; name: string }[]
     expect(agents.map((a) => a.id)).toEqual(['ag1'])
     // every listed agent is accepted by the same tool; the unlisted one is refused
-    const ok = await rpc(momEnv, momCtx, 'seat_attach', { agent: agents[0]!.id }, 'mom-thread')
+    const ok = await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: agents[0]!.id }, 'mom-thread')
     expect(ok.status, JSON.stringify(ok)).toBe('pending_admission')
-    expect(JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { agent: 'ag2' }, 'mom-thread'))).toContain('agent_not_found')
+    expect(JSON.stringify(await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag2' }, 'mom-thread'))).toContain('agent_not_found')
   })
   it('a human with nothing attachable gets an empty list and a next step, not an error', async () => {
     h.sqlite.exec("UPDATE agents SET attach_designated_member_id = NULL")
@@ -168,7 +168,7 @@ describe('(c) seat_attach with no agent lists the choices', () => {
     expect(String(out.note)).toContain('org admin')
   })
   it('a present-but-invalid agent value is refused, not turned into a list', async () => {
-    const out = await rpc(momEnv, momCtx, 'seat_attach', { agent: 'x'.repeat(200) }, 'mom-thread')
+    const out = await rpc(momEnv, momCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'x'.repeat(200) }, 'mom-thread')
     expect(out.status).toBeUndefined()
     expect(out.agents).toBeUndefined()
   })

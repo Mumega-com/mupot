@@ -123,7 +123,7 @@ async function rpc(env: Env, ctx: AuthContext, name: string, args: Record<string
 
 const thread = (session: string): Record<string, unknown> => ({ 'openai/session': session })
 const boot = (env: Env, g: Grant, session: string): Promise<Rpc> => rpc(env, g.ctx, 'boot_context', {}, { meta: thread(session) })
-const attach = (env: Env, g: Grant, session: string, agent: string): Promise<Rpc> => rpc(env, g.ctx, 'seat_attach', { agent }, { meta: thread(session) })
+const attach = (env: Env, g: Grant, session: string, agent: string): Promise<Rpc> => rpc(env, g.ctx, 'seat_attach', { agent, reason: 'This chat is assigned to operate the requested agent.' }, { meta: thread(session) })
 const receiptOf = (r: Rpc): Record<string, unknown> => r.sc.identity_receipt as Record<string, unknown>
 const errOf = (r: Rpc): string => String(((r.body.result ?? {}) as { structuredContent?: { error?: unknown } }).structuredContent?.error ?? (r.body.error as { message?: string } | undefined)?.message ?? '')
 

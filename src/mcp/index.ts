@@ -7181,7 +7181,7 @@ function writeAccessHint(env: Env, w: Whoami, firstStep: string | undefined): st
     case 'own_seat':
       return 'this chat acts as its own seat agent, capped at member and at your human\'s own access. '
         + (seatAttachEnabled(env)
-          ? 'To act as an agent you already have instead, call seat_attach { agent: "<its name or id>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
+          ? 'To act as an agent you already have instead, call seat_attach { agent: "<its name or id>", reason: "<why this chat should act as that agent>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
             + 'Only a fixed CLI/daemon agent with no human in the chat needs an org-admin to mint a WORKSPACE-channel token for it (mint_agent_token), connecting with that bearer. '
           : 'To act as an agent you already have, ask an org-admin for a WORKSPACE-channel token for it (mint_agent_token) and connect with that bearer. ')
         + noGrant
@@ -7451,7 +7451,7 @@ const toolBootContext: ToolSpec = {
       const attachOrder = !seatAttachEnabled(env) || auth.seatBinding.attached || auth.seatAgentStatus === 'held'
         ? ''
         : observedSeat
-          ? " You are observed: request admission with seat_attach {agent:'<slug>'}; your human approves it. Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use)."
+          ? " You are observed: request admission with seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}; your human approves it. Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use)."
           : ` ${attachConnectOrder(env, whoamiFacts.humanCanDesignate)}`
       nextStepOut = auth.seatBinding.attached
         ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you cannot ack or lease. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
@@ -7731,10 +7731,10 @@ const toolConnect: ToolSpec = {
             // Door A (W2): only a session that HAS a seat can seat_attach (seat_required otherwise), so say which case this is.
             ...(seatAttachEnabled(env)
               ? [auth.seatBinding
-                  ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
+                  ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}", reason: "<why this chat should act as that agent>" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
                   : auth.harnessId
-                    ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and pass the returned handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead). Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
-                    : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many}; then call seat_select, then seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
+                    ? `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; otherwise call seat_select { project: "<workspace name>" } and pass the returned handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead). Once it has a seat, call seat_attach { agent: "${agentRef.id}", reason: "<why this chat should act as that agent>" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`
+                    : `DOOR A needs a SEAT first, and a seat needs a harness: this connector was consented without one, so seat_select would answer harness_required. Your human re-consents the connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many}; then call seat_select, then seat_attach { agent: "${agentRef.id}", reason: "<why this chat should act as that agent>" } (your human approves once with their passkey). Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
               : []),
             // Render the ID, never the slug. mint_agent_token resolves through the same
             // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
@@ -7832,7 +7832,7 @@ const toolConnect: ToolSpec = {
         } else if (!(await resolveAttachableAgent(env, auth.seatBinding.humanMemberId, agentRef.id)).ok) {
           how = `This chat cannot become ${agentRef.slug} right now: seat_attach would answer agent_not_found (your human needs admin on its squad, and it must be a normal agent with a usable identity). Ask your human or an admin.`
         } else {
-          how = `To BE ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves with their passkey and this chat then acts as that agent.`
+          how = `To BE ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}", reason: "<why this chat should act as that agent>" }: your human approves with their passkey and this chat then acts as that agent.`
         }
         seatNote = {
           acting_as: { id: auth.boundAgentId, slug: actingSlug },
@@ -7851,7 +7851,7 @@ const toolConnect: ToolSpec = {
         ? seatNote.next_step
         : auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
         ? (auth.seatBinding
-            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`
+            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}", reason: "<why this chat should act as that agent>" }: your human approves once with their passkey and this chat then acts as the agent. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`
             : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. ${auth.harnessId ? 'Call seat_select { project } to get one (a ChatGPT conversation gets a seat automatically)' : `Your human re-consents the connector choosing ${consentLabels(consentChoiceLabels(env)).many} so it can get a seat (a ChatGPT conversation gets one automatically)`}; a background Claude Code / CLI harness signs in once by OAuth as ${agentRef.slug}, choosing "This connection is ${agentRef.name}", and keeps its own refresh token. For your agent's briefing call orient { agent: "${agentRef.slug}" }.`)
         : durable
           ? 'You are now hot. Call orient {} (or rely on this packet) for your full briefing.'

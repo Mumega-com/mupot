@@ -5,6 +5,7 @@
 // Reject / Detach / Hold / Return / Release call the existing /connections routes (same checks as that page). Plain words only: "chat",
 // "request" (no "admission" / "seat" in anything the human reads). The copy-to-agent text is for the AGENT, so it names tools.
 
+import { attachIdentityCard } from './attach-identity'
 import { html, raw } from 'hono/html'
 import type { Env } from '../types'
 import { latestConnectionCheck } from '../members/connection-check'
@@ -16,7 +17,7 @@ import { mcpEndpoint, requiredCanonicalOrigin } from './connect'
 import { pill, type Html } from './ui'
 import { reauthRedirectUrl } from './claim'
 
-export interface ConnectedChat { attachment_id: string; label: string; harness: string; since: string }
+export interface ConnectedChat { attachment_id: string; admission_id: string; label: string; harness: string; since: string }
 
 export interface AgentConnectView {
   endpoint: string | null
@@ -45,7 +46,7 @@ export async function loadAgentConnectView(env: Env, memberId: string, agent: { 
   const origin = requiredCanonicalOrigin(env)
   const claims = await claimsForAgent(env, memberId, agent.id).catch(() => ({ pending: [] as ClaimView[], expired: null }))
   const connected = (await env.DB.prepare(
-    `SELECT t.id AS attachment_id, COALESCE(NULLIF(tl.label, ''), s.label_basename) AS label, h.client_name AS harness, t.created_at AS since
+    `SELECT t.id AS attachment_id, t.admission_id AS admission_id, COALESCE(NULLIF(tl.label, ''), s.label_basename) AS label, h.client_name AS harness, t.created_at AS since
        FROM agent_seat_attachments t JOIN agent_seats s ON s.id = t.seat_id JOIN harnesses h ON h.id = t.harness_id
        LEFT JOIN agent_seat_thread_labels tl ON tl.tenant = t.tenant AND tl.seat_id = t.seat_id AND tl.human_member_id = t.human_member_id
       WHERE t.tenant = ?1 AND t.human_member_id = ?2 AND t.agent_id = ?3 AND t.detached_at IS NULL ORDER BY t.created_at DESC LIMIT 20`,
@@ -79,7 +80,7 @@ export function renderAgentConnectPanel(
         <p>Currently allowed: ${des.designeeText ?? 'nobody'}</p>${warn}${allowForm}</li>`
   const pending = v.pending.length === 0
     ? html`<p class="ui-sub" data-connect-none>No chat has asked yet. This updates when one does.</p>`
-    : html`${v.pending.map((c) => html`<div class="card" data-connect-request>
+    : html`${v.pending.map((c) => html`<div class="card" data-connect-request>${attachIdentityCard(c)}
         <p><strong>${c.harnessName || 'A chat app'}</strong>${c.seatLabel ? html` · chat ${c.seatLabel}` : ''} asked ${when(c.requestedAt)} to act as ${agent.name}.</p>
         <p>Approval code <code>${c.attachCode ?? 'unavailable'}</code></p>
         ${c.scope === 'harness'
@@ -104,7 +105,8 @@ export function renderAgentConnectPanel(
     : html`<p data-connect-done><strong>Connected. Mupot takes it from here.</strong> It sends the agent its tasks and instructions directly; you do not need to relay anything.</p>
       <p data-connect-check>${v.lastCheck ? html`Last connection check (${when(v.lastCheck.at)}): ${v.lastCheck.summary}` : 'Connection check: the agent runs it first and reports back to you. This updates when it does.'}</p>
       <ul>${v.connected.map((c) => html`<li data-connect-attached>${c.label || 'A chat'} (${c.harness}) since ${when(c.since)}
-        <button type="button" class="btn danger" data-cx-detach="${c.attachment_id}">Detach</button></li>`)}</ul>`
+        <button type="button" class="btn danger" data-cx-revoke="${c.admission_id}">Wrong agent? Detach</button></li>`)}</ul>
+      <p class="ui-sub">Detaching ends the approval for all chats using it.</p>`
   const observed = v.observed.length === 0
     ? ''
     : html`<p class="ui-sub">Chats of yours that joined a squad first are limited until you let them through. They can still ask above.</p>
@@ -135,7 +137,7 @@ export function renderAgentConnectPanel(
         fetch(url,{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:'{}'}).then(function(r){return r.json().catch(function(){return {};}).then(function(d){
           if(r.ok){window.location.reload();return;}
           if(d.error==='reauth_required'){window.location.href='${reauthRedirectUrl(`/agents/${agent.id}`)}';return;}else{say('Could not do that ('+(d.error||r.status)+').');}});}).catch(function(){say('Network error. Try again.');});}
-      [['data-cx-deny','/connections/admissions/','/deny',null],['data-cx-detach','/connections/attachments/','/detach','Detach this chat? It returns to its own identity. Approval for this chat alone is revoked. Approval for every chat of the app stays active; an observed chat needs Release before attaching again.'],
+      [['data-cx-revoke','/connections/admissions/','/revoke',null],['data-cx-deny','/connections/admissions/','/deny',null],['data-cx-detach','/connections/attachments/','/detach','Detach this chat? It returns to its own identity. Approval for this chat alone is revoked. Approval for every chat of the app stays active; an observed chat needs Release before attaching again.'],
        ['data-cx-hold','/connections/seats/','/hold','Hold this chat? It can then only read.'],['data-cx-return','/connections/seats/','/return',null],
        ['data-cx-release','/connections/seats/','/release','Release this chat? The limits no longer apply to it.']].forEach(function(s){
         document.querySelectorAll('button['+s[0]+']').forEach(function(b){b.addEventListener('click',function(){post(s[1]+encodeURIComponent(b.getAttribute(s[0]))+s[2],s[3]);});});});

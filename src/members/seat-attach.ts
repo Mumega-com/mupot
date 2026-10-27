@@ -37,6 +37,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../types'
+import { canonicalHarness } from '../fleet/reported-values'
 import { timingSafeEqual } from '../lib/crypto'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, capabilityRank, currentMemberRankOnScope, exceedsTargetRankCeilingGivenRanks, resolveCapabilities, targetMaxRankAcrossScopes } from '../auth/capability'
@@ -231,6 +232,7 @@ export interface AdmissionRow {
   requested_seat_id: string | null
   /** Short human code the asking chat displays; null on legacy admissions (and dashboard-made rows). Not a credential. */
   attach_code: string | null
+  reason: string | null
   created_at: string
   expires_at: string | null
   decided_at: string | null
@@ -252,7 +254,7 @@ export function autoGateAuthoritySql(agentIdExpr: string): string {
        THEN 1 ELSE 0 END`
 }
 
-const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, scope, ceiling, requested_via, requested_seat_id, attach_code,
+const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, scope, ceiling, requested_via, requested_seat_id, attach_code, reason,
   created_at, expires_at, decided_at, decided_by_member_id, decided_via, revoked_at, revoked_by_member_id`
 
 export async function loadAdmission(env: Env, id: string): Promise<AdmissionRow | null> {
@@ -357,7 +359,7 @@ async function liveAdmissionFor(env: Env, open: AdmissionRow, p: { seatId: strin
  */
 export async function ensureAdmission(
   env: Env,
-  p: { agentId: string; humanMemberId: string; harnessId: string; seatId: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; ceiling?: AttachCeiling; attachCode?: unknown; scope?: AdmissionScope; grantTokenId?: string | null },
+  p: { agentId: string; humanMemberId: string; harnessId: string; seatId: string; via: 'tool' | 'dashboard'; reason?: string; requesterAgentId?: string | null; ceiling?: AttachCeiling; attachCode?: unknown; scope?: AdmissionScope; grantTokenId?: string | null },
   nowMs: number = Date.now(),
 ): Promise<EnsureAdmissionResult> {
   const nowIso = new Date(nowMs).toISOString()
@@ -429,13 +431,13 @@ export async function ensureAdmission(
     const expiresAt = new Date(nowMs + ADMISSION_PENDING_TTL_MS).toISOString()
     const res = await env.DB.prepare(
       `INSERT INTO agent_seat_admissions
-         (id, tenant, agent_id, human_member_id, harness_id, status, gates, requested_via, requested_seat_id, created_at, expires_at, attach_code, scope)
-       SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8, ?10, ?11
+         (id, tenant, agent_id, human_member_id, harness_id, status, gates, requested_via, requested_seat_id, created_at, expires_at, attach_code, scope, reason)
+       SELECT ?1, ?2, ?3, ?4, ?5, 'pending', 0, 'tool', ?6, ?7, ?8, ?10, ?11, ?12
         WHERE (SELECT COUNT(*) FROM agent_seat_admissions
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 ${attachDesignatedClause(env, 'ag', '?4')})
        ON CONFLICT DO NOTHING`,
-    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat').run()
+    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat', p.reason ?? null).run()
     const inserted = res.meta.changes === 1
     pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
     if (!pending) {
@@ -613,13 +615,43 @@ export async function revokeAdmission(
 const CLOSED: Outcome = { status: 409, title: 'Request closed', message: 'This request is no longer pending.', tone: 'warn' }
 
 /** What the human sees for an admission request (rendered inside the decision form). All names are labels. */
-export async function admissionView(env: Env, adm: AdmissionRow): Promise<{ agentName: string; agentSlug: string; harnessName: string; harnessKind: string; seatLabel: string | null; seatFirstSeen: string | null }> {
-  const a = await env.DB.prepare(`SELECT name, slug FROM agents WHERE id = ?1 LIMIT 1`).bind(adm.agent_id).first<{ name: string; slug: string }>()
+export interface AttachIdentity {
+  agentName: string
+  agentRole: string
+  ownerName: string
+  harnessName: string
+  seatLabel: string | null
+  reason: string | null
+  runtimeMismatch: boolean
+}
+
+/** Display hints only; unknown runtime is not evidence of a mismatch. Never used for authority. */
+export function attachRuntimeMismatch(runtime: string | null, kind: string | null): boolean {
+  const hint = (value: string | null): string | null => {
+    const raw = value?.trim().toLowerCase()
+    if (!raw || raw === 'unknown' || raw === 'other') return null
+    const canonical = canonicalHarness(raw === 'gemini' ? 'antigravity' : raw)
+    return canonical === 'other' ? raw : canonical
+  }
+  const home = hint(runtime)
+  const chat = hint(kind)
+  return home !== null && chat !== null && home !== chat
+}
+
+export async function admissionView(env: Env, adm: AdmissionRow): Promise<AttachIdentity & { agentSlug: string; harnessKind: string; seatFirstSeen: string | null }> {
+  const a = await env.DB.prepare(`SELECT a.name, a.slug, a.role, COALESCE(m.display_name, m.email, a.owner, 'unrecorded') AS owner_name,
+      f.runtime FROM agents a LEFT JOIN members m ON m.id = a.owner_member_id AND m.tenant = ?2
+      LEFT JOIN fleet_agents f ON f.agent_id = a.id AND f.tenant = ?2 WHERE a.id = ?1 LIMIT 1`)
+    .bind(adm.agent_id, env.TENANT_SLUG).first<{ name: string; slug: string; role: string; owner_name: string; runtime: string | null }>()
   const h = await env.DB.prepare(`SELECT client_name, kind FROM harnesses WHERE id = ?1 AND tenant = ?2 LIMIT 1`).bind(adm.harness_id, env.TENANT_SLUG).first<{ client_name: string; kind: string }>()
   const s = adm.requested_seat_id
-    ? await env.DB.prepare(`SELECT label_basename, created_at FROM agent_seats WHERE id = ?1 AND tenant = ?2 LIMIT 1`).bind(adm.requested_seat_id, env.TENANT_SLUG).first<{ label_basename: string; created_at: string }>()
+    ? await env.DB.prepare(`SELECT COALESCE(NULLIF(tl.label, ''), s.label_basename) AS label_basename, s.created_at
+        FROM agent_seats s LEFT JOIN agent_seat_thread_labels tl ON tl.tenant = s.tenant AND tl.seat_id = s.id AND tl.human_member_id = s.member_id
+        WHERE s.id = ?1 AND s.tenant = ?2 LIMIT 1`).bind(adm.requested_seat_id, env.TENANT_SLUG).first<{ label_basename: string; created_at: string }>()
     : null
-  return { agentName: a?.name ?? adm.agent_id, agentSlug: a?.slug ?? '', harnessName: h?.client_name ?? '', harnessKind: h?.kind ?? '', seatLabel: s?.label_basename ?? null, seatFirstSeen: s?.created_at ?? null }
+  return { agentName: a?.name ?? adm.agent_id, agentSlug: a?.slug ?? '', agentRole: a?.role || 'unrecorded role', ownerName: a?.owner_name ?? 'unrecorded',
+    harnessName: h?.client_name ?? '', harnessKind: h?.kind ?? '', seatLabel: s?.label_basename ?? null, seatFirstSeen: s?.created_at ?? null,
+    reason: adm.reason, runtimeMismatch: attachRuntimeMismatch(a?.runtime ?? null, h?.kind ?? null) }
 }
 
 // Same contract as durably() in access/decision-core (not imported: that module pulls the whole MCP tool graph into this
@@ -842,7 +874,7 @@ function prepareAttachStatements(
  */
 export async function attachSeatToAgent(
   env: Env,
-  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling; attachCode?: unknown; grantTokenId?: string | null; scope?: AdmissionScope },
+  p: { humanMemberId: string; seatId: string; agentRef: string; via: 'tool' | 'dashboard'; reason?: string; requesterAgentId?: string | null; moveIfAttached?: boolean; ceiling?: AttachCeiling; attachCode?: unknown; grantTokenId?: string | null; scope?: AdmissionScope },
   nowMs: number = Date.now(),
 ): Promise<AttachResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -884,7 +916,7 @@ export async function attachSeatToAgent(
   }
 
   const admission = await ensureAdmission(env, {
-    agentId: agent.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, seatId: seat.id, via: p.via, requesterAgentId: p.requesterAgentId, ceiling: p.ceiling, attachCode: p.attachCode, scope: p.scope, grantTokenId: p.grantTokenId,
+    agentId: agent.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, seatId: seat.id, via: p.via, reason: p.reason, requesterAgentId: p.requesterAgentId, ceiling: p.ceiling, attachCode: p.attachCode, scope: p.scope, grantTokenId: p.grantTokenId,
   }, nowMs)
   if (!admission.ok) return { ok: false, error: admission.error }
   if (admission.state === 'pending') {
@@ -1036,7 +1068,7 @@ export interface ConnectionSeat {
   attached_agent_name: string | null
 }
 export interface ConnectionHarness { id: string; client_name: string; kind: string; credential_kind: string; seats: ConnectionSeat[] }
-export interface ConnectionAdmission {
+export interface ConnectionAdmission extends AttachIdentity {
   id: string
   status: 'pending' | 'live'
   agent_name: string
@@ -1090,14 +1122,19 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
   }))
   const admissions = (await env.DB.prepare(
     `SELECT adm.id AS id, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
+            a.name AS agentName, a.role AS agentRole, COALESCE(om.display_name, om.email, a.owner, 'unrecorded') AS ownerName,
+            h.client_name AS harnessName, h.kind AS harness_kind, f.runtime AS runtime, COALESCE(NULLIF(rtl.label, ''), rs.label_basename) AS seatLabel, adm.reason AS reason,
             adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, adm.requested_seat_id AS requested_seat_id, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
             (SELECT COUNT(*) FROM agent_seat_attachments x WHERE x.admission_id = adm.id AND x.detached_at IS NULL) AS live_threads
        FROM agent_seat_admissions adm
        JOIN agents a ON a.id = adm.agent_id
        JOIN harnesses h ON h.id = adm.harness_id
        LEFT JOIN agent_seats rs ON rs.id = adm.requested_seat_id AND rs.tenant = adm.tenant
+       LEFT JOIN agent_seat_thread_labels rtl ON rtl.tenant = adm.tenant AND rtl.seat_id = rs.id AND rtl.human_member_id = adm.human_member_id
+       LEFT JOIN members om ON om.id = a.owner_member_id AND om.tenant = adm.tenant
+       LEFT JOIN fleet_agents f ON f.agent_id = a.id AND f.tenant = adm.tenant
       WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live')
       ORDER BY adm.created_at DESC LIMIT 200`,
-  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission>()).results ?? []
-  return { harnesses, admissions, bound: await loadBoundConnections(env, humanMemberId) }
+  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission & { runtime: string | null; harness_kind: string }>()).results ?? []
+  return { harnesses, admissions: admissions.map((a) => ({ ...a, runtimeMismatch: attachRuntimeMismatch(a.runtime, a.harness_kind) })), bound: await loadBoundConnections(env, humanMemberId) }
 }

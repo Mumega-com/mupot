@@ -391,7 +391,7 @@ describe('boot_context prints the connect order before seat_attach', () => {
     const selected = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', thread: 'grok-thread', squad: 'core' })
     const seated = await rpc(env, g.ctx, 'boot_context', { seat: String(selected.sc.seat_handle) })
     expect(whoamiOf(seated).state).toBe('own_seat')
-    expect(whoamiOf(seated).next_step_plain).toContain('seat_attach {agent}')
+    expect(whoamiOf(seated).next_step_plain).toContain('seat_attach {agent, reason}')
     expect(whoamiOf(seated).next_step_plain).toContain('/connections')
     expect(String(seated.sc.next_step)).not.toContain('Allow for me')
     expect(String(seated.sc.next_step)).not.toContain('agent_not_designated_for_you')
@@ -410,12 +410,12 @@ describe('boot_context prints the connect order before seat_attach', () => {
     const g = await grant(env, HUMAN)
     const cold = await rpc(env, g.ctx, 'boot_context', {})
     expect(whoamiOf(cold).next_step_plain).toContain('seat_select {project, folder, thread}')
-    expect(whoamiOf(cold).next_step_plain).not.toContain('seat_attach {agent}')
+    expect(whoamiOf(cold).next_step_plain).not.toContain('seat_attach {agent, reason}')
     expect(whoamiOf(cold).next_step_plain).not.toContain('Allow for me')
     const selected = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', thread: 'grok-thread', squad: 'core' })
     const seated = await rpc(env, g.ctx, 'boot_context', { seat: String(selected.sc.seat_handle) })
     expect(String(seated.sc.next_step)).not.toContain('Allow for me')
-    expect(String(seated.sc.next_step)).not.toContain('seat_attach {agent}')
+    expect(String(seated.sc.next_step)).not.toContain('seat_attach {agent, reason}')
     expect((seated.sc.available_doors as Array<{ tool: string }>).map((d) => d.tool)).not.toContain('seat_attach')
   })
 
@@ -454,7 +454,7 @@ describe('boot_context prints the connect order before seat_attach', () => {
         expect((result.available_doors ?? []).map((d) => d.tool)).not.toContain('seat_attach')
       } else {
         for (const text of [result.next_step, result.whoami?.next_step_plain]) {
-          expect(text).toContain("request admission with seat_attach {agent:'<slug>'}")
+          expect(text).toContain("request admission with seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}")
           expect(text).toContain('Show them the approval code')
           expect(text).toContain('wait while they approve it')
           expect(text).toContain('until then you stay limited to the observed tools')
@@ -489,7 +489,7 @@ describe('seat_attach before designation is refused', () => {
     const handle = String(selected.sc.seat_handle)
     expect(handle).toMatch(/^mseat_/)
 
-    const refused = await rpc(env, g.ctx, 'seat_attach', { agent: 'grokbot-ceo', seat: handle })
+    const refused = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'grokbot-ceo', seat: handle })
     expect(refused.sc.ok).toBe(false)
     expect(errOf(refused)).toBe('agent_not_designated_for_you')
     const detail = (refused.sc.detail ?? {}) as { next_step?: string; who_acts?: string }
@@ -505,7 +505,7 @@ describe('seat_attach before designation is refused', () => {
     const designated = await invokeTool(owner, env, 'update_agent', { agent: AGENT, attach_designated_member_id: HUMAN }, ORIGIN)
     expect(designated.ok, JSON.stringify(designated)).toBe(true)
 
-    const pending = await rpc(env, g.ctx, 'seat_attach', { agent: 'grokbot-ceo', seat: handle })
+    const pending = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'grokbot-ceo', seat: handle })
     expect(pending.sc.status, JSON.stringify(pending.sc)).toBe('pending_admission')
     expect(pending.sc.attach_code ?? pending.sc.approve_url).toBeTruthy()
     expect((h.sqlite.prepare(`SELECT COUNT(*) AS n FROM agent_seat_admissions`).get() as { n: number }).n).toBe(1)

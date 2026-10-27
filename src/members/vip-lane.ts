@@ -87,7 +87,7 @@ export function observedFloorNextStep(env: Env, status: 'observed' | 'trusted' |
   const link = connectionsLink(env)
   const where = link ? ` at ${link}` : ' on their Connections page'
   if (status === 'held') return `Your human put this chat on hold, so it can only read. Ask them to return or release it${where}.`
-  return `To request admission, call seat_attach {agent:'<slug>'}; your human approves it${where}. Show them the approval code you get back and wait while they approve it; until then this chat stays limited to the observed tools. Use mupot tools only (no browser or computer use) for this.`
+  return `To request admission, call seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}; your human approves it${where}. Show them the approval code you get back and wait while they approve it; until then this chat stays limited to the observed tools. Use mupot tools only (no browser or computer use) for this.`
 }
 
 export function observedFloorMessage(env: Env, status: 'observed' | 'trusted' | 'held', tool: string): string {

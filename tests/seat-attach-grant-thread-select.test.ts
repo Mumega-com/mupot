@@ -103,7 +103,7 @@ async function rpc(env: Env, ctx: AuthContext, name: string, args: Record<string
 const thread = (session: string, subject?: string): Record<string, unknown> => ({ 'openai/session': session, ...(subject ? { 'openai/subject': subject } : {}) })
 const boot = (env: Env, g: Grant, s: string, subject?: string): Promise<Rpc> => rpc(env, g.ctx, 'boot_context', {}, thread(s, subject))
 const attach = (env: Env, g: Grant, s: string, agent: string, scope?: string, subject?: string): Promise<Rpc> =>
-  rpc(env, g.ctx, 'seat_attach', { agent, ...(scope ? { scope } : {}) }, thread(s, subject))
+  rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent, ...(scope ? { scope } : {}) }, thread(s, subject))
 const errOf = (r: Rpc): string => JSON.stringify(r.body)
 
 async function hit(path: string, e: Env, r: { method?: string; json?: unknown } = {}): Promise<Response> {
@@ -617,11 +617,11 @@ describe('grant anchor and liveness chain: verified on attach AND on every opera
     await boot(env, g, 'conv-c')
     const admId = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
     // a forged seat handle in _meta is rejected outright; it never selects someone else's seat
-    const forgedSeat = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { ...thread('conv-c'), 'mupot/seat': attachments()[0].seat_id })
+    const forgedSeat = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }, { ...thread('conv-c'), 'mupot/seat': attachments()[0].seat_id })
     expect(forgedSeat.sc.status).not.toBe('attached')
     expect(attachments()).toHaveLength(2)
     // forged admission / subject keys are not authority: an unadmitted agent still needs its own human tap
-    const r = await rpc(env, g.ctx, 'seat_attach', { agent: 'hadi-dev' }, { ...thread('conv-c'), 'mupot/admission': admId, 'openai/subject': 'whoever' })
+    const r = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-dev' }, { ...thread('conv-c'), 'mupot/admission': admId, 'openai/subject': 'whoever' })
     expect(r.sc.status).toBe('pending_admission')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE agent_id = 'agent-hadi-dev'`)).toBe(0)
   })

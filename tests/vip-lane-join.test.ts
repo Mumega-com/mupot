@@ -180,7 +180,7 @@ describe('eligible: instant observed seat', () => {
       expect(r.text, tool).toContain('observed_floor')
     }
     // seat_attach is on the floor on purpose (it only FILES a request; see observed-seat-request-admission.test.ts)
-    expect((await rpc(s.ctx, 'seat_attach', { agent: 'x' }, s.session)).text).not.toContain('observed_floor')
+    expect((await rpc(s.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'x' }, s.session)).text).not.toContain('observed_floor')
     for (const tool of ['status', 'task_list', 'recall']) {
       expect((await rpc(s.ctx, tool, tool === 'recall' ? { query: 'x' } : {}, s.session)).text, tool).not.toContain('observed_floor')
     }

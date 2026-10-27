@@ -83,7 +83,7 @@ const toolSeatSelect: ToolSpec = {
           403,
           result.error,
           'seat_select only runs for a chat session that has no agent yet. This credential is already an agent (a workspace, agent or seat token, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat: use it as that agent, call boot_context to see which.'
-            + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached ? ' To act as an agent you already have instead, call seat_attach { agent } from this session.' : ''),
+            + (seatAttachEnabled(env) && auth.seatBinding && !auth.seatBinding.attached ? ' To act as an agent you already have instead, call seat_attach { agent, reason: "<why this chat should act as that agent>" } from this session.' : ''),
         )
       case 'harness_required':
         return fail(

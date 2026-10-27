@@ -90,7 +90,7 @@ let adminEnv: Env
 let adminCtx: AuthContext
 interface Pending { code: string; admissionId: string }
 async function fileAsk(session = 'thread-1'): Promise<Pending> {
-  const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag1' }, session)
+  const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag1' }, session)
   expect(out.status, JSON.stringify(out)).toBe('pending_admission')
   const row = one<{ id: string; attach_code: string }>("SELECT id, attach_code FROM agent_seat_admissions WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1")
   if (!row) throw new Error('no pending admission')

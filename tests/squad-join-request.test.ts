@@ -543,10 +543,10 @@ describe('an attached chat asks on behalf of its attached agent, and only that a
     expect(JSON.stringify(unattached.body)).toContain('attach_first')
     expect(reqRows()).toHaveLength(0)
 
-    const pend = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, 'conv-a')
+    const pend = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }, 'conv-a')
     expect(pend.sc.status).toBe('pending_admission')
     expect((await decide(String(pend.sc.approve_url), humanKey, 'approve', env, pend.sc.attach_code)).status).toBe(200)
-    expect((await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, 'conv-a')).sc.status).toBe('attached')
+    expect((await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }, 'conv-a')).sc.status).toBe('attached')
 
     const other = await rpc(env, g.ctx, 'squad_join_request', { squad: 'squad-target', agent: 'hadi-admin' }, 'conv-a')
     expect(JSON.stringify(other.body)).toContain('own_agent_only')

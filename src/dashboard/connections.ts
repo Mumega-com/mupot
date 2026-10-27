@@ -10,6 +10,7 @@
 // FRESH session (re-authenticated within the step-up window, as /operators create does); actions that REDUCE it (detach, deny,
 // revoke) need only the real session and keep working with the flag off.
 
+import { attachIdentityCard } from './attach-identity'
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
@@ -149,7 +150,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
         a.has_code
           ? html`${pill('Code required', 'primary')} <span>Type the code the chat showed you.</span>`
           : html`${pill('no code (older request)', 'dim')}`,
-        html`${a.agent_name}`,
+        html`${attachIdentityCard(a)}`,
         html`${a.harness_name}${a.seat_label ? html` · ${a.seat_label}` : ''}${a.seat_first_seen ? html` (first seen ${formatWhen(a.seat_first_seen)})` : ''}`,
         html`${formatWhen(a.created_at)}`,
         enabled
