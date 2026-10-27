@@ -225,6 +225,16 @@ app.route('/api/inbox', inboxApp)
 app.route('/api/coordination', coordinationApp)
 
 // Modular sovereign addon sub-apps (SOS bridge, Inkwell CMS, ToRivers automations).
+// Retired Inkwell addon writes must resolve before addon middleware or the
+// dashboard catch-all, regardless of HTTP method or legacy configuration.
+app.on('ALL', [
+  '/api/inkwell/publish', '/api/inkwell/publish/',
+  '/api/inkwell/internal-content', '/api/inkwell/internal-content/',
+  '/api/inkwell/draft', '/api/inkwell/draft/',
+  '/api/addons/inkwell/publish', '/api/addons/inkwell/publish/',
+  '/api/addons/inkwell/internal-content', '/api/addons/inkwell/internal-content/',
+  '/api/addons/inkwell/draft', '/api/addons/inkwell/draft/',
+], (c) => c.notFound())
 app.route('/api/sos', sosApp)
 app.route('/api/inkwell', inkwellApp)
 app.route('/api/torivers', toriversAddonApp)

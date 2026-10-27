@@ -238,7 +238,6 @@ export interface Env {
   TORIVERS_SECRET?: string // shared secret for ToRivers v2 deterministic automation sub-app
   INKWELL_TOKEN?: string // token for Inkwell publishing
   INKWELL_API_TOKEN?: string // API token for Inkwell publishing
-  INKWELL_PUBLISH_TOKEN?: string // Worker secret: outbound /api/publish bearer, matching Inkwell PUBLISH_TOKEN
   AI_GATEWAY_TOKEN?: string
   // Telegram bridge: Mupot bus consumer notifies Hadi of task events
   // via HMAC-signed POST to Hermes webhook deliver_only route.
