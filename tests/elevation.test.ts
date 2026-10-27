@@ -491,6 +491,118 @@ describe('elevation ledger (D1, real migration chain)', () => {
     }
   })
 
+  const orgActions = ['action:project_status', 'action:manage_access', 'action:workspace_project']
+
+  async function orgApproval() {
+    const nowMs = Date.now()
+    const session = await seedAgentSession(nowMs)
+    const web = await seedApproverWebSession(nowMs)
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: orgActions, scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'org work',
+    }, nowMs)
+    if (!created.ok) throw new Error('fixture request failed')
+    const input = {
+      tenant: TENANT, requestId: created.request.id, decision: 'approve' as const,
+      selectedActions: orgActions, decidedByMemberId: ADMIN_MEMBER,
+      decidedByCapabilities: [], decidedByIsOrgAdmin: true,
+      decidedByWebSessionHash: web.id_hash, recentReauthOk: true,
+    }
+    return { nowMs, session, input }
+  }
+
+  it('#2227 multi-action org approval writes all grants and approved status', async () => {
+    const { input, nowMs, session } = await orgApproval()
+    const result = await decideElevationRequest(env, input, nowMs)
+    expect(result.ok).toBe(true)
+    const grants = await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)
+    expect(grants.map((g) => g.action).sort()).toEqual([...orgActions].sort())
+    expect(grants.every((g) => g.scope_type === 'org' && g.scope_id === '')).toBe(true)
+    expect((await loadElevationRequestById(env, TENANT, input.requestId))?.status).toBe('approved')
+  })
+
+  it.each(['ABORT', 'IGNORE'])('#2227 grant insertion %s leaves pending and zero grants', async (failure) => {
+    const { input, nowMs } = await orgApproval()
+    // Fail the SECOND grant, after the first insert has already executed.
+    harness.sqlite.exec(`CREATE TRIGGER fail_grant BEFORE INSERT ON elevation_grants
+      WHEN NEW.action = 'action:manage_access' BEGIN SELECT RAISE(${failure}, 'private SQL sentinel'); END;`
+      .replace("RAISE(IGNORE, 'private SQL sentinel')", 'RAISE(IGNORE)'))
+    await expect(decideElevationRequest(env, input, nowMs)).rejects.toThrow()
+    const request = await loadElevationRequestById(env, TENANT, input.requestId)
+    expect(request?.status).toBe('pending')
+    expect(request?.decided_at).toBeNull()
+    expect((await env.DB.prepare('SELECT id FROM elevation_grants').all()).results).toEqual([])
+    harness.sqlite.exec('DROP TRIGGER fail_grant')
+    expect((await decideElevationRequest(env, input, nowMs)).ok).toBe(true)
+  })
+
+  it.each(['expired', 'revoked'])('#2227 multi-action org approval reuses an %s ordinary grant slot', async (ended) => {
+    const { input, nowMs, session } = await orgApproval()
+    expect((await decideElevationRequest(env, { ...input, selectedActions: ['action:manage_access'] }, nowMs)).ok).toBe(true)
+    const first = (await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs))[0]
+    if (ended === 'expired') {
+      await env.DB.prepare('UPDATE elevation_grants SET expires_at = ?1 WHERE id = ?2')
+        .bind(new Date(nowMs - 1).toISOString(), first.id).run()
+    } else {
+      await revokeElevationGrant(env, TENANT, first.id, 'human_revoke', nowMs)
+    }
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: orgActions, scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'new org work',
+    }, nowMs)
+    if (!created.ok) throw new Error('fixture request failed')
+    expect((await decideElevationRequest(env, { ...input, requestId: created.request.id }, nowMs)).ok).toBe(true)
+    const grants = await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)
+    expect(grants).toHaveLength(3)
+    expect(grants.find((g) => g.action === 'action:manage_access')?.id).toBe(first.id)
+    expect(grants.every((g) => g.elevation_request_id === created.request.id)).toBe(true)
+  })
+
+  it('#2227 failed approval rolls back an ended grant renewal too', async () => {
+    const { input, nowMs, session } = await orgApproval()
+    expect((await decideElevationRequest(env, { ...input, selectedActions: ['action:project_status'] }, nowMs)).ok).toBe(true)
+    const first = (await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs))[0]
+    await revokeElevationGrant(env, TENANT, first.id, 'human_revoke', nowMs)
+    const before = await env.DB.prepare('SELECT * FROM elevation_grants WHERE id = ?1').bind(first.id).first()
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: orgActions, scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'new work',
+    }, nowMs)
+    if (!created.ok) throw new Error('fixture request failed')
+    harness.sqlite.exec(`CREATE TRIGGER fail_grant BEFORE INSERT ON elevation_grants
+      BEGIN SELECT RAISE(ABORT, 'forced failure after renewal'); END;`)
+    await expect(decideElevationRequest(env, { ...input, requestId: created.request.id }, nowMs)).rejects.toThrow()
+    expect(await env.DB.prepare('SELECT * FROM elevation_grants WHERE id = ?1').bind(first.id).first()).toEqual(before)
+    expect(await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)).toHaveLength(0)
+    expect((await loadElevationRequestById(env, TENANT, created.request.id))?.status).toBe('pending')
+  })
+
+  it('#2227 concurrent approve and deny produce one terminal decision with matching grants', async () => {
+    const { input, nowMs, session } = await orgApproval()
+    const results = await Promise.all([
+      decideElevationRequest(env, input, nowMs),
+      decideElevationRequest(env, { ...input, decision: 'deny' }, nowMs),
+    ])
+    expect(results.filter((r) => r.ok)).toHaveLength(1)
+    const request = await loadElevationRequestById(env, TENANT, input.requestId)
+    const grants = await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)
+    expect(['approved', 'denied']).toContain(request?.status)
+    expect(grants).toHaveLength(request?.status === 'approved' ? 3 : 0)
+  })
+
+  it('#2227 a live grant conflict rolls back the entire new approval', async () => {
+    const { input, nowMs, session } = await orgApproval()
+    expect((await decideElevationRequest(env, { ...input, selectedActions: ['action:manage_access'] }, nowMs)).ok).toBe(true)
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: orgActions, scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'overlap',
+    }, nowMs)
+    if (!created.ok) throw new Error('fixture request failed')
+    await expect(decideElevationRequest(env, { ...input, requestId: created.request.id }, nowMs)).rejects.toThrow(/UNIQUE/)
+    expect((await loadElevationRequestById(env, TENANT, created.request.id))?.status).toBe('pending')
+    expect(await loadLiveElevationGrantsForSession(env, TENANT, session.id, nowMs)).toHaveLength(1)
+  })
+
   it('concurrent double-approve yields exactly one terminal decision and one grant set', async () => {
     const nowMs = Date.now()
     const session = await seedAgentSession(nowMs)

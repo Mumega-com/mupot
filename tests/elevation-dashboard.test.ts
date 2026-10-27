@@ -592,7 +592,7 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     expect(orphans).toEqual([])
   })
 
-  it('running the real decideScript with every action ticked POSTs all actions, the duration and the note', async () => {
+  it.each(['approved', 'denied', 'failed', 'network'])('running the real decideScript POSTs the controls and shows %s with a next step', async (outcome) => {
     const { page, request } = await renderApproval(['action:dispatch', 'action:manage_access'])
     const { named, belongs } = decisionControls(page)
     const afterForm = page.slice(page.indexOf('<form id="decide-form"'))
@@ -620,24 +620,38 @@ describe('elevation dashboard screens — integration through dashboardApp (real
       querySelectorAll: () => [],
       addEventListener: (ev: string, fn: (e: { preventDefault(): void }) => void) => { if (ev === 'submit') submitHandlers.push(fn) },
     }
+    let deny: () => void = () => {}
     const doc = {
-      getElementById: (id: string) => (id === 'decide-form' ? form : id === 'decide-status' ? status : { addEventListener() {} }),
+      getElementById: (id: string) => (id === 'decide-form' ? form : id === 'decide-status' ? status : { addEventListener(_event: string, fn: () => void) { deny = fn } }),
     }
     const fakeFetch = async (url: string, init: { body: string }) => {
       posts.push({ url, body: JSON.parse(init.body) })
-      return { ok: true, json: async () => ({ ok: true }) }
+      if (outcome === 'network') throw new Error('disconnected')
+      return { ok: outcome !== 'failed', json: async () => outcome === 'failed'
+        ? { error: 'elevation_decision_failed', detail: 'The decision could not be saved.' }
+        : { ok: true, grants: [{ expires_at: '2026-10-27T12:00:00.000Z' }] } }
     }
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- executing the rendered page script against stubs is the test
     new Function('document', 'FormData', 'fetch', 'window', 'setTimeout', script as string)(
       doc, FakeFormData, fakeFetch, { location: { href: '' } }, () => 0,
     )
-    submitHandlers[0]({ preventDefault() {} })
+    if (outcome === 'denied') deny()
+    else submitHandlers[0]({ preventDefault() {} })
     await new Promise((r) => setTimeout(r, 0))
 
     expect(status.textContent).not.toContain('Select at least one action')
     expect(posts).toHaveLength(1)
     expect(posts[0].url).toBe(`/auth/elevation/requests/${request.id}/decide`)
-    expect(posts[0].body).toEqual({
+    expect(status.textContent).toContain('Next:')
+    if (outcome === 'approved') expect(status.textContent).toContain('Approved — active until ')
+    if (outcome === 'denied') expect(status.textContent).toContain('Denied.')
+    if (outcome === 'failed') {
+      expect(status.textContent).toContain('Failed: The decision could not be saved.')
+      expect(status.textContent).toContain('Nothing was granted')
+      expect(status.textContent).not.toContain('elevation_decision_failed')
+    }
+    if (outcome === 'network') expect(status.textContent).toContain('result is unknown')
+    expect(posts[0].body).toEqual(outcome === 'denied' ? { decision: 'deny', note: 'looks fine' } : {
       decision: 'approve',
       actions: ['action:dispatch', 'action:manage_access'],
       duration_minutes: 30,
