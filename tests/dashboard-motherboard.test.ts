@@ -56,6 +56,8 @@ describe('Dashboard Motherboard View Layer', () => {
     const data = await loadMotherboardData(env, 'fractalresonance.com')
     const renderedHtml = String(await motherboardPageBody(data))
 
+    expect(renderedHtml).not.toContain('/api/integrations/inkwell/publish')
+    expect(renderedHtml).toContain('Inkwell addon: health only; publishing uses connector adapters')
     expect(renderedHtml).toContain('Fractal Motherboard — 1,000 Agent Map')
     expect(renderedHtml).toContain('Subagent Tentacle Tree')
     expect(renderedHtml).toContain('parent_agent_id')

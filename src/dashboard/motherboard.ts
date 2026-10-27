@@ -265,7 +265,7 @@ export async function loadMotherboardData(env: Env, selectedTenant = 'mumega.com
         lead: 'agent:river',
         tentacles: ['river-docs', 'inkwell-compiler-1'],
         desc: 'Compiles markdown files into static Astro pages and pushes to multi-tenant CMS outputs.',
-        state: 'Addon: @mumega/addon-inkwell • Webhook: POST /api/integrations/inkwell/publish',
+        state: 'Inkwell addon: health only; publishing uses connector adapters',
       },
     ],
     'dept-eng': [

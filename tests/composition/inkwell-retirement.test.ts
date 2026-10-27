@@ -4,7 +4,7 @@ import type { Env } from '../../src/types'
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
 const prefixes = ['/api/inkwell', '/api/addons/inkwell']
-const paths = prefixes.flatMap((prefix) => ['publish', 'internal-content', 'draft'].flatMap((route) => [`${prefix}/${route}`, `${prefix}/${route}/`]))
+const paths = prefixes.flatMap((prefix) => ['', '/', '/publish', '/publish/', '/publish/nested', '/internal-content', '/internal-content/', '/draft', '/draft/', '/publications', '/health/', '/health/nested', '/unknown'].map((route) => `${prefix}${route}`))
 const methods = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'PROPFIND']
 
 describe('Inkwell retirement through the worker entry', () => {
@@ -31,5 +31,11 @@ describe('Inkwell retirement through the worker entry', () => {
     } as Env, ctx)
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ ok: true, addon: 'inkwell' })
+    for (const [method, status] of [['HEAD', 200], ['POST', 404]] as const) {
+      const result = await worker.fetch(new Request(`https://pot.test${prefix}/health`, { method }), {
+        TENANT_SLUG: 'mumega', PUBLIC_ORIGIN: 'https://pot.test',
+      } as Env, ctx)
+      expect(result.status, method).toBe(status)
+    }
   })
 })
