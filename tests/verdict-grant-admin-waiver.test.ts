@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { evaluateVerdictGates } from '../src/tasks'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createVerdictGateCache, evaluateVerdictGates } from '../src/tasks'
 import { VerdictIndependenceError, writeVerdict } from '../src/tasks/service'
 import { invokeTool } from '../src/mcp/index'
 import type { AuthContext, CapabilityGrant, Env, Task } from '../src/types'
@@ -90,6 +90,45 @@ describe('owner-self takes precedence over supervisory standing', () => {
       })
     }
   }
+
+  it.each([true, false])('memoises party ownership (%s) across concurrent approve/reject checks within one request', async (owns) => {
+    const s = harness.sqlite
+    s.prepare(`UPDATE agents SET owner_member_id = ? WHERE id = 'A'`).run(owns ? 'GADMIN' : null)
+    s.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'A', 'pk-admin', 'GADMIN', unixepoch())`).run(TENANT)
+    const reads = vi.spyOn(env.DB, 'prepare') // observe real D1 reads; do not replace the database
+    try {
+      const cache = createVerdictGateCache()
+      const task = { id: TASK, squad_id: SQUAD, gate_owner: GATE, assignee_agent_id: 'A' }
+      const results = await Promise.all([
+        evaluateVerdictGates(env, adminAuth(), task, 'approved', cache),
+        evaluateVerdictGates(env, adminAuth(), task, 'rejected', cache),
+      ])
+      const expected = owns ? { allowed: false, code: 'self_verdict' } : { allowed: true, independenceWaiver: 'admin_supervisory' }
+      for (const result of results) expect(result).toMatchObject(expected)
+      const ownershipReads = () => reads.mock.calls.filter(([sql]) => sql.includes('agents po')).length
+      expect(ownershipReads()).toBe(1)
+      // A new request must re-read ownership, including a previously cached false.
+      s.prepare(`UPDATE agents SET owner_member_id = ? WHERE id = 'A'`).run(owns ? null : 'GADMIN')
+      expect(await evaluateVerdictGates(env, adminAuth(), task, 'approved', createVerdictGateCache()))
+        .toMatchObject(owns ? { allowed: true, independenceWaiver: 'admin_supervisory' } : { allowed: false, code: 'self_verdict' })
+      expect(ownershipReads()).toBe(2)
+    } finally {
+      reads.mockRestore()
+    }
+  })
+
+  it.each(['member', 'admin'] as const)('an owner also bound to the party agent stays refused with %s role, even with lenses and an override request', async (role) => {
+    const s = harness.sqlite
+    s.prepare(`UPDATE agents SET owner_member_id = 'GADMIN' WHERE id = 'A'`).run()
+    s.prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, 'A', 'GADMIN', datetime('now'))`).run(TENANT)
+    seedLenses()
+    expect(await evaluateVerdictGates(env, adminAuth(role), { id: TASK, squad_id: SQUAD, gate_owner: GATE, assignee_agent_id: 'A' }, 'approved'))
+      .toMatchObject({ allowed: false, code: 'self_verdict' })
+    expect(await invokeTool(adminAuth(role), env, 'task_verdict', { task_id: TASK, verdict: 'approved', override_self_verdict: true }, 'https://pot.test'))
+      .toMatchObject({ ok: false, error: 'self_verdict' })
+    expect(s.prepare('SELECT * FROM task_verdicts').all()).toHaveLength(0)
+    expect(s.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK)).toMatchObject({ status: 'review' })
+  })
 
   it('an admin affiliated through a key without owning a party retains admin_supervisory', async () => {
     harness.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'A', 'pk-admin', 'GADMIN', unixepoch())`).run(TENANT)

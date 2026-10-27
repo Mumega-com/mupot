@@ -1569,10 +1569,12 @@ export interface VerdictGateCache {
   readonly independence: Map<string, Promise<VerdictConflictKind | null>>
   // Mom-walk D1: one owner-self read per (member, task) per request.
   readonly ownerSelf: Map<string, Promise<boolean>>
+  // One party-ownership read per (member, task), shared by both verdicts.
+  readonly partyOwnership: Map<string, Promise<boolean>>
 }
 
 export function createVerdictGateCache(): VerdictGateCache {
-  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map(), independence: new Map(), ownerSelf: new Map() }
+  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map(), independence: new Map(), ownerSelf: new Map(), partyOwnership: new Map() }
 }
 
 /**
@@ -1632,6 +1634,22 @@ function ownerSelfAuthority(
   if (!hit) {
     hit = ownerSelfWithLenses(env, memberId, taskId)
     cache.ownerSelf.set(key, hit)
+  }
+  return hit
+}
+
+function partyOwnership(
+  env: Env,
+  memberId: string,
+  taskId: string,
+  cache: VerdictGateCache | undefined,
+): Promise<boolean> {
+  if (!cache) return ownsTaskPartyAgent(env, memberId, taskId)
+  const key = `${memberId}:${taskId}`
+  let hit = cache.partyOwnership.get(key)
+  if (!hit) {
+    hit = ownsTaskPartyAgent(env, memberId, taskId)
+    cache.partyOwnership.set(key, hit)
   }
   return hit
 }
@@ -1804,7 +1822,7 @@ export async function evaluateVerdictGates(
       // current, independent lenses as any other member; supervisory standing only covers non-owner affiliations.
       if (principal.type === 'member' && await ownerSelfAuthority(env, principal.id, task.id, cache)) {
         independenceWaiver = 'owner_self'
-      } else if (principal.type === 'member' && isOrgAdmin(auth) && !(await ownsTaskPartyAgent(env, principal.id, task.id))) {
+      } else if (principal.type === 'member' && isOrgAdmin(auth) && !(await partyOwnership(env, principal.id, task.id, cache))) {
         independenceWaiver = 'admin_supervisory'
       } else {
         return { allowed: false, code: 'self_verdict', principal }
