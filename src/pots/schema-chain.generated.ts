@@ -4664,9 +4664,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_audit_actor_changes" },
     ],
   },
+  {
+    file: "0265_attach_reason.sql",
+    sha256: "38b73ecbe67ac0ea403d907d3d850995d2a8c03d3fc5bf5841f95c8b14e39c25",
+    statements: [
+      "-- #2229: preserve legacy/direct-human admissions; new seat_attach asks require a reason.\n-- 0264 is already occupied on main. Production head was not checked (offline build).\nALTER TABLE agent_seat_admissions ADD COLUMN reason TEXT\n  CHECK (reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 280);",
+      "\n\nCREATE TRIGGER agent_seat_admissions_reason_immutable\nBEFORE UPDATE OF reason ON agent_seat_admissions\nWHEN NEW.reason IS NOT OLD.reason\nBEGIN\n  SELECT RAISE(ABORT, 'admission reason is immutable');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_reason_immutable" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "ae485655112bf4b795f97aa4e8b7a0f212715127fc764c84460d937be14fcd32"
+export const SCHEMA_CHAIN_DIGEST: string = "2dbc4a2ff915fe902650861b0e9e9810788564e72b7234f418e216998396a760"

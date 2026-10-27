@@ -26,12 +26,12 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     const auto = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT }))
     expect(auto.state).toBe('own_seat')
     expect(auto.next_step_plain).toContain('no seat handle is needed')
-    expect(auto.next_step_plain).toContain('seat_attach {agent}')
+    expect(auto.next_step_plain).toContain('seat_attach {agent, reason}')
     expect(auto.next_step_plain).toContain('do not call seat_select')
     const handle = run(authOf({ boundAgentId: 'sa', seatBinding: { ...SEAT, source: 'handle' } }))
     expect(handle.next_step_plain).toContain('Keep sending your seat handle')
     const noAttach = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT }), {}, { ...ENV, SEAT_ATTACH: undefined } as unknown as Env)
-    expect(noAttach.next_step_plain).not.toContain('seat_attach {agent}')
+    expect(noAttach.next_step_plain).not.toContain('seat_attach {agent, reason}')
   })
 
   it('attached: a HANDLE-keyed seat keeps passing its handle; an OAuth/auto seat needs none', () => {
@@ -55,14 +55,14 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     expect(w.next_step_plain).toContain('inbox {peek:true}')
     expect(w.next_step_plain).toContain('ask your human to lift the hold')
     expect(w.next_step_plain).toContain('do not call seat_attach or seat_select')
-    expect(w.next_step_plain).not.toContain('seat_attach {agent}')
+    expect(w.next_step_plain).not.toContain('seat_attach {agent, reason}')
   })
 
   it('an observed seat can request admission and must wait for human approval', () => {
     const observed = authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'observed' })
     const w = run(observed)
     expect(w.state).toBe('own_seat')
-    expect(w.next_step_plain).toContain("request admission with seat_attach {agent:'<slug>'}")
+    expect(w.next_step_plain).toContain("request admission with seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}")
     expect(w.next_step_plain).toContain('Show them the approval code')
     expect(w.next_step_plain).toContain('wait while they approve it')
     expect(w.next_step_plain).toContain('until then you stay limited to the observed tools')
@@ -72,18 +72,18 @@ describe('whoami.next_step_plain: one sentence per state', () => {
     expect(off.next_step_plain).toContain('attaching to an existing agent is not enabled')
     expect(off.next_step_plain).not.toContain('seat_attach {agent')
     const trusted = run(authOf({ boundAgentId: 'sa', seatBinding: SEAT, seatAgentStatus: 'trusted' }))
-    expect(trusted.next_step_plain).toContain('seat_attach {agent}')
+    expect(trusted.next_step_plain).toContain('seat_attach {agent, reason}')
   })
 
   it('unseated harness chat: seat_select first, then seat_attach; seats off says so', () => {
     const w = run(authOf({ harnessId: 'h-1' }))
     expect(w.state).toBe('harness_unseated')
     expect(w.next_step_plain).toContain('seat_select {project, folder, thread}')
-    expect(w.next_step_plain).toContain('seat_attach {agent}')
+    expect(w.next_step_plain).toContain('seat_attach {agent, reason}')
     const attachOff = run(authOf({ harnessId: 'h-1' }), {}, { ...ENV, SEAT_ATTACH: undefined } as unknown as Env)
     expect(attachOff.state).toBe('harness_unseated')
     expect(attachOff.next_step_plain).toContain('seat_select {project, folder, thread}')
-    expect(attachOff.next_step_plain).not.toContain('seat_attach {agent}')
+    expect(attachOff.next_step_plain).not.toContain('seat_attach {agent, reason}')
     const off = run(authOf({ harnessId: 'h-1' }), {}, { ...ENV, SEAT_AUTO_ENROLL: undefined } as unknown as Env)
     expect(off.state).toBe('no_agent') // seats off: seat_select is not offered
     expect(off.next_step_plain).not.toContain('seat_select {project')
@@ -111,9 +111,9 @@ describe('designation step follows SEAT_ATTACH_DESIGNATED (#2178)', () => {
   const attachOff = { ...ENV, SEAT_ATTACH: undefined, SEAT_ATTACH_DESIGNATED: '1' } as unknown as Env
   const ownSeat = authOf({ boundAgentId: 'sa', seatBinding: SEAT })
   const unseated = authOf({ harnessId: 'h-1' })
-  const ORDER_OFF = "Call seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+  const ORDER_OFF = "Call seat_attach {agent, reason}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
   const ORDER_ON = "Before seat_attach, your human opens that agent's page and presses 'Allow for me' (the box 'Allow my chats to become this agent'); seat_attach before that returns 409 agent_not_designated_for_you. Then call " + ORDER_OFF.slice('Call '.length)
-  const DOOR_TAIL = "seat_attach {agent}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
+  const DOOR_TAIL = "seat_attach {agent, reason}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
 
   it('attach + auto-enroll on, designated off: connect order and the seat_attach door omit Allow for me', () => {
     expect(attachConnectOrder(ENV)).toBe(ORDER_OFF)
@@ -149,7 +149,7 @@ describe('designation step follows SEAT_ATTACH_DESIGNATED (#2178)', () => {
     expect(seatAttachDoor(attachOff).does).not.toContain('Allow for me')
     for (const auth of [ownSeat, unseated]) {
       const plain = run(auth, {}, attachOff).next_step_plain
-      expect(plain).not.toContain('seat_attach {agent}')
+      expect(plain).not.toContain('seat_attach {agent, reason}')
       expect(plain).not.toContain('Allow for me')
       expect(plain).not.toContain('agent_not_designated_for_you')
     }

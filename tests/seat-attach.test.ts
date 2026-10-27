@@ -31,7 +31,7 @@ import { mintEnrolmentToken } from '../src/secure-moments/store'
 import { seedLiveToken } from './helpers/live-token'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import {
-  attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, promoteAdmissionDetailed, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
+  attachRuntimeMismatch, attachSeatToAgent, decideAdmissionDirect, decideSeatAdmission, promoteAdmissionDetailed, detachAttachment, ensureAdmission, listAttachableAgents, loadAdmission, revokeAdmission,
   seatAttachEnabled, findLiveAttachment,
 } from '../src/members/seat-attach'
 import type { AuthContext, Env } from '../src/types'
@@ -123,7 +123,7 @@ async function rpc(env: Env, ctx: AuthContext, name: string, args: Record<string
 
 const thread = (session: string): Record<string, unknown> => ({ 'openai/session': session })
 const boot = (env: Env, g: Grant, session: string): Promise<Rpc> => rpc(env, g.ctx, 'boot_context', {}, { meta: thread(session) })
-const attach = (env: Env, g: Grant, session: string, agent: string): Promise<Rpc> => rpc(env, g.ctx, 'seat_attach', { agent }, { meta: thread(session) })
+const attach = (env: Env, g: Grant, session: string, agent: string): Promise<Rpc> => rpc(env, g.ctx, 'seat_attach', { agent, reason: 'This chat is assigned to operate the requested agent.' }, { meta: thread(session) })
 const receiptOf = (r: Rpc): Record<string, unknown> => r.sc.identity_receipt as Record<string, unknown>
 const errOf = (r: Rpc): string => String(((r.body.result ?? {}) as { structuredContent?: { error?: unknown } }).structuredContent?.error ?? (r.body.error as { message?: string } | undefined)?.message ?? '')
 
@@ -196,6 +196,35 @@ async function admitAndAttach(env: Env, g: Grant, session: string, agent = 'rava
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+describe('#2229 explicit identity intent', () => {
+  it('compares runtime hints without warning for missing hints or equivalent aliases', () => {
+    expect(attachRuntimeMismatch('codex', 'claude')).toBe(true)
+    expect(attachRuntimeMismatch('codex-cli', 'codex')).toBe(false)
+    expect(attachRuntimeMismatch('antigravity-cli', 'gemini')).toBe(false)
+    expect(attachRuntimeMismatch('claude-code', 'claude')).toBe(false)
+    expect(attachRuntimeMismatch(null, 'claude')).toBe(false)
+    expect(attachRuntimeMismatch('codex', 'other')).toBe(false)
+  })
+  it('requires a bounded nonempty reason before filing an ask, with a next step', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'reason-thread')
+    for (const reason of [undefined, null, '', '   ', '\0hidden', 123, 'x'.repeat(281)]) {
+      const r = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava', reason }, { meta: thread('reason-thread') })
+      expect(errOf(r)).toBe('invalid_args')
+      expect(JSON.stringify(r.body)).toContain('reason')
+      if (reason === undefined || typeof reason === 'string') expect(JSON.stringify(r.body)).toContain('next_step')
+      expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(0)
+    }
+    const r = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava', reason: '  I run this agent for my owner.  ' }, { meta: thread('reason-thread') })
+    expect(r.sc.status).toBe('pending_admission')
+    expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions')?.reason).toBe('I run this agent for my owner.')
+    // Retries cannot change the reason behind the human's already-open approval card.
+    await rpc(env, g.ctx, 'seat_attach', { agent: 'rava', reason: 'A different story' }, { meta: thread('reason-thread') })
+    expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions')?.reason).toBe('I run this agent for my owner.')
+  })
+})
+
 describe('flag off: nothing changes', () => {
   it('SEAT_ATTACH unset: seat_attach is not advertised and a direct call refuses before args handling', async () => {
     const off = envFor(h, { SEAT_ATTACH: undefined })
@@ -320,11 +349,11 @@ describe('the flow: ask -> passkey admission -> attach -> act AS the agent', () 
     const sel = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/explicit' })
     const handle = String(sel.sc.seat_handle)
     expect(handle.startsWith('mseat_')).toBe(true)
-    const pend = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { headers: { 'x-mupot-seat': handle } })
+    const pend = await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }, { headers: { 'x-mupot-seat': handle } })
     expect(pend.sc.status).toBe('pending_admission')
     const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
     expect((await decideMoment(env, String(pend.sc.approve_url), key, 'approve')).status).toBe(200)
-    expect((await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { headers: { 'x-mupot-seat': handle } })).sc.status).toBe('attached')
+    expect((await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }, { headers: { 'x-mupot-seat': handle } })).sc.status).toBe('attached')
     const boot2 = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': handle } })
     expect(boot2.sc.bound_agent_id).toBe('agent-rava')
     expect(receiptOf(boot2)).toMatchObject({ binding_source: 'attached_seat', seat: { source: 'handle' } })
@@ -582,12 +611,12 @@ describe('who may be attached, and who may call', () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     // bare unbound grant, no client key -> no seat
-    expect(errOf(await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }))).toBe('seat_required')
+    expect(errOf(await rpc(env, g.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'rava' }))).toBe('seat_required')
     // a legacy consent-bound directory session (no seatBinding)
     // Live agent-member token row the header hop re-reads (a blob alone never authenticates).
     seedLiveToken(h.sqlite, { memberId: 'mem-agent-rava', tenant: TENANT, tokenId: 'tok-legacy-bound', channel: 'directory', boundAgentId: 'agent-rava' })
     const bound: AuthContext = { ...g.ctx, boundAgentId: 'agent-rava', memberId: 'mem-agent-rava', userId: 'mem-agent-rava', consentedByMemberId: HUMAN, harnessId: undefined, tokenId: 'tok-legacy-bound' }
-    const r = await rpc(env, bound, 'seat_attach', { agent: 'hadi-admin' }, { meta: thread('conv-z') })
+    const r = await rpc(env, bound, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-admin' }, { meta: thread('conv-z') })
     expect(r.sc.status).not.toBe('pending_admission')
     expect(JSON.stringify(r.body)).toContain('seat_required')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
@@ -633,6 +662,9 @@ describe('who may be attached, and who may call', () => {
     await boot(env, g, 'conv-a')
     const pend = await attach(env, g, 'conv-a', 'rava')
     const page = await (await hit(new URL(String(pend.sc.approve_url)).pathname, env)).text()
+    expect(page).toContain('wants to act as Rava (')
+    expect(page).toContain('owner ')
+    expect(page).toContain('Reason: This chat is assigned to operate the requested agent.')
     expect(page).toContain('Let Rava work in your chat')
     expect(page).toContain('Rava')
     expect(page).toContain('also lets these chats review (give approve or reject verdicts)')
@@ -652,7 +684,7 @@ describe('who may be attached, and who may call', () => {
     expect(page).toContain('id="agent-prompt"')
     expect(page).toContain('Message from mupot for Rava. Your user approved your request')
     expect(page).not.toMatch(/textarea[^>]*>[^<]*\bI have\b/)
-    expect(page).toContain('seat_attach { agent: &quot;agent-rava&quot; }') // the id, escaped inside the textarea
+    expect(page).toContain('seat_attach { agent: &quot;agent-rava&quot;, reason: &quot;&lt;why this chat should act as that agent&gt;&quot; }') // the id, escaped inside the textarea
     expect(page).toContain('id="copy-prompt"')
     expect(page).toContain('already_pending') // the message covers every non-attached answer
     expect(page).toContain('box-sizing:border-box')

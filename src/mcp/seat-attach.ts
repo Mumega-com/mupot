@@ -36,11 +36,12 @@ const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
   scope: 'Only for a chat on its own seat that wants to act as an existing agent its human administers. Never call it from a workspace-token agent; from an already-attached chat it only confirms the current attachment: self (attach THIS thread to an existing agent the human has admitted; seat session only)',
   min: 'authenticated',
-  args: '{ agent?: string, scope?: "seat" | "harness" }  // the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to. scope "harness" asks your human to approve ONCE for every chat of this app (later chats then attach with no new tap); the default asks for this chat only',
+  args: '{ agent?: string, scope?: "seat" | "harness", reason?: string }  // reason is required when agent is supplied (1..280 characters); the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to. scope "harness" asks your human to approve ONCE for every chat of this app (later chats then attach with no new tap); the default asks for this chat only',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', description: 'The existing agent this thread should act as: id, slug or exact name. A label to look up, not an access request: the human decides.' },
+      reason: { type: 'string', minLength: 1, maxLength: 280, description: 'Required when naming an agent: explain why THIS chat should act as that identity (1..280 characters).' },
       scope: { type: 'string', enum: ['seat', 'harness'], description: 'Only used when filing a NEW ask. "seat" (default): the approval covers this chat only. "harness": the human is asked to approve once for every chat of this app, so a later chat can seat_attach to the same agent with no new tap. A request, not authority: the human sees the scope at the passkey tap and can refuse it.' },
     },
     additionalProperties: false,
@@ -83,10 +84,15 @@ const toolSeatAttach: ToolSpec = {
       return done({
         status: 'choose_agent',
         agents,
-        note: 'These are the agents your human can attach this thread to. Pick one (ask your human if there is more than one) and call seat_attach { agent: "<id>" }.',
+        note: 'These are the agents your human can attach this thread to. Pick one (ask your human if there is more than one) and call seat_attach { agent: "<id>", reason: "why this chat should act as that agent" }.',
       })
     }
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+    if (!reason || reason.length > 280 || reason.includes('\0')) return fail(400, 'invalid_args', {
+      field: 'reason',
+      next_step: 'Call seat_attach again with the designated agent and a reason (1..280 characters) explaining why THIS chat should act as that agent.',
+    })
     if (args.scope !== undefined && args.scope !== 'seat' && args.scope !== 'harness') return fail(400, 'invalid_args', { field: 'scope' })
 
     const r = await attachSeatToAgent(env, {
@@ -94,6 +100,7 @@ const toolSeatAttach: ToolSpec = {
       seatId: seat.seatId,
       agentRef: attachedAs ?? agentRef, // already attached: only ever the agent it is attached to (id), never a second resolution of the caller's text
       via: 'tool',
+      reason,
       requesterAgentId: auth.boundAgentId,
       grantTokenId: seat.grantTokenId,
       scope: args.scope === 'harness' ? 'harness' : args.scope === 'seat' ? 'seat' : undefined,
@@ -235,7 +242,7 @@ const toolConnectionCheck: ToolSpec = {
     if (!att) {
       return fail(409, 'not_attached', {
         message: 'connection_check runs from an attached chat. This chat is not attached to an agent yet.',
-        next_step: "Call seat_attach {agent:'<slug>'}, show your human the approval code you get back, and wait while they approve it. Then call boot_context and run connection_check.",
+        next_step: "Call seat_attach {agent:'<slug>', reason:'why this chat should act as that agent'}, show your human the approval code you get back, and wait while they approve it. Then call boot_context and run connection_check.",
       })
     }
     const r = await runConnectionCheck(env, { attachmentId: att.attachmentId, agentId: att.agentId, humanMemberId: att.humanMemberId, fresh: args.fresh === true })

@@ -27,12 +27,13 @@ import {
   loadAdmission,
   seatAttachEnabled,
   type AdmissionRow,
+  type AttachIdentity,
   type AdmissionScope,
 } from './seat-attach'
 
 export type ClaimState = 'pending' | 'already_claimed' | 'expired' | 'closed' | 'ambiguous' | 'not_found'
 
-export interface ClaimView {
+export interface ClaimView extends AttachIdentity {
   admissionId: string
   agentId: string
   agentName: string
@@ -78,6 +79,7 @@ async function viewOf(env: Env, adm: AdmissionRow): Promise<ClaimView> {
     admissionId: adm.id,
     agentId: adm.agent_id,
     agentName: v.agentName,
+    agentRole: v.agentRole, ownerName: v.ownerName, reason: v.reason, runtimeMismatch: v.runtimeMismatch,
     agentSlug: v.agentSlug,
     harnessName: v.harnessName,
     seatLabel: v.seatLabel,
@@ -254,7 +256,7 @@ export async function reissueClaim(env: Env, p: { memberId: string; agentId: str
   const seat = await reissueSeat(env, old)
   if (!seat) return { ok: false, error: 'nothing_to_reissue' }
   const r = await ensureAdmission(env, {
-    agentId: p.agentId, humanMemberId: p.memberId, harnessId: old.harness_id, seatId: seat.seatId, via: 'tool', requesterAgentId: seat.seatAgentId, scope: old.scope, // a reissued ask keeps the scope the chat originally asked for
+    agentId: p.agentId, humanMemberId: p.memberId, harnessId: old.harness_id, seatId: seat.seatId, via: 'tool', reason: old.reason ?? undefined, requesterAgentId: seat.seatAgentId, scope: old.scope, // a reissued ask keeps the scope the chat originally asked for
   }, nowMs)
   if (!r.ok) return { ok: false, error: r.error }
   if (r.state !== 'pending') return { ok: false, error: 'nothing_to_reissue' }

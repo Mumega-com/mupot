@@ -9,6 +9,7 @@
 //      id), so nothing is held server-side and nothing is lost; the write is never performed by a GET.
 //   4. the member is ALWAYS the session member, never a form field.
 
+import { attachIdentityCard } from './attach-identity'
 import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
@@ -65,7 +66,7 @@ export function reauthRedirectUrl(returnPath: string): string {
 }
 
 function identityTable(v: ClaimView): Html {
-  return html`<dl class="kv">
+  return html`${attachIdentityCard(v)}<dl class="kv">
     <dt>Agent</dt><dd><strong>${v.agentName}</strong>${v.agentSlug ? html` <code>${v.agentSlug}</code>` : ''}</dd>
     <dt>Connecting app</dt><dd>${v.harnessName || 'an app you connected'}${v.seatLabel ? html` · chat ${v.seatLabel}` : ''}</dd>
     <dt>Connected via</dt><dd>your sign-in (${v.signedInAs})</dd>

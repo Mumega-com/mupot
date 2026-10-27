@@ -96,13 +96,13 @@ afterEach(() => { h.close(); vi.restoreAllMocks() })
 describe('observed seat can FILE a request, and only that', () => {
   it('files a pending request; the seat stays observed and keeps its refusals', async () => {
     const c = await chat('observed')
-    const r = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     expect(r.sc.status).toBe('pending_admission')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status = 'pending'`)).toBe(1)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
     expect(seatStatus(c.seatId)).toBe('observed')
     // a repeat does not widen or re-file
-    expect((await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)).sc.status).toBe('already_pending')
+    expect((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.status).toBe('already_pending')
     // every other non-floor tool is still refused
     const t = await rpc(c.ctx, 'request_elevation', {}, c.session)
     expect(t.text).toContain('observed_floor')
@@ -111,14 +111,14 @@ describe('observed seat can FILE a request, and only that', () => {
   it('the observed_floor refusal names the next step and the Connections link', async () => {
     const c = await chat('observed')
     const t = await rpc(c.ctx, 'request_elevation', {}, c.session)
-    expect(t.text).toContain("seat_attach {agent:'<slug>'}")
+    expect(t.text).toContain("seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}")
     expect(t.text).toContain('your human approves')
     expect(t.text).toContain('https://colony.example.test/connections')
   })
 
   it('without approval nothing widens: the human decision attaches, and only then', async () => {
     const c = await chat('observed')
-    const r = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     const adm = String(r.sc.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
     const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
@@ -134,7 +134,7 @@ describe('observed seat can FILE a request, and only that', () => {
 
   it('a denied request attaches nothing and the chat stays limited', async () => {
     const c = await chat('observed')
-    const adm = String((await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)).sc.admission_id)
+    const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
     expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'deny' })).toEqual({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
     expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
@@ -143,7 +143,7 @@ describe('observed seat can FILE a request, and only that', () => {
   it('the first task is part of the onboarding block', async () => {
     h.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, body, status, assignee_agent_id, done_when) VALUES ('task-1', 'squad-core', 'Welcome: read the board', '', 'open', 'agent-coo', 'read')`)
     const c = await chat('observed')
-    const adm = String((await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)).sc.admission_id)
+    const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
     const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
     await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })
     const ob = (await rpc(c.ctx, 'boot_context', {}, c.session)).sc.attached_onboarding as { first_task: { id: string } | null }
@@ -152,7 +152,7 @@ describe('observed seat can FILE a request, and only that', () => {
 
   it('held cannot file: held stays read-only and says who lifts it', async () => {
     const c = await chat('held')
-    const r = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     expect(r.text).toContain('observed_floor')
     expect(r.text).toContain('on hold')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
@@ -173,7 +173,7 @@ describe('observed seat can FILE a request, and only that', () => {
 
 async function attachedChat(): Promise<Chat> {
   const c = await chat('observed')
-  const adm = String((await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)).sc.admission_id)
+  const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
   const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
   await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })
   return c
@@ -186,7 +186,7 @@ describe('chat approval boundaries', () => {
     const att = one<{ id: string; admission_id: string }>(`SELECT id, admission_id FROM agent_seat_attachments WHERE detached_at IS NULL`)!
     expect(await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).toEqual({ ok: true })
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, att.admission_id)?.status).toBe('revoked')
-    const again = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const again = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     expect(again.sc.status).toBe('pending_admission')
     expect(again.sc.admission_id).not.toBe(att.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
@@ -198,7 +198,7 @@ describe('chat approval boundaries', () => {
   it('an observed chat detached by the idle sweep also needs a new human action', async () => {
     const c = await attachedChat()
     h.sqlite.exec(`UPDATE agent_seat_attachments SET detached_at = datetime('now'), detach_reason = 'idle_expired'`)
-    const again = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const again = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     expect(again.sc.status).toBe('pending_admission')
     expect(again.text).toContain('Release')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
@@ -244,7 +244,7 @@ describe('connection_check (full-duplex)', () => {
     const plain = await chat(null)
     const r = await rpc(plain.ctx, 'connection_check', {}, plain.session)
     expect(r.text).toContain('not_attached')
-    expect(r.text).toContain("seat_attach {agent:'<slug>'}")
+    expect(r.text).toContain("seat_attach {agent:'<slug>', reason:'why this chat should act as that agent'}")
     expect(r.text).toContain('approval code')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'connection_check'`)).toBe(0)
     const obs = await chat('observed', 'conv-obs')
@@ -393,7 +393,7 @@ describe('agent page: Connect a chat checklist', () => {
     await chat('observed', 'private-chat')
     seedAgent('agent-other', 'other', 'Other', 'squad-core')
     const other = await chat('observed', 'private-pending')
-    const pending = await rpc(other.ctx, 'seat_attach', { agent: 'other' }, other.session)
+    const pending = await rpc(other.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'other' }, other.session)
     h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('human-two', 'two@example.test', 'Two', 'active', '${TENANT}'); INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-two', 'human-two', 'squad', 'squad-core', 'admin')`)
     const cookie = await session(env, 'two@example.test')
     const p = await get(env, cookie, '/agents/agent-coo')
@@ -424,7 +424,7 @@ describe('agent page: Connect a chat checklist', () => {
 
   it('a pending request shows with Approve and Reject; plain words only', async () => {
     const c = await chat('observed')
-    const r = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)
+    const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const p = await get(env, cookie, '/agents/agent-coo')
@@ -447,7 +447,7 @@ describe('agent page: Connect a chat checklist', () => {
 
   it('a request for all chats opens passkey approval, scoped to a fresh human session', async () => {
     const c = await chat('observed')
-    const ask = await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo', scope: 'harness' }, c.session)
+    const ask = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo', scope: 'harness' }, c.session)
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const p = await get(env, cookie, '/agents/agent-coo')
@@ -478,12 +478,13 @@ describe('agent page: Connect a chat checklist', () => {
 
   it('an attached chat shows Connected and Detach', async () => {
     const c = await chat('observed')
-    const adm = String((await rpc(c.ctx, 'seat_attach', { agent: 'hadi-coo' }, c.session)).sc.admission_id)
+    const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
     const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
     await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })
     const p = await page()
     expect(p).toContain('Connected. Mupot takes it from here.')
-    expect(p).toContain('data-cx-detach=')
+    expect(p).toContain('data-cx-revoke=')
+    expect(p).toContain('Wrong agent? Detach')
   })
 
   it('an observed chat is listed with Release and Return/Hold actions', async () => {

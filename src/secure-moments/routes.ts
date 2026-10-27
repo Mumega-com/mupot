@@ -9,6 +9,7 @@
 //   HUMAN member (never an agent's welded member row) -> that member's CURRENT authority is re-checked with
 //   the existing predicates -> ONE guarded UPDATE consumes the moment -> the shared decision core runs.
 // The link alone decides nothing. A passkey proves WHO, never WHAT. No cookie is ever set on this host.
+import { attachIdentityCard } from '../dashboard/attach-identity'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
@@ -433,7 +434,7 @@ momentsApp.get('/m/:id/:token', async (c) => {
     const codeBlock = subject.adm.attach_code
       ? `<h2>Attach code</h2><p>The chat that asked was told to show you a short code. Type the code that chat showed you; it is not printed here, so it proves you are looking at that chat.</p><label>Attach code <input name="attach_code" autocomplete="off" maxlength="12" size="8" required></label>`
       : ''
-    inner = `${codeBlock}<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
+    inner = `${await attachIdentityCard(v)}${codeBlock}<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
 <dt>App</dt><dd>${untrustedBox('Connected app', `${v.harnessName} (${v.harnessKind})`)}</dd>
 <dt>Asked from chat</dt><dd>${escapeHtml(v.seatLabel ?? 'a chat')}${v.seatFirstSeen ? ` (first seen ${escapeHtml(v.seatFirstSeen.slice(0, 16).replace('T', ' '))} UTC)` : ''}</dd>
 <dt>Expires</dt><dd>${escapeHtml(subject.adm.expires_at ?? '')}</dd></dl>
@@ -528,7 +529,7 @@ function agentPromptBlock(raw: { agentName: string; agentSlug: string; agentId: 
   const who = a.agentSlug ? `${a.agentName} (${a.agentSlug})` : a.agentName
   const text = [
     `Message from mupot for ${a.agentName}. Your user approved your request to act as ${a.agentName} in this chat.`,
-    `Attach now: call seat_attach { agent: "${a.agentId}" }.`,
+    `Attach now: call seat_attach { agent: "${a.agentId}", reason: "<why this chat should act as that agent>" }.`,
     `- If it says attached: call boot_context, then orient, and tell your user in two or three lines who you are, which squad you are in, and what you can do for them.`,
     `- If it says pending_admission, already_pending or returns an error: stop and show your user the exact response. Do not try other routes, and do not ask for tokens or extra access.`,
   ].join('\n')

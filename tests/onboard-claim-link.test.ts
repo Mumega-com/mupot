@@ -87,7 +87,7 @@ interface Pending { code: string; url: string; admissionId: string }
 let adminEnv: Env
 let adminCtx: AuthContext
 async function fileAsk(session = 'thread-1'): Promise<Pending> {
-  const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag1' }, session)
+  const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag1' }, session)
   expect(out.status, JSON.stringify(out)).toBe('pending_admission')
   const row = one<{ id: string; attach_code: string }>("SELECT id, attach_code FROM agent_seat_admissions WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1")
   if (!row) throw new Error('no pending admission')
@@ -119,11 +119,55 @@ beforeEach(async () => {
 })
 afterEach(() => h.close())
 
+describe('#2229 attach identity approval surfaces', () => {
+  it('Wrong agent Detach ends the admission through the existing revoke route and refuses another member', async () => {
+    const request = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag1', reason: 'I am assigned Agent One.' }, 'wrong-agent-thread')
+    const owner = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    const code = new URL(String(request.claim_url)).pathname
+    expect((await post(code, owner, { admission_id: String(request.admission_id), agent_id: 'ag1' })).status).toBe(303)
+    const page = await (await get('/agents/ag1', owner)).text()
+    expect(page).toContain(`data-cx-revoke="${request.admission_id}">Wrong agent? Detach`)
+    expect(page).toContain("['data-cx-revoke','/connections/admissions/','/revoke',null]")
+    expect(page).toContain('Detaching ends the approval for all chats using it.')
+    const other = await login('other@x.test')
+    const path = `/connections/admissions/${request.admission_id}/revoke`
+    // Existing endpoint is JSON and checks the signed-in web session and human ownership.
+    const call = (u: { env: Env; cookie: string }) => dashboardApp.request(path, {
+      method: 'POST', headers: { cookie: u.cookie, origin: ORIGIN, 'content-type': 'application/json' }, body: '{}',
+    }, u.env)
+    expect((await call(other)).status).toBe(404)
+    expect(liveAttachments()).toBe(1)
+    expect((await call(owner)).status).toBe(200)
+    expect(liveAttachments()).toBe(0)
+    expect(one<{ status: string }>('SELECT status FROM agent_seat_admissions WHERE id = ?', request.admission_id)?.status).toBe('revoked')
+  })
+
+  it('names the target, role, owner and reason, warns on a different runtime, and escapes labels', async () => {
+    h.sqlite.prepare("UPDATE agents SET role = ?, owner_member_id = ? WHERE id = 'ag1'").run('COO <role>', 'mem-admin')
+    h.sqlite.prepare("INSERT INTO fleet_agents (agent_id, tenant, display, runtime) VALUES ('ag1', ?, 'Agent One', 'codex')").run(TENANT)
+    h.sqlite.prepare("UPDATE members SET display_name = ? WHERE id = 'mem-admin'").run('Ada <owner>')
+    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag1', reason: 'I manage <video> for Ada.' }, 'identity-thread')
+    expect(out.status).toBe('pending_admission')
+    const who = await login('admin@x.test')
+    for (const path of [new URL(String(out.claim_url)).pathname, '/agents/ag1', '/connections']) {
+      const response = await get(path, who)
+      expect(response.status).toBe(200)
+      const body = await response.text()
+      expect(body).toContain('wants to act as Agent One (COO &lt;role&gt;, owner Ada &lt;owner&gt;)')
+      expect(body).toContain('Reason: I manage &lt;video&gt; for Ada.')
+      expect(body).toContain('This chat does not usually run as Agent One.')
+      expect(body).not.toContain('<owner>')
+      expect(body).not.toContain('<video>')
+    }
+  })
+})
+
 describe('seat_attach and boot_context hand the agent the claim link', () => {
   it('seat_attach returns claim_url next to the code; boot_context repeats the same pending claim', async () => {
     const p = await fileAsk()
     expect(p.url).toBe(`${COLONY}/claim/${p.code}`)
-    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag1' }, 'thread-1')
+    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag1' }, 'thread-1')
     expect(String(out.tell_the_person)).toContain(p.url)
     const b = await rpc(adminEnv, adminCtx, 'boot_context', {}, 'thread-1')
     expect(b.pending_claim).toMatchObject({ claim_url: p.url, attach_code: p.code, agent: 'ag1' })
@@ -445,7 +489,7 @@ describe('agent page: "Own this agent" and "Issue a new claim link"', () => {
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     expect((await post('/agents/ag2/designation', a, { action: 'allow' })).status).toBe(303)
-    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag2' }, 'thread-1')
+    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag2' }, 'thread-1')
     expect(out.status).toBe('pending_admission')
     const code2 = String(out.attach_code)
     const adm2 = one<{ id: string }>("SELECT id FROM agent_seat_admissions WHERE agent_id = 'ag2' AND status = 'pending'")!.id
@@ -517,7 +561,7 @@ describe('Codex/gate round: honest outcome when the chat cannot be attached; res
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     expect((await post('/agents/ag2/designation', a, { action: 'allow' })).status).toBe(303)
-    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { agent: 'ag2' }, 'thread-1')
+    const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag2' }, 'thread-1')
     const adm2 = one<{ id: string }>("SELECT id FROM agent_seat_admissions WHERE agent_id = 'ag2'")!.id
     expect((await post(`/claim/${String(out.attach_code)}`, a, { admission_id: adm2, agent_id: 'ag2' })).headers.get('location')).toBe('/agents/ag2?claimed=1')
     const res = await post(`/claim/${p1.code}`, a, { admission_id: p1.admissionId, agent_id: 'ag1' })

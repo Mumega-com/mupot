@@ -126,7 +126,7 @@ const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet
  * so naming it would send the human to a dead end (#2178).
  */
 const ATTACH_ADMIT =
-  "seat_attach {agent}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+  "seat_attach {agent, reason}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
 
 /** Next step for a human without current designation standing. */
 export const ASK_ADMIN_TO_DESIGNATE =
@@ -142,7 +142,7 @@ export function attachConnectOrder(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENR
 
 /** boot_context available_doors seat_attach copy. Same designation gate as attachConnectOrder (#2178). */
 const SEAT_ATTACH_DOOR_TAIL =
-  "seat_attach {agent}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
+  "seat_attach {agent, reason}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
 
 export function seatAttachDoor(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>, humanCanDesignate?: boolean): { does: string; requires: string } {
   if (seatAttachDesignatedEnabled(env) && humanCanDesignate === false) {
@@ -198,7 +198,7 @@ export function plainNextStep(
       ? 'This chat is held, so it can only read until your human returns or releases it on their Connections page: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the hold.'
       : status === 'observed'
       ? (seatAttachEnabled(env)
-        ? "You are observed: request admission with seat_attach {agent:'<slug>'}; your human approves it (Connections page, one tap). Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use); do not call seat_select."
+        ? "You are observed: request admission with seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}; your human approves it (Connections page, one tap). Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use); do not call seat_select."
         : 'You are observed and limited to the observed tools until your human releases this chat on their Connections page; attaching to an existing agent is not enabled on this pot; do not call seat_select.')
       : seatAttachEnabled(env)
       ? `${attachConnectOrder(env, facts.humanCanDesignate)} do not call seat_select (you already have a seat).`

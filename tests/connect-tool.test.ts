@@ -593,7 +593,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     ;(on as unknown as Record<string, string>).SEAT_ATTACH = '1'
     ;(on as unknown as Record<string, string>).SEAT_AUTO_ENROLL = '1'
     const onBody = (await (await callConnect(on, AGENT.id)).json()) as { error: { data: { detail: string } } }
-    expect(onBody.error.data.detail).toContain(`seat_attach { agent: "${AGENT.id}" }`)
+    expect(onBody.error.data.detail).toContain(`seat_attach { agent: "${AGENT.id}", reason: "<why this chat should act as that agent>" }`)
     expect(onBody.error.data.detail).toMatch(/passkey/)
     expect(onBody.error.data.detail).toContain(`mint_agent_token { agent: "${AGENT.id}" }`)
     const off = makeEnv({ channel: 'directory', grants: [] })
