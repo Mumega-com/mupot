@@ -251,16 +251,31 @@ describe('IM owner-self selection for grant admins', () => {
   })
   afterEach(() => harness.close())
 
-  it('requires lenses on owned work and records owner_self', async () => {
+  it.each([false, true])('a non-owner key minter remains refused on the review lane (org admin: %s)', async (admin) => {
+    const s = harness.sqlite
+    seedMember(s, 'minter', 'chat-minter')
+    seedSquadMemberCapability(s, 'minter')
+    if (admin) seedOrgAdminCapability(s, 'minter')
+    seedAgent(s, 'keyed-agent')
+    seedGrant(s, 'gate:review', 'member', 'minter')
+    s.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'keyed-agent', 'pk-minter', 'minter', unixepoch())`).run(TENANT)
+    seedReviewTask(s, 'task-keyed', 'gate:review', 'keyed-agent')
+    await handleImMessage(envFor(harness), 'chat-minter', 'approve task-keyed')
+    expect(taskVerdictCount(s, 'task-keyed')).toBe(0)
+    expect(s.prepare(`SELECT status FROM tasks WHERE id = 'task-keyed'`).get()).toMatchObject({ status: 'review' })
+  })
+
+  it.each(['approve', 'reject'])('owner who also minted the key needs lenses for %s and records owner_self', async (verb) => {
     const s = harness.sqlite
     seedMember(s, 'admin-own', 'chat-own')
     seedOrgAdminCapability(s, 'admin-own')
     seedAgent(s, 'owned-agent')
     s.prepare(`UPDATE agents SET owner_member_id = 'admin-own' WHERE id = 'owned-agent'`).run()
+    s.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'owned-agent', 'pk-owner', 'admin-own', unixepoch())`).run(TENANT)
     seedGrant(s, 'gate:review', 'member', 'admin-own')
     seedReviewTask(s, 'task-own', 'gate:review', 'owned-agent')
     const env = envFor(harness)
-    await handleImMessage(env, 'chat-own', 'approve task-own')
+    await handleImMessage(env, 'chat-own', `${verb} task-own reviewed`)
     expect(taskVerdictCount(s, 'task-own')).toBe(0)
     expect(s.prepare(`SELECT status FROM tasks WHERE id = 'task-own'`).get()).toMatchObject({ status: 'review' })
     s.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
@@ -273,8 +288,9 @@ describe('IM owner-self selection for grant admins', () => {
       s.prepare(`INSERT INTO task_review_lenses (id, task_id, submission_id, result_digest, gate_owner, lens, reviewer_kind, reviewer_id, outcome, created_at)
         VALUES (?, 'task-own', 'sub-own', ?, 'gate:review', ?, 'agent', ?, 'pass', datetime('now'))`).run(`lens-${i}`, 'cd'.repeat(32), lens, reviewer)
     }
-    await handleImMessage(env, 'chat-own', 'approve task-own')
+    await handleImMessage(env, 'chat-own', `${verb} task-own reviewed`)
     expect(taskVerdictCount(s, 'task-own')).toBe(1)
+    expect(s.prepare(`SELECT status FROM tasks WHERE id = 'task-own'`).get()).toMatchObject({ status: verb === 'approve' ? 'approved' : 'rejected' })
     expect(s.prepare(`SELECT independence_waiver FROM task_verdicts WHERE task_id = 'task-own'`).get()).toMatchObject({ independence_waiver: 'owner_self' })
   })
 })

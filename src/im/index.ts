@@ -774,14 +774,11 @@ async function verdictReply(
     return `You don't have permission to decide "${task.title}" (need ${need}).`
   }
 
-  // IM-SPECIFIC conflict-of-interest rule, layered ON TOP of the shared
-  // predicate above (not replaced by it): a human who owns/minted the
-  // assignee agent's token may not verdict that agent's own task. This is
-  // orthogonal to evaluateVerdictGates' self-verdict rule (which compares
-  // the DECIDING principal to the assignee — for IM the deciding principal
-  // is always a member, never the agent itself, so that rule can never fire
-  // here) — memberOwnsAssigneeAgent is IM's own, additional guard.
-  if (await memberOwnsAssigneeAgent(env, member.id, task.assignee_agent_id)) {
+  // Keep IM's key-minter refusal unless the shared predicate grants owner_self:
+  // ownership plus current independent lenses permits an owner who also minted the key.
+  // A non-owner key minter (including an admin_supervisory decider) stays refused here.
+  if (gateResult.independenceWaiver !== 'owner_self'
+    && await memberOwnsAssigneeAgent(env, member.id, task.assignee_agent_id)) {
     return `You can't decide "${task.title}" because you are the assignee.`
   }
 
