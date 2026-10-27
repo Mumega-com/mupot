@@ -34,7 +34,7 @@ export function changeFilters(params = new URLSearchParams()): ChangeFilters {
     kind: CHANGE_KINDS.includes(kind) ? kind : 'all',
     table: ARCHIVE_TABLES.includes(table) ? table : 'all',
     actor: params.get('actor') === 'me' ? 'me' : 'anyone',
-    q: (params.get('q') ?? '').trim().slice(0, SEARCH_MAX_LENGTH),
+    q: Array.from((params.get('q') ?? '').trim()).slice(0, SEARCH_MAX_LENGTH).join(''),
     from: date(params.get('from')), to: date(params.get('to')),
     undoable: params.get('undoable') === '1',
   }
@@ -59,9 +59,10 @@ export function changeCursor(params: URLSearchParams, filters: ChangeFilters): C
 
 export function changesLink(filters: ChangeFilters, cursor?: ChangeCursor): string {
   const params = new URLSearchParams()
+  const defaults = changeFilters()
   for (const [key, value] of Object.entries(filters)) {
     if (key === 'undoable') { if (value) params.set(key, '1') }
-    else if (value && value !== 'all' && value !== 'anyone') params.set(key, String(value))
+    else if (value !== defaults[key as keyof ChangeFilters]) params.set(key, String(value))
   }
   if (cursor) params.set('cursor', JSON.stringify([cursor.at, cursor.id, cursor.position, cursor.direction, filterKey(filters)]))
   return `/changes${params.size ? `?${params}` : ''}`

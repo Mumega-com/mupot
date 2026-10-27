@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { html } from 'hono/html'
-import { changesBody, loadRecentChangesPage, makeChangesApp, type RecentChangesPage } from '../src/dashboard/changes'
-import { changeFilters, changeSourceQuery, SEARCH_MAX_LENGTH } from '../src/dashboard/changes-query'
+import { changesBody, loadChange, loadRecentChangesPage, makeChangesApp, type RecentChangesPage } from '../src/dashboard/changes'
+import { changeCursor, changeFilters, changesLink, changeSourceQuery, SEARCH_MAX_LENGTH } from '../src/dashboard/changes-query'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -79,6 +79,73 @@ describe('Recent changes filters and search', () => {
   it.each(['projects', 'squads', 'tasks', 'agents', 'members'])('filters archive table=%s', async (table) => {
     for (const t of ['projects', 'squads', 'tasks', 'agents', 'members']) archive(t, t, t)
     expect(ids(await page(`kind=archive&table=${table}`))).toEqual([`archive:${table}`])
+  })
+
+  it('excludes verdicts, reversals and agent edits when an archive table is selected', async () => {
+    seedKinds()
+    expect(ids(await page('table=projects'))).toEqual(['archive:project'])
+    for (const kind of ['verdict', 'verdict_reversal', 'agent_change']) {
+      expect(ids(await page(`table=projects&kind=${kind}`))).toEqual([])
+    }
+  })
+
+  it.each(['all', 'anyone'])('preserves literal q=%s across Next and Previous', async (q) => {
+    harness.sqlite.prepare('UPDATE projects SET name = ?').run(q)
+    for (let i = 0; i < 105; i++) archive(String(i).padStart(3, '0'))
+    const first = await page(`q=${q}`)
+    expect(params(first.next!).get('q')).toBe(q)
+    const second = await follow(first.next!)
+    expect(second.start).toBe(50)
+    expect(ids(await follow(second.previous!))).toEqual(ids(first))
+  })
+
+  it('truncates search on a code-point boundary and preserves its cursor filter key', () => {
+    const filters = changeFilters(new URLSearchParams({ q: 'x'.repeat(99) + '😀tail' }))
+    expect(filters.q).toBe('x'.repeat(99) + '😀')
+    const linked = params(changesLink(filters, { at: AT, id: 'archive:a', position: 50, direction: 'next' }))
+    expect(changeCursor(linked, changeFilters(linked))?.position).toBe(50)
+  })
+
+  it('rejects cursors with a different filter key or invalid source id', () => {
+    const filters = changeFilters()
+    const linked = params(changesLink(filters, { at: AT, id: 'archive:a', position: 50, direction: 'next' }))
+    expect(changeCursor(linked, filters)).not.toBeNull()
+    expect(changeCursor(linked, { ...filters, q: 'different' })).toBeNull()
+    const cursor = JSON.parse(linked.get('cursor')!)
+    for (const id of ['arbitrary:a', 'archive:', 'info:unknown:a']) {
+      linked.set('cursor', JSON.stringify([cursor[0], id, ...cursor.slice(2)]))
+      expect(changeCursor(linked, filters)).toBeNull()
+    }
+  })
+
+  it('limits undoable verdicts to the latest receipt even when all other state matches', async () => {
+    verdict('older')
+    verdict('z-latest')
+    expect(ids(await page('kind=verdict&undoable=1'))).toEqual(['verdict:z-latest'])
+  })
+
+  it('does not load a cross-tenant archive for Undo even for an admin', async () => {
+    archive('foreign', 'projects', 'proj-viamar', 'admin', OLD, 'archive', 'elsewhere')
+    expect(await loadChange(env, admin, 'archive:foreign')).toBeNull()
+  })
+
+  it.each(['owner', 'member'])('explains the own-only view for an unelevated %s and hides unavailable filters', async (role) => {
+    const result = await page('undoable=1', { ...plain, role } as AuthContext)
+    const body = String(await changesBody(result.changes, false, '', Date.now(), result))
+    expect(body).toContain('Only your own changes are shown')
+    expect(body).toContain('/auth/reauth?return=/elevation')
+    expect(body).not.toContain('>Anyone</option>')
+    expect(body).not.toContain('name="undoable"')
+    expect(body).toContain('Undo requires workspace admin elevation')
+    expect(body.match(/>Clear filters<\/a>/g)).toHaveLength(1)
+  })
+
+  it('does not claim everyone else is inactive when an admin filters to me', async () => {
+    archive('mine')
+    const result = await page('actor=me')
+    const body = String(await changesBody(result.changes, true, '', Date.now(), result))
+    expect(body).not.toContain('Changes by everyone else')
+    expect(body).not.toContain('Nobody else has changed')
   })
 
   it('finds the Viamar archive by display name behind 1,950 newer archives, with its Undo unchanged', async () => {

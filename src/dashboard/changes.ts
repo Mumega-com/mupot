@@ -273,7 +273,7 @@ async function recentCandidates(env: Env, auth: AuthContext, filters: ChangeFilt
   }
 
   // 2. verdicts
-  const verdictExtra = filters.kind === 'all' || filters.kind === 'verdict' ? [] : ['0']
+  const verdictExtra = filters.table === 'all' && (filters.kind === 'all' || filters.kind === 'verdict') ? [] : ['0']
   if (filters.undoable) {
     // Same state checks as classifyVerdict, including the dedicated gate exclusions.
     verdictExtra.push(mayReverseVerdict(auth) ? `v.reversed_at IS NULL AND v.proposal_id IS NULL
@@ -310,7 +310,7 @@ async function recentCandidates(env: Env, auth: AuthContext, filters: ChangeFilt
     visibility: ['vr.tenant = ?1', ...(org ? [] : ['vr.actor_id = ?2'])],
     values: org ? [env.TENANT_SLUG] : [env.TENANT_SLUG, auth.memberId],
     filters, cursor, prefix: 'info:reversal:', at: 'vr.created_at', id: 'vr.id', search: ['vr.task_id', 't.title'],
-    extra: filters.undoable || !['all', 'verdict_reversal'].includes(filters.kind) ? ['0'] : [],
+    extra: filters.table !== 'all' || filters.undoable || !['all', 'verdict_reversal'].includes(filters.kind) ? ['0'] : [],
   })
   const reversals = await env.DB.prepare(reversalQuery.sql).bind(...reversalQuery.values).all<{
     id: string; task_id: string; prior_verdict: string | null; actor_id: string; created_at: string; title: string | null; actor_name: string | null
@@ -337,7 +337,7 @@ async function recentCandidates(env: Env, auth: AuthContext, filters: ChangeFilt
        LEFT JOIN members u ON u.id = a.actor_id`,
     visibility: org ? [] : ['a.actor_id = ?1'], values: org ? [] : [auth.memberId],
     filters, cursor, prefix: 'info:agent_audit:', at: 'a.created_at', id: 'a.id', search: ['a.agent_id', 'g.name', 'g.slug'],
-    extra: filters.undoable || !['all', 'agent_change'].includes(filters.kind) ? ['0'] : [],
+    extra: filters.table !== 'all' || filters.undoable || !['all', 'agent_change'].includes(filters.kind) ? ['0'] : [],
   })
   const audits = await env.DB.prepare(auditQuery.sql).bind(...auditQuery.values).all<{
     id: string; agent_id: string; actor_id: string; action: string; created_at: string; agent_name: string | null; actor_name: string | null
@@ -369,6 +369,7 @@ export interface RecentChangesPage {
   changes: RecentChange[]
   filters: ChangeFilters
   start: number
+  query: string
   previous?: string
   next?: string
 }
@@ -384,7 +385,7 @@ export async function loadRecentChangesPage(env: Env, auth: AuthContext, params 
   const first = changes[0]
   const last = changes[changes.length - 1]
   return {
-    changes, filters, start,
+    changes, filters, start, query: params.toString(),
     previous: first && (cursor?.direction === 'previous' ? more : Boolean(cursor))
       ? changesLink(filters, { at: first.at, id: first.id, position: start, direction: 'previous' }) : undefined,
     next: last && (cursor?.direction === 'previous' ? true : more)
@@ -454,10 +455,10 @@ function ago(iso: string, nowMs: number): string {
   return `${Math.floor(s / 86400)} d ago`
 }
 
-function changeRow(c: RecentChange, nowMs: number): Html {
+function changeRow(c: RecentChange, nowMs: number, query: string): Html {
   let action: Html | string = ''
   if (c.undo.kind === 'available') {
-    action = html`<form method="post" action="/changes/undo" data-undo-form>
+    action = html`<form method="post" action="${`/changes/undo${query ? `?${query}` : ''}`}" data-undo-form>
       <input type="hidden" name="change" value="${c.id}">
       <button class="btn" type="submit">Undo</button>
     </form>`
@@ -472,16 +473,16 @@ function changeRow(c: RecentChange, nowMs: number): Html {
   </div>`
 }
 
-function filterForm(filters: ChangeFilters): Html {
+function filterForm(filters: ChangeFilters, admin: boolean): Html {
   const labels: Record<string, string> = { all: 'All', archive: 'Archive', unarchive: 'Unarchive', verdict: 'Verdict', verdict_reversal: 'Verdict reversal', agent_change: 'Agent change' }
   return sectionPanel({ body: html`<form method="get" action="/changes" style="display:flex;flex-wrap:wrap;gap:var(--s3,12px);align-items:end">
     <label>Kind <select name="kind">${CHANGE_KINDS.map((kind) => html`<option value="${kind}" ${kind === filters.kind ? html`selected` : ''}>${labels[kind]}</option>`)}</select></label>
     <label>Archive table <select name="table">${ARCHIVE_TABLES.map((table) => html`<option value="${table}" ${table === filters.table ? html`selected` : ''}>${table === 'all' ? 'All' : table}</option>`)}</select></label>
-    <label>Actor <select name="actor"><option value="anyone" ${filters.actor === 'anyone' ? html`selected` : ''}>Anyone</option><option value="me" ${filters.actor === 'me' ? html`selected` : ''}>Me</option></select></label>
+    ${admin ? html`<label>Actor <select name="actor"><option value="anyone" ${filters.actor === 'anyone' ? html`selected` : ''}>Anyone</option><option value="me" ${filters.actor === 'me' ? html`selected` : ''}>Me</option></select></label>` : html`<span>Actor: Me</span>`}
     <label>Search <input type="search" name="q" value="${filters.q}" maxlength="${SEARCH_MAX_LENGTH}" placeholder="Target id, slug or name"></label>
     <label>From <input type="date" name="from" value="${filters.from}"></label>
     <label>To <input type="date" name="to" value="${filters.to}"></label>
-    <label><input type="checkbox" name="undoable" value="1" ${filters.undoable ? html`checked` : ''}> Undoable only</label>
+    ${admin ? html`<label><input type="checkbox" name="undoable" value="1" ${filters.undoable ? html`checked` : ''}> Undoable only</label>` : html`<span class="ui-panel-sub">Undo requires workspace admin elevation. ${filters.undoable ? 'The Undoable only filter is active; clear filters to see your changes.' : ''}</span>`}
     <button class="btn" type="submit">Apply filters</button><a class="ui-link" href="/changes">Clear filters</a>
     <span class="ui-panel-sub">Apply filters to find changes; clear them to see recent activity.</span>
   </form>` })
@@ -499,7 +500,9 @@ function pageLinks(page: RecentChangesPage): Html {
 export function changesBody(changes: RecentChange[], admin: boolean, extra: Html | '' = '', nowMs: number = Date.now(), page?: RecentChangesPage): Html {
   const mine = changes.filter((c) => c.mine)
   const others = changes.filter((c) => !c.mine)
-  const filters = filterForm(page?.filters ?? changeFilters())
+  const activeFilters = page?.filters ?? changeFilters()
+  const filters = filterForm(activeFilters, admin)
+  const visibility = admin ? '' : html`<p class="ui-panel-sub">Only your own changes are shown. To see everyone's changes, <a class="ui-link" href="/auth/reauth?return=/elevation">confirm your identity and arrange workspace admin elevation</a>.</p>`
   const paging = page ? pageLinks(page) : ''
   const header = pageHeader({
     crumbs: 'Workspace / Activity',
@@ -507,12 +510,12 @@ export function changesBody(changes: RecentChange[], admin: boolean, extra: Html
     sub: 'Nothing here is permanent. Where a change can be safely taken back, there is an Undo.',
   })
   if (changes.length === 0) {
-    return html`${header}${extra}${filters}${emptyState({ title: 'No changes found', detail: 'No visible changes match these filters.', hint: 'Clear filters or widen the date range to try again.' })}<a class="ui-link" href="/changes">Clear filters</a>`
+    return html`${header}${extra}${visibility}${filters}${emptyState({ title: 'No changes found', detail: 'No visible changes match these filters.', hint: !admin && activeFilters.undoable ? 'Undo requires workspace admin elevation. Clear filters to see your changes.' : 'Clear filters or widen the date range to try again.' })}`
   }
-  const list = (rows: RecentChange[]): Html => html`<div class="ui-table">${rows.map((c) => changeRow(c, nowMs))}</div>`
-  return html`${header}${extra}${filters}${paging}
+  const list = (rows: RecentChange[]): Html => html`<div class="ui-table">${rows.map((c) => changeRow(c, nowMs, page?.query ?? ''))}</div>`
+  return html`${header}${extra}${visibility}${filters}${paging}
     ${sectionPanel({ title: 'Your changes', body: mine.length ? list(mine) : html`<p class="ui-panel-sub">You have not changed anything recently.</p>` })}
-    ${admin ? sectionPanel({ title: 'Changes by everyone else', body: others.length ? list(others) : html`<p class="ui-panel-sub">Nobody else has changed anything recently.</p>` }) : ''}${paging}`
+    ${admin && activeFilters.actor !== 'me' ? sectionPanel({ title: 'Changes by everyone else', body: others.length ? list(others) : html`<p class="ui-panel-sub">Nobody else has changed anything recently.</p>` }) : ''}${paging}`
 }
 
 function reauthNotice(): Html {
@@ -522,7 +525,7 @@ function reauthNotice(): Html {
 }
 
 function notice(text: string): Html {
-  return sectionPanel({ body: html`<p role="status">${text}</p><p class="ui-panel-sub">Review the changes below or adjust the filters to continue.</p>` })
+  return sectionPanel({ body: html`<p role="status">${text}</p><p class="ui-panel-sub"><a class="ui-link" href="/changes">Return to Recent changes</a>.</p>` })
 }
 
 function undoFailureText(error: string): string {
@@ -552,8 +555,9 @@ export function makeChangesApp(shell: ShellFn) {
   app.post('/changes/undo', async (c) => {
     c.header('Cache-Control', 'no-store')
     const auth = c.get('auth')
+    const query = new URL(c.req.url).search
     const page = async (status: 200 | 400 | 403 | 404, extra: Html) => {
-      const result = await loadRecentChangesPage(c.env, auth)
+      const result = await loadRecentChangesPage(c.env, auth, new URLSearchParams(query))
       return c.html(shell(c.env, 'Recent changes', changesBody(result.changes, seesOrg(auth), extra, Date.now(), result)), status)
     }
 
@@ -586,7 +590,7 @@ export function makeChangesApp(shell: ShellFn) {
     // THE existing inverse, through the same chokepoint as every other caller. This module never writes rows.
     const outcome = await invokeTool(auth, c.env, found.run.tool, found.run.args, new URL(c.req.url).origin)
     if (!outcome.ok) return page(outcome.status === 403 ? 403 : 200, notice(undoFailureText(outcome.error)))
-    return page(200, notice(`Undone: ${found.change.sentence}.`))
+    return c.redirect(`/changes${query}`, 303)
   })
 
   return app

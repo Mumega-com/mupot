@@ -7,6 +7,7 @@
 // viewer without the authority" tests red.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { changeFilters, changesLink } from '../src/dashboard/changes-query'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
@@ -128,7 +129,7 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     expect(page).toContain('name="change"')
     expect(taskArchived('t-1')).toBe(true)
     const res = await undo(env, cookie, archiveChangeId('tasks'))
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(303)
     expect(taskArchived('t-1')).toBe(false)
     expect(rows(`SELECT status FROM tasks WHERE id='t-1'`)[0]?.status).toBe('open')
     const receipt = rows(`SELECT actor_member_id, reason FROM archive_receipts WHERE action='unarchive' AND entity_table='tasks'`)
@@ -142,7 +143,7 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     expect(rows(`SELECT status FROM projects WHERE id='P2'`)[0]?.status).toBe('archived')
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
-    expect((await undo(env, cookie, archiveChangeId('projects'))).status).toBe(200)
+    expect((await undo(env, cookie, archiveChangeId('projects'))).status).toBe(303)
     expect(rows(`SELECT status FROM projects WHERE id='P2'`)[0]?.status).not.toBe('archived')
     expect(countReceipts('unarchive')).toBe(1)
   })
@@ -151,7 +152,7 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     await adminArchive('squads', 'S2')
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
-    expect((await undo(env, cookie, archiveChangeId('squads'))).status).toBe(200)
+    expect((await undo(env, cookie, archiveChangeId('squads'))).status).toBe(303)
     expect(rows(`SELECT status FROM squads WHERE id='S2'`)[0]?.status).toBe('active')
     expect(countReceipts('unarchive')).toBe(1)
   })
@@ -164,7 +165,7 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     const page = await (await get(env, cookie)).text()
     expect(page).toContain('You approved the task')
     const res = await undo(env, cookie, verdictChangeId('t-r1'))
-    expect(res.status, await res.clone().text()).toBe(200)
+    expect(res.status, await res.clone().text()).toBe(303)
     expect(rows(`SELECT status FROM tasks WHERE id='t-r1'`)[0]?.status).toBe('review')
     expect(rows(`SELECT reversed_at FROM task_verdicts WHERE task_id='t-r1'`)[0]?.reversed_at).not.toBeNull()
     const receipts = rows(`SELECT actor_id, from_status FROM verdict_reversals WHERE task_id='t-r1'`)
@@ -358,7 +359,7 @@ describe('the POST bar and idempotence', () => {
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
     const id = archiveChangeId('tasks')
-    expect((await undo(env, cookie, id)).status).toBe(200)
+    expect((await undo(env, cookie, id)).status).toBe(303)
     const second = await undo(env, cookie, id)
     expect(second.status).toBe(200)
     expect(await second.text()).toContain('Already undone')
@@ -371,7 +372,7 @@ describe('the POST bar and idempotence', () => {
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
     const id = verdictChangeId('t-r1')
-    expect((await undo(env, cookie, id)).status).toBe(200)
+    expect((await undo(env, cookie, id)).status).toBe(303)
     expect(await (await undo(env, cookie, id)).text()).toContain('Already undone')
     expect(rows(`SELECT id FROM verdict_reversals WHERE task_id='t-r1'`)).toHaveLength(1)
   })
@@ -386,12 +387,46 @@ describe('the POST bar and idempotence', () => {
     expect(taskArchived('t-1')).toBe(true)
   })
 
+  it('Undo keeps filters and page through the rendered form and redirects back', async () => {
+    await adminArchive('projects', 'P2')
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    // Earlier receipt sorts after this cursor; position records the second page.
+    const filters = changeFilters(new URLSearchParams('kind=archive&table=projects&actor=me&q=Quiet&from=2020-01-01&to=2099-01-01&undoable=1'))
+    const path = changesLink(filters, { at: '2098-01-01', id: 'archive:boundary', position: 50, direction: 'next' })
+    const body = await (await get(env, cookie, path)).text()
+    expect(body).toContain('Showing 51–51')
+    const action = /action="([^" ]+)" data-undo-form/.exec(body)?.[1].replace(/&amp;/g, '&')
+    expect(action).toBe(path.replace('/changes?', '/changes/undo?'))
+    const res = await dashboardApp.request(action!, {
+      method: 'POST', headers: { cookie, origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ change: archiveChangeId('projects') }).toString(),
+    }, env)
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toBe(path)
+    expect(rows(`SELECT status FROM projects WHERE id='P2'`)[0]?.status).not.toBe('archived')
+    expect((await get(env, cookie, res.headers.get('location')!)).status).toBe(200)
+  })
+
+  it('a cross-tenant Undo is not found and writes no restore receipt', async () => {
+    await adminArchive('projects', 'P2')
+    harness.sqlite.exec(`INSERT INTO archive_receipts
+      (id, tenant, entity_table, entity_id, action, reason, actor_member_id, created_at)
+      VALUES ('foreign', 'elsewhere', 'projects', 'P2', 'archive', 'tidy', 'mem-admin', '2099-01-01')`)
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    expect((await undo(env, cookie, 'archive:foreign')).status).toBe(404)
+    expect(countReceipts('unarchive')).toBe(0)
+  })
+
   it('a missing or foreign Origin is refused', async () => {
     await adminArchive('tasks', 't-1')
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())
     expect((await undo(env, cookie, archiveChangeId('tasks'), null)).status).toBe(403)
-    expect((await undo(env, cookie, archiveChangeId('tasks'), 'https://evil.example')).status).toBe(403)
+    const refused = await undo(env, cookie, archiveChangeId('tasks'), 'https://evil.example')
+    expect(refused.status).toBe(403)
+    expect(await refused.text()).not.toContain('Review the changes below')
     expect(taskArchived('t-1')).toBe(true)
   })
 
