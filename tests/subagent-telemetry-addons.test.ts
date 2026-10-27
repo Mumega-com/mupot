@@ -363,8 +363,8 @@ describe('Mirror 16D RRF Memory Search Sub-App (src/addons/mirror.ts)', () => {
   })
 })
 
-// ── 4. Inkwell Publishing Sub-App Tests ─────────────────────────────────────
-describe('Inkwell Publishing Sub-App (src/addons/inkwell.ts)', () => {
+// ── 4. Inkwell Health Sub-App Tests ─────────────────────────────────────
+describe('Inkwell Health Sub-App (src/addons/inkwell.ts)', () => {
   it('GET /health returns 200 status', async () => {
     const res = await inkwellApp.request('/health', {}, env)
     expect(res.status).toBe(200)
@@ -373,112 +373,15 @@ describe('Inkwell Publishing Sub-App (src/addons/inkwell.ts)', () => {
     expect(body.addon).toBe('inkwell')
   })
 
-  it('enforces secret header authorization', async () => {
-    const res = await inkwellApp.request('/publish', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: 'T', slug: 's', content: 'c' }),
-    }, env)
-    expect(res.status).toBe(401)
-  })
-
-  it('Flight F1: fails closed with HTTP 503 unconfigured_secret when INKWELL_SECRET is missing', async () => {
-    const unconfiguredEnv = {
-      DB: harness.db,
-      TENANT_SLUG: 'mumega',
-    } as Env
-
-    const res = await inkwellApp.request('/publish', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: 'T', slug: 's', content: 'c' }),
-    }, unconfiguredEnv)
-
-    expect(res.status).toBe(503)
-    const body = await res.json() as Record<string, unknown>
-    expect(body.error).toBe('unconfigured_secret')
-  })
-
-  it('publishes content and creates draft items', async () => {
-    // POST /publish
-    const pubRes = await inkwellApp.request('/publish', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'authorization': 'Bearer test-inkwell-secret',
-      },
-      body: JSON.stringify({
-        title: 'Sovereign Addons Architecture',
-        slug: 'v028-sovereign-addons',
-        content: 'Mupot v0.28 introduces modular sub-apps and token telemetry.',
-        targetSite: 'mumega.com',
-      }),
-    }, env)
-
-    expect(pubRes.status).toBe(201)
-    const pubBody = await pubRes.json() as { ok: boolean; publicationId: string; url: string; status: string }
-    expect(pubBody.ok).toBe(true)
-    expect(pubBody.publicationId).toContain('ink-')
-    expect(pubBody.url).toBe('https://mumega.com/v028-sovereign-addons')
-    expect(pubBody.status).toBe('published')
-
-    // POST /draft
-    const draftRes = await inkwellApp.request('/draft', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-secret': 'test-inkwell-secret',
-      },
-      body: JSON.stringify({
-        title: 'Draft Post',
-        slug: 'draft-post',
-        content: 'Work in progress content...',
-      }),
-    }, env)
-
-    expect(draftRes.status).toBe(200)
-    const draftBody = await draftRes.json() as { ok: boolean; status: string }
-    expect(draftBody.ok).toBe(true)
-    expect(draftBody.status).toBe('draft')
-  })
-
-  it('returns HTTP 400 when required fields are missing', async () => {
-    const res = await inkwellApp.request('/publish', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-secret': 'test-inkwell-secret',
-      },
-      body: JSON.stringify({ title: 'No Content' }),
-    }, env)
-    expect(res.status).toBe(400)
-    const body = await res.json() as Record<string, unknown>
-    expect(body.error).toBe('invalid_payload')
-  })
-
-  it('fails closed with HTTP 500 when service fetcher throws an error', async () => {
-    const failingServiceEnv = {
-      ...env,
-      INKWELL_SVC: {
-        fetch: vi.fn(async () => {
-          throw new Error('Inkwell worker unreachable')
-        }),
-      } as unknown as Env['INKWELL_SVC'],
+  it.each(['/publish', '/internal-content', '/draft'])('retired %s returns 404 with or without credentials', async (path) => {
+    for (const bindings of [env, {} as Env]) {
+      const res = await inkwellApp.request(path, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-inkwell-secret' },
+        body: JSON.stringify({ title: 'Title', slug: 'slug', content: 'Content' }),
+      }, bindings)
+      expect(res.status).toBe(404)
     }
-
-    const res = await inkwellApp.request('/publish', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-secret': 'test-inkwell-secret',
-      },
-      body: JSON.stringify({ title: 'Title', slug: 'slug', content: 'Content' }),
-    }, failingServiceEnv)
-
-    expect(res.status).toBe(500)
-    const body = await res.json() as Record<string, unknown>
-    expect(body.error).toBe('publishing_failed')
-    expect(body.detail).toContain('Inkwell worker unreachable')
   })
 })
 
