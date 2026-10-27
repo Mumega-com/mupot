@@ -1216,6 +1216,7 @@ function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 
     || error === 'cannot_grant_above_own_rank'
     || error === 'member_not_active'
     || error === 'home_scope_not_invitable'
+    || error === 'reauth_required'
   ) return 403
   if (error === 'pairing_code_collision') return 409
   return 400

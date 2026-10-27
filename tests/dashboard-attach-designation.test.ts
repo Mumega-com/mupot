@@ -228,3 +228,226 @@ describe('agent page control', () => {
     expect(await page(p.env, p.cookie)).not.toContain('Allow for me')
   })
 })
+
+// Mom-walk D2 (mupot task 7ae27377): an agent's OWNER may designate THEMSELVES for their own agent without org admin.
+// Self only, own agents only; everything else keeps the admin floor.
+describe('owner self-designation (mom-walk D2)', () => {
+  const ownBy = async (member: string) => {
+    const { env, cookie } = await login('admin@x.test')
+    const res = await dashboardApp.request('/agents/ag1/owner', {
+      method: 'POST', headers: { cookie, origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ action: 'set', owner_member_id: member }),
+    }, env)
+    expect(res.status, await res.clone().text()).toBe(303)
+  }
+  const door = async (env: Env, memberId: string, target: string | null, extra: Record<string, unknown> = {}) => {
+    const { authorizeOwnerMemberChange } = await import('../src/org/agent-owner')
+    const { resolveCapabilities } = await import('../src/auth/capability')
+    const auth = {
+      userId: memberId, email: null, role: 'member', tenant: TENANT, memberId,
+      capabilities: await resolveCapabilities(env, memberId), boundAgentId: null, channel: 'dashboard',
+      webSessionIdHash: (h.sqlite.prepare('SELECT id_hash FROM web_sessions WHERE member_id = ? ORDER BY rowid DESC LIMIT 1').get(memberId) as { id_hash: string } | undefined)?.id_hash,
+      webSessionMemberId: memberId, ...extra,
+    } as unknown as import('../src/types').AuthContext
+    return authorizeOwnerMemberChange(env, auth, 'ag1', target, 'attach_designated_member_id')
+  }
+
+  it('the OWNER (plain member, no org admin) designates themselves: column set, audit attributed to them', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    const res = await post(env, cookie, 'allow')
+    expect(res.status, await res.clone().text()).toBe(303)
+    expect(designee()).toBe('mem-plain')
+    const { humanHasDesignationStanding } = await import('../src/members/seat-attach')
+    expect(await humanHasDesignationStanding(env, 'mem-plain', 'ag1')).toBe(true)
+    const audit = h.sqlite.prepare("SELECT actor_id FROM agent_audit WHERE agent_id = 'ag1' ORDER BY rowid DESC LIMIT 1").get()
+    expect(audit).toEqual({ actor_id: 'mem-plain' })
+  })
+
+  it('a member who does NOT own the agent is refused, even with a fresh session', async () => {
+    await ownBy('mem-admin')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('a member who merely holds a KEY for the agent (a token minter, not the owner) is refused', async () => {
+    await ownBy('mem-admin')
+    h.sqlite.prepare("INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES (?, 'ag1', 'pk', 'mem-plain', unixepoch())").run(TENANT)
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('the owner still needs the fresh-session step-up (no weaker than the admin path)', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', stale())
+    const body = await (await dashboardApp.request('/agents/ag1', { headers: { cookie } }, env)).text()
+    expect(body).toContain('Allow for me')
+    const res = await post(env, cookie, 'allow')
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toContain('/auth/reauth')
+    expect(designee()).toBeNull()
+  })
+
+  it('the owner may Stop their own designation without step-up, but cannot designate someone else', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(303)
+    setReauth('mem-plain', stale())
+    expect((await post(env, cookie, 'stop')).status).toBe(303)
+    expect(designee()).toBeNull()
+    expect(await door(env, 'mem-plain', 'mem-admin')).toMatchObject({ ok: false, error: 'forbidden' })
+    expect(await door(env, 'mem-plain', null)).toMatchObject({ ok: false, error: 'forbidden' })
+  })
+
+  it('door: the owner may designate only themselves; a non-owner self-target, another member and a bound agent session are refused', async () => {
+    await ownBy('mem-plain')
+    const { env } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: true })
+    expect(await door(env, 'mem-plain', 'mem-boss')).toMatchObject({ ok: false })
+    await ownBy('mem-admin')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'forbidden' })
+    await ownBy('mem-plain')
+    expect(await door(env, 'mem-plain', 'mem-plain', { boundAgentId: 'ag1' })).toMatchObject({ ok: false })
+    expect(await door(env, 'mem-plain', 'mem-plain', { seatBinding: { seatId: 's', label: 'l', harnessId: 'h', grantTokenId: 'g', humanMemberId: 'mem-plain', source: 'handle' } }))
+      .toMatchObject({ ok: false, error: 'seat_session_forbidden' })
+  })
+
+  it('the agent ceiling still applies to an owner: an agent bound to a higher-ranked member is refused', async () => {
+    await ownBy('mem-plain')
+    h.sqlite.prepare("INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, 'ag1', 'mem-boss', datetime('now'))").run(TENANT)
+    const { env } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'agent_rank_exceeds_ceiling' })
+  })
+
+  it('the outgoing designee ceiling still applies: a boss designation cannot be replaced by the owner', async () => {
+    await ownBy('mem-plain')
+    h.sqlite.exec("UPDATE agents SET attach_designated_member_id = 'mem-boss' WHERE id = 'ag1'")
+    const { env } = await login('plain@x.test')
+    expect(await door(env, 'mem-plain', 'mem-plain')).toMatchObject({ ok: false, error: 'target_rank_exceeds_ceiling' })
+  })
+
+  it('page: the eligible owner sees Allow and Stop; a non-owner member sees neither', async () => {
+    await ownBy('mem-plain')
+    const page = async (env: Env, cookie: string) => (await dashboardApp.request('/agents/ag1', { headers: { cookie } }, env)).text()
+    const o = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect(await page(o.env, o.cookie)).toContain('Allow for me')
+    await post(o.env, o.cookie, 'allow')
+    const after = await page(o.env, o.cookie)
+    expect(after).toContain('Currently allowed')
+    expect(after).toContain('>Stop<')
+    await ownBy('mem-admin')
+    expect(await page(o.env, o.cookie)).not.toContain('Allow for me')
+  })
+  it('a squad admin self-setting the owner cannot then designate through MCP or the dashboard', async () => {
+    h.sqlite.exec("DELETE FROM capabilities WHERE member_id = 'mem-plain'; INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('squad-admin', 'mem-plain', 'squad', 'S1', 'admin')")
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    const { resolveCapabilities } = await import('../src/auth/capability')
+    const { invokeTool } = await import('../src/mcp/index')
+    const auth = { userId: 'mem-plain', email: 'plain@x.test', role: 'member', tenant: TENANT, channel: 'workspace', memberId: 'mem-plain', capabilities: await resolveCapabilities(env, 'mem-plain') } as import('../src/types').AuthContext
+    expect((await invokeTool(auth, env, 'update_agent', { agent: 'ag1', owner_member_id: 'mem-plain' }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(auth, env, 'update_agent', { agent: 'ag1', attach_designated_member_id: 'mem-plain' }, ORIGIN)).ok).toBe(false)
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+    expect(await (await dashboardApp.request('/agents/ag1', { headers: { cookie } }, env)).text()).not.toContain('Allow for me')
+  })
+
+  it('an independently assigned owner has no D2 exemption through a workspace bearer, even with session-looking fields', async () => {
+    await ownBy('mem-plain')
+    const { env } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect(await door(env, 'mem-plain', 'mem-plain', { channel: 'workspace' })).toMatchObject({ ok: false, error: 'forbidden' })
+  })
+
+  it('missing historical assignment evidence fails closed; later demotion of the assigning admin does not erase the receipt', async () => {
+    h.sqlite.exec("UPDATE agents SET owner_member_id = 'mem-plain' WHERE id = 'ag1'")
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    h.sqlite.exec("UPDATE agents SET owner_member_id = NULL WHERE id = 'ag1'")
+    await ownBy('mem-plain')
+    h.sqlite.exec("UPDATE capabilities SET capability = 'member' WHERE id = 'cap-admin'")
+    expect((await post(env, cookie, 'allow')).status).toBe(303)
+  })
+
+  it('ownership changes between authorization and the batch return 409 with no designation or audit', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    const before = auditCount()
+    const batch = env.DB.batch.bind(env.DB)
+    env.DB.batch = (async (stmts: Parameters<typeof env.DB.batch>[0]) => {
+      h.sqlite.exec("UPDATE agents SET owner_member_id = NULL WHERE id = 'ag1'")
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    expect((await post(env, cookie, 'allow')).status).toBe(409)
+    expect(designee()).toBeNull()
+    expect(auditCount()).toBe(before)
+  })
+
+  it('an owner Stop also loses if ownership changes before the batch', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(303)
+    setReauth('mem-plain', stale())
+    const before = auditCount()
+    const batch = env.DB.batch.bind(env.DB)
+    env.DB.batch = (async (stmts: Parameters<typeof env.DB.batch>[0]) => {
+      h.sqlite.exec("UPDATE agents SET owner_member_id = NULL WHERE id = 'ag1'")
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    expect((await post(env, cookie, 'stop')).status).toBe(409)
+    expect(designee()).toBe('mem-plain')
+    expect(auditCount()).toBe(before)
+  })
+
+  it('an admin self-assignment does not become independent ownership after demotion', async () => {
+    await ownBy('mem-admin')
+    h.sqlite.exec("UPDATE capabilities SET capability = 'member' WHERE id = 'cap-admin'")
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('a historical audit without assignment authority is not upgraded by the actor being an admin today', async () => {
+    const { updateAgentProfile } = await import('../src/org/service')
+    const { env, cookie } = await login('plain@x.test')
+    expect((await updateAgentProfile(env, 'ag1', { owner_member_id: 'mem-plain' }, { id: 'mem-admin', type: 'user' })).ok).toBe(true)
+    setReauth('mem-plain', fresh())
+    expect((await post(env, cookie, 'allow')).status).toBe(403)
+    expect(designee()).toBeNull()
+  })
+
+  it('reassigning the same owner through another assignment invalidates the old authorization receipt', async () => {
+    await ownBy('mem-plain')
+    const { env, cookie } = await login('plain@x.test')
+    setReauth('mem-plain', fresh())
+    const before = auditCount()
+    const batch = env.DB.batch.bind(env.DB)
+    let raced = false
+    env.DB.batch = (async (stmts: Parameters<typeof env.DB.batch>[0]) => {
+      if (!raced) {
+        raced = true
+        await ownBy('mem-admin')
+        await ownBy('mem-plain')
+      }
+      return batch(stmts)
+    }) as typeof env.DB.batch
+    expect((await post(env, cookie, 'allow')).status).toBe(409)
+    expect(designee()).toBeNull()
+    expect(auditCount()).toBe(before + 2)
+  })
+
+})

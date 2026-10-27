@@ -12,17 +12,19 @@ import { createBus } from '../bus'
 import { actorRankOnScopeFor, capabilityRank, exceedsTargetRankCeiling } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import { attachedAuthority } from '../auth/attached-ceiling'
+import { independentlyAssignedOwner } from './owner-provenance'
+import { checkWebSession } from '../secure-moments/enrol-mint'
 
 /** Which member-reference column on agents the change targets. Both are authenticate-as-conferring, both use ONE predicate. */
 export type OwnerDoorColumn = 'owner_member_id' | 'attach_designated_member_id'
 
 export type OwnerChangeRefusal =
-  | { ok: true; /** the outgoing value read by THIS check; carry it into the write so the check and the write cannot interleave */ current?: string | null }
+  | { ok: true; /** the outgoing value read by THIS check; carry it into the write so the check and the write cannot interleave */ current?: string | null; ownerAssignmentOrgAdmin?: boolean; expectedOwner?: string | null; expectedOwnerAuditId?: string }
   | { ok: false; status: 400; error: 'invalid_args'; detail: string }
   | { ok: false; status: 403; error: 'forbidden'; detail: { need: typeof MEMBER_BIND_MINT_FLOOR; scope: 'org' } }
   | { ok: false; status: 403; error: 'target_rank_exceeds_ceiling'; detail: { owner_member_id: string } }
   | { ok: false; status: 403; error: 'agent_rank_exceeds_ceiling'; detail: { agent_id: string } }
-  | { ok: false; status: 403; error: 'seat_session_forbidden'; detail: { column: OwnerDoorColumn } }
+  | { ok: false; status: 403; error: 'seat_session_forbidden' | 'reauth_required'; detail: { column: OwnerDoorColumn } }
 
 export async function authorizeOwnerMemberChange(
   env: Env,
@@ -32,7 +34,7 @@ export async function authorizeOwnerMemberChange(
   column: OwnerDoorColumn = 'owner_member_id',
 ): Promise<OwnerChangeRefusal> {
   // attach_designated_member_id (migration 0238) decides which agents a human's chats may BECOME. It goes through this same
-  // door with two differences: (1) NO self-target waiver (a squad admin could otherwise designate themselves on any agent),
+  // door with two differences: (1) self-designation needs independent owner provenance and fresh dashboard sign-in,
   // and (2) a seat or attached chat may never write it (a chat must not widen what chats may become). The seat test reads
   // the server-derived auth.seatBinding / attachedAuthority, never a client claim. Ranks below are read from the EFFECTIVE
   // auth.capabilities (actorRankOnScopeFor), never DB rows, so an attached or clamped session cannot out-rank its clamp.
@@ -47,31 +49,52 @@ export async function authorizeOwnerMemberChange(
   // The current owner is read HERE, fresh, so no caller can pass a stale or wrong one.
   const currentRow = ownerMemberId === undefined
     ? null
-    : await env.DB.prepare(`SELECT ${column} AS owner_member_id FROM agents WHERE id = ?`).bind(agentId).first<{ owner_member_id: string | null }>()
+    : await env.DB.prepare(`SELECT ${column} AS owner_member_id, owner_member_id AS agent_owner_member_id FROM agents WHERE id = ?`).bind(agentId).first<{ owner_member_id: string | null; agent_owner_member_id: string | null }>()
   const currentOwnerMemberId = currentRow?.owner_member_id ?? null
   if (ownerMemberId !== undefined && currentOwnerMemberId) {
     if (await exceedsTargetRankCeiling(env, auth, currentOwnerMemberId)) {
       return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: currentOwnerMemberId } }
     }
   }
-  if (designation && ownerMemberId !== undefined) {
-    // Clearing a designation disables every attached chat of the agent, so it needs the same org floor as setting one.
+  // Only a separately assigned owner may use D2. Historical audits without an authority receipt fail closed.
+  // MCP keeps its org-admin path; the owner exemption is dashboard-only and uses the same fresh session as the form.
+  const ownerProof = designation && ownerMemberId !== undefined && auth.memberId
+    ? await independentlyAssignedOwner(env, agentId, auth.memberId) : null
+  const stoppingSelf = designation && ownerMemberId === null && currentOwnerMemberId === auth.memberId
+    && currentRow?.agent_owner_member_id === auth.memberId
+    && !auth.boundAgentId && auth.channel === 'dashboard'
+    && (await checkWebSession(env, auth, { fresh: false })).ok
+  const ownerSelfDesignation = !!ownerProof && !auth.boundAgentId && auth.channel === 'dashboard'
+    && ownerMemberId === auth.memberId && (await checkWebSession(env, auth, { fresh: false })).ok
+  const proof = {
+    current: currentOwnerMemberId,
+    ...((ownerSelfDesignation || stoppingSelf) ? { expectedOwner: auth.memberId! } : {}),
+    ...(ownerSelfDesignation ? { expectedOwnerAuditId: ownerProof!.id } : {}),
+    ...(!designation && ownerMemberId !== undefined ? {
+      ownerAssignmentOrgAdmin: !auth.boundAgentId && !auth.seatBinding && !attachedAuthority(auth)
+        && (await actorRankOnScopeFor(env, auth, 'org', null)) >= capabilityRank(MEMBER_BIND_MINT_FLOOR),
+    } : {}),
+  }
+  if (designation && ownerMemberId !== undefined && !ownerSelfDesignation && !stoppingSelf) {
+    // Apart from an owner stopping their own designation, clearing keeps the org floor.
     const floorRank = await actorRankOnScopeFor(env, auth, 'org', null)
     if (floorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
       return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
     }
   }
-  if (typeof ownerMemberId !== 'string' || ownerMemberId.length === 0) return { ok: true, current: currentOwnerMemberId }
+  if (typeof ownerMemberId !== 'string' || ownerMemberId.length === 0) return { ok: true, ...proof }
   if (/\s/.test(ownerMemberId)) {
     return { ok: false, status: 400, error: 'invalid_args', detail: 'owner_member_id must not contain whitespace' }
   }
   const isSelfTarget = !designation && auth.memberId != null && auth.memberId === ownerMemberId
-  if (isSelfTarget) return { ok: true, current: currentOwnerMemberId }
-  const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-  if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
-    return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
+  if (isSelfTarget) return { ok: true, ...proof }
+  if (!ownerSelfDesignation) {
+    const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
+    if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
+      return { ok: false, status: 403, error: 'forbidden', detail: { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' } }
+    }
   }
-  if (await exceedsTargetRankCeiling(env, auth, ownerMemberId)) {
+  if (!ownerSelfDesignation && await exceedsTargetRankCeiling(env, auth, ownerMemberId)) {
     return { ok: false, status: 403, error: 'target_rank_exceeds_ceiling', detail: { owner_member_id: ownerMemberId } }
   }
   // AGENT ceiling (designation only): a chat that becomes the agent acts with the agent's standing, so the actor may not
@@ -90,7 +113,10 @@ export async function authorizeOwnerMemberChange(
       }
     }
   }
-  return { ok: true, current: currentOwnerMemberId }
+  if (ownerSelfDesignation && !(await checkWebSession(env, auth, { fresh: true })).ok) {
+    return { ok: false, status: 403, error: 'reauth_required', detail: { column } }
+  }
+  return { ok: true, ...proof }
 }
 
 // Same org.provisioned / agent_updated event shape MCP update_agent emits (a small

@@ -2403,11 +2403,11 @@ const toolUpdateAgent: ToolSpec = {
     // listener, not the record of truth. No schema change in this PR.
     const actor: AuditActor = isSelf
       ? { id: auth.boundAgentId as string, type: 'agent' }
-      : { id: auth.memberId as string, type: 'user' }
+      : { id: auth.memberId as string, type: 'user', ownerAssignmentOrgAdmin: ownerGate.ownerAssignmentOrgAdmin }
 
     // The designation door's outgoing-value read travels into the write: if another designation change lands in between, 409.
     const result = await updateAgentProfile(env, agent.id, patch, actor,
-      patch.attach_designated_member_id !== undefined ? { attach_designated_member_id: designationGate.current ?? null } : undefined)
+      patch.attach_designated_member_id !== undefined ? { attach_designated_member_id: designationGate.current ?? null, owner_member_id: designationGate.expectedOwner, ownerAuditId: designationGate.expectedOwnerAuditId } : undefined)
     if (!result.ok) {
       if (result.error === 'designation_changed') return fail(409, 'designation_changed', { agent: agentRef })
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })

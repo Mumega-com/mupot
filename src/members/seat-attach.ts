@@ -41,6 +41,7 @@ import { timingSafeEqual } from '../lib/crypto'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { canOnSquad, capabilityRank, currentMemberRankOnScope, exceedsTargetRankCeilingGivenRanks, resolveCapabilities, targetMaxRankAcrossScopes } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from './project-invites'
+import { independentlyAssignedOwner } from '../org/owner-provenance'
 
 import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding, sha256Hex } from './service'
 import { issueMomentLink } from '../secure-moments/issue'
@@ -147,7 +148,7 @@ export async function resolveAttachableAgent(env: Env, humanMemberId: string, re
 /**
  * THE ONE "this human has standing to designate this agent for themselves" predicate (member-id based: a seat chat's own auth may
  * never write a designation, so it is re-derived from the human's CURRENT grants). Same standing the dashboard "Allow for me"
- * control and update_agent enforce through authorizeOwnerMemberChange: org-scope MEMBER_BIND_MINT_FLOOR plus the rank ceiling over
+ * control and update_agent enforce through authorizeOwnerMemberChange: org-scope MEMBER_BIND_MINT_FLOOR or an independently assigned owner, plus the rank ceiling over
  * the agent's owner and welded member. Used ONLY to choose between a guiding refusal and agent_not_found; it writes nothing.
  */
 export async function humanHasDesignationStanding(env: Env, humanMemberId: string, agentId: string): Promise<boolean> {
@@ -155,7 +156,7 @@ export async function humanHasDesignationStanding(env: Env, humanMemberId: strin
     .bind(humanMemberId, env.TENANT_SLUG).first<{ x: number }>()
   if (!live) return false
   const actorRank = await currentMemberRankOnScope(env, humanMemberId, 'org', null)
-  if (actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) return false
+  if (actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR) && !(await independentlyAssignedOwner(env, agentId, humanMemberId))) return false
   const holders = await env.DB.prepare(
     `SELECT a.owner_member_id AS owner_member_id, b.member_id AS bound_member_id
        FROM agents a LEFT JOIN agent_member_bindings b ON b.tenant = ?2 AND b.agent_id = a.id WHERE a.id = ?1`,
@@ -169,14 +170,19 @@ export async function humanHasDesignationStanding(env: Env, humanMemberId: strin
 }
 
 /**
- * Can this human press the "Allow for me" control at all (org-scope MEMBER_BIND_MINT_FLOOR, the same floor humanHasDesignationStanding
- * applies first)? Used ONLY to pick honest next-step copy: it grants nothing and writes nothing.
+ * Can this human reach the "Allow for me" control after fresh dashboard sign-in? Uses the same standing as humanHasDesignationStanding. Used ONLY to pick honest next-step copy: it grants nothing and writes nothing.
  */
-export async function humanCanDesignateAtAll(env: Env, humanMemberId: string): Promise<boolean> {
+export async function humanCanDesignateAtAll(env: Env, humanMemberId: string, agentId?: string): Promise<boolean> {
   const live = await env.DB.prepare(`SELECT 1 AS x FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active' LIMIT 1`)
     .bind(humanMemberId, env.TENANT_SLUG).first<{ x: number }>()
   if (!live) return false
-  return (await currentMemberRankOnScope(env, humanMemberId, 'org', null)) >= capabilityRank(MEMBER_BIND_MINT_FLOOR)
+  if (agentId) return humanHasDesignationStanding(env, humanMemberId, agentId)
+  if ((await currentMemberRankOnScope(env, humanMemberId, 'org', null)) >= capabilityRank(MEMBER_BIND_MINT_FLOOR)) return true
+  const owned = await env.DB.prepare('SELECT id FROM agents WHERE owner_member_id = ?').bind(humanMemberId).all<{ id: string }>()
+  for (const agent of owned.results ?? []) {
+    if (await humanHasDesignationStanding(env, humanMemberId, agent.id)) return true
+  }
+  return false
 }
 
 /** Active, non-seat, UNDESIGNATED agents matching `ref` that this human could designate for themselves and administers.
