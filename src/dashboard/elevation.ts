@@ -441,20 +441,20 @@ function decideScript(requestId: string): Html {
             var data = await res.json().catch(function () { return {}; });
             if (res.ok && data.ok) {
               status.textContent = decision === 'approve'
-                ? 'Approved. Access is live now for this exact agent session.'
-                : 'Denied. No access was granted.';
+                ? 'Approved — active until ' + new Date(data.grants[0].expires_at).toLocaleString() + '.\\nNext: ask the agent to retry its action in this session.'
+                : 'Denied.\\nNext: tell the agent why access was declined.';
               setBusy(true);
-              setTimeout(function () { window.location.href = '/elevation'; }, 1200);
             } else if (data.reason === 'reauth_required') {
-              status.innerHTML = 'Your identity check has expired — this includes a sensitive action. ' +
+              status.innerHTML = 'Failed: your identity check has expired. Nothing was granted; you can try again.<br>Next: ' +
                 '<a href="/auth/reauth?return=/elevation/${requestId}">Step up now</a>, then come back to this page and try again.';
               setBusy(false);
             } else {
-              status.textContent = 'Could not decide: ' + (data.reason || data.error || res.status);
+              status.textContent = 'Failed: ' + (data.detail || 'The decision could not be saved.') +
+                ' Nothing was granted by this attempt; you can try again.\\nNext: check Active elevations, then reload this request before retrying.';
               setBusy(false);
             }
           } catch (e) {
-            status.textContent = 'Network error — try again.';
+            status.textContent = 'Failed: the connection was interrupted; the result is unknown.\\nNext: reload this request and check Active elevations before retrying.';
             setBusy(false);
           }
         }
@@ -595,7 +595,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
         <button type="submit" class="btn">Approve narrowed access</button>
         <button type="button" class="btn secondary" id="deny-btn">Deny</button>
       </div>
-      <div id="decide-status" class="status-line" style="margin-top:8px;"></div>
+      <div id="decide-status" class="status-line" style="margin-top:8px; white-space:pre-line;"></div>
     </form>
     ${decideScript(request.id)}
     <p><a href="/elevation">← Back to pending requests</a></p>

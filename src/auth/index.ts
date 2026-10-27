@@ -1984,40 +1984,57 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
 // GET /auth/reauth exists for.
 authApp.post('/elevation/requests/:id/decide', requireAuthMw(), async (c) => {
   const auth = c.get('auth')
-  if (!auth.webSessionMemberId || !auth.webSessionIdHash) return c.json({ error: 'forbidden' }, 403)
+  if (!auth.webSessionMemberId || !auth.webSessionIdHash) return c.json({ error: 'forbidden', detail: 'Sign in with a browser session to decide this request.' }, 403)
 
   let body: Record<string, unknown>
   try {
     body = (await c.req.json()) as Record<string, unknown>
   } catch {
-    return c.json({ error: 'invalid_json' }, 400)
+    return c.json({ error: 'invalid_json', detail: 'The decision could not be read. Reload the page and try again.' }, 400)
   }
   const decision = body.decision === 'approve' || body.decision === 'deny' ? body.decision : null
-  if (!decision) return c.json({ error: 'invalid_args', detail: 'decision must be approve|deny' }, 400)
+  if (!decision) return c.json({ error: 'invalid_args', detail: 'Choose Approve or Deny.' }, 400)
 
   const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
   const currentWebSession = await loadWebSessionByHash(c.env, c.env.TENANT_SLUG, auth.webSessionIdHash)
   const recentReauthOk = currentWebSession ? hasRecentReauth(currentWebSession) : false
 
-  const result = await decideElevationRequest(c.env, {
-    tenant: c.env.TENANT_SLUG,
-    requestId: c.req.param('id'),
-    decision,
-    selectedActions: Array.isArray(body.actions) ? body.actions.filter((a): a is string => typeof a === 'string') : undefined,
-    scopeType: typeof body.scope_type === 'string' ? (body.scope_type as CapabilityScopeType) : undefined,
-    scopeId: typeof body.scope_id === 'string' ? body.scope_id : undefined,
-    durationMinutes: typeof body.duration_minutes === 'number' ? body.duration_minutes : undefined,
-    decidedByMemberId: auth.webSessionMemberId,
-    decidedByCapabilities: capabilities,
-    decidedByIsOrgAdmin: isOrgAdmin(auth),
-    decidedByWebSessionHash: auth.webSessionIdHash,
-    recentReauthOk,
-    note: typeof body.note === 'string' ? body.note : undefined,
-  })
+  let result: Awaited<ReturnType<typeof decideElevationRequest>>
+  try {
+    result = await decideElevationRequest(c.env, {
+      tenant: c.env.TENANT_SLUG,
+      requestId: c.req.param('id'),
+      decision,
+      selectedActions: Array.isArray(body.actions) ? body.actions.filter((a): a is string => typeof a === 'string') : undefined,
+      scopeType: typeof body.scope_type === 'string' ? (body.scope_type as CapabilityScopeType) : undefined,
+      scopeId: typeof body.scope_id === 'string' ? body.scope_id : undefined,
+      durationMinutes: typeof body.duration_minutes === 'number' ? body.duration_minutes : undefined,
+      decidedByMemberId: auth.webSessionMemberId,
+      decidedByCapabilities: capabilities,
+      decidedByIsOrgAdmin: isOrgAdmin(auth),
+      decidedByWebSessionHash: auth.webSessionIdHash,
+      recentReauthOk,
+      note: typeof body.note === 'string' ? body.note : undefined,
+    })
+  } catch {
+    // Never expose database exceptions, SQL, or bound values to the browser.
+    return c.json({ ok: false, error: 'elevation_decision_failed',
+      detail: 'The decision could not be saved. A selected action may already have active access; check Active elevations before retrying.' }, 503)
+  }
 
   if (!result.ok) {
     const status = result.reason === 'not_found' ? 404 : result.reason === 'forbidden' ? 403 : 409
-    return c.json({ ok: false, reason: result.reason, detail: 'detail' in result ? result.detail : undefined }, status)
+    const details = {
+      not_found: 'This request could not be found.',
+      forbidden: 'You do not have authority to decide this request.',
+      already_decided: 'This request has already been decided. Check Active elevations for its access.',
+      request_expired: 'The decision window has expired. Ask the agent to request access again.',
+      agent_session_ended: 'The agent session has ended. Ask the agent to reconnect and request access again.',
+      reauth_required: 'Verify your identity again before approving sensitive access.',
+      invalid_elevation_request: 'The selected access is invalid.',
+    }
+    return c.json({ ok: false, error: result.reason, reason: result.reason,
+      detail: 'detail' in result ? result.detail : details[result.reason] }, status)
   }
   return c.json({
     ok: true,

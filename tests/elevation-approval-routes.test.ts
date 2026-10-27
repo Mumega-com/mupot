@@ -261,6 +261,48 @@ describe('elevation approval — integration through authApp (real D1)', () => {
     expect(activeBody.grants[0].id).toBe(decideBody.grants[0].id)
   })
 
+  it('#2227 owner approves all three org actions through the dashboard route', async () => {
+    const env = makeEnv('bootstrap-owner@x.test')
+    const { session } = await seedFixture(env)
+    const actions = ['action:project_status', 'action:manage_access', 'action:workspace_project']
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: session.id, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions, scopeType: 'org', scopeId: '', durationMinutes: 60, reason: 'org work',
+    })
+    if (!created.ok) throw new Error('fixture request failed')
+    const cookie = await devLogin(env)
+    await env.DB.prepare('UPDATE web_sessions SET recent_reauth_at = ?1 WHERE member_id = ?2')
+      .bind(new Date().toISOString(), 'bootstrap-owner').run()
+    const response = await authApp.request(`/elevation/requests/${created.request.id}/decide`, {
+      method: 'POST', headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve', actions }),
+    }, env)
+    expect(response.status).toBe(200)
+    const body = await response.json() as { request: { status: string }; grants: Array<{ action: string; expires_at: string }> }
+    expect(body.request.status).toBe('approved')
+    expect(body.grants.map((g) => g.action).sort()).toEqual([...actions].sort())
+    expect(body.grants.every((g) => Date.parse(g.expires_at) > Date.now())).toBe(true)
+  })
+
+  it('#2227 returns a safe structured error and leaves pending when a grant insert fails', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const request = await seedPendingRequest(env, session.id, ['action:project_lifecycle'])
+    const cookie = await devLogin(env)
+    harness.sqlite.exec(`CREATE TRIGGER fail_grant BEFORE INSERT ON elevation_grants
+      BEGIN SELECT RAISE(ABORT, 'secret SQL INSERT sentinel'); END;`)
+    const response = await authApp.request(`/elevation/requests/${request.id}/decide`, {
+      method: 'POST', headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve', actions: ['action:project_lifecycle'] }),
+    }, env)
+    expect(response.status).toBe(503)
+    expect(await response.json()).toEqual({ ok: false, error: 'elevation_decision_failed',
+      detail: 'The decision could not be saved. A selected action may already have active access; check Active elevations before retrying.' })
+    expect(await env.DB.prepare('SELECT status, decided_at FROM elevation_requests WHERE id = ?1')
+      .bind(request.id).first()).toEqual({ status: 'pending', decided_at: null })
+    expect((await env.DB.prepare('SELECT id FROM elevation_grants').all()).results).toEqual([])
+  })
+
   it('cannot approve a superset of the requested actions through the HTTP route either', async () => {
     const env = makeEnv('admin@x.test')
     const { session } = await seedFixture(env)

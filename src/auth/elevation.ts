@@ -47,7 +47,6 @@ import {
   isRequestableElevationAction,
   isValidElevationDuration,
 } from './elevation-actions'
-import { assertBatchWritten } from '../lib/receipt'
 import { installerRequestRefusal, installerWindowEnabled, isInstallerAction } from '../operators/installer-tiers'
 import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
 import { canonicalizeSudoArgs, ownerSudoEnabled, type SudoActionKey } from './owner-sudo-args'
@@ -762,18 +761,10 @@ export async function findElevationDecisionRefusal(
   return null
 }
 
-/**
- * decideElevationRequest — THE single-decision transaction. Security
- * Invariant 6 ("Approval is single-decision and atomic. Concurrent
- * Allow/Deny or double-Allow yields one terminal decision and one grant
- * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
- * — SQLite serializes it, so at most one concurrent caller ever observes
- * `changes === 1`; every other concurrent/later caller sees 0 and returns
- * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
- * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
- * mid-batch D1 failure leaves the request 'approved' with zero grants
- * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
- * silent extra authority).
+/** Grant writes and the terminal decision share one D1 transaction. Grant writes
+ * are gated on pending; the final update verifies the complete grant set inside
+ * SQL, so even a silent no-op aborts rather than committing a partial approval.
+ * Concurrent decisions serialize in D1: only the first pending request writes.
  */
 export async function decideElevationRequest(
   env: Env,
@@ -809,8 +800,9 @@ export async function decideElevationRequest(
       .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
       .run()
     if (Number(result.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'denied' }
-    const updated = await loadElevationRequestById(env, input.tenant, request.id)
-    return { ok: true, request: updated ?? { ...request, status: 'denied' }, grants: [] }
+    return { ok: true, request: { ...request, status: 'denied', decided_at: nowIso,
+      decided_by_member_id: input.decidedByMemberId, decided_by_web_session_hash: input.decidedByWebSessionHash,
+      decision_note: input.note ?? null }, grants: [] }
   }
 
   // ── approve ── (every refusal was already cleared by findElevationDecisionRefusal above)
@@ -818,16 +810,6 @@ export async function decideElevationRequest(
   const scopeType = input.scopeType ?? request.requested_scope_type
   const scopeId = input.scopeId ?? request.requested_scope_id
   const durationMinutes = input.durationMinutes ?? request.requested_duration_minutes
-
-  const flip = await env.DB.prepare(
-    `UPDATE elevation_requests
-        SET status = 'approved', decided_at = ?1, decided_by_member_id = ?2,
-            decided_by_web_session_hash = ?3, decision_note = ?4
-      WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
-  )
-    .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
-    .run()
-  if (Number(flip.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'approved' }
 
   const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
   const grants: ElevationGrantRecord[] = selected.map((action) => ({
@@ -847,16 +829,11 @@ export async function decideElevationRequest(
     revoke_reason: null,
   }))
 
-  // Owner-sudo grants renew the same way (a SPENT one is revoked by finishOwnerSudo, so it counts as ended): without it an agent's
-  // second approval for the same one-call action in one session could never be written. Their single-use claim counts usage only
-  // since the renewed created_at (claimOwnerSudo), so the old spend does not follow the renewed row.
-  // Installer window renewal: UNIQUE(agent_session_id, action, scope_type, scope_id) means a second window for the same tier and scope
-  // on one session cannot be INSERTed. When the earlier install grant has ENDED (expired or revoked) it is renewed in place (new
-  // request, approver, created_at, expiry; revoked cleared) and keeps its id; its write cap counts only usage since the new created_at.
-  // A still-live grant is left alone (the insert then fails as before). Other actions are unchanged.
+  // The unique session/action/scope slot survives expiry and revocation. Reuse
+  // ended slots for every action, preserving the grant id and its usage receipts.
+  // Still-live slots remain conflicts; approval never overwrites active authority.
   const renewed = new Set<string>()
   for (const g of grants) {
-    if (!isInstallerAction(g.action) && !isOwnerSudoAction(g.action)) continue
     const prior = await env.DB.prepare(
       `SELECT id FROM elevation_grants
         WHERE tenant = ?1 AND agent_session_id = ?2 AND action = ?3 AND scope_type = ?4 AND scope_id = ?5
@@ -869,40 +846,51 @@ export async function decideElevationRequest(
       renewed.add(g.id)
     }
   }
-  const batchResults = await env.DB.batch(
-    grants.map((g) =>
-      renewed.has(g.id)
-        ? env.DB.prepare(
-            `UPDATE elevation_grants
-                SET elevation_request_id = ?2, approved_by_member_id = ?3, approved_by_web_session_hash = ?4,
-                    created_at = ?5, expires_at = ?6, revoked_at = NULL, revoke_reason = NULL, effect = ?7
-              WHERE id = ?1 AND tenant = ?8`,
-          ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at, g.effect, g.tenant)
-        : env.DB.prepare(
-        `INSERT INTO elevation_grants
-           (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
-            approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
-      ).bind(
-        g.id,
-        g.tenant,
-        g.elevation_request_id,
-        g.agent_session_id,
-        g.action,
-        g.scope_type,
-        g.scope_id,
-        g.effect,
-        g.approved_by_member_id,
-        g.approved_by_web_session_hash,
-        g.created_at,
-        g.expires_at,
-      ),
-    ),
+  const grantStatements = grants.map((g) =>
+    renewed.has(g.id)
+      ? env.DB.prepare(
+          `UPDATE elevation_grants
+              SET elevation_request_id = ?2, approved_by_member_id = ?3, approved_by_web_session_hash = ?4,
+                  created_at = ?5, expires_at = ?6, revoked_at = NULL, revoke_reason = NULL, effect = ?7
+            WHERE id = ?1 AND tenant = ?8
+              AND (revoked_at IS NOT NULL OR expires_at <= ?5)
+              AND EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?2 AND tenant = ?8 AND status = 'pending')`,
+        ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash,
+          g.created_at, g.expires_at, g.effect, g.tenant)
+      : env.DB.prepare(
+          `INSERT INTO elevation_grants
+             (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
+              approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+            WHERE EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND status = 'pending')`,
+        ).bind(g.id, g.tenant, g.elevation_request_id, g.agent_session_id, g.action, g.scope_type,
+          g.scope_id, g.effect, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at),
   )
-  assertBatchWritten(batchResults, 'elevation_grants.insert', 1)
+  const batchResults = await env.DB.batch([
+    ...grantStatements,
+    env.DB.prepare(
+      `UPDATE elevation_requests
+          SET status = CASE WHEN (
+                SELECT COUNT(*) FROM elevation_grants
+                 WHERE elevation_request_id = ?5 AND tenant = ?6
+                   AND id IN (${grants.map((_, i) => `?${i + 8}`).join(', ')})
+              ) = ?7 THEN 'approved' ELSE NULL END,
+              decided_at = ?1, decided_by_member_id = ?2,
+              decided_by_web_session_hash = ?3, decision_note = ?4
+        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
+    ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null,
+      request.id, input.tenant, grants.length, ...grants.map((g) => g.id)),
+  ])
+  // NULL deliberately violates status's NOT NULL constraint when any grant was
+  // skipped. This check must run inside the transaction, not after it commits.
+  if (Number(batchResults[grants.length].meta?.changes ?? 0) === 0) {
+    return { ok: false, reason: 'already_decided', status: 'approved' }
+  }
 
-  const updatedRequest = await loadElevationRequestById(env, input.tenant, request.id)
-  return { ok: true, request: updatedRequest ?? { ...request, status: 'approved' }, grants }
+  // No fallible read after commit: a read failure must not report a committed approval as failed.
+  return { ok: true, request: { ...request, status: 'approved', decided_at: nowIso,
+    decided_by_member_id: input.decidedByMemberId, decided_by_web_session_hash: input.decidedByWebSessionHash,
+    decision_note: input.note ?? null }, grants }
 }
 
 // ── grants: evaluate / list / revoke ────────────────────────────────────────
