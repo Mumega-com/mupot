@@ -73,7 +73,6 @@ import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
 import { sosApp } from './addons/sos'
-import { mirrorApp } from './addons/mirror'
 import { inkwellApp } from './addons/inkwell'
 import { toriversAddonApp } from './addons/torivers'
 import { projectLinkApp } from './addons/project-link/routes'
@@ -225,15 +224,20 @@ app.route('/api/inbox', inboxApp)
 // dashboard /coordination. Before the '/' catch-all.
 app.route('/api/coordination', coordinationApp)
 
-// Modular sovereign addon sub-apps (SOS bridge, Mirror RRF search, Inkwell CMS, ToRivers automations).
+// Modular sovereign addon sub-apps (SOS bridge, Inkwell CMS, ToRivers automations).
 app.route('/api/sos', sosApp)
-app.route('/api/mirror', mirrorApp)
 app.route('/api/inkwell', inkwellApp)
 app.route('/api/torivers', toriversAddonApp)
 app.route('/api/addons/sos', sosApp)
-app.route('/api/addons/mirror', mirrorApp)
 app.route('/api/addons/inkwell', inkwellApp)
 app.route('/api/addons/torivers', toriversAddonApp)
+
+// Keep Mirror unmounted until principal access is defined. Stop these retired
+// namespaces before addon auth and the dashboard catch-all can handle them.
+for (const prefix of ['/api/mirror', '/api/addons/mirror']) {
+  app.all(prefix, (c) => c.notFound())
+  app.all(`${prefix}/*`, (c) => c.notFound())
+}
 
 // Native addon catalog and lifecycle commands. Before the dashboard catch-all.
 app.route('/api/addons', addonsApp)
