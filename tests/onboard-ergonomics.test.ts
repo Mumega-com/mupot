@@ -164,19 +164,38 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
       expect((await taskRow((none as { result: { task: { id: string } } }).result.task.id)).gate_owner).toBeNull()
     })
 
-    it('gate_owner at create is REFUSED when the creator is the assignee (agent and member forms)', async () => {
+    it('gate_owner at create: creator=assignee naming ITS OWN lane is refused at every Security Bar level (agent and member forms)', async () => {
+      await run(
+        `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-a', 'gate:hadi', 'agent', ?1, 'x', '2026-10-01T00:00:00.000Z')`,
+        AGENT_A,
+      )
       const selfAgent = await create(agentAuth(), { gate_owner: 'hadi', assignee_agent_id: AGENT_A })
       expect(selfAgent.ok).toBe(false)
       if (!selfAgent.ok) expect(selfAgent.error).toBe('gate_owner_creator_is_assignee')
 
-      // member-assignee form: a human creator assigning the task to themselves
+      // member-assignee form: a human creator assigning the task to themselves, naming a lane they hold
       await run(
         `INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES (?1, 'squad', ?2, 'member')`,
         MEM_ADMIN, SQUAD_CORE,
       )
-      const selfMember = await create(humanAuth(), { squad_id: 'squad-core', gate_owner: 'hadi', assignee_member_id: MEM_ADMIN })
+      await run(
+        `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-m', 'gate:mine', 'member', ?1, 'x', '2026-10-01T00:00:00.000Z')`,
+        MEM_ADMIN,
+      )
+      const selfMember = await create(humanAuth(), { squad_id: 'squad-core', gate_owner: 'mine', assignee_member_id: MEM_ADMIN })
       expect(selfMember.ok).toBe(false)
       if (!selfMember.ok) expect(selfMember.error).toBe('gate_owner_creator_is_assignee')
+    })
+
+    it('gate_owner at create: creator=assignee naming a lane someone ELSE holds is allowed only at onboarding (Security Bar) and refused by default', async () => {
+      expect(await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })).toMatchObject({ ok: false, error: 'gate_owner_creator_is_assignee' })
+      await run(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?1, 'onboarding', 1, 'test')`, TENANT)
+      const relaxed = await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })
+      expect(relaxed.ok, JSON.stringify(relaxed)).toBe(true)
+      await run(`UPDATE security_bar_state SET level = 'under_attack' WHERE scope_kind = 'tenant' AND scope_id = ?1`, TENANT)
+      const strict = await create(agentAuth(), { gate_owner: 'athena', assignee_agent_id: AGENT_A })
+      expect(strict.ok).toBe(false)
+      if (!strict.ok) expect(strict.error).toBe('gate_owner_creator_is_assignee')
     })
 
     it('gate_owner form guard and reserved machine gates', async () => {

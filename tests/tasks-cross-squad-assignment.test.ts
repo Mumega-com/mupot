@@ -147,8 +147,9 @@ describe('cross-squad task assignment over HTTP', () => {
       .toEqual({ assignee_agent_id: CROSS_AGENT_ID })
   })
 
-  it('rejects an observer-only cross-squad assignment without changing the task', async () => {
+  it('rejects an observer-only cross-squad assignment without changing the task (Security Bar at under_attack: today\'s rule)', async () => {
     addCrossSquadIdentity(harness.sqlite, 'observer')
+    harness.sqlite.prepare(`INSERT INTO security_bar_state (scope_kind, scope_id, level, version, updated_by) VALUES ('tenant', ?, 'under_attack', 1, 'test')`).run(env.TENANT_SLUG)
     harness.sqlite.prepare(
       `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, github_issue_url, result, completed_at, gate_owner, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

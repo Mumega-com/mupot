@@ -99,7 +99,6 @@ import {
   assigneeCannotMutateOwnAssignment,
   assigneeChangesInReview,
   assigneeSelfClose,
-  checkTransition,
   createTask,
   emitTaskEvent,
   isDoneWhenValid,
@@ -111,7 +110,8 @@ import {
   TaskProjectError,
   TaskUpdateConflictError,
   TaskIntakeContractError,
-  assertValidIntakeContract,
+  assertIntakeWithBar,
+  checkTransitionWithBar,
   evaluateTaskIntakeContract,
   isTaskStatus,
   ALL_TASK_STATUSES,
@@ -177,7 +177,9 @@ import {
 import { routeAgentWake } from '../agents/wake-routing'
 import { authorizeExecutionScope } from '../auth/execution-scope'
 import { runRouterTick } from '../router/engine'
-import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
+import { verifyTaskEvidence } from '../tasks/evidence'
+import { actorOf, relaxes as policyRelaxes, securityBarField } from '../policy/bar'
+import { creatorHoldsLane } from '../gates/own-lane'
 import {
   leaseAgentInbox, reconcileAgentInboxLeaseAttempt, ackAgentInboxLeaseAttempt,
   ackAgentMessages, listDeadLetteredMessages, summarizeDeadLetters,
@@ -238,6 +240,7 @@ import { ARCHIVE_TOOLS } from './archive'
 import { GARDENER_TOOLS } from './gardener'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { APPROVAL_EXPIRY_TOOLS } from './approval-expiry'
+import { SECURITY_BAR_TOOLS } from './security-bar'
 import { isResubmitCapError } from '../gates/approval-expiry-rule'
 import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
 import { TASK_BRIEF_TOOLS } from './task-brief'
@@ -1314,7 +1317,7 @@ const toolTaskCreate: ToolSpec = {
     const body = bodyRaw === undefined ? '' : typeof bodyRaw === 'string' ? bodyRaw : null
     if (body === null) return fail(400, 'invalid_args', 'body must be a string')
 
-    const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
+    const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id, { auth, scopeRef: `squad:${squad.id}` })
     if (assignee.error) return fail(400, assignee.error)
     // migrations/0150 — one owner, two possible kinds. Refused by name here; the
     // DB trigger is the backstop for writers that never reach this tool.
@@ -1324,7 +1327,7 @@ const toolTaskCreate: ToolSpec = {
     ) {
       return fail(400, 'task_single_assignee', 'a task has one owner: pass assignee_agent_id or assignee_member_id, never both')
     }
-    const assigneeMember = await resolveTaskAssigneeMember(env, args.assignee_member_id, squad.id)
+    const assigneeMember = await resolveTaskAssigneeMember(env, args.assignee_member_id, squad.id, { auth, scopeRef: `squad:${squad.id}` })
     if (assigneeMember.error) return fail(400, assigneeMember.error)
 
     // PR #659 P0 fix: bounded, optional provenance carry-forward (see inputSchema comment
@@ -1369,7 +1372,11 @@ const toolTaskCreate: ToolSpec = {
         (assignee.value != null && assignee.value === auth.boundAgentId) ||
         (assigneeMember.value != null && assigneeMember.value === auth.memberId)
       if (creatorIsAssignee) {
-        return fail(403, 'gate_owner_creator_is_assignee', 'gate_owner at create is refused when you are also the assignee — a creator may not gate its own work')
+        // Security Bar (task.create.gate-owner-creator-is-assignee). FLOOR first: naming a lane the creator holds is refused at
+        // every level. Otherwise the bar decides; a relaxation is only honoured once its would_block row is written.
+        const refusal = fail(403, 'gate_owner_creator_is_assignee', 'gate_owner at create is refused when you are also the assignee — a creator may not gate its own work. Name a gate lane someone else holds, or ask your owner to relax the Security Bar.')
+        if (await creatorHoldsLane(env, auth, candidate)) return refusal
+        if (!(await policyRelaxes(env, 'task.create.gate-owner-creator-is-assignee', { actor: actorOf(auth), scopeRef: `squad:${squad.id}`, scope: { squad: squad.id } }))) return refusal
       }
       gateOwner = candidate
     }
@@ -1972,8 +1979,10 @@ const toolTaskUpdate: ToolSpec = {
         }
         reversesVerdict = true
       } else {
-        const transitionErr = checkTransition(existing.status, args.status)
-        if (transitionErr) return fail(400, 'invalid_transition', transitionErr)
+        const transitionErr = await checkTransitionWithBar(env, existing.status, args.status, {
+          actor: actorOf(auth), scopeRef: `task:${existing.id}`, reason: args.reason ?? args.note,
+        })
+        if (transitionErr) return fail(400, transitionErr.error, transitionErr)
       }
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
       // requires a gate_owner, else the task is a zombie with no legal exit
@@ -2049,12 +2058,12 @@ const toolTaskUpdate: ToolSpec = {
       const entersReview = args.status === 'review'
       const ungatedDirectDone = args.status === 'done' && existing.status !== 'approved' && existing.status !== 'rejected' && !effectiveGateOwner
       if ((entersReview || ungatedDirectDone) && existing.assignee_agent_id) {
-        const artifactCheck = verifyTaskArtifactShape(existing.result)
+        const artifactCheck = await verifyTaskEvidence(env, existing.result, { actor: actorOf(auth), scopeRef: `task:${existing.id}` })
         if (!artifactCheck.verified) {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-            detail: 'an agent-assigned task can only enter review or be marked done directly when its result states both "Artifact: <path>" and "SHA256: <64-hex>"',
+            detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (operating and under_attack require exactly this), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
           })
         }
       }
@@ -2110,7 +2119,7 @@ const toolTaskUpdate: ToolSpec = {
         }
       }
       if (args.assignee_agent_id !== undefined) {
-        const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
+        const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id, { auth, scopeRef: `task:${existing.id}` })
         if (check.error) return fail(400, check.error)
         // mupot#1494 round 3 (P2-5, adversarial round 2) — reassigning (or unassigning)
         // AWAY from the agent a dispatch is currently mid-flight to orphans that dispatch:
@@ -2132,7 +2141,7 @@ const toolTaskUpdate: ToolSpec = {
         changed = true
       }
       if (args.assignee_member_id !== undefined) {
-        const check = await resolveTaskAssigneeMember(env, args.assignee_member_id, existing.squad_id)
+        const check = await resolveTaskAssigneeMember(env, args.assignee_member_id, existing.squad_id, { auth, scopeRef: `task:${existing.id}` })
         if (check.error) return fail(400, check.error)
         next.assignee_member_id = check.value
         if (check.value !== null) next.assignee_agent_id = null
@@ -2270,7 +2279,7 @@ const toolTaskUpdate: ToolSpec = {
     // If priority is explicitly modified to P0/P1, validate intake contract requirements
     if (args.priority !== undefined && (next.priority === 'P0' || next.priority === 'P1')) {
       try {
-        assertValidIntakeContract(next, { allowDeferredPredicate: true })
+        await assertIntakeWithBar(env, next, { allowDeferredPredicate: true }, actorOf(auth))
       } catch (error) {
         if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
         throw error
@@ -3548,12 +3557,12 @@ const toolTaskSubmitResult: ToolSpec = {
     // that module's own header), applied to the INCOMING result: this tool IS
     // the write path for it, so there is nothing already on the row to fall
     // back to checking.
-    const artifactCheck = verifyTaskArtifactShape(resultText)
+    const artifactCheck = await verifyTaskEvidence(env, resultText, { actor: actorOf(auth), scopeRef: `task:${existing.id}` })
     if (!artifactCheck.verified) {
       return fail(409, 'artifact_verification_failed', {
         reason: artifactCheck.reason,
         ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
-        detail: 'a completion result must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done',
+        detail: 'a completion result must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>", or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference — prose describing intended work is not evidence of work done',
       })
     }
 
@@ -7493,6 +7502,7 @@ const toolBootContext: ToolSpec = {
       // Emitted ONCE, top level (the receipt exists only with SEAT_AUTO_ENROLL; detection has its own flag).
       ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
       ...(repoProject ? { repo_project: repoProject } : {}),
+      ...(await securityBarField(env)),
     })
   },
 }
@@ -7576,7 +7586,7 @@ const toolOrient: ToolSpec = {
       { recordInduction: !ctx.sideEffectFree && !ctx.heldSeat },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
-    return done({ packet: data, brief: renderBrief(data), ...(ctx.sideEffectFree ? {} : await joinNextStepsField(env, auth)), ...(ctx.sideEffectFree ? {} : await squadChoiceField(env, auth)), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
+    return done({ packet: data, brief: renderBrief(data), ...(await securityBarField(env)), ...(ctx.sideEffectFree ? {} : await joinNextStepsField(env, auth)), ...(ctx.sideEffectFree ? {} : await squadChoiceField(env, auth)), ...(ctx.sideEffectFree ? {} : { whoami: await whoamiFor(env, auth, ctx.origin) }) })
   },
 }
 
@@ -7905,6 +7915,7 @@ export const TOOLS: ToolSpec[] = [
   ...GARDENER_TOOLS,
   ...INCIDENT_REVERT_TOOLS,
   ...APPROVAL_EXPIRY_TOOLS,
+  ...SECURITY_BAR_TOOLS,
   ...EXECUTION_PAUSE_TOOLS,
   ...TASK_BRIEF_TOOLS,
   toolAgentLifecycle,

@@ -29,7 +29,7 @@ import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent , TokenUsage }
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose, CLEAR_REJECTED_RESULT_SQL } from '../tasks/service'
-import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
+import { verifyTaskEvidence } from '../tasks/evidence'
 import {
   EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR, EXECUTION_RETRY_CEILING,
   executionPausedSql, retryCeilingReachedSql, taskHeldSql,
@@ -413,12 +413,12 @@ async function runTaskExecutionAttempt(
     // for exactly what is and is not checked, and why (shape only — a CF
     // Worker has no access to a caller's real files, node:fs is banned in
     // src/ regardless, and this Door runs in that same environment).
-    const artifactCheck = verifyTaskArtifactShape(result)
+    const artifactCheck = await verifyTaskEvidence(env, result, { actor: `agent:${agent.id}`, scopeRef: `task:${task.id}` })
     if (!artifactCheck.verified) {
       const note = capResult(
         `artifact_verification_failed: ${artifactCheck.reason}` +
         (artifactCheck.path ? ` (path: ${artifactCheck.path})` : '') +
-        '. A completion must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done.',
+        '. A completion must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>" (required at the strictest level), or a repository/PR URL with a full commit id, or a "Snapshot: <label>" with content — prose describing intended work is not evidence of work done.',
       )
       if (!(await finishTask(env, task.id, agent.id, executionReceiptId, 'blocked', note, finishedAt, recordedCostMicroUsd))) {
         return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }

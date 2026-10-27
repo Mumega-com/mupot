@@ -4616,9 +4616,33 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdicts_no_update_0262" },
     ],
   },
+  {
+    file: "0263_security_bar.sql",
+    sha256: "f1ff462cd3962176429d7149ba0fe576815834bf5a8e488b8ea5f163d924063e",
+    statements: [
+      "-- 0263 — the Security Bar (Hadi, 2026-10-26: \"move the restriction settings to a security bar\n-- that can have onboarding, operating, under attack\").\n--\n-- Numbering: rebased above origin/main's migration chain; 0263 is reserved for this change.\n-- Renumber on rebase if the migration-numbering guard reports a later applied head.\n--\n-- THREE TABLES, ONE CONCERN\n--   security_bar_state          the level per scope (only the tenant row is writable in this PR).\n--                               A missing row is NOT a level: the reader maps it to 'operating'\n--                               (all rules strict, exactly today's behaviour). Only explicit\n--                               onboarding opts in to friction relaxations. A malformed row or failed read maps to\n--                               'under_attack' (src/policy/bar.ts).\n--   policy_events               append-only audit: would_block records (a relaxed check that\n--                               would have refused), level changes, lowering requests. NO bodies,\n--                               NO secrets: ids and a short enum-ish detail only.\n--   security_bar_lower_requests a LOWERING of the level is a two-step act (request, then confirm\n--                               by a second owner, or by the same owner after a delay). Raising\n--                               is never gated. At most one pending request at a time.\n\nCREATE TABLE IF NOT EXISTS security_bar_state (\n  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('tenant', 'department', 'squad', 'project', 'agent')),\n  scope_id   TEXT NOT NULL CHECK (length(scope_id) BETWEEN 1 AND 200),\n  level      TEXT NOT NULL CHECK (level IN ('onboarding', 'operating', 'under_attack')),\n  version    INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),\n  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  updated_by TEXT NOT NULL CHECK (length(updated_by) BETWEEN 1 AND 200),\n  PRIMARY KEY (scope_kind, scope_id)\n);",
+      "\n\nCREATE TABLE IF NOT EXISTS policy_events (\n  seq     INTEGER PRIMARY KEY AUTOINCREMENT,\n  id      TEXT NOT NULL UNIQUE,\n  ts      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  kind    TEXT NOT NULL CHECK (kind IN (\n            'would_block', 'relaxed_applied',\n            'level_change', 'lower_requested', 'lower_confirmed', 'lower_cancelled', 'lower_refused'\n          )),\n  rule_id TEXT CHECK (rule_id IS NULL OR length(rule_id) BETWEEN 1 AND 120),\n  level   TEXT CHECK (level IS NULL OR level IN ('onboarding', 'operating', 'under_attack')),\n  actor   TEXT NOT NULL CHECK (length(actor) BETWEEN 1 AND 200),\n  scope   TEXT NOT NULL CHECK (length(scope) BETWEEN 1 AND 200),\n  detail  TEXT CHECK (detail IS NULL OR length(detail) <= 200)\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_policy_events_rule ON policy_events (rule_id, ts);",
+      "\nCREATE INDEX IF NOT EXISTS idx_policy_events_kind ON policy_events (kind, ts);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS policy_events_no_update BEFORE UPDATE ON policy_events\nBEGIN SELECT RAISE(ABORT, 'policy_events is append-only'); END;",
+      "\nCREATE TRIGGER IF NOT EXISTS policy_events_no_delete BEFORE DELETE ON policy_events\nBEGIN SELECT RAISE(ABORT, 'policy_events is append-only'); END;",
+      "\n\nCREATE TABLE IF NOT EXISTS security_bar_lower_requests (\n  id              TEXT PRIMARY KEY,\n  from_level      TEXT NOT NULL CHECK (from_level IN ('onboarding', 'operating', 'under_attack')),\n  target_level    TEXT NOT NULL CHECK (target_level IN ('onboarding', 'operating', 'under_attack')),\n  requested_by    TEXT NOT NULL,\n  requested_at    TEXT NOT NULL,\n  effective_after TEXT NOT NULL,\n  needs_second_owner INTEGER NOT NULL CHECK (needs_second_owner IN (0, 1)),\n  status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'cancelled')),\n  resolved_by     TEXT,\n  resolved_at     TEXT\n);",
+      "\nCREATE UNIQUE INDEX IF NOT EXISTS idx_security_bar_one_pending\n  ON security_bar_lower_requests (status) WHERE status = 'pending';",
+    ],
+    objects: [
+      { type: "table", name: "security_bar_state" },
+      { type: "table", name: "policy_events" },
+      { type: "index", name: "idx_policy_events_rule" },
+      { type: "index", name: "idx_policy_events_kind" },
+      { type: "trigger", name: "policy_events_no_update" },
+      { type: "trigger", name: "policy_events_no_delete" },
+      { type: "table", name: "security_bar_lower_requests" },
+      { type: "index", name: "idx_security_bar_one_pending" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "4fe69817d0ac321f9372ea5027f1791a58a13c0b5d66d381a070adf6c57e22b0"
+export const SCHEMA_CHAIN_DIGEST: string = "bacd409b0b66e80a1438051c66dfd708351ae79a2738a94cb4e512b3a86af8cf"
