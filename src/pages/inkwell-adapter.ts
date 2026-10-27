@@ -6,6 +6,7 @@
 
 import type { Env } from '../types'
 import {
+  getProjectWikiGraph,
   getProjectWikiTopic,
   upsertProjectWikiTopic,
   WikiClientError,
@@ -17,6 +18,7 @@ import {
   isPageTier,
   PagesPortError,
   type PageEnvelope,
+  type PageBacklink,
   type PageLink,
   type PagePutInput,
   type PagePutResult,
@@ -44,6 +46,38 @@ export function decodeEnvelope(tags: string[], purpose: string): PageEnvelope | 
   return { owner, writer, tier, purpose, version, writtenAt: at }
 }
 
+const MAX_BACKLINKS = 100
+
+/** Fail-closed squad check on the raw stamp: a half-stamped topic still carrying `tier:squad` counts as squad. */
+export function isSquadTierTags(tags: unknown): boolean {
+  return Array.isArray(tags) && tags.includes('tier:squad')
+}
+
+/**
+ * Drop squad-tier topics (and every edge touching one) from an Inkwell wiki graph for a caller without squad
+ * access to the project. Used by EVERY surface that renders the raw graph (project_wiki, the dashboard wiki
+ * tab, task_brief), so a squad page cannot leak through the graph. Shape-tolerant: anything it cannot read as
+ * a squad node is left alone (a foreign page is project-visible), but a squad stamp always wins.
+ */
+export function filterWikiGraphForCaller<G extends { nodes: unknown; edges: unknown }>(graph: G, canSeeSquadPages: boolean): G {
+  if (canSeeSquadPages || !Array.isArray(graph.nodes)) return graph
+  const hidden = new Set<string>()
+  const nodes = graph.nodes.filter((n: unknown) => {
+    const rec = typeof n === 'object' && n !== null ? (n as { slug?: unknown; tags?: unknown }) : null // shape-probed below
+    if (rec && isSquadTierTags(rec.tags)) {
+      if (typeof rec.slug === 'string') hidden.add(rec.slug)
+      return false
+    }
+    return true
+  })
+  const edges = Array.isArray(graph.edges)
+    ? graph.edges.filter((e: unknown) => {
+        const rec = typeof e === 'object' && e !== null ? (e as { from_slug?: unknown; to_slug?: unknown }) : null // shape-probed below
+        return !(rec && ((typeof rec.from_slug === 'string' && hidden.has(rec.from_slug)) || (typeof rec.to_slug === 'string' && hidden.has(rec.to_slug))))
+      })
+    : graph.edges
+  return { ...graph, nodes, edges }
+}
 const EDGE_REFUSALS = new Set(['edge_target_invalid', 'cross_project_edge_refused', 'edge_target_unpublished'])
 
 function mapError(e: unknown): never {
@@ -76,6 +110,9 @@ function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: str
 export function createInkwellPagesPort(env: Env, fetchImpl?: typeof fetch): PagesPort {
   return {
     id: 'inkwell-wiki',
+    // The Inkwell service PUT keeps description <= 500 chars and writes no content_blocks, so a body has no
+    // home yet (inkwell-api PR2). Flip to true when it stores bodies; until then put() refuses a non-empty body.
+    supportsBody: false,
     async get(projectId, slug) {
       try {
         const found = await getProjectWikiTopic(env, projectId, slug, fetchImpl)
@@ -85,6 +122,8 @@ export function createInkwellPagesPort(env: Env, fetchImpl?: typeof fetch): Page
       }
     },
     async put(projectId, input: PagePutInput): Promise<PagePutResult> {
+      // Typed refusal BEFORE any I/O: dropping a body silently would be data loss the caller cannot see.
+      if (input.body !== undefined && input.body !== '') throw new PagesPortError('unsupported', 'body_unsupported')
       try {
         const res = await upsertProjectWikiTopic(
           env,
@@ -100,6 +139,28 @@ export function createInkwellPagesPort(env: Env, fetchImpl?: typeof fetch): Page
           fetchImpl,
         )
         return { slug: input.slug, created: res.created, linksWritten: res.edges_upserted }
+      } catch (e) {
+        return mapError(e)
+      }
+    },
+    async listBacklinks(projectId, slug): Promise<PageBacklink[]> {
+      try {
+        const graph = await getProjectWikiGraph(env, projectId, fetchImpl)
+        const nodes = new Map(graph.nodes.filter((n) => n.published !== false).map((n) => [n.slug, n]))
+        const out: PageBacklink[] = []
+        for (const edge of graph.edges) {
+          if (edge.to_slug !== slug || edge.from_slug === slug) continue
+          const from = nodes.get(edge.from_slug)
+          if (!from) continue
+          const tags = Array.isArray(from.tags) ? from.tags.filter((t): t is string => typeof t === 'string') : []
+          out.push({
+            slug: from.slug,
+            title: from.title,
+            ...(edge.relation_type ? { relation: edge.relation_type } : {}),
+            tier: isSquadTierTags(tags) ? 'squad' : (decodeEnvelope(tags, from.topic_type)?.tier ?? null),
+          })
+        }
+        return out.sort((a, b) => a.slug.localeCompare(b.slug)).slice(0, MAX_BACKLINKS)
       } catch (e) {
         return mapError(e)
       }

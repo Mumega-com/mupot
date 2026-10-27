@@ -8128,6 +8128,8 @@ function profileToolList(): Record<string, unknown>[] {
   return out
 }
 
+const PAGE_TOOLS_DETAIL_AS_RESULT: ReadonlySet<string> = new Set(['project_wiki_upsert', 'project_wiki_get'])
+
 function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
   return {
     content: [{ type: 'text', text: JSON.stringify({ ok: true, tool, result }) }],
@@ -8793,6 +8795,15 @@ async function handleJsonRpc(
     // 2025-11-25 (SEP-1303): input validation errors are Tool Execution Errors so the model can self-correct. Only
     // for a session that negotiated that version through the URL-elicitation path (flag on); everything else keeps -32602.
     if (outcome.error === 'invalid_args' && urlElicitOn && c.req.header('mcp-protocol-version') === URL_ELICITATION_PROTOCOL_VERSION) {
+      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
+    }
+    // Page-tool validator refusals (project_wiki_upsert / project_wiki_get) carry a teaching string such as
+    // "purpose required: kebab, 3-32 chars". As a -32602 it rode only in error.data, which connector harnesses do
+    // not show (they surface `message`, the bare "invalid_args"). So for THESE tools, when the detail is a string,
+    // answer as an execution error (the model reads the result text and can self-correct), like the SEP-1303 path.
+    // Narrow on purpose: other tools' tests pin -32602 + message 'invalid_args'. Detail strings here are static
+    // validator text (lengths and limits), never request echoes or secrets.
+    if (outcome.error === 'invalid_args' && typeof outcome.detail === 'string' && PAGE_TOOLS_DETAIL_AS_RESULT.has(String(outcome.tool))) {
       return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {

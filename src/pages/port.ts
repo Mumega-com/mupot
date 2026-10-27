@@ -5,10 +5,11 @@
 // (src/mcp/pages.ts) over src/pages/service.ts. A future adapter (merged Inkwell store, gbrain,
 // mem0, hosted pages) implements PagesPort and changes nothing above it.
 //
-// v1 is SUMMARY-ONLY: title + short summary + tags + links + the stamped envelope. A long markdown
-// body has no home in the default adapter's store (Inkwell service PUT keeps description <= 500
-// characters and never writes content_blocks), so the port deliberately has no `body`; long text
-// stays in project memory until an adapter can store it.
+// v2 adds an OPTIONAL markdown `body` (bounded by MAX_BODY_BYTES; refused over the cap, never truncated)
+// and listBacklinks. A body is a capability of the adapter (`supportsBody`): an adapter whose store cannot
+// hold one (the Inkwell wiki store until inkwell-api stores bodies) refuses a non-empty body with the typed
+// `body_unsupported` failure instead of silently dropping it. mupot keeps ALL access control (project read/
+// write, squad-tier visibility, in src/pages/service.ts); an adapter stores and returns text only.
 
 export const PAGE_TIERS = ['project', 'squad'] as const
 export type PageTier = (typeof PAGE_TIERS)[number]
@@ -37,6 +38,8 @@ export interface PageRecord {
   slug: string
   title: string
   summary: string
+  /** Markdown body (v2). undefined = the page has none or this adapter cannot store one. */
+  body?: string
   /** Caller tags only (envelope stamps are NOT mixed in). */
   tags: string[]
   links: PageLink[]
@@ -48,9 +51,19 @@ export interface PagePutInput {
   slug: string
   title: string
   summary: string
+  /** Markdown body. undefined = leave the stored body unchanged; a string (incl. '') replaces it. */
+  body?: string
   tags: string[]
   links: PageLink[]
   envelope: PageEnvelope
+}
+
+/** A page that links TO the requested slug. `tier` is null for a page this port did not stamp. */
+export interface PageBacklink {
+  slug: string
+  title: string
+  relation?: string
+  tier: PageTier | null
 }
 
 export interface PagePutResult {
@@ -59,7 +72,7 @@ export interface PagePutResult {
   linksWritten: number
 }
 
-export type PagesFailureKind = 'unavailable' | 'rejected' | 'conflict'
+export type PagesFailureKind = 'unavailable' | 'rejected' | 'conflict' | 'unsupported'
 
 /** The one error shape an adapter throws. `code` is a short safe enum, never an upstream body. */
 export class PagesPortError extends Error {
@@ -75,6 +88,8 @@ export class PagesPortError extends Error {
 export interface PagesPort {
   /** Adapter id, e.g. 'inkwell-wiki'. */
   readonly id: string
+  /** true when put() can store `body`. false = put() throws PagesPortError('unsupported', 'body_unsupported') for a non-empty body. */
+  readonly supportsBody: boolean
   /** null exactly when the page does not exist (or is not visible to the service path). */
   get(projectId: string, slug: string): Promise<PageRecord | null>
   /**
@@ -89,6 +104,11 @@ export interface PagesPort {
    *    (the service enforces the latter from the envelope returned by get).
    */
   put(projectId: string, input: PagePutInput): Promise<PagePutResult>
+  /**
+   * Pages in the project that link to `slug`, any tier. Raw: the adapter does NOT filter by caller (it has no
+   * notion of one); the service drops squad-tier sources the caller may not see.
+   */
+  listBacklinks(projectId: string, slug: string): Promise<PageBacklink[]>
 }
 
 // ── validation (pure; the service calls these BEFORE any I/O) ───────────────────────────────────
@@ -104,6 +124,8 @@ export const MAX_SUMMARY = 500
 export const MAX_USER_TAGS = 7
 export const MAX_TAG_LEN = 40
 export const MAX_LINKS = 20
+/** Markdown body cap in UTF-8 BYTES. Over the cap is refused, never truncated. */
+export const MAX_BODY_BYTES = 64 * 1024
 /** Tag prefixes the adapter uses to stamp the envelope; a caller tag with one is refused (forgery). */
 export const ENVELOPE_TAG_PREFIXES: readonly string[] = ['owner:', 'tier:', 'v:', 'by:', 'at:']
 

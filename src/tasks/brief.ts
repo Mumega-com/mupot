@@ -34,6 +34,7 @@ import { redactSecretPatterns } from '../lib/redact'
 import { sanitizeInline } from '../lib/prompt-safety'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import { SEED_RISK_CLASSES } from '../seeds/contract'
+import { filterWikiGraphForCaller } from '../pages/inkwell-adapter'
 import { getProjectWikiGraph } from '../projects/wiki-client'
 import { PAGE_SLUG_RE } from '../pages/port'
 import { priorityOrderSql } from './ranking'
@@ -330,6 +331,8 @@ export interface TaskBriefInput {
    * legs are omitted rather than reached through this tool.
    */
   flooredSeat?: boolean
+  /** Caller holds squad access to the project (callerHasSquadAccessToProject). Absent = false: squad-tier wiki pages are left out. */
+  canSeeSquadPages?: boolean
 }
 
 export interface TaskBriefDeps {
@@ -514,6 +517,7 @@ export async function buildTaskBrief(env: Env, input: TaskBriefInput, deps: Task
   // The wiki leg only runs when readableProject passed (project !== null): that is what satisfies the 'mupot:project' key.
   const wikiPromise = project
     ? withTimeout((deps.wiki ?? getProjectWikiGraph)(env, project.id), WIKI_TIMEOUT_MS)
+        .then((g) => safelySync(() => (isRec(g) ? filterWikiGraphForCaller({ ...g, nodes: g.nodes, edges: g.edges }, input.canSeeSquadPages === true) : g)))
     : Promise.resolve(null)
 
   const [parent, siblings, verdicts, rejected, runtimeFails, dispatchFails, seedRow, hits, recent, wiki] =

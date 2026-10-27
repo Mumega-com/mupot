@@ -653,6 +653,18 @@ describe('task_brief: wiki leg', () => {
     expect(out.sources).not.toContain('wiki:lunch')
     expect(out.brief).toContain('wiki -> project_wiki_get')
   })
+  it('squad-tier wiki topics are left out unless the caller holds squad access to the project (fail closed by default)', async () => {
+    const squadWiki: WikiGraph = {
+      ...wiki,
+      nodes: [...wiki.nodes, { id: 'w5', tenant_id: 't', project: P1, slug: 'squad-receipts-plan', title: 'Squad receipts plan', description: 'dispatch receipts retry ceiling secret plan', topic_type: 'decision', required_keys: ['mupot:project'], tags: ['owner:a', 'tier:squad', 'v:1', 'by:a', 'at:2026-10-26T00:00:00.000Z'], published: true, created_at: 1, updated_at: 1 }],
+    }
+    const hidden = await buildTaskBrief(strict.env, await baseInput(), { wiki: async () => squadWiki })
+    expect(hidden.sources).toContain('wiki:receipt-hashing')
+    expect(hidden.sources).not.toContain('wiki:squad-receipts-plan')
+    expect(hidden.brief).not.toContain('Squad receipts plan')
+    const shown = await buildTaskBrief(strict.env, { ...(await baseInput()), canSeeSquadPages: true }, { wiki: async () => squadWiki })
+    expect(shown.sources).toContain('wiki:squad-receipts-plan')
+  })
   it('a wiki that errors is an empty leg, not a failure', async () => {
     const out = await buildTaskBrief(strict.env, await baseInput(), { wiki: async () => { throw new Error('upstream 500') } })
     expect(out.sections).toContain('task')

@@ -137,6 +137,21 @@ export async function anySquadHasProjectWrite(
 }
 
 /**
+ * "Is this caller a member of a squad that has access to the project" (any level), or a workspace admin.
+ * Built on projectVisibilityClause with org-observer and department paths switched OFF, so squad-tier
+ * wiki pages (src/pages/service.ts) are NOT visible to a caller whose only reach is org-wide observer
+ * or a department grant. Absence of a project_squad_access row is denial.
+ */
+export async function callerHasSquadAccessToProject(env: Env, access: ProjectReadAccess, projectId: string): Promise<boolean> {
+  if (access.workspaceAdmin) return true
+  if (access.squadIds.length === 0) return false
+  const visibility = projectVisibilityClause({ workspaceAdmin: false, orgRead: false, squadIds: access.squadIds, departmentIds: [] })
+  const row = await env.DB.prepare(`SELECT 1 AS ok FROM projects p WHERE p.id = ? AND ${visibility.sql}`)
+    .bind(projectId, ...visibility.binds).first<{ ok: number }>()
+  return row !== null
+}
+
+/**
  * Of `projectIds`, the ones the viewer may read (workspace admin / org observer: all that exist).
  * One D1 query, built on the same projectVisibilityClause the project readers use.
  */
