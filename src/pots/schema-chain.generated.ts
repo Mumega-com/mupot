@@ -4640,9 +4640,33 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_security_bar_one_pending" },
     ],
   },
+  {
+    file: "0264_recent_changes_keysets.sql",
+    sha256: "94ba3557272ad58e7afcc336a036002a4adcc5adb90ad5b7cf8b837fcefedc15",
+    statements: [
+      "-- Ordered source ranges for /changes. Equality prefixes preserve the existing\n-- tenant/actor scopes; (timestamp,id) supports both directions without OFFSET.\nCREATE INDEX idx_archive_receipts_changes ON archive_receipts(tenant, created_at DESC, id DESC);",
+      "\nCREATE INDEX idx_archive_receipts_actor_changes ON archive_receipts(tenant, actor_member_id, created_at DESC, id DESC);",
+      "\nCREATE INDEX idx_task_verdicts_changes ON task_verdicts(decided_at DESC, id DESC);",
+      "\nCREATE INDEX idx_task_verdicts_actor_changes ON task_verdicts(decided_by, decided_at DESC, id DESC);",
+      "\nCREATE INDEX idx_verdict_reversals_changes ON verdict_reversals(tenant, created_at DESC, id DESC);",
+      "\nCREATE INDEX idx_verdict_reversals_actor_changes ON verdict_reversals(tenant, actor_id, created_at DESC, id DESC);",
+      "\nCREATE INDEX idx_agent_audit_changes ON agent_audit(created_at DESC, id DESC);",
+      "\nCREATE INDEX idx_agent_audit_actor_changes ON agent_audit(actor_id, created_at DESC, id DESC);",
+    ],
+    objects: [
+      { type: "index", name: "idx_archive_receipts_changes" },
+      { type: "index", name: "idx_archive_receipts_actor_changes" },
+      { type: "index", name: "idx_task_verdicts_changes" },
+      { type: "index", name: "idx_task_verdicts_actor_changes" },
+      { type: "index", name: "idx_verdict_reversals_changes" },
+      { type: "index", name: "idx_verdict_reversals_actor_changes" },
+      { type: "index", name: "idx_agent_audit_changes" },
+      { type: "index", name: "idx_agent_audit_actor_changes" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "bacd409b0b66e80a1438051c66dfd708351ae79a2738a94cb4e512b3a86af8cf"
+export const SCHEMA_CHAIN_DIGEST: string = "ae485655112bf4b795f97aa4e8b7a0f212715127fc764c84460d937be14fcd32"
