@@ -1,23 +1,14 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createAgent, findAgentsByName, getAgentProfile } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // Port 1.3 agent profile (0068_agent_profile.sql). Real SQLite, ALL migrations
 // applied in order (incl. 0068) — so this exercises the actual production write/read
 // path, not a JS-reimplemented mock. This is the anti-pattern guard from
 // feedback_test_real_production_path_not_isolation: prove the columns exist, the
 // INSERT binds them, and resolve reads them back across squads.
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql'))
-    .sort()
-}
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
@@ -37,9 +28,7 @@ describe('Port 1.3 agent profile (0068) — real SQL', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     seed(harness.sqlite)
     env = { DB: harness.db } as unknown as Env
   })

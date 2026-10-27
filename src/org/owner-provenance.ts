@@ -15,4 +15,3 @@ export async function independentlyAssignedOwner(env: Env, agentId: string, memb
       AND json_extract(audit.after_state, '$._owner_assignment_org_admin') = 1`)
     .bind(agentId, memberId).first<{ id: string }>()
 }
-
