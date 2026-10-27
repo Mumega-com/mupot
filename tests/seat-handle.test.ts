@@ -1097,11 +1097,19 @@ describe('seat handle as a tool argument', () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     const a = await select(env, g, '/work/a')
-    for (const bad of [mintSeatHandle(), 'mseat_short', a.handle.slice(0, -2) + 'AA']) {
+    // Replacing a random suffix with 'AA' sometimes returned the original LIVE handle.
+    // Mutate a character unconditionally, and exercise a genuinely revoked DB row too.
+    const changed = a.handle.slice(0, 6) + (a.handle[6] === 'A' ? 'B' : 'A') + a.handle.slice(7)
+    const revoked = await select(env, g, '/work/revoked')
+    h.sqlite.prepare('UPDATE seat_handles SET revoked_at = ? WHERE handle_hash = ?')
+      .run('2026-10-09T00:00:00.000Z', await hashSeatHandle(revoked.handle))
+    expect(changed).not.toBe(a.handle)
+    for (const bad of [changed, 'mseat_short', revoked.handle]) {
       const viaArg = await rpc(env, g.ctx, 'boot_context', { seat: bad })
       const viaHeader = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': bad } })
       expect(viaArg.sc.bound_agent_id).toBeNull()
       expect(receiptOf(viaArg).seat_handle_rejected).toBe(true)
+      expect(viaHeader.sc.bound_agent_id).toBeNull()
       expect(receiptOf(viaHeader).seat_handle_rejected).toBe(true)
     }
     // an UNPREFIXED value is a cosmetic label, not a carrier (same split as the header)

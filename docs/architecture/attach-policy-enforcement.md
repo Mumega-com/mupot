@@ -45,9 +45,20 @@ harness-attested origin path, the office approval tool) write through that one b
 Exemptions are explicit values on the write input, never a default:
 
 - `admin_supervisory`: an org owner or admin who is only *affiliated* with the assignee (the existing
-  supervisory path). It never waives a direct party.
+  supervisory path). It never waives a direct party or an affiliation where the decider owns any party agent.
+- `owner_self`: a member who owns every party agent they are affiliated with and is bound to none
+  of them may decide with two current, independent passing review lenses. This also permits an owner
+  who minted the assignee's key on MCP and Telegram; Telegram still refuses non-owner key minters.
 - `owner_override`: the org owner's explicit `override_self_verdict: true`, recorded in the verdict note.
 - the `gate:agent-self-completion` lane exempts only the agent that produced the task's current result, and only while that agent is also the task's current assignee. "Produced" is read from the append-only `task_result_submissions` ledger: the execute landing and `task_submit_result` each write a row (carrying the exact submitted `result_text`) in the same batch as the move to review, and the producer is the submitter of the latest row for this tenant whose `result_text` equals the task's current result (a result replaced by any other writer, such as the CI sync, no longer matches). A submission that an unreversed rejection came after is spent: the same text written back by another path does not revive it, and only a fresh submission does. Producer, assignee, the lane itself and a present result are all re-read inside the write's `WHERE`, so a reassignment or re-gate after the check cannot land it. The assignee alone is not authority, because it can be changed outside review. With no ledger row, or a legacy row without `result_text`, the exemption does not apply and the decider is judged like on any other lane. Any other decider on that lane (including an org owner or admin who is a direct party) is judged like every other lane and needs `owner_override`; that override still requires the task to be on the lane at write time.
+
+An org admin who both owns a party agent and is bound to it is intentionally refused even with
+valid lenses: the binding excludes `owner_self`, and ownership excludes `admin_supervisory`.
+The only remaining exception is the explicit `owner_override`, which requires the legacy
+`auth.role === 'owner'`; an org admin or owner capability grant alone does not enable it.
+MCP member authentication sets `auth.role` to `member`, so that override is unavailable to
+those callers even with `override_self_verdict: true`. Use an independent decider; this restriction
+is intentional and does not call for widening MCP authority.
 
 A task sent back from `rejected` to `in_progress` (by an update, an execute claim or a runtime consume) has its rejected result cleared, so it can re-enter review only through a fresh submission by whoever does the rework. A verdict reversal restores the same work to review and cannot change the assignee in the same call.
 

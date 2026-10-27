@@ -370,9 +370,8 @@ describe('through the real webhook route', () => {
     return [...new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)))].map((b) => b.toString(16).padStart(2, '0')).join('')
   }
   /** Deliver through the real route with an ExecutionContext; waits for waitUntil work unless `settle` is false. */
-  async function deliver(env: Env, event: string, payload: unknown, delivery: string, settle = true): Promise<Response> {
+  async function deliver(env: Env, event: string, payload: unknown, delivery: string, settle = true, pending: Promise<unknown>[] = []): Promise<Response> {
     const body = JSON.stringify(payload)
-    const pending: Promise<unknown>[] = []
     const ctx = { waitUntil: (p: Promise<unknown>) => void pending.push(p), passThroughOnException: () => {} } as unknown as ExecutionContext
     const res = await githubInboundApp.fetch(
       new Request('https://pot.test/', {
@@ -417,22 +416,32 @@ describe('through the real webhook route', () => {
     const baseline = await (await deliver(makeEnv({ PROJECT_OFFICE: undefined }), 'issues', issue, 'deliv-base')).json()
     expect(baseline).toEqual({ ok: true, synced: false, action: 'closed' })
 
-    let rpcStarted = false
+    let startRpc!: () => void
+    const rpcStarted = new Promise<void>((resolve) => { startRpc = resolve })
+    let releaseRpc!: (value: { ok: true; outcome: 'duplicate' }) => void
+    const rpcResult = new Promise<{ ok: true; outcome: 'duplicate' }>((resolve) => { releaseRpc = resolve })
     const hung = {
       idFromName: (name: string) => ({ name }),
-      get: () => ({ notice: () => { rpcStarted = true; return new Promise(() => {}) } }),
+      get: () => ({ notice: () => { startRpc(); return rpcResult } }),
     } as unknown as DurableObjectNamespace
     const env = makeEnv({ PROJECT_OFFICE_DO: hung })
-    const started = Date.now()
-    const res = await Promise.race([
-      deliver(env, 'issues', issue, 'deliv-hung', false),
-      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 3000)),
-    ])
-    expect(res).not.toBe('timeout')
-    expect(Date.now() - started).toBeLessThan(3000)
-    expect(await (res as Response).json()).toEqual(baseline) // same answer as with the office off
-    await new Promise((r) => setTimeout(r, 50))
-    expect(rpcStarted).toBe(true) // the intake did start; the response just did not wait for it
+    const pending: Promise<unknown>[] = []
+    let answered = false
+    const response = deliver(env, 'issues', issue, 'deliv-hung', false, pending).then((res) => {
+      answered = true
+      return res
+    })
+    try {
+      // Wait for both observable events with the office result still under our control.
+      // An accidental await of intake in the route makes this test hit Vitest's timeout.
+      const [res] = await Promise.all([response, rpcStarted])
+      expect(answered).toBe(true)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual(baseline)
+    } finally {
+      releaseRpc({ ok: true, outcome: 'duplicate' })
+      await Promise.all(pending)
+    }
   })
 
   it('with the flag off the same delivery changes nothing in any office', async () => {
