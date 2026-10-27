@@ -622,7 +622,14 @@ describe('sudo for attached chats: it ends with the attachment, and with its clo
   it('re-attaching later is a NEW attachment (new credential, new session): the old grant is not inherited', async () => {
     const w = await world()
     await sudo(w)
+    const oldAdmissionId = admId()
     await detachAttachment(w.env, { attachmentId: attId(), humanMemberId: HUMAN })
+    // Detach revokes this chat's approval; the human must approve the new request before it can re-attach.
+    const pending = await attach(w.env, w.g, 'conv-a', 'rava')
+    expect(pending.sc.status).toBe('pending_admission')
+    expect(pending.sc.admission_id).not.toBe(oldAdmissionId)
+    const approved = await decideMoment(w.env, String(pending.sc.approve_url), w.key, 'approve')
+    expect(approved.status, JSON.stringify(approved.body)).toBe(200)
     expect((await attach(w.env, w.g, 'conv-a', 'rava')).sc.status).toBe('attached')
     const again = await w.att()
     expect(again.seatBinding?.attached?.agentId).toBe('agent-rava')

@@ -197,24 +197,28 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
         }),
     }))}`
 
-  const observed = await listObservedSeats(env, memberId)
-  const observedBlock = !vipLaneEnabled(env)
+  const vipOn = vipLaneEnabled(env)
+  const observedAll = await listObservedSeats(env, memberId)
+  // Flag on: the full panel (always). Flag off: the floor is not enforced, but a seat left observed/held by an earlier setting must stay
+  // visible and clearable, so the panel appears whenever one exists (trusted rows are then just history and stay hidden).
+  const observed = vipOn ? observedAll : observedAll.filter((o) => o.status !== 'trusted')
+  const observedBlock = !vipOn && observed.length === 0
     ? ''
     : sectionPanel({
       title: 'Observed chats',
       body: observed.length === 0
         ? emptyState({ title: 'No observed chats', detail: 'A chat that joined a squad instantly shows up here, where you can hold it or release it to trusted.' })
-        : dataTable({
+        : html`${vipOn ? '' : html`<p class="ui-sub">Limits on observed chats are switched off on this pot, so these chats are not restricted right now. You can clear the label with Release.</p>`}${dataTable({
           cols: [{ label: 'Chat', width: '1.4fr' }, { label: 'Acting as', width: '1.2fr' }, { label: 'State', width: '0.7fr' }, { label: 'Last used', width: '1fr' }, { label: '', width: '2fr' }],
           rows: observed.map((o) => [
             html`${o.label || o.seat_id}`,
             html`${o.agent_name}`,
             html`${pill(o.status, o.status === 'held' ? 'danger' : o.status === 'trusted' ? 'ok' : 'dim')}`,
             html`${formatWhen(o.last_used_at)}`,
-            html`${o.status !== 'held' ? html`<button class="btn danger" data-cx-hold="${o.seat_id}">Hold</button>` : ''} ${o.status !== 'observed' ? html`<button class="btn" data-cx-return="${o.seat_id}">Return to observed</button>` : ''} ${o.status !== 'trusted' ? html`<button class="btn" data-cx-release="${o.seat_id}">Release to trusted</button>` : ''}`,
+            html`${vipOn && o.status !== 'held' ? html`<button class="btn danger" data-cx-hold="${o.seat_id}">Hold</button>` : ''} ${vipOn && o.status !== 'observed' ? html`<button class="btn" data-cx-return="${o.seat_id}">Return to observed</button>` : ''} ${o.status !== 'trusted' ? html`<button class="btn" data-cx-release="${o.seat_id}">Release to trusted</button>` : ''}`,
           ]),
           empty: '',
-        }),
+        })}`,
     })
 
   const boundBlock = enabled && bound.length > 0

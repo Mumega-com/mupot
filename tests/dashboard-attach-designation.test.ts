@@ -212,7 +212,7 @@ describe('agent page control', () => {
     let body = await page(env, cookie)
     expect(body).toContain('Allow for me')
     expect(body).toContain('Currently allowed: nobody')
-    expect(body).toContain('you approve each one with your passkey. Stopping ends all of them now.')
+    expect(body).toContain('approve each request with the code shown below. Stopping ends all of them now.')
     expect(body).not.toContain('>Stop<')
     await post(env, cookie, 'allow')
     body = await page(env, cookie)
@@ -226,6 +226,16 @@ describe('agent page control', () => {
     expect(await page(off.env, off.cookie)).not.toContain('Allow for me')
     const p = await login('plain@x.test')
     expect(await page(p.env, p.cookie)).not.toContain('Allow for me')
+  })
+
+  it('a non-admin designee sees their own designation without receiving the admin control', async () => {
+    h.sqlite.exec("UPDATE agents SET attach_designated_member_id = 'mem-plain' WHERE id = 'ag1'")
+    const p = await login('plain@x.test')
+    const body = await page(p.env, p.cookie)
+    expect(body).toContain('Currently allowed: P*** M*** (you)')
+    expect(body).toContain('Allowed for you')
+    expect(body).not.toContain('Ask one to allow your chats')
+    expect(body).not.toContain('data-attach-designation')
   })
 })
 

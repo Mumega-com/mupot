@@ -325,7 +325,7 @@ export function weldAudit(env: Env, agentId: string, actorId: string, admissionI
 
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
-  | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean }
+  | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean; requiresHumanRelease?: boolean }
   | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch' }
 
 /**
@@ -334,11 +334,16 @@ export type EnsureAdmissionResult =
  * attach INSERT, which re-reads the harness anchor and the live grant atomically). A seat-scoped admission, which every legacy row is,
  * stays bound to its one chat; asking for the wider scope on top of it is an upgrade the human must make explicitly (revoke, re-ask).
  */
-function liveAdmissionFor(open: AdmissionRow, p: { seatId: string; via: 'tool' | 'dashboard'; scope?: AdmissionScope; grantTokenId?: string | null }): EnsureAdmissionResult {
+async function liveAdmissionFor(env: Env, open: AdmissionRow, p: { seatId: string; via: 'tool' | 'dashboard'; scope?: AdmissionScope; grantTokenId?: string | null }): Promise<EnsureAdmissionResult> {
   if (p.scope === 'harness' && open.scope !== 'harness') return { ok: false, error: 'admission_scope_mismatch' }
   if (open.scope === 'harness' && !p.grantTokenId) return { ok: false, error: 'attach_refused' }
-  if (open.requested_seat_id === p.seatId) return { ok: true, state: 'live', admission: open }
-  if (open.scope !== 'harness') return { ok: false, error: 'approval_bound_to_other_chat' }
+  if (open.scope !== 'harness' && open.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
+  // An earlier approval cannot lift an observed chat, including one detached by the idle sweep.
+  // A dashboard attach is itself a new human action; a tool must wait for this chat's Release.
+  const seat = await loadHumanSeat(env, open.human_member_id, p.seatId)
+  if (seat?.admission_status === 'observed' && (open.scope === 'harness' || p.via === 'tool')) {
+    return { ok: true, state: 'pending', admission: open, approveUrl: null, alreadyPending: false, requiresHumanRelease: true }
+  }
   return { ok: true, state: 'live', admission: open }
 }
 
@@ -365,7 +370,7 @@ export async function ensureAdmission(
   const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
   // An admission is bound to the ONE chat (seat) that asked: the unique (agent, human, harness) slot means a second chat gets
   // no row of its own, so it is refused (the human revokes, then it asks again and gets its own coded ask).
-  if (open && open.status === 'live') return liveAdmissionFor(open, p)
+  if (open && open.status === 'live') return liveAdmissionFor(env, open, p)
 
   if (p.via === 'dashboard') {
     if (open && open.status === 'pending') {
@@ -439,7 +444,7 @@ export async function ensureAdmission(
         .bind(p.agentId, p.humanMemberId).first<{ x: number }>()
       return { ok: false, error: stillDesignated ? 'too_many_pending_admissions' : 'attach_refused' }
     }
-    if (pending.status === 'live') return liveAdmissionFor(pending, p)
+    if (pending.status === 'live') return liveAdmissionFor(env, pending, p)
     // Lost a concurrent first-ask race: the winner mints the one link. Minting here would rotate it and silently kill the
     // link the winner returned (bot review P2).
     if (!inserted && pending.status === 'pending') return { ok: true, state: 'pending', admission: pending, approveUrl: null, alreadyPending: true }
@@ -741,12 +746,13 @@ export interface SeatForAttach {
   member_id: string
   agent_id: string
   label_basename: string
+  admission_status: string | null
 }
 
 /** A live (un-retired) seat of THIS human. Nothing else is attachable. */
 export async function loadHumanSeat(env: Env, humanMemberId: string, seatId: string): Promise<SeatForAttach | null> {
   return env.DB.prepare(
-    `SELECT s.id AS id, s.harness_id AS harness_id, s.member_id AS member_id, s.agent_id AS agent_id, s.label_basename AS label_basename
+    `SELECT s.id AS id, s.harness_id AS harness_id, s.member_id AS member_id, s.agent_id AS agent_id, s.label_basename AS label_basename, s.admission_status AS admission_status
        FROM agent_seats s JOIN harnesses h ON h.id = s.harness_id AND h.tenant = s.tenant AND h.member_id = s.member_id
       WHERE s.id = ?1 AND s.tenant = ?2 AND s.member_id = ?3 AND s.retired_at IS NULL LIMIT 1`,
   ).bind(seatId, env.TENANT_SLUG, humanMemberId).first<SeatForAttach>()
@@ -763,6 +769,7 @@ export interface AttachOk {
 export interface AttachPending {
   ok: true
   status: 'pending_admission'
+  requires_human_release?: boolean
   admission_id: string
   approve_url: string | null
   expires_at: string | null
@@ -790,10 +797,11 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
  */
 function prepareAttachStatements(
   env: Env,
-  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string; grantTokenId: string | null },
+  p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string; grantTokenId: string | null; humanAction?: boolean },
 ): D1PreparedStatement[] {
   // R1: for a harness-wide admission the INSERT itself re-proves the request's grant is the install's own (null -> NULL -> no row).
   const grantIdx = p.promotedAt !== undefined ? 10 : 9
+  const approvalGuard = p.promotedAt !== undefined ? 'AND adm.decided_at = ?9' : p.humanAction ? '' : "AND s.admission_status IS NOT 'observed'"
   return [
     env.DB.prepare(
       `INSERT INTO agent_seat_attachments (id, tenant, seat_id, human_member_id, harness_id, agent_id, admission_id, seat_token_id, created_at)
@@ -809,7 +817,7 @@ function prepareAttachStatements(
         WHERE s.id = ?7 AND s.tenant = ?2 AND s.member_id = ?8 AND s.retired_at IS NULL
           AND (adm.scope = 'seat' OR (hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ?${grantIdx}))
           AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
-          ${p.promotedAt !== undefined ? 'AND adm.decided_at = ?9' : ''} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
+          ${approvalGuard} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
           ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
           ${attachDesignatedClause(env, 'a', '?8')}`,
     ).bind(...[p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId,
@@ -881,8 +889,8 @@ export async function attachSeatToAgent(
   if (!admission.ok) return { ok: false, error: admission.error }
   if (admission.state === 'pending') {
     // Only the chat that filed the ask learns the code; a different chat hitting the same pending row gets none.
-    const attachCode = admission.admission.requested_seat_id === seat.id ? admission.admission.attach_code : null
-    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.admission.requested_seat_id === seat.id ? admission.approveUrl : null, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode }
+    const attachCode = !admission.requiresHumanRelease && admission.admission.requested_seat_id === seat.id ? admission.admission.attach_code : null
+    return { ok: true, status: 'pending_admission', admission_id: admission.admission.id, approve_url: admission.admission.requested_seat_id === seat.id ? admission.approveUrl : null, expires_at: admission.admission.expires_at, already_pending: admission.alreadyPending, attach_code: attachCode, ...(admission.requiresHumanRelease ? { requires_human_release: true } : {}) }
   }
   if ((await resolveAgentMemberBinding(env, agent.id)).kind !== 'bound') return { ok: false, error: 'agent_identity_unminted' }
   // ensureAdmission may have just PROMOTED a pending admission, and promotion completes the attachment for the asking seat in the same batch:
@@ -909,7 +917,7 @@ export async function attachSeatToAgent(
   const attachIndex = statements.length
   statements.push(...prepareAttachStatements(env, {
     attachmentId, tokenId, tokenHash, nowIso, admissionId: admission.admission.id, agent: { id: agent.id, slug: agent.slug },
-    seat: { id: seat.id, harnessId: seat.harness_id }, humanMemberId: p.humanMemberId, requireNoLiveAttachment: false,
+    seat: { id: seat.id, harnessId: seat.harness_id }, humanMemberId: p.humanMemberId, requireNoLiveAttachment: false, humanAction: p.via === 'dashboard',
     // Every path proves the request's own grant in the INSERT; null fails closed for a harness-wide admission.
     grantTokenId: p.grantTokenId ?? null,
   }))
@@ -924,7 +932,7 @@ export async function attachSeatToAgent(
   return { ok: true, status: 'attached', attachment_id: attachmentId, admission_id: admission.admission.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
 }
 
-/** The human detaches a thread: it returns to its own seat agent on the next request. */
+/** The human detaches a thread and ends its seat-scoped approval. Harness approvals remain available to other chats. */
 export async function detachAttachment(
   env: Env,
   p: { attachmentId: string; humanMemberId: string },
@@ -938,6 +946,13 @@ export async function detachAttachment(
     env.DB.prepare(
       `UPDATE agent_seat_attachments SET detached_at = ?2, detach_reason = 'human', detached_by_member_id = ?3
         WHERE id = ?1 AND tenant = ?4 AND human_member_id = ?3 AND detached_at IS NULL`,
+    ).bind(p.attachmentId, nowIso, p.humanMemberId, env.TENANT_SLUG),
+    env.DB.prepare(
+      `UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = ?2, revoked_by_member_id = ?3
+        WHERE tenant = ?4 AND human_member_id = ?3 AND scope = 'seat' AND status = 'live'
+          AND EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.id = ?1 AND a.tenant = ?4
+            AND a.human_member_id = ?3 AND a.admission_id = agent_seat_admissions.id
+            AND a.seat_id = agent_seat_admissions.requested_seat_id AND a.detached_at = ?2 AND a.detach_reason = 'human')`,
     ).bind(p.attachmentId, nowIso, p.humanMemberId, env.TENANT_SLUG),
     auditInsert(env, att.agent_id, p.humanMemberId, 'seat_detach',
       { attachment_id: p.attachmentId, human_member_id: p.humanMemberId },

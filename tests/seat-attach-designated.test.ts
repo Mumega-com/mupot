@@ -425,17 +425,21 @@ describe('designated agent: attach, then the chat IS that agent (end to end)', (
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, seat.id)).toBe(0)
   })
 
-  it('revoke the admission / detach the thread kills the next request even while designated', async () => {
+  it.each(['detach', 'revoke'] as const)('%s ends the approval on the next request even while designated', async (action) => {
     const env = envFor(h, DESIGNATED)
     await designate(env, 'agent-rava', HUMAN)
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
     await boot(env, g, 'conv-b'); bindAdm('agent-rava')
     expect((await attach(env, g, 'conv-b', 'rava')).sc.status).toBe('attached')
-    const att = one<{ id: string }>(`SELECT att.id AS id FROM agent_seat_attachments att JOIN agent_seats s ON s.id = att.seat_id WHERE att.detached_at IS NULL ORDER BY att.created_at DESC, att.id LIMIT 1`)!
-    expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
     const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!
-    expect((await revokeAdmission(env, { admissionId: adm.id, humanMemberId: HUMAN })).ok).toBe(true)
+    if (action === 'detach') {
+      const att = one<{ id: string }>(`SELECT att.id FROM agent_seat_attachments att JOIN agent_seat_admissions adm ON adm.id = att.admission_id WHERE att.seat_id = adm.requested_seat_id AND att.detached_at IS NULL`)!
+      expect((await detachAttachment(env, { attachmentId: att.id, humanMemberId: HUMAN })).ok).toBe(true)
+    } else {
+      expect((await revokeAdmission(env, { admissionId: adm.id, humanMemberId: HUMAN })).ok).toBe(true)
+    }
+    expect(one(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm.id)).toEqual({ status: 'revoked' })
     for (const s of ['conv-a', 'conv-b']) expect((await boot(env, g, s)).sc.bound_agent_id).not.toBe('agent-rava')
   })
 })

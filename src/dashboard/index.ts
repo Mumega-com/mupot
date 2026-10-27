@@ -198,6 +198,7 @@ import {
   statusDot as uiStatusDot,
 } from './ui'
 import type { Html } from './ui'
+import { loadAgentConnectView, renderAgentConnectPanel, type AgentConnectView } from './agent-connect-panel'
 import { SELECT_SEARCH_SCRIPT } from './select-search'
 import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
@@ -2116,7 +2117,8 @@ dashboardApp.get('/agents/:id', async (c) => {
   const resumeParam = c.req.query('resume')
   const resume = resumeParam === 'claim' || resumeParam === 'allow' || resumeParam === 'push' ? resumeParam : null
   const freshNow = auth.webSessionIdHash ? (await checkWebSession(c.env, auth, { fresh: true })).ok : false
-  const claimCard = await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
+  // The Connect checklist lists (and approves) pending requests itself; the older single-purpose card would duplicate them.
+  const claimCard = ownerView.connect && ownerView.connect.pending.length > 0 ? null : await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   const wakeCard = await loadAgentWakeCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   const onboardingCards = claimCard || wakeCard ? html`${claimCard ?? ''}${wakeCard ?? ''}` : null
   return c.html(
@@ -2135,6 +2137,8 @@ interface AgentOwnerView {
   callerMemberId: string | null
   /** Attach designation (SEAT_ATTACH_DESIGNATED on only): null = control hidden. */
   designation: { enabled: true; designeeLabel: string | null; designeeIsCaller: boolean; /** Each control follows the shared authorization result. */ canStop: boolean; canAllow: boolean } | null
+  /** Guided "Connect a chat" checklist: only for a real human web session (null = hidden). */
+  connect: AgentConnectView | null
 }
 
 // First letter of each word then ***: enough to recognise yourself or a colleague, not enough to read a name off a shared screen.
@@ -2183,7 +2187,7 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
   const stopGate = agent.attach_designated_member_id && seatAttachDesignatedEnabled(env) && auth.memberId && !auth.boundAgentId
     ? await authorizeOwnerMemberChange(env, auth, agent.id, null, 'attach_designated_member_id') : null
   const canAllow = allowGate?.ok === true || allowGate?.error === 'reauth_required'
-  if (canAllow || stopGate?.ok) {
+  if (seatAttachDesignatedEnabled(env) && !auth.boundAgentId && auth.memberId) {
     let designeeLabel: string | null = null
     if (agent.attach_designated_member_id) {
       const row = await env.DB.prepare('SELECT display_name FROM members WHERE id = ? AND tenant = ?')
@@ -2193,7 +2197,10 @@ async function loadAgentOwnerView(env: Env, auth: AuthContext, agent: Agent): Pr
     }
     designation = { enabled: true, designeeLabel, designeeIsCaller: agent.attach_designated_member_id === auth.memberId, canStop: stopGate?.ok === true, canAllow }
   }
-  return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation }
+  const connect = auth.memberId && !auth.boundAgentId && (await checkWebSession(env, auth, { fresh: false })).ok
+    ? await loadAgentConnectView(env, auth.memberId, agent).catch(() => null)
+    : null
+  return { ownerLabel, canSet, candidates, callerMemberId: auth.memberId ?? null, designation, connect }
 }
 
 // "Allow my chats to become this agent" (attach designation). Plain form posts; the write is the SAME door and the SAME
@@ -2203,12 +2210,13 @@ function agentDesignationControl(
   view: NonNullable<AgentOwnerView['designation']>,
   flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean } = { resume: null, fresh: false },
 ) {
+  if (!view.canAllow && !view.canStop) return html`<p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>`
   // Back from the one sign-in redirect (resume=allow, session now fresh): the same button, labelled as the single remaining click.
   const allowLabel = flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me'
   return html`<form method="post" action="/agents/${agent.id}/designation" class="inline-form" data-attach-designation>
       <strong>Allow my chats to become this agent</strong>
       <p>Currently allowed: ${view.designeeLabel ?? 'nobody'}${view.designeeIsCaller ? ' (you)' : ''}</p>
-      <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; you approve each one with your passkey. Stopping ends all of them now.</p>
+      <p>Your ChatGPT/Claude/Codex chats can then ask to act as ${agent.name}; approve each request with the code shown on its card. Stopping ends all of them now.</p>
       ${view.canAllow ? html`<button type="submit" name="action" value="allow" class="btn">${allowLabel}</button>` : ''}
       ${agent.attach_designated_member_id && view.canStop ? html`<button type="submit" name="action" value="stop" class="btn secondary">Stop</button>` : ''}
     </form>`
@@ -6205,8 +6213,15 @@ function agentConsoleBody(
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
       ${ownerView?.canSet ? agentOwnerControl(agent, ownerView) : ''}
-      ${ownerView?.designation ? agentDesignationControl(agent, ownerView.designation, flash) : ''}
+      ${ownerView?.designation && !ownerView.connect ? agentDesignationControl(agent, ownerView.designation, flash) : ''}
     </div>
+    ${ownerView?.connect ? renderAgentConnectPanel(agent, ownerView.connect, {
+      allowLabel: flash.resume === 'allow' && flash.fresh ? 'Confirm: Allow for me' : 'Allow for me',
+      canAllow: ownerView.designation?.canAllow === true,
+      canStop: ownerView.designation?.canStop === true,
+      resumeClaim: flash.resume === 'claim',
+      designeeText: ownerView.designation?.designeeLabel ? `${ownerView.designation.designeeLabel}${ownerView.designation.designeeIsCaller ? ' (you)' : ''}` : null,
+    }, flash.fresh) : ''}
     <div class="card" data-agent-connect>
       <h2>Connect</h2>
       <p>Copy this into the agent's app:</p>

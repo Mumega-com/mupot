@@ -17,9 +17,11 @@ import type { Env } from '../types'
 import type { ToolSpec } from './index'
 import { fail, done } from './index'
 import { attachSeatToAgent, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
+import { connectionsLink } from '../members/vip-lane'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
+import { runConnectionCheck } from '../members/connection-check'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
 
 /** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
@@ -103,6 +105,13 @@ const toolSeatAttach: ToolSpec = {
         admission_id: r.admission_id,
         agent: r.agent,
         note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
+      })
+    }
+    if (r.ok && r.status === 'pending_admission' && r.requires_human_release) {
+      return done({
+        status: 'pending_admission', admission_id: r.admission_id,
+        connections_url: connectionsLink(env),
+        note: 'Pending. This chat is observed. The earlier approval cannot attach it. Your human must select Release for THIS chat on Connections, then call seat_attach again.',
       })
     }
     if (r.ok && r.already_pending) {
@@ -214,4 +223,24 @@ const toolInboxMarkHandled: ToolSpec = {
   },
 }
 
-export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach, toolInboxMarkHandled]
+// connection_check — the full-duplex check (SEND, RECEIVE, WAKE) an attached chat runs on request. See members/connection-check.ts.
+const toolConnectionCheck: ToolSpec = {
+  name: 'connection_check',
+  scope: 'self (an ATTACHED chat checks its own connection to mupot: send, receive, wake; writes one probe message to its own agent inbox and one audit row)',
+  min: 'authenticated',
+  args: '{ fresh?: boolean }  // fresh:true starts a new receive round after one completed',
+  inputSchema: { type: 'object', properties: { fresh: { type: 'boolean', description: 'Start a new receive round after the previous one completed.' } }, additionalProperties: false },
+  async run(auth, env, args) {
+    const att = attachedAuthority(auth)
+    if (!att) {
+      return fail(409, 'not_attached', {
+        message: 'connection_check runs from an attached chat. This chat is not attached to an agent yet.',
+        next_step: "Call seat_attach {agent:'<slug>'}, show your human the approval code you get back, and wait while they approve it. Then call boot_context and run connection_check.",
+      })
+    }
+    const r = await runConnectionCheck(env, { attachmentId: att.attachmentId, agentId: att.agentId, humanMemberId: att.humanMemberId, fresh: args.fresh === true })
+    return done({ ...r, tell_your_human: r.summary })
+  },
+}
+
+export const SEAT_ATTACH_TOOLS: ToolSpec[] = [toolSeatAttach, toolInboxMarkHandled, toolConnectionCheck]

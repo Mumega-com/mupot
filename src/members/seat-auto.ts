@@ -244,6 +244,7 @@ export async function applySeatForRequest(
       await allGens()
       row = await findLiveAutoSeat(env, gens.map((g) => g.hash), tokenId, memberId, harnessId)
     }
+    if (row === null && inputs.readOnly) return afterHandle
     if (row === null) {
       const wide = cachedRefusal(harnessId, hash0, nowMs, true)
       if (wide !== null) return refuse(wide)
@@ -275,9 +276,9 @@ export async function applySeatForRequest(
       row = await findLiveAutoSeat(env, gens.map((g) => g.hash), tokenId, memberId, harnessId)
       if (row === null) { cacheRefusal(harnessId, hash0, 'seat_not_live', undefined, nowMs); return refuse('seat_not_live') }
     }
-    const bound = await buildSeatContext(env, { memberId, tokenId }, row, inputs.hints, candidate.source)
+    const bound = await buildSeatContext(env, { memberId, tokenId }, row, inputs.hints, candidate.source, inputs.readOnly)
     if (!bound) return refuse('no_capabilities')
-    await touchAutoSeat(env, row, nowMs)
+    if (!inputs.readOnly) await touchAutoSeat(env, row, nowMs)
     return bound
   } catch {
     return refuse('error')

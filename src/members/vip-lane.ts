@@ -27,6 +27,7 @@ import type { AuthContext, Capability, Env, OrgKind } from '../types'
 import { CAPABILITY_LIVE_PREDICATE, brandSquadScope, canOnSquad, capabilityRank, loadSquadScope, resolveCapabilities, type SquadScope } from '../auth/capability'
 import { buildAuth, memberIsActiveHuman } from '../access/identity'
 import { resolveSquadRef } from '../org/resolve'
+import { requiredCanonicalOrigin } from '../dashboard/connect'
 import { addSquadMember } from './squad-membership'
 import { resetTrustedOnRejoin } from './seat-hold-release'
 
@@ -70,7 +71,28 @@ export const OBSERVED_FLOOR_TOOLS: ReadonlySet<string> = new Set([
   'project_list', 'project_get', 'project_context', 'project_wiki', 'project_wiki_get', 'project_squad_list',
   'squad_member_list', 'flight_get', 'flight_list', 'resolve_agent', 'get_agent_profile', 'fleet_agent_get',
   'join_squad', 'squad_join_request',
+  // seat_attach only FILES a request: attachSeatToAgent attaches only when the human's decision already exists (a live admission); an observed
+  // seat never self-approves. Held is deliberately NOT allowed (the human's hard stop; see HELD_READ_TOOLS).
+  'seat_attach',
 ])
+
+/** The /connections page link the human uses to lift an observed/held chat, or null when the pot has no pinned origin. */
+export function connectionsLink(env: Env): string | null {
+  const o = requiredCanonicalOrigin(env)
+  return o.ok ? `${o.origin.replace(/\/+$/, '')}/connections` : null
+}
+
+/** The actionable next step carried by every observed_floor refusal. Static text: no caller input is interpolated. */
+export function observedFloorNextStep(env: Env, status: 'observed' | 'trusted' | 'held'): string {
+  const link = connectionsLink(env)
+  const where = link ? ` at ${link}` : ' on their Connections page'
+  if (status === 'held') return `Your human put this chat on hold, so it can only read. Ask them to return or release it${where}.`
+  return `To request admission, call seat_attach {agent:'<slug>'}; your human approves it${where}. Show them the approval code you get back and wait while they approve it; until then this chat stays limited to the observed tools. Use mupot tools only (no browser or computer use) for this.`
+}
+
+export function observedFloorMessage(env: Env, status: 'observed' | 'trusted' | 'held', tool: string): string {
+  return `This seat is ${status}: ${tool} is outside the observed floor (read, check in, orient, message, propose and update tasks, scoped recall/remember). ${observedFloorNextStep(env, status)}`
+}
 
 export type SeatAdmissionStatus = 'observed' | 'trusted' | 'held'
 

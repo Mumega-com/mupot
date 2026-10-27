@@ -23,6 +23,7 @@ import {
   lookupClaim,
   normalizeClaimCode,
   reissueClaim,
+  reissueHarnessClaimApproval,
   type ClaimView,
   type ConfirmClaimResult,
 } from '../members/claim'
@@ -185,7 +186,7 @@ export function makeClaimApp(shell: ShellFn) {
     return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
   })
 
-  // POST /agents/:id/claim — "Own this agent", no code. The server finds this member's pending ask for THIS agent.
+  // POST /agents/:id/claim — agent-page approval. The server finds this member's pending ask for THIS agent and checks the displayed code.
   app.post('/agents/:id/claim', async (c) => {
     const resolved = await resolveAgentRef(c.env, c.req.param('id'))
     if (!resolved.ok) return page(c, 'Claim', note('Agent not found.'), 404)
@@ -193,9 +194,22 @@ export function makeClaimApp(shell: ShellFn) {
     const s = await formSession(c, `/agents/${agentId}?resume=claim`)
     if (!s.ok) return s.res
     const form = await c.req.parseBody()
-    const r = await confirmClaimOnAgentPage(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id })
+    const r = await confirmClaimOnAgentPage(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id, attachCode: form.attach_code })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[r.error])
     return c.redirect(`/agents/${encodeURIComponent(agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
+  })
+
+  // POST /agents/:id/claim/passkey — an explicit fresh-human request may rotate a harness-wide approval link.
+  app.post('/agents/:id/claim/passkey', async (c) => {
+    const resolved = await resolveAgentRef(c.env, c.req.param('id'))
+    if (!resolved.ok) return page(c, 'Claim', note('Agent not found.'), 404)
+    const agentId = resolved.value.id
+    const s = await formSession(c, `/agents/${agentId}?resume=claim`)
+    if (!s.ok) return s.res
+    const form = await c.req.parseBody()
+    const r = await reissueHarnessClaimApproval(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id })
+    if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[r.error])
+    return c.redirect(r.url, 303)
   })
 
   // POST /agents/:id/claim/reissue — a fresh pending ask for the same agent/member/app/thread. Grants nothing, so a real

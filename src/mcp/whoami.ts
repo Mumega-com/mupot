@@ -191,10 +191,15 @@ export function plainNextStep(
     const handle = auth.seatBinding?.source === 'handle'
       ? 'Keep sending your seat handle with each request.'
       : 'This is an automatic seat tied to this chat: no seat handle is needed.'
-    // A held / observed seat is limited to the read floor, and seat_attach is refused at that floor: do not offer it.
-    const limited = auth.seatAgentStatus === 'held' || auth.seatAgentStatus === 'observed'
-    const attach = limited
-      ? `This seat is ${auth.seatAgentStatus}, so it is limited to the read floor until your human lifts it: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the limit.`
+    // A held seat is read-only and cannot file anything; an observed seat is limited to the observed floor but seat_attach IS on that floor
+    // (it only files a request the human decides), so it is offered with the exact next step instead of generic attach advice.
+    const status = auth.seatAgentStatus
+    const attach = status === 'held'
+      ? 'This chat is held, so it can only read until your human returns or releases it on their Connections page: do not call seat_attach or seat_select; you can read your inbox with inbox {peek:true} and your open work with needs_you_list, and ask your human to lift the hold.'
+      : status === 'observed'
+      ? (seatAttachEnabled(env)
+        ? "You are observed: request admission with seat_attach {agent:'<slug>'}; your human approves it (Connections page, one tap). Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use); do not call seat_select."
+        : 'You are observed and limited to the observed tools until your human releases this chat on their Connections page; attaching to an existing agent is not enabled on this pot; do not call seat_select.')
       : seatAttachEnabled(env)
       ? `${attachConnectOrder(env, facts.humanCanDesignate)} do not call seat_select (you already have a seat).`
       : 'Attaching to an existing agent is not enabled on this pot; do not call seat_select (you already have a seat).'
@@ -389,7 +394,7 @@ export function whoamiDoorFilter(env: Env, auth: AuthContext, w: Whoami): (tool:
     if (auth.harnessCredential === true) return HARNESS_SESSION_ALLOWED_TOOLS.has(tool)
     if (tool === 'bootstrap_self') return offered.has('bootstrap_self')
     if (tool === 'seat_select') return offered.has('seat_select')
-    if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat' && auth.seatAgentStatus !== 'held' && auth.seatAgentStatus !== 'observed'
+    if (tool === 'seat_attach') return seatAttachEnabled(env) && w.state === 'own_seat' && auth.seatAgentStatus !== 'held'
     // K3/K4: connect needs a slug this caller was never handed (the step is a human re-consent or seat_select), so it is not a door.
     if (tool === 'connect' && (w.state === 'no_agent' || w.state === 'harness_unseated')) return false
     // K2 (member token, no agent): connect answers no_squad_access and the step is an org admin's mint_agent_token, so only that stays.

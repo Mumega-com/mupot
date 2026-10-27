@@ -419,7 +419,7 @@ describe('boot_context prints the connect order before seat_attach', () => {
     expect((seated.sc.available_doors as Array<{ tool: string }>).map((d) => d.tool)).not.toContain('seat_attach')
   })
 
-  it('a held or observed seat is not offered seat_attach', async () => {
+  it('held seats stay read-only while observed seats can request admission', async () => {
     const env = envFor(h)
     const seat = {
       seatId: 'seat-1',
@@ -447,9 +447,21 @@ describe('boot_context prints the connect order before seat_attach', () => {
       if (!out.ok) return
       const result = out.result as { next_step?: string; whoami?: { next_step_plain?: string }; available_doors?: Array<{ tool: string }> }
       expect(result.next_step ?? '').not.toContain('Allow for me')
-      expect(result.next_step ?? '').not.toContain('seat_attach {agent}')
-      expect(result.whoami?.next_step_plain ?? '').toContain(`This seat is ${status}`)
-      expect((result.available_doors ?? []).map((d) => d.tool)).not.toContain('seat_attach')
+      if (status === 'held') {
+        expect(result.next_step ?? '').not.toContain('seat_attach {agent')
+        expect(result.whoami?.next_step_plain ?? '').toContain('This chat is held')
+        expect(result.whoami?.next_step_plain ?? '').toContain('do not call seat_attach or seat_select')
+        expect((result.available_doors ?? []).map((d) => d.tool)).not.toContain('seat_attach')
+      } else {
+        for (const text of [result.next_step, result.whoami?.next_step_plain]) {
+          expect(text).toContain("request admission with seat_attach {agent:'<slug>'}")
+          expect(text).toContain('Show them the approval code')
+          expect(text).toContain('wait while they approve it')
+          expect(text).toContain('until then you stay limited to the observed tools')
+          expect(text).toContain('Use mupot tools only (no browser or computer use)')
+        }
+        expect((result.available_doors ?? []).map((d) => d.tool)).toContain('seat_attach')
+      }
     }
   })
 

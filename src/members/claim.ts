@@ -13,11 +13,12 @@
 //     one displayed.
 //   * single use and the TTL are the admission's own (status 'pending' + expires_at); nothing here extends either.
 //
-// The agent-page one-click (no code) is the same write; the server finds the member's own pending admission for THAT agent and
-// supplies its stored code itself. The client asserts only an admission id, and it must be in the server-found set.
+// The agent-page approval displays the request's code and checks the code the human submits, together with the admission id.
+// Harness-wide requests instead open the passkey decision page; the ordinary claim POST cannot approve them.
 
 import type { Env } from '../types'
 import { requiredCanonicalOrigin } from '../dashboard/connect'
+import { issueMomentLink } from '../secure-moments/issue'
 import {
   admissionIsPendingLive,
   admissionView,
@@ -26,6 +27,7 @@ import {
   loadAdmission,
   seatAttachEnabled,
   type AdmissionRow,
+  type AdmissionScope,
 } from './seat-attach'
 
 export type ClaimState = 'pending' | 'already_claimed' | 'expired' | 'closed' | 'ambiguous' | 'not_found'
@@ -41,6 +43,9 @@ export interface ClaimView {
   signedInAs: string
   requestedAt: string
   expiresAt: string | null
+  /** Code the requesting chat displayed. The human must return it with an agent-page approval. */
+  attachCode: string | null
+  scope: AdmissionScope
 }
 
 export type ClaimLookup =
@@ -79,6 +84,8 @@ async function viewOf(env: Env, adm: AdmissionRow): Promise<ClaimView> {
     signedInAs: [m?.display_name, m?.email].filter((x): x is string => !!x).join(' · ') || adm.human_member_id,
     requestedAt: adm.created_at,
     expiresAt: adm.expires_at,
+    attachCode: adm.attach_code,
+    scope: adm.scope,
   }
 }
 
@@ -185,13 +192,13 @@ async function reissueSeat(env: Env, adm: AdmissionRow): Promise<{ seatId: strin
 }
 
 /**
- * Agent-page one-click (no code). The member is the SESSION member; the admission must be in the set the server finds for
- * (this member, this agent) and still pending. The stored code is supplied by the server, deliberately: the page displayed the
- * asking chat (app, thread, time) to the signed-in owner in place of the typed code.
+ * Agent-page approval. The member is the SESSION member; the admission must be in the set the server finds for
+ * (this member, this agent) and still pending. The code shown on that card is returned by the human, so this path has the
+ * same code proof as Connections and cannot silently substitute the stored code.
  */
 export async function confirmClaimOnAgentPage(
   env: Env,
-  p: { memberId: string; agentId: string; shownAdmissionId: unknown },
+  p: { memberId: string; agentId: string; shownAdmissionId: unknown; attachCode: unknown },
   nowMs: number = Date.now(),
 ): Promise<ConfirmClaimResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -201,7 +208,7 @@ export async function confirmClaimOnAgentPage(
   const adm = await loadAdmission(env, hit.admissionId)
   if (!adm || adm.human_member_id !== p.memberId || adm.agent_id !== p.agentId) return { ok: false, error: 'claim_changed' }
   const r = await decideAdmissionDirect(env, {
-    admissionId: adm.id, humanMemberId: p.memberId, decision: 'approve', ceiling: 'member', attachCode: adm.attach_code ?? undefined,
+    admissionId: adm.id, humanMemberId: p.memberId, decision: 'approve', ceiling: 'member', attachCode: p.attachCode,
   }, nowMs)
   if (!r.ok) {
     if (r.error === 'not_pending') return { ok: false, error: 'claim_not_pending' }
@@ -209,6 +216,24 @@ export async function confirmClaimOnAgentPage(
     return { ok: false, error: r.error }
   }
   return { ok: true, agentId: p.agentId, attached: await seatIsAttachedVia(env, adm.id) }
+}
+
+/** Explicitly reissue the passkey decision link for a harness-wide request. This rotates only after the signed-in human asks. */
+export async function reissueHarnessClaimApproval(
+  env: Env,
+  p: { memberId: string; agentId: string; shownAdmissionId: unknown },
+  nowMs: number = Date.now(),
+): Promise<{ ok: true; url: string } | { ok: false; error: 'claim_not_found' | 'claim_not_pending' | 'attach_refused' }> {
+  if (!seatAttachEnabled(env)) return { ok: false, error: 'attach_refused' }
+  const mine = await claimsForAgent(env, p.memberId, p.agentId, nowMs)
+  const hit = mine.pending.find((c) => c.admissionId === p.shownAdmissionId && c.scope === 'harness')
+  if (!hit) return { ok: false, error: mine.pending.length > 0 ? 'claim_not_pending' : 'claim_not_found' }
+  const adm = await loadAdmission(env, hit.admissionId)
+  if (!adm || adm.scope !== 'harness' || !admissionIsPendingLive(adm, nowMs)) return { ok: false, error: 'claim_not_pending' }
+  const link = adm.expires_at
+    ? await issueMomentLink(env, { kind: 'seat_admit', subjectId: adm.id, requesterAgentId: null, subjectExpiresAtIso: adm.expires_at })
+    : null
+  return link ? { ok: true, url: link.url } : { ok: false, error: 'attach_refused' }
 }
 
 export type ReissueResult =

@@ -254,7 +254,7 @@ describe('single writer', () => {
     const walk = (d: string): void => { for (const e of readdirSync(d, { withFileTypes: true })) { const f = pjoin(d, e.name); if (e.isDirectory()) walk(f); else if (f.endsWith('.ts')) files.push(f) } }
     walk(pjoin(__dirname, '..', 'src'))
     const importers = files.filter((f) => /seat-hold-release/.test(readFileSync(f, 'utf8')) && !f.endsWith('seat-hold-release.ts')).map((f) => f.replace(/.*\/src\//, ''))
-    expect(importers.sort()).toEqual(['dashboard/connections.ts', 'members/vip-lane.ts']) // vip-lane only for the trusted -> observed rejoin reset
+    expect(importers.sort()).toEqual(['dashboard/agent-connect-panel.ts', 'dashboard/connections.ts', 'members/vip-lane.ts']) // vip-lane only for the trusted -> observed rejoin reset; agent-connect-panel imports only the read-only listObservedSeats
     const writers = files.filter((f) => /(\bSET\b[^`;]*\badmission_status\s*=|\bINSERT\b[^`;]*\bagent_seats\b[^`;]*\badmission_status)/is.test(readFileSync(f, 'utf8'))).map((f) => f.replace(/.*\/src\//, '')).sort()
     expect(writers).toEqual(['members/seat-hold-release.ts', 'members/vip-lane.ts'])
   })
@@ -456,20 +456,25 @@ describe('what each state means at the chokepoint', () => {
 })
 
 describe('flag off', () => {
-  it('VIP_LANE off: the writer refuses, nothing changes, no audit, the section is absent, the floor is not read', async () => {
+  it('VIP_LANE off: hold and return are refused (nothing would enforce them); release works with fresh reauth; the stale label stays visible; the floor is not read', async () => {
     const s = await seatFor(OWNER)
     setStatus(s.seatId, 'observed')
     const off = envFor(h, { VIP_LANE: undefined })
     const cookie = await session(off, `${OWNER}@example.test`)
     fresh()
-    expect((await post(cookie, s.seatId, 'release', off)).status).toBe(403)
+    expect((await post(cookie, s.seatId, 'hold', off)).status).toBe(403)
     expect(status(s.seatId)).toBe('observed')
     expect(audit(s.seatId)).toEqual([])
     const { dashboardApp } = await import('../src/dashboard/index')
-    expect(await (await dashboardApp.request('/connections', { headers: { cookie } }, { ...off, LOCAL_TEST_AUTH: '1' } as unknown as Env)).text()).not.toContain('Observed chats')
+    const page = await (await dashboardApp.request('/connections', { headers: { cookie } }, { ...off, LOCAL_TEST_AUTH: '1' } as unknown as Env)).text()
+    expect(page).toContain('Observed chats')
+    expect(page).toContain(`data-cx-release="${s.seatId}"`)
     const bare = { ...s.ctx, boundAgentId: s.agentId } as AuthContext
     delete bare.seatBinding
     expect(await observedFloorRefusal(off, bare, 'request_elevation')).toBeNull()
-    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: true })).toEqual({ ok: false, error: 'vip_lane_disabled' })
+    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'hold', fresh: true })).toEqual({ ok: false, error: 'vip_lane_disabled' })
+    expect(await changeSeatAdmission(off, { humanMemberId: OWNER, seatId: s.seatId, action: 'release', fresh: false })).toEqual({ ok: false, error: 'reauth_required' })
+    expect((await post(cookie, s.seatId, 'release', off)).status).toBe(200)
+    expect(status(s.seatId)).toBe('trusted')
   })
 })

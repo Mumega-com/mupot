@@ -796,7 +796,7 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).not.toBe('agent-rava')
   })
 
-  it('detach: the thread returns to its own seat agent; the admission stays so a re-attach is immediate', async () => {
+  it('detach: the thread returns to its own seat agent and needs a fresh approval', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await admitAndAttach(env, g, 'conv-a')
@@ -804,7 +804,9 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     expect(await detachAttachment(env, { attachmentId: att, humanMemberId: HUMAN })).toEqual({ ok: true })
     expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).not.toBe('agent-rava')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_detach'`)).toBe(1)
-    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
+    expect(one(`SELECT status FROM agent_seat_admissions`)).toEqual({ status: 'revoked' })
+    expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('pending_admission')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
   })
 
   it('another human cannot detach, revoke or approve someone else\'s rows', async () => {
@@ -1122,9 +1124,12 @@ describe('dashboard: Connections', () => {
     const off = { ...env, SEAT_ATTACH: undefined } as unknown as Env // same SESSIONS store, flag off
     expect((await dash(off, cookie, `/connections/attachments/${att}/detach`, {})).status).toBe(200)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
-    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions`)!.id
-    expect((await dash(off, cookie, `/connections/admissions/${adm}/revoke`, {})).status).toBe(200)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('revoked')
+    // Make a separate live approval, then revoke it with the same stale session and flag off.
+    expect((await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId, agentRef: 'rava', via: 'dashboard' })).ok).toBe(true)
+    const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'live'`)!.id
+    expect((await dash(off, cookie, `/connections/admissions/${adm}/revoke`, {})).status).toBe(200)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions WHERE id = ?`, adm)?.status).toBe('revoked')
     // approve/attach stay refused with the flag off
     fresh()
     expect((await dash(off, cookie, `/connections/admissions/${adm}/approve`, {})).status).toBe(403)
@@ -1337,12 +1342,14 @@ describe('dashboard: Connections', () => {
       expect(JSON.stringify(b.body)).toContain('different chat')
       expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
       expect((await boot(env, g, 'conv-b')).sc.bound_agent_id).not.toBe('agent-rava')
-      // the same chat that was admitted re-attaches fine after a detach
+      // Human Detach ends the seat approval: the same chat now needs a new coded request.
       const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
       expect((await detachAttachment(env, { attachmentId: att, humanMemberId: HUMAN })).ok).toBe(true)
-      expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('attached')
-      // revoke, then the second chat asks again and gets its OWN coded ask
-      const adm = one<{ id: string }>(`SELECT id FROM agent_seat_admissions WHERE status = 'live'`)!.id
+      const againA = await attach(env, g, 'conv-a', 'rava')
+      expect(againA.sc.status).toBe('pending_admission')
+      expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
+      // deny this pending ask, then the second chat asks again and gets its OWN coded ask
+      const adm = String(againA.sc.admission_id)
       expect((await revokeAdmission(env, { admissionId: adm, humanMemberId: HUMAN })).ok).toBe(true)
       const again = await attach(env, g, 'conv-b', 'rava')
       expect(again.sc.status).toBe('pending_admission')
@@ -1354,7 +1361,8 @@ describe('dashboard: Connections', () => {
       const g = await grant(env, HUMAN)
       await admitAndAttach(env, g, 'conv-a')
       const attId = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
-      expect((await detachAttachment(env, { attachmentId: attId, humanMemberId: HUMAN })).ok).toBe(true)
+      // Fixture: system idle detach preserves the admission, isolating the INSERT binding guard below.
+      h.sqlite.prepare(`UPDATE agent_seat_attachments SET detached_at = datetime('now'), detach_reason = 'idle_expired' WHERE id = ?`).run(attId)
       const seatA = one<{ seat_id: string }>(`SELECT seat_id FROM agent_seat_attachments WHERE id = ?`, attId)!.seat_id
       h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_requested_seat_immutable`) // fixture: simulate a drifted row to prove the INSERT guard on its own
       const db = env.DB
@@ -2239,7 +2247,9 @@ describe('MCP Events for attached agents', () => {
     const att = one<{ id: string }>(`SELECT id FROM agent_seat_attachments WHERE detached_at IS NULL`)!.id
     await detachAttachment(env, { attachmentId: att, humanMemberId: HUMAN })
     expect(await listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId })).toEqual([]) // detached: no candidate
-    await attach(env, g, 'conv-a', 'rava') // re-attach (admission still live)
+    const pending = await attach(env, g, 'conv-a', 'rava') // Detach ended the old approval.
+    expect(pending.sc.status).toBe('pending_admission')
+    expect(await decideAdmissionDirect(env, { admissionId: String(pending.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: pending.sc.attach_code })).toEqual({ ok: true })
     expect((await listLiveAttachmentsForEvents(env, { memberId: g.memberId, harnessId: g.harnessId, grantTokenId: g.tokenId })).length).toBe(1)
     // the SAME human holds another live unbound directory token: the candidates are pinned to the grant token that made THIS request
     h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('tok-extra', '${HUMAN}', 'hash-extra', 'oauth:other', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)

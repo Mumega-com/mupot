@@ -191,6 +191,8 @@ export interface HarnessHints {
 }
 
 export interface SeatRequestInputs {
+  /** Catalog inspection resolves existing seats without provisioning or usage bookkeeping. */
+  readOnly?: boolean
   /** `X-Mupot-Seat` header value, if any. */
   headerHandle?: string | null
   /** `_meta["mupot/seat"]` (call params or call arguments), if any. */
@@ -340,6 +342,7 @@ export async function buildSeatContext(
   row: SeatContextRow,
   hints: HarnessHints,
   source: SeatBindingSource,
+  readOnly = false,
 ): Promise<AuthContext | null> {
   // W2 (SEAT_ATTACH): the thread may be ATTACHED to an existing agent. The admission check lives in ONE place
   // (findLiveAttachment); here its row simply replaces the seat agent's identity. Any failure to resolve a live
@@ -357,7 +360,7 @@ export async function buildSeatContext(
           ceiling: att.ceiling,
         })
         if (attCaps.length > 0) {
-          await touchAttachment(env, att, Date.now())
+          if (!readOnly) await touchAttachment(env, att, Date.now())
           return {
             userId: att.agent_member_id,
             email: att.agent_email,
@@ -460,10 +463,10 @@ export async function applySeatHandle(
     const row = await findLiveSeatForHandle(env, hash, human.tokenId, human.memberId, human.harnessId)
     if (!row || !row.seat_token_id) return record(true)
 
-    const bound = await buildSeatContext(env, { memberId: human.memberId, tokenId: human.tokenId }, { ...row, seat_token_id: row.seat_token_id }, inputs.hints, 'handle')
+    const bound = await buildSeatContext(env, { memberId: human.memberId, tokenId: human.tokenId }, { ...row, seat_token_id: row.seat_token_id }, inputs.hints, 'handle', inputs.readOnly)
     // Never a zero-capability context wearing the agent's identity: fall back to the human.
     if (!bound) return record(true)
-    await touchHandle(env, row, nowMs)
+    if (!inputs.readOnly) await touchHandle(env, row, nowMs)
     return bound
   } catch {
     return record(true)
