@@ -107,6 +107,28 @@ function partyAgentSources(): Array<{ from: string; agentCol: string }> {
   ]
 }
 
+/** Ownership of ANY party agent excludes the supervisory waiver, including former submitters and runners. */
+export function compilePartyAgentOwnershipSql(
+  deciderId: string,
+  task: { bind: string } | { column: string },
+): { sql: string; params: string[] } {
+  const raw = partyAgentSources().map((src) => `EXISTS (SELECT 1 FROM ${src.from}
+    AND EXISTS (SELECT 1 FROM agents po WHERE po.id = ${src.agentCol} AND po.owner_member_id = @D))`).join(' OR ')
+  const params: string[] = []
+  const sql = raw.replace(/@D|@T/g, (marker) => {
+    if (marker === '@D') { params.push(deciderId); return '?' }
+    if ('column' in task) return task.column
+    params.push(task.bind); return '?'
+  })
+  return { sql: `(${sql})`, params }
+}
+
+export async function ownsTaskPartyAgent(env: Env, deciderId: string, taskId: string): Promise<boolean> {
+  const own = compilePartyAgentOwnershipSql(deciderId, { bind: taskId })
+  const row = await env.DB.prepare(`SELECT ${own.sql} AS c`).bind(...own.params).first<{ c: number }>()
+  return row !== null && Number(row.c) === 1
+}
+
 /**
  * agentLinkedToMemberSql (mupot#2009) — TRUE iff the AGENT is owned by, bound to, or keyed to the member.
  * ONE copy shared by the verdict check (directConflictSqlRaw: an agent decider linked to the submission's
@@ -155,6 +177,117 @@ function affiliatedConflictSqlRaw(): string {
   return `(\n    ${parts.join('\n    OR ')}\n  )`
 }
 
+/**
+ * OWNER-SELF AUTHORITY (mom-walk D1, task 7ae27377). The ONE narrow exemption from the 'affiliated' conflict for a
+ * plain MEMBER decider: the human who OWNS the agent (agents.owner_member_id) may give the verdict on that agent's
+ * work. TRUE iff, for EVERY party agent of the task (assignee, every submitter, every runner) the decider is
+ * affiliated with, the decider is that agent's OWNER and is NOT bound to it (agent_member_bindings: a bound member IS
+ * the agent's own identity, so deciding there is the agent grading itself). Any party agent the decider reaches by a
+ * leg other than ownership alone (a key minter who is not the owner, a binding) makes this FALSE, so a non-owner who
+ * merely minted a token for the agent (#2094) stays refused. It never speaks to the 'direct' kind: callers evaluate
+ * 'direct' first and keep refusing it.
+ */
+function ownerSelfSqlRaw(): string {
+  const parts = partyAgentSources().map((src) => `NOT EXISTS (
+      SELECT 1 FROM ${src.from}
+         AND ${memberAffiliatedWithAssigneeSql({ memberExpr: '@D', assigneeIdExpr: src.agentCol })}
+         AND NOT (
+           EXISTS (SELECT 1 FROM agents os_owner WHERE os_owner.id = ${src.agentCol} AND os_owner.owner_member_id = @D)
+           AND NOT EXISTS (SELECT 1 FROM agent_member_bindings os_bind WHERE os_bind.agent_id = ${src.agentCol} AND os_bind.member_id = @D)
+         )
+    )`)
+  return `(\n    EXISTS (SELECT 1 FROM members os_member WHERE os_member.id = @D AND os_member.status = 'active')\n    AND ${parts.join('\n    AND ')}\n  )`
+}
+
+export function compileOwnerSelfAuthoritySql(
+  deciderId: string,
+  task: { bind: string } | { column: string },
+): { sql: string; params: string[] } {
+  const params: string[] = []
+  const sql = ownerSelfSqlRaw().replace(/@D|@T/g, (marker) => {
+    if (marker === '@D') { params.push(deciderId); return '?' }
+    if ('column' in task) return task.column
+    params.push(task.bind)
+    return '?'
+  })
+  return { sql, params }
+}
+
+/**
+ * OWNER-SELF LENS EVIDENCE (mom-walk D1, Athena's conditions on task 565da9e9). An owner may decide their own agent's
+ * work ONLY when the task's CURRENT submission carries two independent passing review lenses. The predicate (re-asserted
+ * inside the verdict UPDATE's WHERE, so a revoked reviewer, a replaced submission, a re-gated task or an ownership change
+ * between the pre-check and the write refuses atomically):
+ *   - rows in task_review_lenses bound to THIS submission id AND result digest AND the task's CURRENT gate_owner
+ *     (replacing the submission, or re-gating / changing the reviewer lane, orphans every earlier lens);
+ *   - per (reviewer, lens) only the LATEST row counts (append-only ledger: a later 'fail' withdraws an earlier 'pass');
+ *   - the reviewer is live-eligible NOW: still holds the gate lane, is active, is not the decider, is not a task party and
+ *     does not act for one (verdict independence, both kinds), and is not owned by / bound to / keyed to the decider
+ *     (self-authored evidence);
+ *   - at least two DISTINCT reviewers with two DISTINCT lens names pass, and no eligible reviewer's latest lens is a fail.
+ * `taskIdExpr`/`gateOwnerExpr` are raw correlated expressions; the submission id/digest and the decider are bound params.
+ */
+function ownerSelfLensesSqlRaw(): string {
+  const latest = `l.rowid = (SELECT MAX(l2.rowid) FROM task_review_lenses l2
+          WHERE l2.task_id = l.task_id AND l2.submission_id = l.submission_id AND l2.reviewer_id = l.reviewer_id AND LOWER(l2.lens) = LOWER(l.lens))`
+  const bound = `l.task_id = @T AND l.submission_id = @SUB AND l.result_digest = @DIG AND l.gate_owner = @GATE AND ${latest}`
+  const independent = compileVerdictIndependenceSql(['direct', 'affiliated'], { column: 'l.reviewer_id' }, { column: '@T' })
+  const eligible = `(
+      l.reviewer_id <> @D
+      AND NOT ${independent.sql}
+      AND (
+        (l.reviewer_kind = 'agent'
+          AND EXISTS (SELECT 1 FROM agents la WHERE la.id = l.reviewer_id AND la.status = 'active')
+          AND NOT ${agentLinkedToMemberSql({ agentExpr: 'l.reviewer_id', memberExpr: '@D' })})
+        OR (l.reviewer_kind = 'member'
+          AND EXISTS (SELECT 1 FROM members lm WHERE lm.id = l.reviewer_id AND lm.status = 'active'))
+      )
+      AND EXISTS (SELECT 1 FROM gate_grants lg WHERE lg.capability = @GATE AND lg.principal_type = l.reviewer_kind AND lg.principal_id = l.reviewer_id)
+    )`
+  return `(
+    (SELECT COUNT(DISTINCT l.reviewer_id) FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'pass' AND ${eligible}) >= 2
+    AND (SELECT COUNT(DISTINCT LOWER(l.lens)) FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'pass' AND ${eligible}) >= 2
+    AND NOT EXISTS (SELECT 1 FROM task_review_lenses l WHERE ${bound} AND l.outcome = 'fail' AND ${eligible})
+  )`
+}
+
+export function compileOwnerSelfLensesSql(
+  deciderId: string,
+  task: { taskIdExpr: string; gateOwnerExpr: string },
+  submission: { submissionId: string; resultDigest: string },
+): { sql: string; params: string[] } {
+  const params: string[] = []
+  const sql = ownerSelfLensesSqlRaw().replace(/@DIG|@SUB|@GATE|@D|@T/g, (marker) => {
+    switch (marker) {
+      case '@D': params.push(deciderId); return '?'
+      case '@SUB': params.push(submission.submissionId); return '?'
+      case '@DIG': params.push(submission.resultDigest); return '?'
+      case '@T': return task.taskIdExpr
+      default: return task.gateOwnerExpr
+    }
+  })
+  return { sql, params }
+}
+
+/**
+ * The whole owner-self verdict authority, JS form of the pair the verdict UPDATE re-asserts: live ownership
+ * (compileOwnerSelfAuthoritySql) AND two independent passing lenses on the given CURRENT submission. A null submission
+ * (no ledger row the verdict could bind to) fails closed: lenses are about a specific piece of content.
+ */
+export async function holdsOwnerSelfVerdictAuthority(
+  env: Env,
+  deciderId: string,
+  taskId: string,
+  submission: { submissionId: string; resultDigest: string } | null,
+): Promise<boolean> {
+  if (!submission) return false
+  const own = compileOwnerSelfAuthoritySql(deciderId, { bind: taskId })
+  const lens = compileOwnerSelfLensesSql(deciderId, { taskIdExpr: 'tasks.id', gateOwnerExpr: 'tasks.gate_owner' }, submission)
+  const row = await env.DB.prepare(`SELECT ${own.sql} AND ${lens.sql} AS c FROM tasks WHERE tasks.id = ?`)
+    .bind(...own.params, ...lens.params, taskId).first<{ c: number }>()
+  return row !== null && Number(row.c) === 1
+}
+
 export type VerdictConflictKind = 'direct' | 'affiliated'
 
 /**
@@ -164,13 +297,16 @@ export type VerdictConflictKind = 'direct' | 'affiliated'
  */
 export function compileVerdictIndependenceSql(
   kinds: readonly VerdictConflictKind[],
-  deciderId: string,
+  deciderId: string | { column: string },
   task: { bind: string } | { column: string },
 ): { sql: string; params: string[] } {
   const raw = kinds.map((k) => (k === 'direct' ? directConflictSqlRaw() : affiliatedConflictSqlRaw())).join(' OR ')
   const params: string[] = []
   const sql = raw.replace(/@D|@T/g, (marker) => {
-    if (marker === '@D') { params.push(deciderId); return '?' }
+    if (marker === '@D') {
+      if (typeof deciderId !== 'string') return deciderId.column
+      params.push(deciderId); return '?'
+    }
     if ('column' in task) return task.column
     params.push(task.bind)
     return '?'

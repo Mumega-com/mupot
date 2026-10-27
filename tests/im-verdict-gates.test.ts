@@ -241,3 +241,40 @@ describe('IM verdictReply — gate.verdict receipt outcome is surfaced (seed B4)
     expect(taskVerdictCount(harness.sqlite, 'task-b4')).toBe(1)
   })
 })
+
+describe('IM owner-self selection for grant admins', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+  })
+  afterEach(() => harness.close())
+
+  it('requires lenses on owned work and records owner_self', async () => {
+    const s = harness.sqlite
+    seedMember(s, 'admin-own', 'chat-own')
+    seedOrgAdminCapability(s, 'admin-own')
+    seedAgent(s, 'owned-agent')
+    s.prepare(`UPDATE agents SET owner_member_id = 'admin-own' WHERE id = 'owned-agent'`).run()
+    seedGrant(s, 'gate:review', 'member', 'admin-own')
+    seedReviewTask(s, 'task-own', 'gate:review', 'owned-agent')
+    const env = envFor(harness)
+    await handleImMessage(env, 'chat-own', 'approve task-own')
+    expect(taskVerdictCount(s, 'task-own')).toBe(0)
+    expect(s.prepare(`SELECT status FROM tasks WHERE id = 'task-own'`).get()).toMatchObject({ status: 'review' })
+    s.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('sub-own', ?, 'task-own', 'squad-1', 'owned-agent', '/tmp/x', ?, ?, 'RESULT')`).run(TENANT, 'ab'.repeat(32), 'cd'.repeat(32))
+    s.prepare(`UPDATE tasks SET result = 'RESULT' WHERE id = 'task-own'`).run()
+    for (const [i, lens] of ['correctness', 'adversarial'].entries()) {
+      const reviewer = `reviewer-${i}`
+      seedAgent(s, reviewer)
+      seedGrant(s, 'gate:review', 'agent', reviewer)
+      s.prepare(`INSERT INTO task_review_lenses (id, task_id, submission_id, result_digest, gate_owner, lens, reviewer_kind, reviewer_id, outcome, created_at)
+        VALUES (?, 'task-own', 'sub-own', ?, 'gate:review', ?, 'agent', ?, 'pass', datetime('now'))`).run(`lens-${i}`, 'cd'.repeat(32), lens, reviewer)
+    }
+    await handleImMessage(env, 'chat-own', 'approve task-own')
+    expect(taskVerdictCount(s, 'task-own')).toBe(1)
+    expect(s.prepare(`SELECT independence_waiver FROM task_verdicts WHERE task_id = 'task-own'`).get()).toMatchObject({ independence_waiver: 'owner_self' })
+  })
+})

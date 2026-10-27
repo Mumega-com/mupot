@@ -261,6 +261,7 @@ async function appendVerdictReceipt(env: Env, verdict: TaskVerdict): Promise<Gat
       result_digest: verdict.result_digest ?? null,
       attachment_id: verdict.attachment_id ?? null,
       consenting_member_id: verdict.consenting_member_id ?? null,
+      independence_waiver: verdict.independence_waiver ?? null,
     }
     return await appendWithRetry(env, kind, verdict.decided_by, {
       type: 'gate.verdict',

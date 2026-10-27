@@ -129,7 +129,8 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     ['the assignee agent (A)', () => agentAuth('A')],
     ['an agent that SUBMITTED a result and was reassigned off (S)', () => agentAuth('S')],
     ['an agent recorded as RUNNING the task (R)', () => agentAuth('R')],
-    ['the member who OWNS the assignee agent (MA)', () => memberAuth('MA')],
+    // MA (the OWNER of A, bound to nothing) is NOT here since mom-walk D1: an owner may give the verdict on their own
+    // agent's work (waiver 'owner_self', tests/verdict-owner-self.test.ts). MB (bound) and MK (key minter) stay refused.
     ['the member BOUND to the assignee agent (MB)', () => memberAuth('MB')],
     ['the member whose KEY the assignee agent authenticates as (MK)', () => memberAuth('MK')],
     ['the member whose credential RAN the task (MR)', () => memberAuth('MR')],
@@ -162,12 +163,13 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     })
   }
 
-  it('an org ADMIN who is merely affiliated (owns A) passes the supervisory path, and the write carries the waiver', async () => {
+  it('an org ADMIN who owns A is refused without two independent lenses', async () => {
     seedWorld(harness.sqlite)
     harness.sqlite.prepare(`UPDATE agents SET owner_member_id = 'ADMIN_OWNS_A' WHERE id = 'A'`).run()
     const res = await decide(env, memberAuth('ADMIN_OWNS_A', 'admin'))
-    expect(res.ok, JSON.stringify(res)).toBe(true)
-    expect(verdictRows(harness.sqlite)).toBe(1)
+    expect(res).toMatchObject({ ok: false, error: 'self_verdict' })
+    expect(verdictRows(harness.sqlite)).toBe(0)
+    expect(taskStatus(harness.sqlite)).toBe('review')
   })
 
   it('an org ADMIN who is a DIRECT party (MR ran it) is refused: admin never waives a direct party', async () => {
@@ -360,11 +362,13 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
       expect((await decide(env, memberAuth('ADMIN', 'admin'))).ok).toBe(true)
     })
 
-    it('an admin who merely OWNS the assignee (admin_supervisory) closes a lane task', async () => {
+    it('an admin owning the assignee cannot close a lane task without owner-self evidence', async () => {
       seedWorld(harness.sqlite, { gateOwner: LANE })
       harness.sqlite.prepare(`UPDATE agents SET owner_member_id = 'ADMIN_OWNS_A' WHERE id = 'A'`).run()
       const res = await decide(env, memberAuth('ADMIN_OWNS_A', 'admin'))
-      expect(res.ok, JSON.stringify(res)).toBe(true)
+      expect(res).toMatchObject({ ok: false, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
     })
   })
 
@@ -464,7 +468,7 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
 
     it('writeVerdict throws VerdictIndependenceError for each party, with no waiver', async () => {
       seedWorld(harness.sqlite)
-      for (const decidedBy of ['A', 'S', 'R', 'MA', 'MB', 'MK', 'MR']) {
+      for (const decidedBy of ['A', 'S', 'R', 'MA', 'MB', 'MK', 'MR']) { // MA: refused unless the caller carries the owner_self waiver
         await expect(writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy }), decidedBy)
           .rejects.toBeInstanceOf(VerdictIndependenceError)
       }
@@ -492,12 +496,14 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
       expect(verdictRows(harness.sqlite)).toBe(0)
     })
 
-    it('waivers are exact: admin_supervisory waives AFFILIATED only; owner_override waives both', async () => {
+    it('admin_supervisory waives non-owner affiliation only', async () => {
       seedWorld(harness.sqlite)
       await expect(writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MR', independenceWaiver: 'admin_supervisory' }))
         .rejects.toBeInstanceOf(VerdictIndependenceError) // MR is direct
-      const ok = await writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MA', independenceWaiver: 'admin_supervisory' })
-      expect(ok.verdict.decided_by).toBe('MA') // MA is affiliated only
+      await expect(writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MA', independenceWaiver: 'admin_supervisory' }))
+        .rejects.toBeInstanceOf(VerdictIndependenceError) // MA owns a party agent
+      const ok = await writeVerdict(env, { task: task(), verdict: 'approved', note: null, decidedBy: 'MB', independenceWaiver: 'admin_supervisory' })
+      expect(ok.verdict.decided_by).toBe('MB') // MB is bound, without ownership
     })
 
     it('owner_override lets a direct party through', async () => {

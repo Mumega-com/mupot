@@ -4596,9 +4596,29 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdict_channels_no_delete" },
     ],
   },
+  {
+    file: "0262_task_verdict_independence_waiver.sql",
+    sha256: "b3cb64c5fb47db267908257792995e41c35523e49c72abe42b92adc7e999f10b",
+    statements: [
+      "-- 0262 a verdict records WHICH independence exemption let its decider through (mom-walk D1, mupot task 7ae27377).\n--\n-- independence_waiver: NULL for an ordinary independent verdict (and every pre-0262 verdict); otherwise the\n-- VerdictIndependenceWaiver the write carried: 'admin_supervisory', 'owner_override', or 'owner_self' (a member who OWNS\n-- the assignee agent giving the verdict on its work). Written in the verdict INSERT, atomic with it, so an owner's own-agent\n-- approval is auditable apart from an admin's supervisory one. Additive, no backfill, no FK.\n--\n-- The append-only update trigger is replaced WITHOUT a window where none exists (new name FIRST, old dropped after), pinning\n-- the new column on both branches exactly as 0252 did.\n--\n-- task_review_lenses: the evidence an OWNER's own-agent verdict ('owner_self') requires: two independent passing review\n-- lenses on the task's CURRENT submission. Append-only (latest row per reviewer+lens wins, so a later fail withdraws a pass).\n-- Each row binds the submission id + result digest + the gate_owner lane it was given for, so replacing the submission or\n-- re-gating the task orphans it. Eligibility of the reviewer (lane held, independent, not owner-linked) is judged at decision\n-- time inside the verdict UPDATE, never trusted from this row. (A later migration that re-creates it must drop BOTH names.)\nCREATE TABLE IF NOT EXISTS task_review_lenses (\n  id            TEXT PRIMARY KEY,\n  task_id       TEXT NOT NULL,\n  submission_id TEXT NOT NULL,\n  result_digest TEXT NOT NULL,\n  gate_owner    TEXT NOT NULL,\n  lens          TEXT NOT NULL CHECK (length(trim(lens)) BETWEEN 1 AND 64),\n  reviewer_kind TEXT NOT NULL CHECK (reviewer_kind IN ('agent', 'member')),\n  reviewer_id   TEXT NOT NULL,\n  outcome       TEXT NOT NULL CHECK (outcome IN ('pass', 'fail')),\n  note          TEXT,\n  created_at    TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_task_review_lenses_task_submission ON task_review_lenses(task_id, submission_id);",
+      "\nCREATE TRIGGER IF NOT EXISTS task_review_lenses_no_update BEFORE UPDATE ON task_review_lenses\nBEGIN SELECT RAISE(ABORT, 'task_review_lenses are append-only: UPDATE is forbidden'); END;",
+      "\nCREATE TRIGGER IF NOT EXISTS task_review_lenses_no_delete BEFORE DELETE ON task_review_lenses\nBEGIN SELECT RAISE(ABORT, 'task_review_lenses are append-only: DELETE is forbidden'); END;",
+      "\n\nALTER TABLE task_verdicts ADD COLUMN independence_waiver TEXT CHECK (independence_waiver IS NULL OR independence_waiver IN ('admin_supervisory', 'owner_override', 'owner_self'));",
+      "\n\nCREATE TRIGGER IF NOT EXISTS task_verdicts_no_update_0262\nBEFORE UPDATE ON task_verdicts\nWHEN NOT (\n  (\n    OLD.project_id IS NULL\n    AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.reversed_at IS OLD.reversed_at\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n    AND NEW.submission_id IS OLD.submission_id\n    AND NEW.result_digest IS OLD.result_digest\n    AND NEW.receipt_actor_kind IS OLD.receipt_actor_kind\n    AND NEW.independence_waiver IS OLD.independence_waiver\n  )\n  OR\n  (\n    OLD.reversed_at IS NULL\n    AND NEW.reversed_at IS NOT NULL\n    AND NEW.id IS OLD.id\n    AND NEW.task_id IS OLD.task_id\n    AND NEW.verdict IS OLD.verdict\n    AND NEW.note IS OLD.note\n    AND NEW.decided_by IS OLD.decided_by\n    AND NEW.decided_at IS OLD.decided_at\n    AND NEW.decided_via IS OLD.decided_via\n    AND NEW.origin_agent_id IS OLD.origin_agent_id\n    AND NEW.proposal_id IS OLD.proposal_id\n    AND NEW.project_id IS OLD.project_id\n    AND NEW.attachment_id IS OLD.attachment_id\n    AND NEW.consenting_member_id IS OLD.consenting_member_id\n    AND NEW.submission_id IS OLD.submission_id\n    AND NEW.result_digest IS OLD.result_digest\n    AND NEW.receipt_actor_kind IS OLD.receipt_actor_kind\n    AND NEW.independence_waiver IS OLD.independence_waiver\n  )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'verdicts are append-only: UPDATE is forbidden');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS task_verdicts_no_update_0252;",
+    ],
+    objects: [
+      { type: "table", name: "task_review_lenses" },
+      { type: "index", name: "idx_task_review_lenses_task_submission" },
+      { type: "trigger", name: "task_review_lenses_no_update" },
+      { type: "trigger", name: "task_review_lenses_no_delete" },
+      { type: "trigger", name: "task_verdicts_no_update_0262" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "3b1842cec8a212ee669185ce022c4461835a02f2781b0ca1273b5a5eacf1e519"
+export const SCHEMA_CHAIN_DIGEST: string = "4fe69817d0ac321f9372ea5027f1791a58a13c0b5d66d381a070adf6c57e22b0"

@@ -353,9 +353,9 @@ describe('B3: a stale verdict does not apply to a newer submission', () => {
     expect(upd(`reversed_at = '2026-10-22T01:00:00Z'`)).not.toThrow()
   })
 
-  it('there is never a moment without an update trigger: 0252 creates the new trigger, then drops the old', () => {
+  it('there is never a moment without an update trigger: 0262 creates the new trigger, then drops the old (0252\'s)', () => {
     const names = (harness.sqlite.prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'task_verdicts' AND name LIKE '%no_update%'`).all() as Array<{ name: string }>).map((r) => r.name)
-    expect(names).toEqual(['task_verdicts_no_update_0252'])
+    expect(names).toEqual(['task_verdicts_no_update_0262'])
   })
 })
 

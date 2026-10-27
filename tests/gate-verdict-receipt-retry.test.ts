@@ -38,6 +38,14 @@ afterEach(() => {
 })
 
 describe('gate.verdict receipt append retry', () => {
+  it.each(['owner_self', 'admin_supervisory', 'owner_override', null] as const)('carries the recorded waiver %s in gate.verdict claims', async (waiver) => {
+    append.mockResolvedValueOnce(okReceipt)
+    await emitGateVerdictReceipt(env, { ...verdict, independence_waiver: waiver })
+    expect(append).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({
+      type: 'gate.verdict', claims: expect.objectContaining({ independence_waiver: waiver }),
+    }))
+  })
+
   it('retries stale_head and succeeds', async () => {
     append
       .mockRejectedValueOnce(new ExecutionReceiptError('stale_head'))

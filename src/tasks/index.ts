@@ -38,7 +38,7 @@ import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
-import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
+import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, ownsTaskPartyAgent, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
 import { resolveVerdictSubmission, VerdictSubmissionMismatchError, VerdictSubmissionRequiredError, type GateVerdictReceiptOutcome } from './verdict-binding'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
@@ -1560,10 +1560,12 @@ export interface VerdictGateCache {
   readonly affiliation: Map<string, Promise<boolean>>
   // Policy rule 3: one independence read per (decider, task) per request, shared by both verdicts.
   readonly independence: Map<string, Promise<VerdictConflictKind | null>>
+  // Mom-walk D1: one owner-self read per (member, task) per request.
+  readonly ownerSelf: Map<string, Promise<boolean>>
 }
 
 export function createVerdictGateCache(): VerdictGateCache {
-  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map(), independence: new Map() }
+  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map(), independence: new Map(), ownerSelf: new Map() }
 }
 
 /**
@@ -1602,6 +1604,27 @@ function memberAffiliated(
   if (!hit) {
     hit = isMemberAffiliatedWithAssigneeAgent(env, memberId, assigneeAgentId)
     cache.affiliation.set(key, hit)
+  }
+  return hit
+}
+
+// Live ownership AND two independent passing lenses on the task's CURRENT submission (the same pair the verdict UPDATE re-asserts).
+async function ownerSelfWithLenses(env: Env, memberId: string, taskId: string): Promise<boolean> {
+  return holdsOwnerSelfVerdictAuthority(env, memberId, taskId, await resolveVerdictSubmission(env, taskId))
+}
+
+function ownerSelfAuthority(
+  env: Env,
+  memberId: string,
+  taskId: string,
+  cache: VerdictGateCache | undefined,
+): Promise<boolean> {
+  if (!cache) return ownerSelfWithLenses(env, memberId, taskId)
+  const key = `${memberId}:${taskId}`
+  let hit = cache.ownerSelf.get(key)
+  if (!hit) {
+    hit = ownerSelfWithLenses(env, memberId, taskId)
+    cache.ownerSelf.set(key, hit)
   }
   return hit
 }
@@ -1770,8 +1793,15 @@ export async function evaluateVerdictGates(
       || (principal.type === 'member' && task.assignee_agent_id !== null
         && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache)))
     if (affiliated) {
-      if (!legacyOwnerAdmin(auth)) return { allowed: false, code: 'self_verdict', principal }
-      independenceWaiver = 'admin_supervisory'
+      // Ownership takes precedence over org-admin standing on every verdict surface. The owner needs the same
+      // current, independent lenses as any other member; supervisory standing only covers non-owner affiliations.
+      if (principal.type === 'member' && await ownerSelfAuthority(env, principal.id, task.id, cache)) {
+        independenceWaiver = 'owner_self'
+      } else if (principal.type === 'member' && isOrgAdmin(auth) && !(await ownsTaskPartyAgent(env, principal.id, task.id))) {
+        independenceWaiver = 'admin_supervisory'
+      } else {
+        return { allowed: false, code: 'self_verdict', principal }
+      }
     }
   }
 
