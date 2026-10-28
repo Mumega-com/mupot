@@ -27,8 +27,8 @@
 //    minted for another pot can never touch this one.
 
 import { Hono } from 'hono'
-import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
-import { revokeTelegramApprovedElevationGrants } from '../auth/elevation'
+import { recordTgAudit } from '../secure-moments/telegram-miniapp-store'
+import { prepareTelegramApprovedElevationGrantRevocation } from '../auth/elevation'
 import type { Context, MiddlewareHandler } from 'hono'
 import type {
   Env,
@@ -1736,28 +1736,12 @@ membersApp.delete(
     const receiptId = crypto.randomUUID()
     const unboundAt = new Date().toISOString()
 
-    // mupot#1411 A8 round 5 (Athena final-gate, 2026-09-15): the clearing
-    // UPDATE and the receipt INSERT used to be two SEPARATE .run() calls — a
-    // failure on the receipt side (or a crash between the two calls) would
-    // leave the binding cleared with NO durable trace of who did it, exactly
-    // the phantom-success class assertWritten exists to catch elsewhere in
-    // this file (invite-accept's own mint batch, a few hundred lines up).
-    // Batched atomically now (same `DB.batch()` shape the
-    // suspend route above already uses for its UPDATE+UPDATE pair) so either
-    // both writes land or neither does.
-    //
-    // The receipt INSERT is `... SELECT ... WHERE changes() = 1` rather than
-    // an unconditional VALUES row — the same cross-statement idiom this
-    // codebase already uses (migrations 0071/0134/0135's triggers,
-    // src/flight-spine/receipts.ts's own atomic-audit guard) to make one
-    // statement's write conditional on the row count the PREVIOUS statement
-    // in the same transaction actually changed. `changes() = 1` here reads
-    // the UPDATE immediately above: a 0-row UPDATE (the TOCTOU race the
-    // `telegram_chat_id = ?3` conjunct guards — someone else changed the
-    // binding between the SELECT above and now) must not write a receipt
-    // that claims a clearing which never happened.
+    // Keep the binding clear immediately before its conditional receipt: changes()
+    // must see that UPDATE. All authority revocation commits in the same batch.
+    // Already-unbound retries run cleanup without writing another receipt.
+    const statements = []
     if (priorTelegramChatId !== null) {
-      const [update, insert] = await c.env.DB.batch([
+      statements.push(
         c.env.DB.prepare(
           `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
             WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
@@ -1768,26 +1752,33 @@ membersApp.delete(
            SELECT ?1, ?2, ?3, ?4, ?5, ?6
             WHERE changes() = 1`,
         ).bind(receiptId, c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, unboundAt),
-      ])
+      )
+    }
+    statements.push(
+      c.env.DB.prepare(
+        `UPDATE tg_miniapp_devices SET revoked_at = ?3, revoked_reason = 'telegram_unbound'
+          WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL
+            AND EXISTS (SELECT 1 FROM members WHERE id = ?2 AND (tenant = ?1 OR tenant IS NULL) AND telegram_chat_id IS NULL)`,
+      ).bind(c.env.TENANT_SLUG, memberId, unboundAt),
+      prepareTelegramApprovedElevationGrantRevocation(c.env, memberId, unboundAt),
+    )
+    const results = await c.env.DB.batch(statements)
+    if (priorTelegramChatId !== null) {
+      const [update, insert] = results
       if (!update.meta || update.meta.changes === 0) {
-        const current = await c.env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?1 AND tenant = ?2')
+        const current = await c.env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)')
           .bind(memberId, c.env.TENANT_SLUG).first<{ telegram_chat_id: string | null }>()
         if (!current) return c.json({ error: 'member_not_found' }, 404)
         if (current.telegram_chat_id !== null) return c.json({ error: 'telegram_binding_changed' }, 409)
       }
-      // The UPDATE landed (changes === 1), so the conditional INSERT above was
-      // guaranteed to fire — assertWritten catches a phantom success (e.g. a
-      // future constraint silently no-opping the row) rather than reporting
-      // telegram_unbound: true over an unrecorded revocation.
       if (Number(update.meta?.changes ?? 0) > 0) assertWritten(insert, 'telegram_unbind_receipts.insert')
     }
-    // A Mini App device is bound to the Telegram user id this member WAS linked to: unlinking ends that device too (it would
-    // also be refused at use, since the binding is re-checked, but a re-link to another account must never find it live).
-    // Cleanup is retried even when already unbound. Any failure propagates: never
-    // claim success over live authority. The decision batch checks the binding,
-    // so no in-flight bot approval can mint a grant after the clear above.
-    await revokeMemberTgDevices(c.env, memberId, 'telegram_unbound')
-    await revokeTelegramApprovedElevationGrants(c.env, memberId)
+    // Preserve the device helper's best-effort audit after its SQL revocation commits.
+    const devicesRevoked = Number(results[priorTelegramChatId !== null ? 2 : 0].meta?.changes ?? 0)
+    if (devicesRevoked > 0) await recordTgAudit(c.env, {
+      operation: 'tg_device_revoke', memberId, deviceId: null,
+      evidence: { reason: 'telegram_unbound', count: String(devicesRevoked) },
+    }, Date.parse(unboundAt))
 
     return c.json({ member_id: memberId, telegram_unbound: true })
   },

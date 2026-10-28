@@ -1010,11 +1010,12 @@ export async function revokeElevationGrant(
 /** #2100: use trusted channel provenance, never the user-editable decision note.
  * Older bot approvals may have only the audit receipt (the channel stamp used
  * to be best-effort). Both forms are scoped to the tenant, request and approver.
- * No missing-table fallback: failure must prevent an unbind success response. */
-export async function revokeTelegramApprovedElevationGrants(env: Env, memberId: string): Promise<void> {
-  const nowMs = Date.now()
-  const live = await env.DB.prepare(
-    `SELECT g.id, g.created_at FROM elevation_grants g
+ * Prepared for the unbind batch: any failure rolls back the binding and receipt too. */
+export function prepareTelegramApprovedElevationGrantRevocation(env: Env, memberId: string, nowIso: string) {
+  return env.DB.prepare(
+    `UPDATE elevation_grants SET revoked_at = ?3, revoke_reason = 'telegram_unbound'
+      WHERE EXISTS (SELECT 1 FROM members WHERE id = ?2 AND (tenant = ?1 OR tenant IS NULL) AND telegram_chat_id IS NULL)
+        AND id IN (SELECT g.id FROM elevation_grants g
       JOIN elevation_requests r ON r.id = g.elevation_request_id AND r.tenant = g.tenant
       WHERE g.tenant = ?1 AND g.approved_by_member_id = ?2
         AND r.decided_by_member_id = ?2
@@ -1023,11 +1024,8 @@ export async function revokeTelegramApprovedElevationGrants(env: Env, memberId: 
            WHERE a.tenant = g.tenant AND a.member_id = ?2 AND a.target_kind = 'elevation_request'
              AND a.target_id = r.id AND a.handler = 'approval_bot' AND a.operation = 'elevation_approve'
         )))
-        AND g.revoked_at IS NULL AND g.expires_at > ?3`,
-  ).bind(env.TENANT_SLUG, memberId, new Date(nowMs).toISOString()).all<{ id: string; created_at: string }>()
-  for (const grant of live.results) {
-    await revokeElevationGrant(env, env.TENANT_SLUG, grant.id, 'telegram_unbound', nowMs, grant.created_at)
-  }
+        AND g.revoked_at IS NULL AND g.expires_at > ?3)`,
+  ).bind(env.TENANT_SLUG, memberId, nowIso)
 }
 
 // ── usage log ────────────────────────────────────────────────────────────
