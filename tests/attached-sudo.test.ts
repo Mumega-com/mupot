@@ -775,12 +775,22 @@ describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)
     const w = await world()
     const r = await ask(w)
     const human = { memberId: HUMAN, userId: HUMAN, role: 'member', tenant: TENANT, capabilities: await resolveCapabilities(w.env, HUMAN) } as unknown as AuthContext
+    // world() enrolled a passkey through a live Google login identity, as in the Mini App enrolment fixture.
+    const identity = one<{ id: string }>('SELECT id FROM human_login_identities WHERE tenant = ? AND member_id = ? AND revoked_at IS NULL', TENANT, HUMAN)!
+    const telegramUserId = '1001'
+    const deviceId = crypto.randomUUID()
+    h.sqlite.prepare('UPDATE members SET telegram_chat_id = ? WHERE id = ?').run(telegramUserId, HUMAN)
+    h.sqlite.prepare(`INSERT INTO tg_miniapp_devices
+      (id, tenant, member_id, telegram_user_id, login_identity_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
+      .run(deviceId, TENANT, HUMAN, telegramUserId, identity.id, crypto.randomUUID(), 'a'.repeat(64))
     const gate = vi.fn(async () => true)
     const mint = vi.fn(async () => { throw new Error('must not mint a session for a refused approval') })
-    const base = { id: reqIdOf(r), durationMinutes: 15, mintSession: mint, gate, auth: human, proof: { memberId: HUMAN, via: 'telegram_miniapp' as const, evidence: {} } }
+    const base = { id: reqIdOf(r), durationMinutes: 15, mintSession: mint, gate, auth: human, proof: { memberId: HUMAN, via: 'telegram_miniapp' as const, evidence: { tg_device_id: deviceId, telegram_user_id: telegramUserId } } }
     const approve = await decideElevation(w.env, { ...base, decision: 'approve', selectedActions: [SUDO] })
     expect(approve.status).toBe(403)
     expect(approve.title).toBe('Use a passkey')
+    expect(approve.message).toBe('A request from an attached chat is approved with a passkey, not from Telegram. Open the approval link in your browser.')
     expect(gate).not.toHaveBeenCalled()
     expect(mint).not.toHaveBeenCalled()
     expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)

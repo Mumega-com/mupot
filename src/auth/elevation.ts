@@ -437,6 +437,10 @@ export interface DecideElevationInput {
   decidedViaAccess?: boolean
   /** Trusted channel flag, set by the shared decision core, never from a user-supplied note. */
   decidedViaApprovalBot?: boolean
+  /** Trusted Mini App proof; device/user come from the verified channel, never the decision note. */
+  decidedViaTelegramMiniapp?: boolean
+  telegramMiniappDeviceId?: string
+  telegramMiniappUserId?: string
   note?: string
 }
 
@@ -794,23 +798,34 @@ export async function decideElevationRequest(
 
   // Check inside each decision write, including the grant transaction. A callback
   // can pass its initial binding read just before a concurrent unbind commits.
-  const botBindingGuard = (request: string, tenant: string, member: string): string =>
+  const telegramBindingGuard = (request: string, tenant: string, member: string, device: string, user: string): string =>
     input.decidedViaApprovalBot === true
       ? ` AND EXISTS (SELECT 1 FROM approval_bot_deliveries d JOIN members m ON m.id = d.member_id
             WHERE d.request_id = ${request} AND d.tenant = ${tenant} AND d.member_id = ${member}
               AND d.status = 'sent' AND m.telegram_chat_id = d.chat_id
               AND (m.tenant = ${tenant} OR m.tenant IS NULL) AND m.status = 'active')`
-      : ''
+      : input.decidedViaTelegramMiniapp === true
+        ? ` AND EXISTS (SELECT 1 FROM tg_miniapp_devices d
+              JOIN members m ON m.id = d.member_id AND m.tenant = d.tenant
+              JOIN human_login_identities i ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id
+             WHERE d.id = ${device} AND d.tenant = ${tenant} AND d.member_id = ${member}
+               AND d.telegram_user_id = ${user} AND m.telegram_chat_id = d.telegram_user_id
+               AND m.status = 'active' AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL AND i.revoked_at IS NULL)`
+        : ''
+  const miniappBindings = input.decidedViaTelegramMiniapp === true
+    ? [input.telegramMiniappDeviceId ?? null, input.telegramMiniappUserId ?? null] : []
+  const decidedVia = input.decidedViaApprovalBot === true ? "'approval_bot'"
+    : input.decidedViaTelegramMiniapp === true ? "'telegram_miniapp'" : 'NULL'
   if (input.decision === 'deny') {
     const result = await env.DB.prepare(
       `UPDATE elevation_requests
           SET status = 'denied', decided_at = ?1, decided_by_member_id = ?2,
               decided_by_web_session_hash = ?3, decision_note = ?4,
-              decided_via = ${input.decidedViaApprovalBot === true ? "'approval_bot'" : 'NULL'}
+              decided_via = ${decidedVia}
         WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
-          ${botBindingGuard('?5', '?6', '?2')}`,
+          ${telegramBindingGuard('?5', '?6', '?2', '?7', '?8')}`,
     )
-      .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
+      .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant, ...miniappBindings)
       .run()
     if (Number(result.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'denied' }
     return { ok: true, request: { ...request, status: 'denied', decided_at: nowIso,
@@ -868,18 +883,18 @@ export async function decideElevationRequest(
             WHERE id = ?1 AND tenant = ?8
               AND (revoked_at IS NOT NULL OR expires_at <= ?5)
               AND EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?2 AND tenant = ?8 AND status = 'pending')
-              ${botBindingGuard('?2', '?8', '?3')}`,
+              ${telegramBindingGuard('?2', '?8', '?3', '?9', '?10')}`,
         ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash,
-          g.created_at, g.expires_at, g.effect, g.tenant)
+          g.created_at, g.expires_at, g.effect, g.tenant, ...miniappBindings)
       : env.DB.prepare(
           `INSERT INTO elevation_grants
              (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
               approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
             WHERE EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND status = 'pending')
-              ${botBindingGuard('?3', '?2', '?9')}`,
+              ${telegramBindingGuard('?3', '?2', '?9', '?13', '?14')}`,
         ).bind(g.id, g.tenant, g.elevation_request_id, g.agent_session_id, g.action, g.scope_type,
-          g.scope_id, g.effect, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at),
+          g.scope_id, g.effect, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at, ...miniappBindings),
   )
   const batchResults = await env.DB.batch([
     ...grantStatements,
@@ -892,11 +907,11 @@ export async function decideElevationRequest(
               ) = ?7 THEN 'approved' ELSE NULL END,
               decided_at = ?1, decided_by_member_id = ?2,
               decided_by_web_session_hash = ?3, decision_note = ?4,
-              decided_via = ${input.decidedViaApprovalBot === true ? "'approval_bot'" : 'NULL'}
+              decided_via = ${decidedVia}
         WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
-          ${botBindingGuard('?5', '?6', '?2')}`,
+          ${telegramBindingGuard('?5', '?6', '?2', `?${grants.length + 8}`, `?${grants.length + 9}`)}`,
     ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null,
-      request.id, input.tenant, grants.length, ...grants.map((g) => g.id)),
+      request.id, input.tenant, grants.length, ...grants.map((g) => g.id), ...miniappBindings),
   ])
   // NULL deliberately violates status's NOT NULL constraint when any grant was
   // skipped. This check must run inside the transaction, not after it commits.
@@ -1008,8 +1023,8 @@ export async function revokeElevationGrant(
 }
 
 /** #2100: use trusted channel provenance, never the user-editable decision note.
- * Older bot approvals may have only the audit receipt (the channel stamp used
- * to be best-effort). Both forms are scoped to the tenant, request and approver.
+ * Older Telegram approvals may have only the audit receipt (the bot stamp used
+ * to be best-effort, and Mini App decisions had no stamp). Both forms are scoped to the tenant, request and approver.
  * Prepared for the unbind batch: any failure rolls back the binding and receipt too. */
 export function prepareTelegramApprovedElevationGrantRevocation(env: Env, memberId: string, nowIso: string) {
   return env.DB.prepare(
@@ -1019,10 +1034,12 @@ export function prepareTelegramApprovedElevationGrantRevocation(env: Env, member
       JOIN elevation_requests r ON r.id = g.elevation_request_id AND r.tenant = g.tenant
       WHERE g.tenant = ?1 AND g.approved_by_member_id = ?2
         AND r.decided_by_member_id = ?2
-        AND (r.decided_via = 'approval_bot' OR (r.decided_via IS NULL AND EXISTS (
+        AND (r.decided_via IN ('approval_bot', 'telegram_miniapp') OR (r.decided_via IS NULL AND EXISTS (
           SELECT 1 FROM mutation_audit_entries a
            WHERE a.tenant = g.tenant AND a.member_id = ?2 AND a.target_kind = 'elevation_request'
-             AND a.target_id = r.id AND a.handler = 'approval_bot' AND a.operation = 'elevation_approve'
+             AND a.target_id = r.id AND a.operation = 'elevation_approve'
+             AND (a.handler = 'approval_bot' OR (a.handler = 'secure_moment'
+               AND json_extract(CASE WHEN json_valid(a.evidence_json) THEN a.evidence_json ELSE '{}' END, '$.via') = 'telegram_miniapp'))
         )))
         AND g.revoked_at IS NULL AND g.expires_at > ?3)`,
   ).bind(env.TENANT_SLUG, memberId, nowIso)
