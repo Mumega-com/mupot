@@ -8,7 +8,7 @@ import type {
   TaskBoardPort,
   TaskBoardSyncResult,
 } from './port'
-import { touchProjectBindingSync } from './bindings'
+import { isLinearDestinationValid, touchProjectBindingSync } from './bindings'
 import { registerBoardProvider } from './registry-core'
 import { linearLinkArtifact, linearPostComment, linearPushStatus } from '../../integrations/linear-writeback'
 import { handleLinearWebhook, parseLinearWebhook, verifyLinearWebhook } from '../../integrations/linear-webhook'
@@ -68,10 +68,14 @@ export function createLinearBoardPort(env: Env): TaskBoardPort {
     ): Promise<TaskBoardSyncResult | TaskBoardError> {
       if (!binding.connector_id) return { ok: false, error: 'connector_required' }
       if (opts.project_id !== binding.project_id) return { ok: false, error: 'project_mismatch' }
+      const destination = defaultSquadIdFromMeta(binding.meta_json)
+      if (destination && !await isLinearDestinationValid(env, binding.project_id, destination)) {
+        return { ok: false, error: 'invalid_default_squad' }
+      }
       const res = await importLinearIssues(env, {
         connectorId: binding.connector_id,
         teamKey: binding.external_id,
-        defaultSquadId: defaultSquadIdFromMeta(binding.meta_json),
+        defaultSquadId: destination,
         dryRun: opts.dryRun,
         projectId: binding.project_id,
       })

@@ -799,7 +799,10 @@ describe('project dashboard renderers', () => {
     ))).toBe(true)
     expect(view?.members.some((member) => member.agent_id === 'omitted-agent')).toBe(false)
     for (const name of visibleNames) expect(body).toContain(name)
-    expect(body).not.toContain('AAA omitted squad')
+    // The destination picker lists all eligible squads independently of the team window.
+    const teamSection = body.match(/<section id="squads"[\s\S]*?(?=<section id="activity")/)?.[0]
+    expect(teamSection).toBeDefined()
+    expect(teamSection).not.toContain('AAA omitted squad')
     expect(body).not.toContain('AAA omitted member')
     expect(body).toContain('Showing the first 100 readable squad edges.')
     expect(body).toContain('Showing the first 100 readable agent members.')
@@ -1814,5 +1817,351 @@ describe('projectMutationStatus', () => {
     expect(projectMutationStatus('invalid_status')).toBe(400)
     expect(projectMutationStatus('invalid_target_date')).toBe(400)
     expect(projectMutationStatus('invalid_access_level')).toBe(400)
+  })
+})
+
+describe('Linear destination squad authority', () => {
+  let h: SqliteD1Harness
+  afterEach(() => { authState.current = null; h?.close() })
+  function setup() {
+    h = makeHarness()
+    h.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind, archived_at) VALUES
+        ('home', 'dept-a', 'home-test', 'Home excluded', 'home', NULL),
+        ('archived', 'dept-a', 'archived-test', 'Archived excluded', 'work', '2026-01-01'),
+        ('unlinked', 'dept-a', 'unlinked-test', 'Unlinked excluded', 'work', NULL);
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('visible-child', 'home', 'write'), ('visible-child', 'archived', 'write');
+    `)
+    as(memberA())
+    return envFor(h)
+  }
+  async function bind(env: Env, squad: string, provider = 'linear') {
+    return dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+      provider, external_id: 'ENG', defaultSquadId: squad,
+    }), env)
+  }
+  it('lists only linked, active, non-home squads within actor authority and selects the current value', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    const view = await loadProjectDetail(env, memberA(), 'visible-child')
+    const body = await render(projectDetailBody(view!))
+    const select = body.match(/<select name="defaultSquadId"[^>]*>([\s\S]*?)<\/select>/)?.[1]
+    expect(select).toBeDefined()
+    expect(select).toMatch(/value="squad-a" selected/)
+    for (const id of ['squad-b', 'home', 'archived', 'unlinked']) expect(select).not.toContain(`value="${id}"`)
+    const adminView = await loadProjectDetail(env, actor({ role: 'admin' }), 'visible-child')
+    const adminBody = await render(projectDetailBody(adminView!))
+    const adminSelect = adminBody.match(/<select name="defaultSquadId"[^>]*>([\s\S]*?)<\/select>/)?.[1]
+    expect(adminSelect).not.toContain('value="squad-b"')
+    for (const id of ['home', 'archived', 'unlinked']) expect(adminSelect).not.toContain(`value="${id}"`)
+  })
+  it('stores a valid destination and routes a webhook-created issue there', async () => {
+    const env = setup()
+    expect((await bind(env, 'squad-a')).status).toBe(302)
+    const { getProjectBinding } = await import('../src/projects/providers/bindings')
+    const binding = await getProjectBinding(env, 'visible-child', 'linear')
+    expect(JSON.parse(binding!.meta_json)).toEqual({ defaultSquadId: 'squad-a' })
+    const { handleLinearWebhook } = await import('../src/integrations/linear-webhook')
+    expect(await handleLinearWebhook(env, binding!, { kind: 'item_created', item: {
+      native_id: 'linear-destination-test', ref: 'ENG-999', title: 'Destination test', url: null, status: 'Todo',
+    } })).toMatchObject({ ok: true, imported: 1 })
+    expect(await h.db.prepare("SELECT squad_id, project_id FROM tasks WHERE title = 'Destination test'").first())
+      .toMatchObject({ squad_id: 'squad-a', project_id: 'visible-child' })
+  })
+  it.each(['home', 'unlinked', 'archived', 'squad-b', 'missing'])('refuses %s without changing any binding', async (id) => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    const before = await h.db.prepare('SELECT * FROM project_provider_bindings').all()
+    const response = await bind(env, id)
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('invalid_default_squad')
+    expect(await h.db.prepare('SELECT * FROM project_provider_bindings').all()).toEqual(before)
+  })
+  it.each(['EVIL', 'ENG'])('clears an admin destination on unauthorized omitted relink to %s; webhook imports nothing', async (external_id) => {
+    const env = setup()
+    h.sqlite.exec("UPDATE project_squad_access SET access_level = 'write' WHERE project_id = 'visible-child' AND squad_id = 'squad-b'")
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b')).status).toBe(302)
+    as(memberA())
+    const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+      provider: 'linear', external_id,
+    }), env)
+    expect(response.status).toBe(302)
+    const { getProjectBinding } = await import('../src/projects/providers/bindings')
+    const binding = (await getProjectBinding(env, 'visible-child', 'linear'))!
+    expect(JSON.parse(binding.meta_json)).toEqual({})
+    const { handleLinearWebhook } = await import('../src/integrations/linear-webhook')
+    expect(await handleLinearWebhook(env, binding, { kind: 'item_created', item: {
+      native_id: 'evil', ref: `${external_id}-999`, title: 'Unauthorized import', url: null, status: null,
+    } })).toEqual({ ok: true, imported: 0, detail: 'no_squad' })
+    expect(await h.db.prepare("SELECT id FROM tasks WHERE title = 'Unauthorized import'").first()).toBeNull()
+    const body = await render(projectDetailBody((await loadProjectDetail(env, memberA(), 'visible-child'))!))
+    expect(body).toContain('destination cleared; choose a squad')
+  })
+  it('keeps only the destination on an authorized unchanged omitted relink, and clears it on a changed target', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    for (const values of [{ defaultSquadId: '' }, {}]) {
+      expect((await dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+        provider: 'linear', external_id: 'ENG', ...values,
+      }), env)).status).toBe(302)
+      expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first())
+        .toEqual({ meta_json: '{"defaultSquadId":"squad-a"}' })
+    }
+    await dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', { provider: 'linear', external_id: 'NEW' }), env)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first()).toEqual({ meta_json: '{}' })
+  })
+  it('merges only the destination key, preserves writeback, and supports explicit clear', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    h.sqlite.exec(`UPDATE project_provider_bindings SET meta_json = '{"defaultSquadId":"squad-a","writeback":{"enabled":true},"other":"retained"}'`)
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const result = await upsertProjectBinding(env, 'visible-child', {
+      provider: 'linear', external_id: 'ENG', meta: { defaultSquadId: 'squad-a', injected: true },
+    }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(result.ok && JSON.parse(result.value.meta_json)).toEqual({ defaultSquadId: 'squad-a', writeback: { enabled: true }, other: 'retained' })
+    expect((await bind(env, '__clear__')).status).toBe(302)
+    const row = await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first<{ meta_json: string }>()
+    expect(JSON.parse(row!.meta_json)).toEqual({ writeback: { enabled: true }, other: 'retained' })
+  })
+  it.each(['github_projects', 'notion'])('resets stale metadata on %s relink', async (provider) => {
+    const env = setup()
+    await bind(env, '', provider)
+    h.sqlite.exec(`UPDATE project_provider_bindings SET meta_json = '{"agent_field":"stale"}'`)
+    await bind(env, '', provider)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first()).toEqual({ meta_json: '{}' })
+  })
+  it('refuses read-only destinations even for admins', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b')).status).toBe(400)
+  })
+  it('shows a visible destination by name and hides an out-of-scope destination', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    let body = await render(projectDetailBody((await loadProjectDetail(env, memberA(), 'visible-child'))!))
+    expect(body).toContain('Current destination: Squad A')
+    expect(body).toContain('Clear destination')
+    h.sqlite.exec(`UPDATE project_provider_bindings SET meta_json = '{"defaultSquadId":"squad-b"}'`)
+    body = await render(projectDetailBody((await loadProjectDetail(env, memberA(), 'visible-child'))!))
+    expect(body).toContain('Current destination: set by an admin')
+    expect(body).not.toContain('Current destination: squad-b')
+  })
+  it.each(['explicit', 'omitted'])('rechecks destination inside the write after a concurrent downgrade (%s)', async (choice) => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const prepare = h.db.prepare.bind(h.db)
+    const spy = vi.spyOn(h.db, 'prepare').mockImplementation((sql) => {
+      // Land a concurrent downgrade after JS validation, immediately before the INSERT executes.
+      if (sql.startsWith('INSERT INTO project_provider_bindings')) {
+        h.sqlite.exec("UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'visible-child' AND squad_id = 'squad-a'")
+      }
+      return prepare(sql)
+    })
+    try {
+      const result = await upsertProjectBinding(env, 'visible-child', {
+        provider: 'linear', external_id: 'ENG', ...(choice === 'explicit' ? { meta: { defaultSquadId: 'squad-a' } } : {}),
+      }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+      if (choice === 'explicit') expect(result).toEqual({ ok: false, error: 'invalid_default_squad' })
+      else expect(result.ok && JSON.parse(result.value.meta_json)).toEqual({})
+    } finally { spy.mockRestore() }
+  })
+  it('allows a workspace admin to select any eligible linked squad', async () => {
+    const env = setup()
+    h.sqlite.exec("UPDATE project_squad_access SET access_level = 'write' WHERE project_id = 'visible-child' AND squad_id = 'squad-b'")
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b')).status).toBe(302)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first())
+      .toEqual({ meta_json: '{"defaultSquadId":"squad-b"}' })
+  })
+  it.each(['github_projects', 'notion'])('ignores destination for %s', async (provider) => {
+    const env = setup()
+    expect((await bind(env, 'home', provider)).status).toBe(302)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first()).toEqual({ meta_json: '{}' })
+  })
+})
+// Append to a copy of tests/dashboard-projects.test.ts @ a1d96e65; run with -t 'GATE R2'. 14/14 green at a1d96e65.
+describe('GATE R2', () => {
+  let h: SqliteD1Harness
+  afterEach(() => { authState.current = null; h?.close() })
+  async function bind(env: Env, squad: string | undefined, ext = 'ENG', connector = '') {
+    return dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+      provider: 'linear', external_id: ext, connector_id: connector, ...(squad === undefined ? {} : { defaultSquadId: squad }),
+    }), env)
+  }
+  function setup() {
+    h = makeHarness()
+    h.sqlite.exec(`UPDATE project_squad_access SET access_level='write' WHERE project_id='visible-child' AND squad_id='squad-b';
+      INSERT INTO connectors (id, tenant, type, label, encrypted_secret, meta, scope_type, scope_id, created_by, created_at) VALUES
+      ('c-pot', 'pot-a', 'linear', 'Pot', 'x', NULL, 'pot', NULL, 'admin', datetime('now')),
+      ('c-pot2', 'pot-a', 'linear', 'Pot2', 'x', NULL, 'pot', NULL, 'admin', datetime('now')),
+      ('c-sqa', 'pot-a', 'linear', 'SqA', 'x', NULL, 'squad', 'squad-a', 'admin', datetime('now'));`)
+    return envFor(h)
+  }
+  async function meta(env: Env) {
+    const { getProjectBinding } = await import('../src/projects/providers/bindings')
+    return (await getProjectBinding(env, 'visible-child', 'linear'))
+  }
+  async function hook(env: Env, ref: string) {
+    const b = await meta(env)
+    const { handleLinearWebhook } = await import('../src/integrations/linear-webhook')
+    const out = await handleLinearWebhook(env, b!, { kind: 'item_created', item: { native_id: ref, ref, title: `T ${ref}`, url: null, status: 'Todo' } } as any)
+    const row = await h.db.prepare('SELECT squad_id FROM tasks WHERE title = ?').bind(`T ${ref}`).first<{ squad_id: string }>()
+    return { out, squad: row?.squad_id ?? null }
+  }
+
+  it('R1 PoC: squad-A relink to own team does not keep squad-b', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    as(memberA())
+    expect((await bind(env, undefined, 'EVIL', 'c-sqa')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+    const r = await hook(env, 'EVIL-1')
+    expect(r.squad).toBeNull()
+    expect(r.out).toMatchObject({ ok: true, detail: 'no_squad' })
+  })
+  it('squad-A relink same external_id + same connector(null) w/o authority over squad-b clears', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG')).status).toBe(302)
+    as(memberA())
+    expect((await bind(env, undefined, 'ENG')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+  })
+  it('admin same target omitted keeps', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    expect((await bind(env, undefined, 'ENG', 'c-pot')).status).toBe(302)
+    expect(JSON.parse((await meta(env))!.meta_json)).toEqual({ defaultSquadId: 'squad-b' })
+  })
+  it('same external_id different connector clears (even admin)', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    expect((await bind(env, undefined, 'ENG', 'c-pot2')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    as(memberA())
+    expect((await bind(env, undefined, 'ENG', 'c-sqa')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+  })
+  it('case-different / whitespace external_id', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    expect((await bind(env, undefined, 'eng', 'c-pot')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    expect((await bind(env, undefined, ' ENG ', 'c-pot')).status).toBe(302)
+    expect(JSON.parse((await meta(env))!.meta_json)).toEqual({ defaultSquadId: 'squad-b' })
+  })
+  it('squad-A explicit squad-b refused; squad-a accepted; clear works', async () => {
+    const env = setup()
+    as(memberA())
+    expect((await bind(env, 'squad-b', 'EVIL', 'c-sqa')).status).toBe(400)
+    expect(await meta(env)).toBeNull()
+    expect((await bind(env, 'squad-a', 'EVIL', 'c-sqa')).status).toBe(302)
+    expect(JSON.parse((await meta(env))!.meta_json)).toEqual({ defaultSquadId: 'squad-a' })
+    expect((await bind(env, '__clear__', 'EVIL', 'c-sqa')).status).toBe(302)
+    expect((await meta(env))!.meta_json).toBe('{}')
+  })
+  it('clear-then-relink by squad-A cannot resurrect squad-b', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    as(memberA())
+    expect((await bind(env, '__clear__', 'ENG', 'c-sqa')).status).toBe(302)
+    expect((await bind(env, undefined, 'ENG', 'c-pot')).status).toBe(400)
+    expect((await meta(env))!.meta_json).toBe('{}')
+  })
+  it('home / archived / read-only / unlinked squads are refused', async () => {
+    const env = setup()
+    h.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('squad-h','dept-a','squad-h','Home','home');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child','squad-h','write')`)
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-h', 'ENG', 'c-pot')).status).toBe(400)
+    h.sqlite.exec(`UPDATE project_squad_access SET access_level='read' WHERE project_id='visible-child' AND squad_id='squad-b'`)
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(400)
+    expect((await bind(env, 'nope', 'ENG', 'c-pot')).status).toBe(400)
+  })
+  it('lost access between JS check and write: SQL guard refuses', async () => {
+    const env0 = setup()
+    let armed = true
+    const db = new Proxy(h.db, { get(t, p, r) {
+      if (p !== 'prepare') return Reflect.get(t, p, r)
+      return (sql: string) => {
+        if (armed && sql.includes('INSERT INTO project_provider_bindings')) {
+          armed = false
+          h.sqlite.exec(`UPDATE project_squad_access SET access_level='read' WHERE project_id='visible-child' AND squad_id='squad-a'`)
+        }
+        return t.prepare(sql)
+      }
+    } })
+    const env = { ...env0, DB: db } as Env
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const res = await upsertProjectBinding(env, 'visible-child', { provider: 'linear', external_id: 'EVIL', meta: { defaultSquadId: 'squad-a' } }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(res).toEqual({ ok: false, error: 'invalid_default_squad' })
+    expect(await meta(env0)).toBeNull()
+  })
+  it('preserve branch: actor who lost squad-a access on an existing squad-a destination row clears it', async () => {
+    const env = setup()
+    as(memberA())
+    expect((await bind(env, 'squad-a', 'EVIL', '')).status).toBe(302)
+    h.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-c','dept-a','squad-c','C');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child','squad-c','write');
+      UPDATE project_squad_access SET access_level='read' WHERE project_id='visible-child' AND squad_id='squad-a'`)
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const res = await upsertProjectBinding(env, 'visible-child', { provider: 'linear', external_id: 'EVIL' }, { workspaceAdmin: false, actorSquadIds: ['squad-a', 'squad-c'] })
+    expect(res.ok).toBe(true)
+    expect((await meta(env))!.meta_json).toBe('{}')
+  })
+  it('use-time recheck: webhook 200-ignored and sync refused after archive/unlink', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    h.sqlite.exec(`UPDATE squads SET archived_at='2026-01-01' WHERE id='squad-b'`)
+    let r = await hook(env, 'ENG-1')
+    expect(r).toEqual({ out: { ok: true, imported: 0, detail: 'invalid_default_squad' }, squad: null })
+    h.sqlite.exec(`UPDATE squads SET archived_at=NULL WHERE id='squad-b'; DELETE FROM project_squad_access WHERE project_id='visible-child' AND squad_id='squad-b'`)
+    r = await hook(env, 'ENG-2')
+    expect(r.squad).toBeNull()
+    const { createLinearBoardPort } = await import('../src/projects/providers/linear')
+    const s = await createLinearBoardPort(env).syncIntoProject((await meta(env))!, { project_id: 'visible-child', dryRun: false })
+    expect(s).toEqual({ ok: false, error: 'invalid_default_squad' })
+    h.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('visible-child','squad-b','write')`)
+    r = await hook(env, 'ENG-3')
+    expect(r.squad).toBe('squad-b')
+  })
+  it('meta merge cannot inject keys via upsert (linear)', async () => {
+    const env = setup()
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const res = await upsertProjectBinding(env, 'visible-child', { provider: 'linear', external_id: 'EVIL', meta: { defaultSquadId: 'squad-a', writeback: true, stateMap: { done: 'X' } } }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(res.ok).toBe(true)
+    expect(JSON.parse((await meta(env))!.meta_json)).toEqual({ defaultSquadId: 'squad-a' })
+    await upsertProjectBinding(env, 'visible-child', { provider: 'linear', external_id: 'EVIL', meta: { defaultSquadId: 'squad-a"}', writeback: true } }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(JSON.parse((await meta(env))!.meta_json)).toEqual({ defaultSquadId: 'squad-a' })
+    const bad = await upsertProjectBinding(env, 'visible-child', { provider: 'linear', external_id: 'EVIL', meta: { defaultSquadId: ['squad-a'] } }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(bad).toEqual({ ok: false, error: 'invalid_default_squad' })
+  })
+  it('OBSERVE: stale admin writeback/stateMap survives a squad-A target change when a destination is set', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b', 'ENG', 'c-pot')).status).toBe(302)
+    h.sqlite.exec(`UPDATE project_provider_bindings SET meta_json='{"defaultSquadId":"squad-b","writeback":true,"stateMap":{"done":"Shipped"}}'`)
+    as(memberA())
+    expect((await bind(env, 'squad-a', 'EVIL', 'c-sqa')).status).toBe(302)
+    // observed: {"defaultSquadId":"squad-a","writeback":true,"stateMap":{"done":"Shipped"}}
+    expect((await meta(env))!.external_id).toBe('EVIL')
+  })
+  it('github binding meta defaultSquadId is inert to linear', async () => {
+    const env = setup()
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const res = await upsertProjectBinding(env, 'visible-child', { provider: 'github_projects', external_id: 'o/1', meta: { defaultSquadId: 'squad-b' } }, { workspaceAdmin: false, actorSquadIds: ['squad-a'] })
+    expect(res.ok).toBe(true)
+    expect(await meta(env)).toBeNull()
   })
 })

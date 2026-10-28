@@ -87,6 +87,7 @@ boardWebhookApp.post('/:provider', async (c) => {
 
   let imported = 0
   let noted = 0
+  const ignoredDetails: string[] = []
   try {
     const parsed = port.parseWebhook(rawBody)
     if (!parsed || parsed.event.kind === 'ignored') return c.json({ ok: true, ignored: true })
@@ -105,6 +106,7 @@ boardWebhookApp.post('/:provider', async (c) => {
       try {
         const out = await port.webhook(binding, parsed.event)
         if (!out.ok) failed = true
+        if (out.ok && (out.detail === 'no_squad' || out.detail === 'invalid_default_squad')) ignoredDetails.push(out.detail)
         imported += out.imported ?? 0
         noted += out.noted ?? 0
       } catch {
@@ -119,5 +121,5 @@ boardWebhookApp.post('/:provider', async (c) => {
     await releaseDelivery(c.env, provider, verified.deliveryId)
     return c.json({ error: 'handler_failed' }, 503)
   }
-  return c.json({ ok: true, imported, noted })
+  return c.json({ ok: true, imported, noted, ...(ignoredDetails.length ? { ignored: true, details: ignoredDetails } : {}) })
 })

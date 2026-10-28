@@ -1042,10 +1042,12 @@ dashboardApp.post('/projects/:id/boards', async (c) => {
     provider: form.provider,
     external_id: form.external_id,
     connector_id: form.connector_id,
+    ...(form.provider === 'linear' && form.defaultSquadId !== undefined && form.defaultSquadId !== ''
+      ? { meta: { defaultSquadId: form.defaultSquadId === '__clear__' ? null : form.defaultSquadId } } : {}),
   }, { workspaceAdmin: access.workspaceAdmin, actorSquadIds: access.actorSquadIds })
   if (!result.ok) {
     return c.html(
-      shell(c.env, view.project.name, projectDetailBody(view)),
+      shell(c.env, view.project.name, projectDetailBody(view, result.error)),
       result.error === 'archived_project' || result.error === 'project_not_found' ? 400 : 400,
     )
   }

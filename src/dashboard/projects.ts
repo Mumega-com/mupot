@@ -1,3 +1,4 @@
+import { defaultSquadIdFromMeta } from '../integrations/linear-issues'
 import { html, raw } from 'hono/html'
 import type {
   AuthContext,
@@ -38,7 +39,7 @@ import type {
 import type { ProjectHealth, ProjectSituation } from '../projects/situation'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
 import type { Presence } from '../fleet/registry'
-import { listProjectBindings } from '../projects/providers/bindings'
+import { listProjectBindings, listBindingDestinationSquads } from '../projects/providers/bindings'
 import type { ProjectProviderBinding } from '../projects/providers/port'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
@@ -187,6 +188,7 @@ export interface ProjectDetailView {
   evidence: ProjectProjectionPage<ProjectEvidenceSource>
   canManage: boolean
   boards: ProjectProviderBinding[]
+  boardDestinationSquads?: { id: string; name: string }[]
   canManageBoards: boolean
   assignedSquadName: string | null
   recentFlights: { id: string; goal: string; status: string }[]
@@ -765,7 +767,7 @@ export async function loadProjectDetail(
 
   const squads = await loadReadableSquads(env, project.id, access)
   const taskScope = await resolveVisibleTaskScope(env, auth)
-  const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards, worker] = await Promise.all([
+  const [aggregates, tasks, members, parent, situation, activity, evidence, boards, manageAccess, worker] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableProjectMembers(env, squads.rows),
@@ -774,9 +776,11 @@ export async function loadProjectDetail(
     listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds, taskSquadIds: taskScope.squadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
-    projectManageAccessContextFor(env, access, project.id).then((ctx) => ctx.authorized),
+    projectManageAccessContextFor(env, access, project.id),
     loadWorkerCards(env, [project]).then((cards) => cards.get(project.id) ?? EMPTY_WORKER_CARD),
   ])
+  const boardDestinationSquads = manageAccess.authorized
+    ? await listBindingDestinationSquads(env, project.id, manageAccess) : []
   const deployments = await listProjectDeployments(env, project.id, 8)
 
   return {
@@ -793,7 +797,8 @@ export async function loadProjectDetail(
     evidence,
     canManage: access.workspaceAdmin,
     boards,
-    canManageBoards,
+    canManageBoards: manageAccess.authorized,
+    boardDestinationSquads,
     assignedSquadName: worker.assignedSquadName,
     recentFlights: worker.recentFlights,
     recentPrs: worker.recentPrs,
@@ -1655,6 +1660,7 @@ function providerLabel(provider: string): string {
 
 function boardSection(view: ProjectDetailView) {
   const { project, boards, canManageBoards } = view
+  const currentDestination = defaultSquadIdFromMeta(boards.find((b) => b.provider === 'linear')?.meta_json ?? '{}')
   const rows = boards.map((board) => [
     html`<span>${providerLabel(board.provider)}</span>`,
     html`<code class="inline">${board.external_id}</code>`,
@@ -1668,7 +1674,7 @@ function boardSection(view: ProjectDetailView) {
   ])
 
   const linkForm = canManageBoards
-    ? html`<form class="adminform" method="post" action="/projects/${encodeURIComponent(project.id)}/boards" autocomplete="off" style="margin-top:14px;flex-direction:column;align-items:stretch;gap:10px;">
+    ? html`<form data-board-link-form class="adminform" method="post" action="/projects/${encodeURIComponent(project.id)}/boards" autocomplete="off" style="margin-top:14px;flex-direction:column;align-items:stretch;gap:10px;">
         <label>Provider
           <select name="provider" required>
             <option value="github_projects">GitHub Projects</option>
@@ -1682,8 +1688,27 @@ function boardSection(view: ProjectDetailView) {
         <label>Connector id <span style="font-size:12px;color:var(--muted)">(optional vault connector)</span>
           <input name="connector_id" placeholder="uuid from /admin/connectors" />
         </label>
+        <label data-linear-destination hidden>Destination squad <span>(optional)</span>
+          <span class="ui-panel-sub">If no authorized destination remains: destination cleared; choose a squad</span>
+          ${currentDestination ? html`<span class="ui-panel-sub">Current destination: ${view.squads.find((s) => s.squad_id === currentDestination)?.squad_name ?? 'set by an admin'}</span>` : html``}
+          <select name="defaultSquadId" disabled>
+            <option value="">Keep destination if authorized and target unchanged</option>
+            <option value="__clear__">Clear destination</option>
+            ${(view.boardDestinationSquads ?? []).map((squad) => html`<option value="${squad.id}"${squad.id === currentDestination ? ' selected' : ''}>${squad.name}</option>`)}
+          </select>
+        </label>
         <button class="btn" type="submit">Link board</button>
       </form>
+      <script>
+        document.querySelectorAll('[data-board-link-form]').forEach(function (form) {
+          var provider = form.querySelector('[name="provider"]');
+          var label = form.querySelector('[data-linear-destination]');
+          var select = label.querySelector('select');
+          function update() { label.hidden = provider.value !== 'linear'; select.disabled = label.hidden; }
+          provider.addEventListener('change', update);
+          update();
+        });
+      </script>
       <p style="color:var(--muted);font-size:13px;margin-top:10px;max-width:40rem;">
         Mupot keeps project identity and RBAC. Linked boards import work into attributed pot tasks.
         GitHub format: <code class="inline">owner/number</code>. Linear and Notion activate once vault connectors are present.
@@ -1720,6 +1745,7 @@ function jsonScript(value: unknown): string {
 }
 
 const PROJECT_RESULT_MESSAGES: Readonly<Record<string, string>> = {
+  invalid_default_squad: 'invalid_default_squad: Choose an active, linked work squad within your authority.',
   created: 'Project created.',
   updated: 'Project settings saved.',
   activated: 'Project activated.',

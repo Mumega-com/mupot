@@ -8,6 +8,7 @@ export type BindingMutationError =
   | 'invalid_provider'
   | 'invalid_external_id'
   | 'invalid_meta'
+  | 'invalid_default_squad'
   | 'project_not_found'
   | 'archived_project'
   | 'receipt_failed'
@@ -98,6 +99,28 @@ export async function getProjectBinding(
   )
 }
 
+// Destination authority is independent of connector authority. Only linked,
+// active work squads in the actor's own scope may receive external issues.
+const DESTINATION_SQUAD_SQL = `SELECT s.id, s.name FROM squads s
+  JOIN project_squad_access psa ON psa.squad_id = s.id
+ WHERE psa.project_id = ? AND psa.access_level IN ('write','admin') AND s.archived_at IS NULL AND s.kind != 'home'
+   AND (? = 1 OR s.id IN (SELECT CAST(value AS TEXT) FROM json_each(?)))`
+
+/** Use-time eligibility: never trust a destination solely because it was valid at bind time. */
+export async function isLinearDestinationValid(env: Env, projectId: string, squadId: string): Promise<boolean> {
+  return !!await env.DB.prepare(`${DESTINATION_SQUAD_SQL} AND s.id = ?`)
+    .bind(projectId, 1, '[]', squadId).first()
+}
+
+export async function listBindingDestinationSquads(
+  env: Env, projectId: string, actor: BindingActorContext,
+): Promise<{ id: string; name: string }[]> {
+  const rows = await env.DB.prepare(`${DESTINATION_SQUAD_SQL} ORDER BY s.name, s.id`)
+    .bind(projectId, actor.workspaceAdmin ? 1 : 0, JSON.stringify(actor.actorSquadIds))
+    .all<{ id: string; name: string }>()
+  return rows.results ?? []
+}
+
 export async function upsertProjectBinding(
   env: Env,
   projectId: string,
@@ -166,6 +189,22 @@ export async function upsertProjectBinding(
       return { ok: false, error: 'invalid_meta' }
     }
   }
+  const destination = input.provider === 'linear' && input.meta !== null && typeof input.meta === 'object'
+    ? (input.meta as Record<string, unknown>).defaultSquadId : undefined
+  if (destination !== undefined && destination !== null && !isNonEmptyString(destination)) {
+    return { ok: false, error: 'invalid_default_squad' }
+  }
+  const destinationArgs = destination == null ? [] : [
+    projectId, actor.workspaceAdmin ? 1 : 0, JSON.stringify(actor.actorSquadIds), destination,
+  ]
+  const destinationGuard = destination == null ? ''
+    : ` AND EXISTS (${DESTINATION_SQUAD_SQL} AND s.id = ?)`
+  if (destination != null) {
+    const eligible = await env.DB.prepare(`${DESTINATION_SQUAD_SQL} AND s.id = ?`)
+      .bind(...destinationArgs).first()
+    if (!eligible) return { ok: false, error: 'invalid_default_squad' }
+  }
+  if (input.provider === 'linear') metaJson = destination == null ? '{}' : JSON.stringify({ defaultSquadId: destination })
   const now = new Date().toISOString()
   try {
     // The WHERE clause on the SELECT is the real authority gate: if it
@@ -182,7 +221,7 @@ export async function upsertProjectBinding(
       `INSERT INTO project_provider_bindings
          (project_id, provider, external_id, connector_id, meta_json, created_at, updated_at)
        SELECT ?, ?, ?, ?, ?, ?, ?
-        WHERE ? IS NULL
+        WHERE (? IS NULL
            OR EXISTS (
                 SELECT 1 FROM connectors c
                  WHERE c.id = ?
@@ -200,11 +239,21 @@ export async function upsertProjectBinding(
                                )
                           ))
                        )
-              )
+              ))${destinationGuard}
        ON CONFLICT(project_id, provider) DO UPDATE SET
          external_id = excluded.external_id,
          connector_id = excluded.connector_id,
-         meta_json = excluded.meta_json,
+         -- Only Linear may retain a destination; recheck actor authority inside this write.
+         meta_json = CASE
+           WHEN excluded.provider != 'linear' THEN excluded.meta_json
+           WHEN ? = 1 THEN json_set(project_provider_bindings.meta_json, '$.defaultSquadId', ?)
+           WHEN ? = 1 THEN json_remove(project_provider_bindings.meta_json, '$.defaultSquadId')
+           WHEN project_provider_bindings.external_id = excluded.external_id
+             AND project_provider_bindings.connector_id IS excluded.connector_id
+             AND EXISTS (${DESTINATION_SQUAD_SQL}
+               AND s.id = json_extract(project_provider_bindings.meta_json, '$.defaultSquadId'))
+           THEN json_object('defaultSquadId', json_extract(project_provider_bindings.meta_json, '$.defaultSquadId'))
+           ELSE '{}' END,
          updated_at = excluded.updated_at`,
     )
       .bind(
@@ -216,6 +265,11 @@ export async function upsertProjectBinding(
         actor.workspaceAdmin ? 1 : 0,
         projectId,
         JSON.stringify(actor.actorSquadIds ?? []),
+        ...destinationArgs,
+        destination != null ? 1 : 0,
+        destination ?? null,
+        input.meta !== undefined ? 1 : 0,
+        projectId, actor.workspaceAdmin ? 1 : 0, JSON.stringify(actor.actorSquadIds),
       )
       .run()
     if (!wrote(result)) {
@@ -224,7 +278,7 @@ export async function upsertProjectBinding(
       // e.g. the JS pre-check above passed but access was revoked in the
       // interim. Fail closed as out-of-scope rather than a generic error so
       // the caller can distinguish "not authorized" from "server error."
-      return { ok: false, error: connectorId !== null ? 'connector_out_of_scope' : 'receipt_failed' }
+      return { ok: false, error: destination !== undefined ? 'invalid_default_squad' : connectorId !== null ? 'connector_out_of_scope' : 'receipt_failed' }
     }
   } catch (error) {
     const mapped = triggerError(error)
