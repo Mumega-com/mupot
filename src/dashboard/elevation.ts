@@ -408,15 +408,165 @@ function actionChecklist(actions: string[]): Html {
     </fieldset>`
 }
 
+/** One receipt for every decide outcome (approved, denied, failed). The
+ *  script fills #decide-status with textContent only — dynamic text never
+ *  goes through innerHTML. The step-up link is static markup, escaped here. */
+function elevationResultBox(requestId: string): Html {
+  return html`
+    <style>
+      .elevation-result {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        margin-top: 14px;
+        font-size: 16px;
+        line-height: 1.5;
+        color: var(--text);
+      }
+      .elevation-result[hidden] { display: none; }
+      .elevation-result.is-approved {
+        border-color: var(--ok);
+        background: color-mix(in srgb, var(--ok) 14%, var(--surface));
+      }
+      .elevation-result.is-denied {
+        border-color: var(--warn);
+        background: color-mix(in srgb, var(--warn) 14%, var(--surface));
+      }
+      .elevation-result.is-failed {
+        border-color: var(--danger);
+        background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+      }
+      .elevation-result-text {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.45;
+        color: var(--text);
+        white-space: pre-line;
+        user-select: text;
+      }
+      .elevation-result-meta {
+        margin: 10px 0 0;
+        font-size: 14px;
+        color: var(--text2);
+        user-select: text;
+      }
+      .elevation-result-actions {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-top: 14px;
+      }
+      .elevation-result-feedback {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--ok);
+      }
+    </style>
+    <div id="decide-hint" class="status-line" style="margin-top:8px;white-space:pre-line;"></div>
+    <div id="decide-result" class="card elevation-result" hidden role="status" aria-live="polite">
+      <p id="decide-status" class="elevation-result-text"></p>
+      <p id="decide-reauth" class="elevation-result-text" hidden>Next: <a href="/auth/reauth?return=/elevation/${requestId}">Step up now</a>, then come back to this page and try again.</p>
+      <p id="decide-request" class="elevation-result-meta">Request id: ${requestId}</p>
+      <div class="elevation-result-actions">
+        <button type="button" class="btn secondary" id="decide-copy">Copy</button>
+        <span id="decide-copy-feedback" class="elevation-result-feedback" role="status"></span>
+      </div>
+    </div>`
+}
+
 function decideScript(requestId: string): Html {
+  const requestIdJs = JSON.stringify(requestId)
   return raw(`
     <script>
       (function () {
+        var REQUEST_ID = ${requestIdJs};
         var form = document.getElementById('decide-form');
         if (!form) return;
         var status = document.getElementById('decide-status');
+        var hint = document.getElementById('decide-hint');
+        function setHint(text) {
+          if (hint) hint.textContent = text || '';
+        }
         function setBusy(busy) {
-          form.querySelectorAll('button').forEach(function (b) { b.disabled = busy; });
+          form.querySelectorAll('button').forEach(function (b) {
+            if (b.id === 'decide-copy') return;
+            b.disabled = busy;
+          });
+        }
+        function pad2(n) { return (n < 10 ? '0' : '') + n; }
+        function formatExpiry(iso) {
+          var d = new Date(iso);
+          if (isNaN(d.getTime())) return String(iso);
+          var zone = 'UTC';
+          try {
+            var resolved = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            if (resolved) zone = resolved;
+          } catch (e) {}
+          var local;
+          try {
+            local = d.toLocaleString(undefined, {
+              year: 'numeric', month: 'short', day: 'numeric',
+              hour: 'numeric', minute: '2-digit', second: '2-digit',
+              timeZoneName: 'long'
+            });
+          } catch (e2) {
+            local = d.toLocaleString();
+          }
+          var utc = d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate())
+            + ' ' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds()) + ' UTC';
+          return local + ' (' + zone + ') · ' + utc;
+        }
+        function showResult(kind, text) {
+          var box = document.getElementById('decide-result');
+          var reauth = document.getElementById('decide-reauth');
+          var fb = document.getElementById('decide-copy-feedback');
+          if (reauth) reauth.hidden = true;
+          if (fb) fb.textContent = '';
+          if (status) status.textContent = text;
+          if (box) {
+            box.hidden = false;
+            box.className = 'card elevation-result is-' + kind;
+          }
+          setHint('');
+        }
+        function copyPayload() {
+          var reauth = document.getElementById('decide-reauth');
+          var parts = [];
+          if (status && status.textContent) parts.push(String(status.textContent).trim());
+          if (reauth && !reauth.hidden && reauth.textContent) {
+            parts.push(String(reauth.textContent).replace(/\\s+/g, ' ').trim());
+          }
+          parts.push('Request id: ' + REQUEST_ID);
+          return parts.join('\\n');
+        }
+        function selectResultText() {
+          if (!status) return;
+          try {
+            var range = document.createRange();
+            range.selectNodeContents(status);
+            var sel = window.getSelection && window.getSelection();
+            if (sel) {
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+          } catch (e) {}
+        }
+        var copyBtn = document.getElementById('decide-copy');
+        if (copyBtn) {
+          copyBtn.addEventListener('click', function () {
+            var fb = document.getElementById('decide-copy-feedback');
+            if (fb) fb.textContent = '';
+            var payload = copyPayload();
+            try {
+              navigator.clipboard.writeText(payload).then(function () {
+                if (fb) fb.textContent = 'Copied';
+              }, function () {
+                selectResultText();
+              });
+            } catch (e) {
+              selectResultText();
+            }
+          });
         }
         async function decide(decision) {
           var fd = new FormData(form);
@@ -425,36 +575,37 @@ function decideScript(requestId: string): Html {
             body.actions = fd.getAll('actions');
             body.duration_minutes = Number(fd.get('duration_minutes'));
             if (!body.actions.length) {
-              status.textContent = 'Select at least one action, or use Deny.';
+              setHint('Select at least one action, or use Deny.');
               return;
             }
           }
           var note = String(fd.get('note') || '').trim();
           if (note) body.note = note;
           setBusy(true);
-          status.textContent = decision === 'approve' ? 'Approving…' : 'Denying…';
+          setHint(decision === 'approve' ? 'Approving…' : 'Denying…');
           try {
-            var res = await fetch('/auth/elevation/requests/${requestId}/decide', {
+            var res = await fetch('/auth/elevation/requests/' + encodeURIComponent(REQUEST_ID) + '/decide', {
               method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
               body: JSON.stringify(body)
             });
             var data = await res.json().catch(function () { return {}; });
             if (res.ok && data.ok) {
-              status.textContent = decision === 'approve'
-                ? 'Approved — active until ' + new Date(data.grants[0].expires_at).toLocaleString() + '.\\nNext: ask the agent to retry its action in this session.'
-                : 'Denied.\\nNext: tell the agent why access was declined.';
+              showResult(decision === 'approve' ? 'approved' : 'denied', decision === 'approve'
+                ? 'Approved — active until ' + formatExpiry(data.grants[0].expires_at) + '.\\nNext: ask the agent to retry its action in this session.'
+                : 'Denied.\\nNext: tell the agent why access was declined.');
               setBusy(true);
             } else if (data.reason === 'reauth_required') {
-              status.innerHTML = 'Failed: your identity check has expired. Nothing was granted; you can try again.<br>Next: ' +
-                '<a href="/auth/reauth?return=/elevation/${requestId}">Step up now</a>, then come back to this page and try again.';
+              showResult('failed', 'Failed: your identity check has expired. Nothing was granted; you can try again.');
+              var reauth = document.getElementById('decide-reauth');
+              if (reauth) reauth.hidden = false;
               setBusy(false);
             } else {
-              status.textContent = 'Failed: ' + (data.detail || 'The decision could not be saved.') +
-                ' Nothing was granted by this attempt; you can try again.\\nNext: check Active elevations, then reload this request before retrying.';
+              showResult('failed', 'Failed: ' + (data.detail || 'The decision could not be saved.') +
+                ' Nothing was granted by this attempt; you can try again.\\nNext: check Active elevations, then reload this request before retrying.');
               setBusy(false);
             }
           } catch (e) {
-            status.textContent = 'Failed: the connection was interrupted; the result is unknown.\\nNext: reload this request and check Active elevations before retrying.';
+            showResult('failed', 'Failed: the connection was interrupted; the result is unknown.\\nNext: reload this request and check Active elevations before retrying.');
             setBusy(false);
           }
         }
@@ -595,8 +746,8 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
         <button type="submit" class="btn">Approve narrowed access</button>
         <button type="button" class="btn secondary" id="deny-btn">Deny</button>
       </div>
-      <div id="decide-status" class="status-line" style="margin-top:8px; white-space:pre-line;"></div>
     </form>
+    ${elevationResultBox(request.id)}
     ${decideScript(request.id)}
     <p><a href="/elevation">← Back to pending requests</a></p>
   `
