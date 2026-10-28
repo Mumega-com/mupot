@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
 import {
   CLAIM_INVITE_SQL,
@@ -8,6 +8,7 @@ import {
   createProjectInvite,
   redeemTelegramProjectInvite,
 } from '../src/members/project-invites'
+import * as projectInvites from '../src/members/project-invites'
 import { membersApp } from '../src/members'
 import { handleImMessage, imApp } from '../src/im'
 import { requireCapability } from '../src/auth/capability'
@@ -1673,10 +1674,10 @@ describe('Telegram project invitation service', () => {
     })
 
     const needs = await telegram('/needs project-active')
-    expect(needs).toContain('/answer participant-run <choice>')
+    expect(needs).toContain('/muanswer participant-run <choice>')
     expect(needs).toContain('/muapprove participant-review')
     expect(needs).toContain('/mureject participant-review <reason>')
-    expect(needs).not.toContain('/answer other-run')
+    expect(needs).not.toContain('/muanswer other-run')
     expect(needs).not.toContain('/approve other-review')
     expect(needs).not.toContain('/reject other-review')
 
@@ -1770,6 +1771,49 @@ describe('Telegram project invitation service', () => {
     `).get()).toEqual({ display_name: 'Telegram member' })
   })
 
+  it('teaches the Hermes-safe command names in help', async () => {
+    harness.sqlite.prepare("UPDATE members SET telegram_chat_id = '9099000' WHERE id = 'member-inviter'").run()
+    const reply = await handleImMessage(env, '9099000', '/help')
+    for (const command of ['/muneeds [project-id]', '/muapprove <task-id>', '/mureject <task-id> <reason>', '/muanswer <run-id> <choice>', '/mulogin']) {
+      expect(reply).toContain(`"${command}"`)
+    }
+    expect(reply).not.toMatch(/"\/?(?:needs|approve|reject|answer|login)(?:[ "])/)
+  })
+
+  it('gives an unbound bare start the account and manual-code next steps', async () => {
+    await expect(handleImMessage(env, '9099000', '/start')).resolves.toBe(
+      'Open My Account → Connect Telegram, then tap the link, or send /start <code> here.',
+    )
+    await expect(handleImMessage(env, '9099000', '/help')).resolves.toContain("You're not registered")
+  })
+
+  it.each([
+    'invalid_or_expired_pairing_code', 'ambiguous_pairing_code', 'redemption_failed',
+    'update_receipt_invalid', 'update_already_completed', 'member_already_exists',
+  ] as const)('keeps %s indistinguishable with a fresh-code next step', async error => {
+    // Isolate presentation for service outcomes that require collisions or failed writes.
+    const redemption = vi.spyOn(projectInvites, 'redeemTelegramProjectInvite').mockResolvedValue({ ok: false, error })
+    try {
+      await expect(handleImMessage(env, '9099000', '/start secret', {
+        telegram: { update_id: 'copy-test', telegram_user_id: '9099000', request_digest: VALID_REQUEST_DIGEST },
+      })).resolves.toBe('That code did not work. Press Connect Telegram on My Account for a fresh code, or ask an admin for a new invitation.')
+    } finally {
+      redemption.mockRestore()
+    }
+  })
+
+  it('explains lost invitation authority without redeeming the invitation', async () => {
+    const created = await createInvite()
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    harness.sqlite.prepare("DELETE FROM capabilities WHERE member_id = 'member-inviter'").run()
+    reserveUpdate('lost-authority', VALID_REQUEST_DIGEST, '9099000')
+    await expect(handleImMessage(env, '9099000', `/start ${created.value.pairing_code}`, {
+      telegram: { update_id: 'lost-authority', telegram_user_id: '9099000', request_digest: VALID_REQUEST_DIGEST },
+    })).resolves.toBe('This invitation is no longer valid. Press Connect Telegram again on My Account, or ask the admin who sent it.')
+    expect(harness.sqlite.prepare("SELECT id FROM members WHERE telegram_chat_id = '9099000'").all()).toEqual([])
+  })
+
   it('P2 — never echoes the raw redemption error enum into the Telegram chat reply', async () => {
     const expired = await createInvite('join-error-expired@example.test')
     expect(expired.ok).toBe(true)
@@ -1795,9 +1839,9 @@ describe('Telegram project invitation service', () => {
       telegram: { update_id: 'update-join-conflict', telegram_user_id: '9099002', request_digest: VALID_REQUEST_DIGEST },
     })
 
-    const GENERIC = 'Could not join. Ask an admin for a new invitation.'
+    const GENERIC = 'That code did not work. Press Connect Telegram on My Account for a fresh code, or ask an admin for a new invitation.'
     expect(expiredReply).toBe(GENERIC)
-    expect(conflictReply).toBe(GENERIC)
+    expect(conflictReply).toBe('This Telegram is already linked to a different account. Disconnect it on My Account there, then connect again.')
     for (const reply of [expiredReply, conflictReply]) {
       expect(reply).not.toMatch(
         /invalid_or_expired_pairing_code|ambiguous_pairing_code|telegram_identity_conflict|member_already_exists|redemption_failed|update_receipt_invalid/,
@@ -2781,7 +2825,7 @@ describe('Telegram project invite — bind existing member', () => {
         telegram: { update_id: 'update-bind-im', telegram_user_id: '9200700', request_digest: VALID_REQUEST_DIGEST },
       })
 
-      expect(reply).toBe('Joined project project-bind. Use /needs to see what needs your attention.')
+      expect(reply).toBe('Joined project project-bind. Use /muneeds to see what needs your attention; if you have no web sign-in yet, send /mulogin for a browser link.')
     })
 
     it('does not burn the invite when the target member is suspended — it is retryable once reactivated', async () => {
