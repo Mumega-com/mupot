@@ -106,7 +106,7 @@ function accountBrowser(body: string, response: Record<string, unknown>, status 
     addEventListener(_event: string, listener: () => Promise<void>) { this.click = listener }
   }
   const elements = new Map<string, Element>()
-  for (const tag of body.replace(/<script>[\s\S]*?<\/script>/g, '').matchAll(/<[^>]+\sid="([^"]+)"[^>]*>/g)) {
+  for (const tag of body.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '').matchAll(/<[^>]+\sid="([^"]+)"[^>]*>/g)) {
     const attributes = Object.fromEntries([...tag[0].matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1], m[2]]))
     elements.set(tag[1], new Element(attributes))
   }
@@ -122,7 +122,7 @@ function accountBrowser(body: string, response: Record<string, unknown>, status 
     location: { reload: () => { events.push('reload') }, assign: (url: string) => { events.push(url) } },
   }
   const fetch = async () => ({ ok: status >= 200 && status < 300, status, json: async () => response })
-  for (const script of body.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+  for (const script of body.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)) {
     new Function('document', 'fetch', 'window', script[1])(document, fetch, window)
   }
   return {
