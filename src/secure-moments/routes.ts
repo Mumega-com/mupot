@@ -90,7 +90,7 @@ function json(c: Context<AppEnv>, status: HttpStatus, body: Record<string, unkno
 const fail = (c: Context<AppEnv>, status: HttpStatus, message: string, title = 'Refused'): Response =>
   json(c, status, { ok: false, title, message })
 
-const outcomeJson = (c: Context<AppEnv>, o: Outcome): Response => json(c, o.status, { ok: o.status === 200, title: o.title, message: o.message })
+const outcomeJson = (c: Context<AppEnv>, o: Outcome): Response => json(c, o.status, { ok: o.status === 200, title: o.title, message: o.message, ...(o.error ? { error: o.error, next_step: o.next_step } : {}) })
 
 // ── gate: flag, config, host ────────────────────────────────────────────────────────────────────
 momentsApp.use('*', async (c, next) => {

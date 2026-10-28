@@ -278,7 +278,7 @@ import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
-import { DYAD_PIN_SUDO_STEP, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
+import { DYAD_PIN_SUDO_STEP, SUDO_CLAIM_RELEASE_REMEDY, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -8555,7 +8555,12 @@ async function invokeToolInner(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
   if (sudoClaim) {
-    await finishOwnerSudo(env, sudoClaim, outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error })
+    const finished = await finishOwnerSudo(env, sudoClaim, outcome.ok ? { ok: true } : { ok: false, status: outcome.status, error: outcome.error })
+    // A refused tool whose claim could not be released leaves the one-time approval stuck: say so, instead of the tool's own refusal
+    // (a retry would otherwise read as sudo_already_used with no explanation). #2106.
+    if (!outcome.ok && !finished.released) {
+      outcome = fail(500, 'sudo_claim_release_failed', { remedy: SUDO_CLAIM_RELEASE_REMEDY, refused_with: outcome.error })
+    }
     // The agent is told what happened: it ran as its human, once, and the approval is spent.
     if (outcome.ok && typeof outcome.result === 'object' && outcome.result !== null && !Array.isArray(outcome.result)) {
       outcome = { ...outcome, result: { ...outcome.result, owner_sudo: { executed_as_authority: sudoClaim.authorityMemberId, approval: 'spent' } } }

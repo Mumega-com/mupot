@@ -1,8 +1,7 @@
 // tests/owner-sudo.test.ts — "/muapprove = sudo": an agent makes ONE call of ONE owner-only tool, as the approving human, after the
 // human taps Approve in Telegram. Real migrated schema + the REAL tools through invokeTool + the REAL approval-bot decision path;
 // only the Bot API (global fetch) is stubbed. Every guard in src/auth/owner-sudo.ts has a test that fails without it.
-import { execSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp/index' // first: the mcp/seeds modules form an import cycle that only resolves from mcp/index
@@ -124,13 +123,20 @@ describe('the registry pins tool <-> action both ways', () => {
   })
 })
 
+function sourceWriters(pattern: RegExp): string[] {
+  const root = join(__dirname, '..')
+  return readdirSync(join(root, 'src'), { recursive: true, encoding: 'utf8' })
+    .filter((file) => file.endsWith('.ts') && pattern.test(readFileSync(join(root, 'src', file), 'utf8')))
+    .map((file) => `src/${file}`).sort()
+}
+
 describe('the marker cannot arrive from outside', () => {
   it('resolveAuth drops ownerSudo from the injected header blob next to seatBinding (it is set only by invokeTool, in memory)', () => {
     const src = readFileSync(join(__dirname, '..', 'src', 'mcp', 'index.ts'), 'utf8')
     expect(src).toMatch(/delete auth\.seatBinding\n[\s\S]{0,400}delete auth\.ownerSudo\n/)
   })
   it('the only writer of ownerSudo in src is owner-sudo.ts', () => {
-    const hits = execSync("grep -rln 'ownerSudo = \\|ownerSudo:' src || true", { cwd: join(__dirname, '..') }).toString().split('\n').filter(Boolean).sort()
+    const hits = sourceWriters(/ownerSudo = |ownerSudo:/)
     expect(hits).toEqual(['src/auth/owner-sudo.ts'])
   })
 })
@@ -1002,7 +1008,56 @@ describe('#2103 P2-5/6 rolePlaneGrants guards', () => {
   it('the marker is stripped from the header blob and written only by owner-sudo.ts', () => {
     const root = join(__dirname, '..')
     expect(readFileSync(join(root, 'src/mcp/index.ts'), 'utf8')).toContain('delete auth.ownerSudoVerifiedRole')
-    const hits = execSync("grep -rln 'ownerSudoVerifiedRole = ' src || true", { cwd: root }).toString().split('\n').filter(Boolean)
+    const hits = sourceWriters(/ownerSudoVerifiedRole = /)
     expect(hits).toEqual(['src/auth/owner-sudo.ts'])
   })
+})
+
+describe('#2106 P2: sudo request atomicity and a stuck claim is surfaced', () => {
+  it('a request that names a sudo act is never stored without its exact arguments (no half-written, approvable row)', async () => {
+    run("CREATE TRIGGER no_sudo_args_update BEFORE UPDATE ON elevation_requests BEGIN SELECT RAISE(ABORT, 'db down'); END")
+    await call('check_in', {})
+    const r = await out('request_elevation', { actions: ['action:sudo_squad_member_add'], scope_type: 'squad', scope_id: 'squad-b', duration_minutes: 15, reason: 'r', sudo_args: DEFAULT_ARGS['action:sudo_squad_member_add'] })
+    run('DROP TRIGGER no_sudo_args_update')
+    expect(count('elevation_requests', "requested_actions_json LIKE '%action:sudo_%' AND sudo_args_json IS NULL")).toBe(0)
+    if (r.ok) expect(count('elevation_requests', "requested_actions_json LIKE '%action:sudo_%' AND sudo_args_json IS NOT NULL")).toBe(1)
+  })
+  it('the args and their digest are written by the same statement that creates the request', async () => {
+    run("CREATE TRIGGER reject_partial BEFORE INSERT ON elevation_requests WHEN NEW.sudo_args_json IS NULL AND NEW.requested_actions_json LIKE '%action:sudo_%' BEGIN SELECT RAISE(ABORT, 'partial sudo request'); END")
+    await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+    expect(count('elevation_requests', "sudo_args_json IS NOT NULL AND sudo_args_sha256 IS NOT NULL")).toBe(1)
+  })
+  it('a refused tool whose claim cannot be released says so (it would otherwise read as sudo_already_used on the retry)', async () => {
+    const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { args: { squad: 'squad-b', agent: 'agent-u', capability: 'member' } })
+    run("CREATE TRIGGER no_release BEFORE UPDATE ON elevation_usage_log WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'db down'); END")
+    const bad = await out('squad_member_add', { agent: 'agent-u', squad: 'squad-b', capability: 'member' })
+    expect(bad).toMatchObject({ ok: false, error: 'sudo_claim_release_failed' })
+    expect(usage(reqId)).toEqual([{ status: 'pending' }])
+    expect(count('elevation_grants', `elevation_request_id = '${reqId}' AND revoked_at IS NULL`)).toBe(0)
+    expect(count('elevation_grants', `elevation_request_id = '${reqId}' AND revoke_reason = 'owner_sudo_claim_release_failed'`)).toBe(1)
+    run('DROP TRIGGER no_release')
+    await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { args: { squad: 'squad-b', agent: 'agent-u', capability: 'member' } })
+    expect(JSON.stringify(bad)).toContain('sudo_already_used') // the detail explains the symptom the agent will see on retry
+  })
+})
+
+
+it('ends the grant when both authorization audit and claim release fail', async () => {
+  const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' })
+  run("CREATE TRIGGER no_sudo_audit BEFORE INSERT ON mutation_audit_entries WHEN NEW.handler = 'owner_sudo' BEGIN SELECT RAISE(ABORT, 'audit down'); END")
+  run("CREATE TRIGGER no_release BEFORE UPDATE ON elevation_usage_log WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'release down'); END")
+  const bad = await out('squad_member_add', DEFAULT_ARGS['action:sudo_squad_member_add'])
+  expect(bad).toMatchObject({ ok: false, error: 'sudo_claim_release_failed' })
+  expect(usage(reqId)).toEqual([{ status: 'pending' }])
+  expect(count('elevation_grants', `elevation_request_id = '${reqId}' AND revoke_reason = 'owner_sudo_claim_release_failed' AND revoked_at IS NOT NULL`)).toBe(1)
+})
+
+it('requires revocation or expiry before reapproval if ending the stuck grant also fails', async () => {
+  const reqId = await requestAndApprove('action:sudo_squad_member_add', { type: 'squad', id: 'squad-b' }, { args: { squad: 'squad-b', agent: 'agent-u', capability: 'member' } })
+  run("CREATE TRIGGER no_release BEFORE UPDATE ON elevation_usage_log WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'release down'); END")
+  run("CREATE TRIGGER no_end BEFORE UPDATE OF revoked_at ON elevation_grants BEGIN SELECT RAISE(ABORT, 'revoke down'); END")
+  const bad = await out('squad_member_add', { agent: 'agent-u', squad: 'squad-b', capability: 'member' })
+  expect(bad).toMatchObject({ ok: false, error: 'sudo_claim_release_failed' })
+  expect(count('elevation_grants', `elevation_request_id = '${reqId}' AND revoked_at IS NULL`)).toBe(1)
+  expect(JSON.stringify(bad)).toContain('revoke the grant or wait for expiry before requesting again')
 })

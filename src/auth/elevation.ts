@@ -263,12 +263,17 @@ export async function createElevationRequest(
   const decisionExpiresAt = new Date(nowMs + REQUEST_DECISION_WINDOW_MS).toISOString()
   const scopeId = input.scopeId ?? ''
 
+  // The exact sudo arguments and their digest are part of the SAME insert: a request row that names a sudo act exists only together with
+  // the arguments the human is shown and the call is checked against. A second statement could fail and leave an approvable request
+  // with no arguments bound to it (#2106).
+  const sudoCols = sudoCanonical?.ok ? ', sudo_args_json, sudo_args_sha256' : ''
+  const sudoVals = sudoCanonical?.ok ? ', ?13, ?14' : ''
   await env.DB.prepare(
     `INSERT INTO elevation_requests
        (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
         requested_scope_type, requested_scope_id, requested_duration_minutes, reason,
-        status, created_at, decision_expires_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12)`,
+        status, created_at, decision_expires_at${sudoCols})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12${sudoVals})`,
   )
     .bind(
       id,
@@ -283,13 +288,9 @@ export async function createElevationRequest(
       input.reason.trim(),
       nowIso,
       decisionExpiresAt,
+      ...(sudoCanonical?.ok ? [sudoCanonical.value.json, sudoCanonical.value.sha256] : []),
     )
     .run()
-
-  if (sudoCanonical?.ok) {
-    await env.DB.prepare('UPDATE elevation_requests SET sudo_args_json = ?1, sudo_args_sha256 = ?2 WHERE id = ?3 AND tenant = ?4')
-      .bind(sudoCanonical.value.json, sudoCanonical.value.sha256, id, input.tenant).run()
-  }
 
   return {
     ok: true,
@@ -425,6 +426,11 @@ export interface DecideElevationInput {
    *  cached/stale set here. */
   decidedByCapabilities: CapabilityGrant[]
   decidedByWebSessionHash: string
+  /** TRUE = the decision row is written only while `decidedByWebSessionHash` is STILL a live session on a still-live login identity,
+   *  checked inside the very UPDATE that records the decision (#2106). Without it, an identity revoked (and its sessions swept) between
+   *  the caller's checks and this write would still land an approved/denied row. Leave unset only for callers whose hash is not a real
+   *  web session (tests that exercise the ledger alone). */
+  requireLiveApproverSession?: boolean
   /** Whether the approver's web session proved a fresh (within RECENT_REAUTH_WINDOW_MS) reauth
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
@@ -767,6 +773,49 @@ export async function findElevationDecisionRefusal(
   return null
 }
 
+/** The condition that makes a decision write atomic with the approver's identity: the web session is unrevoked AND its login identity is
+ *  unrevoked, evaluated inside the same UPDATE. `tenantParam` and `hashParam` are the numbered binds the statement already carries. */
+function liveApproverSessionSql(tenantParam: string, hashParam: string): string {
+  return `AND EXISTS (SELECT 1 FROM web_sessions ws JOIN human_login_identities hli ON hli.id = ws.login_identity_id
+                       WHERE ws.id_hash = ${hashParam} AND ws.tenant = ${tenantParam} AND ws.revoked_at IS NULL AND hli.revoked_at IS NULL)`
+}
+
+function telegramBindingGuard(input: DecideElevationInput, request: string, tenant: string, member: string, device: string, user: string): string {
+  return input.decidedViaApprovalBot === true
+      ? ` AND EXISTS (SELECT 1 FROM approval_bot_deliveries d JOIN members m ON m.id = d.member_id
+            WHERE d.request_id = ${request} AND d.tenant = ${tenant} AND d.member_id = ${member}
+              AND d.status = 'sent' AND m.telegram_chat_id = d.chat_id
+              AND (m.tenant = ${tenant} OR m.tenant IS NULL) AND m.status = 'active')`
+      : input.decidedViaTelegramMiniapp === true
+        ? ` AND EXISTS (SELECT 1 FROM tg_miniapp_devices d
+              JOIN members m ON m.id = d.member_id AND m.tenant = d.tenant
+              JOIN human_login_identities i ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id
+             WHERE d.id = ${device} AND d.tenant = ${tenant} AND d.member_id = ${member}
+               AND d.telegram_user_id = ${user} AND m.telegram_chat_id = d.telegram_user_id
+               AND m.status = 'active' AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL AND i.revoked_at IS NULL)`
+        : ''
+}
+
+/** Re-read the failed predicates for a guarded no-op; a still-pending request is not closed. */
+async function decisionLostReason(env: Env, input: DecideElevationInput, requestId: string, status: ElevationRequestStatus): Promise<DecideElevationResult> {
+  const current = await loadElevationRequestById(env, input.tenant, requestId)
+  if (current?.status !== 'pending') return { ok: false, reason: 'already_decided', status: current?.status ?? status }
+  if (input.decidedViaApprovalBot === true || input.decidedViaTelegramMiniapp === true) {
+    const bound = await env.DB.prepare(
+      `SELECT 1 AS live WHERE 1 = 1 ${telegramBindingGuard(input, '?1', '?2', '?3', '?4', '?5')}`,
+    ).bind(requestId, input.tenant, input.decidedByMemberId,
+      ...(input.decidedViaTelegramMiniapp === true ? [input.telegramMiniappDeviceId ?? null, input.telegramMiniappUserId ?? null] : []),
+    ).first()
+    if (!bound) return { ok: false, reason: 'invalid_elevation_request', detail: 'binding_changed' }
+  }
+  if (input.requireLiveApproverSession === true) {
+    const live = await env.DB.prepare(`SELECT 1 AS live WHERE 1 = 1 ${liveApproverSessionSql('?1', '?2')}`)
+      .bind(input.tenant, input.decidedByWebSessionHash).first()
+    if (!live) return { ok: false, reason: 'invalid_elevation_request', detail: 'approver_session_ended' }
+  }
+  return { ok: false, reason: 'invalid_elevation_request', detail: 'decision_not_recorded' }
+}
+
 /** Grant writes and the terminal decision share one D1 transaction. Grant writes
  * are gated on pending; the final update verifies the complete grant set inside
  * SQL, so even a silent no-op aborts rather than committing a partial approval.
@@ -798,20 +847,6 @@ export async function decideElevationRequest(
 
   // Check inside each decision write, including the grant transaction. A callback
   // can pass its initial binding read just before a concurrent unbind commits.
-  const telegramBindingGuard = (request: string, tenant: string, member: string, device: string, user: string): string =>
-    input.decidedViaApprovalBot === true
-      ? ` AND EXISTS (SELECT 1 FROM approval_bot_deliveries d JOIN members m ON m.id = d.member_id
-            WHERE d.request_id = ${request} AND d.tenant = ${tenant} AND d.member_id = ${member}
-              AND d.status = 'sent' AND m.telegram_chat_id = d.chat_id
-              AND (m.tenant = ${tenant} OR m.tenant IS NULL) AND m.status = 'active')`
-      : input.decidedViaTelegramMiniapp === true
-        ? ` AND EXISTS (SELECT 1 FROM tg_miniapp_devices d
-              JOIN members m ON m.id = d.member_id AND m.tenant = d.tenant
-              JOIN human_login_identities i ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id
-             WHERE d.id = ${device} AND d.tenant = ${tenant} AND d.member_id = ${member}
-               AND d.telegram_user_id = ${user} AND m.telegram_chat_id = d.telegram_user_id
-               AND m.status = 'active' AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL AND i.revoked_at IS NULL)`
-        : ''
   const miniappBindings = input.decidedViaTelegramMiniapp === true
     ? [input.telegramMiniappDeviceId ?? null, input.telegramMiniappUserId ?? null] : []
   const decidedVia = input.decidedViaApprovalBot === true ? "'approval_bot'"
@@ -823,11 +858,12 @@ export async function decideElevationRequest(
               decided_by_web_session_hash = ?3, decision_note = ?4,
               decided_via = ${decidedVia}
         WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
-          ${telegramBindingGuard('?5', '?6', '?2', '?7', '?8')}`,
+          ${telegramBindingGuard(input, '?5', '?6', '?2', '?7', '?8')}
+          ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?6', '?3') : ''}`,
     )
       .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant, ...miniappBindings)
       .run()
-    if (Number(result.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_decided', status: 'denied' }
+    if (Number(result.meta?.changes ?? 0) === 0) return decisionLostReason(env, input, request.id, 'denied')
     return { ok: true, request: { ...request, status: 'denied', decided_at: nowIso,
       decided_by_member_id: input.decidedByMemberId, decided_by_web_session_hash: input.decidedByWebSessionHash,
       decision_note: input.note ?? null }, grants: [] }
@@ -883,7 +919,8 @@ export async function decideElevationRequest(
             WHERE id = ?1 AND tenant = ?8
               AND (revoked_at IS NOT NULL OR expires_at <= ?5)
               AND EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?2 AND tenant = ?8 AND status = 'pending')
-              ${telegramBindingGuard('?2', '?8', '?3', '?9', '?10')}`,
+              ${telegramBindingGuard(input, '?2', '?8', '?3', '?9', '?10')}
+              ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?8', '?4') : ''}`,
         ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash,
           g.created_at, g.expires_at, g.effect, g.tenant, ...miniappBindings)
       : env.DB.prepare(
@@ -892,7 +929,8 @@ export async function decideElevationRequest(
               approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
             WHERE EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND status = 'pending')
-              ${telegramBindingGuard('?3', '?2', '?9', '?13', '?14')}`,
+              ${telegramBindingGuard(input, '?3', '?2', '?9', '?13', '?14')}
+              ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?2', '?10') : ''}`,
         ).bind(g.id, g.tenant, g.elevation_request_id, g.agent_session_id, g.action, g.scope_type,
           g.scope_id, g.effect, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at, ...miniappBindings),
   )
@@ -909,14 +947,15 @@ export async function decideElevationRequest(
               decided_by_web_session_hash = ?3, decision_note = ?4,
               decided_via = ${decidedVia}
         WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
-          ${telegramBindingGuard('?5', '?6', '?2', `?${grants.length + 8}`, `?${grants.length + 9}`)}`,
+          ${telegramBindingGuard(input, '?5', '?6', '?2', `?${grants.length + 8}`, `?${grants.length + 9}`)}
+          ${input.requireLiveApproverSession === true ? liveApproverSessionSql('?6', '?3') : ''}`,
     ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null,
       request.id, input.tenant, grants.length, ...grants.map((g) => g.id), ...miniappBindings),
   ])
   // NULL deliberately violates status's NOT NULL constraint when any grant was
   // skipped. This check must run inside the transaction, not after it commits.
   if (Number(batchResults[grants.length].meta?.changes ?? 0) === 0) {
-    return { ok: false, reason: 'already_decided', status: 'approved' }
+    return decisionLostReason(env, input, request.id, 'approved')
   }
 
   // No fallible read after commit: a read failure must not report a committed approval as failed.

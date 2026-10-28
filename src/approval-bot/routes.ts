@@ -1,8 +1,9 @@
 // mupot — POST /im/approve/webhook: Telegram's update feed for the approval bot.
 //
 // Fail closed: bot off = 404 (the route does not exist), misconfigured = 503, a missing or wrong
-// X-Telegram-Bot-Api-Secret-Token = 401 before the body is read or parsed. After the secret, EVERY outcome is a 200 (Telegram
-// retries non-200s; a refusal is told to the human in the chat, never to the caller of this route).
+// X-Telegram-Bot-Api-Secret-Token = 401 before the body is read or parsed. After the secret, every HANDLED outcome (decided, refused,
+// ignored) is a 200 (Telegram retries non-200s; a refusal is told to the human in the chat, never to the caller of this route). Only an
+// UNEXPECTED processing failure is a 503, so Telegram redelivers it.
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
@@ -34,7 +35,10 @@ approvalBotApp.post('/webhook', async (c) => {
     const result = await handleApprovalBotUpdate(c.env, update, { waitUntil: (p) => { try { c.executionCtx.waitUntil(p) } catch { /* no execution context (tests) */ } } })
     return c.json({ ok: true, result: result.kind })
   } catch {
-    return c.json({ ok: true, result: 'error' })
+    // An unexpected failure (not a handled refusal) is retryable: a non-2xx makes Telegram redeliver the update. Every write on the
+    // retried path is guarded or atomic (a decision is one guarded UPDATE, a /murevoke is one batch keyed on the update id), so a
+    // redelivery cannot decide twice or sweep twice.
+    return c.json({ error: 'processing_failed' }, 503)
   }
 })
 

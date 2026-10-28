@@ -59,6 +59,9 @@ function floor(id: string, description: string, sites: readonly string[], refusa
 }
 
 export const POLICY_RULES: readonly PolicyRule[] = [
+  floor('approval.bot.processing-failed', 'Approval bot processing failures return a retryable refusal rather than acknowledging an unrecorded operation.', ['src/approval-bot/routes.ts'], ['processing_failed']),
+  floor('sudo.owner.claim-release-failed', 'A refused owner-sudo call whose claim cannot be released ends its grant or requires revocation before reapproval.', ['src/auth/owner-sudo.ts', 'src/mcp/index.ts'], ['sudo_claim_release_failed']),
+  floor('approval.identity.not-live', 'Approval session minting refuses an identity that is no longer live and asks the human to sign in again.', ['src/access/decision-core.ts', 'src/access/routes.ts'], ['approver_identity_not_live']),
   // ── BAR: the first batch of friction rules, wired in this PR ─────────────────────────────────
   {
     id: 'task.create.gate-owner-creator-is-assignee',

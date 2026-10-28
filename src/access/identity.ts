@@ -91,7 +91,9 @@ export async function mintApproverSession(
   env: Env, approver: ApproverMember, nowMs: number = Date.now(),
 ): Promise<{ approver: ApproverMember; webSessionHash: string }> {
   const raw = randomWebSessionId()
-  await createWebSession(env, raw, { tenant: env.TENANT_SLUG, memberId: approver.memberId, loginIdentityId: approver.identityId }, nowMs)
+  // requireLiveIdentity: the caller checked the identity live, but it may be revoked (and its sessions swept) before this insert, so
+  // the insert itself carries the liveness condition (#2106).
+  await createWebSession(env, raw, { tenant: env.TENANT_SLUG, memberId: approver.memberId, loginIdentityId: approver.identityId, requireLiveIdentity: true }, nowMs)
   const idHash = await hashWebSessionId(raw)
   await markRecentReauth(env, idHash, nowMs)
   return {

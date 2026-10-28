@@ -944,3 +944,26 @@ describe('round 2: durable decisions and the lazy reconcile (Access page)', () =
     expect(res.headers.get('content-security-policy')).toContain(`script-src 'nonce-${nonce}'`)
   })
 })
+
+
+it('Access identity race returns a clean 409 refusal instead of a 500', async () => {
+  const id = await pendingElevation(['action:project_status'], 15)
+  const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+  const prepare = env.DB.prepare.bind(env.DB)
+  let fired = false
+  const spy = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+    if (!fired && /INSERT INTO web_sessions/.test(sql)) {
+      fired = true
+      harness.sqlite.exec("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE provider = 'cloudflare-access'")
+    }
+    return prepare(sql)
+  })
+  try {
+    const res = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf, decision: 'deny' } })
+    expect(fired).toBe(true)
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'approver_identity_not_live', next_step: 'sign in again, then retry' })
+    expect(harness.sqlite.prepare('SELECT status FROM elevation_requests WHERE id = ?').get(id)).toEqual({ status: 'pending' })
+    expect(count('web_sessions')).toBe(0)
+  } finally { spy.mockRestore() }
+})

@@ -22,6 +22,7 @@ import { b64uEncode, derToP1363, decodeCbor, verifyAssertion, verifyRegistration
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { createWebSession, markRecentReauth, revokeAllWebSessions } from '../src/auth/web-sessions'
 import { revokeLoginIdentity } from '../src/auth/login-identity'
+import { buildAuth, mintApproverSession } from '../src/access/identity'
 import { decideElevation, decideSeed } from '../src/access/decision-core'
 import { loadSeedRequest } from '../src/access/seed-request'
 import { createAgentSession, revokeAgentSessionById } from '../src/auth/agent-sessions'
@@ -1475,4 +1476,55 @@ describe('round 2 (#1853 P1): a dedicated host may not be a PARENT of a colony o
     expect(dedicatedSecureHost(e('approve.mumega.com', 'secure.mumega.com'))).toBe('secure.mumega.com')
     expect(secureMomentsStatus(e('approve.mumega.com', 'secure.approve.mumega.com')).state).toBe('misconfigured')
   })
+})
+
+
+describe('round-2 shared identity race refusal', () => {
+  it.each(['access_passkey', 'webauthn', 'telegram_miniapp'] as const)('returns a clean refusal for %s after identity revocation at mint', async (via) => {
+    const m = await fileElevation(['action:project_status'], 15)
+    const auth = await buildAuth(env, 'mem-owner')
+    let consumed = false
+    const outcome = await decideElevation(env, {
+      id: m.subject, decision: 'deny', selectedActions: [], durationMinutes: undefined, auth,
+      proof: { memberId: 'mem-owner', via, evidence: {} },
+      ...(via === 'access_passkey' ? {} : { gate: async () => { consumed = true; return true } }),
+      mintSession: async () => {
+        harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
+        const s = await mintApproverSession(env, { memberId: 'mem-owner', identityId: identities.owner, auth })
+        return { auth: s.approver.auth, webSessionHash: s.webSessionHash }
+      },
+    })
+    expect(outcome).toMatchObject({ status: 409, error: 'approver_identity_not_live' })
+    expect((outcome as { next_step?: string }).next_step).toContain('sign in again, then retry')
+    if (via !== 'access_passkey') {
+      expect(consumed).toBe(true)
+      expect((outcome as { next_step?: string }).next_step).toContain('one-shot proof was consumed')
+    }
+    expect((await loadElevationRequestById(env, TENANT, m.subject))?.status).toBe('pending')
+    expect(count('web_sessions')).toBe(0)
+  })
+})
+
+
+it('WebAuthn identity race returns 409 with a consumed-proof remedy and no decision', async () => {
+  const owner = await enrol('mem-owner', identities.owner)
+  const m = await fileElevation(['action:project_status'], 15)
+  const prepare = env.DB.prepare.bind(env.DB)
+  let fired = false
+  const spy = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+    if (!fired && /INSERT INTO web_sessions/.test(sql)) {
+      fired = true
+      harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
+    }
+    return prepare(sql)
+  })
+  try {
+    const res = await decide(m, owner, { decision: 'deny' })
+    expect(fired).toBe(true)
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ error: 'approver_identity_not_live', next_step: expect.stringContaining('one-shot proof was consumed') })
+    expect(status(m.id)).toBe('denied')
+    expect((await loadElevationRequestById(env, TENANT, m.subject))?.status).toBe('pending')
+    expect(count('web_sessions')).toBe(0)
+  } finally { spy.mockRestore() }
 })
