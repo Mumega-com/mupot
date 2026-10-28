@@ -592,6 +592,36 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     expect(orphans).toEqual([])
   })
 
+  it('the decide result is one full-width box with a Copy button and theme tokens', async () => {
+    const { page, request } = await renderApproval(['action:dispatch'])
+    const resultAt = page.indexOf('id="decide-result"')
+    const copyAt = page.indexOf('id="decide-copy"')
+    const afterForm = page.slice(page.indexOf('<form id="decide-form"'))
+    const scriptAt = afterForm.indexOf('<script>')
+    expect(resultAt).toBeGreaterThan(-1)
+    expect(copyAt).toBeGreaterThan(resultAt)
+    expect(scriptAt).toBeGreaterThan(-1)
+    expect(afterForm.indexOf('id="decide-copy"')).toBeGreaterThan(-1)
+    expect(afterForm.indexOf('id="decide-copy"')).toBeLessThan(scriptAt)
+    expect(page).toContain('class="card elevation-result"')
+    expect(page).toContain('>Copy</button>')
+    expect(page).toContain(`Request id: ${request.id}`)
+    expect(page).toContain(`href="/auth/reauth?return=/elevation/${request.id}"`)
+    expect(page).toContain('id="decide-status"')
+    const styleStart = page.indexOf('.elevation-result {')
+    expect(styleStart).toBeGreaterThan(-1)
+    const style = page.slice(styleStart, page.indexOf('</style>', styleStart))
+    expect(style).toMatch(/width:\s*100%/)
+    expect(style).toContain('font-size: 18px')
+    expect(style).toContain('var(--ok)')
+    expect(style).toContain('var(--warn)')
+    expect(style).toContain('var(--danger)')
+    expect(style).not.toMatch(/#[0-9a-fA-F]{3,8}/)
+    const script = afterForm.slice(scriptAt + '<script>'.length, afterForm.indexOf('</script>', scriptAt))
+    expect(script).toContain('navigator.clipboard.writeText')
+    expect(script).not.toContain('innerHTML')
+  })
+
   it.each(['approved', 'denied', 'failed', 'network'])('running the real decideScript POSTs the controls and shows %s with a next step', async (outcome) => {
     const { page, request } = await renderApproval(['action:dispatch', 'action:manage_access'])
     const { named, belongs } = decisionControls(page)
@@ -614,15 +644,47 @@ describe('elevation dashboard screens — integration through dashboardApp (real
       get(k: string) { return entries.find(([n]) => n === k)?.[1] ?? null }
     }
     const posts: Array<{ url: string; body: Record<string, unknown> }> = []
-    const status = { textContent: '', innerHTML: '' }
-    const submitHandlers: Array<(e: { preventDefault(): void }) => void> = []
-    const form = {
-      querySelectorAll: () => [],
-      addEventListener: (ev: string, fn: (e: { preventDefault(): void }) => void) => { if (ev === 'submit') submitHandlers.push(fn) },
-    }
+    const els = new Map<string, {
+      id: string
+      hidden: boolean
+      className: string
+      textContent: string
+      disabled: boolean
+      listeners: Record<string, Array<(...args: unknown[]) => void>>
+      addEventListener: (ev: string, fn: (...args: unknown[]) => void) => void
+      querySelectorAll: () => unknown[]
+    }>()
     let deny: () => void = () => {}
+    function element(id: string) {
+      let el = els.get(id)
+      if (!el) {
+        const listeners: Record<string, Array<(...args: unknown[]) => void>> = {}
+        el = {
+          id,
+          hidden: id === 'decide-result' || id === 'decide-reauth',
+          className: id === 'decide-result' ? 'card elevation-result' : '',
+          textContent: '',
+          disabled: false,
+          listeners,
+          addEventListener(ev: string, fn: (...args: unknown[]) => void) {
+            ;(listeners[ev] ||= []).push(fn)
+            if (id === 'deny-btn' && ev === 'click') deny = fn as () => void
+          },
+          querySelectorAll: () => [],
+        }
+        els.set(id, el)
+      }
+      return el
+    }
+    const status = element('decide-status')
+    const selected: Array<{ id: string }> = []
     const doc = {
-      getElementById: (id: string) => (id === 'decide-form' ? form : id === 'decide-status' ? status : { addEventListener(_event: string, fn: () => void) { deny = fn } }),
+      getElementById: (id: string) => element(id),
+      createRange: () => ({ selectNodeContents(node: { id: string }) { selected.push(node) } }),
+    }
+    const win = {
+      location: { href: '' },
+      getSelection: () => ({ removeAllRanges() {}, addRange(_range: unknown) {} }),
     }
     const fakeFetch = async (url: string, init: { body: string }) => {
       posts.push({ url, body: JSON.parse(init.body) })
@@ -633,29 +695,80 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     }
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- executing the rendered page script against stubs is the test
     new Function('document', 'FormData', 'fetch', 'window', 'setTimeout', script as string)(
-      doc, FakeFormData, fakeFetch, { location: { href: '' } }, () => 0,
+      doc, FakeFormData, fakeFetch, win, () => 0,
     )
     if (outcome === 'denied') deny()
-    else submitHandlers[0]({ preventDefault() {} })
+    else element('decide-form').listeners.submit[0]({ preventDefault() {} })
     await new Promise((r) => setTimeout(r, 0))
 
     expect(status.textContent).not.toContain('Select at least one action')
     expect(posts).toHaveLength(1)
     expect(posts[0].url).toBe(`/auth/elevation/requests/${request.id}/decide`)
-    expect(status.textContent).toContain('Next:')
-    if (outcome === 'approved') expect(status.textContent).toContain('Approved — active until ')
-    if (outcome === 'denied') expect(status.textContent).toContain('Denied.')
+    expect(element('decide-result').hidden).toBe(false)
+    expect(element('decide-result').className).toContain('elevation-result')
+    if (outcome === 'approved') {
+      expect(status.textContent).toContain('Approved — active until ')
+      expect(status.textContent).toContain('Next:')
+      expect(status.textContent).toContain('2026-10-27 12:00:00 UTC')
+      const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+      expect(zone.length).toBeGreaterThan(0)
+      expect(status.textContent).toContain(`(${zone})`)
+      expect(element('decide-result').className).toContain('is-approved')
+    }
+    if (outcome === 'denied') {
+      expect(status.textContent).toContain('Denied.')
+      expect(status.textContent).toContain('Next:')
+      expect(element('decide-result').className).toContain('is-denied')
+    }
     if (outcome === 'failed') {
       expect(status.textContent).toContain('Failed: The decision could not be saved.')
       expect(status.textContent).toContain('Nothing was granted')
+      expect(status.textContent).toContain('Next:')
       expect(status.textContent).not.toContain('elevation_decision_failed')
+      expect(element('decide-result').className).toContain('is-failed')
     }
-    if (outcome === 'network') expect(status.textContent).toContain('result is unknown')
+    if (outcome === 'network') {
+      expect(status.textContent).toContain('result is unknown')
+      expect(status.textContent).toContain('Next:')
+      expect(element('decide-result').className).toContain('is-failed')
+    }
     expect(posts[0].body).toEqual(outcome === 'denied' ? { decision: 'deny', note: 'looks fine' } : {
       decision: 'approve',
       actions: ['action:dispatch', 'action:manage_access'],
       duration_minutes: 30,
       note: 'looks fine',
     })
+
+    const writes: string[] = []
+    const clipboard = {
+      writeText(text: string) {
+        writes.push(text)
+        return Promise.resolve()
+      },
+    }
+    const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: { clipboard } })
+    try {
+      const copy = element('decide-copy').listeners.click[0]
+      expect(copy).toBeTypeOf('function')
+      copy()
+      await new Promise((r) => setTimeout(r, 0))
+      expect(writes).toHaveLength(1)
+      expect(writes[0]).toContain(status.textContent.trim())
+      expect(writes[0]).toContain(`Request id: ${request.id}`)
+      expect(element('decide-copy-feedback').textContent).toBe('Copied')
+      if (outcome === 'approved') {
+        expect(writes[0]).toContain('2026-10-27 12:00:00 UTC')
+        expect(writes[0]).toContain(`(${Intl.DateTimeFormat().resolvedOptions().timeZone})`)
+        clipboard.writeText = () => Promise.reject(new Error('denied'))
+        copy()
+        await new Promise((r) => setTimeout(r, 0))
+        expect(element('decide-copy-feedback').textContent).not.toBe('Copied')
+        expect(selected.map((node) => node.id)).toContain('decide-status')
+      }
+    } finally {
+      if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator)
+      else delete (globalThis as { navigator?: unknown }).navigator
+    }
   })
 })
