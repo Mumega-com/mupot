@@ -56,6 +56,7 @@ export type InviteLandingView =
   | { kind: 'ready'; ctx: InviteLandingContext }
 
 interface InviteLandingRow {
+  invite_kind: 'grant' | 'identity_only'
   id: string
   department_id: string | null
   project_id: string | null
@@ -89,7 +90,7 @@ async function resolveInviterName(env: Env, invitedBy: string | null): Promise<s
 
 export async function loadInviteLanding(env: Env, inviteId: string): Promise<InviteLandingView> {
   const invite = await env.DB.prepare(
-    `SELECT id, department_id, project_id, squad_id, pairing_hash, pairing_expires_at,
+    `SELECT id, department_id, project_id, squad_id, pairing_hash, pairing_expires_at, invite_kind,
             capability, invited_by, accepted_at
        FROM invites WHERE id = ?1 LIMIT 1`,
   )
@@ -131,7 +132,7 @@ export async function loadInviteLanding(env: Env, inviteId: string): Promise<Inv
   // A3: pairing_hash OR pairing_expires_at is the Telegram door (unchanged
   // 409). A plain squad invite (squad_id set, pairing columns NULL) is a
   // web accept — 0156 legalized that shape.
-  return invite.pairing_hash !== null || invite.pairing_expires_at !== null
+  return invite.invite_kind === 'identity_only' || invite.pairing_hash !== null || invite.pairing_expires_at !== null
     ? { kind: 'telegram_only', ctx }
     : { kind: 'ready', ctx }
 }

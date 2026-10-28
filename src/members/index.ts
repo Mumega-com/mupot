@@ -69,7 +69,7 @@ import {
   upsertCapabilityGrant,
   provisionHomeForMember,
 } from './service'
-import { createProjectInvite, type CreateProjectInviteError } from './project-invites'
+import { createIdentityOnlyInvite, createProjectInvite, type CreateProjectInviteError } from './project-invites'
 // mupot#1551 slice 1: the SAME live-token predicate every bearer lookup in
 // this codebase already shares (see that module's header) — reused here so
 // "does this member hold a live token" can never drift into a second,
@@ -102,7 +102,7 @@ import {
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
 interface ParsedInvite {
-  kind: 'legacy' | 'project' | 'squad'
+  kind: 'legacy' | 'project' | 'squad' | 'identity_only'
   email: string
   /** Bind path only — an existing member to attach a Telegram identity to. */
   member_id: string | null
@@ -181,6 +181,7 @@ function agentAccessErrorResponse(
 }
 
 interface InviteRow {
+  invite_kind: 'grant' | 'identity_only'
   id: string
   email: string
   department_id: string | null
@@ -364,12 +365,14 @@ export type AcceptInviteResult =
 /** Telegram/project door. Any one conjunct is enough — legal D1 rows cannot
  *  isolate them, so callers and WARN-D tests go through this helper. */
 export function isTelegramDoorInvite(invite: {
+  invite_kind?: 'grant' | 'identity_only'
   pairing_hash: string | null
   pairing_expires_at: string | null
   project_id: string | null
 }): boolean {
   return (
-    invite.pairing_hash !== null
+    invite.invite_kind === 'identity_only'
+    || invite.pairing_hash !== null
     || invite.pairing_expires_at !== null
     || invite.project_id !== null
   )
@@ -417,7 +420,7 @@ export async function acceptInvite(
   options?: AcceptInviteOptions,
 ): Promise<AcceptInviteResult> {
   const invite = await env.DB.prepare(
-    `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
+    `SELECT id, email, department_id, project_id, squad_id, pairing_hash, invite_kind,
             pairing_expires_at, capability, invited_by, minted_by_member_id,
             accepted_at, created_at
        FROM invites WHERE id = ? LIMIT 1`,
@@ -986,6 +989,7 @@ const orgScope = (_c: Context): { type: CapabilityScopeType; id: string | null }
 // ── invites (create) ──────────────────────────────────────────────────────────
 
 interface CreateInviteBody {
+  invite_kind?: unknown
   email?: unknown
   member_id?: unknown
   department_id?: unknown
@@ -1021,6 +1025,19 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
   }
 
   if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
+
+  if (body.invite_kind !== undefined && body.invite_kind !== 'grant' && body.invite_kind !== 'identity_only') {
+    return c.json({ error: 'invalid_invite_scope' }, 400)
+  }
+  if (body.invite_kind === 'identity_only') {
+    if (!isNonEmptyString(body.member_id)) return c.json({ error: 'invalid_member_id' }, 400)
+    if (['email', 'department_id', 'project_id', 'squad_id', 'capability', 'expires_in_seconds']
+      .some((key) => key in body)) return c.json({ error: 'invalid_invite_scope' }, 400)
+    c.set('inviteBody', { kind: 'identity_only', member_id: body.member_id.trim(), email: '',
+      department_id: null, project_id: null, squad_id: null, capability: 'observer', expires_in_seconds: null })
+    await next()
+    return
+  }
 
   // member_id (bind-existing-member path) and a caller-supplied email are
   // mutually exclusive — the target member's own email is derived server-side
@@ -1144,14 +1161,14 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 
 const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
   const body = c.get('inviteBody')
-  if (body?.kind === 'project') {
+  if (body?.kind === 'project' || body?.kind === 'identity_only') {
     const projectVerdict = await authorizeStructuralWrite(c.env, c.get('auth'), 'create_invite', {}, { surface: 'http' })
     if (projectVerdict.kind === 'refused') return c.json(structuralRefusalBody(projectVerdict), projectVerdict.status)
   }
   // Project invite authorization is enforced by createProjectInvite against both
   // the legacy role plane and the caller's live/resolved squad grants. Keeping it
   // in the service prevents a non-HTTP caller from bypassing the same ceiling.
-  if (body?.kind === 'project') {
+  if (body?.kind === 'project' || body?.kind === 'identity_only') {
     await next()
     return
   }
@@ -1232,6 +1249,13 @@ membersApp.post(
     const body = c.get('inviteBody')
     if (!body) return c.json({ error: 'invalid_json' }, 400)
     const auth = c.get('auth')
+
+    if (body.kind === 'identity_only') {
+      const result = await createIdentityOnlyInvite(c.env, auth, { member_id: body.member_id ?? '' })
+      if (!result.ok) return c.json({ error: result.error }, projectInviteErrorStatus(result.error))
+      protectRawTokenResponse(c)
+      return c.json(result.value, 201)
+    }
 
     if (body.kind === 'project') {
       if (!body.project_id || !body.squad_id || body.expires_in_seconds === null) {

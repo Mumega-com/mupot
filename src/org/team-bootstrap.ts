@@ -347,7 +347,7 @@ async function findLiveInvite(
   email: string,
 ): Promise<{ id: string; capability: Capability } | null> {
   return env.DB.prepare(
-    `SELECT id, capability FROM invites WHERE squad_id = ?1 AND lower(email) = lower(?2) AND accepted_at IS NULL LIMIT 1`,
+    `SELECT id, capability FROM invites WHERE invite_kind = 'grant' AND squad_id = ?1 AND lower(email) = lower(?2) AND accepted_at IS NULL LIMIT 1`,
   )
     .bind(squadId, email)
     .first<{ id: string; capability: Capability }>()

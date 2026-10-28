@@ -136,7 +136,11 @@ function accountBrowser(body: string, response: Record<string, unknown>, status 
     alert: (message: string) => { events.push(message) },
     location: { reload: () => { events.push('reload') }, assign: (url: string) => { events.push(url) } },
   }
-  const fetch = async () => ({ ok: status >= 200 && status < 300, status, json: async () => response })
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+  const fetch = async (url: string, options: { body?: string }) => {
+    requests.push({ url, body: options.body ? JSON.parse(options.body) : {} })
+    return { ok: status >= 200 && status < 300, status, json: async () => response }
+  }
   for (const script of scripts) {
     new Function('document', 'fetch', 'window', script)(document, fetch, window)
   }
@@ -146,7 +150,7 @@ function accountBrowser(body: string, response: Record<string, unknown>, status 
       if (!element) throw new Error(`Missing element ${id}`)
       return element
     },
-    events,
+    events, requests,
   }
 }
 
@@ -300,7 +304,7 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).not.toContain('Archived Project')
   })
 
-  it('an org-admin sees a "no active project" explain state when nothing is eligible, not the Connect form', async () => {
+  it('an org-admin with no eligible project sees the identity-only Connect form', async () => {
     harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE status = 'active';`)
     const env = makeEnv('admin@x.test')
     env.DB = harness.db
@@ -308,8 +312,8 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).not.toContain('id="tg-connect"')
-    expect(body).toContain('No active project is linked to a squad yet')
+    expect(body).toContain('id="tg-connect"')
+    expect(body).toContain('Connect Telegram (sign-in and notifications only)')
   })
 
   // Mom-walk D3 (supersedes "ask an admin"): below the org-admin floor a member connects THEIR OWN Telegram through the
@@ -329,7 +333,7 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).not.toContain('Ask an org admin to send you')
   })
 
-  it('a member whose only squad has no project link sees an explain state, not a button wired to a guaranteed refusal', async () => {
+  it('a member whose only squad has no project link sees the identity-only Connect form', async () => {
     harness.sqlite.exec(`
       INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-c', 'dept-a', 'charlie', 'Squad Charlie');
       INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-nobody', 'nobody@x.test', 'Nobody', 'active', '${TENANT}');
@@ -341,8 +345,8 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     expect(res.status).toBe(200)
     const body = await res.text()
-    expect(body).not.toContain('id="tg-connect"')
-    expect(body).toContain('Ask an org admin to add you to a project squad')
+    expect(body).toContain('id="tg-connect"')
+    expect(body).toContain('Connect Telegram (sign-in and notifications only)')
   })
 
   it('an org-scope LEAD member (one rank below the mint floor) self-connects at observer, never at lead (the floor still stops any other target)', async () => {
@@ -681,6 +685,35 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       body: JSON.stringify({ status: 'suspended' }),
     }, dashEnv)
     expect(suspend.status, await suspend.clone().text()).toBe(200)
+  })
+
+  it('identity-only Connect submits only self and kind, and the real route requires a fresh cookie', async () => {
+    harness.sqlite.exec("UPDATE projects SET status='archived' WHERE status='active'")
+    const env = makeEnv('plain@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const rendered = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(await rendered.text()).toContain('Connect Telegram (sign-in and notifications only)')
+    const section = String(await telegramSectionBody(env, { userId: 'plain-user', email: 'plain@x.test', role: 'member', tenant: TENANT, memberId: 'member-plain', capabilities: [] }))
+    const browser = accountBrowser(section, { pairing_code: 'identity-code' }, 201)
+    await browser.element('tg-connect').click!()
+    expect(browser.requests).toEqual([{ url: '/api/members/invites', body: { invite_kind: 'identity_only', member_id: 'member-plain' } }])
+    const post = (extra: Record<string, unknown> = {}) => membersApp.request('/invites', {
+      method: 'POST', headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...browser.requests[0].body, ...extra }),
+    }, env)
+    expect(await (await post()).json()).toEqual({ error: 'reauth_required' })
+    harness.sqlite.exec("UPDATE web_sessions SET recent_reauth_at = datetime('now') WHERE member_id = 'member-plain'")
+    for (const extra of [{ squad_id: 'squad-a' }, { department_id: null }, { project_id: 'project-a' }, { capability: 'owner' }, { email: 'other@x.test' }, { expires_in_seconds: 604800 }]) {
+      expect(await (await post(extra)).json()).toEqual({ error: 'invalid_invite_scope' })
+    }
+    expect(await (await post({ member_id: 'member-admin' })).json()).toEqual({ error: 'forbidden' })
+    const before = harness.sqlite.prepare('SELECT COUNT(*) n FROM capabilities').get()
+    const result = await post()
+    expect(result.status, await result.clone().text()).toBe(201)
+    expect(result.headers.get('cache-control')).toBe('no-store')
+    expect((await result.json() as { invite: { invite_kind: string } }).invite.invite_kind).toBe('identity_only')
+    expect(harness.sqlite.prepare('SELECT COUNT(*) n FROM capabilities').get()).toEqual(before)
   })
 
   it('the real member invite route requires step-up for self-connect, then accepts the fresh dashboard cookie', async () => {
@@ -1085,13 +1118,13 @@ describe('self-service Telegram connect (mom-walk D3): createProjectInvite below
     expect(harness.sqlite.prepare('SELECT * FROM capabilities ORDER BY id').all()).toEqual(before)
   })
 
-  it('home squads are omitted and a member with only a home project sees an explanation', async () => {
+  it('home squads are omitted and a home-only member sees identity-only Connect', async () => {
     harness.sqlite.exec("UPDATE squads SET kind = 'home' WHERE id = 'squad-a'")
     const auth = asMember('m-mom', MOM)
     expect(await loadConnectableSquads(env, auth, 0, true)).toEqual([])
     const body = String(await telegramSectionBody(env, auth))
-    expect(body).toContain('Telegram not connected')
-    expect(body).not.toContain('id="tg-connect"')
+    expect(body).toContain('Connect Telegram (sign-in and notifications only)')
+    expect(body).toContain('id="tg-connect"')
   })
 
 })

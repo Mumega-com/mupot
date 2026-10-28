@@ -133,9 +133,10 @@ export interface RedeemTelegramProjectInviteInput {
 }
 
 export interface RedeemedProjectInvite {
+  identity_only?: true
   member_id: string
-  project_id: string
-  squad_id: string
+  project_id: string | null
+  squad_id: string | null
   capability: Capability
 }
 
@@ -170,10 +171,11 @@ interface ProjectSquadRow {
 }
 
 interface RedeemableInviteRow {
+  invite_kind: 'grant' | 'identity_only'
   id: string
   email: string
-  project_id: string
-  squad_id: string
+  project_id: string | null
+  squad_id: string | null
   capability: Capability
   accepted_at: string | null
   pairing_expires_at: string
@@ -436,20 +438,25 @@ export const CLAIM_INVITE_SQL = `
      SET accepted_at = ?
    WHERE id = ?
      AND pairing_hash = ?
-     AND project_id = ?
-     AND squad_id = ?
+     AND project_id IS ?
+     AND squad_id IS ?
      AND capability = ?
      AND email = ?
      AND accepted_at IS NULL
      AND pairing_expires_at > ?
-     AND EXISTS (
-       SELECT 1 FROM projects project
-        WHERE project.id = invites.project_id AND project.status = 'active'
-     )
-     AND EXISTS (
-       SELECT 1 FROM project_squad_access access
-        WHERE access.project_id = invites.project_id
-          AND access.squad_id = invites.squad_id
+     AND (
+       (invite_kind = 'identity_only' AND project_id IS NULL AND squad_id IS NULL
+        AND department_id IS NULL AND member_id = minted_by_member_id AND member_id = invited_by
+        AND capability = 'observer'
+        AND EXISTS (SELECT 1 FROM members m WHERE m.id = invites.member_id AND m.archived_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.member_id = m.id AND b.tenant = m.tenant)))
+       OR (invite_kind = 'grant' AND EXISTS (
+         SELECT 1 FROM projects project
+          WHERE project.id = invites.project_id AND project.status = 'active'
+       ) AND EXISTS (
+         SELECT 1 FROM project_squad_access access
+          WHERE access.project_id = invites.project_id AND access.squad_id = invites.squad_id
+       ))
      )
      AND EXISTS (
        SELECT 1 FROM telegram_webhook_receipts receipt
@@ -492,20 +499,59 @@ function parseStoredRedemption(text: string | null): RedeemedProjectInvite | nul
     const parsed = JSON.parse(text) as Record<string, unknown>
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
     const keys = Object.keys(parsed).sort()
-    if (keys.join(',') !== 'capability,member_id,project_id,squad_id') return null
+    const identityOnly = parsed.identity_only === true
+    if (keys.join(',') !== (identityOnly ? 'capability,identity_only,member_id,project_id,squad_id' : 'capability,member_id,project_id,squad_id')) return null
     if (!isNonEmptyString(parsed.member_id)) return null
-    if (!isNonEmptyString(parsed.project_id)) return null
-    if (!isNonEmptyString(parsed.squad_id)) return null
+    if (identityOnly ? parsed.project_id !== null || parsed.squad_id !== null || parsed.capability !== 'observer'
+      : !isNonEmptyString(parsed.project_id) || !isNonEmptyString(parsed.squad_id)) return null
     if (!isCapability(parsed.capability)) return null
     return {
       member_id: parsed.member_id.trim(),
-      project_id: parsed.project_id.trim(),
-      squad_id: parsed.squad_id.trim(),
+      project_id: typeof parsed.project_id === 'string' ? parsed.project_id.trim() : null,
+      squad_id: typeof parsed.squad_id === 'string' ? parsed.squad_id.trim() : null,
+      ...(identityOnly ? { identity_only: true as const } : {}),
       capability: parsed.capability,
     }
   } catch {
     return null
   }
+}
+
+/** Identity proof only: never accepts scope, rank, email, or an alternate target. */
+export async function createIdentityOnlyInvite(
+  env: Env,
+  auth: AuthContext,
+  input: { member_id: string },
+): Promise<
+  | { ok: true; value: { invite: { id: string; invite_kind: 'identity_only'; created_at: string; pairing_expires_at: string }; pairing_code: string; access_notice: string } }
+  | { ok: false; error: CreateProjectInviteError }
+> {
+  if (auth.tenant !== env.TENANT_SLUG) return { ok: false, error: 'tenant_scope' }
+  if (!auth.memberId || input.member_id !== auth.memberId || auth.channel !== 'dashboard'
+    || auth.boundAgentId || auth.seatBinding || attachedAuthority(auth)) return { ok: false, error: 'forbidden' }
+  const checked = await checkWebSession(env, auth, { fresh: true })
+  if (!checked.ok) return { ok: false, error: checked.error === 'reauth_required' ? 'reauth_required' : 'forbidden' }
+  const member = await env.DB.prepare('SELECT email FROM members WHERE id = ?1 AND tenant = ?2')
+    .bind(auth.memberId, env.TENANT_SLUG).first<{ email: string | null }>()
+  if (!member || !isNonEmptyString(member.email)) return { ok: false, error: 'member_missing_email' }
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const pairingCode = mintPairingCode()
+    const hash = await sha256Hex(pairingCode)
+    if (await env.DB.prepare('SELECT id FROM invites WHERE pairing_hash = ?1 LIMIT 1').bind(hash).first()) continue
+    const id = crypto.randomUUID()
+    const createdAt = new Date().toISOString()
+    const expiresAt = new Date(Date.parse(createdAt) + 86400 * 1000).toISOString()
+    await env.DB.prepare(`INSERT INTO invites
+      (id, email, capability, invited_by, created_at, member_id, minted_by_member_id, pairing_hash, pairing_expires_at, invite_kind)
+      VALUES (?1, ?2, 'observer', ?3, ?4, ?3, ?3, ?5, ?6, 'identity_only')`)
+      .bind(id, member.email.trim(), auth.memberId, createdAt, hash, expiresAt).run()
+    return { ok: true, value: {
+      invite: { id, invite_kind: 'identity_only', created_at: createdAt, pairing_expires_at: expiresAt },
+      pairing_code: pairingCode,
+      access_notice: 'No squad or project access is granted.',
+    } }
+  }
+  return { ok: false, error: 'pairing_code_collision' }
 }
 
 /**
@@ -777,7 +823,7 @@ export async function redeemTelegramProjectInvite(
   if (receipt.state !== 'processing') return { ok: false, error: 'update_receipt_invalid' }
 
   const matches = await env.DB.prepare(
-    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at, member_id, minted_by_member_id
+    `SELECT id, email, project_id, squad_id, capability, accepted_at, pairing_expires_at, member_id, minted_by_member_id, invite_kind
        FROM invites
       WHERE pairing_hash = ?1
       LIMIT 2`,
@@ -890,11 +936,19 @@ export async function redeemTelegramProjectInvite(
   // a follow-up issue rather than fixed here; the fix (only the granting
   // squad owner, or an org owner, can act back) is a broader ceiling-design
   // question than this round's scope.
-  const identityOnly = invite.member_id !== null
+  if (invite.invite_kind === 'grant' && (!invite.project_id || !invite.squad_id)) {
+    return { ok: false, error: 'invalid_or_expired_pairing_code' }
+  }
+  const noScopeIdentity = invite.invite_kind === 'identity_only'
+  if (noScopeIdentity && (invite.member_id === null || invite.member_id !== invite.minted_by_member_id
+    || invite.project_id !== null || invite.squad_id !== null || invite.capability !== 'observer')) {
+    return { ok: false, error: 'invalid_or_expired_pairing_code' }
+  }
+  const identityOnly = noScopeIdentity || invite.member_id !== null
     && invite.minted_by_member_id === invite.member_id
     && invite.capability === 'observer'
   let minterRank = 0
-  if (invite.minted_by_member_id !== null) {
+  if (!noScopeIdentity && invite.minted_by_member_id !== null) {
     const minter = await env.DB.prepare(
       'SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
     ).bind(invite.minted_by_member_id, env.TENANT_SLUG).first<{ status: string }>()
@@ -902,13 +956,13 @@ export async function redeemTelegramProjectInvite(
     minterRank = minterActive
       ? invite.member_id !== null
         ? await currentMemberOrgRank(env, invite.minted_by_member_id)
-        : await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id)
+        : await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id ?? '')
       : 0
     let baselineAuthorityLost =
       minterRank < capabilityRank('admin') || capabilityRank(invite.capability) > minterRank
     // Only observer self-connect uses squad standing; higher-capability binds retain the org-admin floor.
     if (baselineAuthorityLost && identityOnly) {
-      const squadRank = minterActive ? await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id) : 0
+      const squadRank = minterActive ? await currentMemberSquadRank(env, invite.minted_by_member_id, invite.squad_id ?? '') : 0
       baselineAuthorityLost = squadRank < capabilityRank('observer') || capabilityRank(invite.capability) > squadRank
     }
     if (baselineAuthorityLost) {
@@ -928,6 +982,7 @@ export async function redeemTelegramProjectInvite(
   const grantId = crypto.randomUUID()
   const claimedAt = claimTimestamp()
   const value: RedeemedProjectInvite = {
+    ...(noScopeIdentity ? { identity_only: true as const } : {}),
     member_id: memberId,
     project_id: invite.project_id,
     squad_id: invite.squad_id,
