@@ -125,7 +125,7 @@ async function writeRevokeReceipt(env: Env, memberId: string, evidence: Record<s
   ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, targetKind, targetId, requestKey, JSON.stringify({ via: 'approval_bot', ...evidence }), new Date().toISOString()).run()
 }
 
-const HELP = 'Approval bot. When an agent asks for time-boxed access you get a message with Approve and Deny buttons. You can also reply /muapprove <id> or /mudeny <id>. /murevoke ends every live approval you gave (or /murevoke <id> for one).'
+const HELP = 'Approval bot. When an agent asks for time-boxed access you get a message with Approve and Deny buttons. You can also reply /muapprove <id> or /mudeny <id>. The id is the request id from this message. Task decisions go to the decision bot. /murevoke ends every live approval you gave (or /murevoke <id> for one).'
 
 export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: BotUpdateOpts = {}): Promise<BotUpdateResult> {
   const bot = approvalBotStatus(env)
@@ -150,7 +150,10 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
   }
   const cmd = parseCommand(p, bot.username)
   if (!cmd) {
-    if (p.kind === 'message' && p.text.trim().startsWith('/')) return { kind: 'ignored', reason: 'not_our_command' }
+    if (p.kind === 'message' && p.text.trim().startsWith('/')) {
+      await tell('This chat is only for approval requests. Pairing codes and task decisions go to the decision bot.')
+      return { kind: 'ignored', reason: 'not_our_command' }
+    }
     return { kind: 'ignored', reason: 'not_a_command' }
   }
 

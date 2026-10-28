@@ -125,6 +125,7 @@ export async function deliverDecisionCard(
   const base = origin ?? env.PUBLIC_ORIGIN ?? ''
   const card = {
     type: 'decision_card',
+    instruction: 'The id is a task id for the decision bot, not an approval-bot request.',
     task_id: task.id,
     short_id: shortId,
     title: truncateSafe(row.title, MAX_TITLE_CHARS),
