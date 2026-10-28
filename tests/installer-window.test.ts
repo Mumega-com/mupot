@@ -714,6 +714,19 @@ describe('floor and approver liveness', () => {
 
 describe('shared decision core carries the passkey-class bit; envelope marker', () => {
   async function viaChannel(via: 'webauthn' | 'access_passkey' | 'telegram_miniapp', action: string) {
+    const evidence: Record<string, string> = {}
+    if (via === 'telegram_miniapp') {
+      // Match the real Mini App proof: a bound private chat, confirmed device and live login identity.
+      const telegramUserId = '1001'
+      const deviceId = crypto.randomUUID()
+      sql('UPDATE members SET telegram_chat_id = ? WHERE id = ?', telegramUserId, APPROVER)
+      sql(`INSERT INTO tg_miniapp_devices
+        (id, tenant, member_id, telegram_user_id, login_identity_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      deviceId, TENANT, APPROVER, telegramUserId, APPROVER_IDENTITY, crypto.randomUUID(), 'a'.repeat(64))
+      evidence.tg_device_id = deviceId
+      evidence.telegram_user_id = telegramUserId
+    }
     const sessionId = await checkIn(op())
     const created = await createElevationRequest(env, {
       tenant: TENANT, agentSessionId: sessionId, agentId: 'agent-op', memberId: 'seat-agent-op',
@@ -724,7 +737,7 @@ describe('shared decision core carries the passkey-class bit; envelope marker', 
       capabilities: [{ member_id: APPROVER, scope_type: 'org', scope_id: null, capability: 'admin' }] } as unknown as AuthContext // fixture human
     const out = await decideElevation(env, {
       id: created.request.id, decision: 'approve', selectedActions: [action], durationMinutes: 60, auth: approver,
-      proof: { memberId: APPROVER, via, evidence: {} },
+      proof: { memberId: APPROVER, via, evidence },
       mintSession: async () => {
         const web = await createWebSession(env, `raw-core-${++webSeq}`, { tenant: TENANT, memberId: APPROVER, loginIdentityId: APPROVER_IDENTITY }, Date.now())
         return { auth: approver, webSessionHash: web.id_hash }
@@ -733,7 +746,12 @@ describe('shared decision core carries the passkey-class bit; envelope marker', 
     return { out, grants: rows('SELECT 1 FROM elevation_grants WHERE action = ?', action).length }
   }
   it('install_high: webauthn and access_passkey approve; the Telegram Mini App cannot', async () => {
-    expect((await viaChannel('telegram_miniapp', INSTALL_HIGH_ACTION)).grants).toBe(0)
+    const miniapp = await viaChannel('telegram_miniapp', INSTALL_HIGH_ACTION)
+    expect(miniapp.grants).toBe(0)
+    expect(miniapp.out).toMatchObject({
+      status: 409,
+      message: 'The decision was not recorded: invalid_elevation_request (action:install_high is approved with a passkey; open the approval link in your browser).',
+    })
     expect((await viaChannel('webauthn', INSTALL_HIGH_ACTION)).grants).toBe(1)
   })
   it('install_standard: the Telegram Mini App path approves it', async () => {
