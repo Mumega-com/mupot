@@ -584,7 +584,7 @@ function decideScript(requestId: string): Html {
           setBusy(true);
           setHint(decision === 'approve' ? 'Approving…' : 'Denying…');
           try {
-            var res = await fetch('/auth/elevation/requests/' + encodeURIComponent(REQUEST_ID) + '/decide', {
+            var res = await fetch('/auth/elevation/requests/${requestId}/decide', {
               method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' },
               body: JSON.stringify(body)
             });
