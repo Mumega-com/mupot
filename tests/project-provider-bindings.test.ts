@@ -52,6 +52,14 @@ describe('project provider bindings', () => {
       expect(listed).toHaveLength(1)
       const got = await getProjectBinding(env, 'proj-1', 'github_projects')
       expect(got?.provider).toBe('github_projects')
+      const relinked = await upsertProjectBinding(env, 'proj-1', {
+        provider: 'github_projects', external_id: 'Mumega-com/13',
+      }, ADMIN)
+      expect(relinked.ok && JSON.parse(relinked.value.meta_json)).toEqual({ agent_field: 'Agent' })
+      const replaced = await upsertProjectBinding(env, 'proj-1', {
+        provider: 'github_projects', external_id: 'Mumega-com/13', meta: { replacement: true },
+      }, ADMIN)
+      expect(replaced.ok && JSON.parse(replaced.value.meta_json)).toEqual({ replacement: true })
       const removed = await removeProjectBinding(env, 'proj-1', 'github_projects')
       expect(removed.ok).toBe(true)
       expect(await listProjectBindings(env, 'proj-1')).toEqual([])

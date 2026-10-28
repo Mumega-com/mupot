@@ -799,7 +799,10 @@ describe('project dashboard renderers', () => {
     ))).toBe(true)
     expect(view?.members.some((member) => member.agent_id === 'omitted-agent')).toBe(false)
     for (const name of visibleNames) expect(body).toContain(name)
-    expect(body).not.toContain('AAA omitted squad')
+    // The destination picker lists all eligible squads independently of the team window.
+    const teamSection = body.match(/<section id="squads"[\s\S]*?(?=<section id="activity")/)?.[0]
+    expect(teamSection).toBeDefined()
+    expect(teamSection).not.toContain('AAA omitted squad')
     expect(body).not.toContain('AAA omitted member')
     expect(body).toContain('Showing the first 100 readable squad edges.')
     expect(body).toContain('Showing the first 100 readable agent members.')
@@ -1814,5 +1817,91 @@ describe('projectMutationStatus', () => {
     expect(projectMutationStatus('invalid_status')).toBe(400)
     expect(projectMutationStatus('invalid_target_date')).toBe(400)
     expect(projectMutationStatus('invalid_access_level')).toBe(400)
+  })
+})
+
+describe('Linear destination squad authority', () => {
+  let h: SqliteD1Harness
+  afterEach(() => { authState.current = null; h?.close() })
+  function setup() {
+    h = makeHarness()
+    h.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind, archived_at) VALUES
+        ('home', 'dept-a', 'home-test', 'Home excluded', 'home', NULL),
+        ('archived', 'dept-a', 'archived-test', 'Archived excluded', 'work', '2026-01-01'),
+        ('unlinked', 'dept-a', 'unlinked-test', 'Unlinked excluded', 'work', NULL);
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('visible-child', 'home', 'write'), ('visible-child', 'archived', 'write');
+    `)
+    as(memberA())
+    return envFor(h)
+  }
+  async function bind(env: Env, squad: string, provider = 'linear') {
+    return dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+      provider, external_id: 'ENG', defaultSquadId: squad,
+    }), env)
+  }
+  it('lists only linked, active, non-home squads within actor authority and selects the current value', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    const view = await loadProjectDetail(env, memberA(), 'visible-child')
+    const body = await render(projectDetailBody(view!))
+    const select = body.match(/<select name="defaultSquadId"[^>]*>([\s\S]*?)<\/select>/)?.[1]
+    expect(select).toBeDefined()
+    expect(select).toMatch(/value="squad-a" selected/)
+    for (const id of ['squad-b', 'home', 'archived', 'unlinked']) expect(select).not.toContain(`value="${id}"`)
+    const adminView = await loadProjectDetail(env, actor({ role: 'admin' }), 'visible-child')
+    const adminBody = await render(projectDetailBody(adminView!))
+    const adminSelect = adminBody.match(/<select name="defaultSquadId"[^>]*>([\s\S]*?)<\/select>/)?.[1]
+    expect(adminSelect).toContain('value="squad-b"')
+    for (const id of ['home', 'archived', 'unlinked']) expect(adminSelect).not.toContain(`value="${id}"`)
+  })
+  it('stores a valid destination and routes a webhook-created issue there', async () => {
+    const env = setup()
+    expect((await bind(env, 'squad-a')).status).toBe(302)
+    const { getProjectBinding } = await import('../src/projects/providers/bindings')
+    const binding = await getProjectBinding(env, 'visible-child', 'linear')
+    expect(JSON.parse(binding!.meta_json)).toEqual({ defaultSquadId: 'squad-a' })
+    const { handleLinearWebhook } = await import('../src/integrations/linear-webhook')
+    expect(await handleLinearWebhook(env, binding!, { kind: 'item_created', item: {
+      native_id: 'linear-destination-test', ref: 'ENG-999', title: 'Destination test', url: null, status: 'Todo',
+    } })).toMatchObject({ ok: true, imported: 1 })
+    expect(await h.db.prepare("SELECT squad_id, project_id FROM tasks WHERE title = 'Destination test'").first())
+      .toMatchObject({ squad_id: 'squad-a', project_id: 'visible-child' })
+  })
+  it.each(['home', 'unlinked', 'archived', 'squad-b', 'missing'])('refuses %s without changing any binding', async (id) => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    const before = await h.db.prepare('SELECT * FROM project_provider_bindings').all()
+    const response = await bind(env, id)
+    expect(response.status).toBe(400)
+    expect(await response.text()).toContain('invalid_default_squad')
+    expect(await h.db.prepare('SELECT * FROM project_provider_bindings').all()).toEqual(before)
+  })
+  it('preserves all metadata when relinking without a choice (empty or omitted)', async () => {
+    const env = setup()
+    await bind(env, 'squad-a')
+    h.sqlite.exec(`UPDATE project_provider_bindings SET meta_json = '{"defaultSquadId":"squad-a","other":"retained"}'`)
+    for (const values of [{ defaultSquadId: '' }, {}]) {
+      const response = await dashboardApp.fetch(projectFormRequest('/projects/visible-child/boards', {
+        provider: 'linear', external_id: 'NEW', ...values,
+      }), env)
+      expect(response.status).toBe(302)
+      expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first()).toEqual({
+        meta_json: '{"defaultSquadId":"squad-a","other":"retained"}',
+      })
+    }
+  })
+  it('allows a workspace admin to select any eligible linked squad', async () => {
+    const env = setup()
+    as(actor({ role: 'admin' }))
+    expect((await bind(env, 'squad-b')).status).toBe(302)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first())
+      .toEqual({ meta_json: '{"defaultSquadId":"squad-b"}' })
+  })
+  it.each(['github_projects', 'notion'])('ignores destination for %s', async (provider) => {
+    const env = setup()
+    expect((await bind(env, 'home', provider)).status).toBe(302)
+    expect(await h.db.prepare('SELECT meta_json FROM project_provider_bindings').first()).toEqual({ meta_json: '{}' })
   })
 })
