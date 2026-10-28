@@ -2,8 +2,9 @@
 // through the registry — the ProjectBoardProvider contract level, one layer above
 // tests/linear-issues.test.ts's direct integration-module tests.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { createHmac } from 'node:crypto'
+import { boardWebhookApp } from '../src/integrations/board-webhook-routes'
+import { applyAllMigrations } from './helpers/migrations'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
@@ -12,15 +13,12 @@ import { getTaskBoardPort } from '../src/projects/providers/registry'
 import type { ProjectProviderBinding } from '../src/projects/providers/port'
 import type { Env } from '../src/types'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const MASTER_KEY = '22'.repeat(32)
 const TENANT = 'tenant-a'
 
 async function makeEnv() {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');
@@ -174,4 +172,47 @@ describe('createLinearBoardPort.syncIntoProject', () => {
     ).bind('proj-1').first<{ synced_at: string | null }>()
     expect(row?.synced_at).not.toBeNull() // a genuine empty-team sync IS a successful sync
   })
+})
+
+
+describe('stored Linear destination eligibility at use time', () => {
+  it.each(['archived', 'home', 'read', 'unlinked'])('refuses %s destinations for sync and acknowledges webhook without retry', async (invalid) => {
+    const { env, harness } = await makeEnv()
+    try {
+      harness.sqlite.exec(`INSERT INTO project_provider_bindings (project_id, provider, external_id, connector_id, meta_json)
+        VALUES ('proj-1', 'linear', 'ENG', 'connector-linear-1', '{"defaultSquadId":"squad-a"}')`)
+      if (invalid === 'archived') harness.sqlite.exec("UPDATE squads SET archived_at = '2026-01-01' WHERE id = 'squad-a'")
+      if (invalid === 'home') harness.sqlite.exec("UPDATE squads SET kind = 'home' WHERE id = 'squad-a'")
+      if (invalid === 'read') harness.sqlite.exec("UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-1'")
+      if (invalid === 'unlinked') harness.sqlite.exec("DELETE FROM project_squad_access WHERE project_id = 'proj-1'")
+      const fetchSpy = linearFetch([])
+      vi.stubGlobal('fetch', fetchSpy)
+      expect(await createLinearBoardPort(env).syncIntoProject(binding({ meta_json: '{"defaultSquadId":"squad-a"}' }), { project_id: 'proj-1', dryRun: false }))
+        .toEqual({ ok: false, error: 'invalid_default_squad' })
+      expect(fetchSpy).not.toHaveBeenCalled()
+      const body = JSON.stringify({ type: 'Issue', action: 'create', webhookTimestamp: Date.now(), data: {
+        id: 'invalid-dest', identifier: 'ENG-1', title: 'Must not import', team: { key: 'ENG' },
+      } })
+      const response = await boardWebhookApp.request('/linear', {
+        method: 'POST', body, headers: { 'linear-signature': createHmac('sha256', 'test-secret').update(body).digest('hex') },
+      }, { ...env, LINEAR_WEBHOOK_SECRET: 'test-secret' })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({ ok: true, imported: 0, ignored: true, details: ['invalid_default_squad'] })
+      expect(await env.DB.prepare('SELECT id FROM tasks').first()).toBeNull()
+    } finally { harness.close() }
+  })
+})
+
+
+it('clears an omitted destination when only the Linear connector changes', async () => {
+  const { env, harness } = await makeEnv()
+  try {
+    const { upsertProjectBinding } = await import('../src/projects/providers/bindings')
+    const actor = { workspaceAdmin: true, actorSquadIds: [] }
+    expect((await upsertProjectBinding(env, 'proj-1', {
+      provider: 'linear', external_id: 'ENG', connector_id: 'connector-linear-1', meta: { defaultSquadId: 'squad-a' },
+    }, actor)).ok).toBe(true)
+    const result = await upsertProjectBinding(env, 'proj-1', { provider: 'linear', external_id: 'ENG', connector_id: null }, actor)
+    expect(result.ok && JSON.parse(result.value.meta_json)).toEqual({})
+  } finally { harness.close() }
 })

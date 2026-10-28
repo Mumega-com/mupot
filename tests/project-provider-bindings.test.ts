@@ -1,5 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { applyAllMigrations } from './helpers/migrations'
 import { describe, expect, it } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import {
@@ -12,16 +11,7 @@ import {
 import { isProjectBoardProvider, listBoardProviders } from '../src/projects/providers/registry'
 import { isConnectorType } from '../src/connectors/crypto'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-const THROUGH = '0062_project_provider_bindings.sql'
-
 const ADMIN: BindingActorContext = { workspaceAdmin: true, actorSquadIds: [] }
-
-function applyThrough(sqlite: { exec(sql: string): void }, throughFile: string): void {
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name <= throughFile).sort()) {
-    sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
-}
 
 describe('project provider bindings', () => {
   it('exposes github_projects, linear, and notion as board providers', () => {
@@ -34,7 +24,7 @@ describe('project provider bindings', () => {
   it('upserts and lists bindings on an active project', async () => {
     const { sqlite, db, close } = createSqliteD1()
     try {
-      applyThrough(sqlite, THROUGH)
+      applyAllMigrations(sqlite)
       sqlite.exec(`
         INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
         INSERT INTO projects (id, slug, name, status) VALUES ('proj-1', 'proj', 'Proj', 'active');
@@ -55,7 +45,7 @@ describe('project provider bindings', () => {
       const relinked = await upsertProjectBinding(env, 'proj-1', {
         provider: 'github_projects', external_id: 'Mumega-com/13',
       }, ADMIN)
-      expect(relinked.ok && JSON.parse(relinked.value.meta_json)).toEqual({ agent_field: 'Agent' })
+      expect(relinked.ok && JSON.parse(relinked.value.meta_json)).toEqual({})
       const replaced = await upsertProjectBinding(env, 'proj-1', {
         provider: 'github_projects', external_id: 'Mumega-com/13', meta: { replacement: true },
       }, ADMIN)
@@ -71,7 +61,7 @@ describe('project provider bindings', () => {
   it('rejects bindings on archived projects', async () => {
     const { sqlite, db, close } = createSqliteD1()
     try {
-      applyThrough(sqlite, THROUGH)
+      applyAllMigrations(sqlite)
       sqlite.exec(`
         INSERT INTO projects (id, slug, name, status) VALUES ('proj-a', 'archived', 'Archived', 'archived');
       `)
@@ -131,7 +121,7 @@ describe('project provider bindings', () => {
     it('workspace admin may bind a pot-wide connector', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-pot', 'pot', null)
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -149,7 +139,7 @@ describe('project provider bindings', () => {
     it('REJECTS a pot-wide connector for a non-admin project manager', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-pot', 'pot', null)
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -167,7 +157,7 @@ describe('project provider bindings', () => {
     it('accepts a squad-scoped connector when the actor is authorized through that same squad', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -189,7 +179,7 @@ describe('project provider bindings', () => {
     it('workspace admin may bind a squad-scoped connector too (admin is the authority superset)', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -207,7 +197,7 @@ describe('project provider bindings', () => {
     it('REJECTS a squad-scoped connector belonging to a squad unrelated to this project', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         // squad-other has no project_squad_access row on proj-1 at all.
         insertConnector(sqlite, 'conn-other', 'squad', 'squad-other')
@@ -226,7 +216,7 @@ describe('project provider bindings', () => {
     it('REJECTS a squad-scoped connector for a DIFFERENT squad even when that squad also has project access (the exact confused-deputy gap)', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         // squad-other ALSO has (read-only) access to proj-1 — but the calling
         // actor is authorized here through squad-mine only, so squad-other's
@@ -251,7 +241,7 @@ describe('project provider bindings', () => {
     it('REJECTS an agent-scoped connector outright, even for a workspace admin', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-agent', 'agent', 'agent-1')
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -269,7 +259,7 @@ describe('project provider bindings', () => {
     it('fails closed on a connector_id that does not exist', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         const env = { DB: db, TENANT_SLUG: TENANT } as never
         const result = await upsertProjectBinding(env, 'proj-1', {
@@ -286,7 +276,7 @@ describe('project provider bindings', () => {
     it('fails closed on a revoked connector', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-revoked', 'pot', null, true)
         const env = { DB: db, TENANT_SLUG: TENANT } as never
@@ -304,7 +294,7 @@ describe('project provider bindings', () => {
     it('fails closed on a connector belonging to a different tenant', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         sqlite.exec(`
           INSERT INTO connectors (id, tenant, type, label, encrypted_secret, scope_type, scope_id, created_by, created_at, revoked_at)
@@ -334,7 +324,7 @@ describe('project provider bindings', () => {
     it('REJECTS a bind when the actor context is stale — squad access was revoked in the DB before this call runs', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite) // grants squad-mine 'write' on proj-1
         insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
         // Simulate a concurrent revoke landing between the caller's
@@ -358,7 +348,7 @@ describe('project provider bindings', () => {
     it('clearing connector_id back to null never needs scope validation', async () => {
       const { sqlite, db, close } = createSqliteD1()
       try {
-        applyThrough(sqlite, THROUGH)
+        applyAllMigrations(sqlite)
         seed(sqlite)
         insertConnector(sqlite, 'conn-mine', 'squad', 'squad-mine')
         const env = { DB: db, TENANT_SLUG: TENANT } as never

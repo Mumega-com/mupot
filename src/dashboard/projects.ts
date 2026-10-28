@@ -1689,9 +1689,11 @@ function boardSection(view: ProjectDetailView) {
           <input name="connector_id" placeholder="uuid from /admin/connectors" />
         </label>
         <label data-linear-destination hidden>Destination squad <span>(optional)</span>
-          ${currentDestination ? html`<span class="ui-panel-sub">Current destination: ${currentDestination}</span>` : html``}
+          <span class="ui-panel-sub">If no authorized destination remains: destination cleared; choose a squad</span>
+          ${currentDestination ? html`<span class="ui-panel-sub">Current destination: ${view.squads.find((s) => s.squad_id === currentDestination)?.squad_name ?? 'set by an admin'}</span>` : html``}
           <select name="defaultSquadId" disabled>
-            <option value="">Keep current destination</option>
+            <option value="">Keep destination if authorized and target unchanged</option>
+            <option value="__clear__">Clear destination</option>
             ${(view.boardDestinationSquads ?? []).map((squad) => html`<option value="${squad.id}"${squad.id === currentDestination ? ' selected' : ''}>${squad.name}</option>`)}
           </select>
         </label>

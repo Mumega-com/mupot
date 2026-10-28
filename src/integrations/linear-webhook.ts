@@ -1,3 +1,4 @@
+import { isLinearDestinationValid } from '../projects/providers/bindings'
 // mupot — Linear INBOUND webhook pieces (verify + parse + handle). Provider-specific; the route that calls
 // them (integrations/board-webhook-routes.ts) knows no provider name.
 //
@@ -129,6 +130,9 @@ export async function handleLinearWebhook(
   if (event.kind === 'item_created') {
     const squad = defaultSquadIdFromMeta(binding.meta_json)
     if (!squad) return { ok: true, imported: 0, detail: 'no_squad' }
+    if (!await isLinearDestinationValid(env, binding.project_id, squad)) {
+      return { ok: true, imported: 0, detail: 'invalid_default_squad' }
+    }
     const status = await importOneLinearIssue(
       env,
       {
