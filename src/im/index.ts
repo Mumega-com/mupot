@@ -402,7 +402,7 @@ export async function handleImMessage(
     }
     if (result.ok) return joinedReply(result.value.project_id)
     if (result.error === 'telegram_identity_conflict') {
-      return 'This Telegram is already linked to a different account. Disconnect it on My Account there, then connect again.'
+      return "This Telegram and this account can't be linked: one of them is already linked elsewhere. Disconnect Telegram on My Account for the account that has it, then connect again."
     }
     if (result.error === 'invite_minter_authority_lost') {
       return 'This invitation is no longer valid. Press Connect Telegram again on My Account, or ask the admin who sent it.'
@@ -423,7 +423,7 @@ export async function handleImMessage(
   // from the authenticated private webhook envelope (same fence as join), and only ever reaches that chat.
   if (intent.kind === 'weblogin') {
     if (!options.telegram || options.telegram.telegram_user_id !== chat) {
-      return 'Send /login from your direct Telegram conversation with me.'
+      return 'Send /mulogin from your direct Telegram conversation with me.'
     }
     const origin = (env.PUBLIC_ORIGIN ?? '').trim().replace(/\/+$/, '')
     if (!origin) return 'Web sign-in is not configured for this workspace. Ask an admin.'

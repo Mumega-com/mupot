@@ -1841,7 +1841,7 @@ describe('Telegram project invitation service', () => {
 
     const GENERIC = 'That code did not work. Press Connect Telegram on My Account for a fresh code, or ask an admin for a new invitation.'
     expect(expiredReply).toBe(GENERIC)
-    expect(conflictReply).toBe('This Telegram is already linked to a different account. Disconnect it on My Account there, then connect again.')
+    expect(conflictReply).toBe("This Telegram and this account can't be linked: one of them is already linked elsewhere. Disconnect Telegram on My Account for the account that has it, then connect again.")
     for (const reply of [expiredReply, conflictReply]) {
       expect(reply).not.toMatch(
         /invalid_or_expired_pairing_code|ambiguous_pairing_code|telegram_identity_conflict|member_already_exists|redemption_failed|update_receipt_invalid/,

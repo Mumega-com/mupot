@@ -33,6 +33,19 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
   afterEach(() => harness.close())
 
+  it('routes /mulogin through the private bound-member webhook to weblogin like /login', async () => {
+    await member()
+    // With no PUBLIC_ORIGIN, this exact reply identifies the weblogin handler.
+    const login = await post(envelope('/login', 20))
+    const mulogin = await post(envelope('/mulogin', 21))
+    expect(login.status).toBe(200)
+    expect(mulogin.status).toBe(200)
+    const loginBody = await login.json() as { reply: string }
+    const muloginBody = await mulogin.json() as { reply: string }
+    expect(loginBody.reply).toBe('Web sign-in is not configured for this workspace. Ask an admin.')
+    expect(muloginBody.reply).toBe(loginBody.reply)
+  })
+
   async function post(body: unknown, secret = SECRET) {
     return app.fetch(new Request('https://pot.test/im/webhook', {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
