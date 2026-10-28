@@ -316,10 +316,10 @@ function parseIntent(rawText: string): Intent {
 
 // ── reply copy (short, friendly, never leaks internals) ───────────────────────
 const HELP =
-  'I can: "/start <invite-code>", "/login", "/needs [project-id]", "/answer <run-id> <choice>", ' +
+  'I can: "/start <invite-code>", "/mulogin", "/muneeds [project-id]", "/muanswer <run-id> <choice>", ' +
   '"task: <title>" (optionally "@squad"), "status" or "status <agent>", ' +
-  '"wake <agent>", "fleet start|stop|restart|status <agent>", "approve <task-id>", ' +
-  '"reject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
+  '"wake <agent>", "fleet start|stop|restart|status <agent>", "/muapprove <task-id>", ' +
+  '"/mureject <task-id> <reason>", "directive: <text>", or "directive clear". ' +
   'I act as you, with your permissions.'
 
 const IM_TASK_DONE_WHEN =
@@ -374,11 +374,9 @@ export async function handleImMessage(
       pairing_code: intent.code,
       display_name: sanitizeTelegramDisplayName(options.displayName),
     })
-    // P2: never echo the raw error enum into the chat — `invalid_or_expired_pairing_code`
-    // vs `ambiguous_pairing_code` vs `telegram_identity_conflict` vs `member_already_exists`
-    // is a weak enumeration oracle over a secret pairing code. The distinguishing detail
-    // (`result.error`) stays in this function's return value / caller-side receipts and
-    // observability — never in the text that reaches the requester.
+    // Keep pairing-code and receipt failures indistinguishable. Only the two
+    // actionable account/inviter failures below get distinct prose; no raw enum
+    // is ever echoed into the chat.
     // HOME CREATION ON FIRST CONTACT (mupot-plugin PR #19 v2 contract,
     // §2f(a) point 3; scoped down in FP-01 Slice 2 v2 round 2, P1-a): a
     // successful invite redemption is the ONE unambiguous first-contact
@@ -402,12 +400,22 @@ export async function handleImMessage(
         })
       })
     }
-    return result.ok ? joinedReply(result.value.project_id) : 'Could not join. Ask an admin for a new invitation.'
+    if (result.ok) return joinedReply(result.value.project_id)
+    if (result.error === 'telegram_identity_conflict') {
+      return "This Telegram and this account can't be linked: one of them is already linked elsewhere. Disconnect Telegram on My Account for the account that has it, then connect again."
+    }
+    if (result.error === 'invite_minter_authority_lost') {
+      return 'This invitation is no longer valid. Press Connect Telegram again on My Account, or ask the admin who sent it.'
+    }
+    return 'That code did not work. Press Connect Telegram on My Account for a fresh code, or ask an admin for a new invitation.'
   }
 
   // 1) Identity: chat_id → member. No member → polite refusal, NO action taken.
   const member = await memberForChat(env, chat)
   if (!member) {
+    if (normalizeImCommand(text ?? '').trim().toLowerCase() === '/start') {
+      return 'Open My Account → Connect Telegram, then tap the link, or send /start <code> here.'
+    }
     return "You're not registered with this workspace yet. Ask an admin to invite you, then connect Telegram."
   }
 
@@ -415,7 +423,7 @@ export async function handleImMessage(
   // from the authenticated private webhook envelope (same fence as join), and only ever reaches that chat.
   if (intent.kind === 'weblogin') {
     if (!options.telegram || options.telegram.telegram_user_id !== chat) {
-      return 'Send /login from your direct Telegram conversation with me.'
+      return 'Send /mulogin from your direct Telegram conversation with me.'
     }
     const origin = (env.PUBLIC_ORIGIN ?? '').trim().replace(/\/+$/, '')
     if (!origin) return 'Web sign-in is not configured for this workspace. Ask an admin.'
@@ -476,7 +484,7 @@ export async function handleImMessage(
 }
 
 function joinedReply(projectId: string): string {
-  return `Joined project ${projectId}. Use /needs to see what needs your attention.`
+  return `Joined project ${projectId}. Use /muneeds to see what needs your attention; if you have no web sign-in yet, send /mulogin for a browser link.`
 }
 
 // IM resolves an ordinary human member, just like member HTTP/MCP auth. A
@@ -501,7 +509,7 @@ async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], p
     const actions = item.allowed_actions.map(action => {
       if (action === 'approve') return `/muapprove ${item.source_id}`
       if (action === 'reject') return `/mureject ${item.source_id} <reason>`
-      if (action === 'answer') return `/answer ${item.source_id} <choice>`
+      if (action === 'answer') return `/muanswer ${item.source_id} <choice>`
       if (action === 'view') return item.safe_url
       return action
     })
@@ -1373,7 +1381,10 @@ imApp.post('/webhook', async (c) => {
   const updateId = telegramId(update.update_id, true)
   if (!updateId) return c.json({ error: 'no_update_id' }, 400)
   if (update.message?.chat?.type !== 'private' || userId !== chatId) {
-    return c.json({ error: 'private_chat_required' }, 400)
+    return c.json({
+      ok: false, error: 'private_chat_required',
+      reply: "Open a private chat with me and send the command there. I don't act on group messages.",
+    })
   }
   const text = typeof update.message?.text === 'string' ? update.message.text : ''
   if (text.length > 4096) return c.json({ error: 'message_too_long' }, 400)

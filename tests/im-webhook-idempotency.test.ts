@@ -33,6 +33,19 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
   afterEach(() => harness.close())
 
+  it('routes /mulogin through the private bound-member webhook to weblogin like /login', async () => {
+    await member()
+    // With no PUBLIC_ORIGIN, this exact reply identifies the weblogin handler.
+    const login = await post(envelope('/login', 20))
+    const mulogin = await post(envelope('/mulogin', 21))
+    expect(login.status).toBe(200)
+    expect(mulogin.status).toBe(200)
+    const loginBody = await login.json() as { reply: string }
+    const muloginBody = await mulogin.json() as { reply: string }
+    expect(loginBody.reply).toBe('Web sign-in is not configured for this workspace. Ask an admin.')
+    expect(muloginBody.reply).toBe(loginBody.reply)
+  })
+
   async function post(body: unknown, secret = SECRET) {
     return app.fetch(new Request('https://pot.test/im/webhook', {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
@@ -129,15 +142,42 @@ describe('authenticated Telegram receipts and human controls', () => {
 
   it.each([
     { ...envelope('task: do work').message, chat: { id: 123, type: 'group' } },
+    { ...envelope('task: do work').message, chat: { id: 123, type: 'supergroup' } },
+    { ...envelope('task: do work').message, chat: { id: 123, type: 'channel' } },
     { ...envelope('task: do work').message, from: { id: 456 } },
     { ...envelope('task: do work').message, chat: { id: 123 } },
-  ])('refuses non-private or mismatched sender chats', async message => {
+  ])('refuses non-private or mismatched sender chats with a relay reply and no receipt', async message => {
     await member()
     const before = businessState()
     const response = await post({ update_id: 10, message })
-    expect(response.status).toBe(400)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      ok: false, error: 'private_chat_required',
+      reply: "Open a private chat with me and send the command there. I don't act on group messages.",
+    })
     expect(businessState()).toEqual(before)
     expect(receipt()).toEqual([])
+    // The same update id is still usable in a valid private envelope.
+    expect((await post(envelope('task: do work'))).status).toBe(200)
+    expect(harness.sqlite.prepare('SELECT title FROM tasks').all()).toEqual([{ title: 'do work' }])
+  })
+
+  it('does not bind or consume a group invitation before the same update arrives privately', async () => {
+    const code = await invite()
+    const request = envelope(`/start ${code}`)
+    const before = businessState()
+    const response = await post({ ...request, message: { ...request.message, chat: { id: 456, type: 'group' } } })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      ok: false, error: 'private_chat_required',
+      reply: "Open a private chat with me and send the command there. I don't act on group messages.",
+    })
+    expect(businessState()).toEqual(before)
+    expect(receipt()).toEqual([])
+    const privateResponse = await post(request)
+    expect(privateResponse.status).toBe(200)
+    expect(await privateResponse.json()).toMatchObject({ ok: true, bound: true })
+    expect(receipt()).toHaveLength(1)
   })
 
   it('stores the verified user and replays the stored response with exactly one task effect', async () => {

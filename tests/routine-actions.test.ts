@@ -246,7 +246,7 @@ describe('Routine proposal submission and governed actions', () => {
     const needs = await message('/needs project-1')
     expect(needs).toContain('Which event?')
     expect(needs).toContain('Booked | Paid')
-    expect(needs).toContain('/answer run-1')
+    expect(needs).toContain('/muanswer run-1')
     expect(await message('/answer run-1 paid')).toContain('invalid_answer')
     expect(state()).toEqual(pending)
     expect(await message('/answer run-1 Paid', true)).toMatch(/direct.*forward/i)
