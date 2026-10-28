@@ -9,6 +9,7 @@ import { ELEVATION_ACTIONS } from '../auth/elevation-actions'
 import type { ElevationRequestRecord } from '../auth/elevation'
 import { exactCallLine } from '../auth/owner-sudo-args'
 import { untrustedLine } from '../auth/untrusted-line'
+import { SETTINGS_KEYS, getSetting, isValidBotUsername } from '../dashboard/settings'
 
 /** Reversible, enforced, narrow, and not credential- or structure-minting. The broad action:manage_access is NOT here: it stays passkey / Mini App only. Adding a key here is a reviewed one-line change. */
 export const APPROVAL_BOT_ACTIONS: readonly string[] = [
@@ -57,6 +58,15 @@ export function newShortId(): string {
 
 export { untrustedLine }
 
+/**
+ * How copy names the decision-channel bot. Display only: nothing in the decision path reads this.
+ * A missing or invalid `org_settings.im_bot_username` (IM_BOT_USERNAME_RE) stays "the decision bot".
+ */
+export async function decisionBotLabel(env: Env): Promise<string> {
+  const raw = await getSetting(env, SETTINGS_KEYS.imBotUsername)
+  return isValidBotUsername(raw) ? `@${raw}` : 'the decision bot'
+}
+
 async function scopeName(env: Env, req: ElevationRequestRecord): Promise<string> {
   if (req.requested_scope_type === 'org') return 'the whole organisation'
   const table = req.requested_scope_type === 'squad' ? 'squads' : 'departments'
@@ -91,6 +101,9 @@ export async function describeForBot(env: Env, req: ElevationRequestRecord, shor
   const rec = untrustedLine(recRow?.recommendation, 200)
   if (rec) lines.push(`Agent recommends (its own words, unverified): "${rec}"`)
   const secsLeft = Math.max(0, Math.floor((Date.parse(req.decision_expires_at) - nowMs) / 1000))
-  lines.push(`Decide within ${Math.ceil(secsLeft / 60)} min. Tap a button, or reply /muapprove ${shortId} or /mudeny ${shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to the decision bot.`)
+  // One keyed org_settings read on this card build, which already loads the agent, scope and recommendation.
+  // Not on the webhook path: a tap or a command never waits on this.
+  const decisionBot = await decisionBotLabel(env)
+  lines.push(`Decide within ${Math.ceil(secsLeft / 60)} min. Tap a button, or reply /muapprove ${shortId} or /mudeny ${shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to ${decisionBot}.`)
   return lines.join('\n')
 }

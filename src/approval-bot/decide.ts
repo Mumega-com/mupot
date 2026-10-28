@@ -17,7 +17,7 @@ import { decideElevation, type Outcome } from '../access/decision-core'
 import { listActiveElevationGrants, loadElevationRequestById, revokeElevationGrant, type ElevationRequestRecord } from '../auth/elevation'
 import { resolveTelegramMember } from '../secure-moments/telegram-miniapp-binding'
 import { approvalBotStatus } from './config'
-import { botMayCarry, parseRequestedActions, SHORT_ID_RE } from './policy'
+import { botMayCarry, decisionBotLabel, parseRequestedActions, SHORT_ID_RE } from './policy'
 import { answerCallback, editBotMessage, sendBotMessage, type FetchFn } from './telegram'
 
 export type BotUpdateResult =
@@ -127,6 +127,20 @@ async function writeRevokeReceipt(env: Env, memberId: string, evidence: Record<s
 
 const HELP = 'Approval bot. When an agent asks for time-boxed access you get a message with Approve and Deny buttons. You can also reply /muapprove <id> or /mudeny <id>. The id is the request id from this message. Task decisions go to the decision bot. /murevoke ends every live approval you gave (or /murevoke <id> for one).'
 
+/** A /muapprove, /mudeny or /murevoke (optional @bot) that did not parse: extra words, an over-long id, a bad @bot. */
+const TRIED_DECISION_RE = /^\/(?:muapprove|mudeny|murevoke)(?:@\S+)?(?=\s|$)/
+
+const ID_ONLY = 'Send the id only: /muapprove <id> or /mudeny <id>. Add any reason on the approval page.'
+const START_WELCOME = 'This bot sends you approval requests. When one arrives, tap a button or reply /muapprove <id>.'
+
+function isBareStart(text: string): boolean {
+  return /^\/start(?:@[A-Za-z0-9_]+)?$/.test(text)
+}
+
+async function routingSentence(env: Env): Promise<string> {
+  return `This chat is only for approval requests. Pairing codes and task decisions go to ${await decisionBotLabel(env)}.`
+}
+
 export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: BotUpdateOpts = {}): Promise<BotUpdateResult> {
   const bot = approvalBotStatus(env)
   if (bot.state !== 'on') return { kind: 'ignored', reason: 'bot_off' }
@@ -151,7 +165,17 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
   const cmd = parseCommand(p, bot.username)
   if (!cmd) {
     if (p.kind === 'message' && p.text.trim().startsWith('/')) {
-      await tell('This chat is only for approval requests. Pairing codes and task decisions go to the decision bot.')
+      const trimmed = p.text.trim()
+      // Tried to decide here but the line did not parse. Do not send them to the decision bot.
+      if (TRIED_DECISION_RE.test(trimmed)) {
+        await tell(ID_ONLY)
+        return { kind: 'ignored', reason: 'not_our_command' }
+      }
+      if (isBareStart(trimmed)) {
+        await tell(START_WELCOME)
+        return { kind: 'ignored', reason: 'not_our_command' }
+      }
+      await tell(await routingSentence(env))
       return { kind: 'ignored', reason: 'not_our_command' }
     }
     return { kind: 'ignored', reason: 'not_a_command' }
