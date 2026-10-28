@@ -225,6 +225,7 @@ function disconnectScript(): Html {
             });
             var data = await res.json().catch(function () { return {}; });
             if (res.ok && data.telegram_unbound) {
+              window.alert('Telegram disconnected. Phone setup (Mini App devices) was removed too.');
               window.location.reload();
             } else {
               if (status) status.textContent = 'Disconnect failed (' + (data.error || res.status) + ').';
@@ -280,6 +281,10 @@ function connectScript(): Html {
                 var codeP = document.createElement('p');
                 codeP.textContent = 'Pairing code: ' + data.pairing_code;
                 result.appendChild(codeP);
+                var pending = document.createElement('p');
+                pending.className = 'ui-sub';
+                pending.textContent = 'This code is not a connection yet. Telegram connects when the decision bot' + (botUsername ? ' @' + botUsername : '') + ' replies to /start. Then reload this page.';
+                result.appendChild(pending);
                 if (botUsername) {
                   var link = 'https://t.me/' + botUsername + '?start=' + encodeURIComponent(data.pairing_code);
                   var a = document.createElement('a');
@@ -291,7 +296,7 @@ function connectScript(): Html {
                   result.appendChild(then);
                 } else {
                   var manual = document.createElement('p');
-                  manual.textContent = 'Message the bot and send: /start ' + data.pairing_code;
+                  manual.textContent = 'Message the decision bot and send: /start ' + data.pairing_code;
                   result.appendChild(manual);
                   var askOwner = document.createElement('p');
                   askOwner.className = 'ui-sub';
@@ -307,7 +312,29 @@ function connectScript(): Html {
             } else if (data.error === 'reauth_required') {
               window.location.assign('/auth/reauth?return=' + encodeURIComponent('/account'));
             } else {
-              if (status) status.textContent = 'Could not connect (' + (data.error || res.status) + ').';
+              var message;
+              switch (data.error) {
+                case 'forbidden':
+                case 'cannot_grant_above_own_rank':
+                  message = "You don't have a squad you can connect through yet. Ask an org admin to add you to a project squad.";
+                  break;
+                case 'member_not_active':
+                  message = 'Your account is not active. Ask an admin to activate it.';
+                  break;
+                case 'project_not_active':
+                case 'archived_project':
+                case 'squad_archived':
+                case 'project_not_found':
+                case 'project_squad_not_linked':
+                  message = "That project can't take new connections. Pick another, or ask an admin.";
+                  break;
+                case 'pairing_code_collision':
+                  message = 'Try again.';
+                  break;
+                default:
+                  message = 'Could not connect. Try again, or ask an admin.';
+              }
+              if (status) status.textContent = message;
               btn.disabled = false;
             }
           } catch (e) {
@@ -422,7 +449,7 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   return html`
     <div data-state="unbound">
       ${pill('Not connected', 'dim')}
-      <p class="ui-sub" style="margin-top:8px;">Connect your Telegram to approve and be notified through chat.</p>
+      <p class="ui-sub" style="margin-top:8px;">Connect your Telegram to approve through chat.</p>
       ${scopePicker}
       <button class="btn" id="tg-connect" data-member-id="${member.id}" data-bot-username="${botUsername ?? ''}" style="margin-top:10px;">
         Connect Telegram
@@ -493,12 +520,12 @@ function telegramDeviceScript(): Html {
           try {
             var res = await fetch('/account/telegram-device/enrol', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
             var data = await res.json().catch(function () { return {}; });
-            if (res.ok && data.sent) { if (status) status.textContent = 'Sent. Open the new message from the approvals bot in Telegram on your phone and tap the button (it is valid for 10 minutes).'; }
+            if (res.ok && data.sent) { if (status) status.textContent = 'Sent. Open the new message from the phone-setup bot in Telegram on your phone and tap the button (it is valid for 10 minutes).'; }
             else if (data.error === 'reauth_required') {
               if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth?return=/account'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
             } else if (data.error === 'telegram_not_bound') { if (status) status.textContent = 'Connect Telegram in the section above first; the setup button is sent to that private chat.'; }
             else if (data.error === 'rate_limited') { if (status) status.textContent = 'Too many messages just now. Wait a few minutes.'; }
-            else if (data.error === 'chat_unreachable') { if (status) status.textContent = 'Telegram would not deliver it: open the approvals bot in Telegram and press Start once, then try again.'; }
+            else if (data.error === 'chat_unreachable') { if (status) status.textContent = 'Telegram would not deliver it: open the phone-setup bot in Telegram and press Start once, then try again.'; }
             else if (status) { status.textContent = 'Could not send (' + (data.error || res.status) + ').'; }
           } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
           add.disabled = false;
