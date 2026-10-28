@@ -435,6 +435,8 @@ export interface DecideElevationInput {
   decidedViaPasskey?: boolean
   /** TRUE when that passkey-class proof came through the Cloudflare Access page (its strength is the configured ACCESS_REQUIRED_AMR). */
   decidedViaAccess?: boolean
+  /** Trusted channel flag, set by the shared decision core, never from a user-supplied note. */
+  decidedViaApprovalBot?: boolean
   note?: string
 }
 
@@ -790,12 +792,23 @@ export async function decideElevationRequest(
 
   const nowIso = new Date(nowMs).toISOString()
 
+  // Check inside each decision write, including the grant transaction. A callback
+  // can pass its initial binding read just before a concurrent unbind commits.
+  const botBindingGuard = (request: string, tenant: string, member: string): string =>
+    input.decidedViaApprovalBot === true
+      ? ` AND EXISTS (SELECT 1 FROM approval_bot_deliveries d JOIN members m ON m.id = d.member_id
+            WHERE d.request_id = ${request} AND d.tenant = ${tenant} AND d.member_id = ${member}
+              AND d.status = 'sent' AND m.telegram_chat_id = d.chat_id
+              AND (m.tenant = ${tenant} OR m.tenant IS NULL) AND m.status = 'active')`
+      : ''
   if (input.decision === 'deny') {
     const result = await env.DB.prepare(
       `UPDATE elevation_requests
           SET status = 'denied', decided_at = ?1, decided_by_member_id = ?2,
-              decided_by_web_session_hash = ?3, decision_note = ?4
-        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
+              decided_by_web_session_hash = ?3, decision_note = ?4,
+              decided_via = ${input.decidedViaApprovalBot === true ? "'approval_bot'" : 'NULL'}
+        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
+          ${botBindingGuard('?5', '?6', '?2')}`,
     )
       .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant)
       .run()
@@ -854,7 +867,8 @@ export async function decideElevationRequest(
                   created_at = ?5, expires_at = ?6, revoked_at = NULL, revoke_reason = NULL, effect = ?7
             WHERE id = ?1 AND tenant = ?8
               AND (revoked_at IS NOT NULL OR expires_at <= ?5)
-              AND EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?2 AND tenant = ?8 AND status = 'pending')`,
+              AND EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?2 AND tenant = ?8 AND status = 'pending')
+              ${botBindingGuard('?2', '?8', '?3')}`,
         ).bind(g.id, g.elevation_request_id, g.approved_by_member_id, g.approved_by_web_session_hash,
           g.created_at, g.expires_at, g.effect, g.tenant)
       : env.DB.prepare(
@@ -862,7 +876,8 @@ export async function decideElevationRequest(
              (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
               approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-            WHERE EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND status = 'pending')`,
+            WHERE EXISTS (SELECT 1 FROM elevation_requests WHERE id = ?3 AND tenant = ?2 AND status = 'pending')
+              ${botBindingGuard('?3', '?2', '?9')}`,
         ).bind(g.id, g.tenant, g.elevation_request_id, g.agent_session_id, g.action, g.scope_type,
           g.scope_id, g.effect, g.approved_by_member_id, g.approved_by_web_session_hash, g.created_at, g.expires_at),
   )
@@ -876,8 +891,10 @@ export async function decideElevationRequest(
                    AND id IN (${grants.map((_, i) => `?${i + 8}`).join(', ')})
               ) = ?7 THEN 'approved' ELSE NULL END,
               decided_at = ?1, decided_by_member_id = ?2,
-              decided_by_web_session_hash = ?3, decision_note = ?4
-        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'`,
+              decided_by_web_session_hash = ?3, decision_note = ?4,
+              decided_via = ${input.decidedViaApprovalBot === true ? "'approval_bot'" : 'NULL'}
+        WHERE id = ?5 AND tenant = ?6 AND status = 'pending'
+          ${botBindingGuard('?5', '?6', '?2')}`,
     ).bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null,
       request.id, input.tenant, grants.length, ...grants.map((g) => g.id)),
   ])
@@ -988,6 +1005,27 @@ export async function revokeElevationGrant(
     .bind(nowIso, reason, id, tenant, generation ?? null)
     .run()
   return { revoked: Number(result.meta?.changes ?? 0) > 0 }
+}
+
+/** #2100: use trusted channel provenance, never the user-editable decision note.
+ * Older bot approvals may have only the audit receipt (the channel stamp used
+ * to be best-effort). Both forms are scoped to the tenant, request and approver.
+ * Prepared for the unbind batch: any failure rolls back the binding and receipt too. */
+export function prepareTelegramApprovedElevationGrantRevocation(env: Env, memberId: string, nowIso: string) {
+  return env.DB.prepare(
+    `UPDATE elevation_grants SET revoked_at = ?3, revoke_reason = 'telegram_unbound'
+      WHERE EXISTS (SELECT 1 FROM members WHERE id = ?2 AND (tenant = ?1 OR tenant IS NULL) AND telegram_chat_id IS NULL)
+        AND id IN (SELECT g.id FROM elevation_grants g
+      JOIN elevation_requests r ON r.id = g.elevation_request_id AND r.tenant = g.tenant
+      WHERE g.tenant = ?1 AND g.approved_by_member_id = ?2
+        AND r.decided_by_member_id = ?2
+        AND (r.decided_via = 'approval_bot' OR (r.decided_via IS NULL AND EXISTS (
+          SELECT 1 FROM mutation_audit_entries a
+           WHERE a.tenant = g.tenant AND a.member_id = ?2 AND a.target_kind = 'elevation_request'
+             AND a.target_id = r.id AND a.handler = 'approval_bot' AND a.operation = 'elevation_approve'
+        )))
+        AND g.revoked_at IS NULL AND g.expires_at > ?3)`,
+  ).bind(env.TENANT_SLUG, memberId, nowIso)
 }
 
 // ── usage log ────────────────────────────────────────────────────────────

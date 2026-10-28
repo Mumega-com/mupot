@@ -150,6 +150,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
   floor('task.assign.invalid-assignee', 'An assignee id that does not exist is refused.', ['src/tasks/assignee.ts'], ['invalid_assignee']),
   floor('task.update.external-assign-admin', 'Assigning externally-sourced (source_pot / external_source) tasks needs admin+: untrusted content must not be self-assigned and executed.', ['src/mcp/index.ts:toolTaskUpdate', 'src/tasks/index.ts:PATCH /:id']),
   floor('task.update.assignee-cannot-mutate-own', 'The current assignee of an in_progress task cannot change the assignee (fake-green launder path).', ['src/tasks/service.ts:assigneeCannotMutateOwnAssignment'], ['assignee_cannot_mutate_own_assignment']),
+  floor('members.telegram-unbind.binding-changed', 'A Telegram unbind that loses a race to a concurrent rebind revokes nothing and reports the conflict; it never ends grants against a binding it did not clear (#2100).', ['src/members/index.ts'], ['telegram_binding_changed']),
   floor('task.update.reassign-in-flight-dispatch', 'No reassignment while a dispatch is mid-flight (orphans the receipt).', ['src/mcp/index.ts:toolTaskUpdate'], ['task_dispatch_in_flight']),
   floor('task.update.assignee-frozen-in-review', 'The assignee of a task in review is frozen (verdict independence keys on it).', ['src/tasks/service.ts:assigneeChangesInReview'], ['assignee_frozen_in_review']),
   floor('task.create.single-assignee', 'A task has one owner: agent or member, never both.', ['src/mcp/index.ts', 'src/tasks/index.ts'], ['task_single_assignee']),

@@ -782,3 +782,223 @@ describe('/murevoke and expiry end an approval', () => {
     expect((await activeElevations()).some((x) => x.live)).toBe(false)
   })
 })
+
+// #2100: exercise the real unbind route, decision core and live authorization.
+async function unbind(memberId = 'mem-owner', actor = 'owner'): Promise<Response> {
+  const { membersApp } = await import('../src/members')
+  const session = JSON.stringify({ userId: `u-${actor}`, email: `${actor}@x.test`, role: actor === 'owner' ? 'owner' : 'member', createdAt: new Date().toISOString() })
+  const e = { ...env, SESSIONS: { get: async (key: string) => key === 'sess:unbind' ? session : null, put: async () => undefined, delete: async () => undefined } } as Env
+  return membersApp.request(`/members/${memberId}/telegram`, { method: 'DELETE', headers: { 'content-type': 'application/json', cookie: 'mupot_session=unbind' } }, e)
+}
+async function approve(f: Filed, from = TG.owner): Promise<void> {
+  expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from }))).kind).toBe('approved')
+}
+
+describe('Telegram unbind ends only that member’s bot approvals (#2100)', () => {
+  it('revokes the bot grant with a reason, refuses its next use, and repeats without another receipt', async () => {
+    const { hasElevatedAction } = await import('../src/auth/elevation')
+    const f = await file()
+    // Channel provenance must commit even if the best-effort receipt write fails.
+    harness.sqlite.exec("CREATE TRIGGER fail_bot_audit BEFORE INSERT ON mutation_audit_entries WHEN NEW.operation = 'elevation_approve' BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END")
+    await approve(f)
+    harness.sqlite.exec('DROP TRIGGER fail_bot_audit')
+    expect((await hasElevatedAction(env, agentAuth(), 'action:project_status', 'squad', 'squad-a')).granted).toBe(true)
+    expect(status(f.requestId).decided_via).toBe('approval_bot')
+    expect(count('mutation_audit_entries', "operation = 'elevation_approve'")).toBe(0)
+    const res = await unbind()
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(await res.json()).toEqual({ member_id: 'mem-owner', telegram_unbound: true })
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+    expect((await hasElevatedAction(env, agentAuth(), 'action:project_status', 'squad', 'squad-a')).granted).toBe(false)
+    const ended = one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)
+    expect((await unbind()).status).toBe(200)
+    expect(one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual(ended)
+    expect(count('telegram_unbind_receipts')).toBe(1)
+  })
+
+  it('also revokes legacy approvals whose channel tail write failed but bot receipt exists', async () => {
+    const f = await file()
+    await approve(f)
+    harness.sqlite.prepare('UPDATE elevation_requests SET decided_via = NULL WHERE id = ?').run(f.requestId)
+    expect((await unbind()).status).toBe(200)
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+  })
+
+  it('preserves the same member’s passkey approval and another member’s bot approval (admin unbind)', async () => {
+    const { decideElevation } = await import('../src/access/decision-core')
+    const { buildAuth, mintApproverSession } = await import('../src/access/identity')
+    const web = await file({ actions: ['action:project_status'] })
+    const auth = await buildAuth(env, 'mem-owner', undefined, { verifiedRole: true })
+    expect((await decideElevation(env, {
+      id: web.requestId, decision: 'approve', selectedActions: ['action:project_status'], auth,
+      proof: { memberId: 'mem-owner', via: 'webauthn', evidence: {} },
+      mintSession: async () => { const s = await mintApproverSession(env, { memberId: 'mem-owner', auth, identityId: 'hli-owner', verifiedRole: true }); return { auth: s.approver.auth, webSessionHash: s.webSessionHash } },
+    })).status).toBe(200)
+    // The legacy web endpoint accepts an arbitrary note: this text is not channel proof.
+    harness.sqlite.prepare("UPDATE elevation_requests SET decision_note = 'via:approval_bot' WHERE id = ?").run(web.requestId)
+    const ownBot = await file({ actions: ['action:project_lifecycle'] })
+    await approve(ownBot)
+    setOwner('mem-sqadmin')
+    const other = await file({ actions: ['action:workspace_project'] })
+    await approve(other, TG.sqadmin)
+    expect((await unbind()).status).toBe(200)
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', ownBot.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+    expect(one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', other.requestId)).toEqual({ revoked_at: null })
+    // An org admin uses the same cleanup path for another member.
+    expect((await unbind('mem-sqadmin')).status).toBe(200)
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', other.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+    expect(one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', web.requestId)).toEqual({ revoked_at: null })
+  })
+
+  it('leaves another member’s bot grant active while unbinding self', async () => {
+    setOwner('mem-sqadmin')
+    const other = await file()
+    await approve(other, TG.sqadmin)
+    expect((await unbind()).status).toBe(200)
+    expect((await activeElevations()).some((g) => g.live)).toBe(true)
+  })
+
+  it('old-chat callbacks and commands decide no pending request after unbind', async () => {
+    const f = await file()
+    expect((await unbind()).status).toBe(200)
+    for (const update of [tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: deliveredMessageId(f.requestId) }), cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner })]) {
+      expect(await handleApprovalBotUpdate(env, update)).toEqual({ kind: 'refused', reason: 'not_bound' })
+    }
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+
+  it('an in-flight approval cannot commit after unbind clears the binding', async () => {
+    const f = await file()
+    const batch = env.DB.batch.bind(env.DB)
+    const spy = vi.spyOn(env.DB, 'batch').mockImplementationOnce(async (statements) => {
+      expect((await unbind()).status).toBe(200)
+      return batch(statements)
+    })
+    try {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).not.toBe('approved')
+      expect(status(f.requestId).status).toBe('pending')
+      expect(grants(f.requestId)).toBe(0)
+    } finally { spy.mockRestore() }
+  })
+
+  it('an in-flight renewal cannot resurrect an ended slot after unbind', async () => {
+    const old = await file()
+    await approve(old)
+    harness.sqlite.prepare("UPDATE elevation_grants SET revoked_at = '2020-01-01T00:00:00.000Z', revoke_reason = 'ended' WHERE elevation_request_id = ?").run(old.requestId)
+    const ended = one('SELECT * FROM elevation_grants WHERE elevation_request_id = ?', old.requestId)
+    const f = await file()
+    const batch = env.DB.batch.bind(env.DB)
+    const spy = vi.spyOn(env.DB, 'batch').mockImplementationOnce(async (statements) => {
+      expect((await unbind()).status).toBe(200)
+      return batch(statements)
+    })
+    try {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))).kind).not.toBe('approved')
+      expect(status(f.requestId).status).toBe('pending')
+      expect(one('SELECT * FROM elevation_grants WHERE elevation_request_id = ?', old.requestId)).toEqual(ended)
+      expect(grants(f.requestId)).toBe(0)
+    } finally { spy.mockRestore() }
+  })
+
+  it('an in-flight deny cannot decide after unbind', async () => {
+    const f = await file()
+    const prepare = env.DB.prepare.bind(env.DB)
+    const spy = vi.spyOn(env.DB, 'prepare').mockImplementation((sql) => {
+      const statement = prepare(sql)
+      if (sql.includes("SET status = 'denied', decided_at")) {
+        const bind = statement.bind.bind(statement)
+        statement.bind = (...values) => {
+          const bound = bind(...values)
+          const run = bound.run.bind(bound)
+          bound.run = async () => {
+            expect((await unbind()).status).toBe(200)
+            return run()
+          }
+          return bound
+        }
+      }
+      return statement
+    })
+    try {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${f.shortId}`, { from: TG.owner }))).kind).not.toBe('denied')
+      expect(status(f.requestId).status).toBe('pending')
+      expect(grants(f.requestId)).toBe(0)
+    } finally { spy.mockRestore() }
+  })
+
+  it('preserves a bot grant in another tenant for the same approver', async () => {
+    const foreign = await file()
+    await approve(foreign)
+    harness.sqlite.prepare("UPDATE elevation_grants SET tenant = 'tenant-b' WHERE elevation_request_id = ?").run(foreign.requestId)
+    harness.sqlite.prepare("UPDATE elevation_requests SET tenant = 'tenant-b' WHERE id = ?").run(foreign.requestId)
+    const local = await file({ actions: ['action:project_lifecycle'] })
+    await approve(local)
+    expect((await unbind()).status).toBe(200)
+    expect(one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', foreign.requestId)).toEqual({ revoked_at: null })
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', local.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+  })
+
+  it('never exposes a committed unbound member with live bot grants', async () => {
+    const f = await file()
+    await approve(f)
+    const batch = env.DB.batch.bind(env.DB)
+    let observed = false
+    const spy = vi.spyOn(env.DB, 'batch').mockImplementation(async (statements) => {
+      const result = await batch(statements)
+      observed = true
+      expect(one<{ n: number }>(`SELECT COUNT(*) AS n FROM members m JOIN elevation_grants g ON g.approved_by_member_id = m.id
+        WHERE m.id = 'mem-owner' AND m.telegram_chat_id IS NULL AND g.revoked_at IS NULL`).n).toBe(0)
+      return result
+    })
+    try {
+      expect((await unbind()).status).toBe(200)
+      expect(observed).toBe(true)
+      expect(one("SELECT telegram_chat_id FROM members WHERE id = 'mem-owner'")).toEqual({ telegram_chat_id: null })
+    } finally { spy.mockRestore() }
+  })
+
+  it('accepts a concurrent unbind of a legacy NULL-tenant member', async () => {
+    const batch = env.DB.batch.bind(env.DB)
+    const spy = vi.spyOn(env.DB, 'batch').mockImplementationOnce(async (statements) => {
+      harness.sqlite.exec("UPDATE members SET tenant = NULL, telegram_chat_id = NULL WHERE id = 'mem-owner'")
+      return batch(statements)
+    })
+    try {
+      expect((await unbind()).status).toBe(200)
+      expect(count('telegram_unbind_receipts')).toBe(0)
+    } finally { spy.mockRestore() }
+  })
+
+  it('concurrent unbinds both succeed and write only one receipt', async () => {
+    const f = await file()
+    await approve(f)
+    const responses = await Promise.all([unbind(), unbind()])
+    expect(responses.map((r) => r.status)).toEqual([200, 200])
+    expect(count('telegram_unbind_receipts')).toBe(1)
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+  })
+
+  it('fails closed on revoke failure, then retries cleanup without double-logging', async () => {
+    const f = await file()
+    await approve(f)
+    harness.sqlite.prepare(`INSERT INTO tg_miniapp_devices
+      (id, tenant, member_id, telegram_user_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+      VALUES ('device-unbind', ?, 'mem-owner', '1001', 'enrol-unbind', ?, '2026-01-01', '2026-01-01')`).run(TENANT, 'a'.repeat(64))
+    harness.sqlite.exec("CREATE TRIGGER fail_unbind_revoke BEFORE UPDATE OF revoked_at ON elevation_grants BEGIN SELECT RAISE(ABORT, 'injected revoke failure'); END")
+    expect((await unbind()).status).toBe(500)
+    expect(one('SELECT revoked_at FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual({ revoked_at: null })
+    expect(one("SELECT telegram_chat_id FROM members WHERE id = 'mem-owner'")).toEqual({ telegram_chat_id: String(TG.owner) })
+    expect(count('telegram_unbind_receipts')).toBe(0)
+    expect(one("SELECT revoked_at FROM tg_miniapp_devices WHERE id = 'device-unbind'")).toEqual({ revoked_at: null })
+    harness.sqlite.exec('DROP TRIGGER fail_unbind_revoke')
+    expect((await unbind()).status).toBe(200)
+    expect(one('SELECT revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', f.requestId)).toEqual({ revoke_reason: 'telegram_unbound' })
+    expect(count('telegram_unbind_receipts')).toBe(1)
+    expect(one("SELECT revoked_reason FROM tg_miniapp_devices WHERE id = 'device-unbind'")).toEqual({ revoked_reason: 'telegram_unbound' })
+    expect(count('mutation_audit_entries', "operation = 'tg_device_revoke'")).toBe(1)
+    expect((await unbind()).status).toBe(200)
+    expect(count('telegram_unbind_receipts')).toBe(1)
+    expect(count('mutation_audit_entries', "operation = 'tg_device_revoke'")).toBe(1)
+  })
+})

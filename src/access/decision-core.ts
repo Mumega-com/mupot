@@ -323,6 +323,7 @@ export async function decideElevation(
     recentReauthOk: proof.via === 'approval_bot' ? input.selectedActions.every((a) => BOT_STEP_UP_ACTIONS.includes(a)) : true,
     decidedViaPasskey: PASSKEY_CLASS_VIA.has(proof.via),
     decidedViaAccess: proof.via === 'access_passkey',
+    decidedViaApprovalBot: proof.via === 'approval_bot',
     note: `via:${proof.via}`,
   })
   const refusal = await findElevationDecisionRefusal(env, decideInput('', capabilities, hasWorkspaceAdmin(input.auth)), pre)
