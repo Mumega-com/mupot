@@ -24,8 +24,8 @@
 //
 // EXPLAIN, NEVER OMIT (defect #1162, same standard as elevation.ts): a
 // member below the mint floor, a login with no bridged member row, and a
-// pot with no active project/squad at all each get their OWN honest empty
-// state — never a silently blank or crashing page.
+// pot with no active project/squad each get an explicit state. Active humans
+// without an eligible project can connect identity only, granting no access.
 
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
@@ -251,10 +251,11 @@ function connectScript(): Html {
           var result = document.getElementById('tg-result');
           var sel = document.getElementById('tg-scope');
           var scopeEl = sel ? sel.options[sel.selectedIndex] : document.getElementById('tg-scope-fixed');
-          if (!scopeEl) return;
-          var projectId = scopeEl.getAttribute('data-project');
-          var squadId = scopeEl.getAttribute('data-squad');
-          var capability = scopeEl.getAttribute('data-capability');
+          var identityOnly = btn.getAttribute('data-identity-only') === 'true';
+          if (!scopeEl && !identityOnly) return;
+          var projectId = scopeEl && scopeEl.getAttribute('data-project');
+          var squadId = scopeEl && scopeEl.getAttribute('data-squad');
+          var capability = scopeEl && scopeEl.getAttribute('data-capability');
           btn.disabled = true;
           if (status) status.textContent = 'requesting…';
           try {
@@ -262,7 +263,9 @@ function connectScript(): Html {
               method: 'POST',
               credentials: 'same-origin',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({
+              body: JSON.stringify(identityOnly ? {
+                invite_kind: 'identity_only', member_id: btn.getAttribute('data-member-id')
+              } : {
                 member_id: btn.getAttribute('data-member-id'),
                 project_id: projectId,
                 squad_id: squadId,
@@ -292,7 +295,7 @@ function connectScript(): Html {
                   result.appendChild(a);
                   var then = document.createElement('p');
                   then.className = 'ui-sub';
-                  then.textContent = 'Tap Start in Telegram. Once the bot confirms the link, send /muneeds to see what is waiting for you, then /muapprove <task id> or /mureject <task id> <reason>.';
+                  then.textContent = identityOnly ? 'Tap Start in Telegram. Once the decision bot confirms the link, reload this page. Send /mulogin for a browser sign-in link.' : 'Tap Start in Telegram. Once the bot confirms the link, send /muneeds to see what is waiting for you, then /muapprove <task id> or /mureject <task id> <reason>.';
                   result.appendChild(then);
                 } else {
                   var manual = document.createElement('p');
@@ -353,9 +356,8 @@ function connectScript(): Html {
  *  2. member row missing/inactive -> explain, no controls
  *  3. already bound -> "Connected" + Disconnect (self-unbind needs no rank
  *     at all — src/members/index.ts's requireAdminOrSelfForTelegramUnbind)
- *  4. not bound, below the org-admin mint floor -> self-service Connect for squads they hold (D3), else explain,
- *     no doomed-to-403 button
- *  5. not bound, no active project/squad exists -> explain
+ *  4. not bound, below the org-admin mint floor -> self-service Connect for eligible squads (D3)
+ *  5. not bound, no eligible project/squad -> identity-only self-connect
  *  6. not bound, eligible -> the real Connect form
  */
 export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<Html> {
@@ -400,20 +402,10 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
 
   const orgRank = await actorRankOnScopeFor(env, auth, 'org', null)
   // Mom-walk D3: below the org-admin floor a member may still connect THEIR OWN Telegram (target = self, capped at their own
-  // standing on a squad: createProjectInvite's self-service path). They need a fresh dashboard session with at least one
-  // squad they can see; otherwise explain, never a button wired to a guaranteed refusal.
+  // standing on a squad: createProjectInvite's self-service path). With no eligible
+  // squad, createIdentityOnlyInvite binds their own identity without any grant.
   const selfService = orgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)
   const squads = await loadConnectableSquads(env, auth, orgRank, selfService)
-  if (squads.length === 0) {
-    return emptyState({
-      title: 'Telegram not connected',
-      detail: selfService
-        ? 'Connecting Telegram needs access to at least one active project squad, and you have none yet.'
-        : 'No active project is linked to a squad yet, so there is nothing to bind Telegram access to.',
-      ...(selfService ? { hint: 'Ask an org admin to add you to a project squad.' } : {}),
-    })
-  }
-
   // im_bot_username (org_settings) is the DECISION-CHANNEL bot's @username —
   // an explicit, non-secret, owner-configured display value (see
   // SETTINGS_KEYS.imBotUsername's docstring in ./settings.ts and the
@@ -429,8 +421,10 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   // never a broken or unsafe link.
   const rawBotUsername = await getSetting(env, SETTINGS_KEYS.imBotUsername)
   const botUsername = isValidBotUsername(rawBotUsername) ? rawBotUsername : null
-  const scopePicker =
-    squads.length > 1
+  const identityOnly = squads.length === 0
+  const scopePicker = identityOnly
+    ? html`<p class="ui-sub" style="margin-top:8px;">No squad or project access is granted. Notification delivery depends on the workspace configuration.</p>`
+    : squads.length > 1
       ? html`
           <label class="ui-sub" for="tg-scope" style="display:block;margin-top:8px;">Project / squad</label>
           <select id="tg-scope">
@@ -449,10 +443,10 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   return html`
     <div data-state="unbound">
       ${pill('Not connected', 'dim')}
-      <p class="ui-sub" style="margin-top:8px;">Connect your Telegram to approve through chat.</p>
+      <p class="ui-sub" style="margin-top:8px;">${identityOnly ? 'Connect your Telegram for sign-in and notifications only.' : 'Connect your Telegram to approve through chat.'}</p>
       ${scopePicker}
-      <button class="btn" id="tg-connect" data-member-id="${member.id}" data-bot-username="${botUsername ?? ''}" style="margin-top:10px;">
-        Connect Telegram
+      <button class="btn" id="tg-connect" data-identity-only="${String(identityOnly)}" data-member-id="${member.id}" data-bot-username="${botUsername ?? ''}" style="margin-top:10px;">
+        ${identityOnly ? 'Connect Telegram (sign-in and notifications only)' : 'Connect Telegram'}
       </button>
       <div class="status-line" id="tg-status"></div>
       <div id="tg-result" hidden></div>

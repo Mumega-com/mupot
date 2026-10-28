@@ -392,7 +392,7 @@ export async function handleImMessage(
     // provisionHomeForMember's own internal never-throws guarantee — an
     // uncaught rejection here must never cost the human their "Joined
     // project ..." reply for a join that already durably happened.
-    if (result.ok) {
+    if (result.ok && !result.value.identity_only) {
       await provisionHomeForMember(env, result.value.member_id, 'im').catch((err: unknown) => {
         console.error('im/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
           member_id: result.value.member_id, channel: 'im',
@@ -483,7 +483,8 @@ export async function handleImMessage(
   }
 }
 
-function joinedReply(projectId: string): string {
+function joinedReply(projectId: string | null): string {
+  if (projectId === null) return 'Telegram connected for sign-in and notifications only. No squad or project access was granted. Send /mulogin for a browser sign-in link.'
   return `Joined project ${projectId}. Use /muneeds to see what needs your attention; if you have no web sign-in yet, send /mulogin for a browser link.`
 }
 
@@ -1325,10 +1326,11 @@ function storedTelegramReply(responseText: string): StoredTelegramReplyValue | n
       return { ok: true, reply: value.reply, bound, member_id: memberId, home_squad_id: homeSquadId, intake_state: intakeState }
     }
     // Project redemption completes this receipt in its atomic membership batch.
-    if (typeof value.member_id === 'string' && typeof value.project_id === 'string'
-      && typeof value.squad_id === 'string' && typeof value.capability === 'string') {
+    if (typeof value.member_id === 'string' && (
+      (value.identity_only === true && value.project_id === null && value.squad_id === null && value.capability === 'observer')
+      || (typeof value.project_id === 'string' && typeof value.squad_id === 'string' && typeof value.capability === 'string'))) {
       return {
-        ok: true, reply: joinedReply(value.project_id), bound: true, member_id: value.member_id,
+        ok: true, reply: joinedReply(typeof value.project_id === 'string' ? value.project_id : null), bound: true, member_id: value.member_id,
         // This legacy receipt shape predates home_squad_id/intake_state — a
         // replay of one of these rows reports the conservative unknown
         // state rather than fabricating a home id it never recorded.

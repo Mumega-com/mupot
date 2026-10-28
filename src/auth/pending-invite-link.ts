@@ -111,7 +111,7 @@ export async function loadInviteLinkAuthority(
     `SELECT i.id AS invite_id, i.email, i.accepted_at, i.member_id, s.name AS squad_name
        FROM invites i
        LEFT JOIN squads s ON s.id = i.squad_id
-      WHERE i.id = ?1
+      WHERE i.id = ?1 AND i.invite_kind = 'grant'
       LIMIT 1`,
   )
     .bind(inviteId)
