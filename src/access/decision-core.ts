@@ -324,6 +324,9 @@ export async function decideElevation(
     decidedViaPasskey: PASSKEY_CLASS_VIA.has(proof.via),
     decidedViaAccess: proof.via === 'access_passkey',
     decidedViaApprovalBot: proof.via === 'approval_bot',
+    decidedViaTelegramMiniapp: proof.via === 'telegram_miniapp',
+    telegramMiniappDeviceId: proof.via === 'telegram_miniapp' ? proof.evidence.tg_device_id : undefined,
+    telegramMiniappUserId: proof.via === 'telegram_miniapp' ? proof.evidence.telegram_user_id : undefined,
     note: `via:${proof.via}`,
   })
   const refusal = await findElevationDecisionRefusal(env, decideInput('', capabilities, hasWorkspaceAdmin(input.auth)), pre)

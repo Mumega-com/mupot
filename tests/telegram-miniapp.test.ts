@@ -1278,3 +1278,89 @@ describe('touch-friendly approval rows (presentation only)', () => {
     expect([c.checked, c.disabled]).toEqual([true, false])
   })
 })
+
+
+// Mini App approvals now end on unbind.
+async function unbindMiniappMember(): Promise<Response> {
+  const { membersApp } = await import('../src/members')
+  const session = JSON.stringify({ userId: 'u-owner', email: 'owner@x.test', role: 'owner', createdAt: new Date().toISOString() })
+  const e = { ...env, SESSIONS: { get: async (key: string) => key === 'sess:unbind' ? session : null, put: async () => undefined, delete: async () => undefined } } as Env
+  return membersApp.request('/members/mem-owner/telegram', { method: 'DELETE', headers: { 'content-type': 'application/json', cookie: 'mupot_session=unbind' } }, e)
+}
+const miniappGrant = (m: Moment) => one<{ revoked_at: string | null; revoke_reason: string | null }>('SELECT revoked_at, revoke_reason FROM elevation_grants WHERE elevation_request_id = ?', m.subject)
+
+describe('Mini App approvals now end on unbind', () => {
+  it.each([false, true])('ends own approvals, including legacy receipts=%s, while preserving other authority', async (legacy) => {
+    const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
+    const own = await fileElevation(['action:project_status'])
+    expect((await decide(own, TG.owner, dev, { decision: 'approve', actions: ['action:project_status'] })).status).toBe(200)
+    expect(one('SELECT decided_via FROM elevation_requests WHERE id = ?', own.subject)).toEqual({ decided_via: 'telegram_miniapp' })
+    if (legacy) harness.sqlite.prepare('UPDATE elevation_requests SET decided_via = NULL WHERE id = ?').run(own.subject)
+
+    const { decideElevationRequest } = await import('../src/auth/elevation')
+    const { buildAuth, mintApproverSession } = await import('../src/access/identity')
+    const { resolveCapabilities } = await import('../src/auth/capability')
+    const web = await fileElevation(['action:project_lifecycle'])
+    const auth = await buildAuth(env, 'mem-owner', undefined, { verifiedRole: true })
+    const session = await mintApproverSession(env, { memberId: 'mem-owner', auth, identityId: identities.owner, verifiedRole: true })
+    expect(await decideElevationRequest(env, {
+      tenant: TENANT, requestId: web.subject, decision: 'approve', selectedActions: ['action:project_lifecycle'],
+      decidedByMemberId: 'mem-owner', decidedByIsOrgAdmin: true,
+      decidedByCapabilities: await resolveCapabilities(env, 'mem-owner'), decidedByWebSessionHash: session.webSessionHash,
+      recentReauthOk: true, decidedViaPasskey: true, note: 'via:telegram_miniapp',
+    })).toMatchObject({ ok: true })
+    expect(one('SELECT decided_via FROM elevation_requests WHERE id = ?', web.subject)).toEqual({ decided_via: null })
+
+    const otherDev = await enrolDevice('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    const other = await fileElevation(['action:workspace_project'])
+    expect((await decide(other, TG.sqadmin, otherDev, { decision: 'approve', actions: ['action:workspace_project'] })).status).toBe(200)
+    expect((await unbindMiniappMember()).status).toBe(200)
+    expect(miniappGrant(own)?.revoke_reason).toBe('telegram_unbound')
+    expect(miniappGrant(web)?.revoked_at).toBeNull()
+    expect(miniappGrant(other)?.revoked_at).toBeNull()
+  })
+
+  it.each(['approve', 'deny'] as const)('stamps %s even when the optional audit receipt is unavailable', async (decision) => {
+    const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
+    const m = await fileElevation(['action:project_status'])
+    harness.sqlite.exec("CREATE TRIGGER fail_miniapp_audit BEFORE INSERT ON mutation_audit_entries WHEN NEW.operation IN ('elevation_approve', 'elevation_deny') BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END")
+    expect((await decide(m, TG.owner, dev, { decision, actions: ['action:project_status'] })).status).toBe(200)
+    expect(one('SELECT decided_via FROM elevation_requests WHERE id = ?', m.subject)).toEqual({ decided_via: 'telegram_miniapp' })
+    if (decision === 'approve') {
+      expect((await unbindMiniappMember()).status).toBe(200)
+      expect(miniappGrant(m)?.revoke_reason).toBe('telegram_unbound')
+    }
+  })
+
+  it.each(['unbind', 'binding_changed', 'device_revoked', 'renew', 'deny'])('rechecks binding and device in the decision write: %s', async (change) => {
+    const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
+    const actions = ['action:project_status']
+    if (change === 'renew') {
+      const prior = await fileElevation(actions)
+      expect((await decide(prior, TG.owner, dev, { decision: 'approve', actions })).status).toBe(200)
+      harness.sqlite.prepare("UPDATE elevation_grants SET revoked_at = '2026-01-01', revoke_reason = 'test'").run()
+    }
+    const m = await fileElevation(actions)
+    const decision = change === 'deny' ? 'deny' : 'approve'
+    const nonce = await nonceFor(m, TG.owner, { decision, actions })
+    const batch = env.DB.batch.bind(env.DB)
+    let gateWon = false
+    const spy = vi.spyOn(env.DB, 'batch').mockImplementation(async (statements) => {
+      // The first batch consumes the channel gate. The next write must independently recheck binding.
+      const out = await batch(statements)
+      if (!gateWon) {
+        gateWon = true
+        expect(one('SELECT decision FROM tg_miniapp_decisions WHERE moment_id = ?', m.id)).toEqual({ decision })
+        if (change === 'binding_changed') harness.sqlite.prepare("UPDATE members SET telegram_chat_id = '2001' WHERE id = 'mem-owner'").run()
+        else if (change === 'device_revoked') harness.sqlite.prepare("UPDATE tg_miniapp_devices SET revoked_at = '2026-01-01' WHERE id = ?").run(dev.split('.')[0])
+        else expect((await unbindMiniappMember()).status).toBe(200)
+      }
+      return out
+    })
+    try {
+      expect((await decide(m, TG.owner, dev, { decision, actions }, { nonce })).status).toBe(409)
+      expect(one('SELECT status, decided_via FROM elevation_requests WHERE id = ?', m.subject)).toEqual({ status: 'pending', decided_via: null })
+      expect(count('elevation_grants', 'revoked_at IS NULL')).toBe(0)
+    } finally { spy.mockRestore() }
+  })
+})
