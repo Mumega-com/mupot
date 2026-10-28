@@ -86,6 +86,55 @@ function seedDevLoginIdentity(harness: SqliteD1Harness, memberId: string, email:
     .run(`ident-${memberId}`, TENANT, email, email, memberId)
 }
 
+// Execute the rendered account scripts against a small DOM boundary. Fetch is
+// supplied as a response fixture; all copy and branch selection run as shipped.
+function accountBrowser(body: string, response: Record<string, unknown>, status = 200) {
+  class Element {
+    textContent = ''
+    innerHTML = ''
+    hidden = true
+    disabled = false
+    className = ''
+    href = ''
+    target = ''
+    rel = ''
+    children: Element[] = []
+    click?: () => Promise<void>
+    constructor(readonly attributes: Record<string, string> = {}) {}
+    getAttribute(name: string) { return this.attributes[name] ?? null }
+    appendChild(child: Element) { this.children.push(child) }
+    addEventListener(_event: string, listener: () => Promise<void>) { this.click = listener }
+  }
+  const elements = new Map<string, Element>()
+  for (const tag of body.replace(/<script>[\s\S]*?<\/script>/g, '').matchAll(/<[^>]+\sid="([^"]+)"[^>]*>/g)) {
+    const attributes = Object.fromEntries([...tag[0].matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1], m[2]]))
+    elements.set(tag[1], new Element(attributes))
+  }
+  const events: string[] = []
+  const document = {
+    getElementById: (id: string) => elements.get(id) ?? null,
+    querySelectorAll: () => [],
+    createElement: () => new Element(),
+  }
+  const window = {
+    confirm: () => true,
+    alert: (message: string) => { events.push(message) },
+    location: { reload: () => { events.push('reload') }, assign: (url: string) => { events.push(url) } },
+  }
+  const fetch = async () => ({ ok: status >= 200 && status < 300, status, json: async () => response })
+  for (const script of body.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+    new Function('document', 'fetch', 'window', script[1])(document, fetch, window)
+  }
+  return {
+    element: (id: string) => {
+      const element = elements.get(id)
+      if (!element) throw new Error(`Missing element ${id}`)
+      return element
+    },
+    events,
+  }
+}
+
 describe('dashboard My Account — Telegram connect/disconnect (integration through dashboardApp, real D1)', () => {
   let harness: SqliteD1Harness
 
@@ -138,6 +187,77 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
   })
 
   afterEach(() => harness.close())
+
+  async function connectBody(botUsername?: string) {
+    // One scope keeps the rendered fixed-scope field available to the browser.
+    harness.sqlite.exec("UPDATE projects SET status = 'archived' WHERE id = 'project-b'")
+    if (botUsername !== undefined) {
+      harness.sqlite.prepare("INSERT INTO org_settings (key, value) VALUES ('im_bot_username', ?)").run(botUsername)
+    }
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    return String(await telegramSectionBody(env, {
+      userId: 'admin-user', email: 'admin@x.test', role: 'admin', tenant: TENANT, memberId: 'member-admin',
+    }))
+  }
+
+  it.each([undefined, 'Decision_bot', 'bad/name'])('code creation explains the pending connection and reload, username=%s', async (username) => {
+    const body = await connectBody(username)
+    expect(body).toContain('Connect your Telegram to approve through chat.')
+    expect(body).not.toContain('and be notified through chat')
+    const browser = accountBrowser(body, { pairing_code: 'test-code', invite: { pairing_expires_at: '2026-10-29' } }, 201)
+    await browser.element('tg-connect').click!()
+    const result = browser.element('tg-result')
+    expect(result.hidden).toBe(false)
+    expect(result.children.map((p) => p.textContent)).toContain(
+      'This code is not a connection yet. Telegram connects when the decision bot' +
+      (username === 'Decision_bot' ? ' @Decision_bot' : '') + ' replies to /start. Then reload this page.',
+    )
+    expect(result.children.map((p) => p.textContent)).toContain('Pairing code: test-code')
+    expect(result.children.map((p) => p.textContent)).toContain('Expires 2026-10-29')
+    if (username === 'Decision_bot') {
+      expect(result.children.find((p) => p.href)?.href).toBe('https://t.me/Decision_bot?start=test-code')
+    } else {
+      expect(result.children.some((p) => p.href)).toBe(false)
+      expect(result.children.map((p) => p.textContent)).toContain('Message the decision bot and send: /start test-code')
+      expect(result.children.map((p) => p.textContent)).toContain('Ask your owner to set the decision bot username so this page can link you straight there.')
+    }
+    expect(browser.events).toEqual([])
+  })
+
+  it.each([
+    ['forbidden', "You don't have a squad you can connect through yet. Ask an org admin to add you to a project squad."],
+    ['cannot_grant_above_own_rank', "You don't have a squad you can connect through yet. Ask an org admin to add you to a project squad."],
+    ['member_not_active', 'Your account is not active. Ask an admin to activate it.'],
+    ...['project_not_active', 'archived_project', 'squad_archived', 'project_not_found', 'project_squad_not_linked'].map((code) =>
+      [code, "That project can't take new connections. Pick another, or ask an admin."]),
+    ['pairing_code_collision', 'Try again.'],
+    ...['home_scope_not_invitable', 'member_not_found', 'member_missing_email', 'invalid_expiry', 'invalid_capability',
+      'invalid_or_expired_pairing_code', 'ambiguous_pairing_code', 'unexpected', ''].map((code) =>
+      [code, 'Could not connect. Try again, or ask an admin.']),
+  ])('connect refusal %s shows a plain next step without an enum', async (error, sentence) => {
+    const browser = accountBrowser(await connectBody(), { error }, 403)
+    await browser.element('tg-connect').click!()
+    expect(browser.element('tg-status').textContent).toBe(sentence)
+    expect(browser.element('tg-connect').disabled).toBe(false)
+    expect(browser.events).toEqual([])
+  })
+
+  it('connect keeps the existing reauthentication redirect', async () => {
+    const browser = accountBrowser(await connectBody(), { error: 'reauth_required' }, 403)
+    await browser.element('tg-connect').click!()
+    expect(browser.events).toEqual(['/auth/reauth?return=%2Faccount'])
+  })
+
+  it('disconnect success tells the member phone setup was removed before reloading', async () => {
+    harness.sqlite.exec("UPDATE members SET telegram_chat_id = '555000111' WHERE id = 'member-admin'")
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    const body = String(await telegramSectionBody(env, {
+      userId: 'admin-user', email: 'admin@x.test', role: 'admin', tenant: TENANT, memberId: 'member-admin',
+    }))
+    const browser = accountBrowser(body, { telegram_unbound: true })
+    await browser.element('tg-disconnect').click!()
+    expect(browser.events).toEqual(['Telegram disconnected. Phone setup (Mini App devices) was removed too.', 'reload'])
+  })
 
   // ── GET /account — real HTTP round trip through dashboardApp ─────────────
 
@@ -718,6 +838,16 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       expect(html).toContain('Set up this phone')
       expect(html).toContain('/account/telegram-device/enrol')
       expect(html).not.toMatch(/\/m\/tg\/enrol|secure\.example\.test/) // the page never learns a link
+    })
+    it.each([
+      [{ sent: true }, 200, 'Sent. Open the new message from the phone-setup bot in Telegram on your phone and tap the button (it is valid for 10 minutes).'],
+      [{ error: 'chat_unreachable' }, 502, 'Telegram would not deliver it: open the phone-setup bot in Telegram and press Start once, then try again.'],
+    ] as const)('phone setup response %j names the correct bot', async (response, status, sentence) => {
+      const body = String(await telegramDeviceSectionBody(flagged(), admin))
+      const browser = accountBrowser(body, response, status)
+      await browser.element('tgd-add').click!()
+      expect(browser.element('tgd-status').textContent).toBe(sentence)
+      expect(browser.element('tgd-add').disabled).toBe(false)
     })
     it('an empty list says so', async () => {
       expect(String(await telegramDeviceSectionBody(flagged(), admin))).toContain('No phone set up')
