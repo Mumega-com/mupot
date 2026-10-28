@@ -374,7 +374,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-nobind'), {
       task_id: 'task-nobind', verdict: 'approved', human_origin: origin({ text: 'approve task-nobind' }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound', next_step: 'Connect Telegram on My Account, then send /start <code> to the decision bot.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound', next_step: 'For the human: Connect Telegram on My Account, then send /start <code> to the decision bot.' })
     expect(result.verdict.decided_by).toBe('agent-nobind') // own-seat fallback only, never the member
 
     const after = await snapshotUnbound('member-nobind')
@@ -397,7 +397,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-taken'), {
       task_id: 'task-6', verdict: 'approved', human_origin: origin({ text: 'approve task-6' }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound', next_step: 'Connect Telegram on My Account, then send /start <code> to the decision bot.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound', next_step: 'For the human: Connect Telegram on My Account, then send /start <code> to the decision bot.' })
     expect(result.verdict.decided_by).toBe('agent-taken')
 
     const after = await snapshotUnbound('member-owner-unbound')
@@ -544,7 +544,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(env, auth, {
       task_id: 'task-13', verdict: 'approved', human_origin: origin({ text: 'approve task-13', message_at: elevenMinutesAgo }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale', next_step: 'Send the command again; it must be fresh, within 10 minutes.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale', next_step: 'For the human: Send the command again now; it must be recent (within 10 minutes) and the device clock must be right.' })
     expect(result.verdict.decided_by).toBe('agent-stale-old')
   })
 
@@ -560,7 +560,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(env, auth, {
       task_id: 'task-14', verdict: 'approved', human_origin: origin({ text: 'approve task-14', message_at: twoMinutesFromNow }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale', next_step: 'Send the command again; it must be fresh, within 10 minutes.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale', next_step: 'For the human: Send the command again now; it must be recent (within 10 minutes) and the device clock must be right.' })
     expect(result.verdict.decided_by).toBe('agent-stale-future')
   })
 
@@ -974,7 +974,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       expect(result.human_origin).toEqual({
         applied: false,
         reason: rebindTo === null ? 'origin_chat_not_bound' : 'origin_member_mismatch',
-        ...(rebindTo === null ? { next_step: 'Connect Telegram on My Account, then send /start <code> to the decision bot.' } : {}),
+        ...(rebindTo === null ? { next_step: 'For the human: Connect Telegram on My Account, then send /start <code> to the decision bot.' } : {}),
       })
       expect(result.verdict.decided_by).toBe(`agent-race-${id}`) // fell back to the agent
 
@@ -1323,19 +1323,19 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     })
     it('/mureject <id> used for an approval is refused', async () => {
       const r = await attempt('swap', 'approved', '/mureject c0de1234')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('text naming the task but no verb is refused', async () => {
       const r = await attempt('noverb', 'approved', 'c0de1234 looks fine to me')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('both verbs present is refused', async () => {
       const r = await attempt('both', 'approved', 'approve c0de1234 or reject it')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('lookalikes (unapprove / approved) do not count as the verb', async () => {
       const r = await attempt('look', 'approved', 'unapprove c0de1234 approved')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
 
     // mupot#2015 — the grammar is anchored to the WHOLE message.
@@ -1352,11 +1352,11 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     ]
     it.each(REFUSED)('refuses non-command text (%s)', async (tag, text) => {
       const r = await attempt(`nc-${tag}`, 'approved', text)
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('refuses a wrong ref token even when the task id appears elsewhere in the text', async () => {
       const r = await attempt('wrongref', 'approved', 'approve deadbeef0 c0de1234')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it.each([
       ['a1', '/muapprove c0de1234'],
@@ -1378,17 +1378,17 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     })
     it('approve text spent as rejected is refused', async () => {
       const r = await attempt('dir-ar', 'rejected', 'approve c0de1234')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('reject text spent as approved is refused', async () => {
       const r = await attempt('dir-ra', 'approved', 'reject c0de1234')
-      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect(r.human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('uppercase approve text spent as rejected is refused', async () => {
-      expect((await attempt('dir-up1', 'rejected', 'APPROVE c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect((await attempt('dir-up1', 'rejected', 'APPROVE c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
     it('uppercase reject text spent as approved is refused', async () => {
-      expect((await attempt('dir-up2', 'approved', '/MUREJECT c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
+      expect((await attempt('dir-up2', 'approved', '/MUREJECT c0de1234')).human_origin).toEqual({ applied: false, reason: 'origin_verb_mismatch', next_step: 'For the human: Send one line only: /muapprove <task id> or /mureject <task id> <reason>.' })
     })
   })
 
@@ -1406,7 +1406,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       verdict: 'approved',
       human_origin: origin({ text: 'approve', chat_id: '5559999', user_id: '5559999' }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named', next_step: 'Include the task id (8+ characters) in the command.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named', next_step: 'For the human: Include the task id (8+ characters) in the command.' })
     expect(result.verdict.decided_by).toBe('agent-named-absent') // fell back to the agent
 
     const verdictCount = await env.DB.prepare(
@@ -1429,7 +1429,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       verdict: 'approved',
       human_origin: origin({ text: 'approve f9408956', chat_id: '5558888', user_id: '5558888' }),
     }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named', next_step: 'Include the task id (8+ characters) in the command.' })
+    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named', next_step: 'For the human: Include the task id (8+ characters) in the command.' })
     expect(result.verdict.decided_by).toBe('agent-named-wrong')
   })
 

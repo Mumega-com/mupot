@@ -353,7 +353,7 @@ describe('decision: approve and deny land once, from the bound private chat only
     await handleApprovalBotUpdate(env, cmdUpdate('/muhelp', { from: TG.owner }))
     expect(String(sentTo('sendMessage')[0].body.text)).toContain('The id is the request id from this message. Task decisions go to the decision bot.')
   })
-  it.each(['/start', '/start secret-pairing-code', '/needs', '/login', '/mureject abcdef12 no', '/unknown'])('routes private %s without deciding or echoing its payload', async (text) => {
+  it.each(['/start secret-pairing-code', '/needs', '/login', '/mureject abcdef12 no', '/unknown'])('routes private %s without deciding or echoing its payload', async (text) => {
     const f = await file()
     for (const from of [TG.owner, TG.stranger]) {
       calls.length = 0
@@ -365,6 +365,101 @@ describe('decision: approve and deny land once, from the bound private chat only
       expect(grants(f.requestId)).toBe(0)
       expect(one<{ n: number }>('SELECT COUNT(*) AS n FROM task_verdicts').n).toBe(0)
     }
+  })
+  const ID_ONLY = 'Send the id only: /muapprove <id> or /mudeny <id>. Add any reason on the approval page.'
+  const START_WELCOME = 'This bot sends you approval requests. When one arrives, tap a button or reply /muapprove <id>.'
+  const ROUTING = 'This chat is only for approval requests. Pairing codes and task decisions go to the decision bot.'
+  const ROUTING_NAMED = 'This chat is only for approval requests. Pairing codes and task decisions go to @kayhermes_mubot.'
+  it('bare /start welcomes and does not send the routing sentence', async () => {
+    const f = await file()
+    for (const text of ['/start', '/start@muapprove_test_bot']) {
+      calls.length = 0
+      expect(await handleApprovalBotUpdate(env, cmdUpdate(text, { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+      expect(sentTo('sendMessage')).toHaveLength(1)
+      expect(sentTo('sendMessage')[0].body).toMatchObject({ chat_id: String(TG.owner), text: START_WELCOME })
+      expect(sentTo('sendMessage')[0].body.parse_mode).toBeUndefined()
+      expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('decision bot')
+      expect(status(f.requestId).status).toBe('pending')
+      expect(grants(f.requestId)).toBe(0)
+    }
+  })
+  it('/start with a payload keeps the routing sentence and does not echo the payload', async () => {
+    const f = await file()
+    calls.length = 0
+    const payload = 'secret-pairing-code'
+    expect(await handleApprovalBotUpdate(env, cmdUpdate(`/start ${payload}`, { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+    expect(sentTo('sendMessage')[0].body).toMatchObject({ chat_id: String(TG.owner), text: ROUTING })
+    expect(sentTo('sendMessage')[0].body.parse_mode).toBeUndefined()
+    expect(String(sentTo('sendMessage')[0].body.text)).not.toContain(payload)
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it.each([
+    ['extra words', (id: string) => `/mudeny ${id} secret-reason-do-not-echo`],
+    ['id too long', (id: string) => `/muapprove ${id}${'a'.repeat(17)}`],
+    ['wrong bot', (id: string) => `/muapprove@some_other_bot ${id}`],
+    ['revoke extra', (id: string) => `/murevoke ${id} everything`],
+  ])('a malformed decision command (%s) gets the id-only reply and writes no state', async (_label, build) => {
+    const f = await file()
+    calls.length = 0
+    const text = build(f.shortId ?? 'abcdefgh')
+    expect(await handleApprovalBotUpdate(env, cmdUpdate(text, { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+    expect(sentTo('sendMessage')).toHaveLength(1)
+    expect(sentTo('sendMessage')[0].body).toMatchObject({ chat_id: String(TG.owner), text: ID_ONLY })
+    expect(sentTo('sendMessage')[0].body.parse_mode).toBeUndefined()
+    expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('secret-reason-do-not-echo')
+    expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('decision bot')
+    expect(String(sentTo('sendMessage')[0].body.text)).not.toContain(f.shortId)
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it('a group /mudeny <id> reason stays silent', async () => {
+    const f = await file()
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${f.shortId} not now`, { from: TG.owner, chat: -100123, chatType: 'group' }))).toEqual({ kind: 'ignored', reason: 'not_private_chat' })
+    expect(calls).toHaveLength(0)
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it('a forwarded malformed /mudeny is refused as forwarded before the id-only reply', async () => {
+    const f = await file()
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${f.shortId} not now`, { from: TG.owner, forwarded: true }))).toEqual({ kind: 'refused', reason: 'forwarded' })
+    expect(sentTo('sendMessage')[0].body.text).toBe('A forwarded message cannot decide anything. Type the command yourself.')
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it('names @im_bot_username on the routing reply when the org set a valid one', async () => {
+    harness.sqlite.prepare("INSERT INTO org_settings (key, value) VALUES ('im_bot_username', 'kayhermes_mubot')").run()
+    const f = await file()
+    const last = String(approvalCalls()[0].body.text).split('\n').pop()
+    const mins = last?.match(/^Decide within (\d+) min\./)?.[1]
+    expect(last).toBe(`Decide within ${mins} min. Tap a button, or reply /muapprove ${f.shortId} or /mudeny ${f.shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to @kayhermes_mubot.`)
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, cmdUpdate('/start secret-pairing-code', { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+    expect(sentTo('sendMessage')[0].body).toMatchObject({ chat_id: String(TG.owner), text: ROUTING_NAMED })
+    expect(sentTo('sendMessage')[0].body.parse_mode).toBeUndefined()
+    expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('secret-pairing-code')
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, cmdUpdate('/start', { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+    expect(sentTo('sendMessage')[0].body.text).toBe(START_WELCOME)
+  })
+  it('keeps "the decision bot" when im_bot_username is missing or invalid, and does not echo the stored value', async () => {
+    for (const bad of ['bot', 'abcd', 'has space', '@kayhermes_mubot', 'a'.repeat(33), 'bad-name', 'evil_bot\nApproved']) {
+      harness.sqlite.prepare("INSERT INTO org_settings (key, value) VALUES ('im_bot_username', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(bad)
+      calls.length = 0
+      expect(await handleApprovalBotUpdate(env, cmdUpdate('/needs', { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+      expect(sentTo('sendMessage')[0].body.text).toBe(ROUTING)
+      expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('evil_bot')
+      expect(String(sentTo('sendMessage')[0].body.text)).not.toContain('@kayhermes_mubot')
+    }
+    calls.length = 0
+    const f = await file()
+    const card = String(approvalCalls()[0].body.text)
+    const last = card.split('\n').pop()
+    const mins = last?.match(/^Decide within (\d+) min\./)?.[1]
+    expect(last).toBe(`Decide within ${mins} min. Tap a button, or reply /muapprove ${f.shortId} or /mudeny ${f.shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to the decision bot.`)
+    expect(card).not.toContain('evil_bot')
   })
   it.each(['group', 'supergroup', 'channel'])('keeps unknown commands silent in %s', async (chatType) => {
     const f = await file()
