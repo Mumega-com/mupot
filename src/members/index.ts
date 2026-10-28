@@ -28,6 +28,7 @@
 
 import { Hono } from 'hono'
 import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
+import { revokeTelegramApprovedElevationGrants } from '../auth/elevation'
 import type { Context, MiddlewareHandler } from 'hono'
 import type {
   Env,
@@ -1726,7 +1727,6 @@ membersApp.delete(
       'SELECT id, telegram_chat_id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1',
     ).bind(memberId, c.env.TENANT_SLUG).first<{ id: string; telegram_chat_id: string | null }>()
     if (!member) return c.json({ error: 'member_not_found' }, 404)
-    if (member.telegram_chat_id === null) return c.json({ error: 'telegram_not_bound' }, 404)
 
     const ceiling = await targetRankCeiling(c, memberId)
     if (ceiling) return ceiling
@@ -1756,27 +1756,38 @@ membersApp.delete(
     // `telegram_chat_id = ?3` conjunct guards — someone else changed the
     // binding between the SELECT above and now) must not write a receipt
     // that claims a clearing which never happened.
-    const [update, insert] = await c.env.DB.batch([
-      c.env.DB.prepare(
-        `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
-          WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
-      ).bind(memberId, c.env.TENANT_SLUG, priorTelegramChatId),
-      c.env.DB.prepare(
-        `INSERT INTO telegram_unbind_receipts
-           (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6
-          WHERE changes() = 1`,
-      ).bind(receiptId, c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, unboundAt),
-    ])
-    if (!update.meta || update.meta.changes === 0) return c.json({ error: 'member_not_found' }, 404)
-    // The UPDATE landed (changes === 1), so the conditional INSERT above was
-    // guaranteed to fire — assertWritten catches a phantom success (e.g. a
-    // future constraint silently no-opping the row) rather than reporting
-    // telegram_unbound: true over an unrecorded revocation.
-    assertWritten(insert, 'telegram_unbind_receipts.insert')
+    if (priorTelegramChatId !== null) {
+      const [update, insert] = await c.env.DB.batch([
+        c.env.DB.prepare(
+          `UPDATE members SET telegram_chat_id = NULL, telegram_bound_at = NULL, tenant = ?2
+            WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) AND telegram_chat_id = ?3`,
+        ).bind(memberId, c.env.TENANT_SLUG, priorTelegramChatId),
+        c.env.DB.prepare(
+          `INSERT INTO telegram_unbind_receipts
+             (id, tenant, member_id, actor_id, prior_telegram_chat_id, created_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            WHERE changes() = 1`,
+        ).bind(receiptId, c.env.TENANT_SLUG, memberId, actorId, priorTelegramChatId, unboundAt),
+      ])
+      if (!update.meta || update.meta.changes === 0) {
+        const current = await c.env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?1 AND tenant = ?2')
+          .bind(memberId, c.env.TENANT_SLUG).first<{ telegram_chat_id: string | null }>()
+        if (!current) return c.json({ error: 'member_not_found' }, 404)
+        if (current.telegram_chat_id !== null) return c.json({ error: 'telegram_binding_changed' }, 409)
+      }
+      // The UPDATE landed (changes === 1), so the conditional INSERT above was
+      // guaranteed to fire — assertWritten catches a phantom success (e.g. a
+      // future constraint silently no-opping the row) rather than reporting
+      // telegram_unbound: true over an unrecorded revocation.
+      if (Number(update.meta?.changes ?? 0) > 0) assertWritten(insert, 'telegram_unbind_receipts.insert')
+    }
     // A Mini App device is bound to the Telegram user id this member WAS linked to: unlinking ends that device too (it would
     // also be refused at use, since the binding is re-checked, but a re-link to another account must never find it live).
+    // Cleanup is retried even when already unbound. Any failure propagates: never
+    // claim success over live authority. The decision batch checks the binding,
+    // so no in-flight bot approval can mint a grant after the clear above.
     await revokeMemberTgDevices(c.env, memberId, 'telegram_unbound')
+    await revokeTelegramApprovedElevationGrants(c.env, memberId)
 
     return c.json({ member_id: memberId, telegram_unbound: true })
   },

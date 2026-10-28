@@ -243,8 +243,6 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
     return { kind: 'refused', reason: 'decision_error' }
   }
   if (outcome.status === 200) {
-    await env.DB.prepare("UPDATE elevation_requests SET decided_via = 'approval_bot' WHERE id = ?1 AND tenant = ?2 AND decided_by_member_id = ?3 AND decided_via IS NULL")
-      .bind(req.id, env.TENANT_SLUG, memberId).run().catch(() => undefined)
     await tell(`${cmd.op === 'approve' ? 'Approved' : 'Denied'} ${cmd.id}. ${outcome.message}`, { editMessageId: editId })
     return { kind: cmd.op === 'approve' ? 'approved' : 'denied' }
   }

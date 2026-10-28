@@ -3267,14 +3267,14 @@ describe('Telegram project invite — bind existing member', () => {
       `).get()).toEqual({ telegram_chat_id: null, telegram_bound_at: null })
     })
 
-    it('404s when the member has no Telegram identity bound', async () => {
+    it('succeeds idempotently when the member has no Telegram identity bound', async () => {
       const response = await membersApp.request('/members/member-existing/telegram', {
         method: 'DELETE',
         headers: { 'content-type': 'application/json', cookie: 'mupot_session=bind-owner' },
       }, ownerSession())
 
-      expect(response.status, await response.clone().text()).toBe(404)
-      await expect(response.json()).resolves.toEqual({ error: 'telegram_not_bound' })
+      expect(response.status, await response.clone().text()).toBe(200)
+      await expect(response.json()).resolves.toEqual({ member_id: 'member-existing', telegram_unbound: true })
     })
 
     it('404s for a nonexistent member', async () => {
