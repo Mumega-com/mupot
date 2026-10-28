@@ -180,6 +180,7 @@ describe('delivery: ONE message from the approval bot', () => {
     expect(text).toContain('approve, it is read-only')
     expect(text).toContain(`/muapprove ${f.shortId}`)
     expect(text).toContain(`/mudeny ${f.shortId}`)
+    expect(text).toContain('The id is the request id from this message. Task decisions go to the decision bot.')
     const buttons = ((m.body.reply_markup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }).inline_keyboard)[0]
     expect(buttons.map((b) => [b.text, b.callback_data])).toEqual([['Approve', `ea:${f.shortId}`], ['Deny', `ed:${f.shortId}`]])
     expect(one('SELECT member_id, chat_id, status FROM approval_bot_deliveries WHERE request_id = ?', f.requestId)).toEqual({ member_id: 'mem-owner', chat_id: String(TG.owner), status: 'sent' })
@@ -348,6 +349,42 @@ describe('webhook: the secret is enforced', () => {
 })
 
 describe('decision: approve and deny land once, from the bound private chat only', () => {
+  it('help distinguishes approval request ids from task decisions', async () => {
+    await handleApprovalBotUpdate(env, cmdUpdate('/muhelp', { from: TG.owner }))
+    expect(String(sentTo('sendMessage')[0].body.text)).toContain('The id is the request id from this message. Task decisions go to the decision bot.')
+  })
+  it.each(['/start', '/start secret-pairing-code', '/needs', '/login', '/mureject abcdef12 no', '/unknown'])('routes private %s without deciding or echoing its payload', async (text) => {
+    const f = await file()
+    for (const from of [TG.owner, TG.stranger]) {
+      calls.length = 0
+      expect(await handleApprovalBotUpdate(env, cmdUpdate(text, { from }))).toEqual({ kind: 'ignored', reason: 'not_our_command' })
+      expect(sentTo('sendMessage')).toHaveLength(1)
+      expect(sentTo('sendMessage')[0].body).toMatchObject({ chat_id: String(from), text: 'This chat is only for approval requests. Pairing codes and task decisions go to the decision bot.' })
+      expect(sentTo('sendMessage')[0].body.parse_mode).toBeUndefined()
+      expect(status(f.requestId).status).toBe('pending')
+      expect(grants(f.requestId)).toBe(0)
+      expect(one<{ n: number }>('SELECT COUNT(*) AS n FROM task_verdicts').n).toBe(0)
+    }
+  })
+  it.each(['group', 'supergroup', 'channel'])('keeps unknown commands silent in %s', async (chatType) => {
+    const f = await file()
+    calls.length = 0
+    for (const text of ['/start secret-pairing-code', '/unknown']) {
+      expect((await handleApprovalBotUpdate(env, cmdUpdate(text, { from: TG.owner, chat: TG.owner, chatType }))).kind).toBe('ignored')
+    }
+    expect(calls).toHaveLength(0)
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
+  it('keeps plain text and sender/chat mismatch silent', async () => {
+    const f = await file()
+    calls.length = 0
+    expect(await handleApprovalBotUpdate(env, cmdUpdate('hello /start', { from: TG.owner }))).toEqual({ kind: 'ignored', reason: 'not_a_command' })
+    expect(await handleApprovalBotUpdate(env, cmdUpdate('/start code', { from: TG.owner, chat: TG.plain }))).toEqual({ kind: 'ignored', reason: 'not_private_chat' })
+    expect(calls).toHaveLength(0)
+    expect(status(f.requestId).status).toBe('pending')
+    expect(grants(f.requestId)).toBe(0)
+  })
   it('Approve tap: grants created, decided by the owner via approval_bot, receipt written, message edited, grant live for the agent', async () => {
     const f = await file()
     const r = await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: deliveredMessageId(f.requestId) }))

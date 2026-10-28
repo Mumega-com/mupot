@@ -91,6 +91,6 @@ export async function describeForBot(env: Env, req: ElevationRequestRecord, shor
   const rec = untrustedLine(recRow?.recommendation, 200)
   if (rec) lines.push(`Agent recommends (its own words, unverified): "${rec}"`)
   const secsLeft = Math.max(0, Math.floor((Date.parse(req.decision_expires_at) - nowMs) / 1000))
-  lines.push(`Decide within ${Math.ceil(secsLeft / 60)} min. Tap a button, or reply /muapprove ${shortId} or /mudeny ${shortId}. /murevoke ends everything you approved.`)
+  lines.push(`Decide within ${Math.ceil(secsLeft / 60)} min. Tap a button, or reply /muapprove ${shortId} or /mudeny ${shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to the decision bot.`)
   return lines.join('\n')
 }

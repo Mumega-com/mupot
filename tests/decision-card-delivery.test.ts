@@ -89,6 +89,7 @@ describe('wakeGateOwnerOnReview — member-held gate', () => {
     const card = JSON.parse(m.body) as Record<string, unknown>
     expect(card).toMatchObject({
       type: 'decision_card', task_id: TASK_ID, short_id: 'abcdef12', title: 'Decide the thing', priority: 'P1',
+      instruction: 'The id is a task id for the decision bot, not an approval-bot request.',
       approve: '/muapprove abcdef12', reject: '/mureject abcdef12', reject_hint: '/mureject abcdef12 <reason>',
     })
     expect((card.result_excerpt as string).length).toBe(400)

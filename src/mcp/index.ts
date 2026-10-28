@@ -2674,7 +2674,14 @@ const HUMAN_ORIGIN_SCHEMA = {
 function humanOriginResponsePayload(outcome: HumanOriginResolution): Record<string, unknown> {
   if (outcome.replayed) return { applied: false, reason: 'origin_replayed' }
   if (outcome.applied) return { applied: true }
-  return { applied: false, reason: outcome.reason }
+  const nextSteps: Partial<Record<typeof outcome.reason, string>> = {
+    origin_stale: 'Send the command again; it must be fresh, within 10 minutes.',
+    origin_chat_not_bound: 'Connect Telegram on My Account, then send /start <code> to the decision bot.',
+    origin_verb_mismatch: 'Send one line only: /muapprove <task id> or /mureject <task id> <reason>.',
+    task_not_named: 'Include the task id (8+ characters) in the command.',
+  }
+  const nextStep = nextSteps[outcome.reason]
+  return { applied: false, reason: outcome.reason, ...(nextStep ? { next_step: nextStep } : {}) }
 }
 
 const toolTaskVerdict: ToolSpec = {
