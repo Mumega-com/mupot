@@ -27,6 +27,17 @@ describe('identity-only Telegram self-connect', () => {
   }
   const authority = () => Object.fromEntries(['capabilities', 'memberships', 'project_squad_access', 'members', 'squads', 'departments'].map((t) =>
     [t, h.sqlite.prepare(`SELECT * FROM ${t} ORDER BY 1`).all()]))
+  const disconnect = async () => {
+    h.sqlite.prepare("UPDATE web_sessions SET id_hash=? WHERE id_hash='session-self'").run(createHash('sha256').update('disconnect').digest('hex'))
+    const session = JSON.stringify({ ...auth(), webSessionRegistered: true, createdAt: new Date().toISOString() })
+    const disconnectEnv = { ...env, SESSIONS: {
+      get: async (key: string) => key === 'sess:disconnect' ? session : null,
+      put: async () => undefined, delete: async () => undefined,
+    } } as unknown as Env
+    return membersApp.request('/members/self/telegram', {
+      method: 'DELETE', headers: { 'content-type': 'application/json', cookie: 'mupot_session=disconnect' },
+    }, disconnectEnv)
+  }
   beforeEach(() => {
     h = createSqliteD1()
     applyAllMigrations(h.sqlite)
@@ -112,15 +123,7 @@ describe('identity-only Telegram self-connect', () => {
       (id,email,capability,invited_by,created_at,member_id,minted_by_member_id,pairing_hash,pairing_expires_at,invite_kind)
       VALUES ('other-code','other@x.test','observer','other',datetime('now'),'other','other',?,?,'identity_only')`)
       .run('b'.repeat(64), created.value.invite.pairing_expires_at)
-    h.sqlite.prepare('UPDATE web_sessions SET id_hash=?').run(createHash('sha256').update('disconnect').digest('hex'))
-    const session = JSON.stringify({ ...auth(), webSessionRegistered: true, createdAt: new Date().toISOString() })
-    const disconnectEnv = { ...env, SESSIONS: {
-      get: async (key: string) => key === 'sess:disconnect' ? session : null,
-      put: async () => undefined, delete: async () => undefined,
-    } } as unknown as Env
-    const response = await membersApp.request('/members/self/telegram', {
-      method: 'DELETE', headers: { 'content-type': 'application/json', cookie: 'mupot_session=disconnect' },
-    }, disconnectEnv)
+    const response = await disconnect()
     expect(response.status, await response.clone().text()).toBe(200)
     expect(h.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id='self'").get()).toEqual({ telegram_chat_id: null })
     expect(await redeem(created.value.pairing_code, '90002', 'after-disconnect')).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
@@ -129,6 +132,101 @@ describe('identity-only Telegram self-connect', () => {
       .toEqual({ pairing_expires_at: accepted.value.invite.pairing_expires_at })
     expect(h.sqlite.prepare("SELECT pairing_expires_at FROM invites WHERE id='other-code'").get())
       .toEqual({ pairing_expires_at: created.value.invite.pairing_expires_at })
+  })
+  it('disconnect leaves an already-expired unaccepted identity-only code unchanged without aborting the batch', async () => {
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    h.sqlite.exec("UPDATE members SET telegram_chat_id='90001', telegram_bound_at=datetime('now') WHERE id='self'")
+    h.sqlite.prepare('UPDATE invites SET pairing_expires_at=? WHERE id=?').run('2000-01-01T00:00:00.000Z', created.value.invite.id)
+    const before = h.sqlite.prepare('SELECT * FROM invites WHERE id=?').get(created.value.invite.id)
+    const response = await disconnect()
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(h.sqlite.prepare('SELECT * FROM invites WHERE id=?').get(created.value.invite.id)).toEqual(before)
+    expect(h.sqlite.prepare("SELECT telegram_chat_id, telegram_bound_at FROM members WHERE id='self'").get())
+      .toEqual({ telegram_chat_id: null, telegram_bound_at: null })
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM telegram_unbind_receipts').get()).toEqual({ n: 1 })
+  })
+  it('disconnect expires an outstanding identity-only code for an already-unbound member without a receipt', async () => {
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    expect(h.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id='self'").get()).toEqual({ telegram_chat_id: null })
+    const before = new Date().toISOString()
+    const response = await disconnect()
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(await response.json()).toEqual({ member_id: 'self', telegram_unbound: true })
+    const row = h.sqlite.prepare('SELECT pairing_expires_at FROM invites WHERE id=?').get(created.value.invite.id)!
+    expect(Date.parse(String(row.pairing_expires_at))).toBeGreaterThanOrEqual(Date.parse(before))
+    expect(Date.parse(String(row.pairing_expires_at))).toBeLessThanOrEqual(Date.now())
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM telegram_unbind_receipts').get()).toEqual({ n: 0 })
+    expect(await redeem(created.value.pairing_code, '90002', 'already-unbound')).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+  })
+  it.each([0, 2])('bound disconnect expires codes, revokes bot grants and records the correct audit count for %i devices', async (deviceCount) => {
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    h.sqlite.exec(`
+      UPDATE members SET telegram_chat_id='90001', telegram_bound_at=datetime('now') WHERE id='self';
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+        VALUES ('grant-agent','home','grant-agent','Agent','r','m','active');
+      INSERT INTO agent_sessions (id, tenant, agent_id, member_id, auth_kind, credential_id, idle_expires_at, absolute_expires_at)
+        VALUES ('grant-session','local','grant-agent','other','workspace_token','credential',datetime('now','+1 day'),datetime('now','+7 days'));
+      INSERT INTO web_sessions (id_hash, tenant, member_id, login_identity_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at)
+        SELECT 'grant-web-session', tenant, member_id, login_identity_id, created_at, last_seen_at, idle_expires_at, absolute_expires_at FROM web_sessions WHERE id_hash='session-self';
+      INSERT INTO elevation_requests (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
+        requested_scope_type, requested_duration_minutes, reason, status, created_at, decision_expires_at, decided_by_member_id, decided_via)
+        VALUES ('bot-request','local','grant-session','grant-agent','other','["action:task_create"]',
+          'org',60,'test','approved',datetime('now'),datetime('now','+1 day'),'self','approval_bot');
+      INSERT INTO elevation_grants (id, tenant, elevation_request_id, agent_session_id, action, scope_type, effect,
+        approved_by_member_id, approved_by_web_session_hash, created_at, expires_at)
+        VALUES ('bot-grant','local','bot-request','grant-session','action:task_create','org','reversible',
+          'self','grant-web-session',datetime('now'),'9999-01-01T00:00:00.000Z');
+    `)
+    for (let i = 0; i < deviceCount; i++) {
+      h.sqlite.prepare(`INSERT INTO tg_miniapp_devices
+        (id, tenant, member_id, telegram_user_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+        VALUES (?, 'local', 'self', '90001', ?, ?, datetime('now'), datetime('now'))`)
+        .run(`device-${i}`, `enrol-${i}`, 'a'.repeat(64))
+    }
+    const before = new Date().toISOString()
+    const response = await disconnect()
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(h.sqlite.prepare("SELECT telegram_chat_id, telegram_bound_at FROM members WHERE id='self'").get())
+      .toEqual({ telegram_chat_id: null, telegram_bound_at: null })
+    const receipt = h.sqlite.prepare('SELECT * FROM telegram_unbind_receipts').all()
+    expect(receipt).toHaveLength(1)
+    expect(receipt[0]).toMatchObject({ member_id: 'self', prior_telegram_chat_id: '90001' })
+    const expiry = h.sqlite.prepare('SELECT pairing_expires_at FROM invites WHERE id=?').get(created.value.invite.id)!
+    expect(Date.parse(String(expiry.pairing_expires_at))).toBeGreaterThanOrEqual(Date.parse(before))
+    expect(expiry.pairing_expires_at).toBe(receipt[0].created_at)
+    expect(h.sqlite.prepare("SELECT revoked_at, revoke_reason FROM elevation_grants WHERE id='bot-grant'").get())
+      .toEqual({ revoked_at: receipt[0].created_at, revoke_reason: 'telegram_unbound' })
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM tg_miniapp_devices WHERE revoked_at IS NOT NULL AND revoked_reason='telegram_unbound'").get())
+      .toEqual({ n: deviceCount })
+    const audits = h.sqlite.prepare("SELECT evidence_json FROM mutation_audit_entries WHERE operation='tg_device_revoke'").all()
+    expect(audits).toHaveLength(deviceCount === 0 ? 0 : 1)
+    if (deviceCount > 0) expect(JSON.parse(String(audits[0].evidence_json))).toMatchObject({ reason: 'telegram_unbound', count: String(deviceCount) })
+  })
+  it('disconnect preserves other-member, accepted and grant-kind invites', async () => {
+    const accepted = await mint()
+    if (!accepted.ok) throw new Error(JSON.stringify(accepted))
+    expect((await redeem(accepted.value.pairing_code)).ok).toBe(true)
+    const outstanding = await mint()
+    if (!outstanding.ok) throw new Error(JSON.stringify(outstanding))
+    h.sqlite.prepare(`INSERT INTO invites
+      (id,email,capability,invited_by,created_at,member_id,minted_by_member_id,pairing_hash,pairing_expires_at,invite_kind)
+      VALUES ('other-code','other@x.test','observer','other',datetime('now'),'other','other',?,?,'identity_only')`)
+      .run('b'.repeat(64), outstanding.value.invite.pairing_expires_at)
+    h.sqlite.exec(`INSERT INTO projects (id,slug,name,status) VALUES ('grant-project','grant-project','Project','active');
+      INSERT INTO project_squad_access (project_id,squad_id,access_level) VALUES ('grant-project','home','write');`)
+    h.sqlite.prepare(`INSERT INTO invites (id,email,capability,invited_by,created_at,member_id,project_id,squad_id,pairing_hash,pairing_expires_at,invite_kind)
+      VALUES ('grant-code','self@x.test','observer','self',datetime('now'),'self','grant-project','home',?,?,'grant')`)
+      .run('d'.repeat(64), outstanding.value.invite.pairing_expires_at)
+    const preserved = () => h.sqlite.prepare('SELECT * FROM invites WHERE id != ? ORDER BY id').all(outstanding.value.invite.id)
+    const before = preserved()
+    expect(before).toHaveLength(3)
+    const response = await disconnect()
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(preserved()).toEqual(before)
+    expect(await redeem(outstanding.value.pairing_code, '90002', 'after-isolated-disconnect')).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
   })
   it('offers the identity-only account action for a home-only member', async () => {
     const body = String(await telegramSectionBody(env, auth()))
