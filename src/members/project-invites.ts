@@ -544,7 +544,7 @@ export async function createIdentityOnlyInvite(
     await env.DB.prepare(`INSERT INTO invites
       (id, email, capability, invited_by, created_at, member_id, minted_by_member_id, pairing_hash, pairing_expires_at, invite_kind)
       VALUES (?1, ?2, 'observer', ?3, ?4, ?3, ?3, ?5, ?6, 'identity_only')`)
-      .bind(id, member.email.trim(), auth.memberId, createdAt, hash, expiresAt).run()
+      .bind(id, normalizeInviteEmail(member.email), auth.memberId, createdAt, hash, expiresAt).run()
     return { ok: true, value: {
       invite: { id, invite_kind: 'identity_only', created_at: createdAt, pairing_expires_at: expiresAt },
       pairing_code: pairingCode,

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createIdentityOnlyInvite, createProjectInvite, redeemTelegramProjectInvite } from '../src/members/project-invites'
 import { acceptInvite, membersApp } from '../src/members'
@@ -62,6 +63,72 @@ describe('identity-only Telegram self-connect', () => {
     expect(h.sqlite.prepare('SELECT state, response_text FROM telegram_webhook_receipts').get()).toEqual({ state: 'completed', response_text: expect.stringContaining('"identity_only":true') })
     expect(await redeemTelegramProjectInvite(env, { pairing_code: created.value.pairing_code, telegram_user_id: '90001', display_name: 'Self', update_id: 'u1', request_digest: digest })).toMatchObject({ ok: true })
     expect(await redeem(created.value.pairing_code, '90001', 'u2')).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+  })
+  it('normalizes the identity-only invite email before storing it', async () => {
+    h.sqlite.exec("UPDATE members SET email='  Self@X.Test  ' WHERE id='self'")
+    expect((await mint()).ok).toBe(true)
+    expect(h.sqlite.prepare('SELECT email FROM invites').get()).toEqual({ email: 'self@x.test' })
+  })
+  it('claim refuses an agent-bound member without consuming the invite', async () => {
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('agent-self','home','agent-self','Agent','r','m','active');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('local','agent-self','self',datetime('now'));`)
+    expect(await redeem(created.value.pairing_code)).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+    expect(h.sqlite.prepare('SELECT accepted_at FROM invites').get()).toEqual({ accepted_at: null })
+    expect(h.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id='self'").get()).toEqual({ telegram_chat_id: null })
+    expect(h.sqlite.prepare('SELECT state FROM telegram_webhook_receipts').get()).toEqual({ state: 'processing' })
+  })
+  it('schema refuses a raw malformed identity-only insert', () => {
+    h.sqlite.exec("INSERT INTO projects (id,slug,name,status) VALUES ('p','p','P','active')")
+    expect(() => h.sqlite.prepare(`INSERT INTO invites
+      (id,email,capability,invited_by,created_at,member_id,minted_by_member_id,project_id,pairing_hash,pairing_expires_at,invite_kind)
+      VALUES ('bad','self@x.test','owner','other',datetime('now'),'self','other','p',?,datetime('now','+1 day'),'identity_only')`)
+      .run('a'.repeat(64))).toThrow(/invalid identity-only invite/)
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM invites').get()).toEqual({ n: 0 })
+  })
+  it('schema refuses INSERT OR REPLACE with NULL kind and an invalid grant shape', () => {
+    expect(() => h.sqlite.exec(`INSERT OR REPLACE INTO invites
+      (id,email,capability,invited_by,created_at,member_id,invite_kind)
+      VALUES ('bad-null','self@x.test','observer','self',datetime('now'),'self',NULL)`))
+      .toThrow(/project invite member bind requires the full project field set/)
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM invites').get()).toEqual({ n: 0 })
+  })
+  it('schema refuses UPDATE OR REPLACE to NULL kind on an identity-only row', async () => {
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    expect(() => h.sqlite.exec('UPDATE OR REPLACE invites SET invite_kind=NULL')).toThrow(/invite kind is immutable/)
+    expect((await redeem(created.value.pairing_code)).ok).toBe(true)
+  })
+  it('disconnect expires outstanding identity-only codes so they cannot rebind', async () => {
+    const accepted = await mint()
+    if (!accepted.ok) throw new Error(JSON.stringify(accepted))
+    expect((await redeem(accepted.value.pairing_code)).ok).toBe(true)
+    const created = await mint()
+    if (!created.ok) throw new Error(JSON.stringify(created))
+    h.sqlite.prepare(`INSERT INTO invites
+      (id,email,capability,invited_by,created_at,member_id,minted_by_member_id,pairing_hash,pairing_expires_at,invite_kind)
+      VALUES ('other-code','other@x.test','observer','other',datetime('now'),'other','other',?,?,'identity_only')`)
+      .run('b'.repeat(64), created.value.invite.pairing_expires_at)
+    h.sqlite.prepare('UPDATE web_sessions SET id_hash=?').run(createHash('sha256').update('disconnect').digest('hex'))
+    const session = JSON.stringify({ ...auth(), webSessionRegistered: true, createdAt: new Date().toISOString() })
+    const disconnectEnv = { ...env, SESSIONS: {
+      get: async (key: string) => key === 'sess:disconnect' ? session : null,
+      put: async () => undefined, delete: async () => undefined,
+    } } as unknown as Env
+    const response = await membersApp.request('/members/self/telegram', {
+      method: 'DELETE', headers: { 'content-type': 'application/json', cookie: 'mupot_session=disconnect' },
+    }, disconnectEnv)
+    expect(response.status, await response.clone().text()).toBe(200)
+    expect(h.sqlite.prepare("SELECT telegram_chat_id FROM members WHERE id='self'").get()).toEqual({ telegram_chat_id: null })
+    expect(await redeem(created.value.pairing_code, '90002', 'after-disconnect')).toEqual({ ok: false, error: 'invalid_or_expired_pairing_code' })
+    expect(h.sqlite.prepare('SELECT accepted_at FROM invites WHERE id=?').get(created.value.invite.id)).toEqual({ accepted_at: null })
+    expect(h.sqlite.prepare('SELECT pairing_expires_at FROM invites WHERE id=?').get(accepted.value.invite.id))
+      .toEqual({ pairing_expires_at: accepted.value.invite.pairing_expires_at })
+    expect(h.sqlite.prepare("SELECT pairing_expires_at FROM invites WHERE id='other-code'").get())
+      .toEqual({ pairing_expires_at: created.value.invite.pairing_expires_at })
   })
   it('offers the identity-only account action for a home-only member', async () => {
     const body = String(await telegramSectionBody(env, auth()))
@@ -143,7 +210,7 @@ describe('identity-only Telegram self-connect', () => {
   })
   it.each([
     "invite_kind='grant'", "member_id='other', minted_by_member_id='other', invited_by='other'",
-    "capability='owner'", "squad_id='home'", "department_id='home-dept'", "pairing_hash=NULL", "pairing_expires_at=NULL",
+    "capability='owner'", "squad_id='home'", "department_id='home-dept'", "pairing_hash=NULL", "pairing_expires_at=NULL", "pairing_expires_at='9999-01-01T00:00:00.000Z'",
   ])('schema refuses repurposing identity-only pairing: %s', async (assignment) => {
     const created = await mint()
     if (!created.ok) throw new Error(JSON.stringify(created))

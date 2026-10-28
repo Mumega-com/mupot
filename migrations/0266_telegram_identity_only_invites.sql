@@ -8,7 +8,7 @@ DROP TRIGGER IF EXISTS validate_invites_project_pairing_update;
 
 CREATE TRIGGER validate_invites_project_pairing_insert
 BEFORE INSERT ON invites
-WHEN NEW.invite_kind = 'grant'
+WHEN NEW.invite_kind IS NOT 'identity_only'
 BEGIN
   SELECT RAISE(ABORT, 'project invite fields must be jointly null, plain-squad, or full project/pairing')
   WHERE NOT (
@@ -70,7 +70,7 @@ END;
 
 CREATE TRIGGER validate_invites_project_pairing_update
 BEFORE UPDATE OF project_id, squad_id, pairing_hash, pairing_expires_at, member_id ON invites
-WHEN NEW.invite_kind = 'grant'
+WHEN NEW.invite_kind IS NOT 'identity_only'
 BEGIN
   SELECT RAISE(ABORT, 'project invite fields must be jointly null, plain-squad, or full project/pairing')
   WHERE NOT (
@@ -164,7 +164,7 @@ END;
 -- A pairing must never be converted into a grant or retargeted after mint.
 CREATE TRIGGER invites_kind_immutable
 BEFORE UPDATE OF invite_kind ON invites
-WHEN NEW.invite_kind <> OLD.invite_kind
+WHEN NEW.invite_kind IS NOT OLD.invite_kind
 BEGIN
   SELECT RAISE(ABORT, 'invite kind is immutable');
 END;
@@ -173,7 +173,9 @@ BEFORE UPDATE ON invites
 WHEN OLD.invite_kind = 'identity_only' AND (
   NEW.member_id IS NOT OLD.member_id OR NEW.minted_by_member_id IS NOT OLD.minted_by_member_id
   OR NEW.invited_by IS NOT OLD.invited_by OR NEW.email IS NOT OLD.email
-  OR NEW.pairing_hash IS NOT OLD.pairing_hash OR NEW.pairing_expires_at IS NOT OLD.pairing_expires_at
+  OR NEW.pairing_hash IS NOT OLD.pairing_hash
+  -- Revocation may shorten expiry, never extend it or remove it.
+  OR NEW.pairing_expires_at IS NULL OR NEW.pairing_expires_at > OLD.pairing_expires_at
 )
 BEGIN
   SELECT RAISE(ABORT, 'identity-only invite target is immutable');

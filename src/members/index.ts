@@ -1785,6 +1785,15 @@ membersApp.delete(
             AND EXISTS (SELECT 1 FROM members WHERE id = ?2 AND (tenant = ?1 OR tenant IS NULL) AND telegram_chat_id IS NULL)`,
       ).bind(c.env.TENANT_SLUG, memberId, unboundAt),
       prepareTelegramApprovedElevationGrantRevocation(c.env, memberId, unboundAt),
+      // Disconnect also expires this member's outstanding self-pairing codes, so a leaked code cannot
+      // rebind after unbind. Last in the batch and guarded like the device revoke (member is unbound),
+      // so it does not depend on changes() or on statement position.
+      c.env.DB.prepare(
+        `UPDATE invites SET pairing_expires_at = ?1
+          WHERE member_id = ?2 AND invite_kind = 'identity_only' AND accepted_at IS NULL
+            AND pairing_expires_at > ?1
+            AND EXISTS (SELECT 1 FROM members WHERE id = ?2 AND (tenant = ?3 OR tenant IS NULL) AND telegram_chat_id IS NULL)`,
+      ).bind(unboundAt, memberId, c.env.TENANT_SLUG),
     )
     const results = await c.env.DB.batch(statements)
     if (priorTelegramChatId !== null) {
