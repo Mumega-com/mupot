@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { applyAllMigrations } from './helpers/migrations'
 import { describe, expect, it } from 'vitest'
 import { mcpApp, TOOLS, invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
@@ -1250,193 +1250,15 @@ describe('MCP granted multi-squad flight lifecycle', () => {
     const events: unknown[] = []
     try {
       const productTokenHash = await sha256Hex(PRODUCT_TOKEN)
+            // mupot#1590 P1-4 (Codex): the lifecycle fixture no longer hand-writes its schema.
+      // It predates the migration harness (see the removed notes: squads.status 0149,
+      // member_tokens 0099/0204, tasks 0079/0150, flights 0267 — three separate incidents
+      // of purely-additive columns 500ing this file). The committed migration chain is the
+      // ONE source of truth now: applyAllMigrations + INSERTs.
+      applyAllMigrations(harness.sqlite)
       harness.sqlite.exec(`
-        CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
-        CREATE TABLE squads (
-          id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-          charter TEXT, budget_cap_cents INTEGER, budget_window TEXT NOT NULL DEFAULT 'day',
-          kind TEXT NOT NULL DEFAULT 'work',
-          -- mupot#1496 Round 4: isSquadArchived (src/hygiene/filters.ts) does an
-          -- unconditional SELECT status FROM squads, and grant_agent_capability
-          -- (src/mcp/provision.ts) calls it unconditionally as of Round 3's
-          -- squad_archived guard. A hand-written fixture lacking a purely-additive
-          -- column another shared tool now unconditionally reads is exactly the
-          -- failure mode documented on tasks above (migrations/0079/0150) and on
-          -- member_tokens above (migrations/0099) -- same class, third instance in
-          -- this one file. Prefer the real migration harness for new fixtures.
-          status TEXT NOT NULL DEFAULT 'active',
-          created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE agents (
-          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-          role TEXT NOT NULL DEFAULT 'member', model TEXT NOT NULL DEFAULT 'test',
-          status TEXT NOT NULL DEFAULT 'active', budget_cap_cents INTEGER,
-          budget_window TEXT NOT NULL DEFAULT 'day', created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE members (
-          id TEXT PRIMARY KEY, email TEXT, display_name TEXT NOT NULL, telegram_chat_id TEXT,
-          status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          tenant TEXT NOT NULL
-        );
-        CREATE TABLE member_tokens (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
-          label TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT 'workspace',
-          created_at TEXT NOT NULL DEFAULT (datetime('now')), revoked_at TEXT,
-          -- migrations/0099: the bearer lookup now references these. Hand-written here
-          -- because this fixture predates the real-migration harness. That is exactly
-          -- why it broke: a transcribed schema is a second source of truth, and it
-          -- drifts silently — the query referenced a column this table never had and
-          -- every authenticated call in the file returned 500. Prefer the migration
-          -- harness (tests/token-lifecycle-real-schema.test.ts) for anything new.
-          expires_at TEXT, last_used_at TEXT,
-          -- migrations/0204 (mupot#1794 W4): the bearer lookup reads the credential class from the row.
-          harness_kind TEXT,
-          agent_id TEXT, tenant TEXT NOT NULL
-        );
-        CREATE TABLE agent_member_bindings (
-          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, member_id TEXT NOT NULL,
-          created_at TEXT NOT NULL, PRIMARY KEY (tenant, agent_id), UNIQUE (tenant, member_id)
-        );
-        -- migrations/0203: task_update's assign-over-hold decision reads execution_holds (mupot#1809).
-        CREATE TABLE execution_holds (
-          task_id TEXT PRIMARY KEY, escalation_id TEXT NOT NULL, agent_id TEXT NOT NULL, refused_count INTEGER NOT NULL,
-          reason TEXT, held_at TEXT NOT NULL, released_at TEXT, released_by_member_id TEXT, release_id TEXT, release_reason TEXT
-        );
-        CREATE TABLE task_execution_attempts (
-          task_id TEXT PRIMARY KEY, refused_count INTEGER NOT NULL DEFAULT 0, last_agent_id TEXT, last_reason TEXT,
-          first_at TEXT NOT NULL, last_at TEXT NOT NULL
-        );
-        CREATE TABLE memberships (
-          id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
-          capability TEXT NOT NULL, expires_at TEXT, UNIQUE (agent_id, squad_id)
-        );
-        CREATE TABLE capabilities (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT,
-          capability TEXT NOT NULL CHECK (capability IN ('owner','admin','lead','member','observer')),
-          created_at TEXT NOT NULL DEFAULT (datetime('now')), expires_at TEXT, reason TEXT, granted_by TEXT, granted_via TEXT, UNIQUE (member_id, scope_type, scope_id)
-        );
-        CREATE TABLE grant_event_context (
-          id INTEGER PRIMARY KEY CHECK (id = 1), tenant TEXT, actor TEXT, reason TEXT, event TEXT NOT NULL, at TEXT NOT NULL
-        );
-        CREATE TABLE channel_capability_grants (
-          id TEXT PRIMARY KEY, member_id TEXT NOT NULL, squad_id TEXT NOT NULL, capability TEXT NOT NULL
-        );
-        -- NOTE (migrations/0079): priority + parent_task_id added here by hand, because this
-        -- fixture hand-writes tasks instead of applying the committed migration chain.
-        -- That is why this file broke on a purely-additive column: persistTaskUpdate writes
-        -- every column it owns, and this schema is a SUBSET of production's. It is one of the
-        -- 13 hand-written-schema tests tracked in #703, and this is the second time its
-        -- fixture has blocked a feature rather than caught a bug. Fixed properly by #703;
-        -- patched minimally here so a task-management change is not gated on that conversion.
-        -- assignee_member_id (migrations/0150) is the next instance. Worth recording what it
-        -- cost, because the cost is never paid where the shortcut was taken: this fixture and
-        -- the one in tests/tasks-cross-squad-assignment.test.ts both 500'd on a purely-additive
-        -- column, in a change that has nothing to do with flights or cross-squad assignment,
-        -- and neither failure appeared until a FULL suite ran — which on a contended host is
-        -- the run most likely to be skipped.
-        CREATE TABLE tasks (
-          id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, project_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
-          done_when TEXT NOT NULL, status TEXT NOT NULL, priority TEXT, parent_task_id TEXT,
-          assignee_agent_id TEXT, assignee_member_id TEXT, github_issue_url TEXT,
-          result TEXT, completed_at TEXT, gate_owner TEXT, source_pot TEXT, external_source TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE task_verdicts (
-          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL, note TEXT,
-          decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
-        );
-        CREATE TABLE flights (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, project_id TEXT, agent TEXT NOT NULL,
-          dispatched_by_agent_id TEXT NOT NULL DEFAULT '', goal TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
-          gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
-          cost_micro_usd INTEGER NOT NULL DEFAULT 0, cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1)),
-          bookkeeping INTEGER NOT NULL DEFAULT 0 CHECK (bookkeeping IN (0,1)), next_run_at INTEGER,
-          created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
-          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}',
-        -- mupot 0267 (brief P3): purely-additive land-time columns, mirrored here for the
-        -- SAME reason as the 0150 note above (this fixture 500s on additive columns).
-          harness TEXT, model TEXT
-        );
-        -- mupot 0267 (brief P3): landGovernedFlight now derives harness/model from the
-        -- executing agent's fleet_agents row (0035 + 0097 shape, trimmed to the columns
-        -- the land path reads). Same hand-built-subset rule as the tables above.
-        CREATE TABLE fleet_agents (
-          agent_id TEXT NOT NULL, tenant TEXT NOT NULL, display TEXT NOT NULL DEFAULT '',
-          runtime TEXT NOT NULL DEFAULT '', squads TEXT NOT NULL DEFAULT '[]',
-          lifecycle TEXT NOT NULL DEFAULT '', provider_contract TEXT, model TEXT,
-          status TEXT NOT NULL DEFAULT 'unknown', reported_by TEXT NOT NULL DEFAULT '',
-          last_reported_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          PRIMARY KEY (tenant, agent_id)
-        );
-        -- flight_dispatch delivers a flight.dispatch/v1 envelope (#860), so this
-        -- lifecycle test now needs the table the send writes to. Mirrors 0032.
-        CREATE TABLE agent_messages (
-          seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-          id           TEXT NOT NULL UNIQUE,
-          tenant       TEXT NOT NULL,
-          to_agent     TEXT NOT NULL,
-          from_agent   TEXT NOT NULL,
-          from_member  TEXT NOT NULL,
-          kind         TEXT NOT NULL DEFAULT 'message',
-          body         TEXT NOT NULL,
-          request_id   TEXT,
-          in_reply_to  TEXT,
-          created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-          read_at      TEXT,
-          project_id   TEXT,
-          target_seat  TEXT,
-          attachment_id TEXT, consenting_member_id TEXT
-        );
-        CREATE TABLE agent_inbox_fences (
-          tenant TEXT NOT NULL, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
-          generation INTEGER NOT NULL DEFAULT 1, key_fingerprint TEXT,
-          updated_by_member_id TEXT NOT NULL, updated_at TEXT NOT NULL, reason TEXT NOT NULL,
-          PRIMARY KEY (tenant, agent_id)
-        );
-        CREATE TABLE flight_event_outbox (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, flight_id TEXT NOT NULL, event_type TEXT NOT NULL,
-          actor_kind TEXT NOT NULL, actor_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL,
-          delivered_at TEXT, consumed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-          attachment_id TEXT, consenting_member_id TEXT,
-          UNIQUE (tenant, flight_id, event_type)
-        );
-        -- mupot#1494 round 3 (P2-5) — task_update's reassignment guard
-        -- (hasInFlightDispatchReceipt, src/tasks/runtime-receipts.ts) queries these two
-        -- tables unconditionally on every assignee_agent_id change; this fixture never
-        -- seeds a row in either (no test here ever dispatches task-m000), so both stay
-        -- empty and the guard's own query correctly finds nothing "in flight" — but the
-        -- TABLES themselves must exist or the query throws (a real column addition to
-        -- shared production tables silently 500ing every hand-rolled fixture that never
-        -- expected to need them is exactly the failure mode
-        -- scripts/check-test-schema-source.mjs exists to catch).
-        -- migrations/0192 (mupot#1723): the in-flight dispatch check now reads settled_at;
-        -- same hand-written-subset class as above (#703).
-        CREATE TABLE task_dispatch_receipts (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, task_id TEXT NOT NULL, created_at TEXT NOT NULL,
-          settled_stage TEXT, settled_at TEXT, settled_reason TEXT
-        );
-        CREATE TABLE task_dispatch_runtime_receipts (
-          tenant TEXT NOT NULL, dispatch_receipt_id TEXT NOT NULL, stage TEXT NOT NULL
-        );
-        -- mupot#1496 Round 4 (Athena, confirmation-pass BLOCK): flight_dispatch's
-        -- meta validation (src/flight/meta.ts's validateFlightMetaReferences,
-        -- Round 3) queries tasks_archive_state via TASK_NOT_ARCHIVED_SQL
-        -- unconditionally for every task_id in the flight's meta, and this fixture
-        -- dispatches a flight with meta.task_ids set -- same "purely-additive table a
-        -- shared surface now unconditionally reads" failure as the squads.status
-        -- column above. Always empty here; no task in this fixture is archived.
-        -- mupot#1748: listFlights/listFlightsForSquad now read flight_cancel_receipts (0194)
-        -- through the shared cancelled predicate (src/flight/cancelled.ts). Same hand-written-subset
-        -- class: a purely-additive table a shared surface unconditionally reads. Always empty here.
-        CREATE TABLE flight_cancel_receipts (tenant TEXT NOT NULL, flight_id TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE tasks_archive_state (
-          task_id TEXT PRIMARY KEY, archived_at TEXT NOT NULL, archived_reason TEXT NOT NULL,
-          archived_by_member_id TEXT NOT NULL, prior_status TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-
-        INSERT INTO departments VALUES ('dept-home', 'home', 'Home');
-        INSERT INTO departments VALUES ('dept-other', 'other', 'Other');
+        INSERT INTO departments (id, slug, name) VALUES ('dept-home', 'home', 'Home');
+        INSERT INTO departments (id, slug, name) VALUES ('dept-other', 'other', 'Other');
         INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', 'dept-home', 'mmhq', 'Mumega HQ');
         INSERT INTO squads (id, department_id, slug, name) VALUES ('${OTHER_SQUAD_ID}', 'dept-other', 'other', 'Other');
         INSERT INTO agents (id, squad_id, slug, name) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'product', 'Product');
@@ -1461,8 +1283,11 @@ Artifact: /tmp/fixture-marker.txt
 SHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88',
            NULL, NULL,
            '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
+        -- mupot#1590 P1-3 witness: the executing agent's fleet row, so a landed flight can
+        -- name harness + model at the MCP layer (flight_get / flight_list).
+        INSERT INTO fleet_agents (agent_id, tenant, display, runtime, model, status)
+        VALUES ('${AGENT_ID}', '${TENANT}', 'Product', 'codex-cloud', 'gpt-5.4', 'running');
       `)
-      harness.sqlite.exec(readFileSync(new URL('../migrations/0137_agent_message_integrity.sql', import.meta.url), 'utf8'))
       const env = {
         TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0',
         DB: harness.db,
@@ -1544,6 +1369,20 @@ SHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88',
       })
       expect(landed).toMatchObject({ ok: true, result: { flight: { id: flightId, status: 'landed' } } })
       expect(events).toContainEqual(expect.objectContaining({ type: 'flight.landed', agent_id: AGENT_ID }))
+
+      // mupot#1590 P1-3: the landed flight NAMES what executed at the MCP layer —
+      // flight_get and flight_list both render the server-derived harness/model.
+      const readLabels = await authenticatedTool(env, 'flight_get', { flight_id: flightId })
+      expect(readLabels).toMatchObject({
+        ok: true,
+        result: { flight: { id: flightId, harness: 'codex-cloud', model: 'gpt-5.4' } },
+      })
+      const listed = await authenticatedTool(env, 'flight_list', { squad_id: OTHER_SQUAD_ID, limit: 20 })
+      expect(listed).toMatchObject({ ok: true })
+      const listedFlight = (listed.result.flights as Array<{ id: string; harness: string; model: string }>)
+        .find((entry) => entry.id === flightId)
+      expect(listedFlight).toBeDefined()
+      expect(listedFlight).toMatchObject({ harness: 'codex-cloud', model: 'gpt-5.4' })
     } finally {
       harness.close()
     }

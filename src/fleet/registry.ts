@@ -665,6 +665,8 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 export interface FleetAgentRowIdentity {
   agent_id: string
   runtime: string | null
+  /** Runtime-reported model, iff the reporter supplied one (0097 added the column). */
+  model?: string | null
   status: string | null
   last_reported_at: string | null
   /** '' (legacy rows, migration default) | 'poll' | 'resident'. See "Poll-mode presence" above. */
@@ -749,7 +751,7 @@ export async function readFleetAgentRow(
 
   // 1. Exact id match — unambiguous (fleet_agents PK is (tenant, agent_id)), always wins.
   const byId = await env.DB.prepare(
-    `SELECT agent_id, runtime, status, last_reported_at, presence_mode, presence_ttl_sec
+    `SELECT agent_id, runtime, model, status, last_reported_at, presence_mode, presence_ttl_sec
        FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, agentId)
@@ -772,7 +774,7 @@ export async function readFleetAgentRow(
   if (Number(dupes?.n ?? 0) !== 1) return null // 0 means an ID collision; >1 means an ambiguous slug.
 
   return await env.DB.prepare(
-    `SELECT agent_id, runtime, status, last_reported_at, presence_mode, presence_ttl_sec
+    `SELECT agent_id, runtime, model, status, last_reported_at, presence_mode, presence_ttl_sec
        FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, self.slug)
