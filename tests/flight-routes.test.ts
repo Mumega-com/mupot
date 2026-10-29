@@ -522,4 +522,26 @@ describe('REST governed flight landing parity', () => {
     expect(event.claimed_harness).toBe('claude-code-fake')
     expect(event.claimed_model).toBe('opus-9-imaginary')
   })
+
+  // mupot#1590 gate-2270-b M15: claims are sanitised on intake — dirty caller input
+  // (control chars, over-long) can never ride the receipt raw.
+  it('#1590 sanitises dirty harness/model claims before they land on the receipt', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await land(env, {
+      cost_micro_usd: 0,
+      harness: `${'a'.repeat(70)}\u0007x\u202e\u200b`,
+      model: `${'m'.repeat(140)}\u0007bad`,
+    })
+    expect(response.status).toBe(200)
+    expect(flight.status).toBe('landed')
+
+    const receipt = (env as unknown as { DB: { prepare: (sql: string) => unknown } }).DB
+      .prepare('SELECT payload FROM flight_event_outbox')
+    const payload = await (receipt as {
+      bind: (args: unknown[]) => { first: <T>() => Promise<T | null> }
+    }).bind(['flight-m000', 'test']).first<{ payload: string }>()
+    const event = JSON.parse(payload!.payload) as { claimed_harness?: unknown; claimed_model?: unknown }
+    expect(event.claimed_harness).toBe('a'.repeat(64))
+    expect(event.claimed_model).toBe('m'.repeat(128))
+  })
 })

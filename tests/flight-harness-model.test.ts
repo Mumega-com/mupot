@@ -11,7 +11,10 @@
 //      says 'unknown' — never blank, never invented.
 import { describe, expect, it } from 'vitest'
 
-import { flightHarnessDisplay, landGovernedFlight, loadFlightHarness } from '../src/flight/service'
+import {
+  flightHarnessDisplay, landGovernedFlight, loadFlightHarness,
+  sanitizeBoundedFlightText, FLIGHT_MODEL_MAX_LEN,
+} from '../src/flight/service'
 import { systemLandParkedFlight } from '../src/flight/watchdog'
 import type { FlightRow } from '../src/flight/service'
 import { parseFlightMetaV1 } from '../src/flight/meta'
@@ -57,8 +60,10 @@ function fixture(agent = 'agent-1') {
   return { harnessDb, env }
 }
 
-function insertFleetRow(env: Env, agent: string, runtime: string, model: string | null) {
-  env.DB.prepare(
+async function insertFleetRow(env: Env, agent: string, runtime: string, model: string | null) {
+  // mupot#1590 gate round 2: EVERY .run() off the async D1 wrapper is awaited — an
+  // unawaited run() escapes as an unhandled rejection (gate-2270-a/b: vitest exit 1).
+  await env.DB.prepare(
     `INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
      VALUES (?1, ?2, ?3, ?4, 'running')`,
   ).bind(agent, TENANT, runtime, model).run()
@@ -94,7 +99,7 @@ const LAND_OPTS_BASE = {
 describe('P3: a landed flight names harness and model (server-derived)', () => {
   it('stores harness+model from the executing agent fleet row and writes both to the landing receipt', async () => {
     const { env } = fixture()
-    insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
 
     const result = await landGovernedFlight(env, FLIGHT, { ...LAND_OPTS_BASE, cost_micro_usd: 4200 })
     expect(result).toEqual({ transitioned: true, receipt: true })
@@ -114,7 +119,7 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
 
   it('ignores a caller-supplied harness/model: server values win, caller values ride only as claimed_* in the receipt', async () => {
     const { env } = fixture()
-    insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
 
     const result = await landGovernedFlight(env, FLIGHT, {
       ...LAND_OPTS_BASE,
@@ -140,7 +145,7 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
     // mupot#1590 P1-2: the control char must sit INSIDE the first 64 chars, so stripping is
     // load-bearing for the assertion — at index 95 the 64-cut would delete it anyway and stay green.
     const oddHarness = `e\u0007xotic-runtime-${'x'.repeat(60)}-${'pad'.repeat(12)} trailing`
-    insertFleetRow(env, 'agent-1', oddHarness, 'weird-model-1')
+    await insertFleetRow(env, 'agent-1', oddHarness, 'weird-model-1')
 
     const result = await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)
     expect(result).toEqual({ transitioned: true, receipt: true })
@@ -158,7 +163,7 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
     const { env } = fixture()
     // Only C0/DEL stripping would leave every one of these embedded characters in the row.
     const dirty = 'cod\u0085ex\u202e-hidden\u200b\u2028x'
-    insertFleetRow(env, 'agent-1', dirty, 'model\u200e-1')
+    await insertFleetRow(env, 'agent-1', dirty, 'model\u200e-1')
 
     const result = await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)
     expect(result).toEqual({ transitioned: true, receipt: true })
@@ -169,39 +174,58 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
     expect(row?.model).toBe('model-1')
   })
 
-  it('P1 (mupot#1590): model is bounded at 128 like fleet_agents.model and never leaves a lone surrogate at the cut', async () => {
+  it('P1 (mupot#1590): the model bound is exactly 128 — a longer model stores precisely its first 128 chars', async () => {
     const { env } = fixture()
-    // 128 'm' then a high surrogate would end up the 128th char if the pair split there.
-    insertFleetRow(env, 'agent-1', 'codex-cloud', `${'m'.repeat(128)}\ud83d\ude00tail`)
+    // M4 (gate-2270): the bound back at 64 must NOT survive — assert exact equality.
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', 'm'.repeat(140))
 
     const result = await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)
     expect(result).toEqual({ transitioned: true, receipt: true })
 
     const row = await landedRow(env)
-    expect(row?.model).toBeTruthy()
-    expect(row!.model!.length).toBeLessThanOrEqual(128)
-    const last = row!.model!.charCodeAt(row!.model!.length - 1)
-    expect(last < 0xd800 || last > 0xdbff).toBe(true)
+    expect(row?.model).toBe('m'.repeat(128))
+    // Direct on the loader too — no sqlite round-trip can mask a weak cut.
+    expect((await loadFlightHarness(env, 'agent-1')).model).toBe('m'.repeat(128))
   })
 
-  it('P1 (mupot#1590): harness cut at 64 never ends mid surrogate pair', async () => {
+  it('P1 (mupot#1590): a pair that ends exactly at the 128 cut survives whole — assert on the returned value', async () => {
     const { env } = fixture()
-    insertFleetRow(env, 'agent-1', `a${'\ud83d\ude00'.repeat(40)}`, 'model-1')
+    // The pair occupies units 126-127 (0-based): the 128-cut lands exactly after it.
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', `${'x'.repeat(126)}\ud83d\ude00zzzzz`)
 
     const result = await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)
     expect(result).toEqual({ transitioned: true, receipt: true })
 
     const row = await landedRow(env)
-    expect(row!.harness!.length).toBeLessThanOrEqual(64)
-    const last = row!.harness!.charCodeAt(row!.harness!.length - 1)
-    expect(last < 0xd800 || last > 0xdbff).toBe(true)
+    expect(row?.model).toBe(`${'x'.repeat(126)}\ud83d\ude00`)
+    expect(row!.model!.length).toBe(128)
+  })
+
+  it('P1 (mupot#1590): the lone-surrogate guard is witnessed on RETURN values, not a sqlite round-trip', async () => {
+    // M3 (gate-2270-b): node:sqlite maps a stored lone high surrogate to U+FFFD, so a
+    // read-back assertion passes either way. Assert on what the sanitizer/loader RETURN.
+    const { env } = fixture()
+    // The pair straddles the cut: unit 127 is the HIGH surrogate, 128 the low one.
+    const splitModel = `${'y'.repeat(127)}\ud83d\ude00tail`
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', splitModel)
+
+    const identity = await loadFlightHarness(env, 'agent-1')
+    expect(identity.model).toBe('y'.repeat(127))
+    expect(identity.model!.length).toBe(127)
+    const lastChar = identity.model!.charCodeAt(identity.model!.length - 1)
+    expect(lastChar < 0xd800 || lastChar > 0xdbff).toBe(true)
+
+    const directHarness = sanitizeBoundedFlightText(`${'a'.repeat(127)}\ud83d\ude00tail`, 128)
+    expect(directHarness).toBe('a'.repeat(127))
+    const directModel = sanitizeBoundedFlightText(`${'b'.repeat(127)}\ud83d\ude00tail`, FLIGHT_MODEL_MAX_LEN)
+    expect(directModel).toBe('b'.repeat(127))
   })
 
   it('P2 provenance (Codex, mupot#1590): a slug-keyed fleet row is found through readFleetAgentRow, not lost as unknown', async () => {
     const { env } = fixture('agent-slug-id')
     // The daemon reported the agent BY ITS SLUG: a fleet row keyed on the slug, no id-keyed row.
     env.DB.prepare(`UPDATE agents SET slug = 'walker-slug' WHERE id = ?1`).bind('agent-slug-id').run()
-    insertFleetRow(env, 'walker-slug', 'herdr-probe', 'glm-1')
+    await insertFleetRow(env, 'walker-slug', 'herdr-probe', 'glm-1')
 
     const identity = await loadFlightHarness(env, 'agent-slug-id')
     expect(identity.harness).toBe('herdr-probe')
@@ -211,13 +235,16 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
   it('P2 (mupot#1590): an ambiguous slug resolves to nothing — refused to guess, never leaks the slug row', async () => {
     // Two agents tenant-wide carry the same slug and a daemon keyed the fleet row by that
     // slug. The exact-id branch finds no row; the slug fallback must refuse (>1 matches)
-    // rather than silently read the other agent's harness. Today's naive id-only lookup
-    // returns null too — this pins the ambiguity REFUSAL of the fallback access path.
+    // rather than silently read the other agent's harness.
+    // gate-2270 a/b: agent-a2 sits in a SECOND squad (agents.slug is UNIQUE per squad),
+    // and every .run() is awaited — the unawaited UNIQUE-violation was CI red round 1.
     const { env } = fixture('agent-a1')
-    env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status)
-      VALUES ('agent-a2', 'squad-core', 'shared-slug', 'Agent Two', 'operator', 'test', 'active')`).run()
-    env.DB.prepare(`UPDATE agents SET slug = 'shared-slug' WHERE id = 'agent-a1'`).run()
-    env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
+    await env.DB.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-b', 'dept-b', 'Dept B')`).run()
+    await env.DB.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', 'dept-b', 'squad-b', 'Squad B')`).run()
+    await env.DB.prepare(`UPDATE agents SET slug = 'shared-slug' WHERE id = 'agent-a1'`).run()
+    await env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('agent-a2', 'squad-b', 'shared-slug', 'Agent Two', 'operator', 'test', 'active')`).run()
+    await env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
       VALUES ('shared-slug', 'mumega', 'leak-probe-runtime', 'leak-probe-model', 'running')`).run()
 
     const identity = await loadFlightHarness(env, 'agent-a1')
@@ -227,15 +254,17 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
 
   it('P1 (mupot#1590): the fleet lookup filters by tenant AND agent — no neighbouring row can supply identity', async () => {
     const { env } = fixture('agent-1')
-    // Wrong-tenant row for the SAME agent id: fleet PK is (tenant, agent_id) — must not be read.
-    env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
-      VALUES ('agent-1', 'other-tenant', 'wrong-tenant-runtime', 'wrong-tenant-model', 'running')`).run()
-    // Right tenant, wrong agent: also must not be read.
-    env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status)
-      VALUES ('agent-wrong', 'squad-core', 'agent-wrong', 'Wrong', 'operator', 'test', 'active')`).run()
-    env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
-      VALUES ('agent-wrong', 'mumega', 'wrong-agent-runtime', 'wrong-agent-model', 'running')`).run()
-    insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
+    // gate-2270-a P2: the neighbours must resist whatever row the PK index reaches first,
+    // so they are named to sort BEFORE the right row ('aaa-' tenant, 'agent-0wrong' id).
+    // Dropping either filter then returns a neighbour first and fails loudly, independent
+    // of insertion order.
+    await env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
+      VALUES ('agent-1', 'aaa-wrong-tenant', 'wrong-tenant-runtime', 'wrong-tenant-model', 'running')`).run()
+    await env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+      VALUES ('agent-0wrong', 'squad-core', 'agent-0wrong', 'Wrong', 'operator', 'test', 'active')`).run()
+    await env.DB.prepare(`INSERT INTO fleet_agents (agent_id, tenant, runtime, model, status)
+      VALUES ('agent-0wrong', 'mumega', 'wrong-agent-runtime', 'wrong-agent-model', 'running')`).run()
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
 
     const result = await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)
     expect(result).toEqual({ transitioned: true, receipt: true })
@@ -268,7 +297,7 @@ SHA256: ${'1'.repeat(64)}'
 
     // Park again and add a fleet row: the SAME path now writes both.
     db.sqlite.exec(`UPDATE flights SET status='waiting', harness=NULL, model=NULL WHERE id='${FLIGHT}'`)
-    insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
+    await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')
     const relanded = await systemLandParkedFlight(env, (await rawFlightRow(env, FLIGHT)) as FlightRow, Date.now())
     expect(relanded).toMatchObject({ landed: true })
     row = await landedRow(env)

@@ -913,6 +913,26 @@ describe('MCP flight tools', () => {
     expect((out.result as { flight: FlightRow & { meta: typeof meta } }).flight.meta).toEqual(meta)
   })
 
+  // mupot#1590 gate-2270-b M12: an agent (or flight) with NO fleet row must read back as
+  // 'unknown' at the MCP layer — never a raw NULL/undefined field dropped by the seam.
+  it('renders in-air flights without a fleet row as unknown at the MCP layer, not raw NULL', async () => {
+    const { env } = makeEnv()
+    const dispatched = await invokeTool(auth(), env, 'flight_dispatch', {
+      squad_id: SQUAD_ID,
+      goal: 'no-fleet-row probe',
+      meta_json: JSON.stringify(meta),
+      signals_json: JSON.stringify(signals),
+    }, 'https://pot.example')
+    expect(dispatched).toMatchObject({ ok: true })
+    const flightId = (dispatched.result.flight as FlightRow).id
+
+    const read = await invokeTool(auth(), env, 'flight_get', { flight_id: flightId }, 'https://pot.example')
+    expect(read).toMatchObject({
+      ok: true,
+      result: { flight: { id: flightId, harness: 'unknown', model: 'unknown' } },
+    })
+  })
+
   it('lands the bound agent own flight after every referenced task is done', async () => {
     const { env, tasks, verdicts, events } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
