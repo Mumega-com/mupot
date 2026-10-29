@@ -4698,9 +4698,18 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "identity_only_invite_target_immutable" },
     ],
   },
+  {
+    file: "0267_flight_harness_model.sql",
+    sha256: "8f546e989b7e8287764fdc7322df450f93daac9ea56447d551254de13e1a3906",
+    statements: [
+      "-- 0267_flight_harness_model.sql — a landed flight names the harness and model that flew it.\n--\n-- Brief P3 (v0.33 \"Proof in\", criterion 2, Hadi 2026-10-29): the flights table records\n-- who flew and what it cost, but never WHAT harness/model executed, so a landed receipt\n-- cannot prove criterion 2 (\"10 agents across 3 harnesses on flights\").\n--\n-- Source of truth is SERVER-DERIVED: the land path reads the executing agent's\n-- fleet_agents row (runtime -> harness, model) and writes it here. A caller-supplied\n-- value may CLAIM but never override (see src/flight/service.ts landGovernedFlight).\n-- NULL means \"no fleet row existed at land time\" — the honest value, rendered 'unknown'\n-- at the read seam, never fabricated. Additive only; no backfill (out of scope).\nALTER TABLE flights ADD COLUMN harness TEXT;",
+      "\nALTER TABLE flights ADD COLUMN model TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0e495e54542f8738c65985fa45994480a8159a452318a1b4cf4379d2ba4fae27"
+export const SCHEMA_CHAIN_DIGEST: string = "58577f5369c1581e1ba7276059338cb0ddb8f0c9b92390a76c1eeee00c256a5d"

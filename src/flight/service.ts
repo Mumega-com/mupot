@@ -68,6 +68,14 @@ export interface FlightRow {
   cancelled: number | undefined
   /** 1 when the cancel receipt records routine_outcome='unconfirmed' (#1756): closed, but the effect was not fenced. */
   cancel_unconfirmed?: number
+  // Brief P3 (0267): WHAT harness/model executed, captured at LAND time from the executing
+  // agent's fleet_agents row — server-derived, never caller-supplied. NULL = no fleet row
+  // existed at land (the read seam renders 'unknown', see flightHarnessDisplay). Hand-built
+  // rows and pre-landing rows omit both.
+  /** Server-derived harness (fleet runtime) that landed this flight; NULL when unknown. */
+  harness?: string | null
+  /** Server-derived model (fleet_agents.model) that landed this flight; NULL when unknown. */
+  model?: string | null
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null
@@ -640,6 +648,49 @@ function parseReceiptRefs(raw: string | null | undefined): string[] {
   }
 }
 
+// ── Brief P3 (0267): harness/model capture at land ──────────────────────────
+// Source of truth is SERVER-DERIVED from the executing agent's fleet_agents row
+// (fleet runtime -> harness, fleet model). A caller-supplied value is describe-only:
+// it may ride the landing receipt as claimed_*, but the stored columns always come
+// from the fleet row. Every stored string is a BOUNDED string: max 64 chars, control
+// characters stripped (fleet rows are runtime-reported, not canonical authority).
+
+export const FLIGHT_HARNESS_MAX_LEN = 64
+
+/** max 64 chars, no control chars; empty after sanitising -> null. Never fabricated. */
+export function sanitizeBoundedFlightText(raw: unknown, maxLength = FLIGHT_HARNESS_MAX_LEN): string | null {
+  if (typeof raw !== 'string') return null
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLength)
+  return cleaned.length > 0 ? cleaned : null
+}
+
+/** The server-side harness/model identity of the executing agent at land time. */
+export async function loadFlightHarness(
+  env: Env,
+  agentId: string,
+): Promise<{ harness: string | null; model: string | null }> {
+  if (!agentId) return { harness: null, model: null }
+  const row = await env.DB.prepare(
+    `SELECT runtime, model FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`,
+  ).bind(env.TENANT_SLUG, agentId)
+    .first<{ runtime: string | null; model: string | null }>()
+  if (!row) return { harness: null, model: null }
+  return { harness: sanitizeBoundedFlightText(row.runtime), model: sanitizeBoundedFlightText(row.model) }
+}
+
+/**
+ * The read seam for a person: a NULL/unreported harness or model is rendered
+ * 'unknown', never blank — a blank field reads as "nobody checked", which is
+ * exactly the lie this column pair exists to stop. Receipts keep the raw NULL
+ * (the row's honest value); this labels it for humans.
+ */
+export function flightHarnessDisplay(row: {
+  harness?: string | null
+  model?: string | null
+} | null | undefined): { harness: string; model: string } {
+  return { harness: row?.harness ?? 'unknown', model: row?.model ?? 'unknown' }
+}
+
 export async function landGovernedFlight(
   env: Env,
   id: string,
@@ -654,11 +705,20 @@ export async function landGovernedFlight(
     actor: { kind: 'member' | 'agent'; id: string }
     /** mupot#2006: the attached thread's attribution (from auth only); omitted/null = NULL columns. */
     attribution?: { attachmentId: string; consentingMemberId: string } | null
+    // Brief P3 (0267): DESCRIBE-ONLY claims of what executed. Accepted and sanitised, then
+    // recorded on the landing receipt as claimed_harness/claimed_model — they NEVER
+    // override the stored columns, which are always derived from the executing agent's
+    // fleet_agents row (loadFlightHarness below). Authority stays server-derived.
+    claimed_harness?: unknown
+    claimed_model?: unknown
   },
 ): Promise<GovernedLandingResult> {
   const endedAt = Date.now()
   const createdAt = new Date(endedAt).toISOString()
   const eventId = crypto.randomUUID()
+  // SERVER-DERIVED identity (brief P3, 0267): what the fleet registry says executed —
+  // not what the caller claims. NULL = no fleet row at land time (never fabricated).
+  const harnessIdentity = await loadFlightHarness(env, opts.agent_id)
   const payload = JSON.stringify({
     outbox_id: eventId,
     flight_id: id,
@@ -722,13 +782,14 @@ export async function landGovernedFlight(
             -- non-zero landing cost still wins.
             cost_micro_usd = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN cost_micro_usd ELSE ?4 END,
             cost_metered = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN 1 ELSE ?7 END,
-            score=COALESCE(?5, score), ended_at=?6
+            score=COALESCE(?5, score), ended_at=?6,
+            harness=?8, model=?9
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')
        AND ${governedLandEligibilitySql('flights', '(?7 = 0 OR ?4 <= flights.budget_micro_usd)')}${evidenceExtraSql}
        ${routineWitnessSql}
-     RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd, json_extract(meta, '$.receipt_refs') AS receipt_refs`,
+     RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd, harness, model, json_extract(meta, '$.receipt_refs') AS receipt_refs`,
   )
     .bind(
       id,
@@ -738,6 +799,8 @@ export async function landGovernedFlight(
       opts.score ?? null,
       endedAt,
       opts.cost_metered === false ? 0 : 1,
+      harnessIdentity.harness,
+      harnessIdentity.model,
     )
   // SEQUENTIAL, NOT BATCHED (#916). The previous version put the transition and this
   // INSERT in one env.DB.batch(), and the INSERT read back the row the transition had
@@ -793,6 +856,7 @@ export async function landGovernedFlight(
   const transitionResult = await transition.all<{
     score: number | null; cost_micro_usd: number; cost_metered: number; budget_micro_usd: number | null
     receipt_refs: string | null
+    harness: string | null; model: string | null
   }>()
   const landedRows = transitionResult.results ?? []
   if (landedRows.length !== 1) return { transitioned: false, receipt: false }
@@ -814,11 +878,22 @@ export async function landGovernedFlight(
   const storedMetered = landedRow ? landedRow.cost_metered === 1 : opts.cost_metered !== false
   const storedCost = landedRow?.cost_micro_usd ?? opts.cost_micro_usd
   const storedBudget = landedRow?.budget_micro_usd ?? null
+  // Brief P3 (0267): the receipt carries the SERVER-DERIVED harness/model the row now
+  // holds (NULL stays NULL — the row's honest value), plus the caller's describe-only
+  // claim (sanitised bounded string) under claimed_* so the audit can see both.
+  const claimedKeys: Record<string, unknown> = {}
+  const claimedHarness = sanitizeBoundedFlightText(opts.claimed_harness)
+  const claimedModel = sanitizeBoundedFlightText(opts.claimed_model)
+  if (claimedHarness !== null) claimedKeys.claimed_harness = claimedHarness
+  if (claimedModel !== null) claimedKeys.claimed_model = claimedModel
   const receiptPayload = JSON.stringify({
     ...JSON.parse(payload) as Record<string, unknown>,
     score: landedRow?.score ?? opts.score ?? null,
     cost_micro_usd: storedMetered ? storedCost : null,
     cost_metered: storedMetered,
+    harness: landedRow?.harness ?? harnessIdentity.harness,
+    model: landedRow?.model ?? harnessIdentity.model,
+    ...claimedKeys,
     // #2025: the evidence the landing rested on (task-result-submission:<id> per task), as stored on the row.
     receipt_refs: parseReceiptRefs(landedRow?.receipt_refs),
     budget_compliance: !storedMetered

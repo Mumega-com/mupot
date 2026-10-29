@@ -31,6 +31,7 @@ import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { FlightRow, FlightStatus } from './service'
 import {
   getFlight, governedLandEligibilitySql, landEvidenceEligibleSql, landEvidenceEnabled, landReceiptRefsSetSql,
+  loadFlightHarness,
 } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
 import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
@@ -1047,10 +1048,15 @@ export async function systemLandParkedFlight(env: Env, flight: FlightRow, nowMs:
   const evidenceGuardSql = evidenceRequired ? ` AND ${landEvidenceEligibleSql('flights')}` : ''
   const receiptRefsSql = evidenceRequired ? landReceiptRefsSetSql('flights') : ''
 
+  // Brief P3 (0267): the system land is a landing like any other — name the harness/model
+  // from the executing agent's fleet row, same server-derived rule as landGovernedFlight.
+  const harnessIdentity = await loadFlightHarness(env, flight.agent)
+
   const [landed] = await env.DB.batch([
     env.DB.prepare(
       `UPDATE flights
-          SET ${receiptRefsSql} status = 'landed', score = NULL, gate_reason = 'watchdog_system_land', ended_at = ?3
+          SET ${receiptRefsSql} status = 'landed', score = NULL, gate_reason = 'watchdog_system_land', ended_at = ?3,
+              harness = ?4, model = ?5
         WHERE id = ?1 AND tenant = ?2
           AND status = 'waiting'${evidenceGuardSql}
           AND budget_micro_usd IS NOT NULL AND cost_micro_usd <= budget_micro_usd
@@ -1066,7 +1072,7 @@ export async function systemLandParkedFlight(env: Env, flight: FlightRow, nowMs:
             SELECT 1 FROM routine_runs rr WHERE rr.flight_id = flights.id AND rr.tenant = flights.tenant
           )
         RETURNING id`,
-    ).bind(flight.id, env.TENANT_SLUG, nowMs),
+    ).bind(flight.id, env.TENANT_SLUG, nowMs, harnessIdentity.harness, harnessIdentity.model),
     env.DB.prepare(
       `INSERT INTO flight_status_transitions
          (id, tenant, flight_id, from_status, to_status, cause, created_at)

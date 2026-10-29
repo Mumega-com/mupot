@@ -437,6 +437,10 @@ flightsApp.post('/:id/land', async (c) => {
       agent_id: existing.agent,
       meta: governedMeta,
       actor: { kind: 'member', id: auth.id.memberId },
+      // Brief P3 (0267): describe-only claims — landGovernedFlight records them on the
+      // landing receipt as claimed_*, never lets them override the derived columns.
+      ...(b.harness !== undefined ? { claimed_harness: b.harness } : {}),
+      ...(b.model !== undefined ? { claimed_model: b.model } : {}),
     })
     // See the note in src/mcp/index.ts — a missing receipt is not a failed landing (#916).
     if (!landing.transitioned) {
