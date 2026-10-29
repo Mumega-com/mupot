@@ -40,7 +40,8 @@ const PUBKEY_B64URL_RE = /^[A-Za-z0-9_-]{40,64}$/ // Ed25519 pub = 32 bytes → 
 
 /** The exact bytes both sides sign/verify. Fixed field order, newline-joined, with the
  *  domain tag first and the tenant bound in. The host signer MUST produce byte-identical
- *  output (see agents/fleet-control/attach-signed.mjs).
+ *  output (see fleet-runtime/fleet-sign.mjs). When model is present, append
+ *  newline + "model" + newline + JSON.stringify(raw model); omission keeps legacy bytes.
  *
  *  lifecycle is INCLUDED in the signed bytes (gate fix): every field written to the
  *  fleet_agents row under this signature must be covered by it, so an in-flight request
@@ -53,9 +54,13 @@ export function canonicalAttachMessage(p: {
   lifecycle: string
   ts: number
   nonce: string
+  model?: string
 }): Uint8Array {
-  const s = [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, p.lifecycle, String(p.ts), p.nonce].join('\n')
-  return new TextEncoder().encode(s)
+  const fields = [SIG_DOMAIN, p.tenant, p.agent_id, p.type, p.runtime, p.lifecycle, String(p.ts), p.nonce]
+  // Preserve legacy bytes on omission. Tag + JSON string cover presence and the RAW
+  // value unambiguously, including embedded newlines; clean only after verification.
+  if (p.model !== undefined) fields.push('model', JSON.stringify(p.model))
+  return new TextEncoder().encode(fields.join('\n'))
 }
 
 // ── base64url ─────────────────────────────────────────────────────────────────────
@@ -98,6 +103,7 @@ export type SignedAttachOk = {
   runtime: string
   lifecycle: string
   member_id: string
+  model?: string
 }
 export type SignedAttachErr = {
   ok: false
@@ -140,6 +146,13 @@ export async function verifySignedAttach(
     return { ok: false, status: 400, error: 'bad_request', detail: 'runtime: a non-empty string (<=256 chars) is required' }
   }
   const runtime = body.runtime
+
+  // Optional reported metadata. The route's 8 KB body cap bounds the raw signed input;
+  // the caller truncates/cleans to MAX_REPORTED_MODEL only after signature verification.
+  if (body.model !== undefined && typeof body.model !== 'string') {
+    return { ok: false, status: 400, error: 'bad_request', detail: 'model: must be a string' }
+  }
+  const model = body.model as string | undefined
 
   // lifecycle MUST be present and signed (gate fix — no unsigned field reaches the upsert).
   // The host signer always includes it (defaulting to on_demand) so it is part of the bytes.
@@ -188,7 +201,7 @@ export async function verifySignedAttach(
   }
 
   // 4. Verify the signature over the canonical, tenant-bound message.
-  const msg = canonicalAttachMessage({ tenant, agent_id: agentId, type, runtime, lifecycle, ts, nonce })
+  const msg = canonicalAttachMessage({ tenant, agent_id: agentId, type, runtime, lifecycle, ts, nonce, model })
   let verified = false
   try {
     verified = await crypto.subtle.verify({ name: 'Ed25519' }, pubKey, sigBytes, msg)
@@ -220,5 +233,5 @@ export async function verifySignedAttach(
     return { ok: false, status: 409, error: 'replay', detail: 'nonce already used' }
   }
 
-  return { ok: true, agent_id: agentId, type, runtime, lifecycle, member_id: keyRow.member_id }
+  return { ok: true, agent_id: agentId, type, runtime, lifecycle, member_id: keyRow.member_id, model }
 }

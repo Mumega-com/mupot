@@ -3,6 +3,7 @@
 //
 //   node attach-signed.mjs <base_url> <agent_id> --tenant SLUG [--type T] [--runtime R] [--lifecycle L]
 //   (tenant may also come from the FLEET_TENANT env var)
+//   FLEET_ATTACH_MODEL optionally reports this runtime's model (omitted when unset/empty).
 //
 // Reads the host-held Ed25519 private key from ~/.fleet/agents/<agent_id>.key (0600), signs a
 // tenant-bound, time-boxed, single-use message, and POSTs it to /api/fleet/attach-signed. The
@@ -36,6 +37,7 @@ const res = await signedAttach(baseUrl, agentId, {
   tenant,
   lifecycle: arg('--lifecycle', 'on_demand'),
   host: hostname(),
+  ...(process.env.FLEET_ATTACH_MODEL ? { model: process.env.FLEET_ATTACH_MODEL } : {}),
 }).catch((e) => {
   console.error(String(e && e.message ? e.message : e))
   process.exit(3)
