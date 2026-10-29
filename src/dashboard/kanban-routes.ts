@@ -16,8 +16,6 @@ import { readableProjectIdSet, redactUnreadableProjectNames } from '../projects/
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { measureBoardRead } from '../telemetry/route-latency'
-import { waitUntilFromContext } from '../agents/webhook-doorbell'
 
 export const kanbanApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -298,28 +296,13 @@ export async function loadKanbanData(
 // ── API Route ───────────────────────────────────────────────────────────────
 
 kanbanApp.get('/api/kanban/board', requireAuth, async (c) => {
-  try {
-    const run = async () => {
-      const squad = c.req.query('squad') || c.req.query('squad_id')
-      const project = c.req.query('project') || c.req.query('project_id')
-      const view = c.req.query('view')
-
-      const data = await loadKanbanData(c.env, c.get('auth'), {
-        squadIdOrSlug: squad,
-        projectIdOrSlug: project,
-        view,
-      })
-
-      return c.json({ ok: true, ...data })
-    }
-    // Hono also routes HEAD through GET handlers; keep that outside this GET metric.
-    return c.req.method === 'GET' ? await measureBoardRead(c.env, run, waitUntilFromContext(c)) : await run()
-  } catch (error) {
-    if (error instanceof Error && error.message === 'route_latency_unavailable') {
-      return c.json({ error: 'route_latency_unavailable' }, 503)
-    }
-    throw error
-  }
+  const squad = c.req.query('squad') || c.req.query('squad_id')
+  const project = c.req.query('project') || c.req.query('project_id')
+  const view = c.req.query('view')
+  const data = await loadKanbanData(c.env, c.get('auth'), {
+    squadIdOrSlug: squad, projectIdOrSlug: project, view,
+  })
+  return c.json({ ok: true, ...data })
 })
 
 // ── HTML Views ──────────────────────────────────────────────────────────────

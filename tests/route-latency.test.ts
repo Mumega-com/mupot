@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
+import { latencyKv } from './helpers/latency-kv'
 import {
   BOARD_LATENCY_ROUTE, MAX_LATENCY_SAMPLES, RETENTION_MS, percentile,
   countRouteRequest, saveRouteSample, readRouteLatency, pruneRouteLatency, measureBoardRead,
@@ -15,7 +16,7 @@ let env: Env
 beforeEach(() => {
   h = createSqliteD1()
   applyAllMigrations(h.sqlite)
-  env = { DB: h.db, TENANT_SLUG: 'latency-test' } as unknown as Env
+  env = { DB: h.db, TENANT_SLUG: 'latency-test', SESSIONS: latencyKv().kv } as unknown as Env
 })
 afterEach(() => h.close())
 
@@ -106,11 +107,15 @@ describe('route latency retention: real migration chain', () => {
       SELECT CAST(x AS TEXT), ?, ?, ?, x FROM n`).run(MAX_LATENCY_SAMPLES, env.TENANT_SLUG, BOARD_LATENCY_ROUTE, OBSERVED)
     h.sqlite.prepare(`UPDATE route_latency_requests SET total_requests=? WHERE tenant=?`).run(MAX_LATENCY_SAMPLES + 1, env.TENANT_SLUG)
     await saveRouteSample(env, BOARD_LATENCY_ROUTE, 99, OBSERVED + 1, NOW)
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM route_latency_samples').get()?.n).toBe(20_001)
+    expect(await readRouteLatency(env, 7, NOW)).toMatchObject({ n: 20_000, total_requests: 20_001, status: 'partial' })
+    await pruneRouteLatency(env, NOW)
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM route_latency_samples').get()?.n).toBe(20_000)
     expect(await readRouteLatency(env, 7, NOW)).toMatchObject({ n: MAX_LATENCY_SAMPLES, total_requests: MAX_LATENCY_SAMPLES + 1, status: 'partial' })
   })
 
   it('accepts only the fixed route label and never stores URL/query/auth material', async () => {
-    for (const route of ["GET /api/kanban/board'; DROP TABLE tasks;--", 'GET /api/kanban/board?token=private', 'other']) {
+    for (const route of ["GET /dashboard/kanban'; DROP TABLE tasks;--", 'GET /dashboard/kanban?token=private', 'other']) {
       await expect(countRouteRequest(env, route, OBSERVED)).rejects.toThrow('invalid_latency_route')
       await expect(saveRouteSample(env, route, 2, OBSERVED, NOW)).rejects.toThrow('invalid_latency_route')
     }
@@ -144,32 +149,12 @@ describe('route latency retention: real migration chain', () => {
     batch.mockRestore()
   })
 
-  it('records a duration for handler errors without replacing the original error', async () => {
+  it('records handler errors off path without replacing the original error', async () => {
+    const work: Promise<unknown>[] = []
     const error = new Error('handler-failed')
-    await expect(measureBoardRead(env, async () => { throw error })).rejects.toBe(error)
+    await expect(measureBoardRead(env, async () => { throw error }, p => work.push(p))).rejects.toBe(error)
+    await Promise.all(work)
     expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM route_latency_samples').get()?.n).toBe(1)
     expect(h.sqlite.prepare('SELECT SUM(total_requests) AS n FROM route_latency_requests').get()?.n).toBe(1)
-  })
-
-  it('durably counts before executing, and lost async samples remain visible', async () => {
-    const work: Promise<unknown>[] = []
-    let ran = false
-    await measureBoardRead(env, async () => {
-      ran = true
-      expect(h.sqlite.prepare(`SELECT SUM(total_requests) AS n FROM route_latency_requests`).get()?.n).toBe(1)
-      h.sqlite.exec('DROP TABLE route_latency_samples') // inject a real sample persistence failure
-      return 'response'
-    }, p => work.push(p))
-    expect(ran).toBe(true)
-    expect(work).toHaveLength(1)
-    await Promise.all(work)
-    expect(h.sqlite.prepare(`SELECT SUM(total_requests) AS n FROM route_latency_requests`).get()?.n).toBe(1)
-  })
-
-  it('never executes an uncounted handler when denominator persistence fails', async () => {
-    h.sqlite.exec('DROP TABLE route_latency_requests')
-    let ran = false
-    await expect(measureBoardRead(env, async () => { ran = true })).rejects.toThrow('route_latency_unavailable')
-    expect(ran).toBe(false)
   })
 })

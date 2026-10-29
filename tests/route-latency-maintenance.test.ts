@@ -24,37 +24,21 @@ const { default: worker } = await import('../src/index')
 const MAINTENANCE_CRON = '0-9,15-24,30-39,45-54 * * * *'
 
 describe('route latency scheduled retention', () => {
-  it('keeps waitUntil alive for the surviving sweep when the other rejects', async () => {
-    const h = createSqliteD1()
-    applyAllMigrations(h.sqlite)
-    let release!: () => void
-    const pending = new Promise<void>(resolve => { release = resolve })
-    const other = vi.spyOn(agentConnections, 'sweepAgentConnectionRetention').mockRejectedValueOnce(new Error('injected-retention-failure'))
-    const prune = vi.spyOn(latency, 'pruneRouteLatency').mockReturnValueOnce(pending)
-    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  it('latency retention has its own scheduled label and does not invoke agent-connection retention', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite)
+    const other = vi.spyOn(agentConnections, 'sweepAgentConnectionRetention').mockRejectedValue(new Error('must-not-run'))
+    const prune = vi.spyOn(latency, 'pruneRouteLatency').mockResolvedValue(undefined)
     const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
     try {
       const work: Promise<unknown>[] = []
-      await worker.scheduled({ scheduledTime: Date.UTC(2026, 9, 29, 14, 9), cron: MAINTENANCE_CRON } as ScheduledController,
+      await worker.scheduled({ scheduledTime: Date.UTC(2026, 9, 29, 14, 23), cron: MAINTENANCE_CRON } as ScheduledController,
         { DB: h.db, TENANT_SLUG: 'retention-cron' } as Env,
         { waitUntil(p: Promise<unknown>) { work.push(p) } } as ExecutionContext)
-      let settled = false
-      const completion = Promise.all(work).then(() => { settled = true })
-      await new Promise(resolve => setTimeout(resolve, 0))
+      await Promise.all(work)
       expect(prune).toHaveBeenCalledOnce()
-      expect(settled).toBe(false)
-      release()
-      await completion
-      expect(settled).toBe(true)
-      expect(error).toHaveBeenCalled()
-    } finally {
-      release()
-      other.mockRestore()
-      prune.mockRestore()
-      error.mockRestore()
-      info.mockRestore()
-      h.close()
-    }
+      expect(other).not.toHaveBeenCalled()
+      expect(info.mock.calls.some(([tag, data]) => tag === '[scheduled:dispatch]' && (data as { route: string }).route === 'board-latency-retention')).toBe(true)
+    } finally { other.mockRestore(); prune.mockRestore(); info.mockRestore(); h.close() }
   })
 
   it('the existing retention heartbeat physically deletes expired latency data during inactivity', async () => {
@@ -69,7 +53,7 @@ describe('route latency scheduled retention', () => {
         VALUES ('retention-cron', ?, ?, 1)`).run(BOARD_LATENCY_ROUTE, expired)
       const work: Promise<unknown>[] = []
       await worker.scheduled({
-        scheduledTime: Date.UTC(2026, 9, 29, 13, 9), cron: MAINTENANCE_CRON,
+        scheduledTime: Date.UTC(2026, 9, 29, 13, 23), cron: MAINTENANCE_CRON,
       } as ScheduledController, { DB: h.db, TENANT_SLUG: 'retention-cron' } as Env, {
         waitUntil(promise: Promise<unknown>) { work.push(promise) },
       } as ExecutionContext)

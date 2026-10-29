@@ -1,75 +1,91 @@
-# Retained authenticated board latency
+# Retained canonical board-page latency
 
-The measured route is **GET /api/kanban/board**. Every cookie-authenticated GET
-admitted to its handler is counted; HEAD and authentication refusals are excluded.
-Timing begins after authentication and includes the durable counter batch and board
-handler through response creation. Handler failures are counted and sampled too.
-This measures server response preparation, not browser/network time or auth latency.
+The measured surface is the authenticated **GET /dashboard/kanban** HTML page,
+linked by the dashboard's own “Kanban board” navigation. Only its canonical full-board
+load, with **no query string**, contributes. Filtered/query variants, HEAD, auth
+refusals, the legacy `/api/kanban/board` API and MCP `kanban_board` are out of scope.
+This excludes cheap `?project=bogus` responses from the distribution and sample cap.
 
-An org admin with an existing dashboard session can read:
+The timer covers the page handler through response creation. It excludes auth,
+network/browser time and every telemetry write. The page always runs first. Its
+counter, collection onset and sample are then committed in **one off-path D1 batch**
+kept alive by `waitUntil`. There is no awaited telemetry on the response path and
+no telemetry-generated 503. Standalone callers without a Worker context use best-effort
+background persistence too; they do not hold the page for instrumentation.
+
+If that atomic batch fails, its missing counter is recorded separately in the existing
+SESSIONS KV namespace. Each failure gets a unique opaque key, with only tenant,
+fixed namespace, UTC day and random UUID, plus timestamp metadata; it expires after
+14 days. There is no KV read/modify/write increment to race under concurrent failures.
+The failed batch saves no sample, so its KV failure marker is a coverage gap.
+Neither D1 nor KV failure changes the user's page response. Failure logs are fixed
+strings and contain no request or error material.
+
+An org admin with an existing session can read:
 
 ```text
 GET /api/telemetry/board-latency?days=7
 ```
 
-The default is seven **complete UTC days**, excluding the current day. Accepted
-windows are 1..13 days, keeping every requested day within rolling 14-day retention.
-The response names the route, UTC window, `n`, `total_requests`, `coverage`,
-`p50_ms`, `p95_ms`, `recording_since`, and `window_complete`. It is not cached.
-Only org admins can read this pot-wide aggregate; route labels are not selectable.
+Windows are 1..13 **complete UTC days**, default seven, excluding the current day.
+They stay wholly inside rolling 14-day retention. The read returns the fixed route,
+window, `n`, `recorded_requests`, `counter_failures`, `total_requests`, `coverage`,
+nearest-rank `p50_ms`/`p95_ms`, collection start and window completeness. It is
+admin-only, tenant-scoped and `no-store`; route labels are not selectable.
 
-Coverage is `n / total_requests`, where the denominator is durably admitted
-authenticated handler executions. It is not a Cloudflare edge request count.
-Zero requests or inconsistent counts produce null coverage. Below **20 samples**,
-percentiles are null and status is `unknown`; otherwise nearest-rank percentiles
-describe the retained observations. Missing samples or collection warmup produce
-`partial`. `observed` means the requested collection window and counts agree;
-it is not a performance/SLO verdict. A new deployment cannot claim seven days of
-history immediately. Missing or unreadable tables return 503/unknown.
+`total_requests = persisted D1 counters + independent KV counter-failure markers`.
+Coverage is `n / total_requests`. A zero or inconsistent denominator, fewer than
+20 samples, or an unavailable/incomplete failure-ledger read yields unknown
+percentiles. With enough samples, gaps or collection warmup yield `partial`.
+`observed` requires a complete collection window, coverage exactly one and no
+counter failures. It is not a latency/SLO verdict or an edge-traffic count.
 
-Collection attempts **all** samples, retaining the latest **20,000** per tenant and
-fixed route, with a 14-day time limit. Cap eviction leaves request counts intact,
-so coverage falls rather than presenting a truncated distribution as complete.
-Samples contain only an opaque random id, tenant, fixed route, timestamp and
-duration. Daily counters hold only tenant, route, bucket and count. No request
-URL, query, user id, header, cookie, token, SQL text or error content is stored.
-Collection-start metadata has no request data and survives sample expiry.
+The KV ledger is [eventually consistent](https://developers.cloudflare.com/kv/concepts/how-kv-works/).
+A newly written failure can take time to appear in another location's read. The response
+labels this explicitly; an unreadable, malformed, non-progressing or over-budget ledger
+read is unknown, never zero failures. Reads page the scoped ledger, up to 32 pages
+across the selected days. If both D1 and the independent KV write fail, only the fixed
+failure log remains: complete loss of both stores cannot be reconstructed by this metric.
+No claim of lossless edge accounting or live production performance is made.
 
-Samples and expired data are written/pruned in one off-path D1 batch under
-`waitUntil`; non-Worker callers await it. Cleanup also runs on the existing
-agent-connection-retention maintenance heartbeat during inactivity, without adding
-a cron trigger or changing slot order. Reads exclude expired windows even between
-maintenance ticks. Physical deletion during inactivity follows that heartbeat's cadence.
-The heartbeat awaits both independent sweeps to settle before reporting a failure,
-so one rejected sweep cannot release `waitUntil` while the other is still running.
+Collection attempts every eligible canonical page sample. Reads are bounded to the
+latest **20,000** observations, so a temporary excess already lowers read coverage.
+Physical cap and 14-day cutoff deletion run **only** in the separately named
+`board-latency-retention` maintenance slot. The existing cron trigger is unchanged;
+there are now 19 reachable slots. The old agent-connection retention sweep keeps its
+own label and outcome. Cutoff predicates include tenant AND route to use the sample
+index range. Table size can temporarily exceed the cap between maintenance ticks;
+there are no per-page DELETEs or cap scans.
 
-There is an intentional availability/performance cost: an independent denominator
-requires **one additional awaited D1 batch** before executing the handler. It holds
-collection-start insertion, a counter increment and expired-counter cleanup. If it
-fails, the board returns 503 before doing uncounted work. A failed async sample
-cannot erase its durable count. A whole Worker/edge failure before admission is
-outside this metric. The bounded sample-cap scan also consumes off-path D1 work.
-Kasra should assess this tradeoff in the two-lens gate; no production latency or
-availability claim has been made from local tests.
+Samples contain only an opaque UUID, tenant, fixed route, timestamp and duration.
+Counters contain tenant, route, UTC-day bucket and count. Collection-start metadata
+contains no request data and survives expiry. No user id, URL/query, header, cookie,
+token, SQL text or error content is stored.
 
-Apply migration `0268_route_latency_retention.sql` before deploying the code. The
-generated schema bundle includes it for new pots. The origin/main numbering guard
-was checked; production's applied head remains UNPROVEN because this builder did
-not access secret files or production D1 credentials. Kasra must verify the applied
-head before landing/deployment. No deployment or live seven-day collection is included.
-Resolving that UNPROVEN item requires an authenticated D1 migration-list receipt naming
-the highest applied file below 0268; otherwise renumber and regenerate before landing.
+Migration `0268_route_latency_retention.sql` is additive and the generated schema
+bundle contains its current page-label CHECK constraints. Kasra owns production
+migration-head verification, migration application, review and deployment; the builder
+needs no production credentials and makes no production mutation.
 
-Local proof includes fixed-distribution math, sample gaps, floor, warmup, tenant/admin
-isolation, injection-safe labels, strict request/sample retention, sample cap, handler
-failures, real dashboard mounting and the real scheduled deletion path. The mutation
-runner temporarily changes source in a review worktree, requires assertion failures,
-restores it, and requires the restored suite to exit 0:
+Local integration tests load the actual cookie-authenticated HTML page, run its
+background writes and perform the seven-day metric read with nonzero n and numeric
+p50/p95. Synthetic fixture dates do not imply existing production history. On a new
+deployment there is no retroactive data; the first complete-day window starts filling
+after UTC rollover. The suite also pins coverage with a complete window, cross-tenant
+collection onset, cross-tenant admin rejection, equality at the warmup boundary,
+exclusive window_end, 14-day retention and the 20,000 cap as literals.
 
 ```sh
 node scripts/prove-route-latency-mutations.mjs
 ```
 
-All 22 mutations were killed (19 core guards, maintenance wiring, dashboard mounting,
-and cleanup failure isolation). Mutants exited 1 with assertion failures; restored
-suites and runners exited 0.
+The prover requires assertion failures (not import/setup/compiler failures), restores
+source byte-for-byte, and requires the restored suite to exit 0. Gate-surviving
+mutants are explicitly named M1, M6/M7, M11 and M13; retention=30 days and cap=200,000
+are separate mutations.
+
+Round-2 verification: 125 Vitest tests across nine files and 59 Node schema tests
+passed, with completed processes exiting 0. All 35 mutations produced assertion
+failures; the prover restored source and exited 0. Typecheck, migration numbering,
+schema freshness, test-schema-source and diff checks also exited 0. These are local
+build/test receipts, not a gate verdict, deployment or live seven-day measurement.

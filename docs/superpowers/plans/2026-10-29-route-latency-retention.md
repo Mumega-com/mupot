@@ -1,53 +1,39 @@
-# Authenticated board latency retention
+# Canonical board-page latency — round 2 implementation record
 
-Spec: Kasra brief `v039-p50-retention-20261029.md`.
+Spec: Kasra brief `v039-p50-retention-20261029.md` and both pinned #2272 gate receipts
+at afe444c3. This is round 2 of 2 on the same builder branch.
 
-Measure `GET /api/kanban/board`, after cookie authentication, including the durable
-request count and handler through response creation. Count all admitted authenticated
-executions, including handler failures. Persist the denominator before the handler;
-if it fails, return 503 without executing the handler. This one extra D1 batch is the
-cost of an independent denominator: a lost asynchronous sample must leave a gap.
-Persist every measured latency using waitUntil (await only without a Worker context).
-No identity, query, header, auth material, or request URL is retained.
+Final design:
 
-Migration 0268 (main's head is 0267) adds tenant-scoped daily request counts, at most
-20,000 latest samples per tenant/route, and collection-start metadata. Retention is
-14 days; existing maintenance retention work also prunes during inactivity.
-The admin-only read defaults to seven complete UTC days (1..13 accepted so the first
-day cannot overlap the partially expired 14th day). Return n, total_requests,
-coverage=n/total_requests, nearest-rank p50/p95 in ms, collection start, and window.
-Percentiles are unknown below 20 samples or if the denominator is inconsistent.
-Gaps and collection warmup are explicitly partial; zero requests means unknown.
-The coverage denominator is durable admitted executions, not unauthenticated edge
-attempts. This does not independently measure Cloudflare edge traffic.
+- Measure the actual authenticated GET /dashboard/kanban HTML page. Only a no-query
+  canonical full-board load contributes; filtered variants, HEAD, the unused API and
+  MCP kanban_board are explicitly out of scope.
+- Run the page first and capture handler duration before any telemetry. Commit
+  counter, collection onset and sample in one background D1 batch via waitUntil.
+  Catch failures, never block or fail the page, and record a separate unique KV
+  counter-failure marker. Coverage includes these markers; unreadable ledger means
+  unknown. KV consistency and simultaneous store-loss limits are documented.
+- Keep reads bounded to 20,000 latest observations. Move physical cap/cutoff pruning
+  solely to the independently named maintenance slot. Include route in both cutoff
+  predicates. No per-request prune. Actual page integration also corrected an
+  existing SQL string literal (`archived`) exposed by strict SQLite.
+- Retain default seven complete UTC days, floor 20, nearest-rank math and existing
+  admin read. Pin literal retention=14 days/cap=20,000; test and mutate M1, M6/M7,
+  M11, M13, window_end and actual instrumentation routing.
+- Kasra verifies production's applied migration head at deployment. No credentials
+  are requested or accessed by this builder.
 
-- [x] Baseline kanban tests; write real-migration service and HTTP/auth tests first.
-- [x] Observe red; implement percentile/read/write/prune helpers and migration.
-- [x] Wire the existing board read and an admin metrics route; extend the existing
-  retention maintenance entry without changing the maintenance slot schedule.
-- [x] Mutation-prove route/tenant guards, floor, denominator, retention, cap, and auth.
-- [x] Run focused Vitest with --maxWorkers=2, typecheck and repository guards to exit 0.
-Delivery: own-branch PR receipt with URL/SHA/commands for Kasra's two review lenses.
+Tests were written first for the requested regressions. Before the fixes, seven
+new regression cases failed; actual-page integration also reproduced the strict SQL
+literal failure. The single-background-batch test observed two batches before its fix.
+The complete-window/boundary/tenant tests pin guards that previously existed but had
+survived the independent lenses' mutations.
 
-Production applied migration head is inaccessible without credentials; no secret files
-will be read. Recheck numbering against origin/main and flag remote-head proof for Kasra.
-
-Verified: 112 Vitest tests in eight files, 59 Node schema-generator/guard tests,
-typecheck, schema freshness, test-schema source, migration numbering, and diff checks.
-All final unmutated checks exited 0. The initial service/API tests failed before their
-implementation modules existed. Mutations then proved the behavioral guards with
-assertion failures rather than compile/import/setup failures.
-
-Ruling: retain the explicit synchronous denominator batch / pre-handler 503 behavior.
-The independent read-only review identified this as a P1 cost to assess in Kasra's gate;
-asynchronous counters would permit count and sample loss together, hiding a gap. This
-build preserves the independently durable denominator and documents the availability
-and latency tradeoff; it does not claim the tradeoff has passed the steward's gate.
-
-Reproduce unmutated verification:
+Validation commands:
 
 ```sh
-npx vitest run tests/route-latency.test.ts tests/route-latency-routes.test.ts tests/route-latency-maintenance.test.ts tests/kanban-routes.test.ts tests/maintenance-heartbeat-slots.test.ts tests/scheduled-budget.test.ts tests/schema-chain.test.ts tests/migration-d1-compat.test.ts --maxWorkers=2
+npx vitest run tests/route-latency*.test.ts tests/kanban-routes.test.ts tests/maintenance-heartbeat-slots.test.ts tests/scheduled-budget.test.ts tests/schema-chain.test.ts tests/migration-d1-compat.test.ts --maxWorkers=2
+node scripts/prove-route-latency-mutations.mjs
 node --test tests/gen-schema-chain.test.mjs tests/check-schema-chain-fresh.test.mjs
 npm run typecheck
 node scripts/check-migration-numbering.mjs
@@ -55,3 +41,6 @@ node scripts/check-schema-chain-fresh.mjs
 node scripts/check-test-schema-source.mjs
 git diff --check
 ```
+
+Operational scope and evidence limits: `docs/operations/board-latency-retention.md`.
+No merge, deploy or publish. Return the new head for Kasra's pinned round-2 gate.

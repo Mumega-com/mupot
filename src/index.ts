@@ -525,7 +525,7 @@ export default {
       return
     }
 
-    // Eighteen independent maintenance heartbeats, staggered across each 15-minute
+    // Nineteen independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -595,15 +595,7 @@ export default {
       ['flight-outbox', () => flushFlightEventOutbox(env)],
       ['concierge', () => runConciergeTick(env)],
       ['project-loop', () => runProjectLoopTick(env, {})],
-      ['agent-connection-retention', async () => {
-        // Keep the Worker alive for both independent sweeps even if one fails early.
-        const results = await Promise.allSettled([
-          sweepAgentConnectionRetention(env),
-          pruneRouteLatency(env),
-        ])
-        if (results.some(result => result.status === 'rejected')) throw new Error('retention_sweep_failed')
-        return results
-      }],
+      ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
       ['gate-stall-watchdog', () => sweepStalledGateReviews(env)],
@@ -612,6 +604,7 @@ export default {
       ['gate-verdict-receipts', () => reconcileGateVerdictReceipts(env)],
       ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
+      ['board-latency-retention', () => pruneRouteLatency(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

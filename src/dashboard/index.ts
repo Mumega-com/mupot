@@ -204,6 +204,7 @@ import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
 import { routeLatencyApp } from './route-latency'
+import { measureBoardRead } from '../telemetry/route-latency'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
 // Reuses getFleetAgentRuntimeStates VERBATIM — the SAME dual-surface (fleet_agents ∪
 // module_registry) presence primitive src/routines/dispatch.ts#selectAgent already
@@ -1767,37 +1768,43 @@ dashboardApp.route('/', routeLatencyApp)
 
 // GET /dashboard/kanban — Multi-Perspective Squad & Project Kanban Board
 dashboardApp.get('/dashboard/kanban', async (c) => {
-  const auth = c.get('auth')
-  const squad = c.req.query('squad') || c.req.query('squad_id')
-  const project = c.req.query('project') || c.req.query('project_id')
-  const view = c.req.query('view')
+  const run = async () => {
+    const auth = c.get('auth')
+    const squad = c.req.query('squad') || c.req.query('squad_id')
+    const project = c.req.query('project') || c.req.query('project_id')
+    const view = c.req.query('view')
 
-  const accessibleSquadIds = await resolveAccessibleSquadIds(c.env, auth)
-  // G-FP1b point 2/3: same fix as src/dashboard/kanban-routes.ts — drop the
-  // redundant `isOrgAdmin(auth)` shortcut, which bypassed
-  // resolveAccessibleSquadIds's home-squad exclusion and would otherwise
-  // list every member's home squad in this picker for any org admin.
-  const isAllAccessible = accessibleSquadIds === null
+    const accessibleSquadIds = await resolveAccessibleSquadIds(c.env, auth)
+    // G-FP1b point 2/3: same fix as src/dashboard/kanban-routes.ts — drop the
+    // redundant `isOrgAdmin(auth)` shortcut, which bypassed
+    // resolveAccessibleSquadIds's home-squad exclusion and would otherwise
+    // list every member's home squad in this picker for any org admin.
+    const isAllAccessible = accessibleSquadIds === null
 
-  const [data, allSquads, allProjects] = await Promise.all([
-    loadKanbanData(c.env, auth, { squadIdOrSlug: squad, projectIdOrSlug: project, view }),
-    loadSquads(c.env),
-    c.env.DB.prepare('SELECT id, slug, name, goal, status FROM projects WHERE status <> "archived" ORDER BY name ASC').all<Project>().then(r => r.results ?? []),
-  ])
+    const [data, allSquads, allProjects] = await Promise.all([
+      loadKanbanData(c.env, auth, { squadIdOrSlug: squad, projectIdOrSlug: project, view }),
+      loadSquads(c.env),
+      c.env.DB.prepare("SELECT id, slug, name, goal, status FROM projects WHERE status <> 'archived' ORDER BY name ASC").all<Project>().then(r => r.results ?? []),
+    ])
 
-  const visibleSquads = isAllAccessible
-    ? allSquads
-    : allSquads.filter(s => accessibleSquadIds?.includes(s.id))
+    const visibleSquads = isAllAccessible
+      ? allSquads
+      : allSquads.filter(s => accessibleSquadIds?.includes(s.id))
 
-  const visibleProjects = allProjects // Projects without accessible squad tasks will render empty/scoped per-squad lanes
+    const visibleProjects = allProjects // Projects without accessible squad tasks will render empty/scoped per-squad lanes
 
-  const title = data.mode === 'project' && data.project
-    ? `Project Board · ${data.project.name}`
-    : `Squad Board · ${data.squad?.name || 'Kanban'}`
+    const title = data.mode === 'project' && data.project
+      ? `Project Board · ${data.project.name}`
+      : `Squad Board · ${data.squad?.name || 'Kanban'}`
 
-  return c.html(
-    shell(c.env, title, kanbanBoardBody(data, visibleSquads, visibleProjects)),
-  )
+    return c.html(
+      shell(c.env, title, kanbanBoardBody(data, visibleSquads, visibleProjects)),
+    )
+  }
+  // Only the canonical full-board page contributes. Cheap query variants, HEAD,
+  // the legacy API and MCP kanban_board are deliberately outside this metric.
+  const canonical = c.req.method === 'GET' && new URL(c.req.url).search === ''
+  return canonical ? measureBoardRead(c.env, run, waitUntilFromContext(c)) : run()
 })
 
 

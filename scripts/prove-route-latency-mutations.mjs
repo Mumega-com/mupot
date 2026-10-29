@@ -12,30 +12,44 @@ const cases = [
   ['sample-floor', service, 'values.length >= LATENCY_SAMPLE_FLOOR', 'values.length >= 1'],
   ['coverage-fraction', service, 'values.length / total', '1'],
   ['denominator-consistency', service, 'values.length <= total', 'true'],
+  ['M6_M7-complete-gap', service, 'values.length < total || ', ''],
+  ['M11-warmup-boundary', service, 'since <= start', 'since < start'],
   ['collection-warmup', service, 'since !== null && since <= start', 'true'],
+  ['M13-collection-tenant', service, 'FROM route_latency_collection WHERE tenant = ?1 AND route = ?2', 'FROM route_latency_collection WHERE route = ?2'],
   ['tenant-isolation', service, 'WHERE tenant = ?1 AND route = ?2 AND observed_at_ms >= ?3', 'WHERE route = ?2 AND observed_at_ms >= ?3'],
-  ['sample-retention', service, 'DELETE FROM route_latency_samples WHERE tenant = ?1 AND observed_at_ms < ?2', 'DELETE FROM route_latency_samples WHERE tenant = ?1 AND observed_at_ms < ?2 AND 0'],
-  ['counter-retention', service, 'DELETE FROM route_latency_requests WHERE tenant = ?1 AND bucket_ms < ?2', 'DELETE FROM route_latency_requests WHERE tenant = ?1 AND bucket_ms < ?2 AND 0'],
+  ['M5-window-end', service, 'observed_at_ms < ?4', 'observed_at_ms <= ?4'],
+  ['sample-retention', service, 'DELETE FROM route_latency_samples WHERE tenant = ?1 AND route = ?2 AND observed_at_ms < ?3', 'DELETE FROM route_latency_samples WHERE tenant = ?1 AND route = ?2 AND observed_at_ms < ?3 AND 0'],
+  ['counter-retention', service, 'DELETE FROM route_latency_requests WHERE tenant = ?1 AND route = ?2 AND bucket_ms < ?3', 'DELETE FROM route_latency_requests WHERE tenant = ?1 AND route = ?2 AND bucket_ms < ?3 AND 0'],
+  ['cutoff-route-index', service, 'tenant = ?1 AND route = ?2 AND observed_at_ms < ?3', 'tenant = ?1 AND observed_at_ms < ?3'],
   ['sample-cap', service, 'LIMIT -1 OFFSET ?3)', 'LIMIT -1 OFFSET (?3 + 1))'],
+  ['literal-cap', service, 'export const MAX_LATENCY_SAMPLES = 20_000', 'export const MAX_LATENCY_SAMPLES = 200_000'],
+  ['literal-retention', service, 'export const RETENTION_MS = 14 * DAY_MS', 'export const RETENTION_MS = 30 * DAY_MS'],
   ['route-allowlist', service, 'route !== BOARD_LATENCY_ROUTE', 'false'],
   ['duration-validation', service, '!Number.isFinite(duration) || duration < 0', 'false'],
   ['timestamp-validation', service, '!Number.isSafeInteger(value) || value < 0', 'false'],
   ['sample-time-bounds', service, 'observedAt < now - RETENTION_MS || observedAt > now', 'false'],
-  ['durable-admission', service, 'await countRouteRequest(env, BOARD_LATENCY_ROUTE, observedAt)', 'await Promise.resolve()'],
+  ['off-path-persistence', service, 'if (waitUntil) waitUntil(work)', 'await work'],
+  ['timer-counter-order', service, 'const start = performance.now()', 'await countRouteRequest(env, BOARD_LATENCY_ROUTE, observedAt); const start = performance.now()'],
+  ['failure-marker', service, 'await env.SESSIONS.put(', 'await Promise.resolve('],
+  ['failure-marker-unique', service, 'failurePrefix(env.TENANT_SLUG, observedAt) + crypto.randomUUID()', "failurePrefix(env.TENANT_SLUG, observedAt) + 'same-key'"],
   ['window-bounds', service, '!Number.isInteger(days) || days < 1 || days > 13', 'false'],
-  ['admin-gate', api, 'auth.tenant !== c.env.TENANT_SLUG || !isOrgAdmin(auth)', 'false'],
+  ['M1-admin-tenant', api, 'auth.tenant !== c.env.TENANT_SLUG || ', ''],
+  ['admin-role', api, '!isOrgAdmin(auth)', 'false'],
+  ['no-store', api, "'no-store'", "'public'"],
   ['query-selectors', api, "c.req.query('route') !== undefined || !/^(?:[1-9]|1[0-3])$/.test(raw)", 'false'],
-  ['get-method-scope', 'src/dashboard/kanban-routes.ts', "c.req.method === 'GET' ?", 'true ?'],
-  ['schema-route-guard', 'migrations/0268_route_latency_retention.sql', "CHECK (route = 'GET /api/kanban/board')", ''],
-  ['maintenance-wiring', 'src/index.ts', 'pruneRouteLatency(env),', 'Promise.resolve(),'],
+  ['canonical-query-only', 'src/dashboard/index.ts', "&& new URL(c.req.url).search === ''", ''],
+  ['get-method-scope', 'src/dashboard/index.ts', "c.req.method === 'GET' &&", 'true &&'],
+  ['real-page-instrumentation', 'src/dashboard/index.ts', 'return canonical ? measureBoardRead(c.env, run, waitUntilFromContext(c)) : run()', 'return run()'],
+  ['schema-route-guard', 'migrations/0268_route_latency_retention.sql', "CHECK (route = 'GET /dashboard/kanban')", ''],
+  ['maintenance-wiring', 'src/index.ts', "['board-latency-retention', () => pruneRouteLatency(env)]", "['board-latency-retention', () => Promise.resolve()]"],
   ['dashboard-mount', 'src/dashboard/index.ts', "dashboardApp.route('/', routeLatencyApp)", "dashboardApp.route('/unused', routeLatencyApp)"],
-  ['cleanup-failure-isolation', 'src/index.ts', 'const results = await Promise.allSettled([', 'const results = await Promise.all(['],
 ]
+
 const requested = new Set(process.argv.slice(2))
 const selected = requested.size === 0 ? cases : cases.filter(([name]) => requested.has(name))
 if (selected.length !== (requested.size || cases.length)) throw new Error('unknown mutation name')
 
-function suite(files = ['tests/route-latency.test.ts', 'tests/route-latency-routes.test.ts', 'tests/route-latency-maintenance.test.ts']) {
+function suite(files = ['tests/route-latency.test.ts', 'tests/route-latency-routes.test.ts', 'tests/route-latency-maintenance.test.ts', 'tests/route-latency-round2.test.ts']) {
   return spawnSync(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', ...files, '--maxWorkers=2'], {
     cwd: root, encoding: 'utf8', timeout: 120_000,
   })
@@ -53,8 +67,8 @@ for (const [name, path, before, after] of selected) {
   let result
   try {
     writeFileSync(url, original.replaceAll(before, after))
-    const files = path === service || path.startsWith('migrations/') ? ['tests/route-latency.test.ts']
-      : path === 'src/index.ts' ? ['tests/route-latency-maintenance.test.ts'] : ['tests/route-latency-routes.test.ts']
+    const files = path === service || path.startsWith('migrations/') ? ['tests/route-latency.test.ts', 'tests/route-latency-round2.test.ts']
+      : path === 'src/index.ts' ? ['tests/route-latency-maintenance.test.ts'] : ['tests/route-latency-routes.test.ts', 'tests/route-latency-round2.test.ts']
     result = suite(files)
   } finally {
     writeFileSync(url, original)

@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin } from '../auth/capability'
@@ -6,7 +7,7 @@ import { readRouteLatency } from '../telemetry/route-latency'
 
 export const routeLatencyApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
-routeLatencyApp.get('/api/telemetry/board-latency', requireAuth, async (c) => {
+export async function boardLatencyRead(c: Context<{ Bindings: Env; Variables: { auth: AuthContext } }>) {
   const auth = c.get('auth')
   if (auth.tenant !== c.env.TENANT_SLUG || !isOrgAdmin(auth)) return c.json({ error: 'forbidden' }, 403)
   c.header('Cache-Control', 'no-store')
@@ -20,4 +21,6 @@ routeLatencyApp.get('/api/telemetry/board-latency', requireAuth, async (c) => {
   } catch {
     return c.json({ error: 'route_latency_unavailable', status: 'unknown' }, 503)
   }
-})
+}
+
+routeLatencyApp.get('/api/telemetry/board-latency', requireAuth, boardLatencyRead)
