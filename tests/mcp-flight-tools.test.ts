@@ -1352,7 +1352,22 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           cost_micro_usd INTEGER NOT NULL DEFAULT 0, cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1)),
           bookkeeping INTEGER NOT NULL DEFAULT 0 CHECK (bookkeeping IN (0,1)), next_run_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
-          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
+          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}',
+        -- mupot 0267 (brief P3): purely-additive land-time columns, mirrored here for the
+        -- SAME reason as the 0150 note above (this fixture 500s on additive columns).
+          harness TEXT, model TEXT
+        );
+        -- mupot 0267 (brief P3): landGovernedFlight now derives harness/model from the
+        -- executing agent's fleet_agents row (0035 + 0097 shape, trimmed to the columns
+        -- the land path reads). Same hand-built-subset rule as the tables above.
+        CREATE TABLE fleet_agents (
+          agent_id TEXT NOT NULL, tenant TEXT NOT NULL, display TEXT NOT NULL DEFAULT '',
+          runtime TEXT NOT NULL DEFAULT '', squads TEXT NOT NULL DEFAULT '[]',
+          lifecycle TEXT NOT NULL DEFAULT '', provider_contract TEXT, model TEXT,
+          status TEXT NOT NULL DEFAULT 'unknown', reported_by TEXT NOT NULL DEFAULT '',
+          last_reported_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (tenant, agent_id)
         );
         -- flight_dispatch delivers a flight.dispatch/v1 envelope (#860), so this
         -- lifecycle test now needs the table the send writes to. Mirrors 0032.

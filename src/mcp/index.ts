@@ -330,6 +330,7 @@ import {
   validateFlightTaskProjectConsistency,
   type FlightRow,
   withCostSemantics,
+  flightHarnessDisplay,
 } from '../flight/service'
 import {
   findFinishedWorkConflict,
@@ -3864,8 +3865,11 @@ function memberCanAccessFlight(
   return true
 }
 
-function flightWithParsedMeta(flight: FlightRow, meta: FlightMetaV1): Omit<FlightRow, 'meta' | 'cost_micro_usd' | 'cost_metered'> & { meta: FlightMetaV1; cost_micro_usd: number | null; cost_metered: boolean } {
-  return { ...withCostSemantics(flight), meta }
+function flightWithParsedMeta(flight: FlightRow, meta: FlightMetaV1): Omit<FlightRow, 'meta' | 'cost_micro_usd' | 'cost_metered'> & { meta: FlightMetaV1; cost_micro_usd: number | null; cost_metered: boolean; harness: string; model: string } {
+  // Brief P3 (0267): harness/model are named for a person here — NULL (no fleet row at
+  // land, or not yet landed) reads 'unknown', never blank.
+  const harnessLabels = flightHarnessDisplay(flight)
+  return { ...withCostSemantics(flight), meta, harness: harnessLabels.harness, model: harnessLabels.model }
 }
 
 const toolFlightDispatch: ToolSpec = {
