@@ -299,13 +299,9 @@ kanbanApp.get('/api/kanban/board', requireAuth, async (c) => {
   const squad = c.req.query('squad') || c.req.query('squad_id')
   const project = c.req.query('project') || c.req.query('project_id')
   const view = c.req.query('view')
-
   const data = await loadKanbanData(c.env, c.get('auth'), {
-    squadIdOrSlug: squad,
-    projectIdOrSlug: project,
-    view,
+    squadIdOrSlug: squad, projectIdOrSlug: project, view,
   })
-
   return c.json({ ok: true, ...data })
 })
 

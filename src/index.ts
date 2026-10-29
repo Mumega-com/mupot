@@ -21,6 +21,7 @@ import { ROUTES } from './types'
 import { publicHealth } from './health'
 import { cliResponse } from './cli/serve'
 import { instrumentEnv, serverTimingAuthorized, withServerTiming } from './lib/server-timing'
+import { pruneRouteLatency } from './telemetry/route-latency'
 
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
@@ -524,7 +525,7 @@ export default {
       return
     }
 
-    // Eighteen independent maintenance heartbeats, staggered across each 15-minute
+    // Nineteen independent maintenance heartbeats, staggered across each 15-minute
     // window and isolated from the Routine invocation budget on Workers Free.
     //  1. membership sync — reconcile channel membership → squad capabilities.
     //  2. metabolism — kick goal-bearing agents so their goal loops actually run
@@ -603,6 +604,7 @@ export default {
       ['gate-verdict-receipts', () => reconcileGateVerdictReceipts(env)],
       ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
+      ['board-latency-retention', () => pruneRouteLatency(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

@@ -59,6 +59,8 @@ function floor(id: string, description: string, sites: readonly string[], refusa
 }
 
 export const POLICY_RULES: readonly PolicyRule[] = [
+  floor('telemetry.board-latency.window-bounds', 'Board latency reads accept only bounded complete-day windows and the fixed route label.', ['src/dashboard/route-latency.ts:boardLatencyRead'], ['invalid_latency_window']),
+  floor('telemetry.board-latency.unavailable', 'Unavailable retained latency is reported as unknown rather than fabricated healthy data.', ['src/dashboard/route-latency.ts:boardLatencyRead'], ['route_latency_unavailable']),
   floor('approval.bot.processing-failed', 'Approval bot processing failures return a retryable refusal rather than acknowledging an unrecorded operation.', ['src/approval-bot/routes.ts'], ['processing_failed']),
   floor('sudo.owner.claim-release-failed', 'A refused owner-sudo call whose claim cannot be released ends its grant or requires revocation before reapproval.', ['src/auth/owner-sudo.ts', 'src/mcp/index.ts'], ['sudo_claim_release_failed']),
   floor('approval.identity.not-live', 'Approval session minting refuses an identity that is no longer live and asks the human to sign in again.', ['src/access/decision-core.ts', 'src/access/routes.ts'], ['approver_identity_not_live']),
