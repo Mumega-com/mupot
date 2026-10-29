@@ -66,7 +66,7 @@ describe('the full /mcp tools/list response includes them', () => {
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
     // SECURE_DROP is unset as well: the five secure-drop tools (W2) are not advertised either.
     const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'join_squad' && t.name !== 'inbox_mark_handled' && t.name !== 'connection_check' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !DROP.includes(t.name)).length)
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'owner_call' && t.name !== 'seat_select' && t.name !== 'seat_attach' && t.name !== 'squad_join_request' && t.name !== 'join_squad' && t.name !== 'inbox_mark_handled' && t.name !== 'connection_check' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && t.name !== 'worktree_open' && t.name !== 'worktree_list' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
       // #1910: an office_* wire alias carries its dotted tool's row (same ToolSpec object).
       const canonical = resolveToolSpec(t.name)?.name ?? t.name
@@ -85,13 +85,14 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
     'presence_register', 'presence_heartbeat', 'presence_deregister', 'check_in', 'mint_agent_token', 'revoke_agent_token',
     'archive_row', 'unarchive_row', 'task_incident_revert', 'flight_dispatch', 'flight_land', 'office.health', 'office.publish_post',
     'secret_env_request', 'supabase_mutate', 'create_agent', 'deactivate_agent', 'routine_create', 'routine_run_now',
-    'request_elevation', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
+    'owner_call', 'request_elevation', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
   ]
   it.each(KNOWN_WRITERS)('%s is not readOnly', (name) => {
     expect(TOOL_ANNOTATION_ROWS[name]?.readOnlyHint, name).toBe(false)
   })
 
   const KNOWN_DESTRUCTIVE = [
+    'owner_call',
     'revoke_agent_token', 'revoke_agent_session', 'archive_row', 'task_incident_revert', 'deactivate_agent', 'routine_archive', 'task_verdict',
     'task_verdict_reverse', 'pot_release', 'revoke_gate_capability', 'task_update', 'update_agent', 'move_agent_squad', 'squad_choose',
     'squad_member_remove', 'project_squad_remove', 'end_agent_session', 'reveal_credential_claim', 'secret_env_request',
@@ -141,6 +142,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'supabase_query', 'supabase_schema', 'task_board', 'task_brief', 'task_get', 'task_intake_audit', 'worktree_list',
   ]
   const ALL_DESTRUCTIVE = [
+    'owner_call',
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
     'approval_expiry_sweep', 'approval_resubmit_cap_reset', 'approve_gate_edge', 'archive_row', 'credential_request', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
     'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'host_key_register', 'loop_control', 'loop_set_status', 'mint_agent_token',
