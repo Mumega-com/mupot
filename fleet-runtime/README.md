@@ -61,6 +61,20 @@ TENANT_SLUG=<your-tenant> ./fleet-runtime/register-agent-key.sh my-agent <AGENT_
 node fleet-runtime/attach-signed.mjs https://YOUR-POT my-agent --tenant <your-tenant> --type builder --runtime claude-code
 ```
 
+Set `FLEET_ATTACH_MODEL` on that CLI invocation to report the running model. Library
+callers pass `model` to `signedAttach`. Unset/empty env omits the field. The optional
+model is signed as sent: append `\nmodel\n` plus `JSON.stringify(model)` to the original
+canonical message. Deploy the matching server before enabling model on host callers;
+old callers keep their original signing bytes and leave the stored model unchanged.
+
+The server verifies before cleaning, strips controls and trims/truncates model to 128
+characters with `cleanReported`; empty after cleaning means unreported. The existing
+8 KB request cap bounds raw input. `fleet_agents.reported_by` remains key-derived. The
+HTTP response's `report` receipt includes the cleaned model (null when unreported),
+`reported_by`, and `signed: true`. This receipt describes this attach only: it does not
+attest to a model retained from an older report or independently verify the runtime's
+model claim. No signed-provenance column or migration is added.
+
 ## Install on a host
 
 From a checkout, lay down the runtime scripts, platform service definitions, editable

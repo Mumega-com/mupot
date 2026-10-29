@@ -21,6 +21,8 @@ import { parseFlightMetaV1 } from '../src/flight/meta'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import type { Env } from '../src/types'
+import { fleetAttachApp } from '../src/fleet/attach-routes'
+import { signedAttach } from '../fleet-runtime/fleet-sign.mjs'
 
 const TENANT = 'mumega'
 const FLIGHT = 'flight-harness'
@@ -97,6 +99,32 @@ const LAND_OPTS_BASE = {
 }
 
 describe('P3: a landed flight names harness and model (server-derived)', () => {
+  it('P3b: the real host signer reports model through signed attach into the flight landing receipt', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as CryptoKeyPair
+      const jwk = await crypto.subtle.exportKey('jwk', pair.publicKey)
+      harnessDb.sqlite.exec(`
+        INSERT INTO members (id, display_name, tenant, status) VALUES ('m-signed', 'Signed runner', '${TENANT}', 'active');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+          VALUES ('${TENANT}', 'agent-1', 'm-signed', datetime('now'));
+      `)
+      harnessDb.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES (?, ?, ?, 'Ed25519', ?, ?)`).run(TENANT, 'agent-1', jwk.x!, 'm-signed', Math.floor(Date.now() / 1000))
+      const attached = await signedAttach('https://pot.example.com', 'agent-1', {
+        tenant: TENANT, runtime: 'claude-code', model: 'claude-opus-4-6', privKey: pair.privateKey,
+        fetchImpl: async (_url: string, init: RequestInit) => fleetAttachApp.request('/attach-signed', init, env),
+      })
+      expect(attached.ok).toBe(true)
+      expect(attached.json.report).toMatchObject({ model: 'claude-opus-4-6', reported_by: 'm-signed', signed: true })
+      expect(await landGovernedFlight(env, FLIGHT, LAND_OPTS_BASE)).toEqual({ transitioned: true, receipt: true })
+      expect(await landedRow(env)).toMatchObject({ status: 'landed', harness: 'claude-code', model: 'claude-opus-4-6' })
+      expect(await landedReceiptPayload(env)).toMatchObject({ harness: 'claude-code', model: 'claude-opus-4-6' })
+    } finally {
+      harnessDb.close()
+    }
+  })
+
   it('stores harness+model from the executing agent fleet row and writes both to the landing receipt', async () => {
     const { env } = fixture()
     await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-5.4')

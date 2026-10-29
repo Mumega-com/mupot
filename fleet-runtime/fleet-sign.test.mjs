@@ -1,4 +1,4 @@
-// node --test fleet-runtime/fleet-sign.test.mjs   (node >= 18 built-in runner, no deps)
+// node --test fleet-runtime/fleet-sign.test.mjs   (Node 22.15+ for CLI module hooks, no deps)
 //
 // signedAttach's `host` field (#21 slice 2) — verifies the ACTUAL POST body sent to
 // /api/fleet/attach-signed carries the self-reported hostname, not just that a caller's
@@ -8,7 +8,70 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { webcrypto as w } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { signedAttach, canonicalMessage, validatePrivateKeyStat } from './fleet-sign.mjs'
+
+test('signedAttach: model is sent raw and covered by the actual signature', async () => {
+  const pair = await w.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])
+  const capture = {}
+  const model = ' preview\nmodel\u0000' + 'x'.repeat(130)
+  await signedAttach('https://pot.example.com', 'agent-one', {
+    tenant: 't', model, privKey: pair.privateKey, fetchImpl: fakeFetch(capture),
+  })
+  const b = capture.body
+  assert.equal(b.model, model)
+  const legacy = ['fleet-attach:v1', 't', b.agent_id, b.type, b.runtime, b.lifecycle, String(b.ts), b.nonce].join('\n')
+  const sig = Buffer.from(b.sig, 'base64url')
+  const verify = (msg) => w.subtle.verify('Ed25519', pair.publicKey, sig, new TextEncoder().encode(msg))
+  assert.equal(await verify(legacy + '\nmodel\n' + JSON.stringify(model)), true)
+  assert.equal(await verify(legacy), false)
+  assert.equal(await verify(legacy + '\nmodel\n' + JSON.stringify('other')), false)
+})
+
+test('signedAttach: omitted model keeps the legacy signature and omits the body field', async () => {
+  const pair = await w.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])
+  const capture = {}
+  await signedAttach('https://pot.example.com', 'agent-one', {
+    tenant: 't', privKey: pair.privateKey, fetchImpl: fakeFetch(capture),
+  })
+  const b = capture.body
+  assert.equal(Object.hasOwn(b, 'model'), false)
+  const legacy = ['fleet-attach:v1', 't', b.agent_id, b.type, b.runtime, b.lifecycle, String(b.ts), b.nonce].join('\n')
+  assert.equal(canonicalMessage({ tenant: 't', agentId: b.agent_id, ...b }), legacy)
+  assert.equal(await w.subtle.verify('Ed25519', pair.publicKey, Buffer.from(b.sig, 'base64url'), new TextEncoder().encode(legacy)), true)
+})
+
+test('signedAttach: refuses non-string model', async () => {
+  const privKey = await genKey()
+  for (const model of [null, 42, {}, []]) {
+    await assert.rejects(signedAttach('https://pot.example.com', 'agent-one', {
+      tenant: 't', model, privKey, fetchImpl: fakeFetch({}),
+    }), /model.*string/)
+  }
+})
+
+test('attach-signed CLI: FLEET_ATTACH_MODEL forwards unchanged, default omits it (no key access)', () => {
+  // Intercept only the signing module in the child: exercise the real CLI argument/env
+  // handling while guaranteeing the test cannot load a host private key or send HTTP.
+  const mockSource = 'export async function signedAttach(base, agent, opts) { return { ok:true, json:{ agent:opts } } }'
+  const preload = `import { registerHooks } from 'node:module';
+    registerHooks({ resolve(specifier, context, next) {
+      if (specifier === './fleet-sign.mjs') return { url: ${JSON.stringify('data:text/javascript,' + encodeURIComponent(mockSource))}, shortCircuit:true };
+      return next(specifier, context);
+    } });`
+  const run = (model) => {
+    const env = { ...process.env, FLEET_TENANT: 't' }
+    delete env.FLEET_ATTACH_MODEL
+    if (model !== undefined) env.FLEET_ATTACH_MODEL = model
+    const res = spawnSync(process.execPath, ['--import', 'data:text/javascript,' + encodeURIComponent(preload),
+      new URL('./attach-signed.mjs', import.meta.url).pathname, 'https://pot.example.com', 'agent-one'], { env, encoding: 'utf8' })
+    assert.equal(res.status, 0, res.stderr)
+    return JSON.parse(res.stdout).attached
+  }
+  assert.equal(run('claude-opus-4-6').model, 'claude-opus-4-6')
+  assert.equal(Object.hasOwn(run(), 'model'), false)
+  assert.equal(Object.hasOwn(run(''), 'model'), false)
+})
 
 async function genKey() {
   const pair = await w.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])

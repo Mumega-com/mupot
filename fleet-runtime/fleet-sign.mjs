@@ -7,6 +7,7 @@
 // The private key never leaves the host; it is used only to sign. The canonical message MUST
 // stay byte-identical to the pot's canonicalAttachMessage() (src/fleet/signed-attach.ts):
 //   [domain, tenant, agent_id, type, runtime, lifecycle, ts, nonce]  '\n'-joined, UTF-8.
+//   Optional model adds '\nmodel\n' + JSON.stringify(raw model); omission keeps v1 bytes.
 import { webcrypto as w } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -53,8 +54,12 @@ export async function loadPrivKey(agentId) {
 }
 
 /** The exact bytes both sides sign/verify. Keep field order in lockstep with the worker. */
-export function canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce }) {
-  return [SIG_DOMAIN, tenant, agentId, type, runtime, lifecycle, String(ts), nonce].join('\n')
+export function canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce, model }) {
+  const fields = [SIG_DOMAIN, tenant, agentId, type, runtime, lifecycle, String(ts), nonce]
+  // Keep legacy bytes on omission; JSON encoding prevents embedded controls from
+  // introducing ambiguous field separators. Must match canonicalAttachMessage().
+  if (model !== undefined) fields.push('model', JSON.stringify(model))
+  return fields.join('\n')
 }
 
 /** Domain-separated bytes for signed detach. Keep byte-identical to
@@ -86,6 +91,8 @@ function nonce() {
  *  survives transient errors; a missing/bad key OR a missing tenant throws.
  *
  *  STERILE: `tenant` is REQUIRED — there is no default. The pot is multi-tenant-neutral.
+ *  `model` is optional reported metadata, signature-covered as sent. The server cleans
+ *  and truncates it for display only after verifying; omitting it preserves stored model.
  *
  *  `host` (#21 slice 2) is the self-reported physical-machine signal (os.hostname() on
  *  the calling runtime — see attach-signed.mjs / fleet-daemon.mjs). It is UNTRUSTED,
@@ -101,19 +108,23 @@ export async function signedAttach(baseUrl, agentId, opts = {}) {
     tenant,
     lifecycle = 'on_demand',
     host = '',
+    model,
     privKey,
     fetchImpl = fetch,
   } = opts
   if (typeof tenant !== 'string' || !tenant) {
     throw new Error('signedAttach: tenant is required (this runtime hardcodes no tenant)')
   }
+  if (model !== undefined && typeof model !== 'string') {
+    throw new Error('signedAttach: model must be a string')
+  }
   const key = privKey ?? (await loadPrivKey(agentId))
   const ts = Math.floor(Date.now() / 1000)
   const requestNonce = nonce()
-  const message = canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce: requestNonce })
+  const message = canonicalMessage({ tenant, agentId, type, runtime, lifecycle, ts, nonce: requestNonce, model })
   const sigBuf = await w.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(message))
   const sig = Buffer.from(sigBuf).toString('base64url')
-  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce: requestNonce, sig, host: typeof host === 'string' ? host : '' }
+  const body = { agent_id: agentId, type, runtime, lifecycle, ts, nonce: requestNonce, sig, host: typeof host === 'string' ? host : '', ...(model !== undefined ? { model } : {}) }
 
   try {
     const res = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/fleet/attach-signed`, {

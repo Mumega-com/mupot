@@ -70,6 +70,7 @@ async function upsertRunning(
   memberId: string | null,
   host: string,
   model: string | null = null,
+  preserveUnreportedModel = false,
 ): Promise<string> {
   const writeAgentId = await resolveFleetWriteAgentId(env, agentId)
   await env.DB.prepare(
@@ -86,11 +87,11 @@ async function upsertRunning(
           agent_type       = excluded.agent_type,
           member_id        = excluded.member_id,
           host             = excluded.host,
-          model            = excluded.model,
+          model            = CASE WHEN ?11 = 1 THEN COALESCE(excluded.model, fleet_agents.model) ELSE excluded.model END,
           last_reported_at = excluded.last_reported_at,
           updated_at       = excluded.updated_at`,
   )
-    .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model, canonicalHarness(runtime))
+    .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model, canonicalHarness(runtime), preserveUnreportedModel ? 1 : 0)
     .run()
 
   // Runtime truth reaches the identity record too (harness-native-mupot lane A): the Fleet
@@ -349,12 +350,16 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   //    last wrote it. `upsertRunning` now resolves `v.agent_id` to the canonical `agents.id`
   //    INTERNALLY (v4 round 2, P1-1 — resolution centralized in the write function itself,
   //    never at an individual call site) and returns it for the boot-ack lookup below.
-  const writeAgentId = await upsertRunning(c.env, v.agent_id, cleanReported(v.runtime, MAX_REPORTED) ?? 'unknown', v.lifecycle, v.type, v.member_id, host)
+  // Model comes only from the verified payload. Old clients and cleaned-empty reports
+  // leave the existing model unchanged; the bearer attach path keeps its own semantics.
+  const model = v.model === undefined ? null : cleanReported(v.model, MAX_REPORTED_MODEL)
+  const writeAgentId = await upsertRunning(c.env, v.agent_id, cleanReported(v.runtime, MAX_REPORTED) ?? 'unknown', v.lifecycle, v.type, v.member_id, host, model, true)
 
   // 4. Boot-ack.
   const views = await getAgentView(c.env)
   const agent = views.find((view) => view.agent_id === writeAgentId) ?? null
-  return c.json({ ok: true, agent })
+  // Receipt describes THIS report, not a model retained from a previous attachment.
+  return c.json({ ok: true, agent, report: { model, reported_by: v.member_id, signed: true } })
 })
 
 // ── POST /api/fleet/detach-signed ─────────────────────────────────────────────────
