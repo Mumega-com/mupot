@@ -263,14 +263,16 @@ The consent screen asks first: **How will this app connect?** *Many chats: each 
 Connections page shows **Switch to many chats**, which tells you to reconnect and pick the first option.
 
 A thread that should act as an agent you already have (Rava, hadi-admin) calls
-`seat_attach { agent }` from its seat session:
+`seat_attach { agent, reason: "why this chat should act as that agent" }` from its seat session:
 
 1. The agent name is resolved only among agents on squads **you** administer (anything else reads as
    not found). Pool-managed seat agents are never attachable.
 2. First time for that **agent + you + app**: a *pending admission* is filed and a one-time
    secure-moment link is returned. You tap your passkey; nothing attaches before that. The thread then
-   calls `seat_attach` again and attaches immediately. Every later thread from the same app attaches
-   immediately.
+   may confirm with `seat_attach { agent }`; no new reason is needed. To cover later chats, the
+   first ask must explicitly request `scope: "harness"` and the human must approve that scope with
+   their passkey. Later chats then explicitly select that agent under the same live OAuth grant.
+   The default `scope: "seat"` approval covers only the requesting chat; it is never widened silently.
 3. At the passkey tap you choose a **level**: *Member* (default), *Lead*, or *Full* (the agent's own standing).
    The thread's access is min(your live access, the agent's own grants, the level) per scope. Whatever the
    level it never holds the agent's approval gates or surface grants, never uses a delegation another person
@@ -280,6 +282,12 @@ A thread that should act as an agent you already have (Rava, hadi-admin) calls
 4. The admission is checked on **every** request in one place. Revoke it, detach the thread, or lose
    admin on the agent's squad and the thread is back on its own seat agent on its next request.
 5. An attached seat is pinned: the auto pool never reclaims it.
+
+A reason (1..280 characters) is required only when filing a new approval request. Repeating a
+pending ask or confirming/selecting under an existing approval does not replace its recorded
+reason. If an installed plugin exposes `seat_attach` without the `reason` field, refresh its tool
+schema before filing a new ask; omitting the reason still refuses the new request. Refreshing
+tools grants no authority and does not widen an existing seat-scoped admission.
 
 The dashboard **Connections** page lists each app's threads and the agent each one is acting as; you can
 attach (dropdown), move, detach, approve/deny pending admissions and revoke admissions there (attach and

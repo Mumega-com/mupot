@@ -88,7 +88,7 @@ const toolBootstrapSelf: ToolSpec = {
             + 'other connection channel, already has a voice and does not need this tool.'
             // A chat with a seat is agent-bound (its seat agent), so it lands here. Say what it can do instead.
             + (auth.seatBinding && !auth.seatBinding.attached && seatAttachEnabled(env)
-              ? ' This chat already acts as a seat agent. To act as an agent you already have, call seat_attach { agent: "<its id, slug or name>" } (your human approves once with their passkey). To work as this seat agent, call orient.'
+              ? ' This chat already acts as a seat agent. To act as an agent you already have, call seat_attach { agent: "<its id, slug or name>", reason: "<why this chat should act as that agent>" } (your human approves once with their passkey). To work as this seat agent, call orient.'
               : auth.seatBinding?.attached
                 ? ' This chat is already attached to an existing agent; call boot_context and orient.'
                 : ' If this credential is an agent or seat token you already are that agent: call boot_context. If it is an unbound member token with no agent, an admin mints you one (mint_agent_token).'),

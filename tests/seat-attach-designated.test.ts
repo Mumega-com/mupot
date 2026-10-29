@@ -873,7 +873,7 @@ describe('codex review dispositions', () => {
         return realPrepare(sql)
       }
       const v = Reflect.get(t, prop, rcv); return typeof v === 'function' ? v.bind(t) : v } }) } as Env
-    const r = await attachSeatToAgent(racing, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'agent-rava', via: 'tool' })
+    const r = await attachSeatToAgent(racing, { humanMemberId: HUMAN, seatId: seat.id, agentRef: 'agent-rava', via: 'tool', reason: 'This chat operates Rava for my owner.' })
     expect(fired).toBe(true)
     expect(r).toEqual({ ok: false, error: 'attach_refused' })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions`)).toBe(0)
