@@ -2,6 +2,8 @@
 import { env as bindings, applyD1Migrations as applyAllMigrations } from 'cloudflare:test'
 import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { ownerCall } from '../../src/owner-call/service'
+import { decideElevationRequest, expireStaleElevationRequests } from '../../src/auth/elevation'
+import { resolveCapabilities } from '../../src/auth/capability'
 import type { AuthContext, Env } from '../../src/types'
 
 const testBindings = bindings as unknown as { MUPOT_DB: Env['DB']; TEST_MIGRATIONS: Parameters<typeof applyAllMigrations>[1] }
@@ -120,6 +122,82 @@ describe('owner_call local D1 conditional commits',()=>{
     expect(await f.call(id,'admitted',bound)).toMatchObject({ok:true})
     await f.db.prepare("UPDATE agent_seat_admissions SET status='revoked',revoked_at=? WHERE id=?").bind(now,adm).run()
     expect(await f.call(id,'admitted',bound)).toMatchObject({ok:false,error:'agent_binding_required'})
+  })
+
+  it('competing alias keys cannot exceed the per-version budget and rotation retries still work',async()=>{
+    const f=await fixture(),id=await f.source()
+    for(let i=0;i<31;i++) expect((await f.call(id,`bounded-${i}`)).ok).toBe(true)
+    const out=await Promise.all([f.call(id,'race-a'),f.call(id,'race-b')])
+    expect(out.filter(r=>r.ok)).toHaveLength(1)
+    expect(out.find(r=>!r.ok)).toMatchObject({ok:false,error:'owner_call_alias_limit'})
+    expect(await f.count('owner_call_key_aliases')).toBe(32)
+    f.env.OWNER_CALL_HMAC_KEYS=JSON.stringify([{version:'v2',key:'another-fixture-key-at-least-32-bytes'},{version:'v1',key:'only-a-fixture-key-at-least-32-bytes'}])
+    expect(await f.call(id,'bounded-0')).toMatchObject({ok:true,result:{retry:true}})
+    expect(await f.count('owner_call_key_aliases')).toBe(33)
+    expect(await f.count('owner_calls')).toBe(1)
+  })
+  it.each(['approve','deny'] as const)('canonical %s decision succeeds unchanged and closes the projection',async decision=>{
+    const f=await fixture(),id=await f.source(),human=`${f.tenant}-human`,sq=f.actors[0].capabilities![0].scope_id
+    expect((await f.call(id)).ok).toBe(true)
+    const identity=crypto.randomUUID(),session=crypto.randomUUID().replaceAll('-','').repeat(2)
+    const now=new Date().toISOString(),future=new Date(Date.now()+86400_000).toISOString()
+    await f.db.batch([
+      f.db.prepare("INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES(?,?,'squad',?,'admin')").bind(`${f.tenant}-decider-admin`,human,sq),
+      f.db.prepare("INSERT INTO human_login_identities(id,tenant,provider,provider_subject,verified_email,member_id,created_at) VALUES(?,?,'google',?,?,?,?)").bind(identity,f.tenant,f.tenant,`${f.tenant}@example.test`,human,now),
+      f.db.prepare('INSERT INTO web_sessions(id_hash,tenant,member_id,login_identity_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?,?,?)').bind(session,f.tenant,human,identity,now,now,future,future),
+    ])
+    const result=await decideElevationRequest(f.env,{
+      tenant:f.tenant,requestId:id,decision,selectedActions:['action:project_lifecycle'],
+      decidedByMemberId:human,decidedByCapabilities:await resolveCapabilities(f.env,human),decidedByWebSessionHash:session,
+      requireLiveApproverSession:true,recentReauthOk:true,
+    })
+    expect(result).toMatchObject({ok:true,request:{status:decision==='approve'?'approved':'denied'}})
+    if(result.ok)expect(result.grants).toHaveLength(decision==='approve'?1:0)
+    expect(await f.db.prepare('SELECT state FROM owner_calls WHERE tenant=?').bind(f.tenant).first()).toEqual({state:'closed'})
+    expect(await f.count('owner_call_requesters')).toBe(1);expect(await f.count('owner_call_key_aliases')).toBe(1)
+  })
+  it('natural expiry cleanup releases stale D1 capacity before admission without deleting history',async()=>{
+    const f=await fixture(),a=f.actors[0]
+    for(let i=0;i<10;i++){
+      const id=await f.source(a),old=new Date(Date.now()-(40-i)*900_001).toISOString()
+      await f.db.batch([
+        f.db.prepare(`INSERT INTO owner_calls(id,tenant,owner_member_id,owner_revision,created_by_agent_id,source_agent_id,kind,action_type,action_id,action_version,reason_code,canonical_delivery_id,created_at)
+          SELECT ?,?,member_id,0,?,?,'access','elevation_request',?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','access_required',id,? FROM approval_bot_deliveries WHERE tenant=? AND request_id=?`)
+          .bind(`oc-${id}`,f.tenant,a.boundAgentId,a.boundAgentId,id,old,f.tenant,id),
+        f.db.prepare('INSERT INTO owner_call_requesters(tenant,ask_id,agent_id,owner_revision,created_at) VALUES(?,?,?,0,?)').bind(f.tenant,`oc-${id}`,a.boundAgentId,old),
+        f.db.prepare("UPDATE elevation_requests SET decision_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 second') WHERE id=? AND tenant=?").bind(id,f.tenant),
+      ])
+    }
+    expect(await f.db.prepare("SELECT COUNT(*) n FROM owner_calls WHERE tenant=? AND state='pending'").bind(f.tenant).first()).toEqual({n:10})
+    const fresh=await f.source(a)
+    expect(await f.call(fresh)).toMatchObject({ok:true})
+    expect(await f.db.prepare("SELECT COUNT(*) n FROM owner_calls WHERE tenant=? AND state='pending'").bind(f.tenant).first()).toEqual({n:1})
+    expect(await f.count('owner_calls')).toBe(11);expect(await f.count('owner_call_requesters')).toBe(11)
+  })
+
+  it('canonical expiry retains its exact source count and lazy cleanup closes the stale slot',async()=>{
+    const f=await fixture(),id=await f.source()
+    expect((await f.call(id)).ok).toBe(true)
+    await f.db.prepare("UPDATE elevation_requests SET decision_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 second') WHERE id=? AND tenant=?").bind(id,f.tenant).run()
+    expect(await expireStaleElevationRequests(f.env,f.tenant)).toEqual({expiredCount:1})
+    expect(await f.db.prepare('SELECT state FROM owner_calls WHERE tenant=?').bind(f.tenant).first()).toEqual({state:'pending'})
+    const fresh=await f.source()
+    expect((await f.call(fresh)).ok).toBe(true)
+    expect(await f.db.prepare('SELECT state FROM owner_calls WHERE tenant=? AND action_id=?').bind(f.tenant,id).first()).toEqual({state:'closed'})
+  })
+
+  it('fresh keys refuse an old retained requester epoch on real D1 without rewriting its history',async()=>{
+    const f=await fixture(),id=await f.source(),a=f.actors[1],human=`${f.tenant}-human`,other=`${f.tenant}-other-human`
+    expect((await f.call(id,'retained-old',a)).ok).toBe(true)
+    await f.db.batch([
+      f.db.prepare('INSERT INTO members(id,tenant,display_name) VALUES(?,?,?)').bind(other,f.tenant,'Other human'),
+      f.db.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').bind(other,a.boundAgentId),
+      f.db.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').bind(human,a.boundAgentId),
+    ])
+    expect(await f.call(id,'retained-new',a)).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(await f.call(id,'retained-new',a)).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(await f.count('owner_call_key_aliases')).toBe(1)
+    expect(await f.db.prepare('SELECT owner_revision FROM owner_call_requesters WHERE tenant=? AND agent_id=?').bind(f.tenant,a.boundAgentId).first()).toEqual({owner_revision:0})
   })
 
 })

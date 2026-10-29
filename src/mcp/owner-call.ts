@@ -10,7 +10,7 @@ export const toolOwnerCall: ToolSpec = {
   shouldTouchPresence: () => false,
   async run(auth, env, args) {
     const result = await ownerCall(env, auth, args)
-    return result.ok ? done(result.result) : fail(result.error === 'invalid_args' ? 400 : result.error === 'ask_key_conflict' ? 409 : result.error === 'owner_call_limit' ? 429 : 403,
+    return result.ok ? done(result.result) : fail(result.error === 'invalid_args' ? 400 : (result.error === 'ask_key_conflict' || result.error === 'owner_call_alias_limit') ? 409 : result.error === 'owner_call_limit' ? 429 : 403,
       result.error, result.retry_after ? { retry_after: result.retry_after } : undefined)
   },
 }

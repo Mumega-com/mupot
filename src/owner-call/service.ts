@@ -176,6 +176,17 @@ export async function ownerCall(env: Env, auth: AuthContext, raw: Record<string,
   const prior = historical.results?.[0]
   if (historical.results?.some(r => r.payload_digest !== digest || r.id !== prior?.id)) return { ok: false, error: 'ask_key_conflict' }
   if (prior && (prior.owner_member_id !== who.owner_id || prior.requester_owner_revision !== who.owner_revision)) return { ok: false, error: 'owner_setup_required' }
+  // A fresh key must not attach to an immutable requester association from an older owner generation.
+  // Preserve that history and refuse; otherwise the accepted key would fail its very next identical retry.
+  if (!prior) {
+    const retainedRequester = await env.DB.prepare(`SELECT r.owner_revision FROM owner_calls c
+      JOIN owner_call_requesters r ON r.tenant=c.tenant AND r.ask_id=c.id AND r.agent_id=?2
+      WHERE c.tenant=?1 AND c.owner_member_id=?3 AND c.action_type=?4 AND c.action_id=?5
+        AND c.action_version=?6 AND c.state='pending' LIMIT 1`)
+      .bind(env.TENANT_SLUG,auth.boundAgentId,who.owner_id,arg.action_ref.type,arg.action_ref.id,version)
+      .first<{ owner_revision: number }>()
+    if (retainedRequester && retainedRequester.owner_revision !== who.owner_revision) return { ok: false, error: 'owner_setup_required' }
+  }
   const liveSource = source.status === 'pending' && Date.parse(source.expires_at) > Date.now()
   if (!prior && !liveSource) return { ok: false, error: 'owner_call_source_unavailable' }
   const id = prior?.id ?? `oc-${crypto.randomUUID()}`
@@ -195,7 +206,11 @@ export async function ownerCall(env: Env, auth: AuthContext, raw: Record<string,
   const sourceAgentLive = `EXISTS(SELECT 1 FROM agents sa JOIN agent_member_bindings sb ON sb.agent_id=sa.id AND sb.tenant=${tenantP}
     WHERE sa.id=${p(source.agent_id)} AND sa.owner_member_id=${ownerP} AND sa.squad_id=${p(who.squad_id)} AND sa.status='active')`
   const ring = aliases.map(k => `(key_version=${p(k.version)} AND key_check=${p(k.check)})`).join(' OR ')
-  const guardConditions = `NOT EXISTS(SELECT 1 FROM owner_call_hmac_versions WHERE tenant=${tenantP} AND NOT (${ring})) AND (SELECT stamp FROM owner_call_actor)=${stampP} AND ${ownerLive} AND ${sourceAgentLive} AND (SELECT stamp FROM owner_call_source)=${sourceStampP}`
+  const requesterCurrent = `NOT EXISTS(SELECT 1 FROM owner_calls c JOIN owner_call_requesters r
+    ON r.tenant=c.tenant AND r.ask_id=c.id AND r.agent_id=${agentP}
+    WHERE c.tenant=${tenantP} AND c.owner_member_id=${ownerP} AND c.action_type=${typeP} AND c.action_id=${sourceP}
+      AND c.action_version=${versionP} AND c.state='pending' AND r.owner_revision<>${revisionP})`
+  const guardConditions = `NOT EXISTS(SELECT 1 FROM owner_call_hmac_versions WHERE tenant=${tenantP} AND NOT (${ring})) AND (SELECT stamp FROM owner_call_actor)=${stampP} AND ${ownerLive} AND ${sourceAgentLive} AND (SELECT stamp FROM owner_call_source)=${sourceStampP} AND ${requesterCurrent}`
   // Materialized CTEs keep the canonical attachment predicate below D1's expression-depth ceiling.
   // These are statement-local snapshots inside the SAME transaction, not application-side cached authorization.
   const withGuard = `WITH owner_call_actor AS MATERIALIZED (${actorSql}), owner_call_source AS MATERIALIZED (${sourceSql}),
@@ -212,6 +227,12 @@ export async function ownerCall(env: Env, auth: AuthContext, raw: Record<string,
       ON CONFLICT(tenant,key_version) DO UPDATE SET key_check=excluded.key_check`)
   }
   statements.push(
+    // Natural expiry has no SQL event. Release this owner's stale access slots before the same commit checks quotas.
+    // This projects canonical terminal/expiry facts only; it never decides or mutates an elevation request.
+    `UPDATE owner_calls SET state='closed' WHERE tenant=${tenantP} AND owner_member_id=${ownerP} AND state='pending'
+      AND action_type='elevation_request' AND EXISTS(SELECT 1 FROM elevation_requests e
+        WHERE e.tenant=${tenantP} AND e.id=owner_calls.action_id
+          AND (e.status<>'pending' OR julianday(e.decision_expires_at)<=julianday('now'))) AND ${guard}`,
     `UPDATE owner_calls SET state='closed' WHERE tenant=${tenantP} AND owner_member_id=${ownerP} AND action_type=${typeP}
       AND action_id=${sourceP} AND (action_version<>${versionP} OR NOT EXISTS(SELECT 1 FROM agents anchor
         WHERE anchor.id=owner_calls.source_agent_id AND anchor.owner_member_id=owner_calls.owner_member_id
@@ -252,6 +273,7 @@ export async function ownerCall(env: Env, auth: AuthContext, raw: Record<string,
   } catch (error) {
     const message = error instanceof Error ? error.message : ''
     if (message.includes('owner_call_key_history')) return { ok: false, error: 'owner_call_setup_required' }
+    if (message.includes('owner_call_alias_limit')) return { ok: false, error: 'owner_call_alias_limit' }
     if (message.includes('ask_key_conflict')) return { ok: false, error: 'ask_key_conflict' }
     if (/owner_call_(agent_rate|owner_rate|agent_pending|owner_pending|owner_total)/.test(message)) return { ok: false, error: 'owner_call_limit', retry_after: 900 }
     // Never echo SQL, bindings, provider errors or private source content.

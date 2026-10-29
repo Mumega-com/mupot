@@ -6,7 +6,8 @@ import { spawnSync } from 'node:child_process'
 const dir=resolve(process.argv[2] ?? 'tmp/owner-call-mutations')
 mkdirSync(dir,{recursive:true})
 const service='src/owner-call/service.ts', migration='migrations/0269_owner_calls.sql'
-const originals=new Map([service,migration].map(p=>[p,readFileSync(p,'utf8')]))
+const followup='migrations/0270_owner_call_maintenance.sql'
+const originals=new Map([service,migration,followup].map(p=>[p,readFileSync(p,'utf8')]))
 const replace=(text,from,to)=>{if(!text.includes(from))throw new Error(`mutation anchor absent: ${from}`);return text.replace(from,to)}
 const mutants=[
   ['live-actor-commit',service,s=>replace(s,'(SELECT stamp FROM owner_call_actor)=${stampP}','1=1'),'actor credential revocation with independent source'],
@@ -22,13 +23,35 @@ const mutants=[
   ['source-member-commit',service,s=>replace(replace(s,"AND sm.status='active' AND sm.archived_at IS NULL",''),'sm.id,sm.status,sm.archived_at,sm.tenant','sm.id,sm.tenant'),'source welded member suspension'],
   ['active-action-unique',migration,s=>replace(s,'CREATE UNIQUE INDEX owner_call_active_action','CREATE INDEX owner_call_active_action'),'database active-action uniqueness'],
   ['key-history-conflict',migration,s=>replace(s,"BEGIN SELECT RAISE(ABORT,'ask_key_conflict'); END;",'BEGIN SELECT 1; END;'),'database key-history conflict'],
-  ['agent-creation-limit',migration,s=>replace(s,">= 5\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate')",">= 500\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate')"),'atomic agent creation ceiling'],
-  ['owner-creation-limit',migration,s=>replace(s,">= 20\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate')",">= 2000\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate')"),'atomic owner creation ceiling'],
+  ['agent-creation-limit',followup,s=>replace(s,">= 5\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate')",">= 500\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate')"),'atomic agent creation ceiling'],
+  ['owner-creation-limit',followup,s=>replace(s,">= 20\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate')",">= 2000\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate')"),'atomic owner creation ceiling'],
   ['agent-unresolved-limit',migration,s=>replace(s,"c.state='pending') >= 10","c.state='pending') >= 1000"),'joined associations count'],
   ['ordinary-owner-limit',migration,s=>replace(s,">= 40\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_pending')",">= 4000\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_pending')"),'ordinary owner queue stops'],
   ['owner-revision-aba',migration,s=>replace(s,'SET owner_call_owner_revision = OLD.owner_call_owner_revision + 1','SET owner_call_owner_revision = OLD.owner_call_owner_revision'),'owner revision catches'],
   ['requester-isolation',migration,s=>replace(s,"BEGIN SELECT RAISE(ABORT,'owner_call_requester_immutable'); END;",'BEGIN SELECT 1; END;').replace("CREATE TRIGGER owner_call_requesters_no_delete BEFORE DELETE ON owner_call_requesters BEGIN SELECT RAISE(ABORT,'owner_call_requester_immutable'); END;","CREATE TRIGGER owner_call_requesters_no_delete BEFORE DELETE ON owner_call_requesters BEGIN SELECT 1; END;"),'a requester cannot remove'],
-  ['creation-flag',service,s=>replace(s,"if (env.OWNER_CALL !== '1')",'if (false)'),'flag off hides tool'],
+  ['actor-session-revoked-predicate',service,s=>replace(s,'AND s.revoked_at IS NULL AND','AND 1=1 AND'),'revoked actor session cannot use a peer source'],
+  ['actor-token-channel',service,s=>replace(s,"AND t.channel='${auth.channel === 'directory' ? 'directory' : 'workspace'}'",'AND 1=1'),'workspace context rejects token/session channel mismatch'],
+  ['actor-session-kind',service,s=>replace(s,"AND s.auth_kind='${auth.channel === 'directory' ? 'oauth' : 'workspace_token'}'",'AND 1=1'),'workspace context rejects token/session channel mismatch'],
+  ['plain-unattached-seat',service,s=>replace(s,'if (!seat.attached) return false','if (!seat.attached) return true'),'plain unattached seat is refused'],
+  ['requester-revision-retry',service,s=>replace(s,' || prior.requester_owner_revision !== who.owner_revision',''),'requester revision retry rejects|same-key owner-changed-and-back retry'],
+  ['actor-member-active',service,s=>replace(s,"AND m.status='active'",'AND 1=1'),"actor liveness cannot be masked.*members SET status"],
+  ['actor-member-unarchived',service,s=>replace(s,'AND m.archived_at IS NULL','AND 1=1'),'actor liveness cannot be masked.*archived_at'],
+  ['actor-active-independent-source',service,s=>replace(s,"AND a.status='active'",'AND 1=1'),"actor liveness cannot be masked.*agents SET status"],
+  ['commit-nonhuman-owner',service,s=>replace(s,'AND NOT EXISTS(SELECT 1 FROM agent_member_bindings ob WHERE ob.tenant=${tenantP} AND ob.member_id=om.id)','AND 1=1'),'commit refuses an owner welded'],
+  ['closed-projection-no-reopen',migration,s=>replace(s,"OR (OLD.state='closed' AND NEW.state<>'closed')",'OR 0'),'DB closed-to-pending transition'],
+  ['outbox-kind',migration,s=>replace(s,"BEGIN SELECT RAISE(ABORT,'owner_call_outbox_kind'); END;",'BEGIN SELECT 1; END;'),'outbox kind trigger accepts'],
+  ['ask-history-no-delete',migration,s=>replace(s,"CREATE TRIGGER owner_calls_no_delete BEFORE DELETE ON owner_calls BEGIN SELECT RAISE(ABORT,'owner_call_history_retained'); END;",'CREATE TRIGGER owner_calls_no_delete BEFORE DELETE ON owner_calls BEGIN SELECT 1; END;'),'owner_calls no-delete guard retains'],
+  ['hmac-version-immutable',migration,s=>replace(s,"BEGIN SELECT RAISE(ABORT,'owner_call_key_history'); END;",'BEGIN SELECT 1; END;'),'HMAC version history is immutable: UPDATE'],
+  ['hmac-version-no-delete',migration,s=>replace(s,"CREATE TRIGGER owner_call_hmac_version_no_delete BEFORE DELETE ON owner_call_hmac_versions BEGIN SELECT RAISE(ABORT,'owner_call_key_history'); END;",'CREATE TRIGGER owner_call_hmac_version_no_delete BEFORE DELETE ON owner_call_hmac_versions BEGIN SELECT 1; END;'),'HMAC version history is immutable: DELETE'],
+  ['canonical-terminal-projection',followup,s=>replace(s,"UPDATE owner_calls SET state='closed' WHERE tenant=NEW.tenant AND action_type='elevation_request'\n    AND action_id=NEW.id AND state='pending';",'SELECT 1;'),'canonical .* transition closes projections'],
+  ['expired-projection-catchup',service,s=>replace(s,"(e.status<>'pending' OR julianday(e.decision_expires_at)<=julianday('now'))",'0'),'lazy expiry frees stale requester capacity'],
+  ['alias-budget',followup,s=>replace(s,">= 32\nBEGIN SELECT RAISE(ABORT,'owner_call_alias_limit')",">= 3200\nBEGIN SELECT RAISE(ABORT,'owner_call_alias_limit')"),'alias budget bounds fresh keys'],
+  ['agent-rate-window-index',migration,s=>replace(s,'CREATE INDEX owner_call_agent_window ON owner_calls(tenant,created_by_agent_id,created_at);','-- mutation: missing agent window index'),'agent rate trigger uses an indexed'],
+  ['owner-rate-window-index',followup,s=>replace(s,'CREATE INDEX owner_call_owner_window ON owner_calls(tenant,owner_member_id,created_at);','-- mutation: missing owner window index'),'owner rate trigger uses an indexed'],
+  ['retained-requester-revision',service,s=>replace(replace(s,'if (retainedRequester && retainedRequester.owner_revision !== who.owner_revision)','if (false)'),'AND ${requesterCurrent}`','AND 1=1`'),'fresh keys reject retained requester revision mismatch'],
+  ['retained-requester-commit',service,s=>replace(s,'AND ${requesterCurrent}`','AND 1=1`'),'retained requester revision is rechecked in the conditional commit'],
+  ['terminal-source-catchup',service,s=>replace(s,"e.status<>'pending' OR ",''),'reconciles legacy terminal sources before pending quotas'],
+  ['creation-flag' ,service,s=>replace(s,"if (env.OWNER_CALL !== '1')",'if (false)'),'flag off hides tool'],
   ['disabled-kinds',service,s=>replace(s,"return { ok: false, error: 'owner_call_kind_disabled' }","return { ok: true, result: { ask_id: 'fake', state: 'pending', delivery_state: 'inert', next_step: 'wait', retry: false } }"),'keeps .* disabled'],
 ]
 let failed=false
