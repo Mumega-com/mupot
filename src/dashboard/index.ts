@@ -203,6 +203,7 @@ import { SELECT_SEARCH_SCRIPT } from './select-search'
 import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
+import { routeLatencyApp } from './route-latency'
 // Flight-008 Slice 3 (#1062): the /send dispatch-now picker's reachability signal.
 // Reuses getFleetAgentRuntimeStates VERBATIM — the SAME dual-surface (fleet_agents ∪
 // module_registry) presence primitive src/routines/dispatch.ts#selectAgent already
@@ -1762,6 +1763,7 @@ dashboardApp.route('/', makeSecurityBarApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
+dashboardApp.route('/', routeLatencyApp)
 
 // GET /dashboard/kanban — Multi-Perspective Squad & Project Kanban Board
 dashboardApp.get('/dashboard/kanban', async (c) => {

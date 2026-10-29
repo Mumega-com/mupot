@@ -4707,9 +4707,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0268_route_latency_retention.sql",
+    sha256: "cf717de6e1f828bcb6ecbecd20f0a6cd2c28e6b1f48f160a4e50037d4b2857f5",
+    statements: [
+      "-- One fixed authenticated route. No user, query, URL, header or credential fields.\nCREATE TABLE route_latency_requests (\n  tenant TEXT NOT NULL,\n  route TEXT NOT NULL CHECK (route = 'GET /api/kanban/board'),\n  bucket_ms INTEGER NOT NULL CHECK (bucket_ms >= 0),\n  total_requests INTEGER NOT NULL CHECK (total_requests > 0),\n  PRIMARY KEY (tenant, route, bucket_ms)\n);",
+      "\n\nCREATE TABLE route_latency_samples (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  route TEXT NOT NULL CHECK (route = 'GET /api/kanban/board'),\n  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),\n  duration_ms REAL NOT NULL CHECK (duration_ms >= 0)\n);",
+      "\nCREATE INDEX route_latency_samples_window\n  ON route_latency_samples (tenant, route, observed_at_ms DESC, id DESC);",
+      "\n\n-- Collection-start metadata survives sample expiry; it contains no request data.\nCREATE TABLE route_latency_collection (\n  tenant TEXT NOT NULL,\n  route TEXT NOT NULL CHECK (route = 'GET /api/kanban/board'),\n  started_at_ms INTEGER NOT NULL,\n  PRIMARY KEY (tenant, route)\n);",
+    ],
+    objects: [
+      { type: "table", name: "route_latency_requests" },
+      { type: "table", name: "route_latency_samples" },
+      { type: "index", name: "route_latency_samples_window" },
+      { type: "table", name: "route_latency_collection" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "58577f5369c1581e1ba7276059338cb0ddb8f0c9b92390a76c1eeee00c256a5d"
+export const SCHEMA_CHAIN_DIGEST: string = "4edc5d3ffa53e44c704c26f5105bb2a41eb29ef0e110112284e0fe8d554b765a"

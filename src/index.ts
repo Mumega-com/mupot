@@ -21,6 +21,7 @@ import { ROUTES } from './types'
 import { publicHealth } from './health'
 import { cliResponse } from './cli/serve'
 import { instrumentEnv, serverTimingAuthorized, withServerTiming } from './lib/server-timing'
+import { pruneRouteLatency } from './telemetry/route-latency'
 
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
@@ -594,7 +595,15 @@ export default {
       ['flight-outbox', () => flushFlightEventOutbox(env)],
       ['concierge', () => runConciergeTick(env)],
       ['project-loop', () => runProjectLoopTick(env, {})],
-      ['agent-connection-retention', () => sweepAgentConnectionRetention(env)],
+      ['agent-connection-retention', async () => {
+        // Keep the Worker alive for both independent sweeps even if one fails early.
+        const results = await Promise.allSettled([
+          sweepAgentConnectionRetention(env),
+          pruneRouteLatency(env),
+        ])
+        if (results.some(result => result.status === 'rejected')) throw new Error('retention_sweep_failed')
+        return results
+      }],
       ['token-expiry-warning', () => sweepExpiringTokensWarning(env)],
       ['flight-watchdog', () => sweepStalledFlights(env)],
       ['gate-stall-watchdog', () => sweepStalledGateReviews(env)],
