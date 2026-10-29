@@ -3,7 +3,7 @@ import type { ToolSpec } from '../mcp/index'
 import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 import { canDecideElevationRequest, loadElevationRequestById } from '../auth/elevation'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
-import { hasCapabilityOnDynamicScope, resolveCapabilities } from '../auth/capability'
+import { CAPABILITY_LIVE_PREDICATE, hasCapabilityOnDynamicScope, resolveCapabilities } from '../auth/capability'
 import { resolveConsentedAgentCapabilities } from '../mcp/oauth-authorize'
 import { resolveSeatCapabilities } from '../members/seat-handle'
 import { findLiveAttachment } from '../members/seat-attach'
@@ -52,12 +52,8 @@ function identityQuery(env: Env, auth: AuthContext): { sql: string; values: unkn
       'session',json_array(s.id,s.created_at,s.revoked_at,s.absolute_expires_at,s.idle_expires_at),
       'human_roles',(SELECT json_group_array(json_array(li.id,li.revoked_at,u.id,u.role)) FROM human_login_identities li LEFT JOIN users u ON lower(u.email)=lower(li.verified_email) WHERE li.tenant=?1 AND li.member_id=?5 ORDER BY li.id,u.id),
       'human',(SELECT json_array(id,status,archived_at) FROM members WHERE id=?5 AND tenant=?1),
-      'caps',(SELECT json_group_array(json_array(id,member_id,scope_type,scope_id,capability,expires_at,CASE WHEN expires_at IS NULL OR julianday(expires_at)>julianday(?10) THEN 1 ELSE 0 END)) FROM
-        (SELECT * FROM capabilities WHERE member_id IN (?3,?5) ORDER BY id)),
-      'memberships',(SELECT json_group_array(json_array(id,agent_id,squad_id,capability,expires_at)) FROM
-        (SELECT * FROM memberships WHERE agent_id=?2 ORDER BY id)),
-      'human_memberships',(SELECT json_group_array(json_array(m.id,m.agent_id,m.squad_id,m.capability,m.expires_at)) FROM
-        (SELECT ms.* FROM memberships ms JOIN agent_member_bindings b ON b.agent_id=ms.agent_id AND b.tenant=?1 WHERE b.member_id=?5 ORDER BY ms.id) m),
+      'caps',(SELECT json_group_array(json_array(id,member_id,scope_type,scope_id,capability,expires_at)) FROM
+        (SELECT * FROM capabilities WHERE member_id IN (?3,?5) AND ${CAPABILITY_LIVE_PREDICATE('', '?10')} ORDER BY id)),
       'channel_grants',(SELECT json_group_array(json_array(id,binding_id,member_id,squad_id,capability,updated_at)) FROM (SELECT * FROM channel_capability_grants WHERE member_id IN (?3,?5) ORDER BY id)),
       'scope',(SELECT json_array(sq.id,sq.kind,sq.department_id,d.kind) FROM squads sq JOIN departments d ON d.id=sq.department_id WHERE sq.id=a.squad_id),
       'admission',(SELECT json_array(ad.id,ad.status,ad.ceiling,ad.expires_at,ad.revoked_at,ad.decided_at,ad.requested_seat_id,ad.scope) FROM agent_seat_admissions ad WHERE ad.id=?8 AND ad.tenant=?1),

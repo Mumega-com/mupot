@@ -4725,7 +4725,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0269_owner_calls.sql",
-    sha256: "c9459aac40c1dc1b9814cdf57dc64a960dcf51386bc948ea3a1cb81c1a9acace",
+    sha256: "a7016aaf386ee059d2895997308b4ef29817bbc9c52fb884cc757016880f0d0d",
     statements: [
       "-- Owner-call slice 1: projection only. No authority, route, dispatcher or enablement.\n-- 0268 is reserved by route-latency PR #2272. Preserve owner assignment ABA history.\nALTER TABLE agents ADD COLUMN owner_call_owner_revision INTEGER NOT NULL DEFAULT 0;",
       "\nCREATE TRIGGER owner_call_owner_revision\nAFTER UPDATE OF owner_member_id ON agents\nWHEN NEW.owner_member_id IS NOT OLD.owner_member_id\nBEGIN\n  UPDATE agents SET owner_call_owner_revision = OLD.owner_call_owner_revision + 1 WHERE id = NEW.id;\nEND;",
@@ -4733,7 +4733,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\nCREATE UNIQUE INDEX owner_call_active_action ON owner_calls(tenant,owner_member_id,action_type,action_id,action_version)\n  WHERE state = 'pending';",
       "\nCREATE INDEX owner_call_owner_queue ON owner_calls(tenant,owner_member_id,state,priority,created_at);",
       "\nCREATE INDEX owner_call_agent_window ON owner_calls(tenant,created_by_agent_id,created_at);",
-      "\nCREATE TRIGGER owner_call_creation_limits BEFORE INSERT ON owner_calls BEGIN\n  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND created_by_agent_id=NEW.created_by_agent_id\n    AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 5 THEN RAISE(ABORT,'owner_call_agent_rate') END;\n  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n    AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 20 THEN RAISE(ABORT,'owner_call_owner_rate') END;\n  SELECT CASE WHEN NEW.priority=0 AND (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n    AND state='pending' AND priority=0) >= 40 THEN RAISE(ABORT,'owner_call_owner_pending') END;\n  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n    AND state='pending') >= 50 THEN RAISE(ABORT,'owner_call_owner_total') END;\nEND;",
+      "\n-- Separate WHEN triggers use the remote-D1-compatible RAISE form (SELECT CASE ... RAISE is rejected remotely).\nCREATE TRIGGER owner_call_agent_rate BEFORE INSERT ON owner_calls\nWHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND created_by_agent_id=NEW.created_by_agent_id\n  AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 5\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate'); END;",
+      "\nCREATE TRIGGER owner_call_owner_rate BEFORE INSERT ON owner_calls\nWHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n  AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 20\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate'); END;",
+      "\nCREATE TRIGGER owner_call_owner_pending BEFORE INSERT ON owner_calls\nWHEN NEW.priority=0 AND (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n  AND state='pending' AND priority=0) >= 40\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_pending'); END;",
+      "\nCREATE TRIGGER owner_call_owner_total BEFORE INSERT ON owner_calls\nWHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n  AND state='pending') >= 50\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_total'); END;",
       "\nCREATE TRIGGER owner_calls_immutable BEFORE UPDATE ON owner_calls\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.owner_member_id IS NOT OLD.owner_member_id\n OR NEW.owner_revision IS NOT OLD.owner_revision OR NEW.created_by_agent_id IS NOT OLD.created_by_agent_id OR NEW.source_agent_id IS NOT OLD.source_agent_id\n OR NEW.kind IS NOT OLD.kind OR NEW.action_type IS NOT OLD.action_type OR NEW.action_id IS NOT OLD.action_id\n OR NEW.action_version IS NOT OLD.action_version OR NEW.reason_code IS NOT OLD.reason_code\n OR NEW.priority IS NOT OLD.priority OR NEW.canonical_delivery_id IS NOT OLD.canonical_delivery_id OR NEW.created_at IS NOT OLD.created_at\n OR (OLD.state='closed' AND NEW.state<>'closed')\nBEGIN SELECT RAISE(ABORT,'owner_call_immutable'); END;",
       "\nCREATE TRIGGER owner_calls_no_delete BEFORE DELETE ON owner_calls BEGIN SELECT RAISE(ABORT,'owner_call_history_retained'); END;",
       "\n\nCREATE TABLE owner_call_requesters (\n  tenant TEXT NOT NULL,\n  ask_id TEXT NOT NULL REFERENCES owner_calls(id) ON DELETE RESTRICT,\n  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  owner_revision INTEGER NOT NULL,\n  created_at TEXT NOT NULL,\n  PRIMARY KEY(tenant,ask_id,agent_id)\n);",
@@ -4758,7 +4761,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "owner_call_active_action" },
       { type: "index", name: "owner_call_owner_queue" },
       { type: "index", name: "owner_call_agent_window" },
-      { type: "trigger", name: "owner_call_creation_limits" },
+      { type: "trigger", name: "owner_call_agent_rate" },
+      { type: "trigger", name: "owner_call_owner_rate" },
+      { type: "trigger", name: "owner_call_owner_pending" },
+      { type: "trigger", name: "owner_call_owner_total" },
       { type: "trigger", name: "owner_calls_immutable" },
       { type: "trigger", name: "owner_calls_no_delete" },
       { type: "table", name: "owner_call_requesters" },
@@ -4783,4 +4789,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "63c6eb3f5df6c75e6b418414533eefcd7110e673ef96eeb714b1d887669a3fce"
+export const SCHEMA_CHAIN_DIGEST: string = "a44402a00ba5ff113d46808c8efcbcf28656c6de0cf72004e77e3968c9c61544"

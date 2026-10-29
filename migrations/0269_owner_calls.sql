@@ -31,16 +31,23 @@ CREATE UNIQUE INDEX owner_call_active_action ON owner_calls(tenant,owner_member_
   WHERE state = 'pending';
 CREATE INDEX owner_call_owner_queue ON owner_calls(tenant,owner_member_id,state,priority,created_at);
 CREATE INDEX owner_call_agent_window ON owner_calls(tenant,created_by_agent_id,created_at);
-CREATE TRIGGER owner_call_creation_limits BEFORE INSERT ON owner_calls BEGIN
-  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND created_by_agent_id=NEW.created_by_agent_id
-    AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 5 THEN RAISE(ABORT,'owner_call_agent_rate') END;
-  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
-    AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 20 THEN RAISE(ABORT,'owner_call_owner_rate') END;
-  SELECT CASE WHEN NEW.priority=0 AND (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
-    AND state='pending' AND priority=0) >= 40 THEN RAISE(ABORT,'owner_call_owner_pending') END;
-  SELECT CASE WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
-    AND state='pending') >= 50 THEN RAISE(ABORT,'owner_call_owner_total') END;
-END;
+-- Separate WHEN triggers use the remote-D1-compatible RAISE form (SELECT CASE ... RAISE is rejected remotely).
+CREATE TRIGGER owner_call_agent_rate BEFORE INSERT ON owner_calls
+WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND created_by_agent_id=NEW.created_by_agent_id
+  AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 5
+BEGIN SELECT RAISE(ABORT,'owner_call_agent_rate'); END;
+CREATE TRIGGER owner_call_owner_rate BEFORE INSERT ON owner_calls
+WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
+  AND julianday(created_at)>julianday(NEW.created_at)-15.0/1440) >= 20
+BEGIN SELECT RAISE(ABORT,'owner_call_owner_rate'); END;
+CREATE TRIGGER owner_call_owner_pending BEFORE INSERT ON owner_calls
+WHEN NEW.priority=0 AND (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
+  AND state='pending' AND priority=0) >= 40
+BEGIN SELECT RAISE(ABORT,'owner_call_owner_pending'); END;
+CREATE TRIGGER owner_call_owner_total BEFORE INSERT ON owner_calls
+WHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id
+  AND state='pending') >= 50
+BEGIN SELECT RAISE(ABORT,'owner_call_owner_total'); END;
 CREATE TRIGGER owner_calls_immutable BEFORE UPDATE ON owner_calls
 WHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.owner_member_id IS NOT OLD.owner_member_id
  OR NEW.owner_revision IS NOT OLD.owner_revision OR NEW.created_by_agent_id IS NOT OLD.created_by_agent_id OR NEW.source_agent_id IS NOT OLD.source_agent_id
