@@ -42,6 +42,10 @@ export interface WorkflowBinding<PARAMS = unknown> {
 // ── Cloudflare bindings (must match wrangler.toml) ──
 export interface Env {
   DB: D1Database
+  // Owner-call storage pilot. Default off; no notification consumer exists in slice 1.
+  OWNER_CALL?: string
+  // Secret JSON key ring, newest first: [{version,key}]. Retain old versions for all supported retry history.
+  OWNER_CALL_HMAC_KEYS?: string
   // Email reply approvals (design-email-reply-approvals-20261026). '1' enables the log-only spike handler; off otherwise.
   EMAIL_DECISIONS?: string
   // Secret (wrangler secret put). Absent => token mint/verify fail closed.

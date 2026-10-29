@@ -1,3 +1,4 @@
+import { toolOwnerCall } from './owner-call'
 // mupot — MCP seam. The network surface a MEMBER's workspace connects to.
 //
 // Humans are first-class nodes: a person puts a scoped member token in their
@@ -7925,6 +7926,7 @@ export const TOOLS: ToolSpec[] = [
   toolCheckIn,
   toolEndAgentSession,
   toolRequestElevation,
+  toolOwnerCall,
   toolElevationStatus,
   toolStatus,
   toolFleetAgentGet,
@@ -8103,7 +8105,7 @@ const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.ma
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
 // Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
 const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE' | 'OWNER_CALL'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
@@ -8112,8 +8114,8 @@ export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH
   const attach = seatAttachEnabled(env)
   const moments = secureMomentsEnabled(env)
   const vip = vipLaneEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip) return TOOLS
-  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)))
+  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip && env.OWNER_CALL === '1') return TOOLS
+  return TOOLS.filter((t) => (env.OWNER_CALL === '1' || t.name !== 'owner_call') && (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
