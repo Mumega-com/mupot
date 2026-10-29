@@ -14,6 +14,8 @@ import { redispatchReceiptStatement, type RedispatchReceiptInput } from './reboo
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { cancelledColumnSql, outcomeFilterSql } from './cancelled'
 import { LIVE_FLIGHT_STATUSES } from './clearance'
+import { cleanReported } from '../fleet/reported-values'
+import { readFleetAgentRow } from '../fleet/registry'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -648,20 +650,31 @@ function parseReceiptRefs(raw: string | null | undefined): string[] {
   }
 }
 
-// ── Brief P3 (0267): harness/model capture at land ──────────────────────────
+// ── Brief P3 (0267) + #1590 P1/P2: harness/model capture at land ────────────
 // Source of truth is SERVER-DERIVED from the executing agent's fleet_agents row
-// (fleet runtime -> harness, fleet model). A caller-supplied value is describe-only:
-// it may ride the landing receipt as claimed_*, but the stored columns always come
-// from the fleet row. Every stored string is a BOUNDED string: max 64 chars, control
-// characters stripped (fleet rows are runtime-reported, not canonical authority).
+// (fleet runtime -> harness, fleet model), resolved through readFleetAgentRow so a
+// slug-keyed fleet row is found and an ambiguous slug refuses to guess. A caller-
+// supplied value is describe-only: it may ride the landing receipt as claimed_*,
+// but the stored columns always come from the fleet row. Every stored string is
+// exactly what the fleet's OWN scanner (cleanReported, src/fleet/reported-values.ts)
+// would have accepted of a self-report: C0/DEL AND C1 NEL, RTL/bidi controls,
+// zero-width chars and U+2028/2029 stripped, trim, truncate, never a lone
+// surrogate at the cut — harness 64, model 128 (same bounds as the fleet row).
 
 export const FLIGHT_HARNESS_MAX_LEN = 64
 
-/** max 64 chars, no control chars; empty after sanitising -> null. Never fabricated. */
+/** Same bound the fleet row itself keeps on a self-reported model (MAX_REPORTED_MODEL=128). */
+export const FLIGHT_MODEL_MAX_LEN = 128
+
+/**
+ * Sanitise one land-time value through the fleet's OWN reported-value cleaner.
+ * Non-strings (registry quirks, caller junk) are "not reported" -> null; strings go
+ * through cleanReported so the stored value can never be wilder than what the fleet
+ * itself would ingest. Never fabricated.
+ */
 export function sanitizeBoundedFlightText(raw: unknown, maxLength = FLIGHT_HARNESS_MAX_LEN): string | null {
   if (typeof raw !== 'string') return null
-  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLength)
-  return cleaned.length > 0 ? cleaned : null
+  return cleanReported(raw, Math.max(1, Math.min(maxLength, 512)))
 }
 
 /** The server-side harness/model identity of the executing agent at land time. */
@@ -670,12 +683,14 @@ export async function loadFlightHarness(
   agentId: string,
 ): Promise<{ harness: string | null; model: string | null }> {
   if (!agentId) return { harness: null, model: null }
-  const row = await env.DB.prepare(
-    `SELECT runtime, model FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2`,
-  ).bind(env.TENANT_SLUG, agentId)
-    .first<{ runtime: string | null; model: string | null }>()
+  // #1590 P2: single fleet read with readFleetAgentRow — already tenant-scoped, and the
+  // slug fallback an id-keyed read misses (a daemon can key the row by the agent's SLUG).
+  const row = await readFleetAgentRow(env, agentId)
   if (!row) return { harness: null, model: null }
-  return { harness: sanitizeBoundedFlightText(row.runtime), model: sanitizeBoundedFlightText(row.model) }
+  return {
+    harness: sanitizeBoundedFlightText(row.runtime, FLIGHT_HARNESS_MAX_LEN),
+    model: sanitizeBoundedFlightText(row.model, FLIGHT_MODEL_MAX_LEN),
+  }
 }
 
 /**
@@ -883,7 +898,7 @@ export async function landGovernedFlight(
   // claim (sanitised bounded string) under claimed_* so the audit can see both.
   const claimedKeys: Record<string, unknown> = {}
   const claimedHarness = sanitizeBoundedFlightText(opts.claimed_harness)
-  const claimedModel = sanitizeBoundedFlightText(opts.claimed_model)
+  const claimedModel = sanitizeBoundedFlightText(opts.claimed_model, FLIGHT_MODEL_MAX_LEN)
   if (claimedHarness !== null) claimedKeys.claimed_harness = claimedHarness
   if (claimedModel !== null) claimedKeys.claimed_model = claimedModel
   const receiptPayload = JSON.stringify({

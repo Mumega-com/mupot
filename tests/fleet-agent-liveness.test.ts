@@ -47,6 +47,9 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       agent_id TEXT NOT NULL,
       display TEXT NOT NULL DEFAULT '',
       runtime TEXT NOT NULL DEFAULT '',
+      -- mupot#1590: readFleetAgentRow now reads model too (server-derived flight identity).
+      -- The real column is migrations/0097; mirrored here to keep this hand-built subset in step.
+      model TEXT,
       squads TEXT NOT NULL DEFAULT '[]',
       lifecycle TEXT NOT NULL DEFAULT '',
       provider_contract TEXT,

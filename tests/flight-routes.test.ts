@@ -491,4 +491,57 @@ describe('REST governed flight landing parity', () => {
     expect(response.status).toBe(200)
     expect(flight.status).toBe('landed')
   })
+
+  // mupot#1590 P1-3: the HTTP land accepts describe-only harness/model claims and they ride
+  // the landing receipt as claimed_* ONLY — the stored columns stay server-derived (the
+  // executor's own fleet row; this mock resolves no fleet row, so both stay null).
+  it('#1590 passes HTTP harness/model claims through as claimed_* describe-only, never as stored identity', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await land(env, {
+      cost_micro_usd: 0,
+      harness: 'claude-code-fake',
+      model: 'opus-9-imaginary',
+    })
+    expect(response.status).toBe(200)
+    expect(flight.status).toBe('landed')
+
+    const receipt = (env as unknown as { DB: { prepare: (sql: string) => unknown } }).DB
+      // the outbox row is stored in the mock closure; re-read via its own first() handler
+      .prepare('SELECT payload FROM flight_event_outbox')
+    const payload = await (receipt as {
+      bind: (args: unknown[]) => { first: <T>() => Promise<T | null> }
+    }).bind(['flight-m000', 'test']).first<{ payload: string }>()
+    expect(payload).not.toBeNull()
+    const event = JSON.parse(payload!.payload) as {
+      harness?: unknown; model?: unknown; claimed_harness?: unknown; claimed_model?: unknown
+    }
+    // server-derived identity (no fleet row in this mock -> null, never the caller's claim)
+    expect(event.harness).toBeNull()
+    expect(event.model).toBeNull()
+    // the claim survives as a describe-only audit fact
+    expect(event.claimed_harness).toBe('claude-code-fake')
+    expect(event.claimed_model).toBe('opus-9-imaginary')
+  })
+
+  // mupot#1590 gate-2270-b M15: claims are sanitised on intake — dirty caller input
+  // (control chars, over-long) can never ride the receipt raw.
+  it('#1590 sanitises dirty harness/model claims before they land on the receipt', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await land(env, {
+      cost_micro_usd: 0,
+      harness: `${'a'.repeat(70)}\u0007x\u202e\u200b`,
+      model: `${'m'.repeat(140)}\u0007bad`,
+    })
+    expect(response.status).toBe(200)
+    expect(flight.status).toBe('landed')
+
+    const receipt = (env as unknown as { DB: { prepare: (sql: string) => unknown } }).DB
+      .prepare('SELECT payload FROM flight_event_outbox')
+    const payload = await (receipt as {
+      bind: (args: unknown[]) => { first: <T>() => Promise<T | null> }
+    }).bind(['flight-m000', 'test']).first<{ payload: string }>()
+    const event = JSON.parse(payload!.payload) as { claimed_harness?: unknown; claimed_model?: unknown }
+    expect(event.claimed_harness).toBe('a'.repeat(64))
+    expect(event.claimed_model).toBe('m'.repeat(128))
+  })
 })

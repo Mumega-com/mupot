@@ -14,7 +14,6 @@
     "tests/marketing-monitor-opportunities.test.ts",
     "tests/marketing-monitor-service.test.ts",
     "tests/mcp-addon-tools.test.ts",
-    "tests/mcp-flight-tools.test.ts",
     "tests/mcp-loop-tools.test.ts",
     "tests/mcp-workflow-circuit-tools.test.ts",
     "tests/members-capability-sqlite.test.ts",
