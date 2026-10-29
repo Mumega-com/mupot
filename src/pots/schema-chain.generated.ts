@@ -4784,9 +4784,33 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "owner_call_source_owner_changed" },
     ],
   },
+  {
+    file: "0270_owner_call_maintenance.sql",
+    sha256: "b95883276fa591c4fc725c2ec9894d276df926cc9161fe659d4f0b7af08e7560",
+    statements: [
+      "-- Owner-call slice 1b: bounded aliases, indexed rate windows and canonical decision projection.\n-- Additive follow-up to landed 0269; no creation, notification or authority enablement.\n\n\nCREATE INDEX owner_call_owner_window ON owner_calls(tenant,owner_member_id,created_at);",
+      "\n\nCREATE INDEX owner_call_pending_source ON owner_calls(tenant,action_type,action_id) WHERE state='pending';",
+      "\n\n-- Creation timestamps are server-generated UTC ISO (Date.toISOString); leave the indexed column unwrapped.\n\nDROP TRIGGER owner_call_agent_rate;",
+      "\n\nCREATE TRIGGER owner_call_agent_rate BEFORE INSERT ON owner_calls\nWHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND created_by_agent_id=NEW.created_by_agent_id\n  AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ',NEW.created_at,'-15 minutes')) >= 5\nBEGIN SELECT RAISE(ABORT,'owner_call_agent_rate'); END;",
+      "\n\nDROP TRIGGER owner_call_owner_rate;",
+      "\n\nCREATE TRIGGER owner_call_owner_rate BEFORE INSERT ON owner_calls\nWHEN (SELECT COUNT(*) FROM owner_calls WHERE tenant=NEW.tenant AND owner_member_id=NEW.owner_member_id\n  AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ',NEW.created_at,'-15 minutes')) >= 20\nBEGIN SELECT RAISE(ABORT,'owner_call_owner_rate'); END;",
+      "\n\n-- At most 32 logical keys per requester/ask in every retained key version. The service supports at most 8 versions,\n-- bounding rows at 256/requester/ask while preserving room to backfill rotations of already-supported keys.\nCREATE INDEX owner_call_alias_ask ON owner_call_key_aliases(tenant,agent_id,ask_id,key_version);",
+      "\nCREATE TRIGGER owner_call_alias_limit BEFORE INSERT ON owner_call_key_aliases\nWHEN NOT EXISTS(SELECT 1 FROM owner_call_key_aliases WHERE tenant=NEW.tenant AND agent_id=NEW.agent_id\n  AND key_version=NEW.key_version AND key_hmac=NEW.key_hmac)\n AND (SELECT COUNT(*) FROM owner_call_key_aliases WHERE tenant=NEW.tenant AND agent_id=NEW.agent_id\n  AND ask_id=NEW.ask_id AND key_version=NEW.key_version) >= 32\nBEGIN SELECT RAISE(ABORT,'owner_call_alias_limit'); END;",
+      "\n\n-- Canonical decisions release capacity in the same transaction. Expiry stays lazy to preserve canonical expiredCount metadata.\nCREATE TRIGGER owner_call_elevation_terminal AFTER UPDATE OF status ON elevation_requests\nWHEN NEW.status IN ('approved','denied','revoked') AND NEW.status IS NOT OLD.status\nBEGIN\n  UPDATE owner_calls SET state='closed' WHERE tenant=NEW.tenant AND action_type='elevation_request'\n    AND action_id=NEW.id AND state='pending';\nEND;",
+    ],
+    objects: [
+      { type: "index", name: "owner_call_owner_window" },
+      { type: "index", name: "owner_call_pending_source" },
+      { type: "trigger", name: "owner_call_agent_rate" },
+      { type: "trigger", name: "owner_call_owner_rate" },
+      { type: "index", name: "owner_call_alias_ask" },
+      { type: "trigger", name: "owner_call_alias_limit" },
+      { type: "trigger", name: "owner_call_elevation_terminal" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a44402a00ba5ff113d46808c8efcbcf28656c6de0cf72004e77e3968c9c61544"
+export const SCHEMA_CHAIN_DIGEST: string = "ed55a799a7fce3b864094f495718c81a29e4cbac2f1ba195d6a4964b81e2a018"

@@ -5,6 +5,8 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
 const NOW = Date.parse('2026-10-29T14:00:00Z')
+// Commit predicates use the database clock, so live fixture deadlines must not expire as the calendar advances.
+const LIVE_UNTIL = new Date(Date.now() + 7 * 86400_000).toISOString()
 let h: SqliteD1Harness
 let env: Env
 function auth(agent = 'a', changes: Partial<AuthContext> = {}): AuthContext {
@@ -16,9 +18,16 @@ const call = (key = 'opaque', source = 'e1', a = auth()) => invokeTool(a, env, '
 function count(table: string) { return h.sqlite.prepare(`SELECT COUNT(*) n FROM ${table}`).get()!.n }
 function source(id: string, agent = 'a') {
   h.sqlite.prepare(`INSERT INTO elevation_requests (id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
-    VALUES (?,'test',?,?,?,'["action:project_lifecycle"]','squad','sq',15,'private-secret-source','pending','2026-10-29T13:59:00Z','2026-11-01T14:10:00Z')`).run(id, `s-${agent}`, agent, `m-${agent}`)
+    VALUES (?,'test',?,?,?,'["action:project_lifecycle"]','squad','sq',15,'private-secret-source','pending','2026-10-29T13:59:00Z',?)`).run(id, `s-${agent}`, agent, `m-${agent}`, LIVE_UNTIL)
   h.sqlite.prepare(`INSERT INTO approval_bot_deliveries (id,tenant,request_id,member_id,chat_id,status,created_at) VALUES (?,'test',?,'human','private-chat','reserved','2026-10-29T13:59:00Z')`).run(`d-${id}`, id)
 }
+// Real migrated storage fixture with no requester/alias children: lets retention guards be tested independently of FKs.
+function bareAsk(id: string, kind: 'access' | 'reauth' = 'access', sourceId='e1', createdAt='2026-10-29T14:00:00.000Z') {
+  h.sqlite.prepare(`INSERT INTO owner_calls(id,tenant,owner_member_id,owner_revision,created_by_agent_id,source_agent_id,kind,action_type,action_id,action_version,reason_code,canonical_delivery_id,created_at)
+    VALUES (?,'test','human',0,'a','a',?,?,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','access_required',?,?)`)
+    .run(id,kind,kind==='access'?'elevation_request':'connection',kind==='access'?sourceId:'connection-fixture',kind==='access'?`d-${sourceId}`:null,createdAt)
+}
+
 function admittedAuth(): AuthContext {
   env.SEAT_AUTO_ENROLL='1';env.SEAT_ATTACH='1'
   h.sqlite.exec(`
@@ -51,7 +60,7 @@ beforeEach(() => {
     h.sqlite.prepare(`INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES(?,?,'squad','sq','admin')`).run(`cap-${agent}`, `m-${agent}`)
     h.sqlite.prepare(`INSERT INTO member_tokens(id,member_id,token_hash,channel,tenant,agent_id) VALUES(?,?,?,'workspace','test',?)`).run(`t-${agent}`, `m-${agent}`, `fake-hash-${agent}`, agent)
     h.sqlite.prepare(`INSERT INTO agent_sessions(id,tenant,agent_id,member_id,auth_kind,credential_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
-      VALUES(?,'test',?,?,'workspace_token',?,'2026-10-29T13:59:00Z','2026-10-29T13:59:00Z','2026-11-01T15:00:00Z','2026-11-02T14:00:00Z')`).run(`s-${agent}`, agent, `m-${agent}`, `t-${agent}`)
+      VALUES(?,'test',?,?,'workspace_token',?,'2026-10-29T13:59:00Z','2026-10-29T13:59:00Z',?,?)`).run(`s-${agent}`, agent, `m-${agent}`, `t-${agent}`, LIVE_UNTIL, LIVE_UNTIL)
   }
   source('e1')
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('outbound forbidden') }))
@@ -157,7 +166,8 @@ describe('owner_call contract and storage', () => {
     for (let i = 2; i <= 7; i++) source(`e${i}`)
     const results = await Promise.all(Array.from({ length: 7 }, (_, i) => call(`k${i}`, `e${i + 1}`)))
     expect(results.filter(r => r.ok)).toHaveLength(5); expect(count('owner_calls')).toBe(5)
-    expect(await call('k0')).toMatchObject({ ok: true, result: { retry: true } })
+    const winner=results.findIndex(r=>r.ok)
+    expect(await call(`k${winner}`,`e${winner+1}`)).toMatchObject({ ok: true, result: { retry: true } })
   })
   it('atomic owner creation ceiling spans agents', async () => {
     const results = []
@@ -365,6 +375,174 @@ describe('owner_call contract and storage', () => {
     const batch=h.db.batch.bind(h.db)
     vi.spyOn(h.db,'batch').mockImplementationOnce(async statements=>{h.sqlite.exec("UPDATE member_tokens SET revoked_at='2026-10-29T14:00:00Z' WHERE id='t-a'");return batch(statements)})
     expect((await call('independent-actor','independent-source')).ok).toBe(false);expect(count('owner_calls')).toBe(0)
+  })
+
+  it('revoked actor session cannot use a peer source',async()=>{
+    source('peer-session-source','b')
+    h.sqlite.exec("UPDATE agent_sessions SET revoked_at='2026-10-29T14:00:00Z' WHERE id='s-a'")
+    expect(await call('revoked-session','peer-session-source')).toMatchObject({ok:false,error:'agent_binding_required'})
+    expect(count('owner_calls')).toBe(0)
+  })
+  it.each([
+    "UPDATE member_tokens SET channel='directory' WHERE id='t-a'",
+    "UPDATE agent_sessions SET auth_kind='oauth' WHERE id='s-a'",
+    "UPDATE member_tokens SET channel='directory' WHERE id='t-a'; UPDATE agent_sessions SET auth_kind='oauth' WHERE id='s-a'",
+  ])('workspace context rejects token/session channel mismatch: %s',async sql=>{
+    source('peer-channel-source','b');h.sqlite.exec(sql)
+    expect(await call('mismatch','peer-channel-source')).toMatchObject({ok:false,error:'agent_binding_required'})
+    expect(count('owner_calls')).toBe(0)
+  })
+  it('directory context rejects a workspace credential even with a live consenter',async()=>{
+    source('directory-peer','b')
+    h.sqlite.exec("INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('consenter-admin','human','squad','sq','admin')")
+    expect(await call('directory-mismatch','directory-peer',auth('a',{channel:'directory',consentedByMemberId:'human'}))).toMatchObject({ok:false,error:'agent_binding_required'})
+    expect(count('owner_calls')).toBe(0)
+  })
+  it('plain unattached seat is refused with a safe source refusal',async()=>{
+    const attached=admittedAuth()
+    const {attached:ignored,...plain}=attached.seatBinding!
+    void ignored
+    expect(await call('plain-seat','e1',{...attached,seatBinding:plain})).toMatchObject({ok:false,error:'owner_call_source_unavailable'})
+    expect(count('owner_calls')).toBe(0)
+  })
+  it('DB closed-to-pending transition cannot resurrect an ask',async()=>{
+    const out=await call();const id=(out as any).result.ask_id
+    h.sqlite.prepare("UPDATE owner_calls SET state='closed' WHERE id=?").run(id)
+    expect(()=>h.sqlite.prepare("UPDATE owner_calls SET state='pending' WHERE id=?").run(id)).toThrow(/owner_call_immutable/)
+    expect(h.sqlite.prepare('SELECT state FROM owner_calls WHERE id=?').get(id)).toEqual({state:'closed'})
+  })
+  it('requester revision retry rejects owner changed and restored on a peer source',async()=>{
+    const out=await call('requester-epoch','e1',auth('b'));expect(out.ok).toBe(true)
+    h.sqlite.exec("UPDATE agents SET owner_member_id='m-c' WHERE id='b'; UPDATE agents SET owner_member_id='human' WHERE id='b'")
+    expect(h.sqlite.prepare('SELECT state FROM owner_calls').get()).toEqual({state:'pending'})
+    expect(await call('requester-epoch','e1',auth('b'))).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(count('owner_calls')).toBe(1);expect(count('owner_call_key_aliases')).toBe(1)
+  })
+  it('same-key owner-changed-and-back retry never reopens the closed projection',async()=>{
+    expect((await call()).ok).toBe(true)
+    h.sqlite.exec("UPDATE agents SET owner_member_id='m-c' WHERE id='a'; UPDATE agents SET owner_member_id='human' WHERE id='a'")
+    expect(await call()).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(h.sqlite.prepare('SELECT state FROM owner_calls').get()).toEqual({state:'closed'})
+  })
+  it.each([
+    "UPDATE members SET status='suspended' WHERE id='m-a'",
+    "UPDATE members SET archived_at='2026-10-29T14:00:00Z' WHERE id='m-a'",
+    "UPDATE agents SET status='paused' WHERE id='a'",
+  ])('actor liveness cannot be masked by a live peer source: %s',async sql=>{
+    source('independent-actor-member','b');h.sqlite.exec(sql)
+    expect(await call('actor-member','independent-actor-member')).toMatchObject({ok:false,error:'agent_binding_required'})
+    expect(count('owner_calls')).toBe(0)
+  })
+  it('commit refuses an owner welded to an agent after the pre-read',async()=>{
+    source('nonhuman-owner-source','b')
+    h.sqlite.exec("INSERT INTO agents(id,squad_id,slug,name,role,model) VALUES('owner-agent','sq','owner-agent','Owner agent','member','test')")
+    const batch=h.db.batch.bind(h.db)
+    vi.spyOn(h.db,'batch').mockImplementationOnce(async statements=>{
+      h.sqlite.exec("INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('test','owner-agent','human','2026-10-29T14:00:00Z')")
+      return batch(statements)
+    })
+    expect((await call('nonhuman-owner','nonhuman-owner-source')).ok).toBe(false)
+    expect(count('owner_calls')).toBe(0)
+  })
+  it('outbox kind trigger accepts inert reauth metadata and refuses access',()=>{
+    bareAsk('oc-access');bareAsk('oc-reauth','reauth')
+    h.sqlite.exec("INSERT INTO owner_call_outbox(ask_id,tenant,created_at) VALUES('oc-reauth','test','2026-10-29T14:00:00.000Z')")
+    expect(()=>h.sqlite.exec("INSERT INTO owner_call_outbox(ask_id,tenant,created_at) VALUES('oc-access','test','2026-10-29T14:00:00.000Z')")).toThrow(/owner_call_outbox_kind/)
+    expect(count('owner_call_outbox')).toBe(1)
+  })
+  it('owner_calls no-delete guard retains an unreferenced ask independently of FKs',()=>{
+    bareAsk('oc-unreferenced')
+    expect(()=>h.sqlite.exec("DELETE FROM owner_calls WHERE id='oc-unreferenced'")).toThrow(/owner_call_history_retained/)
+    expect(count('owner_calls')).toBe(1)
+  })
+  it.each([
+    "UPDATE owner_call_hmac_versions SET key_check='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+    "UPDATE owner_call_hmac_versions SET key_version='v-next'",
+    "DELETE FROM owner_call_hmac_versions",
+  ])('HMAC version history is immutable: %s',async sql=>{
+    await call()
+    expect(()=>h.sqlite.exec(sql)).toThrow(/owner_call_key_history/)
+    expect(count('owner_call_hmac_versions')).toBe(1)
+  })
+  it.each(['approved','denied','revoked'])('canonical %s transition closes projections without requester retry',async status=>{
+    const first=await call()
+    h.sqlite.prepare('UPDATE elevation_requests SET status=? WHERE id=?').run(status,'e1')
+    expect(h.sqlite.prepare('SELECT state FROM owner_calls WHERE id=?').get((first as any).result.ask_id)).toEqual({state:'closed'})
+    expect(count('owner_call_requesters')).toBe(1);expect(count('owner_call_key_aliases')).toBe(1)
+  })
+  it('lazy expiry frees stale requester capacity before the next authorized creation',async()=>{
+    for(let i=0;i<10;i++){
+      source(`stale-${i}`)
+      expect((await call(`stale-key-${i}`,`stale-${i}`)).ok).toBe(true)
+      if(i%5===4)vi.advanceTimersByTime(900_001)
+    }
+    h.sqlite.exec("UPDATE elevation_requests SET decision_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 second') WHERE id LIKE 'stale-%'")
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM owner_calls WHERE state='pending'").get()).toEqual({n:10})
+    source('fresh-after-expiry')
+    expect(await call('fresh-after-expiry','fresh-after-expiry')).toMatchObject({ok:true})
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM owner_calls WHERE state='pending'").get()).toEqual({n:1})
+    expect(count('owner_calls')).toBe(11);expect(count('owner_call_requesters')).toBe(11)
+  })
+  it('alias budget bounds fresh keys while preserving retries and HMAC rotation at capacity',async()=>{
+    let first:any
+    for(let i=0;i<32;i++){
+      const out=await call(`alias-${i}`);expect(out.ok).toBe(true)
+      if(i===0)first=out
+    }
+    expect(await call('alias-over')).toMatchObject({ok:false,error:'owner_call_alias_limit'})
+    expect(await call('alias-0')).toMatchObject({ok:true,result:{ask_id:first.result.ask_id,retry:true}})
+    env.OWNER_CALL_HMAC_KEYS=JSON.stringify([{version:'v2',key:'rotation-test-key-at-least-32-bytes'},{version:'v1',key:'test-only-hmac-key-at-least-32-bytes'}])
+    expect(await call('alias-0')).toMatchObject({ok:true,result:{ask_id:first.result.ask_id,retry:true}})
+    expect(await call('alias-over')).toMatchObject({ok:false,error:'owner_call_alias_limit'})
+    expect(count('owner_call_key_aliases')).toBe(33);expect(count('owner_calls')).toBe(1)
+  })
+  it.each(['agent','owner'])('%s rate trigger uses an indexed created_at range',scope=>{
+    const row=h.sqlite.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(`owner_call_${scope}_rate`)!
+    const when=String(row.sql).split('WHEN ')[1].split('BEGIN ')[0]
+      .replaceAll('NEW.tenant',"'test'").replaceAll('NEW.created_by_agent_id',"'a'").replaceAll('NEW.owner_member_id',"'human'")
+      .replaceAll('NEW.created_at',"'2026-10-29T14:00:00.000Z'")
+    const plan=h.sqlite.prepare(`EXPLAIN QUERY PLAN SELECT 1 WHERE ${when}`).all()
+    const column=scope==='agent'?'created_by_agent_id':'owner_member_id'
+    expect(plan.some(r=>String(r.detail).includes(`${column}=?`) && /created_at>\?/.test(String(r.detail)))).toBe(true)
+  })
+
+  it('fresh keys reject retained requester revision mismatch without accepting an unstable retry',async()=>{
+    expect((await call('retained-original','e1',auth('b'))).ok).toBe(true)
+    h.sqlite.exec("UPDATE agents SET owner_member_id='m-c' WHERE id='b'; UPDATE agents SET owner_member_id='human' WHERE id='b'")
+    expect(await call('retained-fresh','e1',auth('b'))).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(await call('retained-fresh','e1',auth('b'))).toMatchObject({ok:false,error:'owner_setup_required'})
+    expect(count('owner_call_key_aliases')).toBe(1)
+    expect(h.sqlite.prepare("SELECT owner_revision FROM owner_call_requesters WHERE agent_id='b'").get()).toEqual({owner_revision:0})
+  })
+  it('retained requester revision is rechecked in the conditional commit before alias insertion',async()=>{
+    const first=await call();const id=(first as any).result.ask_id
+    h.sqlite.exec("UPDATE agents SET owner_member_id='m-c' WHERE id='b'; UPDATE agents SET owner_member_id='human' WHERE id='b'")
+    const batch=h.db.batch.bind(h.db)
+    vi.spyOn(h.db,'batch').mockImplementationOnce(async statements=>{
+      h.sqlite.prepare("INSERT INTO owner_call_requesters(tenant,ask_id,agent_id,owner_revision,created_at) VALUES('test',?,'b',0,'2026-10-29T14:00:00.000Z')").run(id)
+      return batch(statements)
+    })
+    expect((await call('retained-race','e1',auth('b'))).ok).toBe(false)
+    expect(count('owner_calls')).toBe(1);expect(count('owner_call_key_aliases')).toBe(1)
+    expect(count('owner_call_requesters')).toBe(2) // includes the independently committed stale association
+  })
+  it('reconciles legacy terminal sources before pending quotas even after their source session ends',async()=>{
+    for(let i=0;i<10;i++){
+      const sourceId=`legacy-terminal-${i}`;source(sourceId)
+      h.sqlite.prepare("UPDATE elevation_requests SET status='denied' WHERE id=?").run(sourceId)
+      const id=`oc-legacy-${i}`,createdAt=new Date(NOW-(40-i)*900_001).toISOString()
+      bareAsk(id,'access',sourceId,createdAt)
+      h.sqlite.prepare("INSERT INTO owner_call_requesters(tenant,ask_id,agent_id,owner_revision,created_at) VALUES('test',?,'a',0,?)").run(id,createdAt)
+    }
+    h.sqlite.exec("UPDATE agent_sessions SET revoked_at='2026-10-29T14:00:00Z' WHERE id='s-a'")
+    h.sqlite.prepare(`INSERT INTO agent_sessions(id,tenant,agent_id,member_id,auth_kind,credential_id,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
+      VALUES('s-a-new','test','a','m-a','workspace_token','t-a','2026-10-29T14:00:00Z','2026-10-29T14:00:00Z',?,?)`).run(LIVE_UNTIL,LIVE_UNTIL)
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM owner_calls WHERE state='pending'").get()).toEqual({n:10})
+    source('new-session-source')
+    h.sqlite.exec("UPDATE elevation_requests SET agent_session_id='s-a-new' WHERE id='new-session-source'")
+    expect(await call('new-session-source','new-session-source')).toMatchObject({ok:true})
+    expect(h.sqlite.prepare("SELECT COUNT(*) n FROM owner_calls WHERE state='pending'").get()).toEqual({n:1})
+    expect(count('owner_calls')).toBe(11);expect(count('owner_call_requesters')).toBe(11)
   })
 
 })
