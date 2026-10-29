@@ -89,3 +89,21 @@ passed, with completed processes exiting 0. All 35 mutations produced assertion
 failures; the prover restored source and exited 0. Typecheck, migration numbering,
 schema freshness, test-schema-source and diff checks also exited 0. These are local
 build/test receipts, not a gate verdict, deployment or live seven-day measurement.
+
+The CI refusal-code guard also requires `invalid_latency_window` and
+`route_latency_unavailable` to have Security Bar registry entries. Both describe
+existing non-relaxable behavior and are registered as floors. Follow-up tests pin
+the timer across an asynchronous handler suspension and spy on the actual page's
+Worker `waitUntil` registration. Their targeted mutation command is:
+
+```sh
+node scripts/prove-route-latency-mutations.mjs await-handler-completion page-waitUntil-hook
+```
+
+CI repair receipt: the pinned 517211a7 shard-4 baseline reproduced the single
+`policy-refusal-guard.test.ts` failure for the two unregistered codes. After their
+registration, the CI-configured shard (default/JSON/blob reporters, `--shard=4/4`
+and `--maxWorkers=2`) completed with 209 files and 4,594 tests passing, exit 0.
+The focused policy/Security Bar/lifecycle suite passed 122 tests, exit 0. Both new
+mutation probes were killed; their restored suite and runner exited 0. Typecheck
+and the schema-source guard also exited 0.

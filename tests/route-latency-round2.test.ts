@@ -76,6 +76,31 @@ describe('round 2 independent gate regressions', () => {
     expect(await res.json()).toEqual({ error: 'forbidden' })
   })
 
+  it('the timer waits for an asynchronous handler before stopping', async () => {
+    const work: Promise<unknown>[] = []
+    let clock = 100
+    vi.spyOn(performance, 'now').mockImplementation(() => clock)
+    let release!: () => void
+    const handlerPending = new Promise<void>(resolve => { release = resolve })
+    const response = measureBoardRead(env, async () => {
+      await handlerPending
+      clock = 125
+      return 'page'
+    }, p => work.push(p))
+    try {
+      await Promise.resolve()
+      expect(work).toHaveLength(0)
+      release()
+      expect(await response).toBe('page')
+      await Promise.all(work)
+      expect(h.sqlite.prepare('SELECT duration_ms FROM route_latency_samples').get()?.duration_ms).toBe(25)
+    } finally {
+      release()
+      await response
+      await Promise.all(work)
+    }
+  })
+
   it('the page returns before a blocked counter and its latency excludes that write', async () => {
     const work: Promise<unknown>[] = []
     let clock = 100

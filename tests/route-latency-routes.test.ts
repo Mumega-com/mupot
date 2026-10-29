@@ -70,6 +70,23 @@ describe('authenticated board latency HTTP integration', () => {
     expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM route_latency_samples').get()?.n).toBe(1)
   })
 
+  it('the actual HTML board page registers its telemetry with the Worker waitUntil', async () => {
+    const waitUntil = vi.fn<(work: Promise<unknown>) => void>()
+    try {
+      const res = await dashboardApp.request('/dashboard/kanban', {
+        headers: { cookie: 'mupot_session=owner' },
+      }, env, { waitUntil, passThroughOnException() {}, props: {} })
+      expect(res.status).toBe(200)
+      expect(waitUntil).toHaveBeenCalledExactlyOnceWith(expect.any(Promise))
+      await Promise.all(waitUntil.mock.calls.map(([work]) => work))
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM route_latency_samples').get()?.n).toBe(1)
+    } finally {
+      await Promise.all(waitUntil.mock.calls.map(([work]) => work))
+      // Drain best-effort work too when probing a deliberately removed hook.
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+  })
+
   it('a seven-day read is nonzero after organic page loads (real auth, render, telemetry and read)', async () => {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 9, 28, 12))
     for (let i = 0; i < 20; i++) expect((await page()).status).toBe(200)
