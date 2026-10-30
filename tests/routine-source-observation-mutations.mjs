@@ -11,7 +11,13 @@ function replace(source, from, to) {
   if (!source.includes(from)) throw new Error(`mutation anchor missing: ${from}`)
   return source.replace(from, to)
 }
-const mutants = [
+function inSource(source, mutate) {
+  const start = source.indexOf('async function sourceObservation(')
+  const end = source.indexOf('async function proposalSituationCurrent(', start)
+  if (start < 0 || end < 0) throw new Error('source observation boundaries missing')
+  return source.slice(0, start) + mutate(source.slice(start, end)) + source.slice(end)
+}
+const legacyMutants = [
   ['global-board-gate', service, s => replace(s, 'return live !== null && live.digest === proposal.source_observation.digest', 'return await currentSituationDigest(env, run, policy) === run.situation_digest'), 'accepts a long read-only audit'],
   ['submit-freshness', service, s => replace(s, 'if (!await proposalSituationCurrent(env, run, policy, proposal))', 'if (false)'), 'refuses changed declared source facts'],
   ['execution-freshness', service, s => replace(s, 'if (!await proposalSituationCurrent(env, run, policy, storedProposal.value))', 'if (false)'), 'rechecks sources at execution'],
@@ -39,9 +45,57 @@ const mutants = [
   ['flight-all-squads', service, s => replace(s, 'if (!meta || meta.squad_ids.some(id => id !== policy.responsible_squad_id)) return null', 'if (!meta) return null'), 'out-of-scope flight observation: multi-squad'],
   ['historical-control-exclusions', dispatch, s => replace(s, 'const exclusions = run.attempt > 1', 'const exclusions = false'), 'historical active controls'],
 ]
-const files = ['tests/routine-source-observation.test.ts', 'tests/routine-dispatch.test.ts']
-function run(name, pattern) {
-  const args = ['vitest', 'run', ...files, '--maxWorkers=2', ...(pattern ? ['-t', pattern] : [])]
+const followupMutants = [
+  ...['submit', 'execution'].map(phase => [
+    `create-task-global-${phase}`, service,
+    s => replace(s, "if (!proposal.source_observation || proposal.action.kind === 'create_task')", 'if (!proposal.source_observation)'),
+    `prose-only targets at ${phase}`,
+  ]),
+  ['create-task-declared-facts', service, s => replace(s, 'if (!current || !proposal.source_observation) return current', 'return current'), 'create_task keeps its declared-source check'],
+  ...[
+    ['task-squad', 'AND squad_id = ? AND ${TASK_NOT_ARCHIVED_SQL()}', 'AND ? IS NOT NULL AND ${TASK_NOT_ARCHIVED_SQL()}'],
+    ['task-project', 'WHERE id = ? AND project_id = ? AND squad_id', 'WHERE id = ? AND ? IS NOT NULL AND squad_id'],
+    ['flight-tenant', 'WHERE id = ? AND tenant = ? AND project_id', 'WHERE id = ? AND ? IS NOT NULL AND project_id'],
+    ['flight-project', 'AND project_id = ? AND json_valid(meta)', 'AND ? IS NOT NULL AND json_valid(meta)'],
+    ['artifact-run', 'WHERE run_id = ? AND tenant = ? AND ref_id', 'WHERE ? IS NOT NULL AND tenant = ? AND ref_id'],
+    ['artifact-type', "AND ref_type IN ('evidence','output','receipt')", 'AND 1=1'],
+  ].flatMap(([name, from, to]) => ['observe', 'submit'].map(phase => [
+    `extra-${name}-${phase}`, service,
+    s => inSource(s, body => replace(body, from, to)),
+    `extra ${name} scope is enforced at ${phase}`,
+  ])),
+  ['project-access-submit-offline', service, s => inSource(s, body => replace(body, "if (proposal.action.kind === 'project_access') return null", '')), 'project_access rejects a correctly forged source witness at submit'],
+  ...['task', 'flight'].flatMap(type => ['observe', 'submit'].map(phase => [
+    `control-${type}-${phase}`, service,
+    s => inSource(s, body => replace(body,
+      "if (unique.some(ref => (ref.type === 'task' && ref.id === run.task_id)\n    || (ref.type === 'flight' && ref.id === run.flight_id))) return null", '')),
+    `refuses this run control ${type} as an extra source at ${phase}`,
+  ])),
+  ['submit-source-budget', service, s => replace(s,
+    'if (proposal.source_observation && proposalSourceReferences(proposal).length > 200)', 'if (false)'), 'over-budget union is invalid_proposal at submit'],
+  ['execution-stored-observation', service, s => replace(s,
+    'proposalSituationCurrent(env, run, policy, storedProposal.value)',
+    'proposalSituationCurrent(env, run, policy, { ...storedProposal.value, source_observation: undefined })'), 'approved stored business observation succeeds'],
+  ['missing-extra-source', service, s => inSource(s, body => replace(body, 'if (!fact) return null', 'if (!fact) continue')), 'refuses a nonexistent extra source'],
+  ...['task', 'flight'].flatMap(type => ['observe', 'submit'].map(phase => [
+    `historical-control-${type}-${phase}`, service,
+    s => inSource(s, body => replace(body,
+      'if (unique.some(ref => historicalControlIds.has(`${ref.type}:${ref.id}`))) return null', '')),
+    `refuses historical dispatch control ${type} at ${phase}`,
+  ])),
+  ...['task', 'flight'].map(type => [
+    `business-${type}-lineage`, service,
+    s => inSource(s, body => replace(body, `AND relation = 'dispatch_${type}'`, '')),
+    `keeps produced business ${type} records observable`,
+  ]),
+]
+const mutants = [
+  ...legacyMutants.map(m => [...m, m[0] === 'historical-control-exclusions' ? 'tests/routine-dispatch.test.ts' : 'tests/routine-source-observation.test.ts']),
+  ...followupMutants.map(m => [...m, 'tests/routine-source-followups.test.ts']),
+]
+const files = ['tests/routine-source-observation.test.ts', 'tests/routine-source-followups.test.ts', 'tests/routine-dispatch.test.ts']
+function run(name, pattern, testFile) {
+  const args = ['vitest', 'run', ...(testFile ? [testFile] : files), '--maxWorkers=2', ...(pattern ? ['-t', pattern] : [])]
   const r = spawnSync('npx', args, { encoding: 'utf8', timeout: 120000, maxBuffer: 16 * 1024 * 1024 })
   const output = (r.stdout ?? '') + (r.stderr ?? '')
   writeFileSync(resolve(dir, `${name}.log`), output)
@@ -52,10 +106,10 @@ if (baseline.r.status !== 0) throw new Error('baseline is not green; no mutation
 console.log('baseline: PASS (exit 0)')
 let failed = false
 try {
-  for (const [name, path, mutate, pattern] of mutants) {
+  for (const [name, path, mutate, pattern, testFile] of mutants) {
     for (const [p, bytes] of originals) writeFileSync(p, bytes)
     writeFileSync(path, mutate(originals.get(path)))
-    const { r, output } = run(name, pattern)
+    const { r, output } = run(name, pattern, testFile)
     const killed = r.status !== 0 && r.status !== null && /AssertionError/.test(output)
     console.log(`${name}: ${killed ? 'KILLED' : 'UNPROVEN'} (exit ${r.status})`)
     if (!killed) failed = true

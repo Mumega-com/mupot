@@ -47,6 +47,18 @@ sources must belong to the run's readable project and responsible squad;
 flights and run-owned artifact references also match the tenant. Flights must
 use only the responsible squad, so this reader adds no cross-squad reach. Archived task
 sources are refused.
+An over-budget union at submission also returns `invalid_proposal`, without
+reserving an action, requeuing the run or consuming a retry.
+
+The run's **current and historical dispatch controls cannot be source records**.
+Approval changes the task and receipt stamping changes the flight, so including
+them would make a proposal invalidate itself. Observe refuses these references
+with `reference_out_of_scope`; a forged submit witness fails closed with
+`stale_situation`. Declare business evidence, or use the legacy board snapshot.
+References are refused rather than silently stripped from a declaration.
+Historical controls are identified by server-owned `dispatch_task` and
+`dispatch_flight` references; produced business records (`action_result`)
+remain usable and retain their normal content and scope checks.
 
 The digest binds the run, attempt, dispatch digest, policy, project, exact
 action and current source records. Task bodies, status, ownership, results and
@@ -55,9 +67,16 @@ other task projection fields are included in the internal hash, rather than only
 and raw flight `meta` are withheld.
 Submission and execution both recompute the witness. A changed or missing
 source yields `stale_situation`; unrelated task counts, activity and flights
-do not. Existing authorization, budget, cancellation and human gates still
+do not invalidate other scoped proposals. Existing authorization, budget, cancellation and human gates still
 apply. `project_access` retains the legacy protocol and cannot opt into this
 path until its member/home/grant source contract is separately reviewed.
+
+`create_task` always retains the whole-board freshness check, **in addition to**
+any declared-source witness. Task creation can encode dependencies in arbitrary
+title/description prose, so it cannot leave the board check by declaring one
+stable decoy. UUID scanning would miss aliases, non-UUID IDs and semantic
+references. A busy board can therefore still require a new dispatch attempt for
+task creation; read-only audit proposals can use scoped business sources.
 
 Only declared facts are protected. File paths and task IDs mentioned solely in
 free-text summaries or an external manifest are not declarations. List every

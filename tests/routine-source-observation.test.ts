@@ -109,11 +109,17 @@ describe('routine declared source observations', () => {
   })
 
   it('pins declared flight records and rejects another tenant or squad', async () => {
-    const a: RoutineProposalAction = { key: 'flight-review', kind: 'ask_human', input: { question: 'Review flight?', references: [{ type: 'flight', id: 'control-flight' }] } }
+    const meta = JSON.parse(String(f.harness.sqlite.prepare("SELECT meta FROM flights WHERE id='control-flight'").get()?.meta))
+    meta.task_ids = ['source']
+    delete meta.routine_run_id
+    delete meta.routine_revision
+    f.harness.sqlite.prepare(`INSERT INTO flights (id,tenant,project_id,agent,goal,status,meta)
+      VALUES ('business-flight','tenant-a','project-1','agent-2','Audit source','running',?)`).run(JSON.stringify(meta))
+    const a: RoutineProposalAction = { key: 'flight-review', kind: 'ask_human', input: { question: 'Review flight?', references: [{ type: 'flight', id: 'business-flight' }] } }
     const o = await observe(a)
-    expect(o.sources[0].fact).toMatchObject({ id: 'control-flight', status: 'running' })
+    expect(o.sources[0].fact).toMatchObject({ id: 'business-flight', status: 'running' })
     expect(o.sources[0].fact).not.toHaveProperty('meta')
-    f.harness.sqlite.exec("UPDATE flights SET goal='New flight goal' WHERE id='control-flight'")
+    f.harness.sqlite.exec("UPDATE flights SET goal='New flight goal' WHERE id='business-flight'")
     await expect(submitRoutineProposal(f.env, f.principal, proposal(o, a))).resolves.toEqual({ ok: false, error: 'stale_situation' })
     noReservation()
   })
