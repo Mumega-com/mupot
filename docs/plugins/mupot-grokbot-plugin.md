@@ -18,7 +18,7 @@ A Grok Bot seat connects, boots, checks in, and wakes on this pot the way Claude
 2. `boot_context`. A harness with no seat has `whoami.state` `harness_unseated`.
 3. `seat_select { project, thread, squad }` (`folder` is optional). Every value is a label. The result is an `mseat_` handle. Pass it as `seat` on every later call.
 4. When this pot requires attach designation (mumega production does), the human opens that agent's page and presses **Allow for me** (the box "Allow my chats to become this agent"). `seat_attach` before that returns `409 agent_not_designated_for_you`. A pot with attach on and designation off has no such button: skip this step.
-5. `seat_attach { agent }` returns `pending_admission` and an attach code.
+5. `seat_attach { agent, reason: "why this chat should act as that agent" }` returns `pending_admission` and an attach code.
 6. The human admits that code on `/connections`.
 7. `seat_attach { agent }` again returns `attached`. The next `boot_context` shows `acts_as` (`whoami.state` `acting_as`, basis `attached`).
 8. The attached connection peeks: `inbox { peek: true }` and `inbox_mark_handled`. It does not ack or lease.

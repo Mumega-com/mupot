@@ -223,6 +223,40 @@ describe('#2229 explicit identity intent', () => {
     await rpc(env, g.ctx, 'seat_attach', { agent: 'rava', reason: 'A different story' }, { meta: thread('reason-thread') })
     expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions')?.reason).toBe('I run this agent for my owner.')
   })
+  it('recovers the same pending ask without a reason and keeps the reason shown to the human', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'reason-retry')
+    const pending = await attach(env, g, 'reason-retry', 'rava')
+    const retry = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { meta: thread('reason-retry') })
+    expect(retry.sc).toMatchObject({ status: 'already_pending', admission_id: pending.sc.admission_id, attach_code: pending.sc.attach_code })
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions')?.reason).toBe('This chat is assigned to operate the requested agent.')
+  })
+  it('confirms the same approved attachment without a reason and cannot switch identities', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'reason-confirm')
+    const before = one<{ id: string }>('SELECT id FROM agent_seat_attachments')!.id
+    const confirm = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { meta: thread('reason-confirm') })
+    expect(confirm.sc).toMatchObject({ status: 'attached', attachment_id: before })
+    expect(errOf(await rpc(env, g.ctx, 'seat_attach', { agent: 'hadi-admin' }, { meta: thread('reason-confirm') }))).toBe('already_attached')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments')).toBe(1)
+  })
+  it('does not replace an expired ask when a retry omits the reason', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'reason-expired')
+    const pending = await attach(env, g, 'reason-expired', 'rava')
+    h.sqlite.prepare("UPDATE agent_seat_admissions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(pending.sc.admission_id)
+    const retry = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, { meta: thread('reason-expired') })
+    expect(errOf(retry)).toBe('invalid_args')
+    expect(JSON.stringify(retry.body)).toContain('reason')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(one<{ status: string }>('SELECT status FROM agent_seat_admissions')?.status).toBe('expired')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments')).toBe(0)
+  })
 })
 
 describe('flag off: nothing changes', () => {
@@ -2145,15 +2179,23 @@ describe('connection names: every connection has a human name (label only)', () 
 })
 
 describe('ensureAdmission unit edges', () => {
+  it('a tool cannot create a new admission without a reason by bypassing the MCP adapter', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'service-reason')
+    const seatId = one<{ id: string }>('SELECT id FROM agent_seats')!.id
+    expect(await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'tool' })).toEqual({ ok: false, error: 'invalid_args' })
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(0)
+  })
   it('an expired pending admission does not hold the unique slot: a fresh ask files a new row', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await boot(env, g, 'conv-a')
     const seatId = one<{ id: string }>(`SELECT id FROM agent_seats`)!.id
-    const first = await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'tool' })
+    const first = await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'tool', reason: 'This chat operates Rava for my owner.' })
     expect(first.ok && first.state).toBe('pending')
     h.sqlite.exec(`UPDATE agent_seat_admissions SET expires_at = '2000-01-01T00:00:00.000Z'`)
-    const second = await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'tool' })
+    const second = await ensureAdmission(env, { agentId: 'agent-rava', humanMemberId: HUMAN, harnessId: g.harnessId, seatId, via: 'tool', reason: 'This chat operates Rava for my owner.' })
     expect(second.ok && second.state).toBe('pending')
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status = 'expired'`)).toBe(1)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status = 'pending'`)).toBe(1)
