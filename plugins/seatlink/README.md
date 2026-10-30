@@ -47,3 +47,17 @@ In `openInboxStream`, replace the `if (!res.ok) throw new Error(...)` with
 `if (!res.ok) throw Object.assign(new Error(\`HTTP ${res.status}\`), { status: res.status })`, and run the
 body of `run` through `runSeatStream({ seat: entry.herdr, openOnce, readToken, log, sleep })`, with the 403 `body` text attached to the thrown error as `.body`. In `startInboxStreams`,
 when started with `--discover`, build `cfg.seats` from `buildSeatSet(...)` instead of reading only `seats.json`.
+
+## Push mode (SeatEventsDO client)
+
+`seat-events-client.mjs` replaces per-seat `/api/inbox/stream` polls with one WebSocket per host.
+Config (all optional; absent = SSE exactly as before): top-level
+`"seat_events": {"host_id": "<agent id>", "tenant": "<TENANT_SLUG>", "host_key_file": "~/.fleet/agents/seatlink-host.key"}`
+plus `"seat_events": true` and `"agent_id": "<agent uuid/id>"` on each seat to opt in (canary one seat first).
+Key: `node bin/seatlink-hostkey-gen.mjs` (mode 600, refuses existing file / group-writable dir); register the printed
+`public_key` with `register_agent_key`; a seat_event_grants row per seat is required (operator action).
+No automatic SSE fallback: while a grant is live the stream route returns 409 `notify_owned_by_fleet_host`.
+Rollback is operator-only: revoke the seat's grant, then remove `seat_events` from the seat in seats.json, and restart the bridge.
+
+## Bridge in this repo
+`bridge/` is the installable bridge (seatlink.mjs + lib/). Install = copy `bridge/seatlink.mjs` and `bridge/lib/*.mjs` over the installed dir (seats.json, tokens, state stay in place). Seats opt in via seats.json `seat_events: true` (uses the seat's `mupot_agent_id` + `mupot_token_file`).
