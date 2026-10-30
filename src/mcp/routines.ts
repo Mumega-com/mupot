@@ -1,7 +1,7 @@
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { listNeedsYou } from '../attention/service'
 import { priceUsage } from '../economy/prices'
-import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
+import { answerRoutineRun, cancelRoutineRun, observeRoutineProposal, submitRoutineProposal } from '../routines/actions'
 import { principalCanReadProject, routinePrincipal, type RoutinePrincipal } from '../routines/access'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
@@ -486,12 +486,22 @@ const routineRunAnswer: ToolSpec = {
 
 const routineProposalSubmit: ToolSpec = {
   name: 'routine_proposal_submit', scope: 'assigned agent routine proposal submission', min: 'member',
-  args: '{ version: "routine.proposal/v1", run_id: string, project_id: string, situation_digest: string, summary: string, action: object }',
+  args: '{ version: "routine.proposal/v1", run_id: string, project_id: string, situation_digest: string, summary: string, action: object, source_observation?: { digest: string, references: object[] } }',
   inputSchema: {
     type: 'object',
     properties: {
       version: { type: 'string', enum: ['routine.proposal/v1'] }, run_id: id(), project_id: id(),
       situation_digest: { type: 'string', pattern: '^[a-f0-9]{64}$', minLength: 64, maxLength: 64 }, summary: string(4000),
+      source_observation: {
+        type: 'object', additionalProperties: false, required: ['digest', 'references'],
+        properties: {
+          digest: { type: 'string', pattern: '^[a-f0-9]{64}$', minLength: 64, maxLength: 64 },
+          references: { type: 'array', maxItems: 20, items: {
+            type: 'object', additionalProperties: false, required: ['type', 'id'],
+            properties: { type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, id: string(200) },
+          } },
+        },
+      },
       action: {
         type: 'object',
         properties: {
@@ -508,6 +518,29 @@ const routineProposalSubmit: ToolSpec = {
   },
   async run(auth, env, args, ctx) {
     const result = await submitRoutineProposal(env, routinePrincipal(auth), args, { waitUntil: ctx.waitUntil })
+    return result.ok ? done(result) : sourceFailure(result.error)
+  },
+}
+
+const routineProposalObserve: ToolSpec = {
+  name: 'routine_proposal_observe', min: 'member',
+  scope: 'assigned agent; read declared proposal source facts and a source-bound digest before submit',
+  args: '{ run_id: string, action: object, references?: { type: "task"|"flight"|"artifact", id: string }[] }',
+  inputSchema: {
+    type: 'object', additionalProperties: false, required: ['run_id', 'action'],
+    properties: {
+      run_id: id(), action: (routineProposalSubmit.inputSchema!.properties as Record<string, unknown>).action,
+      references: { type: 'array', maxItems: 20, items: {
+        type: 'object', additionalProperties: false, required: ['type', 'id'],
+        properties: { type: { type: 'string', enum: ['task', 'flight', 'artifact'] }, id: string(200) },
+      } },
+    },
+  },
+  async run(auth, env, args) {
+    if (!validId(args.run_id)) return fail(404, 'run_not_found')
+    const result = await observeRoutineProposal(env, routinePrincipal(auth), {
+      run_id: args.run_id, action: args.action, references: args.references,
+    })
     return result.ok ? done(result) : sourceFailure(result.error)
   },
 }
@@ -724,6 +757,6 @@ const projectAccessReintakeAuthorize: ToolSpec = {
 export const ROUTINE_TOOLS: ToolSpec[] = [
   routineList, routineGet, routineCreate, routineUpdate,
   lifecycle('routine_enable', enableRoutine), lifecycle('routine_pause', pauseRoutine), lifecycle('routine_archive', archiveRoutine),
-  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, reportRunUsage, needsYouList,
+  routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, routineProposalObserve, reportRunUsage, needsYouList,
   projectAccessReintakeAuthorize,
 ]

@@ -1,3 +1,4 @@
+import { controlExclusions } from './control-situation'
 import type { D1Result } from '@cloudflare/workers-types'
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql } from './running-action'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
@@ -666,10 +667,12 @@ export async function dispatchRoutineRun(
   if (!task) return { ok: false, error: 'run_not_dispatchable' }
   const flightId = await ensureFlight(env, run, policy, selected.agentId, task, remainingBudget)
   if (!flightId) return { ok: false, error: 'run_not_dispatchable' }
-  const situation = await loadProjectSituation(env, projectFrom(run), [policy.responsible_squad_id], {
-    excludeTaskIds: [task.id],
-    excludeFlightIds: [flightId],
-  })
+  // First attempts have no historical controls. Preserve the scheduler's D1
+  // statement headroom; retries must also exclude every earlier attempt.
+  const exclusions = run.attempt > 1
+    ? await controlExclusions(env, { ...run, task_id: task.id, flight_id: flightId })
+    : { excludeTaskIds: [task.id], excludeFlightIds: [flightId] }
+  const situation = await loadProjectSituation(env, projectFrom(run), [policy.responsible_squad_id], exclusions)
   const situationDigest = await canonicalJsonDigest(situation)
   const nowIso = now.toISOString()
   // mupot#1821: the refusing write's time. A refusal is a pause iff a pause covered the agent at this instant.

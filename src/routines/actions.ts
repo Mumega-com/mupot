@@ -1,3 +1,4 @@
+import { controlExclusions } from './control-situation'
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql, runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage } from '../agents/messages'
@@ -524,23 +525,6 @@ async function deterministicUuid(namespace: string, value: string): Promise<stri
   return `${normalized.slice(0, 8)}-${normalized.slice(8, 12)}-${normalized.slice(12, 16)}-${normalized.slice(16, 20)}-${normalized.slice(20)}`
 }
 
-async function controlExclusions(env: Env, run: RunContext): Promise<{
-  excludeTaskIds: string[]
-  excludeFlightIds: string[]
-  excludeMessageIds: string[]
-}> {
-  const refs = await env.DB.prepare(
-    `SELECT ref_type, ref_id FROM routine_run_refs
-      WHERE run_id = ? AND tenant = ? AND ref_type IN ('task','flight','message')`,
-  ).bind(run.id, run.tenant).all<{ ref_type: string; ref_id: string }>()
-  const rows = refs.results ?? []
-  return {
-    excludeTaskIds: [...new Set([run.task_id, ...rows.filter(row => row.ref_type === 'task').map(row => row.ref_id)].filter(Boolean) as string[])],
-    excludeFlightIds: [...new Set([run.flight_id, ...rows.filter(row => row.ref_type === 'flight').map(row => row.ref_id)].filter(Boolean) as string[])],
-    excludeMessageIds: [...new Set(rows.filter(row => row.ref_type === 'message').map(row => row.ref_id))],
-  }
-}
-
 async function currentSituationDigest(
   env: Env,
   run: RunContext,
@@ -626,6 +610,125 @@ async function referenceReadable(
         AND ref_type IN ('evidence','output','receipt')`,
   ).bind(run.id, run.tenant, reference.id).first()
   return artifact !== null
+}
+
+function proposalSourceReferences(proposal: RoutineProposal): RoutineProposalReference[] {
+  const references = [...(proposal.source_observation?.references ?? [])]
+  const action = proposal.action
+  if (action.kind === 'ask_human') references.push(...action.input.references)
+  if (action.kind === 'request_review') references.push({ type: action.input.source_type, id: action.input.source_id })
+  if (action.kind === 'dispatch_flight') {
+    references.push(...action.input.task_ids.map(id => ({ type: 'task' as const, id })))
+    references.push(...action.input.artifact_refs.map(id => ({ type: 'artifact' as const, id })))
+  }
+  return [...new Map(references.map(ref => [`${ref.type}:${ref.id}`, ref])).values()]
+    .sort((a, b) => a.type.localeCompare(b.type) || a.id.localeCompare(b.id))
+}
+
+/** Hash the actual declared records, not the capped board projection. The
+ * dispatch digest remains an attempt fence; this observation grants no authority.
+ * Only server-readable facts are returned, with no write or refresh of the run. */
+async function sourceObservation(
+  env: Env, run: RunContext, policy: RoutinePolicySnapshot, proposal: RoutineProposal,
+): Promise<{ digest: string; sources: Array<{ type: string; id: string; fact: unknown }> } | null> {
+  if (proposal.action.kind === 'project_access') return null
+  const unique = proposalSourceReferences(proposal)
+  if (unique.length === 0 || unique.length > 200) return null
+  const sources: Array<{ type: string; id: string; fact: unknown }> = []
+  for (const ref of unique) {
+    let fact: unknown
+    if (ref.type === 'task') {
+      fact = await env.DB.prepare(`SELECT ${TASK_SELECT_COLUMNS} FROM tasks
+        WHERE id = ? AND project_id = ? AND squad_id = ? AND ${TASK_NOT_ARCHIVED_SQL()}`)
+        .bind(ref.id, run.project_id, policy.responsible_squad_id).first()
+    } else if (ref.type === 'flight') {
+      fact = await env.DB.prepare(`SELECT id, tenant, project_id, agent, goal, status,
+        gate_verdict, gate_reason, budget_micro_usd, cost_micro_usd, next_run_at,
+        created_at, started_at, ended_at, meta FROM flights
+        WHERE id = ? AND tenant = ? AND project_id = ? AND json_valid(meta)
+          AND EXISTS (SELECT 1 FROM json_each(flights.meta, '$.squad_ids') WHERE CAST(value AS TEXT) = ?)`)
+        .bind(ref.id, run.tenant, run.project_id, policy.responsible_squad_id).first()
+      if (fact) {
+        const meta = parseFlightMetaV1(JSON.parse((fact as { meta: string }).meta))
+        if (!meta || meta.squad_ids.some(id => id !== policy.responsible_squad_id)) return null
+      }
+    } else {
+      // Artifact references are opaque run-owned evidence/receipt identities.
+      // This witnesses the reference, not bytes stored outside the pot.
+      const rows = await env.DB.prepare(`SELECT ref_type, ref_id, relation, created_at FROM routine_run_refs
+        WHERE run_id = ? AND tenant = ? AND ref_id = ? AND ref_type IN ('evidence','output','receipt')
+        ORDER BY ref_type, relation`).bind(run.id, run.tenant, ref.id).all()
+      fact = rows.results?.length ? rows.results : null
+    }
+    if (!fact) return null
+    sources.push({ ...ref, fact })
+  }
+  return {
+    digest: await canonicalJsonDigest({
+      version: 'routine.source-observation/v1', tenant: run.tenant, run_id: run.id,
+      attempt: run.attempt, situation_digest: run.situation_digest,
+      policy, project: projectFrom(run), action: proposal.action, sources,
+    }),
+    sources,
+  }
+}
+
+async function proposalSituationCurrent(
+  env: Env, run: RunContext, policy: RoutinePolicySnapshot, proposal: RoutineProposal,
+): Promise<boolean> {
+  if (!proposal.source_observation) return await currentSituationDigest(env, run, policy) === run.situation_digest
+  const live = await sourceObservation(env, run, policy, proposal)
+  return live !== null && live.digest === proposal.source_observation.digest
+}
+
+/** Read-only, assigned-agent observation. Return the facts together with their
+ * digest so the caller can reconsider its proposal before echoing the witness. */
+export async function observeRoutineProposal(
+  env: Env, principal: RoutinePrincipal, input: { run_id: string; action: unknown; references?: unknown },
+): Promise<{ ok: false; error: ProposalError } | { ok: true; run_id: string; project_id: string;
+  situation_digest: string; source_observation: NonNullable<RoutineProposal['source_observation']>;
+  sources: Array<{ type: string; id: string; fact: unknown }> }> {
+  const run = await loadRun(env, input.run_id)
+  if (!run || principal.tenant !== env.TENANT_SLUG || !await principalCanReadProject(env, principal, run.project_id)) {
+    return { ok: false, error: 'run_not_found' }
+  }
+  const policy = parsePolicy(run.policy_json)
+  if (!policy) return { ok: false, error: 'invalid_policy' }
+  if (principal.actor_type !== 'agent' || !await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) {
+    return { ok: false, error: 'forbidden' }
+  }
+  if (principal.actor_id !== run.assigned_agent_id) return { ok: false, error: 'assigned_agent_mismatch' }
+  if (!['running', 'waiting'].includes(run.status) || !run.situation_digest
+    || await isCancellationPending(env, run.id, run.tenant)) return { ok: false, error: 'run_not_accepting_proposal' }
+  if (run.project_status !== 'active') return { ok: false, error: 'project_not_active' }
+  const parsed = parseRoutineProposal({
+    version: 'routine.proposal/v1', run_id: run.id, project_id: run.project_id,
+    situation_digest: run.situation_digest, summary: 'Observe declared proposal sources', action: input.action,
+    source_observation: { digest: '0'.repeat(64), references: input.references ?? [] },
+  })
+  if (!parsed.ok) return { ok: false, error: 'invalid_proposal' }
+  if (parsed.value.action.kind === 'project_access' || proposalSourceReferences(parsed.value).length > 200) {
+    return { ok: false, error: 'invalid_proposal' }
+  }
+  const scoped = await validateActionScope(env, run, policy, parsed.value.action)
+  if (scoped) return { ok: false, error: scoped }
+  const observation = await sourceObservation(env, run, policy, parsed.value)
+  if (!observation) return { ok: false, error: 'reference_out_of_scope' }
+  return { ok: true, run_id: run.id, project_id: run.project_id, situation_digest: run.situation_digest,
+    source_observation: { digest: observation.digest, references: parsed.value.source_observation!.references },
+    sources: observation.sources.map(source => {
+      // Keep raw internal snapshots in the hash; expose an explicit reader DTO.
+      const fields = source.type === 'task'
+        ? ['id', 'squad_id', 'project_id', 'title', 'body', 'done_when', 'status', 'assignee_agent_id',
+          'assignee_member_id', 'gate_owner', 'result', 'completed_at', 'created_at', 'updated_at']
+        : source.type === 'flight'
+          ? ['id', 'project_id', 'agent', 'goal', 'status', 'gate_verdict', 'gate_reason',
+            'budget_micro_usd', 'cost_micro_usd', 'next_run_at', 'created_at', 'started_at', 'ended_at']
+          : null
+      return { ...source, fact: fields
+        ? Object.fromEntries(fields.map(key => [key, (source.fact as Record<string, unknown>)[key] ?? null]))
+        : source.fact }
+    }) }
 }
 
 async function validateActionScope(
@@ -1554,7 +1657,7 @@ export async function executeRoutineAction(
   const typedAction = storedProposal.value.action
   if (action.status !== 'running') {
     if (run.project_status !== 'active') return { ok: false, error: 'project_not_active' }
-    if (await currentSituationDigest(env, run, policy) !== run.situation_digest) {
+    if (!await proposalSituationCurrent(env, run, policy, storedProposal.value)) {
       await queueStaleObservation(env, run)
       const [racedRun, racedAction] = await Promise.all([
         loadRun(env, run.id),
@@ -2184,7 +2287,7 @@ export async function submitRoutineProposal(
   }
   if (!['running', 'waiting'].includes(run.status)) return { ok: false, error: 'run_not_accepting_proposal' }
   if (run.project_status !== 'active') return { ok: false, error: 'project_not_active' }
-  if (await currentSituationDigest(env, run, policy) !== run.situation_digest) {
+  if (!await proposalSituationCurrent(env, run, policy, proposal)) {
     await queueStaleObservation(env, run)
     return { ok: false, error: 'stale_situation' }
   }

@@ -17,9 +17,10 @@ export interface ReadyRoutineFixture {
 
 export async function makeReadyRoutineFixture(
   executionMode: 'propose' | 'execute_internal' = 'execute_internal',
+  migratedHarness?: SqliteD1Harness,
 ): Promise<ReadyRoutineFixture> {
-  const harness = createSqliteD1()
-  applyAllMigrations(harness.sqlite)
+  const harness = migratedHarness ?? createSqliteD1()
+  if (!migratedHarness) applyAllMigrations(harness.sqlite)
   const policy = JSON.stringify({
     execution_mode: executionMode,
     overlap_policy: 'skip',

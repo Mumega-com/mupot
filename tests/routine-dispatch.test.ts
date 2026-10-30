@@ -4,7 +4,7 @@ import type { Env } from '../src/types'
 import { leaseAgentInbox, sendAgentMessage } from '../src/agents/messages'
 import { cancelFlight } from '../src/flight/watchdog'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
-import { cancelRoutineRun } from '../src/routines/actions'
+import { cancelRoutineRun, submitRoutineProposal } from '../src/routines/actions'
 import { runRouterTick } from '../src/router/engine'
 import { runProjectConcierge, BUILD_CAPABILITY } from '../src/concierge/service'
 import { registerModule } from '../src/registry/service'
@@ -290,6 +290,33 @@ describe('routine runtime-neutral dispatch', () => {
     expect(row(harness, 'SELECT assignee_agent_id FROM tasks LIMIT 1')).toEqual({
       assignee_agent_id: 'agent-preferred',
     })
+  })
+
+  it('accepts a retry envelope with historical active controls and no business churn', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    const first = await dispatchRoutineRun(env, 'run-1', NOW)
+    expect(first).toMatchObject({ ok: true, status: 'dispatched' })
+    harness.sqlite.exec(`UPDATE routine_runs SET status='queued' WHERE id='run-1';
+      UPDATE routine_runs SET status='leased', attempt=2, proposal_json=NULL,
+        lease_owner='retry-test', lease_expires_at='2026-07-19T16:10:00.000Z'
+      WHERE id='run-1'`)
+    const retry = await dispatchRoutineRun(env, 'run-1', new Date('2026-07-19T16:01:00.000Z'))
+    expect(retry).toMatchObject({ ok: true, status: 'dispatched' })
+    if (!retry.ok || retry.status !== 'dispatched') throw new Error('retry did not dispatch')
+    const agent: RoutinePrincipal = {
+      tenant: 'tenant-a', actor_type: 'agent', actor_id: retry.agent_id, workspace_admin: false,
+      grants: [{ member_id: 'member-preferred', scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }],
+      project_read: { workspaceAdmin: false, orgRead: false, squadIds: ['squad-1'], departmentIds: [] },
+    }
+    const run = row(harness, "SELECT situation_digest FROM routine_runs WHERE id='run-1'")
+    const result = await submitRoutineProposal(env, agent, {
+      version: 'routine.proposal/v1', run_id: 'run-1', project_id: 'project-1',
+      situation_digest: run?.situation_digest, summary: 'No business change since retry dispatch.',
+      action: { key: 'retry-none', kind: 'no_action', input: { reason: 'Nothing to change' } },
+    })
+    expect(result).toMatchObject({ ok: true })
+    expect(row(harness, "SELECT result_summary FROM routine_runs WHERE id='run-1'")?.result_summary).not.toBe('stale_situation')
   })
 
   it('attributes Task, Flight, references, digest, and inbox envelope to the exact Project', async () => {

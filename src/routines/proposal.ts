@@ -41,6 +41,8 @@ export interface RoutineProposal {
   situation_digest: string
   summary: string
   action: RoutineProposalAction
+  /** Opt-in source-bound observation from routine_proposal_observe. */
+  source_observation?: { digest: string; references: RoutineProposalReference[] }
 }
 
 export type ProposalParseResult =
@@ -220,7 +222,7 @@ function parseAction(action: Record<string, unknown>): ProposalParseResult | Rou
 
 export function parseRoutineProposal(value: unknown): ProposalParseResult {
   if (!record(value)) return { ok: false, error: 'invalid_envelope' }
-  if (!exactKeys(value, ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'])) {
+  if (!exactKeys(value, ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action', 'source_observation'])) {
     return { ok: false, error: 'unknown_key' }
   }
   if (
@@ -234,6 +236,17 @@ export function parseRoutineProposal(value: unknown): ProposalParseResult {
   ) return { ok: false, error: 'invalid_envelope' }
   const action = parseAction(value.action)
   if ('ok' in action) return action
+  let observation: RoutineProposal['source_observation']
+  if (value.source_observation !== undefined) {
+    const source = value.source_observation
+    if (!record(source) || !exactKeys(source, ['digest', 'references'])
+      || typeof source.digest !== 'string' || !DIGEST.test(source.digest)) {
+      return { ok: false, error: 'invalid_envelope' }
+    }
+    const references = parseReferences(source.references)
+    if (!Array.isArray(references)) return references
+    observation = { digest: source.digest, references }
+  }
   return {
     ok: true,
     value: {
@@ -243,6 +256,7 @@ export function parseRoutineProposal(value: unknown): ProposalParseResult {
       situation_digest: value.situation_digest,
       summary: value.summary,
       action,
+      ...(observation ? { source_observation: observation } : {}),
     },
   }
 }
