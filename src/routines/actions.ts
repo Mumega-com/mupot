@@ -690,9 +690,10 @@ async function sourceObservation(
 async function proposalSituationCurrent(
   env: Env, run: RunContext, policy: RoutinePolicySnapshot, proposal: RoutineProposal,
 ): Promise<boolean> {
-  // Task creation can encode dependencies in arbitrary prose. It retains the
-  // whole-board check as well as any explicitly declared source commitment.
-  if (!proposal.source_observation || proposal.action.kind === 'create_task') {
+  // Autonomous writers can encode dependencies in arbitrary prose. They retain
+  // the board projection check as well as any declared-source commitment.
+  if (!proposal.source_observation || proposal.action.kind === 'create_task'
+    || proposal.action.kind === 'dispatch_flight') {
     const current = await currentSituationDigest(env, run, policy) === run.situation_digest
     if (!current || !proposal.source_observation) return current
   }

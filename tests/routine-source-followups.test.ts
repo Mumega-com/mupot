@@ -114,6 +114,34 @@ describe('routine source observation gate followups', () => {
     expect(count('routine_run_actions')).toBe(0)
   })
 
+  it.each(['submit', 'execution'])('dispatch_flight retains whole-board freshness for prose-only targets at %s', async phase => {
+    await reset(phase === 'execution' ? 'propose' : 'execute_internal')
+    const action: RoutineProposalAction = { key: 'flight', kind: 'dispatch_flight', input: {
+      goal: `Inspect and close task ${TARGET}`, task_ids: ['decoy'], artifact_refs: [], budget_micro_usd: 100,
+    } }
+    const proposal = { ...base(action), source_observation: await observe(action) }
+    if (phase === 'execution') {
+      await expect(submitRoutineProposal(f.env, f.principal, proposal)).resolves.toMatchObject({ ok: true, status: 'waiting' })
+      await approve()
+    }
+    const flightsBefore = count('flights')
+    f.harness.sqlite.prepare("UPDATE tasks SET body='Flight target changed',status='blocked' WHERE id=?").run(TARGET)
+    const result = phase === 'submit' ? await submitRoutineProposal(f.env, f.principal, proposal)
+      : await executeRoutineAction(f.env, 'run-1', 'flight')
+    expect(result).toEqual({ ok: false, error: 'stale_situation' })
+    expect(row('SELECT COUNT(*) AS n FROM flights WHERE goal=?', action.input.goal)).toEqual({ n: 0 })
+    expect(count('flights')).toBe(flightsBefore)
+  })
+
+  it('dispatch_flight with fresh board and declared evidence creates one flight', async () => {
+    const action: RoutineProposalAction = { key: 'fresh-flight', kind: 'dispatch_flight', input: {
+      goal: 'Ship the declared work', task_ids: ['decoy'], artifact_refs: [], budget_micro_usd: 100,
+    } }
+    const proposal = { ...base(action), source_observation: await observe(action) }
+    await expect(submitRoutineProposal(f.env, f.principal, proposal)).resolves.toMatchObject({ ok: true, status: 'succeeded' })
+    expect(row('SELECT COUNT(*) AS n FROM flights WHERE goal=?', action.input.goal)).toEqual({ n: 1 })
+  })
+
   function seedBoundary(boundary: string): RoutineProposalReference {
     f.harness.sqlite.exec(`INSERT INTO squads (id,department_id,slug,name) VALUES ('other','dept-1','other','Other');
       INSERT INTO projects (id,slug,name,status) VALUES ('other','other','Other','active');

@@ -48,8 +48,13 @@ const legacyMutants = [
 const followupMutants = [
   ...['submit', 'execution'].map(phase => [
     `create-task-global-${phase}`, service,
-    s => replace(s, "if (!proposal.source_observation || proposal.action.kind === 'create_task')", 'if (!proposal.source_observation)'),
+    s => replace(s, " || proposal.action.kind === 'create_task'", ''),
     `prose-only targets at ${phase}`,
+  ]),
+  ...['submit', 'execution'].map(phase => [
+    `dispatch-flight-global-${phase}`, service,
+    s => replace(s, "\n    || proposal.action.kind === 'dispatch_flight'", ''),
+    `dispatch_flight retains whole-board freshness for prose-only targets at ${phase}`,
   ]),
   ['create-task-declared-facts', service, s => replace(s, 'if (!current || !proposal.source_observation) return current', 'return current'), 'create_task keeps its declared-source check'],
   ...[
