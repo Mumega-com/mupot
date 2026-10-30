@@ -18,7 +18,7 @@ import { createVerdictGateCache, evaluateVerdictGates, primeVerdictIndependence,
 import { canReadSquadTasks } from '../tasks/visibility'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
 import { nowSqlUtc } from '../auth/token-lifecycle'
-import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
+import { APPROVAL_EXPIRY, GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -480,15 +480,16 @@ async function sourceRows(
       AND ${visibility.sql}
   `, projectScope, cursor)
 
-  const agedReviews = stuckView
+  // gate-2275 a/b P1: agent principals age nothing for a HUMAN — skip the source entirely.
+  const agedReviews = stuckView || principal.actor_type !== 'member'
     ? Promise.resolve<SourceResult>({ name: 'aged_reviews', rows: [], truncated: false })
     : querySource(env, 'aged_reviews', `
     SELECT
       'aged_review' AS kind, 'task' AS source_type, t.id AS source_id,
       p.id AS project_id, p.name AS project_name, t.title,
-      CASE WHEN ${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} >= ${NEEDS_YOU_STALE_DAYS}
-        THEN 'Review ask expired ' || CAST(${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} AS INTEGER) || ' days ago with no verdict on ' || t.gate_owner || ' — the ask cannot be approved now (expiry is never approval). Ask an admin to run the approval-expiry sweep, or reset the resubmit cap to start a new round.'
-        ELSE 'No holder of any kind is registered to answer ' || t.gate_owner || ' — no human and no agent. The ask cannot be approved until a holder exists; ask an admin to register the gate.'
+      CASE WHEN ${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} >= ${APPROVAL_EXPIRY.gate_verdict_days}
+        THEN 'Review ask expired ' || CAST(MAX(0, ${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} - ${APPROVAL_EXPIRY.gate_verdict_days}) AS INTEGER) || ' days ago with no verdict on ' || t.gate_owner || ' — the ask cannot be approved now (expiry is never approval). Ask an admin to run the approval-expiry sweep, or reset the resubmit cap to start a new round.'
+        ELSE 'No gate holder is registered to answer ' || t.gate_owner || ' — an org owner or admin can decide it. Register the gate lane, or answer it directly.'
       END AS reason,
       ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
@@ -499,7 +500,8 @@ async function sourceRows(
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'review' AND t.gate_owner IS NOT NULL AND t.gate_owner <> 'gate:agent-self-completion'${projectClause}
-      AND t.assignee_member_id IS NOT NULL
+      AND t.assignee_member_id = ${sqlQuote(principal.actor_id)}
+      -- (assignment in SQL: gate-2275 P1 — 600-row flood must not starve the own row)
       AND ${projectLive}
       AND (${TASK_NOT_ARCHIVED_SQL('t')})
       AND (
