@@ -1,3 +1,4 @@
+import { routineReviewDeadline, routineReviewDeadlineSql } from './review-window'
 import { controlExclusions } from './control-situation'
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql, runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
@@ -578,6 +579,19 @@ async function queueStaleObservation(env: Env, run: RunContext): Promise<void> {
                AND e.occurred_at = ?
           )`,
     ).bind(crypto.randomUUID(), ROUTINE_ACTOR, now, run.id, run.tenant, now, now),
+    ...(run.status === 'waiting' && run.waiting_reason === 'review' && run.flight_id ? [
+      // Re-observation is execution work too; the completed human wait is not its budget.
+      env.DB.prepare(`UPDATE flights
+          SET resumed_at = ?1
+        WHERE id = ?2 AND tenant = ?3 AND project_id = ?4 AND status = 'running'
+          AND changes() = 1
+          AND EXISTS (SELECT 1 FROM routine_runs rr
+            WHERE rr.id = ?5 AND rr.tenant = ?3 AND rr.project_id = ?4
+              AND rr.flight_id = flights.id AND rr.attempt = ?6
+              AND rr.status = 'queued' AND rr.result_summary = 'stale_situation'
+              AND rr.retry_at = ?7 AND rr.updated_at = ?7)`)
+        .bind(Date.parse(now), run.flight_id, run.tenant, run.project_id, run.id, run.attempt, now),
+    ] : []),
   ])
 }
 
@@ -1084,12 +1098,13 @@ async function waitForHuman(
            SELECT 1 FROM routine_run_events e
             WHERE e.run_id = routine_runs.id AND e.kind = ?
               AND json_extract(e.metadata_json, '$.action_key') = ?
+              AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?
          )`,
     ).bind(
       crypto.randomUUID(), reason === 'review' ? 'approval_requested' : 'action_started',
-      ROUTINE_ACTOR, now, JSON.stringify({ action_key: action.action_key, reason }),
+      ROUTINE_ACTOR, now, JSON.stringify({ action_key: action.action_key, reason, attempt: run.attempt, ...(reason === 'review' ? { review_deadline_at: routineReviewDeadline(env, now) } : {}) }),
       run.id, run.tenant, reason, now, action.id, run.tenant, waitReceipt,
-      reason === 'review' ? 'approval_requested' : 'action_started', action.action_key,
+      reason === 'review' ? 'approval_requested' : 'action_started', action.action_key, run.attempt,
     ),
   ]
   const outcomes = await env.DB.batch(statements)
@@ -1663,6 +1678,12 @@ export async function executeRoutineAction(
   const run = await loadRun(env, runId)
   if (!run) return { ok: false, error: 'run_not_found' }
   if (await isCancellationPending(env, run.id, run.tenant)) return { ok: false, error: 'receipt_failed' }
+  if (run.status === 'waiting' && run.waiting_reason === 'review') {
+    const pending = await env.DB.prepare(`SELECT ${routineReviewDeadlineSql('rr')} AS deadline
+      FROM routine_runs rr WHERE rr.id = ?1 AND rr.tenant = ?2`)
+      .bind(run.id, run.tenant).first<{ deadline: string | null }>()
+    if (!pending?.deadline || Date.parse(pending.deadline) <= Date.now()) return { ok: false, error: 'approval_required' }
+  }
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
   let action = await loadAction(env, run.id, actionKey)
@@ -1770,8 +1791,10 @@ export async function executeRoutineAction(
               SELECT 1 FROM routine_runs
                WHERE id = ? AND tenant = ? AND status IN ('running','waiting')
                  AND ${sqlNotCancellationPending('routine_runs')}
+                 AND (status <> 'waiting' OR COALESCE(waiting_reason, '') <> 'review'
+                   OR ${routineReviewDeadlineSql('routine_runs')} > ?)
             )`,
-      ).bind(startedAt, action.id, run.tenant, run.id, run.tenant),
+      ).bind(startedAt, action.id, run.tenant, run.id, run.tenant, startedAt),
       env.DB.prepare(
         `INSERT INTO routine_run_events (
           id, tenant, project_id, run_id, kind, actor_type, actor_id,
@@ -1793,6 +1816,17 @@ export async function executeRoutineAction(
         JSON.stringify({ action_key: action.action_key, attempt: run.attempt }),
         run.id, run.tenant, action.id, startedAt, action.action_key, run.attempt,
       ),
+      ...(run.status === 'waiting' && run.waiting_reason === 'review' && run.flight_id ? [
+        env.DB.prepare(`UPDATE flights SET resumed_at = ?1
+          WHERE id = ?2 AND tenant = ?3 AND project_id = ?4 AND status = 'running'
+            AND changes() = 1
+            AND EXISTS (SELECT 1 FROM routine_run_actions a JOIN routine_runs rr
+              ON rr.id = a.run_id AND rr.tenant = a.tenant AND rr.project_id = a.project_id
+              WHERE rr.id = ?5 AND rr.tenant = ?3 AND rr.flight_id = flights.id
+                AND rr.status = 'waiting' AND rr.waiting_reason = 'review'
+                AND a.id = ?6 AND a.status = 'running' AND a.updated_at = ?7)`)
+          .bind(Date.parse(startedAt), run.flight_id, run.tenant, run.project_id, run.id, action.id, startedAt),
+      ] : []),
     ])
     if (!wrote(outcomes[0])) {
       const [racedRun, racedAction] = await Promise.all([
@@ -1807,7 +1841,7 @@ export async function executeRoutineAction(
       } else {
         return { ok: false, error: 'receipt_failed' }
       }
-    } else if (!wrote(outcomes[1])) {
+    } else if (!wrote(outcomes[1]) || (outcomes.length > 2 && !wrote(outcomes[2]))) {
       return classifyActionFailure(env, run, policy, { ...action, status: 'running' }, 'receipt_failed')
     } else {
       action = { ...action, status: 'running' }

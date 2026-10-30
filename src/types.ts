@@ -41,6 +41,8 @@ export interface WorkflowBinding<PARAMS = unknown> {
 
 // ── Cloudflare bindings (must match wrangler.toml) ──
 export interface Env {
+  /** New routine human-review asks: 24h..7d, default 24h; snapshotted per ask. */
+  ROUTINE_REVIEW_WINDOW_MS?: string
   DB: D1Database
   // Owner-call storage pilot. Default off; no notification consumer exists in slice 1.
   OWNER_CALL?: string

@@ -6,6 +6,9 @@
 // 1. Precise Classification:
 //    - 'running' / 'preflight' > timeout (default 60m, or meta.timeout_ms [5m..24h]) -> 'reap'
 //      measured from resumed_at (last waiting -> running) when set, else started_at
+//    - routine control flights with a current receipted human review use that ask's
+//      explicit review deadline instead (24h default); expiry is review_window_expired.
+//      Action start or re-observation resumes the execution clock after the human wait.
 //    - 'sleeping' with missed wake deadline (now > next_run_at + 30m) -> 'reap'
 //    - 'waiting' (human review gate) > 24h since waiting_since -> 'escalate'
 //      (HARD INVARIANT: NEVER REAP)
@@ -27,6 +30,7 @@
 import type { Env } from '../types'
 import { routineEffectInFlightSql } from '../routines/running-action'
 import { routineControlId } from '../routines/identity'
+import { flightReviewValueSql } from '../routines/review-window'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { FlightRow, FlightStatus } from './service'
 import {
@@ -137,6 +141,7 @@ export async function resolveReapDisposition(env: Env, flight: FlightRow): Promi
 export function evaluateFlightLiveness(
   flight: FlightRow,
   nowMs: number = Date.now(),
+  review?: { requested_at?: string | null; deadline_at?: string | null } | null,
 ): FlightWatchdogEvaluation {
   const status = flight.status
 
@@ -199,6 +204,18 @@ export function evaluateFlightLiveness(
       reason: 'sleeping_in_window',
       ageMs: Math.max(0, nowMs - (flight.started_at ?? flight.created_at)),
       timeoutMs: DEFAULT_SLEEPING_STALL_TIMEOUT_MS,
+    }
+  }
+
+  // Routine control flights remain running while their run waits at a human gate.
+  // Only a correlated, current server review event grants this separate finite clock.
+  if (status === 'running' && review?.requested_at && review.deadline_at) {
+    const requested = Date.parse(review.requested_at)
+    const deadline = Date.parse(review.deadline_at)
+    if (Number.isFinite(requested) && Number.isFinite(deadline) && deadline > requested) {
+      return { action: nowMs >= deadline ? 'reap' : 'healthy',
+        reason: nowMs >= deadline ? 'review_window_expired' : 'routine_review_pending',
+        ageMs: Math.max(0, nowMs - requested), timeoutMs: deadline - requested, stalledAt: deadline }
     }
   }
 
@@ -280,7 +297,9 @@ export async function scanStalledFlights(
   //   2. waiting flights only when their escalation is DUE and has not already fired
   //      (escalated_at IS NULL) — an escalated-once wait never re-enters the window.
   const reapable = await env.DB.prepare(
-    `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+    `SELECT f.*, a.name AS agent_name, s.name AS squad_name,
+            ${flightReviewValueSql('f', 'requested')} AS routine_review_requested_at,
+            ${flightReviewValueSql('f', 'deadline')} AS routine_review_deadline_at
        FROM flights f
        LEFT JOIN agents a ON a.id = f.agent
        LEFT JOIN squads s ON s.id = a.squad_id
@@ -290,11 +309,14 @@ export async function scanStalledFlights(
         -- them would fill it for good (the #1540 class). They are handled by their own bounded pass
         -- (expireUnverifiedHeldFlights) and surfaced in needs_you's stuck view.
         AND COALESCE(f.gate_reason, '') NOT LIKE '${UNVERIFIED_GATE_REASON_LIKE}' ESCAPE '\\'
+        -- Pending human reviews must not monopolize the bounded running window.
+        AND (${flightReviewValueSql('f', 'deadline')} IS NULL
+          OR ${flightReviewValueSql('f', 'deadline')} <= ?3)
       ORDER BY f.created_at ASC
       LIMIT ?2`,
   )
-    .bind(env.TENANT_SLUG, limit)
-    .all<FlightRow>()
+    .bind(env.TENANT_SLUG, limit, new Date(nowMs).toISOString())
+    .all<FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string }>()
   const escalationDue = await env.DB.prepare(
     `SELECT f.*, a.name AS agent_name, s.name AS squad_name
        FROM flights f
@@ -315,7 +337,10 @@ export async function scanStalledFlights(
   const items: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }> = []
 
   for (const flight of [...reapableRows, ...escalationRows]) {
-    const evaluation = evaluateFlightLiveness(flight, nowMs)
+    const enriched = flight as FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string }
+    const evaluation = evaluateFlightLiveness(flight, nowMs, {
+      requested_at: enriched.routine_review_requested_at, deadline_at: enriched.routine_review_deadline_at,
+    })
     if (evaluation.action === 'reap' || evaluation.action === 'escalate') {
       items.push({ flight, evaluation })
     }
@@ -439,7 +464,12 @@ export async function reapStalledFlight(
   }
 
   // Check liveness predicate
-  const evalResult = evaluateFlightLiveness(flight, nowMs)
+  const review = await env.DB.prepare(`SELECT
+      ${flightReviewValueSql('f', 'requested')} AS requested_at,
+      ${flightReviewValueSql('f', 'deadline')} AS deadline_at
+    FROM flights f WHERE f.id = ?1 AND f.tenant = ?2`)
+    .bind(flightId, env.TENANT_SLUG).first<{ requested_at: string | null; deadline_at: string | null }>()
+  const evalResult = evaluateFlightLiveness(flight, nowMs, review)
   if (evalResult.action !== 'reap') {
     return {
       transitioned: false,
@@ -458,6 +488,7 @@ export async function reapStalledFlight(
       error: 'forbidden_insufficient_reap_capability',
     }
   }
+  if (evalResult.reason === 'review_window_expired') reason = 'review_window_expired'
 
   // #2025: all tasks done but the landing evidence is missing. The stall clock must NOT land it (that is how a
   // self-approved flight reached 'landed' with no proof) and must not fail finished work either. Record why on the
@@ -544,13 +575,18 @@ export async function reapStalledFlight(
         WHERE id = ?1
           AND tenant = ?2
           AND status IN ('preflight', 'running', 'sleeping')
+          AND ((${flightReviewValueSql('flights', 'deadline')} = ?7)
+            OR (?7 IS NULL AND ${flightReviewValueSql('flights', 'deadline')} IS NULL))
+          AND (status = 'sleeping' OR COALESCE(resumed_at, started_at, created_at) = ?8)
           AND (
             ?5 = 'failed'
             OR (?6 = 'bookkeeping_closed' AND flights.bookkeeping = 1)
             OR (?6 = 'tasks_done' AND flights.status = 'running' AND flights.bookkeeping = 0 AND ${tasksAllDoneSql('flights', landEvidenceEnabled(env))})
           )
         RETURNING id, status`,
-    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, targetStatus, disposition),
+    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, targetStatus, disposition,
+      evalResult.reason === 'review_window_expired' ? review?.deadline_at ?? null : null,
+      flight.resumed_at ?? flight.started_at ?? flight.created_at),
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'failed',
@@ -577,7 +613,7 @@ export async function reapStalledFlight(
       `UPDATE tasks
           SET status = 'blocked', result = ?1, updated_at = ?2
         WHERE id = ?3
-          AND status = 'in_progress'
+          AND (status = 'in_progress' OR (?12 = 1 AND status = 'review' AND gate_owner = 'gate:routines'))
           AND result IS NULL
           AND execution_receipt_id IS NULL
           AND execution_claim_expires_at IS NULL
@@ -606,7 +642,7 @@ export async function reapStalledFlight(
         RETURNING id`,
     ).bind(
       taskFailureReason, nowIso, expectedRoutineTaskId, routineCandidate?.id ?? null,
-      env.TENANT_SLUG, flightId, nowIso, runReason, routineCandidate?.attempt ?? null, nowMs, gateReason,
+      env.TENANT_SLUG, flightId, nowIso, runReason, routineCandidate?.attempt ?? null, nowMs, gateReason, evalResult.reason === 'review_window_expired' ? 1 : 0,
     ),
     // The task write is direct to remain in the same atomic batch as the
     // flight/run transition, so record its actual actor and flight correlation

@@ -229,7 +229,10 @@ describe('Project Routines dashboard', () => {
     const detailBody = await detail.text()
     expect(detailBody).toContain('Run detail: run-waiting')
     expect(detailBody).toContain('Cancel run')
+    expect(detailBody).toContain('Review due: unavailable')
     expect(jsonScript(detailBody, 'routine-run-json')).toEqual({
+      review_requested_at: null,
+      review_deadline_at: null,
       id: 'run-waiting',
       project_id: 'project-a',
       routine_id: 'routine-enabled',

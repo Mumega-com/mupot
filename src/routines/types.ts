@@ -80,6 +80,8 @@ export interface RoutineRun {
   finished_at: string | null
   created_at: string
   updated_at: string
+  review_requested_at?: string | null
+  review_deadline_at?: string | null
 }
 
 export type RoutineAction =

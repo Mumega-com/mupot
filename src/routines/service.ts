@@ -1,3 +1,4 @@
+import { routineReviewRequestedSql, routineReviewDeadlineSql } from './review-window'
 import type { D1Result } from '@cloudflare/workers-types'
 import type { Env, OrgKind, Project } from '../types'
 import { projectVisibilityClause } from '../projects/access'
@@ -128,6 +129,12 @@ const RUN_SELECT = `id, tenant, project_id, routine_id, routine_revision, policy
   lease_expires_at, attempt, retry_at, assigned_agent_id, task_id, flight_id,
   situation_digest, proposal_json, result_summary, cost_micro_usd, started_at,
   finished_at, created_at, updated_at`
+
+function runReadColumns(alias: string): string {
+  return RUN_SELECT.split(',').map(column => `${alias}.${column.trim()}`).join(', ')
+    + `, ${routineReviewRequestedSql(alias)} AS review_requested_at, ${routineReviewDeadlineSql(alias)} AS review_deadline_at`
+}
+
 
 function wrote(result: D1Result<unknown>): boolean {
   return Number(result.meta?.changes ?? 0) > 0
@@ -536,7 +543,7 @@ export async function createManualRoutineRun(
   const now = new Date()
   const occurrenceKey = routineOccurrenceKey({ kind: 'manual', timezone: routine.timezone }, now, idempotencyKey)
   const existing = await env.DB.prepare(
-    `SELECT ${RUN_SELECT} FROM routine_runs
+    `SELECT ${runReadColumns('routine_runs')} FROM routine_runs
       WHERE tenant = ? AND routine_id = ? AND occurrence_key = ?`,
   ).bind(env.TENANT_SLUG, routine.id, occurrenceKey).first<RoutineRun>()
   if (existing) return { ok: true, value: existing, duplicate: true }
@@ -593,7 +600,7 @@ export async function createManualRoutineRun(
     }
     if (error instanceof Error && /UNIQUE constraint failed/i.test(error.message)) {
       const raced = await env.DB.prepare(
-        `SELECT ${RUN_SELECT} FROM routine_runs
+        `SELECT ${runReadColumns('routine_runs')} FROM routine_runs
           WHERE tenant = ? AND routine_id = ? AND occurrence_key = ?`,
       ).bind(env.TENANT_SLUG, routine.id, occurrenceKey).first<RoutineRun>()
       if (raced) return { ok: true, value: raced, duplicate: true }
@@ -610,7 +617,7 @@ export async function getRoutineRun(
   if (principal.tenant !== env.TENANT_SLUG) return null
   const visibility = projectVisibilityClause(principal.project_read)
   return env.DB.prepare(
-    `SELECT ${RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')}
+    `SELECT ${runReadColumns('rr')}
        FROM routine_runs rr JOIN projects p ON p.id = rr.project_id
       WHERE rr.id = ? AND rr.tenant = ? AND ${visibility.sql}`,
   ).bind(id, env.TENANT_SLUG, ...visibility.binds).first<RoutineRun>()
@@ -631,7 +638,7 @@ export async function listLatestRoutineRuns(
     return { ok: false, error: 'project_not_found' }
   }
   if (ids.length === 0) return { ok: true, items: [], next_cursor: null }
-  const select = RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')
+  const select = runReadColumns('rr')
   const result = await env.DB.prepare(
     `SELECT ${select}
        FROM routine_runs rr
@@ -670,7 +677,7 @@ export async function listRoutineRuns(
     binds.push(input.after.timestamp, input.after.timestamp, input.after.id)
   }
   const result = await env.DB.prepare(
-    `SELECT ${RUN_SELECT} FROM routine_runs WHERE ${clauses.join(' AND ')}
+    `SELECT ${runReadColumns('routine_runs')} FROM routine_runs WHERE ${clauses.join(' AND ')}
       ORDER BY created_at DESC, id ASC LIMIT ?`,
   ).bind(...binds, limit + 1).all<RoutineRun>()
   const rows = result.results ?? []

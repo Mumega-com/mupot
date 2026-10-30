@@ -1,3 +1,4 @@
+import { routineReviewDeadlineSql, taskReviewDeadlineSql } from '../routines/review-window'
 import type { AuthContext, Env, OrgKind } from '../types'
 import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
@@ -456,6 +457,8 @@ async function sourceRows(
   const gateAskNotLive = `NOT (${GATE_ASK_LIVE_PREDICATE('t', sqlQuote(nowIso))})`
   const projectScope = [...projectBinds, ...visibility.binds]
 
+  const routinesReady = await routineTablesReady(env)
+  const reviewDeadline = routinesReady ? taskReviewDeadlineSql('t', sqlQuote(env.TENANT_SLUG)) : 'NULL'
   const approvals = querySource(env, 'approvals', `
     SELECT
       'approval' AS kind, 'task' AS source_type, t.id AS source_id,
@@ -466,10 +469,10 @@ async function sourceRows(
           FROM gate_stall_rewakes g
          WHERE g.task_id = t.id AND g.review_since = t.updated_at AND g.delivered_count > 0), '') AS reason,
       ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
-      t.created_at, p.target_date AS deadline_at,
+      t.created_at, COALESCE(${reviewDeadline}, p.target_date) AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
       t.assignee_agent_id, NULL AS assignee_member_id, t.gate_owner,
-      COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
+      COALESCE(${reviewDeadline}, p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
@@ -517,7 +520,6 @@ async function sourceRows(
   if (stuckView) return [await approvals, await heldUnverifiedFlights(env, projectClause, projectScope, visibility, cursor, projectLive)]
 
   // Rolling deploy: Worker may ship before D1 applies 0073. Skip Routine waits until tables exist.
-  const routinesReady = await routineTablesReady(env)
   const routineWaits = routinesReady
     ? querySource(env, 'routine_waits', `
     SELECT
@@ -534,11 +536,11 @@ async function sourceRows(
       (CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END
         + CASE WHEN ${ageDaysSql('rr.created_at', nowIso)} >= ${NEEDS_YOU_STALE_DAYS} THEN ${NEEDS_YOU_STALE_RANK_OFFSET} ELSE 0 END) AS urgency_rank,
       r.responsible_squad_id AS responsible, r.created_by AS requested_by,
-      rr.created_at, rr.scheduled_for AS deadline_at,
+      rr.created_at, CASE WHEN rr.waiting_reason = 'review' THEN ${routineReviewDeadlineSql('rr')} ELSE rr.scheduled_for END AS deadline_at,
       r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind,
       psa.access_level AS project_access_level,
       NULL AS assignee_agent_id, NULL AS assignee_member_id, NULL AS gate_owner,
-      COALESCE(rr.scheduled_for, '${DEADLINE_SENTINEL}') AS sort_deadline,
+      COALESCE(CASE WHEN rr.waiting_reason = 'review' THEN ${routineReviewDeadlineSql('rr')} ELSE rr.scheduled_for END, '${DEADLINE_SENTINEL}') AS sort_deadline,
       rr.created_at AS sort_timestamp
     FROM routine_runs rr
     JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant
