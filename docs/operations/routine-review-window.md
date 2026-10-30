@@ -3,7 +3,8 @@
 The flight watchdog evaluates **flights**, not the routine run's waiting reason.
 Its execution timeout is 60 minutes by default, or `flight.meta.timeout_ms` clamped
 to 5 minutes..24 hours. The clock starts at `resumed_at`, then `started_at`, then
-`created_at`. Sleeping wake deadlines and ordinary flight waiting/escalation are
+`created_at`. A current proposal-bound decision resumes the execution budget
+from `decided_at`; a later actual `resumed_at` takes precedence. Sleeping wake deadlines and ordinary flight waiting/escalation are
 separate existing rules.
 
 Proposal acceptance under a human-review policy calls `waitForHuman`: the action
@@ -37,13 +38,26 @@ flight does not pin every later cron occurrence as `overlap` (#1369).
   Existing exact-attempt task-repair fences block the current deterministic review
   control task with correlated failure/audit evidence. Legacy/ambiguous task IDs are
   not rewritten. No approval or successful landing is manufactured.
+- The review clock ends when the current control task has a matching latest,
+  unreversed `approved` or `rejected` verdict bound to this exact proposal and
+  newer than its creation. Unbound, stale, wrong-task, reversed or superseded
+  decisions grant no new clock. The run need not wait for an agent replay to
+  stop sheltering an already-decided review. The ordinary execution timeout now
+  runs from the later of the decision and the real physical execution baseline.
 - Pending reviews are excluded before the bounded reap-candidate LIMIT, so they
   cannot hide a genuinely stuck flight. The UPDATE rechecks the review deadline and
-  execution-clock baseline, preventing a review/resume race after evaluation.
+  execution-clock baseline and decision timestamp, preventing review, resume or
+  decision races after evaluation.
 - Action execution refuses overdue or unproven review authorization. Starting an
   approved action, or queueing fresh observation after a long review, resumes the
   flight's execution clock. A running effect does not retain the human-review grace.
   Other routine waits and non-routine flight timeout rules remain unchanged.
+- The deadline gate applies when starting an effect, including its atomic SQL
+  claim. An already-running action skips that entry gate so crash replay can
+  reconcile the effect and its receipts. A timely bound approval gets the
+  normal execution budget from its decision, even across the old review deadline;
+  a verdict cast at/after ask expiry does not authorize a late effect. Legacy
+  unbound approvals retain the original ask deadline.
 
 ## Approver data
 
@@ -80,3 +94,8 @@ the exact review boundary, unchanged execution/wake clocks, invalid binding/prod
 candidate starvation, reaper-entry race, expiry/overlap release, late effects,
 action/re-observation resumption, immutable snapshots, and deadline read/UI surfaces.
 The mutation prover restores source and rejects import/setup failures as evidence.
+It also refuses primary checkouts, branch checkouts and uncommitted changes.
+Run it only after committing, in a clean dedicated **detached worktree**; a
+read-only `node scripts/prove-routine-review-window.mjs --check-worktree` verifies
+that precondition. Temporary test repositories for this guard live under the
+checkout's ignored `tmp/` directory, not the deployment checkout.

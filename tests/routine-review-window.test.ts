@@ -46,8 +46,16 @@ beforeEach(async () => {
 })
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); h.close() })
 
-function seed(opts: { review?: boolean; event?: boolean; eventTenant?: string; eventActor?: string; eventActorId?: string; metadata?: string } = {}) {
+function seed(opts: { review?: boolean; event?: boolean; eventTenant?: string; eventProject?: string; eventActor?: string; eventActorId?: string; metadata?: string } = {}) {
   const review = opts.review !== false
+  if (opts.eventTenant || opts.eventProject) {
+    // Corrupt/legacy audit-row defense in depth. The canonical producer's schema
+    // guard prevents this today; disable only that insert guard in this isolated
+    // real-schema fixture so the reader's own correlation can be exercised.
+    h.sqlite.exec('DROP TRIGGER validate_routine_event_insert')
+    if (opts.eventProject) h.sqlite.prepare('INSERT INTO projects (id,slug,name,status) VALUES (?,?,?,?)')
+      .run(opts.eventProject, opts.eventProject, 'Foreign event project', 'active')
+  }
   h.sqlite.prepare(`INSERT INTO tasks (id,squad_id,project_id,title,status,gate_owner,assignee_agent_id)
     VALUES (?,'s','p','Review proposal',?,'gate:routines','agent')`).run(controlTaskId, review ? 'review' : 'in_progress')
   h.sqlite.prepare(`INSERT INTO flights (id,tenant,agent,project_id,goal,status,trigger_source,
@@ -72,12 +80,19 @@ function seed(opts: { review?: boolean; event?: boolean; eventTenant?: string; e
     new Date(REQUESTED - 1000).toISOString(), new Date(REQUESTED).toISOString())
   if (opts.event !== false) h.sqlite.prepare(`INSERT INTO routine_run_events
     (id,tenant,project_id,run_id,kind,actor_type,actor_id,occurred_at,metadata_json,correlation_id)
-    VALUES ('review-event',?,'p','run','approval_requested',?,?,?,?, 'run')`)
-    .run(opts.eventTenant ?? TENANT, opts.eventActor ?? 'system', opts.eventActorId ?? 'mupot-routines', new Date(REQUESTED).toISOString(),
+    VALUES ('review-event',?,?,'run','approval_requested',?,?,?,?, 'run')`)
+    .run(opts.eventTenant ?? TENANT, opts.eventProject ?? 'p', opts.eventActor ?? 'system', opts.eventActorId ?? 'mupot-routines', new Date(REQUESTED).toISOString(),
       opts.metadata ?? JSON.stringify({ action_key: 'a', reason: 'review' }))
 }
 const flight = () => h.sqlite.prepare("SELECT status,gate_reason FROM flights WHERE id='flight'").get()
 const run = () => h.sqlite.prepare("SELECT status,result_summary FROM routine_runs WHERE id='run'").get()
+
+function decide(verdict: 'approved' | 'rejected', at: number, opts: { proposalId?: string | null; reversed?: boolean; taskId?: string } = {}) {
+  h.sqlite.prepare('UPDATE tasks SET status=? WHERE id=?').run(verdict, controlTaskId)
+  h.sqlite.prepare(`INSERT INTO task_verdicts (id,task_id,proposal_id,verdict,decided_by,decided_at,reversed_at)
+    VALUES ('decision',?,?,?,?,?,?)`).run(opts.taskId ?? controlTaskId, opts.proposalId === undefined ? 'action' : opts.proposalId,
+      verdict, 'owner', new Date(at).toISOString(), opts.reversed ? new Date(at + 1).toISOString() : null)
+}
 
 describe('routine review has its own bounded watchdog clock', () => {
   it('survives the 60-minute running timeout while a genuine review request is pending', async () => {
@@ -102,6 +117,50 @@ describe('routine review has its own bounded watchdog clock', () => {
     h.sqlite.exec("UPDATE routine_runs SET flight_id=NULL WHERE id='run'")
     expect((await sweepStalledFlights(env, { nowMs: T0 + 70 * 60_000 })).reaped).toBe(1)
     expect(String(flight()?.gate_reason)).toContain('running_exceeded_timeout')
+  })
+
+  it.each(['approved', 'rejected'] as const)('a bound %s verdict ends review and runs execution time from decided_at', async verdict => {
+    seed()
+    const decidedAt = REQUESTED + 1_000
+    decide(verdict, decidedAt)
+    expect(publicRoutineRun((await getRoutineRun(env, principal, 'run'))!))
+      .toMatchObject({ review_requested_at: null, review_deadline_at: null })
+    expect((await sweepStalledFlights(env, { nowMs: decidedAt + 59 * 60_000 })).reaped).toBe(0)
+    expect((await sweepStalledFlights(env, { nowMs: T0 + 3 * HOUR })).reaped).toBe(1)
+    expect(String(run()?.result_summary)).toContain('running_exceeded_timeout')
+    expect(String(run()?.result_summary)).not.toContain('review_window_expired')
+  })
+
+  it('a real resume later than the bound decision gets its own execution budget', async () => {
+    seed()
+    decide('approved', REQUESTED + 1_000)
+    const resumedAt = REQUESTED + 2 * HOUR
+    h.sqlite.prepare("UPDATE flights SET resumed_at=? WHERE id='flight'").run(resumedAt)
+    expect((await sweepStalledFlights(env, { nowMs: resumedAt + 59 * 60_000 })).reaped).toBe(0)
+    expect((await sweepStalledFlights(env, { nowMs: resumedAt + HOUR + 1 })).reaped).toBe(1)
+    expect(String(run()?.result_summary)).toContain('running_exceeded_timeout')
+  })
+
+  it.each([{ proposalId: null }, { proposalId: 'other-action' }, { reversed: true }])('an unbound or reversed verdict cannot end the review clock: %j', async opts => {
+    seed()
+    decide('approved', REQUESTED + 1_000, opts)
+    expect((await sweepStalledFlights(env, { nowMs: T0 + 3 * HOUR })).reaped).toBe(0)
+    expect(publicRoutineRun((await getRoutineRun(env, principal, 'run'))!).review_deadline_at)
+      .toBe(new Date(DEADLINE).toISOString())
+  })
+
+  it.each(['stale', 'wrong-task', 'reopened', 'superseded'])('a %s verdict cannot end the current proposal review', async kind => {
+    seed()
+    if (kind === 'wrong-task') {
+      h.sqlite.exec("INSERT INTO tasks (id,squad_id,project_id,title,status) VALUES ('other-task','s','p','Other','approved')")
+    }
+    decide('approved', kind === 'stale' ? REQUESTED - 1_000 : REQUESTED + 1_000,
+      kind === 'wrong-task' ? { taskId: 'other-task' } : {})
+    if (kind === 'reopened') h.sqlite.prepare("UPDATE tasks SET status='review' WHERE id=?").run(controlTaskId)
+    if (kind === 'superseded') h.sqlite.prepare(`INSERT INTO task_verdicts (id,task_id,verdict,decided_by,decided_at)
+      VALUES ('newer-unbound',?,'approved','owner',?)`).run(controlTaskId, new Date(REQUESTED + 2_000).toISOString())
+    expect((await sweepStalledFlights(env, { nowMs: T0 + 3 * HOUR })).reaped).toBe(0)
+    expect(publicRoutineRun((await getRoutineRun(env, principal, 'run'))!).review_deadline_at).toBe(new Date(DEADLINE).toISOString())
   })
 
   it.each(['preflight', 'sleeping'])('does not shelter a stuck %s flight behind a review record', async status => {
@@ -152,6 +211,7 @@ describe('routine review has its own bounded watchdog clock', () => {
     { metadata: JSON.stringify({ action_key: 'a', review_deadline_at: new Date(REQUESTED + 8 * 24 * HOUR).toISOString() }) },
     { metadata: JSON.stringify({ action_key: 'a', review_deadline_at: new Date(REQUESTED + HOUR).toISOString() }) },
     { eventActor: 'agent' }, { eventActorId: 'another-component' },
+    { eventTenant: 'another-tenant' }, { eventProject: 'another-project' },
   ])('does not grant an indefinite exemption to an unproven review binding: %j', async opts => {
     seed(opts)
     expect((await sweepStalledFlights(env, { nowMs: T0 + 2 * HOUR })).reaped).toBe(1)
@@ -257,6 +317,85 @@ describe('routine review has its own bounded watchdog clock', () => {
     expect(run()?.status).toBe('waiting')
   })
 
+  it('a physical resume after evaluation prevents a stale reaper commit even without review', async () => {
+    seed({ review: false, event: false })
+    const batch = h.db.batch.bind(h.db)
+    vi.spyOn(h.db, 'batch').mockImplementationOnce(async statements => {
+      h.sqlite.prepare("UPDATE flights SET resumed_at=? WHERE id='flight'").run(T0 + 2 * HOUR)
+      return batch(statements)
+    })
+    expect((await reapStalledFlight(env, 'flight', ACTOR, 'running_exceeded_timeout', T0 + 2 * HOUR)).transitioned).toBe(false)
+    expect(flight()?.status).toBe('running')
+    expect(run()?.status).toBe('running')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM flight_reap_receipts').get()?.n).toBe(0)
+  })
+
+  it('a fresh decision after evaluation prevents an execution-timeout reap on the old decision clock', async () => {
+    seed()
+    decide('approved', REQUESTED + 1_000)
+    const now = T0 + 3 * HOUR
+    const batch = h.db.batch.bind(h.db)
+    vi.spyOn(h.db, 'batch').mockImplementationOnce(async statements => {
+      h.sqlite.prepare(`INSERT INTO task_verdicts (id,task_id,proposal_id,verdict,decided_by,decided_at)
+        VALUES ('new-decision',?,'action','approved','owner',?)`).run(controlTaskId, new Date(now).toISOString())
+      return batch(statements)
+    })
+    expect((await reapStalledFlight(env, 'flight', ACTOR, 'running_exceeded_timeout', now)).transitioned).toBe(false)
+    expect(flight()?.status).toBe('running')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM flight_reap_receipts').get()?.n).toBe(0)
+  })
+
+  it('two live run bindings grant no review exemption to the flight', async () => {
+    seed()
+    h.sqlite.exec(`INSERT INTO routine_runs (id,tenant,project_id,routine_id,routine_revision,policy_json,
+      occurrence_key,trigger_kind,status,attempt,flight_id)
+      SELECT 'second-run',tenant,project_id,routine_id,routine_revision,policy_json,'second','manual','running',1,flight_id
+      FROM routine_runs WHERE id='run'`)
+    expect((await sweepStalledFlights(env, { nowMs: T0 + 2 * HOUR })).reaped).toBe(1)
+    expect(flight()?.status).toBe('failed')
+  })
+
+  it('replays a running action after a mid-effect crash instead of requiring approval again', async () => {
+    const f = await makeReadyRoutineFixture('propose')
+    try {
+      const p = f.proposal({ key: 'crash-replay', kind: 'create_task', input: { title: 'Recovered effect', description: 'Reconcile once' } })
+      expect(await submitRoutineProposal(f.env, f.principal, p)).toMatchObject({ ok: true, status: 'waiting' })
+      f.harness.sqlite.exec("UPDATE routine_run_actions SET status='running',gate_status='approved' WHERE action_key='crash-replay'")
+      // Simulate an interrupted effect's completion path against the real DB.
+      // The effect is created, but landing cannot finish because a real child is still running.
+      const meta = JSON.parse(String(f.harness.sqlite.prepare("SELECT meta FROM flights WHERE id='control-flight'").get()?.meta))
+      meta.parent_flight_id = 'control-flight'
+      f.harness.sqlite.prepare(`INSERT INTO flights (id,tenant,project_id,agent,goal,status,meta)
+        VALUES ('unfinished-child','tenant-a','project-1','agent-2','Child still executing','running',?)`).run(JSON.stringify(meta))
+      expect(await submitRoutineProposal(f.env, f.principal, p)).toMatchObject({ ok: true, status: 'retry_scheduled' })
+      expect(f.harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE title='Recovered effect'").get()?.n).toBe(1)
+      expect(f.harness.sqlite.prepare("SELECT status FROM routine_runs WHERE id='run-1'").get()?.status).toBe('queued')
+    } finally { f.harness.close() }
+  })
+
+  it('the SQL start fence stops time crossing the deadline after the JavaScript read', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(REQUESTED))
+    const f = await makeReadyRoutineFixture('propose')
+    try {
+      const p = f.proposal({ key: 'atomic-expiry', kind: 'create_task', input: { title: 'No late effect', description: 'Fence the claim' } })
+      expect((await submitRoutineProposal(f.env, f.principal, p)).ok).toBe(true)
+      f.harness.sqlite.prepare(`INSERT INTO task_verdicts (id,task_id,verdict,decided_by,decided_at)
+        VALUES ('approved-unbound','control-task','approved','independent',?)`).run(new Date().toISOString())
+      vi.setSystemTime(new Date(DEADLINE - 1))
+      // Advance after the JS check, during approval persistence, before the
+      // start timestamp and SQL claim binds are captured.
+      const originalPrepare = f.env.DB.prepare.bind(f.env.DB)
+      vi.spyOn(f.env.DB, 'prepare').mockImplementation(sql => {
+        if (sql.includes("UPDATE routine_run_actions SET gate_status = 'approved'")) vi.setSystemTime(new Date(DEADLINE))
+        return originalPrepare(sql)
+      })
+      const result = await executeRoutineAction(f.env, 'run-1', 'atomic-expiry')
+      expect(result.ok).toBe(false)
+      expect(f.harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE title='No late effect'").get()?.n).toBe(0)
+      expect(f.harness.sqlite.prepare("SELECT status FROM routine_run_actions WHERE action_key='atomic-expiry'").get()?.status).not.toBe('running')
+    } finally { f.harness.close() }
+  })
+
   it('approved work resumes the execution clock when action execution starts', async () => {
     const f = await makeReadyRoutineFixture('propose')
     try {
@@ -268,6 +407,28 @@ describe('routine review has its own bounded watchdog clock', () => {
       const resumed = f.harness.sqlite.prepare("SELECT resumed_at FROM flights WHERE id='control-flight'").get()?.resumed_at
       expect(typeof resumed).toBe('number')
       expect(Number(resumed)).toBeGreaterThan(1752940800000)
+    } finally { f.harness.close() }
+  })
+
+  it.each(['timely-start', 'expired-execution', 'late-verdict'] as const)('bound approval uses its execution clock without extending ask authorization: %s', async kind => {
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date(REQUESTED))
+    const f = await makeReadyRoutineFixture('propose')
+    try {
+      const p = f.proposal({ key: 'decided-start', kind: 'create_task', input: { title: 'Decision-clock effect', description: 'Current approved evidence' } })
+      expect((await submitRoutineProposal(f.env, f.principal, p)).ok).toBe(true)
+      const decidedAt = kind === 'late-verdict' ? DEADLINE + 1
+        : kind === 'expired-execution' ? REQUESTED + 1_000 : DEADLINE - 30 * 60_000
+      const executeAt = kind === 'expired-execution' ? decidedAt + HOUR + 1 : decidedAt + 40 * 60_000
+      const action = f.harness.sqlite.prepare("SELECT id FROM routine_run_actions WHERE action_key='decided-start'").get()!
+      f.harness.sqlite.exec("UPDATE tasks SET status='approved' WHERE id='control-task'")
+      f.harness.sqlite.prepare(`INSERT INTO task_verdicts (id,task_id,proposal_id,verdict,decided_by,decided_at)
+        VALUES ('bound','control-task',?,'approved','independent',?)`).run(action.id, new Date(decidedAt).toISOString())
+      vi.setSystemTime(new Date(executeAt))
+      const result = await executeRoutineAction(f.env, 'run-1', 'decided-start')
+      if (kind === 'timely-start') expect(result).toMatchObject({ ok: true, status: 'succeeded' })
+      else expect(result).toMatchObject({ ok: false, error: 'approval_required' })
+      expect(f.harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE title='Decision-clock effect'").get()?.n)
+        .toBe(kind === 'timely-start' ? 1 : 0)
     } finally { f.harness.close() }
   })
 

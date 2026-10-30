@@ -1,4 +1,4 @@
-import { routineReviewDeadline, routineReviewDeadlineSql } from './review-window'
+import { routineReviewDeadline, routineEffectDeadlineSql, routineReviewRejectedSql } from './review-window'
 import { controlExclusions } from './control-situation'
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql, runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
@@ -1678,18 +1678,21 @@ export async function executeRoutineAction(
   const run = await loadRun(env, runId)
   if (!run) return { ok: false, error: 'run_not_found' }
   if (await isCancellationPending(env, run.id, run.tenant)) return { ok: false, error: 'receipt_failed' }
-  if (run.status === 'waiting' && run.waiting_reason === 'review') {
-    const pending = await env.DB.prepare(`SELECT ${routineReviewDeadlineSql('rr')} AS deadline
-      FROM routine_runs rr WHERE rr.id = ?1 AND rr.tenant = ?2`)
-      .bind(run.id, run.tenant).first<{ deadline: string | null }>()
-    if (!pending?.deadline || Date.parse(pending.deadline) <= Date.now()) return { ok: false, error: 'approval_required' }
-  }
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
   let action = await loadAction(env, run.id, actionKey)
   if (!action) return { ok: false, error: 'action_not_found' }
   const stored = storedActionResult(run, action, true)
   if (stored) return stored
+  if (action.status !== 'running' && run.status === 'waiting' && run.waiting_reason === 'review') {
+    const pending = await env.DB.prepare(`SELECT ${routineEffectDeadlineSql('rr')} AS deadline,
+      ${routineReviewRejectedSql('rr')} AS rejected_at
+      FROM routine_runs rr WHERE rr.id = ?1 AND rr.tenant = ?2`)
+      .bind(run.id, run.tenant).first<{ deadline: string | null; rejected_at: string | null }>()
+    if (!pending?.rejected_at && (!pending?.deadline || Date.parse(pending.deadline) <= Date.now())) {
+      return { ok: false, error: 'approval_required' }
+    }
+  }
   if (!run.proposal_json) return { ok: false, error: 'receipt_failed' }
   const storedProposal = parseRoutineProposal(JSON.parse(run.proposal_json) as unknown)
   if (!storedProposal.ok || storedProposal.value.action.key !== action.action_key) {
@@ -1792,7 +1795,7 @@ export async function executeRoutineAction(
                WHERE id = ? AND tenant = ? AND status IN ('running','waiting')
                  AND ${sqlNotCancellationPending('routine_runs')}
                  AND (status <> 'waiting' OR COALESCE(waiting_reason, '') <> 'review'
-                   OR ${routineReviewDeadlineSql('routine_runs')} > ?)
+                   OR ${routineEffectDeadlineSql('routine_runs')} > ?)
             )`,
       ).bind(startedAt, action.id, run.tenant, run.id, run.tenant, startedAt),
       env.DB.prepare(

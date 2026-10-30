@@ -141,7 +141,7 @@ export async function resolveReapDisposition(env: Env, flight: FlightRow): Promi
 export function evaluateFlightLiveness(
   flight: FlightRow,
   nowMs: number = Date.now(),
-  review?: { requested_at?: string | null; deadline_at?: string | null } | null,
+  review?: { requested_at?: string | null; deadline_at?: string | null; decided_at?: string | null } | null,
 ): FlightWatchdogEvaluation {
   const status = flight.status
 
@@ -238,7 +238,9 @@ export function evaluateFlightLiveness(
   // resumed_at: set when a waiting flight is sent back to running (reject / reopen).
   // The stall clock restarts there — otherwise a flight that waited 5h at a gate would
   // be reaped the instant its task was sent back for rework.
-  const baseline = flight.resumed_at ?? flight.started_at ?? flight.created_at
+  const physicalBaseline = flight.resumed_at ?? flight.started_at ?? flight.created_at
+  const decisionAt = review?.decided_at ? Date.parse(review.decided_at) : NaN
+  const baseline = Number.isFinite(decisionAt) ? Math.max(physicalBaseline, decisionAt) : physicalBaseline
   const ageMs = Math.max(0, nowMs - baseline)
 
   if (ageMs > timeoutMs) {
@@ -299,7 +301,8 @@ export async function scanStalledFlights(
   const reapable = await env.DB.prepare(
     `SELECT f.*, a.name AS agent_name, s.name AS squad_name,
             ${flightReviewValueSql('f', 'requested')} AS routine_review_requested_at,
-            ${flightReviewValueSql('f', 'deadline')} AS routine_review_deadline_at
+            ${flightReviewValueSql('f', 'deadline')} AS routine_review_deadline_at,
+            ${flightReviewValueSql('f', 'decided')} AS routine_review_decided_at
        FROM flights f
        LEFT JOIN agents a ON a.id = f.agent
        LEFT JOIN squads s ON s.id = a.squad_id
@@ -316,7 +319,7 @@ export async function scanStalledFlights(
       LIMIT ?2`,
   )
     .bind(env.TENANT_SLUG, limit, new Date(nowMs).toISOString())
-    .all<FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string }>()
+    .all<FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string; routine_review_decided_at?: string }>()
   const escalationDue = await env.DB.prepare(
     `SELECT f.*, a.name AS agent_name, s.name AS squad_name
        FROM flights f
@@ -337,9 +340,10 @@ export async function scanStalledFlights(
   const items: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }> = []
 
   for (const flight of [...reapableRows, ...escalationRows]) {
-    const enriched = flight as FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string }
+    const enriched = flight as FlightRow & { routine_review_requested_at?: string; routine_review_deadline_at?: string; routine_review_decided_at?: string }
     const evaluation = evaluateFlightLiveness(flight, nowMs, {
       requested_at: enriched.routine_review_requested_at, deadline_at: enriched.routine_review_deadline_at,
+      decided_at: enriched.routine_review_decided_at,
     })
     if (evaluation.action === 'reap' || evaluation.action === 'escalate') {
       items.push({ flight, evaluation })
@@ -466,9 +470,10 @@ export async function reapStalledFlight(
   // Check liveness predicate
   const review = await env.DB.prepare(`SELECT
       ${flightReviewValueSql('f', 'requested')} AS requested_at,
-      ${flightReviewValueSql('f', 'deadline')} AS deadline_at
+      ${flightReviewValueSql('f', 'deadline')} AS deadline_at,
+      ${flightReviewValueSql('f', 'decided')} AS decided_at
     FROM flights f WHERE f.id = ?1 AND f.tenant = ?2`)
-    .bind(flightId, env.TENANT_SLUG).first<{ requested_at: string | null; deadline_at: string | null }>()
+    .bind(flightId, env.TENANT_SLUG).first<{ requested_at: string | null; deadline_at: string | null; decided_at: string | null }>()
   const evalResult = evaluateFlightLiveness(flight, nowMs, review)
   if (evalResult.action !== 'reap') {
     return {
@@ -578,6 +583,8 @@ export async function reapStalledFlight(
           AND ((${flightReviewValueSql('flights', 'deadline')} = ?7)
             OR (?7 IS NULL AND ${flightReviewValueSql('flights', 'deadline')} IS NULL))
           AND (status = 'sleeping' OR COALESCE(resumed_at, started_at, created_at) = ?8)
+          AND ((${flightReviewValueSql('flights', 'decided')} = ?9)
+            OR (?9 IS NULL AND ${flightReviewValueSql('flights', 'decided')} IS NULL))
           AND (
             ?5 = 'failed'
             OR (?6 = 'bookkeeping_closed' AND flights.bookkeeping = 1)
@@ -586,7 +593,7 @@ export async function reapStalledFlight(
         RETURNING id, status`,
     ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, targetStatus, disposition,
       evalResult.reason === 'review_window_expired' ? review?.deadline_at ?? null : null,
-      flight.resumed_at ?? flight.started_at ?? flight.created_at),
+      flight.resumed_at ?? flight.started_at ?? flight.created_at, review?.decided_at ?? null),
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'failed',
