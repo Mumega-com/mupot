@@ -634,6 +634,20 @@ async function sourceObservation(
   if (proposal.action.kind === 'project_access') return null
   const unique = proposalSourceReferences(proposal)
   if (unique.length === 0 || unique.length > 200) return null
+  // These records are this attempt's machinery, not business observations:
+  // human review changes the task and receipt stamping changes the flight.
+  // Refuse them instead of silently dropping a caller's declared dependency.
+  if (unique.some(ref => (ref.type === 'task' && ref.id === run.task_id)
+    || (ref.type === 'flight' && ref.id === run.flight_id))) return null
+  // Historical dispatch controls are machinery too. Do not ban action_result
+  // refs: produced business records remain legitimate source observations.
+  const historicalControls = await env.DB.prepare(
+    `SELECT ref_type, ref_id FROM routine_run_refs WHERE run_id = ? AND tenant = ?
+      AND ((ref_type = 'task' AND relation = 'dispatch_task' AND ref_id <> COALESCE(?, ''))
+        OR (ref_type = 'flight' AND relation = 'dispatch_flight' AND ref_id <> COALESCE(?, '')))`,
+  ).bind(run.id, run.tenant, run.task_id, run.flight_id).all<{ ref_type: string; ref_id: string }>()
+  const historicalControlIds = new Set((historicalControls.results ?? []).map(ref => `${ref.ref_type}:${ref.ref_id}`))
+  if (unique.some(ref => historicalControlIds.has(`${ref.type}:${ref.id}`))) return null
   const sources: Array<{ type: string; id: string; fact: unknown }> = []
   for (const ref of unique) {
     let fact: unknown
@@ -676,7 +690,13 @@ async function sourceObservation(
 async function proposalSituationCurrent(
   env: Env, run: RunContext, policy: RoutinePolicySnapshot, proposal: RoutineProposal,
 ): Promise<boolean> {
-  if (!proposal.source_observation) return await currentSituationDigest(env, run, policy) === run.situation_digest
+  // Autonomous writers can encode dependencies in arbitrary prose. They retain
+  // the board projection check as well as any declared-source commitment.
+  if (!proposal.source_observation || proposal.action.kind === 'create_task'
+    || proposal.action.kind === 'dispatch_flight') {
+    const current = await currentSituationDigest(env, run, policy) === run.situation_digest
+    if (!current || !proposal.source_observation) return current
+  }
   const live = await sourceObservation(env, run, policy, proposal)
   return live !== null && live.digest === proposal.source_observation.digest
 }
@@ -2242,6 +2262,9 @@ export async function submitRoutineProposal(
   const parsed = parseRoutineProposal(rawProposal)
   if (!parsed.ok) return { ok: false, error: 'invalid_proposal' }
   const proposal = parsed.value
+  if (proposal.source_observation && proposalSourceReferences(proposal).length > 200) {
+    return { ok: false, error: 'invalid_proposal' }
+  }
   const run = await loadRun(env, proposal.run_id)
   if (!run) return { ok: false, error: 'run_not_found' }
   if (principal.tenant !== env.TENANT_SLUG || !await principalCanReadProject(env, principal, run.project_id)) {
