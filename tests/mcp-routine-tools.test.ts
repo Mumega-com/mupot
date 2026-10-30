@@ -11,7 +11,7 @@ const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const NAMES = [
   'routine_list', 'routine_get', 'routine_create', 'routine_update', 'routine_enable',
   'routine_pause', 'routine_archive', 'routine_run_now', 'routine_run_list',
-  'routine_run_get', 'routine_run_answer', 'routine_run_cancel', 'routine_proposal_submit', 'needs_you_list',
+  'routine_run_get', 'routine_run_answer', 'routine_run_cancel', 'routine_proposal_submit', 'routine_proposal_observe', 'needs_you_list',
 ] as const
 
 function sessions() {
@@ -217,7 +217,8 @@ describe('routine MCP tools', () => {
       routine_run_get: { required: ['run_id'], properties: ['run_id'] },
       routine_run_answer: { required: ['run_id', 'answer'], properties: ['run_id', 'answer'] },
       routine_run_cancel: { required: ['run_id'], properties: ['run_id'] },
-      routine_proposal_submit: { required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], properties: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'] },
+      routine_proposal_submit: { required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], properties: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action', 'source_observation'] },
+      routine_proposal_observe: { required: ['run_id', 'action'], properties: ['run_id', 'action', 'references'] },
       needs_you_list: { properties: ['project_id', 'limit', 'cursor', 'view'] },
     }
     for (const tool of routines) {

@@ -281,6 +281,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   routine_run_answer: ADD('answerRoutineRun UPDATE routine_run_actions/runs + INSERT event (routines/actions.ts:1880-1906); records an answer'),
   routine_run_cancel: MUT('cancelRoutineRun terminates the run (routines/actions.ts:2070-2084)'),
   routine_proposal_submit: ADD('submitRoutineProposal records a proposal (routines/actions.ts:2127)'),
+  routine_proposal_observe: RO('observeRoutineProposal SELECTs declared source records and hashes them; no writes'),
   report_run_usage: ADD('UPDATE flights.cost_micro_usd + routine_runs cost + outbox payload (mcp/routines.ts:414,498): a recomputed accounting rollup from reported usage, not an overwrite of user content, so additive by rule'),
   needs_you_list: RO('listNeedsYou SELECTs (attention/service.ts:855); the only write is the TTL\'d caller-bound pagination cursor (issueCursor, attention/service.ts:772) when more pages exist, covered by the cursor carve-out'),
   project_access_reintake_authorize: ADD('INSERT project_access_grant_receipts (mcp/routines.ts:582)'),
