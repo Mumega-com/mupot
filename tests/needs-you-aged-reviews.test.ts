@@ -21,15 +21,13 @@
 //   * dropping the source empties the viewer's own rows from the list;
 //   * widening the rule (assignee check removed) would surface another member's rows to
 //     the viewer — the exclusion pin keeps that red.
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { applyAllMigrations } from './helpers/migrations'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { CapabilityGrant, Env } from '../src/types'
 import { listNeedsYou } from '../src/attention/service'
 import type { RoutinePrincipal } from '../src/routines/access'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 
 // Pinned server clock — AFTER the fixture dates, so age math is deterministic.
 const NOW_ISO = '2026-08-20T00:00:00.000Z'
@@ -48,10 +46,9 @@ function sessions() {
 }
 
 function makeHarness(): SqliteD1Harness {
+  // gate-2275 Codex P1: the committed migration chain is the ONE schema source — applyAllMigrations.
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter(name => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'delivery', 'Delivery');
     INSERT INTO squads (id, department_id, slug, name)
@@ -147,6 +144,135 @@ function seedTask(seed: {
 }
 
 describe('needs_you shows the human assignee their own aged review rows (brief v0.33-4)', () => {
+  // ── gate-2275-a P1-1 / gate-2275-b P1-2: the SQL itself binds the caller's own rows ──
+  it('FLOOD: 600 other-member aged rows cannot starve the callers own row off the list', async () => {
+    // 600 aged rows assigned to squad-mate + exactly 1 aged row for assignee-own.
+    // Before the SQL binding, the viewer's own row fell past MAX_SCAN_PAGES(5) x
+    // SOURCE_SCAN_CAP(100) and needs_you returned 0 items with truncated_sources
+    // mentioning aged_reviews. The SQL must scope to the caller so this cannot happen.
+    seedTask({ id: 'flood-own', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, project_id, squad_id, title, done_when, status, priority,
+        gate_owner, assignee_member_id, created_at, updated_at)
+      WITH RECURSIVE flood(n) AS (
+        SELECT 1
+        UNION ALL SELECT n + 1 FROM flood WHERE n < 600
+      )
+      SELECT 'flood-' || n, 'project-a', 'squad-a', 'other member flood', 'dw', 'review', NULL,
+        'gate:content', 'squad-mate', '2026-07-25T00:00:00Z', '2026-07-25T00:00:00Z' FROM flood`)
+    harness.sqlite.exec(`UPDATE tasks SET status = 'review', review_entered_at = '2026-07-30T00:00:00Z' WHERE id LIKE 'flood-%'`)
+
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    const own = page.items.find(entry => entry.source_id === 'flood-own')
+    expect(own, 'the caller\'s own aged row must survive a 600-row flood').toBeDefined()
+    expect(page.items.find(entry => entry.source_id.startsWith('flood-0') && entry.source_id !== 'flood-own')).toBeUndefined()
+  })
+
+  it('an AGENT principal never enters the aged source at all (skip, not empty page)', async () => {
+    seedTask({ id: 'task-agent-skip', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    const agentPrincipal = {
+      tenant: 'tenant-b', actor_type: 'agent', actor_id: 'agent-a', workspace_admin: false,
+      grants: [], project_read: { workspaceAdmin: false, orgRead: false, squadIds: [], departmentIds: [] },
+    } as RoutinePrincipal
+    const page = await listNeedsYou(env, agentPrincipal, {}, NOW_ISO)
+    expect(page.items.find(entry => entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  it('the admin stuck view never lists aged_review, even for an admin who is the assignee (M17 witness)', async () => {
+    seedTask({ id: 'task-stuck-view', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    const adminAssignee = {
+      ...assigneeOwn(), workspace_admin: true,
+      project_read: { workspaceAdmin: true, orgRead: true, squadIds: ['squad-a'], departmentIds: [] },
+    } as RoutinePrincipal
+    const strokePage = await listNeedsYou(env, adminAssignee, { view: 'stuck' }, NOW_ISO)
+    expect(strokePage.items.find(entry => entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  // ── gate-2275-a/b P2-1: the reason threshold is the EXPIRY window, and the age is days SINCE expiry ──
+  it('a live-but-holderless ask reads as role-decidable, never as "cannot be approved until a holder exists"', async () => {
+    seedTask({ id: 'task-holderless-role', gate_owner: 'gate:age-lane', assignee_member_id: 'assignee-own',
+      created_at: '2026-08-14T00:00:00Z' })
+    const ownPage = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    const item = ownPage.items.find(entry => entry.source_id.startsWith('task-holderless-role'))
+    expect(item).toBeDefined()
+    expect(item!.kind).toBe('aged_review')
+    expect(item!.reason).toContain('No gate holder is registered')
+    expect(item!.reason).toContain('an org owner or admin can decide it')
+    // The old text was FALSE: org owner/admin decide such lanes by role.
+    expect(item!.reason).not.toContain('until a holder exists')
+  })
+
+  it('the reason clock is review ENTRY, not the row creation (gate-2275-a M15)', async () => {
+    // created 2026-08-10 (10d), entered review 2026-07-31 (20d): the EXPIRY clock matters.
+    seedTask({ id: 'task-entry-clock', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-08-10T00:00:00Z', review_entered_at: '2026-07-31T00:00:00Z' })
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    const item = page.items.find(entry => entry.source_id.startsWith('task-entry-clock'))
+    expect(item).toBeDefined()
+    expect(item!.reason).toContain('Review ask expired')
+  })
+
+  it('boundary: an ask aged EXACTLY 14 days is expired and listed; one hour short is not (window pin)', async () => {
+    seedTask({ id: 'task-at-14d', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-08-06T00:00:00Z', review_entered_at: '2026-08-06T00:00:00Z' })
+    seedTask({ id: 'task-under-14d', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-08-06T01:00:00Z', review_entered_at: '2026-08-06T01:00:00Z' })
+
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-at-14d')).toBeDefined()
+    // threshold-pin witness: the EXPIRY window (APPROVAL_EXPIRY.gate_verdict_days), not any
+    // other constant (a 15-day reason threshold would reclassify this row's reason).
+    const at14 = page.items.find(entry => entry.source_id === 'task-at-14d')
+    expect(at14!.reason).toContain('Review ask expired')
+    expect(page.items.find(entry => entry.source_id === 'task-under-14d' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  // ── gate-2275-a P1-1 leftovers: the SQL guards each get a witness ──
+  it('an ARCHIVED project never lists its aged rows (projectLive guard)', async () => {
+    // Seed FIRST (the task-insert trigger refuses an archived project), then archive.
+    seedTask({ id: 'task-arch-project', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'project-a'`)
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-arch-project' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  it('an ARCHIVED task never lists its aged rows (task archive guard)', async () => {
+    seedTask({ id: 'task-task-arch', gate_owner: 'gate:content', assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+      VALUES ('task-task-arch', '2026-08-19T00:00:00Z', 'test', 'owner-human', 'review', '2026-08-19T00:00:00Z')`)
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-task-arch' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  it('a row whose status drifted OFF review (blocked) never enters the aged source', async () => {
+    seedTask({ id: 'task-status-blocked', status: 'blocked', gate_owner: 'gate:content',
+      assignee_member_id: 'assignee-own', created_at: '2026-07-25T00:00:00Z',
+      review_entered_at: '2026-07-30T00:00:00Z' })
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-status-blocked' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  it('gate agent-self-completion rows never enter the aged source (they are the stuck view lane)', async () => {
+    seedTask({ id: 'task-self-completion', gate_owner: 'gate:agent-self-completion',
+      assignee_member_id: 'assignee-own', created_at: '2026-07-25T00:00:00Z',
+      review_entered_at: '2026-07-30T00:00:00Z' })
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-self-completion' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+  it('an UNGATED review row (no gate_owner at all) never becomes an aged item — it has no gate ask to expire', async () => {
+    seedTask({ id: 'task-ungated', gate_owner: null, assignee_member_id: 'assignee-own',
+      created_at: '2026-07-25T00:00:00Z', review_entered_at: '2026-07-30T00:00:00Z' })
+    const page = await listNeedsYou(env, assigneeOwn(), {}, NOW_ISO)
+    expect(page.items.find(entry => entry.source_id === 'task-ungated' && entry.kind === 'aged_review')).toBeUndefined()
+  })
+
+
   it('lists an aged review row in the human assignee inbox, view-only, with the expiry reason', async () => {
     // 20-day-old ask: past the 14-day expiry window, so the approvals source refuses it —
     // this is exactly the baseline shape (mem-hadi's rows invisible).
@@ -186,7 +312,8 @@ describe('needs_you shows the human assignee their own aged review rows (brief v
     expect(item).toBeDefined()
     expect(item!.kind).toBe('aged_review')
     expect(item!.allowed_actions).toEqual(['view'])
-    expect(item!.reason).toContain('No holder of any kind')
+    expect(item!.reason).toContain('No gate holder is registered')
+    expect(item!.reason).toContain('an org owner or admin can decide it')
   })
 
   it('does NOT surface fresh (still-live) gated review rows — those belong to the approvals source', async () => {
