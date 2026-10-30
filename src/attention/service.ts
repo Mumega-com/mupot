@@ -18,7 +18,7 @@ import { createVerdictGateCache, evaluateVerdictGates, primeVerdictIndependence,
 import { canReadSquadTasks } from '../tasks/visibility'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
 import { nowSqlUtc } from '../auth/token-lifecycle'
-import { GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
+import { APPROVAL_EXPIRY, GATE_ASK_LIVE_PREDICATE } from '../gates/approval-expiry-rule'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -77,6 +77,7 @@ export const NEEDS_YOU_DUE_BUMP_DAYS = 2
 const NEEDS_YOU_STALE_RANK_OFFSET = 10
 
 export type NeedsYouKind =
+  | 'aged_review'
   | 'approval'
   | 'routine_agent'
   | 'routine_answer'
@@ -162,6 +163,7 @@ interface SourceRow {
   squad_kind: OrgKind | null
   project_access_level: 'read' | 'write' | 'admin' | null
   assignee_agent_id: string | null
+  assignee_member_id: string | null
   gate_owner: string | null
   sort_deadline: string
   sort_timestamp: string
@@ -240,6 +242,12 @@ interface TaskDecision {
 
 function actionsFor(row: SourceRow, principal: RoutinePrincipal, decision?: TaskDecision): NeedsYouAction[] {
   if (row.source_type === 'task') {
+    if (row.kind === 'aged_review') {
+      // Brief v0.33-4: expiry is NEVER approval (src/gates/approval-expiry-rule.ts), so an
+      // aged ask gets no verb here either — the escape is the admin expiry sweep / resubmit
+      // cap reset, which is an admin tool, not a list verb. View-only by design.
+      return ['view']
+    }
     if (row.kind === 'approval') {
       // The RBAC half (gate ownership, gate:loops surface cap, self-verdict,
       // owner-affiliation) is evaluateVerdictGates' answer, resolved by the caller
@@ -303,6 +311,11 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal, decision?: Task
 function isActionable(row: SourceRow, principal: RoutinePrincipal, actions: NeedsYouAction[]): boolean {
   if (actions.some(action => action !== 'view')) return true
   return row.kind === 'blocked_task' && principal.actor_type === 'member' && principalCanActOnSquad(row, principal)
+    // Brief v0.33-4: a human assignee's OWN aged row is actionable by being theirs — the
+    // action is living with it / chasing the admin sweep, not a list verb. The rule is the
+    // ASSIGNMENT: task.assignee_member_id === the viewer (never another member's rows).
+    || (row.kind === 'aged_review' && principal.actor_type === 'member'
+      && row.assignee_member_id !== null && row.assignee_member_id === principal.actor_id)
 }
 
 function itemFrom(row: SourceRow, principal: RoutinePrincipal, decision?: TaskDecision): NeedsYouItem {
@@ -438,6 +451,9 @@ async function sourceRows(
      WHERE agent_lane.capability = t.gate_owner AND agent_lane.principal_type = 'agent'
   )))`
   const holderClause = stuckView ? `AND NOT ${humanHolder}` : `AND ${humanHolder}`
+  // Brief v0.33-4 ask clock: the exported GATE_ASK_LIVE_PREDICATE's own inverse — built
+  // with the validated `nowIso` so ages and expiry read ONE clock (deterministic in tests).
+  const gateAskNotLive = `NOT (${GATE_ASK_LIVE_PREDICATE('t', sqlQuote(nowIso))})`
   const projectScope = [...projectBinds, ...visibility.binds]
 
   const approvals = querySource(env, 'approvals', `
@@ -452,7 +468,7 @@ async function sourceRows(
       ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
-      t.assignee_agent_id, t.gate_owner,
+      t.assignee_agent_id, NULL AS assignee_member_id, t.gate_owner,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -461,6 +477,39 @@ async function sourceRows(
       AND ${projectLive} ${holderClause}
       AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${GATE_ASK_LIVE_PREDICATE('t', "datetime('now')")}
+      AND ${visibility.sql}
+  `, projectScope, cursor)
+
+  // gate-2275 a/b P1: agent principals age nothing for a HUMAN — skip the source entirely.
+  const agedReviews = stuckView || principal.actor_type !== 'member'
+    ? Promise.resolve<SourceResult>({ name: 'aged_reviews', rows: [], truncated: false })
+    : querySource(env, 'aged_reviews', `
+    SELECT
+      'aged_review' AS kind, 'task' AS source_type, t.id AS source_id,
+      p.id AS project_id, p.name AS project_name, t.title,
+      CASE WHEN ${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} >= ${APPROVAL_EXPIRY.gate_verdict_days}
+        THEN 'Review ask expired ' || CAST(MAX(0, ${ageDaysSql("COALESCE(t.review_entered_at, t.updated_at)", nowIso)} - ${APPROVAL_EXPIRY.gate_verdict_days}) AS INTEGER) || ' days ago with no verdict on ' || t.gate_owner || ' — the ask cannot be approved now (expiry is never approval). Ask an admin to run the approval-expiry sweep, or reset the resubmit cap to start a new round.'
+        ELSE 'No gate holder is registered to answer ' || t.gate_owner || ' — an org owner or admin can decide it. Register the gate lane, or answer it directly.'
+      END AS reason,
+      ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
+      t.created_at, p.target_date AS deadline_at,
+      t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
+      t.assignee_agent_id, t.assignee_member_id, t.gate_owner,
+      COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
+      t.created_at AS sort_timestamp
+    FROM tasks t JOIN projects p ON p.id = t.project_id
+    JOIN squads s ON s.id = t.squad_id
+    WHERE t.status = 'review' AND t.gate_owner IS NOT NULL AND t.gate_owner <> 'gate:agent-self-completion'${projectClause}
+      AND t.assignee_member_id = ${sqlQuote(principal.actor_id)}
+      -- (assignment in SQL: gate-2275 P1 — 600-row flood must not starve the own row)
+      AND ${projectLive}
+      AND (${TASK_NOT_ARCHIVED_SQL('t')})
+      AND (
+        ${gateAskNotLive}
+        OR NOT EXISTS (
+          SELECT 1 FROM gate_grants any_holder WHERE any_holder.capability = t.gate_owner
+        )
+      )
       AND ${visibility.sql}
   `, projectScope, cursor)
 
@@ -488,7 +537,7 @@ async function sourceRows(
       rr.created_at, rr.scheduled_for AS deadline_at,
       r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind,
       psa.access_level AS project_access_level,
-      NULL AS assignee_agent_id, NULL AS gate_owner,
+      NULL AS assignee_agent_id, NULL AS assignee_member_id, NULL AS gate_owner,
       COALESCE(rr.scheduled_for, '${DEADLINE_SENTINEL}') AS sort_deadline,
       rr.created_at AS sort_timestamp
     FROM routine_runs rr
@@ -512,7 +561,7 @@ async function sourceRows(
       ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, NULL AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
-      NULL AS assignee_agent_id, t.gate_owner,
+      NULL AS assignee_agent_id, NULL AS assignee_member_id, t.gate_owner,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
@@ -545,7 +594,7 @@ async function sourceRows(
 
   const recommitDue = recommitDueSource(env, projectClause, projectScope, visibility, cursor, nowIso)
 
-  return Promise.all([approvals, routineWaits, blockedTasks, publishableOutputs, recommitDue])
+  return Promise.all([approvals, routineWaits, blockedTasks, publishableOutputs, agedReviews, recommitDue])
 }
 
 interface RecommitCandidateRow {
@@ -691,7 +740,7 @@ async function recommitDueSource(
       created_at: candidate.created_at,
       deadline_at: candidate.cycle_boundary_at,
       squad_id: null, squad_department_id: null, squad_kind: null, project_access_level: null,
-      assignee_agent_id: null, gate_owner: null,
+      assignee_agent_id: null, assignee_member_id: null, gate_owner: null,
       sort_deadline: candidate.cycle_boundary_at,
       sort_timestamp: candidate.created_at,
     }
