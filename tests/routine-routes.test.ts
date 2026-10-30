@@ -120,7 +120,7 @@ describe('routine REST routes', () => {
     expect(firstBody.run).not.toHaveProperty('proposal_json')
     expect(Object.keys(firstBody.run).sort()).toEqual([
       'assigned_agent_id', 'attempt', 'cost_micro_usd', 'created_at', 'finished_at', 'flight_id', 'id', 'project_id',
-      'result_summary', 'routine_id', 'routine_revision', 'scheduled_for', 'started_at', 'status', 'task_id',
+      'result_summary', 'review_deadline_at', 'review_requested_at', 'routine_id', 'routine_revision', 'scheduled_for', 'started_at', 'status', 'task_id',
       'trigger_kind', 'updated_at', 'waiting_reason',
     ])
 

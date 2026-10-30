@@ -463,6 +463,7 @@ function detailRunPanel(view: RoutineWorkspaceView, projectPath: string): Html {
     <div id="run-activity" style="display:grid;gap:8px;">
       <div>${pill(runState(run), runTone(run))} · attempt ${run.attempt} · ${run.trigger_kind}</div>
       <div class="ui-panel-sub">Task ${run.task_id ?? 'none'} · Flight ${run.flight_id ?? 'none'} · Agent ${run.assigned_agent_id ?? 'unassigned'}</div>
+      ${run.waiting_reason === 'review' ? html`<div>Review due: ${run.review_deadline_at ?? 'unavailable'}</div>` : ''}
       <div>${run.result_summary ?? 'No terminal summary'} · ${run.cost_micro_usd} micro USD</div>
       ${view.detailQuestion ? html`<form method="post" action="${projectPath}/routines/${encodeURIComponent(run.id)}/answer" style="display:grid;gap:8px;max-width:42rem;">
         <strong>${view.detailQuestion.question}</strong>

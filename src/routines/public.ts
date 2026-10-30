@@ -1,6 +1,8 @@
 import type { RoutineRun } from './types'
 
 export interface PublicRoutineRun {
+  review_requested_at: string | null
+  review_deadline_at: string | null
   id: string
   project_id: string
   routine_id: string
@@ -23,6 +25,8 @@ export interface PublicRoutineRun {
 
 export function publicRoutineRun(run: RoutineRun): PublicRoutineRun {
   return {
+    review_requested_at: run.review_requested_at ?? null,
+    review_deadline_at: run.review_deadline_at ?? null,
     id: run.id,
     project_id: run.project_id,
     routine_id: run.routine_id,

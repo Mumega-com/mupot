@@ -1,3 +1,4 @@
+import { routineReviewDeadlineSql, taskReviewDeadlineSql } from '../routines/review-window'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 import { projectLinkTimestampMsSql } from '../addons/project-link/timestamps'
@@ -616,7 +617,7 @@ export async function loadProjectSituation(
        approvals AS (
          SELECT 'approval' AS kind, 'task' AS source_type, t.id AS source_id, t.title,
                 'Approval required by ' || t.gate_owner AS reason, 'urgent' AS urgency,
-                0 AS urgency_rank, t.gate_owner AS responsible, t.created_at, p.target_date AS deadline_at
+                0 AS urgency_rank, t.gate_owner AS responsible, t.created_at, COALESCE(${taskReviewDeadlineSql('t', '?5')}, p.target_date) AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'review' AND t.gate_owner IS NOT NULL
             AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
@@ -631,7 +632,7 @@ export async function loadProjectSituation(
                 'Routine is waiting for ' || rr.waiting_reason AS reason,
                 CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 'urgent' ELSE 'high' END AS urgency,
                 CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END AS urgency_rank,
-                r.responsible_squad_id AS responsible, rr.created_at, rr.scheduled_for AS deadline_at
+                r.responsible_squad_id AS responsible, rr.created_at, CASE WHEN rr.waiting_reason = 'review' THEN ${routineReviewDeadlineSql('rr')} ELSE rr.scheduled_for END AS deadline_at
            FROM routine_runs rr INDEXED BY idx_routine_runs_project_needs_you_keyset
            JOIN routines r ON r.id = rr.routine_id AND r.tenant = rr.tenant AND r.project_id = rr.project_id
           WHERE rr.tenant = ?5 AND rr.project_id = ?1 AND rr.status = 'waiting' AND rr.waiting_reason IS NOT NULL

@@ -1,3 +1,4 @@
+import { withRoutineReviewDeadlines } from '../routines/review-window'
 import { toolOwnerCall } from './owner-call'
 // mupot — MCP seam. The network surface a MEMBER's workspace connects to.
 //
@@ -1581,7 +1582,7 @@ const toolTaskList: ToolSpec = {
 
     return done({
       squad_id: squadRes.squad.id,
-      tasks: rankedTasks,
+      tasks: await withRoutineReviewDeadlines(env, rankedTasks),
       // mupot#1784: null = this page reached the end; otherwise pass it back as `cursor`
       // (with the same squad/filters) for the next page.
       next_cursor: page.nextCursor,
@@ -1752,8 +1753,11 @@ const toolTaskGet: ToolSpec = {
       latestDispatch = info ? await loadDispatchStatus(env, info.dispatch_receipt_id) : null
       dispatchTimeline = await listTaskDispatchReceiptTimeline(env, full.id, 20, { withReceiptIds: true })
     }
+    const [taskWithReview] = await withRoutineReviewDeadlines(env, [{ ...row, id: full.id,
+        project_id: typeof full.project_id === 'string' ? full.project_id : null,
+        status: typeof full.status === 'string' ? full.status : undefined }])
     return done({
-      task: row,
+      task: taskWithReview ?? row,
       // Context travels with the work: this row is a bare ticket; task_brief assembles the project goal, what the
       // team knows, related work, conventions and open questions for it in one call.
       hint: 'call task_brief { task_id } for full context before you start',

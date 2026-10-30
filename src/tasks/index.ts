@@ -1,3 +1,4 @@
+import { withRoutineReviewDeadlines } from '../routines/review-window'
 // mupot — tasks component. Tasks are the unit of work in the pot. GitHub is the
 // source of truth: every create/update mirrors to a GitHub issue (env.GITHUB_TOKEN
 // + GITHUB_REPO) and we persist the returned issue URL on the row. If GITHUB_REPO
@@ -352,7 +353,7 @@ export async function listTasksForAuth(
     const states: ReadonlyMap<string, AgentRuntimeState> =
       page.rows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
     return jsonResponse({
-      tasks: rankTasks(page.rows, states),
+      tasks: await withRoutineReviewDeadlines(env, rankTasks(page.rows, states)),
       next_cursor: page.nextCursor,
       truncated: page.nextCursor !== null,
     })
@@ -429,7 +430,7 @@ export async function listTasksForAuth(
     taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
   // `truncated`: the legacy bounded read hit its cap; pass ?limit= (or ?cursor=) to page it.
-  return jsonResponse({ tasks: rankTasks(taskRows, agentStates), next_cursor: nextCursor, truncated })
+  return jsonResponse({ tasks: await withRoutineReviewDeadlines(env, rankTasks(taskRows, agentStates)), next_cursor: nextCursor, truncated })
 }
 
 // ── GET /audit — audit task intake compliance across squad/tenant (Issue #1040 Phase 3) ──
@@ -551,7 +552,7 @@ export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): 
     return jsonResponse({ error: 'forbidden', need: 'member' }, 403)
   }
 
-  const [visibleTask] = await loadGateWakeNotices(env, [task])
+  const [visibleTask] = await withRoutineReviewDeadlines(env, await loadGateWakeNotices(env, [task]))
   // mupot#1704: the runtime receipt timeline (receipt hashes, artifact sha256/refs, stages) goes
   // through the SAME chokepoint as MCP task_get (#1702/#1703): assignee, org admin, or a live
   // gate-lane holder. Any other squad reader gets null, never a narrower re-derived rule.
