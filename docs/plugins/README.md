@@ -31,14 +31,16 @@ Harness weld   how that body authenticates (Grok / Claude / Hermes / Prime / Cur
 
 Herdr is local dispatch. Mupot is cross-machine mail. A plugin that polls every 5s and a plugin that subscribes to Herdr events are **different** — both talk to the pot.
 
-## Two token kinds
+## Authentication and accountable operators
 
 | Kind | `bound_agent_id` | Can | Refuses |
 |---|---|---|---|
-| Operator | `null` | mint / grant / create_agent | send / inbox |
-| Agent-bound | the seat UUID | send / inbox / tasks | `operator_principal_required` |
+| Human operator | `null` | authority allowed by the human's live role and connection | agent-only mail without an agent binding |
+| Agent-bound | existing agent UUID | mail/tasks/flights within its own live authority; structural acts covered by an existing delegated-operator grant | human-only delegation management and other reserved actions |
 
-OAuth directory door mints operator, never an agent. Minted workspace token + `boot_context` / `orient`. Do not `connect` on a minted token.
+An **unbound OAuth directory** connection has zero effective capabilities; it does not inherit the human's operator rights. Explicit background-agent consent can instead bind OAuth to an **existing agent**, using that agent's own authority clamped to the consenting human's live standing. It does not create another agent merely because a thread or runtime changes. Check `boot_context` / `orient` before reporting presence or accepting work; names and worktree paths do not select authority. Do not call `connect` to switch an already agent-bound credential.
+
+Delegated-operator authority permits only its covered structural acts and ceiling; it does not make delegation management human-free or confer blanket flight authority. Ordinary `flight_dispatch` accepts a correctly bound OAuth agent with the required squad/project rights. `objective_accept`, `token_binding_attest` and `runtime_seat_register_pending` are a separate workspace-credential surface. Onboarding security-bar relaxations concern task friction, not identity admission or these credential floors. See [the existing consolidation issue](https://github.com/Mumega-com/mupot/issues/1719) and [Operators + Admission](https://github.com/Mumega-com/mumega-com/issues/1386).
 
 ## How to retrieve
 

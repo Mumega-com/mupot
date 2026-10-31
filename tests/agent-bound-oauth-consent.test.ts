@@ -2252,3 +2252,116 @@ describe('background consent recovery reads', () => {
     expect(await memberMayConsentToBackgroundAgent(envFor(harness), HUMAN, AGENT_A.id)).toBe(false)
   })
 })
+
+describe('existing agent OAuth composed with flights and delegated operator authority', () => {
+  function compositionEnv(): Env {
+    return envFor(harness, { SESSIONS: memoryKv(), DELEGATED_OPERATORS: '1' })
+  }
+
+  async function consentedAuth(env: Env) {
+    insertDirectoryToken(harness.sqlite, 'composition-oauth', MEMBER_AGENT_A, AGENT_A.id)
+    const auth = await buildAuthContextFromProps(env, {
+      memberId: MEMBER_AGENT_A,
+      tokenId: 'composition-oauth',
+      email: 'human@example.test',
+      consentedByMemberId: HUMAN,
+      backgroundAgentHumanRequired: true,
+    })
+    expect(auth).not.toBeNull()
+    expect(auth!.channel).toBe('directory')
+    expect(auth!.boundAgentId).toBe(AGENT_A.id)
+    return auth!
+  }
+
+  function flightArgs() {
+    harness.sqlite.exec(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id)
+      VALUES ('oauth-flight-proof', '${AGENT_A.squad_id}', 'Fixture only', '', 'A retained fixture receipt', 'in_progress', '${AGENT_A.id}')`)
+    return {
+      squad_id: AGENT_A.squad_id,
+      goal: 'Fixture-only OAuth composition; neutral progress is an assumption, not a measurement',
+      budget_micro_usd: 0,
+      client_request_id: 'oauth-flight-composition',
+      meta_json: JSON.stringify({
+        schema: 'mupot.flight.meta/v1', goal_id: 'fixture', objective_id: 'fixture-label',
+        squad_ids: [AGENT_A.squad_id], task_ids: ['oauth-flight-proof'],
+        done_when: ['A retained fixture receipt'], artifact_refs: [], receipt_refs: [],
+        confidentiality: 'internal', publication_target: 'none', parent_flight_id: null,
+      }),
+      signals_json: JSON.stringify({
+        contextComplete: true, toolsReachable: true, budgetRemainingMicroUsd: 0,
+        budgetEstimateMicroUsd: 0, recentProgress: 0.5, progressPerStep: 0.5,
+        wastePerStep: 0.5, stepSeconds: 60,
+      }),
+    }
+  }
+
+  it('dispatches an ordinary flight using the real consent-bound OAuth principal', async () => {
+    const env = compositionEnv()
+    const auth = await consentedAuth(env)
+    const out = await invokeTool(auth, env, 'flight_dispatch', flightArgs(), 'https://pot.test')
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    if (!out.ok) return
+    const result = out.result as { flight: { id: string; agent: string; status: string }; delivered: boolean }
+    expect(result.flight).toMatchObject({ agent: AGENT_A.id, status: 'running' })
+    expect(result.delivered).toBe(true)
+    const stored = harness.sqlite.prepare('SELECT agent, dispatched_by_agent_id FROM flights WHERE id = ?').get(result.flight.id)
+    expect(stored).toMatchObject({ agent: AGENT_A.id, dispatched_by_agent_id: AGENT_A.id })
+    const mail = harness.sqlite.prepare('SELECT to_agent, body FROM agent_messages WHERE request_id = ?').get(`flight.${result.flight.id}`) as { to_agent: string; body: string }
+    expect(mail.to_agent).toBe(AGENT_A.id)
+    expect(JSON.parse(mail.body)).toMatchObject({ version: 'flight.dispatch/v1', flight_id: result.flight.id })
+  })
+
+  it('does not give an unbound OAuth session flight authority from human grants', async () => {
+    const env = compositionEnv()
+    insertDirectoryToken(harness.sqlite, 'composition-unbound', HUMAN, null)
+    const auth = await buildAuthContextFromProps(env, { memberId: HUMAN, tokenId: 'composition-unbound', email: 'human@example.test' })
+    expect(auth!.boundAgentId).toBeNull()
+    const out = await invokeTool(auth!, env, 'flight_dispatch', flightArgs(), 'https://pot.test')
+    // The zero-capability directory floor rejects before the flight handler.
+    expect(out).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM flights').get()).toEqual({ n: 0 })
+  })
+
+  it('does not let an OAuth-bound worker choose a foreign executor without its scope', async () => {
+    const env = compositionEnv()
+    const auth = await consentedAuth(env)
+    const out = await invokeTool(auth, env, 'flight_dispatch', { ...flightArgs(), executor_agent_id: AGENT_B.id }, 'https://pot.test')
+    expect(out).toMatchObject({ ok: false, error: 'flight_delegation_forbidden' })
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM flights').get()).toEqual({ n: 0 })
+  })
+
+  it('keeps workspace token attestation off the same legitimate OAuth principal', async () => {
+    const env = compositionEnv()
+    const auth = await consentedAuth(env)
+    expect(await invokeTool(auth, env, 'token_binding_attest', {}, 'https://pot.test'))
+      .toMatchObject({ ok: false, error: 'agent_bound_workspace_credential_required' })
+  })
+
+  it('uses an existing human delegation for a scoped OAuth operator act without delegation-management authority', async () => {
+    const env = compositionEnv()
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('composition-human-org', '${HUMAN}', 'org', NULL, 'admin')`)
+    const human: AuthContext = {
+      userId: HUMAN, memberId: HUMAN, email: 'human@example.test', role: 'member',
+      tenant: TENANT, channel: 'workspace', boundAgentId: null,
+      capabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const delegation = await invokeTool(human, env, 'operator_delegate', {
+      agent: AGENT_A.id, scope_type: 'org', max_grant: 'lead',
+    }, 'https://pot.test')
+    expect(delegation.ok, JSON.stringify(delegation)).toBe(true)
+    if (!delegation.ok) return
+    const auth = await consentedAuth(env)
+    const added = await invokeTool(auth, env, 'squad_member_add', {
+      squad: AGENT_A.squad_id, agent: AGENT_B.id, capability: 'member',
+    }, 'https://pot.test')
+    expect(added.ok, JSON.stringify(added)).toBe(true)
+    expect(await invokeTool(auth, env, 'operator_list', {}, 'https://pot.test'))
+      .toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    // Revoke has no admin dispatch floor: this reaches the intentional human-only guard.
+    const delegationId = (delegation.result as { delegation: { id: string } }).delegation.id
+    expect(await invokeTool(auth, env, 'operator_revoke', { delegation_id: delegationId }, 'https://pot.test'))
+      .toMatchObject({ ok: false, error: 'operator_principal_required' })
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_operator_delegations').get()).toEqual({ n: 1 })
+  })
+})
