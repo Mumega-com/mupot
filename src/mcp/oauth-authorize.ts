@@ -43,7 +43,7 @@ import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
-import { MemberAttachDeniedError } from '../members/human-identity'
+import { MemberAttachDeniedError, NewMemberRefusedError, type BeforeCreateGuard } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
@@ -160,10 +160,11 @@ async function findOrCreateMember(
   env: Env,
   email: string,
   displayName: string,
+  beforeCreate: BeforeCreateGuard,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; created: boolean }> {
   const { findOrCreateHumanMemberDetailed } = await import('../members/human-identity')
-  return findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)
+  return findOrCreateHumanMemberDetailed(env, email, displayName, beforeCreate, loginIdentity)
 }
 
 // ── Token mint for OAuth seat ─────────────────────────────────────────────────
@@ -1566,12 +1567,17 @@ async function buildAuthContextFromPropsInner(
 }
 
 // ── B2: Per-IP rate limiter for the OAuth registration path ───────────────────
-// findOrCreateMember is reachable by ANY verified Google account — it writes a
-// members row + member_tokens row. Without a guard an attacker can spam the
-// callback to exhaust D1 write budget and pollute the member roster.
+// findOrCreateMember is reachable by ANY verified Google account — it can write a
+// members row. Without a guard an attacker can spam the callback to exhaust D1
+// write budget and pollute the member roster.
 //
 // Strategy: KV counter in SESSIONS namespace, key = `oauth-reg-rl:<ip>`.
-// Window: 5 mints per hour per IP. On exceed: 429 + Retry-After: 3600.
+// Window: 5 NEW members per hour per IP. On exceed: 429 + Retry-After: 3600.
+// It is passed to findOrCreateMember as the pre-create guard, so it runs only
+// when no existing member was found, immediately before the members INSERT:
+// an existing member's sign-in is neither refused nor counted, and a refused
+// sign-in writes nothing. A team behind one NAT is not locked out by its own
+// members signing in.
 // Fail-open on KV errors (network faults must not lock out legitimate users).
 const OAUTH_REG_RL_MAX = 5
 const OAUTH_REG_RL_TTL = 3600 // seconds (1 hour)
@@ -1760,33 +1766,31 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
     }
 
-    // B2: per-IP rate limit on member mint. The CF-Connecting-IP header is set by
-    // Cloudflare on every inbound Worker request; fall back to 'unknown' if absent
-    // (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
+    // B2: per-IP rate limit on NEW member creation only (checkOAuthRegRateLimit, passed below as the pre-create
+    // guard). The CF-Connecting-IP header is set by Cloudflare on every inbound Worker request; fall back to
+    // 'unknown' if absent (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
     const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
-    const rl = await checkOAuthRegRateLimit(env, ip)
-    if (!rl.allowed) {
-      return new Response('Too many OAuth registrations from this IP. Please try again later.', {
-        status: 429,
-        headers: {
-          'Retry-After': String(rl.retryAfter),
-          'Content-Type': 'text/plain',
-        },
-      })
-    }
 
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     // mupot#1022: true only when THIS login created the member row, so the consent screen can say so once, in-band.
     let memberJustCreated = false
     try {
-      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, {
+      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, () => checkOAuthRegRateLimit(env, ip), {
         provider: 'google',
         subject: googleUser.id,
       })
       memberId = found.id
       memberJustCreated = found.created
     } catch (err) {
+      // B2: the guard refused a NEW member before any row was written.
+      if (err instanceof NewMemberRefusedError) {
+        return new Response(
+          'Too many new accounts have been created from this network recently, so we cannot create another one right now. '
+            + 'Try again in an hour, or ask an org admin to invite you.',
+          { status: 429, headers: { 'Retry-After': String(err.retryAfter), 'Content-Type': 'text/plain' } },
+        )
+      }
       // mupot#1551 round 2 (P0): a denial/ambiguity is NOT the same failure
       // as a D1 outage — it means this email's member row is legitimately
       // someone else's (or ambiguous) and must never silently become a

@@ -29,6 +29,25 @@ export class MemberAttachDeniedError extends Error {
   }
 }
 
+/**
+ * Thrown by findOrCreateHumanMemberDetailed when its required `beforeCreate` guard refuses a NEW member. Nothing has been
+ * written at that point: the guard runs after every resolve branch said `not_found` and before the members INSERT.
+ */
+export class NewMemberRefusedError extends Error {
+  readonly retryAfter: number
+  constructor(retryAfter: number) {
+    super('new member creation refused by the pre-create guard')
+    this.name = 'NewMemberRefusedError'
+    this.retryAfter = retryAfter
+  }
+}
+
+/** Runs immediately before the members INSERT, only when no existing member was found. `allowed: false` aborts the create. */
+export type BeforeCreateGuard = () => Promise<{ allowed: boolean; retryAfter: number }>
+
+/** The explicit "no limit" guard for callers with no new-member budget to enforce. Spelled out so omitting a guard is a type error. */
+export const ALLOW_NEW_MEMBER: BeforeCreateGuard = async () => ({ allowed: true, retryAfter: 0 })
+
 export async function resolveVerifiedHumanMemberId(
   env: Env,
   email: string,
@@ -48,7 +67,7 @@ export async function findOrCreateHumanMember(
   displayName: string,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<string> {
-  return (await findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)).id
+  return (await findOrCreateHumanMemberDetailed(env, email, displayName, ALLOW_NEW_MEMBER, loginIdentity)).id
 }
 
 /** Same as findOrCreateHumanMember, and says whether THIS call created the row (mupot#1022: the consent screen tells a
@@ -57,6 +76,7 @@ export async function findOrCreateHumanMemberDetailed(
   env: Env,
   email: string,
   displayName: string,
+  beforeCreate: BeforeCreateGuard,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; created: boolean }> {
   const result = await resolveHumanMemberForAttach(env, {
@@ -85,7 +105,10 @@ export async function findOrCreateHumanMemberDetailed(
       'normalized email matches more than one member',
     )
   }
-  // result.kind === 'not_found' — create as today.
+  // result.kind === 'not_found' — create as today, unless the guard refuses. This is the ONLY place a member row is
+  // inserted, so the guard sees exactly the creations: resolved/denied/ambiguous returned or threw above without it.
+  const guard = await beforeCreate()
+  if (!guard.allowed) throw new NewMemberRefusedError(guard.retryAfter)
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(
