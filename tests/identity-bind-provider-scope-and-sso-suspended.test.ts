@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { resolveHumanMemberId } from '../src/members/resolve-human-member'
-import { findOrCreateHumanMember } from '../src/members/human-identity'
+import { findOrCreateHumanMember } from './helpers/find-or-create-human-member'
 import { autoEnrollSsoMember } from '../src/auth/sso'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
