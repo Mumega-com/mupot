@@ -105,8 +105,7 @@ function googleAuthorizeUrl(clientId: string, state: string, redirectUri: string
     redirect_uri: redirectUri,
     response_type: 'code',
     scope: 'openid email profile',
-    access_type: 'offline',
-    prompt: 'consent',
+    prompt: 'select_account',
     state,
   })
   return `https://accounts.google.com/o/oauth2/v2/auth?${params}`
@@ -714,6 +713,74 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;')
 }
 
+// ── Requester disclosure ──────────────────────────────────────────────────────
+// The consent page always says who is asking and where the browser goes next, so a person who followed
+// someone else's authorize link can see it is not their app. BOTH values are attacker-controlled
+// (dynamic client registration is open): the name is self-declared and the redirect is whatever the
+// client registered. They are escaped by the caller; this only bounds and cleans them for display.
+const REQUESTER_NAME_MAX = 60
+const REDIRECT_TAIL_MAX = 80
+const REDIRECT_HOST_HEAD = 40
+const REDIRECT_HOST_TAIL = 200
+
+// Characters that move, reorder or hide text, or render as nothing: C0/C1 controls, soft hyphen, combining grapheme
+// joiner, Arabic letter mark, zero-width and bidi marks/overrides/isolates, word joiner and invisible operators,
+// Hangul filler, variation selector 16 and the BOM. One list, written with escapes so it cannot be silently edited away.
+const INVISIBLE_CHARS = /[\u0000-\u001F\u007F-\u009F\u00AD\u034F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\u3164\uFE0F\uFEFF]/g
+
+/** Drop invisible characters, collapse whitespace, bound visibly. A name that is only such characters comes back empty. */
+function displayName(raw: unknown): string {
+  if (typeof raw !== 'string') return ''
+  const clean = raw.replace(INVISIBLE_CHARS, ' ').replace(/\s+/g, ' ').trim()
+  const chars = Array.from(clean)
+  return chars.length > REQUESTER_NAME_MAX ? `${chars.slice(0, REQUESTER_NAME_MAX).join('')}…` : clean
+}
+
+function boundText(s: string, max: number): string {
+  const chars = Array.from(s)
+  return chars.length > max ? `${chars.slice(0, max).join('')}… (${chars.length} characters in all)` : s
+}
+
+/** Keep both ends: the end of a host is the part that names the real domain. */
+function boundMiddle(s: string, head: number, tail: number): string {
+  const chars = Array.from(s)
+  return chars.length > head + tail ? `${chars.slice(0, head).join('')}…${chars.slice(-tail).join('')} (${chars.length} characters in all)` : s
+}
+
+/**
+ * The redirect address as HTML: scheme and any userinfo as written, the host emphasised, and only the
+ * path/query tail bounded. A host over 253 characters keeps its start AND its end (the end names the real
+ * domain), with the cut shown. `URL` normalises an IDN host to punycode, so a look-alike host is shown as
+ * the ASCII name the browser will really connect to. Custom schemes (cursor://...) are valid; an address
+ * with no host is shown whole, bounded. Every piece is escaped here: `URL` leaves some characters raw.
+ */
+function redirectDisplayHtml(redirectUri: unknown): string {
+  if (typeof redirectUri !== 'string' || !redirectUri) return '<em>(none)</em>'
+  let u: URL
+  try {
+    u = new URL(redirectUri)
+  } catch {
+    return escapeHtml(boundText(redirectUri.replace(INVISIBLE_CHARS, ' '), REDIRECT_TAIL_MAX))
+  }
+  if (!u.host) return escapeHtml(boundText(u.href, REDIRECT_TAIL_MAX))
+  // The `@` is appended after bounding, so a long userinfo can never read as a path.
+  const userinfo = u.username ? `${escapeHtml(boundText(`${u.username}${u.password ? `:${u.password}` : ''}`, REDIRECT_TAIL_MAX))}@` : ''
+  const tail = `${u.pathname}${u.search}${u.hash}`
+  return `${escapeHtml(u.protocol)}//${userinfo}<strong class="rhost">${escapeHtml(boundMiddle(u.host, REDIRECT_HOST_HEAD, REDIRECT_HOST_TAIL))}</strong>${escapeHtml(boundText(tail, REDIRECT_TAIL_MAX))}`
+}
+
+function requesterDisclosureHtml(clientName: unknown, redirectUri: unknown): string {
+  const name = displayName(clientName)
+  const who = name
+    ? `An app calling itself &ldquo;<strong>${escapeHtml(name)}</strong>&rdquo;`
+    : 'An app that gave no name'
+  return `<div class="requester" role="note">
+  <p class="req-who">${who} is asking to connect to your account. <span class="req-note">The name is chosen by the app and is not verified.</span></p>
+  <p class="req-to">If you continue, you will be sent back to <code class="redirect">${redirectDisplayHtml(redirectUri)}</code></p>
+  <p class="req-warn">If you didn&rsquo;t start this from your own app, choose <strong>Decline</strong>.</p>
+</div>`
+}
+
 // formatCapabilities was removed here. It rendered grants as
 // `squad:<uuid> → admin`, which is what made the consent screen unreadable.
 // summarizeGrants + scopeLabel in ./consent-view replace it; nothing else called it.
@@ -876,10 +943,21 @@ function renderConsentPage(
   memberJustCreated = false,
   suggestedAgentId: string | null = null,
   canBootstrap = true,
+  // Who is asking and where they go next: always disclosed, independent of every flag.
+  requester: { clientName?: unknown; redirectUri?: unknown } = {},
+  // True when the suggestion came from the authorize URL (?agent=), which anyone can write. False: it came
+  // from this human's own pending admission, which the server derived.
+  suggestedViaLink = false,
 ): Response {
   const choice = harnessOption && connectChoice
-  const suggestedAgent = agents.find((a) => a.id === suggestedAgentId)
-  const chatTabFirst = harnessOption && !suggestedAgent && (!choice || connectMode === 'many')
+  const hinted = agents.find((a) => a.id === suggestedAgentId)
+  // A link-supplied hint never suggests, badges or opens the tab for an agent carrying org admin: a crafted
+  // link must not steer a person toward the most powerful choice. Any other hinted agent is attributed to the link.
+  const suggestedAgent = hinted && !(suggestedViaLink && carriesOrgAdmin(hinted.capabilities)) ? hinted : undefined
+  const suggestedBy = suggestedViaLink ? 'Suggested by this link' : 'Suggested for this connection'
+  // The chat option is the visible default (fewest choices) unless a suggestion applies (a pending admission, or a
+  // link hint for a non-admin agent). Only the visible tab: no radio is ever pre-checked, and every other choice is one click away.
+  const chatTabFirst = harnessOption && !suggestedAgent
   const rows = agents.map((a) => {
     const groups = summarizeGrants(a.capabilities, scopeNames)
     const orgAdmin = carriesOrgAdmin(a.capabilities)
@@ -908,7 +986,7 @@ function renderConsentPage(
             <div class="agent-title">
               <strong>This connection is ${escapeHtml(a.name)} (runs in the background)</strong>
               <code>${escapeHtml(a.slug)}</code>
-              ${a.id === suggestedAgent?.id ? '<span class="suggested">Suggested for this connection</span>' : ''}
+              ${a.id === suggestedAgent?.id ? `<span class="suggested">${suggestedBy}</span>` : ''}
               ${orgAdmin ? '<span class="badge-org">organisation admin</span>' : ''}
             </div>
             <div class="agent-meta">Home squad ${escapeHtml(a.squad_name)} &middot; autonomy ${escapeHtml(a.autonomy)} &middot; budget ${formatBudgetCap(a.budget_cap_cents)} / ${escapeHtml(a.budget_window)}</div>
@@ -975,6 +1053,7 @@ function renderConsentPage(
   const harnessPanel = harnessOption ? `
     <p class="panel-title">${CHAT_CONSENT_LABEL}</p>
     <div class="panel" id="p-harness">
+      ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. To name your first one and continue in one step, open <strong>New agent</strong>.</p>' : ''}
       <label class="agent-option harness-option">
         <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required data-chat-choice data-label="${CHAT_CONSENT_LABEL}" data-top="member capability, capped at your own access">
         <div class="opt-body">
@@ -1029,6 +1108,14 @@ function renderConsentPage(
   .tabs-on .panel { display:none }
   .tabs-on .panel.active { display:block }
   .suggested { font-size:.68rem; font-weight:700; background:var(--accent-soft); color:var(--accent); padding:.12rem .4rem; border-radius:3px }
+  .requester { background:var(--raised); border:1px solid var(--rule-2); border-left:3px solid var(--accent);
+               border-radius:7px; padding:.75rem .9rem; margin:0 0 1.25rem; font-size:.92rem; overflow-wrap:anywhere }
+  .requester p { margin:0 0 .4rem }
+  .requester p:last-child { margin:0 }
+  .req-note { color:var(--ink-3); font-size:.82rem }
+  .redirect { font-family:ui-monospace,Menlo,monospace; font-size:.84rem; color:var(--ink-2) }
+  .rhost { color:var(--ink); background:var(--accent-soft); padding:0 .2rem; border-radius:3px; font-size:.95rem }
+  .req-warn { color:var(--ink-2) }
   .how { font-size:1.05rem; margin:.25rem 0 .35rem }
   .panel-help { font-size:.84rem; color:var(--ink-2); margin:0 0 .75rem }
   .panel-title { font-size:.82rem; color:var(--ink-3); margin:1.25rem 0 .5rem; font-weight:600 }
@@ -1093,8 +1180,9 @@ function renderConsentPage(
 <div class="wrap">
 <h1>Connect to mupot</h1>
 <p class="who">Signed in as <strong>${escapeHtml(email)}</strong>. Choose what this connection can act as.</p>
+${requesterDisclosureHtml(requester.clientName, requester.redirectUri)}
 ${choice ? `<h2 class="how">How will this app connect?</h2>
-<p class="who"><strong>Background agent</strong>: this connection is the agent, runs on its own and can be woken. <strong>${CHAT_CONSENT_LABEL}</strong>: acts for you and is capped at your rights.${suggestedAgent ? ` Suggested for this connection: <strong>${escapeHtml(suggestedAgent.name)}</strong>. Choose it below after reviewing its access, or choose a chat you drive.` : connectMode === 'one' ? ' We suggest <strong>Background agent</strong> for this app. Choose an agent below.' : ` We suggest <strong>${CHAT_CONSENT_LABEL}</strong> for this app.`} Continue to approve your choice.</p>` : ''}
+<p class="who"><strong>Background agent</strong>: this connection is the agent, runs on its own and can be woken. <strong>${CHAT_CONSENT_LABEL}</strong>: acts for you and is capped at your rights.${suggestedAgent ? (suggestedViaLink ? ` The link you followed suggests <strong>${escapeHtml(suggestedAgent.name)}</strong>; mupot does not vouch for that. Choose it below only after reviewing its access, or choose a chat you drive.` : ` Suggested for this connection: <strong>${escapeHtml(suggestedAgent.name)}</strong>. Choose it below after reviewing its access, or choose a chat you drive.`) : connectMode === 'one' ? ` Choose <strong>${CHAT_CONSENT_LABEL}</strong> to keep it simple, or <strong>Background agent</strong> if this app runs on its own.` : ` We suggest <strong>${CHAT_CONSENT_LABEL}</strong> for this app.`} Continue to approve your choice.</p>` : ''}
 
 <form method="POST" action="/oauth/consent" id="consent-form">
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
@@ -1110,7 +1198,7 @@ ${choice ? `<h2 class="how">How will this app connect?</h2>
       ${agentsListed && agents.length === 0 ? unlinkedSignInHint(maskConsentEmail(email), memberJustCreated) : ''}
       ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
       ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
-      <p class="panel-help"><strong>Background agent:</strong> this connection is the agent you choose. It runs on its own and can be woken. Its ranked access is capped at your rights; its own gate grants also apply.</p>
+      <p class="panel-help"><strong>Background agent:</strong> this connection is the agent you choose. It runs on its own and can be woken. Its ranked access is capped at your rights; its own gate grants also apply.${agents.length > 0 ? ` It stays the agent you choose. To use a different agent, connect again and choose it${harnessOption ? `, or choose ${CHAT_CONSENT_LABEL} instead` : ''}.` : ''}</p>
       ${agents.length > 0 ? `<input class="filter" type="search" id="agent-filter" placeholder="Filter by name, squad, or capability — try &quot;admin&quot;" autocomplete="off">
       <p class="count-line" id="filter-count"></p>` : ''}
 ${rows}
@@ -1129,7 +1217,7 @@ ${mintPanel}
         <input type="radio" name="agent_id" value="" required data-label="no agent" data-top="no standing capability">
         <div class="opt-body">
           <div class="agent-title"><strong>Continue without an agent</strong></div>
-          <div class="agent-meta">No standing access. You can look up agents and squads.${harnessOption ? ' Choose a chat you drive to ask to act as an agent later.' : ''}</div>
+          <div class="agent-meta">No standing access. You can look up agents and squads.<br>This connection stays without an agent. To give it one, disconnect it and connect again, then choose a different option.${harnessOption ? ` Choose ${CHAT_CONSENT_LABEL} instead if each chat should be able to ask for an agent later.` : ''}</div>
         </div>
       </label>
     </div>
@@ -1862,15 +1950,15 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // loader, so a naming outage degrades the wording and never the disclosure.
     const scopeNames = await loadScopeNames(env, agents)
 
+    // The client's self-declared name is disclosed on every consent page (flag-independent) and also feeds the
+    // connect-mode suggestion. A failed lookup falls back to the redirect address alone; it never hides the page.
     let consentClientName: unknown = ''
-    if (seatAttachEnabled(env)) {
-      try {
-        const op = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER // eslint-disable-line @typescript-eslint/no-explicit-any -- same untyped provider handle as the rest of this file
-        const cid = typeof stored.clientId === 'string' ? stored.clientId : ''
-        if (cid && typeof op?.lookupClient === 'function') consentClientName = ((await op.lookupClient(cid)) as { clientName?: unknown } | null)?.clientName ?? ''
-      } catch {
-        // cosmetic: the suggestion falls back to the redirect host alone
-      }
+    try {
+      const op = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER // eslint-disable-line @typescript-eslint/no-explicit-any -- same untyped provider handle as the rest of this file
+      const cid = typeof stored.clientId === 'string' ? stored.clientId : ''
+      if (cid && typeof op?.lookupClient === 'function') consentClientName = ((await op.lookupClient(cid)) as { clientName?: unknown } | null)?.clientName ?? ''
+    } catch {
+      // cosmetic: the page shows the redirect address alone
     }
     let suggestedAgentId: string | null = null
     try {
@@ -1887,7 +1975,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
     }
     const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames, seatAutoEnrollEnabled(env),
-      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env), memberJustCreated, suggestedAgentId, canBootstrap)
+      suggestedConnectMode({ clientName: consentClientName, redirectUri: stored.redirectUri }), seatAttachEnabled(env), memberJustCreated, suggestedAgentId, canBootstrap,
+      { clientName: consentClientName, redirectUri: stored.redirectUri },
+      // suggestedBackgroundAgent consults the pending-admission path only when there is no hint at all.
+      typeof stored.backgroundAgentHint === 'string' && stored.backgroundAgentHint !== '')
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
