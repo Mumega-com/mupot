@@ -1,6 +1,7 @@
-// Client-only fallback for the consent screen when no eligible agent hint or unique pending request exists.
-// `many` suggests "A chat you drive"; `one` suggests "Background agent". This function only
-// chooses the first tab; background-agent-consent.ts owns agent defaults and the POST validates consent.
+// Client-only wording for the consent screen. `many` words "A chat you drive" as the suggestion; `one` names
+// "Background agent" as the option for an app that runs on its own. It no longer picks the first tab: the chat
+// option is the default tab whenever it exists, unless an agent was suggested (a pending admission, or a link
+// hint for a non-admin agent). background-agent-consent.ts owns agent defaults and the POST validates consent.
 // Client names and redirect hosts are presentation hints, never authority.
 
 export const CHAT_CONSENT_LABEL = 'A chat you drive'

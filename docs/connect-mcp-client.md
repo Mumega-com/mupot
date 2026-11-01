@@ -257,10 +257,14 @@ agent-bound connection is untouched.
 
 > Needs `SEAT_ATTACH=1` **and** `SEAT_AUTO_ENROLL=1`. Off, none of this exists (the tool is not advertised).
 
-The consent screen asks first: **How will this app connect?** *Many chats: each chat picks its agent*
-(ChatGPT, Claude, Cursor, Grok; suggested for those apps) or *One agent: this whole app is one agent*
-(Muse, a single bot). Nothing is pre-selected. A one-agent connection is not switched in place: the
-Connections page shows **Switch to many chats**, which tells you to reconnect and pick the first option.
+The consent screen first says who is asking: the app's self-declared (unverified) name and the exact address
+you will be sent back to. It then asks **How will this app connect?** *A chat you drive: each chat picks its
+agent* (suggested for ChatGPT, Claude, Cursor, Grok) or *Background agent: this whole app is one agent*
+(Muse, a single bot). **A chat you drive** is the tab that opens first for every app; Background agent is one
+click away. The exception is a suggested agent (one this human has a pending admission for, or one named by an
+`?agent=` link, which the screen attributes to the link; a link can never suggest an organisation-admin agent).
+Nothing is pre-selected. A one-agent connection is not switched in place: the Connections page shows
+**Switch to many chats**, which tells you to reconnect and pick the first option.
 
 A thread that should act as an agent you already have (Rava, hadi-admin) calls
 `seat_attach { agent }` from its seat session:

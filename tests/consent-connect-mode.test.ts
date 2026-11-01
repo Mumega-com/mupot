@@ -181,7 +181,8 @@ describe('background agent consent defaults', () => {
     const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1'), hint)
     expect(checkedAgents(html)).toEqual([])
     expect(html).toContain('This connection is Athena (runs in the background)')
-    expect(html).toContain('Suggested for this connection')
+    expect(html).toContain('Suggested by this link')
+    expect(html).not.toContain('Suggested for this connection')
     expect(html).not.toContain('Selected for this connection')
     expect(html).toContain('id="summary-text">Nothing selected yet.')
     expect(html).toContain('data-panel="p-existing" aria-selected="true"')
@@ -389,11 +390,29 @@ describe('requester disclosure (door PR B)', () => {
     expect(r.html).toContain('An app that gave no name')
     expect(r.html).toContain('value="decline"')
   })
-  it('the chat default stays the visible tab unless an agent was assigned; stranding recovery is worded on the page', async () => {
+  it('the chat default stays the visible tab unless an agent was suggested; recovery is worded on the page in every config', async () => {
+    for (const [auto, attach] of [['1', '1'], ['1', null], [undefined, undefined]] as const) {
+      const { html } = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), auto, attach))
+      expect(html).toContain('This connection stays without an agent. To give it one, disconnect it and connect again, then choose a different option.')
+      expect(html).not.toContain('cannot ask to act as an agent later')
+      expect(html.includes(`selectTab('p-harness')`)).toBe(auto === '1')
+      // only the chat option names the chat route, and only when the chat option exists
+      expect(html.includes('Choose A chat you drive instead if each chat should be able to ask for an agent later.')).toBe(auto === '1')
+    }
+  })
+  it('the agent panel tells you how to use a different agent (connect again and choose it)', async () => {
+    seedBackgroundAgent()
+    const on = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), '1'))
+    expect(on.html).toContain('It stays the agent you choose. To use a different agent, connect again and choose it, or choose A chat you drive instead.')
+    const off = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), undefined))
+    expect(off.html).toContain('It stays the agent you choose. To use a different agent, connect again and choose it.')
+    expect(off.html).not.toContain('or choose A chat you drive instead')
+  })
+  it('a member with no agent yet sees the first-run hint on the visible chat tab', async () => {
     const { html } = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), '1'))
+    const chat = html.slice(html.indexOf('id="p-harness"'), html.indexOf('id="p-existing"'))
+    expect(chat).toContain('You do not have an agent yet. To name your first one and continue in one step, open <strong>New agent</strong>.')
     expect(html).toContain(`selectTab('p-harness')`)
-    expect(html).toContain('This connection cannot ask to act as an agent later. To change that, disconnect it and connect again, choosing A chat you drive.')
-    expect(html).toContain('It stays that agent; to use another, connect again and choose A chat you drive.')
   })
   it('?agent= never checks a radio (not even when it names an org-admin agent), and the admin banner stays', async () => {
     seedBackgroundAgent()
@@ -411,6 +430,91 @@ describe('requester disclosure (door PR B)', () => {
     expect(html).toContain('badge-org">organisation admin')
     expect(html).toContain('carry administrator control of the whole organisation')
     expect(html).toContain('summary.classList.toggle(\'danger\', !!orgAdmin)')
+  })
+})
+
+describe('door PR B gate round 1', () => {
+  const tabSelected = (html: string, panel: string) => html.includes(`data-panel="${panel}" aria-selected="true"`)
+  function makeOrgAdmin(id = 'athena') {
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-${id}-org', 'member-${id}', 'org', NULL, 'admin');
+      INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('human-org', '${HUMAN}', 'org', NULL, 'admin')`)
+  }
+  it.each(['1', undefined])('a link hint for an org-admin agent: no suggestion, no badge, no tab flip, no mupot-voice sentence (flag %s)', async (flag) => {
+    seedBackgroundAgent(); makeOrgAdmin()
+    for (const hint of ['&agent=athena', '&agent_id=athena']) {
+      const { html } = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), flag), hint)
+      expect(html).toContain('badge-org">organisation admin') // the agent is still listed, with its warning
+      expect(html).not.toContain('Suggested by this link')
+      expect(html).not.toContain('Suggested for this connection')
+      expect(html).not.toContain('The link you followed')
+      expect(checkedAgents(html)).toEqual([])
+      if (flag === '1') {
+        expect(tabSelected(html, 'p-harness')).toBe(true)
+        expect(html).toContain('data-panel="p-existing" aria-selected="false"')
+        expect(html).toContain(`selectTab('p-harness')`)
+      }
+    }
+  })
+  it('a link hint for an ordinary agent is attributed to the link, not to mupot', async () => {
+    seedBackgroundAgent()
+    const { html } = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), '1', '1'), '&agent=athena')
+    expect(tabSelected(html, 'p-existing')).toBe(true)
+    expect(html).toContain('<span class="suggested">Suggested by this link</span>')
+    expect(html).toContain('The link you followed suggests <strong>Athena</strong>; mupot does not vouch for that.')
+    expect(html).not.toContain('Suggested for this connection')
+    expect(checkedAgents(html)).toEqual([])
+  })
+  it('a server-derived pending admission keeps its suggestion, in mupot voice, even without a hint', async () => {
+    seedBackgroundAgent(); pendingAgent()
+    const { html } = await reachConsent(httpEnv(stubProvider('Codex', 'https://client.test/cb'), '1', '1'))
+    expect(tabSelected(html, 'p-existing')).toBe(true)
+    expect(html).toContain('<span class="suggested">Suggested for this connection</span>')
+    expect(html).toContain('Suggested for this connection: <strong>Athena</strong>.')
+    expect(html).not.toContain('Suggested by this link')
+    expect(html).not.toContain('The link you followed')
+    expect(checkedAgents(html)).toEqual([])
+  })
+  it('hostless custom scheme: raw characters survive URL parsing, escaping is the only barrier', async () => {
+    const { html } = await reachConsent(httpEnv(stubProvider('App', 'app:"><img src=x onerror=alert(1)>'), '1'))
+    expect(html).toContain('<code class="redirect">app:&quot;&gt;&lt;img src=x onerror=alert(1)&gt;</code>')
+    expect(html).not.toContain('<img src=x')
+    expect(html).not.toContain('<strong class="rhost"></strong>')
+  })
+  it('a percent-encoded bidi override in userinfo stays encoded; the real host is the emphasised part', async () => {
+    const { html } = await reachConsent(httpEnv(stubProvider('Cursor', 'https://cursor.com%E2%80%AE@attacker.example/cb'), '1'))
+    expect(html).not.toContain('‮')
+    expect(html).toContain('https://cursor.com%E2%80%AE@<strong class="rhost">attacker.example</strong>/cb')
+  })
+  it('a long userinfo is bounded but keeps its @ visible and cannot read as a path', async () => {
+    const userinfo = 'a%2F'.repeat(1250) // 5000 characters including %2F
+    const { html } = await reachConsent(httpEnv(stubProvider('App', `https://${userinfo}@attacker.example/cb`), '1'))
+    const code = /<code class="redirect">([^]*?)<\/code>/.exec(html)![1]
+    expect(code).toMatch(/^https:\/\/a%2F[^@]*characters in all\)@<strong class="rhost">attacker\.example<\/strong>\/cb$/)
+    expect(code.length).toBeLessThan(400)
+  })
+  it('a host over 253 characters keeps its start and its end, with the cut shown', async () => {
+    const host = `claude.ai.${'a'.repeat(300)}.evil.test`
+    const { html } = await reachConsent(httpEnv(stubProvider('App', `https://${host}/cb`), '1'))
+    const rhost = /<strong class="rhost">([^]*?)<\/strong>/.exec(html)![1]
+    expect(rhost.startsWith('claude.ai.')).toBe(true)
+    expect(rhost).toContain('.evil.test')
+    expect(rhost).toContain(`…`)
+    expect(rhost).toContain(`(${host.length} characters in all)`)
+    expect(rhost.length).toBeLessThan(300)
+  })
+  it.each(['​‏‮', '؜­͏️ㅤ', 'ㅤ ⠀'.slice(0, 2)])('a name of only invisible characters is treated as no name (%#)', async (name) => {
+    const { html } = await reachConsent(httpEnv(stubProvider(name, 'https://muse.example.test/cb'), '1'))
+    expect(html).toContain('An app that gave no name is asking to connect')
+    expect(html).not.toContain('calling itself')
+  })
+  it('invisible characters are stripped from around a visible name', async () => {
+    const { html } = await reachConsent(httpEnv(stubProvider('Mu؜­͏️ㅤse', 'https://muse.example.test/cb'), '1'))
+    expect(html).toContain('&ldquo;<strong>Mu se</strong>&rdquo;')
+  })
+  it('the continue wording is true for Decline and refusals', async () => {
+    const { html } = await reachConsent(httpEnv(stubProvider('Muse', 'https://muse.example.test/cb'), '1'))
+    expect(html).toContain('If you continue, you will be sent back to')
+    expect(html).not.toContain('When you decide')
   })
 })
 
