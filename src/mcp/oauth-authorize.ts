@@ -29,7 +29,7 @@ import { CHAT_CONSENT_LABEL, BACKGROUND_CONSENT_LABEL, suggestedConnectMode, typ
 import { backgroundAgentHumanClause, backgroundAgentIdsForHuman, backgroundAgentConsentPolicy, suggestedBackgroundAgent } from './background-agent-consent'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, resolveCapabilitiesForMembers, canOnSquad, hasCapability, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, brandSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank, type SquadScope } from '../auth/capability'
-import { bootstrapSelf, findExistingBootstrap, type BootstrapSelfFailure } from '../members/bootstrap-self'
+import { bootstrapSelf, findExistingBootstrap } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
   highestCapability,
@@ -1152,6 +1152,7 @@ ${mintPanel}
   var summary = document.getElementById('summary')
   var summaryText = document.getElementById('summary-text')
   var options = Array.prototype.slice.call(document.querySelectorAll('#p-existing .agent-option'))
+  var submitted = false
 
   function applyFilter() {
     var q = (filter.value || '').trim().toLowerCase()
@@ -1240,13 +1241,23 @@ ${mintPanel}
   // one, is what enforces explicit consent.
   form.addEventListener('submit', function (e) {
     var action = (e.submitter && e.submitter.value) || 'continue'
-    if (action === 'decline') return
-    if (!form.querySelector('input[name="agent_id"]:checked')) {
+    if (action !== 'decline' && !form.querySelector('input[name="agent_id"]:checked')) {
       e.preventDefault()
       summary.classList.remove('danger')
       summaryText.textContent = 'Choose an option before continuing.'
+      return
     }
+    // One submit per page, Continue and Decline alike: a second click would post a nonce the
+    // server already consumed and show the person a refusal for a connection that worked. This
+    // is a flag, never 'disabled' — a button disabled during the submit event can drop its
+    // name=action value from the form data, and the server reads any action other than
+    // 'continue' as decline, so Approve would arrive as Decline. Courtesy only: the server
+    // consumes the consent record and stays authoritative.
+    if (submitted) { e.preventDefault(); return }
+    submitted = true
   })
+  // Back from bfcache restores this page with the flag still set; the person is back on a live form.
+  window.addEventListener('pageshow', function () { submitted = false })
 })()
 </script>
 <script>${SELECT_SEARCH_SCRIPT}</script>
@@ -1640,7 +1651,23 @@ interface PendingConsent {
    *  consent step in between (mupot#903b must not perturb pre-existing behaviour
    *  for the unbound path). */
   googleUserId: string
+  /** Absolute KV expiry (epoch seconds) of this record. Lets a recoverable first-agent refusal put
+   *  the record back for the REST of its original life, never a fresh 10 minutes. Absent on a record
+   *  written before this field existed: such a record is simply not restored. */
+  expiresAt?: number
 }
+
+// Workers KV rejects an expiration less than 60s away.
+const KV_MIN_TTL_SECONDS = 60
+
+// Refusals on /oauth/consent. Each is one sentence plus a next step; the person is on a dead or
+// consumed page, so the next step is always to start again from their app, never "sign in again".
+const CONSENT_EXPIRED_MESSAGE =
+  'This page has expired or was already used. If your app already shows the connection working, there is nothing more to do; otherwise start the connection again from your app.'
+const CONSENT_NO_COOKIE_MESSAGE =
+  'Your browser did not send the sign-in cookie for this page. Start the connection again from your app, using your normal browser.'
+const CONSENT_MALFORMED_MESSAGE =
+  'This page is not valid. Start the connection again from your app.'
 
 // ── Main authorize handler ────────────────────────────────────────────────────
 // Mounted at /authorize, /oauth/google-callback, /oauth/consent in src/index.ts
@@ -1812,6 +1839,9 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const consentNonce = crypto.randomUUID()
     const pending: PendingConsent = {
       stored, memberId, email: googleUser.email, googleUserId: googleUser.id,
+      // Computed BEFORE the put, so the real KV expiry is never earlier than this and a restore
+      // that uses it can only ever end sooner.
+      expiresAt: Math.floor(Date.now() / 1000) + CONSENT_TTL_SECONDS,
     }
     await env.SESSIONS.put(
       `oauth-consent:${consentNonce}`,
@@ -1894,7 +1924,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const action = String(form.get('action') ?? '')
 
     if (action === 'continue' && !form.has('agent_id')) {
-      return new Response('Missing agent_id: explicit consent choice is required', { status: 400 })
+      return new Response('Missing agent_id: explicit consent choice is required. Choose an option on the page, then continue.', { status: 400, headers: { 'Content-Type': 'text/plain' } })
     }
     let agentIdRaw = String(form.get('agent_id') ?? '').trim()
     // mupot#1794 W3: the harness option is the EXISTING unbound path under another name. Flag on, the
@@ -1904,18 +1934,32 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const harnessChosen = agentIdRaw === HARNESS_CONSENT_VALUE && seatAutoEnrollEnabled(env)
     if (harnessChosen) agentIdRaw = ''
 
-    if (!consentNonce) return new Response('Missing consent_nonce', { status: 400 })
+    if (!consentNonce) {
+      return new Response('This page is missing its session. Start the connection again from your app.', { status: 400, headers: { 'Content-Type': 'text/plain' } })
+    }
 
     // CSRF: the cookie set when the consent page was rendered must match the
     // nonce the form posted back. Same defence as B3 above, second instance.
+    // Every case below is refused; the branches only choose what to tell the person.
     const cookieHeader = request.headers.get('Cookie') ?? ''
     if (!hasNonceCookie(cookieHeader, CONSENT_COOKIE_NAME, consentNonce)) {
-      return new Response('CSRF check failed: consent nonce mismatch', { status: 403 })
+      // Malformed nonce: refuse without a KV read (and no key is built from it).
+      if (!CONSENT_NONCE_RE.test(consentNonce)) {
+        return new Response(CONSENT_MALFORMED_MESSAGE, { status: 403, headers: { 'Content-Type': 'text/plain' } })
+      }
+      // Read-only: tell "page already used or expired" (nothing pending) from "the cookie did not
+      // arrive" (a pending record exists). NEVER consume or delete here — the nonce is in the page
+      // source, and a cross-site post carrying it must not be able to burn the victim's session.
+      const livePending = await env.SESSIONS.get(`oauth-consent:${consentNonce}`)
+      if (!livePending) {
+        return new Response(CONSENT_EXPIRED_MESSAGE, { status: 400, headers: { 'Content-Type': 'text/plain' } })
+      }
+      return new Response(CONSENT_NO_COOKIE_MESSAGE, { status: 403, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const pending = await env.SESSIONS.get(`oauth-consent:${consentNonce}`, 'json') as PendingConsent | null
     if (!pending) {
-      return new Response('Consent session expired or invalid. Please sign in again.', { status: 400 })
+      return new Response(CONSENT_EXPIRED_MESSAGE, { status: 400, headers: { 'Content-Type': 'text/plain' } })
     }
     // Single-use: consumed here regardless of outcome (continue, decline, or a
     // rejected agent_id) so a replayed POST can never re-run this step.
@@ -1982,12 +2026,40 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // is visible.
       const firstName = String(form.get('first_agent_name') ?? '').trim()
 
-      const rejectSoftly = (message: string, status: 400 | 403 | 429 | 500) => {
-        // Deliberately NOT clearing the consent cookie. This is a recoverable
-        // condition on the signup funnel; destroying the session here is what
-        // turns "you mistyped a name" into "sign in again and hit the identical
-        // wall", which is the loop this flow was reported for.
+      // Put the consumed record back, for the REST of its original life and not a second longer.
+      // Called only for a refusal where bootstrapSelf created nothing, so the record was consumed
+      // for no mint: every path that mints has already consumed it and never reaches this. Returns
+      // false (record stays gone) when its expiry is unknown or under KV's 60s minimum.
+      const restorePending = async (): Promise<boolean> => {
+        const expiresAt = pending.expiresAt
+        if (typeof expiresAt !== 'number' || expiresAt - Math.floor(Date.now() / 1000) < KV_MIN_TTL_SECONDS) return false
+        try {
+          await env.SESSIONS.put(`oauth-consent:${consentNonce}`, JSON.stringify(pending), { expiration: expiresAt })
+          return true
+        } catch (err) {
+          console.error('[oauth-authorize] consent restore failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+          return false
+        }
+      }
+
+      // Recoverable: nothing was created, so the same page can be submitted again. Deliberately NOT
+      // clearing the consent cookie. This is a recoverable condition on the signup funnel; destroying
+      // the session here is what turns "you mistyped a name" into "sign in again and hit the identical
+      // wall", which is the loop this flow was reported for. If the record cannot be restored the
+      // person is told to start again, not to retry a page that would now be refused.
+      const rejectSoftly = async (what: string, retry: string, status: 400 | 403 | 429 | 500) => {
+        const restored = await restorePending()
+        const message = restored
+          ? `${what} ${retry}`
+          : `${what} This page can no longer be used, so start the connection again from your app.`
         return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+      }
+
+      // Not recoverable: the record is spent and stays spent. The cookie goes with it.
+      const rejectFinal = (message: string, status: 400 | 403) => {
+        const rejected = new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
       }
 
       // No local name check. bootstrapSelf already owns that rule (naming is its
@@ -2003,22 +2075,29 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
 
       if (!bootstrapped.ok) {
-        const explain: Record<BootstrapSelfFailure, { message: string; status: 400 | 403 | 429 | 500 }> = {
-          agent_name_required: { message: 'Give your agent a name, then continue. Nothing was created.', status: 400 },
-          not_unbound_directory_session: {
-            message: 'This connection already has an identity, so a first agent cannot be created from it. Choose an existing agent instead.',
-            status: 403,
-          },
-          rate_limited: { message: 'Too many attempts. Wait a minute and try again. Nothing was created.', status: 429 },
-          already_bootstrapped: {
-            message: 'You have already created your first agent. Go back and choose it from the list. If it is not listed, reconnect and it will be.',
-            status: 400,
-          },
-          provisioning_failed: { message: 'Creating the agent did not complete, and nothing was left behind. Try again.', status: 500 },
-        }
-        const { message, status } = explain[bootstrapped.error]
         console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
-        return rejectSoftly(message, status)
+        // Nothing was created by these four, so the page stays usable (see restorePending).
+        switch (bootstrapped.error) {
+          case 'agent_name_required':
+            return rejectSoftly('Your agent needs a name. Nothing was created.', 'Type a name and continue.', 400)
+          case 'not_unbound_directory_session':
+            return rejectSoftly(
+              'This connection already has an identity, so a first agent cannot be created from it. Nothing was created.',
+              'Choose an existing agent instead.',
+              403,
+            )
+          case 'rate_limited':
+            return rejectSoftly('Too many attempts. Nothing was created.', 'Wait a minute, then continue again.', 429)
+          case 'provisioning_failed':
+            return rejectSoftly('Creating the agent did not complete, and nothing was left behind.', 'Continue again to retry.', 500)
+          case 'already_bootstrapped':
+            // The agent exists and this page does not list it, so resubmitting this page can never
+            // succeed: not restored. Starting again renders it in the list.
+            return rejectFinal(
+              'You have already created your first agent. Start the connection again from your app and choose it from the list.',
+              400,
+            )
+        }
       }
 
       // Re-validate through the SAME gate the ordinary path uses. bootstrapSelf
@@ -2029,9 +2108,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const binding = eligible ? await resolveAgentMemberBinding(env, bootstrapped.agent.id) : null
       if (!eligible || !binding || binding.kind !== 'bound') {
         // The agent EXISTS and is theirs; only this session could not be bound to
-        // it. Say exactly that, because "sign in again" would read as failure.
-        return rejectSoftly(
-          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically — reconnect and choose it from the list.`,
+        // it. Say exactly that, because "sign in again" would read as failure. Not restored:
+        // a resubmit would only find the agent already created.
+        return rejectFinal(
+          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically, so reconnect from your app and choose it from the list.`,
           403,
         )
       }
@@ -2046,7 +2126,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
       if (!newName || !squadId) {
         const rejected = new Response(
-          'Agent name and home squad are required to mint a new agent. Please sign in again.',
+          'A new agent needs a name and a home squad. Start the connection again from your app and fill in both.',
           { status: 400, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2057,7 +2137,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const allowed = await canOnSquad(env, humanGrants, squadId, 'admin')
       if (!allowed) {
         const rejected = new Response(
-          'You do not have admin capability on the selected squad to mint a new agent.',
+          'You do not have admin access on the selected squad, so a new agent cannot be created there. Ask an org admin for access, then start the connection again from your app.',
           { status: 403, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2074,8 +2154,11 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }, { ownerMemberId: pending.memberId })
 
       if (!createRes.ok) {
+        // slug_taken is the only createAgent failure a person can fix by choosing differently.
         const rejected = new Response(
-          `Failed to create agent: ${createRes.error}. Please sign in again.`,
+          createRes.error === 'slug_taken'
+            ? 'That agent name is already taken. Start the connection again from your app, then pick a different name or choose the existing agent.'
+            : `The agent could not be created (${createRes.error}). Start the connection again from your app and check the name.`,
           { status: 400, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2092,7 +2175,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         // mupot#1961: the agent was deactivated between creation and the mint batch; nothing landed.
         if (!(err instanceof AgentInactiveError)) throw err
         const rejected = new Response(
-          'The new agent is no longer active, so no connection key was issued. Please sign in again.',
+          'The new agent is no longer active, so no connection key was issued. Start the connection again from your app.',
           { status: 409, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2123,7 +2206,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const binding = await resolveAgentMemberBinding(env, agentIdRaw)
       if (binding.kind !== 'bound') {
         const rejected = new Response(
-          'The selected agent is no longer available for this connection. Please sign in again.',
+          'The selected agent is no longer available for this connection. Start the connection again from your app and choose another.',
           { status: 403, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2185,14 +2268,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // mupot#1961: the agent was deactivated after the eligibility check; no credential exists.
       if (err instanceof AgentInactiveError) {
         const rejected = new Response(
-          'The selected agent is no longer active, so no connection key was issued. Please sign in again.',
+          'The selected agent is no longer active, so no connection key was issued. Start the connection again from your app and choose another.',
           { status: 409, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
         return rejected
       }
       console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
-      return new Response('Token mint failed', { status: 500 })
+      return new Response('The connection key could not be issued. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 
     // mupot#1551 round 2 (adversarial gate P0): mint time is exactly when this
@@ -2323,7 +2406,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       redirectTo = result.redirectTo
     } catch (err) {
       console.error('[oauth-authorize] completeAuthorization failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
-      return new Response('OAuth completion failed', { status: 500 })
+      return new Response('The connection could not be completed. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const finalResponse = Response.redirect(redirectTo, 302)
