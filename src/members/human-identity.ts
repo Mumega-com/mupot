@@ -13,7 +13,7 @@ import {
 export { OWNER_LOGIN_EMAILS_KEY }
 
 /**
- * mupot#1551 round 2 (P0): thrown by findOrCreateHumanMember instead of
+ * mupot#1551 round 2 (P0): thrown by findOrCreateHumanMemberDetailed instead of
  * silently inserting a duplicate member when resolveHumanMemberForAttach
  * returns `denied`/`ambiguous`. Callers that can offer the human a distinct
  * HTTP response (409/403) should catch this specifically; anything else
@@ -29,6 +29,22 @@ export class MemberAttachDeniedError extends Error {
   }
 }
 
+/**
+ * Thrown by findOrCreateHumanMemberDetailed when its required `beforeCreate` guard refuses a NEW member. Nothing has been
+ * written at that point: the guard runs after every resolve branch said `not_found` and before the members INSERT.
+ */
+export class NewMemberRefusedError extends Error {
+  readonly retryAfter: number
+  constructor(retryAfter: number) {
+    super('new member creation refused by the pre-create guard')
+    this.name = 'NewMemberRefusedError'
+    this.retryAfter = retryAfter
+  }
+}
+
+/** Runs immediately before the members INSERT, only when no existing member was found. `allowed: false` aborts the create. */
+export type BeforeCreateGuard = () => Promise<{ allowed: boolean; retryAfter: number }>
+
 export async function resolveVerifiedHumanMemberId(
   env: Env,
   email: string,
@@ -42,21 +58,18 @@ export async function resolveVerifiedHumanMemberId(
   })
 }
 
-export async function findOrCreateHumanMember(
-  env: Env,
-  email: string,
-  displayName: string,
-  loginIdentity?: { provider: string; subject: string },
-): Promise<string> {
-  return (await findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)).id
-}
-
-/** Same as findOrCreateHumanMember, and says whether THIS call created the row (mupot#1022: the consent screen tells a
- *  member once, in-band, that this sign-in just made a new, empty member). */
+/** Find the human's member row or create one, and say whether THIS call created it (mupot#1022: the consent screen tells a
+ *  member once, in-band, that this sign-in just made a new, empty member).
+ *
+ *  `beforeCreate` is REQUIRED (a type error to omit) so a caller cannot get unmetered creation by accident. It guards only
+ *  the INSERT made by THIS function; other code paths write members rows (invites, Telegram, bootstrap) and are not
+ *  covered by it. The OAuth callback is the only production caller. The old no-guard wrapper `findOrCreateHumanMember`
+ *  was removed for that reason; tests use tests/helpers/find-or-create-human-member.ts. */
 export async function findOrCreateHumanMemberDetailed(
   env: Env,
   email: string,
   displayName: string,
+  beforeCreate: BeforeCreateGuard,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; created: boolean }> {
   const result = await resolveHumanMemberForAttach(env, {
@@ -85,7 +98,11 @@ export async function findOrCreateHumanMemberDetailed(
       'normalized email matches more than one member',
     )
   }
-  // result.kind === 'not_found' — create as today.
+  // result.kind === 'not_found' — create as today, unless the guard refuses. This is the only INSERT in THIS function,
+  // so the guard sees exactly this function's creations: resolved/denied/ambiguous returned or threw above without it.
+  // (Other code paths write members rows too; they are not metered here.)
+  const guard = await beforeCreate()
+  if (!guard.allowed) throw new NewMemberRefusedError(guard.retryAfter)
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(

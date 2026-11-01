@@ -43,7 +43,8 @@ import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
-import { MemberAttachDeniedError } from '../members/human-identity'
+import { ipRateLimitKey } from '../agents/seat-events'
+import { MemberAttachDeniedError, NewMemberRefusedError, type BeforeCreateGuard } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
@@ -160,16 +161,17 @@ async function findOrCreateMember(
   env: Env,
   email: string,
   displayName: string,
+  beforeCreate: BeforeCreateGuard,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; created: boolean }> {
   const { findOrCreateHumanMemberDetailed } = await import('../members/human-identity')
-  return findOrCreateHumanMemberDetailed(env, email, displayName, loginIdentity)
+  return findOrCreateHumanMemberDetailed(env, email, displayName, beforeCreate, loginIdentity)
 }
 
 // ── Token mint for OAuth seat ─────────────────────────────────────────────────
 // Mints a member_tokens row for the OAuth seat.
 // channel='directory' always — this is what marks the row as issued through the
-// public OAuth door (rate-limited registration, consent record) regardless of which
+// public OAuth door (new-member-limited registration, consent record) regardless of which
 // member it belongs to. agentId=NULL by default (pure human/operator principal, C6
 // zero capabilities — unchanged default behaviour); memberId is then the human's own
 // member row, exactly as before mupot#903b.
@@ -1566,27 +1568,40 @@ async function buildAuthContextFromPropsInner(
 }
 
 // ── B2: Per-IP rate limiter for the OAuth registration path ───────────────────
-// findOrCreateMember is reachable by ANY verified Google account — it writes a
-// members row + member_tokens row. Without a guard an attacker can spam the
-// callback to exhaust D1 write budget and pollute the member roster.
+// findOrCreateMember is reachable by ANY verified Google account — it can write a
+// members row. Without a guard an attacker can spam the callback to exhaust D1
+// write budget and pollute the member roster.
 //
 // Strategy: KV counter in SESSIONS namespace, key = `oauth-reg-rl:<ip>`.
-// Window: 5 mints per hour per IP. On exceed: 429 + Retry-After: 3600.
+// Window: 5 NEW members per hour per IP. On exceed: 429 + Retry-After: 3600.
+// It is passed to findOrCreateMember as the pre-create guard, so it runs only
+// when no existing member was found, immediately before the members INSERT:
+// an existing member's sign-in is neither refused nor counted, and a refused
+// sign-in writes nothing. A team behind one NAT is not locked out by its own
+// members signing in.
 // Fail-open on KV errors (network faults must not lock out legitimate users).
+//
+// LIMITS, stated plainly:
+//  - The counter is NOT atomic: KV has no increment, so this is get-then-put and parallel first-time callbacks from
+//    one IP can all read the same count and all pass. It bounds a sequential flood, not a concurrent burst.
+//  - The key is the client IP, bucketed to the /64 for IPv6 (ipRateLimitKey); an attacker with many /64s or many
+//    IPv4 addresses gets a fresh budget each.
+//  - It meters member-row creation in findOrCreateHumanMemberDetailed ONLY. member_tokens minting at the consent
+//    POST is no longer bounded by it (existing members mint freely), and other member-writing paths are not covered.
 const OAUTH_REG_RL_MAX = 5
 const OAUTH_REG_RL_TTL = 3600 // seconds (1 hour)
 
 async function checkOAuthRegRateLimit(env: Env, ip: string): Promise<{ allowed: boolean; retryAfter: number }> {
-  const key = `oauth-reg-rl:${ip}`
+  const key = `oauth-reg-rl:${ipRateLimitKey(ip)}`
   try {
     const raw = await env.SESSIONS.get(key)
     const count = raw !== null ? parseInt(raw, 10) : 0
     if (count >= OAUTH_REG_RL_MAX) {
-      // KV TTL is set to OAUTH_REG_RL_TTL on first write; we conservatively return
+      // The KV TTL is (re-)set to OAUTH_REG_RL_TTL on every increment; we conservatively return
       // the full window as Retry-After (no need to track exact expiry in the value).
       return { allowed: false, retryAfter: OAUTH_REG_RL_TTL }
     }
-    // Increment; (re-)set TTL on every increment so the window rolls from first use.
+    // Increment; the TTL is re-set on EVERY increment, so the window restarts at the latest creation (not first use).
     await env.SESSIONS.put(key, String(count + 1), { expirationTtl: OAUTH_REG_RL_TTL })
     return { allowed: true, retryAfter: 0 }
   } catch {
@@ -1760,33 +1775,31 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
     }
 
-    // B2: per-IP rate limit on member mint. The CF-Connecting-IP header is set by
-    // Cloudflare on every inbound Worker request; fall back to 'unknown' if absent
-    // (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
+    // B2: per-IP rate limit on NEW member creation only (checkOAuthRegRateLimit, passed below as the pre-create
+    // guard). The CF-Connecting-IP header is set by Cloudflare on every inbound Worker request; fall back to
+    // 'unknown' if absent (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
     const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
-    const rl = await checkOAuthRegRateLimit(env, ip)
-    if (!rl.allowed) {
-      return new Response('Too many OAuth registrations from this IP. Please try again later.', {
-        status: 429,
-        headers: {
-          'Retry-After': String(rl.retryAfter),
-          'Content-Type': 'text/plain',
-        },
-      })
-    }
 
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     // mupot#1022: true only when THIS login created the member row, so the consent screen can say so once, in-band.
     let memberJustCreated = false
     try {
-      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, {
+      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, () => checkOAuthRegRateLimit(env, ip), {
         provider: 'google',
         subject: googleUser.id,
       })
       memberId = found.id
       memberJustCreated = found.created
     } catch (err) {
+      // B2: the guard refused a NEW member before any row was written.
+      if (err instanceof NewMemberRefusedError) {
+        return new Response(
+          'Too many new accounts have been created from this network recently, so we cannot create another one right now. '
+            + 'Start the connection again from your app in an hour, or ask an org admin to invite you.',
+          { status: 429, headers: { 'Retry-After': String(err.retryAfter), 'Content-Type': 'text/plain' } },
+        )
+      }
       // mupot#1551 round 2 (P0): a denial/ambiguity is NOT the same failure
       // as a D1 outage — it means this email's member row is legitimately
       // someone else's (or ambiguous) and must never silently become a
@@ -1959,7 +1972,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // fired on 6 of this suite's tests before this fix). So a consent-bound session
     // mints under the AGENT's OWN member row — exactly the identity mint_agent_token
     // already uses for workspace-channel tokens — with channel staying 'directory' to
-    // preserve OAuth-door provenance (rate-limited registration, this consent record).
+    // preserve OAuth-door provenance (new-member-limited registration, this consent record).
     // capabilities still resolve correctly: resolveConsentedAgentCapabilities (below,
     // called from buildAuthContextFromProps) re-derives the SAME member id from
     // agent_member_bindings independently of what got minted here, so it stays the
