@@ -724,7 +724,7 @@ const REDIRECT_HOST_TAIL = 200
 // Characters that move, reorder or hide text, or render as nothing: C0/C1 controls, soft hyphen, combining grapheme
 // joiner, Arabic letter mark, zero-width and bidi marks/overrides/isolates, word joiner and invisible operators,
 // Hangul filler, variation selector 16 and the BOM. One list, written with escapes so it cannot be silently edited away.
-const INVISIBLE_CHARS = /[\u0000-\u001F\u007F-\u009F­͏؜​-‏‪-‮⁠-⁩ㅤ️﻿]/g
+const INVISIBLE_CHARS = /[\u0000-\u001F\u007F-\u009F\u00AD\u034F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\u3164\uFE0F\uFEFF]/g
 
 /** Drop invisible characters, collapse whitespace, bound visibly. A name that is only such characters comes back empty. */
 function displayName(raw: unknown): string {
