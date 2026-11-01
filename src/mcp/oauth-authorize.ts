@@ -29,7 +29,7 @@ import { CHAT_CONSENT_LABEL, BACKGROUND_CONSENT_LABEL, suggestedConnectMode, typ
 import { backgroundAgentHumanClause, backgroundAgentIdsForHuman, backgroundAgentConsentPolicy, suggestedBackgroundAgent } from './background-agent-consent'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, resolveCapabilitiesForMembers, canOnSquad, hasCapability, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, brandSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank, type SquadScope } from '../auth/capability'
-import { bootstrapSelf, findExistingBootstrap } from '../members/bootstrap-self'
+import { bootstrapSelf, findExistingBootstrap, validateBootstrapAgentName } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
   highestCapability,
@@ -924,7 +924,7 @@ function renderConsentPage(
 
   const firstAgentPanel = canOfferFirstAgent ? `
         <label class="agent-option first-run">
-          <input type="radio" name="agent_id" value="__bootstrap__" required data-label="your first agent" data-top="member on its own squad">
+          <input type="radio" name="agent_id" value="__bootstrap__" required data-first-agent data-label="your first agent" data-top="member on its own squad">
           <div class="opt-body">
             <div class="agent-title"><strong>Name your first agent</strong></div>
             <div class="agent-meta">This creates your workspace and an agent you own. It becomes a member of its own squad, and you administer that squad.</div>
@@ -1241,10 +1241,21 @@ ${mintPanel}
   // one, is what enforces explicit consent.
   form.addEventListener('submit', function (e) {
     var action = (e.submitter && e.submitter.value) || 'continue'
-    if (action !== 'decline' && !form.querySelector('input[name="agent_id"]:checked')) {
+    var picked = form.querySelector('input[name="agent_id"]:checked')
+    if (action !== 'decline' && !picked) {
       e.preventDefault()
       summary.classList.remove('danger')
       summaryText.textContent = 'Choose an option before continuing.'
+      return
+    }
+    // Naming the first agent is required. Checked here so a blank name never leaves the page; the
+    // server refuses it too (no-JS or tampered posts) before it consumes anything.
+    var firstName = form.querySelector('input[name="first_agent_name"]')
+    if (action !== 'decline' && picked && picked.hasAttribute('data-first-agent') && firstName && !firstName.value.trim()) {
+      e.preventDefault()
+      summary.classList.remove('danger')
+      summaryText.textContent = 'Give your first agent a name before continuing.'
+      firstName.focus()
       return
     }
     // One submit per page, Continue and Decline alike: a second click would post a nonce the
@@ -1255,6 +1266,13 @@ ${mintPanel}
     // consumes the consent record and stays authoritative.
     if (submitted) { e.preventDefault(); return }
     submitted = true
+    // Visible proof the click registered, so a second click does not look like a dead button.
+    // After a Stop the page stays and pageshow does not fire, so the flag also times out: if the
+    // page is still here after 10s the person can try again (a retry of a post that did land just
+    // gets the server's "already used" message).
+    summary.classList.remove('danger')
+    summaryText.textContent = 'Working on it...'
+    setTimeout(function () { submitted = false; updateSummary() }, 10000)
   })
   // Back from bfcache restores this page with the flag still set; the person is back on a live form.
   window.addEventListener('pageshow', function () { submitted = false })
@@ -1651,14 +1669,7 @@ interface PendingConsent {
    *  consent step in between (mupot#903b must not perturb pre-existing behaviour
    *  for the unbound path). */
   googleUserId: string
-  /** Absolute KV expiry (epoch seconds) of this record. Lets a recoverable first-agent refusal put
-   *  the record back for the REST of its original life, never a fresh 10 minutes. Absent on a record
-   *  written before this field existed: such a record is simply not restored. */
-  expiresAt?: number
 }
-
-// Workers KV rejects an expiration less than 60s away.
-const KV_MIN_TTL_SECONDS = 60
 
 // Refusals on /oauth/consent. Each is one sentence plus a next step; the person is on a dead or
 // consumed page, so the next step is always to start again from their app, never "sign in again".
@@ -1756,7 +1767,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // not originate from the browser that initiated /authorize.
     const cookieHeader = request.headers.get('Cookie') ?? ''
     if (!hasNonceCookie(cookieHeader, CSRF_COOKIE_NAME, state)) {
-      return new Response('CSRF check failed: nonce mismatch', { status: 403 })
+      // Reached by Back or reload after the flow already ran: refused, nothing changes.
+      return new Response('This sign-in page was already used or came from a different browser. Start the connection again from your app.', { status: 403, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const stored = await env.SESSIONS.get(`oauth-req:${state}`, 'json') as Record<string, unknown> | null
@@ -1839,9 +1851,6 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const consentNonce = crypto.randomUUID()
     const pending: PendingConsent = {
       stored, memberId, email: googleUser.email, googleUserId: googleUser.id,
-      // Computed BEFORE the put, so the real KV expiry is never earlier than this and a restore
-      // that uses it can only ever end sooner.
-      expiresAt: Math.floor(Date.now() / 1000) + CONSENT_TTL_SECONDS,
     }
     await env.SESSIONS.put(
       `oauth-consent:${consentNonce}`,
@@ -1961,6 +1970,23 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     if (!pending) {
       return new Response(CONSENT_EXPIRED_MESSAGE, { status: 400, headers: { 'Content-Type': 'text/plain' } })
     }
+    // A first-agent name that bootstrapSelf would refuse is refused HERE, before anything is
+    // consumed: no KV write or delete, so the person can fix the name on the same page. Same rule
+    // as bootstrapSelf (one shared validator). The record is NEVER written back after it is
+    // consumed — a put after a delete would let a refusing post re-open a nonce that a concurrent
+    // post already spent.
+    if (action === 'continue' && agentIdRaw === '__bootstrap__') {
+      const nameCheck = validateBootstrapAgentName(form.get('first_agent_name'))
+      if (!nameCheck.ok) {
+        return new Response(
+          nameCheck.reason === 'blank'
+            ? 'Your agent needs a name, and none was sent. Go back to the previous page and type a name; if that does not work, start the connection again from your app.'
+            : 'That agent name is longer than 128 characters. Go back to the previous page and shorten it; if that does not work, start the connection again from your app.',
+          { status: 400, headers: { 'Content-Type': 'text/plain' } },
+        )
+      }
+    }
+
     // Single-use: consumed here regardless of outcome (continue, decline, or a
     // rejected agent_id) so a replayed POST can never re-run this step.
     await env.SESSIONS.delete(`oauth-consent:${consentNonce}`)
@@ -2026,47 +2052,18 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // is visible.
       const firstName = String(form.get('first_agent_name') ?? '').trim()
 
-      // Put the consumed record back, for the REST of its original life and not a second longer.
-      // Called only for a refusal where bootstrapSelf created nothing, so the record was consumed
-      // for no mint: every path that mints has already consumed it and never reaches this. Returns
-      // false (record stays gone) when its expiry is unknown or under KV's 60s minimum.
-      const restorePending = async (): Promise<boolean> => {
-        const expiresAt = pending.expiresAt
-        if (typeof expiresAt !== 'number' || expiresAt - Math.floor(Date.now() / 1000) < KV_MIN_TTL_SECONDS) return false
-        try {
-          await env.SESSIONS.put(`oauth-consent:${consentNonce}`, JSON.stringify(pending), { expiration: expiresAt })
-          return true
-        } catch (err) {
-          console.error('[oauth-authorize] consent restore failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
-          return false
-        }
-      }
-
-      // Recoverable: nothing was created, so the same page can be submitted again. Deliberately NOT
-      // clearing the consent cookie. This is a recoverable condition on the signup funnel; destroying
-      // the session here is what turns "you mistyped a name" into "sign in again and hit the identical
-      // wall", which is the loop this flow was reported for. If the record cannot be restored the
-      // person is told to start again, not to retry a page that would now be refused.
-      const rejectSoftly = async (what: string, retry: string, status: 400 | 403 | 429 | 500) => {
-        const restored = await restorePending()
-        const message = restored
-          ? `${what} ${retry}`
-          : `${what} This page can no longer be used, so start the connection again from your app.`
-        return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
-      }
-
-      // Not recoverable: the record is spent and stays spent. The cookie goes with it.
-      const rejectFinal = (message: string, status: 400 | 403) => {
-        const rejected = new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+      // Every refusal below is final: the record is spent and the cookie is cleared. A consumed
+      // record is never written back (see the name check above), so the next step is always to
+      // start again from the app — the person is on a page with no form left to resubmit.
+      const rejectFinal = (message: string, status: 400 | 403 | 429 | 500, extra?: Record<string, string>) => {
+        const rejected = new Response(message, { status, headers: { 'Content-Type': 'text/plain', ...extra } })
         rejected.headers.set('Set-Cookie', clearConsentCookie)
         return rejected
       }
 
-      // No local name check. bootstrapSelf already owns that rule (naming is its
-      // condition 1) and returns agent_name_required, which is mapped below. A
-      // second copy of the same predicate here was redundant and untested — a
-      // mutation deleting it changed nothing, which is exactly how two copies of
-      // one rule drift apart later.
+      // The name rule is NOT copied here: validateBootstrapAgentName (shared with bootstrapSelf)
+      // ran before the record was consumed. bootstrapSelf still re-checks it and returns
+      // agent_name_required, mapped below, as defence in depth.
 
       const bootstrapped = await bootstrapSelf(
         env,
@@ -2076,25 +2073,35 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
       if (!bootstrapped.ok) {
         console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
-        // Nothing was created by these four, so the page stays usable (see restorePending).
         switch (bootstrapped.error) {
           case 'agent_name_required':
-            return rejectSoftly('Your agent needs a name. Nothing was created.', 'Type a name and continue.', 400)
+            // Unreachable in practice: the shared validator refused a bad name before consuming.
+            return rejectFinal('Your agent needs a name. Start the connection again from your app and name it.', 400)
           case 'not_unbound_directory_session':
-            return rejectSoftly(
-              'This connection already has an identity, so a first agent cannot be created from it. Nothing was created.',
-              'Choose an existing agent instead.',
-              403,
-            )
-          case 'rate_limited':
-            return rejectSoftly('Too many attempts. Nothing was created.', 'Wait a minute, then continue again.', 429)
-          case 'provisioning_failed':
-            return rejectSoftly('Creating the agent did not complete, and nothing was left behind.', 'Continue again to retry.', 500)
-          case 'already_bootstrapped':
-            // The agent exists and this page does not list it, so resubmitting this page can never
-            // succeed: not restored. Starting again renders it in the list.
+            // Unreachable here (this branch always passes an unbound directory session).
+            return rejectFinal('This connection already has an identity, so a first agent cannot be created from it. Start the connection again from your app and choose an existing agent.', 403)
+          case 'rate_limited': {
+            const detail = bootstrapped.detail as { retry_after_seconds?: unknown } | undefined
+            const seconds = typeof detail?.retry_after_seconds === 'number' && detail.retry_after_seconds > 0
+              ? Math.ceil(detail.retry_after_seconds)
+              : 3600
+            const minutes = Math.ceil(seconds / 60)
+            const wait = minutes >= 60 ? `about ${Math.ceil(minutes / 60)} hour${minutes > 60 ? 's' : ''}` : `about ${minutes} minute${minutes === 1 ? '' : 's'}`
             return rejectFinal(
-              'You have already created your first agent. Start the connection again from your app and choose it from the list.',
+              `Too many first-agent attempts. Nothing was created. Wait ${wait}, then start the connection again from your app.`,
+              429,
+              { 'Retry-After': String(seconds) },
+            )
+          }
+          case 'provisioning_failed':
+            // Not "nothing was left behind": a race or a committed batch can leave the agent made.
+            return rejectFinal(
+              'Creating the agent may not have completed. If your app already shows the connection working, there is nothing more to do; otherwise start the connection again from your app.',
+              500,
+            )
+          case 'already_bootstrapped':
+            return rejectFinal(
+              'You have already created your first agent. Start the connection again from your app and look for it in the list; if it is not there, ask an org admin to give you access to it.',
               400,
             )
         }
@@ -2108,8 +2115,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const binding = eligible ? await resolveAgentMemberBinding(env, bootstrapped.agent.id) : null
       if (!eligible || !binding || binding.kind !== 'bound') {
         // The agent EXISTS and is theirs; only this session could not be bound to
-        // it. Say exactly that, because "sign in again" would read as failure. Not restored:
-        // a resubmit would only find the agent already created.
+        // it. Say exactly that, because "sign in again" would read as failure.
         return rejectFinal(
           `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically, so reconnect from your app and choose it from the list.`,
           403,
@@ -2154,11 +2160,18 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }, { ownerMemberId: pending.memberId })
 
       if (!createRes.ok) {
-        // slug_taken is the only createAgent failure a person can fix by choosing differently.
+        // One true next step per createAgent error code; none of them blames the name unless the
+        // name is what failed. The generic case never prints the raw code.
+        const MINT_NEW_STEPS: Record<string, string> = {
+          slug_taken: 'That agent name is already taken. Start the connection again from your app, then pick a different name or choose the existing agent.',
+          agent_limit_reached: 'This organisation has reached its agent limit, so a new agent cannot be created. Ask an org admin to free a slot or raise the limit, then start the connection again from your app.',
+          invalid_purpose: 'The purpose text for the new agent was not accepted. Start the connection again from your app and shorten or simplify it.',
+          invalid_name: 'The agent name was not accepted. Start the connection again from your app and use a different name.',
+          invalid_slug: 'The agent name could not be turned into a valid short name. Start the connection again from your app and use letters and numbers.',
+        }
         const rejected = new Response(
-          createRes.error === 'slug_taken'
-            ? 'That agent name is already taken. Start the connection again from your app, then pick a different name or choose the existing agent.'
-            : `The agent could not be created (${createRes.error}). Start the connection again from your app and check the name.`,
+          MINT_NEW_STEPS[createRes.error]
+            ?? 'The agent could not be created. Start the connection again from your app; if it keeps failing, ask an org admin.',
           { status: 400, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)

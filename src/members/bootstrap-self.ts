@@ -544,6 +544,22 @@ async function findSquadBySlug(env: Env, departmentId: string, slug: string): Pr
     .first<Squad>()
 }
 
+export const BOOTSTRAP_AGENT_NAME_MAX = 128
+
+export type BootstrapAgentNameCheck = { ok: true; name: string } | { ok: false; reason: 'blank' | 'too_long' }
+
+/**
+ * The ONE rule for the first agent's name (condition 1: naming is required). bootstrapSelf applies it
+ * and /oauth/consent applies it before it consumes a consent record, so a mistyped name is refused
+ * without spending anything. No write, no side effect.
+ */
+export function validateBootstrapAgentName(agentNameArg: unknown): BootstrapAgentNameCheck {
+  const name = typeof agentNameArg === 'string' ? agentNameArg.trim() : ''
+  if (!name) return { ok: false, reason: 'blank' }
+  if (name.length > BOOTSTRAP_AGENT_NAME_MAX) return { ok: false, reason: 'too_long' }
+  return { ok: true, name }
+}
+
 export interface BootstrapSelfDeps {
   createDepartment: typeof createDepartment
   createSquad: typeof createSquad
@@ -588,11 +604,13 @@ export async function bootstrapSelf(
 
   // Condition 1 — agent_name is REQUIRED. Naming is the witness act; there is
   // no silent auto-create and no defaulted name.
-  const agentName = typeof agentNameArg === 'string' ? agentNameArg.trim() : ''
-  if (!agentName) return { ok: false, error: 'agent_name_required' }
-  if (agentName.length > 128) {
-    return { ok: false, error: 'agent_name_required', detail: 'agent_name must be 128 characters or fewer' }
+  const nameCheck = validateBootstrapAgentName(agentNameArg)
+  if (!nameCheck.ok) {
+    return nameCheck.reason === 'blank'
+      ? { ok: false, error: 'agent_name_required' }
+      : { ok: false, error: 'agent_name_required', detail: 'agent_name must be 128 characters or fewer' }
   }
+  const agentName = nameCheck.name
 
   // Per-member attempt throttle (adversarial review LOW-1) — runs BEFORE the
   // already-bootstrapped pre-check, not after. Before this reorder, a member

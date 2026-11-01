@@ -214,129 +214,230 @@ describe('the missing-cookie refusal tells the person what happened, and still r
   })
 })
 
-describe('a first-agent mistake that created nothing leaves the page usable, for the rest of its original life', () => {
+describe('a bad first-agent name is refused BEFORE the record is consumed (no write at all)', () => {
   const bootstrap = (nonce: string, name: string) =>
     post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: name }, cookieFor(nonce))
+  const BLANK = 'Your agent needs a name, and none was sent. Go back to the previous page and type a name; if that does not work, start the connection again from your app.'
+  const LONG = 'That agent name is longer than 128 characters. Go back to the previous page and shorten it; if that does not work, start the connection again from your app.'
 
-  it('blank name: refused, nothing created, cookie kept; corrected retry on the same nonce+cookie succeeds exactly once; a replay is refused', async () => {
+  it.each([['blank', '   ', BLANK], ['over 128', 'x'.repeat(129), LONG]])(
+    '%s name: 400, record untouched with no delete or put, cookie kept; corrected post on the same nonce+cookie succeeds exactly once; replay refused',
+    async (_label, bad, message) => {
+      const { nonce } = await reachConsentScreen()
+      const agentsBefore = count('agents')
+      kv._calls.length = 0
+
+      const refused = await bootstrap(nonce, bad)
+      expect(refused.status).toBe(400)
+      expect(await refused.text()).toBe(message)
+      expect(refused.headers.get('Set-Cookie')).toBeNull()
+      expect(kv._calls.filter((c) => c.op !== 'get')).toEqual([]) // not one write or delete
+      expect(kv._store.has(pendingKey(nonce))).toBe(true)
+      expect(count('agents')).toBe(agentsBefore)
+      expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+
+      const ok = await bootstrap(nonce, 'Ada')
+      expect(ok.status).toBe(302)
+      expect(count('agents')).toBe(agentsBefore + 1)
+      expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+      const tokens = count('member_tokens')
+
+      for (const cookie of [cookieFor(nonce), null]) {
+        const replay = await post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada' }, cookie)
+        expect(replay.status).toBe(400)
+        expect(await replay.text()).toBe(EXPIRED)
+      }
+      expect(count('agents')).toBe(agentsBefore + 1)
+      expect(count('member_tokens')).toBe(tokens)
+      expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('exactly 128 characters is accepted (boundary)', async () => {
+    const { nonce } = await reachConsentScreen()
+    expect((await bootstrap(nonce, 'y'.repeat(128))).status).toBe(302)
+  })
+
+  it('a decline with a blank first-agent name is still just a decline (consumed, 200)', async () => {
+    const { nonce } = await reachConsentScreen()
+    const res = await post({ consent_nonce: nonce, action: 'decline', agent_id: '__bootstrap__', first_agent_name: '' }, cookieFor(nonce))
+    expect(res.status).toBe(200)
+    expect(kv._store.has(pendingKey(nonce))).toBe(false)
+  })
+})
+
+describe('every bootstrapSelf refusal is final: consumed, cookie cleared, a true next step', () => {
+  const bootstrap = (nonce: string, name: string) =>
+    post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: name }, cookieFor(nonce))
+  const memberIdOf = (email: string) => (harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(email) as { id: string }).id
+
+  function expectSpent(res: Response, nonce: string) {
+    expect(res.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0')
+    expect(kv._store.has(pendingKey(nonce))).toBe(false)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  }
+
+  it('provisioning_failed: 500, may-not-have-completed wording (never "nothing was left behind"), no put of the record', async () => {
     const { nonce } = await reachConsentScreen()
     const agentsBefore = count('agents')
+    harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('squat', 'dept-home-${memberIdOf(NEWCOMER)}', 'Squat', 'work')`)
+    kv._calls.length = 0
 
-    const refused = await bootstrap(nonce, '   ')
-    expect(refused.status).toBe(400)
-    expect(await refused.text()).toBe('Your agent needs a name. Nothing was created. Type a name and continue.')
-    expect(refused.headers.get('Set-Cookie') ?? '').not.toContain('Max-Age=0')
+    const res = await bootstrap(nonce, 'Ada')
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(text).toBe('Creating the agent may not have completed. If your app already shows the connection working, there is nothing more to do; otherwise start the connection again from your app.')
+    expect(text).not.toContain('left behind')
+    expectSpent(res, nonce)
     expect(count('agents')).toBe(agentsBefore)
-    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
-    // The record is back.
-    expect(kv._store.has(pendingKey(nonce))).toBe(true)
+    expect(kv._calls.filter((c) => c.op === 'put' && c.key === pendingKey(nonce))).toEqual([])
 
-    const ok = await bootstrap(nonce, 'Ada')
-    expect(ok.status).toBe(302)
-    expect(count('agents')).toBe(agentsBefore + 1)
-    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
-    const tokens = count('member_tokens')
-
-    // Replay of the successful post (with and without cookie): refused, nothing runs again.
-    for (const cookie of [cookieFor(nonce), null]) {
-      const replay = await post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada' }, cookie)
-      expect(replay.status).toBe(400)
-      expect(await replay.text()).toBe(EXPIRED)
-    }
-    expect(count('agents')).toBe(agentsBefore + 1)
-    expect(count('member_tokens')).toBe(tokens)
-    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+    // Fixing the cause does not reopen the page.
+    harness.sqlite.exec(`DELETE FROM departments WHERE id = 'squat'`)
+    const retry = await bootstrap(nonce, 'Ada')
+    expect(retry.status).toBe(400)
+    expect(await retry.text()).toBe(EXPIRED)
+    expect(count('agents')).toBe(agentsBefore)
   })
 
-  it('the restored record keeps its ORIGINAL expiry: same absolute expiration, never a fresh 10 minutes', async () => {
+  it('rate_limited: 429, Retry-After from detail.retry_after_seconds (3600), about-an-hour wording, final', async () => {
     const { nonce } = await reachConsentScreen()
-    const original = JSON.parse(kv._store.get(pendingKey(nonce))!) as { expiresAt: number }
-    const firstPut = kv._calls.find((c) => c.op === 'put' && c.key === pendingKey(nonce))!
-    expect(firstPut.options).toEqual({ expirationTtl: 600 })
-
-    // Three minutes later the person submits a blank name.
-    vi.useFakeTimers({ toFake: ['Date'] })
-    try {
-      vi.setSystemTime(new Date((original.expiresAt - 420) * 1000))
-      await bootstrap(nonce, '')
-    } finally {
-      vi.useRealTimers()
-    }
-    const restore = kv._calls.filter((c) => c.op === 'put' && c.key === pendingKey(nonce)).at(-1)!
-    expect(restore.options).toEqual({ expiration: original.expiresAt })
-    expect((JSON.parse(kv._store.get(pendingKey(nonce))!) as { expiresAt: number }).expiresAt).toBe(original.expiresAt)
+    kv._store.set(`bootstrap-self-rl:${memberIdOf(NEWCOMER)}`, '5')
+    const res = await bootstrap(nonce, 'Ada')
+    expect(res.status).toBe(429)
+    expect(res.headers.get('Retry-After')).toBe('3600')
+    expect(await res.text()).toBe('Too many first-agent attempts. Nothing was created. Wait about 1 hour, then start the connection again from your app.')
+    expectSpent(res, nonce)
+    expect(count('agents')).toBe(0)
   })
 
-  it('under 60s of life left (KV minimum): not restored, and the person is told to start again instead of retrying', async () => {
-    const { nonce } = await reachConsentScreen()
-    const original = JSON.parse(kv._store.get(pendingKey(nonce))!) as { expiresAt: number }
-    vi.useFakeTimers({ toFake: ['Date'] })
-    let res: Response
-    try {
-      vi.setSystemTime(new Date((original.expiresAt - 30) * 1000))
-      res = await bootstrap(nonce, '')
-    } finally {
-      vi.useRealTimers()
-    }
-    expect(res.status).toBe(400)
-    expect(await res.text()).toBe('Your agent needs a name. Nothing was created. This page can no longer be used, so start the connection again from your app.')
-    expect(kv._store.has(pendingKey(nonce))).toBe(false)
-  })
-
-  it('a record written before expiresAt existed is never restored (fail closed)', async () => {
-    const { nonce } = await reachConsentScreen()
-    const legacy = JSON.parse(kv._store.get(pendingKey(nonce))!) as Record<string, unknown>
-    delete legacy.expiresAt
-    kv._store.set(pendingKey(nonce), JSON.stringify(legacy))
-    const res = await bootstrap(nonce, '')
-    expect(res.status).toBe(400)
-    expect(await res.text()).toContain('This page can no longer be used')
-    expect(kv._store.has(pendingKey(nonce))).toBe(false)
-  })
-
-  it('already_bootstrapped is final: record stays consumed, cookie cleared, message says what to do', async () => {
+  it('already_bootstrapped: 400, hedged wording with the org-admin fallback, final', async () => {
     const first = await reachConsentScreen()
     expect((await bootstrap(first.nonce, 'Ada')).status).toBe(302)
+    oauthProvider.completeAuthorization.mockClear()
 
     const second = await reachConsentScreen()
     const res = await bootstrap(second.nonce, 'Bob')
     expect(res.status).toBe(400)
-    expect(await res.text()).toBe('You have already created your first agent. Start the connection again from your app and choose it from the list.')
-    expect(kv._store.has(pendingKey(second.nonce))).toBe(false)
-    expect(res.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0')
+    expect(await res.text()).toBe('You have already created your first agent. Start the connection again from your app and look for it in the list; if it is not there, ask an org admin to give you access to it.')
+    expectSpent(res, second.nonce)
     expect(count('agents')).toBe(1)
-  })
-
-  it('provisioning_failed is recoverable: nothing created, record restored, then the same page succeeds', async () => {
-    const { nonce } = await reachConsentScreen()
-    const agentsBefore = count('agents')
-    // Make provisioning fail without creating anything: a work-kind department squatting the home slug.
-    const memberId = (harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(NEWCOMER) as { id: string }).id
-    harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('squat', 'dept-home-${memberId}', 'Squat', 'work')`)
-
-    const res = await bootstrap(nonce, 'Ada')
-    expect(res.status).toBe(500)
-    expect(await res.text()).toBe('Creating the agent did not complete, and nothing was left behind. Continue again to retry.')
-    expect(count('agents')).toBe(agentsBefore)
-    expect(kv._store.has(pendingKey(nonce))).toBe(true)
-    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
-
-    // Clear the squatter: the same page now succeeds.
-    harness.sqlite.exec(`DELETE FROM departments WHERE id = 'squat'`)
-    expect((await bootstrap(nonce, 'Ada')).status).toBe(302)
-    expect(count('agents')).toBe(agentsBefore + 1)
   })
 })
 
-describe('other refusals on this handler carry a next step, never "sign in again"', () => {
-  it('__mint_new__ with no name or squad', async () => {
+describe('concurrency: a refusing post can never re-open a nonce a concurrent post already spent', () => {
+  it('forced interleaving: refusing post A reads the record, succeeding post B runs to completion, then A finishes; no live record, no third mint', async () => {
+    const { nonce } = await reachConsentScreen()
+    const memberId = (harness.sqlite.prepare('SELECT id FROM members WHERE email = ?').get(NEWCOMER) as { id: string }).id
+    // A will be refused by bootstrapSelf (provisioning_failed), not by the pre-consume name check.
+    harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('squat', 'dept-home-${memberId}', 'Squat', 'work')`)
+
+    // Hold A at its consume (delete) until B has fully finished.
+    let releaseA!: () => void
+    const gate = new Promise<void>((r) => { releaseA = r })
+    const realDelete = kv.delete.bind(kv)
+    let held = false
+    kv.delete = async (key: string) => {
+      if (key === pendingKey(nonce) && !held) { held = true; await gate }
+      return realDelete(key)
+    }
+    kv._calls.length = 0
+
+    const a = post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: 'Ada' }, cookieFor(nonce))
+    // Let A read the record and park on its delete.
+    for (let i = 0; i < 50 && !held; i++) await new Promise((r) => setTimeout(r, 5))
+    expect(held).toBe(true)
+    const b = await post({ consent_nonce: nonce, action: 'continue', agent_id: '' }, cookieFor(nonce))
+    expect(b.status).toBe(302)
+    releaseA()
+    const aRes = await a
+
+    expect(aRes.status).toBe(500) // refused, as before
+    expect(kv._store.has(pendingKey(nonce))).toBe(false) // nothing re-opened it
+    expect(kv._calls.filter((c) => c.op === 'put' && c.key === pendingKey(nonce))).toEqual([])
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+    expect(count('member_tokens')).toBe(1)
+
+    // A third post (the PoC's second mint) is refused.
+    const c = await post({ consent_nonce: nonce, action: 'continue', agent_id: '' }, cookieFor(nonce))
+    expect(c.status).toBe(400)
+    expect(oauthProvider.completeAuthorization).toHaveBeenCalledTimes(1)
+    expect(count('member_tokens')).toBe(1)
+  })
+
+  it('a refusing post after a Decline cannot undo the decline', async () => {
+    const { nonce } = await reachConsentScreen()
+    expect((await post({ consent_nonce: nonce, action: 'decline' }, cookieFor(nonce))).status).toBe(200)
+    const bad = await post({ consent_nonce: nonce, action: 'continue', agent_id: '__bootstrap__', first_agent_name: '' }, cookieFor(nonce))
+    expect(bad.status).toBe(400)
+    expect(kv._store.has(pendingKey(nonce))).toBe(false)
+    expect((await post({ consent_nonce: nonce, action: 'continue', agent_id: '' }, cookieFor(nonce))).status).toBe(400)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
+})
+
+describe('__mint_new__ refusals stay consumed and give a true next step', () => {
+  const SQUAD_ADMIN = 'minter@example.test'
+  function seedMinter(existingAgents: number) {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-m', 'm', 'M');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-m', 'dept-m', 'squad-m', 'Squad M');
+      INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('mem-minter', '${SQUAD_ADMIN}', 'Minter', 'active', '2026-08-01T00:00:00.000Z', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-minter', 'mem-minter', 'squad', 'squad-m', 'admin');
+    `)
+    for (let i = 0; i < existingAgents; i++) {
+      harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-${i}', 'squad-m', 'taken-slug${i === 0 ? '' : i}', 'Existing ${i}', 'active')`)
+    }
+  }
+  const mint = (nonce: string, fields: Record<string, string>) =>
+    post({ consent_nonce: nonce, action: 'continue', agent_id: '__mint_new__', new_agent_squad_id: 'squad-m', ...fields }, cookieFor(nonce))
+
+  function expectSpent(res: Response, nonce: string) {
+    expect(res.headers.get('Set-Cookie') ?? '').toContain('Max-Age=0')
+    expect(kv._store.has(pendingKey(nonce))).toBe(false)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  }
+
+  it('slug_taken: pinned message, consumed, cookie cleared', async () => {
+    seedMinter(1)
+    const { nonce } = await reachConsentScreen(SQUAD_ADMIN)
+    const res = await mint(nonce, { new_agent_name: 'Other', new_agent_slug: 'taken-slug' })
+    expect(res.status).toBe(400)
+    expect(await res.text()).toBe('That agent name is already taken. Start the connection again from your app, then pick a different name or choose the existing agent.')
+    expectSpent(res, nonce)
+  })
+
+  it('agent_limit_reached: names the limit and an org admin, not the name', async () => {
+    seedMinter(2) // free tier allows 2 work agents
+    const { nonce } = await reachConsentScreen(SQUAD_ADMIN)
+    const res = await mint(nonce, { new_agent_name: 'Third', new_agent_slug: 'third' })
+    expect(res.status).toBe(400)
+    const text = await res.text()
+    expect(text).toBe('This organisation has reached its agent limit, so a new agent cannot be created. Ask an org admin to free a slot or raise the limit, then start the connection again from your app.')
+    expect(text).not.toContain('name')
+    expectSpent(res, nonce)
+  })
+
+  it('invalid_slug: general next step, consumed', async () => {
+    seedMinter(0)
+    const { nonce } = await reachConsentScreen(SQUAD_ADMIN)
+    const res = await mint(nonce, { new_agent_name: 'Fine', new_agent_slug: 'Bad Slug!' })
+    expect(res.status).toBe(400)
+    expect(await res.text()).toBe('The agent name could not be turned into a valid short name. Start the connection again from your app and use letters and numbers.')
+    expectSpent(res, nonce)
+  })
+
+  it('no name or squad: consumed, cookie cleared, pinned message', async () => {
     const { nonce } = await reachConsentScreen()
     const res = await post({ consent_nonce: nonce, action: 'continue', agent_id: '__mint_new__' }, cookieFor(nonce))
     expect(res.status).toBe(400)
     expect(await res.text()).toBe('A new agent needs a name and a home squad. Start the connection again from your app and fill in both.')
+    expectSpent(res, nonce)
   })
+})
 
-  it('missing consent_nonce and missing agent_id', async () => {
+describe('other refusals on this handler carry a next step, never "sign in again"', () => {
+  it('missing consent_nonce and missing agent_id (page stays usable: nothing consumed)', async () => {
     const noNonce = await post({ action: 'continue', agent_id: '' }, null)
     expect(noNonce.status).toBe(400)
     expect(await noNonce.text()).toBe('This page is missing its session. Start the connection again from your app.')
@@ -346,22 +447,39 @@ describe('other refusals on this handler carry a next step, never "sign in again
     expect(await noChoice.text()).toBe('Missing agent_id: explicit consent choice is required. Choose an option on the page, then continue.')
     expect(kv._store.has(pendingKey(nonce))).toBe(true)
   })
+
+  it('callback reload/Back: refused, no state change, tells the person to start again', async () => {
+    const before = [...kv._store.keys()]
+    const res = await handleOAuthAuthorize(new Request('https://pot.test/oauth/google-callback?code=abc&state=00000000-0000-4000-8000-000000000000'), env)
+    expect(res.status).toBe(403)
+    expect(await res.text()).toBe('This sign-in page was already used or came from a different browser. Start the connection again from your app.')
+    expect([...kv._store.keys()]).toEqual(before)
+    expect(count('members')).toBe(0)
+    expect(oauthProvider.completeAuthorization).not.toHaveBeenCalled()
+  })
 })
 
-describe('the one-submit guard in the rendered page (pinned as text; no DOM here)', () => {
-  it('has the flag guard after the choice validation, resets on pageshow, and never disables anything', async () => {
+describe('the consent page script (pinned as text; no DOM here, so browser behaviour is NOT exercised)', () => {
+  it('has the flag guard after the validations, a visible message, a pageshow reset, a timeout reset, and never disables anything', async () => {
     const { html } = await reachConsentScreen()
-    const script = html.slice(html.indexOf('form.addEventListener(\'submit\''), html.indexOf('</script>', html.indexOf('form.addEventListener(\'submit\'')))
+    const start = html.indexOf("form.addEventListener('submit'")
+    const script = html.slice(start, html.indexOf('</script>', start))
     expect(html).toContain('var submitted = false')
     expect(script).toContain('if (submitted) { e.preventDefault(); return }')
     expect(script).toContain('submitted = true')
     expect(script).toContain("window.addEventListener('pageshow', function () { submitted = false })")
-    // Order: choice validation first, so an unselected Continue does not lock the page.
-    expect(script.indexOf('Choose an option before continuing.')).toBeLessThan(script.indexOf('if (submitted)'))
-    expect(script.indexOf('if (submitted)')).toBeLessThan(script.indexOf('submitted = true'))
-    // Decline is covered: the decline early-return no longer skips the guard.
+    expect(script).toContain("summaryText.textContent = 'Working on it...'")
+    expect(script).toContain('setTimeout(function () { submitted = false; updateSummary() }, 10000)')
+    // Order: choice check, then first-agent name check, then the guard, then the flag.
+    const order = ['Choose an option before continuing.', 'Give your first agent a name before continuing.', 'if (submitted)', 'submitted = true', 'Working on it...']
+    const at = order.map((m) => script.indexOf(m))
+    expect(at.every((i) => i >= 0)).toBe(true)
+    expect([...at].sort((x, y) => x - y)).toEqual(at)
+    // The name check is skipped for decline and keyed on the first-agent radio's marker attribute
+    // (not its value, so a page that does not offer the door never contains the sentinel).
+    expect(script).toContain("picked.hasAttribute('data-first-agent')")
+    expect(script).not.toContain('__bootstrap__')
     expect(script).not.toMatch(/action === 'decline'\) return/)
-    // Never disable the buttons or the submitter (a disabled submitter drops name=action).
     const code = script.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
     expect(code).not.toMatch(/disabled/)
     expect(html).not.toMatch(/\.disabled\s*=/)
