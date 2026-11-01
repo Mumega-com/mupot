@@ -29,7 +29,7 @@ import { CHAT_CONSENT_LABEL, BACKGROUND_CONSENT_LABEL, suggestedConnectMode, typ
 import { backgroundAgentHumanClause, backgroundAgentIdsForHuman, backgroundAgentConsentPolicy, suggestedBackgroundAgent } from './background-agent-consent'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, resolveCapabilitiesForMembers, canOnSquad, hasCapability, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope, brandSquadScope, planeCoversScope, humanVerifiedLegacyRoleRank, type SquadScope } from '../auth/capability'
-import { bootstrapSelf, findExistingBootstrap, type BootstrapSelfFailure } from '../members/bootstrap-self'
+import { bootstrapSelf, findExistingBootstrap, validateBootstrapAgentName } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
   highestCapability,
@@ -1004,7 +1004,7 @@ function renderConsentPage(
 
   const firstAgentPanel = canOfferFirstAgent ? `
         <label class="agent-option first-run">
-          <input type="radio" name="agent_id" value="__bootstrap__" required data-label="your first agent" data-top="member on its own squad">
+          <input type="radio" name="agent_id" value="__bootstrap__" required data-first-agent data-label="your first agent" data-top="member on its own squad">
           <div class="opt-body">
             <div class="agent-title"><strong>Name your first agent</strong></div>
             <div class="agent-meta">This creates your workspace and an agent you own. It becomes a member of its own squad, and you administer that squad.</div>
@@ -1242,6 +1242,7 @@ ${mintPanel}
   var summary = document.getElementById('summary')
   var summaryText = document.getElementById('summary-text')
   var options = Array.prototype.slice.call(document.querySelectorAll('#p-existing .agent-option'))
+  var submitted = false
 
   function applyFilter() {
     var q = (filter.value || '').trim().toLowerCase()
@@ -1330,13 +1331,41 @@ ${mintPanel}
   // one, is what enforces explicit consent.
   form.addEventListener('submit', function (e) {
     var action = (e.submitter && e.submitter.value) || 'continue'
-    if (action === 'decline') return
-    if (!form.querySelector('input[name="agent_id"]:checked')) {
+    var picked = form.querySelector('input[name="agent_id"]:checked')
+    if (action !== 'decline' && !picked) {
       e.preventDefault()
       summary.classList.remove('danger')
       summaryText.textContent = 'Choose an option before continuing.'
+      return
     }
+    // Naming the first agent is required. Checked here so a blank name never leaves the page; the
+    // server refuses it too (no-JS or tampered posts) before it consumes anything.
+    var firstName = form.querySelector('input[name="first_agent_name"]')
+    if (action !== 'decline' && picked && picked.hasAttribute('data-first-agent') && firstName && !firstName.value.trim()) {
+      e.preventDefault()
+      summary.classList.remove('danger')
+      summaryText.textContent = 'Give your first agent a name before continuing.'
+      firstName.focus()
+      return
+    }
+    // One submit per page, Continue and Decline alike: a second click would post a nonce the
+    // server already consumed and show the person a refusal for a connection that worked. This
+    // is a flag, never 'disabled' — a button disabled during the submit event can drop its
+    // name=action value from the form data, and the server reads any action other than
+    // 'continue' as decline, so Approve would arrive as Decline. Courtesy only: the server
+    // consumes the consent record and stays authoritative.
+    if (submitted) { e.preventDefault(); return }
+    submitted = true
+    // Visible proof the click registered, so a second click does not look like a dead button.
+    // After a Stop the page stays and pageshow does not fire, so the flag also times out: if the
+    // page is still here after 10s the person can try again (a retry of a post that did land just
+    // gets the server's "already used" message).
+    summary.classList.remove('danger')
+    summaryText.textContent = 'Working on it...'
+    setTimeout(function () { submitted = false; updateSummary() }, 10000)
   })
+  // Back from bfcache restores this page with the flag still set; the person is back on a live form.
+  window.addEventListener('pageshow', function () { submitted = false })
 })()
 </script>
 <script>${SELECT_SEARCH_SCRIPT}</script>
@@ -1745,6 +1774,15 @@ interface PendingConsent {
   googleUserId: string
 }
 
+// Refusals on /oauth/consent. Each is one sentence plus a next step; the person is on a dead or
+// consumed page, so the next step is always to start again from their app, never "sign in again".
+const CONSENT_EXPIRED_MESSAGE =
+  'This page has expired or was already used. If your app already shows the connection working, there is nothing more to do; otherwise start the connection again from your app.'
+const CONSENT_NO_COOKIE_MESSAGE =
+  'Your browser did not send the sign-in cookie for this page. Start the connection again from your app, using your normal browser.'
+const CONSENT_MALFORMED_MESSAGE =
+  'This page is not valid. Start the connection again from your app.'
+
 // ── Main authorize handler ────────────────────────────────────────────────────
 // Mounted at /authorize, /oauth/google-callback, /oauth/consent in src/index.ts
 // (before the dashboardApp catch-all).
@@ -1832,7 +1870,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // not originate from the browser that initiated /authorize.
     const cookieHeader = request.headers.get('Cookie') ?? ''
     if (!hasNonceCookie(cookieHeader, CSRF_COOKIE_NAME, state)) {
-      return new Response('CSRF check failed: nonce mismatch', { status: 403 })
+      // Reached by Back or reload after the flow already ran: refused, nothing changes.
+      return new Response('This sign-in page was already used or came from a different browser. Start the connection again from your app.', { status: 403, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const stored = await env.SESSIONS.get(`oauth-req:${state}`, 'json') as Record<string, unknown> | null
@@ -1998,7 +2037,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const action = String(form.get('action') ?? '')
 
     if (action === 'continue' && !form.has('agent_id')) {
-      return new Response('Missing agent_id: explicit consent choice is required', { status: 400 })
+      return new Response('Missing agent_id: explicit consent choice is required. Choose an option on the page, then continue.', { status: 400, headers: { 'Content-Type': 'text/plain' } })
     }
     let agentIdRaw = String(form.get('agent_id') ?? '').trim()
     // mupot#1794 W3: the harness option is the EXISTING unbound path under another name. Flag on, the
@@ -2008,19 +2047,50 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     const harnessChosen = agentIdRaw === HARNESS_CONSENT_VALUE && seatAutoEnrollEnabled(env)
     if (harnessChosen) agentIdRaw = ''
 
-    if (!consentNonce) return new Response('Missing consent_nonce', { status: 400 })
+    if (!consentNonce) {
+      return new Response('This page is missing its session. Start the connection again from your app.', { status: 400, headers: { 'Content-Type': 'text/plain' } })
+    }
 
     // CSRF: the cookie set when the consent page was rendered must match the
     // nonce the form posted back. Same defence as B3 above, second instance.
+    // Every case below is refused; the branches only choose what to tell the person.
     const cookieHeader = request.headers.get('Cookie') ?? ''
     if (!hasNonceCookie(cookieHeader, CONSENT_COOKIE_NAME, consentNonce)) {
-      return new Response('CSRF check failed: consent nonce mismatch', { status: 403 })
+      // Malformed nonce: refuse without a KV read (and no key is built from it).
+      if (!CONSENT_NONCE_RE.test(consentNonce)) {
+        return new Response(CONSENT_MALFORMED_MESSAGE, { status: 403, headers: { 'Content-Type': 'text/plain' } })
+      }
+      // Read-only: tell "page already used or expired" (nothing pending) from "the cookie did not
+      // arrive" (a pending record exists). NEVER consume or delete here — the nonce is in the page
+      // source, and a cross-site post carrying it must not be able to burn the victim's session.
+      const livePending = await env.SESSIONS.get(`oauth-consent:${consentNonce}`)
+      if (!livePending) {
+        return new Response(CONSENT_EXPIRED_MESSAGE, { status: 400, headers: { 'Content-Type': 'text/plain' } })
+      }
+      return new Response(CONSENT_NO_COOKIE_MESSAGE, { status: 403, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const pending = await env.SESSIONS.get(`oauth-consent:${consentNonce}`, 'json') as PendingConsent | null
     if (!pending) {
-      return new Response('Consent session expired or invalid. Please sign in again.', { status: 400 })
+      return new Response(CONSENT_EXPIRED_MESSAGE, { status: 400, headers: { 'Content-Type': 'text/plain' } })
     }
+    // A first-agent name that bootstrapSelf would refuse is refused HERE, before anything is
+    // consumed: no KV write or delete, so the person can fix the name on the same page. Same rule
+    // as bootstrapSelf (one shared validator). The record is NEVER written back after it is
+    // consumed — a put after a delete would let a refusing post re-open a nonce that a concurrent
+    // post already spent.
+    if (action === 'continue' && agentIdRaw === '__bootstrap__') {
+      const nameCheck = validateBootstrapAgentName(form.get('first_agent_name'))
+      if (!nameCheck.ok) {
+        return new Response(
+          nameCheck.reason === 'blank'
+            ? 'Your agent needs a name, and none was sent. Go back to the previous page and type a name; if that does not work, start the connection again from your app.'
+            : 'That agent name is longer than 128 characters. Go back to the previous page and shorten it; if that does not work, start the connection again from your app.',
+          { status: 400, headers: { 'Content-Type': 'text/plain' } },
+        )
+      }
+    }
+
     // Single-use: consumed here regardless of outcome (continue, decline, or a
     // rejected agent_id) so a replayed POST can never re-run this step.
     await env.SESSIONS.delete(`oauth-consent:${consentNonce}`)
@@ -2086,19 +2156,18 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // is visible.
       const firstName = String(form.get('first_agent_name') ?? '').trim()
 
-      const rejectSoftly = (message: string, status: 400 | 403 | 429 | 500) => {
-        // Deliberately NOT clearing the consent cookie. This is a recoverable
-        // condition on the signup funnel; destroying the session here is what
-        // turns "you mistyped a name" into "sign in again and hit the identical
-        // wall", which is the loop this flow was reported for.
-        return new Response(message, { status, headers: { 'Content-Type': 'text/plain' } })
+      // Every refusal below is final: the record is spent and the cookie is cleared. A consumed
+      // record is never written back (see the name check above), so the next step is always to
+      // start again from the app — the person is on a page with no form left to resubmit.
+      const rejectFinal = (message: string, status: 400 | 403 | 429 | 500, extra?: Record<string, string>) => {
+        const rejected = new Response(message, { status, headers: { 'Content-Type': 'text/plain', ...extra } })
+        rejected.headers.set('Set-Cookie', clearConsentCookie)
+        return rejected
       }
 
-      // No local name check. bootstrapSelf already owns that rule (naming is its
-      // condition 1) and returns agent_name_required, which is mapped below. A
-      // second copy of the same predicate here was redundant and untested — a
-      // mutation deleting it changed nothing, which is exactly how two copies of
-      // one rule drift apart later.
+      // The name rule is NOT copied here: validateBootstrapAgentName (shared with bootstrapSelf)
+      // ran before the record was consumed. bootstrapSelf still re-checks it and returns
+      // agent_name_required, mapped below, as defence in depth.
 
       const bootstrapped = await bootstrapSelf(
         env,
@@ -2107,22 +2176,39 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
 
       if (!bootstrapped.ok) {
-        const explain: Record<BootstrapSelfFailure, { message: string; status: 400 | 403 | 429 | 500 }> = {
-          agent_name_required: { message: 'Give your agent a name, then continue. Nothing was created.', status: 400 },
-          not_unbound_directory_session: {
-            message: 'This connection already has an identity, so a first agent cannot be created from it. Choose an existing agent instead.',
-            status: 403,
-          },
-          rate_limited: { message: 'Too many attempts. Wait a minute and try again. Nothing was created.', status: 429 },
-          already_bootstrapped: {
-            message: 'You have already created your first agent. Go back and choose it from the list. If it is not listed, reconnect and it will be.',
-            status: 400,
-          },
-          provisioning_failed: { message: 'Creating the agent did not complete, and nothing was left behind. Try again.', status: 500 },
-        }
-        const { message, status } = explain[bootstrapped.error]
         console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
-        return rejectSoftly(message, status)
+        switch (bootstrapped.error) {
+          case 'agent_name_required':
+            // Unreachable in practice: the shared validator refused a bad name before consuming.
+            return rejectFinal('Your agent needs a name. Start the connection again from your app and name it.', 400)
+          case 'not_unbound_directory_session':
+            // Unreachable here (this branch always passes an unbound directory session).
+            return rejectFinal('This connection already has an identity, so a first agent cannot be created from it. Start the connection again from your app and choose an existing agent.', 403)
+          case 'rate_limited': {
+            const detail = bootstrapped.detail as { retry_after_seconds?: unknown } | undefined
+            const seconds = typeof detail?.retry_after_seconds === 'number' && detail.retry_after_seconds > 0
+              ? Math.ceil(detail.retry_after_seconds)
+              : 3600
+            const minutes = Math.ceil(seconds / 60)
+            const wait = minutes >= 60 ? `about ${Math.ceil(minutes / 60)} hour${minutes > 60 ? 's' : ''}` : `about ${minutes} minute${minutes === 1 ? '' : 's'}`
+            return rejectFinal(
+              `Too many first-agent attempts. Nothing was created. Wait ${wait}, then start the connection again from your app.`,
+              429,
+              { 'Retry-After': String(seconds) },
+            )
+          }
+          case 'provisioning_failed':
+            // Not "nothing was left behind": a race or a committed batch can leave the agent made.
+            return rejectFinal(
+              'Creating the agent may not have completed. If your app already shows the connection working, there is nothing more to do; otherwise start the connection again from your app.',
+              500,
+            )
+          case 'already_bootstrapped':
+            return rejectFinal(
+              'You have already created your first agent. Start the connection again from your app and look for it in the list; if it is not there, ask an org admin to give you access to it.',
+              400,
+            )
+        }
       }
 
       // Re-validate through the SAME gate the ordinary path uses. bootstrapSelf
@@ -2134,8 +2220,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       if (!eligible || !binding || binding.kind !== 'bound') {
         // The agent EXISTS and is theirs; only this session could not be bound to
         // it. Say exactly that, because "sign in again" would read as failure.
-        return rejectSoftly(
-          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically — reconnect and choose it from the list.`,
+        return rejectFinal(
+          `Your agent "${bootstrapped.agent.name}" was created. This connection could not be bound to it automatically, so reconnect from your app and choose it from the list.`,
           403,
         )
       }
@@ -2150,7 +2236,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
       if (!newName || !squadId) {
         const rejected = new Response(
-          'Agent name and home squad are required to mint a new agent. Please sign in again.',
+          'A new agent needs a name and a home squad. Start the connection again from your app and fill in both.',
           { status: 400, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2161,7 +2247,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const allowed = await canOnSquad(env, humanGrants, squadId, 'admin')
       if (!allowed) {
         const rejected = new Response(
-          'You do not have admin capability on the selected squad to mint a new agent.',
+          'You do not have admin access on the selected squad, so a new agent cannot be created there. Ask an org admin for access, then start the connection again from your app.',
           { status: 403, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2178,8 +2264,18 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }, { ownerMemberId: pending.memberId })
 
       if (!createRes.ok) {
+        // One true next step per createAgent error code; none of them blames the name unless the
+        // name is what failed. The generic case never prints the raw code.
+        const MINT_NEW_STEPS: Record<string, string> = {
+          slug_taken: 'That agent name is already taken. Start the connection again from your app, then pick a different name or choose the existing agent.',
+          agent_limit_reached: 'This organisation has reached its agent limit, so a new agent cannot be created. Ask an org admin to free a slot or raise the limit, then start the connection again from your app.',
+          invalid_purpose: 'The purpose text for the new agent was not accepted. Start the connection again from your app and shorten or simplify it.',
+          invalid_name: 'The agent name was not accepted. Start the connection again from your app and use a different name.',
+          invalid_slug: 'The agent name could not be turned into a valid short name. Start the connection again from your app and use letters and numbers.',
+        }
         const rejected = new Response(
-          `Failed to create agent: ${createRes.error}. Please sign in again.`,
+          MINT_NEW_STEPS[createRes.error]
+            ?? 'The agent could not be created. Start the connection again from your app; if it keeps failing, ask an org admin.',
           { status: 400, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2196,7 +2292,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         // mupot#1961: the agent was deactivated between creation and the mint batch; nothing landed.
         if (!(err instanceof AgentInactiveError)) throw err
         const rejected = new Response(
-          'The new agent is no longer active, so no connection key was issued. Please sign in again.',
+          'The new agent is no longer active, so no connection key was issued. Start the connection again from your app.',
           { status: 409, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2227,7 +2323,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const binding = await resolveAgentMemberBinding(env, agentIdRaw)
       if (binding.kind !== 'bound') {
         const rejected = new Response(
-          'The selected agent is no longer available for this connection. Please sign in again.',
+          'The selected agent is no longer available for this connection. Start the connection again from your app and choose another.',
           { status: 403, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
@@ -2289,14 +2385,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // mupot#1961: the agent was deactivated after the eligibility check; no credential exists.
       if (err instanceof AgentInactiveError) {
         const rejected = new Response(
-          'The selected agent is no longer active, so no connection key was issued. Please sign in again.',
+          'The selected agent is no longer active, so no connection key was issued. Start the connection again from your app and choose another.',
           { status: 409, headers: { 'Content-Type': 'text/plain' } },
         )
         rejected.headers.set('Set-Cookie', clearConsentCookie)
         return rejected
       }
       console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
-      return new Response('Token mint failed', { status: 500 })
+      return new Response('The connection key could not be issued. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 
     // mupot#1551 round 2 (adversarial gate P0): mint time is exactly when this
@@ -2427,7 +2523,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       redirectTo = result.redirectTo
     } catch (err) {
       console.error('[oauth-authorize] completeAuthorization failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
-      return new Response('OAuth completion failed', { status: 500 })
+      return new Response('The connection could not be completed. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 
     const finalResponse = Response.redirect(redirectTo, 302)

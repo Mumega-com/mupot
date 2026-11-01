@@ -131,14 +131,14 @@ describe('mupot#1441 consent nonce binding across tabs (path-aware jar)', () => 
     expect((await decline(b, env, n2)).status).toBe(200)
   })
 
-  it('replay of a consumed consent nonce is refused (400 by KV with the old cookie, 403 once the cookie is cleared)', async () => {
+  it('replay of a consumed consent nonce is refused (400 by KV with the old cookie, and 400 once the cookie is cleared: nothing pending reads as used/expired, not a CSRF failure)', async () => {
     const env = makeEnv(); const b = new Browser()
     const n1 = await renderConsent(b, env)
     await renderConsent(b, env)
     const old = b.cookieFor('/oauth/consent')
     expect((await decline(b, env, n1)).status).toBe(200)
     expect((await decline(b, env, n1, old)).status).toBe(400)
-    expect((await decline(b, env, n1)).status).toBe(403)
+    expect((await decline(b, env, n1)).status).toBe(400)
   })
 
   it('a consent nonce minted for another browser is refused both ways; the owner is unharmed', async () => {
