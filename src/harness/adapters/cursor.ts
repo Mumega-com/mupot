@@ -7,7 +7,7 @@
 
 import type { Env } from '../../types'
 import type { AttemptLabels } from '../types'
-import { attemptLabels, deliveryStateOf } from '../delivery'
+import { attemptLabels, deliveryStateOf, isUncertainLaunch } from '../delivery'
 import { getCursorRun, resolveCursorApiToken } from '../../cursor/client'
 import {
   attachCursorCloudExecution,
@@ -36,8 +36,9 @@ import type {
  * Public error vocabulary. Raw exception text (D1/SQL, vendor) is NEVER returned to callers: anything outside
  * this set (after stripping a `: detail` suffix) collapses to `dispatch_failed`.
  */
-/** A launch that may have happened without being bound. Never collapse these into `reserved`. */
-const UNCONFIRMED_ERRORS = new Set(['launch_unconfirmed', 'bind_unconfirmed', 'bind_lost_lease'])
+// A launch that may have happened without being bound. Never collapse these into `reserved`.
+// Note this is matched with isUncertainLaunch(), because the writers append a detail suffix:
+// `launch_unconfirmed: <detail>` and `bind_unconfirmed: <msg>` (src/cursor/dispatch.ts:386,421).
 
 const PUBLIC_ERROR_CODES = new Set([
   'idempotency_key_conflict',
@@ -183,7 +184,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
       // The vendor may already have the run even though we lost the lease that would let us record
       // it, or the launch answer never arrived. Reporting `accepted: true, delivery: 'reserved'`
       // here would hide work that might be running — the exact failure this PR exists to stop.
-      if (attached.error && UNCONFIRMED_ERRORS.has(attached.error)) {
+      if (attached.error && isUncertainLaunch(attached.error)) {
         return {
           accepted: true,
           state: acceptedStateOf(attached.state),

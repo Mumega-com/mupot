@@ -51,13 +51,28 @@ const RECORD_ONLY_STATUS = 'recorded'
  * The single place that decides delivery. Adapters must not each invent this: the conformance
  * suite exists to prove they all answer the same question the same way.
  */
+/**
+ * A launch that may have happened without being recorded. The writers persist these WITH a detail
+ * suffix (`launch_unconfirmed: <detail>`, `bind_unconfirmed: <msg>` — src/cursor/dispatch.ts:386,421),
+ * so a bare equality check misses every real row. Only the code prefix is compared; the detail is
+ * free text and may contain anything.
+ */
+const UNCERTAIN_LAUNCH_PREFIXES = ['launch_unconfirmed', 'bind_unconfirmed', 'bind_lost_lease'] as const
+
+export function isUncertainLaunch(lastError: string | null | undefined): boolean {
+  const code = (lastError ?? '').trim().toLowerCase().split(':')[0]!.trim()
+  return (UNCERTAIN_LAUNCH_PREFIXES as readonly string[]).includes(code)
+}
+
 export function deliveryStateOf(row: {
   state: HarnessDispatchState | string
   last_vendor_status?: string | null
+  last_error?: string | null
 }): HarnessDeliveryState {
   const status = (row.last_vendor_status ?? '').trim().toLowerCase()
   switch (row.state) {
     case 'attached':
+      if (isUncertainLaunch(row.last_error) && !status) return 'unknown'
       if (!status || status === RECORD_ONLY_STATUS) return 'reserved'
       if (CLAIMED_VENDOR_STATUSES.has(status)) return 'claimed'
       if (DELIVERED_VENDOR_STATUSES.has(status)) return 'delivered'
@@ -69,6 +84,9 @@ export function deliveryStateOf(row: {
       // was delivered even if it later failed; a reservation that never left Mupot was not.
       if (CLAIMED_VENDOR_STATUSES.has(status)) return 'claimed'
       if (DELIVERED_VENDOR_STATUSES.has(status)) return 'delivered'
+      // The row says we lost the thread of a launch we may have made. `reserved` would assert the
+      // work never left, which is the one thing we cannot know here (review round 2, item 2).
+      if (isUncertainLaunch(row.last_error)) return 'unknown'
       if (!status || status === RECORD_ONLY_STATUS) return 'reserved'
       return 'unknown'
     default:

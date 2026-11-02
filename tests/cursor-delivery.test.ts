@@ -114,9 +114,15 @@ describe('cursor dispatch return sites', () => {
     expect(out.unconfirmed).toBe(true)
   })
 
-  it('site 3b — launch_unconfirmed is unconfirmed too', async () => {
+  it('site 3b — launch_unconfirmed is unconfirmed too, in the form the writer emits', async () => {
     reserveMock.mockResolvedValue(reserved({ state: 'attaching', row: { ...ROW, state: 'attaching' } }))
-    attachMock.mockResolvedValue({ reservationId: 'res-1', state: 'attaching', error: 'launch_unconfirmed', replay: false })
+    // src/cursor/dispatch.ts:386 writes `launch_unconfirmed: <detail>`, never a bare code.
+    attachMock.mockResolvedValue({
+      reservationId: 'res-1',
+      state: 'failed',
+      error: 'launch_unconfirmed: maybe_launched after an aborted launch',
+      replay: false,
+    })
     const out = await adapter.dispatch(env, req)
     if (!out.accepted) throw new Error('expected accepted')
     expect(out.delivery).toBe('unknown')
@@ -161,6 +167,36 @@ describe('cursor status return sites', () => {
     // The row says the run was accepted, so the delivery stays delivered even though this read failed.
     expect(out.delivery).toBe('delivered')
     expect(out.error).toContain('500')
+  })
+})
+
+describe('persisted launch uncertainty decides the status answer', () => {
+  it('a reservation whose launch may have happened is unknown, not reserved', async () => {
+    // The exact string markReservationFailed persists (src/cursor/dispatch.ts:386,421).
+    for (const last_error of [
+      'launch_unconfirmed: maybe_launched after an aborted launch',
+      'bind_unconfirmed: D1 timeout while binding',
+    ]) {
+      getReservationMock.mockResolvedValue({
+        ...ROW,
+        state: 'failed',
+        last_vendor_status: null,
+        last_error,
+      })
+      const out = await adapter.status(env, { reservationId: 'res-1' })
+      expect(out.delivery, last_error).toBe('unknown')
+    }
+  })
+
+  it('a clean failure with no uncertainty stays reserved', async () => {
+    getReservationMock.mockResolvedValue({
+      ...ROW,
+      state: 'failed',
+      last_vendor_status: null,
+      last_error: 'flight_gate_held',
+    })
+    const out = await adapter.status(env, { reservationId: 'res-1' })
+    expect(out.delivery).toBe('reserved')
   })
 })
 
