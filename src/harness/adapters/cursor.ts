@@ -6,6 +6,8 @@
 // - Status polling and terminal state reconciliation.
 
 import type { Env } from '../../types'
+import type { AttemptLabels } from '../types'
+import { attemptLabels, deliveryStateOf, isUncertainLaunch } from '../delivery'
 import { getCursorRun, resolveCursorApiToken } from '../../cursor/client'
 import {
   attachCursorCloudExecution,
@@ -34,6 +36,10 @@ import type {
  * Public error vocabulary. Raw exception text (D1/SQL, vendor) is NEVER returned to callers: anything outside
  * this set (after stripping a `: detail` suffix) collapses to `dispatch_failed`.
  */
+// A launch that may have happened without being bound. Never collapse these into `reserved`.
+// Note this is matched with isUncertainLaunch(), because the writers append a detail suffix:
+// `launch_unconfirmed: <detail>` and `bind_unconfirmed: <msg>` (src/cursor/dispatch.ts:386,421).
+
 const PUBLIC_ERROR_CODES = new Set([
   'idempotency_key_conflict',
   'execution_paused',
@@ -60,6 +66,16 @@ export function acceptedStateOf(state: string): 'reserved' | 'attaching' | 'atta
   if (state === 'attached') return 'attached'
   if (state === 'attaching') return 'attaching'
   return 'reserved'
+}
+
+// Descriptive only: model, harness and host are recorded per attempt and never consulted by a
+// fence or a grant.
+function labelsFor(req: DispatchRequest): AttemptLabels {
+  return attemptLabels({
+    harness: 'cursor-cloud',
+    model: req.model ?? null,
+    host: typeof req.metadata?.host === 'string' ? req.metadata.host : null,
+  })
 }
 
 export const cursorCloudAdapter: HarnessAdapter = {
@@ -124,6 +140,8 @@ export const cursorCloudAdapter: HarnessAdapter = {
         return {
           accepted: true,
           state: 'attached',
+          delivery: deliveryStateOf(reserved.row),
+          labels: labelsFor(req),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -146,6 +164,9 @@ export const cursorCloudAdapter: HarnessAdapter = {
         return {
           accepted: true,
           state: acceptedStateOf(reserved.state),
+          // waitUntil means the vendor call has not happened yet: the work is held, not handed over.
+          delivery: 'reserved',
+          labels: labelsFor(req),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -160,6 +181,23 @@ export const cursorCloudAdapter: HarnessAdapter = {
 
       // Synchronous attach fallback (for unit tests or non-waitUntil callers)
       const attached = await attachCursorCloudExecution(env, reserved.reservationId, { model: req.model })
+      // The vendor may already have the run even though we lost the lease that would let us record
+      // it, or the launch answer never arrived. Reporting `accepted: true, delivery: 'reserved'`
+      // here would hide work that might be running — the exact failure this PR exists to stop.
+      if (attached.error && isUncertainLaunch(attached.error)) {
+        // NOT accepted. The P1-a fence (tests/harness-lease-fence.test.ts:108-110, and the 5xx case
+        // in harness-idempotency-mutation.test.ts:130-133) pins this: a launch we could not confirm
+        // must not read as a successful dispatch, and callers key on the bare code. The uncertainty
+        // travels in `detail` instead of being laundered into `accepted: true`.
+        return {
+          accepted: false,
+          error: attached.error.split(':')[0]!.trim(),
+          detail: { delivery: 'unknown', unconfirmed: true, state: acceptedStateOf(attached.state) },
+          reservationId: reserved.reservationId,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
+        }
+      }
       if (attached.state === 'failed' || attached.error === 'execution_paused') {
         return {
           accepted: false,
@@ -172,6 +210,9 @@ export const cursorCloudAdapter: HarnessAdapter = {
       return {
         accepted: true,
         state: acceptedStateOf(attached.state),
+        // A vendor run that came back accepted is a delivery; anything else is still ours.
+        delivery: deliveryStateOf({ state: attached.state, last_vendor_status: attached.state === 'attached' ? 'accepted' : null }),
+        labels: labelsFor(req),
         reservationId: reserved.reservationId,
         taskId: reserved.task?.id ?? reserved.row.task_id,
         flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -202,8 +243,11 @@ export const cursorCloudAdapter: HarnessAdapter = {
     const stuck = row ? isReservationStuck(row) : false
 
     const token = resolveCursorApiToken(env)
-    const agentId = query.vendorAgentId ?? row?.vendor_agent_id
-    const runId = query.vendorRunId ?? row?.vendor_run_id
+    // The row is the record of what Mupot actually launched. A caller-supplied id must never
+    // override it, or a caller could point a reservation's status at someone else's run and have
+    // that run's status decide this reservation's delivery. Query ids are for adhoc lookups only.
+    const agentId = row ? row.vendor_agent_id : query.vendorAgentId
+    const runId = row ? row.vendor_run_id : query.vendorRunId
 
     if (!row && (!agentId || !runId)) {
       throw new Error('reservation_or_vendor_ids_required')
@@ -220,6 +264,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
           reservationId,
           adapter: 'cursor-cloud',
           state,
+          delivery: deliveryStateOf({ state, last_vendor_status: run.status }),
           vendorStatus: run.status,
           vendorAgentId: agentId,
           vendorRunId: runId,
@@ -235,6 +280,8 @@ export const cursorCloudAdapter: HarnessAdapter = {
           reservationId,
           adapter: 'cursor-cloud',
           state,
+          // An error reading the vendor says nothing about whether the work was handed over.
+          delivery: deliveryStateOf(row ?? { state, last_vendor_status: null }),
           vendorAgentId: agentId,
           vendorRunId: runId,
           vendorUrl: row?.vendor_url ?? undefined,
@@ -248,6 +295,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
       reservationId,
       adapter: 'cursor-cloud',
       state,
+      delivery: deliveryStateOf(row ?? { state, last_vendor_status: null }),
       vendorAgentId: agentId ?? undefined,
       vendorRunId: runId ?? undefined,
       vendorUrl: row?.vendor_url ?? undefined,

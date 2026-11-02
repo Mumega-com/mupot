@@ -13,6 +13,7 @@ import type { Env, Task } from '../../types'
 import { createTask } from '../../tasks/service'
 import { dispatchFlight } from '../../flight/dispatch'
 import { FLIGHT_META_V1_SCHEMA } from '../../flight/meta'
+import { attemptLabels, deliveryStateOf } from '../delivery'
 import {
   bindReservationTaskFlight,
   blockTaskForFailedReservation,
@@ -38,10 +39,20 @@ import type {
   ReconcileResult,
   RunStatusResult,
   StatusQuery,
+  AttemptLabels,
 } from '../types'
 
-export const GROK_CLI_DONE_WHEN =
-  'Grokbot completes the assigned task with passing verification evidence and commits'
+export const GROK_CLI_DONE_WHEN = 'Grokbot completes the assigned task with passing verification evidence and commits'
+
+// What the caller says it is running. Recorded on every attempt result so an audit can see model,
+// harness and host, and explicitly not consulted by any fence: labels never grant authority.
+function labelsFor(req: DispatchRequest): AttemptLabels {
+  return attemptLabels({
+    harness: 'grok-cli',
+    model: req.model ?? null,
+    host: typeof req.metadata?.host === 'string' ? req.metadata.host : null,
+  })
+}
 
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const result = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first<Task>()
@@ -100,6 +111,9 @@ export const grokCliAdapter: HarnessAdapter = {
     const replayOutcome = (row: HarnessReservationRow): DispatchOutcome => ({
       accepted: true,
       state: acceptedStateOf(row.state),
+      // A replayed record-only dispatch is still only reserved: nothing has been handed over.
+      delivery: deliveryStateOf(row),
+      labels: labelsFor(req),
       reservationId: row.id,
       taskId: row.task_id,
       flightId: row.flight_id,
@@ -244,7 +258,12 @@ export const grokCliAdapter: HarnessAdapter = {
 
     return {
       accepted: true,
+      // The reservation record is attached to a vendor execution row, but nothing was enqueued:
+      // no inbox message, no vendor run. `accepted: true` here means "Mupot holds the work",
+      // which is why delivery must be reported separately (mupot#2283).
       state: 'attached',
+      delivery: 'reserved',
+      labels: labelsFor(req),
       reservationId,
       taskId: task.id,
       flightId: reservedFlightId,
@@ -274,6 +293,8 @@ export const grokCliAdapter: HarnessAdapter = {
       reservationId,
       adapter: 'grok-cli',
       state: row?.state ?? 'attached',
+      // Same rule as dispatch: a `recorded` vendor status is a note, not a handover.
+      delivery: deliveryStateOf(row ?? { state: 'attached', last_vendor_status: 'recorded' }),
       vendorStatus: row?.last_vendor_status ?? 'recorded',
       vendorAgentId: row?.vendor_agent_id ?? undefined,
       vendorRunId: row?.vendor_run_id ?? undefined,
