@@ -188,7 +188,7 @@ export async function humanCanDesignateAtAll(env: Env, humanMemberId: string, ag
 
 /** Active, non-seat, UNDESIGNATED agents matching `ref` that this human could designate for themselves and administers.
  *  Another human's designation is never a match. Anyone else reads as not found. */
-async function listDesignatableAgents(env: Env, humanMemberId: string, ref: string): Promise<AttachableAgent[]> {
+export async function listDesignatableAgents(env: Env, humanMemberId: string, ref: string): Promise<AttachableAgent[]> {
   if (!seatAttachDesignatedEnabled(env)) return []
   const rows = (await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id, sq.name AS squad_name

@@ -228,6 +228,8 @@ import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
+import { NAMED_INTENT_TOOLS } from './named-intent'
+import { namedIntentEnabled } from '../members/named-intent'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
@@ -685,7 +687,9 @@ async function resolveSeatSession(
   // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
   // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
   return applySeatForRequest(c.env, auth, {
-    readOnly: bodyMeta?.readOnlySeat,
+    // NAMED_INTENT_CONNECT: connect_intent may REUSE a seat this thread already has but must never CREATE one (readOnly never
+    // creates an auto seat, see applySeatForRequest), so an unseated first call reaches the tool unbound and the intent comes first.
+    readOnly: bodyMeta?.readOnlySeat || (bodyMeta?.toolName === 'connect_intent' && namedIntentEnabled(c.env)),
     headerHandle: headerSeat,
     metaHandle: metaSeat,
     argHandle: bodyMeta?.argSeat ?? null,
@@ -7953,6 +7957,7 @@ export const TOOLS: ToolSpec[] = [
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
+  ...NAMED_INTENT_TOOLS,
   ...SQUAD_CHOICE_TOOLS,
   ...SEAT_ATTACH_TOOLS,
   ...VIP_LANE_TOOLS,
@@ -8095,6 +8100,8 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
 // W2: seat_attach is advertised only while SEAT_ATTACH (and SEAT_AUTO_ENROLL) is on (flag off => tools/list unchanged).
 const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.map((t) => t.name))
+// NAMED_INTENT_CONNECT: connect_intent is advertised only while its own flag (and both seat flags) is on (flag off => tools/list unchanged).
+const NAMED_INTENT_FLAG_TOOLS: ReadonlySet<string> = new Set(NAMED_INTENT_TOOLS.map((t) => t.name))
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
 // (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
@@ -8109,7 +8116,8 @@ const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.ma
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
 // Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
 const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE' | 'OWNER_CALL'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE' | 'OWNER_CALL' | 'NAMED_INTENT_CONNECT'>): ToolSpec[] {
+  const named = namedIntentEnabled(env)
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
@@ -8118,8 +8126,8 @@ export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH
   const attach = seatAttachEnabled(env)
   const moments = secureMomentsEnabled(env)
   const vip = vipLaneEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip && env.OWNER_CALL === '1') return TOOLS
-  return TOOLS.filter((t) => (env.OWNER_CALL === '1' || t.name !== 'owner_call') && (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)))
+  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip && named && env.OWNER_CALL === '1') return TOOLS
+  return TOOLS.filter((t) => (env.OWNER_CALL === '1' || t.name !== 'owner_call') && (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)) && (named || !NAMED_INTENT_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {

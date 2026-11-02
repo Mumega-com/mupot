@@ -126,6 +126,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   // caller's shell, never by the Worker. Reserved so no pot secret can squat the CLI's token names.
   'MUPOT_TOKEN',
   'MUPOT_TOKEN_FILE',
+  'NAMED_INTENT_CONNECT',
   'NIGHTLY_BACKUP',
   'OAUTH_CLIENT_ID',
   'OAUTH_CLIENT_SECRET',

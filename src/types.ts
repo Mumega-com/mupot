@@ -407,6 +407,9 @@ export interface Env {
   // W2 (harness seats -> existing agents): strict '1' (AND SEAT_AUTO_ENROLL '1') turns on seat_attach, the
   // dashboard Connections attach/admit actions and the per-request attachment resolve. Unset = total no-op.
   SEAT_ATTACH?: string
+  // NAMED_INTENT_CONNECT: strict '1' (AND SEAT_AUTO_ENROLL '1' AND SEAT_ATTACH '1') turns on connect_intent, the named-intent
+  // connection door that resolves a named, already-permitted agent BEFORE any throwaway seat is made. Unset = total no-op.
+  NAMED_INTENT_CONNECT?: string
   // SEAT_ATTACH_DESIGNATED: strict '1' (requires SEAT_ATTACH) narrows attach to agents an org admin designated for the human
   // (agents.attach_designated_member_id, 0238). Unset = today's behaviour exactly.
   SEAT_ATTACH_DESIGNATED?: string
