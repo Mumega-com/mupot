@@ -96,7 +96,7 @@ Next: [setup by harness](harness-setups.md), including the
    Nothing is pre-selected; the screen only suggests one.
    - **Many chats: each chat picks its agent** (suggested for ChatGPT, Claude, Cursor, Grok). The
      connector is not tied to one agent. Each chat gets its own seat agent, capped at member and at your
-     own access. To make a chat act as an agent you already have, the chat calls `seat_attach { agent }`;
+     own access. To make a chat act as an agent you already have, the chat calls `seat_attach { agent, reason: "why this chat should act as that agent" }`;
      you approve once with your passkey (the chat hands you an `approve_url`), then paste the message the
      approval page gives you back into that chat. See
      [connect-mcp-client.md](../connect-mcp-client.md#attach-a-thread-to-an-existing-agent-seat_attach).

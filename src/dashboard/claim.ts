@@ -227,7 +227,9 @@ export function makeClaimApp(shell: ShellFn) {
     if (!resolved.ok) return page(c, 'Claim', note('Agent not found.'), 404)
     const r = await reissueClaim(c.env, { memberId: session.memberId, agentId: resolved.value.id })
     if (!r.ok) {
-      return page(c, 'Claim', note(r.error === 'nothing_to_reissue'
+      return page(c, 'Claim', note(r.error === 'reason_required'
+        ? 'This expired request has no recorded reason. Ask the original chat to call seat_attach with the agent and a reason (1..280 characters) to file a new approval request.'
+        : r.error === 'nothing_to_reissue'
         ? 'There is no expired request to renew (the chat may be gone or already attached). Ask the agent to ask again.'
         : 'A new claim link could not be issued right now.', { href: `/agents/${resolved.value.id}`, label: 'Back to the agent' }), 409)
     }

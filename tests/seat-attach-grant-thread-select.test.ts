@@ -176,6 +176,43 @@ const attachments = (): Array<{ id: string; seat_id: string; agent_id: string; a
   h.sqlite.prepare(`SELECT id, seat_id, agent_id, admission_id, seat_token_id, detached_at FROM agent_seat_attachments ORDER BY created_at, rowid`).all() as never
 const liveSeatIds = (): string[] => (h.sqlite.prepare(`SELECT seat_id FROM agent_seat_attachments WHERE detached_at IS NULL ORDER BY created_at, rowid`).all() as Array<{ seat_id: string }>).map((r) => r.seat_id)
 
+describe('reasonless selection reuses consent only', () => {
+  it('requires explicit selection but no new reason under a live harness approval', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'reason-day-one')
+    const original = attachments()[0]
+    const before = await boot(env, g, 'reason-day-two')
+    expect(before.sc.bound_agent_id).not.toBe('agent-rava')
+    const selected = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, thread('reason-day-two'))
+    expect(selected.sc).toMatchObject({ status: 'attached', admission_id: original.admission_id })
+    expect((await boot(env, g, 'reason-day-two')).sc.bound_agent_id).toBe('agent-rava')
+    expect(attachments()).toHaveLength(2)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions')?.reason).toBe('This chat is assigned to operate the requested agent.')
+    // An approval for Rava supplies neither consent nor a reason for another agent.
+    const other = await rpc(env, g.ctx, 'seat_attach', { agent: 'hadi-dev' }, thread('reason-other-agent'))
+    expect(errOf(other)).toContain('invalid_args')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+  })
+
+  it.each(['admission', 'grant'] as const)('does not reuse a revoked %s without a reason', async (what) => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'reason-before-revoke')
+    if (what === 'admission') {
+      expect((await revokeAdmission(env, { admissionId: attachments()[0].admission_id, humanMemberId: HUMAN })).ok).toBe(true)
+    } else {
+      h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?`).run(g.tokenId)
+    }
+    const r = await rpc(env, g.ctx, 'seat_attach', { agent: 'rava' }, thread('reason-after-revoke'))
+    expect(r.sc.status).not.toBe('attached')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(attachments()).toHaveLength(1)
+    expect(await findLiveAttachment(env, { memberId: HUMAN, tokenId: g.tokenId }, attachments()[0].seat_id)).toBeNull()
+  })
+})
+
 describe('R1 round 2: grant replacement and approval boundaries', () => {
   it('revoke and re-consent on the same client requires a fresh harness approval', async () => {
     const env = envFor(h)

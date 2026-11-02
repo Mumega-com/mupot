@@ -328,7 +328,7 @@ export function weldAudit(env: Env, agentId: string, actorId: string, admissionI
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
   | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean; requiresHumanRelease?: boolean }
-  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch' }
+  | { ok: false; error: 'invalid_args' | 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch' }
 
 /**
  * A LIVE seat-scoped admission is returned only to the chat that asked for it. A harness-scoped admission (R1) covers
@@ -427,6 +427,10 @@ export async function ensureAdmission(
   }
   let pending = open
   if (!pending) {
+    // The reason belongs to the immutable approval card, not to later selections or confirmations.
+    // Enforce it at creation so an expired/revoked admission cannot turn a reasonless retry into a new ask.
+    const reason = typeof p.reason === 'string' ? p.reason.trim() : ''
+    if (!reason || reason.length > 280 || reason.includes('\0')) return { ok: false, error: 'invalid_args' }
     const id = crypto.randomUUID()
     const expiresAt = new Date(nowMs + ADMISSION_PENDING_TTL_MS).toISOString()
     const res = await env.DB.prepare(
@@ -437,7 +441,7 @@ export async function ensureAdmission(
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 ${attachDesignatedClause(env, 'ag', '?4')})
        ON CONFLICT DO NOTHING`,
-    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat', p.reason ?? null).run()
+    ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat', reason).run()
     const inserted = res.meta.changes === 1
     pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
     if (!pending) {

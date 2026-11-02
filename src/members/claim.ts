@@ -240,7 +240,7 @@ export async function reissueHarnessClaimApproval(
 
 export type ReissueResult =
   | { ok: true; claimUrl: string | null; code: string | null; expiresAt: string | null }
-  | { ok: false; error: 'seat_attach_disabled' | 'nothing_to_reissue' | 'attach_refused' | 'too_many_pending_admissions' | 'approval_bound_to_other_chat' | 'attach_code_mismatch' | 'admission_scope_mismatch' }
+  | { ok: false; error: 'seat_attach_disabled' | 'nothing_to_reissue' | 'reason_required' | 'attach_refused' | 'too_many_pending_admissions' | 'approval_bound_to_other_chat' | 'attach_code_mismatch' | 'admission_scope_mismatch' }
 
 /**
  * "Issue a new claim link": a fresh pending ask for the SAME agent, SAME member, SAME harness and SAME thread as the expired one.
@@ -258,7 +258,8 @@ export async function reissueClaim(env: Env, p: { memberId: string; agentId: str
   const r = await ensureAdmission(env, {
     agentId: p.agentId, humanMemberId: p.memberId, harnessId: old.harness_id, seatId: seat.seatId, via: 'tool', reason: old.reason ?? undefined, requesterAgentId: seat.seatAgentId, scope: old.scope, // a reissued ask keeps the scope the chat originally asked for
   }, nowMs)
-  if (!r.ok) return { ok: false, error: r.error }
+  // A legacy ask without a reason cannot be reissued as a new approval card; the chat must supply its intent.
+  if (!r.ok) return { ok: false, error: r.error === 'invalid_args' ? 'reason_required' : r.error }
   if (r.state !== 'pending') return { ok: false, error: 'nothing_to_reissue' }
   return { ok: true, claimUrl: claimUrl(env, r.admission.attach_code), code: r.admission.attach_code, expiresAt: r.admission.expires_at }
 }

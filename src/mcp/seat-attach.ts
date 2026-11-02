@@ -36,12 +36,12 @@ const toolSeatAttach: ToolSpec = {
   name: 'seat_attach',
   scope: 'Only for a chat on its own seat that wants to act as an existing agent its human administers. Never call it from a workspace-token agent; from an already-attached chat it only confirms the current attachment: self (attach THIS thread to an existing agent the human has admitted; seat session only)',
   min: 'authenticated',
-  args: '{ agent?: string, scope?: "seat" | "harness", reason?: string }  // reason is required when agent is supplied (1..280 characters); the agent id, slug or exact name; resolved only among agents your human administers. Omit it to list the agents this thread can attach to. scope "harness" asks your human to approve ONCE for every chat of this app (later chats then attach with no new tap); the default asks for this chat only',
+  args: '{ agent?: string, scope?: "seat" | "harness", reason?: string }  // reason is required to file a NEW approval request (1..280 characters), not to confirm or reuse an existing approval; the agent id, slug or exact name; resolved only among agents your human administers. Omit agent to list the agents this thread can attach to. scope "harness" asks your human to approve ONCE for every chat of this app (later chats then attach with no new tap); the default asks for this chat only',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', description: 'The existing agent this thread should act as: id, slug or exact name. A label to look up, not an access request: the human decides.' },
-      reason: { type: 'string', minLength: 1, maxLength: 280, description: 'Required when naming an agent: explain why THIS chat should act as that identity (1..280 characters).' },
+      reason: { type: 'string', minLength: 1, maxLength: 280, description: 'Required for a NEW approval request: explain why THIS chat should act as that identity (1..280 characters). May be omitted when repeating a pending request, confirming attachment or explicitly selecting an agent under an existing live approval.' },
       scope: { type: 'string', enum: ['seat', 'harness'], description: 'Only used when filing a NEW ask. "seat" (default): the approval covers this chat only. "harness": the human is asked to approve once for every chat of this app, so a later chat can seat_attach to the same agent with no new tap. A request, not authority: the human sees the scope at the passkey tap and can refuse it.' },
     },
     additionalProperties: false,
@@ -89,7 +89,7 @@ const toolSeatAttach: ToolSpec = {
     }
     if (agentRef.length === 0 || agentRef.length > 128) return fail(400, 'invalid_args', { field: 'agent' })
     const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
-    if (!reason || reason.length > 280 || reason.includes('\0')) return fail(400, 'invalid_args', {
+    if (args.reason !== undefined && (!reason || reason.length > 280 || reason.includes('\0'))) return fail(400, 'invalid_args', {
       field: 'reason',
       next_step: 'Call seat_attach again with the designated agent and a reason (1..280 characters) explaining why THIS chat should act as that agent.',
     })
@@ -100,7 +100,7 @@ const toolSeatAttach: ToolSpec = {
       seatId: seat.seatId,
       agentRef: attachedAs ?? agentRef, // already attached: only ever the agent it is attached to (id), never a second resolution of the caller's text
       via: 'tool',
-      reason,
+      reason: reason || undefined,
       requesterAgentId: auth.boundAgentId,
       grantTokenId: seat.grantTokenId,
       scope: args.scope === 'harness' ? 'harness' : args.scope === 'seat' ? 'seat' : undefined,
@@ -152,6 +152,11 @@ const toolSeatAttach: ToolSpec = {
       })
     }
     switch (r.error) {
+      case 'invalid_args':
+        return fail(400, r.error, {
+          field: 'reason',
+          next_step: 'A new approval request needs a reason (1..280 characters) explaining why THIS chat should act as that agent. Include reason in seat_attach; if your installed tool schema omits it, refresh the plugin tools before retrying.',
+        })
       case 'seat_attach_disabled':
         return fail(403, r.error)
       case 'agent_not_found':

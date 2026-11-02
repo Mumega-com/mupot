@@ -463,12 +463,31 @@ describe('agent page: "Own this agent" and "Issue a new claim link"', () => {
     if (!fresh1 || !old) throw new Error('fixture')
     expect(fresh1.id).not.toBe(p.admissionId)
     expect(fresh1).toMatchObject({ agent_id: 'ag1', human_member_id: 'mem-admin', requested_seat_id: old.requested_seat_id, harness_id: old.harness_id })
+    expect(one<{ reason: string }>('SELECT reason FROM agent_seat_admissions WHERE id = ?', fresh1.id)?.reason).toBe('This chat is assigned to operate the requested agent.')
     const b = await rpc(adminEnv, adminCtx, 'boot_context', {}, 'thread-1')
     expect(b.pending_claim).toMatchObject({ claim_url: `${COLONY}/claim/${fresh1.attach_code}` })
     // old link refused, new link works
     expect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).status).toBe(409)
     expect((await post(`/claim/${fresh1.attach_code}`, a, { admission_id: fresh1.id, agent_id: 'ag1' })).status).toBe(303)
     expect(admStatus(fresh1.id)).toBe('live')
+  })
+
+  it('does not reissue a legacy expired ask without a recorded reason', async () => {
+    const p = await fileAsk()
+    // Fixture only: model a pre-reason admission; production cannot edit an approval card's reason.
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_reason_immutable')
+    h.sqlite.prepare("UPDATE agent_seat_admissions SET reason = NULL, expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(p.admissionId)
+    const a = await login('admin@x.test')
+    setReauth('mem-admin', fresh())
+    const refused = await post('/agents/ag1/claim/reissue', a, {})
+    expect(refused.status).toBe(409)
+    expect(await refused.text()).toContain('Ask the original chat to call seat_attach with the agent and a reason')
+    expect(Number(one<{ n: number }>('SELECT COUNT(*) AS n FROM agent_seat_admissions')?.n)).toBe(1)
+    expect(liveAttachments()).toBe(0)
+    // The chat can still file a fresh, explained ask; no authority is granted by recovery.
+    const next = await fileAsk()
+    expect(next.admissionId).not.toBe(p.admissionId)
+    expect(admStatus(next.admissionId)).toBe('pending')
   })
 
   it('reissue by another member, or when there is nothing expired, does nothing', async () => {
