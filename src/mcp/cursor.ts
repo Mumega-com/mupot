@@ -120,6 +120,10 @@ export const toolCursorDispatch: ToolSpec = {
       ok: true,
       accepted: true,
       state: outcome.state,
+      // The client-facing contract is the same as DispatchResult: branch on delivery, not on state.
+      delivery: outcome.delivery,
+      labels: outcome.labels,
+      ...(outcome.unconfirmed ? { unconfirmed: true } : {}),
       reservation_id: outcome.reservationId,
       task_id: outcome.taskId,
       flight_id: outcome.flightId,
@@ -190,6 +194,7 @@ export const toolCursorRunStatus: ToolSpec = {
         result: statusResult.result ?? null,
         reservation_id: statusResult.reservationId,
         state: statusResult.state,
+        delivery: statusResult.delivery,
         ...(statusResult.stuck ? { stuck: true } : {}),
       })
     } catch (error) {

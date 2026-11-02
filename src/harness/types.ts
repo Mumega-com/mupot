@@ -39,8 +39,9 @@ export type HarnessDispatchState =
  *   reserved  — Mupot holds the reservation; nobody has been given the work
  *   delivered — the work reached a worker's queue (inbox row, or a vendor that accepted it)
  *   claimed   — a worker took it (lease held / task in progress under that runtime)
+ *   unknown   — cannot be proven either way; prefer this over guessing in both directions
  */
-export type HarnessDeliveryState = 'reserved' | 'delivered' | 'claimed'
+export type HarnessDeliveryState = 'reserved' | 'delivered' | 'claimed' | 'unknown'
 
 export interface HarnessCapabilities {
   kind: HarnessKind
@@ -91,6 +92,11 @@ export interface DispatchResult {
    * `harness` and `host` are caller claims, not proofs, and no fence or grant may read them.
    */
   labels: AttemptLabels
+  /**
+   * Set when a launch may have happened but could not be bound (lost lease after launch,
+   * launch_unconfirmed). The work might be with an agent, so this is never `accepted` + `reserved`.
+   */
+  unconfirmed?: boolean
   reservationId: string
   /** null = reserved, not yet bound to a Task/Flight. */
   taskId: string | null

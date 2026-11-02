@@ -1,13 +1,12 @@
-// tests/harness-delivery-conformance.test.ts
+// tests/harness-delivery-classifier.test.ts
 //
-// One suite, two named fixtures, the same cases. The point is not that Grok works — it is that
-// every harness answers "did the work leave Mupot?" the same way, so a caller never has to know
-// which vendor produced a result (task a9441963, mupot#2283).
+// The delivery CLASSIFIER, and the Grok adapter's record-only path.
 //
-// Named fixtures: `codex` and `claude`. Today neither has a HarnessAdapter in this tree; the
-// fixture drives the attached-runtime path (reservation + vendor status) that any future adapter
-// for them must go through. What these fixtures cannot prove is stated in the task result, not
-// implied here: they do not boot a real Codex or Claude process.
+// This suite does not prove Codex or Claude conform to anything: neither has an adapter in this
+// tree, no process is started, and the two labels only vary a scalar passed to one pure function.
+// It also does not test revocation, replay-of-labels or an attached runtime's claim protocol —
+// those need a live walk. Review round 2 asked for the old filename and its claims to be cut down
+// to what is actually exercised, so the file is now named for the classifier it tests.
 import { describe, expect, it } from 'vitest'
 import { deliveryStateOf, attemptLabels } from '../src/harness/delivery'
 import type { HarnessKind } from '../src/harness/types'
@@ -20,9 +19,11 @@ const FIXTURES: Fixture[] = [
 ]
 
 // The same five cases run against both fixtures.
-const CASES = ['bounded task', 'duplicate delivery', 'interruption', 'result', 'revocation'] as const
+// Scalar classifications, not protocol cases. The names are kept only so the round-1 cases stay
+// traceable; several of them (interruption, revocation) are classified here, not exercised.
+const CASES = ['held reservation', 'duplicate dispatch', 'interrupted run', 'finished run', 'revoked run'] as const
 
-describe('harness delivery conformance', () => {
+describe('harness delivery classifier', () => {
   for (const fixture of FIXTURES) {
     describe(`fixture: ${fixture.name} (${fixture.kind})`, () => {
       it(`${CASES[0]}: a held reservation is reserved, not delivered`, () => {
@@ -54,14 +55,14 @@ describe('harness delivery conformance', () => {
         expect(deliveryStateOf({ state: 'attached', last_vendor_status: 'in_progress' })).toBe('claimed')
       })
 
-      it(`${CASES[4]}: revocation is reserved unless the work had already gone out`, () => {
+      it(`${CASES[4]}: a revoked reservation is reserved unless the work had already gone out`, () => {
         expect(deliveryStateOf({ state: 'reconciled', last_vendor_status: null })).toBe('reserved')
         expect(deliveryStateOf({ state: 'reconciled', last_vendor_status: 'queued' })).toBe('delivered')
       })
 
-      it('an unknown vendor status is never evidence of delivery', () => {
+      it('an unknown vendor status proves nothing, so it is unknown — not reserved, not delivered', () => {
         expect(deliveryStateOf({ state: 'attached', last_vendor_status: 'whatever-new-vendor-says' })).toBe(
-          'reserved',
+          'unknown',
         )
       })
 
@@ -87,7 +88,7 @@ describe('harness delivery conformance', () => {
     })
   }
 
-  it('codex and claude fixtures answer every case identically', () => {
+  it('the two labels cannot change the answer, because only one function decides', () => {
     const rows = [
       { state: 'reserved', last_vendor_status: null },
       { state: 'attaching', last_vendor_status: null },
@@ -103,16 +104,16 @@ describe('harness delivery conformance', () => {
     // The decision is made once, in one place, so it cannot differ by vendor.
     const answers = rows.map((row) => deliveryStateOf(row))
     expect(answers).toEqual([
-      'reserved',
-      'reserved',
-      'reserved',
-      'reserved',
-      'delivered',
-      'claimed',
-      'reserved',
-      'delivered',
-      'delivered',
-      'reserved',
+      'reserved', // reserved
+      'reserved', // attaching
+      'reserved', // attached, no status
+      'reserved', // attached, record-only
+      'delivered', // attached, accepted
+      'claimed', // attached, claimed
+      'reserved', // failed, no status
+      'delivered', // failed, running
+      'delivered', // reconciled, queued
+      'unknown', // attached, unheard-of status
     ])
   })
 })

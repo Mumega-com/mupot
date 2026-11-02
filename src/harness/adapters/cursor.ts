@@ -36,6 +36,9 @@ import type {
  * Public error vocabulary. Raw exception text (D1/SQL, vendor) is NEVER returned to callers: anything outside
  * this set (after stripping a `: detail` suffix) collapses to `dispatch_failed`.
  */
+/** A launch that may have happened without being bound. Never collapse these into `reserved`. */
+const UNCONFIRMED_ERRORS = new Set(['launch_unconfirmed', 'bind_unconfirmed', 'bind_lost_lease'])
+
 const PUBLIC_ERROR_CODES = new Set([
   'idempotency_key_conflict',
   'execution_paused',
@@ -177,6 +180,29 @@ export const cursorCloudAdapter: HarnessAdapter = {
 
       // Synchronous attach fallback (for unit tests or non-waitUntil callers)
       const attached = await attachCursorCloudExecution(env, reserved.reservationId, { model: req.model })
+      // The vendor may already have the run even though we lost the lease that would let us record
+      // it, or the launch answer never arrived. Reporting `accepted: true, delivery: 'reserved'`
+      // here would hide work that might be running — the exact failure this PR exists to stop.
+      if (attached.error && UNCONFIRMED_ERRORS.has(attached.error)) {
+        return {
+          accepted: true,
+          state: acceptedStateOf(attached.state),
+          delivery: 'unknown',
+          unconfirmed: true,
+          labels: labelsFor(req),
+          reservationId: reserved.reservationId,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
+          adapter: 'cursor-cloud',
+          idempotencyKey: req.idempotencyKey,
+          replay: attached.replay,
+          // Ids come from the row: the attach result does not carry them, and inventing them here
+          // would let an unconfirmed launch look identified.
+          vendorAgentId: reserved.row.vendor_agent_id ?? undefined,
+          vendorRunId: reserved.row.vendor_run_id ?? undefined,
+          vendorUrl: reserved.row.vendor_url ?? undefined,
+        }
+      }
       if (attached.state === 'failed' || attached.error === 'execution_paused') {
         return {
           accepted: false,
@@ -222,8 +248,11 @@ export const cursorCloudAdapter: HarnessAdapter = {
     const stuck = row ? isReservationStuck(row) : false
 
     const token = resolveCursorApiToken(env)
-    const agentId = query.vendorAgentId ?? row?.vendor_agent_id
-    const runId = query.vendorRunId ?? row?.vendor_run_id
+    // The row is the record of what Mupot actually launched. A caller-supplied id must never
+    // override it, or a caller could point a reservation's status at someone else's run and have
+    // that run's status decide this reservation's delivery. Query ids are for adhoc lookups only.
+    const agentId = row ? row.vendor_agent_id : query.vendorAgentId
+    const runId = row ? row.vendor_run_id : query.vendorRunId
 
     if (!row && (!agentId || !runId)) {
       throw new Error('reservation_or_vendor_ids_required')
