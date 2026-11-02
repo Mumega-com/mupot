@@ -21,13 +21,11 @@
 
 import type { AuthContext, Env } from '../types'
 import { seatAutoEnrollEnabled } from './harness'
-import { seatSelect } from './seat-select'
 import {
   attachSeatToAgent, listDesignatableAgents, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled,
   type AdmissionScope, type AttachableAgent, type AttachResult,
 } from './seat-attach'
 import { isUnboundDirectorySession } from './bootstrap-self'
-import { normalizeSeatKey, seatKeyHash } from './seat-key'
 
 export function namedIntentEnabled(env: Pick<Env, 'NAMED_INTENT_CONNECT' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH'>): boolean {
   return env.NAMED_INTENT_CONNECT === '1' && seatAutoEnrollEnabled(env) && seatAttachEnabled(env)
@@ -35,8 +33,6 @@ export function namedIntentEnabled(env: Pick<Env, 'NAMED_INTENT_CONNECT' | 'SEAT
 
 export const INTENT_REF_MAX = 128
 export const INTENT_REASON_MAX = 280
-/** The fixed project label of every intent seat: the seat key is (project, thread=<target agent id>[:<thread label>]). */
-export const INTENT_SEAT_PROJECT = 'named-intent'
 
 export type NamedIntentFailure =
   | 'named_intent_disabled'
@@ -44,37 +40,29 @@ export type NamedIntentFailure =
   | 'seat_session_required'
   | 'seat_handle_rejected'
   | 'already_attached'
-  | 'intent_seat_cap'
+  | 'conversation_key_required'
   | 'agent_not_found'
   | 'agent_not_designated_for_you'
   | 'agent_ambiguous'
 
-/** Unattached intent seats (handle path) one human may hold per app: a flood bound, so new thread labels cannot mint seats forever. */
-export const INTENT_UNATTACHED_SEAT_CAP = 3
-
-export interface NamedIntentArgs { agent: unknown; reason: unknown; scope?: unknown; thread?: unknown }
+export interface NamedIntentArgs { agent: unknown; reason: unknown; scope?: unknown }
 
 export type NamedIntentResult =
-  | { ok: true; carrier: 'chat_seat' | 'handle_seat'; target: AttachableAgent; attach: AttachResult; seat: { handle: string | null; id: string } }
+  | { ok: true; carrier: 'chat_seat'; target: AttachableAgent; attach: AttachResult; seat: { id: string } }
   | { ok: true; carrier: 'chat_seat'; target: AttachableAgent; attach: null; seat: null }
   | { ok: false; error: NamedIntentFailure; detail?: unknown; agent?: { id: string; slug: string; name: string } }
   | { ok: false; error: 'seat_failed'; seatError: string; detail?: unknown }
 
 /** Validated, trimmed arguments. Never throws. */
 export function readIntentArgs(a: NamedIntentArgs):
-  | { ok: true; ref: string; reason: string; scope: AdmissionScope | undefined; thread: string | undefined }
+  | { ok: true; ref: string; reason: string; scope: AdmissionScope | undefined }
   | { ok: false; field: string } {
   const ref = typeof a.agent === 'string' ? a.agent.trim() : ''
   if (ref.length === 0 || ref.length > INTENT_REF_MAX || ref.includes('\0')) return { ok: false, field: 'agent' }
   const reason = typeof a.reason === 'string' ? a.reason.trim() : ''
   if (reason.length === 0 || reason.length > INTENT_REASON_MAX || reason.includes('\0')) return { ok: false, field: 'reason' }
   if (a.scope !== undefined && a.scope !== 'seat' && a.scope !== 'harness') return { ok: false, field: 'scope' }
-  let thread: string | undefined
-  if (a.thread !== undefined) {
-    if (typeof a.thread !== 'string' || a.thread.trim().length === 0 || a.thread.length > 100) return { ok: false, field: 'thread' }
-    thread = a.thread.trim()
-  }
-  return { ok: true, ref, reason, scope: a.scope === 'harness' ? 'harness' : a.scope === 'seat' ? 'seat' : undefined, thread }
+  return { ok: true, ref, reason, scope: a.scope === 'harness' ? 'harness' : a.scope === 'seat' ? 'seat' : undefined }
 }
 
 /**
@@ -107,15 +95,6 @@ export function intentCarrier(auth: AuthContext): IntentCarrier | null {
   return null
 }
 
-async function unattachedIntentSeats(env: Env, memberId: string, harnessId: string): Promise<number> {
-  const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM agent_seats s
-      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.harness_id = ?3 AND s.source = 'select' AND s.label_basename = ?4 AND s.retired_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments a WHERE a.seat_id = s.id AND a.detached_at IS NULL)`,
-  ).bind(env.TENANT_SLUG, memberId, harnessId, INTENT_SEAT_PROJECT).first<{ n: number }>()
-  return Number(row?.n ?? 0)
-}
-
 export async function connectNamedIntent(env: Env, auth: AuthContext, rawArgs: NamedIntentArgs): Promise<NamedIntentResult> {
   // 1. Flag: first statement; off means nothing below ever runs.
   if (!namedIntentEnabled(env)) return { ok: false, error: 'named_intent_disabled' }
@@ -137,6 +116,13 @@ export async function connectNamedIntent(env: Env, auth: AuthContext, rawArgs: N
     return { ok: true, carrier: 'chat_seat', target: { ...row, squad_name: '' }, attach: null, seat: null }
   }
 
+  // 2b. A chat with no per-conversation client key (openai/session or Codex threadId) has nothing that proves WHICH chat it is, so a
+  //     one-chat approval could be reused by any caller of the same grant: refused here, before anything is read or written.
+  if (carrier.kind === 'unbound') {
+    if (typeof auth.harnessId !== 'string') return { ok: false, error: 'seat_failed', seatError: 'harness_required' }
+    if (!auth.intentSeater) return { ok: false, error: 'conversation_key_required' }
+  }
+
   // 3. Resolve the target BEFORE anything is created or filed.
   const target = await resolveIntentTarget(env, humanMemberId, args.ref)
   if (!target.ok) return target.error === 'agent_not_designated_for_you'
@@ -147,47 +133,20 @@ export async function connectNamedIntent(env: Env, auth: AuthContext, rawArgs: N
   let seatId: string
   let grantTokenId: string | null
   let requesterAgentId: string
-  let seatInfo: { handle: string | null; id: string }
-  let carrierKind: 'chat_seat' | 'handle_seat' = 'chat_seat'
   if (carrier.kind === 'seat') {
     seatId = carrier.seatId; grantTokenId = carrier.grantTokenId; requesterAgentId = carrier.seatAgentId
-    seatInfo = { handle: null, id: seatId }
-  } else if (auth.intentSeater) {
-    // The chat carries a per-conversation client key: its own conversation-keyed seat (created now, after resolution).
-    const bound = await auth.intentSeater()
+  } else {
+    // intentSeater is present (checked in 2b): this chat's own conversation-keyed seat, created now, after resolution.
+    const bound = await auth.intentSeater!() // eslint-disable-line @typescript-eslint/no-non-null-assertion -- presence proven in 2b
     if (!bound.seatBinding || !bound.boundAgentId) {
       return { ok: false, error: 'seat_failed', seatError: bound.seatInputs?.autoSeatRefused ?? 'seat_not_live' }
     }
     seatId = bound.seatBinding.seatId; grantTokenId = bound.seatBinding.grantTokenId; requesterAgentId = bound.boundAgentId
-    seatInfo = { handle: null, id: seatId }
-  } else {
-    if (typeof auth.harnessId !== 'string') return { ok: false, error: 'seat_failed', seatError: 'harness_required' }
-    // No client key at all: the chat must name its own stable thread label (a selector, as in seat_select) and carry the handle.
-    if (args.thread === undefined) return { ok: false, error: 'invalid_args', detail: { field: 'thread', reason: 'thread_required_without_client_key' } }
-    const threadLabel = `${target.agent.id}:${args.thread}`
-    const harnessId = auth.harnessId
-    if (typeof harnessId === 'string') {
-      const nk = normalizeSeatKey({ project: INTENT_SEAT_PROJECT, thread: threadLabel })
-      if (nk.ok) {
-        const kh = await seatKeyHash(humanMemberId, harnessId, nk.key)
-        const exists = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE tenant = ?1 AND member_id = ?2 AND harness_id = ?3 AND key_hash = ?4 LIMIT 1`)
-          .bind(env.TENANT_SLUG, humanMemberId, harnessId, kh).first<{ x: number }>()
-        // Only a NEW label is bounded: a repeat of an existing one creates nothing.
-        if (!exists && (await unattachedIntentSeats(env, humanMemberId, harnessId)) >= INTENT_UNATTACHED_SEAT_CAP) {
-          return { ok: false, error: 'intent_seat_cap', detail: { cap: INTENT_UNATTACHED_SEAT_CAP } }
-        }
-      }
-    }
-    const sel = await seatSelect(env, auth, { project: INTENT_SEAT_PROJECT, thread: threadLabel })
-    if (!sel.ok) return { ok: false, error: 'seat_failed', seatError: sel.error, detail: sel.detail }
-    seatId = sel.seat.id; grantTokenId = auth.tokenId ?? null; requesterAgentId = sel.agent.id
-    seatInfo = { handle: sel.seat_handle, id: seatId }
-    carrierKind = 'handle_seat'
   }
 
   // 5. Attach through the one writer, handing it the RESOLVED id (it re-resolves inside; a name never reaches a write).
   const attach = await attachSeatToAgent(env, {
     humanMemberId, seatId, agentRef: target.agent.id, via: 'tool', reason: args.reason, requesterAgentId, grantTokenId, scope: args.scope,
   })
-  return { ok: true, carrier: carrierKind, target: target.agent, attach, seat: seatInfo }
+  return { ok: true, carrier: 'chat_seat', target: target.agent, attach, seat: { id: seatId } }
 }

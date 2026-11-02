@@ -19,33 +19,29 @@ const toolConnectIntent: ToolSpec = {
   name: 'connect_intent',
   scope: 'Only for a chat that knows WHICH existing agent it should act as and has not attached yet. Call it first, before boot_context, when you were told an agent: self (state the agent this connection means; one passkey consent attaches it)',
   min: 'authenticated',
-  args: '{ agent: string, reason: string, scope?: "seat" | "harness", thread?: string }  // agent: id, slug or exact name of an EXISTING agent your human administers (a selector, never authority); reason (1..280 characters, REQUIRED); thread: REQUIRED only when this connection sends no per-conversation key (then pass the returned seat handle on every call)',
+  args: '{ agent: string, reason: string, scope?: "seat" | "harness" }  // agent: id, slug or exact name of an EXISTING agent your human administers (a selector, never authority); reason (1..280 characters, REQUIRED)',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', maxLength: INTENT_REF_MAX, description: 'The existing agent this connection means: id, slug or exact name. A label to look up, not an access request: your human decides.' },
       reason: { type: 'string', minLength: 1, maxLength: INTENT_REASON_MAX, description: 'Required: why THIS connection should act as that agent (1..280 characters).' },
       scope: { type: 'string', enum: ['seat', 'harness'], description: 'Optional. "seat" (default): the approval covers this chat only. "harness": approve once for every chat of this app. A request, not authority: your human sees it at the tap and can refuse it.' },
-      thread: { type: 'string', maxLength: 100, description: 'Required only when this connection sends no per-conversation key: a stable label for THIS chat (reuse it to resume the same seat). Ignored otherwise.' },
     },
     required: ['agent', 'reason'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const r = await connectNamedIntent(env, auth, { agent: args.agent, reason: args.reason, scope: args.scope, thread: args.thread })
+    const r = await connectNamedIntent(env, auth, { agent: args.agent, reason: args.reason, scope: args.scope })
     if (r.ok) {
       if (r.attach === null) {
         return done({ status: 'attached', agent: { id: r.target.id, slug: r.target.slug, name: r.target.name }, note: 'This thread is already attached to that agent. Nothing to do: call boot_context to see the identity_receipt.' })
       }
       const out = await attachOutcome(env, auth.seatBinding?.humanMemberId ?? auth.memberId ?? '', r.attach)
       if (out.ok && typeof out.result === 'object' && out.result !== null) {
-        const seat = r.seat
         return done({
           ...out.result,
           target: { id: r.target.id, slug: r.target.slug, name: r.target.name },
-          ...(seat && seat.handle
-            ? { seat: seat.handle, seat_id: seat.handle, instruction: `This connection sends no per-conversation key, so it MUST pass \`seat: ${seat.handle}\` on EVERY call (including after approval), or it stays a throwaway identity.` }
-            : { instruction: 'Nothing to pass: after approval this same conversation acts as the agent on its next request, with no handle. A different conversation does not.' }),
+          instruction: 'Nothing to pass: after approval this same conversation acts as the agent on its next request, with no handle. A different conversation does not.',
           next_call: NEXT_CALL,
         })
       }
@@ -67,9 +63,12 @@ const toolConnectIntent: ToolSpec = {
       case 'already_attached':
         return fail(409, r.error, 'This thread is already attached to a different agent. Ask your human to detach or move it on their Connections page.')
       case 'seat_handle_rejected':
-        return fail(403, r.error, { next_step: 'The seat handle you sent was not accepted and a rejected handle is final: pass the exact `seat` value connect_intent returned for this chat, or omit it and let this conversation use its own key.' })
-      case 'intent_seat_cap':
-        return fail(429, r.error, { ...(typeof r.detail === 'object' && r.detail !== null ? r.detail : {}), next_step: 'This app already holds the maximum number of unattached named-intent seats. Reuse the thread label you used before (it creates nothing), or have your human clear pending requests on their Connections page.' })
+        return fail(403, r.error, { next_step: 'The seat handle you sent was not accepted and a rejected handle is final: pass the exact `seat` value seat_select returned for this chat, or omit it and let this conversation use its own key.' })
+      case 'conversation_key_required':
+        return fail(409, r.error, {
+          who_acts: 'self',
+          next_step: 'This connection sends no per-conversation key (openai/session or a Codex threadId), so it cannot prove which chat is asking and a one-chat approval could be reused by another. Nothing was created. Use a client that sends one, or ask your human to attach this chat from their Connections page, or call seat_attach from a seat session.',
+        })
       case 'agent_not_found':
         // One text for every miss (no existence oracle) and no silent creation: say what this door does NOT do.
         return fail(404, r.error, {

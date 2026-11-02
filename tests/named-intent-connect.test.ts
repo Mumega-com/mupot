@@ -420,7 +420,7 @@ describe('schema and instructions publish the same contract (reason is required 
     const tools = advertisedTools(env)
     const ci = tools.find((t) => t.name === 'connect_intent')!
     expect(ci.inputSchema.required).toEqual(['agent', 'reason'])
-    expect(Object.keys(ci.inputSchema.properties)).toEqual(expect.arrayContaining(['agent', 'reason', 'scope', 'thread']))
+    expect(Object.keys(ci.inputSchema.properties)).toEqual(expect.arrayContaining(['agent', 'reason', 'scope']))
     expect(Object.keys(tools.find((t) => t.name === 'seat_attach')!.inputSchema.properties)).toContain('reason')
     // the wire: a real tools/list through the router
     const res = await mcpApp.fetch(mcpInternalRequest(new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) }), (await grant(env, HUMAN)).ctx), env)
@@ -461,47 +461,68 @@ describe('round 2: "this chat only" is true (three chats: A asks, B and C must n
 const keyless = (env: Env, g: Grant, agent: string, args: Record<string, unknown> = {}): Promise<Rpc> =>
   rpc(env, g.ctx, 'connect_intent', { agent, reason: REASON, ...args })
 
-describe('round 2: a connection with NO per-conversation key (handle path) and the scope/thread/grant bindings', () => {
-  it('requires a thread label; the handle must be sent on every call and is the only way to act as the agent', async () => {
+describe('final cut: no per-conversation key => refuse, create nothing (Athena\'s four regression probes)', () => {
+  const noRows = (): number[] => [rows.seats(), rows.agents(), rows.members(), rows.admissions(), rows.attachments(), n(`SELECT COUNT(*) AS n FROM secure_moments`)]
+
+  it('probe 1 (control): two ChatGPT-shaped chats (distinct openai/session): B never receives A\'s code, and only A boots as the agent', async () => {
     const env = envFor(h, ON)
     const g = await grant(env, HUMAN)
-    const bad = await keyless(env, g, 'rava')
-    expect(errOf(bad)).toBe('invalid_args')
-    expect(rows.seats()).toBe(0)
-    const a = await keyless(env, g, 'rava', { thread: 'chat-a' })
-    expect(a.sc.status, JSON.stringify(a.body)).toBe('pending_admission')
-    expect(String(a.sc.seat)).toMatch(/^mseat_/)
-    expect(String(a.sc.instruction)).toMatch(/MUST pass/)
+    const a = await intent(env, g, 'rava', 'gpt-a')
+    const b = await intent(env, g, 'rava', 'gpt-b')
+    expect(b.sc.attach_code ?? null).toBeNull()
+    expect(b.sc.approve_url ?? null).toBeNull()
     const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
     expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
-    expect((await rpc(env, g.ctx, 'boot_context', {})).sc.bound_agent_id).not.toBe('agent-rava') // without the handle: not the agent
-    expect((await rpc(env, g.ctx, 'boot_context', { seat: String(a.sc.seat) })).sc.bound_agent_id).toBe('agent-rava')
+    expect((await boot(env, g, 'gpt-a')).sc.bound_agent_id).toBe('agent-rava')
+    expect((await boot(env, g, 'gpt-b')).sc.bound_agent_id).not.toBe('agent-rava')
   })
 
-  it('thread is frozen into the seat: same label (any spelling of the name) = same seat; a new label = a new seat; a rejected handle is final', async () => {
+  it('probe 2 (control): two Codex-shaped chats (distinct threadId): same isolation', async () => {
     const env = envFor(h, ON)
-    const g = await grant(env, HUMAN)
-    const a1 = await keyless(env, g, 'rava', { thread: 't1' })
-    const a2 = await keyless(env, g, 'Rava', { thread: 't1' })
-    const a3 = await keyless(env, g, 'agent-rava', { thread: 't1' })
-    expect(rows.seats()).toBe(1)
-    expect(a2.sc.admission_id).toBe(a1.sc.admission_id)
-    expect(a3.sc.admission_id).toBe(a1.sc.admission_id)
-    await keyless(env, g, 'rava', { thread: 't2' })
-    expect(rows.seats()).toBe(2)
-    const rej = await rpc(env, g.ctx, 'connect_intent', { agent: 'rava', reason: REASON, thread: 't9' }, { meta: { 'mupot/seat': 'mseat_not-a-real-handle' } })
-    expect(errOf(rej)).toBe('seat_handle_rejected')
-    expect(rows.seats()).toBe(2)
+    const g = await grant(env, HUMAN, 'client-codex', 'Codex')
+    const call = (tid: string): Promise<Rpc> => rpc(env, g.ctx, 'connect_intent', { agent: 'rava', reason: REASON }, { meta: codex(tid) })
+    const a = await call('thr-a')
+    const b = await call('thr-b')
+    expect(a.sc.status, JSON.stringify(a.body)).toBe('pending_admission')
+    expect(b.sc.attach_code ?? null).toBeNull()
+    expect(b.sc.approve_url ?? null).toBeNull()
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await rpc(env, g.ctx, 'boot_context', {}, { meta: codex('thr-a') })).sc.bound_agent_id).toBe('agent-rava')
+    expect((await rpc(env, g.ctx, 'boot_context', {}, { meta: codex('thr-b') })).sc.bound_agent_id).not.toBe('agent-rava')
   })
 
-  it('new labels are bounded: the 4th unattached intent seat is refused, a repeat of an existing label still works, nothing extra is created', async () => {
+  it('probe 3: keyless caller A, then a second keyless caller repeating A\'s (now ignored) thread label: both refused, no code, no handle, no link, nothing created', async () => {
     const env = envFor(h, ON)
     const g = await grant(env, HUMAN)
-    for (const t of ['t1', 't2', 't3']) expect(['pending_admission', 'already_pending']).toContain((await keyless(env, g, 'rava', { thread: t })).sc.status)
-    const agents = rows.agents(); const seats = rows.seats()
-    expect(errOf(await keyless(env, g, 'rava', { thread: 't4' }))).toBe('intent_seat_cap')
-    expect(['already_pending', 'pending_admission']).toContain((await keyless(env, g, 'rava', { thread: 't2' })).sc.status)
-    expect([rows.agents(), rows.seats()]).toEqual([agents, seats])
+    const before = noRows()
+    for (const extra of [{ thread: 'chat-a' }, {}]) {
+      const r = await keyless(env, g, 'rava', extra)
+      expect(['conversation_key_required', 'invalid_args']).toContain(errOf(r)) // `thread` is no longer an argument: the schema refuses it, or the key check does
+    }
+    const r = await keyless(env, g, 'rava')
+    expect(errOf(r)).toBe('conversation_key_required')
+    expect(nextStep(r)).toMatch(/sends no per-conversation key/)
+    const text = JSON.stringify(r.body)
+    expect(text).not.toMatch(/attach_code|approve_url|mseat_/)
+    expect(noRows()).toEqual(before)
+  })
+
+  it('probe 4: concurrent keyless requests with new labels cannot create seats: all refused, zero rows', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const before = noRows()
+    const out = await Promise.all(['t1', 't2', 't3', 't4'].map((t) => keyless(env, g, 'rava', { thread: t })))
+    for (const r of out) expect(['conversation_key_required', 'invalid_args']).toContain(errOf(r))
+    expect(noRows()).toEqual(before)
+  })
+
+  it('keyless refusal precedes resolution: a miss and a hit read the same, and the verdict never depends on the agent', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    expect(errOf(await keyless(env, g, 'ghost'))).toBe('conversation_key_required')
+    expect(errOf(await keyless(env, g, 'rava'))).toBe('conversation_key_required')
+    expect(errOf(await keyless(env, g, 'other-ops'))).toBe('conversation_key_required')
   })
 
   it('scope "harness" is recorded on the ask and, bound to the live grant, lets a LATER chat attach with no new tap; scope "seat" never does', async () => {
@@ -525,21 +546,7 @@ describe('round 2: a connection with NO per-conversation key (handle path) and t
     expect(one<{ scope: string }>(`SELECT scope FROM agent_seat_admissions`)?.scope).toBe('seat')
   })
 
-  it('the handle path also carries the grant: a harness-scoped ask from a keyless chat attaches', async () => {
-    const env = envFor(h, { ...ON, WORKSPACES: '1' })
-    const g = await grant(env, HUMAN)
-    const a = await keyless(env, g, 'rava', { thread: 'k1', scope: 'harness' })
-    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
-    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
-    const done = await keyless(env, g, 'rava', { thread: 'k1', scope: 'harness' })
-    expect(done.sc.status, JSON.stringify(done.body)).toBe('attached')
-    // a LATER chat that already has its own seat (booted first) attaches with no new tap: the existing-seat carrier proves the grant
-    await boot(env, g, 'chat-later')
-    const later = await intent(env, g, 'rava', 'chat-later')
-    expect(later.sc.status, JSON.stringify(later.body)).toBe('attached')
-  })
 })
-
 describe('round 2: the grant rides an EXISTING seat too', () => {
   it('a chat that booted first (own auto seat) files a harness-scoped ask and attaches after the tap', async () => {
     const env = envFor(h, { ...ON, WORKSPACES: '1' })
