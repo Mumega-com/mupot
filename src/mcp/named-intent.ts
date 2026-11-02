@@ -41,7 +41,13 @@ const toolConnectIntent: ToolSpec = {
         return done({
           ...out.result,
           target: { id: r.target.id, slug: r.target.slug, name: r.target.name },
-          instruction: 'Nothing to pass: after approval this same conversation acts as the agent on its next request, with no handle. A different conversation does not.',
+          // mumega-com#1628: the guidance depends on how the SERVER bound this seat. 'handle' means a presented mseat_
+          // handle with no per-conversation key, so telling the caller to pass nothing would lose the seat on the next
+          // call. 'auto:*' means the client's own per-thread key already identifies the conversation: nothing to pass.
+          // The handle value is never echoed.
+          instruction: auth.seatBinding?.source === 'handle'
+            ? 'Keep passing the same `seat` handle you used for this call: this conversation has no per-conversation key, so a next call without it will not act as the agent. A different conversation does not either.'
+            : 'Nothing to pass: after approval this same conversation acts as the agent on its next request, with no handle. A different conversation does not.',
           next_call: NEXT_CALL,
         })
       }

@@ -112,7 +112,14 @@ export async function connectNamedIntent(env: Env, auth: AuthContext, rawArgs: N
   if (carrier.kind === 'seat' && carrier.attachedAgentId !== null) {
     const row = await env.DB.prepare(`SELECT id, slug, name, squad_id FROM agents WHERE id = ?1 LIMIT 1`).bind(carrier.attachedAgentId)
       .first<{ id: string; slug: string; name: string; squad_id: string }>()
-    if (!row || (args.ref !== row.id && args.ref.toLowerCase() !== row.slug.toLowerCase())) return { ok: false, error: 'already_attached' }
+    // mumega-com#1628: the tool schema advertises the ref as id, slug OR exact name, so the repeat call must accept
+    // an exact name that differs from the slug. Without the name arm a caller who selected by name falls through to
+    // already_attached even though this row IS the agent they named. Still compared ONLY against the attached row, so
+    // a non-match stays the same already_attached whether or not the named agent exists (no oracle).
+    const ref = args.ref
+    const lower = ref.toLowerCase()
+    const namesThisAgent = !!row && (ref === row.id || lower === row.slug.toLowerCase() || lower === row.name.toLowerCase())
+    if (!row || !namesThisAgent) return { ok: false, error: 'already_attached' }
     return { ok: true, carrier: 'chat_seat', target: { ...row, squad_name: '' }, attach: null, seat: null }
   }
 

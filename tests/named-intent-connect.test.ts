@@ -293,6 +293,42 @@ describe('(b) a repeat or restart reuses it: same UUIDs, no duplicate', () => {
     expect([rows.attachments(), rows.seats(), rows.agents(), rows.admissions()]).toEqual([1, seats, agents, 1])
     expect((await intent(env, g, 'rava')).sc.status).toBe('attached')
   })
+
+  it('mumega-com#1628: an attached chat selected again by EXACT NAME where the name differs from the slug stays attached', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const first = await intent(env, g, 'hadi-admin')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    await decideMoment(env, String(first.sc.approve_url), key, 'approve')
+    const done = await intent(env, g, 'hadi-admin')
+    expect(done.sc.status).toBe('attached')
+    // 'Hadi Admin' is the seeded NAME, 'hadi-admin' the slug: lowercasing the name does not match the slug, so before
+    // this fix the repeat fell through to already_attached and claimed the thread was attached to something else.
+    const byName = await intent(env, g, 'Hadi Admin')
+    expect(byName.sc.status, JSON.stringify(byName.body)).toBe('attached')
+    expect(byName.sc.attachment_id).toBe(done.sc.attachment_id)
+    // id and slug selectors keep working, and a non-match is still already_attached (no oracle).
+    expect((await intent(env, g, 'agent-hadi-admin')).sc.status).toBe('attached')
+    expect(errOf(await intent(env, g, 'rava'))).toBe('already_attached')
+  })
+
+  it('mumega-com#1628: guidance follows how the server bound the seat: a presented mseat_ handle says keep passing it (never echoed); an auto session key says nothing to pass', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/explicit' })
+    const handle = String(sel.sc.seat_handle)
+    expect(handle.startsWith('mseat_')).toBe(true)
+    const viaHandle = await rpc(env, g.ctx, 'connect_intent', { agent: 'rava', reason: REASON }, { headers: { 'x-mupot-seat': handle } })
+    expect(viaHandle.sc.status, JSON.stringify(viaHandle.body)).toBe('pending_admission')
+    expect(String(viaHandle.sc.instruction)).toContain('Keep passing the same `seat` handle')
+    expect(String(viaHandle.sc.instruction)).not.toContain('Nothing to pass')
+    expect(JSON.stringify(viaHandle.body)).not.toContain(handle)
+    const g2 = await grant(env, HUMAN, 'client-other', 'Other')
+    const viaAuto = await intent(env, g2, 'rava', 'conv-auto')
+    expect(viaAuto.sc.status, JSON.stringify(viaAuto.body)).toBe('pending_admission')
+    expect(String(viaAuto.sc.instruction)).toContain('Nothing to pass')
+    expect(String(viaAuto.sc.instruction)).not.toContain('Keep passing')
+  })
 })
 
 describe('(c) a name alone grants nothing', () => {
