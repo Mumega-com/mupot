@@ -6,6 +6,8 @@
 // - Status polling and terminal state reconciliation.
 
 import type { Env } from '../../types'
+import type { AttemptLabels } from '../types'
+import { attemptLabels, deliveryStateOf } from '../delivery'
 import { getCursorRun, resolveCursorApiToken } from '../../cursor/client'
 import {
   attachCursorCloudExecution,
@@ -60,6 +62,16 @@ export function acceptedStateOf(state: string): 'reserved' | 'attaching' | 'atta
   if (state === 'attached') return 'attached'
   if (state === 'attaching') return 'attaching'
   return 'reserved'
+}
+
+// Descriptive only: model, harness and host are recorded per attempt and never consulted by a
+// fence or a grant.
+function labelsFor(req: DispatchRequest): AttemptLabels {
+  return attemptLabels({
+    harness: 'cursor-cloud',
+    model: req.model ?? null,
+    host: typeof req.metadata?.host === 'string' ? req.metadata.host : null,
+  })
 }
 
 export const cursorCloudAdapter: HarnessAdapter = {
@@ -124,6 +136,8 @@ export const cursorCloudAdapter: HarnessAdapter = {
         return {
           accepted: true,
           state: 'attached',
+          delivery: deliveryStateOf(reserved.row),
+          labels: labelsFor(req),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -146,6 +160,9 @@ export const cursorCloudAdapter: HarnessAdapter = {
         return {
           accepted: true,
           state: acceptedStateOf(reserved.state),
+          // waitUntil means the vendor call has not happened yet: the work is held, not handed over.
+          delivery: 'reserved',
+          labels: labelsFor(req),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -172,6 +189,9 @@ export const cursorCloudAdapter: HarnessAdapter = {
       return {
         accepted: true,
         state: acceptedStateOf(attached.state),
+        // A vendor run that came back accepted is a delivery; anything else is still ours.
+        delivery: deliveryStateOf({ state: attached.state, last_vendor_status: attached.state === 'attached' ? 'accepted' : null }),
+        labels: labelsFor(req),
         reservationId: reserved.reservationId,
         taskId: reserved.task?.id ?? reserved.row.task_id,
         flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -220,6 +240,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
           reservationId,
           adapter: 'cursor-cloud',
           state,
+          delivery: deliveryStateOf({ state, last_vendor_status: run.status }),
           vendorStatus: run.status,
           vendorAgentId: agentId,
           vendorRunId: runId,
@@ -235,6 +256,8 @@ export const cursorCloudAdapter: HarnessAdapter = {
           reservationId,
           adapter: 'cursor-cloud',
           state,
+          // An error reading the vendor says nothing about whether the work was handed over.
+          delivery: deliveryStateOf(row ?? { state, last_vendor_status: null }),
           vendorAgentId: agentId,
           vendorRunId: runId,
           vendorUrl: row?.vendor_url ?? undefined,
@@ -248,6 +271,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
       reservationId,
       adapter: 'cursor-cloud',
       state,
+      delivery: deliveryStateOf(row ?? { state, last_vendor_status: null }),
       vendorAgentId: agentId ?? undefined,
       vendorRunId: runId ?? undefined,
       vendorUrl: row?.vendor_url ?? undefined,

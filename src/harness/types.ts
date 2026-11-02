@@ -30,6 +30,18 @@ export type HarnessDispatchState =
   | 'failed'
   | 'reconciled'
 
+/**
+ * Whether the WORK left Mupot. Deliberately separate from HarnessDispatchState, which tracks the
+ * reservation record. The two diverge: a reservation can be `attached` to a vendor execution row
+ * while nothing has been handed to any worker — Grok's record-only path is exactly that, and
+ * reading `attached` as "the agent got it" is what this type exists to stop (mupot#2283).
+ *
+ *   reserved  — Mupot holds the reservation; nobody has been given the work
+ *   delivered — the work reached a worker's queue (inbox row, or a vendor that accepted it)
+ *   claimed   — a worker took it (lease held / task in progress under that runtime)
+ */
+export type HarnessDeliveryState = 'reserved' | 'delivered' | 'claimed'
+
 export interface HarnessCapabilities {
   kind: HarnessKind
   launch: boolean
@@ -69,6 +81,16 @@ export interface DispatchRequest {
 export interface DispatchResult {
   accepted: true
   state: Extract<HarnessDispatchState, 'reserved' | 'attaching' | 'attached'>
+  /**
+   * Whether the work actually left Mupot. `state: 'attached'` with `delivery: 'reserved'` is a
+   * recorded dispatch, not a delivery — callers must branch on this, never on `state` alone.
+   */
+  delivery: HarnessDeliveryState
+  /**
+   * Descriptive labels for this attempt. Recorded for audit; they grant NO authority. `model`,
+   * `harness` and `host` are caller claims, not proofs, and no fence or grant may read them.
+   */
+  labels: AttemptLabels
   reservationId: string
   /** null = reserved, not yet bound to a Task/Flight. */
   taskId: string | null
@@ -79,6 +101,14 @@ export interface DispatchResult {
   vendorAgentId?: string
   vendorRunId?: string
   vendorUrl?: string
+}
+
+export interface AttemptLabels {
+  /** The harness kind that is actually running the attempt. */
+  harness: HarnessKind
+  model?: string | null
+  /** Where it ran (machine name). Kept for the audit trail, not for routing. */
+  host?: string | null
 }
 
 export interface DispatchFailure {
@@ -104,6 +134,9 @@ export interface RunStatusResult {
   reservationId: string
   adapter: HarnessKind
   state: HarnessDispatchState
+  /** Same distinction as DispatchResult.delivery: attached is not delivered. */
+  delivery: HarnessDeliveryState
+  labels?: AttemptLabels
   vendorStatus?: string
   vendorAgentId?: string
   vendorRunId?: string
