@@ -185,23 +185,17 @@ export const cursorCloudAdapter: HarnessAdapter = {
       // it, or the launch answer never arrived. Reporting `accepted: true, delivery: 'reserved'`
       // here would hide work that might be running — the exact failure this PR exists to stop.
       if (attached.error && isUncertainLaunch(attached.error)) {
+        // NOT accepted. The P1-a fence (tests/harness-lease-fence.test.ts:108-110, and the 5xx case
+        // in harness-idempotency-mutation.test.ts:130-133) pins this: a launch we could not confirm
+        // must not read as a successful dispatch, and callers key on the bare code. The uncertainty
+        // travels in `detail` instead of being laundered into `accepted: true`.
         return {
-          accepted: true,
-          state: acceptedStateOf(attached.state),
-          delivery: 'unknown',
-          unconfirmed: true,
-          labels: labelsFor(req),
+          accepted: false,
+          error: attached.error.split(':')[0]!.trim(),
+          detail: { delivery: 'unknown', unconfirmed: true, state: acceptedStateOf(attached.state) },
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
-          adapter: 'cursor-cloud',
-          idempotencyKey: req.idempotencyKey,
-          replay: attached.replay,
-          // Ids come from the row: the attach result does not carry them, and inventing them here
-          // would let an unconfirmed launch look identified.
-          vendorAgentId: reserved.row.vendor_agent_id ?? undefined,
-          vendorRunId: reserved.row.vendor_run_id ?? undefined,
-          vendorUrl: reserved.row.vendor_url ?? undefined,
         }
       }
       if (attached.state === 'failed' || attached.error === 'execution_paused') {

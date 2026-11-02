@@ -108,10 +108,11 @@ describe('cursor dispatch return sites', () => {
     reserveMock.mockResolvedValue(reserved({ state: 'attaching', row: { ...ROW, state: 'attaching' } }))
     attachMock.mockResolvedValue({ reservationId: 'res-1', state: 'attaching', error: 'bind_lost_lease', replay: false })
     const out = await adapter.dispatch(env, req)
-    expect(out.accepted).toBe(true)
-    if (!out.accepted) return
-    expect(out.delivery).toBe('unknown')
-    expect(out.unconfirmed).toBe(true)
+    // A launch we could not confirm is NOT an accepted dispatch — the lease fence pins that.
+    expect(out.accepted).toBe(false)
+    if (out.accepted) return
+    expect(out.error).toBe('bind_lost_lease')
+    expect(out.detail).toMatchObject({ delivery: 'unknown', unconfirmed: true })
   })
 
   it('site 3b — launch_unconfirmed is unconfirmed too, in the form the writer emits', async () => {
@@ -124,9 +125,11 @@ describe('cursor dispatch return sites', () => {
       replay: false,
     })
     const out = await adapter.dispatch(env, req)
-    if (!out.accepted) throw new Error('expected accepted')
-    expect(out.delivery).toBe('unknown')
-    expect(out.unconfirmed).toBe(true)
+    // The writer appends a detail to the persisted string; the code the caller sees stays bare.
+    expect(out.accepted).toBe(false)
+    if (out.accepted) return
+    expect(out.error).toBe('launch_unconfirmed')
+    expect(out.detail).toMatchObject({ delivery: 'unknown', unconfirmed: true })
   })
 
   it('site 4 — a confirmed launch is delivered', async () => {
