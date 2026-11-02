@@ -47,7 +47,7 @@ supplied, because `message.created` is not replayable).
   The principal is part of the id, so a caller can only address its own subscriptions.
 - **Idempotent**: `INSERT ... ON CONFLICT(id) DO UPDATE` (refresh: new secret, `refresh_before`,
   status back to active). Concurrent identical subscribes yield one row.
-- **ttlMs**: default 1 h, minimum 5 min, maximum 24 h; values are clamped. `null` ("no expiry") is
+- **ttlMs**: default 24 h (when `ttlMs` is omitted), minimum 5 min, maximum 24 h; values are clamped. `null` ("no expiry") is
   **not granted**: the maximum is granted and `refreshBefore` is a real timestamp. Non-positive or
   non-numeric values are `-32602`.
 - **Secret**: must be `whsec_` + base64 decoding to 24–64 bytes. Stored **only** as AES-GCM ciphertext
