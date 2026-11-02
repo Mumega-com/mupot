@@ -72,7 +72,7 @@ import {
 } from '../members/credential-sharing'
 import { notSeatAgentSql } from '../members/seat-agent'
 import { SEAT_HANDLE_PREFIX, seatHandleFromArgs } from '../members/seat-handle'
-import { applySeatForRequest } from '../members/seat-auto'
+import { applySeatForRequest, pickAutoSeatKey } from '../members/seat-auto'
 import type { VerboseProbeInputs } from './harness-identity-probe'
 import { extractClientInfoVersion, extractMetaFacts, extractVerboseMetaValues, hintsFrom, maybeEmitHarnessIdentityProbe, verboseProbeEnabled } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities, resolveHumanStandingGrants } from './oauth-authorize'
@@ -228,6 +228,8 @@ import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
+import { NAMED_INTENT_TOOLS } from './named-intent'
+import { namedIntentEnabled } from '../members/named-intent'
 import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
@@ -684,8 +686,8 @@ async function resolveSeatSession(
   })
   // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
   // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
-  return applySeatForRequest(c.env, auth, {
-    readOnly: bodyMeta?.readOnlySeat,
+  const intentDoor = bodyMeta?.toolName === 'connect_intent' && namedIntentEnabled(c.env)
+  const seatInputs = {
     headerHandle: headerSeat,
     metaHandle: metaSeat,
     argHandle: bodyMeta?.argSeat ?? null,
@@ -696,7 +698,15 @@ async function resolveSeatSession(
     autoKeys: bodyMeta?.toolName === 'seat_select'
       ? undefined
       : { openaiSession: paramsFacts.openaiSession, codexThreadId: paramsFacts.codexThreadId },
-  })
+  }
+  if (!intentDoor) return applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: bodyMeta?.readOnlySeat })
+  // NAMED_INTENT_CONNECT: connect_intent REUSES a seat this chat already has but never creates one in the middleware, so a
+  // miss (unknown agent, bad args) leaves no agent row. After the tool resolves the target it calls intentSeater, which
+  // creates THIS chat's own conversation-keyed seat: the approval is then bound to this chat and every later request of
+  // this chat (same client key, no handle) acts as the agent once the human taps.
+  const seated = await applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: true })
+  if (seated.seatBinding || seated.seatInputs?.handleRejected || pickAutoSeatKey(seatInputs.autoKeys) === null) return seated
+  return { ...seated, intentSeater: () => applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: false }) }
 }
 
 // ── member memory scope ──────────────────────────────────────────────────────
@@ -7953,6 +7963,7 @@ export const TOOLS: ToolSpec[] = [
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
+  ...NAMED_INTENT_TOOLS,
   ...SQUAD_CHOICE_TOOLS,
   ...SEAT_ATTACH_TOOLS,
   ...VIP_LANE_TOOLS,
@@ -8095,6 +8106,8 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
 // W2: seat_attach is advertised only while SEAT_ATTACH (and SEAT_AUTO_ENROLL) is on (flag off => tools/list unchanged).
 const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.map((t) => t.name))
+// NAMED_INTENT_CONNECT: connect_intent is advertised only while its own flag (and both seat flags) is on (flag off => tools/list unchanged).
+const NAMED_INTENT_FLAG_TOOLS: ReadonlySet<string> = new Set(NAMED_INTENT_TOOLS.map((t) => t.name))
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
 // (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
@@ -8109,7 +8122,8 @@ const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.ma
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
 // Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
 const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE' | 'OWNER_CALL'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES' | 'VIP_LANE' | 'OWNER_CALL' | 'NAMED_INTENT_CONNECT'>): ToolSpec[] {
+  const named = namedIntentEnabled(env)
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
@@ -8118,8 +8132,8 @@ export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH
   const attach = seatAttachEnabled(env)
   const moments = secureMomentsEnabled(env)
   const vip = vipLaneEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip && env.OWNER_CALL === '1') return TOOLS
-  return TOOLS.filter((t) => (env.OWNER_CALL === '1' || t.name !== 'owner_call') && (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)))
+  if (seat && access && drop && tgMiniapp && workspaces && attach && moments && vip && named && env.OWNER_CALL === '1') return TOOLS
+  return TOOLS.filter((t) => (env.OWNER_CALL === '1' || t.name !== 'owner_call') && (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (moments || !SQUAD_JOIN_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)) && (vip || !VIP_LANE_FLAG_TOOLS.has(t.name)) && (named || !NAMED_INTENT_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -8782,7 +8796,7 @@ async function handleJsonRpc(
       const auth = await resolveAuth(c, { paramsMeta: params._meta, readOnlySeat: true })
       // A held chat's hard stop also hides the request action; other registry entries retain their shared catalog.
       if (auth && (await observedFloorDecision(c.env, auth, 'seat_attach')).status === 'held') {
-        listed = listed.filter(spec => spec.name !== 'seat_attach')
+        listed = listed.filter(spec => spec.name !== 'seat_attach' && spec.name !== 'connect_intent')
       }
     }
     return ok(id, { tools: listed.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
@@ -8799,7 +8813,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined, skipSeat: canonicalName === 'connect_intent' && !namedIntentEnabled(c.env) } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }

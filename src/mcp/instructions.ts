@@ -98,16 +98,24 @@ SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "A
 export const MUPOT_MCP_ATTACH_INSTRUCTIONS = `
 
 ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when boot_context shows a seat)
-   - If your agent already exists, call 'seat_attach' { agent: "<its id, slug or exact name>" }. Do NOT call bootstrap_self from a seat session: it refuses (and would otherwise create a second agent).
+   - If your agent already exists, call 'seat_attach' { agent: "<its id, slug or exact name>", reason: "<why this chat should act as that agent, 1..280 characters; required>" }. Do NOT call bootstrap_self from a seat session: it refuses (and would otherwise create a second agent).
    - First time, it returns status "pending_admission". If it includes an approve_url, give that URL to your human: they tap their passkey once. If it has none (the pot has no approval links), your human approves on their Connections page instead; the note in the result says which. Nothing attaches before that, and you cannot approve it yourself.
    - If your human has never registered a passkey, they must first add one in My Account (the dashboard /account page, while signed in). The approve link cannot enrol one for them.
    - After they approve, call 'seat_attach' again. It attaches immediately; your NEXT request acts as that agent (boot_context shows the identity_receipt).
    - A harness TOKEN session with no seat yet (a bearer minted for a harness, not an OAuth connector) can call only seat_select, boot_context and worktree_open: call seat_select first, then seat_attach. An OAuth connector consented as "A chat you drive" with no seat yet can call seat_select to get one (a ChatGPT conversation is seated automatically); until it has a seat, seat_attach answers seat_required.
    - A background agent with its own harness signs in once by OAuth as that agent: choose "This connection is <Agent name> (runs in the background)". The harness keeps its own refresh token. This connection IS the agent, runs on its own and can be woken.`
 
-export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string }): string {
+// NAMED_INTENT_CONNECT — appended ONLY while it, SEAT_AUTO_ENROLL and SEAT_ATTACH are all '1'. Static and tenant-neutral.
+export const MUPOT_MCP_NAMED_INTENT_INSTRUCTIONS = `
+
+CONNECTING AS A NAMED AGENT (when you were told which existing agent you are; applies before you do anything else)
+   - Call 'connect_intent' { agent: "<its id, slug or exact name>", reason: "<why this chat should act as that agent, 1..280 characters; required>" } FIRST, before boot_context, so the request is resolved before any seat is made for you. It works only when your client sends a per-conversation key (openai/session or a Codex threadId); with none it refuses and creates nothing. Only THIS conversation becomes the agent. The name is a selector, never authority: it works only for an existing agent your human administers.
+   - It returns status "pending_admission" with an approve_url (or an attach_code for the Connections page). Give that to your human: ONE passkey tap that names the agent. Then call 'connect_intent' again with the same agent: it attaches immediately and your NEXT request acts as that agent. Calling it again before the tap reuses the same pending request; it never files a second one.
+   - It never creates an agent. If the agent does not exist or your human may not attach it, the refusal names who must act (an org admin) and the next step. Do not work around it by bootstrap_self.`
+
+export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string; SEAT_ATTACH?: string; NAMED_INTENT_CONNECT?: string }): string {
   if (env.SEAT_AUTO_ENROLL !== '1') return MUPOT_MCP_INITIALIZE_INSTRUCTIONS
   return env.SEAT_ATTACH === '1'
-    ? MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS + MUPOT_MCP_ATTACH_INSTRUCTIONS
+    ? MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS + MUPOT_MCP_ATTACH_INSTRUCTIONS + (env.NAMED_INTENT_CONNECT === '1' ? MUPOT_MCP_NAMED_INTENT_INSTRUCTIONS : '')
     : MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS
 }

@@ -407,6 +407,9 @@ export interface Env {
   // W2 (harness seats -> existing agents): strict '1' (AND SEAT_AUTO_ENROLL '1') turns on seat_attach, the
   // dashboard Connections attach/admit actions and the per-request attachment resolve. Unset = total no-op.
   SEAT_ATTACH?: string
+  // NAMED_INTENT_CONNECT: strict '1' (AND SEAT_AUTO_ENROLL '1' AND SEAT_ATTACH '1') turns on connect_intent, the named-intent
+  // connection door that resolves a named, already-permitted agent BEFORE any throwaway seat is made. Unset = total no-op.
+  NAMED_INTENT_CONNECT?: string
   // SEAT_ATTACH_DESIGNATED: strict '1' (requires SEAT_ATTACH) narrows attach to agents an org admin designated for the human
   // (agents.attach_designated_member_id, 0238). Unset = today's behaviour exactly.
   SEAT_ATTACH_DESIGNATED?: string
@@ -890,6 +893,9 @@ export interface AuthContext {
      *  src/auth/attached-gate.ts and callerHoldsGateCapability). `agentId` is the attached
      *  agent; `seatAgentId` is the thread's own seat agent it would otherwise be. */
     attached?: { attachmentId: string; admissionId: string; agentId: string; seatAgentId: string; ceiling: 'member' | 'lead' | 'full' } }
+  /** NAMED_INTENT_CONNECT, connect_intent only: creates THIS chat's own conversation-keyed auto seat after the target resolved
+   *  (the per-thread client key stays in the closure). Absent for every other tool and when the chat already has a seat. */
+  intentSeater?: () => Promise<AuthContext>
   /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */
   seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string; attachRefused?: string }
   webSessionIdHash?: string | null

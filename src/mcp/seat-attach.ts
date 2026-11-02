@@ -14,9 +14,9 @@
 // acts as that agent.
 
 import type { Env } from '../types'
-import type { ToolSpec } from './index'
+import type { ToolSpec, ToolOutcome } from './index'
 import { fail, done } from './index'
-import { attachSeatToAgent, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
+import { attachSeatToAgent, type AttachResult, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
 import { connectionsLink } from '../members/vip-lane'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
@@ -30,6 +30,100 @@ function claimFields(env: Env, code: string): { claim_url?: string; tell_the_per
   return url
     ? { claim_url: url, tell_the_person: `Show the person this link: ${url} . They open it while signed in and press Confirm; nothing to type. (Fallback: your attach code is ${code}; press Admit only on the card showing it.)` }
     : { tell_the_person: `Tell the person: your attach code is ${code}. Press Admit only on the card showing this code.` }
+}
+
+/** The one rendering of an attachSeatToAgent result for a tool caller (seat_attach and connect_intent share it, so the
+ *  two doors cannot answer the same state differently). Pure over (env, human, result). */
+export async function attachOutcome(env: Env, humanMemberId: string, r: AttachResult): Promise<ToolOutcome> {
+  if (r.ok && r.status === 'attached') {
+    return done({
+      status: 'attached',
+      attachment_id: r.attachment_id,
+      admission_id: r.admission_id,
+      agent: r.agent,
+      note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
+    })
+  }
+  if (r.ok && r.status === 'pending_admission' && r.requires_human_release) {
+    return done({
+      status: 'pending_admission', admission_id: r.admission_id,
+      connections_url: connectionsLink(env),
+      note: 'Pending. This chat is observed. The earlier approval cannot attach it. Your human must select Release for THIS chat on Connections, then call seat_attach again.',
+    })
+  }
+  if (r.ok && r.already_pending) {
+    if (!r.attach_code) {
+      return done({
+        status: 'already_pending',
+        admission_id: r.admission_id,
+        expires_at: r.expires_at,
+        note: 'A different chat holds this pending request for this agent, so no code or link is given here. Ask your human to deny it on their Connections page, then ask again from this chat to get your own code.',
+      })
+    }
+    return done({
+      status: 'already_pending',
+      admission_id: r.admission_id,
+      expires_at: r.expires_at,
+      attach_code: r.attach_code,
+      ...claimFields(env, r.attach_code),
+      note: 'Your request is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page and type your code. After they approve, call seat_attach again.',
+    })
+  }
+  if (r.ok) {
+    return done({
+      status: 'pending_admission',
+      admission_id: r.admission_id,
+      approve_url: r.approve_url,
+      expires_at: r.expires_at,
+      ...(r.attach_code ? { attach_code: r.attach_code, ...claimFields(env, r.attach_code) } : {}),
+      note: r.approve_url
+        ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let chats from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
+        : 'Pending. Your human can approve this on their Connections page (no secure-moment link is available on this pot). Nothing is attached until then; after they approve, call seat_attach again.',
+    })
+  }
+  switch (r.error) {
+    case 'seat_attach_disabled':
+      return fail(403, r.error)
+    case 'agent_not_found':
+      // One generic text for every miss (no existence oracle). When designation is on, the usual reason for a miss is that an org admin has
+      // not designated this human for the agent yet, so say who can.
+      return fail(404, r.error, seatAttachDesignatedEnabled(env)
+        ? 'No agent by that name is available for your human to admit. If it exists, an org admin has to designate your human for it first (update_agent, attach_designated_member_id); call seat_attach with no agent to list what is available now.'
+        : 'No agent by that name is available for your human to admit.')
+    case 'agent_not_designated_for_you': {
+      // Guide this human using the target agent's current designation standing.
+      const canPress = r.agent ? await humanCanDesignateAtAll(env, humanMemberId, r.agent.id) : false
+      return fail(409, r.error, {
+        who_acts: canPress ? 'owner' : 'admin',
+        agent: r.agent,
+        // Static text (#2081): the agent is named in the structured `agent` field, never interpolated here. The control
+        // lives on the agent's own page, not on Connections.
+        next_step: canPress
+          ? "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again."
+          : "This agent isn't set up for you yet. The 'Allow for me' button is available to org admins and independently assigned owners after fresh dashboard sign-in. Ask your human to ask an org admin to designate them for this agent (an org admin does it with update_agent, setting attach_designated_member_id to your human's member id), then ask me to attach again.",
+      })
+    }
+    case 'agent_ambiguous':
+      return fail(409, r.error, 'More than one agent matches; use the agent id.')
+    case 'agent_identity_unminted':
+      return fail(409, r.error, 'That agent\'s identity is not usable right now (for example its identity member is suspended), so a thread cannot act as it. An admin must restore it first.')
+    case 'already_attached':
+      return fail(409, r.error)
+    case 'too_many_pending_admissions':
+      return fail(429, r.error, 'Your human already has too many pending admissions. Ask them to clear some on their Connections page.')
+    case 'seat_not_found':
+      return fail(409, r.error, 'This thread has no live seat.')
+    case 'admission_scope_mismatch':
+      return fail(409, r.error, 'This agent is already approved (or being asked) for a different scope than the one you requested. An approval is never widened silently: ask your human to revoke the old admission on their Connections page (or deny the old ask), then ask again with the scope you want.')
+    case 'approval_bound_to_other_chat':
+      return fail(409, r.error, 'This agent is approved for a different chat; ask the human to approve this one (they revoke the old admission on their Connections page, then this chat asks again and gets its own code).')
+    case 'attach_code_mismatch':
+      return fail(403, r.error)
+    case 'attach_refused':
+      return fail(409, r.error, 'The attach could not be completed (the agent, the admission, its token or this seat changed). Retry; if it persists the owner must re-admit this chat on their Connections page.')
+    default:
+      return fail(400, r.error)
+  }
 }
 
 const toolSeatAttach: ToolSpec = {
@@ -105,95 +199,7 @@ const toolSeatAttach: ToolSpec = {
       grantTokenId: seat.grantTokenId,
       scope: args.scope === 'harness' ? 'harness' : args.scope === 'seat' ? 'seat' : undefined,
     })
-    if (r.ok && r.status === 'attached') {
-      return done({
-        status: 'attached',
-        attachment_id: r.attachment_id,
-        admission_id: r.admission_id,
-        agent: r.agent,
-        note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
-      })
-    }
-    if (r.ok && r.status === 'pending_admission' && r.requires_human_release) {
-      return done({
-        status: 'pending_admission', admission_id: r.admission_id,
-        connections_url: connectionsLink(env),
-        note: 'Pending. This chat is observed. The earlier approval cannot attach it. Your human must select Release for THIS chat on Connections, then call seat_attach again.',
-      })
-    }
-    if (r.ok && r.already_pending) {
-      if (!r.attach_code) {
-        return done({
-          status: 'already_pending',
-          admission_id: r.admission_id,
-          expires_at: r.expires_at,
-          note: 'A different chat holds this pending request for this agent, so no code or link is given here. Ask your human to deny it on their Connections page, then ask again from this chat to get your own code.',
-        })
-      }
-      return done({
-        status: 'already_pending',
-        admission_id: r.admission_id,
-        expires_at: r.expires_at,
-        attach_code: r.attach_code,
-        ...claimFields(env, r.attach_code),
-        note: 'Your request is already waiting for your human. No new link was made: the one you were given still works, or they can decide it on their Connections page and type your code. After they approve, call seat_attach again.',
-      })
-    }
-    if (r.ok) {
-      return done({
-        status: 'pending_admission',
-        admission_id: r.admission_id,
-        approve_url: r.approve_url,
-        expires_at: r.expires_at,
-        ...(r.attach_code ? { attach_code: r.attach_code, ...claimFields(env, r.attach_code) } : {}),
-        note: r.approve_url
-          ? 'Pending. Give your human approve_url: a one-time link where they tap their passkey to let chats from this app act as that agent. Nothing is attached until then. After they approve, call seat_attach again; it attaches immediately.'
-          : 'Pending. Your human can approve this on their Connections page (no secure-moment link is available on this pot). Nothing is attached until then; after they approve, call seat_attach again.',
-      })
-    }
-    switch (r.error) {
-      case 'seat_attach_disabled':
-        return fail(403, r.error)
-      case 'agent_not_found':
-        // One generic text for every miss (no existence oracle). When designation is on, the usual reason for a miss is that an org admin has
-        // not designated this human for the agent yet, so say who can.
-        return fail(404, r.error, seatAttachDesignatedEnabled(env)
-          ? 'No agent by that name is available for your human to admit. If it exists, an org admin has to designate your human for it first (update_agent, attach_designated_member_id); call seat_attach with no agent to list what is available now.'
-          : 'No agent by that name is available for your human to admit.')
-      case 'agent_not_designated_for_you': {
-        // Guide this human using the target agent's current designation standing.
-        const canPress = r.agent ? await humanCanDesignateAtAll(env, seat.humanMemberId, r.agent.id) : false
-        return fail(409, r.error, {
-          who_acts: canPress ? 'owner' : 'admin',
-          agent: r.agent,
-          // Static text (#2081): the agent is named in the structured `agent` field, never interpolated here. The control
-          // lives on the agent's own page, not on Connections.
-          next_step: canPress
-            ? "This agent isn't set up for you yet. Ask your human to open this agent's page in the mupot dashboard (Agents → the agent), press 'Allow for me' in the box 'Allow my chats to become this agent', then ask me to attach again."
-            : "This agent isn't set up for you yet. The 'Allow for me' button is available to org admins and independently assigned owners after fresh dashboard sign-in. Ask your human to ask an org admin to designate them for this agent (an org admin does it with update_agent, setting attach_designated_member_id to your human's member id), then ask me to attach again.",
-        })
-      }
-      case 'agent_ambiguous':
-        return fail(409, r.error, 'More than one agent matches; use the agent id.')
-      case 'agent_identity_unminted':
-        return fail(409, r.error, 'That agent\'s identity is not usable right now (for example its identity member is suspended), so a thread cannot act as it. An admin must restore it first.')
-      case 'already_attached':
-        return fail(409, r.error)
-      case 'too_many_pending_admissions':
-        return fail(429, r.error, 'Your human already has too many pending admissions. Ask them to clear some on their Connections page.')
-      case 'seat_not_found':
-        return fail(409, r.error, 'This thread has no live seat.')
-      case 'admission_scope_mismatch':
-        return fail(409, r.error, 'This agent is already approved (or being asked) for a different scope than the one you requested. An approval is never widened silently: ask your human to revoke the old admission on their Connections page (or deny the old ask), then ask again with the scope you want.')
-      case 'approval_bound_to_other_chat':
-        return fail(409, r.error, 'This agent is approved for a different chat; ask the human to approve this one (they revoke the old admission on their Connections page, then this chat asks again and gets its own code).')
-      case 'attach_code_mismatch':
-        return fail(403, r.error)
-      case 'attach_refused':
-        return fail(409, r.error, 'The attach could not be completed (the agent, the admission, its token or this seat changed). Retry; if it persists the owner must re-admit this chat on their Connections page.')
-      default:
-        return fail(400, r.error)
-    }
+    return attachOutcome(env, seat.humanMemberId, r)
   },
 }
 
