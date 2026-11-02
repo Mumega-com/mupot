@@ -72,7 +72,7 @@ import {
 } from '../members/credential-sharing'
 import { notSeatAgentSql } from '../members/seat-agent'
 import { SEAT_HANDLE_PREFIX, seatHandleFromArgs } from '../members/seat-handle'
-import { applySeatForRequest } from '../members/seat-auto'
+import { applySeatForRequest, pickAutoSeatKey } from '../members/seat-auto'
 import type { VerboseProbeInputs } from './harness-identity-probe'
 import { extractClientInfoVersion, extractMetaFacts, extractVerboseMetaValues, hintsFrom, maybeEmitHarnessIdentityProbe, verboseProbeEnabled } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities, resolveHumanStandingGrants } from './oauth-authorize'
@@ -686,10 +686,8 @@ async function resolveSeatSession(
   })
   // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
   // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
-  return applySeatForRequest(c.env, auth, {
-    // NAMED_INTENT_CONNECT: connect_intent may REUSE a seat this thread already has but must never CREATE one (readOnly never
-    // creates an auto seat, see applySeatForRequest), so an unseated first call reaches the tool unbound and the intent comes first.
-    readOnly: bodyMeta?.readOnlySeat || (bodyMeta?.toolName === 'connect_intent' && namedIntentEnabled(c.env)),
+  const intentDoor = bodyMeta?.toolName === 'connect_intent' && namedIntentEnabled(c.env)
+  const seatInputs = {
     headerHandle: headerSeat,
     metaHandle: metaSeat,
     argHandle: bodyMeta?.argSeat ?? null,
@@ -700,7 +698,15 @@ async function resolveSeatSession(
     autoKeys: bodyMeta?.toolName === 'seat_select'
       ? undefined
       : { openaiSession: paramsFacts.openaiSession, codexThreadId: paramsFacts.codexThreadId },
-  })
+  }
+  if (!intentDoor) return applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: bodyMeta?.readOnlySeat })
+  // NAMED_INTENT_CONNECT: connect_intent REUSES a seat this chat already has but never creates one in the middleware, so a
+  // miss (unknown agent, bad args) leaves no agent row. After the tool resolves the target it calls intentSeater, which
+  // creates THIS chat's own conversation-keyed seat: the approval is then bound to this chat and every later request of
+  // this chat (same client key, no handle) acts as the agent once the human taps.
+  const seated = await applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: true })
+  if (seated.seatBinding || seated.seatInputs?.handleRejected || pickAutoSeatKey(seatInputs.autoKeys) === null) return seated
+  return { ...seated, intentSeater: () => applySeatForRequest(c.env, auth, { ...seatInputs, readOnly: false }) }
 }
 
 // ── member memory scope ──────────────────────────────────────────────────────
@@ -8790,7 +8796,7 @@ async function handleJsonRpc(
       const auth = await resolveAuth(c, { paramsMeta: params._meta, readOnlySeat: true })
       // A held chat's hard stop also hides the request action; other registry entries retain their shared catalog.
       if (auth && (await observedFloorDecision(c.env, auth, 'seat_attach')).status === 'held') {
-        listed = listed.filter(spec => spec.name !== 'seat_attach')
+        listed = listed.filter(spec => spec.name !== 'seat_attach' && spec.name !== 'connect_intent')
       }
     }
     return ok(id, { tools: listed.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
@@ -8807,7 +8813,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, argSeat: canonicalName === 'seat_select' ? null : seatHandleFromArgs(argsObject, SEAT_LABEL_TOOLS.has(String(canonicalName))), toolName: typeof canonicalName === 'string' ? canonicalName : undefined, skipSeat: canonicalName === 'connect_intent' && !namedIntentEnabled(c.env) } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }

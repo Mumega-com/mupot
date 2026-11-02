@@ -19,14 +19,14 @@ const toolConnectIntent: ToolSpec = {
   name: 'connect_intent',
   scope: 'Only for a chat that knows WHICH existing agent it should act as and has not attached yet. Call it first, before boot_context, when you were told an agent: self (state the agent this connection means; one passkey consent attaches it)',
   min: 'authenticated',
-  args: '{ agent: string, reason: string, scope?: "seat" | "harness", thread?: string }  // agent: id, slug or exact name of an EXISTING agent your human administers (a selector, never authority); reason (1..280 characters, REQUIRED): why this chat should act as it',
+  args: '{ agent: string, reason: string, scope?: "seat" | "harness", thread?: string }  // agent: id, slug or exact name of an EXISTING agent your human administers (a selector, never authority); reason (1..280 characters, REQUIRED); thread: REQUIRED only when this connection sends no per-conversation key (then pass the returned seat handle on every call)',
   inputSchema: {
     type: 'object',
     properties: {
       agent: { type: 'string', maxLength: INTENT_REF_MAX, description: 'The existing agent this connection means: id, slug or exact name. A label to look up, not an access request: your human decides.' },
       reason: { type: 'string', minLength: 1, maxLength: INTENT_REASON_MAX, description: 'Required: why THIS connection should act as that agent (1..280 characters).' },
       scope: { type: 'string', enum: ['seat', 'harness'], description: 'Optional. "seat" (default): the approval covers this chat only. "harness": approve once for every chat of this app. A request, not authority: your human sees it at the tap and can refuse it.' },
-      thread: { type: 'string', maxLength: 100, description: 'Optional label that keeps a second, separate connection to the same agent distinct. Omit it to reuse the same connection after a restart.' },
+      thread: { type: 'string', maxLength: 100, description: 'Required only when this connection sends no per-conversation key: a stable label for THIS chat (reuse it to resume the same seat). Ignored otherwise.' },
     },
     required: ['agent', 'reason'],
     additionalProperties: false,
@@ -43,7 +43,9 @@ const toolConnectIntent: ToolSpec = {
         return done({
           ...out.result,
           target: { id: r.target.id, slug: r.target.slug, name: r.target.name },
-          ...(seat && seat.handle ? { seat: seat.handle, seat_id: seat.handle, instruction: `Pass \`seat: ${seat.handle}\` on every call.` } : {}),
+          ...(seat && seat.handle
+            ? { seat: seat.handle, seat_id: seat.handle, instruction: `This connection sends no per-conversation key, so it MUST pass \`seat: ${seat.handle}\` on EVERY call (including after approval), or it stays a throwaway identity.` }
+            : { instruction: 'Nothing to pass: after approval this same conversation acts as the agent on its next request, with no handle. A different conversation does not.' }),
           next_call: NEXT_CALL,
         })
       }
@@ -64,6 +66,10 @@ const toolConnectIntent: ToolSpec = {
         })
       case 'already_attached':
         return fail(409, r.error, 'This thread is already attached to a different agent. Ask your human to detach or move it on their Connections page.')
+      case 'seat_handle_rejected':
+        return fail(403, r.error, { next_step: 'The seat handle you sent was not accepted and a rejected handle is final: pass the exact `seat` value connect_intent returned for this chat, or omit it and let this conversation use its own key.' })
+      case 'intent_seat_cap':
+        return fail(429, r.error, { ...(typeof r.detail === 'object' && r.detail !== null ? r.detail : {}), next_step: 'This app already holds the maximum number of unattached named-intent seats. Reuse the thread label you used before (it creates nothing), or have your human clear pending requests on their Connections page.' })
       case 'agent_not_found':
         // One text for every miss (no existence oracle) and no silent creation: say what this door does NOT do.
         return fail(404, r.error, {
@@ -83,12 +89,11 @@ const toolConnectIntent: ToolSpec = {
         })
       }
       case 'seat_failed': {
-        const e = r.seatError
-        if (e.error === 'harness_required') {
-          return fail(403, e.error, `This connection carries no verified harness. Your human re-consents this connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many} to register its harness; then call connect_intent again.`)
+        if (r.seatError === 'harness_required') {
+          return fail(403, r.seatError, `This connection carries no verified harness. Your human re-consents this connector (remove and add it again) and picks ${consentLabels(consentChoiceLabels(env)).many} to register its harness; then call connect_intent again.`)
         }
-        const status = e.error === 'rate_limited' ? 429 : e.error === 'provisioning_failed' ? 500 : e.error === 'seat_cap_reached' || e.error === 'seat_agent_inactive' || e.error === 'seat_key_source_conflict' ? 409 : 403
-        return fail(status, e.error, { ...(typeof e.detail === 'object' && e.detail !== null ? e.detail : {}), next_step: 'The connection seat could not be made, so nothing was filed. Retry once; if it persists tell your human so an org admin can look at the audit log. Do not loop.' })
+        const status = r.seatError === 'rate_limited' ? 429 : r.seatError === 'provisioning_failed' ? 500 : 409
+        return fail(status, r.seatError, { ...(typeof r.detail === 'object' && r.detail !== null ? r.detail : {}), next_step: 'The connection seat could not be made, so nothing was filed. Retry once; if it persists tell your human so an org admin can look at the audit log. Do not loop.' })
       }
       /* c8 ignore next 2 -- NamedIntentFailure is exhaustively handled above; safety net. */
       default:

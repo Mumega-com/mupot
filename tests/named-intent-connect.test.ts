@@ -84,10 +84,10 @@ interface Grant { memberId: string; tokenId: string; harnessId: string; ctx: Aut
 
 /** A human's unbound OAuth harness grant (a ChatGPT connector: "Me — auto per workspace"). */
 async function grant(env: Env, memberId: string, clientId = 'client-chatgpt', name = 'ChatGPT'): Promise<Grant> {
-  const harness = await upsertHarness(env, memberId, clientId, name)
-  if (!harness) throw new Error('harness fixture failed')
   const tokenId = `tok-${memberId}-${++tokCounter}`
   h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('${tokenId}', '${memberId}', 'hash-${tokenId}', 'oauth:${clientId}', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+  const harness = await upsertHarness(env, memberId, clientId, name, tokenId) // anchored to its grant, as consent does (harness-scoped admissions prove it)
+  if (!harness) throw new Error('harness fixture failed')
   const ctx = await buildAuthContextFromProps(env, { memberId, tokenId, email: null, channel: 'directory', boundAgentId: null, harnessId: harness.id })
   if (!ctx) throw new Error('grant ctx null')
   return { memberId, tokenId, harnessId: harness.id, ctx }
@@ -198,19 +198,18 @@ describe('(a) a new connection naming a permitted target reaches it in ONE guide
     expect(first.sc.status, JSON.stringify(first.body)).toBe('pending_admission')
     expect(first.sc.target).toMatchObject({ id: 'agent-rava', slug: 'rava' })
     expect(typeof first.sc.approve_url).toBe('string')
-    expect(String(first.sc.seat)).toMatch(/^mseat_/)
-    // BEFORE auto-seat provisioning: the request carried a per-thread key, yet no auto seat exists; one explicit intent seat does.
-    expect(rows.autoSeats()).toBe(0)
+    // THIS chat's own conversation-keyed seat, made only after the target resolved; no handle needed (the chat's key is its identity)
+    expect(first.sc.seat ?? null).toBeNull()
+    expect(String(first.sc.instruction)).toMatch(/Nothing to pass/)
+    expect(rows.autoSeats()).toBe(1)
     expect(rows.seats()).toBe(1)
-    expect(one<{ source: string }>(`SELECT source FROM agent_seats`)?.source).toBe('select')
     expect(rows.admissions()).toBe(1)
     expect(one<{ reason: string; status: string; scope: string; agent_id: string }>(`SELECT reason, status, scope, agent_id FROM agent_seat_admissions`)).toMatchObject({ reason: REASON, status: 'pending', scope: 'seat', agent_id: 'agent-rava' })
     // only the throwaway carrier agent was added (the seat's own), no named agent
     expect(rows.agents()).toBe(agentsBefore + 1)
     expect(rows.attachments()).toBe(0)
     // a pending ask grants nothing: the handle still acts as the seat agent, not rava
-    const handle = String(first.sc.seat)
-    expect((await rpc(env, g.ctx, 'boot_context', { seat: handle })).sc.bound_agent_id).not.toBe('agent-rava')
+    expect((await boot(env, g, 'conv-a')).sc.bound_agent_id).not.toBe('agent-rava')
 
     const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
     const tap = await decideMoment(env, String(first.sc.approve_url), key, 'approve')
@@ -220,7 +219,7 @@ describe('(a) a new connection naming a permitted target reaches it in ONE guide
     expect(second.sc.status, JSON.stringify(second.body)).toBe('attached')
     expect((second.sc.agent as { id: string }).id).toBe('agent-rava')
     expect(rows.attachments()).toBe(1)
-    const after = await rpc(env, g.ctx, 'boot_context', { seat: handle })
+    const after = await boot(env, g, 'conv-a') // NO handle: the next ordinary request of this chat acts as the agent
     expect(after.sc.bound_agent_id).toBe('agent-rava')
     expect((receiptOf(after).agent as { id: string }).id).toBe('agent-rava')
   })
@@ -246,7 +245,7 @@ describe('(a) a new connection naming a permitted target reaches it in ONE guide
     const g = await grant(env, HUMAN, 'client-codex', 'Codex')
     const r = await rpc(env, g.ctx, 'connect_intent', { agent: 'agent-rava', reason: REASON }, { meta: codex('thr-1') })
     expect(r.sc.status, JSON.stringify(r.body)).toBe('pending_admission')
-    expect(rows.autoSeats()).toBe(0)
+    expect(rows.autoSeats()).toBe(1)
   })
 })
 
@@ -277,10 +276,7 @@ describe('(b) a repeat or restart reuses it: same UUIDs, no duplicate', () => {
     const agents = rows.agents(); const seats = rows.seats(); const adms = rows.admissions()
     const again = await intent(env, g, 'rava')
     const other = await intent(env, g, 'rava', 'conv-a', {}, { reason: 'a different reason on a later run' })
-    // with the handle presented (the seat session) the same intent is an idempotent report
-    const viaHandle = await rpc(env, g.ctx, 'connect_intent', { agent: 'rava', reason: REASON, seat: String(first.sc.seat) })
     for (const x of [again, other]) { expect(x.sc.status, JSON.stringify(x.body)).toBe('attached'); expect(x.sc.attachment_id).toBe(done.sc.attachment_id) }
-    expect(viaHandle.sc.status, JSON.stringify(viaHandle.body)).toBe('attached')
     expect([rows.agents(), rows.seats(), rows.admissions(), rows.attachments()]).toEqual([agents, seats, adms, 1])
   })
 
@@ -291,9 +287,11 @@ describe('(b) a repeat or restart reuses it: same UUIDs, no duplicate', () => {
     const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
     await decideMoment(env, String(first.sc.approve_url), key, 'approve')
     await intent(env, g, 'rava')
-    const r = await rpc(env, g.ctx, 'connect_intent', { agent: 'hadi-admin', reason: REASON, seat: String(first.sc.seat) })
-    expect(errOf(r)).toBe('already_attached')
-    expect(rows.attachments()).toBe(1)
+    const seats = rows.seats(); const agents = rows.agents()
+    // an attached chat naming ANOTHER agent (even one it may not attach, or one that does not exist) is the same already_attached: no oracle, no second seat
+    for (const ref of ['hadi-admin', 'other-ops', 'ghost']) expect(errOf(await intent(env, g, ref)), ref).toBe('already_attached')
+    expect([rows.attachments(), rows.seats(), rows.agents(), rows.admissions()]).toEqual([1, seats, agents, 1])
+    expect((await intent(env, g, 'rava')).sc.status).toBe('attached')
   })
 })
 
@@ -391,8 +389,10 @@ describe('(e) flag off is unchanged', () => {
     const g = await grant(env, HUMAN)
     const r = await intent(env, g, 'rava')
     expect(errOf(r)).toBe('named_intent_disabled')
-    // flag off => the call still auto-seats exactly as any other tool (the exemption is flag-gated)
-    expect(rows.autoSeats()).toBe(1)
+    // flag off => a refused connect_intent makes no seat at all (not even an auto seat), even with bad args
+    expect(rows.autoSeats()).toBe(0)
+    expect(errOf(await rpc(env, g.ctx, 'connect_intent', {}, { meta: thread('conv-x') }))).toBe('invalid_args') // schema refusal; still no seat
+    expect(rows.autoSeats()).toBe(0)
     expect(rows.admissions()).toBe(0)
   })
 
@@ -434,5 +434,125 @@ describe('schema and instructions publish the same contract (reason is required 
     const calls = [...all.matchAll(/'(seat_attach|connect_intent)' \{([^}]*)\}/g)]
     expect(calls.length).toBeGreaterThanOrEqual(2)
     for (const m of calls) if (m[2].includes('agent:')) expect(m[2], m[0]).toContain('reason')
+  })
+})
+
+describe('round 2: "this chat only" is true (three chats: A asks, B and C must never gain the agent)', () => {
+  it('B asking the same agent gets no handle/code/link of A\'s; after A\'s tap only A acts as rava', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const a = await intent(env, g, 'rava', 'chat-a')
+    expect(a.sc.status, JSON.stringify(a.body)).toBe('pending_admission')
+    const b = await intent(env, g, 'rava', 'chat-b')
+    expect(b.sc.attach_code ?? null).toBeNull()
+    expect(b.sc.approve_url ?? null).toBeNull()
+    expect(b.sc.seat ?? null).not.toBe(a.sc.seat ?? 'none')
+    await boot(env, g, 'chat-c')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await boot(env, g, 'chat-a')).sc.bound_agent_id).toBe('agent-rava') // A: acts as rava with NO handle
+    expect((await boot(env, g, 'chat-b')).sc.bound_agent_id).not.toBe('agent-rava')
+    expect((await boot(env, g, 'chat-c')).sc.bound_agent_id).not.toBe('agent-rava')
+    expect(errOf(await intent(env, g, 'rava', 'chat-b'))).toBe('approval_bound_to_other_chat')
+    expect(rows.attachments()).toBe(1)
+  })
+})
+
+const keyless = (env: Env, g: Grant, agent: string, args: Record<string, unknown> = {}): Promise<Rpc> =>
+  rpc(env, g.ctx, 'connect_intent', { agent, reason: REASON, ...args })
+
+describe('round 2: a connection with NO per-conversation key (handle path) and the scope/thread/grant bindings', () => {
+  it('requires a thread label; the handle must be sent on every call and is the only way to act as the agent', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const bad = await keyless(env, g, 'rava')
+    expect(errOf(bad)).toBe('invalid_args')
+    expect(rows.seats()).toBe(0)
+    const a = await keyless(env, g, 'rava', { thread: 'chat-a' })
+    expect(a.sc.status, JSON.stringify(a.body)).toBe('pending_admission')
+    expect(String(a.sc.seat)).toMatch(/^mseat_/)
+    expect(String(a.sc.instruction)).toMatch(/MUST pass/)
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await rpc(env, g.ctx, 'boot_context', {})).sc.bound_agent_id).not.toBe('agent-rava') // without the handle: not the agent
+    expect((await rpc(env, g.ctx, 'boot_context', { seat: String(a.sc.seat) })).sc.bound_agent_id).toBe('agent-rava')
+  })
+
+  it('thread is frozen into the seat: same label (any spelling of the name) = same seat; a new label = a new seat; a rejected handle is final', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    const a1 = await keyless(env, g, 'rava', { thread: 't1' })
+    const a2 = await keyless(env, g, 'Rava', { thread: 't1' })
+    const a3 = await keyless(env, g, 'agent-rava', { thread: 't1' })
+    expect(rows.seats()).toBe(1)
+    expect(a2.sc.admission_id).toBe(a1.sc.admission_id)
+    expect(a3.sc.admission_id).toBe(a1.sc.admission_id)
+    await keyless(env, g, 'rava', { thread: 't2' })
+    expect(rows.seats()).toBe(2)
+    const rej = await rpc(env, g.ctx, 'connect_intent', { agent: 'rava', reason: REASON, thread: 't9' }, { meta: { 'mupot/seat': 'mseat_not-a-real-handle' } })
+    expect(errOf(rej)).toBe('seat_handle_rejected')
+    expect(rows.seats()).toBe(2)
+  })
+
+  it('new labels are bounded: the 4th unattached intent seat is refused, a repeat of an existing label still works, nothing extra is created', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    for (const t of ['t1', 't2', 't3']) expect(['pending_admission', 'already_pending']).toContain((await keyless(env, g, 'rava', { thread: t })).sc.status)
+    const agents = rows.agents(); const seats = rows.seats()
+    expect(errOf(await keyless(env, g, 'rava', { thread: 't4' }))).toBe('intent_seat_cap')
+    expect(['already_pending', 'pending_admission']).toContain((await keyless(env, g, 'rava', { thread: 't2' })).sc.status)
+    expect([rows.agents(), rows.seats()]).toEqual([agents, seats])
+  })
+
+  it('scope "harness" is recorded on the ask and, bound to the live grant, lets a LATER chat attach with no new tap; scope "seat" never does', async () => {
+    const env = envFor(h, { ...ON, WORKSPACES: '1' }) // grant-anchored harness, as consent creates
+    const g = await grant(env, HUMAN)
+    const a = await intent(env, g, 'rava', 'chat-a', {}, { scope: 'harness' })
+    expect(one<{ scope: string }>(`SELECT scope FROM agent_seat_admissions`)?.scope).toBe('harness')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    expect((await intent(env, g, 'rava', 'chat-a')).sc.status).toBe('attached') // the grant token is proven in the attach INSERT
+    const later = await intent(env, g, 'rava', 'chat-later')
+    expect(later.sc.status, JSON.stringify(later.body)).toBe('attached')
+    expect((await boot(env, g, 'chat-later')).sc.bound_agent_id).toBe('agent-rava')
+    expect((await boot(env, g, 'chat-never-asked')).sc.bound_agent_id).not.toBe('agent-rava') // harness approval needs the chat to ask
+  })
+
+  it('scope "seat" (the default) is recorded as seat', async () => {
+    const env = envFor(h, ON)
+    const g = await grant(env, HUMAN)
+    await intent(env, g, 'rava', 'chat-a', {}, { scope: 'seat' })
+    expect(one<{ scope: string }>(`SELECT scope FROM agent_seat_admissions`)?.scope).toBe('seat')
+  })
+
+  it('the handle path also carries the grant: a harness-scoped ask from a keyless chat attaches', async () => {
+    const env = envFor(h, { ...ON, WORKSPACES: '1' })
+    const g = await grant(env, HUMAN)
+    const a = await keyless(env, g, 'rava', { thread: 'k1', scope: 'harness' })
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    const done = await keyless(env, g, 'rava', { thread: 'k1', scope: 'harness' })
+    expect(done.sc.status, JSON.stringify(done.body)).toBe('attached')
+    // a LATER chat that already has its own seat (booted first) attaches with no new tap: the existing-seat carrier proves the grant
+    await boot(env, g, 'chat-later')
+    const later = await intent(env, g, 'rava', 'chat-later')
+    expect(later.sc.status, JSON.stringify(later.body)).toBe('attached')
+  })
+})
+
+describe('round 2: the grant rides an EXISTING seat too', () => {
+  it('a chat that booted first (own auto seat) files a harness-scoped ask and attaches after the tap', async () => {
+    const env = envFor(h, { ...ON, WORKSPACES: '1' })
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'chat-a')
+    const a = await intent(env, g, 'rava', 'chat-a', {}, { scope: 'harness' })
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    expect((await decideMoment(env, String(a.sc.approve_url), key, 'approve')).status).toBe(200)
+    const done = await intent(env, g, 'rava', 'chat-a', {}, { scope: 'harness' })
+    expect(done.sc.status, JSON.stringify(done.body)).toBe('attached')
+    // a LATER chat that already has its own seat (booted first) attaches with no new tap: the existing-seat carrier proves the grant
+    await boot(env, g, 'chat-later')
+    const later = await intent(env, g, 'rava', 'chat-later')
+    expect(later.sc.status, JSON.stringify(later.body)).toBe('attached')
   })
 })

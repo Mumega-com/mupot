@@ -109,7 +109,7 @@ ACTING AS AN AGENT YOU ALREADY HAVE (chats with a human present; applies when bo
 export const MUPOT_MCP_NAMED_INTENT_INSTRUCTIONS = `
 
 CONNECTING AS A NAMED AGENT (when you were told which existing agent you are; applies before you do anything else)
-   - Call 'connect_intent' { agent: "<its id, slug or exact name>", reason: "<why this chat should act as that agent, 1..280 characters; required>" } FIRST, before boot_context, so no throwaway seat agent is made for you. The name is a selector, never authority: it works only for an existing agent your human administers.
+   - Call 'connect_intent' { agent: "<its id, slug or exact name>", reason: "<why this chat should act as that agent, 1..280 characters; required>" } FIRST, before boot_context, so the request is resolved before any seat is made for you. If your client sends no per-conversation key, also pass thread: "<a stable label for this chat>" and then pass the returned seat handle on EVERY call; otherwise nothing extra is needed and only THIS conversation becomes the agent. The name is a selector, never authority: it works only for an existing agent your human administers.
    - It returns status "pending_admission" with an approve_url (or an attach_code for the Connections page). Give that to your human: ONE passkey tap that names the agent. Then call 'connect_intent' again with the same agent: it attaches immediately and your NEXT request acts as that agent. Calling it again before the tap reuses the same pending request; it never files a second one.
    - It never creates an agent. If the agent does not exist or your human may not attach it, the refusal names who must act (an org admin) and the next step. Do not work around it by bootstrap_self.`
 

@@ -893,6 +893,9 @@ export interface AuthContext {
      *  src/auth/attached-gate.ts and callerHoldsGateCapability). `agentId` is the attached
      *  agent; `seatAgentId` is the thread's own seat agent it would otherwise be. */
     attached?: { attachmentId: string; admissionId: string; agentId: string; seatAgentId: string; ceiling: 'member' | 'lead' | 'full' } }
+  /** NAMED_INTENT_CONNECT, connect_intent only: creates THIS chat's own conversation-keyed auto seat after the target resolved
+   *  (the per-thread client key stays in the closure). Absent for every other tool and when the chat already has a seat. */
+  intentSeater?: () => Promise<AuthContext>
   /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */
   seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string; attachRefused?: string }
   webSessionIdHash?: string | null
