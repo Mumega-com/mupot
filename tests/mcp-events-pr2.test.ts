@@ -374,7 +374,10 @@ describe('events/subscribe', () => {
     expect(await gap(-5)).toBe(-32602)
     expect(await gap('soon')).toBe(-32602)
     const dflt = await rpc('events/subscribe', { ...subParams({}, { url: `https://${HOST}/t/dflt` }), ttlMs: undefined })
-    expect(Date.parse(dflt.body.result?.refreshBefore as string) - Date.now()).toBeGreaterThan(3_500_000)
+    // omitted ttlMs grants the 24 h maximum (refresh_before = now + 24 h), not 1 h
+    const dfltGap = Date.parse(dflt.body.result?.refreshBefore as string) - Date.now()
+    expect(dfltGap).toBeGreaterThan(24 * 3_600_000 - 60_000)
+    expect(dfltGap).toBeLessThan(24 * 3_600_000 + 5_000)
   })
 
   it('caps active subscriptions per agent (a refresh of an existing one still works at the cap)', async () => {

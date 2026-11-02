@@ -21,8 +21,10 @@ import { reasonOfFailure, recordSubscribeRefusal } from './events-refusals'
 export const SUBSCRIBABLE_EVENTS: ReadonlySet<string> = new Set(['message.created'])
 
 export const TTL_MIN_MS = 5 * 60_000
-export const TTL_DEFAULT_MS = 60 * 60_000
 export const TTL_MAX_MS = 24 * 60 * 60_000
+// Omitted ttlMs grants the maximum: some clients (ChatGPT, for Rava) renew only intermittently, and a 1 h default lapsed their wake.
+// Delivery re-checks token liveness and attachment on every attempt, so a longer lease does not extend access after revocation.
+export const TTL_DEFAULT_MS = TTL_MAX_MS
 export const VERIFICATION_CACHE_MS = 10 * 60_000
 export const SECRET_ROTATION_WINDOW_MS = 24 * 60 * 60_000
 export const MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT = 10
