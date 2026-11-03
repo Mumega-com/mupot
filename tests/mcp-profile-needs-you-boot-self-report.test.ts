@@ -90,7 +90,7 @@ describe('profile boot_context never reaches selfReportAtBoot', () => {
     )
     const tools = ((await res.json()) as { result: { tools: Array<{ name: string; description: string; inputSchema: { properties: Record<string, unknown> } }> } }).result.tools
     const boot = tools.find((t) => t.name === 'boot_context')!
-    expect(Object.keys(boot.inputSchema.properties).sort()).toEqual(['label', 'seat', 'source'])
+    expect(Object.keys(boot.inputSchema.properties).sort()).toEqual(['expected_agent', 'label', 'seat', 'source'])
     expect(boot.description).not.toMatch(/runtime|model/)
   })
 
