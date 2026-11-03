@@ -408,6 +408,13 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     expect(spec?.min).toBe('member') // declared floor (defence in depth with the rank-aware write gate)
     expect(PAGES_TOOLS.find((t) => t.name === 'project_wiki_get')?.min).toBe('observer')
     expect(spec?.scope).toContain('Links are additive')
+    // mumega-com#1631-adjacent: the vocabulary that refuses callers must be discoverable from the
+    // tool description, or every agent learns it by getting a 403/400 first.
+    expect(spec?.scope).toContain('project-card-')
+    expect(spec?.scope).toContain('mupot-')
+    expect(spec?.scope).toContain('system-')
+    expect(spec?.scope).toContain('underscores are refused')
+    expect(spec?.scope).toMatch(/purpose 3-32/)
     expect(spec?.scope).toContain('whitespace-collapsed')
   })
 

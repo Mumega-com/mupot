@@ -39,10 +39,10 @@ async function writerId(auth: AuthContext): Promise<string> {
 
 const toolProjectWikiUpsert: ToolSpec = {
   name: 'project_wiki_upsert',
-  scope: "project wiki (write). tier 'squad' pages are readable and writable only by members of a squad with access to the project (org admins too); tier 'project' pages are visible to every project reader. Optional markdown body (<=65536 bytes; refused over the cap, never truncated; a store that cannot hold bodies answers 501 body_unsupported). Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max",
+  scope: "project wiki (write). tier 'squad' pages are readable and writable only by members of a squad with access to the project (org admins too); tier 'project' pages are visible to every project reader. Optional markdown body (<=65536 bytes; refused over the cap, never truncated; a store that cannot hold bodies answers 501 body_unsupported). Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max. RESERVED SLUG PREFIXES, refused 403 reserved_slug: project-card-, mupot-, system-. VOCABULARY (all kebab-case, lowercase alnum with single hyphens): slug 3-63; purpose 3-32 (e.g. decision, runbook, design, opinion); link relation 1-32 (e.g. opinion-on, depends-on, implements, supersedes) — underscores are refused, so opinion_on fails and opinion-on is accepted. Tags max 7, each <=40 chars, and no tag may start with owner: tier: v: by: at: (the adapter stamps those)",
   min: 'member',
   args:
-    '{ project_id: string, slug: string, title: string, summary: string(<=500), body?: string(markdown, <=65536 bytes), purpose: string, tier: "project"|"squad", tags?: string[], links?: [{to_slug, relation?}] }',
+    '{ project_id: string, slug: string, title: string, summary: string(<=500), body?: string(markdown, <=65536 bytes), purpose: string(kebab 3-32: decision|runbook|design|opinion|...), tier: "project"|"squad", tags?: string[](max 7, <=40 each, no owner:/tier:/v:/by:/at: prefix), links?: [{to_slug, relation?}](relation kebab 1-32, e.g. opinion-on)}',
   inputSchema: {
     type: 'object',
     properties: {
