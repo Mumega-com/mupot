@@ -381,6 +381,53 @@ describe('Pre-dispatch Reservation & Idempotency', () => {
     expect(row?.vendor_agent_id).toBe(AGENT_ID)
   })
 
+  // mumega-com#1637: the delivery axis must survive the MCP tool boundary, not just the adapter.
+  // These go through the real router (invokeTool), so deleting `delivery` from src/mcp/cursor.ts fails here.
+  it('cursor_dispatch returns delivery (reserved) through the MCP tool boundary', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const backgroundPromises: Promise<unknown>[] = []
+    const waitUntilMock = vi.fn((p: Promise<unknown>) => { backgroundPromises.push(p) })
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ agent: SAMPLE_AGENT, run: SAMPLE_RUN })))
+
+    const outcome = await invokeTool(
+      authContext(), env, 'cursor_dispatch',
+      { name: 'Boundary Agent', repo_url: 'https://github.com/mumega/mupot', prompt: 'boundary', idempotency_key: 'boundary-key-01' },
+      { waitUntil: waitUntilMock },
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    // A held reservation is 'reserved'. It must never read as 'delivered', and the field must exist at all.
+    expect(outcome.result).toHaveProperty('delivery')
+    expect((outcome.result as { delivery?: string }).delivery).toBe('reserved')
+    await Promise.all(backgroundPromises)
+  })
+
+  it('cursor_run_status returns delivery through the MCP tool boundary', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ agent: SAMPLE_AGENT, run: SAMPLE_RUN })))
+
+    const dispatch = await invokeTool(
+      authContext(), env, 'cursor_dispatch',
+      { name: 'Status Agent', repo_url: 'https://github.com/mumega/mupot', prompt: 'status', idempotency_key: 'boundary-key-02' },
+      { waitUntil: (p: Promise<unknown>) => { void p } },
+    )
+    expect(dispatch.ok).toBe(true)
+    if (!dispatch.ok) return
+    // The reservation id is the one selector the tool accepts regardless of how the dispatch resolved.
+    const reservationId = (dispatch.result as { reservation_id?: string }).reservation_id
+
+    const status = await invokeTool(authContext(), env, 'cursor_run_status', { reservation_id: reservationId }, {})
+    // Unconditional: a conditional assertion here would silently pass when the tool errors, which is
+    // exactly how a boundary test rots into decoration.
+    expect(status.ok, JSON.stringify(status)).toBe(true)
+    if (!status.ok) return
+    // The status surface carries the same axis; a missing field is the bug this pins.
+    expect(status.result).toHaveProperty('delivery')
+    expect(['reserved', 'delivered', 'unknown']).toContain((status.result as { delivery?: string }).delivery)
+  })
+
   it('concurrent reservation race handles unique constraint collision cleanly', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
