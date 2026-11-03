@@ -89,6 +89,36 @@ export type WebhookDoorbellWake =
   | { type: typeof TASK_ASSIGNED_TYPE; agent_id: string; task_id: string; assignment?: string }
   | { type: typeof DOORBELL_TEST_TYPE; agent_id: string }
 
+export type DoorbellProfile = 'generic' | 'anthropic_routine'
+export const DOORBELL_PROFILES: readonly DoorbellProfile[] = ['generic', 'anthropic_routine']
+
+/**
+ * The ONLY URL shape the anthropic_routine profile accepts (matched against the raw string, so a query, fragment,
+ * port, other host, other path, uppercase host or trailing text is refused rather than normalised away). The profile is
+ * the allowlist: api.anthropic.com is deliberately NOT in EVENTS_CALLBACK_HOSTS.
+ */
+const ANTHROPIC_ROUTINE_URL = /^https:\/\/api\.anthropic\.com\/v1\/claude_code\/routines\/trig_[A-Za-z0-9]{8,64}\/fire$/
+/** Fixed, never caller-supplied. */
+export const ANTHROPIC_ROUTINE_HEADERS = {
+  'anthropic-beta': 'experimental-cc-routine-2026-04-01',
+  'anthropic-version': '2023-06-01',
+} as const
+export const ANTHROPIC_ROUTINE_TEXT_MAX = 200
+
+export function validateAnthropicRoutineUrl(raw: string): { ok: true; url: string } | { ok: false; detail: string } {
+  const trimmed = raw.trim()
+  if (!ANTHROPIC_ROUTINE_URL.test(trimmed)) {
+    return { ok: false, detail: 'webhook_url must be exactly https://api.anthropic.com/v1/claude_code/routines/<trig_id>/fire' }
+  }
+  return { ok: true, url: trimmed }
+}
+
+/** Ids and a type only: never a message body, task title or task text. Each part is reduced to a safe charset. */
+export function routineText(type: string, slug: string, ref: string): string {
+  const clean = (v: string) => v.replace(/[^A-Za-z0-9_.:#@-]/g, '_').slice(0, 64)
+  return `mupot: ${clean(type)} for ${clean(slug)} (${clean(ref)})`.slice(0, ANTHROPIC_ROUTINE_TEXT_MAX)
+}
+
 export type PublicWebhookDoorbell = {
   configured: true
   agent_id: string
@@ -97,9 +127,15 @@ export type PublicWebhookDoorbell = {
   updated_at: string
   /** `legacy` keeps the bearer POST. `signed` is the queue + HMAC path. */
   delivery_version: 'legacy' | 'signed'
+  profile: DoorbellProfile
+}
+
+function asProfile(v: string | undefined): DoorbellProfile {
+  return v === 'anthropic_routine' ? 'anthropic_routine' : 'generic'
 }
 
 export type DoorbellSetFailure =
+  | { ok: false; error: 'invalid_profile'; detail: string }
   | { ok: false; error: 'doorbell_crypto_unavailable' }
   | { ok: false; error: 'invalid_webhook_url'; detail: string }
   | { ok: false; error: 'invalid_bearer'; detail: string }
@@ -136,6 +172,13 @@ export function doorbellEventRef(wake: WebhookDoorbellWake, correlation?: string
   if (correlation) return correlation
   if (wake.type === INBOX_WAKE_TYPE) return wake.message_id
   if (wake.type === TASK_ASSIGNED_TYPE) return wake.assignment ? `${wake.task_id}#${wake.assignment}` : wake.task_id
+  return 'test'
+}
+
+/** The wake's own id (message id / task id), never the correlation or any text. */
+function routineRef(wake: WebhookDoorbellWake): string {
+  if (wake.type === INBOX_WAKE_TYPE) return wake.message_id
+  if (wake.type === TASK_ASSIGNED_TYPE) return wake.task_id
   return 'test'
 }
 
@@ -226,6 +269,8 @@ export async function setAgentWebhookDoorbell(
     webhookUrl: string
     bearer: string
     createdByMemberId: string
+    /** Omitted = 'generic' (today's behaviour). */
+    profile?: string
     now?: string
   },
 ): Promise<{ ok: true; doorbell: PublicWebhookDoorbell } | DoorbellSetFailure> {
@@ -235,10 +280,22 @@ export async function setAgentWebhookDoorbell(
   const master = requireMasterKey(env)
   if (!master) return { ok: false, error: 'doorbell_crypto_unavailable' }
 
+  const requestedProfile = input.profile ?? 'generic'
+  if (!(DOORBELL_PROFILES as readonly string[]).includes(requestedProfile)) {
+    return { ok: false, error: 'invalid_profile', detail: `profile must be one of ${DOORBELL_PROFILES.join(', ')}` }
+  }
+  const profile = requestedProfile as DoorbellProfile // narrowed by the includes() check above
+
+  if (profile === 'anthropic_routine') {
+    const exact = validateAnthropicRoutineUrl(input.webhookUrl)
+    if (!exact.ok) return { ok: false, error: 'invalid_webhook_url', detail: exact.detail }
+  }
   const url = validateHttpsWebhookUrl(input.webhookUrl)
   if (!url.ok) return { ok: false, error: 'invalid_webhook_url', detail: url.detail }
 
-  const signed = webhookDoorbellSignedEnabled(env)
+  // The routine profile is its own allowlist and always uses the legacy bearer path (Anthropic needs the bearer itself,
+  // not an HMAC), so the signed flag and EVENTS_CALLBACK_HOSTS do not apply to it.
+  const signed = webhookDoorbellSignedEnabled(env) && profile === 'generic'
   if (signed) {
     // Allowlist at registration. Send time checks it again (a host can be removed later).
     const allow = validateCallbackUrl(url.url, env)
@@ -268,16 +325,17 @@ export async function setAgentWebhookDoorbell(
 
   await env.DB.prepare(
     `INSERT INTO agent_webhook_doorbells (
-        tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at, delivery_version
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at, delivery_version, profile
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
       ON CONFLICT(tenant, agent_id) DO UPDATE SET
         webhook_url = excluded.webhook_url,
         auth_ciphertext = excluded.auth_ciphertext,
         auth_last4 = excluded.auth_last4,
         created_by_member_id = excluded.created_by_member_id,
         updated_at = excluded.updated_at,
-        delivery_version = excluded.delivery_version`,
-  ).bind(tenant, input.agentId, url.url, ciphertext, last4, input.createdByMemberId, updatedAt, version).run()
+        delivery_version = excluded.delivery_version,
+        profile = excluded.profile`,
+  ).bind(tenant, input.agentId, url.url, ciphertext, last4, input.createdByMemberId, updatedAt, version, profile).run()
 
   return {
     ok: true,
@@ -288,6 +346,7 @@ export async function setAgentWebhookDoorbell(
       auth_last4: last4,
       updated_at: updatedAt,
       delivery_version: version,
+      profile,
     },
   }
 }
@@ -299,7 +358,7 @@ export async function getAgentWebhookDoorbell(
   const tenant = requireTenant(env)
   if (!tenant) return null
   const row = await env.DB.prepare(
-    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version
+    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version, profile
        FROM agent_webhook_doorbells
       WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(tenant, agentId).first<{
@@ -308,6 +367,7 @@ export async function getAgentWebhookDoorbell(
     auth_last4: string
     updated_at: string
     delivery_version: string
+    profile?: string
   }>()
   if (!row) return null
   return {
@@ -317,6 +377,7 @@ export async function getAgentWebhookDoorbell(
     auth_last4: row.auth_last4,
     updated_at: row.updated_at,
     delivery_version: row.delivery_version === 'signed' ? 'signed' : 'legacy',
+    profile: asProfile(row.profile),
   }
 }
 
@@ -338,8 +399,8 @@ export async function listAgentWebhookDoorbells(env: Env): Promise<Map<string, P
   const tenant = requireTenant(env)
   if (!tenant) return out
   const res = await env.DB.prepare(
-    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version FROM agent_webhook_doorbells WHERE tenant = ?1`,
-  ).bind(tenant).all<{ agent_id: string; webhook_url: string; auth_last4: string; updated_at: string; delivery_version: string }>()
+    `SELECT agent_id, webhook_url, auth_last4, updated_at, delivery_version, profile FROM agent_webhook_doorbells WHERE tenant = ?1`,
+  ).bind(tenant).all<{ agent_id: string; webhook_url: string; auth_last4: string; updated_at: string; delivery_version: string; profile?: string }>()
   for (const row of res.results ?? []) {
     out.set(row.agent_id, {
       configured: true,
@@ -348,6 +409,7 @@ export async function listAgentWebhookDoorbells(env: Env): Promise<Map<string, P
       auth_last4: row.auth_last4,
       updated_at: row.updated_at,
       delivery_version: row.delivery_version === 'signed' ? 'signed' : 'legacy',
+      profile: asProfile(row.profile),
     })
   }
   return out
@@ -429,7 +491,9 @@ async function deliverDoorbell(
   // ONE statement (the existence check for the whole send path): resolve to the canonical id, then join the row.
   // delivery_version is read only while the signed flag is on, so a flag-off send keeps today's SELECT.
   const row = await env.DB.prepare(
-    `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext
+    `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext,
+            d.profile AS profile,
+            COALESCE((SELECT a2.slug FROM agents a2 WHERE a2.id = d.agent_id), d.agent_id) AS agent_slug
             ${webhookDoorbellSignedEnabled(env) ? ', d.delivery_version AS delivery_version' : ''}
        FROM agent_webhook_doorbells d
       WHERE d.tenant = ?1
@@ -441,6 +505,8 @@ async function deliverDoorbell(
     agent_id: string
     webhook_url: string
     auth_ciphertext: string
+    profile?: string
+    agent_slug?: string
     delivery_version?: string
   }>()
   if (!row) return { outcome: 'no_doorbell' }
@@ -454,8 +520,10 @@ async function deliverDoorbell(
   const ref = doorbellEventRef(canonical, opts.correlation)
 
   // Re-assert the guard at fire time: a row written before a rule tightened must not be trusted.
+  const profile = asProfile(row.profile)
   const url = validateHttpsWebhookUrl(row.webhook_url)
-  if (!url.ok) {
+  const profileUrl = profile === 'anthropic_routine' ? validateAnthropicRoutineUrl(row.webhook_url) : null
+  if (!url.ok || (profileUrl !== null && !profileUrl.ok)) {
     await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'invalid_url' }, ref)
     return { outcome: 'skipped', reason: 'invalid_url' }
   }
@@ -561,16 +629,25 @@ async function deliverDoorbell(
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), DOORBELL_TIMEOUT_MS)
   try {
+    const routine = profile === 'anthropic_routine'
     const res = await fetchImpl(url.url, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${bearer}`,
-        'content-type': 'application/json',
-      },
+      headers: routine
+        ? {
+            Authorization: `Bearer ${bearer}`,
+            ...ANTHROPIC_ROUTINE_HEADERS,
+            'content-type': 'application/json',
+          }
+        : {
+            Authorization: `Bearer ${bearer}`,
+            'content-type': 'application/json',
+          },
       // The assignment occurrence is a pot-side dedupe key, not part of the wire contract the Bot parses.
-      body: JSON.stringify(canonical.type === TASK_ASSIGNED_TYPE
-        ? { type: canonical.type, agent_id: canonical.agent_id, task_id: canonical.task_id }
-        : canonical),
+      body: JSON.stringify(routine
+        ? { text: routineText(canonical.type, row.agent_slug ?? canonical.agent_id, routineRef(canonical)) }
+        : canonical.type === TASK_ASSIGNED_TYPE
+          ? { type: canonical.type, agent_id: canonical.agent_id, task_id: canonical.task_id }
+          : canonical),
       signal: ac.signal,
       // Never follow a redirect: a 3xx would carry the bearer to a host nobody vetted.
       redirect: 'manual',
@@ -671,6 +748,8 @@ export type DoorbellReceiptView = {
   error_class: string | null
   signed_at: string | null
   attempted_at: string
+  /** The doorbell's delivery profile (the receipts table itself has no such column). */
+  profile: DoorbellProfile
 }
 
 /**
@@ -687,14 +766,17 @@ export async function listAgentWebhookDoorbellReceipts(
   const cap = Math.min(Math.max(limit, 1), 100)
   const res = await env.DB.prepare(
     `SELECT event_type, agent_id, ref_id, attempt, outcome, http_status,
-            COALESCE(error_class, reason) AS error_class, signed_at, attempted_at
+            COALESCE(error_class, reason) AS error_class, signed_at, attempted_at,
+            COALESCE((SELECT d.profile FROM agent_webhook_doorbells d
+                       WHERE d.tenant = agent_webhook_doorbell_receipts.tenant
+                         AND d.agent_id = agent_webhook_doorbell_receipts.agent_id), 'generic') AS profile
        FROM agent_webhook_doorbell_receipts
       WHERE tenant = ?1 AND agent_id = ?2
         AND NOT (outcome = 'claimed' AND reason = 'enqueued')
       ORDER BY attempted_at DESC
       LIMIT ?3`,
   ).bind(tenant, agentId, cap).all<DoorbellReceiptView>()
-  return res.results ?? []
+  return (res.results ?? []).map((r) => ({ ...r, profile: asProfile(r.profile) }))
 }
 
 /** ctx.waitUntil from a Hono context; `c.executionCtx` throws outside a Worker request (tests), so guard it. */

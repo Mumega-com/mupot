@@ -121,3 +121,16 @@ Do not paste bearers into git, Slack, or this wiki. Do not point this at a custo
 - Dashboard: `src/dashboard/doorbells.ts` (`/doorbells`)
 - MCP: `set_agent_webhook_doorbell` / `get_agent_webhook_doorbell` (`src/mcp/webhook-doorbell.ts`)
 - Fire site: `sendAgentMessage` after a real INSERT (`src/agents/messages.ts`) — same “row landed” point as `message.created`, fail-open, not on the Queue consumer
+
+## Profile: `anthropic_routine` (mupot#2301)
+
+`set_agent_webhook_doorbell` takes an optional `profile`: `generic` (default, unchanged) or `anthropic_routine`.
+`anthropic_routine` fires a Claude Code routine. The URL must be exactly
+`https://api.anthropic.com/v1/claude_code/routines/<trig_id>/fire` (`trig_[A-Za-z0-9]{8,64}`; no query, fragment, port or
+other host/path), checked at registration and again at send time. The profile is its own allowlist: do not add
+`api.anthropic.com` to `EVENTS_CALLBACK_HOSTS`. The pot sends `Authorization: Bearer <routine token>`, the constant
+`anthropic-beta: experimental-cc-routine-2026-04-01` and `anthropic-version: 2023-06-01`, and the body
+`{"text":"mupot: <type> for <agent slug> (<task or message id>)"}` (ids and type only, at most 200 characters; Anthropic labels
+it untrusted). Redirects are never followed. The profile always uses the legacy bearer path, even with
+`WEBHOOK_DOORBELL_SIGNED` on. `get_agent_webhook_doorbell` and the receipt list show `profile`, never the bearer.
+Apply migration 0271 before the Worker deploy.
