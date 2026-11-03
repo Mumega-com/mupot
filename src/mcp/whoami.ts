@@ -244,7 +244,11 @@ export function onboardingNext(
 ): OnboardingNext {
   const consentUrl = mcpEndpoint(origin)
   const labels = consentLabels(consentChoiceLabels(env))
-  const expected = typeof expectedAgent === 'string' ? expectedAgent.trim() : ''
+  // NOTE: no production caller passes expectedAgent yet (boot_context / status / orient do not feed it), so wrong_expected_principal is
+  // reachable only from a caller that supplies it. The string is caller text: control characters are stripped and it is capped
+  // before it is echoed into next_step.
+  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+  const expected = typeof expectedAgent === 'string' ? expectedAgent.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) : ''
   if (expected.length > 0) {
     const matches = (auth.boundAgentId !== undefined && auth.boundAgentId !== null && auth.boundAgentId === expected)
       || (facts.actsAs !== null && facts.actsAs.toLowerCase() === expected.toLowerCase())
@@ -268,19 +272,30 @@ export function onboardingNext(
       : { case: 'attached_chat', who_acts: 'self', next_tool: 'inbox', next_step: 'you act as the attached agent: read your inbox with inbox {peek:true} and record what you handled with inbox_mark_handled (you cannot ack or lease). This chat is not routable: never call seat_select or seat_attach from here.' }
   }
   if (state === 'own_seat') {
+    // Same sentence plainNextStep prints for this state (attachConnectOrder), so the two cannot disagree. When designation is required
+    // the legal step is the designate step (a human/org-admin action), not seat_attach, which would answer agent_not_designated_for_you.
     const canAttach = seatAttachEnabled(env) && auth.seatAgentStatus !== 'held'
-    return canAttach
-      ? { case: 'own_chat', who_acts: 'self', next_tool: 'seat_attach', next_step: 'to act as an agent you already have, call seat_attach {agent, reason}; your human approves it. Otherwise read your open work with needs_you_list. Do not call seat_select (you already have a seat).' }
-      : { case: 'own_chat', who_acts: 'self', next_tool: 'needs_you_list', next_step: 'read your open work with needs_you_list; attaching to an existing agent is unavailable for this chat right now. Do not call seat_select (you already have a seat).' }
+    if (!canAttach) {
+      return { case: 'own_chat', who_acts: 'self', next_tool: 'needs_you_list', next_step: 'read your open work with needs_you_list; attaching to an existing agent is unavailable for this chat right now. Do not call seat_select (you already have a seat).' }
+    }
+    if (seatAttachDesignatedEnabled(env)) {
+      return { case: 'own_chat', who_acts: facts.humanCanDesignate === false ? 'org_admin' : 'owner', next_step: attachConnectOrder(env, facts.humanCanDesignate) }
+    }
+    return { case: 'own_chat', who_acts: 'self', next_tool: 'seat_attach', next_step: `${attachConnectOrder(env)} Do not call seat_select (you already have a seat).` }
   }
-  if (state === 'host' || state === 'acting_as') {
+  if (state === 'acting_as') {
+    // legacy_consent: an OAuth connection the human consented to an agent
+    return { case: 'existing_oauth', who_acts: 'self', next_tool: 'needs_you_list', next_step: 'you are a bound agent on this connection; the seat tools (seat_select, seat_attach) do not apply. Read your open work with needs_you_list.' }
+  }
+  if (state === 'host') {
     const m = missing[0]
-    return m && state === 'host'
+    return m
       ? { case: 'workspace_bearer', who_acts: m.who_acts, next_step: m.next_step, ...(m.next_tool ? { next_tool: m.next_tool } : {}) }
       : { case: 'workspace_bearer', who_acts: 'self', next_tool: 'needs_you_list', next_step: 'you are a bound agent on this connection; the seat tools (seat_select, seat_attach) do not apply. Read your open work with needs_you_list.' }
   }
   if (state === 'harness_unseated') {
     const m = missing[0]
+    // missing[] is built behind the same seatSelectCallable gate plainNextStep uses, so it only carries next_tool seat_select when callable.
     return { case: 'harness_unseated', who_acts: m?.who_acts ?? 'owner', next_step: m?.next_step ?? 'ask your human or an org admin.', ...(m?.next_tool ? { next_tool: m.next_tool } : {}), ...(m?.link ? { link: m.link } : {}) }
   }
   // no_agent: a signed-in person (OAuth) or an agent-less member token.

@@ -81,4 +81,46 @@ describe('onboarding_next: one legal step per case', () => {
     const a = authOf({ boundAgentId: 'sa', seatBinding: SEAT })
     expect(next(a)).toEqual(next(a))
   })
+
+  it('own chat with designation required: the step is the designate step (same sentence as plainNextStep), never seat_attach', () => {
+    const env = { ...ENV, SEAT_ATTACH_DESIGNATED: '1' } as unknown as Env
+    const a = authOf({ boundAgentId: 'sa', seatBinding: SEAT })
+    const owner = next(a, {}, undefined, env)
+    expect(owner).toMatchObject({ case: 'own_chat', who_acts: 'owner' })
+    expect(owner.next_tool).toBeUndefined()
+    expect(owner.next_step).toContain('Allow for me')
+    const admin = next(a, { humanCanDesignate: false }, undefined, env)
+    expect(admin).toMatchObject({ case: 'own_chat', who_acts: 'org_admin' })
+    expect(admin.next_tool).toBeUndefined()
+    expect(admin.next_step).toContain('attach_designated_member_id')
+    const plain = buildWhoami(env, a, { facts: { ...FACTS, humanCanDesignate: false }, origin: ORIGIN }).next_step_plain
+    expect(plain).toContain(admin.next_step)
+  })
+
+  it('harness_unseated names seat_select only when seats are callable (seat enrolment on)', () => {
+    const off = { ...ENV, SEAT_AUTO_ENROLL: undefined } as unknown as Env
+    // a harness credential is harness_unseated whatever the flag; with enrolment off the handle-rejected step must not name seat_select
+    const a = authOf({ harnessCredential: true, seatInputs: { handleRejected: true, hints: { openai_session: false, openai_subject: false, codex_thread_id: false } } as AuthContext['seatInputs'] })
+    expect(next(a, {}, undefined, ENV).next_tool).toBe('seat_select')
+    const n = next(a, {}, undefined, off)
+    expect(n.case).toBe('harness_unseated')
+    expect(n.next_tool).toBeUndefined()
+  })
+
+  it('wrong expected principal: echoed string is capped at 64 chars, control characters stripped, surrounding space trimmed', () => {
+    const a = authOf({ boundAgentId: 'sa', seatBinding: SEAT })
+    const long = next(a, { actsAs: 'x' }, 'A'.repeat(200))
+    expect(long.next_step).toContain('A'.repeat(64))
+    expect(long.next_step).not.toContain('A'.repeat(65))
+    const ctl = next(a, { actsAs: 'x' }, 'ra\u0000v\na\u001b[31m')
+    expect(ctl.next_step).toContain('rav a'.replace(' ', '') + '[31m')
+    // eslint-disable-next-line no-control-regex -- asserting none survive
+    expect(ctl.next_step).not.toMatch(/[\u0000-\u001f\u007f]/)
+    // trim: padded expectation of the true principal still matches
+    expect(next(a, { actsAs: 'rava' }, '   rava  ').case).toBe('own_chat')
+  })
+
+  it('OAuth connection consented to an agent (legacy_consent) is labelled existing_oauth, not workspace_bearer', () => {
+    expect(next(authOf({ boundAgentId: 'ag', consentedByMemberId: 'mem-human' }))).toMatchObject({ case: 'existing_oauth', next_tool: 'needs_you_list' })
+  })
 })
