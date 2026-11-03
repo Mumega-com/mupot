@@ -16,23 +16,56 @@ export interface GitHubInstallation {
   updated_at: string
 }
 
-/** Store (or overwrite) this tenant's installation id. A re-install replaces the old one. */
+export type StoreInstallationResult = { ok: true } | { ok: false; reason: 'already_bound_different' }
+
+export interface InstallAuditContext {
+  /** The acting member (or web-login user) id. */
+  memberId: string
+  source: 'callback'
+}
+
+/**
+ * Store this tenant's installation id. A tenant that already holds a DIFFERENT id is refused
+ * (the existing binding is kept); an org admin must disconnect first. Re-storing the SAME id is
+ * idempotent. The write is one conditional upsert, so check-and-write cannot interleave.
+ * With `audit`, an audit row is written in the same atomic batch, only if the binding holds.
+ * A UNIQUE(installation_id) clash with another tenant still throws (caller maps it to 409).
+ */
 export async function storeInstallation(
   env: Env,
   installationId: string,
   accountLogin: string | null,
-): Promise<void> {
+  audit?: InstallAuditContext,
+): Promise<StoreInstallationResult> {
   const now = new Date().toISOString()
-  await env.DB.prepare(
+  const upsert = env.DB.prepare(
     `INSERT INTO github_installations (tenant, installation_id, account_login, installed_at, updated_at)
      VALUES (?1, ?2, ?3, ?4, ?4)
      ON CONFLICT(tenant) DO UPDATE SET
-       installation_id = excluded.installation_id,
-       account_login   = excluded.account_login,
-       updated_at      = excluded.updated_at`,
-  )
-    .bind(env.TENANT_SLUG, installationId, accountLogin, now)
-    .run()
+       account_login = excluded.account_login,
+       updated_at    = excluded.updated_at
+     WHERE github_installations.installation_id = excluded.installation_id`,
+  ).bind(env.TENANT_SLUG, installationId, accountLogin, now)
+
+  if (!audit) {
+    const res = await upsert.run()
+    return res.meta.changes === 0 ? { ok: false, reason: 'already_bound_different' } : { ok: true }
+  }
+  const detail = JSON.stringify({
+    tenant: env.TENANT_SLUG,
+    member: audit.memberId,
+    installation_id: installationId,
+    source: audit.source,
+    at: now,
+  })
+  // Audit row only when the binding now holds this id (a refused overwrite leaves no row).
+  const auditStmt = env.DB.prepare(
+    `INSERT INTO connector_audit (id, connector_id, tenant, action, actor_id, detail, recorded_at)
+     SELECT ?1, ?2, ?3, 'github_install_bind', ?4, ?5, ?6
+     WHERE EXISTS (SELECT 1 FROM github_installations WHERE tenant = ?3 AND installation_id = ?7)`,
+  ).bind(crypto.randomUUID(), `github-install:${installationId}`, env.TENANT_SLUG, audit.memberId, detail, now, installationId)
+  const [stored] = await env.DB.batch([upsert, auditStmt])
+  return stored.meta.changes === 0 ? { ok: false, reason: 'already_bound_different' } : { ok: true }
 }
 
 /** Read this tenant's stored installation id, or null. */
@@ -45,11 +78,27 @@ export async function getInstallationId(env: Env): Promise<string | null> {
   return row?.installation_id ?? null
 }
 
-/** Remove this tenant's installation record (on uninstall / disconnect). Idempotent. */
-export async function removeInstallation(env: Env): Promise<void> {
-  await env.DB.prepare(`DELETE FROM github_installations WHERE tenant = ?1`)
-    .bind(env.TENANT_SLUG)
-    .run()
+/**
+ * Remove this tenant's installation record (disconnect). Idempotent. When `memberId` is given
+ * and a binding existed, an audit row is written in the same atomic batch.
+ */
+export async function removeInstallation(env: Env, memberId?: string): Promise<void> {
+  const del = env.DB.prepare(`DELETE FROM github_installations WHERE tenant = ?1`).bind(env.TENANT_SLUG)
+  if (!memberId) {
+    await del.run()
+    return
+  }
+  const now = new Date().toISOString()
+  const current = await getInstallationId(env)
+  if (current === null) return
+  const detail = JSON.stringify({ tenant: env.TENANT_SLUG, member: memberId, installation_id: current, source: 'dashboard', at: now })
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO connector_audit (id, connector_id, tenant, action, actor_id, detail, recorded_at)
+       VALUES (?1, ?2, ?3, 'github_install_unbind', ?4, ?5, ?6)`,
+    ).bind(crypto.randomUUID(), `github-install:${current}`, env.TENANT_SLUG, memberId, detail, now),
+    del,
+  ])
 }
 
 /**

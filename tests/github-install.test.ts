@@ -313,6 +313,93 @@ describe('GET /connect/github/callback', () => {
   })
 })
 
+describe('install binding hardening (overwrite refusal, audit, disconnect)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  function ghOk(id: number) {
+    return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const u = String(input)
+      if (u.includes('/login/oauth/access_token')) return new Response(JSON.stringify({ access_token: 'utok' }), { status: 200 })
+      if (u.includes('/applications/') && init?.method === 'DELETE') return new Response(null, { status: 204 })
+      if (u.includes('/user/installations')) {
+        return new Response(JSON.stringify({ installations: [{ id, account: { login: 'o', type: 'Organization', id: 9 } }] }), { status: 200 })
+      }
+      if (u.includes('/user/memberships/orgs/')) return new Response(JSON.stringify({ role: 'admin', state: 'active' }), { status: 200 })
+      return new Response('{}', { status: 404 })
+    })
+  }
+  const cb = (id: string) => `/connect/github/callback?installation_id=${id}&setup_action=install&state=good&code=abc`
+  const req = (path: string, method = 'GET') =>
+    new Request(`https://pot.test${path}`, { method, headers: { Cookie: 'mupot_session=sess1', Origin: 'https://pot.test' } })
+  const seed = (sqlite: ReturnType<typeof connectEnv>['sqlite'], id: string) =>
+    sqlite.exec(`INSERT INTO github_installations (tenant, installation_id, account_login, installed_at, updated_at) VALUES ('t','${id}','orig','x','x')`)
+  const audits = (sqlite: ReturnType<typeof connectEnv>['sqlite']) =>
+    sqlite.prepare("SELECT action, actor_id, tenant, connector_id, detail FROM connector_audit WHERE action LIKE 'github_install_%'").all() as Array<{
+      action: string; actor_id: string; tenant: string; connector_id: string; detail: string
+    }>
+
+  it('a different id over an existing binding is refused and the original is kept', async () => {
+    const { env, kv, rows, sqlite } = connectEnv('admin')
+    seed(sqlite, '111')
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghOk(222))
+    const res = await dashboardApp.fetch(req(cb('222')), env)
+    expect(res.status).toBe(409)
+    expect(await res.text()).toContain('disconnect')
+    expect(rows()).toEqual([{ tenant: 't', installation_id: '111', account_login: 'orig' }])
+    expect(audits(sqlite)).toEqual([])
+  })
+
+  it('the same id again is idempotent', async () => {
+    const { env, kv, rows, sqlite } = connectEnv('admin')
+    seed(sqlite, '111')
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghOk(111))
+    const res = await dashboardApp.fetch(req(cb('111')), env)
+    expect(res.status).toBe(302)
+    expect(rows().map((r) => r.installation_id)).toEqual(['111'])
+  })
+
+  it('a successful bind writes one audit row (tenant, member, installation_id, time, source=callback)', async () => {
+    const { env, kv, sqlite } = connectEnv('admin')
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghOk(333))
+    expect((await dashboardApp.fetch(req(cb('333')), env)).status).toBe(302)
+    const a = audits(sqlite)
+    expect(a).toHaveLength(1)
+    expect(a[0]).toMatchObject({ action: 'github_install_bind', actor_id: 'u1', tenant: 't', connector_id: 'github-install:333' })
+    const d = JSON.parse(a[0].detail) as Record<string, string>
+    expect(d).toMatchObject({ tenant: 't', member: 'u1', installation_id: '333', source: 'callback' })
+    expect(Number.isNaN(Date.parse(d.at))).toBe(false)
+  })
+
+  it('storeInstallation reports a refusal instead of overwriting', async () => {
+    const { env, sqlite } = connectEnv('admin')
+    expect(await storeInstallation(env, '111', 'a')).toEqual({ ok: true })
+    expect(await storeInstallation(env, '222', 'b')).toEqual({ ok: false, reason: 'already_bound_different' })
+    expect(await storeInstallation(env, '111', 'a')).toEqual({ ok: true })
+    expect(await getInstallationId(env)).toBe('111')
+    void sqlite
+  })
+
+  it('POST /admin/github/disconnect: admin removes the binding (audited); member is refused; then a new id binds', async () => {
+    const m = connectEnv('member')
+    seed(m.sqlite, '111')
+    expect((await dashboardApp.fetch(req('/admin/github/disconnect', 'POST'), m.env)).status).toBe(403)
+    expect(m.rows()).toHaveLength(1)
+
+    const { env, kv, rows, sqlite } = connectEnv('admin')
+    seed(sqlite, '111')
+    expect((await dashboardApp.fetch(req('/admin/github/disconnect', 'POST'), env)).status).toBe(302)
+    expect(rows()).toEqual([])
+    expect(audits(sqlite).map((x) => x.action)).toEqual(['github_install_unbind'])
+    kv.set('ghstate:good', 't')
+    vi.stubGlobal('fetch', ghOk(222))
+    expect((await dashboardApp.fetch(req(cb('222')), env)).status).toBe(302)
+    expect(rows().map((r) => r.installation_id)).toEqual(['222'])
+  })
+})
+
 describe('verifyInstallationOwnership reasons', () => {
   const env = { GITHUB_APP_CLIENT_ID: 'cid', GITHUB_APP_CLIENT_SECRET: 'csecret' } as unknown as Env
   const mk = (lookup: () => Response | Promise<Response>, exchange?: () => Response) =>
@@ -443,5 +530,19 @@ describe('verifyInstallationOwnership pagination', () => {
       return new Response(JSON.stringify({ installations: u.includes('page=2') ? [{ id: 5, account: { login: 'x', type: 'Organization', id: 1 } }] : page1 }))
     }) as unknown as typeof fetch
     expect(await verifyInstallationOwnership(env, 'c', '5', { fetchImpl: f })).toEqual({ ok: true, accountLogin: 'x' })
+  })
+})
+
+describe('github-install-bindings-audit.sql', () => {
+  it('is read-only and lists bindings with last audit', async () => {
+    const { readFileSync } = await import('node:fs')
+    const sql = readFileSync(new URL('../scripts/github-install-bindings-audit.sql', import.meta.url), 'utf8')
+    expect(/\b(insert|update|delete|drop|alter|create|replace)\b/i.test(sql.replace(/^--.*$/gm, ''))).toBe(false)
+    const { env, sqlite } = connectEnv('admin')
+    expect(await storeInstallation(env, '9', 'o', { memberId: 'm1', source: 'callback' })).toEqual({ ok: true })
+    const rows = sqlite.prepare(sql).all() as Array<{ tenant: string; installation_id: string; last_audit: string }>
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ tenant: 't', installation_id: '9' })
+    expect(rows[0].last_audit).toContain('github_install_bind by m1')
   })
 })
