@@ -82,6 +82,9 @@ export interface WhoamiFacts {
   tenantHasAgents: boolean
   /** Slug/name of the agent this request acts as, when known. */
   actsAs: string | null
+  /** Slug and name of the agent this request is bound to (a seat's attached agent or a workspace bearer's own agent). Read-only
+   *  identifiers used ONLY to compare against a caller's stated expected_agent; never echoed. Absent = unknown (id match still works). */
+  principalNames?: string[]
   /** Boot only: the runtime self-report step. Absent on status/orient (they take no runtime args). */
   report?: { missingFields: string[]; outcome?: string; detail?: string }
   /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
@@ -244,14 +247,16 @@ export function onboardingNext(
 ): OnboardingNext {
   const consentUrl = mcpEndpoint(origin)
   const labels = consentLabels(consentChoiceLabels(env))
-  // NOTE: no production caller passes expectedAgent yet (boot_context / status / orient do not feed it), so wrong_expected_principal is
-  // reachable only from a caller that supplies it. The string is caller text: control characters are stripped and it is capped
-  // before it is echoed into next_step.
+  // expectedAgent comes from boot_context's optional `expected_agent` arg. The string is caller text: control characters are stripped
+  // and it is capped before it is echoed into next_step. It is only COMPARED to the authenticated principal (id, slug, name or the
+  // acting-as identity), never believed. Precedence (intended, pinned by a test): a stated-but-wrong principal, then a lapsed
+  // consent (re-consenting repairs the binding that every other step depends on, including the seat), then the state.
   // eslint-disable-next-line no-control-regex -- stripping control characters is the point
   const expected = typeof expectedAgent === 'string' ? expectedAgent.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) : ''
   if (expected.length > 0) {
     const matches = (auth.boundAgentId !== undefined && auth.boundAgentId !== null && auth.boundAgentId === expected)
       || (facts.actsAs !== null && facts.actsAs.toLowerCase() === expected.toLowerCase())
+      || (facts.principalNames ?? []).some((n) => n.toLowerCase() === expected.toLowerCase())
     if (!matches) {
       return {
         case: 'wrong_expected_principal',

@@ -124,3 +124,23 @@ describe('onboarding_next: one legal step per case', () => {
     expect(next(authOf({ boundAgentId: 'ag', consentedByMemberId: 'mem-human' }))).toMatchObject({ case: 'existing_oauth', next_tool: 'needs_you_list' })
   })
 })
+
+describe('onboarding_next: expected principal and precedence (#2289)', () => {
+  it('a principal matching by bound agent slug/name (principalNames) is not wrong, case-insensitive', () => {
+    const a = authOf({ channel: 'workspace', boundAgentId: 'ag-1' })
+    expect(next(a, { principalNames: ['rava', 'Rava Prime'] }, 'RAVA').case).toBe('workspace_bearer')
+    expect(next(a, { principalNames: ['rava', 'Rava Prime'] }, 'rava prime').case).toBe('workspace_bearer')
+    expect(next(a, { principalNames: ['rava'] }, 'athena').case).toBe('wrong_expected_principal')
+    expect(next(a, {}, 'rava').case).toBe('wrong_expected_principal') // unknown names fail closed
+  })
+
+  it('lapsed consent outranks an unseated harness (intended: re-consent repairs the binding the seat depends on)', () => {
+    const n = next(authOf({ boundAgentId: null, consentedByMemberId: 'mem-human', harnessId: 'h-1' }))
+    expect(n.case).toBe('revoked_consent')
+    expect(n.next_tool).toBeUndefined()
+  })
+
+  it('a wrong expectation outranks lapsed consent', () => {
+    expect(next(authOf({ boundAgentId: null, consentedByMemberId: 'mem-human' }), {}, 'rava').case).toBe('wrong_expected_principal')
+  })
+})

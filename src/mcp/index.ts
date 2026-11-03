@@ -6878,7 +6878,7 @@ interface BootOnboarding {
 async function gatherWhoamiFacts(
   env: Env,
   auth: AuthContext,
-  opts: { actsAs?: string | null; report?: WhoamiFacts['report'] } = {},
+  opts: { actsAs?: string | null; report?: WhoamiFacts['report']; withPrincipalNames?: boolean } = {},
 ): Promise<WhoamiFacts> {
   const agentId = auth.boundAgentId ?? null
   const unboundDirectory = auth.channel === 'directory' && !agentId
@@ -6893,7 +6893,9 @@ async function gatherWhoamiFacts(
   const humanCanDesignate = auth.seatBinding && seatAttachDesignatedEnabled(env)
     ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
     : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
+  // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
+  const principalNames = opts.withPrincipalNames && agentId ? await principalNamesOf(env, agentId) : undefined
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(principalNames ? { principalNames } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -6913,6 +6915,13 @@ async function whoamiFor(env: Env, auth: AuthContext, origin: string | undefined
   // Installer window (flag off => one env read, no D1 read, `whoami` untouched): the elevated agent sees its live window.
   const installerWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: whoami must always answer
   return installerWindow ? { ...whoami, installer_window: installerWindow } : whoami
+}
+
+/** slug + name of the bound agent, for comparing a stated expected_agent. Advisory: a failed read yields none (id match still works). */
+async function principalNamesOf(env: Env, agentId: string): Promise<string[] | undefined> {
+  const row = await env.DB.prepare('SELECT slug, name FROM agents WHERE id = ?1 LIMIT 1').bind(agentId).first<{ slug: string | null; name: string | null }>().catch(() => null)
+  if (!row) return undefined
+  return [row.slug, row.name].filter((v): v is string => typeof v === 'string' && v.length > 0)
 }
 
 async function actsAsName(env: Env, auth: AuthContext): Promise<string | null> {
@@ -7235,7 +7244,7 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string, repo?: string, branch?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot. repo/branch: `git remote get-url origin` and your current branch; the answer names the project you are part of',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string, expected_agent?: string, repo?: string, branch?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot. repo/branch: `git remote get-url origin` and your current branch; the answer names the project you are part of',
   inputSchema: {
     type: 'object',
     properties: {
@@ -7247,6 +7256,7 @@ const toolBootContext: ToolSpec = {
       runtime: STRING_SCHEMA,
       model: STRING_SCHEMA,
       host: STRING_SCHEMA,
+      expected_agent: { type: 'string', maxLength: 64, description: 'Optional. The agent (slug or id) you expect this connection to be. Only COMPARED to the authenticated principal, never believed: a mismatch answers whoami.onboarding_next = wrong_expected_principal (an owner step; this connection never changes agent in place). No effect on auth, seats or writes.' },
     },
     additionalProperties: false,
   },
@@ -7308,12 +7318,14 @@ const toolBootContext: ToolSpec = {
       : undefined
     // ONE derivation of state / have / missing[] (src/mcp/whoami.ts). next_step, onboarding, available_doors and
     // channel_limits below are all read FROM it, so they cannot disagree with each other or with the tools.
+    const expectedAgent = typeof args.expected_agent === 'string' && args.expected_agent.trim().length > 0 ? args.expected_agent : undefined // compared only, never believed
     const receiptAgent = identityReceipt?.agent as { slug?: unknown; name?: unknown } | null | undefined
     const whoamiFacts = await gatherWhoamiFacts(env, auth, {
       actsAs: typeof receiptAgent?.slug === 'string' ? receiptAgent.slug : typeof receiptAgent?.name === 'string' ? receiptAgent.name : null,
       report: attachedAuthority(auth) || ctx?.sideEffectFree ? undefined : reportFacts(args, selfReport),
+      withPrincipalNames: expectedAgent !== undefined,
     })
-    const baseWhoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin) })
+    const baseWhoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin), ...(expectedAgent !== undefined ? { expectedAgent } : {}) })
     // Installer window (flag off => no D1 read): boot is where the agent discovers its current authority, same as status/orient.
     const bootWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: boot must always answer
     const whoami: Whoami = bootWindow ? { ...baseWhoami, installer_window: bootWindow } : baseWhoami
