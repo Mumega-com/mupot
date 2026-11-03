@@ -57,7 +57,7 @@ import {
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { tenantHeaderNotice, TENANT_NOTICE_RESPONSE_HEADER, type TenantHeaderNotice } from './tenant-header-notice'
-import { attachConnectOrder, buildWhoami, seatAttachDoor, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
+import { attachConnectOrder, buildWhoami, cleanExpected, EXPECTED_AGENT_MAX, WRONG_PRINCIPAL_CODE, seatAttachDoor, whoamiDoorFilter, type Whoami, type WhoamiFacts } from './whoami'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { connectionName, humanCanDesignateAtAll, resolveAttachableAgent, seatAttachDesignatedEnabled, seatAttachEnabled, attachDesignatedClause } from '../members/seat-attach'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, attachmentAttribution, isAttachedSudoAction, verdictAttribution } from '../auth/attached-ceiling'
@@ -6878,7 +6878,7 @@ interface BootOnboarding {
 async function gatherWhoamiFacts(
   env: Env,
   auth: AuthContext,
-  opts: { actsAs?: string | null; report?: WhoamiFacts['report'] } = {},
+  opts: { actsAs?: string | null; report?: WhoamiFacts['report']; withAgentDirectory?: boolean } = {},
 ): Promise<WhoamiFacts> {
   const agentId = auth.boundAgentId ?? null
   const unboundDirectory = auth.channel === 'directory' && !agentId
@@ -6893,7 +6893,9 @@ async function gatherWhoamiFacts(
   const humanCanDesignate = auth.seatBinding && seatAttachDesignatedEnabled(env)
     ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
     : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
+  // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
+  const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -6913,6 +6915,18 @@ async function whoamiFor(env: Env, auth: AuthContext, origin: string | undefined
   // Installer window (flag off => one env read, no D1 read, `whoami` untouched): the elevated agent sees its live window.
   const installerWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: whoami must always answer
   return installerWindow ? { ...whoami, installer_window: installerWindow } : whoami
+}
+
+const AGENT_DIRECTORY_LIMIT = 2000
+
+/** Active agents (id, slug, name) for resolving a stated expected_agent. SQL cannot do the NFKC fold, so the scan is by status only and bounded:
+ *  when the cap is hit `truncated` is set and the resolver fails closed (asks for the id) instead of treating the list as complete.
+ *  Read-only, never echoed. Advisory: a failed read yields none (an exact id still matches). */
+async function activeAgentDirectory(env: Env): Promise<{ rows: Array<{ id: string; slug: string | null; name: string | null }>; truncated: boolean } | undefined> {
+  const res = await env.DB.prepare("SELECT id, slug, name FROM agents WHERE status = 'active' ORDER BY id LIMIT ?1").bind(AGENT_DIRECTORY_LIMIT + 1).all<{ id: string; slug: string | null; name: string | null }>().catch(() => null)
+  if (!res) return undefined
+  const truncated = res.results.length > AGENT_DIRECTORY_LIMIT
+  return { rows: truncated ? res.results.slice(0, AGENT_DIRECTORY_LIMIT) : res.results, truncated }
 }
 
 async function actsAsName(env: Env, auth: AuthContext): Promise<string | null> {
@@ -7235,7 +7249,7 @@ const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
   min: 'authenticated',
-  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string, repo?: string, branch?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot. repo/branch: `git remote get-url origin` and your current branch; the answer names the project you are part of',
+  args: '{ source?: string, seat?: string, label?: string, runtime?: string, model?: string, host?: string, expected_agent?: string, repo?: string, branch?: string }  // runtime/model/host: what you are ACTUALLY running on — any bounded string, reported at boot. repo/branch: `git remote get-url origin` and your current branch; the answer names the project you are part of',
   inputSchema: {
     type: 'object',
     properties: {
@@ -7247,10 +7261,14 @@ const toolBootContext: ToolSpec = {
       runtime: STRING_SCHEMA,
       model: STRING_SCHEMA,
       host: STRING_SCHEMA,
+      expected_agent: { type: 'string', maxLength: 64, description: 'Optional. The agent (id, or a slug/name unique in this pot) you expect this connection to be. Only COMPARED to the authenticated principal, never believed: a mismatch answers whoami.onboarding_next = wrong_expected_principal (an owner step; this connection never changes agent in place). No effect on auth, seats or writes.' },
     },
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
+    if (typeof args.expected_agent === 'string' && args.expected_agent.length > EXPECTED_AGENT_MAX) {
+      return fail(400, 'invalid_args', { field: 'expected_agent', message: `expected_agent must be at most ${EXPECTED_AGENT_MAX} characters: pass the agent id` })
+    }
     // mupot#1794 W4 (gate P2): boot_context is allowlisted for a confined harness session as a READ;
     // it must not write presence under the human with a caller-chosen seat label.
     if (auth.memberId && !ctx?.sideEffectFree && !ctx?.heldSeat && !isHarnessCredentialSession(auth) && !attachedAuthority(auth)) {
@@ -7308,16 +7326,23 @@ const toolBootContext: ToolSpec = {
       : undefined
     // ONE derivation of state / have / missing[] (src/mcp/whoami.ts). next_step, onboarding, available_doors and
     // channel_limits below are all read FROM it, so they cannot disagree with each other or with the tools.
+    const expectedAgent = typeof args.expected_agent === 'string' && cleanExpected(args.expected_agent).length > 0 ? args.expected_agent : undefined // compared only, never believed
     const receiptAgent = identityReceipt?.agent as { slug?: unknown; name?: unknown } | null | undefined
     const whoamiFacts = await gatherWhoamiFacts(env, auth, {
       actsAs: typeof receiptAgent?.slug === 'string' ? receiptAgent.slug : typeof receiptAgent?.name === 'string' ? receiptAgent.name : null,
       report: attachedAuthority(auth) || ctx?.sideEffectFree ? undefined : reportFacts(args, selfReport),
+      withAgentDirectory: expectedAgent !== undefined,
     })
-    const baseWhoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin) })
+    const baseWhoami: Whoami = buildWhoami(env, auth, { facts: whoamiFacts, origin: canonicalOrigin(env, ctx.origin), ...(expectedAgent !== undefined ? { expectedAgent } : {}) })
     // Installer window (flag off => no D1 read): boot is where the agent discovers its current authority, same as status/orient.
     const bootWindow = await installerWindowView(env, auth).catch(() => undefined) // advisory read: boot must always answer
     const whoami: Whoami = bootWindow ? { ...baseWhoami, installer_window: bootWindow } : baseWhoami
-    const bootOnboarding = ctx?.sideEffectFree ? null : buildBootOnboarding(env, connectionKind, whoami)
+    // A wrong expected principal is whoami.missing[0]; onboarding.next_step, next_step and available_doors[0] all read it.
+    const wrongPrincipal = whoami.missing.find((m) => m.code === WRONG_PRINCIPAL_CODE)
+    const bootOnboarding = ctx?.sideEffectFree ? null : (() => {
+      const b = buildBootOnboarding(env, connectionKind, whoami)
+      return wrongPrincipal ? { ...b, next_step: wrongPrincipal.next_step, who_acts: wrongPrincipal.who_acts } : b
+    })()
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
     // ── mupot#1283: the self-serve door has to be NAMED at the door ──────────────
@@ -7369,6 +7394,9 @@ const toolBootContext: ToolSpec = {
       // Designation copy follows SEAT_ATTACH_DESIGNATED (seatAttachDoor). The door is inserted only while attach itself is on.
       const door = seatAttachDoor(env, whoamiFacts.humanCanDesignate)
       availableDoors.splice(1, 0, { tool: 'seat_attach', does: door.does, requires: door.requires })
+    }
+    if (wrongPrincipal) {
+      availableDoors.unshift({ tool: wrongPrincipal.next_tool ?? null, does: wrongPrincipal.next_step, requires: wrongPrincipal.who_acts === 'self' ? 'nothing' : `${wrongPrincipal.who_acts} action` })
     }
     const enrollHref = enrollUrl(
       canonicalOrigin(env, ctx.origin),
