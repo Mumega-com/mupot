@@ -428,6 +428,33 @@ describe('Pre-dispatch Reservation & Idempotency', () => {
     expect(['reserved', 'delivered', 'unknown']).toContain((status.result as { delivery?: string }).delivery)
   })
 
+  // mumega-com#1637 P2: a non-accepted dispatch must still tell the client WHAT failed and WHICH row it
+  // belongs to. Dropping detail/reservationId here loses delivery:'unknown', so a retry without an
+  // idempotency_key can launch the vendor twice.
+  it('cursor_dispatch surfaces delivery:unknown and the reservation id on an unconfirmed launch', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    const spy = vi.spyOn(cursorCloudAdapter, 'dispatch').mockResolvedValue({
+      accepted: false,
+      error: 'bind_unconfirmed: connect call failed',
+      detail: { delivery: 'unknown', unconfirmed: true, state: 'reserved' },
+      reservationId: 'res-unconfirmed-01',
+    })
+    try {
+      const outcome = await invokeTool(
+        authContext(), env, 'cursor_dispatch',
+        { name: 'Unconfirmed Agent', repo_url: 'https://github.com/mumega/mupot', prompt: 'unconfirmed' },
+        {},
+      )
+      const wire = JSON.stringify(outcome)
+      expect(wire).toContain('"delivery":"unknown"')
+      expect(wire).toContain('res-unconfirmed-01')
+      expect(wire).toContain('bind_unconfirmed')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('concurrent reservation race handles unique constraint collision cleanly', async () => {
     const harness = makeHarness()
     const env = envFor(harness)

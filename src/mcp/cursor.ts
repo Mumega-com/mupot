@@ -113,7 +113,16 @@ export const toolCursorDispatch: ToolSpec = {
         return fail(409, 'execution_paused')
       }
       // outcome.error is already a fixed public code (publicHarnessError); raw DB/vendor text never reaches here.
-      return fail(400, 'cursor_dispatch_failed', { code: outcome.error })
+      // mumega-com#1637 P2: an unconfirmed launch is not "nothing happened". Dropping the failure detail and the
+      // reservation id here loses delivery:'unknown' and the row identity, so a client retry without an
+      // idempotency_key can launch the vendor a second time. Carry them whenever the failure has them.
+      return fail(400, 'cursor_dispatch_failed', {
+        code: outcome.error,
+        ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+        ...(outcome.reservationId ? { reservation_id: outcome.reservationId } : {}),
+        ...(outcome.taskId ? { task_id: outcome.taskId } : {}),
+        ...(outcome.flightId ? { flight_id: outcome.flightId } : {}),
+      })
     }
 
     return done({
