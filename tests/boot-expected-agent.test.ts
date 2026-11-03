@@ -3,10 +3,10 @@
 // Read-only: no row is written, no seat or agent is created, auth is unchanged.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { invokeTool } from '../src/mcp/index'
+import { HARNESS_SESSION_ALLOWED_TOOLS } from '../src/members/harness-credential'
 import type { AuthContext, Env } from '../src/types'
 
 const ORIGIN = 'https://pot.test'
@@ -15,8 +15,7 @@ let env: Env
 
 beforeEach(() => {
   harness = createSqliteD1()
-  const dir = join(__dirname, '..', 'migrations')
-  for (const f of readdirSync(dir).filter((x) => x.endsWith('.sql')).sort()) harness.sqlite.exec(readFileSync(join(dir, f), 'utf8'))
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'a', 'A');
@@ -87,6 +86,49 @@ describe('boot_context expected_agent', () => {
     // and a matching caller keeps the ordinary step
     const ok = await bootResult(bearer('agent-athena'), { expected_agent: 'agent-athena' })
     expect(ok.next_step).not.toContain('Do not act')
+  })
+
+  const SEAT = { seatId: 'seat-1', label: 'chat', harnessId: 'h-1', grantTokenId: 'g-1', humanMemberId: 'mem-x', source: 'auto:openai_session' as const }
+  const kinds: Array<[string, () => AuthContext, Record<string, unknown>]> = [
+    ['workspace bearer', () => bearer('agent-athena'), {}],
+    ['attached chat', () => ({ ...bearer('agent-athena'), channel: 'directory', seatBinding: { ...SEAT, attached: { attachmentId: 'a', admissionId: 'adm', agentId: 'agent-athena', seatAgentId: 'agent-athena', ceiling: 'member' } } }) as unknown as AuthContext, {}],
+    ['own chat (seat)', () => ({ ...bearer('agent-athena'), channel: 'directory', seatBinding: SEAT }) as unknown as AuthContext, { SEAT_ATTACH: '1' }],
+  ]
+  for (const [kind, mk, flags] of kinds) {
+    it(`mismatch wins on every field for a ${kind}`, async () => {
+      env = { ...env, ...flags } as unknown as Env
+      const r = await bootResult(mk(), { expected_agent: 'agent-rava' })
+      const step: string = r.whoami.onboarding_next.next_step
+      expect(r.whoami.onboarding_next.case).toBe('wrong_expected_principal')
+      expect(r.next_step).toBe(step)
+      expect(r.onboarding.next_step).toBe(step)
+      expect(r.available_doors[0].does).toBe(step)
+      expect(step).not.toMatch(/inbox/)
+    })
+  }
+
+  it('an unseated harness expecting another existing agent: seat_select first (legal for a harness), attach order after; seat_select door kept', async () => {
+    env = { ...env, SEAT_AUTO_ENROLL: '1', SEAT_ATTACH: '1' } as unknown as Env
+    const auth = { ...bearer(null), channel: 'directory', harnessCredential: true } as unknown as AuthContext
+    const r = await bootResult(auth, { expected_agent: 'agent-rava' })
+    const n = r.whoami.onboarding_next
+    expect(n).toMatchObject({ case: 'wrong_expected_principal', who_acts: 'self', next_tool: 'seat_select' })
+    expect(HARNESS_SESSION_ALLOWED_TOOLS.has(n.next_tool)).toBe(true)
+    expect(n.next_step.indexOf('seat_select')).toBeLessThan(n.next_step.indexOf('seat_attach'))
+    expect(r.available_doors.some((d: { tool: string | null }) => d.tool === 'seat_select')).toBe(true)
+    expect(r.available_doors[0].does).toBe(n.next_step)
+    expect(r.whoami.missing.map((m: { code: string }) => m.code)).toEqual(['wrong_expected_principal', 'seat_required']) // seat_select entry kept
+  })
+
+  it('a directory over the row cap fails closed: a name is ambiguous (ask for the id), an id still matches', async () => {
+    harness.sqlite.exec(`
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2100)
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) SELECT 'bulk-' || i, 'squad-a', 'bulk' || i, 'Bulk ' || i, 'r', 'm', 'active' FROM n;
+    `)
+    const amb = await onboarding(bearer('agent-athena'), { expected_agent: 'athena' })
+    expect(amb.case).toBe('wrong_expected_principal')
+    expect(amb.next_step).toContain('agent id')
+    expect((await onboarding(bearer('agent-athena'), { expected_agent: 'agent-athena' })).case).toBe('workspace_bearer')
   })
 
   it('an unbound caller with an expectation is wrong; no expectation (or blank) changes nothing', async () => {

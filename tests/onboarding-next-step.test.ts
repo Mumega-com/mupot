@@ -182,10 +182,17 @@ describe('onboarding_next: expected principal and precedence (#2289)', () => {
     expect(o.next_step).toContain('reconnects the connector')
     // a name that is not an existing agent never offers attach
     expect(next(chat, { agentDirectory: DIR }, 'nobody').next_tool).toBeUndefined()
-    // unseated harness: attach text, no tool (seat_select is not offered while the expectation is wrong)
+    // unseated harness: seat_select FIRST (seat_attach needs a seat), then the attach order
     const h = next(authOf({ harnessId: 'h-1' }), { agentDirectory: DIR }, 'ag-2')
-    expect(h.next_tool).toBeUndefined()
+    expect(h).toMatchObject({ who_acts: 'self', next_tool: 'seat_select' })
     expect(h.next_step).toContain(attachConnectOrder(ENV))
+    expect(h.next_step.indexOf('seat_select')).toBeLessThan(h.next_step.indexOf('seat_attach'))
+  })
+
+  it('truncated directory: a name is ambiguous, an exact id still matches', () => {
+    expect(next(ws('ag-2'), { agentDirectory: DIR, agentDirectoryTruncated: true }, 'Athena Zed').case).toBe('wrong_expected_principal')
+    expect(next(ws('ag-1'), { agentDirectory: DIR, agentDirectoryTruncated: true }, 'Rava Prime')).toMatchObject({ case: 'wrong_expected_principal', next_tool: 'boot_context' })
+    expect(next(ws('ag-1'), { agentDirectory: DIR, agentDirectoryTruncated: true }, 'ag-1').case).toBe('workspace_bearer')
   })
 
   it('lapsed consent outranks an unseated harness (intended: re-consent repairs the binding the seat depends on)', () => {

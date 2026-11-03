@@ -85,6 +85,8 @@ export interface WhoamiFacts {
   /** Active agents in this pot (id, slug, name), read ONLY when the caller stated an expected_agent. Used to decide whether a slug/name
    *  resolves to exactly one agent and whether that agent is the caller. Never echoed. Absent = unknown (only an exact id can match). */
   agentDirectory?: Array<{ id: string; slug: string | null; name: string | null }>
+  /** The directory read hit its row cap, so a slug/name that is absent from it proves nothing: fail closed (ask for the id). */
+  agentDirectoryTruncated?: boolean
   /** Boot only: the runtime self-report step. Absent on status/orient (they take no runtime args). */
   report?: { missingFields: string[]; outcome?: string; detail?: string }
   /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
@@ -258,6 +260,7 @@ function resolveExpected(auth: AuthContext, facts: WhoamiFacts, expected: string
   const dir = facts.agentDirectory
   if (!dir) return 'unknown'
   if (dir.some((a) => a.id === expected)) return 'other' // an exact id of another agent
+  if (facts.agentDirectoryTruncated === true) return 'ambiguous' // incomplete directory: cannot prove a name is unique
   const key = fold(expected)
   const hits = dir.filter((a) => (a.slug !== null && fold(a.slug) === key) || (a.name !== null && fold(a.name) === key))
   if (hits.length === 0) return 'unknown'
@@ -481,7 +484,15 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
         entry = { code: WRONG_PRINCIPAL_CODE, who_acts: 'self', next_tool: 'boot_context', next_step: `${lead} "${expected}" matches more than one agent here, so a slug or name cannot say which you mean. Call boot_context again with expected_agent set to the agent id.` }
       } else if (canAttach) {
         const designated = seatAttachDesignatedEnabled(env)
-        entry = {
+        if (state === 'harness_unseated' && seatAutoEnrollEnabled(env)) {
+          // seat_attach needs a seat (and a harness token may not call it): getting the seat is the legal first step, the attach order follows.
+          entry = {
+            code: WRONG_PRINCIPAL_CODE,
+            who_acts: 'self',
+            next_tool: 'seat_select',
+            next_step: `${lead} First get a seat: ${SEAT_SELECT_STEP} Then, to act as ${expected}: ${attachConnectOrder(env, facts.humanCanDesignate)}`,
+          }
+        } else entry = {
           code: WRONG_PRINCIPAL_CODE,
           who_acts: designated ? (facts.humanCanDesignate === false ? 'org_admin' : 'owner') : state === 'own_seat' ? 'self' : 'owner',
           ...(!designated && state === 'own_seat' ? { next_tool: 'seat_attach' } : {}),
@@ -490,8 +501,10 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
       } else {
         entry = { code: WRONG_PRINCIPAL_CODE, who_acts: 'owner', link: consentUrl, next_step: `${lead} Your human reconnects the connector as ${expected} (pick ${labels.one}); this connection never changes agent in place. If ${expected} is a slug or name, give the agent id instead.` }
       }
-      missing.length = 0
-      missing.push(entry)
+      // An unseated harness keeps its seat_required entry (and so the seat_select door) behind the wrong-principal step; every other caller
+      // kind has nothing else it may legally do, so the entry stands alone.
+      if (state === 'harness_unseated' && entry.next_tool === 'seat_select') missing.unshift(entry)
+      else { missing.length = 0; missing.push(entry) }
     }
   }
 

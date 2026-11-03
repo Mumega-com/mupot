@@ -6894,8 +6894,8 @@ async function gatherWhoamiFacts(
     ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
     : undefined
   // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
-  const agentDirectory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(agentDirectory ? { agentDirectory } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
+  const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -6917,11 +6917,16 @@ async function whoamiFor(env: Env, auth: AuthContext, origin: string | undefined
   return installerWindow ? { ...whoami, installer_window: installerWindow } : whoami
 }
 
-/** Active agents (id, slug, name) for resolving a stated expected_agent: a slug/name counts only when it names exactly one of these and that one
- *  is the caller. Read-only, bounded, never echoed. Advisory: a failed read yields none (an exact id still matches). */
-async function activeAgentDirectory(env: Env): Promise<Array<{ id: string; slug: string | null; name: string | null }> | undefined> {
-  const rows = await env.DB.prepare("SELECT id, slug, name FROM agents WHERE status = 'active' LIMIT 2000").all<{ id: string; slug: string | null; name: string | null }>().catch(() => null)
-  return rows?.results
+const AGENT_DIRECTORY_LIMIT = 2000
+
+/** Active agents (id, slug, name) for resolving a stated expected_agent. SQL cannot do the NFKC fold, so the scan is by status only and bounded:
+ *  when the cap is hit `truncated` is set and the resolver fails closed (asks for the id) instead of treating the list as complete.
+ *  Read-only, never echoed. Advisory: a failed read yields none (an exact id still matches). */
+async function activeAgentDirectory(env: Env): Promise<{ rows: Array<{ id: string; slug: string | null; name: string | null }>; truncated: boolean } | undefined> {
+  const res = await env.DB.prepare("SELECT id, slug, name FROM agents WHERE status = 'active' ORDER BY id LIMIT ?1").bind(AGENT_DIRECTORY_LIMIT + 1).all<{ id: string; slug: string | null; name: string | null }>().catch(() => null)
+  if (!res) return undefined
+  const truncated = res.results.length > AGENT_DIRECTORY_LIMIT
+  return { rows: truncated ? res.results.slice(0, AGENT_DIRECTORY_LIMIT) : res.results, truncated }
 }
 
 async function actsAsName(env: Env, auth: AuthContext): Promise<string | null> {
