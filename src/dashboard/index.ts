@@ -303,7 +303,7 @@ import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
 import { githubCapabilitySnapshot } from '../integrations/github-capabilities'
 import { writeAgentDef, assignIssueToCopilot } from '../integrations/github-repo-write'
-import { installUrl, parseInstallCallback, storeInstallation, getInstallationId, verifyInstallationOwnership } from '../integrations/github-install'
+import { installUrl, parseInstallCallback, storeInstallation, getInstallationId, removeInstallation, verifyInstallationOwnership } from '../integrations/github-install'
 import { syncFleetToGitHub } from '../integrations/github-fleet-sync'
 import { executeTaskAsPR } from '../integrations/github-execute'
 import { importProjectItems } from '../integrations/github-projects'
@@ -3265,12 +3265,35 @@ dashboardApp.get('/connect/github/callback', async (c) => {
     const status = verified.reason === 'not_owned' || verified.reason === 'not_org_admin' || verified.reason === 'not_account_owner' ? 403 : 400
     return c.html(shell(c.env, 'Connect GitHub', errorBody(msg)), status)
   }
+  let stored
   try {
-    await storeInstallation(c.env, parsed.installationId, verified.accountLogin)
+    stored = await storeInstallation(c.env, parsed.installationId, verified.accountLogin, {
+      memberId: auth.memberId ?? auth.userId,
+      source: 'callback',
+    })
   } catch {
     // UNIQUE(installation_id): already bound by another tenant. Refuse without detail.
     return c.html(shell(c.env, 'Connect GitHub', errorBody('This GitHub installation is already connected elsewhere.')), 409)
   }
+  if (!stored.ok) {
+    return c.html(
+      shell(
+        c.env,
+        'Connect GitHub',
+        errorBody('A different GitHub installation is already connected to this pot. An org admin must disconnect GitHub first, then connect again.'),
+      ),
+      409,
+    )
+  }
+  return c.redirect('/admin/github/status')
+})
+
+// POST /admin/github/disconnect — org admin removes this tenant's binding (audited), so a
+// different installation can then be connected. CSRF: dashboardApp-wide csrf().
+dashboardApp.post('/admin/github/disconnect', async (c) => {
+  const auth = c.get('auth')
+  if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenJson('Disconnecting GitHub', auth), 403)
+  await removeInstallation(c.env, auth.memberId ?? auth.userId)
   return c.redirect('/admin/github/status')
 })
 

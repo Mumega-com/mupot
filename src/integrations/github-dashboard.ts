@@ -31,7 +31,10 @@ export function githubStatusBody(view: GitHubStatusView) {
            <span class="tag">${esc(view.tier)}</span>
          </p>
          <div style="margin-top:12px;display:flex;gap:8px">
-           <a class="btn sm secondary" href="/admin/github/connect">Reconnect / change install</a>
+           <a class="btn sm secondary" href="/admin/github/connect">Reconnect</a>
+           <form method="post" action="/admin/github/disconnect" style="margin:0">
+             <button class="btn sm secondary" type="submit">Disconnect</button>
+           </form>
          </div>
        </div>`
     : `<div class="card" style="border-left:3px solid #d29922">
