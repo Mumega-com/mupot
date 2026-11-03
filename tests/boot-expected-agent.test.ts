@@ -20,7 +20,12 @@ beforeEach(() => {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'a', 'A');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', 'dept', 'b', 'B');
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-rava', 'squad-a', 'rava', 'Rava Prime', 'r', 'm', 'active');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-athena', 'squad-a', 'athena', 'Athena', 'r', 'm', 'active');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-rava2', 'squad-b', 'rava', 'Impostor', 'r', 'm', 'active');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-athena-old', 'squad-b', 'athena', 'Athena Retired', 'r', 'm', 'inactive');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-gone', 'squad-b', 'gone', 'Gone', 'r', 'm', 'inactive');
   `)
   env = { DB: harness.db, TENANT_SLUG: 'mumega', BUS: { send: async () => {} } } as unknown as Env
 })
@@ -37,21 +42,51 @@ const onboarding = async (auth: AuthContext, args: Record<string, unknown>): Pro
   return r.whoami.onboarding_next
 }
 
+const bootResult = async (auth: AuthContext, args: Record<string, unknown>): Promise<Record<string, any>> => { // eslint-disable-line @typescript-eslint/no-explicit-any -- test reads a deep response
+  const out = await invokeTool(auth, env, 'boot_context', args, ORIGIN)
+  return (out as { result: Record<string, any> }).result // eslint-disable-line @typescript-eslint/no-explicit-any -- same
+}
+
 describe('boot_context expected_agent', () => {
-  it('a workspace bearer expecting its OWN slug, id or name (any case) is not the wrong principal', async () => {
-    for (const e of ['rava', 'RAVA', 'agent-rava', 'Rava Prime']) {
-      expect((await onboarding(bearer('agent-rava'), { expected_agent: e })).case, e).toBe('workspace_bearer')
+  it('exact id matches; a slug or name matches only when unique pot-wide and it is the caller', async () => {
+    expect((await onboarding(bearer('agent-rava'), { expected_agent: 'agent-rava' })).case).toBe('workspace_bearer')
+    expect((await onboarding(bearer('agent-athena'), { expected_agent: 'ATHENA' })).case).toBe('workspace_bearer')
+    expect((await onboarding(bearer('agent-rava'), { expected_agent: 'Rava Prime' })).case).toBe('workspace_bearer')
+  })
+
+  it('a slug shared by two agents (other squad) is ambiguous for BOTH, and asks for the id', async () => {
+    for (const id of ['agent-rava', 'agent-rava2']) {
+      const n = await onboarding(bearer(id), { expected_agent: 'rava' })
+      expect(n.case, id).toBe('wrong_expected_principal')
+      expect(n.next_step).toContain('agent id')
     }
   })
 
-  it('a different expectation is wrong_expected_principal: owner step, no tool, expectation echoed capped and clean', async () => {
-    const n = await onboarding(bearer('agent-rava'), { expected_agent: 'athena' })
+  it('id match is exact (a prefix of the id is wrong); inactive agents are not name-resolvable', async () => {
+    expect((await onboarding(bearer('agent-rava'), { expected_agent: 'agent' })).case).toBe('wrong_expected_principal')
+    expect((await onboarding(bearer('agent-rava'), { expected_agent: 'agent-rav' })).case).toBe('wrong_expected_principal')
+    expect((await onboarding(bearer('agent-athena'), { expected_agent: 'gone' })).case).toBe('wrong_expected_principal')
+  })
+
+  it('a different expectation is wrong: owner step, no tool, echo clean', async () => {
+    const n = await onboarding(bearer('agent-athena'), { expected_agent: 'rava\u2028x\u202e' })
     expect(n.case).toBe('wrong_expected_principal')
     expect(n.next_tool).toBeUndefined()
-    expect(n.next_step).toContain('athena')
-    const long = await onboarding(bearer('agent-rava'), { expected_agent: `a\u0007b${'x'.repeat(200)}` })
-    expect(long.next_step).not.toContain('\u0007')
-    expect(long.next_step).not.toContain('x'.repeat(65))
+    expect(n.next_step).toContain('ravax')
+    expect(n.next_step).not.toMatch(/[\u2028\u202e]/)
+  })
+
+  it('every next-step field agrees on a mismatch: onboarding_next, next_step, onboarding.next_step, available_doors[0]', async () => {
+    const r = await bootResult(bearer('agent-athena'), { expected_agent: 'agent-rava' })
+    const step: string = r.whoami.onboarding_next.next_step
+    expect(r.whoami.onboarding_next.case).toBe('wrong_expected_principal')
+    expect(step).toContain('Do not act')
+    expect(r.next_step).toBe(step)
+    expect(r.onboarding.next_step).toBe(step)
+    expect(r.available_doors[0].does).toBe(step)
+    // and a matching caller keeps the ordinary step
+    const ok = await bootResult(bearer('agent-athena'), { expected_agent: 'agent-athena' })
+    expect(ok.next_step).not.toContain('Do not act')
   })
 
   it('an unbound caller with an expectation is wrong; no expectation (or blank) changes nothing', async () => {
@@ -60,15 +95,18 @@ describe('boot_context expected_agent', () => {
     expect((await onboarding(bearer('agent-rava'), { expected_agent: '   ' })).case).toBe('workspace_bearer')
   })
 
-  it('is read-only: the agents and presence-free tables are unchanged by a mismatching call', async () => {
+  it('is read-only: a mismatching call writes no rows', async () => {
     const count = (): number => (harness.sqlite.prepare('SELECT (SELECT COUNT(*) FROM agents) + (SELECT COUNT(*) FROM agent_audit) AS n').get() as { n: number }).n
     const before = count()
     await onboarding(bearer('agent-rava'), { expected_agent: 'athena' })
     expect(count()).toBe(before)
   })
 
-  it('a non-string expected_agent is refused by the schema, nothing is compared', async () => {
-    const out = await invokeTool(bearer('agent-rava'), env, 'boot_context', { expected_agent: 5 }, ORIGIN)
-    expect((out as { error?: unknown }).error).toBe('invalid_args')
+  it('non-string and over-64 expected_agent are refused with invalid_args (no truncation)', async () => {
+    for (const v of [5, 'x'.repeat(65), 'x'.repeat(100000)]) {
+      const out = await invokeTool(bearer('agent-rava'), env, 'boot_context', { expected_agent: v }, ORIGIN)
+      expect((out as { error?: unknown }).error, String(v).slice(0, 5)).toBe('invalid_args')
+    }
+    expect((await onboarding(bearer('agent-rava'), { expected_agent: 'x'.repeat(64) })).case).toBe('wrong_expected_principal')
   })
 })

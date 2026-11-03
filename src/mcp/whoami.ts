@@ -82,9 +82,9 @@ export interface WhoamiFacts {
   tenantHasAgents: boolean
   /** Slug/name of the agent this request acts as, when known. */
   actsAs: string | null
-  /** Slug and name of the agent this request is bound to (a seat's attached agent or a workspace bearer's own agent). Read-only
-   *  identifiers used ONLY to compare against a caller's stated expected_agent; never echoed. Absent = unknown (id match still works). */
-  principalNames?: string[]
+  /** Active agents in this pot (id, slug, name), read ONLY when the caller stated an expected_agent. Used to decide whether a slug/name
+   *  resolves to exactly one agent and whether that agent is the caller. Never echoed. Absent = unknown (only an exact id can match). */
+  agentDirectory?: Array<{ id: string; slug: string | null; name: string | null }>
   /** Boot only: the runtime self-report step. Absent on status/orient (they take no runtime args). */
   report?: { missingFields: string[]; outcome?: string; detail?: string }
   /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
@@ -236,6 +236,35 @@ export function plainNextStep(
   return `You have no agent yet. ${missing[0]?.next_step ?? 'Ask your human or an org admin to connect you to one.'}`
 }
 
+export const WRONG_PRINCIPAL_CODE = 'wrong_expected_principal'
+export const EXPECTED_AGENT_MAX = 64
+
+/** Caller text -> a short, single-line, bidi-safe string: C0/C1/DEL, NEL, LS/PS, bidi embeddings/overrides/isolates and marks removed. */
+export function cleanExpected(raw: unknown): string {
+  // eslint-disable-next-line no-control-regex -- stripping control and bidi characters is the point
+  return typeof raw === 'string' ? raw.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, EXPECTED_AGENT_MAX) : ''
+}
+
+// NFKC then lower-case, so compatibility forms (Kelvin sign, fullwidth) collapse onto one key. Two agents that collapse together are
+// ambiguous, which is refused rather than guessed.
+const fold = (v: string): string => v.normalize('NFKC').toLowerCase()
+
+type Resolution = 'self' | 'other' | 'ambiguous' | 'unknown'
+
+/** Id first (exact). A slug or display name counts only when it resolves to exactly one active agent AND that agent is the caller. */
+function resolveExpected(auth: AuthContext, facts: WhoamiFacts, expected: string): Resolution {
+  const callerIds = [auth.boundAgentId, auth.seatBinding?.attached?.agentId].filter((v): v is string => typeof v === 'string' && v.length > 0)
+  if (callerIds.includes(expected)) return 'self'
+  const dir = facts.agentDirectory
+  if (!dir) return 'unknown'
+  if (dir.some((a) => a.id === expected)) return 'other' // an exact id of another agent
+  const key = fold(expected)
+  const hits = dir.filter((a) => (a.slug !== null && fold(a.slug) === key) || (a.name !== null && fold(a.name) === key))
+  if (hits.length === 0) return 'unknown'
+  if (hits.length > 1) return 'ambiguous'
+  return callerIds.includes(hits[0].id) ? 'self' : 'other'
+}
+
 /**
  * The single next-step function. PURE: reads only the already-derived state, `missing[]` and facts, so it cannot offer a tool the
  * rest of whoami would not (no bootstrap for a bound or already-bootstrapped caller, no seat tool for an attached or workspace caller)
@@ -243,28 +272,16 @@ export function plainNextStep(
  */
 export function onboardingNext(
   env: Env, auth: AuthContext, state: WhoamiState, basis: 'attached' | 'legacy_consent' | undefined,
-  facts: WhoamiFacts, missing: WhoamiMissing[], origin: string, expectedAgent?: string,
+  facts: WhoamiFacts, missing: WhoamiMissing[], origin: string,
 ): OnboardingNext {
   const consentUrl = mcpEndpoint(origin)
   const labels = consentLabels(consentChoiceLabels(env))
-  // expectedAgent comes from boot_context's optional `expected_agent` arg. The string is caller text: control characters are stripped
-  // and it is capped before it is echoed into next_step. It is only COMPARED to the authenticated principal (id, slug, name or the
-  // acting-as identity), never believed. Precedence (intended, pinned by a test): a stated-but-wrong principal, then a lapsed
-  // consent (re-consenting repairs the binding that every other step depends on, including the seat), then the state.
-  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
-  const expected = typeof expectedAgent === 'string' ? expectedAgent.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 64) : ''
-  if (expected.length > 0) {
-    const matches = (auth.boundAgentId !== undefined && auth.boundAgentId !== null && auth.boundAgentId === expected)
-      || (facts.actsAs !== null && facts.actsAs.toLowerCase() === expected.toLowerCase())
-      || (facts.principalNames ?? []).some((n) => n.toLowerCase() === expected.toLowerCase())
-    if (!matches) {
-      return {
-        case: 'wrong_expected_principal',
-        who_acts: 'owner',
-        next_step: `you expected to be ${expected}, but this connection is ${facts.actsAs ?? (auth.boundAgentId ? 'a different agent' : 'not bound to any agent')}. Do not act: your human reconnects the connector as ${expected} (pick ${labels.one}); this connection never changes agent in place.`,
-        link: consentUrl,
-      }
-    }
+  // A stated-but-wrong principal is a missing[] entry (built once in buildWhoami), so next_step, onboarding and available_doors read the same
+  // source. Precedence (pinned by a test): wrong expected principal, then a lapsed consent (re-consenting repairs the binding every
+  // other step, including the seat, depends on), then the state.
+  const wrong = missing.find((m) => m.code === WRONG_PRINCIPAL_CODE)
+  if (wrong) {
+    return { case: 'wrong_expected_principal', who_acts: wrong.who_acts, next_step: wrong.next_step, ...(wrong.next_tool ? { next_tool: wrong.next_tool } : {}), ...(wrong.link ? { link: wrong.link } : {}) }
   }
   if (missing.some((m) => m.code === 'consent_lapsed')) {
     const m = missing.find((x) => x.code === 'consent_lapsed')
@@ -450,6 +467,34 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
     }
   }
 
+  // A stated expectation that does not resolve to the caller replaces every other step: "Do not act" is the one thing all next-step
+  // fields (onboarding_next, next_step, onboarding, available_doors) must agree on.
+  const expected = cleanExpected(ctx.expectedAgent)
+  if (expected.length > 0) {
+    const res = resolveExpected(auth, facts, expected)
+    if (res !== 'self') {
+      const now = facts.actsAs ?? (auth.boundAgentId ? 'a different agent' : 'not bound to any agent')
+      const lead = `you expected to be ${expected}, but this connection is ${now}. Do not act.`
+      const canAttach = res === 'other' && (state === 'own_seat' || state === 'harness_unseated') && seatAttachEnabled(env) && auth.seatAgentStatus !== 'held'
+      let entry: WhoamiMissing
+      if (res === 'ambiguous') {
+        entry = { code: WRONG_PRINCIPAL_CODE, who_acts: 'self', next_tool: 'boot_context', next_step: `${lead} "${expected}" matches more than one agent here, so a slug or name cannot say which you mean. Call boot_context again with expected_agent set to the agent id.` }
+      } else if (canAttach) {
+        const designated = seatAttachDesignatedEnabled(env)
+        entry = {
+          code: WRONG_PRINCIPAL_CODE,
+          who_acts: designated ? (facts.humanCanDesignate === false ? 'org_admin' : 'owner') : state === 'own_seat' ? 'self' : 'owner',
+          ...(!designated && state === 'own_seat' ? { next_tool: 'seat_attach' } : {}),
+          next_step: `${lead} To act as ${expected}: ${attachConnectOrder(env, facts.humanCanDesignate)}`,
+        }
+      } else {
+        entry = { code: WRONG_PRINCIPAL_CODE, who_acts: 'owner', link: consentUrl, next_step: `${lead} Your human reconnects the connector as ${expected} (pick ${labels.one}); this connection never changes agent in place. If ${expected} is a slug or name, give the agent id instead.` }
+      }
+      missing.length = 0
+      missing.push(entry)
+    }
+  }
+
   const agent: Whoami['agent'] = !bound
     ? { keyed: false, inbox: 'none', can_self_report: false }
     : state === 'acting_as' && basis === 'attached'
@@ -465,7 +510,7 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
   if (bound) have.push(`inbox:${agent.inbox}`)
 
   return {
-    onboarding_next: onboardingNext(env, auth, state, basis, facts, missing, ctx.origin, ctx.expectedAgent),
+    onboarding_next: onboardingNext(env, auth, state, basis, facts, missing, ctx.origin),
     state,
     ...(basis ? { basis } : {}),
     next_step_plain: plainNextStep(env, auth, state, basis, facts, missing, seatSelectCallable),
