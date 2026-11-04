@@ -44,12 +44,25 @@ afterEach(() => {
 
 // ── helpers ──────────────────────────────────────────────────────────────────────────
 
+// The baked chain has SQL comments stripped (scripts/gen-schema-chain.mjs stripSqlComments), and
+// SQLite keeps comments that sit INSIDE a CREATE statement in sqlite_master.sql. So the reference
+// (raw migration text) and the chain-built schema legitimately differ in comments and whitespace
+// only. Literals ('..', "..", `..`, [..]) are matched first and preserved; each run of
+// comments/whitespace collapses to one space. Strict per-migration schema+data equivalence of the
+// stripper is proven in tests/gen-schema-chain-strip.test.mjs.
+const COMMENT_WHITESPACE_RE =
+  /('(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])|((?:--[^\n]*|\/\*[\s\S]*?\*\/|\s)+)/g
+
+function normaliseSql(sql: unknown): unknown {
+  if (typeof sql !== 'string') return sql
+  return sql.replace(COMMENT_WHITESPACE_RE, (_match, literal: string | undefined) => literal ?? ' ').trim()
+}
+
 function schemaObjects(harness: SqliteD1Harness): string {
-  return JSON.stringify(
-    harness.sqlite
-      .prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
-      .all(),
-  )
+  const rows = harness.sqlite
+    .prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
+    .all() as Array<Record<string, unknown>> // node:sqlite row shape is untyped; fields are read by name only
+  return JSON.stringify(rows.map((row) => ({ ...row, sql: normaliseSql(row.sql) })))
 }
 
 function execViaSqlite(harness: SqliteD1Harness): (sql: string) => Promise<void> {

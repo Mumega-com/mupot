@@ -473,7 +473,7 @@ jobs:
       # change, so there is no pre-existing-offender population to grandfather.
       # Self-tests FIRST, same discipline as the sibling guards.
       - name: Guard self-tests
-        run: node --test tests/gen-schema-chain.test.mjs tests/check-schema-chain-fresh.test.mjs
+        run: node --test tests/gen-schema-chain.test.mjs tests/check-schema-chain-fresh.test.mjs tests/gen-schema-chain-strip.test.mjs
       - name: Guard — schema-chain.generated.ts must match migrations/*.sql
         run: node scripts/check-schema-chain-fresh.mjs
       # mupot CLI: GET /cli serves src/cli/bundle.generated.ts, baked from cli/mupot.mjs.

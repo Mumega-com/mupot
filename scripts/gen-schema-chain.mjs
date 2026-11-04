@@ -425,6 +425,84 @@ export function extractCreatedObjects(statements) {
 }
 
 // ---------------------------------------------------------------------------------------
+// Comment stripping (bundle-size prune)
+// ---------------------------------------------------------------------------------------
+//
+// The deployed Worker bakes every migration's statements into the bundle, comments
+// included; the comments are ~35% of the raw SQL and are never read at runtime. This strips
+// `--` line comments and `/* */` block comments from each ALREADY-SPLIT statement.
+//
+// It is a left-to-right state machine over the same literal zones the splitter tracks and
+// it NEVER edits inside one: 'single' strings, "double" identifiers, `backtick` identifiers
+// (each with the doubled-quote escape) and [bracket] identifiers are copied byte for byte,
+// so a `--` or `/*` inside a CHECK/trigger string survives. Only text OUTSIDE those zones is
+// a candidate comment.
+//
+// Whitespace handling is deliberately minimal: a comment that is the only thing on its line
+// removes the whole line; a trailing line comment removes the spaces before it; a block
+// comment becomes one space (SQLite itself treats a comment as whitespace, so `a/**/b`
+// must not fuse into `ab`); the statement is trimmed at both ends. Whitespace inside
+// literals is never touched.
+//
+// Provisioning is unaffected: the per-file sha256 and SCHEMA_CHAIN_DIGEST are computed from
+// the ORIGINAL file text, so already-provisioned pots see the same chain identity.
+// tests/gen-schema-chain-strip.test.mjs proves, per migration, that a fresh SQLite built
+// from the stripped statements has the same schema and data as one built from the original.
+export function stripSqlComments(sql, fileLabel) {
+  const n = sql.length
+  let out = ''
+  let i = 0
+  const fail = (reason) => {
+    throw new Error(`stripSqlComments: ${reason}` + (fileLabel ? ` in ${fileLabel}` : '') + '.')
+  }
+  const atLineStart = () => out.length === 0 || out.endsWith('\n')
+
+  while (i < n) {
+    const ch = sql[i]
+    if (ch === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i)
+      const stop = nl === -1 ? n : nl
+      out = out.replace(/[ \t]+$/, '')
+      const wholeLine = atLineStart()
+      i = stop
+      // A comment-only line disappears with its newline; a trailing comment keeps it.
+      if (wholeLine && i < n) i += 1
+      continue
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      const close = sql.indexOf('*/', i + 2)
+      if (close === -1) fail('unterminated /* block comment */')
+      i = close + 2
+      if (out.length > 0 && !/\s$/.test(out) && i < n && !/\s/.test(sql[i])) out += ' '
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      let j = i + 1
+      let closed = false
+      while (j < n) {
+        if (sql[j] === ch && sql[j + 1] === ch) { j += 2; continue }
+        if (sql[j] === ch) { j += 1; closed = true; break }
+        j += 1
+      }
+      if (!closed) fail(`unterminated ${ch}-quoted literal`)
+      out += sql.slice(i, j)
+      i = j
+      continue
+    }
+    if (ch === '[') {
+      const close = sql.indexOf(']', i + 1)
+      if (close === -1) fail('unterminated [bracket identifier]')
+      out += sql.slice(i, close + 1)
+      i = close + 1
+      continue
+    }
+    out += ch
+    i += 1
+  }
+  return out.trim()
+}
+
+// ---------------------------------------------------------------------------------------
 // Module generation
 // ---------------------------------------------------------------------------------------
 
@@ -536,7 +614,11 @@ export function assertSplitterVersionMatchesSource() {
 export function buildSchemaChainEntries(migrationsDir = DEFAULT_MIGRATIONS_DIR) {
   return listMigrationFiles(migrationsDir).map((file) => {
     const text = readFileSync(join(migrationsDir, file), 'utf8')
+    // Split on the ORIGINAL text (the splitter's rules are unchanged), then strip comments
+    // per statement; a statement that was only comments is already dropped by the splitter.
     const statements = splitSqlStatements(text, file)
+      .map((stmt) => stripSqlComments(stmt, file))
+      .filter((stmt) => stmt.length > 0)
     return {
       file,
       sha256: sha256Hex(text),
