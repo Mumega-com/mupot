@@ -51,7 +51,7 @@
 // an `error` code the upstream itself already intends to be a stable,
 // public-facing enum value).
 
-import { wikiFetcher } from '../health'
+import { wikiFetcher } from './wiki-fetcher'
 import { assertPublicHttpsUrl } from '../lib/ssrf'
 import { resolveConnector } from '../connectors/service'
 import { cmsFetch, resolveCmsFetch } from '../departments/executors/shared/cms-adapter'
