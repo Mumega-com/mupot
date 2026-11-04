@@ -99,7 +99,11 @@ export function validatePageWrite(input: PageWriteInput): { ok: true; value: Val
     // The cap is measured on what will be stored: after CRLF/CR -> LF normalisation, in UTF-8 bytes.
     cleanBody = normalizeBody(body)
     const bytes = bodyBytes(cleanBody)
-    if (bytes > MAX_BODY_BYTES) return bad(`body is ${bytes} bytes; max ${MAX_BODY_BYTES}. Split it across linked pages (nothing was truncated)`)
+    if (bytes > MAX_BODY_BYTES) {
+      // Typed refusal (mupot#2315): clients branch on error === 'body_too_large', not on a message string.
+      const next_step = 'Split the page: put the first part in this slug and the rest in linked pages (project_wiki_upsert each with links), then retry. Nothing was truncated.'
+      return { ok: false, status: 400, error: 'body_too_large', detail: `body is ${bytes} bytes; max ${MAX_BODY_BYTES} (UTF-8, after LF normalisation). Split it across linked pages (nothing was truncated)`, data: { bytes, max_bytes: MAX_BODY_BYTES, next_step } }
+    }
   }
   if (expectedVersion !== undefined && (typeof expectedVersion !== 'number' || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0)) {
     return bad('expected_version must be a non-negative integer: the page version you last read (0 to create)')
