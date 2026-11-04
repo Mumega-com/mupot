@@ -131,7 +131,7 @@ describe('PagesPort v2: Inkwell adapter refuses a body it cannot store (body_uns
     expect(out.ok).toBe(false)
     expect(status(out)).toBe(501)
     expect(JSON.stringify(out)).toContain('body_unsupported')
-    expect(fake.requests).toEqual([])
+    expect(fake.requests.filter((q) => q.method === 'PUT')).toEqual([]) // handshake GETs only; nothing created
   })
 
   it('an empty body or no body is accepted (nothing to store)', async () => {
@@ -140,13 +140,13 @@ describe('PagesPort v2: Inkwell adapter refuses a body it cannot store (body_uns
     expect(pageOf(await get(squadAuth(SQ_W), 'inkwell-none')).body).toBeNull()
   })
 
-  it('defence in depth: the adapter put itself throws the typed failure before any I/O', async () => {
+  it('defence in depth: the adapter put itself throws the typed failure before any create', async () => {
     const port = createInkwellPagesPort(env)
-    expect(port.supportsBody).toBe(false)
+    expect(port.supportsBody).toBe(true) // capability-aware: decided per call from the store handshake
     const envelope: PageEnvelope = { owner: 'a', writer: 'a', tier: 'project', purpose: 'decision', version: 1, writtenAt: '2026-10-26T00:00:00.000Z' }
     await expect(port.put(PROJ, { slug: 'direct-put', title: 'Direct', summary: 's', body: 'x', tags: [], links: [], envelope }))
       .rejects.toMatchObject({ kind: 'unsupported', code: 'body_unsupported' })
-    expect(fake.requests).toEqual([])
+    expect(fake.requests.map((q) => q.method)).toEqual(['GET']) // the handshake only
   })
 
   it('the service refuses before get/put when the port cannot hold bodies (fake port with supportsBody=false)', async () => {

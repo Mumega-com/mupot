@@ -89,10 +89,10 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     r = await rig()
     const a = await upsert(auth(SQ_W), r.env, { ...base, links: [], tags: ['alpha'] })
     expect(a.ok).toBe(true)
-    expect(a.result).toMatchObject({ project_id: PROJ, slug: 'design-notes', result: 'created', version: 1, owner: MEMBER, writer: MEMBER, tier: 'project' })
+    expect(a.result).toMatchObject({ project_id: PROJ, slug: 'design-notes', result: 'created', version: null, envelope: { version: 1 }, owner: MEMBER, writer: MEMBER, tier: 'project' })
     expect((a.result as { url: string }).url).toBe(`/projects/${PROJ}/wiki#wiki-topic-design-notes`)
     const b = await upsert(auth(SQ_W), r.env, { ...base, title: 'Design notes 2' })
-    expect(b.result).toMatchObject({ result: 'updated', version: 2 })
+    expect(b.result).toMatchObject({ result: 'updated', version: null, envelope: { version: 2 } })
     const g = await get(auth(SQ_R, 'observer'), r.env, { project_id: PROJ, slug: 'design-notes' })
     expect(g.ok).toBe(true)
     expect((g.result as { page: { title: string; envelope: { version: number; owner: string; purpose: string } } }).page).toMatchObject({ title: 'Design notes 2', envelope: { version: 2, owner: MEMBER, purpose: 'decision' } })
@@ -195,7 +195,8 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     r = await rig()
     const o = await upsert(auth(SQ_W), r.env, { ...base, body: '# long text' })
     expect(o.ok).toBe(false)
-    expect(r.fake.requests).toEqual([])
+    // Legacy store: the handshake (GET graph) and the service's reads happen, but NO create/PUT ever does.
+    expect(r.fake.requests.filter((q) => q.method === 'PUT')).toEqual([])
   })
 
   it('envelope is required: missing purpose, missing tier, bad tier are all refused', async () => {
@@ -252,7 +253,7 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     r = await rig()
     await upsert(attached(SQ_W, 'full'), r.env, base)
     const o = await upsert(auth(SQ_W), r.env, { ...base, title: 'Edited by human' })
-    expect(o.result).toMatchObject({ result: 'updated', version: 2, owner: AGENT, writer: MEMBER })
+    expect(o.result).toMatchObject({ result: 'updated', version: null, envelope: { version: 2 }, owner: AGENT, writer: MEMBER })
   })
 
   it('P1-A probe: attacker\'s write fails on a bad link, victim then creates the slug, victim owns it; attacker cannot take it', async () => {
@@ -264,11 +265,11 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     const none = await shared.db.prepare('SELECT COUNT(*) AS n FROM page_versions').first<{ n: number }>()
     expect(none?.n).toBe(0)
     const v = await upsert(victim, r.env, { ...base, slug: 'roadmap' })
-    expect(v.result).toMatchObject({ result: 'created', version: 1, owner: 'victim', writer: 'victim' })
+    expect(v.result).toMatchObject({ result: 'created', version: null, envelope: { version: 1 }, owner: 'victim', writer: 'victim' })
     const a2 = await upsert(attacker, r.env, { ...base, slug: 'roadmap', title: 'Hijack', tier: 'squad' })
     expect(status(a2)).toBe(403) // not the owner: cannot change tier
     const a3 = await upsert(attacker, r.env, { ...base, slug: 'roadmap', title: 'Edit' })
-    expect(a3.result).toMatchObject({ owner: 'victim', writer: 'attacker', version: 2 })
+    expect(a3.result).toMatchObject({ owner: 'victim', writer: 'attacker', envelope: { version: 2 } })
   })
 
   it('P1-A: an upstream outage during an update leaves the counter row untouched', async () => {

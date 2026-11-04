@@ -144,6 +144,8 @@ describe('getProjectWikiTopic (wiki-client) response handling', () => {
   let harness: SqliteD1Harness
   let env: Env
   let handler: (req: Request) => Response | Promise<Response> = () => Response.json({})
+  /** The adapter handshakes on GET graph first (legacy server: no capabilities); only the PUT gets the scripted answer. */
+  const onPut = (h: () => Response) => (req: Request): Response => (req.method === 'PUT' ? h() : Response.json({ nodes: [], edges: [] }))
   beforeAll(async () => {
     harness = createSqliteD1()
     for (const f of readdirSync(join(__dirname, '..', 'migrations')).filter((n) => n.endsWith('.sql')).sort()) harness.sqlite.exec(readFileSync(join(__dirname, '..', 'migrations', f), 'utf8'))
@@ -175,17 +177,17 @@ describe('getProjectWikiTopic (wiki-client) response handling', () => {
     handler = () => Response.json({}) // placeholder
     const port = createInkwellPagesPort(env)
     for (const code of ['edge_target_invalid', 'cross_project_edge_refused', 'edge_target_unpublished']) {
-      handler = () => Response.json({ error: code }, { status: 400 })
+      handler = onPut(() => Response.json({ error: code }, { status: 400 }))
       await expect(port.put(PROJECT, input('some-page'))).rejects.toMatchObject({ kind: 'rejected', code: 'edge_target_invalid' })
     }
-    handler = () => Response.json({ error: 'title too short' }, { status: 400 })
+    handler = onPut(() => Response.json({ error: 'title too short' }, { status: 400 }))
     await expect(port.put(PROJECT, input('some-page'))).rejects.toMatchObject({ kind: 'rejected', code: 'request_rejected' })
-    handler = () => Response.json({ error: 'topic_owned_by_other_project', existing_project: 'secret-project' }, { status: 409 })
+    handler = onPut(() => Response.json({ error: 'topic_owned_by_other_project', existing_project: 'secret-project' }, { status: 409 }))
     const err: unknown = await port.put(PROJECT, input('some-page')).catch((e: unknown) => e)
     expect(err).toMatchObject({ kind: 'conflict', code: 'slug_unavailable' })
     expect(JSON.stringify(err)).not.toContain('secret-project')
     expect(String((err as Error).message)).not.toContain('secret-project')
-    handler = () => new Response('x', { status: 500 })
+    handler = onPut(() => new Response('x', { status: 500 }))
     await expect(port.put(PROJECT, input('some-page'))).rejects.toMatchObject({ kind: 'unavailable' })
   })
   it('an invalid slug never reaches the network', async () => {
