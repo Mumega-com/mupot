@@ -308,6 +308,7 @@ import { recordSubscribeRefusal } from './events-refusals'
 import { recordNegotiation, describeRequestedVersion } from './negotiation-log'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
+import { loadRuntimeTruth } from '../fleet/runtime-truth'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
@@ -6104,14 +6105,19 @@ const toolPeers: ToolSpec = {
       .all<PeerRow>()
 
     const nowMs = Date.now()
+    // fca29748: the live self-reported runtime (check_in first), beside the unchanged profile `model`.
+    const truth = await loadRuntimeTruth(env, (rows.results ?? []).map((r) => ({ id: r.id, slug: r.slug, model: r.model })), nowMs)
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
+      const live = truth.get(row.id)
       return {
         id: row.id,
         slug: row.slug,
         name: row.name,
         role: row.role,
-        model: row.model,
+        model: row.model, // PROFILE value, meaning unchanged
+        live_model: live?.model && live.model.trust !== 'profile' ? live.model.value : null,
+        live_runtime: live ?? null,
         status: row.status,
         squad_id: row.squad_id,
         is_self: auth.boundAgentId === row.id,
@@ -6741,6 +6747,7 @@ const toolStatus: ToolSpec = {
       source: r.source,
     }))
 
+    const liveRuntime = (await loadRuntimeTruth(env, [{ id: agent.id, slug: agent.slug, model: agent.model }])).get(agent.id)
     const stub = env.AGENT.get(env.AGENT.idFromName(agent.id))
     const res = await stub.fetch('https://agent/status')
     const runtime = await res.json<unknown>()
@@ -6753,7 +6760,9 @@ const toolStatus: ToolSpec = {
         active_seat: seatRoster[0] ?? null,
         seat_roster: seatRoster,
         role: agent.role,
-        model: agent.model,
+        model: agent.model, // PROFILE value, meaning unchanged
+        live_model: liveRuntime?.model && liveRuntime.model.trust !== 'profile' ? liveRuntime.model.value : null,
+        live_runtime: liveRuntime ?? null,
         status: agent.status,
         squad_id: agent.squad_id,
       },
@@ -6817,6 +6826,8 @@ const toolFleetAgentGet: ToolSpec = {
       runtime: routeInfo.runtime,
       runtime_canonical: observed?.runtime_canonical || null,
       model: observed?.model ?? null,
+      // fca29748: what the agent says it is running NOW (check_in first), with source + staleness. self-reported, not attested.
+      live_runtime: (await loadRuntimeTruth(env, [{ id: targetAgent.id, slug: targetAgent.slug, model: (await loadAgent(env, targetAgent.id))?.model ?? null }])).get(targetAgent.id) ?? null,
       host: observed?.host || null,
       connection_kind: observed?.connection_kind || null,
       last_boot_at: observed?.last_boot_at ?? null,
