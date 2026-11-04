@@ -18,7 +18,7 @@ import { Hono } from 'hono'
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
 import type { Env } from './types'
 import { ROUTES } from './types'
-import { publicHealth } from './health'
+import { healthPayload } from './health'
 import { cliResponse } from './cli/serve'
 import { instrumentEnv, serverTimingAuthorized, withServerTiming } from './lib/server-timing'
 import { pruneRouteLatency } from './telemetry/route-latency'
@@ -119,7 +119,7 @@ app.use('*', async (c, next) => {
   await next()
 })
 
-app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
+app.get('/health', (c) => c.json(healthPayload(c.env)))
 // The zero-dependency mupot CLI, exact file bytes (public; see src/cli/serve.ts, docs/cli.md).
 app.get('/cli', () => cliResponse())
 

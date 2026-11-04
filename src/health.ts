@@ -1,5 +1,7 @@
 import { MUPOT_PUBLIC_API_VERSION } from './version'
 import { BUILD_INFO } from './build-info'
+import { wikiBindingMode, type WikiBindingEnv } from './projects/wiki-fetcher'
+export { wikiFetcher, wikiBindingMode, type WikiBindingMode } from './projects/wiki-fetcher'
 
 const CLEAN_SHA_RE = /^[0-9a-f]{40}$/i
 // mupot#571: a dirty tree or an off-main HEAD gets a `-dirty` suffix at deploy
@@ -40,4 +42,10 @@ export function publicHealth(tenant: string, releaseSha?: string) {
     ref: BUILD_INFO.ref,
     built_at: BUILD_INFO.builtAt,
   }
+}
+
+
+/** Body of GET /health: the public identity payload plus the non-secret wiki fetcher mode. */
+export function healthPayload(env: WikiBindingEnv & { TENANT_SLUG: string; RELEASE_SHA?: string }) {
+  return { ...publicHealth(env.TENANT_SLUG, env.RELEASE_SHA), wiki_binding: wikiBindingMode(env) }
 }

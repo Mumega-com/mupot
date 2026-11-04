@@ -376,6 +376,8 @@ export interface Env {
   // executor falls back to a public-edge fetch (cross-zone tenants). Declared in
   // wrangler.toml [[services]]; INKWELL_API_URL still supplies the request path.
   INKWELL_SVC?: Fetcher
+  /** Dedicated, props-scoped service binding for internal wiki calls only (see wrangler.example.toml). */
+  INKWELL_WIKI?: Fetcher
   // CRO data source — PostHog connector (CRO epic, slice 2). The first EXTERNAL source on
   // the data fabric. PROJECT_ID + HOST are non-secret (wrangler.toml [vars]); the personal
   // API key is a secret (`wrangler secret put POSTHOG_PERSONAL_API_KEY`). Fail-closed: the

@@ -279,6 +279,31 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 # /auth/email/start still 200s (no account-existence oracle) and logs one structured error; nothing
 # sends. See docs/operations/email-login.md for the full runbook.
 
+# ── Inkwell wiki: DEDICATED scoped service binding (mupot task 5d09276a) ──
+# Internal wiki calls (src/projects/wiki-client.ts) use INKWELL_WIKI when bound, else fall
+# back to INKWELL_SVC, so nothing changes until this block exists. Connectors and the
+# inkwell addon/executor keep INKWELL_SVC.
+#
+# ROLLOUT ORDER: (1) add this block + deploy Mupot FIRST (old Inkwell ignores the props);
+# (2) verify prop delivery; (3) THEN deploy Inkwell enforcement (internal wiki routes 403
+# `wiki_scope_required` without props.wiki). Never deploy Inkwell enforcement first.
+#
+# NEVER put `props` on INKWELL_SVC: that binding is generic and unscoped by design.
+# `tenant` MUST equal TENANT_SLUG above. Check before deploy:
+#   node scripts/check-inkwell-wiki-binding.mjs wrangler.toml
+# `projects` is only an OPTIONAL narrowing ceiling (non-empty array of immutable project
+# UUIDs); omit it for tenant-wide wiki so runtime-created projects need no config edit.
+#
+# [[services]]
+# binding = "INKWELL_SVC"            # unscoped, no props
+# service = "inkwell-api"
+#
+# [[services]]
+# binding = "INKWELL_WIKI"
+# service = "inkwell-api"
+# props = { wiki = { tenant = "<TENANT_SLUG>", project_scope = "tenant", actions = ["read", "write"] } }
+# # optional narrowing: projects = ["<immutable project UUID>"] inside the wiki table
+
 # ── Hermes push delivery (mumega-com#970) — bus consumer's outbound leg for
 # message.created (and future) events. Same shared secret as the Telegram bridge's
 # opt-in webhook path (src/telegram-bridge/bus_notify.ts) — one secret, two callers,
