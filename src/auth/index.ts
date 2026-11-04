@@ -64,6 +64,8 @@ import {
 } from './elevation'
 import { ELEVATION_ACTIONS } from './elevation-actions'
 import { withAuthTiming } from '../lib/server-timing'
+import { escapeHtml } from '../lib/html-escape'
+import { timingSafeEqual } from '../lib/crypto'
 import {
   PENDING_INVITE_COOKIE,
   decidePendingInviteLink,
@@ -84,6 +86,7 @@ import {
   verifyEmailLoginByToken,
   type VerifyEmailLoginResult,
 } from './email-login'
+import { safeConsole } from '../lib/log'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -314,15 +317,6 @@ function bootstrapOwnerEnabled(env: Env): boolean {
     && !env.OAUTH_CLIENT_SECRET
 }
 
-function constantTimeEqual(actual: string, expected: string): boolean {
-  let mismatch = actual.length ^ expected.length
-  const length = Math.max(actual.length, expected.length)
-  for (let index = 0; index < length; index += 1) {
-    mismatch |= (actual.charCodeAt(index) || 0) ^ (expected.charCodeAt(index) || 0)
-  }
-  return mismatch === 0
-}
-
 type BootstrapForm = { token: string; email: string }
 
 async function readBootstrapForm(c: Context<AppEnv>): Promise<BootstrapForm | null> {
@@ -463,7 +457,7 @@ async function registerWebSession(
     // but deliberately NOT applied — see this task's boundary) — a pot
     // running without those tables simply mints ordinary KV-only sessions
     // until the migration lands, exactly like before this change.
-    console.error('registerWebSession failed (login still succeeded via KV session)', err)
+    safeConsole.error('registerWebSession failed (login still succeeded via KV session)', err)
     return { registered: false }
   }
 }
@@ -609,7 +603,7 @@ export function googleAuthTimeVerdict(authTimeSec: number | null, nowMs: number 
 export function googleAuthTimeAllows(authTimeSec: number | null, flow: 'reauth' | 'link', nowMs: number = Date.now(), required: boolean = GOOGLE_AUTH_TIME_REQUIRED): boolean {
   const verdict = googleAuthTimeVerdict(authTimeSec, nowMs)
   if (verdict === 'absent') {
-    console.warn(JSON.stringify({ evt: 'google_auth_time_absent', flow }))
+    safeConsole.warn(JSON.stringify({ evt: 'google_auth_time_absent', flow }))
     return !required
   }
   return verdict === 'fresh'
@@ -644,7 +638,7 @@ authApp.post('/bootstrap', async (c) => {
 
   const form = await readBootstrapForm(c)
   if (!form || !isBootstrapEmail(form.email)) return c.json({ error: 'bad_request' }, 400)
-  if (!constantTimeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
+  if (!timingSafeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
 
@@ -1027,12 +1021,12 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
 authApp.use('/telegram-link/confirm', csrf())
 
 function telegramLinkPage(brand: string, inner: string): string {
-  const esc = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  const esc = (v: string): string => escapeHtml(v)
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Connect your sign-in · ${esc(brand)}</title></head><body><main>${inner}</main></body></html>`
 }
 
 function htmlEscape(v: string): string {
-  return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return escapeHtml(v)
 }
 
 interface TgLinkContext {
@@ -1757,7 +1751,7 @@ authApp.get('/logout', async (c) => {
         const idHash = await hashWebSessionId(sessionId)
         await revokeWebSessionByHash(c.env, c.env.TENANT_SLUG, idHash, 'logout')
       } catch (err) {
-        console.error('web_sessions revoke-on-logout failed (KV session already cleared)', err)
+        safeConsole.error('web_sessions revoke-on-logout failed (KV session already cleared)', err)
       }
     }
   }

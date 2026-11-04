@@ -50,6 +50,7 @@ import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
 import { decideHarnessBearer } from '../members/harness-credential'
+import { safeConsole } from '../lib/log'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -862,12 +863,12 @@ export async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Prom
   try {
     await fill('squads', squads, names.squads)
   } catch (err) {
-    console.error('[oauth-authorize] squad name lookup failed; falling back to ids:', err)
+    safeConsole.error('[oauth-authorize] squad name lookup failed; falling back to ids:', err)
   }
   try {
     await fill('departments', departments, names.departments)
   } catch (err) {
-    console.error('[oauth-authorize] department name lookup failed; falling back to ids:', err)
+    safeConsole.error('[oauth-authorize] department name lookup failed; falling back to ids:', err)
   }
   return names
 }
@@ -1933,14 +1934,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       // second row. Distinct status, distinct body, no retry-with-same-input
       // implied by a 500.
       if (err instanceof MemberAttachDeniedError) {
-        console.error('[oauth-authorize] member attach refused:', err.code)
+        safeConsole.error('[oauth-authorize] member attach refused:', err.code)
         const status = err.code === 'member_attach_ambiguous' ? 409 : 403
         return new Response(
           'Could not connect this Google account to a mupot member. Contact an org admin.',
           { status, headers: { 'Content-Type': 'text/plain' } },
         )
       }
-      console.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      safeConsole.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Member provisioning failed', { status: 500 })
     }
 
@@ -1969,7 +1970,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       const ownedOrDesignated = await backgroundAgentIdsForHuman(env, memberId)
       agents = agents.filter((a) => ownedOrDesignated.has(a.id))
     } catch (err) {
-      console.error('[oauth-authorize] listConsentableAgents failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      safeConsole.error('[oauth-authorize] listConsentableAgents failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       // Fail closed on the LISTING, not on the flow: an admin/D1 hiccup here must not
       // block a legitimate unbound connection. Render the screen with no agent
       // choices — "continue unbound" (today's exact default) is still available.
@@ -1981,7 +1982,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     try {
       squads = await listConsentableSquads(env, memberId)
     } catch (err) {
-      console.error('[oauth-authorize] listConsentableSquads failed:', err)
+      safeConsole.error('[oauth-authorize] listConsentableSquads failed:', err)
       squads = []
     }
 
@@ -2176,7 +2177,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       )
 
       if (!bootstrapped.ok) {
-        console.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
+        safeConsole.error('[oauth-authorize] first-agent bootstrap refused:', bootstrapped.error)
         switch (bootstrapped.error) {
           case 'agent_name_required':
             // Unreachable in practice: the shared validator refused a bad name before consuming.
@@ -2391,7 +2392,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         rejected.headers.set('Set-Cookie', clearConsentCookie)
         return rejected
       }
-      console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      safeConsole.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('The connection key could not be issued. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 
@@ -2421,10 +2422,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         requireExclusiveControl: true,
       })
       if (!linked.ok) {
-        console.error('[oauth-authorize] connector identity link refused (non-fatal):', linked.error)
+        safeConsole.error('[oauth-authorize] connector identity link refused (non-fatal):', linked.error)
       }
     } catch (err) {
-      console.error('[oauth-authorize] connector identity link failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      safeConsole.error('[oauth-authorize] connector identity link failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
     }
 
     // mupot#903b P1-3 (adversarial review): "human X consented to bind to agent A
@@ -2443,7 +2444,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`,
         ).bind(crypto.randomUUID(), env.TENANT_SLUG, tokenId, pending.memberId, boundAgentId, mintMemberId).run()
       } catch (err) {
-        console.error('[oauth-authorize] consent receipt write failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+        safeConsole.error('[oauth-authorize] consent receipt write failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       }
     }
 
@@ -2480,7 +2481,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         const harness = await upsertHarness(env, pending.memberId, clientId, clientName, tokenId)
         harnessId = harness?.id ?? null
       } catch (err) {
-        console.error('[oauth-authorize] harness upsert failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+        safeConsole.error('[oauth-authorize] harness upsert failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       }
     }
     let redirectTo: string
@@ -2522,7 +2523,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       })
       redirectTo = result.redirectTo
     } catch (err) {
-      console.error('[oauth-authorize] completeAuthorization failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      safeConsole.error('[oauth-authorize] completeAuthorization failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('The connection could not be completed. Start the connection again from your app.', { status: 500, headers: { 'Content-Type': 'text/plain' } })
     }
 

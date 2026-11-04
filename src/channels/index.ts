@@ -38,6 +38,8 @@ import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
+import { timingSafeEqual } from '../lib/crypto'
+import { safeConsole } from '../lib/log'
 
 type AppEnv = { Bindings: Env }
 
@@ -641,7 +643,7 @@ export async function postAgentActivity(env: Env, event: BusEvent): Promise<void
       try {
         await adapter.post(env, b.external_channel_id, `🤖 ${agentLabel} ${summary}`)
       } catch (err) {
-        console.error('channels: agent-activity post failed', {
+        safeConsole.error('channels: agent-activity post failed', {
           platform: b.platform,
           channel: b.external_channel_id,
           error: err instanceof Error ? err.message : String(err),
@@ -726,7 +728,7 @@ interface RelayBody {
 }
 channelsApp.post('/relay', async (c) => {
   if (!c.env.HERMES_RELAY_SECRET) return c.json({ error: 'relay_not_configured' }, 503)
-  if (c.req.header('X-Relay-Secret') !== c.env.HERMES_RELAY_SECRET) {
+  if (!timingSafeEqual(c.req.header('X-Relay-Secret') ?? '', c.env.HERMES_RELAY_SECRET)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
   let body: RelayBody
@@ -811,7 +813,7 @@ channelsApp.post('/:platform/webhook', async (c) => {
   try {
     await adapter.post(c.env, inbound.externalChannelId, reply)
   } catch (err) {
-    console.error('channels: reply post failed', {
+    safeConsole.error('channels: reply post failed', {
       platform,
       channel: inbound.externalChannelId,
       error: err instanceof Error ? err.message : String(err),

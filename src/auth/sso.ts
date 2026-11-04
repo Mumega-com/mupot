@@ -6,6 +6,7 @@ import { getJSON, setJSON } from '../dashboard/settings'
 import { createBus } from '../bus'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
+import { safeConsole } from '../lib/log'
 
 // mupot#1454: the ONLY roles a self-service SSO auto-enrollment may hand a
 // brand-new member. Deliberately excludes 'admin' (and every capability above
@@ -228,7 +229,7 @@ export async function autoEnrollSsoMember(
   const storedDefaultRole = config.default_role
   const roleIsAllowed = isAllowedSsoDefaultRole(storedDefaultRole)
   if (!roleIsAllowed) {
-    console.error(
+    safeConsole.error(
       `sso.autoEnrollSsoMember: stored default_role ${JSON.stringify(storedDefaultRole)} for tenant ${env.TENANT_SLUG} is not in the allowlist; clamped to 'member'`,
     )
   }

@@ -35,6 +35,7 @@ import {
   underUpgradeRateLimit,
   verifyTicketRequest,
 } from './seat-events'
+import { safeConsole } from '../lib/log'
 
 const MAX_BODY_BYTES = 8192
 const NO_STORE = { 'Cache-Control': 'no-store' }
@@ -124,7 +125,7 @@ seatEventsApp.post('/ticket', async (c) => {
   try {
     await recordTicketPreCheck(c.env, hash, v.host, expiresAt)
   } catch (err) {
-    console.error('[seat-events] ticket pre-check write failed:', err instanceof Error ? err.message : err)
+    safeConsole.error('[seat-events] ticket pre-check write failed:', err instanceof Error ? err.message : err)
     return c.json({ error: 'ticket_store_failed' }, 503, NO_STORE)
   }
   const stored = await stub(c.env).fetch(

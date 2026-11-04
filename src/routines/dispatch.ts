@@ -22,6 +22,7 @@ import {
   EXECUTION_PAUSED_ERROR, PAUSE_RELEASE_AUDIT_HANDLER, PAUSE_RELEASE_RESULT,
   executionPausedSql, pausedAtOrNow,
 } from '../agents/execution-brake-sql'
+import { safeConsole } from '../lib/log'
 
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
@@ -274,7 +275,7 @@ export async function loadCandidates(
     // which was to hand back an arbitrary ascending-uuid subset with nothing
     // in the response, a log, or an event distinguishing "this is everyone"
     // from "this is a truncated slice".
-    console.error('dispatch: candidate pool exceeds CANDIDATE_LIMIT, truncating', {
+    safeConsole.error('dispatch: candidate pool exceeds CANDIDATE_LIMIT, truncating', {
       tenant: env.TENANT_SLUG,
       squad_id: squadId,
       limit,

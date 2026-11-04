@@ -16,6 +16,7 @@
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { Env, Department, Squad, Agent, Membership } from '../types'
+import { escapeHtml } from '../lib/html-escape'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -188,11 +189,7 @@ export async function loadControlCenterView(env: Env): Promise<ControlCenterView
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 function badge(tone: string, text: string) {

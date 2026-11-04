@@ -53,6 +53,7 @@ import {
   sameDispatchRequest,
   type RedispatchReceiptInput,
 } from './rebooking'
+import { safeConsole } from '../lib/log'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -469,7 +470,7 @@ flightsApp.post('/:id/land', async (c) => {
     if (!landing.receipt) {
       // Same signal the MCP path emits. Without it the org-admin land surface can open a
       // permanent audit gap with no trace anywhere.
-      console.error('flight landed without a receipt', { flight_id: landed.id })
+      safeConsole.error('flight landed without a receipt', { flight_id: landed.id })
     }
     await deliverFlightLandedEvent(c.env, landed.id)
     return c.json({ ok: true, id, status: landed.status })

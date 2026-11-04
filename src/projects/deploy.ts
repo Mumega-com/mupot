@@ -4,6 +4,7 @@ import { createTask } from '../tasks/service'
 import { getProject } from './service'
 import { githubRepoSlug, studioDispatchPath } from './urls'
 import { CANARY_DEPLOYMENT_PREFIX, canaryDeploymentId, checkDeployPolicy, type DeployPolicyError } from './deploy-policy'
+import { safeConsole } from '../lib/log'
 
 export { CANARY_GATE_OWNER, CANARY_RECEIPT_MAX_AGE_HOURS } from './deploy-policy'
 
@@ -225,7 +226,7 @@ export async function deployProject(
   try {
     flightId = await dispatchDeployFlight(env, auth, project, prompt, policy.seedAttached ? { canaryReceipt: policy.canaryReceipt, rollback: policy.rollback } : null)
   } catch (error) {
-    console.error('project deploy flight dispatch failed (receipt still written)', {
+    safeConsole.error('project deploy flight dispatch failed (receipt still written)', {
       project_id: project.id,
       error: error instanceof Error ? error.message : String(error),
     })

@@ -27,6 +27,7 @@ import { html, raw as honoRaw } from 'hono/html'
 import type { Env } from '../types'
 import { enrollClientSnippet } from './enroll'
 import { connectSnippetCard, tokenSurfaceLinks } from './token-surfaces'
+import { escapeHtml } from '../lib/html-escape'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -62,11 +63,7 @@ export async function loadAgentTokenView(env: Env): Promise<AgentTokenView> {
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** GET /admin/agent-token — the agent picker form. */

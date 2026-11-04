@@ -385,6 +385,7 @@ import { MAINTENANCE_CRON, maintenanceSlot } from './scheduled/slots'
 import { healProjectRepoKeys, REPO_KEY_HEAL_PER_TICK } from './projects/repo-key-heal'
 import { reconcileGateVerdictReceipts } from './tasks/verdict-binding'
 import { BACKUP_CRON, startNightlyBackup } from './backup/nightly'
+import { safeConsole } from './lib/log'
 
 const ROUTINE_CRON = '* * * * *'
 const scheduledObservationBuckets = new Map<string, number>()
@@ -402,7 +403,7 @@ function shouldEmitScheduledObservation(
 
 function reportScheduledDispatch(route: string, scheduledAt: Date): void {
   if (!shouldEmitScheduledObservation(`dispatch:${route}`, scheduledAt)) return
-  console.info('[scheduled:dispatch]', {
+  safeConsole.info('[scheduled:dispatch]', {
     kind: 'scheduled_dispatch',
     route,
     scheduled_time: scheduledAt.toISOString(),
@@ -411,7 +412,7 @@ function reportScheduledDispatch(route: string, scheduledAt: Date): void {
 
 function reportUnmatchedCron(scheduledAt: Date): void {
   if (!shouldEmitScheduledObservation('unmatched', scheduledAt)) return
-  console.warn('[scheduled:unmatched-cron]', {
+  safeConsole.warn('[scheduled:unmatched-cron]', {
     kind: 'unmatched_cron',
     scheduled_time: scheduledAt.toISOString(),
     expected_trigger_count: 2,
@@ -503,7 +504,7 @@ export default {
       ctx.waitUntil(
         work
           .catch((error) => {
-            console.error(`[scheduled:${label}]`, error)
+            safeConsole.error(`[scheduled:${label}]`, error)
           }),
       )
     }

@@ -19,25 +19,26 @@
  * learns the length of the secret — which is exactly the search-space
  * reduction a bearer token's length is supposed to hide.
  *
- * RESIDUAL, stated plainly because the previous comments in this codebase
- * claimed more than they delivered: this loop runs `max(a, b)` times, so the
- * running time still depends on the longer input. Where the caller compares a
- * variable-length secret (a bearer token), an attacker who sends a very short
- * value can still observe work proportional to the secret's length. Closing
- * that completely means digesting both sides to a fixed width before
- * comparing, which is async under Workers' `crypto.subtle` and would change
- * every caller's signature. It has NOT been done here. See the call-site map
- * in `tests/timing-safe-equal.test.ts` for which callers are affected: the
- * five HMAC-hex callers are unaffected either way, because one side is a
- * fixed-width digest and its length is not a secret.
+ * FIXED WIDTH (mupot#982): the loop used to run `max(a, b)` times, so a 1-byte guess against a
+ * long secret still took time proportional to the secret's length. It now runs a fixed
+ * `CONSTANT_TIME_WIDTH` iterations for any input up to that many bytes, and a whole number of
+ * width-sized blocks beyond it. Comparing a guess of any length against a secret of up to
+ * 1024 bytes therefore costs the same, which covers every bearer token, webhook key and HMAC
+ * hex digest in this codebase. Comparison is over UTF-8 bytes, and TextEncoder maps every lone
+ * surrogate to U+FFFD, so two strings differing only in lone surrogates compare equal; all secrets here
+ * are ASCII, so this is noted rather than handled. Residual: a secret LONGER than the width still shows its
+ * length to the nearest block when the guess is shorter; none of ours are.
  */
+export const CONSTANT_TIME_WIDTH = 1024
+
 export function timingSafeEqual(a: string, b: string): boolean {
   const enc = new TextEncoder()
   const ab = enc.encode(a)
   const bb = enc.encode(b)
   // Seed with the length delta instead of returning early on it.
   let diff = ab.length ^ bb.length
-  const len = Math.max(ab.length, bb.length)
+  const longest = Math.max(ab.length, bb.length)
+  const len = Math.max(CONSTANT_TIME_WIDTH, Math.ceil(longest / CONSTANT_TIME_WIDTH) * CONSTANT_TIME_WIDTH)
   for (let i = 0; i < len; i++) {
     diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0)
   }

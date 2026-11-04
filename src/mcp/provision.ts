@@ -138,6 +138,7 @@ import {
   recordGrantUsage,
   type ElevationGrantRecord,
 } from '../auth/elevation'
+import { safeConsole } from '../lib/log'
 
 const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_NUMBER_SCHEMA = { type: 'number' }
@@ -254,7 +255,7 @@ async function emitProvisioned(
     await createBus(env).emit(event)
   } catch (error) {
     if (strict) throw error
-    console.error('provision: org.provisioned emit failed (non-fatal)', {
+    safeConsole.error('provision: org.provisioned emit failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       kind,
       id,

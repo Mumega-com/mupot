@@ -9,6 +9,7 @@
 
 import type { Env, Project } from '../types'
 import { getProject } from './service'
+import { safeConsole } from '../lib/log'
 
 export const CYCLE_CREATION_PRINCIPAL = 'system:project-loop'
 /** Default cycle duration: 60 days (Hadi 2026-10-25, #2170: ~2 months; was 14). */
@@ -131,7 +132,7 @@ export async function processProjectCycleCreation(
       else if (outcome === 'advanced') advanced++
     } catch (err) {
       errors++
-      console.error('cycle-creation: scheduling failed (non-fatal)', {
+      safeConsole.error('cycle-creation: scheduling failed (non-fatal)', {
         tenant: env.TENANT_SLUG,
         project_id: project.id,
         principal: CYCLE_CREATION_PRINCIPAL,

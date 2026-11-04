@@ -12,6 +12,7 @@
 import { html, raw } from 'hono/html'
 import type { ConnectorListRow } from './service'
 import type { ConnectorType } from './crypto'
+import { escapeHtml } from '../lib/html-escape'
 
 const TYPE_LABELS: Record<ConnectorType, string> = {
   telegram:  'Telegram',
@@ -33,11 +34,7 @@ const TYPE_LABELS: Record<ConnectorType, string> = {
 }
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** GET /admin/connectors — list view */

@@ -14,6 +14,7 @@ import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { independentlyAssignedOwner } from './owner-provenance'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { safeConsole } from '../lib/log'
 
 /** Which member-reference column on agents the change targets. Both are authenticate-as-conferring, both use ONE predicate. */
 export type OwnerDoorColumn = 'owner_member_id' | 'attach_designated_member_id'
@@ -145,6 +146,6 @@ export async function emitAgentOwnerUpdated(
   try {
     await createBus(env).emit(event)
   } catch {
-    console.error('agent-owner: agent_updated emit failed (non-fatal)', { tenant: env.TENANT_SLUG, id: agent.id })
+    safeConsole.error('agent-owner: agent_updated emit failed (non-fatal)', { tenant: env.TENANT_SLUG, id: agent.id })
   }
 }

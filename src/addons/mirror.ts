@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
+import { safeConsole } from '../lib/log'
 
 export const mirrorApp = new Hono<{ Bindings: Env }>()
 
@@ -23,7 +24,7 @@ function parseConceptsJson(rawJson: string | null | undefined): string[] | undef
     const parsed = JSON.parse(rawJson)
     return Array.isArray(parsed) ? parsed : undefined
   } catch (err) {
-    console.warn('[mirror] Non-fatal JSON parse warning for concepts:', err)
+    safeConsole.warn('[mirror] Non-fatal JSON parse warning for concepts:', err)
     return undefined
   }
 }
@@ -118,7 +119,7 @@ const handleSearch = async (c: import('hono').Context<{ Bindings: Env }>) => {
         }
       } catch (err) {
         // Non-fatal vector search degradation: degrades gracefully to D1 text RRF
-        console.warn('[mirror] Vector search degraded to D1 text RRF:', err)
+        safeConsole.warn('[mirror] Vector search degraded to D1 text RRF:', err)
       }
     }
 
@@ -264,7 +265,7 @@ mirrorApp.post('/memory/store', async (c) => {
           }])
         }
       } catch (err) {
-        console.warn('[mirror] Vector index write failed (relational engram preserved):', err)
+        safeConsole.warn('[mirror] Vector index write failed (relational engram preserved):', err)
       }
     }
   } catch (err) {
@@ -324,7 +325,7 @@ const handleForget = async (c: import('hono').Context<{ Bindings: Env }>) => {
       try {
         await c.env.VEC.deleteByIds([targetId])
       } catch (err) {
-        console.warn('[mirror] Vector index delete failed (relational engram purged):', err)
+        safeConsole.warn('[mirror] Vector index delete failed (relational engram purged):', err)
       }
     }
 

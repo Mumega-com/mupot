@@ -28,6 +28,7 @@ import { createBus } from '../bus'
 import { lifecycleTaskId } from './circuit-breaker'
 import { DEFAULT_CYCLE_DAYS, nextCycleBoundary } from './cycle-creation'
 import { getProject, updateProject, upsertProjectSquadAccess, type ProjectMutationResult } from './service'
+import { safeConsole } from '../lib/log'
 
 // A small, DELIBERATE duplicate of src/mcp/provision.ts's emitProvisioned — same
 // "org.provisioned" event shape, same best-effort/non-fatal discipline (mupot#1498,
@@ -56,7 +57,7 @@ async function emitOrgProvisioned(
   try {
     await createBus(env).emit(event)
   } catch {
-    console.error('start-gate: org.provisioned emit failed (non-fatal)', {
+    safeConsole.error('start-gate: org.provisioned emit failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       kind,
       id,

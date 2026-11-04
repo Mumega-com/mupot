@@ -27,6 +27,7 @@ import { collectFromSources } from './sources'
 import { FIRST_PARTY_KEY } from './first-party'
 import { posthogCroSource } from './posthog'
 import { emitMetric } from '../metrics/pulse'
+import { safeConsole } from '../lib/log'
 
 // The external ingest sources, in order. First-party is deliberately ABSENT — it is a read
 // adapter for the reasoner, not an ingest source (see invariant #1). Add GSC/Ads/CRM here.
@@ -63,7 +64,7 @@ export async function runCroCollection(
   } catch (err) {
     // collectFromSources is designed never to throw (it isolates per-source failures), but
     // guard anyway — a CRO heartbeat failure must never break the rest of the cron.
-    console.error('[cro_cron] collectFromSources failed — skipping CRO collection', err)
+    safeConsole.error('[cro_cron] collectFromSources failed — skipping CRO collection', err)
     return summary
   }
 
@@ -94,7 +95,7 @@ export async function runCroCollection(
       // Per-point fail-soft: a single bad point (e.g. validation reject) must not abort the
       // remaining points. Logged for audit; the key is safe to log (it is not a secret).
       summary.failed++
-      console.error('[cro_cron] emitMetric failed', { key: m.metric_key, source: m.source, err })
+      safeConsole.error('[cro_cron] emitMetric failed', { key: m.metric_key, source: m.source, err })
     }
   }
 

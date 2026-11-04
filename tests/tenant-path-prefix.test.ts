@@ -12,6 +12,7 @@ import { dashboardApp } from '../src/dashboard/index'
 import { requiredCanonicalOrigin, canonicalOrigin } from '../src/dashboard/connect'
 import { resolveApexPathTenant } from '../src/dispatcher'
 import {
+  cspBlocksInlineScript,
   TENANT_GLOBAL_PATHS,
   TENANT_PREFIX_HEADER,
   applyTenantPrefix,
@@ -574,5 +575,36 @@ describe('source ratchets', () => {
   it('copilot and nav compare the pathname with the prefix removed', () => {
     expect(read('../src/dashboard/copilot.ts')).toContain('__MUPOT_BASE')
     expect(read('../src/dashboard/index.ts')).toContain('window.__MUPOT_BASE')
+  })
+})
+
+
+// mupot#981 — the dashboard now sends a baseline CSP (object-src/base-uri/frame-ancestors). The prefix
+// wrapper used to treat ANY CSP as "inline scripts blocked" and dropped the client shim, which broke
+// prefixed tenants. Only a CSP that actually constrains scripts may suppress it.
+describe('cspBlocksInlineScript (multi-policy and script-src-elem)', () => {
+  it('treats a comma-joined list as separate policies; any one blocking blocks', () => {
+    expect(cspBlocksInlineScript("object-src 'none', script-src 'self'")).toBe(true)
+    expect(cspBlocksInlineScript("object-src 'none', base-uri 'none'")).toBe(false)
+  })
+  it('uses script-src-elem for inline script elements before script-src', () => {
+    expect(cspBlocksInlineScript("script-src 'unsafe-inline'; script-src-elem 'self'")).toBe(true)
+    expect(cspBlocksInlineScript("script-src 'self'; script-src-elem 'unsafe-inline'")).toBe(false)
+  })
+})
+
+describe('cspBlocksInlineScript', () => {
+  it('is false with no CSP and for a CSP that does not constrain scripts', () => {
+    expect(cspBlocksInlineScript(null)).toBe(false)
+    expect(cspBlocksInlineScript("object-src 'none'; base-uri 'none'; frame-ancestors 'none'")).toBe(false)
+  })
+  it("is false when script-src allows 'unsafe-inline' without a nonce or hash", () => {
+    expect(cspBlocksInlineScript("script-src 'self' 'unsafe-inline'")).toBe(false)
+  })
+  it('is true for script-src / default-src that exclude inline scripts', () => {
+    expect(cspBlocksInlineScript("default-src 'none'")).toBe(true)
+    expect(cspBlocksInlineScript("script-src 'self'")).toBe(true)
+    expect(cspBlocksInlineScript("script-src 'nonce-abc' 'unsafe-inline'")).toBe(true)
+    expect(cspBlocksInlineScript("default-src 'self'; script-src 'sha256-xyz'")).toBe(true)
   })
 })

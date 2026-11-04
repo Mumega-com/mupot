@@ -4,6 +4,7 @@
 //
 // Never stored or logged: the callback secret, the callback URL (host only), any token, any param value.
 import type { AuthContext, Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export const REFUSAL_RATE_WINDOW_MS = 60_000
 export const REFUSAL_RETENTION_MS = 7 * 24 * 60 * 60_000
@@ -46,7 +47,7 @@ export async function recordSubscribeRefusal(env: Env, nowMs: number, r: Subscri
   const harnessId = r.auth?.harnessId ?? null
   const seatId = r.auth?.seatBinding?.seatId ?? null
   const host = callbackHostOnly(r.rawUrl)
-  console.info('[mcp:events/subscribe] refused', { reason, agent_id: agentId, member_id: memberId, harness_id: harnessId, seat_id: seatId, host })
+  safeConsole.info('[mcp:events/subscribe] refused', { reason, agent_id: agentId, member_id: memberId, harness_id: harnessId, seat_id: seatId, host })
   // No principal => nothing to rate-limit against: log only, never an unbounded anonymous write.
   if (!agentId && !memberId) return
   try {
@@ -72,6 +73,6 @@ export async function recordSubscribeRefusal(env: Env, nowMs: number, r: Subscri
          SELECT rowid FROM event_subscribe_refusals WHERE tenant = ?1 ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?2)`,
     ).bind(env.TENANT_SLUG, REFUSAL_TENANT_ROW_CEILING).run()
   } catch (e) {
-    console.error('[mcp:events/subscribe] refusal record failed', e instanceof Error ? e.message : String(e))
+    safeConsole.error('[mcp:events/subscribe] refusal record failed', e instanceof Error ? e.message : String(e))
   }
 }

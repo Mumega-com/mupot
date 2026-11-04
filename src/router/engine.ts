@@ -8,6 +8,7 @@ import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../ta
 import type { BusEvent, Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { executionPausedSql } from '../agents/execution-brakes'
+import { safeConsole } from '../lib/log'
 
 export interface RouterTickInput {
   squadId: string
@@ -161,7 +162,7 @@ export async function runRouterTick(
     if (!candidate) {
       unrouted += 1
       decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner ?? undefined })
-      console.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
+      safeConsole.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
       continue
     }
 

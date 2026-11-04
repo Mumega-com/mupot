@@ -129,6 +129,49 @@ describe('a length mismatch does not short-circuit', () => {
   })
 })
 
+describe('comparison cost does not reveal the length of the secret (mupot#982)', () => {
+  // Before: the loop ran max(len(a), len(b)) times, so sending a 1-byte guess against a secret
+  // took time proportional to the SECRET's length. Now inputs up to CONSTANT_TIME_WIDTH bytes
+  // all cost the same, so the guess length no longer maps to the secret length.
+  const REPS = 4000
+  const ROUNDS = 7
+  const longSecret = 'k'.repeat(1000)
+  const shortSecret = 'k'.repeat(16)
+  const guess = 'x'
+
+  const cpuMs = (fn: () => void): number => {
+    const start = process.cpuUsage()
+    fn()
+    const elapsed = process.cpuUsage(start)
+    return (elapsed.user + elapsed.system) / 1_000
+  }
+  const batch = (secret: string): number =>
+    cpuMs(() => {
+      for (let i = 0; i < REPS; i += 1) timingSafeEqual(guess, secret)
+    })
+  const median = (xs: number[]): number => xs.sort((x, y) => x - y)[Math.floor(xs.length / 2)] ?? 0
+
+  it('a 1000-byte secret and a 16-byte secret cost about the same against the same short guess', () => {
+    for (let i = 0; i < 3; i += 1) { batch(longSecret); batch(shortSecret) }
+    const longs: number[] = []
+    const shorts: number[] = []
+    for (let i = 0; i < ROUNDS; i += 1) {
+      if (i % 2 === 0) { longs.push(batch(longSecret)); shorts.push(batch(shortSecret)) }
+      else { shorts.push(batch(shortSecret)); longs.push(batch(longSecret)) }
+    }
+    const ratio = median(longs) / Math.max(median(shorts), 0.001)
+    // Old form measured ~15-60x; fixed-width form measures ~1.0. 3x separates them with margin.
+    expect(ratio).toBeLessThan(3)
+  })
+
+  it('still rejects a guess that differs only past the first CONSTANT_TIME_WIDTH bytes', () => {
+    const a = 'z'.repeat(3000)
+    const b = 'z'.repeat(2999) + 'y'
+    expect(timingSafeEqual(a, b)).toBe(false)
+    expect(timingSafeEqual(a, a)).toBe(true)
+  })
+})
+
 describe('exactly one constant-time comparator exists', () => {
   // A source-shape assertion, which is a form this codebase has been burned by before
   // (mupot#1174: four authz source-greps that three text-preserving mutations survived).
@@ -137,11 +180,10 @@ describe('exactly one constant-time comparator exists', () => {
   // reached ten copies - and it is mutation-verified by doing exactly that and watching
   // this test go red.
   //
-  // src/auth/index.ts:constantTimeEqual is allowed and is NOT a defect: it already folds
-  // the length (`let mismatch = actual.length ^ expected.length`) and predates this helper.
-  // It is listed by name so that adding a SECOND exception is a deliberate edit here,
-  // rather than something a regex quietly tolerates.
-  const ALLOWED = new Set(['src/lib/crypto.ts', 'src/auth/index.ts'])
+  // mupot#982: src/auth/index.ts used to be a second allowed exception (its own
+  // constantTimeEqual). It now imports the shared helper, so the allow-list is a single
+  // file and adding a second exception is a deliberate edit here.
+  const ALLOWED = new Set(['src/lib/crypto.ts'])
 
   const walk = (dir: string, out: string[] = []): string[] => {
     for (const entry of readdirSync(dir)) {

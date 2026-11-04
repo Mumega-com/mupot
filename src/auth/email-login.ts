@@ -43,6 +43,8 @@ import { sha256Hex } from '../members/service'
 import { timingSafeEqual } from '../lib/crypto'
 import { normalizeInviteEmail } from './pending-invite-link'
 import { resolveEmailSender } from './email-sender'
+import { escapeHtml } from '../lib/html-escape'
+import { safeConsole } from '../lib/log'
 
 const ATTEMPT_TTL_SECONDS = 600 // 10 minutes — link + code share one expiry
 const RATE_LIMIT_WINDOW_SECONDS = 600 // 10-minute fixed buckets
@@ -138,7 +140,7 @@ async function underRateLimit(
       .run()
     return Number(result.meta?.changes ?? 0) > 0
   } catch (err) {
-    console.error('[email-login] rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    safeConsole.error('[email-login] rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
     return false
   }
 }
@@ -232,7 +234,7 @@ export async function startEmailLogin(input: StartEmailLoginInput): Promise<void
         // absent IM_WEBHOOK_SECRET elsewhere in this codebase, except THIS
         // route has no safe closed state to fall into (it must still 200, or
         // its status code alone becomes the oracle).
-        console.error('[email-login] no sender configured — set RESEND_API_KEY + RESEND_FROM_EMAIL, or EMAIL_PROVIDER=console for dev')
+        safeConsole.error('[email-login] no sender configured — set RESEND_API_KEY + RESEND_FROM_EMAIL, or EMAIL_PROVIDER=console for dev')
       } else {
         const verifyUrl = `${input.origin}/auth/email/verify?t=${token}&a=${attemptId}`
         input.waitUntil(
@@ -244,12 +246,12 @@ export async function startEmailLogin(input: StartEmailLoginInput): Promise<void
               html: `<p><a href="${verifyUrl}">Sign in</a></p><p>Or enter this code: <strong>${code}</strong></p><p>This link and code expire in 10 minutes. If you did not request this, ignore this email.</p>`,
             })
             .catch((err: unknown) => {
-              console.error('[email-login] send failed:', err instanceof Error ? err.message : err)
+              safeConsole.error('[email-login] send failed:', err instanceof Error ? err.message : err)
             }),
         )
       }
     } catch (err) {
-      console.error('[email-login] failed to persist attempt (nothing sent):', err instanceof Error ? err.message : err)
+      safeConsole.error('[email-login] failed to persist attempt (nothing sent):', err instanceof Error ? err.message : err)
     }
   }
 
@@ -424,11 +426,7 @@ export async function verifyEmailLoginByCode(
 }
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** The "check your inbox, or type the code" page after a successful /start

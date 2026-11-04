@@ -30,6 +30,7 @@ import {
   sha256Hex,
   type PreparedAgentTokenMint,
 } from './service'
+import { safeConsole } from '../lib/log'
 
 export const AGENT_CONNECTION_PENDING_TTL_MS = 24 * 60 * 60 * 1000
 export const AGENT_CONNECTION_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
@@ -919,7 +920,7 @@ export async function sweepAgentConnectionRetention(
       receiptsPurged: rowsWritten(writes[3]),
     }
   } catch (error) {
-    console.error('agent connection retention sweep failed', error)
+    safeConsole.error('agent connection retention sweep failed', error)
     return zero
   }
 }

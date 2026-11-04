@@ -3,6 +3,7 @@
 // result, and does the +token survive in message.to. Then it rejects with a neutral message.
 
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export const SPIKE_REJECT_MESSAGE = 'Not accepting mail yet.'
 export const MAX_RAW_SIZE = 64 * 1024
@@ -87,7 +88,7 @@ export async function handleInboundEmail(message: InboundEmail, env: Env, now: D
       )
       .run()
   } catch (error) {
-    console.error('[email-decisions] spike receipt failed', error)
+    safeConsole.error('[email-decisions] spike receipt failed', error)
   }
   message.setReject(SPIKE_REJECT_MESSAGE)
 }

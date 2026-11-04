@@ -7,6 +7,7 @@
 // is enforced at the vector query, not just at the join.
 
 import type { Env, MemoryPort, MemoryHit, MemoryEngram } from '../types'
+import { safeConsole } from '../lib/log'
 
 // 768-dim to match the `mupot-memory` Vectorize index (see wrangler.toml / README:
 // `wrangler vectorize create mupot-memory --dimensions=768 --metric=cosine`).
@@ -118,7 +119,7 @@ export function createMemory(env: Env): MemoryPort {
         // The D1 row is committed; embedding is an index, not the record. Never fail the write over it.
         opts.waitUntil(indexVector().catch((err: unknown) => {
           // D1 row is committed; recall's recent/lexical legs cover the gap. Log, never throw.
-          console.error('memory.vector_index_failed', { agent: agentId, engram: id, error: err instanceof Error ? err.name : typeof err })
+          safeConsole.error('memory.vector_index_failed', { agent: agentId, engram: id, error: err instanceof Error ? err.name : typeof err })
         }))
       } else {
         await indexVector()

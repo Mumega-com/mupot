@@ -12,6 +12,7 @@
 // PRESENTATION ONLY. No authz lives here: who may mint is decided by each route.
 
 import { html, raw as honoRaw } from 'hono/html'
+import { escapeHtml } from '../lib/html-escape'
 
 export type TokenSurface = 'enroll' | 'agent-token' | 'keys'
 
@@ -22,7 +23,7 @@ const SURFACES: ReadonlyArray<{ id: TokenSurface; href: string; label: string; w
 ]
 
 function escText(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** Links to the other two surfaces, one line each saying when to use it. */

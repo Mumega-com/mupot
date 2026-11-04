@@ -16,6 +16,7 @@ import { cancelledColumnSql, outcomeFilterSql } from './cancelled'
 import { LIVE_FLIGHT_STATUSES } from './clearance'
 import { cleanReported } from '../fleet/reported-values'
 import { readFleetAgentRow } from '../fleet/registry'
+import { safeConsole } from '../lib/log'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -950,7 +951,7 @@ export async function landGovernedFlight(
     // exist, and landGovernedFlight is their only producer, so `receipt: false` is a
     // PERMANENT audit gap until a repair path exists (tracked separately). Callers must
     // treat it as an alarm, not as a transient.
-    console.error('flight.landed receipt insert failed', {
+    safeConsole.error('flight.landed receipt insert failed', {
       flight_id: id,
       error: error instanceof Error ? error.message : 'unknown_error',
     })
@@ -974,7 +975,7 @@ export async function landGovernedFlight(
       // precisely the "successful action reported as failure" shape this issue exists to
       // remove. The statement is a recompute-from-SUM, so it is idempotent and a later
       // report_run_usage converges it.
-      console.error('routine cost aggregation failed after landing', {
+      safeConsole.error('routine cost aggregation failed after landing', {
         flight_id: id,
         routine_run_id: opts.meta.routine_run_id,
         error: error instanceof Error ? error.message : 'unknown_error',
@@ -1126,7 +1127,7 @@ export async function deliverFlightLandedEvent(env: Env, flightId: string): Prom
           SET last_error = ?3, attempts = attempts + 1
         WHERE tenant=?1 AND flight_id=?2 AND delivered_at IS NULL`,
     ).bind(env.TENANT_SLUG, flightId, message).run()
-    console.error('flight.landed event delivery failed', { flight_id: flightId, error: message })
+    safeConsole.error('flight.landed event delivery failed', { flight_id: flightId, error: message })
     return false
   }
 }

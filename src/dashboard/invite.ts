@@ -26,11 +26,13 @@ import type { AuthContext, Env, Capability } from '../types'
 import { acceptInvite, protectRawTokenResponse } from '../members'
 import { peekSessionAuth } from '../auth'
 import { provisionHomeForMember } from '../members/service'
+import { escapeHtml } from '../lib/html-escape'
 import {
   PENDING_INVITE_COOKIE,
   PENDING_INVITE_KV_PREFIX,
   PENDING_INVITE_TTL_SECONDS,
 } from '../auth/pending-invite-link'
+import { safeConsole } from '../lib/log'
 
 // Variables.auth mirrors auth/index.ts's AppEnv so peekSessionAuth(c) accepts this context.
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -144,11 +146,7 @@ export async function loadInviteLanding(env: Env, inviteId: string): Promise<Inv
 // a second copy — both pages render config/DB strings (BRAND, org/invite
 // facts) into markup with no session behind them.
 export function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** Minimal self-contained shell — this page is unauthenticated and never
@@ -392,7 +390,7 @@ inviteApp.post('/:id', async (c) => {
   // — they are authenticated; send them to the dashboard.
   if (result.value.linked_existing) {
     await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
-      console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+      safeConsole.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
         member_id: result.value.member_id, channel: 'web',
         error_class: err instanceof Error ? err.constructor.name : typeof err, err,
       })
@@ -483,7 +481,7 @@ inviteApp.post('/:id', async (c) => {
   // guarantee (see its doc comment in src/members/service.ts) — belt and
   // braces, not a claim that the function still needs it.
   await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
-    console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+    safeConsole.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
       member_id: result.value.member_id, channel: 'web',
       error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })

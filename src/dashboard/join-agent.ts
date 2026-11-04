@@ -18,6 +18,7 @@ import { resolveAgentRef } from '../org/resolve'
 import { resolveAgentMemberBinding } from '../members/service'
 import { setAgentSquadAccess, isAgentAccessCapability } from '../members/agent-access'
 import type { AgentAccessCapability } from '../members/agent-access'
+import { escapeHtml } from '../lib/html-escape'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -148,11 +149,7 @@ export async function confirmJoin(
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 const CAP_OPTIONS = JOIN_CAPABILITIES.map((c) => `<option value="${c}">${c}</option>`).join('')

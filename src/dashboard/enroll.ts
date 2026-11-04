@@ -32,6 +32,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
 import { mcpEndpoint, mcpServerKey } from './connect'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { escapeHtml } from '../lib/html-escape'
 
 export const DEFAULT_ENROLL_SEAT = 'unnamed-seat'
 
@@ -338,11 +339,7 @@ export async function loadLiveKeysForAgents(
 }
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 export function enrollPageBody(view: EnrollView, error?: string) {

@@ -12,6 +12,7 @@
 // key can serve both workers without a second naming convention to track.
 
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export interface EmailMessage {
   to: string
@@ -55,12 +56,12 @@ class ResendEmailSender implements EmailSender {
         signal: AbortSignal.timeout(RESEND_TIMEOUT_MS),
       })
       if (!res.ok) {
-        console.error(`[email-sender] resend failed: ${res.status}`)
+        safeConsole.error(`[email-sender] resend failed: ${res.status}`)
         return { ok: false }
       }
       return { ok: true }
     } catch (err) {
-      console.error('[email-sender] resend error:', err instanceof Error ? err.message : err)
+      safeConsole.error('[email-sender] resend error:', err instanceof Error ? err.message : err)
       return { ok: false }
     }
   }
@@ -74,7 +75,7 @@ class ResendEmailSender implements EmailSender {
  */
 class ConsoleEmailSender implements EmailSender {
   async send(message: EmailMessage): Promise<EmailSendResult> {
-    console.log(`[email-sender:console] to=${message.to} subject=${JSON.stringify(message.subject)}\n${message.text}`)
+    console.log(`[email-sender:console] to=${message.to} subject=${JSON.stringify(message.subject)}\n${message.text}`) // allow-raw-console: dev-only sender prints the sign-in link by design
     return { ok: true }
   }
 }
@@ -92,7 +93,13 @@ class ConsoleEmailSender implements EmailSender {
  */
 export function resolveEmailSender(env: Env): EmailSender | null {
   if (env.LOCAL_TEST_AUTH === '1' || env.EMAIL_PROVIDER === 'console') {
-    return new ConsoleEmailSender()
+    // The console sender prints sign-in links and codes. Refuse it when the environment says
+    // production, and say so, instead of silently leaking credentials into the logs.
+    if (/^prod(uction)?$/i.test((env.ENVIRONMENT ?? '').trim())) {
+      safeConsole.error('[email-sender] startup error: the console email sender (EMAIL_PROVIDER=console / LOCAL_TEST_AUTH=1) is refused when ENVIRONMENT=production; configure Resend instead')
+    } else {
+      return new ConsoleEmailSender()
+    }
   }
   if (typeof env.RESEND_API_KEY === 'string' && env.RESEND_API_KEY.length > 0
     && typeof env.RESEND_FROM_EMAIL === 'string' && env.RESEND_FROM_EMAIL.length > 0) {

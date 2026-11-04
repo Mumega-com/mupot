@@ -30,6 +30,7 @@ import { redactSecretPatterns } from '../lib/redact'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR, isExecutionPaused } from '../agents/execution-brakes'
+import { safeConsole } from '../lib/log'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -342,7 +343,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     case 'agent.wake': {
       if (!event.agent_id) {
         // Nothing to wake — drop quietly (ack) rather than retry forever.
-        console.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
+        safeConsole.error('bus: agent.wake missing agent_id', { tenant: event.tenant })
         return true
       }
       if ((event.payload as { already_routed?: unknown })?.already_routed === true) {
@@ -577,7 +578,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     }
     case 'squad.dispatch': {
       if (!event.squad_id) {
-        console.error('bus: squad.dispatch missing squad_id', { tenant: event.tenant })
+        safeConsole.error('bus: squad.dispatch missing squad_id', { tenant: event.tenant })
         return true
       }
       await dispatchSquad(env, event.squad_id, event)
@@ -590,7 +591,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       if (event.squad_id) {
         await dispatchSquad(env, event.squad_id, event)
       } else {
-        console.error(`bus: ${event.type} with no squad_id (org-level)`, {
+        safeConsole.error(`bus: ${event.type} with no squad_id (org-level)`, {
           tenant: event.tenant,
         })
       }
@@ -606,7 +607,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // Terminal observations, gate decisions, and structural provisioning; no DO
       // wake by default. Log for the activity feed (the agent-actor branch in
       // handleQueue surfaces task.completed/blocked into the squad's bound channel).
-      console.log(`bus: ${event.type}`, {
+      safeConsole.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
@@ -615,7 +616,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     case 'task.review':   // K1: gated execution success — task awaits verdict; no DO wake
     case 'task.blocked': {
       // Notify Hadi via Telegram bridge when a task needs his opinion
-      console.log(`bus: ${event.type} — notifying Hadi`, {
+      safeConsole.log(`bus: ${event.type} — notifying Hadi`, {
         tenant: event.tenant,
         task_id: (event.payload as any)?.task_id,
       })
@@ -629,7 +630,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       })
       // Still log for the activity feed (the agent-actor branch in handleQueue
       // surfaces task events into the squad's bound channel).
-      console.log(`bus: ${event.type}`, {
+      safeConsole.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
@@ -637,7 +638,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
     }
     case 'flight.landed': {
       if (!(await claimFlightEvent(env, event))) return false
-      console.log('bus: flight.landed', {
+      safeConsole.log('bus: flight.landed', {
         tenant: event.tenant,
         squad_id: event.squad_id,
       })
@@ -693,7 +694,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       try {
         const seat = await publishSeatHint(env, event.tenant, event.payload)
         if (!seat.ok) {
-          console.error('bus: message.created — seat hint publish failed (isolated, not retried)', {
+          safeConsole.error('bus: message.created — seat hint publish failed (isolated, not retried)', {
             tenant: event.tenant,
             message_id: p?.message_id,
             error: seat.error,
@@ -701,7 +702,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           })
         }
       } catch (err) {
-        console.error('bus: message.created — seat hint publish threw (isolated, not retried)', {
+        safeConsole.error('bus: message.created — seat hint publish threw (isolated, not retried)', {
           tenant: event.tenant,
           message_id: p?.message_id,
           error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
@@ -722,7 +723,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           await enqueueMessageCreatedDeliveries(env, event)
         } catch (err) {
           eventsEnqueueError = err
-          console.error('bus: message.created — mcp events enqueue failed (source message will be retried)', {
+          safeConsole.error('bus: message.created — mcp events enqueue failed (source message will be retried)', {
             tenant: event.tenant,
             message_id: p?.message_id,
             error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
@@ -735,7 +736,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       try {
         await enqueueSignedInboxDoorbell(env, event)
       } catch (err) {
-        console.error('bus: message.created — signed doorbell enqueue failed (fail-open, not retried)', {
+        safeConsole.error('bus: message.created — signed doorbell enqueue failed (fail-open, not retried)', {
           tenant: event.tenant,
           message_id: p?.message_id,
           error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
@@ -759,10 +760,10 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // the DLQ forever for a knob that is off on purpose. Same explicit-opt-in
           // discipline as src/telegram-bridge/bus_notify.ts: log which knob is missing,
           // ack, move on.
-          console.log('bus: message.created — delivery not configured', { ...logCtx, missing: outcome.missing })
+          safeConsole.log('bus: message.created — delivery not configured', { ...logCtx, missing: outcome.missing })
           break
         case 'delivered':
-          console.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
+          safeConsole.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
           break
         case 'declined':
           // The configured Hermes route deliberately filtered this event (mupot#1716).
@@ -770,10 +771,10 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // (Falls through to the eventsEnqueueError check below, which still retries.)
           // warn + metric: a misconfigured filter that drops 100% of messages must be visible.
           // reason comes from the receiver, so bound it.
-          console.warn('bus: message.created — declined by receiver', {
+          safeConsole.warn('bus: message.created — declined by receiver', {
             ...logCtx,
             status: outcome.status,
-            reason: outcome.reason.slice(0, 200),
+            reason: outcome.reason.slice(0, 120), // receiver-supplied free text: bounded here, scrubbed by safeConsole
             route: outcome.route,
             metric: 'hermes_delivery.declined',
           })
@@ -784,7 +785,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // Throwing (not returning false) is what makes handleQueue retry instead of
           // ack — see handleQueue below: only a throw triggers message.retry() /
           // eventual DLQ landing, a `return false` here would still ack silently.
-          console.error('bus: message.created — delivery failed', { ...logCtx, outcome })
+          safeConsole.error('bus: message.created — delivery failed', { ...logCtx, outcome })
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
       if (eventsEnqueueError !== null) {
@@ -821,12 +822,12 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // something that needs a human, and carry the orphan ids so they can be reclaimed
       // rather than discovered on an invoice (mupot#1285).
       const payload = (event.payload ?? {}) as Record<string, unknown>
-      console.error('bus: pot.self_serve_provisioning_incomplete NEEDS ATTENTION', {
+      safeConsole.error('bus: pot.self_serve_provisioning_incomplete NEEDS ATTENTION', {
         tenant: event.tenant,
         slug: payload.slug,
         not_completed: payload.not_completed,
         orphaned_resources: payload.orphaned_resources,
-        reason: payload.incomplete_reason,
+        reason: typeof payload.incomplete_reason === 'string' ? payload.incomplete_reason.slice(0, 120) : payload.incomplete_reason, // free text: bounded, scrubbed by safeConsole
       })
       // Acked, not retried: retrying cannot finish a provisioning run that was never
       // implemented, and a poisoned queue would bury the alert we just logged.
@@ -843,7 +844,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // These producers have already committed their durable effect before
       // publishing. This consumer records and acknowledges the observation
       // without replaying the originating mutation.
-      console.log(`bus: ${event.type}`, {
+      safeConsole.log(`bus: ${event.type}`, {
         tenant: event.tenant,
         squad_id: event.squad_id,
         agent_id: event.agent_id,
@@ -854,7 +855,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // Exhaustiveness guard. Unknown types are acked (not retried) to avoid
       // poisoning the queue with events we will never understand.
       const _exhaustive: never = event.type
-      console.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
+      safeConsole.error('bus: unknown event type', { type: _exhaustive, tenant: event.tenant })
       return true
     }
   }
@@ -875,7 +876,7 @@ export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Prom
         try {
           await postAgentActivity(env, message.body)
         } catch (e) {
-          console.error('bus: activity-feed post failed (non-fatal)', {
+          safeConsole.error('bus: activity-feed post failed (non-fatal)', {
             id: message.id,
             error: redactSecretPatterns(e instanceof Error ? e.message : String(e)),
           })
@@ -883,7 +884,7 @@ export async function handleQueue(batch: MessageBatch<BusEvent>, env: Env): Prom
       }
       message.ack()
     } catch (err) {
-      console.error('bus: message failed, will retry', {
+      safeConsole.error('bus: message failed, will retry', {
         id: message.id,
         attempts: message.attempts,
         error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),

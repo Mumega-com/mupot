@@ -41,6 +41,7 @@ import { isExecutionPaused } from './execution-brake-sql'
 import { sendAgentMessage } from './messages'
 import { ASSIGNMENT_WAKE_SENDER } from './system-senders'
 import { scheduleTaskAssignedDoorbell } from './webhook-doorbell'
+import { safeConsole } from '../lib/log'
 
 export { ASSIGNMENT_WAKE_SENDER }
 /** from_member stamped on the doorbell: the server is the sender, not any member. */
@@ -113,7 +114,7 @@ export function isWakeableTaskStatus(status: string): boolean {
 
 function logWakeProblem(event: string, detail: Record<string, unknown>): void {
   // console.error inside the failure path only: the doorbell is best-effort, so this is its visibility.
-  console.error(JSON.stringify({ event, ...detail }))
+  safeConsole.error(JSON.stringify({ event, ...detail }))
 }
 
 function errorText(error: unknown): string {

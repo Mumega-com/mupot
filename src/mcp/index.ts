@@ -365,6 +365,7 @@ import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
 import { toolAnnotations } from './tool-annotations'
+import { safeConsole } from '../lib/log'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext; tenantNotice?: TenantHeaderNotice } }
 
@@ -4391,7 +4392,7 @@ const toolFlightLand: ToolSpec = {
     const landed = await getFlight(env, flight.id)
     if (!landed || landed.status !== 'landed') return fail(500, 'flight_record_missing')
     if (!landing.receipt) {
-      console.error('flight landed without a receipt', { flight_id: landed.id })
+      safeConsole.error('flight landed without a receipt', { flight_id: landed.id })
     }
     await deliverFlightLandedEvent(env, landed.id)
     return done({ flight: flightWithParsedMeta(landed, meta), receipt: landing.receipt })
@@ -4525,7 +4526,7 @@ const toolFlightCancel: ToolSpec = {
       return fail(409, result.error ?? 'flight_cancel_failed')
     }
     if (!result.receipt) {
-      console.error('flight cancelled without a receipt', { flight_id: result.flight_id })
+      safeConsole.error('flight cancelled without a receipt', { flight_id: result.flight_id })
     }
     // flight_closed = terminal bookkeeping (the flight row left its live states). cancelled = the stronger
     // guarantee that no effect commits afterwards. They differ only when a routine action was already running or its control message was already delivered.
@@ -8765,14 +8766,14 @@ async function logNegotiation(
         if (auth && auth.tenant === c.env.TENANT_SLUG) principal = { harnessId: auth.harnessId, memberId: auth.memberId, heldSeat: auth.seatAgentStatus === 'held' }
       }
       await recordNegotiation(c.env, Date.now(), { method, requested, requestedBucket, negotiated, eventsReturned, principal, clientInfoName: ci })
-    })().catch((e: unknown) => { console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e)) })
+    })().catch((e: unknown) => { safeConsole.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e)) })
     // Never block the response on observability: with an ExecutionContext the work is kept alive by waitUntil; without one it is
     // fire-and-forget (`work` already carries its own catch, so it cannot reject unhandled).
     const wu = safeWaitUntil(c)
     if (wu) wu(work)
     else void work
   } catch (e) {
-    console.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e))
+    safeConsole.error('[mcp:negotiation] failed', e instanceof Error ? e.message : String(e))
   }
 }
 
@@ -8805,7 +8806,7 @@ async function handleJsonRpc(
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
-      console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
+      safeConsole.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: EVENTS_PROTOCOL_VERSION, events_advertised: true })
       if (profile === undefined) await logNegotiation(c, 'initialize', body.params, EVENTS_PROTOCOL_VERSION, true)
       return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
@@ -8820,7 +8821,7 @@ async function handleJsonRpc(
     // tools/call path above) and the Origin/GET clarifications (GET and DELETE answer 405 below while the flag is on).
     const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
     const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
-    console.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
+    safeConsole.info('[mcp:initialize]', { door: profile ?? 'mcp', requested: requestedProtocolVersionForLog(body.params), negotiated: initVersion, events_advertised: false })
     if (profile === undefined) await logNegotiation(c, 'initialize', body.params, initVersion, false)
     const legacyInit = ok(id, {
       protocolVersion: initVersion,
@@ -8998,7 +8999,7 @@ async function handleJsonRpc(
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
-    console.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
+    safeConsole.info('[mcp:server/discover]', { door: profile ?? 'mcp' })
     await logNegotiation(c, 'server/discover', body.params, SUPPORTED_PROTOCOL_VERSIONS.join(','), true)
     return ok(id, serverDiscoverResult())
   }
@@ -9037,7 +9038,7 @@ async function handleJsonRpc(
     const attachedCandidates = seatAttachEnabled(c.env) && auth.channel === 'directory' && !auth.boundAgentId && auth.harnessId && auth.memberId && auth.tokenId
       ? await listLiveAttachmentsForEvents(c.env, { memberId: auth.memberId, harnessId: auth.harnessId, grantTokenId: auth.tokenId }).catch((e: unknown) => {
         // Fails closed (the caller is treated as unattached) but never silently: a DB fault must be visible in the logs.
-        console.error('[mcp:events] attached candidate lookup failed', e instanceof Error ? e.message : String(e))
+        safeConsole.error('[mcp:events] attached candidate lookup failed', e instanceof Error ? e.message : String(e))
         return []
       })
       : []
@@ -9093,7 +9094,7 @@ async function handleJsonRpc(
         : baseCatalogue
       // mupot#1709: what a client was actually shown, so a client canary observes the catalogue instead
       // of inferring it. Shape only — never a token, principal id, or message body.
-      console.info('[mcp:events/list]', {
+      safeConsole.info('[mcp:events/list]', {
         bound: listAuth.boundAgentId != null,
         count: catalogue.length,
         names: catalogue.map((e) => e.name),

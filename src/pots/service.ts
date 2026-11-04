@@ -20,6 +20,7 @@ import {
 } from './schema-chain'
 import { sha256Hex } from '../members/service'
 import { createCredentialClaim, type CredentialClaimHandle } from '../auth/credential-claim'
+import { safeConsole } from '../lib/log'
 
 export const DISPATCH_NAMESPACE = 'mupot-pots'
 export const DEFAULT_ROOT_DOMAIN = 'mupot.mumega.com'
@@ -1212,7 +1213,7 @@ export async function writeProvisionReceipt(
       .run()
     return true
   } catch (error) {
-    console.error(
+    safeConsole.error(
       `pot_provision_receipts write failed for step=${step} slug=${slug} run_id=${runId}: ${errMsg(error)}`,
     )
     return false
@@ -1948,7 +1949,7 @@ export async function releaseStalePot(
         .bind(slug, row.status)
         .run()
     } catch (error) {
-      console.error(`releaseStalePot: compensating revert failed for slug=${slug}: ${errMsg(error)}`)
+      safeConsole.error(`releaseStalePot: compensating revert failed for slug=${slug}: ${errMsg(error)}`)
     }
     return { ok: false, slug, error: 'receipt_write_failed' }
   }

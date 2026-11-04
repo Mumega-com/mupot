@@ -17,6 +17,7 @@ import {
   verifyCallback,
 } from './events-webhook'
 import { reasonOfFailure, recordSubscribeRefusal } from './events-refusals'
+import { safeConsole } from '../lib/log'
 
 export const SUBSCRIBABLE_EVENTS: ReadonlySet<string> = new Set(['message.created'])
 
@@ -169,7 +170,7 @@ function parseTarget(
     if (!check.ok) {
       // mupot#1709: EVENTS_CALLBACK_HOSTS may only name a host a real client was OBSERVED sending, so
       // log the refused hostname — never the path/query/userinfo, which can carry a client's secret.
-      console.info('[mcp:events/subscribe] callback refused', {
+      safeConsole.info('[mcp:events/subscribe] callback refused', {
         reason: check.reason,
         host: refusedCallbackHost(delivery.url),
       })

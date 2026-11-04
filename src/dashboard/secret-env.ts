@@ -16,13 +16,10 @@
 
 import { html, raw } from 'hono/html'
 import type { PublicSecretEnvRequest } from '../secret-env/types'
+import { escapeHtml } from '../lib/html-escape'
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /**

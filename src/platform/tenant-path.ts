@@ -188,6 +188,28 @@ export function rewriteHtmlForPrefix(html: string, prefix: string, injectShim = 
   return shim + out
 }
 
+/** True when a Content-Security-Policy would stop an un-nonced inline <script> from running:
+ *  script-src (or, absent that, default-src) exists and does not allow 'unsafe-inline' without a
+ *  nonce/hash (browsers ignore 'unsafe-inline' once a nonce or hash is present). */
+export function cspBlocksInlineScript(csp: string | null): boolean {
+  if (csp === null) return false
+  // A header may carry several comma-joined policies; the browser enforces ALL of them, so
+  // any single one that blocks inline scripts blocks them.
+  return csp.split(',').some((policy) => {
+    const directives = new Map<string, string[]>()
+    for (const part of policy.split(';')) {
+      const tokens = part.trim().split(/\s+/).filter((t) => t.length > 0)
+      const name = tokens.shift()?.toLowerCase()
+      if (name !== undefined && !directives.has(name)) directives.set(name, tokens.map((t) => t.toLowerCase()))
+    }
+    // An inline <script> element is governed by script-src-elem, then script-src, then default-src.
+    const sources = directives.get('script-src-elem') ?? directives.get('script-src') ?? directives.get('default-src')
+    if (sources === undefined) return false
+    const strict = sources.some((t) => t.startsWith("'nonce-") || t.startsWith("'sha") || t === "'strict-dynamic'")
+    return strict || !sources.includes("'unsafe-inline'")
+  })
+}
+
 /** The response choke point for a prefixed tenant. HTML bodies are rewritten (streams such as
  *  SSE, JSON and binaries are untouched); a root-relative Location gains the prefix. */
 export async function applyTenantPrefix(response: Response, prefix: string): Promise<Response> {
@@ -203,8 +225,10 @@ export async function applyTenantPrefix(response: Response, prefix: string): Pro
   if (!isHtml || response.body === null) {
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   }
-  // A page with its own CSP would block an un-nonced inline shim; its attributes are still rewritten.
-  const body = rewriteHtmlForPrefix(await response.text(), prefix, !response.headers.has('content-security-policy'))
+  // A page whose CSP restricts script sources would block an un-nonced inline shim; its attributes are
+  // still rewritten. A CSP that does not constrain scripts (the dashboard's baseline: object-src,
+  // base-uri, frame-ancestors) leaves inline scripts running, so the shim must still be injected.
+  const body = rewriteHtmlForPrefix(await response.text(), prefix, !cspBlocksInlineScript(response.headers.get('content-security-policy')))
   headers.delete('content-length')
   headers.delete('etag')
   return new Response(body, { status: response.status, statusText: response.statusText, headers })

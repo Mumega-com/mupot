@@ -35,6 +35,7 @@ import {
   ingestBountyClaimed,
 } from './bounty-claimed'
 import type { BountyBindingError, BountyBindingResult } from './bounty-claimed'
+import { safeConsole } from '../lib/log'
 
 // ── Normalized inbound event ────────────────────────────────────────────────
 //
@@ -462,7 +463,7 @@ eventIngestApp.post('/ingest', async (c) => {
     const normalised = normaliseEventSource(source)
     if (normalised !== source) {
       // Length only: the raw value is untrusted and may carry anything, so none of it is logged.
-      console.warn('source_normalised', { original_length: body.source.length })
+      safeConsole.warn('source_normalised', { original_length: body.source.length })
     }
     source = normalised
   }

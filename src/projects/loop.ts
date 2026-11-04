@@ -42,6 +42,7 @@ import {
   DEFAULT_CYCLE_DAYS,
   processProjectCycleCreation,
 } from './cycle-creation'
+import { safeConsole } from '../lib/log'
 
 /** Cap projects evaluated per cron tick — mirrors MAX_PROJECTS_PER_TICK / MAX_LOOPS_PER_TICK. */
 export const MAX_BOUNDARY_PROJECTS_PER_TICK = 25
@@ -249,7 +250,7 @@ export async function runProjectLoopTick(
       else if (outcome === 'skipped' || outcome === 'unchanged') skipped++
     } catch (err) {
       errors++
-      console.error('project-loop: stall detector failed (non-fatal)', {
+      safeConsole.error('project-loop: stall detector failed (non-fatal)', {
         tenant: env.TENANT_SLUG,
         project_id: project.id,
         principal: STALL_DETECTOR_PRINCIPAL,
@@ -286,7 +287,7 @@ export async function runProjectLoopTick(
       else if (outcome === 'killed') killed++
     } catch (err) {
       errors++
-      console.error('project-loop: circuit breaker failed (non-fatal)', {
+      safeConsole.error('project-loop: circuit breaker failed (non-fatal)', {
         tenant: env.TENANT_SLUG,
         project_id: project.id,
         principal: CIRCUIT_BREAKER_PRINCIPAL,
@@ -322,7 +323,7 @@ export async function runProjectLoopTick(
     errors += cycleResult.errors
   } catch (err) {
     errors++
-    console.error('project-loop: cycle creation failed (non-fatal)', {
+    safeConsole.error('project-loop: cycle creation failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       error: err instanceof Error ? err.message : String(err),
     })
@@ -343,7 +344,7 @@ export async function runProjectLoopTick(
       }
     } catch (err) {
       errors++
-      console.error('project-loop: structural completion failed (non-fatal)', {
+      safeConsole.error('project-loop: structural completion failed (non-fatal)', {
         tenant: env.TENANT_SLUG,
         project_id: project.id,
         principal: STRUCTURAL_COMPLETION_PRINCIPAL,
@@ -368,7 +369,7 @@ export async function runProjectLoopTick(
       else if (outcome === 'skipped' || outcome === 'already_alarmed') skipped++
     } catch (err) {
       errors++
-      console.error('project-loop: ghost-start alarm failed (non-fatal)', {
+      safeConsole.error('project-loop: ghost-start alarm failed (non-fatal)', {
         tenant: env.TENANT_SLUG,
         project_id: project.id,
         principal: START_GATE_PRINCIPAL,

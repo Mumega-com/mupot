@@ -1,4 +1,5 @@
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export const BOARD_LATENCY_ROUTE = 'GET /dashboard/kanban'
 export const MAX_LATENCY_SAMPLES = 20_000
@@ -100,7 +101,7 @@ async function persistBoardTiming(env: Env, observedAt: number, duration: number
         expirationTtl: RETENTION_MS / 1000, metadata: { observed_at_ms: observedAt },
       })
     } catch {
-      console.warn('[route-latency] counter failure marker persistence failed')
+      safeConsole.warn('[route-latency] counter failure marker persistence failed')
     }
     return
   }
@@ -145,9 +146,9 @@ export async function measureBoardRead<T>(
   } finally {
     const duration = performance.now() - start
     const work = Promise.resolve().then(() => persistBoardTiming(env, observedAt, duration))
-      .catch(() => { console.warn('[route-latency] telemetry persistence failed') })
+      .catch(() => { safeConsole.warn('[route-latency] telemetry persistence failed') })
     // Standalone/non-Worker callers are best-effort too; never hold a page for telemetry.
-    try { if (waitUntil) waitUntil(work) } catch { console.warn('[route-latency] waitUntil unavailable') }
+    try { if (waitUntil) waitUntil(work) } catch { safeConsole.warn('[route-latency] waitUntil unavailable') }
   }
 }
 

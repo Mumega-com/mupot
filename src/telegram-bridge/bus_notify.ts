@@ -23,6 +23,7 @@
 // failure stayed invisible.
 
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 const TELEGRAM_API = 'https://api.telegram.org'
 export const FETCH_TIMEOUT_MS = 10_000
@@ -130,23 +131,23 @@ async function sendDirect(
       resp = await postJson(url, JSON.stringify(attempt), { 'Content-Type': 'application/json' })
     } catch (err) {
       // Never interpolate the token into a log line — the URL contains it.
-      console.error('telegram-bridge: send failed', redactBotToken(String(err)).slice(0, 200))
+      safeConsole.error('telegram-bridge: send failed', redactBotToken(String(err)).slice(0, 200))
       return { delivered: false }
     }
     if (resp.ok) {
-      console.log('telegram-bridge: delivered', type, taskId ?? '')
+      safeConsole.log('telegram-bridge: delivered', type, taskId ?? '')
       return { delivered: true }
     }
     const detail = await resp.text().catch(() => '')
     // Only a parse failure is worth retrying; 401/403/429 will not improve on attempt 2.
     if (resp.status === 400 && detail.includes('parse')) {
-      console.warn('telegram-bridge: markdown rejected, retrying as plain text')
+      safeConsole.warn('telegram-bridge: markdown rejected, retrying as plain text')
       continue
     }
-    console.error('telegram-bridge: telegram returned', resp.status, detail.slice(0, 200))
+    safeConsole.error('telegram-bridge: telegram returned', resp.status, detail.slice(0, 200))
     return { delivered: false }
   }
-  console.error('telegram-bridge: plain-text retry also failed')
+  safeConsole.error('telegram-bridge: plain-text retry also failed')
   return { delivered: false }
 }
 
@@ -179,20 +180,20 @@ export async function notifyHadi(
       })
       if (!resp.ok) {
         const detail = await resp.text().catch(() => '')
-        console.error('telegram-bridge: webhook returned', resp.status, detail.slice(0, 200))
+        safeConsole.error('telegram-bridge: webhook returned', resp.status, detail.slice(0, 200))
         return { delivered: false }
       }
-      console.log('telegram-bridge: delivered via webhook', notification.type, notification.task_id)
+      safeConsole.log('telegram-bridge: delivered via webhook', notification.type, notification.task_id)
       return { delivered: true }
     } catch (err) {
-      console.error('telegram-bridge: webhook fetch failed', redactBotToken(String(err)).slice(0, 200))
+      safeConsole.error('telegram-bridge: webhook fetch failed', redactBotToken(String(err)).slice(0, 200))
       return { delivered: false }
     }
   }
 
   // Fail closed, and say which knob is missing — "not configured" without a name is
   // what kept this broken.
-  console.error(
+  safeConsole.error(
     'telegram-bridge: no delivery path configured ' +
       `(TELEGRAM_BOT_TOKEN=${token ? 'set' : 'unset'}, TELEGRAM_CHAT_ID=${chatId ? 'set' : 'unset'})`,
   )

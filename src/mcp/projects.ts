@@ -44,6 +44,7 @@ import { authorizeStructuralWrite, finishDelegatedReceipt } from '../operators/c
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
 import { filterWikiGraphForCaller } from '../pages/inkwell-adapter'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
+import { safeConsole } from '../lib/log'
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
@@ -88,7 +89,7 @@ async function emitProjectMutation(
   try {
     await createBus(env).emit(event)
   } catch {
-    console.error('project MCP audit event failed (non-fatal)', {
+    safeConsole.error('project MCP audit event failed (non-fatal)', {
       tenant: env.TENANT_SLUG,
       operation,
       project_id: projectId,

@@ -27,6 +27,7 @@ import {
 import { assertPublicHttpsUrl } from '../lib/ssrf'
 import { normalizeDoorbellHmacSecret } from './doorbell-signature'
 import { validateCallbackUrl } from '../mcp/events-webhook'
+import { safeConsole } from '../lib/log'
 
 export const DOORBELL_TIMEOUT_MS = 3000
 export const INBOX_WAKE_TYPE = 'mupot.inbox.wake'
@@ -223,8 +224,8 @@ async function recordReceipt(
     ...(detail.http_status !== undefined ? { http_status: detail.http_status } : {}),
     ...(detail.reason !== undefined ? { reason: detail.reason } : {}),
   }
-  if (status === 'posted') console.info('[webhook-doorbell] wake posted', line)
-  else console.warn(`[webhook-doorbell] wake ${status}`, line)
+  if (status === 'posted') safeConsole.info('[webhook-doorbell] wake posted', line)
+  else safeConsole.warn(`[webhook-doorbell] wake ${status}`, line)
   try {
     await env.DB.prepare(
       `INSERT INTO agent_webhook_doorbell_receipts
@@ -669,7 +670,7 @@ async function deliverDoorbell(
       return
     }
     // Finalize the claimed row in place (same id), so the window row IS the attempt's receipt.
-    console[status === 'posted' ? 'info' : 'warn'](`[webhook-doorbell] wake ${status}`, {
+    safeConsole[status === 'posted' ? 'info' : 'warn'](`[webhook-doorbell] wake ${status}`, {
       event_type: canonical.type, agent_id: canonical.agent_id, ...detail,
     })
     try {
