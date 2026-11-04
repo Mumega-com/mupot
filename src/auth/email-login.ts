@@ -43,6 +43,7 @@ import { sha256Hex } from '../members/service'
 import { timingSafeEqual } from '../lib/crypto'
 import { normalizeInviteEmail } from './pending-invite-link'
 import { resolveEmailSender } from './email-sender'
+import { escapeHtml } from '../lib/html-escape'
 
 const ATTEMPT_TTL_SECONDS = 600 // 10 minutes — link + code share one expiry
 const RATE_LIMIT_WINDOW_SECONDS = 600 // 10-minute fixed buckets
@@ -424,11 +425,7 @@ export async function verifyEmailLoginByCode(
 }
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** The "check your inbox, or type the code" page after a successful /start

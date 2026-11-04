@@ -32,6 +32,7 @@ import type { LoopDecisionRow } from '../loops/decisions'
 import type { LoopManifest } from '../loops/manifest'
 import { getHumanDirective, type HumanDirective } from '../brain/directive'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
+import { escapeHtml } from '../lib/html-escape'
 
 // ── coherence physics (observe-only, #138) ───────────────────────────────────
 
@@ -659,5 +660,5 @@ async function brainControl(btn) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }

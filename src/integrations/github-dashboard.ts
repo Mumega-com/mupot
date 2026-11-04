@@ -4,13 +4,10 @@
 
 import { html, raw } from 'hono/html'
 import type { GitHubTier, GitHubFeature } from './github-capabilities'
+import { escapeHtml } from '../lib/html-escape'
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 export interface GitHubStatusView {

@@ -26,6 +26,7 @@ import type { AuthContext, Env, Capability } from '../types'
 import { acceptInvite, protectRawTokenResponse } from '../members'
 import { peekSessionAuth } from '../auth'
 import { provisionHomeForMember } from '../members/service'
+import { escapeHtml } from '../lib/html-escape'
 import {
   PENDING_INVITE_COOKIE,
   PENDING_INVITE_KV_PREFIX,
@@ -144,11 +145,7 @@ export async function loadInviteLanding(env: Env, inviteId: string): Promise<Inv
 // a second copy — both pages render config/DB strings (BRAND, org/invite
 // facts) into markup with no session behind them.
 export function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** Minimal self-contained shell — this page is unauthenticated and never

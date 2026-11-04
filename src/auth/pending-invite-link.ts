@@ -8,6 +8,7 @@
 
 import type { Env } from '../types'
 import { linkLoginIdentity, type LinkLoginIdentityResult } from './login-identity'
+import { escapeHtml } from '../lib/html-escape'
 
 export const PENDING_INVITE_COOKIE = 'mupot_pending_invite'
 export const PENDING_INVITE_KV_PREFIX = 'pending_invite_link:'
@@ -193,11 +194,7 @@ export async function linkAcceptedInviteIdentity(
 }
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** Refuse page: org/squad only. Never echoes invite.email or the IdP email. */

@@ -5,6 +5,7 @@
 import { Hono } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { peekSessionAuth } from './index'
+import { escapeHtml } from '../lib/html-escape'
 import {
   DEVICE_POLL_INTERVAL_SECONDS,
   consumeDeviceCsrf,
@@ -28,14 +29,6 @@ import {
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const deviceApp = new Hono<AppEnv>()
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
 
 deviceApp.post('/code', async (c) => {
   let agent = ''

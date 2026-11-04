@@ -42,6 +42,7 @@ import type { Env } from '../types'
 import { mintMemberToken } from '../members/service'
 import { ROLE_PRESETS, findPreset } from '../auth/role-presets'
 import type { RolePreset } from '../auth/role-presets'
+import { escapeHtml } from '../lib/html-escape'
 import {
   capabilityRank,
   resolveCapabilities,
@@ -275,11 +276,7 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
 // ── HTML views ────────────────────────────────────────────────────────────────
 
 function esc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  return escapeHtml(s)
 }
 
 /** The guide panel for a preset — what it allows and what it denies. */

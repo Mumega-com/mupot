@@ -64,6 +64,7 @@ import {
 } from './elevation'
 import { ELEVATION_ACTIONS } from './elevation-actions'
 import { withAuthTiming } from '../lib/server-timing'
+import { escapeHtml } from '../lib/html-escape'
 import {
   PENDING_INVITE_COOKIE,
   decidePendingInviteLink,
@@ -1027,12 +1028,12 @@ authApp.get('/reauth', requireAuthMw(), async (c) => {
 authApp.use('/telegram-link/confirm', csrf())
 
 function telegramLinkPage(brand: string, inner: string): string {
-  const esc = (v: string): string => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  const esc = (v: string): string => escapeHtml(v)
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Connect your sign-in · ${esc(brand)}</title></head><body><main>${inner}</main></body></html>`
 }
 
 function htmlEscape(v: string): string {
-  return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  return escapeHtml(v)
 }
 
 interface TgLinkContext {

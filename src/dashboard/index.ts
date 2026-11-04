@@ -346,6 +346,8 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 export const dashboardApp = new Hono<AppEnv>()
 
+const DASHBOARD_BASELINE_CSP = "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
 // ── browser-surface hardening ─────────────────────────────────────────────────
 // CSRF: every mutating dashboard route is a cookie-authenticated HTML-form POST.
 // SameSite=Lax already blocks cross-site POSTs; hono/csrf adds an Origin check so
@@ -361,6 +363,12 @@ dashboardApp.use('*', async (c, next) => {
   await next()
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'same-origin')
+  // Baseline CSP (mupot#981): defence in depth under the output escaping, never the only line.
+  // It forbids plugin content, <base> hijacking of relative URLs and framing. It deliberately does
+  // NOT restrict script-src/style-src: the shell and ~48 page scripts are inline, so a nonce policy
+  // is a separate rollout. form-action is also left open: claim/checkout POSTs redirect off-origin.
+  c.header('Content-Security-Policy', DASHBOARD_BASELINE_CSP)
+  c.header('X-Content-Type-Options', 'nosniff')
 })
 
 // ── auth gate (redirect HTML callers to login instead of 401 JSON) ───────────
