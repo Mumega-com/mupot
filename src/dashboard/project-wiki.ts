@@ -38,7 +38,8 @@
 // test/mutation, since a slug rendered here is upstream-sourced data this
 // module does not re-validate against Inkwell's own slug shape.
 import { html, raw } from 'hono/html'
-import { filterWikiGraphForCaller } from '../pages/inkwell-adapter'
+import { filterWikiGraphForCaller, upsertWithCapabilities } from '../pages/inkwell-adapter'
+import { PagesPortError } from '../pages/port'
 import { callerHasSquadAccessToProject } from '../projects/access'
 import type { AuthContext, Env, Project } from '../types'
 import type { Html } from './ui'
@@ -46,7 +47,7 @@ import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import { loadReadableSquads, projectAccess, projectTabs } from './projects'
 import {
   getProjectWikiGraph,
-  upsertProjectWikiTopic,
+  getProjectWikiTopic,
   WikiClientError,
   WikiConflictError,
   WikiRequestError,
@@ -220,10 +221,30 @@ export async function createOrRefreshProjectCard(
 ): Promise<CreateProjectCardOutcome> {
   const topic = buildProjectCardTopic(project)
   try {
-    const result = await upsertProjectWikiTopic(env, project.id, topic)
-    return { ok: true, result }
+    // Same capability-aware writer as project_wiki_upsert. The read below supplies the store's capabilities,
+    // the page revision and the page id for this request (a missing card = cold create: the writer probes once).
+    const found = await getProjectWikiTopic(env, project.id, topic.slug)
+    const v1 = found?.capabilities ?? null
+    const version = found?.topic.version
+    const pageId = found?.topic.id
+    const res = await upsertWithCapabilities(env, project.id, {
+      base: topic,
+      writer: 'mupot:dashboard',
+      ...(found ? { capabilities: found.capabilities ? { maxBodyBytes: found.capabilities.max_body_bytes, revisionHistory: found.capabilities.revision_history } : null } : {}),
+      ...(v1 && typeof version === 'number' ? { expectedVersion: version } : {}),
+      ...(v1 && typeof version === 'number' && pageId ? { expectedId: pageId } : {}),
+    })
+    return { ok: true, result: { ok: true, id: res.id, created: res.created, edges_upserted: res.edgesUpserted } }
   } catch (e) {
+    // A stale card write (someone moved the page between our read and write): the card is deterministic, so
+    // the owner can simply press refresh again. Never auto-retried here.
+    if (e instanceof PagesPortError && e.kind === 'stale') return { ok: false, status: 'wiki_conflict', code: 'stale_version' }
+    if (e instanceof PagesPortError && e.kind === 'unavailable') return { ok: false, status: 'wiki_unavailable' }
+    if (e instanceof PagesPortError && e.kind === 'rejected') return { ok: false, status: 'wiki_request_rejected', code: e.code }
+    if (e instanceof PagesPortError) return { ok: false, status: 'wiki_request_rejected', code: e.code }
     if (e instanceof WikiConflictError) {
+      // The store only attaches current_version for a STALE write on this project's own page.
+      if (e.currentVersion !== undefined) return { ok: false, status: 'wiki_conflict', code: 'stale_version' }
       return { ok: false, status: 'wiki_conflict', code: e.code, existingProject: e.existingProject }
     }
     if (e instanceof WikiRequestError) {

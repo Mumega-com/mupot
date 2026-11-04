@@ -87,6 +87,8 @@ export interface WikiTopic {
   last_writer?: string
   /** wiki-documents/v1 topic GET only: the full markdown document (null = none). Graph nodes never carry it. */
   body?: string | null
+  /** v1: a corrupt stored document reads as body:null + body_error. Surfaced, never repaired or thrown on. */
+  body_error?: string
 }
 
 export interface WikiEdge {
@@ -147,7 +149,7 @@ export interface WikiTopicUpsertInput {
    * request body is byte-identical to the pre-v1 shape. `expected_version`: 0 = create, N>0 = the storage
    * revision the caller last read. `body`: undefined leaves the stored document alone, '' clears it.
    */
-  document?: { expected_version: number; body?: string; writer: string }
+  document?: { expected_version: number; expected_id?: string; body?: string; writer: string }
 }
 
 export interface WikiTopicUpsertResult {
@@ -166,11 +168,34 @@ export interface WikiRevision {
   last_writer: string
 }
 
+/** Upstream request budget. Every Inkwell call is bounded and fails closed (wiki_unavailable). */
+export const WIKI_REQUEST_TIMEOUT_MS = 10_000
+
+/**
+ * Store-supplied writer text is untrusted: `svc:mupot/<writer>` is an opaque attestation, never compared to
+ * agent ids, and it reaches an agent-facing refusal. Strip control/bidi characters and bound it.
+ */
+export function boundedWriter(value: string): string {
+  // eslint-disable-next-line no-control-regex -- stripping C0/C1 controls and bidi overrides from untrusted text
+  return value.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g, '').slice(0, 200)
+}
+
 /** The one error shape every UNRECOVERABLE failure in this module collapses to. */
 export class WikiClientError extends Error {
   constructor(public readonly reason: 'wiki_unavailable', message?: string) {
     super(message ?? reason)
     this.name = 'WikiClientError'
+  }
+}
+
+/**
+ * 503 `schema_pending` from the document store: its migration is mid-rollout, so writes (and history) are
+ * paused. Still a WikiClientError (fail closed everywhere); the adapter gives it a next step.
+ */
+export class WikiSchemaPendingError extends WikiClientError {
+  constructor() {
+    super('wiki_unavailable', 'schema_pending')
+    this.name = 'WikiSchemaPendingError'
   }
 }
 
@@ -265,7 +290,9 @@ async function wikiRequest(
   fetchImpl?: typeof fetch,
 ): Promise<Response> {
   const origin = safeOrigin(cfg.apiUrl)
-  const doFetch = resolveCmsFetch(cfg.fetcher, fetchImpl)
+  const inner = resolveCmsFetch(cfg.fetcher, fetchImpl)
+  // Bounded: a hung upstream must fail closed, not hold the write open.
+  const doFetch: typeof fetch = (input, init) => inner(input, { ...init, signal: AbortSignal.timeout(WIKI_REQUEST_TIMEOUT_MS) })
   try {
     return await cmsFetch(
       origin,
@@ -312,13 +339,17 @@ async function throwForErrorResponse(res: Response): Promise<never> {
     const raw = body as { current_version?: unknown; last_writer?: unknown } | null
     const currentVersion = typeof raw?.current_version === 'number' && Number.isSafeInteger(raw.current_version) ? raw.current_version : undefined
     // last_writer is free text from the store: bound it before it reaches an agent-facing refusal.
-    const lastWriter = typeof raw?.last_writer === 'string' ? raw.last_writer.slice(0, 200) : undefined
+    const lastWriter = typeof raw?.last_writer === 'string' ? boundedWriter(raw.last_writer) : undefined
     throw new WikiConflictError(code, existingProject, currentVersion, lastWriter)
   }
   if (res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 403) {
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null
     const code = typeof body?.error === 'string' && body.error ? body.error : 'unknown_request_error'
     throw new WikiRequestError(res.status, code)
+  }
+  if (res.status === 503) {
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null
+    if (body?.error === 'schema_pending') throw new WikiSchemaPendingError()
   }
   throw new WikiClientError('wiki_unavailable', `status ${res.status}`)
 }
@@ -431,6 +462,8 @@ export async function upsertProjectWikiTopic(
     ...(topic.document
       ? {
           expected_version: topic.document.expected_version,
+          // The page id from the read: defeats delete/recreate ABA at the same slug. An older server ignores it.
+          ...(topic.document.expected_id !== undefined ? { expected_id: topic.document.expected_id } : {}),
           writer: topic.document.writer,
           ...(topic.document.body !== undefined ? { body: topic.document.body } : {}),
         }

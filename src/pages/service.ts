@@ -38,6 +38,8 @@ export interface PageWriteInput {
   body?: unknown
   /** Storage revision the caller last read (0 = create). Optional; see writePage for when it is required. */
   expectedVersion?: unknown
+  /** Store page id from the read (project_wiki_get page_id). Optional. */
+  expectedId?: unknown
   purpose: unknown
   tier: unknown
   tags: unknown
@@ -52,6 +54,7 @@ export interface ValidPageWrite {
   body?: string
   /** Validated non-negative safe integer, or undefined. */
   expectedVersion?: number
+  expectedId?: string
   purpose: string
   tier: PageTier
   tags: string[]
@@ -72,7 +75,10 @@ const RELATION_RE = /^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$|^[a-z0-9]$/
 /** Validate-and-normalize. REFUSES (never truncates): a silently clipped summary is silent data loss. */
 export function validatePageWrite(input: PageWriteInput): { ok: true; value: ValidPageWrite } | PageFailure {
   const bad = (detail: string): PageFailure => ({ ok: false, status: 400, error: 'invalid_args', detail })
-  const { slug, title, summary, body, expectedVersion, purpose, tier, tags, links } = input
+  const { slug, title, summary, body, purpose, tier, tags, links } = input
+  // null = omitted: an agent echoing `version: null` from a legacy read must not trip a type error.
+  const expectedVersion = input.expectedVersion === null ? undefined : input.expectedVersion
+  const expectedId = input.expectedId === null ? undefined : input.expectedId
   if (typeof slug !== 'string' || !PAGE_SLUG_RE.test(slug)) return bad('slug must be lowercase kebab, 3-63 chars')
   if (isReservedSlug(slug)) return { ok: false, status: 403, error: 'reserved_slug', detail: 'this slug prefix is reserved' }
   // The store collapses whitespace runs to one space and trims; do the same HERE so every length check
@@ -97,6 +103,9 @@ export function validatePageWrite(input: PageWriteInput): { ok: true; value: Val
   }
   if (expectedVersion !== undefined && (typeof expectedVersion !== 'number' || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0)) {
     return bad('expected_version must be a non-negative integer: the page version you last read (0 to create)')
+  }
+  if (expectedId !== undefined && (typeof expectedId !== 'string' || !/^[A-Za-z0-9._:-]{1,100}$/.test(expectedId))) {
+    return bad('expected_id must be the page_id you last read from project_wiki_get')
   }
   if (typeof purpose !== 'string' || !PURPOSE_RE.test(purpose)) return bad('purpose required: kebab, 3-32 chars (e.g. decision, runbook)')
   if (!isPageTier(tier)) return bad("tier required: 'project' or 'squad'")
@@ -133,7 +142,7 @@ export function validatePageWrite(input: PageWriteInput): { ok: true; value: Val
 
   return {
     ok: true,
-    value: { slug, title: squash(title), summary: squash(summary), ...(cleanBody !== undefined ? { body: cleanBody } : {}), ...(expectedVersion !== undefined ? { expectedVersion } : {}), purpose, tier, tags: cleanTags, links: cleanLinks },
+    value: { slug, title: squash(title), summary: squash(summary), ...(cleanBody !== undefined ? { body: cleanBody } : {}), ...(expectedVersion !== undefined ? { expectedVersion } : {}), ...(expectedId !== undefined ? { expectedId } : {}), purpose, tier, tags: cleanTags, links: cleanLinks },
   }
 }
 
@@ -142,6 +151,7 @@ export type PageWriteOutcome =
       ok: true; slug: string; created: boolean; version: number; linksWritten: number; envelope: PageEnvelope
       /** wiki-documents/v1 storage revision; undefined on a legacy store. Distinct from `version` (the old counter). */
       storageVersion?: number
+      storeId?: string
       verification?: 'readback' | 'history' | 'unverified'
       currentStorageVersion?: number
     }
@@ -149,12 +159,28 @@ export type PageWriteOutcome =
 
 function portFailure(e: PagesPortError): PageFailure {
   if (e.kind === 'conflict') return SLUG_UNAVAILABLE
-  if (e.kind === 'unsupported') return e.code === 'conditional_writes_unsupported' ? CAS_UNSUPPORTED : BODY_UNSUPPORTED
+  if (e.kind === 'unsupported') {
+    if (e.code === 'conditional_writes_unsupported') return CAS_UNSUPPORTED
+    if (e.code === 'body_unsupported_after_write') return BODY_NOT_STORED
+    return BODY_UNSUPPORTED
+  }
   if (e.kind === 'rejected') {
+    if (e.code === 'document_blocks_invalid') {
+      return {
+        ok: false, status: 409, error: 'document_corrupt',
+        detail: 'the stored document on this page is unreadable, so its body cannot be replaced safely; nothing was written. Ask the pot owner to repair the page (project_wiki_get shows body_error)',
+      }
+    }
     if (e.code === 'body_too_large') return { ok: false, status: 400, error: 'body_too_large', detail: 'body exceeds the store limit; split it across linked pages (nothing was truncated)' }
     return e.code === 'edge_target_invalid'
       ? { ok: false, status: 400, error: 'edge_target_invalid', detail: 'a link target is not an existing page in this project' }
       : { ok: false, status: 502, error: 'wiki_request_rejected' }
+  }
+  if (e.code === 'schema_pending') {
+    return {
+      ok: false, status: 503, error: 'wiki_schema_pending',
+      detail: 'the wiki store is mid-upgrade (its migration is not finished), so writes are paused; nothing was written. Retry later; if it persists ask the pot owner to finish the wiki store migration',
+    }
   }
   if (e.code === 'persistence_mismatch') {
     return {
@@ -171,6 +197,14 @@ function portFailure(e: PagesPortError): PageFailure {
 const BODY_UNSUPPORTED: PageFailure = {
   ok: false, status: 501, error: 'body_unsupported',
   detail: 'this wiki store cannot hold a page body yet; send title/summary only, or keep long text in project_remember and link it',
+}
+
+// The PUT WAS sent and acknowledged, then the readback showed the store had fallen back to legacy: the
+// title/summary landed, the body did not. Never say "nothing was created".
+const BODY_NOT_STORED: PageFailure = {
+  ok: false, status: 501, error: 'body_unsupported',
+  detail: 'the wiki store stopped accepting bodies mid-write: the page title/summary WERE written (the page may now exist) but the body was NOT stored. Re-read with project_wiki_get, and retry the body once the store upgrade is back',
+  data: { metadata_written: true, body_stored: false },
 }
 
 const CAS_UNSUPPORTED: PageFailure = {
@@ -212,7 +246,8 @@ export async function writePage(
       .bind(projectId, input.slug).first<{ version: number }>()
     if (existing && !existing.envelope) return SLUG_UNAVAILABLE
     // A squad page the caller cannot see is indistinguishable from a slug that is not theirs to take.
-    if (existing?.envelope?.tier === 'squad' && !args.canSeeSquadPages) return SLUG_UNAVAILABLE
+    // The READ path's predicate (any `tier:squad` stamp hides the page), not the first-tier decode.
+    if (existing && hiddenSquadPage(existing, args.canSeeSquadPages)) return SLUG_UNAVAILABLE
     // Refuse-only hint: we wrote here before but the store no longer shows the page (unpublished/removed).
     // The store's UPDATE matches unpublished rows and republishes them, so a put here would resurrect it.
     if (!existing && counter) return SLUG_UNAVAILABLE
@@ -228,12 +263,18 @@ export async function writePage(
     //    against a write that lands between our read and our put).
     //  - none and no page (or a legacy store): leave undefined; the adapter sends 0 (create) / nothing.
     let expectedVersion = input.expectedVersion
+    // The page id travels with the version: delete+recreate restarts at version 1 under a NEW id (ABA). The
+    // caller's id wins; otherwise the id of the read we just made. A different id is a stale write.
+    if (input.expectedId !== undefined && existing?.storeId !== undefined && input.expectedId !== existing.storeId) {
+      return staleFromPage(existing, expectedVersion)
+    }
+    const expectedId = input.expectedId ?? existing?.storeId
     if (expectedVersion === undefined && existing?.storageVersion !== undefined) {
       if (input.body !== undefined) {
         return {
           ok: false, status: 400, error: 'expected_version_required',
           detail: `this page already exists at version ${existing.storageVersion}; to replace or clear its body pass expected_version (read it with project_wiki_get, merge, then retry with expected_version ${existing.storageVersion})`,
-          data: { current_version: existing.storageVersion },
+          data: { current_version: existing.storageVersion, ...(existing.storeId ? { page_id: existing.storeId } : {}) },
         }
       }
       expectedVersion = existing.storageVersion
@@ -250,10 +291,13 @@ export async function writePage(
     try {
       res = await port.put(projectId, {
         slug: input.slug, title: input.title, summary: input.summary, ...(input.body !== undefined ? { body: input.body } : {}),
-        ...(expectedVersion !== undefined ? { expectedVersion } : {}), tags: input.tags, links: input.links, envelope,
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(expectedId !== undefined && expectedVersion !== 0 ? { expectedId } : {}),
+        ...(existing?.capabilities !== undefined ? { capabilities: existing.capabilities } : {}),
+        tags: input.tags, links: input.links, envelope,
       })
     } catch (e) {
-      if (e instanceof PagesPortError && e.kind === 'stale' && e.stale) return await staleFailure(port, projectId, input.slug, e.stale, args.canSeeSquadPages)
+      if (e instanceof PagesPortError && e.kind === 'stale' && e.stale) return await staleFailure(port, projectId, input.slug, expectedVersion, args.canSeeSquadPages)
       throw e
     }
 
@@ -267,6 +311,7 @@ export async function writePage(
     return {
       ok: true, slug: res.slug, created: res.created, version, linksWritten: res.linksWritten, envelope,
       ...(res.storageVersion !== undefined ? { storageVersion: res.storageVersion } : {}),
+      ...(res.storeId ? { storeId: res.storeId } : {}),
       ...(res.verification !== undefined ? { verification: res.verification } : {}),
       ...(res.currentStorageVersion !== undefined ? { currentStorageVersion: res.currentStorageVersion } : {}),
     }
@@ -276,28 +321,52 @@ export async function writePage(
   }
 }
 
+/** The READ path's predicate: ANY `tier:squad` stamp hides the page from a caller without squad access. */
+function hiddenSquadPage(page: PageRecord, canSeeSquadPages: boolean): boolean {
+  return !canSeeSquadPages && isSquadTierTags(page.rawTags ?? [`tier:${page.envelope?.tier}`])
+}
+
+/** The refusal for a write whose version/id no longer matches. Everything shown comes from the RE-READ page. */
+function staleFromPage(now: PageRecord, sentVersion: number | undefined): PageFailure {
+  if (now.storageVersion === undefined) return SLUG_UNAVAILABLE
+  const v = now.storageVersion
+  // Same number as the caller sent but still refused: the id changed (deleted and recreated) or a write raced
+  // at that exact revision. Pointing at "retry with N" would loop, so say the page was replaced.
+  const replaced = sentVersion !== undefined && sentVersion === v
+  const next = replaced
+    ? 're-read the page in full (project_wiki_get), merge, retry with the version AND page_id it returns'
+    : `re-read, merge, retry with expected_version ${v}`
+  return {
+    ok: false, status: 409, error: 'stale_version',
+    detail: replaced
+      ? 'the page was replaced or rewritten since you read it (same version number, different page). Nothing was overwritten. Re-read the page in full with project_wiki_get, merge your change, then retry with the version and page_id it returns'
+      : `the page changed since you read it (now version ${v}). Nothing was overwritten. Re-read with project_wiki_get, merge your change, then retry with expected_version ${v}`,
+    data: {
+      current_version: v,
+      ...(now.lastWriter ? { last_writer: now.lastWriter } : {}),
+      ...(now.storeId ? { page_id: now.storeId } : {}),
+      next_step: next,
+    },
+  }
+}
+
 /**
- * A stale write (the page moved past expected_version). The store only reveals where the page is after ITS
- * visibility check, but a squad-tier page is mupot's call: re-read once and fall back to the generic refusal
- * when the page is not ours, or is squad-tier and this caller may not see it, so a stale answer never names a
- * hidden squad page's version or last writer.
+ * A stale write (the page moved past expected_version, or the slug holds a different page). The store's 409
+ * body is NOT echoed: we re-read the page and decide visibility with the READ path's predicate, then show
+ * only what that re-read says. A page that is not ours, or is squad-tier for a caller without squad access,
+ * falls back to the generic refusal so a stale answer never names a hidden page's version or last writer.
  */
 async function staleFailure(
   port: PagesPort,
   projectId: string,
   slug: string,
-  stale: { currentVersion: number; lastWriter?: string },
+  sentVersion: number | undefined,
   canSeeSquadPages: boolean,
 ): Promise<PageFailure> {
   const now = await port.get(projectId, slug)
   if (!now || !now.envelope) return SLUG_UNAVAILABLE
-  if (now.envelope.tier === 'squad' && !canSeeSquadPages) return SLUG_UNAVAILABLE
-  const who = stale.lastWriter ? `, last written by ${stale.lastWriter}` : ''
-  return {
-    ok: false, status: 409, error: 'stale_version',
-    detail: `the page changed since you read it (now version ${stale.currentVersion}${who}). Nothing was overwritten. Re-read with project_wiki_get, merge your change, then retry with expected_version ${stale.currentVersion}`,
-    data: { current_version: stale.currentVersion, ...(stale.lastWriter ? { last_writer: stale.lastWriter } : {}), next_step: `re-read, merge, retry with expected_version ${stale.currentVersion}` },
-  }
+  if (hiddenSquadPage(now, canSeeSquadPages)) return SLUG_UNAVAILABLE
+  return staleFromPage(now, sentVersion)
 }
 
 // ── reads: squad-tier visibility enforced HERE, before anything reaches the MCP/dashboard layer ───────────────

@@ -39,10 +39,10 @@ async function writerId(auth: AuthContext): Promise<string> {
 
 const toolProjectWikiUpsert: ToolSpec = {
   name: 'project_wiki_upsert',
-  scope: "project wiki (write). tier 'squad' pages are readable and writable only by members of a squad with access to the project (org admins too); tier 'project' pages are visible to every project reader. Optional markdown body (<=65536 bytes UTF-8 after LF normalisation; refused over the cap, never truncated; a store that cannot hold bodies answers 501 body_unsupported before anything is created). Optional expected_version = the page `version` you last read from project_wiki_get (0 to create): a stale value is refused 409 stale_version with the current version and last writer and is NEVER auto-refreshed (re-read, merge, retry with that version); replacing or clearing the body of an existing page requires it. Returns storage_version (use it for the next expected_version; not the legacy `version` counter) and verification. Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max. RESERVED SLUG PREFIXES, refused 403 reserved_slug: project-card-, mupot-, system-. VOCABULARY (all kebab-case, lowercase alnum with single hyphens): slug 3-63; purpose 3-32 (e.g. decision, runbook, design, opinion); link relation 1-32 (e.g. opinion-on, depends-on, implements, supersedes) — underscores are refused, so opinion_on fails and opinion-on is accepted. Tags max 7, each <=40 chars, and no tag may start with owner: tier: v: by: at: (the adapter stamps those)",
+  scope: "project wiki (write). tier 'squad' pages are readable and writable only by members of a squad with access to the project (org admins too); tier 'project' pages are visible to every project reader. Optional markdown body (<=65536 bytes UTF-8 after LF normalisation; refused over the cap, never truncated; a store that cannot hold bodies answers 501 body_unsupported before anything is created). VERSIONS: `version` means the same thing in project_wiki_get and in this tool's result: the store's page revision (null on a legacy store). It is the ONLY number to pass back as expected_version. The old counter appears only as envelope.version and is never a CAS token. Optional expected_version = the `version` you last read (0 to create; null is treated as omitted): a stale value is refused 409 stale_version with the current version, last writer and a next step, and is NEVER auto-refreshed (re-read, merge, retry with that version); replacing or clearing the body of an existing page requires it. Optional expected_id = the page_id you last read: a slug that was deleted and recreated restarts at version 1 under a new id, and the store refuses a write whose id no longer matches (treated as stale). We send expected_id on every CAS write (an older store that does not know the field ignores it). Returns version, page_id, verification (readback|history|unverified) and current_storage_version when another writer already advanced the page (re-read, never pass it blind). A legacy store refuses a body with 501 body_unsupported before creating anything; a store that stops accepting bodies mid-write says what WAS written. 503 wiki_schema_pending = the wiki store migration is unfinished; retry later. Links are additive (never removed; relation change adds a second link). Text is whitespace-collapsed; summary is 500 chars max. RESERVED SLUG PREFIXES, refused 403 reserved_slug: project-card-, mupot-, system-. VOCABULARY (all kebab-case, lowercase alnum with single hyphens): slug 3-63; purpose 3-32 (e.g. decision, runbook, design, opinion); link relation 1-32 (e.g. opinion-on, depends-on, implements, supersedes) — underscores are refused, so opinion_on fails and opinion-on is accepted. Tags max 7, each <=40 chars, and no tag may start with owner: tier: v: by: at: (the adapter stamps those)",
   min: 'member',
   args:
-    '{ project_id: string, slug: string, title: string, summary: string(<=500), body?: string(markdown, <=65536 bytes), expected_version?: integer(page version last read; 0 = create), purpose: string(kebab 3-32: decision|runbook|design|opinion|...), tier: "project"|"squad", tags?: string[](max 7, <=40 each, no owner:/tier:/v:/by:/at: prefix), links?: [{to_slug, relation?}](relation kebab 1-32, e.g. opinion-on)}',
+    '{ project_id: string, slug: string, title: string, summary: string(<=500), body?: string(markdown, <=65536 bytes), expected_version?: integer|null(the `version` last read; 0 = create), expected_id?: string|null(the page_id last read), purpose: string(kebab 3-32: decision|runbook|design|opinion|...), tier: "project"|"squad", tags?: string[](max 7, <=40 each, no owner:/tier:/v:/by:/at: prefix), links?: [{to_slug, relation?}](relation kebab 1-32, e.g. opinion-on)}',
   inputSchema: {
     type: 'object',
     properties: {
@@ -51,7 +51,8 @@ const toolProjectWikiUpsert: ToolSpec = {
       title: STRING_SCHEMA,
       summary: STRING_SCHEMA,
       body: STRING_SCHEMA,
-      expected_version: { type: 'integer', minimum: 0 },
+      expected_version: { type: ['integer', 'null'], minimum: 0 },
+      expected_id: { type: ['string', 'null'] },
       purpose: STRING_SCHEMA,
       tier: { type: 'string', enum: ['project', 'squad'] },
       tags: { type: 'array', items: STRING_SCHEMA },
@@ -72,7 +73,7 @@ const toolProjectWikiUpsert: ToolSpec = {
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_args', 'project_id required')
     const checked = validatePageWrite({
-      slug: args.slug, title: args.title, summary: args.summary, body: args.body, expectedVersion: args.expected_version, purpose: args.purpose,
+      slug: args.slug, title: args.title, summary: args.summary, body: args.body, expectedVersion: args.expected_version, expectedId: args.expected_id, purpose: args.purpose,
       tier: args.tier, tags: args.tags, links: args.links,
     })
     if (!checked.ok) return fail(checked.status, checked.error, checked.detail)
@@ -94,8 +95,11 @@ const toolProjectWikiUpsert: ToolSpec = {
       project_id: project.id,
       slug: out.slug,
       result: out.created ? 'created' : 'updated',
-      version: out.version,
-      storage_version: out.storageVersion ?? null,
+      // `version` = the store revision, exactly as in project_wiki_get (null on a legacy store). The legacy
+      // counter is only envelope.version.
+      version: out.storageVersion ?? null,
+      page_id: out.storeId ?? null,
+      envelope: out.envelope,
       ...(out.verification ? { verification: out.verification } : {}),
       ...(out.currentStorageVersion !== undefined ? { current_storage_version: out.currentStorageVersion } : {}),
       owner: out.envelope.owner,
@@ -110,7 +114,7 @@ const toolProjectWikiUpsert: ToolSpec = {
 
 const toolProjectWikiGet: ToolSpec = {
   name: 'project_wiki_get',
-  scope: "visible workspace project; squad-tier pages are returned only to members of a squad with access to the project. Returns the markdown body (null when none), version (the storage revision to pass as expected_version when editing; null on a legacy store; NOT envelope.version, the old counter) and the pages linking to this slug",
+  scope: "visible workspace project; squad-tier pages are returned only to members of a squad with access to the project. Returns the markdown body (null when none; body_error 'invalid_content_blocks' when the stored document is corrupt), version (the store revision: the only number to pass as expected_version when editing; null on a legacy store; NOT envelope.version, the old counter), page_id (pass as expected_id) and the pages linking to this slug",
   min: 'observer',
   args: '{ project_id: string, slug: string }',
   inputSchema: {
@@ -141,6 +145,8 @@ const toolProjectWikiGet: ToolSpec = {
           summary: page.summary,
           body: page.body ?? null,
           version: page.storageVersion ?? null,
+          page_id: page.storeId ?? null,
+          ...(page.bodyError ? { body_error: page.bodyError } : {}),
           tags: page.tags,
           links: page.links.map((l) => ({ to_slug: l.toSlug, relation: l.relation })),
           envelope: page.envelope,

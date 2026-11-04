@@ -31,6 +31,9 @@ export interface PageEnvelope {
   writtenAt: string
 }
 
+/** What the store said it can do (wiki-documents/v1 handshake). null = legacy: metadata only. */
+export type StoreCapabilities = { maxBodyBytes: number; revisionHistory: boolean } | null
+
 export interface PageLink {
   toSlug: string
   relation?: string
@@ -45,8 +48,14 @@ export interface PageRecord {
   /** Caller tags only (envelope stamps are NOT mixed in). */
   /** Storage revision (wiki-documents/v1). undefined = a legacy store. NOT envelope.version (the old `v:` counter). */
   storageVersion?: number
-  /** Last writer as recorded by the store (v1), if any. */
+  /** Last writer as recorded by the store (v1), if any. An OPAQUE attestation (e.g. `svc:mupot/<writer>`): never compare it to agent ids. Bounded and control-stripped. */
   lastWriter?: string
+  /** The store's page id (v1). Pair it with storageVersion: a deleted-and-recreated slug restarts at version 1 under a NEW id. */
+  storeId?: string
+  /** A corrupt stored document reads as body undefined + bodyError (surfaced, not thrown). */
+  bodyError?: string
+  /** Capabilities carried by the SAME read (topic GET). undefined = this read could not say (probe needed). */
+  capabilities?: StoreCapabilities
   tags: string[]
   /** Raw store stamps, including incomplete envelopes, for fail-closed visibility checks. */
   rawTags?: string[]
@@ -70,6 +79,10 @@ export interface PagePutInput {
    * (`conditional_writes_unsupported`) rather than ignoring a safety request. Never the envelope counter.
    */
   expectedVersion?: number
+  /** Store page id from the read (v1). The store refuses the write when the slug now holds a different page. */
+  expectedId?: string
+  /** Capabilities from the read that preceded this write (same request). undefined = probe the store (cold create). */
+  capabilities?: StoreCapabilities
 }
 
 /** A page that links TO the requested slug. `tier` is null for a page this port did not stamp. */
@@ -86,6 +99,8 @@ export interface PagePutResult {
   linksWritten: number
   /** v1: the storage version this write produced. */
   storageVersion?: number
+  /** v1: the store's page id for this slug. */
+  storeId?: string
   /**
    * v1 persistence check after the write: 'readback' = GET shows our version and body; 'history' = another
    * writer already advanced the page and our own retained revision matched; 'unverified' = the store acked

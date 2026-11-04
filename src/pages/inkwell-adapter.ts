@@ -14,7 +14,11 @@ import {
   WikiClientError,
   WikiConflictError,
   WikiRequestError,
+  WikiSchemaPendingError,
+  boundedWriter,
+  type WikiDocumentCapabilities,
   type WikiTopic,
+  type WikiTopicUpsertInput,
 } from '../projects/wiki-client'
 import {
   bodyBytes,
@@ -28,6 +32,7 @@ import {
   type PagePutResult,
   type PageRecord,
   type PagesPort,
+  type StoreCapabilities,
 } from './port'
 
 export function encodeEnvelopeTags(e: PageEnvelope): string[] {
@@ -86,6 +91,7 @@ const EDGE_REFUSALS = new Set(['edge_target_invalid', 'cross_project_edge_refuse
 
 function mapError(e: unknown): never {
   if (e instanceof PagesPortError) throw e
+  if (e instanceof WikiSchemaPendingError) throw new PagesPortError('unavailable', 'schema_pending')
   if (e instanceof WikiConflictError) {
     // wiki-documents/v1: the store only attaches current_version once it has re-checked that THIS caller may
     // see the page, so a version here is a STALE write, not a slug probe. Without it: the generic refusal.
@@ -102,7 +108,15 @@ function mapError(e: unknown): never {
   throw e
 }
 
-function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: string; from_slug: string }[]): PageRecord {
+function toStoreCaps(c: WikiDocumentCapabilities | null): StoreCapabilities {
+  return c ? { maxBodyBytes: c.max_body_bytes, revisionHistory: c.revision_history } : null
+}
+
+function toRecord(
+  topic: WikiTopic,
+  edges: { to_slug: string; relation_type: string; from_slug: string }[],
+  capabilities: WikiDocumentCapabilities | null,
+): PageRecord {
   const tags = Array.isArray(topic.tags) ? topic.tags.filter((t): t is string => typeof t === 'string') : []
   const stamped = new Set(['owner:', 'tier:', 'v:', 'by:', 'at:'])
   const links: PageLink[] = edges
@@ -115,7 +129,10 @@ function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: str
     summary: topic.description,
     ...(typeof topic.body === 'string' && topic.body !== '' ? { body: topic.body } : {}),
     ...(hasStorageVersion ? { storageVersion: topic.version } : {}),
-    ...(typeof topic.last_writer === 'string' && topic.last_writer ? { lastWriter: topic.last_writer } : {}),
+    ...(typeof topic.last_writer === 'string' && boundedWriter(topic.last_writer) ? { lastWriter: boundedWriter(topic.last_writer) } : {}),
+    ...(hasStorageVersion && typeof topic.id === 'string' && topic.id ? { storeId: topic.id } : {}),
+    ...(typeof topic.body_error === 'string' && topic.body_error ? { bodyError: boundedWriter(topic.body_error) } : {}),
+    capabilities: toStoreCaps(capabilities),
     tags: tags.filter((t) => ![...stamped].some((p) => t.startsWith(p))),
     rawTags: tags,
     links,
@@ -125,20 +142,108 @@ function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: str
 
 const PERSISTENCE_MISMATCH = (): PagesPortError => new PagesPortError('unavailable', 'persistence_mismatch')
 
+/** Same normalisation the store applies to title/description, so the metadata readback compares like with like. */
+function cleanText(value: string, max: number): string {
+  return value.replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+export interface CapabilityAwareWrite {
+  base: WikiTopicUpsertInput
+  /** undefined = leave the stored body alone; '' clears it. */
+  body?: string
+  expectedVersion?: number
+  expectedId?: string
+  writer: string
+  /** From the read that preceded this write (same request). undefined = probe (cold create). */
+  capabilities?: StoreCapabilities
+}
+
+export interface CapabilityAwareResult {
+  id: string
+  created: boolean
+  edgesUpserted: number
+  storageVersion?: number
+  verification?: 'readback' | 'history' | 'unverified'
+  currentStorageVersion?: number
+}
+
+/**
+ * The ONE capability-aware writer, shared by PagesPort.put and the dashboard project-card write. Throws raw
+ * wiki-client errors and PagesPortError (callers map them). Capabilities come from the read the caller
+ * already made in this request, or from one handshake GET when there was none (cold create); they are never
+ * kept across requests.
+ */
+export async function upsertWithCapabilities(
+  env: Env,
+  projectId: string,
+  w: CapabilityAwareWrite,
+  fetchImpl?: typeof fetch,
+): Promise<CapabilityAwareResult> {
+  const hasBody = w.body !== undefined && w.body !== ''
+  const caps: StoreCapabilities =
+    w.capabilities !== undefined ? w.capabilities : toStoreCaps(await getProjectWikiCapabilities(env, projectId, fetchImpl))
+  if (!caps) {
+    // LEGACY: metadata-only, request byte-identical to before. A body or a CAS request cannot be honoured, so
+    // it is refused explicitly (never silently dropped) before anything is created.
+    if (hasBody) throw new PagesPortError('unsupported', 'body_unsupported')
+    if (w.expectedVersion !== undefined) throw new PagesPortError('unsupported', 'conditional_writes_unsupported')
+    const res = await upsertProjectWikiTopic(env, projectId, w.base, fetchImpl)
+    return { id: res.id, created: res.created, edgesUpserted: res.edges_upserted }
+  }
+
+  // UPGRADED (wiki-documents/v1).
+  const cap = Math.min(caps.maxBodyBytes, MAX_BODY_BYTES)
+  if (w.body !== undefined && bodyBytes(w.body) > cap) throw new PagesPortError('rejected', 'body_too_large') // refuse, never truncate
+  const expected = w.expectedVersion ?? 0
+  const res = await upsertProjectWikiTopic(
+    env,
+    projectId,
+    {
+      ...w.base,
+      document: {
+        expected_version: expected,
+        ...(w.expectedId !== undefined && expected > 0 ? { expected_id: w.expectedId } : {}),
+        writer: w.writer,
+        ...(w.body !== undefined ? { body: w.body } : {}),
+      },
+    },
+    fetchImpl,
+  )
+  // The echo must be EXACTLY expected+1. Anything else (missing, other number) means the ack cannot be
+  // trusted (an old/rolled-back server may ignore expected_version and body): we still check what we expect to
+  // have written (expected+1) by readback/history, and an uncheckable write is NOT success.
+  const putVersion = expected + 1
+  const echoed = res.version === putVersion
+  const verified = await verifyPersisted(
+    env, projectId,
+    { slug: w.base.slug, title: w.base.title, description: w.base.description ?? '', ...(w.body !== undefined ? { body: w.body } : {}) },
+    putVersion, caps.revisionHistory, echoed, fetchImpl,
+  )
+  return {
+    id: res.id,
+    created: res.created,
+    edgesUpserted: res.edges_upserted,
+    storageVersion: putVersion,
+    verification: verified.verification,
+    ...(verified.currentVersion !== undefined ? { currentStorageVersion: verified.currentVersion } : {}),
+  }
+}
+
 /**
  * Read the page back after an acknowledged write (`echoed` = the PUT response carried version === expected+1;
  * when false nothing about the ack is trusted and every "could not check" outcome is a failure). Outcomes:
- *  - our version + our body            -> 'readback'
- *  - a HIGHER version (another writer) -> our own retained revision (after_version = ours - 1) decides:
+ *  - our version + our body/title/description -> 'readback'
+ *  - a HIGHER version (another writer)        -> our own retained revision (after_version = ours - 1) decides:
  *      matches -> 'history'; absent/different -> persistence_mismatch; history unreadable -> 'unverified'
- *  - lower version, or our version with a different body -> persistence_mismatch (a real inconsistency)
- *  - the readback itself cannot be done -> 'unverified' (the store acked: this is NOT a failure and must not
- *    be blind-retried; a blind retry would double-apply or hit our own stale version).
+ *  - lower version, or our version with different content -> persistence_mismatch (a real inconsistency)
+ *  - readback has no storage version (the store fell back to legacy after the ack): the PUT was sent, so the
+ *    title/summary WERE written but a body was NOT stored -> body_unsupported_after_write (never "nothing created")
+ *  - the readback itself cannot be done -> 'unverified' (the store acked: NOT a failure, do not blind-retry)
  */
 async function verifyPersisted(
   env: Env,
   projectId: string,
-  input: PagePutInput,
+  sent: { slug: string; title: string; description: string; body?: string },
   putVersion: number,
   historyAvailable: boolean,
   echoed: boolean,
@@ -151,7 +256,7 @@ async function verifyPersisted(
   }
   let back: Awaited<ReturnType<typeof getProjectWikiTopic>>
   try {
-    back = await getProjectWikiTopic(env, projectId, input.slug, fetchImpl)
+    back = await getProjectWikiTopic(env, projectId, sent.slug, fetchImpl)
   } catch (e) {
     if (e instanceof WikiClientError || e instanceof WikiRequestError) return cannotCheck()
     throw e
@@ -160,13 +265,16 @@ async function verifyPersisted(
   const current = back.topic.version
   if (typeof current !== 'number' || !Number.isSafeInteger(current)) {
     // The handshake said v1 but the readback has no storage version: the server fell back to legacy between
-    // calls (rollback) and silently ignored expected_version/body. A body was NOT stored; say so.
-    if (input.body !== undefined && input.body !== '') throw new PagesPortError('unsupported', 'body_unsupported')
+    // calls (rollback) and ignored expected_version/body. The metadata landed; a body did not.
+    if (sent.body !== undefined && sent.body !== '') throw new PagesPortError('unsupported', 'body_unsupported_after_write')
     throw PERSISTENCE_MISMATCH()
   }
-  const wantBody = input.body !== undefined ? input.body : undefined
+  const wantBody = sent.body
   if (current === putVersion) {
     if (wantBody !== undefined && (back.topic.body ?? '') !== wantBody) throw PERSISTENCE_MISMATCH()
+    if (cleanText(back.topic.title, 120) !== cleanText(sent.title, 120) || cleanText(back.topic.description ?? '', 500) !== cleanText(sent.description, 500)) {
+      throw PERSISTENCE_MISMATCH()
+    }
     return { verification: 'readback' }
   }
   if (current < putVersion) throw PERSISTENCE_MISMATCH()
@@ -174,7 +282,7 @@ async function verifyPersisted(
   if (!historyAvailable) return cannotCheck(current)
   let revisions: Awaited<ReturnType<typeof getProjectWikiRevisions>>
   try {
-    revisions = await getProjectWikiRevisions(env, projectId, input.slug, putVersion - 1, fetchImpl)
+    revisions = await getProjectWikiRevisions(env, projectId, sent.slug, putVersion - 1, fetchImpl)
   } catch (e) {
     if (e instanceof WikiClientError || e instanceof WikiRequestError) return cannotCheck(current)
     throw e
@@ -196,59 +304,41 @@ export function createInkwellPagesPort(env: Env, fetchImpl?: typeof fetch): Page
     async get(projectId, slug) {
       try {
         const found = await getProjectWikiTopic(env, projectId, slug, fetchImpl)
-        return found ? toRecord(found.topic, found.edges) : null
+        return found ? toRecord(found.topic, found.edges, found.capabilities) : null
       } catch (e) {
         return mapError(e)
       }
     },
     async put(projectId, input: PagePutInput): Promise<PagePutResult> {
-      const hasBody = input.body !== undefined && input.body !== ''
       try {
-        // Cold-create handshake: ask the store what it is BEFORE deciding what to send, even for an empty project.
-        const caps = await getProjectWikiCapabilities(env, projectId, fetchImpl)
-        const base = {
-          slug: input.slug,
-          title: input.title,
-          description: input.summary,
-          topic_type: input.envelope.purpose,
-          tags: [...encodeEnvelopeTags(input.envelope), ...input.tags],
-          edges: input.links.map((l) => ({ to_slug: l.toSlug, relation_type: l.relation })),
-        }
-        if (!caps) {
-          // LEGACY: metadata-only, request byte-identical to before. A body or a CAS request cannot be honoured,
-          // so it is refused explicitly (never silently dropped) before anything is created.
-          if (hasBody) throw new PagesPortError('unsupported', 'body_unsupported')
-          if (input.expectedVersion !== undefined) throw new PagesPortError('unsupported', 'conditional_writes_unsupported')
-          const res = await upsertProjectWikiTopic(env, projectId, base, fetchImpl)
-          return { slug: input.slug, created: res.created, linksWritten: res.edges_upserted }
-        }
-
-        // UPGRADED (wiki-documents/v1).
-        const cap = Math.min(caps.max_body_bytes, MAX_BODY_BYTES)
-        if (input.body !== undefined) {
-          const bytes = bodyBytes(input.body)
-          if (bytes > cap) throw new PagesPortError('rejected', 'body_too_large') // refuse, never truncate
-        }
-        const expected = input.expectedVersion ?? 0
-        const res = await upsertProjectWikiTopic(
+        const res = await upsertWithCapabilities(
           env,
           projectId,
-          { ...base, document: { expected_version: expected, writer: input.envelope.writer, ...(input.body !== undefined ? { body: input.body } : {}) } },
+          {
+            base: {
+              slug: input.slug,
+              title: input.title,
+              description: input.summary,
+              topic_type: input.envelope.purpose,
+              tags: [...encodeEnvelopeTags(input.envelope), ...input.tags],
+              edges: input.links.map((l) => ({ to_slug: l.toSlug, relation_type: l.relation })),
+            },
+            ...(input.body !== undefined ? { body: input.body } : {}),
+            ...(input.expectedVersion !== undefined ? { expectedVersion: input.expectedVersion } : {}),
+            ...(input.expectedId !== undefined ? { expectedId: input.expectedId } : {}),
+            writer: input.envelope.writer,
+            ...(input.capabilities !== undefined ? { capabilities: input.capabilities } : {}),
+          },
           fetchImpl,
         )
-        // The echo must be EXACTLY expected+1. Anything else (missing, other number) means the ack cannot be
-        // trusted (an old/rolled-back server may ignore expected_version and body): we still check what we
-        // expect to have written (expected+1) by readback/history, and an uncheckable write is NOT success.
-        const putVersion = expected + 1
-        const echoed = res.version === putVersion
-        const verified = await verifyPersisted(env, projectId, input, putVersion, caps.revision_history, echoed, fetchImpl)
         return {
           slug: input.slug,
           created: res.created,
-          linksWritten: res.edges_upserted,
-          storageVersion: putVersion,
-          verification: verified.verification,
-          ...(verified.currentVersion !== undefined ? { currentStorageVersion: verified.currentVersion } : {}),
+          linksWritten: res.edgesUpserted,
+          ...(res.storageVersion !== undefined ? { storageVersion: res.storageVersion } : {}),
+          ...(res.id ? { storeId: res.id } : {}),
+          ...(res.verification ? { verification: res.verification } : {}),
+          ...(res.currentStorageVersion !== undefined ? { currentStorageVersion: res.currentStorageVersion } : {}),
         }
       } catch (e) {
         return mapError(e)
