@@ -82,6 +82,11 @@ export interface WikiTopic {
   published: boolean
   created_at: number
   updated_at: number
+  /** wiki-documents/v1 only: storage revision (distinct from the legacy `v:` envelope tag). Absent on a legacy server. */
+  version?: number
+  last_writer?: string
+  /** wiki-documents/v1 topic GET only: the full markdown document (null = none). Graph nodes never carry it. */
+  body?: string | null
 }
 
 export interface WikiEdge {
@@ -98,6 +103,31 @@ export interface WikiGraph {
   edges: WikiEdge[]
 }
 
+/** The only contract this client speaks. Anything else is treated as a legacy (metadata-only) server. */
+export const WIKI_DOCUMENTS_CONTRACT = 'wiki-documents/v1'
+
+export interface WikiDocumentCapabilities {
+  contract: typeof WIKI_DOCUMENTS_CONTRACT
+  max_body_bytes: number
+  /** Retained revisions can be read back (needed to verify our own write after another writer advanced it). */
+  revision_history: boolean
+}
+
+/**
+ * Strict handshake parse. Upgraded ONLY when the contract string matches exactly AND the server states it
+ * stores bodies AND honours conditional writes AND gives a sane byte cap. Everything else (field absent,
+ * unknown contract, body:false, conditional_writes:false, junk) is legacy: a partial server is not a server
+ * we can send expected_version/body to.
+ */
+export function parseWikiCapabilities(raw: unknown): WikiDocumentCapabilities | null {
+  if (!raw || typeof raw !== 'object') return null
+  const c = raw as Record<string, unknown> // narrowed from unknown; every field checked below
+  if (c.contract !== WIKI_DOCUMENTS_CONTRACT) return null
+  if (c.body !== true || c.conditional_writes !== true) return null
+  if (typeof c.max_body_bytes !== 'number' || !Number.isSafeInteger(c.max_body_bytes) || c.max_body_bytes < 1) return null
+  return { contract: WIKI_DOCUMENTS_CONTRACT, max_body_bytes: c.max_body_bytes, revision_history: c.revision_history === true }
+}
+
 export interface WikiTopicUpsertEdgeInput {
   to_slug: string
   relation_type?: string
@@ -112,6 +142,12 @@ export interface WikiTopicUpsertInput {
   topic_type?: string
   tags?: string[]
   edges?: WikiTopicUpsertEdgeInput[]
+  /**
+   * wiki-documents/v1 fields. Present ONLY when the handshake proved the server upgraded; absent = the
+   * request body is byte-identical to the pre-v1 shape. `expected_version`: 0 = create, N>0 = the storage
+   * revision the caller last read. `body`: undefined leaves the stored document alone, '' clears it.
+   */
+  document?: { expected_version: number; body?: string; writer: string }
 }
 
 export interface WikiTopicUpsertResult {
@@ -119,6 +155,15 @@ export interface WikiTopicUpsertResult {
   id: string
   created: boolean
   edges_upserted: number
+  /** v1 only: the storage version this write produced. */
+  version?: number
+  last_writer?: string
+}
+
+export interface WikiRevision {
+  version: number
+  body: string | null
+  last_writer: string
 }
 
 /** The one error shape every UNRECOVERABLE failure in this module collapses to. */
@@ -149,6 +194,9 @@ export class WikiConflictError extends Error {
   constructor(
     public readonly code: string,
     public readonly existingProject?: string,
+    /** v1: present only when the server judged the caller allowed to see the page (a STALE expected_version). */
+    public readonly currentVersion?: number,
+    public readonly lastWriter?: string,
   ) {
     super(code)
     this.name = 'WikiConflictError'
@@ -261,7 +309,11 @@ async function throwForErrorResponse(res: Response): Promise<never> {
     const body = (await res.json().catch(() => null)) as { error?: unknown; existing_project?: unknown } | null
     const code = typeof body?.error === 'string' && body.error ? body.error : 'unknown_conflict'
     const existingProject = typeof body?.existing_project === 'string' ? body.existing_project : undefined
-    throw new WikiConflictError(code, existingProject)
+    const raw = body as { current_version?: unknown; last_writer?: unknown } | null
+    const currentVersion = typeof raw?.current_version === 'number' && Number.isSafeInteger(raw.current_version) ? raw.current_version : undefined
+    // last_writer is free text from the store: bound it before it reaches an agent-facing refusal.
+    const lastWriter = typeof raw?.last_writer === 'string' ? raw.last_writer.slice(0, 200) : undefined
+    throw new WikiConflictError(code, existingProject, currentVersion, lastWriter)
   }
   if (res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 403) {
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null
@@ -313,6 +365,28 @@ export async function getProjectWikiGraph(
 }
 
 /**
+ * The cold-create handshake: GET graph (even for an EMPTY project) and parse its `capabilities`.
+ * null = legacy server (field absent, unknown contract, or any required capability missing).
+ * Kept separate from getProjectWikiGraph so the graph shape every existing surface renders is unchanged.
+ */
+export async function getProjectWikiCapabilities(
+  env: Env,
+  projectKey: string,
+  fetchImpl?: typeof fetch,
+): Promise<WikiDocumentCapabilities | null> {
+  const project = projectKey.toLowerCase()
+  if (!isWikiSlug(project)) throw new WikiClientError('wiki_unavailable')
+  const cfg = await resolveWikiConfig(env)
+  if (!cfg) throw new WikiClientError('wiki_unavailable')
+  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project })
+  const res = await wikiRequest(cfg, `/api/internal/wiki/graph?${qs.toString()}`, { method: 'GET' }, fetchImpl)
+  if (!res.ok) return throwForErrorResponse(res)
+  const json = (await res.json().catch(() => null)) as { nodes?: unknown; edges?: unknown; capabilities?: unknown } | null
+  if (!json || !Array.isArray(json.nodes) || !Array.isArray(json.edges)) throw new WikiClientError('wiki_unavailable')
+  return parseWikiCapabilities(json.capabilities)
+}
+
+/**
  * Upsert one topic (+ optional same-project edges) under a project's wiki.
  * Throws WikiClientError on missing config or an unreachable/malformed
  * upstream; WikiConflictError on ANY 409 (slug owned by another project, a
@@ -353,6 +427,14 @@ export async function upsertProjectWikiTopic(
     topic_type: topic.topic_type ?? 'general',
     tags: topic.tags ?? [],
     edges: topic.edges ?? [],
+    // Spread only for an upgraded server so a legacy request keeps its exact pre-v1 byte shape.
+    ...(topic.document
+      ? {
+          expected_version: topic.document.expected_version,
+          writer: topic.document.writer,
+          ...(topic.document.body !== undefined ? { body: topic.document.body } : {}),
+        }
+      : {}),
   }
   const res = await wikiRequest(
     cfg,
@@ -371,6 +453,8 @@ export async function upsertProjectWikiTopic(
     id: json.id,
     created: json.created,
     edges_upserted: typeof json.edges_upserted === 'number' ? json.edges_upserted : 0,
+    ...(typeof json.version === 'number' && Number.isSafeInteger(json.version) ? { version: json.version } : {}),
+    ...(typeof json.last_writer === 'string' ? { last_writer: json.last_writer } : {}),
   }
 }
 
@@ -385,7 +469,7 @@ export async function getProjectWikiTopic(
   projectKey: string,
   slug: string,
   fetchImpl?: typeof fetch,
-): Promise<{ topic: WikiTopic; edges: WikiEdge[] } | null> {
+): Promise<{ topic: WikiTopic; edges: WikiEdge[]; capabilities: WikiDocumentCapabilities | null } | null> {
   const project = projectKey.toLowerCase()
   if (!isWikiSlug(project) || !isWikiSlug(slug)) throw new WikiClientError('wiki_unavailable')
   const cfg = await resolveWikiConfig(env)
@@ -401,9 +485,51 @@ export async function getProjectWikiTopic(
   if (res.status === 404) return null
   if (!res.ok) return throwForErrorResponse(res)
 
-  const json = (await res.json().catch(() => null)) as { topic?: unknown; edges?: unknown } | null
+  const json = (await res.json().catch(() => null)) as { topic?: unknown; edges?: unknown; capabilities?: unknown } | null
   if (!json || !json.topic || typeof json.topic !== 'object' || !Array.isArray(json.edges)) {
     throw new WikiClientError('wiki_unavailable')
   }
-  return { topic: json.topic as WikiTopic, edges: json.edges as WikiEdge[] }
+  return { topic: json.topic as WikiTopic, edges: json.edges as WikiEdge[], capabilities: parseWikiCapabilities(json.capabilities) }
+}
+
+/**
+ * wiki-documents/v1 only: retained revisions of ONE topic strictly after `afterVersion` (first page, <=100).
+ * null exactly on 404 (absent/hidden/unsupported route). Used to verify our own write when a readback shows
+ * another writer already advanced the page.
+ */
+export async function getProjectWikiRevisions(
+  env: Env,
+  projectKey: string,
+  slug: string,
+  afterVersion: number,
+  fetchImpl?: typeof fetch,
+): Promise<WikiRevision[] | null> {
+  const project = projectKey.toLowerCase()
+  if (!isWikiSlug(project) || !isWikiSlug(slug) || !Number.isSafeInteger(afterVersion) || afterVersion < 0) {
+    throw new WikiClientError('wiki_unavailable')
+  }
+  const cfg = await resolveWikiConfig(env)
+  if (!cfg) throw new WikiClientError('wiki_unavailable')
+  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project, after_version: String(afterVersion) })
+  const res = await wikiRequest(
+    cfg,
+    `/api/internal/wiki/topics/${encodeURIComponent(slug)}/revisions?${qs.toString()}`,
+    { method: 'GET' },
+    fetchImpl,
+  )
+  if (res.status === 404) return null
+  if (!res.ok) return throwForErrorResponse(res)
+  const json = (await res.json().catch(() => null)) as { revisions?: unknown } | null
+  if (!json || !Array.isArray(json.revisions)) throw new WikiClientError('wiki_unavailable')
+  const out: WikiRevision[] = []
+  for (const r of json.revisions as unknown[]) {
+    const rec = r && typeof r === 'object' ? (r as Record<string, unknown>) : null // shape-probed below
+    if (!rec || typeof rec.version !== 'number' || !Number.isSafeInteger(rec.version)) continue
+    out.push({
+      version: rec.version,
+      body: typeof rec.body === 'string' ? rec.body : null,
+      last_writer: typeof rec.last_writer === 'string' ? rec.last_writer : '',
+    })
+  }
+  return out
 }

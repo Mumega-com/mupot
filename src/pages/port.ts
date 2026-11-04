@@ -7,8 +7,10 @@
 //
 // v2 adds an OPTIONAL markdown `body` (bounded by MAX_BODY_BYTES; refused over the cap, never truncated)
 // and listBacklinks. A body is a capability of the adapter (`supportsBody`): an adapter whose store cannot
-// hold one (the Inkwell wiki store until inkwell-api stores bodies) refuses a non-empty body with the typed
-// `body_unsupported` failure instead of silently dropping it. mupot keeps ALL access control (project read/
+// hold one refuses a non-empty body with the typed `body_unsupported` failure instead of silently dropping
+// it. The Inkwell adapter decides PER CALL from the store's own handshake (wiki-documents/v1 capabilities):
+// a legacy store keeps metadata-only behavior and refuses a body; an upgraded store takes body + storage
+// version compare-and-set (`expectedVersion`), a version that is NOT the envelope's `v:` counter. mupot keeps ALL access control (project read/
 // write, squad-tier visibility, in src/pages/service.ts); an adapter stores and returns text only.
 
 export const PAGE_TIERS = ['project', 'squad'] as const
@@ -41,6 +43,10 @@ export interface PageRecord {
   /** Markdown body (v2). undefined = the page has none or this adapter cannot store one. */
   body?: string
   /** Caller tags only (envelope stamps are NOT mixed in). */
+  /** Storage revision (wiki-documents/v1). undefined = a legacy store. NOT envelope.version (the old `v:` counter). */
+  storageVersion?: number
+  /** Last writer as recorded by the store (v1), if any. */
+  lastWriter?: string
   tags: string[]
   /** Raw store stamps, including incomplete envelopes, for fail-closed visibility checks. */
   rawTags?: string[]
@@ -58,6 +64,12 @@ export interface PagePutInput {
   tags: string[]
   links: PageLink[]
   envelope: PageEnvelope
+  /**
+   * Storage revision the caller last read (0 = create). undefined = no explicit expectation: the adapter
+   * sends 0 (create) to an upgraded store and nothing to a legacy one. A legacy store REFUSES an explicit value
+   * (`conditional_writes_unsupported`) rather than ignoring a safety request. Never the envelope counter.
+   */
+  expectedVersion?: number
 }
 
 /** A page that links TO the requested slug. `tier` is null for a page this port did not stamp. */
@@ -72,15 +84,27 @@ export interface PagePutResult {
   slug: string
   created: boolean
   linksWritten: number
+  /** v1: the storage version this write produced. */
+  storageVersion?: number
+  /**
+   * v1 persistence check after the write: 'readback' = GET shows our version and body; 'history' = another
+   * writer already advanced the page and our own retained revision matched; 'unverified' = the store acked
+   * but could not be read back (NOT a failure: do not blind-retry).
+   */
+  verification?: 'readback' | 'history' | 'unverified'
+  /** v1: set when the page is already past our version (another writer advanced it). */
+  currentStorageVersion?: number
 }
 
-export type PagesFailureKind = 'unavailable' | 'rejected' | 'conflict' | 'unsupported'
+export type PagesFailureKind = 'unavailable' | 'rejected' | 'conflict' | 'unsupported' | 'stale'
 
 /** The one error shape an adapter throws. `code` is a short safe enum, never an upstream body. */
 export class PagesPortError extends Error {
   constructor(
     public readonly kind: PagesFailureKind,
     public readonly code: string,
+    /** kind 'stale' only: where the page is now. Authorized by the store; the service re-checks tier before use. */
+    public readonly stale?: { currentVersion: number; lastWriter?: string },
   ) {
     super(`${kind}:${code}`)
     this.name = 'PagesPortError'
@@ -90,7 +114,7 @@ export class PagesPortError extends Error {
 export interface PagesPort {
   /** Adapter id, e.g. 'inkwell-wiki'. */
   readonly id: string
-  /** true when put() can store `body`. false = put() throws PagesPortError('unsupported', 'body_unsupported') for a non-empty body. */
+  /** true when put() MAY store `body`. false = refuse before I/O. The Inkwell adapter says true and refuses per call when its store's handshake lacks the capability. */
   readonly supportsBody: boolean
   /** null exactly when the page does not exist (or is not visible to the service path). */
   get(projectId: string, slug: string): Promise<PageRecord | null>
@@ -99,8 +123,10 @@ export interface PagesPort {
    *  - LINKS ARE ADDITIVE: put adds the given links and NEVER removes links written earlier; a link is
    *    identified by (from, to, relation), so re-putting the same target with a different relation adds a
    *    second link. There is no removal in v1.
-   *  - NO COMPARE-AND-SWAP: two concurrent puts both succeed, last writer wins the text, and their stamped
-   *    versions can repeat or land out of order. The version counter only guarantees the NEXT stamp advances.
+   *  - COMPARE-AND-SWAP only where the store offers it (wiki-documents/v1 `expectedVersion`; a stale write
+   *    throws PagesPortError('stale')). On a legacy store there is none: two concurrent puts both succeed, last
+   *    writer wins the text, and their stamped versions can repeat or land out of order. The version counter
+   *    only guarantees the NEXT stamp advances.
    *  - Text is normalised by the store (whitespace runs collapse to one space); callers pre-normalise.
    *  - An update must not change publication state, and must not touch a page the caller did not stamp
    *    (the service enforces the latter from the envelope returned by get).
@@ -128,6 +154,14 @@ export const MAX_TAG_LEN = 40
 export const MAX_LINKS = 20
 /** Markdown body cap in UTF-8 BYTES. Over the cap is refused, never truncated. */
 export const MAX_BODY_BYTES = 64 * 1024
+
+/** Normalise line endings exactly as the store will hold them (LF). The cap is measured on THIS form. */
+export function normalizeBody(body: string): string {
+  return body.replace(/\r\n?/g, '\n')
+}
+export function bodyBytes(body: string): number {
+  return new TextEncoder().encode(body).length
+}
 /** Tag prefixes the adapter uses to stamp the envelope; a caller tag with one is refused (forgery). */
 export const ENVELOPE_TAG_PREFIXES: readonly string[] = ['owner:', 'tier:', 'v:', 'by:', 'at:']
 

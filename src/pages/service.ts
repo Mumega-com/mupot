@@ -8,6 +8,7 @@
 import type { Env } from '../types'
 import { isSquadTierTags } from './inkwell-adapter'
 import {
+  bodyBytes,
   ENVELOPE_TAG_PREFIXES,
   isPageTier,
   isReservedSlug,
@@ -18,6 +19,7 @@ import {
   MAX_TITLE,
   MAX_USER_TAGS,
   MIN_TITLE,
+  normalizeBody,
   PAGE_SLUG_RE,
   PagesPortError,
   PURPOSE_RE,
@@ -34,6 +36,8 @@ export interface PageWriteInput {
   title: unknown
   summary: unknown
   body?: unknown
+  /** Storage revision the caller last read (0 = create). Optional; see writePage for when it is required. */
+  expectedVersion?: unknown
   purpose: unknown
   tier: unknown
   tags: unknown
@@ -46,20 +50,29 @@ export interface ValidPageWrite {
   summary: string
   /** undefined = leave the stored body unchanged; '' clears it. */
   body?: string
+  /** Validated non-negative safe integer, or undefined. */
+  expectedVersion?: number
   purpose: string
   tier: PageTier
   tags: string[]
   links: PageLink[]
 }
 
-export type PageFailure = { ok: false; status: 400 | 403 | 404 | 409 | 501 | 502 | 503; error: string; detail?: string }
+export type PageFailure = {
+  ok: false
+  status: 400 | 403 | 404 | 409 | 501 | 502 | 503
+  error: string
+  detail?: string
+  /** Structured, safe extras for the caller (e.g. stale_version: current_version, last_writer, next_step). */
+  data?: Record<string, unknown>
+}
 
 const RELATION_RE = /^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$|^[a-z0-9]$/
 
 /** Validate-and-normalize. REFUSES (never truncates): a silently clipped summary is silent data loss. */
 export function validatePageWrite(input: PageWriteInput): { ok: true; value: ValidPageWrite } | PageFailure {
   const bad = (detail: string): PageFailure => ({ ok: false, status: 400, error: 'invalid_args', detail })
-  const { slug, title, summary, body, purpose, tier, tags, links } = input
+  const { slug, title, summary, body, expectedVersion, purpose, tier, tags, links } = input
   if (typeof slug !== 'string' || !PAGE_SLUG_RE.test(slug)) return bad('slug must be lowercase kebab, 3-63 chars')
   if (isReservedSlug(slug)) return { ok: false, status: 403, error: 'reserved_slug', detail: 'this slug prefix is reserved' }
   // The store collapses whitespace runs to one space and trims; do the same HERE so every length check
@@ -77,9 +90,13 @@ export function validatePageWrite(input: PageWriteInput): { ok: true; value: Val
     if (typeof body !== 'string') return bad('body must be a markdown string')
     // eslint-disable-next-line no-control-regex -- NUL / C0 controls (except \t \n \r) have no place in markdown text
     if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(body)) return bad('body contains control characters')
-    const bytes = new TextEncoder().encode(body).length
+    // The cap is measured on what will be stored: after CRLF/CR -> LF normalisation, in UTF-8 bytes.
+    cleanBody = normalizeBody(body)
+    const bytes = bodyBytes(cleanBody)
     if (bytes > MAX_BODY_BYTES) return bad(`body is ${bytes} bytes; max ${MAX_BODY_BYTES}. Split it across linked pages (nothing was truncated)`)
-    cleanBody = body.replace(/\r\n?/g, '\n')
+  }
+  if (expectedVersion !== undefined && (typeof expectedVersion !== 'number' || !Number.isSafeInteger(expectedVersion) || expectedVersion < 0)) {
+    return bad('expected_version must be a non-negative integer: the page version you last read (0 to create)')
   }
   if (typeof purpose !== 'string' || !PURPOSE_RE.test(purpose)) return bad('purpose required: kebab, 3-32 chars (e.g. decision, runbook)')
   if (!isPageTier(tier)) return bad("tier required: 'project' or 'squad'")
@@ -116,21 +133,34 @@ export function validatePageWrite(input: PageWriteInput): { ok: true; value: Val
 
   return {
     ok: true,
-    value: { slug, title: squash(title), summary: squash(summary), ...(cleanBody !== undefined ? { body: cleanBody } : {}), purpose, tier, tags: cleanTags, links: cleanLinks },
+    value: { slug, title: squash(title), summary: squash(summary), ...(cleanBody !== undefined ? { body: cleanBody } : {}), ...(expectedVersion !== undefined ? { expectedVersion } : {}), purpose, tier, tags: cleanTags, links: cleanLinks },
   }
 }
 
 export type PageWriteOutcome =
-  | { ok: true; slug: string; created: boolean; version: number; linksWritten: number; envelope: PageEnvelope }
+  | {
+      ok: true; slug: string; created: boolean; version: number; linksWritten: number; envelope: PageEnvelope
+      /** wiki-documents/v1 storage revision; undefined on a legacy store. Distinct from `version` (the old counter). */
+      storageVersion?: number
+      verification?: 'readback' | 'history' | 'unverified'
+      currentStorageVersion?: number
+    }
   | PageFailure
 
 function portFailure(e: PagesPortError): PageFailure {
   if (e.kind === 'conflict') return SLUG_UNAVAILABLE
-  if (e.kind === 'unsupported') return BODY_UNSUPPORTED
+  if (e.kind === 'unsupported') return e.code === 'conditional_writes_unsupported' ? CAS_UNSUPPORTED : BODY_UNSUPPORTED
   if (e.kind === 'rejected') {
+    if (e.code === 'body_too_large') return { ok: false, status: 400, error: 'body_too_large', detail: 'body exceeds the store limit; split it across linked pages (nothing was truncated)' }
     return e.code === 'edge_target_invalid'
       ? { ok: false, status: 400, error: 'edge_target_invalid', detail: 'a link target is not an existing page in this project' }
       : { ok: false, status: 502, error: 'wiki_request_rejected' }
+  }
+  if (e.code === 'persistence_mismatch') {
+    return {
+      ok: false, status: 502, error: 'wiki_persistence_mismatch',
+      detail: 'the store acknowledged the write but the page read back differently; do NOT blindly retry: re-read with project_wiki_get and compare before writing again',
+    }
   }
   return { ok: false, status: 503, error: 'wiki_unavailable' }
 }
@@ -141,6 +171,11 @@ function portFailure(e: PagesPortError): PageFailure {
 const BODY_UNSUPPORTED: PageFailure = {
   ok: false, status: 501, error: 'body_unsupported',
   detail: 'this wiki store cannot hold a page body yet; send title/summary only, or keep long text in project_remember and link it',
+}
+
+const CAS_UNSUPPORTED: PageFailure = {
+  ok: false, status: 501, error: 'conditional_writes_unsupported',
+  detail: 'this wiki store cannot check expected_version yet; omit it (the write would be unconditional) or wait for the store upgrade',
 }
 
 // ONE refusal for every "that slug is not yours to take" case (taken by another project, held by a page this
@@ -185,6 +220,25 @@ export async function writePage(
       return { ok: false, status: 403, error: 'tier_change_owner_only', detail: 'only the page owner may change its tier' }
     }
 
+    // Storage-version expectation. NEVER the envelope `v:` counter and NEVER silently refreshed after a stale 409.
+    //  - caller gave one: use it verbatim.
+    //  - none, the page exists on an upgraded store, and the call carries a body: refuse. Replacing (or clearing)
+    //    a document without naming the revision you read is a blind overwrite.
+    //  - none, metadata-only: the store keeps the body, so condition on the revision we just read (still CAS
+    //    against a write that lands between our read and our put).
+    //  - none and no page (or a legacy store): leave undefined; the adapter sends 0 (create) / nothing.
+    let expectedVersion = input.expectedVersion
+    if (expectedVersion === undefined && existing?.storageVersion !== undefined) {
+      if (input.body !== undefined) {
+        return {
+          ok: false, status: 400, error: 'expected_version_required',
+          detail: `this page already exists at version ${existing.storageVersion}; to replace or clear its body pass expected_version (read it with project_wiki_get, merge, then retry with expected_version ${existing.storageVersion})`,
+          data: { current_version: existing.storageVersion },
+        }
+      }
+      expectedVersion = existing.storageVersion
+    }
+
     const owner = existing?.envelope?.owner ?? writer
     const version = Math.max(counter?.version ?? 0, existing?.envelope?.version ?? 0) + 1
     const envelope: PageEnvelope = { owner, writer, tier: input.tier, purpose: input.purpose, version, writtenAt }
@@ -192,9 +246,16 @@ export async function writePage(
     // PUT FIRST. A refused or failed put (bad link, outage, conflict) leaves no counter row and no owner
     // claim anywhere (owner exists only in the text record), so a failed write cannot squat a slug. The
     // only cost of a failure is that no version is consumed.
-    const res = await port.put(projectId, {
-      slug: input.slug, title: input.title, summary: input.summary, ...(input.body !== undefined ? { body: input.body } : {}), tags: input.tags, links: input.links, envelope,
-    })
+    let res: Awaited<ReturnType<PagesPort['put']>>
+    try {
+      res = await port.put(projectId, {
+        slug: input.slug, title: input.title, summary: input.summary, ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}), tags: input.tags, links: input.links, envelope,
+      })
+    } catch (e) {
+      if (e instanceof PagesPortError && e.kind === 'stale' && e.stale) return await staleFailure(port, projectId, input.slug, e.stale, args.canSeeSquadPages)
+      throw e
+    }
 
     // Counter only advances. The put has NO compare-and-swap (see PagesPort.put), so two racing writers can
     // stamp the same version; MAX(counter + 1, stamped) still moves the counter past both so the NEXT stamp is
@@ -203,10 +264,39 @@ export async function writePage(
       `INSERT INTO page_versions (project_id, slug, version) VALUES (?1, ?2, ?3)
        ON CONFLICT (project_id, slug) DO UPDATE SET version = MAX(page_versions.version + 1, excluded.version)`,
     ).bind(projectId, input.slug, version).run()
-    return { ok: true, slug: res.slug, created: res.created, version, linksWritten: res.linksWritten, envelope }
+    return {
+      ok: true, slug: res.slug, created: res.created, version, linksWritten: res.linksWritten, envelope,
+      ...(res.storageVersion !== undefined ? { storageVersion: res.storageVersion } : {}),
+      ...(res.verification !== undefined ? { verification: res.verification } : {}),
+      ...(res.currentStorageVersion !== undefined ? { currentStorageVersion: res.currentStorageVersion } : {}),
+    }
   } catch (e) {
     if (e instanceof PagesPortError) return portFailure(e)
     throw e
+  }
+}
+
+/**
+ * A stale write (the page moved past expected_version). The store only reveals where the page is after ITS
+ * visibility check, but a squad-tier page is mupot's call: re-read once and fall back to the generic refusal
+ * when the page is not ours, or is squad-tier and this caller may not see it, so a stale answer never names a
+ * hidden squad page's version or last writer.
+ */
+async function staleFailure(
+  port: PagesPort,
+  projectId: string,
+  slug: string,
+  stale: { currentVersion: number; lastWriter?: string },
+  canSeeSquadPages: boolean,
+): Promise<PageFailure> {
+  const now = await port.get(projectId, slug)
+  if (!now || !now.envelope) return SLUG_UNAVAILABLE
+  if (now.envelope.tier === 'squad' && !canSeeSquadPages) return SLUG_UNAVAILABLE
+  const who = stale.lastWriter ? `, last written by ${stale.lastWriter}` : ''
+  return {
+    ok: false, status: 409, error: 'stale_version',
+    detail: `the page changed since you read it (now version ${stale.currentVersion}${who}). Nothing was overwritten. Re-read with project_wiki_get, merge your change, then retry with expected_version ${stale.currentVersion}`,
+    data: { current_version: stale.currentVersion, ...(stale.lastWriter ? { last_writer: stale.lastWriter } : {}), next_step: `re-read, merge, retry with expected_version ${stale.currentVersion}` },
   }
 }
 

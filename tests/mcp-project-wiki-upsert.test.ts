@@ -195,7 +195,8 @@ describe('project_wiki_upsert / project_wiki_get', () => {
     r = await rig()
     const o = await upsert(auth(SQ_W), r.env, { ...base, body: '# long text' })
     expect(o.ok).toBe(false)
-    expect(r.fake.requests).toEqual([])
+    // Legacy store: the handshake (GET graph) and the service's reads happen, but NO create/PUT ever does.
+    expect(r.fake.requests.filter((q) => q.method === 'PUT')).toEqual([])
   })
 
   it('envelope is required: missing purpose, missing tier, bad tier are all refused', async () => {
