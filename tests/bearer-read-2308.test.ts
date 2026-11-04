@@ -284,7 +284,7 @@ describe('the allowlist and the method check', () => {
   }
   const SAMPLES = [
     '/api/tasks', '/api/tasks/audit', '/api/tasks/t-1', '/api/gates/grants', '/api/projects', '/api/projects/p-1',
-    '/api/projects/p-1/activity', '/api/projects/p-1/evidence', '/api/projects/p-1/squads',
+    '/api/projects/p-1/activity', '/api/projects/p-1/squads',
     '/api/kanban/board', '/api/telemetry/board-latency', '/api/pots',
   ]
   it('has a sample for every allowlist entry', () => {
@@ -322,6 +322,7 @@ describe('the allowlist and the method check', () => {
     '/api/auth/sso/config', '/api/studio/database/query', '/api/studio/database/tables',
     '/api/agent-connections/r-1/status', '/api/alerts/webhooks', '/api/channels/bindings', '/api/channels/sync/status',
     '/api/billing/status', '/api/members/members', '/api/members/members/m-1',
+    '/api/projects/p-1/evidence',
     '/api/loops', '/api/loops/l-1', '/api/loops/l-1/decisions',
     // dropped in round 2: no capability gate beyond the tenant (agents status, org/*)
     '/api/agents/agent-a/status', '/api/org/departments', '/api/org/departments/d-1/squads', '/api/org/squads/s-1/agents', '/api/org/tree',

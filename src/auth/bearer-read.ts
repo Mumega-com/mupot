@@ -63,6 +63,7 @@ const route = (pattern: string, min: Capability): BearerRoute => ({ re: new RegE
  *  - /api/channels/*                  channel bindings and sync status
  *  - /api/billing/status              returns the Stripe customer id
  *  - /api/members/members*            email + telegram_chat_id of every member (more than the MCP twin shows)
+ *  - /api/projects/:id/evidence       task results, receipt ids and verdict notes; no MCP twin (#2318 round-2 lens)
  *  - every non-GET/HEAD method, and everything not named below
  */
 export const BEARER_READ_ROUTES: readonly BearerRoute[] = [
@@ -73,7 +74,6 @@ export const BEARER_READ_ROUTES: readonly BearerRoute[] = [
   route('/api/projects', 'observer'), // project_list
   route(`/api/projects/${SEG}`, 'observer'), // project_get
   route(`/api/projects/${SEG}/activity`, 'observer'),
-  route(`/api/projects/${SEG}/evidence`, 'observer'),
   route(`/api/projects/${SEG}/squads`, 'observer'), // project_squad_list
   route('/api/kanban/board', 'member'), // kanban_board
   route('/api/telemetry/board-latency', 'admin'), // handler is org-admin only
