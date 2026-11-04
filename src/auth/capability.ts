@@ -273,6 +273,20 @@ export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
 }
 
 /**
+ * displayRole — the role to SHOW an agent or human (status / boot_context). DISPLAY ONLY:
+ * no permission decision may read this. It is derived from the same two planes isOrgAdmin
+ * reads (legacy `auth.role`, then ORG-scope grants), so the label can never disagree with
+ * the capability check: owner when either plane says owner, admin when isOrgAdmin is true
+ * for any other reason, else the coarse role unchanged (mupot#2309).
+ */
+export function displayRole(auth: AuthContext): string {
+  if (auth.role === 'owner') return 'owner'
+  if (auth.capabilities !== undefined && hasCapability(auth.capabilities, 'org', null, 'owner')) return 'owner'
+  if (isOrgAdmin(auth)) return 'admin'
+  return auth.role
+}
+
+/**
  * sessionMemberId — the ONE way a request handler may read "which member is
  * this session" (mupot#1583 round 1, P0). Pure and synchronous, on purpose:
  * `auth.memberId` / `auth.webSessionMemberId` are exactly what the cookie

@@ -206,12 +206,12 @@ describe('public meter status authorization', () => {
     expect(meterReads.value).toBe(0)
   })
 
-  it('denies an unbound member with no target before any meter read', async () => {
+  it('rejects an unbound caller with no target as invalid_args (mupot#2310), before any meter read', async () => {
     const { env, meterReads } = trackedEnv(harness)
 
     const outcome = await status(env, auth('member-a'))
 
-    expect(outcome).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(outcome).toMatchObject({ ok: false, status: 400, error: 'invalid_args', detail: 'agent_id required' })
     expect(meterReads.value).toBe(0)
   })
 

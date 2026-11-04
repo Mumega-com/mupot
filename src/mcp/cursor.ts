@@ -149,13 +149,16 @@ export const toolCursorRunStatus: ToolSpec = {
   name: 'cursor_run_status',
   scope: 'squad',
   min: 'observer',
-  args: '{ agent_id?: string, run_id?: string, reservation_id?: string }',
+  args: '{ reservation_id: string } OR { agent_id: string, run_id: string }',
+  // Not oneOf at the top level: several MCP clients reject a top-level combinator. The real
+  // requirement is stated in descriptions and enforced in run() with a detail naming the fields (mupot#2310).
   inputSchema: {
     type: 'object',
+    description: 'Provide reservation_id, OR both agent_id and run_id. All three are individually optional but one of those two forms is required.',
     properties: {
-      agent_id: STRING_SCHEMA,
-      run_id: STRING_SCHEMA,
-      reservation_id: STRING_SCHEMA,
+      agent_id: { type: 'string', description: 'Vendor agent id. Required together with run_id when reservation_id is not given.' },
+      run_id: { type: 'string', description: 'Vendor run id. Required together with agent_id when reservation_id is not given.' },
+      reservation_id: { type: 'string', description: 'Reservation id. Alone it is sufficient; omit agent_id and run_id.' },
     },
     additionalProperties: false,
   },
@@ -165,7 +168,8 @@ export const toolCursorRunStatus: ToolSpec = {
     const reservationId = str(args.reservation_id)
 
     if (!reservationId && (!agentId || !runId)) {
-      return fail(400, 'invalid_args')
+      const missing = [!agentId ? 'agent_id' : null, !runId ? 'run_id' : null].filter((f): f is string => f !== null)
+      return fail(400, 'invalid_args', `provide reservation_id, or agent_id plus run_id; missing: ${missing.join(', ')}`)
     }
 
     if (auth.boundAgentId) {
