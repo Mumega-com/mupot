@@ -19,7 +19,8 @@
 //
 // Architecture source: docs/architecture/marketing-channels.md §2, §7 (channel pattern).
 
-import { z } from 'zod'
+// namespace import: lets the bundler drop the 64 unused zod locales (tests/zod-validators-parity.test.ts)
+import * as z from 'zod'
 import type { ChannelDescriptor } from './contract'
 
 // ── WordpressChannelConfigSchema ──────────────────────────────────────────────

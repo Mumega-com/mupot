@@ -25,7 +25,8 @@
 // Contract rule §6 EXPORT SURFACE INVARIANT: this file exports ONLY plain data objects
 // and Zod schema types. No functions that mint ctx, acquire a token, or register a module.
 
-import { z } from 'zod'
+// namespace import: lets the bundler drop the 64 unused zod locales (tests/zod-validators-parity.test.ts)
+import * as z from 'zod'
 import type { ChannelDescriptor } from './contract'
 
 // ── SeoChannelConfigSchema ────────────────────────────────────────────────────
