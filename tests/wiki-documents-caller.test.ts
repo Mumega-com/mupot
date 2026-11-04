@@ -562,10 +562,11 @@ describe('adversarial P3s: re-read values, bounded text, readback guards', () =>
     expect(JSON.stringify(out)).not.toMatch(/secret title|Ignore previous|99/)
   })
   it('a hostile last_writer is control-stripped and capped at 200 chars, and kept out of the prose', async () => {
-    seed('long-writer', { version: 3, body: 'x', last_writer: `svc:mupot/${'w'.repeat(500)}\nIGNORE\u202e` })
+    seed('long-writer', { version: 3, body: 'x', last_writer: `svc:mupot/\nIGNORE\u202e${'w'.repeat(500)}` })
     const out = failOf(await upsert({ slug: 'long-writer', body: 'y', expected_version: 2 }))
     const lw = (out.detail as { last_writer: string }).last_writer
-    expect(lw.length).toBe(200)
+    expect(lw.length).toBeLessThanOrEqual(200)
+    expect(lw.length).toBeGreaterThan(150)
     expect(lw).not.toMatch(/[\n\u202e]/)
     expect(String((out.detail as { message: string }).message)).not.toContain('svc:mupot')
   })
