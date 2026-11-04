@@ -51,6 +51,7 @@
 // an `error` code the upstream itself already intends to be a stable,
 // public-facing enum value).
 
+import { wikiFetcher } from '../health'
 import { assertPublicHttpsUrl } from '../lib/ssrf'
 import { resolveConnector } from '../connectors/service'
 import { cmsFetch, resolveCmsFetch } from '../departments/executors/shared/cms-adapter'
@@ -196,7 +197,7 @@ async function resolveWikiConfig(env: Env): Promise<WikiClientConfig | null> {
   if (!env.INKWELL_API_URL) return null
   const token = await resolveConnector(env, 'pot', 'inkwell')
   if (!token) return null
-  return { apiUrl: env.INKWELL_API_URL, token, tenantSlug: env.TENANT_SLUG, fetcher: env.INKWELL_SVC }
+  return { apiUrl: env.INKWELL_API_URL, token, tenantSlug: env.TENANT_SLUG, fetcher: wikiFetcher(env) }
 }
 
 function safeOrigin(apiUrl: string): string {
