@@ -10,16 +10,25 @@
 // Final head fa6b8eb1 additions replayed: last_writer is namespaced `svc:mupot/<writer>` (default unknown); a PUT with
 // neither expected_version nor body is tolerated (legacy metadata); expected_id fences delete/recreate; a corrupt document reads
 // body:null + body_error; an unfinished schema answers 503 schema_pending.
+// 914bf4fe additions replayed: capabilities.expected_id:true; a body write at expected_version>0 without expected_id is
+// 400 expected_id_required on a VISIBLE page and a bare 409 on a hidden/absent one; a v0 create collision is 409 BEFORE
+// that check; an id mismatch is 409 with reason page_replaced (visible page only); expected_id is trimmed, and an
+// empty or >128-char one is 400 invalid_expected_id.
 // Test hooks model what a unit test cannot otherwise reach: another writer landing after our commit, an ack
 // that did not persist, an unreadable history, and a tier flip between the caller's read and its write.
 
-export const V1_CAPABILITIES = { contract: 'wiki-documents/v1', body: true, max_body_bytes: 65536, conditional_writes: true, revision_history: true }
+// Models mumega-com 914bf4fe (see inkwell-wiki-contract.ts for the commit, the PUT check ORDER, and the 400/409 shapes).
+import { INKWELL_MAX_EXPECTED_ID_LENGTH, INKWELL_PAGE_REPLACED_REASON, INKWELL_V1_CAPABILITIES } from './inkwell-wiki-contract'
+
+export const V1_CAPABILITIES: Record<string, unknown> = { ...INKWELL_V1_CAPABILITIES }
 const SERVICE_KEY = 'mupot:project'
 
 interface Rev { version: number; body: string | null; last_writer: string; title: string; description: string }
 interface Topic {
   id: string; project: string; slug: string; title: string; description: string; topic_type: string; tags: string[]
   version: number; last_writer: string; body: string | null; revisions: Rev[]; bodyError?: string
+  /** gated / unpublished / not service-readable: PUT answers a bare 409, never a typed refusal. */
+  hidden?: boolean
 }
 export interface RecordedRequest { method: string; path: string; search: string; json?: Record<string, unknown> }
 
@@ -140,16 +149,37 @@ export class FakeWikiDocuments {
         return Response.json({ ok: true, id: t0.id, created: !cur0, edges_upserted: 0 }, { status: cur0 ? 200 : 201 })
       }
       const legacyMetadata = p.expected_version === undefined && p.body === undefined
+      // 1. expected_version
       if (!legacyMetadata && (!Number.isSafeInteger(p.expected_version) || (p.expected_version as number) < 0)) return Response.json({ error: 'expected_version_required' }, { status: 400 })
       const expected = legacyMetadata ? (this.topics.get(slug)?.version ?? 0) : (p.expected_version as number)
+      // 2. expected_id shape (trimmed before validation and comparison)
+      const expectedId = typeof p.expected_id === 'string' ? p.expected_id.trim() : undefined
+      if (p.expected_id !== undefined && (expectedId === undefined || !expectedId || expectedId.length > INKWELL_MAX_EXPECTED_ID_LENGTH)) return Response.json({ error: 'invalid_expected_id' }, { status: 400 })
       if (p.body !== undefined && (typeof p.body !== 'string' || new TextEncoder().encode(p.body).byteLength > 65536)) return Response.json({ error: 'invalid_body', max_bytes: 65536 }, { status: 400 })
       this.beforePut?.(this.topics.get(slug))
       const cur = this.topics.get(slug)
-      const conflict = () => Response.json(cur ? { error: 'topic_write_conflict', ...(this.conflictOverride ?? { current_version: cur.version, last_writer: cur.last_writer }) } : { error: 'topic_write_conflict' }, { status: 409 })
+      const visible = !!cur && cur.project === project && !cur.hidden
+      const conflict = () => Response.json(
+        visible && cur
+          ? { error: 'topic_write_conflict', ...(this.conflictOverride ?? { current_version: cur.version, last_writer: cur.last_writer }), ...(expectedId !== undefined && cur.id !== expectedId ? { reason: INKWELL_PAGE_REPLACED_REASON } : {}) }
+          : { error: 'topic_write_conflict' },
+        { status: 409 },
+      )
+      // 3. a row that is another project's or not service-readable: bare 409
+      if (cur && !visible) return Response.json({ error: 'topic_write_conflict' }, { status: 409 })
       if (cur?.bodyError && typeof p.body === 'string') return Response.json({ error: 'invalid_content_blocks' }, { status: 409 })
       if (this.fenceNext) { this.fenceNext = false; return Response.json({ error: 'topic_write_conflict', current_version: expected, last_writer: cur?.last_writer }, { status: 409 }) }
-      if (!legacyMetadata && ((!cur && expected !== 0) || (cur && expected === 0) || (cur && cur.version !== expected))) return conflict()
-      if (typeof p.expected_id === 'string' && cur && p.expected_id !== cur.id) return conflict()
+      // 4. create-vs-missing mismatch (this runs BEFORE the expected_id_required check)
+      if (!legacyMetadata && ((!cur && expected !== 0) || (cur && expected === 0))) return conflict()
+      // 5. a body write at a positive expected_version must name the page it read
+      if (p.body !== undefined && expectedId === undefined && (legacyMetadata ? 0 : expected) > 0) {
+        if (cur && visible) return Response.json({ error: 'expected_id_required' }, { status: 400 })
+        return conflict()
+      }
+      // 6. identity
+      if (expectedId !== undefined && cur?.id !== expectedId) return conflict()
+      // 7. version
+      if (!legacyMetadata && cur && cur.version !== expected) return conflict()
       const writer = `svc:mupot/${typeof p.writer === 'string' ? p.writer : 'unknown'}`
       const next: Topic = cur ?? { id: `t-${this.n++}`, project, slug, title: '', description: '', topic_type: '', tags: [], version: 0, last_writer: '', body: null, revisions: [] }
       if (!this.dropWrites) {

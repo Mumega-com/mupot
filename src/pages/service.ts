@@ -171,6 +171,8 @@ function portFailure(e: PagesPortError): PageFailure {
         detail: 'the stored document on this page is unreadable, so its body cannot be replaced safely; nothing was written. Ask the pot owner to repair the page (project_wiki_get shows body_error)',
       }
     }
+    if (e.code === 'expected_id_required') return expectedIdRequired()
+    if (e.code === 'invalid_expected_id') return { ok: false, status: 400, error: 'invalid_expected_id', detail: 'expected_id must be the page_id returned by project_wiki_get, unchanged' }
     if (e.code === 'body_too_large') return { ok: false, status: 400, error: 'body_too_large', detail: 'body exceeds the store limit; split it across linked pages (nothing was truncated)' }
     return e.code === 'edge_target_invalid'
       ? { ok: false, status: 400, error: 'edge_target_invalid', detail: 'a link target is not an existing page in this project' }
@@ -205,6 +207,19 @@ const BODY_NOT_STORED: PageFailure = {
   ok: false, status: 501, error: 'body_unsupported',
   detail: 'the wiki store stopped accepting bodies mid-write: the page title/summary WERE written (the page may now exist) but the body was NOT stored. Re-read with project_wiki_get, and retry the body once the store upgrade is back',
   data: { metadata_written: true, body_stored: false },
+}
+
+/**
+ * A body replace/clear on an existing page must carry the page_id the AGENT read. mupot never substitutes the id
+ * of its own fresh read: a page deleted and recreated at the same version would then be overwritten (#1657 ABA).
+ * Deliberately shows no current page_id or version: the agent must read the page, not copy it from the refusal.
+ */
+function expectedIdRequired(): PageFailure {
+  return {
+    ok: false, status: 400, error: 'expected_id_required',
+    detail: 'this page already exists; replacing or clearing its body needs the page_id you read, so a page deleted and recreated since then is never overwritten. Nothing was written',
+    data: { next_step: 'read the page with project_wiki_get and pass its page_id as expected_id' },
+  }
 }
 
 const CAS_UNSUPPORTED: PageFailure = {
@@ -268,16 +283,23 @@ export async function writePage(
     if (input.expectedId !== undefined && existing?.storeId !== undefined && input.expectedId !== existing.storeId) {
       return staleFromPage(existing, expectedVersion)
     }
-    const expectedId = input.expectedId ?? existing?.storeId
+    // Only METADATA-ONLY writes may take the id from our own read (the store keeps the body, nothing is replaced).
+    // A body write must bring its own id (checked below): filling it in here would defeat the fence.
+    const expectedId = input.expectedId ?? (input.body === undefined ? existing?.storeId : undefined)
     if (expectedVersion === undefined && existing?.storageVersion !== undefined) {
       if (input.body !== undefined) {
         return {
           ok: false, status: 400, error: 'expected_version_required',
           detail: `this page already exists at version ${existing.storageVersion}; to replace or clear its body pass expected_version (read it with project_wiki_get, merge, then retry with expected_version ${existing.storageVersion})`,
-          data: { current_version: existing.storageVersion, ...(existing.storeId ? { page_id: existing.storeId } : {}) },
+          data: { current_version: existing.storageVersion }, // no page_id here: the id must come from the agent's own read
         }
       }
       expectedVersion = existing.storageVersion
+    }
+    // Body replace/clear on an existing upgraded page (version 0 = a create collision, refused by the store):
+    // the caller's own page_id is mandatory.
+    if (input.body !== undefined && input.expectedId === undefined && existing?.storageVersion !== undefined && expectedVersion !== 0) {
+      return expectedIdRequired()
     }
 
     const owner = existing?.envelope?.owner ?? writer
@@ -297,7 +319,7 @@ export async function writePage(
         tags: input.tags, links: input.links, envelope,
       })
     } catch (e) {
-      if (e instanceof PagesPortError && e.kind === 'stale' && e.stale) return await staleFailure(port, projectId, input.slug, expectedVersion, args.canSeeSquadPages)
+      if (e instanceof PagesPortError && e.kind === 'stale' && e.stale) return await staleFailure(port, projectId, input.slug, expectedVersion, args.canSeeSquadPages, e.stale.replaced === true)
       throw e
     }
 
@@ -327,19 +349,21 @@ function hiddenSquadPage(page: PageRecord, canSeeSquadPages: boolean): boolean {
 }
 
 /** The refusal for a write whose version/id no longer matches. Everything shown comes from the RE-READ page. */
-function staleFromPage(now: PageRecord, sentVersion: number | undefined): PageFailure {
+function staleFromPage(now: PageRecord, sentVersion: number | undefined, storeSaidReplaced = false): PageFailure {
   if (now.storageVersion === undefined) return SLUG_UNAVAILABLE
   const v = now.storageVersion
   // Same number as the caller sent but still refused: the id changed (deleted and recreated) or a write raced
   // at that exact revision. Pointing at "retry with N" would loop, so say the page was replaced.
-  const replaced = sentVersion !== undefined && sentVersion === v
+  const replaced = storeSaidReplaced || (sentVersion !== undefined && sentVersion === v)
   const next = replaced
     ? 're-read the page in full (project_wiki_get), merge, retry with the version AND page_id it returns'
     : `re-read, merge, retry with expected_version ${v}`
   return {
     ok: false, status: 409, error: 'stale_version',
     detail: replaced
-      ? 'the page was replaced or rewritten since you read it (same version number, different page). Nothing was overwritten. Re-read the page in full with project_wiki_get, merge your change, then retry with the version and page_id it returns'
+      ? storeSaidReplaced
+        ? 'the page was deleted and recreated since you read it; re-read the page in full with project_wiki_get, merge your change, then retry with the version and page_id it returns. Nothing was overwritten'
+        : 'the page was replaced or rewritten since you read it (same version number, different page). Nothing was overwritten. Re-read the page in full with project_wiki_get, merge your change, then retry with the version and page_id it returns'
       : `the page changed since you read it (now version ${v}). Nothing was overwritten. Re-read with project_wiki_get, merge your change, then retry with expected_version ${v}`,
     data: {
       current_version: v,
@@ -362,11 +386,12 @@ async function staleFailure(
   slug: string,
   sentVersion: number | undefined,
   canSeeSquadPages: boolean,
+  storeSaidReplaced = false,
 ): Promise<PageFailure> {
   const now = await port.get(projectId, slug)
   if (!now || !now.envelope) return SLUG_UNAVAILABLE
   if (hiddenSquadPage(now, canSeeSquadPages)) return SLUG_UNAVAILABLE
-  return staleFromPage(now, sentVersion)
+  return staleFromPage(now, sentVersion, storeSaidReplaced)
 }
 
 // ── reads: squad-tier visibility enforced HERE, before anything reaches the MCP/dashboard layer ───────────────

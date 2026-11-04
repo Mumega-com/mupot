@@ -222,6 +222,8 @@ export class WikiConflictError extends Error {
     /** v1: present only when the server judged the caller allowed to see the page (a STALE expected_version). */
     public readonly currentVersion?: number,
     public readonly lastWriter?: string,
+    /** 914bf4fe: true only when the store said reason 'page_replaced' (the id the caller named is not the page's id). */
+    public readonly pageReplaced: boolean = false,
   ) {
     super(code)
     this.name = 'WikiConflictError'
@@ -336,11 +338,12 @@ async function throwForErrorResponse(res: Response): Promise<never> {
     const body = (await res.json().catch(() => null)) as { error?: unknown; existing_project?: unknown } | null
     const code = typeof body?.error === 'string' && body.error ? body.error : 'unknown_conflict'
     const existingProject = typeof body?.existing_project === 'string' ? body.existing_project : undefined
-    const raw = body as { current_version?: unknown; last_writer?: unknown } | null
+    const raw = body as { current_version?: unknown; last_writer?: unknown; reason?: unknown } | null
     const currentVersion = typeof raw?.current_version === 'number' && Number.isSafeInteger(raw.current_version) ? raw.current_version : undefined
     // last_writer is free text from the store: bound it before it reaches an agent-facing refusal.
     const lastWriter = typeof raw?.last_writer === 'string' ? boundedWriter(raw.last_writer) : undefined
-    throw new WikiConflictError(code, existingProject, currentVersion, lastWriter)
+    // reason is free text from the store: only the one literal we act on is kept, never echoed.
+    throw new WikiConflictError(code, existingProject, currentVersion, lastWriter, raw?.reason === 'page_replaced')
   }
   if (res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 403) {
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null

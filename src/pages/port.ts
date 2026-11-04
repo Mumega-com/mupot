@@ -119,7 +119,7 @@ export class PagesPortError extends Error {
     public readonly kind: PagesFailureKind,
     public readonly code: string,
     /** kind 'stale' only: where the page is now. Authorized by the store; the service re-checks tier before use. */
-    public readonly stale?: { currentVersion: number; lastWriter?: string },
+    public readonly stale?: { currentVersion: number; lastWriter?: string; /** the store said the page id is not the one the caller named (deleted and recreated) */ replaced?: boolean },
   ) {
     super(`${kind}:${code}`)
     this.name = 'PagesPortError'
