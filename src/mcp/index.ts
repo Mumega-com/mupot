@@ -6105,7 +6105,7 @@ const toolPeers: ToolSpec = {
       .all<PeerRow>()
 
     const nowMs = Date.now()
-    // fca29748: the live attested runtime (check_in first), not agents.model alone.
+    // fca29748: the live self-reported runtime (check_in first), beside the unchanged profile `model`.
     const truth = await loadRuntimeTruth(env, (rows.results ?? []).map((r) => ({ id: r.id, slug: r.slug, model: r.model })), nowMs)
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
@@ -6115,8 +6115,8 @@ const toolPeers: ToolSpec = {
         slug: row.slug,
         name: row.name,
         role: row.role,
-        model: live?.model ?? row.model,
-        stored_model: row.model,
+        model: row.model, // PROFILE value, meaning unchanged
+        live_model: live?.model && live.model.trust !== 'profile' ? live.model.value : null,
         live_runtime: live ?? null,
         status: row.status,
         squad_id: row.squad_id,
@@ -6760,9 +6760,8 @@ const toolStatus: ToolSpec = {
         active_seat: seatRoster[0] ?? null,
         seat_roster: seatRoster,
         role: agent.role,
-        // fca29748: `model` is the live attested model (check_in first); the stored profile stays visible.
-        model: liveRuntime?.model ?? agent.model,
-        stored_model: agent.model,
+        model: agent.model, // PROFILE value, meaning unchanged
+        live_model: liveRuntime?.model && liveRuntime.model.trust !== 'profile' ? liveRuntime.model.value : null,
         live_runtime: liveRuntime ?? null,
         status: agent.status,
         squad_id: agent.squad_id,
@@ -6827,8 +6826,8 @@ const toolFleetAgentGet: ToolSpec = {
       runtime: routeInfo.runtime,
       runtime_canonical: observed?.runtime_canonical || null,
       model: observed?.model ?? null,
-      // fca29748: what the agent says it is running NOW (check_in first), with source + staleness. model:null = no profile fallback here.
-      live_runtime: (await loadRuntimeTruth(env, [{ id: targetAgent.id, slug: targetAgent.slug, model: null }])).get(targetAgent.id) ?? null,
+      // fca29748: what the agent says it is running NOW (check_in first), with source + staleness. self-reported, not attested.
+      live_runtime: (await loadRuntimeTruth(env, [{ id: targetAgent.id, slug: targetAgent.slug, model: (await loadAgent(env, targetAgent.id))?.model ?? null }])).get(targetAgent.id) ?? null,
       host: observed?.host || null,
       connection_kind: observed?.connection_kind || null,
       last_boot_at: observed?.last_boot_at ?? null,
