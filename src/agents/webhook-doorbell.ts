@@ -514,7 +514,7 @@ async function deliverDoorbell(
   // profile and the agent slug are always read; delivery_version only while the signed flag is on.
   const row = await env.DB.prepare(
     `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext,
-            d.profile AS profile,
+            d.profile AS profile, d.updated_at AS updated_at,
             COALESCE((SELECT a2.slug FROM agents a2 WHERE a2.id = d.agent_id), d.agent_id) AS agent_slug
             ${webhookDoorbellSignedEnabled(env) ? ', d.delivery_version AS delivery_version' : ''}
        FROM agent_webhook_doorbells d
@@ -528,6 +528,7 @@ async function deliverDoorbell(
     webhook_url: string
     auth_ciphertext: string
     profile?: string
+    updated_at?: string
     agent_slug?: string
     delivery_version?: string
   }>()
@@ -557,13 +558,15 @@ async function deliverDoorbell(
   }
 
   if (profile === 'anthropic_routine') {
-    // A previous 429 recorded when fires may resume. Suppress (no POST, no billed session) until it passes.
+    // A previous 429 recorded when fires may resume. Suppress (no POST, no billed session) until it passes. Scoped to
+    // THIS registration: only a 429 received after the row was last saved counts, so re-registering (new URL or token)
+    // never inherits the old routine's cooldown. Applies to test pings and wakes alike.
     try {
       const last = await env.DB.prepare(
         `SELECT reason FROM agent_webhook_doorbell_receipts
-          WHERE tenant = ?1 AND agent_id = ?2 AND http_status = 429 AND reason LIKE ?3
+          WHERE tenant = ?1 AND agent_id = ?2 AND http_status = 429 AND reason LIKE ?3 AND attempted_at >= ?4
           ORDER BY attempted_at DESC LIMIT 1`,
-      ).bind(tenant, canonical.agent_id, `${RETRY_AFTER_REASON_PREFIX}%`).first<{ reason: string }>()
+      ).bind(tenant, canonical.agent_id, `${RETRY_AFTER_REASON_PREFIX}%`, row.updated_at ?? '').first<{ reason: string }>()
       const until = last ? Date.parse(last.reason.slice(RETRY_AFTER_REASON_PREFIX.length)) : NaN
       if (Number.isFinite(until) && until > Date.now()) {
         await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'retry_after' }, ref)
@@ -574,12 +577,24 @@ async function deliverDoorbell(
     }
   }
 
+  // Routine profile only: at most one fire per agent per ROUTINE_MIN_FIRE_INTERVAL_MS, counting test pings and wakes
+  // alike (each one starts a billed session). Failed fires do not hold the slot. ?2 tenant, ?3 agent, ?W cutoff.
+  const routine = profile === 'anthropic_routine'
+  const routineWindow = (cutoffParam: string): string => routine
+    ? ` AND NOT EXISTS (
+                  SELECT 1 FROM agent_webhook_doorbell_receipts
+                   WHERE tenant = ?2 AND agent_id = ?3
+                     AND outcome IN ('claimed', 'posted') AND attempted_at > ${cutoffParam})`
+    : ''
+  const routineCutoff = routine ? [isoAgo(ROUTINE_MIN_FIRE_INTERVAL_MS)] : []
+
   let claimId: string | null = null
   if (kind === 'test') {
     // Test pings are rate limited per agent with ONE atomic conditional INSERT of a 'claimed' row, so parallel
     // pings cannot all pass a read-then-post count (gate r2 on #1890). The claimed row is later updated in place
     // to its final outcome, so every test row in the window counts.
-    // They neither open nor are blocked by the wake coalescing window.
+    // They neither open nor are blocked by the generic wake coalescing window; on the routine profile they share the
+    // routine fire window with wakes (each test ping is a billed session too).
     claimId = crypto.randomUUID()
     let claimedTest = false
     try {
@@ -589,28 +604,31 @@ async function deliverDoorbell(
          SELECT ?1, ?2, ?3, ?4, 'test', 'claimed', NULL, NULL, ?5
           WHERE (SELECT count(*) FROM agent_webhook_doorbell_receipts
                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?4
-                    AND attempted_at > ?6) < ?7`,
+                    AND attempted_at > ?6) < ?7${routineWindow('?8')}`,
       ).bind(
         claimId, tenant, canonical.agent_id, DOORBELL_TEST_TYPE, new Date().toISOString(),
-        isoAgo(TEST_PING_WINDOW_MS), TEST_PING_LIMIT,
+        isoAgo(TEST_PING_WINDOW_MS), TEST_PING_LIMIT, ...routineCutoff,
       ).run()
       claimedTest = (res.meta?.changes ?? 0) === 1
     } catch {
       return { outcome: 'skipped', reason: 'receipt_unavailable' }
     }
-    if (!claimedTest) return { outcome: 'rate_limited', reason: 'test_ping_rate_limited' }
+    if (!claimedTest) {
+      // Tell the caller WHICH budget refused it: the routine fire window (nothing fired) or the test-ping cap.
+      if (routine) {
+        const recent = await env.DB.prepare(
+          `SELECT 1 AS hit FROM agent_webhook_doorbell_receipts
+            WHERE tenant = ?1 AND agent_id = ?2 AND outcome IN ('claimed', 'posted') AND attempted_at > ?3 LIMIT 1`,
+        ).bind(tenant, canonical.agent_id, routineCutoff[0]).first<{ hit: number }>().catch(() => null)
+        if (recent) return { outcome: 'skipped', reason: 'coalesced' }
+      }
+      return { outcome: 'rate_limited', reason: 'test_ping_rate_limited' }
+    }
   } else {
     // Claim with ONE atomic conditional INSERT: skip only a repeat of the same event ref, or a burst above the cap.
     // Not claiming at all (DB error) also skips: a doorbell that cannot count must not flood.
     claimId = crypto.randomUUID()
     let claimed = false
-    // Routine profile only: at most one fire per agent per ROUTINE_MIN_FIRE_INTERVAL_MS (failed fires do not hold the slot).
-    const routineWindowClause = profile === 'anthropic_routine'
-      ? ` AND NOT EXISTS (
-                  SELECT 1 FROM agent_webhook_doorbell_receipts
-                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
-                     AND outcome IN ('claimed', 'posted') AND attempted_at > ?10)`
-      : ''
     try {
       const res = await env.DB.prepare(
         `INSERT INTO agent_webhook_doorbell_receipts
@@ -622,11 +640,11 @@ async function deliverDoorbell(
                      AND outcome IN ('claimed', 'posted') AND attempted_at > ?8)
             AND (SELECT count(*) FROM agent_webhook_doorbell_receipts
                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
-                    AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8) < ?9${routineWindowClause}`,
+                    AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8) < ?9${routineWindow('?10')}`,
       ).bind(
         claimId, tenant, canonical.agent_id, canonical.type, ref, new Date().toISOString(),
         DOORBELL_TEST_TYPE, isoAgo(COALESCE_WINDOW_MS), WAKE_BURST_LIMIT,
-        ...(profile === 'anthropic_routine' ? [isoAgo(ROUTINE_MIN_FIRE_INTERVAL_MS)] : []),
+        ...routineCutoff,
       ).run()
       claimed = (res.meta?.changes ?? 0) === 1
     } catch {
@@ -677,7 +695,6 @@ async function deliverDoorbell(
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), DOORBELL_TIMEOUT_MS)
   try {
-    const routine = profile === 'anthropic_routine'
     const res = await fetchImpl(url.url, {
       method: 'POST',
       headers: routine

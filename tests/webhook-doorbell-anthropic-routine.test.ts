@@ -8,6 +8,7 @@ import {
   routineText,
   ROUTINE_MIN_FIRE_INTERVAL_MS,
   scheduleTaskAssignedDoorbell,
+  sendDoorbellTestPing,
   setAgentWebhookDoorbell,
 } from '../src/agents/webhook-doorbell'
 import { invokeTool } from '../src/mcp'
@@ -184,7 +185,66 @@ describe('doorbell profile anthropic_routine', () => {
   describe('rate budget (routine profile only)', () => {
     const receipts = () => harness.sqlite.prepare('SELECT outcome, http_status, reason FROM agent_webhook_doorbell_receipts ORDER BY attempted_at').all()
     /** Move every receipt back in time, as if `ms` had passed. */
-    const age = (ms: number) => harness.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET attempted_at = ?').run(new Date(Date.now() - ms).toISOString())
+    const age = (ms: number) => {
+      const at = new Date(Date.now() - ms).toISOString()
+      harness.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET attempted_at = ?').run(at)
+      // the registration is at least as old as its receipts
+      harness.sqlite.prepare('UPDATE agent_webhook_doorbells SET updated_at = ? WHERE updated_at > ?').run(at, at)
+    }
+    const ping = async (respond: () => Response = () => new Response('ok', { status: 200 })) => {
+      const calls: Call[] = []
+      const d = await sendDoorbellTestPing(env, AGENT_A, {
+        fetch: (async (u: string, init?: RequestInit) => { calls.push({ url: u, init: init ?? {} }); return respond() }) as unknown as typeof fetch,
+      })
+      return { d, calls }
+    }
+
+    it('a test ping takes the routine fire window: ping then wake fires once; wake then ping fires once', async () => {
+      await register(ROUTINE_URL)
+      const first = await ping()
+      expect(first.calls).toHaveLength(1)
+      expect(first.d.outcome).toBe('posted')
+      expect(await sendWake('after ping')).toHaveLength(0)
+      const second = await ping()
+      expect(second.calls).toHaveLength(0)
+      expect(second.d).toEqual({ outcome: 'skipped', reason: 'coalesced' })
+      age(ROUTINE_MIN_FIRE_INTERVAL_MS + 5_000)
+      expect(await sendWake('later')).toHaveLength(1)
+      const third = await ping()
+      expect(third.calls).toHaveLength(0)
+      expect(third.d).toEqual({ outcome: 'skipped', reason: 'coalesced' })
+    })
+
+    it('a test ping honours 429 suppression and says so', async () => {
+      await register(ROUTINE_URL)
+      expect(await sendWake('one', () => new Response('x', { status: 429, headers: { 'retry-after': '600' } }))).toHaveLength(1)
+      const p = await ping()
+      expect(p.calls).toHaveLength(0)
+      expect(p.d).toEqual({ outcome: 'skipped', reason: 'retry_after' })
+    })
+
+    it('generic test pings keep only the test-ping cap (not windowed)', async () => {
+      await register('https://webhook.example/wake', 'generic')
+      expect((await ping()).calls).toHaveLength(1)
+      expect((await ping()).calls).toHaveLength(1)
+      expect(await sendWake('wake')).toHaveLength(1)
+    })
+
+    it('re-registering (new URL or token) clears the old 429 cooldown', async () => {
+      await register(ROUTINE_URL)
+      expect(await sendWake('one', () => new Response('x', { status: 429, headers: { 'retry-after': '3600' } }))).toHaveLength(1)
+      age(ROUTINE_MIN_FIRE_INTERVAL_MS + 5_000)
+      // still suppressed under the same registration, past the 120s window
+      harness.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET reason = ? WHERE http_status = 429').run(`retry_after_until:${new Date(Date.now() + 3_000_000).toISOString()}`)
+      expect(await sendWake('same reg')).toHaveLength(0)
+      const NEW_URL = 'https://api.anthropic.com/v1/claude_code/routines/trig_01ZZZZZZZZZZZZZZZZZZZZZZZZ/fire'
+      expect((await setAgentWebhookDoorbell(env, {
+        agentId: AGENT_A, webhookUrl: NEW_URL, bearer: 'test-routine-bearer-not-a-real-token-9999', createdByMemberId: MEMBER_ID, profile: 'anthropic_routine',
+      })).ok).toBe(true)
+      const calls = await sendWake('new reg')
+      expect(calls).toHaveLength(1)
+      expect(calls[0].url).toBe(NEW_URL)
+    })
 
     it('fires at most once per window; a wake inside it is a coalesced receipt', async () => {
       await register(ROUTINE_URL)

@@ -59,6 +59,8 @@ export function doorbellMessage(d: { outcome: string; http_status?: number; reas
   if (d.outcome === 'disabled') return 'Doorbells are switched off for this pot (WEBHOOK_DOORBELL).'
   if (d.outcome === 'rate_limited') return 'Too many test pings; wait a few minutes and try again.'
   if (d.reason === 'timeout') return 'No answer within 3s.'
+  if (d.reason === 'coalesced') return 'Not sent: this routine fired less than 2 minutes ago. Try again shortly.'
+  if (d.reason === 'retry_after') return 'Not sent: the routine asked us to slow down (HTTP 429). Fires resume after its Retry-After.'
   if (d.outcome === 'skipped') return `Not sent (${d.reason ?? 'skipped'}).`
   const code = d.http_status
   if (code !== undefined) {
