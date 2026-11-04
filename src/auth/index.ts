@@ -22,7 +22,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { isOrgAdmin, resolveCapabilities } from './capability'
-import { bearerReadEligible, resolveBearerReadAuth, unauthenticatedApiBody } from './bearer-read'
+import { bearerMeetsFloor, bearerReadEligible, bearerReadFloor, resolveBearerReadAuth, unauthenticatedApiBody } from './bearer-read'
 import {
   linkLoginIdentity,
   listLoginIdentities,
@@ -2546,6 +2546,9 @@ function requireAuthMw(opts: { bearerReads?: boolean } = {}): MiddlewareHandler<
     // own instances without the option, so they stay cookie-only.
     if (!auth && opts.bearerReads && bearerReadEligible(c.req.method, c.req.path)) {
       auth = await resolveBearerReadAuth(c.env, c.req.header('authorization'))
+      // The route's MCP-twin floor (e.g. kanban_board and task_list need 'member', the dashboard floor is only 'observer').
+      const floor = bearerReadFloor(c.req.method, c.req.path)
+      if (auth && floor && !bearerMeetsFloor(auth, floor)) return c.json({ error: 'forbidden', need: floor }, 403)
     }
     if (!auth) {
       if (opts.bearerReads && c.req.path.startsWith('/api/')) return c.json(unauthenticatedApiBody(c.req.method, c.req.path), 401)
