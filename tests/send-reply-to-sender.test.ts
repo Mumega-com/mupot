@@ -330,18 +330,25 @@ describe('reply path: no oracle, atomic cap, canonical key', () => {
     const seat = await homeSeat(env, 'human-1', 's1')
     await sendFrom(env, seat, { to: 'agent-kasra', body: 'q' })
     const orig = msgId('agent-kasra', seat.agentId)
-    const bad = [{ kind: 'bogus' }, { body: 'y'.repeat(2_000_000) }]
+    // Handler-level refusal (kind) and the two TRANSPORT refusals (mupot#2315: 100 KiB trips the per-tool 64 KiB bound,
+    // 2 MB trips the request cap). The transport refusals fire on the raw byte count before the body is parsed, so
+    // they cannot depend on `to` or the sender's state; the equality assertion below is what proves no oracle.
+    const bad: Array<[Record<string, unknown>, string]> = [
+      [{ kind: 'bogus' }, 'send_target_not_visible'],
+      [{ body: 'y'.repeat(100_000) }, 'payload_too_large'],
+      [{ body: 'y'.repeat(2_000_000) }, 'payload_too_large'],
+    ]
     const shape = async (extra: Record<string, unknown>, to: string): Promise<string> => {
       const r = await rpc(env, kasra, 'send', { to, body: 'x', in_reply_to: orig, ...extra })
       return r.raw
     }
-    for (const extra of bad) {
+    for (const [extra, expected] of bad) {
       const right = await shape(extra, seat.agentId)
       const wrong = await shape(extra, 'agent-nobody')
       h.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(seat.agentId)
       const inactive = await shape(extra, seat.agentId)
       h.sqlite.prepare(`UPDATE agents SET status = 'active' WHERE id = ?`).run(seat.agentId)
-      expect(right).toContain('send_target_not_visible')
+      expect(right).toContain(expected)
       expect(new Set([right, wrong, inactive]).size).toBe(1)
     }
     expect(landed(seat.agentId)).toBe(0)
