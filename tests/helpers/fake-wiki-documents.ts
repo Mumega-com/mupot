@@ -32,6 +32,10 @@ export class FakeWikiDocuments {
   dropWrites = false
   /** answer the revisions route with this status instead of data. */
   historyStatus?: number
+  /** PUT response `version`: 'omit' drops it, a number lies, undefined = honest expected+1. */
+  echoVersion?: number | 'omit'
+  /** Act like a rolled-back legacy server behind a v1 handshake: ignore expected_version and body, no version anywhere. */
+  rolledBack = false
   private n = 0
 
   constructor(private readonly tenant: string, private readonly secret: string) {}
@@ -98,14 +102,24 @@ export class FakeWikiDocuments {
     }
     if (req.method === 'GET') {
       if (!t || t.project !== project) return Response.json({ error: 'not_found' }, { status: 404 })
+      const topic = this.serialize(t, true)
+      if (this.rolledBack) { delete (topic as Record<string, unknown>).version; delete (topic as Record<string, unknown>).body; delete (topic as Record<string, unknown>).last_writer }
       return Response.json({
         tenant_slug: this.tenant, project,
         ...(this.capabilities === undefined ? {} : { capabilities: this.capabilities }),
-        topic: this.serialize(t, true), edges: [],
+        topic, edges: [],
       })
     }
     if (req.method === 'PUT') {
       const p = rec.json ?? {}
+      if (this.rolledBack) {
+        // legacy behavior: unknown keys ignored, metadata stored, response has no version
+        const cur0 = this.topics.get(slug)
+        const t0: Topic = cur0 ?? { id: `t-${this.n++}`, project, slug, title: '', description: '', topic_type: '', tags: [], version: 1, last_writer: '', body: null, revisions: [] }
+        t0.title = String(p.title); t0.description = String(p.description ?? ''); t0.tags = Array.isArray(p.tags) ? (p.tags as string[]) : []
+        this.topics.set(slug, t0)
+        return Response.json({ ok: true, id: t0.id, created: !cur0, edges_upserted: 0 }, { status: cur0 ? 200 : 201 })
+      }
       if (!Number.isSafeInteger(p.expected_version) || (p.expected_version as number) < 0) return Response.json({ error: 'expected_version_required' }, { status: 400 })
       const expected = p.expected_version as number
       if (p.body !== undefined && (typeof p.body !== 'string' || new TextEncoder().encode(p.body).byteLength > 65536)) return Response.json({ error: 'invalid_body', max_bytes: 65536 }, { status: 400 })
@@ -125,7 +139,7 @@ export class FakeWikiDocuments {
         this.topics.set(slug, next)
         this.afterCommit?.(next)
       }
-      return Response.json({ ok: true, tenant_slug: this.tenant, project, slug, id: next.id, created: !cur, version: expected + 1, last_writer: writer, edges_upserted: 0, audit_ok: true }, { status: cur ? 200 : 201 })
+      return Response.json({ ok: true, tenant_slug: this.tenant, project, slug, id: next.id, created: !cur, ...(this.echoVersion === 'omit' ? {} : { version: this.echoVersion ?? expected + 1 }), last_writer: writer, edges_upserted: 0, audit_ok: true }, { status: cur ? 200 : 201 })
     }
     return Response.json({ error: 'not_found' }, { status: 404 })
   }

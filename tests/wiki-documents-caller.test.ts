@@ -337,3 +337,53 @@ describe('adapter port surface', () => {
     expect(rec).toMatchObject({ storageVersion: 5, body: 'Doc', lastWriter: 'agent:z' })
   })
 })
+
+describe('fail-closed handshake and untrusted acks (gate requirements 1-4)', () => {
+  it.each([
+    ['wrong case', { ...V1_CAPABILITIES, contract: 'Wiki-Documents/V1' }],
+    ['trailing space', { ...V1_CAPABILITIES, contract: 'wiki-documents/v1 ' }],
+    ['missing contract', { body: true, conditional_writes: true, max_body_bytes: 65536 }],
+  ])('contract %s -> legacy, body refused, zero PUTs', async (_n, caps) => {
+    v1.capabilities = caps
+    expect(failOf(await upsert({ slug: 'fc-contract', body: 'x' }))).toMatchObject({ status: 501, error: 'body_unsupported' })
+    expect(puts(v1)).toEqual([])
+  })
+
+  it('re-handshakes before EVERY write (never cached across requests): a downgrade between two writes is caught', async () => {
+    okResult(await upsert({ slug: 'rehs-doc', body: 'one' }))
+    okResult(await upsert({ slug: 'rehs-doc', body: 'two', expected_version: 1 }))
+    expect(v1.requests.filter((r) => r.path === '/api/internal/wiki/graph')).toHaveLength(2)
+    v1.capabilities = undefined // server rolled back to legacy
+    const before = puts(v1).length
+    expect(failOf(await upsert({ slug: 'rehs-doc', body: 'three', expected_version: 2 }))).toMatchObject({ status: 501, error: 'body_unsupported' })
+    expect(puts(v1)).toHaveLength(before)
+  })
+
+  it('echo version wrong or missing: NOT trusted, readback decides; a correct readback still verifies', async () => {
+    for (const echo of [99, 'omit'] as const) {
+      v1.echoVersion = echo
+      const slug = `echo-${echo}`
+      const out = okResult(await upsert({ slug, body: 'Mine' }))
+      expect(out).toMatchObject({ storage_version: 1, verification: 'readback' })
+      expect(v1.requests.some((r) => r.method === 'GET' && r.path.endsWith(`/topics/${slug}`))).toBe(true)
+    }
+  })
+
+  it('echo wrong AND the readback cannot confirm (dropped write / unreadable history) -> failure, never success', async () => {
+    v1.echoVersion = 'omit'
+    v1.dropWrites = true
+    expect(failOf(await upsert({ slug: 'echo-drop', body: 'Mine' }))).toMatchObject({ status: 502, error: 'wiki_persistence_mismatch' })
+    v1.dropWrites = false
+    seed('echo-adv', { version: 1, body: 'v1' })
+    v1.historyStatus = 404
+    v1.afterCommit = (t) => { if (t.version === 2) { v1.afterCommit = undefined; v1.advance('echo-adv', 'Other') } }
+    expect(failOf(await upsert({ slug: 'echo-adv', body: 'Mine', expected_version: 1 }))).toMatchObject({ error: 'wiki_persistence_mismatch' })
+  })
+
+  it('rolled-back server (v1 handshake, ignores body + expected_version): body write -> body_unsupported, metadata write -> mismatch; never success', async () => {
+    v1.rolledBack = true
+    seed('rb-doc', { version: 1, body: 'v1' })
+    expect(failOf(await upsert({ slug: 'rb-doc', body: 'Mine', expected_version: 1 }))).toMatchObject({ status: 501, error: 'body_unsupported' })
+    expect(failOf(await upsert({ slug: 'rb-doc2', title: 'Meta only' }))).toMatchObject({ status: 502, error: 'wiki_persistence_mismatch' })
+  })
+})

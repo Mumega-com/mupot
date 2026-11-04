@@ -126,7 +126,8 @@ function toRecord(topic: WikiTopic, edges: { to_slug: string; relation_type: str
 const PERSISTENCE_MISMATCH = (): PagesPortError => new PagesPortError('unavailable', 'persistence_mismatch')
 
 /**
- * Read the page back after an acknowledged write. Outcomes:
+ * Read the page back after an acknowledged write (`echoed` = the PUT response carried version === expected+1;
+ * when false nothing about the ack is trusted and every "could not check" outcome is a failure). Outcomes:
  *  - our version + our body            -> 'readback'
  *  - a HIGHER version (another writer) -> our own retained revision (after_version = ours - 1) decides:
  *      matches -> 'history'; absent/different -> persistence_mismatch; history unreadable -> 'unverified'
@@ -140,17 +141,29 @@ async function verifyPersisted(
   input: PagePutInput,
   putVersion: number,
   historyAvailable: boolean,
+  echoed: boolean,
   fetchImpl?: typeof fetch,
 ): Promise<{ verification: 'readback' | 'history' | 'unverified'; currentVersion?: number }> {
+  // Could not complete the check: tolerated only when the ack itself was a clean echo.
+  const cannotCheck = (currentVersion?: number): { verification: 'unverified'; currentVersion?: number } => {
+    if (!echoed) throw PERSISTENCE_MISMATCH()
+    return { verification: 'unverified', ...(currentVersion !== undefined ? { currentVersion } : {}) }
+  }
   let back: Awaited<ReturnType<typeof getProjectWikiTopic>>
   try {
     back = await getProjectWikiTopic(env, projectId, input.slug, fetchImpl)
   } catch (e) {
-    if (e instanceof WikiClientError || e instanceof WikiRequestError) return { verification: 'unverified' }
+    if (e instanceof WikiClientError || e instanceof WikiRequestError) return cannotCheck()
     throw e
   }
-  const current = back?.topic.version
-  if (!back || typeof current !== 'number' || !Number.isSafeInteger(current)) return { verification: 'unverified' }
+  if (!back) return cannotCheck()
+  const current = back.topic.version
+  if (typeof current !== 'number' || !Number.isSafeInteger(current)) {
+    // The handshake said v1 but the readback has no storage version: the server fell back to legacy between
+    // calls (rollback) and silently ignored expected_version/body. A body was NOT stored; say so.
+    if (input.body !== undefined && input.body !== '') throw new PagesPortError('unsupported', 'body_unsupported')
+    throw PERSISTENCE_MISMATCH()
+  }
   const wantBody = input.body !== undefined ? input.body : undefined
   if (current === putVersion) {
     if (wantBody !== undefined && (back.topic.body ?? '') !== wantBody) throw PERSISTENCE_MISMATCH()
@@ -158,15 +171,15 @@ async function verifyPersisted(
   }
   if (current < putVersion) throw PERSISTENCE_MISMATCH()
   // Another authorized writer advanced the page after ours. Our write is proven by its retained revision.
-  if (!historyAvailable) return { verification: 'unverified', currentVersion: current }
+  if (!historyAvailable) return cannotCheck(current)
   let revisions: Awaited<ReturnType<typeof getProjectWikiRevisions>>
   try {
     revisions = await getProjectWikiRevisions(env, projectId, input.slug, putVersion - 1, fetchImpl)
   } catch (e) {
-    if (e instanceof WikiClientError || e instanceof WikiRequestError) return { verification: 'unverified', currentVersion: current }
+    if (e instanceof WikiClientError || e instanceof WikiRequestError) return cannotCheck(current)
     throw e
   }
-  if (!revisions) return { verification: 'unverified', currentVersion: current }
+  if (!revisions) return cannotCheck(current)
   const mine = revisions.find((r) => r.version === putVersion)
   if (!mine) throw PERSISTENCE_MISMATCH()
   if (wantBody !== undefined && (mine.body ?? '') !== wantBody) throw PERSISTENCE_MISMATCH()
@@ -223,8 +236,12 @@ export function createInkwellPagesPort(env: Env, fetchImpl?: typeof fetch): Page
           { ...base, document: { expected_version: expected, writer: input.envelope.writer, ...(input.body !== undefined ? { body: input.body } : {}) } },
           fetchImpl,
         )
-        const putVersion = res.version ?? expected + 1
-        const verified = await verifyPersisted(env, projectId, input, putVersion, caps.revision_history, fetchImpl)
+        // The echo must be EXACTLY expected+1. Anything else (missing, other number) means the ack cannot be
+        // trusted (an old/rolled-back server may ignore expected_version and body): we still check what we
+        // expect to have written (expected+1) by readback/history, and an uncheckable write is NOT success.
+        const putVersion = expected + 1
+        const echoed = res.version === putVersion
+        const verified = await verifyPersisted(env, projectId, input, putVersion, caps.revision_history, echoed, fetchImpl)
         return {
           slug: input.slug,
           created: res.created,
