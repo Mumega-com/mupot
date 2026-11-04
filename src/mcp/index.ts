@@ -1,3 +1,4 @@
+import { MCP_REQUEST_CAP_BYTES, payloadTooLargeDetail, readBoundedText } from './request-cap'
 import { withRoutineReviewDeadlines } from '../routines/review-window'
 import { TASK_GET_FIELDS } from '../tasks/task-get-fields'
 import { toolOwnerCall } from './owner-call'
@@ -9195,6 +9196,11 @@ export function stampErrorNoticeForTest(env: Record<string, unknown>, notice: Te
   return stampErrorNotice(env, env.error as Record<string, unknown>, notice) // test passes an error envelope
 }
 
+/** 413 at /mcp as a JSON-RPC error (id unknown: the body was never parsed) that says what was too large and what to do. */
+function payloadTooLargeJsonRpc(route: string): Response {
+  return rpcError(null, -32600, 'payload_too_large', payloadTooLargeDetail(route), 413)
+}
+
 mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.TENANT_SLUG }))
 
 // GET /mcp/tools — advertise the tool surface (no auth required to discover the
@@ -9243,11 +9249,13 @@ interface InvokeBody {
 mcpApp.post('/', async (c) => {
   // Pre-auth body-size cap (WARN-1): initialize/tools/list are bearerless, so bound the
   // body BEFORE buffering to deny an unauthenticated memory/CPU-exhaustion POST.
-  const len = Number(c.req.header('content-length') ?? '0')
-  if (Number.isFinite(len) && len > 64 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  // mupot#2315: the cap covers a 64 KiB wiki body in its worst escaped form plus the JSON-RPC envelope
+  // (src/mcp/request-cap.ts), and is enforced on the bytes actually read, not only on Content-Length.
+  const read = await readBoundedText(c.req.raw)
+  if (!read.ok) return payloadTooLargeJsonRpc('POST /mcp')
   let body: InvokeBody | JsonRpcRequest
   try {
-    body = (await c.req.json()) as InvokeBody | JsonRpcRequest
+    body = JSON.parse(read.text) as InvokeBody | JsonRpcRequest // same untyped parse c.req.json() did; shape is checked by isJsonRpcRequest / invokeTool
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
@@ -9405,8 +9413,8 @@ mcpActionsApp.get('/openapi.full.json', async (c) => {
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {
-  const len = Number(c.req.header('content-length') ?? '0')
-  if (Number.isFinite(len) && len > 64 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  const declared = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(declared) && declared > MCP_REQUEST_CAP_BYTES) return c.json({ error: 'payload_too_large', detail: payloadTooLargeDetail('POST /actions/:tool') }, 413)
   const auth = await authenticateMember(c)
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
   if (auth.tenant !== c.env.TENANT_SLUG) {
@@ -9415,7 +9423,9 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
 
   let args: unknown = {}
   try {
-    const raw = await c.req.text()
+    const read = await readBoundedText(c.req.raw)
+    if (!read.ok) return c.json({ error: 'payload_too_large', detail: payloadTooLargeDetail('POST /actions/:tool') }, 413)
+    const raw = read.text
     args = raw.trim().length > 0 ? JSON.parse(raw) : {}
   } catch {
     return c.json({ error: 'invalid_json' }, 400)

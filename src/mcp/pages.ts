@@ -76,7 +76,7 @@ const toolProjectWikiUpsert: ToolSpec = {
       slug: args.slug, title: args.title, summary: args.summary, body: args.body, expectedVersion: args.expected_version, expectedId: args.expected_id, purpose: args.purpose,
       tier: args.tier, tags: args.tags, links: args.links,
     })
-    if (!checked.ok) return fail(checked.status, checked.error, checked.detail)
+    if (!checked.ok) return fail(checked.status, checked.error, checked.data ? { message: checked.detail, ...checked.data } : checked.detail)
 
     const project = await readableProject(env, projectId, readAccess(auth))
     if (!project) return fail(404, 'project_not_found')
