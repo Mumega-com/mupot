@@ -19,7 +19,7 @@ const TENANT = 'tenant-a'
 const MEMBER_ID = 'member-1'
 const AGENT_A = 'agent-a'
 const AGENT_B = 'agent-b'
-const BEARER = 'test-routine-bearer-not-a-real-token-0001'
+const BEARER = 'test-routine-bearer-not-a-real-token-1234'
 const ROUTINE_URL = 'https://api.anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'
 const AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
 
