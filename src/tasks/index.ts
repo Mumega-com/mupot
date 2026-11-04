@@ -64,6 +64,7 @@ import {
   ACTIONABLE_FETCH_CAP,
   PASSTHROUGH_FETCH_CAP,
 } from './ranking'
+import { TASK_GET_FIELDS } from './task-get-fields'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
@@ -531,17 +532,22 @@ tasksApp.get('/audit', async (c) => {
 // ── GET /:id — single task read (for the /send poller) ───────────────────────
 // member+ on the task's squad. Includes result + completed_at so the dashboard
 // can render the live status and the finished output.
-tasksApp.get('/:id', async (c) => readTaskForAuth(c.env, c.get('auth'), c.req.param('id')))
+// #2308: a bearer principal (auth.tokenId is set only by the bearer door) is answered EXACTLY like MCP task_get - archived
+// rows and rows it cannot read are the same 404, and the row is narrowed to TASK_GET_FIELDS. The cookie path is unchanged.
+tasksApp.get('/:id', async (c) => readTaskForAuth(c.env, c.get('auth'), c.req.param('id'), { taskGetParity: !!c.get('auth').tokenId }))
 
 // GET /:id — single-row reader with an explicit AuthContext (see listTasksForAuth).
-export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): Promise<Response> {
+export async function readTaskForAuth(env: Env, auth: AuthContext, id: string, opts: { taskGetParity?: boolean } = {}): Promise<Response> {
   const task = await env.DB.prepare(
-    `SELECT ${TASK_SELECT_COLUMNS}
+    `SELECT ${TASK_SELECT_COLUMNS}${opts.taskGetParity ? ', execution_receipt_id' : ''}
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
     .first<Task>()
   if (!task) return jsonResponse({ error: 'task_not_found' }, 404)
+  if (opts.taskGetParity && !(await canReadTask(env, auth, { id: task.id, squad_id: task.squad_id }))) {
+    return jsonResponse({ error: 'task_not_found' }, 404) // task_get: unreadable and archived are one answer, no oracle
+  }
 
   // RBAC: reading a task requires member+ on its squad. (A token scoped to this
   // tenant but holding no grant on the squad must not read its work.)
@@ -552,6 +558,19 @@ export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): 
     return jsonResponse({ error: 'forbidden', need: 'member' }, 403)
   }
 
+  if (opts.taskGetParity) {
+    const full = task as unknown as Record<string, unknown>
+    const row: Record<string, unknown> = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
+    const isAssignee = !!auth.boundAgentId && task.assignee_agent_id === auth.boundAgentId
+    const canView = isAssignee || (await canViewTaskReceipts(env, auth, task))
+    if (!canView) row.execution_receipt_id = null // task_get: assignee / gate holder / org admin only
+    const [narrowed] = await withRoutineReviewDeadlines(env, [{ ...row, id: task.id, project_id: task.project_id ?? null, status: task.status }])
+    return jsonResponse({
+      task: narrowed ?? row,
+      dispatch_timeline: canView ? await listTaskDispatchReceiptTimeline(env, task.id) : null,
+      current_submission: null,
+    })
+  }
   const [visibleTask] = await withRoutineReviewDeadlines(env, await loadGateWakeNotices(env, [task]))
   // mupot#1704: the runtime receipt timeline (receipt hashes, artifact sha256/refs, stages) goes
   // through the SAME chokepoint as MCP task_get (#1702/#1703): assignee, org admin, or a live

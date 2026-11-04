@@ -111,9 +111,11 @@ describe('root-mounted Routine and Needs You routes', () => {
 
   it('does not intercept unrelated API routes', async () => {
     harness = makeHarness()
-    const response = await app.fetch(request('/api/tasks', { headers: { Authorization: `Bearer ${token}` } }), envFor(harness))
+    // #2308: /api/tasks now takes a member bearer (src/auth/bearer-read.ts allowlist), so the unrelated-route probe is a
+    // route that stays cookie-only. The routine bearer middleware must not leak onto it.
+    const response = await app.fetch(request('/api/loops', { headers: { Authorization: `Bearer ${token}` } }), envFor(harness))
     expect(response.status).toBe(401)
-    await expect(response.json()).resolves.toEqual({ error: 'unauthenticated' })
+    await expect(response.json()).resolves.toEqual({ error: 'unauthenticated', accepted: ['cookie'] })
   })
 
   it('does not trust an externally supplied OAuth auth-context header on REST', async () => {

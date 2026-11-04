@@ -1,4 +1,5 @@
 import { withRoutineReviewDeadlines } from '../routines/review-window'
+import { TASK_GET_FIELDS } from '../tasks/task-get-fields'
 import { toolOwnerCall } from './owner-call'
 // mupot — MCP seam. The network surface a MEMBER's workspace connects to.
 //
@@ -1694,11 +1695,6 @@ const toolTaskBoard: ToolSpec = {
 // predicate, archived tasks EXCLUDED exactly as task_list excludes them. This tool never
 // re-derives rank / plane / home / archive rules. A task the caller cannot read answers with
 // the SAME 404 task_not_found as an id that does not exist (no existence oracle).
-const TASK_GET_FIELDS = [
-  'id', 'squad_id', 'project_id', 'title', 'body', 'done_when', 'status', 'assignee_agent_id',
-  'assignee_member_id', 'gate_owner', 'result', 'execution_receipt_id', 'completed_at',
-  'created_at', 'updated_at',
-] as const
 
 const toolTaskGet: ToolSpec = {
   name: 'task_get',
