@@ -16,6 +16,7 @@
 
 import { Hono } from 'hono'
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
+import { OAUTH_API_ROUTES, refuseNonCanonicalPath } from './oauth-canonical-path'
 import type { Env } from './types'
 import { ROUTES } from './types'
 import { healthPayload } from './health'
@@ -105,6 +106,11 @@ export { TaskWorkflow, BackupWorkflow } from './workflows/task-workflow'
 export { McpOAuthApiHandler }
 
 export const app = new Hono<{ Bindings: Env }>()
+
+// This app decodes the path before routing; the OAuth provider in front of it matches the raw path.
+// A path that only reaches a provider-owned route after decoding is refused here (and again at the
+// entry point, before tenant routing) so nothing behind the provider answers it. src/oauth-canonical-path.ts.
+app.use('*', async (c, next) => refuseNonCanonicalPath(c.req.raw) ?? next())
 
 // Keep Mirror unmounted until principal access is defined. Normalize only for
 // retirement detection; never rewrite a request into another live route.
@@ -318,7 +324,7 @@ app.route(ROUTES.dashboard, dashboardApp)
 //
 // C8: OAUTH_KV binding declared in wrangler.toml [[kv_namespaces]] binding="OAUTH_KV"
 const oauthProvider = new OAuthProvider<Env>({
-  apiRoute: ['/mcp'],
+  apiRoute: [...OAUTH_API_ROUTES],
   apiHandler: McpOAuthApiHandler,
 
   // All non-OAuth paths fall through to the root Hono app.
@@ -413,6 +419,10 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 }
 
 async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // CANONICAL PATH, FIRST: refuse a path that reaches an OAuth-owned route only after decoding (also under /t/<tenant>),
+    // before any host gate, tenant routing or dispatch can forward it anywhere.
+    const nonCanonical = refuseNonCanonicalPath(req)
+    if (nonCanonical) return nonCanonical
     // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
     // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
