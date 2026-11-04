@@ -6893,13 +6893,15 @@ async function gatherWhoamiFacts(
     unboundDirectory ? anyAgentExists(env) : false,
   ])
   const admission = await gatherAdmission(env, auth)
+  // Only the unbound / seat states emit an admin-dependent hint; a plain agent-bound session skips the extra read (auth query-count pin).
+  const callerIsAdmin = auth.boundAgentId && !auth.seatBinding ? false : await holdsAdminStanding(env, auth)
   // Honest designate copy: only a seat session of a known human, and only while the designation step exists at all.
   const humanCanDesignate = auth.seatBinding && seatAttachDesignatedEnabled(env)
     ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
     : undefined
   // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
   const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -7049,21 +7051,25 @@ async function hasBootstrappedBefore(env: Env, memberId: string | null | undefin
   }
 }
 
-// HINT-ONLY (mupot#2309): does this principal hold org admin standing anywhere? On the directory door the B1
-// ceiling parks the real grants in latentCapabilities, so the effective plane is empty for an owner; the hint
-// must still not send that owner to "ask an admin". Never use this for a permission decision.
-async function holdsAdminStanding(env: Env, auth: AuthContext): Promise<boolean> {
+// HINT-ONLY (mupot#2309): does the human behind this connection hold org admin standing? Never a permission decision.
+// Whose standing: on a seat session auth.memberId is the SEAT AGENT's member, so read the human (seatBinding.humanMemberId),
+// else the OAuth consenter, else the caller. On the directory door the B1 ceiling parks the real grants in
+// latentCapabilities (or, for a plain directory bearer, nowhere), so an owner must still not be told to "ask an admin".
+// Computed ONCE per request (in gatherWhoamiFacts) and carried on WhoamiFacts.callerIsAdmin.
+export async function holdsAdminStanding(env: Env, auth: AuthContext): Promise<boolean> {
   if (isOrgAdmin(auth)) return true
   if (auth.latentCapabilities !== undefined && isOrgAdmin({ ...auth, capabilities: auth.latentCapabilities })) return true
-  // A directory bearer carries zero effective AND zero latent grants, so read the member's own rows (read-only, fail-soft).
-  if (auth.channel === 'directory' && auth.memberId && !auth.harnessCredential) {
-    try {
-      return isOrgAdmin({ ...auth, capabilities: await resolveCapabilities(env, auth.memberId) })
-    } catch {
-      return false
-    }
+  // OAuth directory sessions already carry the human's resolved standing in latentCapabilities: no second read (auth query-count pin).
+  if (auth.latentCapabilities !== undefined && !auth.seatBinding) return false
+  const standing = auth.seatBinding?.humanMemberId ?? auth.consentedByMemberId ?? auth.memberId
+  const delegated = standing !== undefined && standing !== null && standing !== auth.memberId
+  // A harness credential with no human behind it has no standing to read; a read is only for the directory door or a delegated human.
+  if (!standing || (auth.harnessCredential && !delegated) || !(auth.channel === 'directory' || delegated)) return false
+  try {
+    return isOrgAdmin({ ...auth, role: 'member', capabilities: await resolveCapabilities(env, standing) })
+  } catch {
+    return false
   }
-  return false
 }
 
 function buildAvailableDoors(state: OnboardingState, callerIsAdmin = false): OnboardingDoor[] {
@@ -7398,7 +7404,7 @@ const toolBootContext: ToolSpec = {
     // available_doors = the legacy door list FILTERED to what whoami says this connection can call (a harness token
     // never sees connect/status/bootstrap_self; a stranger never sees bootstrap_self, #2020), then led by whoami's own step.
     const doorOk = whoamiDoorFilter(env, auth, whoami)
-    const availableDoors = buildAvailableDoors(onboardingState, await holdsAdminStanding(env, auth)).filter((d) => doorOk(d.tool))
+    const availableDoors = buildAvailableDoors(onboardingState, whoamiFacts.callerIsAdmin === true).filter((d) => doorOk(d.tool))
     // mupot#1794 W3 — an unbound harness session (consented as "Me — auto per workspace") has ONE right first move:
     // seat_select. Offered exactly when whoami offers it (same gate as seat_select itself).
     const harnessSeatDoor = whoami.missing.some((m) => m.next_tool === 'seat_select')
@@ -7495,7 +7501,7 @@ const toolBootContext: ToolSpec = {
                   'create or update tasks, projects, agents, or any other write',
                   'anything requiring a standing capability, regardless of what you hold elsewhere',
                 ],
-            to_get_write_access: writeAccessHint(env, whoami, firstStep?.next_step, await holdsAdminStanding(env, auth)),
+            to_get_write_access: writeAccessHint(env, whoami, firstStep?.next_step, whoamiFacts.callerIsAdmin === true),
           }
         : undefined
 

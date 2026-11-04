@@ -93,6 +93,8 @@ export interface WhoamiFacts {
   admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
   /** Seat sessions only: can the human behind this seat press 'Allow for me' (org admin)? Absent = unknown (the original copy). */
   humanCanDesignate?: boolean
+  /** HINT ONLY (mupot#2309): the human behind this connection holds org admin standing, so never send them to "ask an admin". */
+  callerIsAdmin?: boolean
 }
 
 export const AGENT_DOOR_DOCS_URL = 'https://github.com/Mumega-com/mupot/blob/main/docs/agent-door.md'
@@ -435,8 +437,10 @@ export function buildWhoami(env: Env, auth: AuthContext, ctx: WhoamiCtx): Whoami
     } else {
       missing.push({
         code: 'agent_required',
-        who_acts: 'org_admin',
-        next_step: 'This token is a person, not an agent. Ask an org admin to run mint_agent_token for your agent, then reconnect with that token.',
+        who_acts: facts.callerIsAdmin === true ? 'self' : 'org_admin',
+        next_step: facts.callerIsAdmin === true
+          ? 'This token is a person, not an agent. You hold org admin standing: run mint_agent_token for your agent yourself (or mint it on /admin/agent-token), then reconnect with that token.'
+          : 'This token is a person, not an agent. Ask an org admin to run mint_agent_token for your agent, then reconnect with that token.',
       })
     }
   } else if (state === 'acting_as' && basis === 'attached' && facts.fenced) {
