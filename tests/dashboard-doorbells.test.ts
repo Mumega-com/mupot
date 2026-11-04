@@ -120,6 +120,61 @@ describe('Doorbells page', () => {
 })
 
 describe('POST /doorbells/set', () => {
+  const ROUTINE = 'https://api.anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'
+
+  it('the form offers a profile select and registers anthropic_routine', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const page = await (await dashboardApp.request('/doorbells', { headers: { cookie } }, env)).text()
+    expect(page).toContain('id="db-profile"')
+    expect(page).toContain('value="anthropic_routine"')
+    expect(page).toContain('value="generic"')
+    const res = await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: ROUTINE, bearer: KEY, profile: 'anthropic_routine' })
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(((await res.json()) as { doorbell: { profile: string } }).doorbell.profile).toBe('anthropic_routine')
+    expect(stored()[0]).toMatchObject({ profile: 'anthropic_routine', webhook_url: ROUTINE })
+    expect(await (await dashboardApp.request('/doorbells', { headers: { cookie } }, env)).text()).toContain('data-profile="anthropic_routine"')
+  })
+
+  it('the form refuses a wrong URL under anthropic_routine and an unknown profile; nothing is stored', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    for (const url of [URL_OK, `${ROUTINE}?x=1`, 'https://evil.example/x/https://api.anthropic.com/v1/claude_code/routines/trig_abc12345/fire']) {
+      const res = await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: url, bearer: KEY, profile: 'anthropic_routine' })
+      expect(res.status).toBe(400)
+    }
+    expect((await post(env, cookie, '/doorbells/set', { ...SET, profile: 'nope' })).status).toBe(400)
+    expect((await post(env, cookie, '/doorbells/set', { ...SET, profile: 7 })).status).toBe(400)
+    expect(stored()).toHaveLength(0)
+  })
+
+  it('a form re-save that names the same profile keeps it; naming generic switches it back explicitly', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: ROUTINE, bearer: KEY, profile: 'anthropic_routine' })
+    await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: ROUTINE, bearer: 'rotated-key-SECRET-7777', profile: 'anthropic_routine' })
+    expect(stored()[0]).toMatchObject({ profile: 'anthropic_routine', auth_last4: '7777' })
+    expect((await post(env, cookie, '/doorbells/set', { ...SET, profile: 'generic' })).status).toBe(200)
+    expect(stored()[0]).toMatchObject({ profile: 'generic' })
+  })
+
+  it('re-saving a routine doorbell keeps its profile and applies the routine URL check', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const { setAgentWebhookDoorbell } = await import('../src/agents/webhook-doorbell')
+    expect((await setAgentWebhookDoorbell(env, {
+      agentId: 'agent-A', webhookUrl: ROUTINE, bearer: KEY, createdByMemberId: 'mem-admin', profile: 'anthropic_routine',
+    })).ok).toBe(true)
+    // rotate the token from the dashboard: profile must survive
+    const ok = await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: ROUTINE, bearer: 'rotated-key-SECRET-5555' })
+    expect(ok.status, await ok.clone().text()).toBe(200)
+    expect(stored()[0]).toMatchObject({ profile: 'anthropic_routine', auth_last4: '5555' })
+    // a non-routine URL on a routine doorbell is refused and the row is untouched
+    const bad = await post(env, cookie, '/doorbells/set', { agent_id: 'agent-A', webhook_url: URL_OK, bearer: 'rotated-key-SECRET-6666' })
+    expect(bad.status).toBe(400)
+    expect(stored()[0]).toMatchObject({ profile: 'anthropic_routine', auth_last4: '5555', webhook_url: ROUTINE })
+  })
+
   it('stores ciphertext (not the key) and returns the redacted view', async () => {
     const { env, cookie } = await login('admin@x.test')
     setReauth('mem-admin', freshNow())

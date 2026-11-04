@@ -69,13 +69,14 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
   name: 'set_agent_webhook_doorbell',
   scope: "self (own agent) or admin of the agent's squad — register or clear an outbound wake webhook (flag WEBHOOK_DOORBELL)",
   min: 'authenticated',
-  args: '{ agent?: string, webhook_url?: string, bearer?: string, clear?: boolean }',
+  args: '{ agent?: string, webhook_url?: string, bearer?: string, profile?: "generic" | "anthropic_routine", clear?: boolean }',
   inputSchema: {
     type: 'object',
     properties: {
       agent: STRING_SCHEMA,
       webhook_url: STRING_SCHEMA,
       bearer: STRING_SCHEMA,
+      profile: { type: 'string', enum: ['generic', 'anthropic_routine'] },
       clear: { type: 'boolean' },
     },
     additionalProperties: false,
@@ -110,6 +111,7 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
       webhookUrl,
       bearer,
       createdByMemberId: actor,
+      ...(args.profile !== undefined ? { profile: String(args.profile) } : {}),
     })
     if (!result.ok) {
       if (result.error === 'doorbell_crypto_unavailable') {

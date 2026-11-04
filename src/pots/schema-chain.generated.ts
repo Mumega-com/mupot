@@ -4808,9 +4808,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "owner_call_elevation_terminal" },
     ],
   },
+  {
+    file: "0271_doorbell_profile.sql",
+    sha256: "3fc3940ab5f3cdce913a8b35bd5be93f7f11c49b1d3d9e81aac46d729507d46d",
+    statements: [
+      "-- 0271_doorbell_profile.sql — per-doorbell delivery profile.\n--\n-- APPLY THIS BEFORE the Worker that reads `profile` (get / send paths SELECT it).\n--\n-- profile\n--   'generic'            existing rows (the DEFAULT) and every registration that names no profile.\n--                        Inline Authorization: Bearer POST of the wake JSON, unchanged.\n--   'anthropic_routine'  the Claude Code routine fire endpoint\n--                        (https://api.anthropic.com/v1/claude_code/routines/<trig_id>/fire).\n--                        Fixed anthropic-* headers and a short {\"text\": ...} body, id and type only.\n--                        The profile IS the allowlist for that one URL shape; no host is added to\n--                        EVENTS_CALLBACK_HOSTS.\n--\n-- ADD COLUMN ... NOT NULL DEFAULT: every existing row becomes 'generic' with no table rebuild.\n-- Metadata only; the bearer stays AES-GCM ciphertext in auth_ciphertext.\nALTER TABLE agent_webhook_doorbells ADD COLUMN profile TEXT NOT NULL DEFAULT 'generic'\n  CHECK (profile IN ('generic', 'anthropic_routine'));",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "ed55a799a7fce3b864094f495718c81a29e4cbac2f1ba195d6a4964b81e2a018"
+export const SCHEMA_CHAIN_DIGEST: string = "f8755b1bc5c4edf01411682d3f08a0a1987163407d9e668b8092075203ccb0e6"
