@@ -20,6 +20,7 @@ import { checkWebSession } from '../secure-moments/enrol-mint'
 import { RECENT_REAUTH_WINDOW_MINUTES } from '../auth/web-sessions'
 import {
   clearAgentWebhookDoorbell,
+  getAgentWebhookDoorbell,
   listAgentWebhookDoorbells,
   sendDoorbellTestPing,
   setAgentWebhookDoorbell,
@@ -91,15 +92,27 @@ function doorbellScript(): Html {
           var data = await res.json().catch(function () { return {}; });
           return { ok: res.ok, status: res.status, data: data };
         }
+        // Choosing an agent preselects the profile it already has, so rotating a key never flips it by accident.
+        var agentSel = document.getElementById('db-agent');
+        var profileSel = document.getElementById('db-profile');
+        if (agentSel && profileSel) {
+          var sync = function () {
+            var opt = agentSel.options[agentSel.selectedIndex];
+            var p = opt ? opt.getAttribute('data-profile') : null;
+            if (p) profileSel.value = p;
+          };
+          agentSel.addEventListener('change', sync); sync();
+        }
         var save = document.getElementById('db-save');
         if (save) save.addEventListener('click', async function () {
           var agent = document.getElementById('db-agent');
           var url = document.getElementById('db-url');
           var key = document.getElementById('db-key');
+          var profile = document.getElementById('db-profile');
           if (!agent || !url || !key || !agent.value || !url.value || !key.value) { say('Pick an agent, paste the URL and the key.'); return; }
           save.disabled = true; say('saving…');
           try {
-            var r = await post('/doorbells/set', { agent_id: agent.value, webhook_url: url.value, bearer: key.value });
+            var r = await post('/doorbells/set', { agent_id: agent.value, webhook_url: url.value, bearer: key.value, profile: profile ? profile.value : undefined });
             key.value = '';
             if (r.ok) { window.location.href = '/doorbells?saved=' + encodeURIComponent(agent.value); return; }
             if (r.data.error === 'reauth_required') reauthLink();
@@ -162,8 +175,14 @@ async function pageBody(env: Env, auth: AuthContext, savedAgentId: string | null
         <p class="ui-sub">In the Grok Bot routine panel, create a webhook routine and copy its public HTTPS URL, then choose the sender key. Paste both here. The key is stored encrypted, shown only as its last four characters, and can be removed at any time. The routine prompt should peek the pot: the ping carries ids only, never a message body.</p>
         <label class="ui-sub" for="db-agent" style="display:block;margin-top:8px;">Agent</label>
         <select id="db-agent">
-          ${manageable.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}
+          ${manageable.map((a) => html`<option value="${a.id}" data-profile="${bells.get(a.id)?.profile ?? 'generic'}">${a.name} (${a.squad_name})</option>`)}
         </select>
+        <label class="ui-sub" for="db-profile" style="display:block;margin-top:8px;">Kind of doorbell</label>
+        <select id="db-profile">
+          <option value="generic">Generic webhook (Grok Bot or any HTTPS endpoint)</option>
+          <option value="anthropic_routine">Claude Code routine (api.anthropic.com fire URL + routine token)</option>
+        </select>
+        <p class="ui-sub">A Claude Code routine takes only its fire URL, <code>https://api.anthropic.com/v1/claude_code/routines/&lt;trig_id&gt;/fire</code>, and the routine token as the key. It is fired at most once every 2 minutes per agent.</p>
         <label class="ui-sub" for="db-url" style="display:block;margin-top:8px;">Routine webhook URL (https)</label>
         <input id="db-url" type="url" autocomplete="off" spellcheck="false" style="width:100%;" />
         <label class="ui-sub" for="db-key" style="display:block;margin-top:8px;">Sender key (bearer)</label>
@@ -243,11 +262,17 @@ export function makeDoorbellsApp(shell: ShellFn) {
     const g = await guard(c, body.agent_id, true)
     if (!g.ok) return c.json({ error: g.error }, g.status)
     if (typeof body.webhook_url !== 'string' || typeof body.bearer !== 'string') return c.json({ error: 'bad_request' }, 400)
+    // An explicit profile from the form wins (validated by the service, with that profile's own URL check). A body with
+    // none (an older client, a scripted rotate) keeps the stored profile, so re-saving never silently turns a routine
+    // doorbell generic.
+    if (body.profile !== undefined && typeof body.profile !== 'string') return c.json({ error: 'bad_request' }, 400)
+    const existing = body.profile === undefined ? await getAgentWebhookDoorbell(c.env, g.agentId) : null
     const result = await setAgentWebhookDoorbell(c.env, {
       agentId: g.agentId,
       webhookUrl: body.webhook_url,
       bearer: body.bearer,
       createdByMemberId: g.memberId,
+      ...(typeof body.profile === 'string' ? { profile: body.profile } : existing ? { profile: existing.profile } : {}),
     })
     if (!result.ok) {
       const status = result.error === 'doorbell_crypto_unavailable' ? 503 : result.error === 'webhook_doorbell_disabled' ? 403 : result.error === 'no_tenant' ? 500 : 400

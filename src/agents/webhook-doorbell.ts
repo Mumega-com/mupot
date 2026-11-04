@@ -104,6 +104,28 @@ export const ANTHROPIC_ROUTINE_HEADERS = {
   'anthropic-version': '2023-06-01',
 } as const
 export const ANTHROPIC_ROUTINE_TEXT_MAX = 200
+/**
+ * Rate budget of the routine profile only. Anthropic caps a routine at 30 fires/hour and every fire starts a billed
+ * session with no dedupe on their side, so a wake inside this window of the last fire is coalesced (the routine reads
+ * the whole inbox on its next fire anyway). The generic profile keeps COALESCE_WINDOW_MS / WAKE_BURST_LIMIT only.
+ */
+export const ROUTINE_MIN_FIRE_INTERVAL_MS = 120_000
+/** A 429 without a usable Retry-After suppresses fires for this long; any value is clamped to [1, ROUTINE_RETRY_AFTER_MAX_S]. */
+export const ROUTINE_RETRY_AFTER_DEFAULT_S = 60
+export const ROUTINE_RETRY_AFTER_MAX_S = 3600
+const RETRY_AFTER_REASON_PREFIX = 'retry_after_until:'
+
+/** Seconds to wait from a Retry-After header (delta-seconds or HTTP date); default when absent or unparseable. */
+export function parseRetryAfterSeconds(header: string | null, nowMs: number): number {
+  let secs = ROUTINE_RETRY_AFTER_DEFAULT_S
+  const v = header?.trim() ?? ''
+  if (/^\d{1,9}$/.test(v)) secs = Number(v)
+  else if (v !== '') {
+    const at = Date.parse(v)
+    if (Number.isFinite(at)) secs = Math.ceil((at - nowMs) / 1000)
+  }
+  return Math.min(Math.max(secs, 1), ROUTINE_RETRY_AFTER_MAX_S)
+}
 
 export function validateAnthropicRoutineUrl(raw: string): { ok: true; url: string } | { ok: false; detail: string } {
   const trimmed = raw.trim()
@@ -489,7 +511,7 @@ async function deliverDoorbell(
   // agent has that id and the slug names exactly one agent. Only then look the doorbell up by exact id, so an
   // agent whose slug is shaped like another agent's id can never receive that agent's wakes (gate r2 on #1890).
   // ONE statement (the existence check for the whole send path): resolve to the canonical id, then join the row.
-  // delivery_version is read only while the signed flag is on, so a flag-off send keeps today's SELECT.
+  // profile and the agent slug are always read; delivery_version only while the signed flag is on.
   const row = await env.DB.prepare(
     `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext,
             d.profile AS profile,
@@ -534,6 +556,24 @@ async function deliverDoorbell(
     return { outcome: 'skipped', reason: 'crypto_unavailable' }
   }
 
+  if (profile === 'anthropic_routine') {
+    // A previous 429 recorded when fires may resume. Suppress (no POST, no billed session) until it passes.
+    try {
+      const last = await env.DB.prepare(
+        `SELECT reason FROM agent_webhook_doorbell_receipts
+          WHERE tenant = ?1 AND agent_id = ?2 AND http_status = 429 AND reason LIKE ?3
+          ORDER BY attempted_at DESC LIMIT 1`,
+      ).bind(tenant, canonical.agent_id, `${RETRY_AFTER_REASON_PREFIX}%`).first<{ reason: string }>()
+      const until = last ? Date.parse(last.reason.slice(RETRY_AFTER_REASON_PREFIX.length)) : NaN
+      if (Number.isFinite(until) && until > Date.now()) {
+        await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'retry_after' }, ref)
+        return { outcome: 'skipped', reason: 'retry_after' }
+      }
+    } catch {
+      // fail open on the lookup: the claim below still bounds the rate
+    }
+  }
+
   let claimId: string | null = null
   if (kind === 'test') {
     // Test pings are rate limited per agent with ONE atomic conditional INSERT of a 'claimed' row, so parallel
@@ -564,6 +604,13 @@ async function deliverDoorbell(
     // Not claiming at all (DB error) also skips: a doorbell that cannot count must not flood.
     claimId = crypto.randomUUID()
     let claimed = false
+    // Routine profile only: at most one fire per agent per ROUTINE_MIN_FIRE_INTERVAL_MS (failed fires do not hold the slot).
+    const routineWindowClause = profile === 'anthropic_routine'
+      ? ` AND NOT EXISTS (
+                  SELECT 1 FROM agent_webhook_doorbell_receipts
+                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
+                     AND outcome IN ('claimed', 'posted') AND attempted_at > ?10)`
+      : ''
     try {
       const res = await env.DB.prepare(
         `INSERT INTO agent_webhook_doorbell_receipts
@@ -575,10 +622,11 @@ async function deliverDoorbell(
                      AND outcome IN ('claimed', 'posted') AND attempted_at > ?8)
             AND (SELECT count(*) FROM agent_webhook_doorbell_receipts
                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
-                    AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8) < ?9`,
+                    AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8) < ?9${routineWindowClause}`,
       ).bind(
         claimId, tenant, canonical.agent_id, canonical.type, ref, new Date().toISOString(),
         DOORBELL_TEST_TYPE, isoAgo(COALESCE_WINDOW_MS), WAKE_BURST_LIMIT,
+        ...(profile === 'anthropic_routine' ? [isoAgo(ROUTINE_MIN_FIRE_INTERVAL_MS)] : []),
       ).run()
       claimed = (res.meta?.changes ?? 0) === 1
     } catch {
@@ -655,6 +703,11 @@ async function deliverDoorbell(
     // Release the connection; the body is never read.
     try { await res.body?.cancel() } catch { /* nothing to release */ }
     const outcome: ReceiptStatus = res.ok ? 'posted' : 'failed'
+    if (res.status === 429 && routine) {
+      const secs = parseRetryAfterSeconds(res.headers.get('retry-after'), Date.now())
+      await finish('failed', { http_status: 429, reason: `${RETRY_AFTER_REASON_PREFIX}${new Date(Date.now() + secs * 1000).toISOString()}` })
+      return { outcome: 'failed', http_status: 429, reason: 'retry_after' }
+    }
     await finish(outcome, { http_status: res.status })
     return { outcome, http_status: res.status }
   } catch (err) {

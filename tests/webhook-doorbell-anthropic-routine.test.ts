@@ -4,7 +4,9 @@ import { sendAgentMessage } from '../src/agents/messages'
 import {
   getAgentWebhookDoorbell,
   listAgentWebhookDoorbellReceipts,
+  parseRetryAfterSeconds,
   routineText,
+  ROUTINE_MIN_FIRE_INTERVAL_MS,
   scheduleTaskAssignedDoorbell,
   setAgentWebhookDoorbell,
 } from '../src/agents/webhook-doorbell'
@@ -117,6 +119,8 @@ describe('doorbell profile anthropic_routine', () => {
 
   it.each([
     ['other host', 'https://evil.example/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
+    ['url embedded after a prefix path (unanchored)', 'https://evil.example/x/https://api.anthropic.com/v1/claude_code/routines/trig_abc12345/fire'],
+    ['lookalike host (unescaped dot)', 'https://api-anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
     ['subdomain host', 'https://x.api.anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
     ['other path', 'https://api.anthropic.com/v1/messages'],
     ['path suffix', 'https://api.anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire/extra'],
@@ -137,6 +141,8 @@ describe('doorbell profile anthropic_routine', () => {
 
   it.each([
     ['other host', 'https://evil.example/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
+    ['url embedded after a prefix path (unanchored)', 'https://evil.example/x/https://api.anthropic.com/v1/claude_code/routines/trig_abc12345/fire'],
+    ['lookalike host (unescaped dot)', 'https://api-anthropic.com/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
     ['other path', 'https://api.anthropic.com/v1/messages'],
     ['query', `${ROUTINE_URL}?x=1`],
     ['port', 'https://api.anthropic.com:8443/v1/claude_code/routines/trig_01ABCDEFGHJKLMNOPQRSTUVW/fire'],
@@ -173,6 +179,81 @@ describe('doorbell profile anthropic_routine', () => {
     const calls = await sendWake('hi')
     expect(calls).toHaveLength(1)
     expect((calls[0].init.headers as Record<string, string>).Authorization).toBe(`Bearer ${BEARER}`)
+  })
+
+  describe('rate budget (routine profile only)', () => {
+    const receipts = () => harness.sqlite.prepare('SELECT outcome, http_status, reason FROM agent_webhook_doorbell_receipts ORDER BY attempted_at').all()
+    /** Move every receipt back in time, as if `ms` had passed. */
+    const age = (ms: number) => harness.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET attempted_at = ?').run(new Date(Date.now() - ms).toISOString())
+
+    it('fires at most once per window; a wake inside it is a coalesced receipt', async () => {
+      await register(ROUTINE_URL)
+      expect(await sendWake('one')).toHaveLength(1)
+      expect(await sendWake('two')).toHaveLength(0)
+      expect(await sendWake('three')).toHaveLength(0)
+      expect(receipts()).toEqual([
+        { outcome: 'posted', http_status: 200, reason: null },
+        { outcome: 'skipped', http_status: null, reason: 'coalesced' },
+        { outcome: 'skipped', http_status: null, reason: 'coalesced' },
+      ])
+      expect(ROUTINE_MIN_FIRE_INTERVAL_MS).toBe(120_000)
+    })
+
+    it('fires again once the window has passed', async () => {
+      await register(ROUTINE_URL)
+      await sendWake('one')
+      age(ROUTINE_MIN_FIRE_INTERVAL_MS + 5_000)
+      expect(await sendWake('later')).toHaveLength(1)
+    })
+
+    it('a failed fire does not hold the slot', async () => {
+      await register(ROUTINE_URL)
+      expect(await sendWake('one', () => new Response('boom', { status: 500 }))).toHaveLength(1)
+      expect(await sendWake('two')).toHaveLength(1)
+    })
+
+    it('the generic profile is not windowed (two wakes both fire)', async () => {
+      await register('https://webhook.example/wake', 'generic')
+      expect(await sendWake('one')).toHaveLength(1)
+      expect(await sendWake('two')).toHaveLength(1)
+    })
+
+    it('a 429 records Retry-After and suppresses fires until it passes', async () => {
+      await register(ROUTINE_URL)
+      const before = Date.now()
+      expect(await sendWake('one', () => new Response('slow down', { status: 429, headers: { 'retry-after': '600' } }))).toHaveLength(1)
+      const row = harness.sqlite.prepare('SELECT outcome, http_status, reason FROM agent_webhook_doorbell_receipts').get() as { outcome: string; http_status: number; reason: string }
+      expect(row).toMatchObject({ outcome: 'failed', http_status: 429 })
+      const until = Date.parse(row.reason.replace('retry_after_until:', ''))
+      expect(until).toBeGreaterThanOrEqual(before + 599_000)
+      expect(until).toBeLessThanOrEqual(Date.now() + 601_000)
+      // past the 120s window but inside Retry-After: still suppressed, no POST
+      age(ROUTINE_MIN_FIRE_INTERVAL_MS + 5_000)
+      const rewrite = harness.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET reason = ?').run(`retry_after_until:${new Date(Date.now() + 300_000).toISOString()}`)
+      expect(rewrite.changes).toBe(1)
+      expect(await sendWake('during')).toHaveLength(0)
+      expect(receipts().at(-1)).toEqual({ outcome: 'skipped', http_status: null, reason: 'retry_after' })
+      // after it passes, fires resume
+      harness.sqlite.prepare("UPDATE agent_webhook_doorbell_receipts SET reason = ? WHERE http_status = 429").run(`retry_after_until:${new Date(Date.now() - 1_000).toISOString()}`)
+      expect(await sendWake('after')).toHaveLength(1)
+    })
+
+    it('parses Retry-After seconds, dates, junk and clamps', () => {
+      const now = Date.parse('2026-11-04T00:00:00Z')
+      expect(parseRetryAfterSeconds('90', now)).toBe(90)
+      expect(parseRetryAfterSeconds('99999999', now)).toBe(3600)
+      expect(parseRetryAfterSeconds('0', now)).toBe(1)
+      expect(parseRetryAfterSeconds(null, now)).toBe(60)
+      expect(parseRetryAfterSeconds('soon', now)).toBe(60)
+      expect(parseRetryAfterSeconds('Wed, 04 Nov 2026 00:05:00 GMT', now)).toBe(300)
+      expect(parseRetryAfterSeconds('Tue, 03 Nov 2026 00:00:00 GMT', now)).toBe(1)
+    })
+
+    it('a 429 on the generic profile does not suppress anything', async () => {
+      await register('https://webhook.example/wake', 'generic')
+      expect(await sendWake('one', () => new Response('x', { status: 429, headers: { 'retry-after': '600' } }))).toHaveLength(1)
+      expect(await sendWake('two')).toHaveLength(1)
+    })
   })
 
   it('stores the bearer encrypted and shows the profile, never the bearer, in get and receipts', async () => {

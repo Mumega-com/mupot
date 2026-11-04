@@ -134,3 +134,9 @@ other host/path), checked at registration and again at send time. The profile is
 it untrusted). Redirects are never followed. The profile always uses the legacy bearer path, even with
 `WEBHOOK_DOORBELL_SIGNED` on. `get_agent_webhook_doorbell` and the receipt list show `profile`, never the bearer.
 Apply migration 0271 before the Worker deploy.
+
+Routine rate budget: Anthropic caps a routine at 30 fires/hour and bills each fire, so this profile fires at most once per agent per
+120 seconds. A wake inside the window is recorded as a `skipped` receipt with reason `coalesced`; the routine reads the whole
+inbox on its next fire. A 429 records `retry_after_until:<iso>` (from `Retry-After`, clamped to 1 to 3600 s, default 60 s) and
+suppresses fires (`skipped`, reason `retry_after`) until it passes. The dashboard `/doorbells` form has a profile select and
+preselects the one stored for the chosen agent.
