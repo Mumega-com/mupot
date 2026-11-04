@@ -9,7 +9,7 @@
 // #41 work lands, dedupe MCP's authenticateMember onto this helper. Kept separate
 // for now to avoid editing that file mid-change.
 
-import type { Env } from '../types'
+import type { ConnectionChannel, Env } from '../types'
 import { resolveCapabilities, hasCapability } from './capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from './token-lifecycle'
 import { authLookupOrNull } from './fail-closed'
@@ -27,6 +27,9 @@ export interface AgentIdentity {
   // human/operator principal. The weld between the member plane and the agent plane:
   // an agent-scoped token's holder IS that agent (orient/presence/attribution use it).
   boundAgentId: string | null
+  // member_tokens.channel of the live row. Optional so existing identity literals keep compiling;
+  // the HTTP bearer-read door (bearer-read.ts) fails CLOSED when it is absent or not workspace/im.
+  channel?: ConnectionChannel | null
 }
 
 /** SHA-256 hex digest of a raw member token — store/pass this, never the raw secret. */
@@ -95,7 +98,7 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
   const tokenHash = await hashMemberToken(raw)
   const sf = seatFloorSql(env)
   const row = await env.DB.prepare(
-    `SELECT t.id AS token_id, m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id, t.last_used_at AS last_used_at${sf.select}
+    `SELECT t.id AS token_id, m.id AS member_id, m.display_name AS display_name, m.email AS email, m.status AS status, t.agent_id AS bound_agent_id, t.channel AS channel, t.last_used_at AS last_used_at${sf.select}
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
        ${sf.join}
@@ -115,7 +118,7 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
-    .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null; last_used_at?: string | null; seat_status: string | null; seat_row_id: string | null }>()
+    .first<{ token_id: string; member_id: string; display_name: string; email: string | null; status: string; bound_agent_id: string | null; channel?: ConnectionChannel | null; last_used_at?: string | null; seat_status: string | null; seat_row_id: string | null }>()
   if (!row || row.status !== 'active') return null
   // #2060 P1-c: every REST surface resolves its bearer here. A seat agent that is observed/held has no REST reach (the observed floor is
   // MCP tool names; REST routes are not on it), so a human-minted token bound to such a seat agent resolves to nobody. VIP_LANE off = no-op.
@@ -130,6 +133,7 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
     displayName: row.display_name,
     email: row.email,
     boundAgentId: row.bound_agent_id ?? null,
+    ...(row.channel ? { channel: row.channel } : {}),
   }
 }
 

@@ -48,6 +48,7 @@ import type {
 } from '../types'
 
 import { LOGIN_RETURN_COOKIE, requireAuth, safeReturnPath } from '../auth'
+import { unauthenticatedApiBody } from '../auth/bearer-read'
 // mupot#1445: the signed-out '/' landing reuses invite.ts's unauthenticated-
 // safe pageShell/esc (same shape as the /invite/:id page) instead of a second
 // copy, and the pending-invite cookie name from its single source of truth —
@@ -476,6 +477,11 @@ dashboardApp.use('*', async (c, next) => {
     // and validates it with the same safeReturnPath /auth/login uses.
     if (c.req.method === 'GET' && /^\/claim\/[A-Za-z0-9-]{4,16}$/.test(c.req.path)) {
       return c.redirect(`/?return=${encodeURIComponent(c.req.path)}`)
+    }
+    // #2308: an unauthenticated /api/* caller is a program, not a browser. A 302 to an HTML login page tells it
+    // nothing; hand back requireAuth's own 401 JSON, which names the accepted credentials.
+    if (c.req.path.startsWith('/api/')) {
+      return authResult instanceof Response ? authResult : c.json(unauthenticatedApiBody(c.req.method, c.req.path), 401)
     }
     // Unauthenticated → send the browser to the login flow.
     return c.redirect('/auth/login')

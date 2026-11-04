@@ -22,6 +22,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
 import { isOrgAdmin, resolveCapabilities } from './capability'
+import { bearerReadEligible, resolveBearerReadAuth, unauthenticatedApiBody } from './bearer-read'
 import {
   linkLoginIdentity,
   listLoginIdentities,
@@ -2537,16 +2538,25 @@ async function loadAuthFromCookieInner(c: Context<AppEnv>): Promise<AuthContext 
  * cookie is absent or the session is missing/expired. The tenant is taken from
  * the environment, NEVER from the client.
  */
-function requireAuthMw(): MiddlewareHandler<AppEnv> {
+function requireAuthMw(opts: { bearerReads?: boolean } = {}): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
-    const auth = await loadAuthFromCookie(c)
-    if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+    let auth = await loadAuthFromCookie(c)
+    // #2308: ONLY the exported requireAuth (opts.bearerReads) may fall back to a member bearer, and only
+    // for an allowlisted GET/HEAD /api route (src/auth/bearer-read.ts). /auth/* and requireRole build their
+    // own instances without the option, so they stay cookie-only.
+    if (!auth && opts.bearerReads && bearerReadEligible(c.req.method, c.req.path)) {
+      auth = await resolveBearerReadAuth(c.env, c.req.header('authorization'))
+    }
+    if (!auth) {
+      if (opts.bearerReads && c.req.path.startsWith('/api/')) return c.json(unauthenticatedApiBody(c.req.method, c.req.path), 401)
+      return c.json({ error: 'unauthenticated' }, 401)
+    }
     c.set('auth', auth)
     await next()
   }
 }
 
-export const requireAuth: MiddlewareHandler<AppEnv> = requireAuthMw()
+export const requireAuth: MiddlewareHandler<AppEnv> = requireAuthMw({ bearerReads: true })
 
 /**
  * Same cookie/KV resolution as requireAuth, but optional: returns null instead
