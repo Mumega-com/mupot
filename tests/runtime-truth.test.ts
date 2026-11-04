@@ -183,8 +183,23 @@ describe('peers() reads the live runtime (fca29748)', () => {
   it('P2-3: a keyed agent fleet value is attested; an unkeyed one is not', async () => {
     seedFleet('codex', 'gpt-5.6-terra', '-1 minutes')
     expect((await peerOf()).live_runtime.model).toMatchObject({ trust: 'self_reported', attested: false })
-    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, 'kasra', 'k', 'Ed25519', ?, 1)`).run(TENANT, MEMBER)
+    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, ?, 'k', 'Ed25519', ?, 1)`).run(TENANT, AGENT, MEMBER)
     expect((await peerOf()).live_runtime.model).toMatchObject({ trust: 'attested', attested: true })
+  })
+
+  it('P1-T: a uuid-keyed fleet row is NOT attested when the key is registered under the slug (bearer-writable row)', async () => {
+    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, 'kasra', 'k', 'Ed25519', ?, 1)`).run(TENANT, MEMBER)
+    seedFleet('codex', 'bearer-forged-model', '-1 minutes') // uuid row, written over a bearer
+    seedPresence('claude-code', 'claude-opus-5', '-1 minutes')
+    const p = await peerOf()
+    expect(p.live_runtime.model).not.toMatchObject({ attested: true })
+    expect(p.live_runtime.model).toMatchObject({ value: 'claude-opus-5', trust: 'self_reported' })
+  })
+
+  it('P1-T: a slug-keyed fleet row IS attested when the key is registered under that same slug', async () => {
+    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, 'kasra', 'k', 'Ed25519', ?, 1)`).run(TENANT, MEMBER)
+    seedFleet('codex', 'gpt-5.6-terra', '-1 minutes', 'kasra')
+    expect((await peerOf()).live_runtime.model).toMatchObject({ value: 'gpt-5.6-terra', trust: 'attested', attested: true })
   })
 
   it('presence from another tenant is ignored', async () => {
@@ -195,7 +210,7 @@ describe('peers() reads the live runtime (fca29748)', () => {
   })
 
   it('P2-a: a KEYED agent signed fleet model outranks a bearer check_in; the check_in is listed in conflicts', async () => {
-    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, 'kasra', 'k', 'Ed25519', ?, 1)`).run(TENANT, MEMBER)
+    h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES (?, ?, 'k', 'Ed25519', ?, 1)`).run(TENANT, AGENT, MEMBER)
     seedFleet('codex', 'gpt-5.6-terra', '-1 minutes')
     seedPresence('claude-code', 'claude-opus-5', '-1 minutes')
     const p = await peerOf()

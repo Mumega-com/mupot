@@ -252,14 +252,11 @@ export async function loadRuntimeTruth(
   for (const r of presence) presenceBy.set(r.agent_id, [...(presenceBy.get(r.agent_id) ?? []), r])
   const fleetByKey = new Map(fleet.map((r) => [r.agent_id, r]))
   for (const a of agents) {
-    out.set(a.id, deriveRuntimeTruth(
-      a,
-      presenceBy.get(a.id) ?? [],
-      fleetByKey.get(a.id) ?? (slugOk.has(a.slug) ? fleetByKey.get(a.slug) : undefined) ?? null,
-      keyedIds.has(a.id) || (slugOk.has(a.slug) && keyedIds.has(a.slug)),
-      nowMs,
-      degraded,
-    ))
+    const row = fleetByKey.get(a.id) ?? (slugOk.has(a.slug) ? fleetByKey.get(a.slug) : undefined) ?? null
+    // A fleet value is attested only when the key is registered under the SAME id as the row that
+    // supplied it. A uuid row written over a bearer (keys held under the slug) stays self_reported.
+    const keyed = row !== null && keyedIds.has(row.agent_id)
+    out.set(a.id, deriveRuntimeTruth(a, presenceBy.get(a.id) ?? [], row, keyed, nowMs, degraded))
   }
   return out
 }
