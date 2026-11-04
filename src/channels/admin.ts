@@ -7,7 +7,8 @@
 // others) — single-use, short-TTL, never a self-claimed identity.
 
 import { Hono, type MiddlewareHandler } from 'hono'
-import { z } from 'zod'
+// namespace import: lets the bundler drop the 64 unused zod locales (tests/zod-validators-parity.test.ts)
+import * as z from 'zod'
 import type { Env, AuthContext, Capability, ChannelBinding, OrgKind } from '../types'
 import { requireAuth } from '../auth'
 import { csrf } from 'hono/csrf'
@@ -179,7 +180,7 @@ channelsAdminApp.get('/sync/status', requireOrgCapability('member'), async (c) =
 // The route fails closed on absent token, missing binding, or any Discord API
 // error that prevents a reliable projection.
 
-const SyncBody = z.object({
+export const SyncBody = z.object({
   squadId: z.string().optional(),
   dryRun: z.boolean().optional(),
 })

@@ -1,7 +1,8 @@
 // src/auth/sso-routes.ts — Enterprise SSO Configuration & Domain Verification REST Endpoints.
 
 import { Hono } from 'hono'
-import { z } from 'zod'
+// namespace import: lets the bundler drop the 64 unused zod locales (tests/zod-validators-parity.test.ts)
+import * as z from 'zod'
 import type { Env, AuthContext } from '../types'
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from './index'
@@ -31,7 +32,7 @@ export const ssoApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext }
 // declare. autoEnrollSsoMember (sso.ts) re-validates default_role again at
 // enroll time against the SAME allowlist, in case a value written before this
 // fix (or via direct D1 access) is already sitting in org_settings.
-const SsoConfigBody = z
+export const SsoConfigBody = z
   .object({
     enabled: z.boolean().optional(),
     allowed_domains: z.array(z.string()).optional(),
