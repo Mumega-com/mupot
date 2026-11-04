@@ -448,6 +448,10 @@ export function extractCreatedObjects(statements) {
 // the ORIGINAL file text, so already-provisioned pots see the same chain identity.
 // tests/gen-schema-chain-strip.test.mjs proves, per migration, that a fresh SQLite built
 // from the stripped statements has the same schema and data as one built from the original.
+// SQLite whitespace is exactly [ \t\n\f\r]. JS `\s`/trim() also swallow U+00A0, U+000B, U+FEFF,
+// U+2028, which SQLite treats as identifier characters: `a/**/<NBSP>m` must stay two tokens.
+const SQLITE_WS_END = /[ \t\n\f\r]$/
+const SQLITE_WS_CHAR = /[ \t\n\f\r]/
 export function stripSqlComments(sql, fileLabel) {
   const n = sql.length
   let out = ''
@@ -473,7 +477,7 @@ export function stripSqlComments(sql, fileLabel) {
       const close = sql.indexOf('*/', i + 2)
       if (close === -1) fail('unterminated /* block comment */')
       i = close + 2
-      if (out.length > 0 && !/\s$/.test(out) && i < n && !/\s/.test(sql[i])) out += ' '
+      if (out.length > 0 && !SQLITE_WS_END.test(out) && i < n && !SQLITE_WS_CHAR.test(sql[i])) out += ' '
       continue
     }
     if (ch === "'" || ch === '"' || ch === '`') {
@@ -499,7 +503,7 @@ export function stripSqlComments(sql, fileLabel) {
     out += ch
     i += 1
   }
-  return out.trim()
+  return out.replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, '')
 }
 
 // ---------------------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import { createHash } from 'node:crypto'
 import { applyAllMigrations, migrationFiles, resetMigrationCache } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { listMigrationFiles as generatorListMigrationFiles } from '../scripts/gen-schema-chain.mjs'
+import { normaliseSqlForComparison } from '../scripts/sql-compare.mjs'
 import {
   SCHEMA_CHAIN,
   SCHEMA_CHAIN_DIGEST,
@@ -50,12 +51,8 @@ afterEach(() => {
 // only. Literals ('..', "..", `..`, [..]) are matched first and preserved; each run of
 // comments/whitespace collapses to one space. Strict per-migration schema+data equivalence of the
 // stripper is proven in tests/gen-schema-chain-strip.test.mjs.
-const COMMENT_WHITESPACE_RE =
-  /('(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])|((?:--[^\n]*|\/\*[\s\S]*?\*\/|\s)+)/g
-
 function normaliseSql(sql: unknown): unknown {
-  if (typeof sql !== 'string') return sql
-  return sql.replace(COMMENT_WHITESPACE_RE, (_match, literal: string | undefined) => literal ?? ' ').trim()
+  return normaliseSqlForComparison(sql)
 }
 
 function schemaObjects(harness: SqliteD1Harness): string {

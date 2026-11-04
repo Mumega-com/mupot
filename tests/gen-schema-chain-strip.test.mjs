@@ -25,18 +25,11 @@ import {
   splitSqlStatements,
   stripSqlComments,
 } from '../scripts/gen-schema-chain.mjs'
+import { normaliseSqlForComparison } from '../scripts/sql-compare.mjs'
 
-// ── independent normaliser (deliberately NOT stripSqlComments) ──────────────────────────
-// Regex tokenizer: literals are matched first and kept; each run of comments/whitespace
-// becomes one space. Used on BOTH sides, because sqlite_master.sql keeps comments that sit inside a
-// CREATE statement's text.
-const NORMALISE_RE = /('(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])|((?:--[^\n]*|\/\*[\s\S]*?\*\/|\s)+)/g
-function normaliseSql(sql) {
-  if (sql === null || sql === undefined) return null
-  return String(sql)
-    .replace(NORMALISE_RE, (_m, literal) => (literal === undefined ? ' ' : literal))
-    .trim()
-}
+// Independent normaliser (deliberately NOT stripSqlComments): scripts/sql-compare.mjs,
+// SQLite-whitespace-only, shared with tests/schema-chain.test.ts.
+const normaliseSql = normaliseSqlForComparison
 
 function snapshot(db) {
   const master = db
@@ -156,6 +149,13 @@ const FIXTURE = [
       '/* block */',
       'CREATE TABLE fx_log (msg TEXT);',
       'CREATE VIEW fx_v AS SELECT/**/id/**/AS/**/k FROM fx;',
+      // F1: NBSP is an identifier char in SQLite, not whitespace: `a`, comment, `<NBSP>m` stay
+      // two tokens (column a, type "<NBSP>m INT"). JS \s would fuse them into `a<NBSP>m`.
+      'CREATE TABLE fx_nb (a/**/\u00a0m INT);',
+      // F3 (M10): `/*/` does not close the comment — the closer needs its own `*/`.
+      'CREATE VIEW fx_c AS SELECT 1 /*/ still inside */ AS c;',
+      // F3 (M11): a comment between two `-` must leave a space, else `1--1` becomes a comment.
+      'CREATE VIEW fx_m AS SELECT 1-/**/-1 AS v;',
       'CREATE TRIGGER fx_guard BEFORE DELETE ON fx',
       'BEGIN',
       "  -- comment in trigger body with 'quote",
@@ -235,5 +235,18 @@ for (const [name, mutant] of Object.entries(MUTANTS)) {
   test(`mutant rejected: stripper that ${name}`, () => {
     const differences = compareChains(FIXTURE, mutant)
     assert.notDeepEqual(differences, [], `mutant "${name}" survived the equivalence harness`)
+  })
+}
+
+// F1/F3 mutants of the REAL stripper's tricky rules, as reference strippers.
+const MUTANTS_2 = {
+  'uses JS \\s (fuses a/**/<NBSP>m)': (sql) =>
+    makeStripper({})(sql.replace(/\/\*\*\/\u00a0/g, '\u00a0')),
+  'closes block comment at /*/': (sql) => sql.replace(/\/\*\/[\s\S]*?\*\//g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' '),
+  'inserts no space for a comment': (sql) => makeStripper({})(sql).replace(/- -/g, '--'),
+}
+for (const [name, mutant] of Object.entries(MUTANTS_2)) {
+  test(`mutant rejected: stripper that ${name}`, () => {
+    assert.notDeepEqual(compareChains(FIXTURE, mutant), [], `mutant "${name}" survived`)
   })
 }
