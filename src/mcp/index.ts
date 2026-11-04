@@ -1,3 +1,4 @@
+import { boundAgentIsLive, BOUND_AGENT_NOT_AUTHORIZED } from '../auth/bound-agent-live'
 import { MCP_BASE_REQUEST_CAP_BYTES, MCP_REQUEST_CAP_BYTES, oversizeForTool, payloadTooLargeDetail, readBoundedText, toolTooLargeDetail } from './request-cap'
 import { withRoutineReviewDeadlines } from '../routines/review-window'
 import { TASK_GET_FIELDS } from '../tasks/task-get-fields'
@@ -8413,6 +8414,22 @@ export const DELEGATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * mupot#983: the live capability check for agent-bound sessions, run by every transport door (tools/call, the legacy
+ * {tool,args} body, /actions/:tool) before it dispatches a tool. One shared helper, one D1 read, only when the session
+ * carries an agent weld. The refusal code is identical whichever leg (agent / owner / consenter) failed. Returns the refusal
+ * outcome, or null when the session may proceed.
+ */
+export async function boundAgentRefusal(
+  env: Env,
+  auth: AuthContext,
+  toolName: unknown,
+): Promise<(ToolOutcome & { tool?: string }) | null> {
+  if (!auth.boundAgentId) return null
+  if (await boundAgentIsLive(env, auth)) return null
+  return { ...fail(403, BOUND_AGENT_NOT_AUTHORIZED, 'this agent session is no longer authorized'), tool: typeof toolName === 'string' ? toolName : undefined }
+}
+
+/**
  * THE single exit of every tool call. With ADMISSION_TAPE off (default) this is exactly invokeToolInner. With it on, the
  * finished outcome is described to the admission tape (SHADOW: shape only, waitUntil, errors swallowed and counted) and
  * returned UNCHANGED; the tap can never alter, block or delay the response.
@@ -8945,14 +8962,16 @@ async function handleJsonRpc(
     }
     // W3 (MCP_URL_ELICITATION): only the two request tools, only with the flag, secure moments and signing key on.
     let elicitPrep: ElicitationPrep | null = null
-    if (urlElicitOn && typeof canonicalName === 'string' && URL_ELICITATION_TOOLS.has(canonicalName)) {
+    // mupot#983: the live agent check runs before anything (elicitation prep included) can act for the weld.
+    const liveRefusal = await boundAgentRefusal(c.env, auth, params.name)
+    if (!liveRefusal && urlElicitOn && typeof canonicalName === 'string' && URL_ELICITATION_TOOLS.has(canonicalName)) {
       elicitPrep = await prepareUrlElicitation(c.env, auth, {
         toolName: canonicalName, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
       })
       // A refusal of a bad requestState happens INSIDE invokeTool (after its authz gates), via this hook.
       if (elicitPrep) ctx.shortCircuit = elicitPrep.shortCircuit
     }
-    const outcome = await invokeTool(auth, c.env, params.name, toolArguments, ctx)
+    const outcome = liveRefusal ?? await invokeTool(auth, c.env, params.name, toolArguments, ctx)
     if (outcome.ok && elicitPrep?.mode && !elicitPrep.answeredByRetry()) {
       const offered = await buildElicitation(c.env, auth, { toolName: outcome.tool as string, args: toolArguments ?? {}, mode: elicitPrep.mode, result: outcome.result })
       if (offered?.kind === 'error') return rpcError(id, offered.code, offered.message, offered.data)
@@ -9318,7 +9337,7 @@ mcpApp.post('/', async (c) => {
     source: c.req.header('x-mupot-source'),
     tenantNotice: c.get('tenantNotice'),
   }
-  const outcome = await invokeTool(auth, c.env, body.tool, body.args, ctx)
+  const outcome = (await boundAgentRefusal(c.env, auth, body.tool)) ?? await invokeTool(auth, c.env, body.tool, body.args, ctx)
 
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
@@ -9489,7 +9508,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
     source: c.req.header('x-mupot-source'),
   }
-  const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
+  const outcome = (await boundAgentRefusal(c.env, auth, c.req.param('tool'))) ?? await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })

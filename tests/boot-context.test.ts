@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
+import { LIVE_BOUND_AGENT_ROW, isLiveBoundAgentSql } from './helpers/live-agent-row'
 
 // boot_context MCP tool — #126 identity_status signal for coherent first-run onboarding.
 //
@@ -27,6 +28,7 @@ function makeEnv(opts: Opts = {}): Env {
     bind() {
       return {
         async first() {
+          if (isLiveBoundAgentSql(sql)) return LIVE_BOUND_AGENT_ROW
           if (sql.includes('FROM member_tokens')) {
             return {
               member_id: memberId,
