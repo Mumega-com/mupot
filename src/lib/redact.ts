@@ -4,7 +4,14 @@
 // to logs and error sites outside projections without cross-importing a
 // projection module.
 
-const ASSIGNMENT_RE = /((?:^|[\s,;{?&])["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)[^,;}&\r\n]+/g
+// Matches only the `key =` / `key :` HEAD of a pair. The value is consumed separately, and only when the
+// key is sensitive: a head that is NOT sensitive (`Error: ...`, `status: 401 ...`) must leave its value
+// in place to be scanned, or a later `secret=...` inside it would be swallowed and never redacted.
+// The delimiter is a lookbehind so a head's trailing whitespace never eats the delimiter of the next pair.
+const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)/g
+const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
+// A literal flag is not a secret: `has_token=true`.
+const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
 export function isSensitiveDetailKey(key: string): boolean {
@@ -29,14 +36,30 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
+function redactAssignments(text: string): string {
+  let out = ''
+  let cursor = 0
+  ASSIGNMENT_HEAD_RE.lastIndex = 0
+  for (let m = ASSIGNMENT_HEAD_RE.exec(text); m !== null; m = ASSIGNMENT_HEAD_RE.exec(text)) {
+    const head = m[1] ?? ''
+    const key = m[2] ?? ''
+    const valueStart = m.index + head.length
+    if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
+    const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
+    if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
+    out += text.slice(cursor, valueStart) + '[redacted]'
+    cursor = valueStart + valueMatch[0].length
+    ASSIGNMENT_HEAD_RE.lastIndex = cursor
+  }
+  return out + text.slice(cursor)
+}
+
 export function redactSecretPatterns(text: string): string {
   return text
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
-    .replace(ASSIGNMENT_RE, (match, prefix: string, key: string) => (
-      isSensitiveDetailKey(key) ? `${prefix}[redacted]` : match
-    ))
+    .replace(/^[\s\S]*$/, redactAssignments)
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')

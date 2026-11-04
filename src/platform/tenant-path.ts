@@ -193,16 +193,21 @@ export function rewriteHtmlForPrefix(html: string, prefix: string, injectShim = 
  *  nonce/hash (browsers ignore 'unsafe-inline' once a nonce or hash is present). */
 export function cspBlocksInlineScript(csp: string | null): boolean {
   if (csp === null) return false
-  const directives = new Map<string, string[]>()
-  for (const part of csp.split(';')) {
-    const tokens = part.trim().split(/\s+/).filter((t) => t.length > 0)
-    const name = tokens.shift()?.toLowerCase()
-    if (name !== undefined && !directives.has(name)) directives.set(name, tokens.map((t) => t.toLowerCase()))
-  }
-  const sources = directives.get('script-src') ?? directives.get('default-src')
-  if (sources === undefined) return false
-  const strict = sources.some((t) => t.startsWith("'nonce-") || t.startsWith("'sha") || t === "'strict-dynamic'")
-  return strict || !sources.includes("'unsafe-inline'")
+  // A header may carry several comma-joined policies; the browser enforces ALL of them, so
+  // any single one that blocks inline scripts blocks them.
+  return csp.split(',').some((policy) => {
+    const directives = new Map<string, string[]>()
+    for (const part of policy.split(';')) {
+      const tokens = part.trim().split(/\s+/).filter((t) => t.length > 0)
+      const name = tokens.shift()?.toLowerCase()
+      if (name !== undefined && !directives.has(name)) directives.set(name, tokens.map((t) => t.toLowerCase()))
+    }
+    // An inline <script> element is governed by script-src-elem, then script-src, then default-src.
+    const sources = directives.get('script-src-elem') ?? directives.get('script-src') ?? directives.get('default-src')
+    if (sources === undefined) return false
+    const strict = sources.some((t) => t.startsWith("'nonce-") || t.startsWith("'sha") || t === "'strict-dynamic'")
+    return strict || !sources.includes("'unsafe-inline'")
+  })
 }
 
 /** The response choke point for a prefixed tenant. HTML bodies are rewritten (streams such as

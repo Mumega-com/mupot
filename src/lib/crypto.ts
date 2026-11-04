@@ -24,7 +24,9 @@
  * `CONSTANT_TIME_WIDTH` iterations for any input up to that many bytes, and a whole number of
  * width-sized blocks beyond it. Comparing a guess of any length against a secret of up to
  * 1024 bytes therefore costs the same, which covers every bearer token, webhook key and HMAC
- * hex digest in this codebase. Residual: a secret LONGER than the width still shows its
+ * hex digest in this codebase. Comparison is over UTF-8 bytes, and TextEncoder maps every lone
+ * surrogate to U+FFFD, so two strings differing only in lone surrogates compare equal; all secrets here
+ * are ASCII, so this is noted rather than handled. Residual: a secret LONGER than the width still shows its
  * length to the nearest block when the guess is shorter; none of ours are.
  */
 export const CONSTANT_TIME_WIDTH = 1024

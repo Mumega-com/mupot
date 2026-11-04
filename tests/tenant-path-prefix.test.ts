@@ -582,6 +582,17 @@ describe('source ratchets', () => {
 // mupot#981 — the dashboard now sends a baseline CSP (object-src/base-uri/frame-ancestors). The prefix
 // wrapper used to treat ANY CSP as "inline scripts blocked" and dropped the client shim, which broke
 // prefixed tenants. Only a CSP that actually constrains scripts may suppress it.
+describe('cspBlocksInlineScript (multi-policy and script-src-elem)', () => {
+  it('treats a comma-joined list as separate policies; any one blocking blocks', () => {
+    expect(cspBlocksInlineScript("object-src 'none', script-src 'self'")).toBe(true)
+    expect(cspBlocksInlineScript("object-src 'none', base-uri 'none'")).toBe(false)
+  })
+  it('uses script-src-elem for inline script elements before script-src', () => {
+    expect(cspBlocksInlineScript("script-src 'unsafe-inline'; script-src-elem 'self'")).toBe(true)
+    expect(cspBlocksInlineScript("script-src 'self'; script-src-elem 'unsafe-inline'")).toBe(false)
+  })
+})
+
 describe('cspBlocksInlineScript', () => {
   it('is false with no CSP and for a CSP that does not constrain scripts', () => {
     expect(cspBlocksInlineScript(null)).toBe(false)

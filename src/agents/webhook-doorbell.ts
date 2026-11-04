@@ -670,7 +670,7 @@ async function deliverDoorbell(
       return
     }
     // Finalize the claimed row in place (same id), so the window row IS the attempt's receipt.
-    console[status === 'posted' ? 'info' : 'warn'](`[webhook-doorbell] wake ${status}`, {
+    safeConsole[status === 'posted' ? 'info' : 'warn'](`[webhook-doorbell] wake ${status}`, {
       event_type: canonical.type, agent_id: canonical.agent_id, ...detail,
     })
     try {

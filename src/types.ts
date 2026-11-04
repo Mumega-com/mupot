@@ -360,6 +360,8 @@ export interface Env {
   // 'console' (dev/test — logs the link+code, never sends real mail) or unset
   // (Resend, the only real provider today). LOCAL_TEST_AUTH=1 also forces the
   // console sender regardless of this value. See src/auth/email-sender.ts.
+  // 'production' / 'prod' makes dev-only surfaces refuse to start (the console email sender).
+  ENVIRONMENT?: string
   EMAIL_PROVIDER?: string
   // Same secret/var names as workers/inkwell-api's own request-code Resend
   // sender (src/routes/auth.ts) — one Resend key/from-address pair serves

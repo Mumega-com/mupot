@@ -774,7 +774,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           safeConsole.warn('bus: message.created — declined by receiver', {
             ...logCtx,
             status: outcome.status,
-            reason: outcome.reason.slice(0, 200),
+            reason: outcome.reason.slice(0, 120), // receiver-supplied free text: bounded here, scrubbed by safeConsole
             route: outcome.route,
             metric: 'hermes_delivery.declined',
           })
@@ -827,7 +827,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         slug: payload.slug,
         not_completed: payload.not_completed,
         orphaned_resources: payload.orphaned_resources,
-        reason: payload.incomplete_reason,
+        reason: typeof payload.incomplete_reason === 'string' ? payload.incomplete_reason.slice(0, 120) : payload.incomplete_reason, // free text: bounded, scrubbed by safeConsole
       })
       // Acked, not retried: retrying cannot finish a provisioning run that was never
       // implemented, and a poisoned queue would bury the alert we just logged.
