@@ -13,7 +13,8 @@
 // 914bf4fe additions replayed: capabilities.expected_id:true; a body write at expected_version>0 without expected_id is
 // 400 expected_id_required on a VISIBLE page and a bare 409 on a hidden/absent one; a v0 create collision is 409 BEFORE
 // that check; an id mismatch is 409 with reason page_replaced (visible page only); expected_id is trimmed, and an
-// empty or >128-char one is 400 invalid_expected_id.
+// empty or >128-char one is 400 invalid_expected_id; GET 404s hidden and unpublished rows; an unpublished-but-readable row
+// is republished by a matching write; the corrupt-document 409 comes AFTER the identity checks.
 // Test hooks model what a unit test cannot otherwise reach: another writer landing after our commit, an ack
 // that did not persist, an unreadable history, and a tier flip between the caller's read and its write.
 
@@ -27,8 +28,14 @@ interface Rev { version: number; body: string | null; last_writer: string; title
 interface Topic {
   id: string; project: string; slug: string; title: string; description: string; topic_type: string; tags: string[]
   version: number; last_writer: string; body: string | null; revisions: Rev[]; bodyError?: string
-  /** gated / unpublished / not service-readable: PUT answers a bare 409, never a typed refusal. */
+  /** gated / another project's / not service-readable: GET 404, PUT answers a bare 409, never a typed refusal. */
   hidden?: boolean
+  /**
+   * An admin-unpublished row that is STILL service-readable (required_keys empty). Real 914bf4fe: GET answers 404,
+   * the PUT passes the readable check, the typed/rich answers (400 expected_id_required, rich 409) are withheld
+   * (they need a published row), and a write whose version and id match REPUBLISHES it.
+   */
+  unpublished?: boolean
 }
 export interface RecordedRequest { method: string; path: string; search: string; json?: Record<string, unknown> }
 
@@ -107,7 +114,7 @@ export class FakeWikiDocuments {
     const base = '/api/internal/wiki'
 
     if (req.method === 'GET' && url.pathname === `${base}/graph`) {
-      const nodes = [...this.topics.values()].filter((t) => t.project === project).map((t) => this.serialize(t, false))
+      const nodes = [...this.topics.values()].filter((t) => t.project === project && !t.hidden && !t.unpublished).map((t) => this.serialize(t, false))
       return Response.json({
         tenant_slug: this.tenant, project,
         ...(this.capabilities === undefined ? {} : { capabilities: this.capabilities }),
@@ -128,7 +135,7 @@ export class FakeWikiDocuments {
       return Response.json({ revisions, next_after_version: null })
     }
     if (req.method === 'GET') {
-      if (!t || t.project !== project) return Response.json({ error: 'not_found' }, { status: 404 })
+      if (!t || t.project !== project || t.hidden || t.unpublished) return Response.json({ error: 'not_found' }, { status: 404 })
       const topic = this.serialize(t, true)
       if (this.rolledBack) { delete (topic as Record<string, unknown>).version; delete (topic as Record<string, unknown>).body; delete (topic as Record<string, unknown>).last_writer }
       return Response.json({
@@ -158,7 +165,8 @@ export class FakeWikiDocuments {
       if (p.body !== undefined && (typeof p.body !== 'string' || new TextEncoder().encode(p.body).byteLength > 65536)) return Response.json({ error: 'invalid_body', max_bytes: 65536 }, { status: 400 })
       this.beforePut?.(this.topics.get(slug))
       const cur = this.topics.get(slug)
-      const visible = !!cur && cur.project === project && !cur.hidden
+      const readable = !!cur && cur.project === project && !cur.hidden
+      const visible = readable && !cur?.unpublished
       const conflict = () => Response.json(
         visible && cur
           ? { error: 'topic_write_conflict', ...(this.conflictOverride ?? { current_version: cur.version, last_writer: cur.last_writer }), ...(expectedId !== undefined && cur.id !== expectedId ? { reason: INKWELL_PAGE_REPLACED_REASON } : {}) }
@@ -166,8 +174,7 @@ export class FakeWikiDocuments {
         { status: 409 },
       )
       // 3. a row that is another project's or not service-readable: bare 409
-      if (cur && !visible) return Response.json({ error: 'topic_write_conflict' }, { status: 409 })
-      if (cur?.bodyError && typeof p.body === 'string') return Response.json({ error: 'invalid_content_blocks' }, { status: 409 })
+      if (cur && !readable) return Response.json({ error: 'topic_write_conflict' }, { status: 409 })
       if (this.fenceNext) { this.fenceNext = false; return Response.json({ error: 'topic_write_conflict', current_version: expected, last_writer: cur?.last_writer }, { status: 409 }) }
       // 4. create-vs-missing mismatch (this runs BEFORE the expected_id_required check)
       if (!legacyMetadata && ((!cur && expected !== 0) || (cur && expected === 0))) return conflict()
@@ -178,6 +185,8 @@ export class FakeWikiDocuments {
       }
       // 6. identity
       if (expectedId !== undefined && cur?.id !== expectedId) return conflict()
+      // 6b. a corrupt stored document is only discovered when the body is rewritten: AFTER the identity checks
+      if (cur?.bodyError && typeof p.body === 'string') return Response.json({ error: 'invalid_content_blocks' }, { status: 409 })
       // 7. version
       if (!legacyMetadata && cur && cur.version !== expected) return conflict()
       const writer = `svc:mupot/${typeof p.writer === 'string' ? p.writer : 'unknown'}`
@@ -189,6 +198,7 @@ export class FakeWikiDocuments {
         next.version = expected + 1
         next.last_writer = writer
         next.revisions.push({ version: next.version, body: next.body, last_writer: writer, title: next.title, description: next.description })
+        next.unpublished = false // a matching write republishes an unpublished row
         this.topics.set(slug, next)
         this.afterCommit?.(next)
       }

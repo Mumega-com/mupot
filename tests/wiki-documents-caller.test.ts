@@ -114,9 +114,11 @@ describe('legacy server (no capabilities): metadata-only, body refused BEFORE cr
 
   it('an explicit expected_version cannot be honoured: refused 501, never silently ignored, no PUT', async () => {
     const r = legacyRig()
+    okResult(await upsert({ slug: 'legacy-cas' })) // the page must exist, else the unreadable-page guard answers first
+    const before = r.puts.length
     const out = failOf(await upsert({ slug: 'legacy-cas', expected_version: 3 }))
     expect(out).toMatchObject({ status: 501, error: 'conditional_writes_unsupported' })
-    expect(r.puts).toEqual([])
+    expect(r.puts.length).toBe(before)
   })
 
   it('get on a legacy store has version null and body null', async () => {
@@ -186,7 +188,7 @@ describe('upgraded server: body + compare-and-set', () => {
     seed('blind', { version: 4, body: 'Mine' })
     const out = failOf(await upsert({ slug: 'blind', body: 'Theirs' }))
     expect(out).toMatchObject({ status: 400, error: 'expected_version_required' })
-    expect(JSON.stringify(out.detail)).toContain('expected_version 4')
+    expect(JSON.stringify(out.detail)).toMatch(/expected_version and expected_id/)
     expect(puts(v1)).toEqual([])
     expect(v1.topics.get('blind')?.body).toBe('Mine')
   })
@@ -625,7 +627,7 @@ describe('page id travels with the version: delete+recreate (ABA) is a refusal, 
     v1.recreate('aba-doc', 'recreated by someone else') // new id, version restarts at 1
     const out = failOf(await upsert({ slug: 'aba-doc', body: 'stale intent', expected_version: read.version, expected_id: read.page_id }))
     expect(out).toMatchObject({ status: 409, error: 'stale_version' })
-    expect(JSON.stringify(out.detail)).toMatch(/replaced or rewritten/)
+    expect(JSON.stringify(out.detail)).toMatch(/deleted and recreated/)
     expect(puts(v1)).toEqual([]) // refused before the write: the service's own read already shows a different id
     expect(v1.topics.get('aba-doc')?.body).toBe('recreated by someone else')
   })
@@ -802,5 +804,162 @@ describe('the Inkwell 914bf4fe double itself (helpers/inkwell-wiki-contract.ts)'
     expect((await rawPut({ slug: 'd-id', expected_version: 2, body: 'y', expected_id: 'z'.repeat(129) })).status).toBe(400)
     v1.topics.get('d-id')!.hidden = true // eslint-disable-line @typescript-eslint/no-non-null-assertion -- seeded just above
     expect((await rawPut({ slug: 'd-id', expected_version: 2, body: 'y', expected_id: 'other' })).json).toEqual({ error: 'topic_write_conflict' })
+  })
+})
+
+// ── #2319 round 2 ─────────────────────────────────────────────────────────────────────────────────────────────────
+const refusalFields = (o: { detail: unknown }): string => JSON.stringify(o)
+describe('stale refusals never hand over the current page_id (a refusal must not substitute for a read)', () => {
+  it('read A, A deleted, B recreated and advanced, write with A\'s id: refused, no page_id in it, and a retry from the refusal alone is refused too', async () => {
+    const a = seed('hand-over', { version: 1, body: 'A' })
+    const read = await pageGet('hand-over')
+    expect(read.page_id).toBe(a.id)
+    v1.recreate('hand-over', 'B-unseen')
+    v1.advance('hand-over', 'B-unseen v2')
+    const bId = idOf('hand-over') as string
+    const first = failOf(await upsert({ slug: 'hand-over', body: 'overwrite', expected_version: read.version, expected_id: read.page_id }))
+    expect(first).toMatchObject({ status: 409, error: 'stale_version' })
+    expect(refusalFields(first)).not.toContain(bId)
+    expect(first.detail as object).not.toHaveProperty('page_id')
+    expect(JSON.stringify(first.detail)).toContain('deleted and recreated')
+    // retry using ONLY what the refusal gave back
+    const data = ((first.detail as { data?: Record<string, unknown> }).data ?? first.detail) as Record<string, unknown>
+    const retry = await upsert({ slug: 'hand-over', body: 'overwrite', expected_version: data.current_version as number | undefined ?? read.version, expected_id: (data.page_id as string | undefined) ?? read.page_id })
+    expect(retry.ok).toBe(false)
+    expect(v1.topics.get('hand-over')?.body).toBe('B-unseen v2')
+    expect(puts(v1)).toEqual([])
+  })
+  it('a version-0 collision on an existing page does not hand over the page_id either', async () => {
+    const t = seed('v0-hand', { version: 2, body: 'x' })
+    const out = failOf(await upsert({ slug: 'v0-hand', body: 'y', expected_version: 0 }))
+    expect(out).toMatchObject({ status: 409, error: 'stale_version' })
+    expect(refusalFields(out)).not.toContain(t.id)
+  })
+  it('a plain same-page stale (agent holds the id, version moved) carries no page_id', async () => {
+    const t = seed('plain-stale', { version: 2, body: 'x' })
+    v1.advance('plain-stale', 'y')
+    const out = failOf(await upsert({ slug: 'plain-stale', body: 'z', expected_version: 2, expected_id: t.id }))
+    expect(out).toMatchObject({ status: 409, error: 'stale_version' })
+    expect(refusalFields(out)).not.toContain(`"page_id"`)
+  })
+  it('the replaced refusal carries no version either (the id is the fence and the agent has none to retry with)', async () => {
+    seed('rep-ver', { version: 1, body: 'A' })
+    const read = await pageGet('rep-ver')
+    v1.recreate('rep-ver', 'B')
+    const out = failOf(await upsert({ slug: 'rep-ver', body: 'x', expected_version: read.version, expected_id: read.page_id }))
+    expect(refusalFields(out)).not.toContain('current_version')
+    expect(JSON.stringify(out.detail)).not.toMatch(/retry with expected_version \d/)
+  })
+  it('a local id mismatch at a DIFFERENT version says deleted and recreated, not "retry with expected_version N"', async () => {
+    seed('p2c', { version: 1, body: 'A' })
+    const read = await pageGet('p2c')
+    v1.recreate('p2c', 'B')
+    v1.advance('p2c', 'B2') // now version 2, new id
+    const out = failOf(await upsert({ slug: 'p2c', body: 'x', expected_version: read.version, expected_id: read.page_id }))
+    expect(JSON.stringify(out.detail)).toContain('deleted and recreated')
+    expect(JSON.stringify(out.detail)).not.toMatch(/retry with expected_version/)
+  })
+})
+
+describe('a page mupot cannot read is not writable by guessing its version (unpublished row revival)', () => {
+  it('unpublished, service-readable row: body OR metadata write with expected_version > 0 is refused locally, no PUT, still unpublished', async () => {
+    const t = seed('unpub', { version: 3, body: 'taken down' })
+    t.unpublished = true
+    expect(await get('unpub')).toMatchObject({ ok: false, status: 404 })
+    for (const args of [{ expected_version: 3, title: 'Revive' }, { expected_version: 3, body: 'revive', expected_id: t.id }]) {
+      const out = failOf(await upsert({ slug: 'unpub', ...args }))
+      expect(out).toMatchObject({ status: 409, error: 'slug_unavailable' })
+    }
+    expect(puts(v1)).toEqual([])
+    expect(t.unpublished).toBe(true)
+    expect(t.body).toBe('taken down')
+  })
+  it('an absent page with expected_version > 0 is refused locally too (no PUT)', async () => {
+    expect(failOf(await upsert({ slug: 'never-was', body: 'x', expected_version: 4, expected_id: 'abc' }))).toMatchObject({ status: 409, error: 'slug_unavailable' })
+    expect(puts(v1)).toEqual([])
+  })
+})
+
+describe('a create carrying a stale page id from a deleted page still creates (the id is never sent at version 0)', () => {
+  it('no expected_version (default create) with a stale id', async () => {
+    const old = seed('gone-1', { version: 1, body: 'first' })
+    v1.topics.delete('gone-1') // deleted (never written by this tool, so no counter row)
+    const out = okResult(await upsert({ slug: 'gone-1', body: 'again', expected_id: old.id }))
+    expect(out).toMatchObject({ result: 'created' })
+    expect('expected_id' in (puts(v1)[0].json as object)).toBe(false)
+  })
+  it('explicit expected_version 0 with a stale id', async () => {
+    const old = seed('gone-2', { version: 1, body: 'first' })
+    v1.topics.delete('gone-2')
+    okResult(await upsert({ slug: 'gone-2', body: 'again', expected_version: 0, expected_id: old.id }))
+    expect('expected_id' in (puts(v1)[0].json as object)).toBe(false)
+  })
+})
+
+describe('a store 400 expected_id_required is re-checked for visibility before it is passed on', () => {
+  it('the re-read now shows a squad page the caller cannot see -> slug_unavailable, not "this page already exists"', async () => {
+    seed('id-oracle', { version: 1, body: 'a' })
+    const port = createInkwellPagesPort(env)
+    const visible = await port.get(PROJ, 'id-oracle')
+    if (!visible) throw new Error('fixture')
+    const legacyShaped = { ...visible, storageVersion: undefined } // skips the local guard so the store's own 400 is reached
+    let reads = 0
+    const racing = {
+      ...port,
+      async get() { reads += 1; return reads === 1 ? legacyShaped : { ...visible, rawTags: [...(visible.rawTags ?? []), 'tier:squad'] } },
+      async put() { throw new (await import('../src/pages/port')).PagesPortError('rejected', 'expected_id_required') },
+    }
+    const checked = validatePageWrite({ slug: 'id-oracle', title: 'T1', summary: 's', body: 'x', expectedVersion: 1, purpose: 'decision', tier: 'project', tags: undefined, links: undefined })
+    if (!checked.ok) throw new Error('fixture invalid')
+    const out = await writePage(env, racing, { projectId: PROJ, writer: 'w', input: checked.value, canSeeSquadPages: false })
+    expect(out).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
+  })
+})
+
+describe('one refusal for a body edit missing both version and id; tool text states what is fenced', () => {
+  it('names expected_version AND expected_id in the first refusal', async () => {
+    seed('both-missing', { version: 4, body: 'x' })
+    const out = failOf(await upsert({ slug: 'both-missing', body: 'y' }))
+    expect(out).toMatchObject({ status: 400, error: 'expected_version_required' })
+    expect(JSON.stringify(out.detail)).toMatch(/expected_id/)
+    expect(JSON.stringify(out.detail)).toMatch(/page_id/)
+  })
+  it('the tool description says metadata-only writes are not identity-fenced', async () => {
+    const { TOOLS } = await import('../src/mcp/pages') as unknown as { TOOLS?: unknown }
+    void TOOLS
+    const src = (await import('node:fs')).readFileSync('src/mcp/pages.ts', 'utf8')
+    expect(src).toMatch(/not fenced on page identity/)
+  })
+})
+
+describe('Inkwell 914bf4fe double fidelity (round 2)', () => {
+  const rawPut = async (payload: Record<string, unknown>) => {
+    const res = await v1.fetch(`https://x/api/internal/wiki/topics/${String(payload.slug)}`, {
+      method: 'PUT', headers: { authorization: `Bearer ${SECRET}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ project: PROJ, title: 'T', description: 'd', ...payload }),
+    })
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> }
+  }
+  const rawGet = async (slug: string) => (await v1.fetch(`https://x/api/internal/wiki/topics/${slug}?project=${PROJ}`, { headers: { authorization: `Bearer ${SECRET}` } })).status
+  it('GET 404s hidden and unpublished rows, serves published ones', async () => {
+    seed('g-hid', { version: 1, hidden: true }); seed('g-unp', { version: 1, unpublished: true }); seed('g-ok', { version: 1 })
+    expect([await rawGet('g-hid'), await rawGet('g-unp'), await rawGet('g-ok')]).toEqual([404, 404, 200])
+  })
+  it('unpublished readable row: bare 409 for a body write with no id and for a wrong id; a matching write republishes it', async () => {
+    const t = seed('u-row', { version: 2, body: 'x', unpublished: true })
+    expect(await rawPut({ slug: 'u-row', expected_version: 2, body: 'y' })).toEqual({ status: 409, json: { error: 'topic_write_conflict' } })
+    expect(await rawPut({ slug: 'u-row', expected_version: 2, body: 'y', expected_id: 'other' })).toEqual({ status: 409, json: { error: 'topic_write_conflict' } })
+    expect((await rawPut({ slug: 'u-row', expected_version: 2, body: 'y', expected_id: t.id })).status).toBe(200)
+    expect(t.unpublished).toBe(false)
+  })
+  it('corrupt document: the identity checks come first (wrong id -> page_replaced, no id -> expected_id_required); a matching id reaches invalid_content_blocks', async () => {
+    const t = seed('c-doc', { version: 2, bodyError: 'invalid_content_blocks' })
+    expect((await rawPut({ slug: 'c-doc', expected_version: 2, body: 'y', expected_id: 'other' })).json).toMatchObject({ reason: 'page_replaced' })
+    expect(await rawPut({ slug: 'c-doc', expected_version: 2, body: 'y' })).toEqual({ status: 400, json: { error: 'expected_id_required' } })
+    expect(await rawPut({ slug: 'c-doc', expected_version: 2, body: 'y', expected_id: t.id })).toEqual({ status: 409, json: { error: 'invalid_content_blocks' } })
+  })
+  it('a blank id is 400 even on a hidden row (step 2 before step 3)', async () => {
+    seed('b-hid', { version: 1, hidden: true })
+    expect((await rawPut({ slug: 'b-hid', expected_version: 1, body: 'y', expected_id: '  ' })).status).toBe(400)
   })
 })
