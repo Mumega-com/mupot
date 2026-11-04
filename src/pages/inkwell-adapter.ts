@@ -95,11 +95,14 @@ function mapError(e: unknown): never {
   if (e instanceof WikiConflictError) {
     // wiki-documents/v1: the store only attaches current_version once it has re-checked that THIS caller may
     // see the page, so a version here is a STALE write, not a slug probe. Without it: the generic refusal.
-    if (e.currentVersion !== undefined) throw new PagesPortError('stale', 'stale_version', { currentVersion: e.currentVersion, ...(e.lastWriter ? { lastWriter: e.lastWriter } : {}) })
+    if (e.currentVersion !== undefined) throw new PagesPortError('stale', 'stale_version', { currentVersion: e.currentVersion, ...(e.lastWriter ? { lastWriter: e.lastWriter } : {}), ...(e.pageReplaced ? { replaced: true } : {}) })
     if (e.code === 'invalid_content_blocks') throw new PagesPortError('rejected', 'document_blocks_invalid')
     throw new PagesPortError('conflict', 'slug_unavailable') // never leak existing_project
   }
   if (e instanceof WikiRequestError) {
+    // 914bf4fe: the store itself now demands the page id on a body edit. A typed refusal, never a 502.
+    if (e.status === 400 && e.code === 'expected_id_required') throw new PagesPortError('rejected', 'expected_id_required')
+    if (e.status === 400 && e.code === 'invalid_expected_id') throw new PagesPortError('rejected', 'invalid_expected_id')
     // Every edge-target refusal collapses to ONE code (the real route already does; older/other upstream
     // vocabularies distinguish missing vs cross-project vs unpublished, which is an existence oracle).
     throw new PagesPortError('rejected', EDGE_REFUSALS.has(e.code) ? 'edge_target_invalid' : 'request_rejected')
