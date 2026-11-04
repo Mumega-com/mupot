@@ -36,7 +36,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
+import { resolveCapabilities, hasCapability, displayRole, isOrgAdmin, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
@@ -1026,6 +1026,7 @@ export interface ToolSpec {
 
 type JsonSchema = {
   type: 'object'
+  description?: string
   properties: Record<string, unknown>
   required?: string[]
   additionalProperties: boolean
@@ -5054,10 +5055,10 @@ const toolExecutionMeterStatus: ToolSpec = {
   name: 'execution_meter_status',
   scope: 'bound agent self or authorized squad agent',
   min: 'authenticated',
-  args: '{ agent_id?: string }',
+  args: '{ agent_id?: string } (agent_id is required unless this connection is bound to an agent)',
   inputSchema: {
     type: 'object',
-    properties: { agent_id: STRING_SCHEMA },
+    properties: { agent_id: { type: 'string', description: 'Agent to read. Optional only when this connection is bound to an agent (then defaults to that agent); otherwise required.' } },
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -5065,6 +5066,9 @@ const toolExecutionMeterStatus: ToolSpec = {
       return fail(400, 'invalid_args', 'agent_id must be a non-empty string')
     }
     const agentId = str(args.agent_id) ?? undefined
+    // Missing-argument case only, checked before permission: no target resolvable at all is a malformed call,
+    // not a forbidden one. A caller who NAMES an agent still goes through authorizeExecutionScope (403 if forbidden).
+    if (!agentId && !auth.boundAgentId) return fail(400, 'invalid_args', 'agent_id required')
     return getAuthorizedMeterStatus(env, auth, agentId)
   },
 }
@@ -6690,7 +6694,7 @@ const toolStatus: ToolSpec = {
         email: auth.email,
         channel: auth.channel,
         tenant: auth.tenant,
-        role: auth.role,
+        role: displayRole(auth),
         bound_agent_id: auth.boundAgentId ?? null,
         seat_name: seatName,
         seats,
@@ -6889,13 +6893,15 @@ async function gatherWhoamiFacts(
     unboundDirectory ? anyAgentExists(env) : false,
   ])
   const admission = await gatherAdmission(env, auth)
+  // Only the unbound / seat states emit an admin-dependent hint; a plain agent-bound session skips the extra read (auth query-count pin).
+  const callerIsAdmin = auth.boundAgentId && !auth.seatBinding ? false : await holdsAdminStanding(env, auth)
   // Honest designate copy: only a seat session of a known human, and only while the designation step exists at all.
   const humanCanDesignate = auth.seatBinding && seatAttachDesignatedEnabled(env)
     ? await humanCanDesignateAtAll(env, auth.seatBinding.humanMemberId).catch(() => undefined)
     : undefined
   // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
   const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}) }
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -7045,7 +7051,28 @@ async function hasBootstrappedBefore(env: Env, memberId: string | null | undefin
   }
 }
 
-function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
+// HINT-ONLY (mupot#2309): does the human behind this connection hold org admin standing? Never a permission decision.
+// Whose standing: on a seat session auth.memberId is the SEAT AGENT's member, so read the human (seatBinding.humanMemberId),
+// else the OAuth consenter, else the caller. On the directory door the B1 ceiling parks the real grants in
+// latentCapabilities (or, for a plain directory bearer, nowhere), so an owner must still not be told to "ask an admin".
+// Computed ONCE per request (in gatherWhoamiFacts) and carried on WhoamiFacts.callerIsAdmin.
+export async function holdsAdminStanding(env: Env, auth: AuthContext): Promise<boolean> {
+  if (isOrgAdmin(auth)) return true
+  if (auth.latentCapabilities !== undefined && isOrgAdmin({ ...auth, capabilities: auth.latentCapabilities })) return true
+  // OAuth directory sessions already carry the human's resolved standing in latentCapabilities: no second read (auth query-count pin).
+  if (auth.latentCapabilities !== undefined && !auth.seatBinding) return false
+  const standing = auth.seatBinding?.humanMemberId ?? auth.consentedByMemberId ?? auth.memberId
+  const delegated = standing !== undefined && standing !== null && standing !== auth.memberId
+  // A harness credential with no human behind it has no standing to read; a read is only for the directory door or a delegated human.
+  if (!standing || (auth.harnessCredential && !delegated) || !(auth.channel === 'directory' || delegated)) return false
+  try {
+    return isOrgAdmin({ ...auth, role: 'member', capabilities: await resolveCapabilities(env, standing) })
+  } catch {
+    return false
+  }
+}
+
+function buildAvailableDoors(state: OnboardingState, callerIsAdmin = false): OnboardingDoor[] {
   const alwaysOpen: OnboardingDoor[] = [
     { tool: 'status', does: 'echo who this token is', requires: 'nothing' },
     { tool: 'boot_context', does: 'this map', requires: 'nothing' },
@@ -7076,7 +7103,7 @@ function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
     case 'unbound_workspace':
       return [
         { tool: 'connect', does: 'claim an existing agent for this session only (no durable weld)', requires: 'the agent slug, and capability on its squad' },
-        { tool: 'mint_agent_token', does: 'weld a credential to an agent permanently', requires: 'admin on the agent\'s squad — ask an org-admin if you lack it' },
+        { tool: 'mint_agent_token', does: 'weld a credential to an agent permanently', requires: callerIsAdmin ? 'admin on the agent\'s squad — you hold it, run it yourself' : 'admin on the agent\'s squad — ask an org-admin if you lack it' },
         ...alwaysOpen,
       ]
   }
@@ -7211,20 +7238,22 @@ async function buildIdentityReceipt(
 
 // channel_limits.to_get_write_access, derived from whoami so it can never name a tool this connection cannot call
 // (it used to say "call bootstrap_self" to every directory session, including seats and K2 member tokens: dead ends 3, 4).
-function writeAccessHint(env: Env, w: Whoami, firstStep: string | undefined): string {
+function writeAccessHint(env: Env, w: Whoami, firstStep: string | undefined, callerIsAdmin = false): string {
+  // An org owner/admin is the one who mints; telling them to ask an admin is a dead loop (mupot#2309).
+  const mintWho = callerIsAdmin ? 'mint a WORKSPACE-channel token yourself (mint_agent_token, or /admin/agent-token)' : 'ask an org-admin for a WORKSPACE-channel token (mint_agent_token)'
   const noGrant = 'Requesting a squad grant will NOT help — this door discards grants by construction.'
   switch (w.state) {
     case 'harness_unseated':
       return `${firstStep ?? 'this connection has no agent yet.'} ${noGrant}`
     case 'no_agent':
       // The mint is named only when whoami offers it to THIS session (never to a stranger in a populated pot, #2020).
-      return `${firstStep ?? 'this connection has no agent yet.'} If your agent already exists, ask an org-admin for a WORKSPACE-channel token (mint_agent_token), and connect with that bearer. ${noGrant}`
+      return `${firstStep ?? 'this connection has no agent yet.'} If your agent already exists, ${mintWho}, and connect with that bearer. ${noGrant}`
     case 'own_seat':
       return 'this chat acts as its own seat agent, capped at member and at your human\'s own access. '
         + (seatAttachEnabled(env)
           ? 'To act as an agent you already have instead, call seat_attach { agent: "<its name or id>", reason: "<why this chat should act as that agent>" }: your human approves once with their passkey and this chat then acts as that agent, with no token. '
-            + 'Only a fixed CLI/daemon agent with no human in the chat needs an org-admin to mint a WORKSPACE-channel token for it (mint_agent_token), connecting with that bearer. '
-          : 'To act as an agent you already have, ask an org-admin for a WORKSPACE-channel token for it (mint_agent_token) and connect with that bearer. ')
+            + 'Only a fixed CLI/daemon agent with no human in the chat needs a WORKSPACE-channel token minted for it (' + (callerIsAdmin ? 'you hold the standing to run mint_agent_token yourself' : 'an org-admin runs mint_agent_token') + '), connecting with that bearer. '
+          : `To act as an agent you already have, ${mintWho} for it and connect with that bearer. `)
         + noGrant
     case 'acting_as':
       return `this connection already acts as an agent; its authority is the lowest of your human's standing, the agent's own grants and the approved ceiling. For more, an org-admin raises the agent's grants. ${noGrant}`
@@ -7375,7 +7404,7 @@ const toolBootContext: ToolSpec = {
     // available_doors = the legacy door list FILTERED to what whoami says this connection can call (a harness token
     // never sees connect/status/bootstrap_self; a stranger never sees bootstrap_self, #2020), then led by whoami's own step.
     const doorOk = whoamiDoorFilter(env, auth, whoami)
-    const availableDoors = buildAvailableDoors(onboardingState).filter((d) => doorOk(d.tool))
+    const availableDoors = buildAvailableDoors(onboardingState, whoamiFacts.callerIsAdmin === true).filter((d) => doorOk(d.tool))
     // mupot#1794 W3 — an unbound harness session (consented as "Me — auto per workspace") has ONE right first move:
     // seat_select. Offered exactly when whoami offers it (same gate as seat_select itself).
     const harnessSeatDoor = whoami.missing.some((m) => m.next_tool === 'seat_select')
@@ -7472,7 +7501,7 @@ const toolBootContext: ToolSpec = {
                   'create or update tasks, projects, agents, or any other write',
                   'anything requiring a standing capability, regardless of what you hold elsewhere',
                 ],
-            to_get_write_access: writeAccessHint(env, whoami, firstStep?.next_step),
+            to_get_write_access: writeAccessHint(env, whoami, firstStep?.next_step, whoamiFacts.callerIsAdmin === true),
           }
         : undefined
 
@@ -7543,7 +7572,7 @@ const toolBootContext: ToolSpec = {
       tenant: auth.tenant,
       member_id: auth.memberId,
       channel: auth.channel,
-      role: auth.role,
+      role: displayRole(auth),
       capabilities: auth.capabilities ?? [],
       mcp_endpoint: mcpEndpoint(canonicalOrigin(env, ctx.origin)),
       // identity coherence (#126) — NEW field
