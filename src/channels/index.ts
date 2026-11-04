@@ -38,6 +38,7 @@ import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
 import { sendToRef, resolveVisibleSendTarget } from '../agents/messages'
 import { createTask } from '../tasks/service'
+import { timingSafeEqual } from '../lib/crypto'
 
 type AppEnv = { Bindings: Env }
 
@@ -726,7 +727,7 @@ interface RelayBody {
 }
 channelsApp.post('/relay', async (c) => {
   if (!c.env.HERMES_RELAY_SECRET) return c.json({ error: 'relay_not_configured' }, 503)
-  if (c.req.header('X-Relay-Secret') !== c.env.HERMES_RELAY_SECRET) {
+  if (!timingSafeEqual(c.req.header('X-Relay-Secret') ?? '', c.env.HERMES_RELAY_SECRET)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
   let body: RelayBody

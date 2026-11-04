@@ -65,6 +65,7 @@ import {
 import { ELEVATION_ACTIONS } from './elevation-actions'
 import { withAuthTiming } from '../lib/server-timing'
 import { escapeHtml } from '../lib/html-escape'
+import { timingSafeEqual } from '../lib/crypto'
 import {
   PENDING_INVITE_COOKIE,
   decidePendingInviteLink,
@@ -313,15 +314,6 @@ function bootstrapOwnerEnabled(env: Env): boolean {
     && token.length >= BOOTSTRAP_OWNER_TOKEN_MIN_LENGTH
     && !env.OAUTH_CLIENT_ID
     && !env.OAUTH_CLIENT_SECRET
-}
-
-function constantTimeEqual(actual: string, expected: string): boolean {
-  let mismatch = actual.length ^ expected.length
-  const length = Math.max(actual.length, expected.length)
-  for (let index = 0; index < length; index += 1) {
-    mismatch |= (actual.charCodeAt(index) || 0) ^ (expected.charCodeAt(index) || 0)
-  }
-  return mismatch === 0
 }
 
 type BootstrapForm = { token: string; email: string }
@@ -645,7 +637,7 @@ authApp.post('/bootstrap', async (c) => {
 
   const form = await readBootstrapForm(c)
   if (!form || !isBootstrapEmail(form.email)) return c.json({ error: 'bad_request' }, 400)
-  if (!constantTimeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
+  if (!timingSafeEqual(form.token, c.env.BOOTSTRAP_OWNER_TOKEN as string)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
 
