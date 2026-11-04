@@ -146,6 +146,41 @@ describe('the entry point refuses before tenant routing', () => {
   })
 })
 
+describe('separator and dot-segment spellings after a non-canonical prefix', () => {
+  it('are refused plain and under the tenant address, on POST and GET', async () => {
+    for (const form of ['/%6dcp%2f..%2f', '/m%63p%2f..%2f..%2f', '/%6dcp%2f%2e%2e%2fx', '/t/mumega/%6dcp%2f..%2f', '/t/mumega/m%63p%2f..%2f..%2f']) {
+      for (const res of [await post(form), await get(form)]) {
+        expect(res.status, form).toBe(400)
+        expect(await res.text(), form).toContain('non_canonical_path')
+      }
+    }
+  })
+})
+
+describe('shape family never reaches the app behind the provider', () => {
+  const PREFIXES = ['/%6dcp', '/m%63p', '/mc%70', '/%6D%63%70', '/%4dcp', '/MCP']
+  const SUFFIXES = [
+    '', '/', '/profile', '/profile/needs-you', '/profile/%252e%252e/%252e%252e', '/profile/..;x/..;y', '/profile/%2e%2e/%2e%2e',
+    '%2f..%2f', '%2f..%2f..%2f', '%2f%2e%2e%2fx', '/..;x/..;y', '/%252e%252e/%252e%252e', '/;x/..', '/./..', '/tools', '/tools/%252e%252e',
+  ]
+  const TENANT_ADDRESSES = ['', '/t/mumega', '/t/other-pot']
+  const FAMILY = TENANT_ADDRESSES.flatMap((t) => PREFIXES.flatMap((p) => SUFFIXES.map((s) => `${t}${p}${s}`)))
+  
+  const MARKER = 'x-mupot-tenant-header-ignored'
+  it(`${FAMILY.length} spellings: refused or gated by the provider, never answered by the app behind it`, async () => {
+    for (const form of FAMILY) {
+      // The URL parser itself resolves some spellings to the site root before any code runs: not a provider route.
+      if (['/', '/t/mumega/', '/t/other-pot/'].includes(new URL(`https://pot.test${form}`).pathname)) continue
+      const res = await post(form, initialize, { 'x-mupot-tenant-slug': 'other' })
+      const text = await res.text()
+      expect(res.headers.get(MARKER), form).toBeNull()
+      expect(text, form).not.toContain('"not_found"')
+      expect([400, 401, 404, 503], form).toContain(res.status)
+      if (/^(\/t\/mumega)?\/mcp/.test(form)) expect(res.status, form).toBe(401)
+    }
+  })
+})
+
 describe('canonical paths keep working', () => {
   it('unauthenticated canonical requests keep their 401 with the discovery pointer', async () => {
     for (const path of ['/mcp', '/t/mumega/mcp', '/mcp/profile/needs-you']) {

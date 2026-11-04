@@ -39,7 +39,7 @@ function decodeAsciiEscapes(value: string): string {
 
 /** The path as a lenient router could read it: fully decoded, separators folded, dot segments
  *  resolved, params dropped, lower-cased, and with a `/t/<tenant>` address prefix removed. */
-export function lenientPath(pathname: string): string {
+export function lenientPath(pathname: string, resolveDots = true): string {
   let current = pathname
   for (let i = 0; i < MAX_DECODE_ROUNDS; i++) {
     const next = decodeAsciiEscapes(current)
@@ -49,7 +49,7 @@ export function lenientPath(pathname: string): string {
   const segments: string[] = []
   for (const raw of current.replace(/\\/g, '/').replace(/;[^/]*/g, '').split('/')) {
     if (raw === '' || raw === '.') continue
-    if (raw === '..') segments.pop()
+    if (raw === '..' && resolveDots) segments.pop()
     else segments.push(raw.toLowerCase())
   }
   if (segments[0] === 't' && segments.length > 1) segments.splice(0, 2)
@@ -66,7 +66,25 @@ function afterTenantAddress(pathname: string): string {
 /** True when this path would reach a provider-owned route only after normalisation. */
 export function isNonCanonicalProviderPath(pathname: string): boolean {
   if (providerOwnsPath(afterTenantAddress(pathname))) return false
-  return providerOwnsPath(lenientPath(pathname))
+  // Three readings, any of which landing on an owned route is enough: dots resolved, dots kept as literal
+  // segments (Hono never resolves them), and Hono's own decode (decodeURI) of the address-stripped path.
+  return providerOwnsPath(lenientPath(pathname)) || providerOwnsPath(lenientPath(pathname, false)) || providerOwnsPath(honoRoutedPath(pathname))
+}
+
+/** The path Hono routes on for the address-stripped request: decodeURI, per-chunk fallback on malformed escapes. */
+function honoRoutedPath(pathname: string): string {
+  const stripped = afterTenantAddress(pathname)
+  try {
+    return decodeURI(stripped)
+  } catch {
+    return stripped.replace(/(?:%[0-9a-f]{2})+/gi, (chunk) => {
+      try {
+        return decodeURI(chunk)
+      } catch {
+        return chunk
+      }
+    })
+  }
 }
 
 /** 400 for a non-canonical provider path, else null. Call before any routing. */
