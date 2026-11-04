@@ -963,3 +963,104 @@ describe('Inkwell 914bf4fe double fidelity (round 2)', () => {
     expect((await rawPut({ slug: 'b-hid', expected_version: 1, body: 'y', expected_id: '  ' })).status).toBe(400)
   })
 })
+
+// ── #2323: no page id (or storage version) without a fresh project_wiki_get ───────────────────────────────────────
+describe('page_id is echoed only when the agent sent it or the call created the page', () => {
+  it('a metadata-only write that mupot filled the id in for returns page_id: null plus a note, and the id appears nowhere', async () => {
+    const t = seed('pid-meta', { version: 3, body: 'keep' })
+    const out = okResult(await upsert({ slug: 'pid-meta', title: 'New title' }))
+    expect(out.page_id).toBeNull()
+    expect(String(out.page_id_note)).toContain('read with project_wiki_get to get the page_id for body edits')
+    expect(JSON.stringify(out)).not.toContain(t.id)
+  })
+  it('the handover is closed end to end: result of a metadata write on a recreated page B cannot be used for a body write', async () => {
+    seed('pid-aba', { version: 1, body: 'A' })
+    v1.recreate('pid-aba', 'B-unseen')
+    const meta = okResult(await upsert({ slug: 'pid-aba', title: 'Retitle' }))
+    const retry = await upsert({ slug: 'pid-aba', body: 'overwrite', expected_version: meta.version as number, expected_id: meta.page_id as string | null })
+    expect(retry.ok).toBe(false)
+    expect(v1.topics.get('pid-aba')?.body).toBe('B-unseen')
+  })
+  it('a create returns the page_id of the page it created', async () => {
+    const out = okResult(await upsert({ slug: 'pid-create', body: 'x' }))
+    expect(out.page_id).toBe(idOf('pid-create'))
+    expect(out.page_id_note).toBeUndefined()
+  })
+  it('a write carrying the agent\'s own matching id echoes it (body edit and metadata edit)', async () => {
+    const t = seed('pid-own', { version: 2, body: 'a' })
+    expect(okResult(await upsert({ slug: 'pid-own', body: 'b', expected_version: 2, expected_id: t.id })).page_id).toBe(t.id)
+    expect(okResult(await upsert({ slug: 'pid-own', title: 'T2', expected_version: 3, expected_id: t.id })).page_id).toBe(t.id)
+  })
+})
+
+describe('graph surfaces carry no page id or storage version on nodes', () => {
+  it('project_wiki output: nodes have no id and no version', async () => {
+    seed('graph-a', { version: 4, body: 'x' })
+    const out = await invokeTool(auth, env, 'project_wiki', { project_id: PROJ }, ORIGIN)
+    const nodes = ((okResult(out).wiki as { nodes: Record<string, unknown>[] }).nodes)
+    expect(nodes.length).toBeGreaterThan(0)
+    for (const n of nodes) { expect(n).not.toHaveProperty('id'); expect(n).not.toHaveProperty('version') }
+    expect(JSON.stringify(out)).not.toContain(idOf('graph-a'))
+  })
+  it('filterWikiGraphForCaller (dashboard, task brief, project_wiki) strips them for BOTH squad-access cases', async () => {
+    const { filterWikiGraphForCaller } = await import('../src/pages/inkwell-adapter')
+    const g = { nodes: [{ id: 'p1', slug: 'a-page', version: 3, title: 'T', tags: [] }, { id: 'p2', slug: 'sq-page', version: 1, tags: ['tier:squad'] }], edges: [] }
+    for (const can of [true, false]) {
+      const nodes = filterWikiGraphForCaller(g, can).nodes as Record<string, unknown>[]
+      expect(nodes.length).toBe(can ? 2 : 1)
+      for (const n of nodes) { expect(n).not.toHaveProperty('id'); expect(n).not.toHaveProperty('version'); expect(n.slug).toBeDefined() }
+    }
+    expect(g.nodes[0]).toHaveProperty('id') // input not mutated
+  })
+})
+
+describe('round-2 survivors (#2323)', () => {
+  it('an absent page with expected_version exactly 1 is refused locally (kills > 0 -> > 1)', async () => {
+    expect(failOf(await upsert({ slug: 'one-absent', body: 'x', expected_version: 1, expected_id: 'abc' }))).toMatchObject({ status: 409, error: 'slug_unavailable' })
+    expect(puts(v1)).toEqual([])
+  })
+  it('the replaced refusal carries no last_writer either', async () => {
+    seed('rep-lw', { version: 1, body: 'A', last_writer: 'svc:mupot/someone' })
+    const read = await pageGet('rep-lw')
+    v1.recreate('rep-lw', 'B') // last_writer svc:mupot/recreator
+    const out = failOf(await upsert({ slug: 'rep-lw', body: 'x', expected_version: read.version, expected_id: read.page_id }))
+    expect(JSON.stringify(out)).not.toContain('recreator')
+    expect(JSON.stringify(out)).not.toContain('last_writer')
+  })
+  for (const [label, second] of [['absent', null], ['no envelope', 'noenv']] as const) {
+    it(`store 400 expected_id_required whose re-read is ${label} -> slug_unavailable`, async () => {
+      seed('rr-doc', { version: 1, body: 'a' })
+      const port = createInkwellPagesPort(env)
+      const visible = await port.get(PROJ, 'rr-doc')
+      if (!visible) throw new Error('fixture')
+      let reads = 0
+      const racing = {
+        ...port,
+        async get() { reads += 1; return reads === 1 ? { ...visible, storageVersion: undefined } : second === null ? null : { ...visible, envelope: null } },
+        async put() { throw new (await import('../src/pages/port')).PagesPortError('rejected', 'expected_id_required') },
+      }
+      const checked = validatePageWrite({ slug: 'rr-doc', title: 'T1', summary: 's', body: 'x', expectedVersion: 1, purpose: 'decision', tier: 'project', tags: undefined, links: undefined })
+      if (!checked.ok) throw new Error('fixture invalid')
+      const out = await writePage(env, racing, { projectId: PROJ, writer: 'w', input: checked.value, canSeeSquadPages: true })
+      expect(out).toMatchObject({ ok: false, status: 409, error: 'slug_unavailable' })
+    })
+  }
+})
+
+describe('double fidelity (#2323): graph and revisions routes', () => {
+  const rawGet = async (path: string) => {
+    const res = await v1.fetch(`https://x/api/internal/wiki/${path}${path.includes('?') ? '&' : '?'}project=${PROJ}`, { headers: { authorization: `Bearer ${SECRET}` } })
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> }
+  }
+  it('graph lists neither hidden nor unpublished rows', async () => {
+    seed('gr-ok', { version: 1 }); seed('gr-hid', { version: 1, hidden: true }); seed('gr-unp', { version: 1, unpublished: true })
+    const slugs = ((await rawGet('graph')).json.nodes as { slug: string }[]).map((n) => n.slug)
+    expect(slugs).toContain('gr-ok')
+    expect(slugs).not.toContain('gr-hid')
+    expect(slugs).not.toContain('gr-unp')
+  })
+  it('revisions: 404 for hidden and unpublished rows, served for a published one', async () => {
+    seed('rv-ok', { version: 1 }); seed('rv-hid', { version: 1, hidden: true }); seed('rv-unp', { version: 1, unpublished: true })
+    expect([(await rawGet('topics/rv-ok/revisions')).status, (await rawGet('topics/rv-hid/revisions')).status, (await rawGet('topics/rv-unp/revisions')).status]).toEqual([200, 404, 404])
+  })
+})

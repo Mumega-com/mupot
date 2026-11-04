@@ -152,6 +152,8 @@ export type PageWriteOutcome =
       /** wiki-documents/v1 storage revision; undefined on a legacy store. Distinct from `version` (the old counter). */
       storageVersion?: number
       storeId?: string
+      /** the store has an id for this page but mupot filled it in itself: do not echo it */
+      pageIdWithheld?: boolean
       verification?: 'readback' | 'history' | 'unverified'
       currentStorageVersion?: number
     }
@@ -344,7 +346,10 @@ export async function writePage(
     return {
       ok: true, slug: res.slug, created: res.created, version, linksWritten: res.linksWritten, envelope,
       ...(res.storageVersion !== undefined ? { storageVersion: res.storageVersion } : {}),
-      ...(res.storeId ? { storeId: res.storeId } : {}),
+      // Echo the page id only when the AGENT supplied it or this call created the page. A metadata write whose id
+      // mupot filled in from its own read must not hand that id back (the agent never read this page; #2323).
+      ...(res.storeId && (res.created || input.expectedId !== undefined) ? { storeId: res.storeId } : {}),
+      ...(res.storeId && !res.created && input.expectedId === undefined ? { pageIdWithheld: true } : {}),
       ...(res.verification !== undefined ? { verification: res.verification } : {}),
       ...(res.currentStorageVersion !== undefined ? { currentStorageVersion: res.currentStorageVersion } : {}),
     }

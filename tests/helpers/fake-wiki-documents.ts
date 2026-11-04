@@ -129,7 +129,7 @@ export class FakeWikiDocuments {
     if (req.method === 'GET' && m[2]) {
       if (this.schemaPending) return Response.json({ error: 'schema_pending' }, { status: 503 })
       if (this.historyStatus) return Response.json({ error: 'x' }, { status: this.historyStatus })
-      if (!t || t.project !== project) return Response.json({ error: 'not_found' }, { status: 404 })
+      if (!t || t.project !== project || t.hidden || t.unpublished) return Response.json({ error: 'not_found' }, { status: 404 })
       const after = Number(url.searchParams.get('after_version') ?? '0')
       const revisions = t.revisions.filter((r) => r.version > after).map((r) => ({ ...r, written_at: 0 }))
       return Response.json({ revisions, next_after_version: null })

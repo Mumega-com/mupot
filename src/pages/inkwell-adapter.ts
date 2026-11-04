@@ -69,9 +69,14 @@ export function isSquadTierTags(tags: unknown): boolean {
  * a squad node is left alone (a foreign page is project-visible), but a squad stamp always wins.
  */
 export function filterWikiGraphForCaller<G extends { nodes: unknown; edges: unknown }>(graph: G, canSeeSquadPages: boolean): G {
-  if (canSeeSquadPages || !Array.isArray(graph.nodes)) return graph
+  const rawNodes: unknown = graph.nodes
+  if (!Array.isArray(rawNodes)) return graph
+  // Page identity (id) and storage version never leave through a graph read: the page_id is the expected_id fence
+  // and must come from the agent's own project_wiki_get, not from a listing (#2323).
+  const stripped = { ...graph, nodes: rawNodes.map(stripNodeIdentity) }
+  if (canSeeSquadPages) return stripped
   const hidden = new Set<string>()
-  const nodes = graph.nodes.filter((n: unknown) => {
+  const nodes = stripped.nodes.filter((n: unknown) => {
     const rec = typeof n === 'object' && n !== null ? (n as { slug?: unknown; tags?: unknown }) : null // shape-probed below
     if (rec && isSquadTierTags(rec.tags)) {
       if (typeof rec.slug === 'string') hidden.add(rec.slug)
@@ -86,6 +91,11 @@ export function filterWikiGraphForCaller<G extends { nodes: unknown; edges: unkn
       })
     : graph.edges
   return { ...graph, nodes, edges }
+}
+function stripNodeIdentity(n: unknown): unknown {
+  if (typeof n !== 'object' || n === null) return n
+  const { id: _id, version: _version, ...rest } = n as Record<string, unknown> // shape-probed: only these two keys are dropped
+  return rest
 }
 const EDGE_REFUSALS = new Set(['edge_target_invalid', 'cross_project_edge_refused', 'edge_target_unpublished'])
 
