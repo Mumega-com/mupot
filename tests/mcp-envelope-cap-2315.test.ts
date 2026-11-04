@@ -6,7 +6,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mcpActionsApp, mcpApp } from '../src/mcp'
-import { MCP_REQUEST_CAP_BYTES, readBoundedText } from '../src/mcp/request-cap'
+import { MCP_BASE_REQUEST_CAP_BYTES, MCP_REQUEST_CAP_BYTES, readBoundedText } from '../src/mcp/request-cap'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
@@ -54,8 +54,8 @@ const rpcBody = (slug: string, body: string) => JSON.stringify({ jsonrpc: '2.0',
 const clen = (raw: string): Record<string, string> => ({ 'content-length': String(new TextEncoder().encode(raw).byteLength) })
 const post = (raw: string, extra: Record<string, string> = {}) =>
   mcpApp.request('https://pot.example/', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...clen(raw), ...extra }, body: raw }, env)
-const act = (raw: string) =>
-  mcpActionsApp.request('https://pot.example/actions/project_wiki_upsert', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...clen(raw) }, body: raw }, env)
+const act = (raw: string, tool = 'project_wiki_upsert') =>
+  mcpActionsApp.request(`https://pot.example/actions/${tool}`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...clen(raw) }, body: raw }, env)
 // The tool result text of a tools/call response, parsed.
 async function toolPayload(res: Response): Promise<Record<string, unknown>> {
   const j = (await res.json()) as { result?: { content?: Array<{ text: string }>; isError?: boolean }; error?: unknown }
@@ -146,5 +146,112 @@ describe('malicious envelopes are still 413, as a JSON-RPC error that says what 
   it('an unauthenticated oversize envelope is still refused before auth', async () => {
     const res = await mcpApp.request('https://pot.example/', { method: 'POST', headers: { 'content-type': 'application/json', ...clen(`{"pad":"${'x'.repeat(MCP_REQUEST_CAP_BYTES)}"}`) }, body: `{"pad":"${'x'.repeat(MCP_REQUEST_CAP_BYTES)}"}` }, env)
     expect(res.status).toBe(413)
+  })
+})
+
+// ── round 2: auth-tiered cap, per-tool bound, bounded needs-you, boundaries ─────────────────────────────────
+const KIB = 1024
+/** A JSON-RPC initialize padded so the whole wire body is EXACTLY `total` bytes. */
+function initializeOfSize(total: number): string {
+  const frame = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { pad: '' } })
+  return JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { pad: 'p'.repeat(total - frame.length) } })
+}
+const postAs = (raw: string, headers: Record<string, string>) =>
+  mcpApp.request('https://pot.example/', { method: 'POST', headers: { 'content-type': 'application/json', ...clen(raw), ...headers }, body: raw }, env)
+const BEARER = { authorization: `Bearer ${TOKEN}` }
+const rpcCall = (name: string, a: Record<string, unknown>) => JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, arguments: a } })
+
+describe('auth-tiered cap: only an ACCEPTED bearer unlocks the raised read', () => {
+  it('unauthenticated 390 KiB initialize: 413', async () => {
+    const raw = initializeOfSize(390 * KIB)
+    expect((await postAs(raw, {})).status).toBe(413)
+  })
+  it('a merely PRESENT but unaccepted Authorization header: 413', async () => {
+    expect((await postAs(initializeOfSize(390 * KIB), { authorization: 'Bearer not-a-real-token' })).status).toBe(413)
+    expect((await postAs(initializeOfSize(390 * KIB), { authorization: 'Bearer' })).status).toBe(413)
+  })
+  it('an authenticated 390 KiB initialize is allowed past the transport cap', async () => {
+    expect((await postAs(initializeOfSize(390 * KIB), BEARER)).status).toBe(200)
+  })
+  it('route-level boundary, authenticated: exactly the cap passes, cap + 1 is 413', async () => {
+    expect((await postAs(initializeOfSize(MCP_REQUEST_CAP_BYTES), BEARER)).status).toBe(200)
+    expect((await postAs(initializeOfSize(MCP_REQUEST_CAP_BYTES + 1), BEARER)).status).toBe(413)
+  })
+  it('route-level boundary, unauthenticated: exactly 64 KiB passes, 64 KiB + 1 is 413', async () => {
+    expect((await postAs(initializeOfSize(MCP_BASE_REQUEST_CAP_BYTES), {})).status).toBe(200)
+    expect((await postAs(initializeOfSize(MCP_BASE_REQUEST_CAP_BYTES + 1), {})).status).toBe(413)
+  })
+  it('chunked unauthenticated 100 KiB: 413 (the tier applies to bytes read, not the header)', async () => {
+    const stream = new ReadableStream<Uint8Array>({ start(ctl) { for (let i = 0; i < 2; i++) ctl.enqueue(new Uint8Array(50 * KIB).fill(120)); ctl.close() } })
+    const res = await mcpApp.request('https://pot.example/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: stream, duplex: 'half' } as RequestInit, env)
+    expect(res.status).toBe(413)
+  })
+  it('/actions pre-auth: an oversize declared body with no or a bad bearer is 413, not 401, and nothing is read', async () => {
+    for (const h of [{}, { authorization: 'Bearer nope' }]) {
+      const res = await mcpActionsApp.request('https://pot.example/actions/remember', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(100 * KIB), ...h }, body: '{}' }, env)
+      expect(res.status).toBe(413)
+    }
+  })
+})
+
+describe('only project_wiki_upsert may exceed 64 KiB', () => {
+  it('remember at 100 KiB, authenticated, is refused with a typed 413 and a next step', async () => {
+    const res = await post(rpcCall('remember', { text: 'r'.repeat(100 * KIB) }))
+    expect(res.status).toBe(413)
+    const j = (await res.json()) as { id: unknown; error: { message: string; data: { limit_bytes: number; next_step: string } } }
+    expect(j.id).toBe(9)
+    expect(j.error.message).toBe('payload_too_large')
+    expect(j.error.data.limit_bytes).toBe(MCP_BASE_REQUEST_CAP_BYTES)
+    expect(j.error.data.next_step).toMatch(/project_wiki_upsert/)
+  })
+  it('legacy {tool,args} shape and /actions are bounded the same way', async () => {
+    const legacy = JSON.stringify({ tool: 'remember', args: { text: 'r'.repeat(100 * KIB) } })
+    expect((await post(legacy)).status).toBe(413)
+    expect((await act(JSON.stringify({ text: 'r'.repeat(100 * KIB) }).replace(/^/, ''), 'remember')).status).toBe(413)
+  })
+  it('per-tool boundary: a non-wiki call of exactly 64 KiB passes the bound, 64 KiB + 1 is 413', async () => {
+    const sized = (total: number) => { const base = rpcCall('remember', { text: '' }); return rpcCall('remember', { text: 'r'.repeat(total - base.length) }) }
+    expect(new TextEncoder().encode(sized(MCP_BASE_REQUEST_CAP_BYTES)).byteLength).toBe(MCP_BASE_REQUEST_CAP_BYTES)
+    expect((await post(sized(MCP_BASE_REQUEST_CAP_BYTES))).status).not.toBe(413)
+    expect((await post(sized(MCP_BASE_REQUEST_CAP_BYTES + 1))).status).toBe(413)
+  })
+  it('a small remember is not affected by the new bound (reaches the tool)', async () => {
+    expect((await post(rpcCall('remember', { text: 'hi' }))).status).not.toBe(413)
+  })
+  it('a 100 KiB project_wiki_upsert still reaches the tool', async () => {
+    const res = await post(rpcBody('cap-100k', 'a'.repeat(65536)))
+    expect(res.status).toBe(200)
+  })
+  it('worst case: 65536 ASCII bytes ALL written as \\u0061 through the real /mcp handler', async () => {
+    const wire = `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"project_wiki_upsert","arguments":${JSON.stringify(args('cap-all-esc', ''))
+      .replace('"body":""', `"body":"${'\\u0061'.repeat(65536)}"`)}}}`
+    expect(wire.length).toBeGreaterThan(65536 * 6)
+    expect(wire.length).toBeLessThanOrEqual(MCP_REQUEST_CAP_BYTES)
+    const res = await post(wire)
+    expect(res.status).toBe(200)
+    expect((await toolPayload(res)).ok).not.toBe(false)
+    expect(fake.topics.get('cap-all-esc')?.body).toBe('a'.repeat(65536))
+  })
+})
+
+describe('needs-you profile and stream errors', () => {
+  it('a chunked 5 MiB needs-you body is refused 413 and the stream is not drained', async () => {
+    let pulled = 0
+    const stream = new ReadableStream<Uint8Array>({ pull(ctl) { if (pulled >= 80) { ctl.close(); return } pulled += 1; ctl.enqueue(new Uint8Array(64 * KIB).fill(120)) } })
+    const res = await mcpApp.request('https://pot.example/profile/needs-you', { method: 'POST', headers: { 'content-type': 'application/json' }, body: stream, duplex: 'half' } as RequestInit, env)
+    expect(res.status).toBe(413)
+    expect(pulled).toBeLessThan(10)
+  })
+  const broken = () => new ReadableStream<Uint8Array>({ start(ctl) { ctl.enqueue(new Uint8Array(10).fill(120)); ctl.error(new Error('client aborted')) } })
+  it('a stream error mid-body returns JSON 400, not a plain 500, on /mcp, /actions and needs-you', async () => {
+    const mk = (): RequestInit => ({ method: 'POST', headers: { 'content-type': 'application/json', ...BEARER }, body: broken(), duplex: 'half' } as RequestInit)
+    for (const res of [
+      await mcpApp.request('https://pot.example/', mk(), env),
+      await mcpActionsApp.request('https://pot.example/actions/remember', mk(), env),
+      await mcpApp.request('https://pot.example/profile/needs-you', mk(), env),
+    ]) {
+      expect(res.status).toBe(400)
+      expect(res.headers.get('content-type')).toMatch(/json/)
+    }
   })
 })
