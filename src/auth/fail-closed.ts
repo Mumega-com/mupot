@@ -33,6 +33,7 @@
 // handled. Writing a second copy of a security predicate produced the worse one, which is
 // the argument against ever writing the second copy.
 import { redactSecretPatterns } from '../lib/redact'
+import { safeConsole } from '../lib/log'
 
 /**
  * Run an authentication lookup so that a THROWN error resolves to `null`
@@ -54,7 +55,7 @@ export async function authLookupOrNull<T>(
   } catch (err) {
     // console.error so it reaches Workers Logs. Never include the token, the hash, or the
     // row — this runs on the authentication path and the inputs are credentials.
-    console.error('auth lookup failed — failing closed to unauthenticated', {
+    safeConsole.error('auth lookup failed — failing closed to unauthenticated', {
       site,
       error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
     })

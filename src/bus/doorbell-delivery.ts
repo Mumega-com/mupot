@@ -37,6 +37,7 @@ import { DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { backoffDelaySec, MAX_DELIVERY_ATTEMPTS } from './events-delivery'
 import { postSigned, validateCallbackUrl } from '../mcp/events-webhook'
 import { ROUTINE_ACTOR } from '../routines/running-action'
+import { safeConsole } from '../lib/log'
 
 /** The only fields a job may carry. `attempt` is intentionally absent. */
 export interface DoorbellDeliveryJob {
@@ -180,7 +181,7 @@ async function publishDoorbellJob(
     try {
       await deliverSignedDoorbell(env, job)
     } catch (deliverErr) {
-      console.error('[doorbell] queue send failed and the claim was left for reclaim', {
+      safeConsole.error('[doorbell] queue send failed and the claim was left for reclaim', {
         agent_id: agentId,
         error: deliverErr instanceof Error ? deliverErr.message : String(deliverErr),
       })

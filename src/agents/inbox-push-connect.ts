@@ -4,6 +4,7 @@ import { BEARER_LIFETIME_MS } from './seat-events-bearer'
 import { validateInboxStreamIdentity, type StreamIdentity, type StreamAuthorization } from './inbox-stream-auth'
 import { createInboxPushResponse, type PushSocket } from './inbox-push-stream'
 import { readAgentInbox } from './messages'
+import { safeConsole } from '../lib/log'
 
 type Connection = { kind: 'connected'; socket: WebSocket } | { kind: 'unavailable' } | { kind: 'refused'; status: number }
 async function connect(env: Env, id: StreamIdentity): Promise<Connection> {
@@ -77,6 +78,6 @@ export async function openBearerPushStream(env: Env, id: StreamIdentity, since: 
       if (valid !== 'valid' || next.socket.readyState !== 1) { next.socket.close(); return null }
       return next.socket
     },
-    metric: kind => console.info('[inbox-stream]', { mode: fallback ? 'fallback' : 'push', operation: kind }),
+    metric: kind => safeConsole.info('[inbox-stream]', { mode: fallback ? 'fallback' : 'push', operation: kind }),
   })
 }

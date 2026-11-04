@@ -9,6 +9,7 @@ import {
   resolveHumanMemberForAttach,
   resolveHumanMemberId,
 } from './resolve-human-member'
+import { safeConsole } from '../lib/log'
 
 export { OWNER_LOGIN_EMAILS_KEY }
 
@@ -80,7 +81,7 @@ export async function findOrCreateHumanMemberDetailed(
   })
   if (result.kind === 'resolved') return { id: result.member.id, created: false }
   if (result.kind === 'denied') {
-    console.error('findOrCreateHumanMember: attach denied — competing controller, refusing to insert', {
+    safeConsole.error('findOrCreateHumanMember: attach denied — competing controller, refusing to insert', {
       reason: result.reason,
       has_login_identity: !!loginIdentity,
     })
@@ -90,7 +91,7 @@ export async function findOrCreateHumanMemberDetailed(
     )
   }
   if (result.kind === 'ambiguous') {
-    console.error('findOrCreateHumanMember: attach ambiguous — normalized email collision, refusing to insert', {
+    safeConsole.error('findOrCreateHumanMember: attach ambiguous — normalized email collision, refusing to insert', {
       has_login_identity: !!loginIdentity,
     })
     throw new MemberAttachDeniedError(
@@ -118,7 +119,7 @@ export async function findOrCreateHumanMemberDetailed(
     // some callers (e.g. the OAuth callback path) pass an Env carrying secrets,
     // and the scanner taints the whole object once that happens anywhere in the
     // codebase. memberId alone is unique and sufficient to find this row.
-    console.error('oauth: signup default grant failed (non-fatal, member still created)', {
+    safeConsole.error('oauth: signup default grant failed (non-fatal, member still created)', {
       member_id: memberId,
       error: err instanceof Error ? err.message : String(err),
     })

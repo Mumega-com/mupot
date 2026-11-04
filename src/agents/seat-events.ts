@@ -36,6 +36,7 @@ import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
 import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import type { CapabilityGrant } from '../types'
+import { safeConsole } from '../lib/log'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
@@ -529,7 +530,7 @@ async function pruneRateLimitTable(env: Env, table: 'seat_events_ticket_rate_lim
     const cutoff = new Date(nowMs - 2 * windowSec * 1000).toISOString()
     await env.DB.prepare(`DELETE FROM ${table} WHERE tenant = ?1 AND window_start < ?2`).bind(env.TENANT_SLUG, cutoff).run()
   } catch (err) {
-    console.error(`[seat-events] ${table} prune failed (non-fatal):`, err instanceof Error ? err.message : err)
+    safeConsole.error(`[seat-events] ${table} prune failed (non-fatal):`, err instanceof Error ? err.message : err)
   }
 }
 
@@ -562,7 +563,7 @@ export async function underTicketRateLimit(
     // Fail CLOSED on D1 trouble — same posture as email-login and the enroll-mint limiter: a
     // crypto-verifying, unauthenticated, D1-reading endpoint must refuse when its own guard
     // breaks, not open the tap.
-    console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    safeConsole.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
     return false
   }
 }
@@ -596,7 +597,7 @@ export async function underUpgradeRateLimit(
     }
     return result !== null
   } catch (err) {
-    console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    safeConsole.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
     return false
   }
 }
@@ -680,7 +681,7 @@ export async function consumeTicketPreCheck(
     if (!row) return { ok: false, reason: 'invalid' }
     return { ok: true, hostAgentId: row.host_agent_id }
   } catch (err) {
-    console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    safeConsole.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
     return { ok: false, reason: 'error' }
   }
 }

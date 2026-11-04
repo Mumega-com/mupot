@@ -17,6 +17,7 @@ import type { AuthContext, Env, TaskVerdict } from '../types'
 import { appendExecutionReceipt, ExecutionReceiptError } from '../flight-spine/receipts'
 import type { JsonValue } from '../flight-spine/types'
 import { VerdictRaceError } from './verdict-errors'
+import { safeConsole } from '../lib/log'
 
 /** The submission a verdict is bound to. `null` = the task has no CURRENT submission (see header). */
 export interface VerdictSubmissionBinding {
@@ -221,7 +222,7 @@ async function appendWithRetry(
   }
   // Not silent: the verdict stands and the chain is missing a link. The verdict row carries the pending marker
   // (receipt_actor_kind), so reconcileGateVerdictReceipts (scheduled sweep) replays it exactly.
-  console.error('gate.verdict receipt append failed', JSON.stringify({ ...logContext, error: lastCode }))
+  safeConsole.error('gate.verdict receipt append failed', JSON.stringify({ ...logContext, error: lastCode }))
   return { status: 'failed', error: lastCode }
 }
 
@@ -273,7 +274,7 @@ async function appendVerdictReceipt(env: Env, verdict: TaskVerdict): Promise<Gat
     }, { verdict_id: verdict.id, task_id: verdict.task_id })
   } catch (error) {
     const code = error instanceof Error ? error.name : 'unknown'
-    console.error('gate.verdict receipt append failed', JSON.stringify({ verdict_id: verdict.id, task_id: verdict.task_id, error: code }))
+    safeConsole.error('gate.verdict receipt append failed', JSON.stringify({ verdict_id: verdict.id, task_id: verdict.task_id, error: code }))
     return { status: 'failed', error: code }
   }
 }
@@ -365,7 +366,7 @@ export async function emitGateVerdictReversalReceipt(
     }, { verdict_id: verdict.id, task_id: verdict.task_id, reversal: 'true' })
   } catch (error) {
     const code = error instanceof Error ? error.name : 'unknown'
-    console.error('gate.verdict reversal receipt append failed', JSON.stringify({ verdict_id: verdict.id, error: code }))
+    safeConsole.error('gate.verdict reversal receipt append failed', JSON.stringify({ verdict_id: verdict.id, error: code }))
     return { status: 'failed', error: code }
   }
 }

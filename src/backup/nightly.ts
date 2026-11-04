@@ -23,6 +23,7 @@
 
 import type { Env } from '../types'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { safeConsole } from '../lib/log'
 
 export const BACKUP_CRON = '17 3 * * *'
 export const KEY_PREFIX = 'd1/mupot/'
@@ -264,7 +265,7 @@ async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message
     const r = await notifyHadi(env, { type: `backup.${kind}`, title: `D1 nightly backup ${date}`, message })
     return r.delivered
   } catch (err) {
-    console.error('[backup] alert threw', redact(String(err)))
+    safeConsole.error('[backup] alert threw', redact(String(err)))
     return false
   }
 }
@@ -298,7 +299,7 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
         env,
         `INSERT INTO backup_runs (id, run_date, status, error, alerted, started_at, finished_at) VALUES (?, ?, 'skipped:no_credential', ?, ?, ?, ?)`,
         id, date, msg, alerted ? 1 : 0, startedAt, startedAt,
-      ).catch((e) => console.error('[backup] skip row not written', redact(String(e))))
+      ).catch((e) => safeConsole.error('[backup] skip row not written', redact(String(e))))
       return { id, startedAt, skip: msg }
     }
     // A run that died mid-flight leaves 'running' forever; close those out so the table never lies.
@@ -320,7 +321,7 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
       env,
       `INSERT INTO backup_runs (id, run_date, status, error, alerted, started_at, finished_at) VALUES (?, ?, 'failed', ?, ?, ?, ?)`,
       `bk-${date}-${crypto.randomUUID().slice(0, 8)}`, date, `begin failed: ${message}`, alerted ? 1 : 0, now, now,
-    ).catch((e) => console.error('[backup] failure row not written', redact(String(e))))
+    ).catch((e) => safeConsole.error('[backup] failure row not written', redact(String(e))))
     return { status: 'failed', error: `begin failed: ${message}` }
   }
   if (begin.skip) return { status: 'skipped:no_credential', error: begin.skip }
@@ -387,7 +388,7 @@ export async function runNightlyBackup(env: Env, params: BackupParams, step: Bac
       .do('record-failure', () =>
         record(env, `UPDATE backup_runs SET status = 'failed', error = ?, alerted = ?, finished_at = ? WHERE id = ?`,
           message, alerted ? 1 : 0, new Date().toISOString(), begin.id))
-      .catch((e) => console.error('[backup] failure row not written', redact(String(e))))
+      .catch((e) => safeConsole.error('[backup] failure row not written', redact(String(e))))
     return { status: 'failed', error: message }
   }
 }
@@ -398,7 +399,7 @@ export async function startNightlyBackup(env: Env, scheduledAt: Date): Promise<v
   const runDate = scheduledAt.toISOString().slice(0, 10)
   if (!env.BACKUP_WORKFLOW) {
     const msg = 'NIGHTLY_BACKUP=1 but the BACKUP_WORKFLOW binding is not deployed'
-    console.error('[backup]', msg)
+    safeConsole.error('[backup]', msg)
     await alert(env, 'failed', runDate, msg)
     return
   }
@@ -406,7 +407,7 @@ export async function startNightlyBackup(env: Env, scheduledAt: Date): Promise<v
     await env.BACKUP_WORKFLOW.create({ id: `d1-backup-${runDate}`, params: { runDate } })
   } catch (err) {
     const msg = `could not start the backup workflow: ${redact(String(err))}`
-    console.error('[backup]', msg)
+    safeConsole.error('[backup]', msg)
     await alert(env, 'failed', runDate, msg)
   }
 }

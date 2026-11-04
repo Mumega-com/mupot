@@ -31,6 +31,7 @@ import type {
   RunStatusResult,
   StatusQuery,
 } from '../types'
+import { safeConsole } from '../../lib/log'
 
 /**
  * Public error vocabulary. Raw exception text (D1/SQL, vendor) is NEVER returned to callers: anything outside
@@ -158,7 +159,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
         ctx.waitUntil(
           attachCursorCloudExecution(env, reserved.reservationId, { model: req.model })
             .catch((err) => {
-              console.error('attachCursorCloudExecution async failure:', err)
+              safeConsole.error('attachCursorCloudExecution async failure:', err)
             }),
         )
         return {

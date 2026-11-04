@@ -11,6 +11,7 @@
 import type { Env } from '../types'
 import { seatAutoEnrollEnabled } from '../members/harness'
 import type { HarnessHints } from '../members/seat-handle'
+import { safeConsole } from '../lib/log'
 
 export const HARNESS_PROBE_METRIC = 'harness_identity_probe'
 const PROBE_INTERVAL_MS = 60 * 60 * 1000
@@ -189,7 +190,7 @@ export async function maybeEmitHarnessIdentityProbe(
     if (last !== undefined && nowMs - last < PROBE_INTERVAL_MS) return
     if (lastLogged.size >= PROBE_MAX_TRACKED) lastLogged.clear()
     lastLogged.set(key, nowMs)
-    console.info(JSON.stringify({
+    safeConsole.info(JSON.stringify({
       metric: HARNESS_PROBE_METRIC,
       grant: await keyedHash(secret, grantKey),
       x_mupot_seat: inputs.headerSeat !== null,

@@ -65,6 +65,7 @@ import { routinePrincipal } from '../routines/access'
 import { projectReadAccessFromGrants, projectVisibilityClause } from '../projects/access'
 import { completeTelegramUpdate, reserveTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { safeConsole } from '../lib/log'
 
 type AppEnv = { Bindings: Env }
 
@@ -394,7 +395,7 @@ export async function handleImMessage(
     // project ..." reply for a join that already durably happened.
     if (result.ok && !result.value.identity_only) {
       await provisionHomeForMember(env, result.value.member_id, 'im').catch((err: unknown) => {
-        console.error('im/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+        safeConsole.error('im/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
           member_id: result.value.member_id, channel: 'im',
           error_class: err instanceof Error ? err.constructor.name : typeof err, err,
         })

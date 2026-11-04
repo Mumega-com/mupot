@@ -32,6 +32,7 @@ import {
   PENDING_INVITE_KV_PREFIX,
   PENDING_INVITE_TTL_SECONDS,
 } from '../auth/pending-invite-link'
+import { safeConsole } from '../lib/log'
 
 // Variables.auth mirrors auth/index.ts's AppEnv so peekSessionAuth(c) accepts this context.
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -389,7 +390,7 @@ inviteApp.post('/:id', async (c) => {
   // — they are authenticated; send them to the dashboard.
   if (result.value.linked_existing) {
     await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
-      console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+      safeConsole.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
         member_id: result.value.member_id, channel: 'web',
         error_class: err instanceof Error ? err.constructor.name : typeof err, err,
       })
@@ -480,7 +481,7 @@ inviteApp.post('/:id', async (c) => {
   // guarantee (see its doc comment in src/members/service.ts) — belt and
   // braces, not a claim that the function still needs it.
   await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
-    console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+    safeConsole.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
       member_id: result.value.member_id, channel: 'web',
       error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })

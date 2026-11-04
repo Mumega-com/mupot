@@ -36,6 +36,7 @@ import {
   gateAskExpiresAt,
   type ExpiryReason,
 } from './approval-expiry-rule'
+import { safeConsole } from '../lib/log'
 
 export * from './approval-expiry-rule'
 
@@ -258,7 +259,7 @@ export async function runApprovalExpiryTick(env: Env): Promise<ExpirySweepResult
   const counts = await sweepExpiredApprovals(env, { dryRun: env.APPROVAL_EXPIRY_ENFORCE !== '1', via: 'cron' })
   if (counts.scanned > 0 || counts.errors > 0) {
     // Counts only in the log; task ids live in approval_expiry_receipts.
-    console.info('[approval-expiry]', {
+    safeConsole.info('[approval-expiry]', {
       dry_run: counts.dry_run, scanned: counts.scanned, expired: counts.expired,
       approval_expired: counts.approval_expired, gate_owner_dead: counts.gate_owner_dead,
       notified: counts.notified, skipped_claimed: counts.skipped_claimed, errors: counts.errors,

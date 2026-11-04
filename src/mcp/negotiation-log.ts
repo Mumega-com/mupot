@@ -4,6 +4,7 @@
 //
 // Never stored or logged: any token, header value, or param other than the bounded version string and a bounded client label.
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export const NEGOTIATION_RATE_WINDOW_MS = 60_000
 export const NEGOTIATION_RETENTION_MS = 7 * 24 * 60 * 60_000
@@ -55,7 +56,7 @@ export async function recordNegotiation(env: Env, nowMs: number, r: NegotiationR
     // label lookup is best effort
   }
   const authenticated = Boolean(harnessId || memberId)
-  console.info('[mcp:negotiation]', {
+  safeConsole.info('[mcp:negotiation]', {
     method: r.method, harness_id: harnessId, client_name: clientName, requested: authenticated ? r.requested : (r.requestedBucket ?? 'other'), negotiated: r.negotiated, events_returned: r.eventsReturned,
   })
   // No principal => nothing to rate-limit against: log only, never an unbounded anonymous write.
@@ -88,6 +89,6 @@ export async function recordNegotiation(env: Env, nowMs: number, r: NegotiationR
          SELECT rowid FROM mcp_negotiation_log WHERE tenant = ?1 ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?2)`,
     ).bind(env.TENANT_SLUG, NEGOTIATION_TENANT_ROW_CEILING).run()
   } catch (e) {
-    console.error('[mcp:negotiation] record failed', e instanceof Error ? e.message : String(e))
+    safeConsole.error('[mcp:negotiation] record failed', e instanceof Error ? e.message : String(e))
   }
 }

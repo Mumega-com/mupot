@@ -86,6 +86,7 @@ import {
   verifyEmailLoginByToken,
   type VerifyEmailLoginResult,
 } from './email-login'
+import { safeConsole } from '../lib/log'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -456,7 +457,7 @@ async function registerWebSession(
     // but deliberately NOT applied — see this task's boundary) — a pot
     // running without those tables simply mints ordinary KV-only sessions
     // until the migration lands, exactly like before this change.
-    console.error('registerWebSession failed (login still succeeded via KV session)', err)
+    safeConsole.error('registerWebSession failed (login still succeeded via KV session)', err)
     return { registered: false }
   }
 }
@@ -602,7 +603,7 @@ export function googleAuthTimeVerdict(authTimeSec: number | null, nowMs: number 
 export function googleAuthTimeAllows(authTimeSec: number | null, flow: 'reauth' | 'link', nowMs: number = Date.now(), required: boolean = GOOGLE_AUTH_TIME_REQUIRED): boolean {
   const verdict = googleAuthTimeVerdict(authTimeSec, nowMs)
   if (verdict === 'absent') {
-    console.warn(JSON.stringify({ evt: 'google_auth_time_absent', flow }))
+    safeConsole.warn(JSON.stringify({ evt: 'google_auth_time_absent', flow }))
     return !required
   }
   return verdict === 'fresh'
@@ -1750,7 +1751,7 @@ authApp.get('/logout', async (c) => {
         const idHash = await hashWebSessionId(sessionId)
         await revokeWebSessionByHash(c.env, c.env.TENANT_SLUG, idHash, 'logout')
       } catch (err) {
-        console.error('web_sessions revoke-on-logout failed (KV session already cleared)', err)
+        safeConsole.error('web_sessions revoke-on-logout failed (KV session already cleared)', err)
       }
     }
   }

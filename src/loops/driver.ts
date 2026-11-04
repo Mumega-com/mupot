@@ -30,6 +30,7 @@ import {
   clearLoopControl,
 } from './decisions'
 import type { LoopControlRow } from './decisions'
+import { safeConsole } from '../lib/log'
 
 /** Max loops driven per cron tick. Large tenants rotate across ticks (oldest-first via listLoops order). */
 export const MAX_LOOPS_PER_TICK = 25
@@ -161,7 +162,7 @@ export async function runLoopsTick(env: Env, deps: DriverDeps = {}): Promise<Loo
                 }
               } else {
                 // Invalid / non-positive value: clear the row and log, do not apply.
-                console.error(
+                safeConsole.error(
                   `[loops/driver] budget_override on loop ${loop.id} has invalid value (${JSON.stringify(ctrl.value)}); cleared without applying.`,
                 )
               }

@@ -28,6 +28,7 @@ import type { BusEvent, Env, MessageCreatedPayload } from '../types'
 import { InvalidEventSeqError, isEventsEnabled, readAfterSeq } from '../mcp/events'
 import { MAX_EVENT_BODY_BYTES, postSigned, signedHeaders, validateCallbackUrl } from '../mcp/events-webhook'
 import { loadSigningSecrets, subscriberAccessLive, tokenSeatLabel, type SubscriptionRow } from '../mcp/events-subscriptions'
+import { safeConsole } from '../lib/log'
 
 export const MAX_DELIVERY_ATTEMPTS = 5
 export const RETRY_BASE_DELAY_SEC = 10
@@ -77,7 +78,7 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
     try {
       await recordLapsedWake(env, event.tenant, p.to_agent, p.message_id, nowIso)
     } catch (err) {
-      console.error('[events] lapsed-wake bookkeeping failed', err instanceof Error ? err.message : String(err))
+      safeConsole.error('[events] lapsed-wake bookkeeping failed', err instanceof Error ? err.message : String(err))
     }
   }
   for (const s of subs.results ?? []) {

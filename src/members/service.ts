@@ -24,6 +24,7 @@ import {
   TOKEN_LIVE_PREDICATE,
 } from '../auth/token-lifecycle'
 import { revokeAgentSessionByCredentialSafe } from '../auth/agent-sessions'
+import { safeConsole } from '../lib/log'
 
 const CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard']
 export function isChannel(v: unknown): v is ConnectionChannel {
@@ -1437,7 +1438,7 @@ export async function provisionHomeForMember(
     try {
       home = await getMemberHomeSquad(env, memberId)
     } catch (err) {
-      console.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', {
+      safeConsole.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', {
         member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
       })
       return
@@ -1448,7 +1449,7 @@ export async function provisionHomeForMember(
     try {
       created = await createHomeForMember(env, memberId)
     } catch (err) {
-      console.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', {
+      safeConsole.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', {
         member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
       })
       return
@@ -1480,13 +1481,13 @@ export async function provisionHomeForMember(
       // way; this is a degraded-but-recovered audit write, the same
       // severity class as src/addons/mirror.ts's "Vector index write
       // failed (relational engram preserved)".
-      console.warn('members/service: provisionHomeForMember receipt write failed (non-fatal, home already provisioned)', {
+      safeConsole.warn('members/service: provisionHomeForMember receipt write failed (non-fatal, home already provisioned)', {
         member_id: memberId, channel, squad_id: created.squad.id, disposition: created.disposition,
         error_class: err instanceof Error ? err.constructor.name : typeof err, err,
       })
     }
   } catch (err) {
-    console.error('members/service: provisionHomeForMember failed unexpectedly (non-fatal)', {
+    safeConsole.error('members/service: provisionHomeForMember failed unexpectedly (non-fatal)', {
       member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })
   }

@@ -35,6 +35,7 @@ import {
   PROVISIONING_EXEMPT_TOKEN_LABEL,
   UNVERIFIED_LOGIN_PROVIDERS,
 } from '../members/exclusive-control'
+import { safeConsole } from '../lib/log'
 
 export interface LinkedSignIn {
   id: string
@@ -192,7 +193,7 @@ async function auditLink(
     })
   } catch (err) {
     // The identity write already landed and is idempotent; a failed audit must be loud, not a rollback of a login door.
-    console.error('linked-signins audit write failed', { operation, identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
+    safeConsole.error('linked-signins audit write failed', { operation, identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
   }
 }
 
@@ -318,7 +319,7 @@ export async function linkSignIn(
           binds: [requestId, env.TENANT_SLUG, me],
         })
       } catch (err) {
-        console.error('linked-signins move audit prepare failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
+        safeConsole.error('linked-signins move audit prepare failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }
       }
       const anchored = `EXISTS (SELECT 1 FROM mutation_audit_entries a
@@ -362,7 +363,7 @@ export async function linkSignIn(
       try {
         results = await env.DB.batch([claim, move, audit, cutoff, passkeys, phones, supersede, connectors, telegram])
       } catch (err) {
-        console.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
+        safeConsole.error('linked-signins move batch failed', { identity_id: identityId, error: err instanceof Error ? err.message : String(err) })
         return { ok: false, error: 'service_error' }
       }
       if (Number(results[1]?.meta?.changes ?? 0) === 0) return { ok: false, error: 'already_linked' }

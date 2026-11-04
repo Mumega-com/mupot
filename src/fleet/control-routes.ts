@@ -22,6 +22,7 @@ import { resolveOrgAdmin } from '../auth/member-bearer'
 import { panelPublicJwk } from './control-request'
 import { redactSecretPatterns } from '../lib/redact'
 import { waitUntilFromContext } from '../agents/webhook-doorbell'
+import { safeConsole } from '../lib/log'
 
 export const fleetControlApp = new Hono<{ Bindings: Env }>()
 const FLEET_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -143,7 +144,7 @@ fleetControlApp.get('/trust', async (c) => {
       panel_public_key: publicKey,
     })
   } catch (error) {
-    console.error('fleet trust export failed', {
+    safeConsole.error('fleet trust export failed', {
       tenant: c.env.TENANT_SLUG,
       consumer_agent_id: c.env.FLEET_CONSUMER_AGENT,
       error: redactSecretPatterns(error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error'),

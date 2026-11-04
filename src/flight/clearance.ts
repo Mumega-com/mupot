@@ -61,6 +61,7 @@
 
 import type { FlightRow, FlightStatus } from './service'
 import { parseFlightMetaV1, type FlightMetaV1 } from './meta'
+import { safeConsole } from '../lib/log'
 
 export type ClearanceSeverity = 'hold' | 'warn'
 
@@ -111,14 +112,14 @@ function parseRowMeta(row: FlightRow): FlightMetaV1 | null {
   try {
     raw = JSON.parse(row.meta)
   } catch {
-    console.warn('flight/clearance: unparseable meta JSON, treating flight as opaque (no collision asserted)', {
+    safeConsole.warn('flight/clearance: unparseable meta JSON, treating flight as opaque (no collision asserted)', {
       flight_id: row.id,
     })
     return null
   }
   const meta = parseFlightMetaV1(raw)
   if (!meta) {
-    console.warn('flight/clearance: meta failed FlightMetaV1 validation, treating flight as opaque (no collision asserted)', {
+    safeConsole.warn('flight/clearance: meta failed FlightMetaV1 validation, treating flight as opaque (no collision asserted)', {
       flight_id: row.id,
     })
   }

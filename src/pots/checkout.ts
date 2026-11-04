@@ -6,6 +6,7 @@ import { TIER_PRICING } from '../billing/stripe'
 import { provisionSovereignPot, checkSlugAvailability, type SlugCheckResult } from './service'
 import { createBus } from '../bus'
 import { CHECKOUT_UNAVAILABLE, isPotSelfServeCheckoutEnabled } from './checkout-flag'
+import { safeConsole } from '../lib/log'
 
 // checkSlugAvailability / SlugCheckResult moved to src/pots/service.ts in mupot#1507
 // round-2 (P0-4) — provisionSovereignPot needed to call it directly without a circular
@@ -84,14 +85,14 @@ export async function createPotCheckoutSession(
     if (!res.ok) {
       // mupot#1518: the Stripe response body is NOT returned to the (anonymous) caller and
       // NOT logged — it can carry request ids, account hints and echoed params. Status only.
-      console.error('[pots:checkout] stripe_session_create_failed', { status: res.status })
+      safeConsole.error('[pots:checkout] stripe_session_create_failed', { status: res.status })
       return { ok: false, error: CHECKOUT_FAILED }
     }
 
     const session = (await res.json()) as { id: string; url: string }
     return { ok: true, url: session.url, sessionId: session.id }
   } catch (error) {
-    console.error('[pots:checkout] stripe_session_create_threw', {
+    safeConsole.error('[pots:checkout] stripe_session_create_threw', {
       name: error instanceof Error ? error.name : typeof error,
     })
     return { ok: false, error: CHECKOUT_FAILED }

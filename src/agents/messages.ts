@@ -27,6 +27,7 @@ import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, replyViaFor, type ReplyBasis } from './reply-expectation'
 import { isSystemSender, systemSenderReplyVia } from './system-senders'
 import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
+import { safeConsole } from '../lib/log'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -708,7 +709,7 @@ export async function sendAgentMessage(
         ts: createdAt,
       })
     } catch (emitErr) {
-      console.error(
+      safeConsole.error(
         '[message.created] emit FAILED — message %s is committed but no push event was ' +
         'published; a subscriber will not learn of it until the inbox is read: %s',
         id,

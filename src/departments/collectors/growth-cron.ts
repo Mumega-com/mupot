@@ -16,6 +16,7 @@
 import type { Env } from '../../types'
 import { collectGrowthMetrics } from './growth-collector'
 import { getActive } from '../registry'
+import { safeConsole } from '../../lib/log'
 
 // ── runGrowthCollection ───────────────────────────────────────────────────────
 //
@@ -35,7 +36,7 @@ export async function runGrowthCollection(env: Env): Promise<void> {
     growthActive = activeDepts.some((d) => d.template_key === 'growth')
   } catch (err) {
     // If we cannot read the departments table, skip collection silently.
-    console.error('[growth_cron] active-check failed — skipping collection', err)
+    safeConsole.error('[growth_cron] active-check failed — skipping collection', err)
     return
   }
 
@@ -49,6 +50,6 @@ export async function runGrowthCollection(env: Env): Promise<void> {
   } catch (err) {
     // Fail-soft: log and move on. A collector error must never crash the cron
     // or prevent the other heartbeats from completing.
-    console.error('[growth_cron] collectGrowthMetrics failed', { tenantId, now, err })
+    safeConsole.error('[growth_cron] collectGrowthMetrics failed', { tenantId, now, err })
   }
 }

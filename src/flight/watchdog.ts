@@ -39,6 +39,7 @@ import {
 } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
 import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
+import { safeConsole } from '../lib/log'
 
 export interface FlightActor {
   kind: 'member' | 'agent' | 'system'
@@ -779,7 +780,7 @@ export async function reapStalledFlight(
     // The flight is ALREADY transitioned by this point, so a receipt failure means a reap with no
     // audit trail — exactly the condition that hid this defect. It must be loud, and the caller
     // must not read transitioned:true as success on its own.
-    console.error('flight reap receipt insert failed — FLIGHT REAPED WITHOUT AUDIT TRAIL', {
+    safeConsole.error('flight reap receipt insert failed — FLIGHT REAPED WITHOUT AUDIT TRAIL', {
       flight_id: flightId,
       previous_status: previousStatus,
       actor_kind: principal.actor.kind,
@@ -1165,7 +1166,7 @@ export async function expireUnverifiedHeldFlights(env: Env, nowMs: number, limit
         new Date(nowMs).toISOString(),
       ).run()
     } catch (error) {
-      console.error(`[flight-watchdog] unverified_expired receipt failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+      safeConsole.error(`[flight-watchdog] unverified_expired receipt failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return ids
@@ -1262,10 +1263,10 @@ export async function sweepStalledFlights(
       if ((claimed.results ?? []).length === 1) {
         escalated += 1
         escalatedFlightIds.push(flight.id)
-        console.warn(`[flight-watchdog] finished parked flight ${flight.id} cannot be system-landed: ${outcome.reason}`)
+        safeConsole.warn(`[flight-watchdog] finished parked flight ${flight.id} cannot be system-landed: ${outcome.reason}`)
       }
     } catch (error) {
-      console.error(
+      safeConsole.error(
         `[flight-watchdog] system land threw for flight ${flight.id}: ` +
           `${error instanceof Error ? error.message : String(error)}`,
       )
@@ -1275,7 +1276,7 @@ export async function sweepStalledFlights(
 
   const expiredUnverified = await expireUnverifiedHeldFlights(env, nowMs)
   if (expiredUnverified.length > 0) {
-    console.warn(`[flight-watchdog] EXPIRED — ${expiredUnverified.length} unverified held flight(s) failed as unverified_expired: ${expiredUnverified.join(', ')}`)
+    safeConsole.warn(`[flight-watchdog] EXPIRED — ${expiredUnverified.length} unverified held flight(s) failed as unverified_expired: ${expiredUnverified.join(', ')}`)
   }
 
   const scan = await scanStalledFlights(env, opts)
@@ -1296,7 +1297,7 @@ export async function sweepStalledFlights(
           escalatedFlightIds.push(flight.id)
         }
       } catch (error) {
-        console.error(
+        safeConsole.error(
           `[flight-watchdog] escalation claim threw for flight ${flight.id}: ` +
             `${error instanceof Error ? error.message : String(error)}`,
         )
@@ -1330,7 +1331,7 @@ export async function sweepStalledFlights(
       // same counter — the exact shape logged as a silent no-op elsewhere in this repo
       // (mupot#1143, #1150). The flight id and cause are recorded so a persistently
       // failing flight is attributable rather than just a number.
-      console.error(
+      safeConsole.error(
         `[flight-watchdog] reap threw for flight ${flight.id}: ` +
           `${error instanceof Error ? error.message : String(error)}`,
       )
@@ -1339,21 +1340,21 @@ export async function sweepStalledFlights(
   }
 
   if (escalatedFlightIds.length > 0) {
-    console.warn(
+    safeConsole.warn(
       `[flight-watchdog] ESCALATE — ${escalatedFlightIds.length} flight(s) waiting at a gate > 24h ` +
         `(never reaped): ${escalatedFlightIds.join(', ')}`,
     )
   }
 
   if (unverifiedFlightIds.length > 0) {
-    console.warn(
+    safeConsole.warn(
       `[flight-watchdog] HELD — ${unverifiedFlightIds.length} flight(s) have every task done but no landing evidence ` +
         `(result submission + independent verdict); not landed: ${unverifiedFlightIds.join(', ')}`,
     )
   }
 
   if (scan.capped) {
-    console.warn(
+    safeConsole.warn(
       `[flight-watchdog] PARTIAL SWEEP — candidate scan hit its limit of ${scan.limit}; ` +
         'further stalled flights were not evaluated this pass',
     )

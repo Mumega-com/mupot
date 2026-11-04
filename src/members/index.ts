@@ -237,6 +237,7 @@ import {
   type StructuralRefusal,
   type StructuralVerdict,
 } from '../operators/chokepoint'
+import { safeConsole } from '../lib/log'
 
 /**
  * requireCapability(orgScope, 'admin') plus the ONE structural chokepoint (mumega-com#1386, closes #1357).
@@ -927,7 +928,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
   // internal never-throws guarantee (src/members/service.ts) — this call
   // must never be allowed to turn a successful accept into a 500.
   await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
-    console.error('members/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+    safeConsole.error('members/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
       member_id: result.value.member_id, channel: 'web',
       error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })

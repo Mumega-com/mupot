@@ -60,6 +60,7 @@ import { asData, untrustedContentGuard } from '../lib/prompt-safety'
 import { isExternallySourced, externalMarker } from '../tasks/provenance'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 import { receiverNotStoppedSql } from '../fleet/registry'
+import { safeConsole } from '../lib/log'
 export { isExternallySourced, externalMarker }
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
@@ -129,7 +130,7 @@ export async function runTaskExecution(
       const count = await recordRefusedAttempt(env, agent.id, result.task_id, result.error || result.decided || 'execution_failed', attemptStartedAt)
       if (count >= EXECUTION_RETRY_CEILING) await escalateRefusedTask(env, agent.id, result.task_id)
     } catch (brakeErr) {
-      console.error('execute: retry-ceiling bookkeeping failed', brakeErr)
+      safeConsole.error('execute: retry-ceiling bookkeeping failed', brakeErr)
     }
   }
   return result
@@ -208,7 +209,7 @@ async function runTaskExecutionAttempt(
       try {
         await escalateRefusedTask(env, agent.id, task.id)
       } catch (escalateErr) {
-        console.error('execute: escalation after ceiling refusal failed', escalateErr)
+        safeConsole.error('execute: escalation after ceiling refusal failed', escalateErr)
       }
       return { ok: false, task_id: task.id, decided: '', error: RETRY_CEILING_ERROR }
     }
@@ -1071,7 +1072,7 @@ export async function runDispatchedTaskExecution(
         stage: 'failed', reason: r.error, deliveredVia: 'none', ...(r.error === 'receiver_not_live' ? {} : { auditLabel: r.error }),
       })
     } catch (settleErr) {
-      console.error('execute: terminal refusal settle failed', settleErr)
+      safeConsole.error('execute: terminal refusal settle failed', settleErr)
     }
   } else if (executionReceiptId) {
     const stage = inWorkerSettleStage(r)
@@ -1085,7 +1086,7 @@ export async function runDispatchedTaskExecution(
           reason: stage === 'failed' ? (r.error ?? (r.decided || 'execution_failed')) : (r.decided || 'completed'),
         })
       } catch (settleErr) {
-        console.error('execute: in_worker receipt settle failed', settleErr)
+        safeConsole.error('execute: in_worker receipt settle failed', settleErr)
       }
     }
   }

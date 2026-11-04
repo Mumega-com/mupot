@@ -12,6 +12,7 @@
 // key can serve both workers without a second naming convention to track.
 
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 export interface EmailMessage {
   to: string
@@ -55,12 +56,12 @@ class ResendEmailSender implements EmailSender {
         signal: AbortSignal.timeout(RESEND_TIMEOUT_MS),
       })
       if (!res.ok) {
-        console.error(`[email-sender] resend failed: ${res.status}`)
+        safeConsole.error(`[email-sender] resend failed: ${res.status}`)
         return { ok: false }
       }
       return { ok: true }
     } catch (err) {
-      console.error('[email-sender] resend error:', err instanceof Error ? err.message : err)
+      safeConsole.error('[email-sender] resend error:', err instanceof Error ? err.message : err)
       return { ok: false }
     }
   }
@@ -74,7 +75,7 @@ class ResendEmailSender implements EmailSender {
  */
 class ConsoleEmailSender implements EmailSender {
   async send(message: EmailMessage): Promise<EmailSendResult> {
-    console.log(`[email-sender:console] to=${message.to} subject=${JSON.stringify(message.subject)}\n${message.text}`)
+    console.log(`[email-sender:console] to=${message.to} subject=${JSON.stringify(message.subject)}\n${message.text}`) // allow-raw-console: dev-only sender prints the sign-in link by design
     return { ok: true }
   }
 }

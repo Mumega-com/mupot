@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
+import { safeConsole } from '../lib/log'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
 // bounded below that ceiling before an external dispatch processor does any work.
@@ -519,7 +520,7 @@ export async function runRoutineScheduler(
       await processClaimed?.(run.id)
     } catch (error) {
       dispatchErrors++
-      console.error(`[routine-dispatch:${run.id}]`, error)
+      safeConsole.error(`[routine-dispatch:${run.id}]`, error)
     }
   }
 

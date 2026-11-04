@@ -13,6 +13,7 @@
 // yourself pasting the SQL fragment into a third place, the bug is the paste.
 
 import type { Env } from '../types'
+import { safeConsole } from '../lib/log'
 
 /** SQL fragment gating a token row on liveness. Bind: the `now` parameter index.
  *
@@ -207,7 +208,7 @@ export async function sweepExpiringTokensWarning(
       tokens: expiringSoon,
     }
   } catch (error) {
-    console.error('expiring tokens warning sweep failed', error)
+    safeConsole.error('expiring tokens warning sweep failed', error)
     return { warned: 0, tokens: [] }
   }
 }

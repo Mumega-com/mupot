@@ -2,6 +2,7 @@ import type { Env } from '../types'
 import { cancelledColumnSql, flightOutcome, isBookkeepingClosed, isCancelledFlight, isCancelUnconfirmed, isRealFailure } from '../flight/cancelled'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { safeConsole } from '../lib/log'
 
 /**
  * Agent profile panels.
@@ -187,7 +188,7 @@ export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelR
   } catch (err) {
     // The distinction that matters: we could not READ, which is not the same as
     // this agent having flown nothing.
-    console.error('[agent-profile] flight panel read failed:', err)
+    safeConsole.error('[agent-profile] flight panel read failed:', err)
     return unavailable('Flight history could not be read.')
   }
 }
@@ -240,7 +241,7 @@ export async function loadWorkPanel(env: Env, agentId: string): Promise<PanelRes
     if (rows.length === 0) return empty()
     return ready(summariseWork(rows))
   } catch (err) {
-    console.error('[agent-profile] work panel read failed:', err)
+    safeConsole.error('[agent-profile] work panel read failed:', err)
     return unavailable('Assigned work could not be read.')
   }
 }
@@ -347,7 +348,7 @@ export async function loadCollaborationPanel(
     }
     return ready(summariseCollaboration(agentId, rows, names))
   } catch (err) {
-    console.error('[agent-profile] collaboration panel read failed:', err)
+    safeConsole.error('[agent-profile] collaboration panel read failed:', err)
     return unavailable('Collaboration history could not be read.')
   }
 }
