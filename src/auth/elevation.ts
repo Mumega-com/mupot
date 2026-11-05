@@ -27,6 +27,7 @@
 
 import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
+import { reconcileApprovalBotRequestRead, notifyLapsedApprovalBotRequests } from '../approval-bot/status'
 import { capabilityRank, hasCapabilityOnDynamicScope, humanVerifiedLegacyRoleRank, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
@@ -322,6 +323,7 @@ export async function loadElevationRequestById(
   env: Env,
   tenant: string,
   id: string,
+  nowMs: number = Date.now(),
 ): Promise<ElevationRequestRecord | null> {
   try {
     const row = await env.DB.prepare(
@@ -329,7 +331,7 @@ export async function loadElevationRequestById(
     )
       .bind(id, tenant)
       .first<ElevationRequestRecord>()
-    return row ?? null
+    return row ? reconcileApprovalBotRequestRead(env, row, nowMs) : null
   } catch (err) {
     if (isMissingTableError(err)) return null
     throw err
@@ -354,6 +356,7 @@ export async function expireStaleElevationRequests(
     )
       .bind(tenant, nowIso)
       .run()
+    await notifyLapsedApprovalBotRequests(env, tenant, nowMs)
     return { expiredCount: Number(result.meta?.changes ?? 0) }
   } catch (err) {
     if (isMissingTableError(err)) return { expiredCount: 0 }
@@ -797,8 +800,8 @@ function telegramBindingGuard(input: DecideElevationInput, request: string, tena
 }
 
 /** Re-read the failed predicates for a guarded no-op; a still-pending request is not closed. */
-async function decisionLostReason(env: Env, input: DecideElevationInput, requestId: string, status: ElevationRequestStatus): Promise<DecideElevationResult> {
-  const current = await loadElevationRequestById(env, input.tenant, requestId)
+async function decisionLostReason(env: Env, input: DecideElevationInput, requestId: string, status: ElevationRequestStatus, nowMs: number): Promise<DecideElevationResult> {
+  const current = await loadElevationRequestById(env, input.tenant, requestId, nowMs)
   if (current?.status !== 'pending') return { ok: false, reason: 'already_decided', status: current?.status ?? status }
   if (input.decidedViaApprovalBot === true || input.decidedViaTelegramMiniapp === true) {
     const bound = await env.DB.prepare(
@@ -828,7 +831,7 @@ export async function decideElevationRequest(
 ): Promise<DecideElevationResult> {
   await expireStaleElevationRequests(env, input.tenant, nowMs)
 
-  const request = await loadElevationRequestById(env, input.tenant, input.requestId)
+  const request = await loadElevationRequestById(env, input.tenant, input.requestId, nowMs)
   if (!request) return { ok: false, reason: 'not_found' }
   const refusal = await findElevationDecisionRefusal(env, input, request, nowMs)
   if (refusal) {
@@ -863,7 +866,7 @@ export async function decideElevationRequest(
     )
       .bind(nowIso, input.decidedByMemberId, input.decidedByWebSessionHash, input.note ?? null, request.id, input.tenant, ...miniappBindings)
       .run()
-    if (Number(result.meta?.changes ?? 0) === 0) return decisionLostReason(env, input, request.id, 'denied')
+    if (Number(result.meta?.changes ?? 0) === 0) return decisionLostReason(env, input, request.id, 'denied', nowMs)
     return { ok: true, request: { ...request, status: 'denied', decided_at: nowIso,
       decided_by_member_id: input.decidedByMemberId, decided_by_web_session_hash: input.decidedByWebSessionHash,
       decision_note: input.note ?? null }, grants: [] }
@@ -955,7 +958,7 @@ export async function decideElevationRequest(
   // NULL deliberately violates status's NOT NULL constraint when any grant was
   // skipped. This check must run inside the transaction, not after it commits.
   if (Number(batchResults[grants.length].meta?.changes ?? 0) === 0) {
-    return decisionLostReason(env, input, request.id, 'approved')
+    return decisionLostReason(env, input, request.id, 'approved', nowMs)
   }
 
   // No fallible read after commit: a read failure must not report a committed approval as failed.

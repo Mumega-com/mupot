@@ -13,11 +13,12 @@
 // written, and the human gets the outcome. Nothing the agent wrote ever decides anything: its words are quoted, not parsed.
 import type { Env } from '../types'
 import { buildAuth, mintApproverSession } from '../access/identity'
-import { decideElevation, type Outcome } from '../access/decision-core'
+import { decideElevation, mayDecideElevation, type Outcome } from '../access/decision-core'
 import { listActiveElevationGrants, loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
 import { LoginIdentityNotLiveError } from '../auth/web-sessions'
 import { resolveTelegramMember } from '../secure-moments/telegram-miniapp-binding'
 import { approvalBotStatus } from './config'
+import { effectiveApprovalStatus, notifyApprovalRequester } from './status'
 import { botMayCarry, decisionBotLabel, parseRequestedActions, SHORT_ID_RE } from './policy'
 import { answerCallback, editBotMessage, sendBotMessage, type FetchFn } from './telegram'
 
@@ -140,9 +141,34 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
   const tell = async (text: string, tellOpts: { editMessageId?: string } = {}): Promise<void> => {
     if (!p.chatId) return
     if (p.kind === 'callback' && p.callbackId) await answerCallback(bot, { callbackQueryId: p.callbackId, text }, opts.fetchFn)
-    if (p.kind === 'callback' && tellOpts.editMessageId) await editBotMessage(bot, { chatId: p.chatId, messageId: tellOpts.editMessageId, text }, opts.fetchFn)
-    else if (p.kind === 'message' || !p.callbackId) await sendBotMessage(bot, { chatId: p.chatId, text }, opts.fetchFn)
+    const editId = tellOpts.editMessageId ?? (p.kind === 'callback' ? p.messageId ?? undefined : undefined)
+    const edited = editId ? (await editBotMessage(bot, { chatId: p.chatId, messageId: editId, text }, opts.fetchFn)).ok : false
+    if (p.kind === 'message' || !edited) {
+      // A deleted/forwarded/uneditable card still receives a persistent private reply.
+      const sent = await sendBotMessage(bot, { chatId: p.chatId, text }, opts.fetchFn)
+      if (!sent.ok) throw new Error('approval_bot_reply_unavailable')
+    }
   }
+
+  const notify = async (req: ElevationRequestRecord | null, event: string): Promise<void> => {
+    if (req && !(await notifyApprovalRequester(env, req, event))) throw new Error('approval_bot_notice_unavailable')
+  }
+  const report = async (req: ElevationRequestRecord | null, event: string, text: string, tellOpts: { editMessageId?: string } = {}): Promise<void> => {
+    const notice = notify(req, event)
+    const durable = notice.catch(() => undefined)
+    try { opts.waitUntil?.(durable) } catch { /* still awaited below */ }
+    try { await tell(text, tellOpts) } finally { await notice }
+  }
+
+
+  const requesterFromCard = async (): Promise<ElevationRequestRecord | null> => {
+    if (p.kind !== 'callback' || !p.messageId || !p.chatId) return null
+    // This lookup identifies an informational recipient, never decision authority.
+    const offered = await env.DB.prepare(`SELECT request_id FROM approval_bot_deliveries WHERE tenant = ?1 AND chat_id = ?2 AND message_id = ?3 AND status = 'sent' LIMIT 1`)
+      .bind(env.TENANT_SLUG, p.chatId, p.messageId).first<{ request_id: string }>()
+    return offered ? loadElevationRequestById(env, env.TENANT_SLUG, offered.request_id) : null
+  }
+
 
   // 2. private chat, sender == chat, not forwarded. A group or channel message gets NO reply (nothing is said where others can read it).
   if (!p.fromId || !p.chatId || p.chatType !== 'private' || p.chatId !== p.fromId) {
@@ -169,13 +195,15 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
       await tell(await routingSentence(env))
       return { kind: 'ignored', reason: 'not_our_command' }
     }
+    if (p.kind === 'callback') await report(await requesterFromCard(), 'refused_unknown_request', 'Unknown approval request. This bot handles elevation approvals only.')
     return { kind: 'ignored', reason: 'not_a_command' }
   }
 
   // 3. the bound member (unbound, suspended, archived and agent-welded all read the same).
   const who = await resolveTelegramMember(env, p.fromId)
   if (!who.ok) {
-    await tell('This Telegram account is not linked to a member who can decide. Link it under My Account (Connect Telegram).')
+    const request = 'id' in cmd && cmd.id && SHORT_ID_RE.test(cmd.id) ? await loadByShortId(env, cmd.id) : null
+    await report(request, 'refused_not_bound', 'Unknown request for this account. This Telegram account is not linked to a member who can decide. Link it under My Account (Connect Telegram).')
     return { kind: 'refused', reason: 'not_bound' }
   }
   const memberId = who.memberId
@@ -254,24 +282,36 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
   const req = await loadByShortId(env, cmd.id)
   const delivery = req ? await env.DB.prepare('SELECT member_id, chat_id, message_id, status FROM approval_bot_deliveries WHERE request_id = ?1 AND tenant = ?2 LIMIT 1').bind(req.id, env.TENANT_SLUG).first<Delivery>() : null
   if (!req || !delivery || delivery.status !== 'sent' || delivery.member_id !== memberId || delivery.chat_id !== p.fromId) {
-    await tell('No such pending request for you.')
+    // For an unknown short id, a private offered card can still identify its own requester for a notice.
+    const requester = req ?? await requesterFromCard()
+    await report(requester, 'refused_unknown_request', 'Unknown request for you. No decision was made.')
     return { kind: 'refused', reason: 'unknown_request' }
   }
   // A button belongs to the message that carries it: a callback from any other message is not this request's button.
   if (p.kind === 'callback' && delivery.message_id !== null && p.messageId !== delivery.message_id) {
-    await tell('That button is not for this request.')
+    await report(req, 'refused_wrong_message', 'Unknown request for this button. No decision was made.')
     return { kind: 'refused', reason: 'wrong_message' }
   }
-  const editId = p.kind === 'callback' && delivery.message_id !== null ? delivery.message_id : undefined
+  const editId = delivery.message_id ?? undefined
+  const closedText = (current: ElevationRequestRecord): string => {
+    const state = effectiveApprovalStatus(current)
+    const label = state[0].toUpperCase() + state.slice(1)
+    return `${label} request ${cmd.id}. ${state === 'expired' ? 'The decision window ended; ask the agent to file a new request.' : 'This tap made no further change.'}`
+  }
+  if (effectiveApprovalStatus(req) !== 'pending') {
+    const visible = await mayDecideElevation(env, await buildAuth(env, memberId, undefined, { verifiedRole: true }), req)
+    await report(req, req.status === 'expired' && req.decided_at === null ? 'expired' : `refused_${visible ? req.status : 'unknown_request'}`, visible ? closedText(req) : 'Unknown request for you. No decision was made.', { editMessageId: editId })
+    return visible ? { kind: 'closed' } : { kind: 'refused', reason: 'unknown_request' }
+  }
   if (cmd.op === 'approve' && !botMayCarry(req)) {
-    await tell('This request needs a stronger approval than a Telegram tap. Open the approval link instead.')
+    await report(req, 'refused_not_bot_approvable', 'This request needs a stronger approval than a Telegram tap. Open the approval link instead.', { editMessageId: editId })
     return { kind: 'refused', reason: 'not_bot_approvable' }
   }
 
   // 5-6. the shared decision core re-checks window, status, authority, self-approval and writes the receipt. Its own guarded
   // UPDATE is the single decision: a replay, a second tap and a concurrent decision all lose there.
   if (!(await liveLoginIdentityOf(env, memberId))) {
-    await tell('Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
+    await report(req, 'refused_no_login_identity', 'Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
     return { kind: 'refused', reason: 'no_login_identity' }
   }
   const auth = await buildAuth(env, memberId, undefined, { verifiedRole: true })
@@ -287,18 +327,21 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
     // The sign-in this approval anchors to was revoked after the check above and before the session could be written: nothing was
     // decided (the session insert is conditional on the identity being live), so say why instead of a generic failure (#2106).
     if (err instanceof LoginIdentityNotLiveError) {
-      await tell('Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
+      await report(req, 'refused_no_login_identity', 'Sign in to the dashboard once (any login method) so your approvals have a session, then try again.', { editMessageId: editId })
       return { kind: 'refused', reason: 'no_login_identity' }
     }
-    await tell('The decision could not be recorded. Nothing was changed.', { editMessageId: editId })
+    await report(req, 'refused_decision_error', 'The decision could not be recorded. Nothing was changed.', { editMessageId: editId })
     return { kind: 'refused', reason: 'decision_error' }
   }
   if (outcome.status === 200) {
-    await tell(`${cmd.op === 'approve' ? 'Approved' : 'Denied'} ${cmd.id}. ${outcome.message}`, { editMessageId: editId })
+    const text = `${cmd.op === 'approve' ? 'Approved' : 'Denied'} ${cmd.id}. ${outcome.message}`
+    if (cmd.op === 'deny') await report(req, 'denied', text, { editMessageId: editId })
+    else await tell(text, { editMessageId: editId })
     return { kind: cmd.op === 'approve' ? 'approved' : 'denied' }
   }
   const closed = outcome.status === 410 || (outcome.status === 409 && outcome.title === 'Request closed')
-  await tell(closed ? `Request ${cmd.id} is closed: ${outcome.message}` : `Not decided: ${outcome.message}`, closed ? { editMessageId: editId } : {})
+  const latest = closed ? await loadByShortId(env, cmd.id) : null
+  await report(latest ?? req, latest?.status === 'expired' && latest.decided_at === null ? 'expired' : `refused_${latest?.status ?? outcome.status}`, closed && latest ? closedText(latest) : outcome.status === 404 ? 'Unknown request for you. No decision was made.' : `Not decided: ${outcome.message}`, { editMessageId: editId })
   return closed ? { kind: 'closed' } : { kind: 'refused', reason: `core_${outcome.status}` }
 }
 

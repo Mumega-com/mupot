@@ -104,6 +104,7 @@ export async function describeForBot(env: Env, req: ElevationRequestRecord, shor
   // One keyed org_settings read on this card build, which already loads the agent, scope and recommendation.
   // Not on the webhook path: a tap or a command never waits on this.
   const decisionBot = await decisionBotLabel(env)
+  lines.push(`Decision deadline: ${req.decision_expires_at}`)
   lines.push(`Decide within ${Math.ceil(secsLeft / 60)} min. Tap a button, or reply /muapprove ${shortId} or /mudeny ${shortId}. /murevoke ends everything you approved. The id is the request id from this message. Task decisions go to ${decisionBot}.`)
   return lines.join('\n')
 }
