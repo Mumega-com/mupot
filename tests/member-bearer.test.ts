@@ -42,7 +42,8 @@ function makeEnv(
             seen.sql = sql
             seen.binds = args
             return {
-              first: async () => row,
+              // mupot#2343: the bound-agent live check is one extra read; these fixtures' agents are live.
+              first: async () => (sql.includes('has_caps') ? { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 } : row),
               run: async () => {
                 if (opts.failWrites) throw new Error('D1 write failed')
                 return { success: true }

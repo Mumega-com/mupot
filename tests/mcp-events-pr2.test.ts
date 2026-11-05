@@ -1635,7 +1635,7 @@ describe('events/subscribe refusal record', () => {
       'invalid_params:ttlMs',
       'invalid_arguments:message.created_takes_no_arguments',
       'secret_storage_unavailable',
-      'forbidden:events_require_bound_agent_with_capability',
+      'agent_not_authorized',
     ])
     expect(refusals().find((r) => r.reason.endsWith('callback_host_not_allowed'))?.host).toBe('evil.example.org')
   })
@@ -1742,5 +1742,80 @@ describe('events/subscribe refusal record', () => {
     sqlLog.length = 0
     await recordSubscribeRefusal(env, T + 1000, { reason: 'dup', auth })
     expect(sqlLog.filter((q) => q.startsWith('DELETE FROM event_subscribe_refusals'))).toHaveLength(0)
+  })
+})
+
+// ── mupot#2343: the live agent check on events (subscribe + push-time re-check) ─────────────────────────────────
+describe('#2343 events honour the live agent check', () => {
+  const OWNER = 'member-owner-2343'
+  beforeEach(() => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('${OWNER}', 'Owner', 'active', '${TENANT}');
+      UPDATE agents SET owner_member_id = '${OWNER}' WHERE id = 'agent-a';`)
+  })
+  const suspendOwner = (): void => harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${OWNER}'`)
+
+  it('control: an agent with a live owner can subscribe', async () => {
+    expect((await rpc('events/subscribe', subParams())).body.error).toBeUndefined()
+  })
+
+  it('suspended owner -> subscribe refused 403 agent_not_authorized, no row, no outbound request', async () => {
+    suspendOwner()
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.status).toBe(403)
+    expect(r.body.error?.message).toBe('agent_not_authorized')
+    expect(subs()).toHaveLength(0)
+    expect(sent).toHaveLength(0)
+  })
+
+  it.each([
+    ['owner in another tenant', `UPDATE members SET tenant = 'other' WHERE id = '${OWNER}'`],
+    ['owner row missing', `PRAGMA foreign_keys = OFF; DELETE FROM members WHERE id = '${OWNER}'`],
+    ['zero capabilities', `DELETE FROM capabilities WHERE member_id = 'member-agent-a'`],
+  ])('%s -> subscribe refused', async (_n, sql) => {
+    harness.sqlite.exec(sql)
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.status).toBe(403)
+    expect(subs()).toHaveLength(0)
+  })
+
+  it('liveness read throws -> subscribe is a retryable 503 agent_check_unavailable', async () => {
+    const env = makeEnv()
+    const real = env.DB
+    const throwing = { ...real, prepare: (sql: string) => { if (sql.includes('has_caps')) throw new Error('d1 down'); return real.prepare(sql) } } as unknown as Env['DB']
+    const r = await rpc('events/subscribe', subParams(), 'bound-admin', { ...env, DB: throwing })
+    expect(r.status).toBe(503)
+    expect(r.body.error?.message).toBe('agent_check_unavailable')
+    expect(subs()).toHaveLength(0)
+  })
+
+  it('unsubscribe stays open to a refused agent (stopping pushes is always allowed)', async () => {
+    const id = await subscribeOk()
+    suspendOwner()
+    const r = await rpc('events/unsubscribe', { name: 'message.created', arguments: {}, delivery: { mode: 'webhook', url: URL_A } })
+    expect(r.status).toBe(200)
+    expect(subs().find((s) => s.id === id)?.status).not.toBe('active')
+  })
+
+  it('an EXISTING subscription stops pushing once the owner is suspended, and is revoked', async () => {
+    const id = await subscribeOk()
+    sent.length = 0
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-before'))).toBe('delivered')
+    sent.length = 0
+    suspendOwner()
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-after'))).not.toBe('delivered')
+    expect(eventReq()).toHaveLength(0)
+    const row = subs().find((s) => s.id === id)
+    expect(row?.status).toBe('revoked')
+    expect(row?.revoke_reason).toBe('access_owner_inactive')
+  })
+
+  it('an existing subscription whose owner is in another tenant stops pushing', async () => {
+    const id = await subscribeOk()
+    sent.length = 0
+    harness.sqlite.exec(`UPDATE members SET tenant = 'other' WHERE id = '${OWNER}'`)
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'm-x'))
+    expect(eventReq()).toHaveLength(0)
+    expect(subs().find((s) => s.id === id)?.revoke_reason).toBe('access_owner_inactive')
   })
 })

@@ -234,10 +234,11 @@ inboxApp.get('/stream', async (c) => {
       pollMs,
       seat,
       // P0-2: re-validate the bearer credential (every delivery tick + at most every 60 s idle) so a revoked or
-      // suspended-member token ends the stream. NOTE: resolveMemberByToken checks token liveness and the member,
-      // NOT agents.status, so this does not by itself end the stream for a deactivated agent row.
+      // suspended-member token ends the stream. resolveMemberByToken (mupot#2343) also checks the agent row, its owner
+      // and the member's capabilities, so a deactivated agent ends the stream here too.
       revalidate: async () => {
-        const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
+        // A throw here is the 503-class liveness failure: end the stream (the client reconnects), same as any lookup blip.
+        const current = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization'))).catch(() => null)
         return current?.boundAgentId === id.boundAgentId
       },
     },

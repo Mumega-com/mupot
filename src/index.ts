@@ -15,6 +15,7 @@
 // then mount it below. Do NOT change other components' mounts.
 
 import { Hono } from 'hono'
+import { appErrorHandler } from './app-error'
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
 import { OAUTH_API_ROUTES, refuseNonCanonicalPath } from './oauth-canonical-path'
 import type { Env } from './types'
@@ -106,6 +107,9 @@ export { TaskWorkflow, BackupWorkflow } from './workflows/task-workflow'
 export { McpOAuthApiHandler }
 
 export const app = new Hono<{ Bindings: Env }>()
+
+// mupot#2343: the agent-bearer liveness read failed -> retryable 503; everything else is Hono's default (src/app-error.ts).
+app.onError(appErrorHandler)
 
 // This app decodes the path before routing; the OAuth provider in front of it matches the raw path.
 // A path that only reaches a provider-owned route after decoding is refused here (and again at the

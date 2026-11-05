@@ -15,6 +15,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUse
 import { authLookupOrNull } from './fail-closed'
 import { vipLaneEnabled } from '../members/vip-lane'
 import { withAuthTiming } from '../lib/server-timing'
+import { boundAgentVerdict, BoundAgentCheckUnavailableError } from './bound-agent-live'
 
 export interface AgentIdentity {
   // Exact live member_tokens row that authenticated this request. Never supplied
@@ -54,7 +55,15 @@ export function bearerToken(header: string | undefined | null): string | null {
 export async function resolveMemberByToken(env: Env, raw: string | null): Promise<AgentIdentity | null> {
   // mupot#1281 — this copy sits under Hono's error handler, so its throw surfaced as a
   // clean 500 rather than a 1101. Same fault, different surface; guarded the same way.
-  return withAuthTiming(env, () => authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw)))
+  const identity = await withAuthTiming(env, () => authLookupOrNull('resolveMemberByToken', () => resolveMemberByTokenInner(env, raw)))
+  if (!identity?.boundAgentId) return identity
+  // mupot#2343: every REST surface that authorizes on the agent weld resolves its bearer here, so the live agent/owner/
+  // capability check (the one the MCP doors run) sits here too. Refused = the same null (401) as a bad credential; a failed
+  // read is a retryable 503 (BoundAgentCheckUnavailableError -> app.onError), never a pass and never a 403.
+  const verdict = await boundAgentVerdict(env, identity)
+  if (verdict === 'live') return identity
+  if (verdict === 'refused') return null
+  throw new BoundAgentCheckUnavailableError()
 }
 
 /** Stream entry must distinguish an unavailable authority from a bad credential.
@@ -64,7 +73,13 @@ export async function resolveStreamMemberByToken(env: Env, raw: string | null): 
 > {
   try {
     const identity = await boundedStreamLookup(() => withAuthTiming(env, () => resolveMemberByTokenInner(env, raw)))
-    return identity ? { status: 'valid', identity } : { status: 'invalid' }
+    if (!identity) return { status: 'invalid' }
+    if (identity.boundAgentId) { // mupot#2343: same live check as resolveMemberByToken
+      const verdict = await boundedStreamLookup(() => boundAgentVerdict(env, identity))
+      if (verdict === 'unavailable') return { status: 'error' }
+      if (verdict === 'refused') return { status: 'invalid' }
+    }
+    return { status: 'valid', identity }
   } catch { return { status: 'error' } }
 }
 
@@ -164,7 +179,9 @@ export async function memberTokenHashIsLive(
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
     .first<{ member_id: string; status: string; bound_agent_id: string | null; seat_status: string | null; seat_row_id: string | null }>()
   if (row && seatRowFloors(row)) return false // #2060 P1-c: a live presence socket drops when its seat is observed/held
-  return !!row && row.status === 'active' && row.member_id === expectedMemberId
+  if (!(!!row && row.status === 'active' && row.member_id === expectedMemberId)) return false
+  // mupot#2343: an agent-bound socket also drops when its agent / owner / capabilities are no longer live (a failed read drops it too).
+  return row.bound_agent_id ? (await boundAgentVerdict(env, { boundAgentId: row.bound_agent_id, memberId: row.member_id })) === 'live' : true
 }
 
 // Resolve a bearer token to an ORG-ADMIN identity, or a refusal. Shared by the

@@ -422,19 +422,23 @@ export type AccessCheck = { live: true } | { live: false; reason: string }
  */
 export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Promise<AccessCheck> {
   const row = await env.DB.prepare(
-    `SELECT t.channel AS channel, m.status AS member_status, a.status AS agent_status
+    `SELECT t.channel AS channel, m.status AS member_status, a.status AS agent_status,
+            a.owner_member_id AS owner_member_id, om.status AS owner_status
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
        JOIN agents a ON a.id = t.agent_id
+       LEFT JOIN members om ON om.id = a.owner_member_id AND om.tenant = ?4
       WHERE t.id = ?1 AND t.member_id = ?2 AND t.agent_id = ?3 AND t.tenant = ?4
         AND m.tenant = ?4
         AND ${TOKEN_LIVE_PREDICATE('?5')}
       LIMIT 1`,
   ).bind(sub.token_id, sub.member_id, sub.agent_id, env.TENANT_SLUG, nowSqlUtc())
-    .first<{ channel: string; member_status: string; agent_status: string }>()
+    .first<{ channel: string; member_status: string; agent_status: string; owner_member_id: string | null; owner_status: string | null }>()
   if (!row) return { live: false, reason: 'token_not_live' }
   if (row.member_status !== 'active') return { live: false, reason: 'member_inactive' }
   if (row.agent_status !== 'active') return { live: false, reason: 'agent_inactive' }
+  // mupot#2343: the agent's owner must still be an active member of THIS tenant (same rule as the tool doors, bound-agent-live.ts).
+  if (row.owner_member_id !== null && row.owner_status !== 'active') return { live: false, reason: 'owner_inactive' }
   // A subscription made through a W2 ATTACHMENT stores the attachment's own token: it is live only while that attachment, its admission
   // and its seat are. The token's cleanup trigger already revokes it on detach/revoke; this is the explicit re-check (as findLiveAttachment
   // does per request) so a missed trigger can never keep a wake alive.

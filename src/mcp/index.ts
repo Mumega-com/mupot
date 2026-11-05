@@ -1,4 +1,4 @@
-import { boundAgentIsLive, BOUND_AGENT_NOT_AUTHORIZED } from '../auth/bound-agent-live'
+import { boundAgentVerdict, BOUND_AGENT_NOT_AUTHORIZED, BOUND_AGENT_CHECK_UNAVAILABLE } from '../auth/bound-agent-live'
 import { MCP_BASE_REQUEST_CAP_BYTES, MCP_REQUEST_CAP_BYTES, oversizeForTool, payloadTooLargeDetail, readBoundedText, toolTooLargeDetail } from './request-cap'
 import { withRoutineReviewDeadlines } from '../routines/review-window'
 import { TASK_GET_FIELDS } from '../tasks/task-get-fields'
@@ -8425,8 +8425,12 @@ export async function boundAgentRefusal(
   toolName: unknown,
 ): Promise<(ToolOutcome & { tool?: string }) | null> {
   if (!auth.boundAgentId) return null
-  if (await boundAgentIsLive(env, auth)) return null
-  return { ...fail(403, BOUND_AGENT_NOT_AUTHORIZED, 'this agent session is no longer authorized'), tool: typeof toolName === 'string' ? toolName : undefined }
+  const verdict = await boundAgentVerdict(env, auth)
+  if (verdict === 'live') return null
+  const tool = typeof toolName === 'string' ? toolName : undefined
+  // #2343: a failed liveness read is a retryable 503, never a 403 (and never a pass).
+  if (verdict === 'unavailable') return { ...fail(503, BOUND_AGENT_CHECK_UNAVAILABLE, 'agent authorization could not be checked; retry'), tool }
+  return { ...fail(403, BOUND_AGENT_NOT_AUTHORIZED, 'this agent session is no longer authorized'), tool }
 }
 
 /**
@@ -9153,6 +9157,15 @@ async function handleJsonRpc(
       // The salt is the human AND the harness (the connector): two connectors of one human attached to one agent must not share a row either.
       evAttached = { humanMemberId: `${auth.memberId as string}:${auth.harnessId as string}`, grantTokenId: auth.tokenId as string }
       evParams = { ...p, arguments: restArgs } // message.created takes no other arguments: anything left over is refused downstream
+    }
+    // mupot#2343: a subscription must not START for an agent the tool doors would refuse (agent / owner / consenter / capabilities).
+    // Checked on evAuth so an attached agent is judged as itself. Unsubscribe stays open: stopping pushes is always allowed.
+    if (method === 'events/subscribe') {
+      const live = await boundAgentRefusal(c.env, evAuth, method)
+      if (live && !live.ok) {
+        await refusedSubscribe(live.error)
+        return rpcError(id, live.status === 403 ? -32003 : -32000, live.error, undefined, live.status)
+      }
     }
     const floorOk = callerFloorOk(evAuth, hasWorkspaceAdmin(evAuth))
     const out = method === 'events/subscribe'

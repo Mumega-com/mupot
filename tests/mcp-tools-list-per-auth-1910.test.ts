@@ -33,6 +33,7 @@ beforeEach(() => {
   // resolveAuth accepts an injected identity only against a live token row.
   seedLiveToken(h.sqlite, { memberId: 'mem-a', tenant: TENANT, tokenId: 'tok-ws', channel: 'workspace', boundAgentId: 'agent-a' })
   seedLiveToken(h.sqlite, { memberId: 'mem-a', tenant: TENANT, tokenId: 'tok-att', channel: 'directory', boundAgentId: 'agent-a' })
+  h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-mem-a', 'mem-a', 'org', NULL, 'member')`) // #2343: a welded workspace session needs a live capability
   seedLiveToken(h.sqlite, { memberId: 'mem-h', tenant: TENANT, tokenId: 'tok-dir', channel: 'directory' })
   seedLiveToken(h.sqlite, { memberId: 'mem-h', tenant: TENANT, tokenId: 'tok-hn', channel: 'directory', harnessKind: 'codex' })
 })
