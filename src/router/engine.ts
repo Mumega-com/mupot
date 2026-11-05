@@ -4,11 +4,12 @@ import { createBus } from '../bus'
 import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
-import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../tasks/runtime-receipts'
+import { independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import type { BusEvent, Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { executionPausedSql } from '../agents/execution-brakes'
 import { safeConsole } from '../lib/log'
+import { assignmentEligibilitySql, isAssignmentEligible } from '../tasks/assignment-eligibility'
 
 export interface RouterTickInput {
   squadId: string
@@ -98,7 +99,7 @@ export async function runRouterTick(
         -- mupot#1733 — a held task stays open+unassigned forever, so it must not occupy the
         -- bounded scan window (starvation). A real gate:* task is only scanned if SOME
         -- independent holder exists (assignee '' matches no agent: coarse, member+agent mode);
-        -- the per-candidate hasIndependentRuntimeGate below is the precise test.
+        -- the per-candidate shared predicate below is the precise test.
         AND (
           t.gate_owner IS NULL
           OR t.gate_owner = 'gate:agent-self-completion'
@@ -149,20 +150,18 @@ export async function runRouterTick(
       continue
     }
 
-    // Same predicate task_dispatch uses (normal mode: independent agent OR human holder).
-    // The claim UPDATE below does not re-assert it (TOCTOU on a revoked grant; documented).
+    // Shared candidate rule; the claim UPDATE reasserts it against the current task row.
     const gated = task.gate_owner !== null && task.gate_owner !== 'gate:agent-self-completion'
     let candidate: RouterAgentRow | undefined
     for (const agent of live) {
-      if (
-        !gated
-        || await hasIndependentRuntimeGate(env, task.gate_owner, agent.id, squadId, { allowMemberHolders: true })
-      ) { candidate = agent; break }
+      if (await isAssignmentEligible(env, task.id, agent.id)) { candidate = agent; break }
     }
     if (!candidate) {
       unrouted += 1
-      decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner ?? undefined })
-      safeConsole.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
+      if (gated) {
+        decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner ?? undefined })
+        safeConsole.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
+      } else decisions.push({ task_id: task.id, outcome: 'unrouted', agent_id: null })
       continue
     }
 
@@ -218,10 +217,12 @@ export async function runRouterTick(
                AND presence_now.tenant = ?5
              WHERE a.id = ?1
                AND a.squad_id = ?4
-               AND a.status = 'active'
                AND presence_now.last_seen_at >= datetime('now', '-10 minutes')
-               AND NOT ${executionPausedSql('a.id')}
           )
+          AND ${assignmentEligibilitySql({
+            agentIdExpr: '?1', gateOwnerExpr: 'tasks.gate_owner', squadIdExpr: 'tasks.squad_id',
+            tenantParam: '?5', nowParam: '?7',
+          })}
           AND (
             project_id IS NULL
             OR EXISTS (

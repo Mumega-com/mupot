@@ -48,6 +48,8 @@ import type { Env, Project } from '../types'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
+import { assignmentEligibilitySql, isAssignmentEligible } from '../tasks/assignment-eligibility'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 import {
   classifyTaskRoleEffort,
   routeByEffort,
@@ -312,10 +314,6 @@ async function routeUnassignedWork(
   for (const candidate of candidates) {
     if (!bySlug.has(candidate.agent.slug)) bySlug.set(candidate.agent.slug, candidate)
   }
-  const online: OnlineHarness[] = candidates.map((c) => ({
-    slug: c.agent.slug,
-    capabilities: c.capabilities,
-  }))
 
   // SECURITY (#404 invariant, adversarial-gate BLOCK 2026-07-22): NEVER auto-assign a
   // cross-pot task (source_pot IS NOT NULL). An inbound task from a signed-but-untrusted
@@ -362,6 +360,12 @@ async function routeUnassignedWork(
   for (const task of rows.results ?? []) {
     if (routed.length >= MAX_ROUTES_PER_TICK) break
 
+    const online: OnlineHarness[] = []
+    for (const candidate of candidates) {
+      if (await isAssignmentEligible(env, task.id, candidate.agent.id)) {
+        online.push({ slug: candidate.agent.slug, capabilities: candidate.capabilities })
+      }
+    }
     const { role, effort } = classifyTaskRoleEffort({ title: task.title, body: task.body ?? '' })
     const decision = routeByEffort({
       role,
@@ -383,8 +387,8 @@ async function routeUnassignedWork(
     // Idempotent + TOCTOU-safe: only assign if still open + unassigned. Bump
     // updated_at so a routed task shows a fresh timestamp (observability — humans
     // see the work moved) and correctly signals "row changed" to the optimistic-
-    // concurrency task-update path (WHERE updated_at=…). The WHERE guard is
-    // unchanged, so idempotency/TOCTOU safety is preserved.
+    // concurrency task-update path (WHERE updated_at=…). Reassert eligibility
+    // and the task scope/origin at the write, not just in the earlier reads.
     const assignedAt = new Date().toISOString()
     const upd = await env.DB.prepare(
       // The member clause is repeated here, not merely in the SELECT above, because
@@ -395,9 +399,15 @@ async function routeUnassignedWork(
       `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
         WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL
           AND assignee_member_id IS NULL
+          AND project_id = ?4 AND squad_id = ?5
+          AND source_pot IS NULL AND external_source IS NULL
+          AND ${assignmentEligibilitySql({
+            agentIdExpr: '?1', gateOwnerExpr: 'tasks.gate_owner', squadIdExpr: 'tasks.squad_id',
+            tenantParam: '?6', nowParam: '?7',
+          })}
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
-      .bind(picked.agent.id, task.id, assignedAt)
+      .bind(picked.agent.id, task.id, assignedAt, project.id, task.squad_id, env.TENANT_SLUG, nowSqlUtc())
       .run()
     if (upd.meta.changes === 1) {
       // Wake-on-assign: the work-router assigns from a cron tick, so without this the builder is only told when it
