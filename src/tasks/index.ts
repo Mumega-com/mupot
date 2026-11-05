@@ -33,6 +33,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
+import { flightChildBlockedNextStep } from '../flight/child-disposition'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertIntakeWithBar, checkTransitionWithBar, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
@@ -914,7 +915,10 @@ tasksApp.patch('/:id', async (c) => {
       const transitionErr = await checkTransitionWithBar(c.env, existing.status, body.status, {
         actor: actorOf(c.get('auth')), scopeRef: `task:${existing.id}`, reason: body.reason,
       })
-      if (transitionErr) return c.json(transitionErr, 400)
+      if (transitionErr) {
+        const flightNext = transitionErr.error === 'invalid_transition' ? await flightChildBlockedNextStep(c.env, existing.id, existing.status) : null
+        return c.json(flightNext ? { ...transitionErr, ...flightNext } : transitionErr, 400)
+      }
       // Security Bar open->blocked: the reason becomes part of the task body (the audit trail on the task itself).
       if (existing.status === 'open' && body.status === 'blocked' && typeof body.reason === 'string') {
         next.body = next.body ? `${next.body}\n\n${body.reason.trim()}` : body.reason.trim()
