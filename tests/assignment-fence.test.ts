@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { runProjectConcierge, BUILD_CAPABILITY } from '../src/concierge/service'
 import { registerModule } from '../src/registry/service'
+import { getAssignmentEligibleAgentIds } from '../src/tasks/assignment-eligibility'
 import { runRouterTick } from '../src/router/engine'
 import type { Env, Project } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -17,6 +18,7 @@ let env: Env
 let beforeClaim: (() => void) | undefined
 let claims: number
 let claimErrors: unknown[]
+let prepares: string[]
 const send = vi.fn(async (_event: unknown) => undefined)
 
 // Interleave real writes immediately before the real D1 UPDATE. No SQL is mocked
@@ -34,7 +36,7 @@ function interleaved(statement: D1PreparedStatement, claim: boolean): D1Prepared
 
 beforeEach(async () => {
   h = createSqliteD1(); applyAllMigrations(h.sqlite)
-  beforeClaim = undefined; claims = 0; claimErrors = []; send.mockClear()
+  beforeClaim = undefined; claims = 0; claimErrors = []; prepares = []; send.mockClear()
   h.sqlite.exec(`
     INSERT INTO departments(id,slug,name) VALUES('assignment-dept','assignment-dept','Assignment');
     INSERT INTO squads(id,department_id,slug,name) VALUES('${SQUAD}','assignment-dept','assignment-squad','Assignment');
@@ -47,7 +49,7 @@ beforeEach(async () => {
     INSERT INTO presence(tenant,member_id,display_name,source,label,agent_id,first_seen_at,last_seen_at)
       VALUES('${TENANT}','assignment-seat','Builder','test','test','${AGENT}',datetime('now'),datetime('now'));
   `)
-  env = { DB: { ...h.db, prepare: (sql: string) => interleaved(h.db.prepare(sql), /^\s*UPDATE tasks\s+SET assignee_agent_id/i.test(sql)) }, TENANT_SLUG: TENANT, BUS: { send } } as unknown as Env
+  env = { DB: { ...h.db, prepare: (sql: string) => { prepares.push(sql); return interleaved(h.db.prepare(sql), /^\s*UPDATE tasks\s+SET assignee_agent_id/i.test(sql)) } }, TENANT_SLUG: TENANT, BUS: { send } } as unknown as Env
   expect((await registerModule(env, { identity: AGENT, kind: 'agent_system', adapter: 'cursor', projectId: null, capabilities: [BUILD_CAPABILITY] })).ok).toBe(true)
 })
 afterEach(() => h.close())
@@ -90,7 +92,7 @@ for (const writer of ['concierge','router'] as const) describe(`assignment fence
     expect(await run(writer)).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
   })
   it.each(['agent','squad'] as const)('refuses an already paused %s',async scope => {
-    pause(scope); expect(await run(writer)).toBe(0); expect(row().assignee_agent_id).toBeNull()
+    pause(scope); expect(await run(writer)).toBe(0); expect(row().assignee_agent_id).toBeNull(); expect(claims).toBe(0)
   })
   it('refuses the sole gate holder as assignee',async () => {
     selfGate(); expect(await run(writer)).toBe(0); expect(row().assignee_agent_id).toBeNull(); expect(claims).toBe(0)
@@ -162,4 +164,47 @@ it('concierge selection scopes the gate check to the requested task',async () =>
  h.sqlite.prepare('UPDATE tasks SET gate_owner=? WHERE id=?').run(GATE,TASK)
  h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,created_at) VALUES('ungated-other',?,'assignment-project','Other work','done','open','2099-01-01T00:00:00.000Z')").run(SQUAD)
  expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBeNull(); expect(claims).toBe(1)
+})
+
+
+describe('concierge round2 bounded task and candidate reads', () => {
+ it('five older tasks with unheld gates do not starve newer ungated work',async () => {
+  h.sqlite.prepare("UPDATE tasks SET created_at='2099-01-01T00:00:00.000Z' WHERE id=?").run(TASK)
+  for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held work','done','open',?,'2020-01-01T00:00:00.000Z')").run(`held-${i}`,SQUAD,GATE)
+  expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
+  expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id LIKE 'held-%' AND assignee_agent_id IS NULL").get()).toEqual({n:5})
+ })
+ it('uses one eligibility SELECT per task and bounded prepares with forty online candidates',async () => {
+  for(let i=0;i<39;i++){
+   const id=`agent-candidate-${i}`
+   h.sqlite.prepare("INSERT INTO agents(id,squad_id,slug,name,status) VALUES(?,?,?,'Candidate','active')").run(id,SQUAD,`candidate-${i}`)
+   expect((await registerModule(env,{identity:id,kind:'agent_system',adapter:'cursor',projectId:null,capabilities:[BUILD_CAPABILITY]})).ok).toBe(true)
+  }
+  h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,created_at) VALUES('fanout-next',?,'assignment-project','Next work','done','open','2099-01-01T00:00:00.000Z')").run(SQUAD)
+  prepares.length=0
+  expect(await run('concierge')).toBe(2)
+  const scan=prepares.findIndex(sql => /SELECT id, squad_id, title, body FROM tasks/.test(sql))
+  expect(scan).toBeGreaterThanOrEqual(0)
+  const loop=prepares.slice(scan+1)
+  expect(loop.filter(sql => /FROM tasks assignment_task/.test(sql))).toHaveLength(2)
+  expect(loop.length).toBeLessThanOrEqual(16*2)
+  expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id IN (?,?) AND assignee_agent_id IS NOT NULL").get(TASK,'fanout-next')).toEqual({n:2})
+ })
+})
+
+it('bulk eligibility is scoped to the requested task and online roster',async () => {
+ h.sqlite.prepare("INSERT INTO agents(id,squad_id,slug,name,status) VALUES('off-roster',?,'off-roster','Other','active')").run(SQUAD)
+ expect(await getAssignmentEligibleAgentIds(env,TASK,[AGENT])).toEqual(new Set([AGENT]))
+ expect(await getAssignmentEligibleAgentIds(env,TASK,[])).toEqual(new Set())
+ h.sqlite.prepare('UPDATE tasks SET gate_owner=? WHERE id=?').run(GATE,TASK)
+ h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status) VALUES('other-ungated',?,'assignment-project','Other','done','open')").run(SQUAD)
+ expect(await getAssignmentEligibleAgentIds(env,TASK,[AGENT])).toEqual(new Set())
+ expect(await getAssignmentEligibleAgentIds(env,'missing-task',[AGENT])).toEqual(new Set())
+})
+it('expired gate standing does not occupy the concierge task window',async () => {
+ humanGate(); h.sqlite.exec("UPDATE capabilities SET expires_at='2026-07-01T00:00:00.000Z' WHERE id='assignment-reviewer-cap'")
+ h.sqlite.prepare("UPDATE tasks SET gate_owner=NULL,created_at='2099-01-01T00:00:00.000Z' WHERE id=?").run(TASK)
+ for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held','done','open',?,'2020-01-01T00:00:00.000Z')").run(`expired-gate-${i}`,SQUAD,GATE)
+ expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
+ expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id LIKE 'expired-gate-%' AND assignee_agent_id IS NULL").get()).toEqual({n:5})
 })

@@ -48,7 +48,8 @@ import type { Env, Project } from '../types'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
-import { assignmentEligibilitySql, isAssignmentEligible } from '../tasks/assignment-eligibility'
+import { assignmentEligibilitySql, getAssignmentEligibleAgentIds } from '../tasks/assignment-eligibility'
+import { independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import {
   classifyTaskRoleEffort,
@@ -347,10 +348,20 @@ async function routeUnassignedWork(
         AND source_pot IS NULL
         AND external_source IS NULL
         AND ${TASK_NOT_ARCHIVED_SQL()}
+        -- Held gates must not occupy the bounded scan window. The per-candidate
+        -- check below is precise; this coarse check asks whether any holder exists.
+        AND (
+          gate_owner IS NULL
+          OR gate_owner = 'gate:agent-self-completion'
+          OR ${independentGateHolderExistsSql({
+            gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: "''", squadIdExpr: 'tasks.squad_id',
+            tenantParam: '?3', nowParam: '?4', allowMemberHolders: true,
+          })}
+        )
       ORDER BY created_at ASC
       LIMIT ?2`,
   )
-    .bind(project.id, MAX_ROUTES_PER_TICK)
+    .bind(project.id, MAX_ROUTES_PER_TICK, env.TENANT_SLUG, nowSqlUtc())
     .all<UnassignedTaskRow>()
 
   const routed: Array<{ taskId: string; agentId: string }> = []
@@ -360,12 +371,11 @@ async function routeUnassignedWork(
   for (const task of rows.results ?? []) {
     if (routed.length >= MAX_ROUTES_PER_TICK) break
 
-    const online: OnlineHarness[] = []
-    for (const candidate of candidates) {
-      if (await isAssignmentEligible(env, task.id, candidate.agent.id)) {
-        online.push({ slug: candidate.agent.slug, capabilities: candidate.capabilities })
-      }
-    }
+    const eligible = await getAssignmentEligibleAgentIds(env, task.id, candidates.map(candidate => candidate.agent.id))
+    // Keep the roster order: SQL only filters eligibility, never chooses a different ladder order.
+    const online: OnlineHarness[] = candidates
+      .filter(candidate => eligible.has(candidate.agent.id))
+      .map(candidate => ({ slug: candidate.agent.slug, capabilities: candidate.capabilities }))
     const { role, effort } = classifyTaskRoleEffort({ title: task.title, body: task.body ?? '' })
     const decision = routeByEffort({
       role,

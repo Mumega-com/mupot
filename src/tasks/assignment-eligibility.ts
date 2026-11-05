@@ -43,3 +43,14 @@ export async function isAssignmentEligible(env: Env, taskId: string, agentId: st
     })}`).bind(taskId, agentId, env.TENANT_SLUG, nowSqlUtc()).first()
   return row !== null
 }
+
+/** One eligibility read for an entire online roster, independent of its size. */
+export async function getAssignmentEligibleAgentIds(env: Env, taskId: string, agentIds: readonly string[]): Promise<Set<string>> {
+  const rows = await env.DB.prepare(`SELECT CAST(online_agent.value AS TEXT) AS id
+    FROM tasks assignment_task CROSS JOIN json_each(?2) online_agent
+    WHERE assignment_task.id = ?1 AND ${assignmentEligibilitySql({
+      agentIdExpr: 'CAST(online_agent.value AS TEXT)', gateOwnerExpr: 'assignment_task.gate_owner', squadIdExpr: 'assignment_task.squad_id',
+      tenantParam: '?3', nowParam: '?4',
+    })}`).bind(taskId, JSON.stringify(agentIds), env.TENANT_SLUG, nowSqlUtc()).all<{ id: string }>()
+  return new Set((rows.results ?? []).map(row => row.id))
+}
