@@ -13,10 +13,17 @@
 // "Live execution" mirrors the incident-revert fence: an unexpired execution claim, a runtime
 // receipt without an expired claim, or a dispatch that can still be executed or redelivered.
 //
-// TRANSITIONS (tasks/service.ts) has no open->blocked edge (and no review->blocked edge, which the
-// reap already writes for routine control tasks). This is a controller write with the same shape as
-// the other raw status writers; it is recoverable because blocked->in_progress is legal. The status
-// is fenced in every WHERE so a concurrent legal transition always wins.
+// open -> blocked is governed by the Security Bar (checkTransitionWithBar, rule task.update.transition-matrix),
+// which relaxes it only at onboarding/operating with a reason and a policy_events row. This module is a
+// CONTROLLER write that does not go through the bar: that is only acceptable because it is narrowed to
+// the flight executor's OWN tasks (t.assignee_agent_id = flights.agent), so it can never move another
+// agent's or an unassigned task, and it never touches work another live flight or execution still holds.
+// The state is recoverable: blocked -> in_progress is legal for the assignee.
+//
+// Extra fences (decided in SQL, same batch):
+//   - bookkeeping flights (deploy/studio) are closed as 'failed' by design; their tasks are never touched
+//   - a task listed by ANY other preflight/running/waiting/sleeping flight counts as live: left_running
+//   - a task not assigned to the flight's executor is recorded as skipped_not_owned and not touched
 //
 // Each affected child gets one mutation_audit_entries row written BEFORE the UPDATE with the very
 // same predicate, so the evidence and the mutation cannot disagree about which state they matched.
@@ -25,7 +32,7 @@ import type { Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { archiveBlockingDispatchExistsSql } from '../tasks/runtime-receipts'
 
-export type FlightChildDisposition = 'blocked' | 'left_running'
+export type FlightChildDisposition = 'blocked' | 'left_running' | 'skipped_not_owned'
 
 export interface FlightChildRecord {
   task_id: string
@@ -36,6 +43,7 @@ export interface FlightChildRecord {
 
 export const FLIGHT_CHILD_BLOCKED_OP = 'flight_child_task_blocked'
 export const FLIGHT_CHILD_LEFT_RUNNING_OP = 'flight_child_task_left_running'
+export const FLIGHT_CHILD_SKIPPED_OP = 'flight_child_task_skipped_not_owned'
 
 // Params used by the statements below (positional, 1-based):
 //  ?1 flight id  ?2 tenant  ?3 flight ended_at (ms)  ?4 flight gate_reason  ?5 now (ms)
@@ -51,16 +59,26 @@ const NOT_ROUTINE_FLIGHT_SQL = `NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE 
 
 const FLIGHT_FAILED_SQL = `${NOT_ROUTINE_FLIGHT_SQL} AND EXISTS (
   SELECT 1 FROM flights f
-   WHERE f.id = ?1 AND f.tenant = ?2 AND f.status = 'failed' AND f.ended_at = ?3 AND f.gate_reason = ?4)`
+   WHERE f.id = ?1 AND f.tenant = ?2 AND f.status = 'failed' AND f.bookkeeping = 0
+     AND f.ended_at = ?3 AND f.gate_reason = ?4)`
 
 const LIVE_EXECUTION_SQL = `(
   (t.execution_claim_expires_at IS NOT NULL AND t.execution_claim_expires_at > ?5)
   OR (t.execution_receipt_id IS NOT NULL
       AND NOT (t.execution_claim_expires_at IS NOT NULL AND t.execution_claim_expires_at <= ?5))
+  OR EXISTS (
+    SELECT 1 FROM flights f2
+     WHERE f2.tenant = ?2 AND f2.id <> ?1
+       AND f2.status IN ('preflight', 'running', 'waiting', 'sleeping')
+       AND json_valid(f2.meta)
+       AND t.id IN (SELECT value FROM json_each(f2.meta, '$.task_ids')))
   OR ${archiveBlockingDispatchExistsSql({ tenantParam: '?2', taskIdExpr: 't.id' })}
 )`
 
-const BLOCKABLE_SQL = `(t.status = 'open' OR (t.status = 'in_progress' AND NOT ${LIVE_EXECUTION_SQL}))`
+// COALESCE: an unassigned task (NULL) must read as not owned, never as NULL (which would fall through NOT/CASE).
+const OWNED_SQL = `COALESCE(t.assignee_agent_id = (SELECT fo.agent FROM flights fo WHERE fo.id = ?1 AND fo.tenant = ?2), 0)`
+
+const BLOCKABLE_SQL = `(${OWNED_SQL} AND (t.status = 'open' OR (t.status = 'in_progress' AND NOT ${LIVE_EXECUTION_SQL})))`
 const LEFT_RUNNING_SQL = `(t.status = 'in_progress' AND ${LIVE_EXECUTION_SQL})`
 
 export interface FlightChildStatements {
@@ -96,10 +114,13 @@ export function flightChildDispositionStatements(
        target_kind, target_id, flight_id, task_id, request_id, evidence_json, recorded_at
      )
      SELECT lower(hex(randomblob(16))), ?2, ?9, ?10, 'controller', ?11,
-            CASE WHEN ${LEFT_RUNNING_SQL} THEN '${FLIGHT_CHILD_LEFT_RUNNING_OP}' ELSE '${FLIGHT_CHILD_BLOCKED_OP}' END,
+            CASE WHEN NOT ${OWNED_SQL} THEN '${FLIGHT_CHILD_SKIPPED_OP}'
+                 WHEN ${LEFT_RUNNING_SQL} THEN '${FLIGHT_CHILD_LEFT_RUNNING_OP}'
+                 ELSE '${FLIGHT_CHILD_BLOCKED_OP}' END,
             'task', t.id, ?1, t.id, ?12,
             json_object('task_id', t.id, 'from_status', t.status,
-                        'disposition', CASE WHEN ${LEFT_RUNNING_SQL} THEN 'left_running' ELSE 'blocked' END,
+                        'disposition', CASE WHEN NOT ${OWNED_SQL} THEN 'skipped_not_owned'
+                                            WHEN ${LEFT_RUNNING_SQL} THEN 'left_running' ELSE 'blocked' END,
                         'reason', ?7),
             ?6
        FROM tasks t
@@ -128,4 +149,28 @@ export const FLIGHT_CHILD_RECORDS_JSON_SQL = (flightIdParam: string, requestIdPa
   `json((SELECT COALESCE(json_group_array(json(a.evidence_json)), json('[]'))
       FROM mutation_audit_entries a
      WHERE a.flight_id = ${flightIdParam} AND a.request_id = ${requestIdParam}
-       AND a.operation IN ('${FLIGHT_CHILD_BLOCKED_OP}', '${FLIGHT_CHILD_LEFT_RUNNING_OP}')))`
+       AND a.operation IN ('${FLIGHT_CHILD_BLOCKED_OP}', '${FLIGHT_CHILD_LEFT_RUNNING_OP}', '${FLIGHT_CHILD_SKIPPED_OP}')))`
+
+/**
+ * Typed next step for an executor whose task was blocked by a flight cancel/reap. Returns null when the
+ * task is not currently blocked by such a disposition. Never throws (the caller is already refusing).
+ */
+export async function flightChildBlockedNextStep(
+  env: Env,
+  taskId: string,
+  status: string,
+): Promise<{ reason: 'flight_reaped' | 'flight_cancelled'; flight_id: string; next_tool: 'task_update'; next_args: { task_id: string; status: 'in_progress' } } | null> {
+  if (status !== 'blocked') return null
+  try {
+    const row = await env.DB.prepare(
+      `SELECT flight_id, json_extract(evidence_json, '$.reason') AS reason
+         FROM mutation_audit_entries
+        WHERE tenant = ?1 AND task_id = ?2 AND operation = '${FLIGHT_CHILD_BLOCKED_OP}'
+        ORDER BY recorded_at DESC, rowid DESC LIMIT 1`,
+    ).bind(env.TENANT_SLUG, taskId).first<{ flight_id: string | null; reason: string | null }>()
+    if (!row || !row.flight_id || (row.reason !== 'flight_reaped' && row.reason !== 'flight_cancelled')) return null
+    return { reason: row.reason, flight_id: row.flight_id, next_tool: 'task_update', next_args: { task_id: taskId, status: 'in_progress' } }
+  } catch {
+    return null
+  }
+}

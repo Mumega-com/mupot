@@ -750,9 +750,14 @@ describe('C. duplicate booking (mupot#1540)', () => {
     // The real watchdog reaps it while the executor is still working (pre-fix prod shape).
     expect(await sweepStalledFlights(env, { nowMs: startedAt + 62 * MIN })).toMatchObject({ reaped: 1 })
     expect(flightRow(harness, reaped).status).toBe('failed')
-    // The reap now parks the unclaimed in_progress child as blocked; the executor resumes it (blocked -> in_progress).
+    // The reap parks the executor's unclaimed in_progress task as blocked. The executor's real next call
+    // (review) is refused with a typed next step, which it then follows.
     expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'task-1'").get()).toEqual({ status: 'blocked' })
-    const resumed = await invokeTool(execAuth(), env, 'task_update', { task_id: 'task-1', status: 'in_progress' }, ORIGIN)
+    const refused = await invokeTool(execAuth(), env, 'task_update', { task_id: 'task-1', status: 'review' }, ORIGIN)
+    expect(refused).toMatchObject({ ok: false, status: 400, error: 'invalid_transition' })
+    const next = (refused as unknown as { detail: Record<string, unknown> }).detail
+    expect(next).toMatchObject({ reason: 'flight_reaped', flight_id: reaped, next_tool: 'task_update', next_args: { task_id: 'task-1', status: 'in_progress' } })
+    const resumed = await invokeTool(execAuth(), env, next.next_tool as string, next.next_args as Record<string, unknown>, ORIGIN)
     expect(resumed.ok, JSON.stringify(resumed)).toBe(true)
     await toReview(env, 'task-1')
     await verdict(env, 'task-1', 'approved')

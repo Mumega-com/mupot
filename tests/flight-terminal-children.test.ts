@@ -1,7 +1,7 @@
 // Coherence wave 1 item 4: a flight that ends as failed (cancel or reap) must give every
 // meta.task_ids child a fenced disposition in the same batch as the flight transition.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cancelFlight, reapStalledFlight } from '../src/flight/watchdog'
+import { cancelFlight, reapStalledFlight, canReapFlight } from '../src/flight/watchdog'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import type { Env } from '../src/types'
@@ -65,8 +65,8 @@ afterEach(() => h.close())
 const task = (id: string) => h.sqlite.prepare('SELECT status, result, assignee_agent_id AS a FROM tasks WHERE id = ?').get(id) as
   { status: string; result: string | null; a: string | null }
 const flightStatus = () => (h.sqlite.prepare("SELECT status FROM flights WHERE id='f1'").get() as { status: string }).status
-const audit = () => h.sqlite.prepare(
-  "SELECT operation, task_id, evidence_json FROM mutation_audit_entries WHERE flight_id = 'f1' AND operation LIKE 'flight_child_task_%' ORDER BY task_id",
+const audit = (flightId = 'f1') => h.sqlite.prepare(
+  `SELECT operation, task_id, evidence_json FROM mutation_audit_entries WHERE flight_id = '${flightId}' AND operation LIKE 'flight_child_task_%' ORDER BY task_id`,
 ).all() as { operation: string; task_id: string; evidence_json: string }[]
 
 function expectDispositions(reason: string) {
@@ -170,5 +170,71 @@ describe('reapStalledFlight child tasks', () => {
     expect(task('c_open').status).toBe('open')
     expect(task('c_prog_free').status).toBe('in_progress')
     expect(audit()).toEqual([])
+  })
+})
+
+function flightRow(id: string, status: string, ids: string[], o: { agent?: string; by?: string; bk?: number; started?: number } = {}) {
+  h.sqlite.prepare(
+    `INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, status, budget_micro_usd, cost_micro_usd, cost_metered, created_at, started_at, meta, bookkeeping)
+     VALUES (?, ?, ?, ?, 'g', ?, 100, 0, 1, ?, ?, ?, ?)`,
+  ).run(id, TENANT, o.agent ?? 'agent', o.by ?? o.agent ?? 'agent', status, o.started ?? T0, o.started ?? T0, JSON.stringify({
+    schema: 'mupot.flight.meta/v1', goal_id: 'g', objective_id: 'o', squad_ids: ['squad'], task_ids: ids, done_when: ['d'],
+    artifact_refs: [], receipt_refs: [], confidentiality: 'internal', publication_target: 'none', parent_flight_id: null,
+  }), o.bk ?? 0)
+}
+const mkTask = (id: string, status: string, assignee: string | null) => h.sqlite.prepare(
+  `INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at) VALUES (?, 'squad', ?, 'b', 'd', ?, ?, ?, ?)`,
+).run(id, id, status, assignee, NOW_ISO, NOW_ISO)
+
+describe('round 2 fences', () => {
+  it('bookkeeping flights (closed as failed by design) never touch their tasks', async () => {
+    mkTask('t_deploy', 'open', 'agent')
+    flightRow('bk', 'preflight', ['t_deploy'], { bk: 1 })
+    expect(await reapStalledFlight(env, 'bk', WATCHDOG, 'stall', NOW)).toMatchObject({ transitioned: true })
+    expect(task('t_deploy').status).toBe('open')
+    mkTask('t_deploy2', 'open', 'agent')
+    flightRow('bk2', 'running', ['t_deploy2'], { bk: 1 })
+    await cancelFlight(env, 'bk2', LEAD, 'x', NOW)
+    expect(task('t_deploy2').status).toBe('open')
+  })
+
+  it('a task listed by another live flight is left running (reap and cancel)', async () => {
+    mkTask('t_shared', 'in_progress', 'agent')
+    mkTask('t_shared_open', 'open', 'agent')
+    flightRow('a', 'running', ['t_shared'])
+    flightRow('b', 'running', ['t_shared'], { started: NOW - 1000 })
+    await reapStalledFlight(env, 'a', WATCHDOG, 'stall', NOW)
+    expect(task('t_shared').status).toBe('in_progress')
+    expect(audit('a').find((r) => r.task_id === 't_shared')?.operation).toBe('flight_child_task_left_running')
+    flightRow('c', 'waiting', ['t_shared'])
+    await cancelFlight(env, 'c', LEAD, 'dup', NOW)
+    expect(task('t_shared').status).toBe('in_progress')
+  })
+
+  it('only the flight executor\'s own tasks are disposed; others are recorded skipped_not_owned', async () => {
+    h.sqlite.exec("INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('victim','squad','victim','V','active'), ('mallory','squad','mallory','M','active')")
+    mkTask('t_victim', 'open', 'victim')
+    mkTask('t_victim_prog', 'in_progress', 'victim')
+    mkTask('t_unassigned', 'open', null)
+    mkTask('t_mine', 'open', 'mallory')
+    flightRow('fm', 'running', ['t_victim', 't_victim_prog', 't_unassigned', 't_mine'], { agent: 'mallory' })
+    const principal = { actor: { kind: 'agent' as const, id: 'mallory' } }
+    const fl = h.sqlite.prepare("SELECT * FROM flights WHERE id='fm'").get() as never
+    expect(canReapFlight(fl, principal)).toBe(true)
+    expect(await reapStalledFlight(env, 'fm', principal, 'stall', NOW)).toMatchObject({ transitioned: true })
+    expect(task('t_victim').status).toBe('open')
+    expect(task('t_victim_prog').status).toBe('in_progress')
+    expect(task('t_unassigned').status).toBe('open')
+    expect(task('t_mine').status).toBe('blocked')
+    const skipped = audit('fm').filter((r) => r.operation === 'flight_child_task_skipped_not_owned').map((r) => r.task_id).sort()
+    expect(skipped).toEqual(['t_unassigned', 't_victim', 't_victim_prog'])
+  })
+
+  it('a dispatcher who is not the executor cannot block the executor-less tasks of others', async () => {
+    h.sqlite.exec("INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('mallory','squad','mallory','M','active')")
+    mkTask('t_other', 'open', 'agent')
+    flightRow('fd', 'running', ['t_other'], { agent: 'mallory', by: 'mallory' })
+    await reapStalledFlight(env, 'fd', { actor: { kind: 'agent', id: 'mallory' } }, 'stall', NOW)
+    expect(task('t_other').status).toBe('open')
   })
 })

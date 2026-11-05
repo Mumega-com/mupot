@@ -321,6 +321,7 @@ import {
   toolSupabaseMutate,
 } from './supabase-tools'
 import { dispatchFlight } from '../flight/dispatch'
+import { flightChildBlockedNextStep } from '../flight/child-disposition'
 import {
   deliverFlightLandedEvent,
   failFlight,
@@ -2003,7 +2004,11 @@ const toolTaskUpdate: ToolSpec = {
         const transitionErr = await checkTransitionWithBar(env, existing.status, args.status, {
           actor: actorOf(auth), scopeRef: `task:${existing.id}`, reason: args.reason ?? args.note,
         })
-        if (transitionErr) return fail(400, transitionErr.error, transitionErr)
+        if (transitionErr) {
+          // A flight reap/cancel parked this task as blocked: tell the executor the one legal next step.
+          const flightNext = transitionErr.error === 'invalid_transition' ? await flightChildBlockedNextStep(env, existing.id, existing.status) : null
+          return fail(400, transitionErr.error, flightNext ? { ...transitionErr, ...flightNext } : transitionErr)
+        }
       }
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
       // requires a gate_owner, else the task is a zombie with no legal exit
@@ -3554,8 +3559,10 @@ const toolTaskSubmitResult: ToolSpec = {
     // a rejected task must first be moved back to in_progress (task_update, the
     // existing legal rejected→in_progress transition) before resubmitting.
     if (existing.status !== 'in_progress') {
+      const flightNext = await flightChildBlockedNextStep(env, existing.id, existing.status)
       return fail(409, 'task_not_in_progress', {
         status: existing.status,
+        ...(flightNext ?? {}),
         detail: 'a completion result can only be submitted while the task is in_progress; once in review the result is immutable until the task is sent back to in_progress',
       })
     }
