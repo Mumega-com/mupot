@@ -356,7 +356,6 @@ export async function expireStaleElevationRequests(
     )
       .bind(tenant, nowIso)
       .run()
-    await notifyLapsedApprovalBotRequests(env, tenant, nowMs)
     return { expiredCount: Number(result.meta?.changes ?? 0) }
   } catch (err) {
     if (isMissingTableError(err)) return { expiredCount: 0 }
@@ -384,6 +383,7 @@ export async function listPendingElevationRequests(
     )
       .bind(tenant)
       .all<ElevationRequestRecord>()
+    await notifyLapsedApprovalBotRequests(env, tenant, nowMs)
     return rows.results ?? []
   } catch (err) {
     if (isMissingTableError(err)) return []

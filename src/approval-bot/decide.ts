@@ -19,6 +19,7 @@ import { LoginIdentityNotLiveError } from '../auth/web-sessions'
 import { resolveTelegramMember } from '../secure-moments/telegram-miniapp-binding'
 import { approvalBotStatus } from './config'
 import { effectiveApprovalStatus, notifyApprovalRequester } from './status'
+import { safeConsole } from '../lib/log'
 import { botMayCarry, decisionBotLabel, parseRequestedActions, SHORT_ID_RE } from './policy'
 import { answerCallback, editBotMessage, sendBotMessage, type FetchFn } from './telegram'
 
@@ -133,31 +134,35 @@ async function routingSentence(env: Env): Promise<string> {
   return `This chat is only for approval requests. Pairing codes and task decisions go to ${await decisionBotLabel(env)}.`
 }
 
+async function bestEffortDelivery(work: () => Promise<void>, code: string): Promise<void> {
+  try { await work() } catch {
+    try { safeConsole.warn(code) } catch { /* logging cannot change a recorded outcome */ }
+  }
+}
+
 export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: BotUpdateOpts = {}): Promise<BotUpdateResult> {
   const bot = approvalBotStatus(env)
   if (bot.state !== 'on') return { kind: 'ignored', reason: 'bot_off' }
   const p = parseUpdate(update)
   if (!p) return { kind: 'ignored', reason: 'not_a_message' }
-  const tell = async (text: string, tellOpts: { editMessageId?: string } = {}): Promise<void> => {
+  const tell = (text: string, tellOpts: { editMessageId?: string; editOnly?: boolean } = {}): Promise<void> => bestEffortDelivery(async () => {
     if (!p.chatId) return
     if (p.kind === 'callback' && p.callbackId) await answerCallback(bot, { callbackQueryId: p.callbackId, text }, opts.fetchFn)
     const editId = tellOpts.editMessageId ?? (p.kind === 'callback' ? p.messageId ?? undefined : undefined)
     const edited = editId ? (await editBotMessage(bot, { chatId: p.chatId, messageId: editId, text }, opts.fetchFn)).ok : false
-    if (p.kind === 'message' || !edited) {
-      // A deleted/forwarded/uneditable card still receives a persistent private reply.
+    if (!tellOpts.editOnly && (p.kind === 'message' || !edited)) {
       const sent = await sendBotMessage(bot, { chatId: p.chatId, text }, opts.fetchFn)
       if (!sent.ok) throw new Error('approval_bot_reply_unavailable')
     }
-  }
-
-  const notify = async (req: ElevationRequestRecord | null, event: string): Promise<void> => {
+  }, 'approval_bot_reply_unavailable')
+  const notify = (req: ElevationRequestRecord | null, event: string): Promise<void> => bestEffortDelivery(async () => {
     if (req && !(await notifyApprovalRequester(env, req, event))) throw new Error('approval_bot_notice_unavailable')
-  }
-  const report = async (req: ElevationRequestRecord | null, event: string, text: string, tellOpts: { editMessageId?: string } = {}): Promise<void> => {
+  }, 'approval_bot_notice_unavailable')
+  const report = async (req: ElevationRequestRecord | null, event: string, text: string, tellOpts: { editMessageId?: string; editOnly?: boolean } = {}): Promise<void> => {
     const notice = notify(req, event)
-    const durable = notice.catch(() => undefined)
-    try { opts.waitUntil?.(durable) } catch { /* still awaited below */ }
-    try { await tell(text, tellOpts) } finally { await notice }
+    try { opts.waitUntil?.(notice) } catch { /* still awaited below */ }
+    await tell(text, tellOpts)
+    await notice
   }
 
 
@@ -298,8 +303,15 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
     const label = state[0].toUpperCase() + state.slice(1)
     return `${label} request ${cmd.id}. ${state === 'expired' ? 'The decision window ended; ask the agent to file a new request.' : 'This tap made no further change.'}`
   }
+  const sameDecision = (current: ElevationRequestRecord): boolean =>
+    current.decided_by_member_id === memberId && current.status === (cmd.op === 'approve' ? 'approved' : 'denied')
+  const replayText = (current: ElevationRequestRecord): string => `Already ${current.status} request ${cmd.id}. No further change was made.`
   if (effectiveApprovalStatus(req) !== 'pending') {
     const visible = await mayDecideElevation(env, await buildAuth(env, memberId, undefined, { verifiedRole: true }), req)
+    if (visible && sameDecision(req)) {
+      await tell(replayText(req), { editMessageId: editId, editOnly: true })
+      return { kind: cmd.op === 'approve' ? 'approved' : 'denied' }
+    }
     await report(req, req.status === 'expired' && req.decided_at === null ? 'expired' : `refused_${visible ? req.status : 'unknown_request'}`, visible ? closedText(req) : 'Unknown request for you. No decision was made.', { editMessageId: editId })
     return visible ? { kind: 'closed' } : { kind: 'refused', reason: 'unknown_request' }
   }
@@ -341,6 +353,10 @@ export async function handleApprovalBotUpdate(env: Env, update: unknown, opts: B
   }
   const closed = outcome.status === 410 || (outcome.status === 409 && outcome.title === 'Request closed')
   const latest = closed ? await loadByShortId(env, cmd.id) : null
+  if (closed && latest && sameDecision(latest)) {
+    await tell(replayText(latest), { editMessageId: editId, editOnly: true })
+    return { kind: cmd.op === 'approve' ? 'approved' : 'denied' }
+  }
   await report(latest ?? req, latest?.status === 'expired' && latest.decided_at === null ? 'expired' : `refused_${latest?.status ?? outcome.status}`, closed && latest ? closedText(latest) : outcome.status === 404 ? 'Unknown request for you. No decision was made.' : `Not decided: ${outcome.message}`, { editMessageId: editId })
   return closed ? { kind: 'closed' } : { kind: 'refused', reason: `core_${outcome.status}` }
 }

@@ -518,7 +518,7 @@ describe('decision: approve and deny land once, from the bound private chat only
     const f = await file()
     const mid = deliveredMessageId(f.requestId)
     expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: mid }))).kind).toBe('approved')
-    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: mid }))).kind).toBe('closed')
+    expect((await handleApprovalBotUpdate(env, tapUpdate(`ea:${f.shortId}`, { from: TG.owner, messageId: mid }))).kind).toBe('approved')
     expect((await handleApprovalBotUpdate(env, cmdUpdate(`/mudeny ${f.shortId}`, { from: TG.owner }))).kind).toBe('closed')
     expect(status(f.requestId).status).toBe('approved')
     expect(grants(f.requestId)).toBe(1)
@@ -531,7 +531,8 @@ describe('decision: approve and deny land once, from the bound private chat only
   it('concurrent approves of one request: one decision, one grant set', async () => {
     const f = await file()
     const rs = await Promise.all(Array.from({ length: 6 }, () => handleApprovalBotUpdate(env, cmdUpdate(`/muapprove ${f.shortId}`, { from: TG.owner }))))
-    expect(rs.filter((r) => r.kind === 'approved')).toHaveLength(1)
+    expect(rs.every((r) => r.kind === 'approved')).toBe(true)
+    expect(count('mutation_audit_entries', `target_id='${f.requestId}' AND operation='elevation_approve'`)).toBe(1)
     expect(grants(f.requestId)).toBe(1)
   })
 })
@@ -1265,7 +1266,7 @@ describe('slice1 explicit stale replies', () => {
     const id=kind==='unknown'?(f.shortId==='aaaaaaaa'?'bbbbbbbb':'aaaaaaaa'):f.shortId
     const from=kind==='wrong_member'?TG.plain:TG.owner
     const result=await handleApprovalBotUpdate(env,tapUpdate(`ea:${id}`,{from,messageId:mid}))
-    expect(['closed','refused']).toContain(result.kind)
+    expect(result.kind).toBe(kind==='approved'?'approved':kind==='expired'||kind==='denied'?'closed':'refused')
     const label=kind==='wrong_member'?'unknown':kind
     expect(sentTo('answerCallbackQuery')).toHaveLength(1)
     expect(String(sentTo('answerCallbackQuery')[0].body.text).toLowerCase()).toContain(label)
@@ -1275,7 +1276,7 @@ describe('slice1 explicit stale replies', () => {
     expect(sentTo('editMessageText')[0].body.message_id).toBe(mid)
     expect((sentTo('editMessageText')[0].body.reply_markup as any).inline_keyboard).toEqual([])
     expect(grants(f.requestId)).toBe(before)
-    expect(notices(f.requestId).length).toBeGreaterThan(0)
+    if(kind==='approved')expect(notices(f.requestId)).toHaveLength(0);else expect(notices(f.requestId).length).toBeGreaterThan(0)
     expect(status(f.requestId).status).toBe(kind==='unknown'||kind==='wrong_member'?'pending':kind)
   })
   it.each(['expired','approved','denied','unknown','wrong_member'] as const)('command %s replies visibly and never changes the decision',async(kind)=>{
@@ -1285,8 +1286,8 @@ describe('slice1 explicit stale replies', () => {
     const before=grants(f.requestId);calls.length=0
     const id=kind==='unknown'?(f.shortId==='aaaaaaaa'?'bbbbbbbb':'aaaaaaaa'):f.shortId,from=kind==='wrong_member'?TG.plain:TG.owner
     await handleApprovalBotUpdate(env,cmdUpdate(`/muapprove ${id}`,{from}))
-    expect(sentTo('sendMessage')).toHaveLength(1)
-    expect(String(sentTo('sendMessage')[0].body.text).toLowerCase()).toContain(kind==='wrong_member'?'unknown':kind)
+    expect(sentTo('sendMessage')).toHaveLength(kind==='approved'?0:1)
+    if(kind!=='approved')expect(String(sentTo('sendMessage')[0].body.text).toLowerCase()).toContain(kind==='wrong_member'?'unknown':kind)
     expect(sentTo('answerCallbackQuery')).toHaveLength(0)
     if(['expired','approved','denied'].includes(kind))expect(sentTo('editMessageText')).toHaveLength(1)
     if(kind==='wrong_member')expect(sentTo('editMessageText')).toHaveLength(0)
@@ -1400,17 +1401,17 @@ describe('slice1 races and durable status replies',()=>{
     expect(sentTo('answerCallbackQuery')).toHaveLength(1);expect(sentTo('editMessageText')).toHaveLength(1);expect(sentTo('sendMessage')).toHaveLength(1)
     expect(String(sentTo('sendMessage')[0].body.text)).toContain('Unknown')
   })
-  it('unreachable Telegram replies produce a retry response but still persist the requester notice',async()=>{
+  it('unreachable Telegram replies are best-effort and still persist the requester notice',async()=>{
     const f=await file();stubBot('fail')
     const r=await post(WEBHOOK_SECRET,tapUpdate(`ea:${f.shortId}`,{from:TG.plain,messageId:deliveredMessageId(f.requestId)}))
-    expect(r.status).toBe(503);expect(await r.json()).toEqual({error:'processing_failed'})
+    expect(r.status).toBe(200);expect(await r.json()).toEqual({ok:true,result:'refused'})
     expect(noteCount(f.requestId)).toBe(1)
     expect(status(f.requestId).status).toBe('pending');expect(grants(f.requestId)).toBe(0)
   })
-  it('refusal notice failures are retryable and never consume decision authority',async()=>{
+  it('refusal notice failures are best-effort and never consume decision authority',async()=>{
     const f=await file();harness.sqlite.exec("CREATE TRIGGER fail_bot_notice BEFORE INSERT ON agent_messages BEGIN SELECT RAISE(ABORT,'notice unavailable'); END;")
     const tap=tapUpdate(`ea:${f.shortId}`,{from:TG.plain,messageId:deliveredMessageId(f.requestId)})
-    try {expect((await post(WEBHOOK_SECRET,tap)).status).toBe(503)} finally {harness.sqlite.exec('DROP TRIGGER fail_bot_notice')}
+    try {expect((await post(WEBHOOK_SECRET,tap)).status).toBe(200)} finally {harness.sqlite.exec('DROP TRIGGER fail_bot_notice')}
     expect((await post(WEBHOOK_SECRET,tap)).status).toBe(200)
     expect(noteCount(f.requestId)).toBe(1);expect(status(f.requestId).status).toBe('pending');expect(grants(f.requestId)).toBe(0)
   })
@@ -1445,11 +1446,12 @@ describe('slice1 notice boundaries',()=>{
     SELECT ?,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at FROM elevation_requests WHERE id=?`).run(id,f.requestId)
    harness.sqlite.prepare("INSERT INTO approval_bot_deliveries(id,tenant,request_id,member_id,chat_id,message_id,status,created_at) VALUES(?,?,?,?,?,?,'sent',datetime('now'))").run(crypto.randomUUID(),TENANT,id,'mem-owner',String(TG.owner),String(700+i))
   }
-  const {expireStaleElevationRequests}=await import('../src/auth/elevation')
+  const {expireStaleElevationRequests,listPendingElevationRequests}=await import('../src/auth/elevation')
   expect((await expireStaleElevationRequests(env,TENANT)).expiredCount).toBe(27)
-  expect(notes()).toHaveLength(25)
-  await expireStaleElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
-  await expireStaleElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
+  expect(notes()).toHaveLength(0)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(25)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
   for(const note of notes()){
    expect(note.to_agent).toBe('agent-x');expect(note.from_member).toBe('system:approval-bot')
    expect(JSON.parse(note.body)).toMatchObject({type:'elevation_approval_bot',event:'expired'})
@@ -1475,4 +1477,137 @@ it('slice1 terminal state is shown even after the approver login ends',async()=>
  expect(String(sentTo('answerCallbackQuery')[0].body.text)).toContain('Expired')
  expect(String(sentTo('editMessageText')[0].body.text)).toContain('Expired')
  expect(grants(f.requestId)).toBe(0)
+})
+
+describe('round2 committed outcomes',()=>{
+ const notices=(id:string):any[]=>harness.sqlite.prepare("SELECT * FROM agent_messages WHERE tenant=? AND from_agent='mupot-approval-sweeper' AND body LIKE ?").all(TENANT,`%${id}%`) as any[]
+ const fillInbox=()=>{const insert=harness.sqlite.prepare("INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body) VALUES(?,?,'agent-x','filler','filler','message','queue filler')");const n=1000-count('agent_messages',"to_agent='agent-x' AND read_at IS NULL");for(let i=0;i<n;i++)insert.run(`filler-${i}`,TENANT);expect(count('agent_messages',"to_agent='agent-x' AND read_at IS NULL")).toBe(1000)}
+ it.each(['approve','deny','command-deny'] as const)('acknowledges %s exactly once when requester inbox is full',async(mode)=>{
+  const f=await file(),mid=deliveredMessageId(f.requestId);fillInbox();calls.length=0
+  const update=mode==='command-deny'?cmdUpdate(`/mudeny ${f.shortId}`,{from:TG.owner}):tapUpdate(`${mode==='approve'?'ea':'ed'}:${f.shortId}`,{from:TG.owner,messageId:mid})
+  const r=await post(WEBHOOK_SECRET,update)
+  expect(r.status).toBe(200);expect((await r.json() as any).result).toBe(mode==='approve'?'approved':'denied')
+  expect(status(f.requestId).status).toBe(mode==='approve'?'approved':'denied')
+  expect(grants(f.requestId)).toBe(mode==='approve'?1:0)
+  expect(count('mutation_audit_entries',`target_id='${f.requestId}' AND operation='${mode==='approve'?'elevation_approve':'elevation_deny'}'`)).toBe(1)
+  if(mode==='command-deny'){expect(sentTo('sendMessage')).toHaveLength(1);expect(String(sentTo('sendMessage')[0].body.text)).toContain('Denied')}
+  else{expect(sentTo('editMessageText')).toHaveLength(1);expect(sentTo('sendMessage')).toHaveLength(0);expect(sentTo('answerCallbackQuery')).toHaveLength(1)}
+  for(const c of approvalCalls())expect(String(c.body.text)).not.toContain('Nothing was changed')
+ })
+ it.each(['approve','deny','command-deny'] as const)('keeps committed %s acknowledged when Telegram fails',async(mode)=>{
+  const f=await file(),mid=deliveredMessageId(f.requestId);stubBot('fail')
+  const update=mode==='command-deny'?cmdUpdate(`/mudeny ${f.shortId}`,{from:TG.owner}):tapUpdate(`${mode==='approve'?'ea':'ed'}:${f.shortId}`,{from:TG.owner,messageId:mid})
+  expect((await post(WEBHOOK_SECRET,update)).status).toBe(200)
+  expect(status(f.requestId).status).toBe(mode==='approve'?'approved':'denied');expect(grants(f.requestId)).toBe(mode==='approve'?1:0)
+  expect(count('mutation_audit_entries',`target_id='${f.requestId}' AND operation='${mode==='approve'?'elevation_approve':'elevation_deny'}'`)).toBe(1)
+ })
+ it('keeps stranger valid and unknown ids indistinguishable when notes cannot be stored',async()=>{
+  const f=await file();fillInbox()
+  const ids=[f.shortId,f.shortId==='aaaaaaaa'?'bbbbbbbb':'aaaaaaaa'],replies=[]
+  for(const id of ids){const r=await post(WEBHOOK_SECRET,cmdUpdate(`/muapprove ${id}`,{from:TG.stranger}));replies.push({status:r.status,body:await r.json()})}
+  expect(replies[0]).toEqual(replies[1]);expect(replies[0].status).toBe(200);expect(grants(f.requestId)).toBe(0)
+ })
+ it('same-decider approve redelivery and repeated commands are idempotent success without refusal notes',async()=>{
+  const f=await file(),mid=deliveredMessageId(f.requestId),tap=tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid})
+  expect((await post(WEBHOOK_SECRET,tap)).status).toBe(200);calls.length=0
+  for(const update of [tap,cmdUpdate(`/muapprove ${f.shortId}`,{from:TG.owner}),cmdUpdate(`/muapprove ${f.shortId}`,{from:TG.owner})]){
+   const r=await post(WEBHOOK_SECRET,update);expect(r.status).toBe(200);expect((await r.json() as any).result).toBe('approved')
+  }
+  expect(notices(f.requestId)).toHaveLength(0);expect(sentTo('sendMessage')).toHaveLength(0);expect(grants(f.requestId)).toBe(1)
+  expect(count('mutation_audit_entries',`target_id='${f.requestId}' AND operation='elevation_approve'`)).toBe(1)
+  for(const c of approvalCalls())expect(String(c.body.text).toLowerCase()).not.toContain('could not apply')
+ })
+ it('a decision made by another member is not relabeled as this members idempotent success',async()=>{
+  const f=await file(),{buildAuth,mintApproverSession}=await import('../src/access/identity'),{decideElevation}=await import('../src/access/decision-core')
+  const auth=await buildAuth(env,'mem-sqadmin',undefined,{verifiedRole:true})
+  const result=await decideElevation(env,{id:f.requestId,decision:'approve',selectedActions:['action:project_status'],durationMinutes:undefined,auth,proof:{memberId:'mem-sqadmin',via:'access_passkey',evidence:{}},mintSession:async()=>{const s=await mintApproverSession(env,{memberId:'mem-sqadmin',auth,identityId:'hli-sqadmin',verifiedRole:true});return {auth:s.approver.auth,webSessionHash:s.webSessionHash}}})
+  expect(result.status).toBe(200)
+  expect((await handleApprovalBotUpdate(env,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:deliveredMessageId(f.requestId)}))).kind).toBe('closed')
+  expect(grants(f.requestId)).toBe(1)
+ })
+ it('readonly callers compute expired even when the expiry update is rejected',async()=>{
+  const f=await file();harness.sqlite.prepare('UPDATE elevation_requests SET decision_expires_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),f.requestId)
+  harness.sqlite.exec("CREATE TRIGGER readonly_expiry BEFORE UPDATE OF status ON elevation_requests WHEN NEW.status='expired' BEGIN SELECT RAISE(ABORT,'readonly expiry'); END;")
+  try{const {loadElevationRequestById}=await import('../src/auth/elevation');expect((await loadElevationRequestById(env,TENANT,f.requestId))?.status).toBe('expired');expect(status(f.requestId).status).toBe('pending');expect(grants(f.requestId)).toBe(0)}
+  finally{harness.sqlite.exec('DROP TRIGGER readonly_expiry')}
+ })
+ it('only recent lapse notes are eligible, including the exact 24-hour boundary',async()=>{
+  const old=await file(),recent=await file(),boundary=await file(),now=Date.now(),oldDeadline=new Date(now-25*60*60*1000).toISOString()
+  harness.sqlite.prepare('UPDATE elevation_requests SET decision_expires_at=? WHERE id=?').run(oldDeadline,old.requestId)
+  for(let i=0;i<26;i++){
+   const id=crypto.randomUUID();harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at) SELECT ?,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at FROM elevation_requests WHERE id=?`).run(id,old.requestId)
+   harness.sqlite.prepare("INSERT INTO approval_bot_deliveries(id,tenant,request_id,member_id,chat_id,message_id,status,created_at) VALUES(?,?,?,?,?,?,'sent',datetime('now'))").run(crypto.randomUUID(),TENANT,id,'mem-owner',String(TG.owner),String(900+i))
+  }
+  harness.sqlite.prepare('UPDATE elevation_requests SET decision_expires_at=? WHERE id=?').run(new Date(now-1000).toISOString(),recent.requestId)
+  harness.sqlite.prepare('UPDATE elevation_requests SET decision_expires_at=? WHERE id=?').run(new Date(now-24*60*60*1000).toISOString(),boundary.requestId)
+  const {listPendingElevationRequests,loadElevationRequestById}=await import('../src/auth/elevation')
+  await listPendingElevationRequests(env,TENANT,now)
+  expect(notices(old.requestId)).toHaveLength(0);expect(notices(recent.requestId)).toHaveLength(1);expect(notices(boundary.requestId)).toHaveLength(1)
+  expect((await loadElevationRequestById(env,TENANT,old.requestId,now))?.status).toBe('expired');expect(notices(old.requestId)).toHaveLength(0)
+ })
+ it('a decision does not run the unrelated lapse-note sweep',async()=>{
+  const stale=await file(),live=await file();harness.sqlite.prepare('UPDATE elevation_requests SET decision_expires_at=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),stale.requestId)
+  expect((await post(WEBHOOK_SECRET,tapUpdate(`ed:${live.shortId}`,{from:TG.owner,messageId:deliveredMessageId(live.requestId)}))).status).toBe(200)
+  expect(status(live.requestId).status).toBe('denied');expect(notices(stale.requestId)).toHaveLength(0)
+  const {listPendingElevationRequests}=await import('../src/auth/elevation');await listPendingElevationRequests(env,TENANT)
+  expect(notices(stale.requestId)).toHaveLength(1)
+ })
+})
+it.each(['tap','command'] as const)('round2 committed deny survives a throwing inbox insert for %s',async(mode)=>{
+ const f=await file();calls.length=0
+ harness.sqlite.exec("CREATE TRIGGER fail_committed_notice BEFORE INSERT ON agent_messages BEGIN SELECT RAISE(ABORT,'notice unavailable'); END;")
+ try{
+  const update=mode==='tap'?tapUpdate(`ed:${f.shortId}`,{from:TG.owner,messageId:deliveredMessageId(f.requestId)}):cmdUpdate(`/mudeny ${f.shortId}`,{from:TG.owner})
+  expect((await post(WEBHOOK_SECRET,update)).status).toBe(200)
+  expect(status(f.requestId).status).toBe('denied');expect(grants(f.requestId)).toBe(0)
+  expect(count('mutation_audit_entries',`target_id='${f.requestId}' AND operation='elevation_deny'`)).toBe(1)
+  expect(mode==='tap'?sentTo('editMessageText'):sentTo('sendMessage')).toHaveLength(1)
+ }finally{harness.sqlite.exec('DROP TRIGGER fail_committed_notice')}
+})
+it('round2 expired records with future deadlines do not create lapse notices',async()=>{
+ const f=await file(),{loadElevationRequestById}=await import('../src/auth/elevation')
+ for(const deadline of [new Date(Date.now()+60000).toISOString(),'not-a-date']){
+  harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=? WHERE id=?").run(deadline,f.requestId)
+  expect((await loadElevationRequestById(env,TENANT,f.requestId))?.status).toBe('expired')
+  expect(count('agent_messages',"from_agent='mupot-approval-sweeper'")).toBe(0)
+ }
+})
+it('round2 a previously decided opposite action is not idempotent success',async()=>{
+ const f=await file(),mid=deliveredMessageId(f.requestId)
+ await post(WEBHOOK_SECRET,tapUpdate(`ed:${f.shortId}`,{from:TG.owner,messageId:mid}))
+ const r=await post(WEBHOOK_SECRET,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}))
+ expect(r.status).toBe(200);expect((await r.json() as any).result).toBe('closed');expect(grants(f.requestId)).toBe(0)
+})
+it('round2 idempotent state visibility still requires current decision authority',async()=>{
+ const f=await file(),mid=deliveredMessageId(f.requestId);await post(WEBHOOK_SECRET,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}))
+ harness.sqlite.exec("DELETE FROM capabilities WHERE id='cap-o'; UPDATE human_login_identities SET verified_email=NULL WHERE id='hli-owner';");calls.length=0
+ const r=await post(WEBHOOK_SECRET,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}))
+ expect(r.status).toBe(200);expect((await r.json() as any).result).toBe('refused');expect(String(sentTo('answerCallbackQuery')[0].body.text)).toContain('Unknown')
+})
+it('round2 logging failures cannot invalidate a committed outcome',async()=>{
+ const f=await file();stubBot('fail')
+ const log=vi.spyOn(console,'warn').mockImplementation(()=>{throw new Error('logging unavailable')})
+ try{expect((await post(WEBHOOK_SECRET,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:deliveredMessageId(f.requestId)}))).status).toBe(200);expect(status(f.requestId).status).toBe('approved');expect(grants(f.requestId)).toBe(1)}finally{log.mockRestore()}
+})
+it('round2 concurrent repeated commands send one new message for the one committed decision',async()=>{
+ const f=await file();calls.length=0
+ const results=await Promise.all(Array.from({length:6},()=>post(WEBHOOK_SECRET,cmdUpdate(`/muapprove ${f.shortId}`,{from:TG.owner}))))
+ expect(results.every(r=>r.status===200)).toBe(true)
+ for(const r of results)expect((await r.json() as any).result).toBe('approved')
+ expect(sentTo('sendMessage')).toHaveLength(1);expect(grants(f.requestId)).toBe(1)
+ expect(count('mutation_audit_entries',`target_id='${f.requestId}' AND operation='elevation_approve'`)).toBe(1)
+ expect(count('agent_messages',"from_agent='mupot-approval-sweeper'")).toBe(0)
+})
+it('round2 replay fallback never creates a new message if its card is uneditable',async()=>{
+ const f=await file();await post(WEBHOOK_SECRET,cmdUpdate(`/muapprove ${f.shortId}`,{from:TG.owner}));calls.length=0
+ vi.stubGlobal('fetch',async(url:string,init:RequestInit)=>{const method=url.split('/').pop()!;calls.push({url,method,body:JSON.parse(String(init.body))});return method==='editMessageText'?new Response('{"ok":false}',{status:400}):new Response('{"ok":true,"result":true}')})
+ const r=await post(WEBHOOK_SECRET,cmdUpdate(`/muapprove ${f.shortId}`,{from:TG.owner}))
+ expect(r.status).toBe(200);expect((await r.json() as any).result).toBe('approved');expect(sentTo('sendMessage')).toHaveLength(0)
+})
+it('round2 notice scheduling failures never reject a closed tap',async()=>{
+ const f=await file(),mid=deliveredMessageId(f.requestId)
+ await post(WEBHOOK_SECRET,tapUpdate(`ed:${f.shortId}`,{from:TG.owner,messageId:mid}));calls.length=0
+ const result=await handleApprovalBotUpdate(env,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}),{waitUntil:()=>{throw new Error('scheduler unavailable')}})
+ expect(result.kind).toBe('closed');expect(status(f.requestId).status).toBe('denied');expect(grants(f.requestId)).toBe(0)
+ expect(sentTo('answerCallbackQuery')).toHaveLength(1);expect(sentTo('editMessageText')).toHaveLength(1);expect(sentTo('sendMessage')).toHaveLength(0)
 })
