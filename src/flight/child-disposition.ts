@@ -45,7 +45,11 @@ const IN_FLIGHT_SQL = `t.id IN (SELECT value FROM json_each(
   (SELECT CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END FROM flights f WHERE f.id = ?1 AND f.tenant = ?2),
   '$.task_ids'))`
 
-const FLIGHT_FAILED_SQL = `EXISTS (
+// A routine-bound flight's only task is its attempt-scoped control task, which the routine run's own
+// lifecycle (and the reap's exact-identity repair) owns. Never sweep those here.
+const NOT_ROUTINE_FLIGHT_SQL = `NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.tenant = ?2 AND rr.flight_id = ?1)`
+
+const FLIGHT_FAILED_SQL = `${NOT_ROUTINE_FLIGHT_SQL} AND EXISTS (
   SELECT 1 FROM flights f
    WHERE f.id = ?1 AND f.tenant = ?2 AND f.status = 'failed' AND f.ended_at = ?3 AND f.gate_reason = ?4)`
 
@@ -106,7 +110,10 @@ export function flightChildDispositionStatements(
   ).bind(...binds)
   const update = env.DB.prepare(
     `UPDATE tasks AS t
-        SET status = 'blocked', result = ?8, updated_at = ?6
+        SET status = 'blocked',
+            -- never discard what the task already carries (e.g. artifact evidence): append the reason
+            result = CASE WHEN result IS NULL OR result = '' THEN ?8 ELSE result || char(10) || ?8 END,
+            updated_at = ?6
       WHERE ${IN_FLIGHT_SQL}
         AND ${TASK_NOT_ARCHIVED_SQL('t')}
         AND ${BLOCKABLE_SQL}

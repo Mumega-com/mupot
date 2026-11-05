@@ -750,6 +750,10 @@ describe('C. duplicate booking (mupot#1540)', () => {
     // The real watchdog reaps it while the executor is still working (pre-fix prod shape).
     expect(await sweepStalledFlights(env, { nowMs: startedAt + 62 * MIN })).toMatchObject({ reaped: 1 })
     expect(flightRow(harness, reaped).status).toBe('failed')
+    // The reap now parks the unclaimed in_progress child as blocked; the executor resumes it (blocked -> in_progress).
+    expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id = 'task-1'").get()).toEqual({ status: 'blocked' })
+    const resumed = await invokeTool(execAuth(), env, 'task_update', { task_id: 'task-1', status: 'in_progress' }, ORIGIN)
+    expect(resumed.ok, JSON.stringify(resumed)).toBe(true)
     await toReview(env, 'task-1')
     await verdict(env, 'task-1', 'approved')
 

@@ -116,6 +116,14 @@ describe('cancelFlight child tasks', () => {
     expect(audit().find((r) => r.task_id === 'c_open')?.operation).toBe('flight_child_task_left_running')
   })
 
+  it('appends the reason to an existing result instead of replacing it', async () => {
+    h.sqlite.exec("UPDATE tasks SET result = 'Artifact: x SHA256: abc' WHERE id = 'c_open'")
+    await cancelFlight(env, 'f1', LEAD, 'stop', NOW)
+    const r = task('c_open').result ?? ''
+    expect(r.startsWith('Artifact: x SHA256: abc\n')).toBe(true)
+    expect(r).toContain('flight_cancelled')
+  })
+
   it('a lost flight race leaves every child untouched', async () => {
     const p = cancelFlight(env, 'f1', LEAD, 'race', NOW)
     h.sqlite.exec("UPDATE flights SET status = 'landed' WHERE id = 'f1'")
