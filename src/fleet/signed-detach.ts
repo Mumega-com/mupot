@@ -5,7 +5,7 @@
 // key-derived and is never accepted from the body.
 
 import type { Env } from '../types'
-import { loadActiveAgentKey } from './agent-keys'
+import { loadKeyForDoor } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 export const DETACH_WINDOW_SEC = sharedNonceWindowSec('fleet-detach:v1')
@@ -107,10 +107,10 @@ export async function verifySignedDetach(
   }
 
   const tenant = env.TENANT_SLUG
-  // mupot#2345: deliberately the raw key load, NOT the live signer verdict. Detach only relinquishes (marks the fleet row
+  // mupot#2345: deliberately the raw key load (loadKeyForDoor), NOT the live signer verdict. Detach only relinquishes (marks the fleet row
   // stopped), so an agent the live check now refuses must still be able to take itself off the board; the signature and the
   // key's active member are still required.
-  const keyRow = await loadActiveAgentKey(env, agentId)
+  const keyRow = await loadKeyForDoor(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }

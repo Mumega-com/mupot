@@ -1,5 +1,5 @@
 import type { Env } from '../types'
-import { boundAgentVerdict, BoundAgentCheckUnavailableError } from '../auth/bound-agent-live'
+import { boundAgentVerdict, BoundAgentCheckUnavailableError, type BoundAgentVerdict } from '../auth/bound-agent-live'
 
 const ED25519_PUBLIC_X_RE = /^[A-Za-z0-9_-]{43}$/
 
@@ -83,44 +83,68 @@ export type SignerKey =
   | { state: 'none' | 'refused' | 'unavailable' }
 
 /**
- * The agent a key is registered for, resolved to agents.id: agent_keys.agent_id is an agents.id OR a slug
- * (see resolveFleetWriteAgentId). An id wins; a slug resolves only when exactly one agent carries it.
- * Unresolvable or ambiguous = null (the caller refuses; a key we cannot tie to one agent proves nothing).
+ * The agent a key is registered for, resolved to agents.id. agent_keys.agent_id is an agents.id OR a slug
+ * (see resolveFleetWriteAgentId). An id wins. A slug is NOT unique tenant-wide (agents.slug is unique per squad), so it
+ * resolves through the key's own member: among the agents carrying that slug, the one bound to the key's member
+ * (agent_member_bindings) or owned by it. A squatter reusing the slug in another squad is not bound to the key's member and
+ * so changes nothing; zero matches (e.g. the real agent was hard-deleted and a newcomer took the slug) or still more than
+ * one = null (refused).
  */
-async function resolveKeyedAgentId(env: Env, keyedId: string): Promise<string | null> {
+async function resolveKeyedAgentId(env: Env, keyedId: string, keyMemberId: string): Promise<string | null> {
   const found = await env.DB.prepare(
-    'SELECT id FROM agents WHERE id = ?1 OR (slug = ?1 AND NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1)) LIMIT 2',
-  ).bind(keyedId).all<{ id: string }>()
+    `SELECT a.id AS id FROM agents a
+      WHERE a.id = ?1
+         OR (a.slug = ?1 AND NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1)
+             AND (EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.tenant = ?3 AND b.agent_id = a.id AND b.member_id = ?2)
+                  OR a.owner_member_id = ?2))
+      LIMIT 2`,
+  ).bind(keyedId, keyMemberId, env.TENANT_SLUG).all<{ id: string }>()
   const rows = found.results ?? []
   return rows.length === 1 ? rows[0].id : null
 }
 
-/**
- * loadActiveAgentKey plus the shared live verdict (boundAgentVerdict) for the agent the key belongs to: agent
- * active/paused, owner an active member of this tenant, and at least one live capability on the key's member.
- * Every key-SIGNED door uses this so a signature is never a way around what the bearer and MCP doors refuse.
- * A failed read is 'unavailable' (never a pass, never a refusal).
- */
-export async function loadSignerKey(env: Env, agentId: string): Promise<SignerKey> {
+/** Key load for the signed doors: a failed read is the retryable 503 (never a 500, never a pass). */
+export async function loadKeyForDoor(env: Env, agentId: string): Promise<ActiveAgentKey | null> {
   try {
-    const key = await loadActiveAgentKey(env, agentId)
-    if (!key) return { state: 'none' }
-    const resolved = await resolveKeyedAgentId(env, agentId)
-    if (resolved === null) return { state: 'refused' }
-    const verdict = await boundAgentVerdict(env, { boundAgentId: resolved, consentedByMemberId: null, memberId: key.member_id })
-    if (verdict === 'live') return { state: 'live', key }
-    return { state: verdict }
+    return await loadActiveAgentKey(env, agentId)
   } catch {
-    return { state: 'unavailable' }
+    throw new BoundAgentCheckUnavailableError()
   }
 }
 
-/** HTTP-door form: the live key, or null when absent/refused (uniform), or the retryable 503 when the check cannot run. */
-export async function loadLiveSignerKey(env: Env, agentId: string): Promise<ActiveAgentKey | null> {
-  const r = await loadSignerKey(env, agentId)
-  if (r.state === 'live') return r.key
-  if (r.state === 'unavailable') throw new BoundAgentCheckUnavailableError()
-  return null
+/**
+ * The shared live verdict for the agent a (already loaded) signing key belongs to: agent active/paused, owner an active
+ * member of this tenant, and at least one live capability on the key's member. Doors call this AFTER the signature
+ * verifies (cheap reject first, no live-vs-refused timing oracle) and BEFORE burning the nonce, so a 503 retry may reuse it.
+ */
+export async function signerVerdict(env: Env, agentId: string, key: ActiveAgentKey): Promise<BoundAgentVerdict> {
+  try {
+    const resolved = await resolveKeyedAgentId(env, agentId, key.member_id)
+    if (resolved === null) return 'refused'
+    return await boundAgentVerdict(env, { boundAgentId: resolved, consentedByMemberId: null, memberId: key.member_id })
+  } catch {
+    return 'unavailable'
+  }
+}
+
+/** Door form of signerVerdict: true = live, false = refused (answer like a bad signature), throws the retryable 503 when unavailable. */
+export async function signerIsLive(env: Env, agentId: string, key: ActiveAgentKey): Promise<boolean> {
+  const v = await signerVerdict(env, agentId, key)
+  if (v === 'unavailable') throw new BoundAgentCheckUnavailableError()
+  return v === 'live'
+}
+
+/** Non-throwing form for callers that decide for themselves (seat events). */
+export async function loadSignerKey(env: Env, agentId: string): Promise<SignerKey> {
+  let key: ActiveAgentKey | null
+  try {
+    key = await loadActiveAgentKey(env, agentId)
+  } catch {
+    return { state: 'unavailable' }
+  }
+  if (!key) return { state: 'none' }
+  const verdict = await signerVerdict(env, agentId, key)
+  return verdict === 'live' ? { state: 'live', key } : { state: verdict }
 }
 
 /**

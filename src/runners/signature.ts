@@ -4,7 +4,7 @@
 // replay protection. Optional: a receipt without a signature is still accepted
 // when the caller is strictly bearer-bound (recordRunner clamps seat identity).
 import type { Env } from '../types'
-import { loadLiveSignerKey } from '../fleet/agent-keys'
+import { loadKeyForDoor, signerIsLive } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
 import { b64urlToBytes, importEd25519Pub } from '../fleet/signed-detach'
 import type { RunnerStatus } from './types'
@@ -70,7 +70,7 @@ export async function verifyRunnerReceiptSig(
     throw new Error('invalid_signature: signature timestamp out of window')
   }
 
-  const keyRow = await loadLiveSignerKey(env, seatAgentId)
+  const keyRow = await loadKeyForDoor(env, seatAgentId)
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     throw new Error('invalid_signature: no active Ed25519 key for seat')
   }
@@ -101,6 +101,11 @@ export async function verifyRunnerReceiptSig(
   }
   if (!verified) {
     throw new Error('invalid_signature: verification failed')
+  }
+
+  // mupot#2345: liveness AFTER the signature, BEFORE the nonce burns.
+  if (!(await signerIsLive(env, seatAgentId, keyRow))) {
+    throw new Error('invalid_signature: no active Ed25519 key for seat')
   }
 
   const burned = await burnSharedAgentNonce(env, {

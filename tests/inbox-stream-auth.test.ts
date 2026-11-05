@@ -18,6 +18,7 @@ beforeEach(() => {
       ('host-agent','stream-squad','host','Host','member','m','active');
     INSERT INTO members(id,display_name,status,tenant) VALUES('reader','Reader','active','test'),('other-member','Other','active','test'),('host-member','Host','active','test');
     INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('test','reader-agent','reader',datetime('now'));
+    INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('cap-reader','reader','squad','stream-squad','member'),('cap-host','host-member','squad','stream-squad','member');
     INSERT INTO member_tokens(id,member_id,token_hash,label,channel,tenant,agent_id)
       VALUES('stream-token','reader','fixture-hash','seat-one','workspace','test','reader-agent');
   `)
@@ -79,5 +80,35 @@ describe('stream reference authorization', () => {
     expect(await validateInboxStreamIdentity(env, identity)).toBe('valid')
     h.sqlite.exec("UPDATE members SET status='active' WHERE id='host-member'; UPDATE seat_event_grants SET revoked_at=datetime('now'), revoked_by_member_id='host-member'")
     expect(await validateInboxStreamIdentity(env, identity)).toBe('valid')
+  })
+  // mupot#2345: the stream uses the shared live verdict, and a refused host no longer parks the bearer stream.
+  it('an open stream stops when the owner is suspended or capabilities go to zero', async () => {
+    h.sqlite.exec("INSERT INTO members(id,display_name,status,tenant) VALUES('own','Own','active','test'); UPDATE agents SET owner_member_id='own' WHERE id='reader-agent'")
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('valid')
+    h.sqlite.exec("UPDATE members SET status='suspended' WHERE id='own'")
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('invalid')
+    h.sqlite.exec("UPDATE members SET status='active' WHERE id='own'")
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('valid')
+    h.sqlite.exec("DELETE FROM capabilities WHERE member_id='reader'")
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('invalid')
+  })
+  it('a host whose signer verdict is refused (zero capabilities) does not fence the bearer stream: no reconnect loop', async () => {
+    h.sqlite.exec(`
+      INSERT INTO agent_keys(tenant,agent_id,pubkey,algo,member_id,created_at) VALUES('test','host-agent','fixture-public-key','Ed25519','host-member',1);
+      INSERT INTO seat_event_grants(id,tenant,host_agent_id,agent_id,granted_by_member_id,reason,created_at) VALUES('stream-grant','test','host-agent','reader-agent','host-member','test',datetime('now'));
+    `)
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('invalid') // live host owns delivery
+    h.sqlite.exec("DELETE FROM capabilities WHERE member_id='host-member'")
+    expect(await validateInboxStreamIdentity(env, identity)).toBe('valid')
+  })
+  it('a failed read of the shared verdict or of the host decision is error, never valid', async () => {
+    const real = env.DB
+    const throwOn = (needle: string): Env => ({ ...env, DB: { prepare: (sql: string) => { if (sql.includes(needle)) throw new Error('d1 down'); return real.prepare(sql) }, batch: real.batch.bind(real) } } as unknown as Env)
+    expect(await validateInboxStreamIdentity(throwOn('has_caps'), identity)).toBe('error')
+    h.sqlite.exec(`
+      INSERT INTO agent_keys(tenant,agent_id,pubkey,algo,member_id,created_at) VALUES('test','host-agent','fixture-public-key','Ed25519','host-member',1);
+      INSERT INTO seat_event_grants(id,tenant,host_agent_id,agent_id,granted_by_member_id,reason,created_at) VALUES('stream-grant','test','host-agent','reader-agent','host-member','test',datetime('now'));
+    `)
+    expect(await validateInboxStreamIdentity(throwOn('FROM seat_event_grants g'), identity)).toBe('error')
   })
 })

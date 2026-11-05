@@ -32,7 +32,7 @@
 // auto-response without waking it.
 
 import type { Env, MessageCreatedPayload } from '../types'
-import { loadSignerKey, loadLiveSignerKey } from '../fleet/agent-keys'
+import { loadSignerKey, loadKeyForDoor, signerIsLive } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
 import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import type { CapabilityGrant } from '../types'
@@ -769,7 +769,7 @@ export async function verifyTicketRequest(
   const now = nowSec()
   if (Math.abs(now - ts) > TICKET_WINDOW_SEC) return { ok: false, status: 401, error: 'stale_signature' }
 
-  const key = await loadLiveSignerKey(env, host)
+  const key = await loadKeyForDoor(env, host)
   if (!key || key.algo !== 'Ed25519') return { ok: false, status: 401, error: 'unauthorized' }
   let pub: CryptoKey
   try {
@@ -783,6 +783,8 @@ export async function verifyTicketRequest(
     { name: 'Ed25519' }, pub, sig, canonicalTicketMessage({ tenant: env.TENANT_SLUG, host_agent_id: host, agents, ts, nonce }),
   )
   if (!valid) return { ok: false, status: 401, error: 'unauthorized' }
+  // mupot#2345: liveness AFTER the signature (cheap reject first), BEFORE the nonce burns (a 503 retry may reuse it).
+  if (!(await signerIsLive(env, host, key))) return { ok: false, status: 401, error: 'unauthorized' }
   // Burn only after the signature verifies, so unsigned junk cannot fill the ledger.
   const fresh = await burnSharedAgentNonce(env, { domain: TICKET_SIG_DOMAIN, windowSec: TICKET_WINDOW_SEC, agentId: host, nonce, now })
   if (!fresh) return { ok: false, status: 409, error: 'replay' }
