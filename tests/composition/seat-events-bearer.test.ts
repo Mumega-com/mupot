@@ -20,6 +20,7 @@ beforeAll(async () => {
   await e.DB.exec("INSERT OR IGNORE INTO agents(id,squad_id,slug,name,status) VALUES('stream-agent','bs','stream-agent','S','active')")
   await e.DB.exec("INSERT OR IGNORE INTO members(id,display_name,tenant,status) VALUES('stream-m','S','test','active')")
   await e.DB.exec("INSERT OR IGNORE INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('test','stream-agent','stream-m',datetime('now'))")
+  await e.DB.exec("INSERT OR IGNORE INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('cap-stream-m','stream-m','squad','bs','member')") // mupot#2343: a welded bearer needs a live capability
   await e.DB.prepare("INSERT OR IGNORE INTO member_tokens(id,member_id,agent_id,tenant,channel,label,token_hash) VALUES('stream-t','stream-m','stream-agent','test','workspace','stream-seat',?1)").bind(await hashMemberToken('workerd-stream-test')).run()
 }, 120_000)
 function stub() { return ns.get(ns.newUniqueId()) }
