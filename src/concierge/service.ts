@@ -45,6 +45,7 @@
 // isConciergeStarterUniqueViolation below.
 
 import type { Env, Project } from '../types'
+import { agentLiveness } from '../agents/liveness'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -251,7 +252,7 @@ async function pickOnlineBuilder(
 ): Promise<ResolvedAgent | null> {
   for (const module of roster) {
     if (module.identity === selfIdentity) continue
-    if (module.status !== 'online') continue
+    if ((module.reported_status ?? module.status) !== 'online') continue
     if (!module.capabilities.includes(BUILD_CAPABILITY)) continue
     const agent = await resolveAgent(env, module.identity)
     if (agent && agent.status === 'active') return agent
@@ -302,7 +303,7 @@ async function routeUnassignedWork(
   const seen = new Set<string>()
   for (const module of roster) {
     if (module.identity === selfIdentity) continue
-    if (module.status !== 'online') continue
+    if ((module.reported_status ?? module.status) !== 'online') continue
     const agent = await resolveAgent(env, module.identity)
     if (agent && agent.status === 'active' && !seen.has(agent.id)) {
       seen.add(agent.id)
@@ -510,7 +511,20 @@ export async function runProjectConcierge(
     return { registered, decision: { action: 'noop', reason: 'error' }, taskId: null }
   }
 
-  const builder = await pickOnlineBuilder(env, roster, identity, resolveAgent)
+  // Registry entries supply capabilities and explicit registration intent, not a second heartbeat clock.
+  const resolved = new Map<string, ResolvedAgent>()
+  for (const module of roster) {
+    if (module.identity === identity || (module.reported_status ?? module.status) !== 'online') continue
+    const agent = await resolveAgent(env, module.identity)
+    if (agent) resolved.set(module.identity, agent)
+  }
+  const liveness = await agentLiveness(env, [...new Set([...resolved.values()].map(agent => agent.id))], now().getTime())
+  roster = roster.filter(module => {
+    const agent = resolved.get(module.identity)
+    return !!agent && liveness.get(agent.id)?.assignmentEligible === true
+  })
+  const liveResolve = async (_env: Env, ref: string) => resolved.get(ref) ?? null
+  const builder = await pickOnlineBuilder(env, roster, identity, liveResolve)
   if (!builder) {
     return { registered, decision: { action: 'noop', reason: 'no_online_builder' }, taskId: null }
   }
@@ -531,7 +545,7 @@ export async function runProjectConcierge(
     // break the tick; sitting work self-corrects next tick.
     let routed: Array<{ taskId: string; agentId: string }> = []
     try {
-      routed = await routeUnassignedWork(env, project, roster, identity, resolveAgent)
+      routed = await routeUnassignedWork(env, project, roster, identity, liveResolve)
     } catch {
       routed = []
     }

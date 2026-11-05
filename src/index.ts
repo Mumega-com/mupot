@@ -600,6 +600,8 @@ export default {
     //     no-op unless BOARD_WRITEBACK=1. Fail-soft by contract (the cron wrapper catches).
     const { runBoardSyncTick } = await import('./projects/board-sync')
     const { retryFailedWritebacks } = await import('./projects/board-writeback')
+    // Slot 19 of 20: minutes 24 and 54 of the existing maintenance cron.
+    const { reclaimDeadAssignments } = await import('./tasks/dead-assignee-reclaim')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],
@@ -620,6 +622,7 @@ export default {
       ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
       ['board-latency-retention', () => pruneRouteLatency(env)],
+      ['dead-assignee-reclaim', () => reclaimDeadAssignments(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

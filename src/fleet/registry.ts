@@ -1037,7 +1037,11 @@ export async function getFleetAgentLiveness(
   agentId: string,
   nowMs = Date.now(),
 ): Promise<FleetAgentRouteInfo> {
-  const row = await readFleetAgentRow(env, agentId)
+  return deriveFleetAgentRoute(env, await readFleetAgentRow(env, agentId), nowMs)
+}
+
+/** Pure route derivation shared by the point lookup and batched liveness contract. */
+export function deriveFleetAgentRoute(env: Env, row: FleetAgentRowIdentity | null, nowMs = Date.now()): FleetAgentRouteInfo {
   const rawPresenceMode = row?.presence_mode ? String(row.presence_mode) : ''
   const runtime = row?.runtime ? String(row.runtime) : ''
   const status = String(row?.status ?? 'unknown')
@@ -1117,7 +1121,11 @@ export async function evaluateReceiverLiveness(
   agentId: string,
   nowMs = Date.now(),
 ): Promise<ReceiverLivenessVerdict> {
-  const row = await readFleetAgentRow(env, agentId)
+  return deriveReceiverLiveness(env, await readFleetAgentRow(env, agentId), nowMs)
+}
+
+/** Pure receiver fence shared by point dispatch and batched assignment readers. */
+export function deriveReceiverLiveness(env: Env, row: FleetAgentRowIdentity | null, nowMs = Date.now()): ReceiverLivenessVerdict {
   if (!row) {
     return { ok: true, agent_id: '', presence_mode: '', status: 'unknown', live: false, stale_poll: false, last_reported_at: '', presence_ttl_sec: 0 }
   }

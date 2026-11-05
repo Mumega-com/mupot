@@ -208,3 +208,38 @@ it('expired gate standing does not occupy the concierge task window',async () =>
  expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
  expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id LIKE 'expired-gate-%' AND assignee_agent_id IS NULL").get()).toEqual({n:5})
 })
+
+function fleetPresence(mode: 'resident' | 'poll', status: string, ageMs: number): void {
+ const stamp=new Date(Date.now()-ageMs).toISOString()
+ h.sqlite.prepare(`INSERT INTO fleet_agents(tenant,agent_id,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec)
+   VALUES(?,?,'Builder',?,'[]','always_on',?,'test',?,?,?,180)`)
+   .run(TENANT,AGENT,mode==='poll'?'':'claude-code',status,stamp,stamp,mode)
+}
+for(const writer of ['concierge','router'] as const) describe(`canonical candidate liveness: ${writer}`,()=>{
+ it('does not assign an operator-stopped resident despite fresh legacy presence',async()=>{
+  fleetPresence('resident','stopped',0)
+  expect(await run(writer)).toBe(0);expect(row().assignee_agent_id).toBeNull()
+ })
+ it('assigns a stale polling seat even when both legacy clocks have expired',async()=>{
+  fleetPresence('poll','running',20*60*1000)
+  h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01 00:00:00'; UPDATE module_registry SET last_heartbeat='2000-01-01T00:00:00.000Z'")
+  expect(await run(writer)).toBe(1);expect(row().assignee_agent_id).toBe(AGENT)
+ })
+ it('does not assign a dead resident even when legacy presence is fresh',async()=>{
+  fleetPresence('resident','running',20*60*1000)
+  expect(await run(writer)).toBe(0);expect(row().assignee_agent_id).toBeNull()
+ })
+ it('does not require an external heartbeat for an in-Worker agent',async()=>{
+  h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01 00:00:00'; UPDATE module_registry SET last_heartbeat='2000-01-01T00:00:00.000Z'")
+  expect(await run(writer)).toBe(1);expect(row().assignee_agent_id).toBe(AGENT)
+ })
+ it('fences an operator stop arriving between selection and commit',async()=>{
+  fleetPresence('resident','running',0)
+  beforeClaim=()=>{h.sqlite.prepare("UPDATE fleet_agents SET status='stopped' WHERE tenant=? AND agent_id=?").run(TENANT,AGENT)}
+  expect(await run(writer)).toBe(0);expect(claims).toBe(1);expect(row().assignee_agent_id).toBeNull()
+ })
+})
+it('concierge respects an explicit offline registration even when polling is fresh',async()=>{
+ fleetPresence('poll','running',0);h.sqlite.exec("UPDATE module_registry SET status='offline'")
+ expect(await run('concierge')).toBe(0);expect(row().assignee_agent_id).toBeNull()
+})
