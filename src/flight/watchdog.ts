@@ -40,6 +40,7 @@ import {
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
 import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
 import { safeConsole } from '../lib/log'
+import { flightChildDispositionStatements, FLIGHT_CHILD_RECORDS_JSON_SQL } from './child-disposition'
 
 export interface FlightActor {
   kind: 'member' | 'agent' | 'system'
@@ -570,6 +571,12 @@ export async function reapStalledFlight(
   // transaction, so a raced no-op on the flight cannot fail the run alone.
   // A non-failure disposition never touches a run: bookkeeping flights have none
   // (createFlight refuses the combination) and tasksAllDoneSql excludes routine-bound flights.
+  const childRequestId = `flight-children:${flightId}:${reapTransitionId}`
+  const reapChildren = flightChildDispositionStatements(env, {
+    flightId, endedAtMs: nowMs, gateReason, nowMs, childReason: 'flight_reaped',
+    principalKind: principal.actor.kind, principalId: principal.actor.id,
+    handler: 'flight_watchdog', requestId: childRequestId,
+  })
   const transition = await env.DB.batch([
     env.DB.prepare(
       `UPDATE flights
@@ -706,6 +713,9 @@ export async function reapStalledFlight(
       routineCandidate?.id ?? null, env.TENANT_SLUG, flightId, expectedRoutineTaskId,
       `watchdog-reap:${flightId}:${reapTransitionId}`, routineCandidate?.attempt ?? null,
     ),
+    // Child tasks of a reaped (failed) flight get a fenced disposition in this same batch; guarded on
+    // the flight having failed in this transaction, so a landing or a lost race touches nothing.
+    ...reapChildren.statements,
   ])
 
   const rows = transition[0]?.results ?? []
@@ -753,6 +763,12 @@ export async function reapStalledFlight(
   const createdAt = new Date(nowMs).toISOString()
 
   try {
+    // Per-child dispositions were written atomically with the transition; fold them into the receipt.
+    const childRows = await env.DB.prepare(
+      `SELECT ${FLIGHT_CHILD_RECORDS_JSON_SQL('?1', '?2')} AS children`,
+    ).bind(flightId, childRequestId).first<{ children: string }>()
+    const children: unknown = JSON.parse(childRows?.children ?? '[]')
+    const receiptPayloadWithChildren = JSON.stringify({ ...JSON.parse(receiptPayload), child_tasks: children })
     await env.DB.prepare(
       `INSERT INTO flight_reap_receipts
          (id, tenant, flight_id, previous_status, actor_kind, actor_id,
@@ -771,7 +787,7 @@ export async function reapStalledFlight(
         evalResult.reason,
         evalResult.ageMs ?? null,
         evalResult.timeoutMs ?? null,
-        receiptPayload,
+        receiptPayloadWithChildren,
         createdAt,
       )
       .run()
@@ -807,6 +823,8 @@ export interface FlightCancelResult {
   previous_status?: FlightStatus
   receipt?: boolean
   cost_metered?: boolean
+  /** Number of child tasks (flights.meta.task_ids) this cancel moved to blocked; per-child detail is in the receipt payload. */
+  child_tasks_blocked?: number
   /**
    * Fate of the routine run bound to this flight, decided by the guarded write (RETURNING), not a pre-read.
    * 'confirmed' = run cancelled, no action was running and no control message delivered. 'unconfirmed' = a routine
@@ -822,7 +840,7 @@ export interface FlightCancelResult {
  * Governed early close of a flight by a lead/admin (mupot#1730). Authz: cancelAuthority (lead/admin only,
  * NOT the reap's agent/dispatcher allowance). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
  * (label cancelled_by_lead|cancelled_by_admin, with a '(self)' suffix when the executor/dispatcher cancels its own
- * flight; a self-cancel is recorded in the receipt payload and still COUNTS AS A FAILURE for readers; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
+ * flight; a self-cancel is recorded in the receipt payload and still COUNTS AS A FAILURE for readers; the status CHECK is not widened; see migrations/0194). Never touches cost. Child tasks get a fenced disposition (child-disposition.ts) in the same batch. The
  * receipt is inserted in the SAME batch as the transition, guarded on that exact transition
  * having landed, so a cancelled flight cannot lack its receipt.
  */
@@ -868,6 +886,13 @@ export async function cancelFlight(
     cancelled_at: nowIso,
     actor: principal.actor,
     self_cancel: selfCancel,
+  })
+
+  const childRequestId = `flight-children:${flightId}:${crypto.randomUUID()}`
+  const cancelChildren = flightChildDispositionStatements(env, {
+    flightId, endedAtMs: nowMs, gateReason, nowMs, childReason: 'flight_cancelled',
+    principalKind: principal.actor.kind, principalId: principal.actor.id,
+    handler: 'flight_cancel', requestId: childRequestId,
   })
 
   // The status guard pins the exact status we recorded as previous_status, so the receipt's
@@ -934,12 +959,14 @@ export async function cancelFlight(
       JSON.stringify({ reason: 'flight_cancelled', action_claimed: true, flight_stopped: true }),
       env.TENANT_SLUG, flightId,
     ),
+    // Child tasks of the cancelled flight: fenced disposition in this same batch (see child-disposition.ts).
+    ...cancelChildren.statements,
     env.DB.prepare(
       `INSERT INTO flight_cancel_receipts
          (id, tenant, flight_id, previous_status, actor_kind, actor_id, cancel_reason, cost_metered, payload, created_at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
               -- #1756: routine outcome decided in SQL from the run rows THIS batch wrote (same finished_at stamp).
-              json_set(?9, '$.routine_outcome', CASE
+              json_set(?9, '$.child_tasks', ${FLIGHT_CHILD_RECORDS_JSON_SQL('?3', '?13')}, '$.routine_outcome', CASE
                 WHEN EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.tenant = ?2 AND rr.flight_id = ?3 AND rr.status = 'failed'
                                AND rr.result_summary = 'cancellation_unconfirmed' AND rr.finished_at = ?10) THEN 'unconfirmed'
                 WHEN EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.tenant = ?2 AND rr.flight_id = ?3 AND rr.status = 'cancelled'
@@ -954,9 +981,10 @@ export async function cancelFlight(
        RETURNING id`,
     ).bind(
       crypto.randomUUID(), env.TENANT_SLUG, flightId, previousStatus, principal.actor.kind,
-      principal.actor.id, reason, costMetered, payload, nowIso, nowMs, gateReason,
+      principal.actor.id, reason, costMetered, payload, nowIso, nowMs, gateReason, childRequestId,
     ),
   ])
+  const receiptIdx = batch.length - 1
 
   // Decide from RETURNING rows, never meta.changes.
   if ((batch[0]?.results ?? []).length === 0) {
@@ -966,7 +994,8 @@ export async function cancelFlight(
     transitioned: true,
     flight_id: flightId,
     previous_status: previousStatus,
-    receipt: (batch[5]?.results ?? []).length > 0,
+    receipt: (batch[receiptIdx]?.results ?? []).length > 0,
+    child_tasks_blocked: (batch[5 + cancelChildren.updateIndex]?.results ?? []).length,
     cost_metered: costMetered === 1,
     ...((batch[2]?.results ?? []).length > 0
       ? { routine_outcome: 'unconfirmed' as const }
