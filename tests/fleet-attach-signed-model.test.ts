@@ -32,6 +32,7 @@ describe('signed attach model (real migration chain)', () => {
       INSERT INTO members (id, display_name, tenant, status) VALUES ('m-model', 'Model member', 'model-test', 'active');
       INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('model-test', 'agent-model-uuid', 'm-model', datetime('now'));
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-model', 'm-model', 'squad', 's-model', 'member');
     `)
     h.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
       VALUES (?, ?, ?, 'Ed25519', ?, ?)`).run('model-test', 'model-runner', jwk.x!, 'm-model', Math.floor(Date.now() / 1000))

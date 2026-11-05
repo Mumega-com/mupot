@@ -80,6 +80,8 @@ function makeDb(opts: {
         m_id: null, m_email: null, m_display: null,
       }))
     }
+    // mupot#2345: the signer-key agent resolution (id, else a unique slug); the fixture's agent id IS the signed id.
+    if (sql.includes('NOT EXISTS (SELECT 1 FROM agents WHERE id')) return [{ id: b[0] }]
     if (sql.includes('capabilities')) return []
     // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's slug lookup, reached only when the
     // id probe above already missed. No real agents table in this mock — always unmatched.
@@ -529,6 +531,7 @@ describe('mupot#1494 v4 round 2 (P1-1) — real-schema slug/uuid resolution on t
         INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_UUID}', 'squad-p11', '${AGENT_SLUG}', 'P11 Runner', 'active');
         INSERT INTO members (id, display_name, status, tenant) VALUES ('mem-p11', 'P11 Member', 'active', 'mumega');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('mumega', '${AGENT_UUID}', 'mem-p11', '${now()}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-p11', 'mem-p11', 'squad', 'squad-p11', 'member');
       `)
 
       // agent_keys is keyed by the SLUG (the identifier-space-bridge convention this whole

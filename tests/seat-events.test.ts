@@ -131,6 +131,12 @@ async function world(): Promise<World> {
       ('${A1}', 's1', 'seat-one', 'Seat One', 'member', 'm', 'active'),
       ('${A2}', 's1', 'seat-two', 'Seat Two', 'member', 'm', 'active'),
       ('${A3}', 's1', 'seat-three', 'Seat Three', 'member', 'm', 'active');
+    -- mupot#2345: a host key's agent must resolve to a live agents row; the hosts live in their own squad so they gain no
+    -- implicit standing in s1 (the grant tests below depend on that).
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('s-host', 'd1', 'hosts', 'Hosts');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+      ('${HOST1}', 's-host', '${HOST1}', 'Host One', 'member', 'm', 'active'),
+      ('${HOST2}', 's-host', '${HOST2}', 'Host Two', 'member', 'm', 'active');
     INSERT INTO members (id, display_name, status, tenant) VALUES
       ('admin', 'Admin', 'active', '${TENANT}'),
       ('host1-m', 'Host One', 'active', '${TENANT}'),
@@ -1285,6 +1291,7 @@ describe('grant scope: host standing and revoke rank ceiling (P2-C)', () => {
     // capability grant, just squad_id = 's1'. That alone must satisfy standing.
     w.h.sqlite.exec(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
       VALUES ('${TENANT}', '${A3}', '${k3.x}', 'Ed25519', 'admin', ${NOW})`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin-key', 'admin', 'squad', 's-host', 'member')`) // #2345: the key's member holds a live capability
     const r = await createSeatEventGrant(w.env, { hostAgentId: A3, agentId: A1, memberId: 'admin', reason: 'A3 hosts A1' })
     expect(r.ok).toBe(true)
   })
@@ -1466,6 +1473,7 @@ describe('host standing is revalidated on every delivery, not just at grant crea
     // A3 hosts A1 by being registered to s1 itself ("registered to it") — no capability row.
     w.h.sqlite.exec(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
       VALUES ('${TENANT}', '${A3}', '${k3.x}', 'Ed25519', 'admin', ${NOW})`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin-key', 'admin', 'squad', 's-host', 'member')`) // #2345: the key's member holds a live capability
     const created = await createSeatEventGrant(w.env, { hostAgentId: A3, agentId: A1, memberId: 'admin', reason: 'A3 hosts A1' })
     expect(created.ok).toBe(true)
     expect(await authorizeSeatDelivery(w.env, A3, A1)).toBe('granted')
@@ -1484,6 +1492,7 @@ describe('host standing is revalidated on every delivery, not just at grant crea
     const k3 = await keypair()
     w.h.sqlite.exec(`
       INSERT INTO members (id, display_name, status, tenant) VALUES ('standing-m', 'Standing', 'active', '${TENANT}');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('standing-host', 's-host', 'standing-host', 'Standing', 'member', 'm', 'active');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-standing', 'standing-m', 'squad', 's1', 'member');
       INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
         VALUES ('${TENANT}', 'standing-host', '${k3.x}', 'Ed25519', 'standing-m', ${NOW});

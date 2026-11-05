@@ -32,7 +32,7 @@
 // auto-response without waking it.
 
 import type { Env, MessageCreatedPayload } from '../types'
-import { loadActiveAgentKey } from '../fleet/agent-keys'
+import { loadSignerKey, loadKeyForDoor, signerIsLive } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
 import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, hasCapability, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import type { CapabilityGrant } from '../types'
@@ -303,8 +303,9 @@ export async function hostHasStandingInSquad(
   const asOwnerAdmin = await env.DB.prepare(`SELECT 1 AS x WHERE ${ownerAdminStandingSql('?1', '?2', '?3', '?4')}`)
     .bind(hostAgentId, squadId, writerMemberId, env.TENANT_SLUG).first()
   if (asOwnerAdmin) return true
-  const key = await loadActiveAgentKey(env, hostAgentId)
-  if (!key) return false
+  const signer = await loadSignerKey(env, hostAgentId)
+  if (signer.state !== 'live') return false
+  const key = signer.key
   const grants = await resolveCapabilities(env, key.member_id)
   return canOnSquad(env, grants, squadId, 'member')
 }
@@ -323,10 +324,13 @@ export async function createSeatEventGrant(
     .bind(input.agentId).first<{ squad_id: string }>()
   if (!agent) return { ok: false, reason: 'agent_not_found' }
   if (input.expectSquadId !== undefined && input.expectSquadId !== agent.squad_id) return { ok: false, reason: 'agent_not_found' }
-  if (!(await loadActiveAgentKey(env, input.hostAgentId))) return { ok: false, reason: 'host_key_missing' }
+  const signer = await loadSignerKey(env, input.hostAgentId)
+  if (signer.state === 'none') return { ok: false, reason: 'host_key_missing' }
   if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id, input.memberId))) {
     return { ok: false, reason: 'host_no_squad_standing' }
   }
+  // mupot#2345: a host whose key's agent the live check refuses (or cannot check) is not a usable host; fail closed.
+  if (signer.state !== 'live') return { ok: false, reason: 'host_no_squad_standing' }
   const projectId = input.projectId ?? null
   if (projectId !== null && !(await agentHasProject(env, input.agentId, projectId))) {
     return { ok: false, reason: 'project_access_denied' }
@@ -469,7 +473,10 @@ export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agent
     const row = await env.DB.prepare(
       seatDeliveryQuery('?1', '?3', '?2'),
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()
-    return row !== null ? 'granted' : 'not_granted'
+    if (row === null) return 'not_granted'
+    // mupot#2345: the host's signing key is judged like any other agent credential (agent live, owner active, a live capability).
+    const signer = await loadSignerKey(env, hostAgentId)
+    return signer.state === 'live' ? 'granted' : signer.state === 'unavailable' ? 'error' : 'not_granted'
   } catch {
     return 'error' // transient — distinct from a definitive not_granted (P2-3)
   }
@@ -762,7 +769,7 @@ export async function verifyTicketRequest(
   const now = nowSec()
   if (Math.abs(now - ts) > TICKET_WINDOW_SEC) return { ok: false, status: 401, error: 'stale_signature' }
 
-  const key = await loadActiveAgentKey(env, host)
+  const key = await loadKeyForDoor(env, host)
   if (!key || key.algo !== 'Ed25519') return { ok: false, status: 401, error: 'unauthorized' }
   let pub: CryptoKey
   try {
@@ -776,6 +783,8 @@ export async function verifyTicketRequest(
     { name: 'Ed25519' }, pub, sig, canonicalTicketMessage({ tenant: env.TENANT_SLUG, host_agent_id: host, agents, ts, nonce }),
   )
   if (!valid) return { ok: false, status: 401, error: 'unauthorized' }
+  // mupot#2345: liveness AFTER the signature (cheap reject first), BEFORE the nonce burns (a 503 retry may reuse it).
+  if (!(await signerIsLive(env, host, key))) return { ok: false, status: 401, error: 'unauthorized' }
   // Burn only after the signature verifies, so unsigned junk cannot fill the ledger.
   const fresh = await burnSharedAgentNonce(env, { domain: TICKET_SIG_DOMAIN, windowSec: TICKET_WINDOW_SEC, agentId: host, nonce, now })
   if (!fresh) return { ok: false, status: 409, error: 'replay' }

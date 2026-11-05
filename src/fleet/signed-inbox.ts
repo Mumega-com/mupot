@@ -8,7 +8,7 @@
 
 import type { Env } from '../types'
 import { readVerifiedSignedAgentInbox, type InboxMessage } from '../agents/messages'
-import { agentKeyFingerprint, loadActiveAgentKey } from './agent-keys'
+import { agentKeyFingerprint, loadKeyForDoor, signerIsLive } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 export const INBOX_WINDOW_SEC = sharedNonceWindowSec('agent-inbox:v1')
@@ -129,7 +129,7 @@ export async function verifySignedInboxRead(
   }
 
   const tenant = env.TENANT_SLUG
-  const keyRow = await loadActiveAgentKey(env, agentId)
+  const keyRow = await loadKeyForDoor(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
@@ -148,6 +148,11 @@ export async function verifySignedInboxRead(
     verified = false
   }
   if (!verified) {
+    return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
+  }
+
+  // mupot#2345: liveness AFTER the signature (cheap reject first), BEFORE the nonce burns (a 503 retry may reuse it).
+  if (!(await signerIsLive(env, agentId, keyRow))) {
     return { ok: false, status: 401, error: 'unauthorized', detail: 'signature verification failed' }
   }
 

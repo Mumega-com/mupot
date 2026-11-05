@@ -43,6 +43,8 @@ async function world(hostOwnerSql: string, hostExtra = '') {
       ('work-seat', 'sw', 'work-seat', 'WorkSeat', 'member', 'm', 'active', NULL);
     INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id)
       VALUES ('${HOST}', 'sw', 'orca-hadi-mac', 'Orca', 'member', 'm', 'active', ${hostOwnerSql});
+    -- mupot#2345: the host's signing key is judged as an agent credential, so its member holds a live capability.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-hostkey', 'hostkey-m', 'squad', 'sw', 'member');
     ${hostExtra}
     INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
       VALUES ('${TENANT}', '${HOST}', '${x}', 'Ed25519', 'hostkey-m', ${NOW});

@@ -108,6 +108,7 @@ describe('P3: a landed flight names harness and model (server-derived)', () => {
         INSERT INTO members (id, display_name, tenant, status) VALUES ('m-signed', 'Signed runner', '${TENANT}', 'active');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
           VALUES ('${TENANT}', 'agent-1', 'm-signed', datetime('now'));
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-signed', 'm-signed', 'squad', 'squad-core', 'member');
       `)
       harnessDb.sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
         VALUES (?, ?, ?, 'Ed25519', ?, ?)`).run(TENANT, 'agent-1', jwk.x!, 'm-signed', Math.floor(Date.now() / 1000))

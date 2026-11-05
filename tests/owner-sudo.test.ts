@@ -106,6 +106,10 @@ beforeEach(() => {
       ('cap-sa-b', 'mem-sqadmin', 'squad', 'squad-b', 'admin'),
       ('cap-adm', 'mem-admin', 'org', NULL, 'admin'),
       ('cap-host', 'host-m', 'squad', 'squad-a', 'member');
+    -- mupot#2345: a host key's agent must resolve to a live agents row; hosts sit in squad-b so they hold no implicit standing in squad-a.
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id) VALUES
+      ('host-1', 'squad-b', 'host-1', 'Host 1', 'r', 'm', 'active', NULL),
+      ('host-2', 'squad-b', 'host-2', 'Host 2', 'r', 'm', 'active', NULL);
     INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES ('${TENANT}', 'host-1', 'AAAA', 'Ed25519', 'host-m', 1760000000);
   `)
   env = {
