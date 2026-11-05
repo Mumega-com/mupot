@@ -107,6 +107,9 @@ export async function verifySignedDetach(
   }
 
   const tenant = env.TENANT_SLUG
+  // mupot#2345: deliberately the raw key load, NOT the live signer verdict. Detach only relinquishes (marks the fleet row
+  // stopped), so an agent the live check now refuses must still be able to take itself off the board; the signature and the
+  // key's active member are still required.
   const keyRow = await loadActiveAgentKey(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {

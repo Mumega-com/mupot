@@ -18,7 +18,7 @@
 //     leaks key material.
 
 import type { Env } from '../types'
-import { loadActiveAgentKey } from './agent-keys'
+import { loadLiveSignerKey } from './agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from './shared-nonce-ledger'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────
@@ -188,7 +188,7 @@ export async function verifySignedAttach(
   // 3. Look up the registered PUBLIC key for THIS tenant + agent. No key → no signed
   //    attach (and crucially: no fallthrough to bearer; the route enforces that).
   const tenant = env.TENANT_SLUG
-  const keyRow = await loadActiveAgentKey(env, agentId)
+  const keyRow = await loadLiveSignerKey(env, agentId)
 
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     // Indistinguishable from a bad signature to the caller — no key-existence oracle.

@@ -2,6 +2,7 @@
 
 import { type ToolSpec, fail, done, str } from './index'
 import { recordRunner, listRunners } from '../runners/service'
+import { BoundAgentCheckUnavailableError, BOUND_AGENT_CHECK_UNAVAILABLE } from '../auth/bound-agent-live'
 import type { RunnerStatus, ListRunnersFilter } from '../runners/types'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 
@@ -94,6 +95,8 @@ export const toolRunnerRecord: ToolSpec = {
       )
       return done({ receipt })
     } catch (err: unknown) {
+      // mupot#2345: the signing-key liveness read failing is the retryable 503, not a 400 about the request.
+      if (err instanceof BoundAgentCheckUnavailableError) return fail(503, BOUND_AGENT_CHECK_UNAVAILABLE)
       const msg = err instanceof Error ? err.message : String(err)
       return fail(400, msg)
     }

@@ -1,3 +1,4 @@
+import { BoundAgentCheckUnavailableError } from '../auth/bound-agent-live'
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { Context } from 'hono'
@@ -465,7 +466,9 @@ addonsApp.use('*', async (c, next) => {
   let resolved: Awaited<ReturnType<typeof resolveOrgAdmin>>
   try {
     resolved = await resolveOrgAdmin(c.env, c.req.header('authorization'))
-  } catch {
+  } catch (err) {
+    // mupot#2345: a failed agent liveness read is the retryable 503 (app.onError), not a 401.
+    if (err instanceof BoundAgentCheckUnavailableError) throw err
     return c.json({ error: 'unauthenticated' }, 401)
   }
   if (!resolved.ok) {

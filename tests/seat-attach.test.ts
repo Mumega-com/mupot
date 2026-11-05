@@ -2180,6 +2180,18 @@ describe('MCP Events for attached agents', () => {
   })
   afterEach(() => { vi.unstubAllGlobals() })
 
+  it('#2345: an attached subscribe is judged on the ATTACHED agent (evAuth), not the unbound grant: a suspended owner refuses it', async () => {
+    const env = evEnv()
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a', 'rava')
+    h.sqlite.exec(`INSERT INTO members (id, display_name, status, tenant) VALUES ('mem-rava-owner', 'Owner', 'suspended', '${TENANT}');
+      UPDATE agents SET owner_member_id = 'mem-rava-owner' WHERE id = 'agent-rava'`)
+    const r = await ev(env, g.ctx, 'events/subscribe', sub())
+    expect(r.status).toBe(403)
+    expect(r.body.error?.message).toBe('agent_not_authorized')
+    expect(one<{ n: number }>(`SELECT COUNT(*) AS n FROM event_subscriptions`)?.n).toBe(0)
+  })
+
   it('an UNATTACHED grant sees no events and cannot subscribe (unchanged)', async () => {
     const env = evEnv()
     const g = await grant(env, HUMAN)

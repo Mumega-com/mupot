@@ -31,6 +31,7 @@
 import type { AuthContext, Capability, ConnectionChannel, Env } from '../types'
 import { hasWorkspaceAdmin, holdsCapabilityFloor, resolveCapabilities } from './capability'
 import { bearerToken, resolveMemberByToken } from './member-bearer'
+import { BoundAgentCheckUnavailableError } from './bound-agent-live'
 
 // A path segment (an id or slug). Deliberately narrow: no '/', no '%', no '.', so an encoded or dotted
 // segment can never be widened into a different route by a router that decodes it.
@@ -137,7 +138,9 @@ export async function resolveBearerReadAuth(env: Env, authorization: string | un
       tokenId: identity.tokenId,
       capabilities,
     }
-  } catch {
+  } catch (err) {
+    // mupot#2345: a failed agent liveness read is the retryable 503 (app.onError), not "no principal" (401).
+    if (err instanceof BoundAgentCheckUnavailableError) throw err
     return null
   }
 }

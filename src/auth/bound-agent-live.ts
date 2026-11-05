@@ -11,7 +11,7 @@
 //   - the member who consented to the weld (AuthContext.consentedByMemberId), when one exists, is
 //     still an active member. Their admin-rank floor is re-derived separately by
 //     resolveConsentedAgentCapabilities on the same request; a weld that fails it never reaches here.
-//   - (#2343) a workspace-style session (no consenter, not a directory session) must still hold at least one
+//   - (#2343) a session with no consenter (#2345: keyed on consent, not channel) must still hold at least one
 //     live capability: a member whose every capability was revoked is demoted, and the agent weld must not keep
 //     reaching 'authenticated'-floor tools on its own. A consented session derives its capabilities separately.
 // A refusal carries one stable code; the caller cannot tell which leg failed. A read that THROWS is not a refusal:
@@ -52,14 +52,16 @@ interface LiveRow {
  */
 export async function boundAgentVerdict(
   env: Pick<Env, 'DB' | 'TENANT_SLUG'>,
-  auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null; channel?: string | null },
+  auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null },
 ): Promise<BoundAgentVerdict> {
   const agentId = auth.boundAgentId
   if (!agentId) return 'live'
   const consenter = auth.consentedByMemberId ?? null
-  // The capability leg applies to a session whose authority IS the member's own grants. Consented / directory sessions
-  // derive theirs through resolveConsentedAgentCapabilities (which already refuses an empty set) and are not re-judged here.
-  const capMember = consenter === null && auth.channel !== 'directory' ? (auth.memberId ?? null) : null
+  // The capability leg applies to a session whose authority IS the member's own grants. A consented session derives
+  // its capabilities through resolveConsentedAgentCapabilities (which already refuses an empty set) and is not re-judged
+  // here. The exemption is keyed on the consenter being PRESENT (mupot#2345), never on the channel label: a directory
+  // session with no consenter has no derived grants to lean on, so it is judged like any workspace session.
+  const capMember = consenter === null ? (auth.memberId ?? null) : null
   try {
     const row = await env.DB.prepare(
       `SELECT a.status AS status, a.owner_member_id AS owner_member_id,
@@ -88,7 +90,7 @@ export async function boundAgentVerdict(
 /** Boolean form: true only on 'live' (a failed read is NOT live). */
 export async function boundAgentIsLive(
   env: Pick<Env, 'DB' | 'TENANT_SLUG'>,
-  auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null; channel?: string | null },
+  auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null },
 ): Promise<boolean> {
   return (await boundAgentVerdict(env, auth)) === 'live'
 }

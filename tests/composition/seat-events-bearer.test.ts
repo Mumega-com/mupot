@@ -16,6 +16,7 @@ beforeAll(async () => {
   await e.DB.exec("INSERT OR IGNORE INTO agents(id,squad_id,slug,name,status) VALUES('agent-a','bs','agent-a','A','active'),('host-a','bs','host-a','H','active')")
   await e.DB.exec("INSERT OR IGNORE INTO members(id,display_name,tenant,status) VALUES('host-m','H','test','active')")
   await e.DB.exec("INSERT OR IGNORE INTO agent_keys(tenant,agent_id,pubkey,algo,member_id,created_at) VALUES('test','host-a','public-fixture','Ed25519','host-m',1)")
+  await e.DB.exec("INSERT OR IGNORE INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('cap-host-m','host-m','squad','bs','member')") // mupot#2345: the host key's member holds a live capability
   await e.DB.exec("INSERT OR IGNORE INTO seat_event_grants(id,tenant,host_agent_id,agent_id,granted_by_member_id,reason,created_at) VALUES('bg','test','host-a','agent-a','host-m','test',datetime('now'))")
   await e.DB.exec("INSERT OR IGNORE INTO agents(id,squad_id,slug,name,status) VALUES('stream-agent','bs','stream-agent','S','active')")
   await e.DB.exec("INSERT OR IGNORE INTO members(id,display_name,tenant,status) VALUES('stream-m','S','test','active')")

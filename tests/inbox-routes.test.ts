@@ -87,6 +87,8 @@ function makeDb(
     return true // no seat predicate in the SQL at all — matches everything (fail-open)
   }
   function runFirst(sql: string, b: unknown[]) {
+    // mupot#2345: the shared bound-agent verdict (signer key's agent is live: active, no owner, a capability).
+    if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
     if (/^\s*SELECT mode, generation, key_fingerprint FROM agent_inbox_fences/.test(sql)) {
       const [tenant, agentId] = b as [string, string]
       return tenant === 't' && signedOnlyAgents.has(agentId)
@@ -156,6 +158,8 @@ function makeDb(
     throw new Error('unhandled first: ' + sql)
   }
   function runAll(sql: string, b: unknown[]) {
+    // mupot#2345: the signer-key agent resolution (id, else unique slug); the fixture's keyed id IS the agents.id.
+    if (sql.includes('NOT EXISTS (SELECT 1 FROM agents WHERE id')) return [{ id: b[0] }]
     if (sql.includes('FROM capabilities') && sql.includes('channel_capability_grants')) {
       const [memberId] = b as [string]
       return capabilityGrants[memberId] ?? []

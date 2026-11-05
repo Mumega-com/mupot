@@ -4,7 +4,7 @@
 // replay protection. Optional: a receipt without a signature is still accepted
 // when the caller is strictly bearer-bound (recordRunner clamps seat identity).
 import type { Env } from '../types'
-import { loadActiveAgentKey } from '../fleet/agent-keys'
+import { loadLiveSignerKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
 import { b64urlToBytes, importEd25519Pub } from '../fleet/signed-detach'
 import type { RunnerStatus } from './types'
@@ -70,7 +70,7 @@ export async function verifyRunnerReceiptSig(
     throw new Error('invalid_signature: signature timestamp out of window')
   }
 
-  const keyRow = await loadActiveAgentKey(env, seatAgentId)
+  const keyRow = await loadLiveSignerKey(env, seatAgentId)
   if (!keyRow || keyRow.algo !== 'Ed25519' || !PUBKEY_B64URL_RE.test(keyRow.pubkey)) {
     throw new Error('invalid_signature: no active Ed25519 key for seat')
   }

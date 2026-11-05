@@ -8251,7 +8251,8 @@ function orientEnvelope(table: object | undefined, w: Whoami | undefined): objec
 function rpcError(id: unknown, code: number, message: string, data?: unknown, status = 200, envelope?: object): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message, data, ...(envelope ?? {}) } }), {
     status,
-    headers: { 'content-type': 'application/json' },
+    // mupot#2345: every 503 here is retryable (the agent liveness read failing is the main one), so say when.
+    headers: status === 503 ? { 'content-type': 'application/json', 'Retry-After': '2' } : { 'content-type': 'application/json' },
   })
 }
 
@@ -9355,7 +9356,7 @@ mcpApp.post('/', async (c) => {
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   }
-  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
 })
 
 // Capability tiers that may ever appear in the PUBLIC (unauthenticated) OpenAPI spec.
@@ -9523,5 +9524,5 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
   }
   const outcome = (await boundAgentRefusal(c.env, auth, c.req.param('tool'))) ?? await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
-  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
 })

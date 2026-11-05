@@ -25,6 +25,7 @@ import {
   type UpdateRoutineInput,
 } from './service'
 import type { Routine } from './types'
+import { BoundAgentCheckUnavailableError } from '../auth/bound-agent-live'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 type JsonObject = Record<string, unknown>
@@ -59,7 +60,9 @@ export const routineAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
       boundAgentId: identity.boundAgentId,
       capabilities,
     })
-  } catch {
+  } catch (err) {
+    // mupot#2345: a failed agent liveness read is the retryable 503 (app.onError), not a 401.
+    if (err instanceof BoundAgentCheckUnavailableError) throw err
     return c.json({ error: 'unauthenticated' }, 401)
   }
   await next()
