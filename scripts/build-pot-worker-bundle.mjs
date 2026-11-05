@@ -8,7 +8,19 @@
 // (explicit `worker_js_code`) AND the first half of option B (CI-published R2 artifact) —
 // both need the SAME built bundle text, this script just produces it.
 //
-//   node scripts/build-pot-worker-bundle.mjs [--outdir <dir>]
+//   node scripts/build-pot-worker-bundle.mjs [--outdir <dir>] [--config <wrangler.toml>]
+//
+// ONLY `--outdir <dir>` and a `--config`/`-c <file>` (or `--config=<file>`) are accepted —
+// ANYTHING else is refused outright, never forwarded. Two reasons this is an allowlist and
+// not "forward everything to wrangler" (which an earlier version of this script did):
+// (1) Kasra-core round-2 finding (2026-09-22): forwarding arbitrary argv to
+// `wrangler deploy --dry-run` means a caller-supplied `--dry-run=false` (or any flag this
+// script doesn't know about) could turn a documented no-network dry-run build into a REAL
+// deploy — exactly the "must not touch live Cloudflare" boundary this script exists to
+// hold. (2) `--config` needed the SAME three-spelling recognition
+// (`scripts/lib/wrangler-config-arg.mjs`) scripts/deploy.mjs uses, so a multi-tenant
+// colony's `-c wrangler.acme.toml` or `--config=wrangler.acme.toml` deploy builds its OWN
+// bundle here too, not the default config's.
 //
 // Prints the built worker.js path to stdout. Uses `wrangler deploy --dry-run --outdir` —
 // dry-run means wrangler builds the bundle and writes it to disk WITHOUT calling the
@@ -32,12 +44,45 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readdirSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { matchConfigFlag } from './lib/wrangler-config-arg.mjs'
 
 const args = process.argv.slice(2)
-const outdirFlagIndex = args.indexOf('--outdir')
-const outdir = outdirFlagIndex >= 0 ? args[outdirFlagIndex + 1] : mkdtempSync(join(tmpdir(), 'mupot-pot-bundle-'))
+let outdir = null
+let configPath = null
+for (let i = 0; i < args.length; i++) {
+  const a = args[i]
+  if (a === '--outdir') {
+    const value = args[i + 1]
+    // mupot#1524 round-2 P2-2: a value that itself starts with `-` is refused as a
+    // likely-missing-value (e.g. `--outdir --x`) rather than accepted as a literal
+    // directory named `--x` — the same discipline `matchConfigFlag` now applies to
+    // `--config`/`-c` (scripts/lib/wrangler-config-arg.mjs), for the same reason: a flag
+    // silently absorbed as another flag's value can turn a documented no-network
+    // dry-run build into something else this script never validated.
+    if (typeof value !== 'string' || value.startsWith('-')) {
+      console.error('✘ --outdir requires a value (got none, or a value starting with "-", which is refused as a likely flag).')
+      process.exit(1)
+    }
+    outdir = value
+    i++
+    continue
+  }
+  const configMatch = matchConfigFlag(args, i)
+  if (configMatch) {
+    configPath = configMatch.value
+    i += configMatch.consumed - 1
+    continue
+  }
+  console.error(
+    `✘ unrecognized argument '${a}' — this script accepts ONLY --outdir <dir> and ` +
+      '--config/-c <file> (or --config=<file>); nothing else is forwarded to wrangler.',
+  )
+  process.exit(1)
+}
+if (!outdir) outdir = mkdtempSync(join(tmpdir(), 'mupot-pot-bundle-'))
+const forwardedArgs = configPath ? ['--config', configPath] : []
 
-const res = spawnSync('npx', ['wrangler', 'deploy', '--dry-run', '--outdir', outdir], { stdio: 'inherit' })
+const res = spawnSync('npx', ['wrangler', 'deploy', '--dry-run', '--outdir', outdir, ...forwardedArgs], { stdio: 'inherit' })
 if (res.status !== 0) {
   console.error('✘ wrangler dry-run build failed — see output above.')
   process.exit(res.status ?? 1)

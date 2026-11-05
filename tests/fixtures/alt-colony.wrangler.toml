@@ -1,0 +1,195 @@
+# mupot — Cloudflare bindings TEMPLATE. For a new isolated pot, run
+# `bash scripts/setup.sh --pot <yourpot>` to create resources, write
+# wrangler.<yourpot>.toml, and apply migrations. The manual path may copy this template,
+# create the resources, and replace the <YOUR_*> placeholders before deployment.
+# This file is the BINDING CONTRACT every component builds against (see src/types.ts Env).
+name = "mupot-alt-fixture-marker"
+main = "../../src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[build]
+command = "node scripts/generate-build-info.mjs"
+
+# ── tenant config (non-secret; secrets via `wrangler secret put`) ──
+[vars]
+TENANT_SLUG = "alt-fixture-marker"
+# OWNER_TENANT_SLUG = "mumega"  # UNCOMMENT only on the operator's own pot deployment —
+                                 # set to the SAME value as TENANT_SLUG above. Gates
+                                 # env-level operator creds (e.g. POSTHOG_*) so they are
+                                 # only ever used on behalf of the owning tenant, never a
+                                 # customer/forked deployment (src/types.ts Env, #473).
+BRAND = "Mumega"                   # dashboard brand
+IDP_PROVIDER = "google"           # google | telegram
+                                  # NOT `OAUTH_PROVIDER` — that binding name is RESERVED by
+                                  # @cloudflare/workers-oauth-provider, which injects its helpers
+                                  # object there only if the slot is empty. A [vars] entry of that
+                                  # name is truthy, so injection is skipped and /authorize throws
+                                  # at runtime while the worker still deploys green. (#699, P0-0;
+                                  # enforced by scripts/reserved-bindings.mjs.)
+# Required for Project Routine dispatch; scheduled work has no request Host to derive safely.
+# Set this to the canonical public origin of this pot before enabling a Routine.
+# PUBLIC_ORIGIN = "https://mupot.example.com"
+FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
+FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
+# REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
+# secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
+# BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
+# routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
+# For a one-time self-hosted first owner without dashboard OAuth, set
+# BOOTSTRAP_OWNER_TOKEN via `bash scripts/secrets.sh --pot <slug> --bootstrap-owner`,
+# deploy, open /auth/bootstrap, then delete that secret. The route is unavailable
+# whenever OAuth is configured; its singleton claim permits only the selected owner.
+# ── secret-env taker: CF Workers Secrets API bootstrap ──
+# Enables approved tenant secret bindings to be pushed to this Worker's CF script.
+# All three absent ⇒ secret-env bind path fails closed (no CF writes).
+#   npx wrangler secret put SECRET_ENV_CF_API_TOKEN   # CF API token (MUST be secret)
+# Optional [vars] (or set all three as secrets if preferred):
+#   SECRET_ENV_CF_ACCOUNT_ID = "<cloudflare-account-id>"
+#   SECRET_ENV_CF_SCRIPT_NAME = "mupot"               # this Worker's script name
+# OAuth 2.1 Google IdP secrets (deploy prerequisites — set before live-flip, Hadi approval required):
+#   npx wrangler secret put GOOGLE_CLIENT_ID          # Google OAuth app client ID
+#   npx wrangler secret put GOOGLE_CLIENT_SECRET      # Google OAuth app client secret
+# Register redirect URIs in Google Cloud Console (TWO flows, two paths — register the one(s) you use):
+#   DASHBOARD LOGIN (operators sign into the pot): https://mupot.mumega.com/auth/callback   ← the seam uses THIS
+#   OAuth2.1 PROVIDER (MCP clients get tokens):     https://mupot.mumega.com/oauth/google-callback
+# (src/auth/index.ts callbackUrl() = <origin>/auth/callback ; src/index.ts mounts /oauth/google-callback)
+
+# ── Workers for Platforms: project sub-worker dispatch (optional) ──
+# When bound, `/preview/:project_id/*` and `https://<project>.mupot.mumega.com`
+# proxy to the project's user Worker. Absent ⇒ fallback preview renderer.
+# [[dispatch_namespaces]]
+# binding = "DISPATCHER"
+# namespace = "mupot-pots"
+
+# ── memory: D1 (relational org + engram metadata) ──
+[[d1_databases]]
+binding = "DB"
+database_name = "mupot"
+database_id = "<YOUR_D1_DATABASE_ID>"
+migrations_dir = "migrations"
+
+# ── memory: Vectorize (semantic recall) ──
+[[vectorize]]
+binding = "VEC"
+index_name = "mupot-memory"
+
+# ── bus: Queues (async events / leads) ──
+[[queues.producers]]
+binding = "BUS"
+queue = "mupot-events"
+
+[[queues.consumers]]
+queue = "mupot-events"
+max_batch_size = 10
+max_retries = 3
+dead_letter_queue = "mupot-events-dlq"
+
+# ── sessions / config cache ──
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "<YOUR_SESSIONS_KV_ID>"
+
+# ── OAuth 2.1 state (clients, grants, tokens) ──
+# Dedicated namespace so OAuth token lifecycle (TTL, rotation, revocation)
+# is isolated from sessions. Used by @cloudflare/workers-oauth-provider.
+# Deploy prerequisite (C8):
+#   npx wrangler kv namespace create OAUTH_KV --account-id <YOUR_CF_ACCOUNT_ID>
+#   then replace the id placeholder below with the output namespace id.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "<YOUR_OAUTH_KV_ID>"
+
+# ── blobs ──
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mupot-blobs"
+
+# ── sovereign-pot worker bundles (mupot#1285/#1516 enablement) ──
+# Optional. `loadPotWorkerBundle` (src/pots/service.ts) checks this FIRST when
+# provisioning a new tenant pot, keyed `${RELEASE_SHA}/worker.js` — written by
+# `npm run deploy` (scripts/deploy.mjs's post-deploy step) via
+# scripts/publish-pot-bundle.mjs. See docs/workflows/tenant-provision.md
+# "Bundle source trade-off" for the full design and the CI publish output
+# contract a caller of the bucket directly (not through those two scripts)
+# must still satisfy. Absent entirely ⇒ provisionSovereignPot falls back to an
+# explicit `worker_js_code` argument, unchanged.
+[[r2_buckets]]
+binding = "POT_WORKER_BUNDLE_BUCKET"
+bucket_name = "mupot-pot-bundles"
+
+# ── Workers AI (embeddings + cheap inference) ──
+[ai]
+binding = "AI"
+
+# ── agent runtime: one Durable Object per agent; one per squad ──
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AgentDO"
+
+[[durable_objects.bindings]]
+name = "SQUAD"
+class_name = "SquadCoordinatorDO"
+
+# Live roster WebSocket channel (ADR #473). Binding is always declared so the
+# DO class can deploy; the feature stays OFF until REALTIME_PRESENCE=1 under [vars].
+[[durable_objects.bindings]]
+name = "PRESENCE_CHANNEL"
+class_name = "PresenceChannelDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PresenceChannelDO"]
+
+# ── durable task pipeline (issue #7) ──
+# Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute
+# path (runTaskExecution) is unaffected.  step.waitForEvent pauses the instance
+# at zero idle cost until the verdict endpoint resumes it.
+[[workflows]]
+name = "mupot-task-workflow"
+binding = "TASK_WORKFLOW"
+class_name = "TaskWorkflow"
+
+# Project Routines and maintenance use separate triggers so their D1/subrequest
+# budgets cannot combine in one invocation. Maintenance jobs remain staggered.
+[triggers]
+crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
+
+# ── GHL act-channel secrets (issue #8) ──
+# These are secrets — do NOT add them under [vars]. Set via wrangler secret put:
+#
+#   npx wrangler secret put CURSOR_API_TOKEN     # Cursor Cloud Agents API key (optional SaaS engine)
+#   npx wrangler secret put GHL_API_KEY          # GHL location API key (outbound sends)
+#   npx wrangler secret put GHL_LOCATION_ID      # GHL location id (scopes all API calls)
+#   npx wrangler secret put GHL_WEBHOOK_SECRET   # HMAC-SHA256 secret for inbound webhook
+#
+# Optional var (non-secret; may go in [vars]):
+#   GHL_INBOUND_SQUAD_ID = "<squad-uuid>"  # route inbound webhooks to this squad
+#                                           # (falls back to the pot's first squad if unset)
+#
+# Until these secrets are set the GHL channel is inert (fails closed):
+#   - Outbound sends return { ok: false, reason: 'not_configured' }
+#   - Inbound webhook returns 503 { error: 'not_configured' }
+
+# ── Hermes push delivery (mumega-com#970) — bus consumer's outbound leg for
+# message.created (and future) events. Same shared secret as the Telegram bridge's
+# opt-in webhook path (src/telegram-bridge/bus_notify.ts) — one secret, two callers,
+# see src/types.ts Env comment on HERMES_WEBHOOK_SECRET.
+#
+#   npx wrangler secret put HERMES_WEBHOOK_SECRET   # HMAC-SHA256 signing secret —
+#                                                     # SAME value as HERMES_R6_WEBHOOK_SECRET
+#                                                     # in the Hermes .env
+#
+# Non-secret (goes in [vars]):
+#   HERMES_EVENTS_WEBHOOK_URL = "https://hermes-kay.mumega.com/webhooks/mupot-events"
+#
+# Until BOTH are set, src/bus/hermes-delivery.ts returns { kind: 'not_configured' } and the
+# consumer acks without attempting delivery — never a silent fallback, never a retry storm
+# for a knob that is deliberately off. Once both are set but the Hermes-side route is not
+# yet registered, delivery attempts 404 loudly and retry per the Queue's DLQ policy above —
+# that is expected today; registering the route is Hermes-lane, host-side work, not this
+# repo's.
