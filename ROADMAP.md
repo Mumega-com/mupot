@@ -865,8 +865,9 @@ Release contract (done-when). `v0.32.0` is stable only when all seven hold:
 Onboarding-door items merged to `main` toward this release (merged, not released; not a
 stable verdict): `whoami` (#2031 and the whoami lane), seat attach with designation
 (#2042), per-chat binding and attach code (#2055, #2057), and the VIP lane / `join_squad`
-(#2059, #2062, #2063, #2064, #2065). Open follow-ups: #2051, #2053, #2056, #2060, #2061,
-#2069.
+(#2059, #2062, #2063, #2064, #2065). Remaining follow-ups (the merged parts above are
+not open; #2056 and #2060 still have remaining items): #2051, #2053, #2056, #2060,
+#2061, #2069.
 
 Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
 met by the frozen SHA, not by the existence of those PRs.
