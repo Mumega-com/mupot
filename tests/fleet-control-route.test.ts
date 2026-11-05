@@ -23,6 +23,8 @@ function makeDb(opts: { tokens: Record<string, TokenRow>; caps: Record<string, G
   const log: unknown[][] = []
   let seq = 0
   function first(sql: string, b: unknown[]) {
+    // mupot#2343: the bound-agent live check (src/auth/bound-agent-live.ts) is one extra read; this fixture's agents are live.
+    if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
     if (sql.includes('FROM member_tokens t')) {
       const [hash] = b as [string]
       return opts.tokens[hash] ?? null

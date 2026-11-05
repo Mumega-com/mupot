@@ -57,6 +57,7 @@ describe('mupot#1494 round 3 (P1-iii) — operator-stopped poll row must not rou
       INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Round3 Member', 'active', '${TENANT}');
       INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', datetime('now'));
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-round3', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
       INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
         VALUES ('token-round3', '${MEMBER_ID}', '${tokenHash}', 'round3', 'workspace', datetime('now'), '${AGENT_ID}', '${TENANT}', '2099-01-01T00:00:00.000Z');
     `)

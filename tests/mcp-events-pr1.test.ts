@@ -562,6 +562,8 @@ describe('message.created read instruction is TRUE end to end (real SQL)', () =>
     expect(got.map((m) => m.id)).not.toContain(foreign.id)
     expect(got).toEqual([])
     // and the mirror: agent-b's own token does see it, proving the row is really there
+    // mupot#2343: a welded session needs at least one live capability to reach inbox at all.
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-b-2343', 'member-agent-b', 'org', NULL, 'observer')`)
     const own = await inboxAsCatalogueSays(readAfterSeq(foreign.seq), 'bound-nogrants')
     expect(own.map((m) => m.id)).toEqual([foreign.id])
   })

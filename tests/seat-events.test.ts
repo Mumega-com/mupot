@@ -773,6 +773,7 @@ describe('dual-consumer conflict (one consumer per UUID)', () => {
     const raw = 'seat-one-token'
     w.h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${A1}', 'seat1-m', datetime('now'))`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-fence-1', 'seat1-m', 'squad', 's1', 'member')`) // #2343: a welded REST bearer must hold a live capability
     w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id)
       VALUES ('tok1', 'seat1-m', '${await hashMemberToken(raw)}', '', 'workspace', datetime('now'), '${TENANT}', '${A1}')`)
     const hub = hubFor(w)
@@ -1200,6 +1201,7 @@ describe('Herdr fence parity (P2-1)', () => {
     const raw = 'seat-two-token'
     w.h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${A1}', 'seat1-m', datetime('now'))`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-fence-2', 'seat1-m', 'squad', 's1', 'member')`) // #2343: a welded REST bearer must hold a live capability
     w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id)
       VALUES ('tok-fence', 'seat1-m', '${await hashMemberToken(raw)}', '', 'workspace', datetime('now'), '${TENANT}', '${A1}')`)
     await grant(w, HOST1, A1)
@@ -1225,6 +1227,7 @@ describe('Herdr fence fails CLOSED on a D1 error (P2-B)', () => {
     const raw = 'seat-fence-b-token'
     w.h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
       VALUES ('${TENANT}', '${A1}', 'seat1-m', datetime('now'))`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-fence-3', 'seat1-m', 'squad', 's1', 'member')`) // #2343: a welded REST bearer must hold a live capability
     w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id)
       VALUES ('tok-fence-b', 'seat1-m', '${await hashMemberToken(raw)}', '', 'workspace', datetime('now'), '${TENANT}', '${A1}')`)
     await grant(w, HOST1, A1)

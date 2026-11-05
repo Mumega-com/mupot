@@ -69,6 +69,8 @@ function makeEnv(opts: Opts = {}): Env {
           return { success: true, meta: { changes: 1 } }
         },
         async first() {
+          // mupot#2343: the bound-agent live check is one extra read; this fixture's agent is live.
+          if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
           if (isLiveBoundAgentSql(sql)) return LIVE_BOUND_AGENT_ROW
           if (sql.includes('FROM member_tokens')) {
             return {

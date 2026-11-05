@@ -49,6 +49,8 @@ function makeDb(opts: {
   const meta = { pruneCutoff: -1 }            // last DELETE cutoff (for the retention assertion)
 
   function first(sql: string, b: unknown[]) {
+    // mupot#2343: the bound-agent live check (src/auth/bound-agent-live.ts) is one extra read; this fixture's agents are live.
+    if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
     if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
       const row = keys[`${b[0]}:${b[1]}`]
       if (!row?.member_id || memberStatuses[row.member_id] === 'inactive') return null

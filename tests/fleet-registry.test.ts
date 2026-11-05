@@ -21,6 +21,8 @@ interface CapRow { member_id: string; scope_type: string; scope_id: string | nul
 function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapRow[]> = {}, keyedAgents: string[] = []) {
   const fleet = new Map<string, FleetRow>()
   function first(sql: string, b: unknown[]) {
+    // mupot#2343: the bound-agent live check (src/auth/bound-agent-live.ts) is one extra read; this fixture's agents are live.
+    if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
     // member_id existence check added in 0039 — no members seeded in this fixture, always null
     if (sql.includes('FROM members WHERE id')) return null

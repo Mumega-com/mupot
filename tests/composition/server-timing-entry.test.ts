@@ -34,6 +34,8 @@ beforeAll(async () => {
   await db.exec("INSERT OR IGNORE INTO agents (id, squad_id, slug, name) VALUES ('ag-hidden', 'sq-b', 'hidden-target', 'Hidden')")
   await db.exec("INSERT OR IGNORE INTO members (id, email, display_name, status, tenant) VALUES ('m2', 'm2@example.test', 'M2', 'active', 'mumega')")
   await db.exec("INSERT OR IGNORE INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('mumega', 'ag-send', 'm2', datetime('now'))")
+  // mupot#2343: a welded session must hold at least one live capability (a non-admin squad member, so the oracle stays non-admin).
+  await db.exec("INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-m2', 'm2', 'squad', 'sq-a', 'member')")
   await db.exec(`INSERT OR IGNORE INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('t2', 'm2', '${await sha256Hex(SENDER_TOKEN)}', 'x', 'workspace', datetime('now'), 'ag-send', 'mumega')`)
 }, 120_000)
 

@@ -170,6 +170,17 @@ describe('2025-11-25: -32042 URLElicitationRequiredError', () => {
     expect(count('seed_attach_requests')).toBe(1)
   })
 
+  it('#2343 ordering: an agent the live check refuses gets the refusal, never an elicitation, and no moment is minted', async () => {
+    const env = makeEnv()
+    const sid = await initWithUrl(env)
+    harness.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'mem-1'`) // demoted: zero capabilities, token still live
+    const r = await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs() }, { headers: sh(sid ?? '') })
+    expect(r.json.error?.code).not.toBe(-32042)
+    expect(r.text).toContain('agent_not_authorized')
+    expect(momentRows()).toHaveLength(0)
+    expect(count('seed_attach_requests')).toBe(0)
+  })
+
   it('the same for request_elevation (one elevation request, one moment)', async () => {
     const env = makeEnv()
     await checkIn(env)

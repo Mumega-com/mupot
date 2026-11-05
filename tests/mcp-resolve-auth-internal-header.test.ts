@@ -89,6 +89,10 @@ function seedMemberToken(
          VALUES (?, ?, ?, datetime('now'))`,
       )
       .run(opts.tenant, opts.boundAgentId, opts.memberId)
+    // mupot#2343: a welded session must hold at least one live capability (the demoted-member refusal).
+    sqlite
+      .prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'member')`)
+      .run(`cap-${opts.memberId}`, opts.memberId)
   }
   sqlite
     .prepare(

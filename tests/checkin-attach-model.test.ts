@@ -30,6 +30,7 @@ describe('lane A: runtime=pi + model on /attach (real D1)', () => {
         ('a-loom', 'squad-core', 'loom', 'Loom', 'weaver', 'old-model', 'active', datetime('now'));
       INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
         ('saas-test', 'a-loom', 'm1', datetime('now'));
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-m1', 'm1', 'squad', 'squad-core', 'member');
       INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at) VALUES
         ('t1', 'm1', 'saas-test', '${h}', 'a-loom', 'test', 'workspace', datetime('now'));
     `)

@@ -14,6 +14,7 @@ beforeEach(async () => {
     INSERT INTO agents(id,squad_id,slug,name,status) VALUES('pa','ps','pa','P','active');
     INSERT INTO members(id,display_name,tenant,status) VALUES('pm','P','test','active');
     INSERT INTO agent_member_bindings VALUES('test','pa','pm',datetime('now'));
+    INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('pcap','pm','squad','ps','member');
     INSERT INTO member_tokens(id,member_id,agent_id,tenant,token_hash,label,channel) VALUES('pt','pm','pa','test','${await hashMemberToken('secret-test-token')}','seat-one','workspace');`)
   env = { DB: h.db, TENANT_SLUG: 'test', INBOX_STREAM_PUSH: '1', REALTIME_SEAT_EVENTS: '1', SEAT_EVENTS: {
     idFromName: (n: string) => n,
