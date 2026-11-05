@@ -4,6 +4,7 @@ import type { CapabilityGrant, Env } from '../src/types'
 import { resolveAgentTokenExpiry } from '../src/auth/token-lifecycle'
 import { discardCredentialClaim } from '../src/auth/credential-claim'
 import { mcpRequest } from './helpers/mcp-call'
+import { LIVE_BOUND_AGENT_ROW, isLiveBoundAgentSql } from './helpers/live-agent-row'
 
 // mupot#682 — list_agent_tokens / revoke_agent_token.
 //
@@ -68,6 +69,7 @@ function makeEnv(opts: Opts = {}): Env {
         sql,
         args,
         async first() {
+          if (isLiveBoundAgentSql(sql)) return LIVE_BOUND_AGENT_ROW
           // ORDER MATTERS. revoke's ownership lookup is matched FIRST by its distinctive
           // projection; every other member_tokens read is the authn lookup. Getting this
           // backwards makes the mock swallow authentication and every test 401s before

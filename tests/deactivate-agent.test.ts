@@ -3,6 +3,7 @@ import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
 import { withoutSeat } from './helpers/without-seat'
+import { LIVE_BOUND_AGENT_ROW, isLiveBoundAgentSql } from './helpers/live-agent-row'
 
 // deactivate_agent is the inverse of create_agent: a gated, auditable way to retire a
 // dead/junk agent (or a duplicate identity) without a raw-D1 hand-edit. These tests
@@ -60,6 +61,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
           sql,
           args,
           async first() {
+            if (isLiveBoundAgentSql(sql)) return LIVE_BOUND_AGENT_ROW
             if (sql.includes('FROM member_tokens') && sql.includes('JOIN members')) {
               return {
                 member_id: memberId,

@@ -5,6 +5,7 @@ import { callerCanGrantAgentCapability, PROVISION_TOOLS } from '../src/mcp/provi
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
 import { mcpRequest } from './helpers/mcp-call'
 import { withoutSeat } from './helpers/without-seat'
+import { LIVE_BOUND_AGENT_ROW, isLiveBoundAgentSql } from './helpers/live-agent-row'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
 // org-builder surface. These tests drive them through the JSON-RPC seam (tools/call) the
@@ -69,6 +70,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
         // .first() serves the member_tokens authn lookup and every WHERE-id resolve
         // (ids are globally unique). Slug resolves go through .all() (count matches).
         async first() {
+          if (isLiveBoundAgentSql(sql)) return LIVE_BOUND_AGENT_ROW
           if (sql.includes('LEFT JOIN agent_member_bindings')) {
             return {
               home_squad_id: AGENT.squad_id,
