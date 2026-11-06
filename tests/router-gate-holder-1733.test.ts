@@ -98,11 +98,13 @@ describe('router_tick gate-holder hold (#1733)', () => {
     expect(r.decisions).toEqual([])
   })
 
-  it('sole live agent is the only holder: scanned, then held with reason (precise per-candidate check)', async () => {
+  it('sole eligible agent is the only holder: scanned, then held with reason (precise per-candidate check)', async () => {
     seed('gate:gater')
     agentHolder()
-    // the gate agent is also the only live agent; the worker presence is removed
-    h.sqlite.exec(`DELETE FROM presence WHERE agent_id = '${WORKER}';
+    // The worker is operator-paused; removing legacy presence alone no longer disables in-Worker execution.
+    h.sqlite.exec(`INSERT INTO execution_pauses(id,tenant,scope_type,scope_id,reason,paused_by_member_id,paused_at)
+      VALUES('pause-worker','${TENANT}','agent','${WORKER}','test','${OPERATOR}',datetime('now'));
+      DELETE FROM presence WHERE agent_id = '${WORKER}';
       INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at)
       VALUES ('${TENANT}', 'seat-g', 'G', 'test', 'seat-g', '${GATE_AGENT}', datetime('now'), datetime('now'));`)
     const r = await tick()

@@ -1,7 +1,7 @@
 import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { enqueueAssignmentWake } from '../agents/assignment-wake'
 import { createBus } from '../bus'
-import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { independentGateHolderExistsSql } from '../tasks/runtime-receipts'
@@ -9,6 +9,7 @@ import type { BusEvent, Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { executionPausedSql } from '../agents/execution-brakes'
 import { safeConsole } from '../lib/log'
+import { assignmentLivenessProofSql, agentLiveness } from '../agents/liveness'
 import { assignmentEligibilitySql, isAssignmentEligible } from '../tasks/assignment-eligibility'
 
 export interface RouterTickInput {
@@ -115,6 +116,7 @@ export async function runRouterTick(
   const decisions: RouterTickResult['decisions'] = []
   let assigned = 0
   let unrouted = 0
+  let livePool: RouterAgentRow[] | undefined
 
   for (const task of tasks.results ?? []) {
     if (task.project_routable !== 1) {
@@ -127,22 +129,17 @@ export async function runRouterTick(
     // gate's holders; a gate held only by the lowest-id agent must not strand the task when
     // another live agent could take it. Hold only if none passes. null / self-completion
     // gates claim no independent holder, so the first live agent is taken as before.
-    const candidates = await env.DB.prepare(
-      `SELECT DISTINCT a.id
-         FROM agents a
-         JOIN presence p
-           ON p.agent_id = a.id
-          AND p.tenant = ?1
-        WHERE a.squad_id = ?2
-          AND a.status = 'active'
-          AND p.last_seen_at >= datetime('now', '-10 minutes')
-          -- Loop brake (migration 0203): a paused agent/squad is never a routing candidate, so neither a
-          -- dry run nor a live tick plans or makes an assignment the executor would only refuse.
-          AND NOT ${executionPausedSql('a.id')}
-        ORDER BY a.id ASC
-        LIMIT 50`,
-    ).bind(decision.tenant, squadId).all<RouterAgentRow>()
-    const live = candidates.results ?? []
+    if (!livePool) {
+      const candidates = await env.DB.prepare(
+        `SELECT a.id FROM agents a WHERE a.squad_id = ?1 AND a.status = 'active'
+          AND NOT ${executionPausedSql('a.id')} ORDER BY a.id ASC`,
+      ).bind(squadId).all<RouterAgentRow>()
+      const rows = candidates.results ?? []
+      const states = await agentLiveness(env, rows.map(agent => agent.id))
+      // Apply liveness before the candidate cap so dead rows cannot starve later eligible IDs.
+      livePool = rows.filter(agent => states.get(agent.id)?.assignmentEligible === true).slice(0,50)
+    }
+    const live = livePool
 
     if (live.length === 0) {
       unrouted += 1
@@ -212,12 +209,8 @@ export async function runRouterTick(
           AND EXISTS (
             SELECT 1
               FROM agents a
-              JOIN presence presence_now
-                ON presence_now.agent_id = a.id
-               AND presence_now.tenant = ?5
              WHERE a.id = ?1
                AND a.squad_id = ?4
-               AND presence_now.last_seen_at >= datetime('now', '-10 minutes')
           )
           AND ${assignmentEligibilitySql({
             agentIdExpr: '?1', gateOwnerExpr: 'tasks.gate_owner', squadIdExpr: 'tasks.squad_id',
@@ -236,8 +229,9 @@ export async function runRouterTick(
                  AND project_now.status = 'active'
             )
           )
+          AND ${assignmentLivenessProofSql(env,{tenant:'?5',agentId:'?1',now:'?7'})}
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId, nowCapabilitySql()).run()
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId, now).run()
 
     if (claim.meta.changes !== 1) {
       decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })

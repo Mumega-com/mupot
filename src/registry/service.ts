@@ -34,6 +34,7 @@ export function isModuleKind(v: unknown): v is ModuleKind {
 // place that defines what "stale" means for presence. 120s: comfortably wider than a
 // typical heartbeat cadence (the design doc's "every N seconds") without letting a
 // dead module linger "online" for long.
+// This is a roster/display window; routing uses agents/liveness and does not treat this clock as execution eligibility.
 export const PRESENCE_STALE_SECONDS = 120
 
 /**
@@ -119,6 +120,8 @@ export interface ModulePresence {
   project_id: string | null
   identity: string
   status: ModuleStatus
+  /** Stored registration intent; unlike status this does not decay with a display TTL. */
+  reported_status?: ModuleStatus
   capabilities: string[]
   model?: string | null
   last_heartbeat: string
@@ -249,6 +252,7 @@ function hydrate(row: ModuleRegistryRow, nowMs: number): ModulePresence | null {
     project_id: row.project_id,
     identity: row.identity,
     status,
+    reported_status: row.status === 'offline' ? 'offline' : 'online',
     capabilities: parseCapabilities(row.capabilities),
     model: row.model ?? null,
     last_heartbeat: row.last_heartbeat,

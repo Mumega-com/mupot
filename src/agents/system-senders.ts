@@ -26,6 +26,7 @@ export const WAKE_ROUTER_SENDER = 'mupot-wake-router'
 export const ASSIGNMENT_WAKE_SENDER = 'mupot-assignment-wake'
 // One-time welcome after a human claims an agent (src/members/claim-welcome.ts). Informational: the response is the agent's own next steps.
 export const ONBOARDING_SENDER = 'mupot-onboarding'
+export const TASK_RECLAIM_SENDER = 'mupot-task-reclaim'
 
 /** Response tool per system sender; null = informational, nothing to answer. */
 export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.freeze({
@@ -39,6 +40,7 @@ export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.fr
   [WAKE_ROUTER_SENDER]: null,
   [ASSIGNMENT_WAKE_SENDER]: null,
   [ONBOARDING_SENDER]: null,
+  [TASK_RECLAIM_SENDER]: null,
 })
 
 export function isSystemSender(ref: unknown): ref is string {

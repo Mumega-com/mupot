@@ -1,5 +1,6 @@
 import { executionPausedSql } from '../agents/execution-brake-sql'
 import { nowSqlUtc } from '../auth/token-lifecycle'
+import { receiverNotStoppedSql } from '../fleet/registry'
 import type { Env } from '../types'
 import { independentGateHolderExistsSql } from './runtime-receipts'
 
@@ -22,6 +23,7 @@ export function assignmentEligibilitySql(p: AssignmentEligibilitySql): string {
        WHERE assignment_agent.id = ${p.agentIdExpr}
          AND assignment_agent.status = 'active'
          AND NOT ${executionPausedSql('assignment_agent.id')}
+         AND ${receiverNotStoppedSql(p.tenantParam, 'assignment_agent.id')}
     )
     AND (
       ${p.gateOwnerExpr} IS NULL

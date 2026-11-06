@@ -310,13 +310,6 @@ describe('router_tick authorization and squad fencing', () => {
     ['candidate became inactive', () => {
       harness.sqlite.prepare('UPDATE agents SET status = ? WHERE id = ?').run('paused', AGENT_A)
     }],
-    ['candidate presence became stale', () => {
-      harness.sqlite.prepare('UPDATE presence SET last_seen_at = ? WHERE agent_id = ?')
-        .run('2020-01-01T00:00:00.000Z', AGENT_A)
-    }],
-    ['candidate presence was removed', () => {
-      harness.sqlite.prepare('DELETE FROM presence WHERE agent_id = ?').run(AGENT_A)
-    }],
   ])('does not claim after selection when %s', async (_name, interleave) => {
     insertTask(harness.sqlite, 'task-a', SQUAD_A)
     const { env, events } = makeEnv(harness, { beforeClaim: interleave })
@@ -332,6 +325,17 @@ describe('router_tick authorization and squad fencing', () => {
     expect(events).toHaveLength(0)
     expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a'))
       .toEqual({ assignee_agent_id: null })
+  })
+
+  it.each(['stale','removed'])('claim refuses when its only fresh presence becomes %s', async mode => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env } = makeEnv(harness, { beforeClaim: () => {
+      if (mode === 'stale') harness.sqlite.prepare('UPDATE presence SET last_seen_at = ? WHERE agent_id = ?').run('2020-01-01T00:00:00Z', AGENT_A)
+      else harness.sqlite.prepare('DELETE FROM presence WHERE agent_id = ?').run(AGENT_A)
+    } })
+    const result = await routerTick(auth('lead-a',[grant('lead-a','lead',SQUAD_A)]),env,{squad_id:SQUAD_A,dry_run:false})
+    expect(result).toMatchObject({ok:true,result:{assigned:0}})
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id=?').get('task-a')).toEqual({assignee_agent_id:null})
   })
 
   it.each([

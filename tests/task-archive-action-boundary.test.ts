@@ -449,11 +449,11 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     seedTask('t-race', 'open')
     const decision = { ok: true as const, tenant: TENANT, squadId: SQUAD, agentId: null, source: 'principal' as const }
     // Archive lands between the candidate SELECT and the claim UPDATE: a bus emit is the only seam, so
-    // archive from the presence read the engine does after scanning.
+    // archive from the liveness read the engine does after scanning (#2354 replaced the presence read).
     const realPrepare = h.db.prepare.bind(h.db)
     let armed = true
     h.db.prepare = ((sql: string) => {
-      if (armed && sql.includes('SELECT DISTINCT a.id')) {
+      if (armed && sql.includes('WITH liveness_facts AS')) {
         armed = false
         archive('t-race')
       }

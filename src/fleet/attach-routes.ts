@@ -76,12 +76,13 @@ async function upsertRunning(
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
-           status, reported_by, agent_type, member_id, host, model, runtime_canonical, last_reported_at, updated_at)
-     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))
+           status, reported_by, agent_type, member_id, host, model, runtime_canonical, connection_kind, last_reported_at, updated_at)
+     VALUES (?1, ?2, '', ?3, '[]', ?4, NULL, 'running', ?5, ?6, ?7, ?8, ?9, ?10, 'fleet_attach', datetime('now'), datetime('now'))
      ON CONFLICT(tenant, agent_id) DO UPDATE SET
           runtime          = excluded.runtime,
           runtime_canonical = excluded.runtime_canonical,
           lifecycle        = excluded.lifecycle,
+          connection_kind  = 'fleet_attach',
           status           = 'running',
           reported_by      = excluded.reported_by,
           agent_type       = excluded.agent_type,
