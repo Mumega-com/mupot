@@ -1,7 +1,7 @@
 import { canOnSquadAuth, hasCapability, loadSquadScope, resolveCapabilities } from '../auth/capability'
 import { resolveActiveAgentMember } from '../members/service'
 import { actorOf, relaxes } from '../policy/bar'
-import type { Agent, AuthContext, Env } from '../types'
+import type { Agent, AuthContext, Env, Task } from '../types'
 
 /**
  * Security Bar context for an assignment (rules task.assign.*). Pass it from a caller that has an authenticated
@@ -20,6 +20,22 @@ export interface AssignBar {
 export interface AssigneeResult {
   value: string | null
   error?: 'invalid_assignee' | 'assignee_not_in_squad'
+}
+
+type GateAssigneeState = Pick<Task, 'gate_owner' | 'assignee_agent_id' | 'assignee_member_id'>
+
+/** Shared MCP/REST boundary; both current and resulting ownership count. */
+export function assigneeChangesOwnGate(
+  auth: Pick<AuthContext, 'boundAgentId' | 'memberId'>,
+  existing: GateAssigneeState,
+  next: GateAssigneeState,
+): boolean {
+  if (next.gate_owner === existing.gate_owner) return false
+  const agentIsAssignee = !!auth.boundAgentId &&
+    (existing.assignee_agent_id === auth.boundAgentId || next.assignee_agent_id === auth.boundAgentId)
+  const memberIsAssignee = !!auth.memberId &&
+    (existing.assignee_member_id === auth.memberId || next.assignee_member_id === auth.memberId)
+  return agentIsAssignee || memberIsAssignee
 }
 
 /** Resolve whether an agent is currently assignable on a task's squad. */

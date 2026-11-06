@@ -481,13 +481,13 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       h.sqlite.prepare(
         `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at)
          VALUES (?, ?, 'proj-c', 'Old archived work', 'done', 'open', ?, ?)`,
-      ).run(`c-dead-${i}`, SQUAD, `2020-01-0${i + 1}T00:00:00.000Z`, `2020-01-0${i + 1}T00:00:00.000Z`)
+      ).run(`c-dead-${i}`, SQUAD, new Date(Date.now()-2*86400000+i*1000).toISOString(), new Date(Date.now()-2*86400000+i*1000).toISOString())
       archive(`c-dead-${i}`)
     }
     h.sqlite.prepare(
       `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at)
-       VALUES ('c-live', ?, 'proj-c', 'Live work', 'done', 'open', '2021-01-01T00:00:00.000Z', '2021-01-01T00:00:00.000Z')`,
-    ).run(SQUAD)
+       VALUES ('c-live', ?, 'proj-c', 'Live work', 'done', 'open', ?, ?)`,
+    ).run(SQUAD, new Date(Date.now()-86400000).toISOString(), new Date(Date.now()-86400000).toISOString())
     const reg = await registerModule(env, {
       identity: WORKER, kind: 'agent_system', adapter: 'cursor', projectId: null, capabilities: [BUILD_CAPABILITY],
     })

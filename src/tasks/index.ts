@@ -36,7 +36,7 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 import { flightChildBlockedNextStep } from '../flight/child-disposition'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertIntakeWithBar, checkTransitionWithBar, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
-import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
+import { resolveTaskAssignee, resolveTaskAssigneeMember, assigneeChangesOwnGate } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskEvidence } from './evidence'
 import { actorOf } from '../policy/bar'
@@ -1182,6 +1182,11 @@ tasksApp.patch('/:id', async (c) => {
       next.gate_owner = trimmed
     } else {
       return c.json({ error: 'invalid_gate_owner' }, 400)
+    }
+    if (assigneeChangesOwnGate(c.get('auth'), existing, next) &&
+      !(await canActOnSquad(c.env, c.get('auth'), existing.squad_id, 'lead'))) {
+      return c.json({ error: 'gate_owner_assignee_requires_lead', need: 'lead', scope: 'squad',
+        next_step: 'Ask a lead or admin of this task squad to select the review gate.' }, 403)
     }
   }
   if (body.project_id !== undefined) {

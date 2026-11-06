@@ -52,6 +52,7 @@ import { resolveTaskAssignee } from '../tasks/assignee'
 import { assignmentEligibilitySql, getAssignmentEligibleAgentIds } from '../tasks/assignment-eligibility'
 import { independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import { nowSqlUtc } from '../auth/token-lifecycle'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import {
   classifyTaskRoleEffort,
   routeByEffort,
@@ -75,6 +76,23 @@ export const BUILD_CAPABILITY = 'build'
 // authority; the assignee still builds on a branch and the gate-driver reviews.
 export const MAX_ROUTES_PER_TICK = 5
 export const MAX_ROUTES_PER_AGENT = 2
+/** Automatic routing only. Recent automation/notes must not revive an old card. */
+export const STALE_ROUTE_DAYS = 30
+
+/** UUID shape emitted by steward-worker.py; the marker must occupy a complete line. */
+const STEWARD_REISSUE_UUID_GLOB = [8, 4, 4, 4, 12].map(size => '[0-9A-Fa-f]'.repeat(size)).join('-')
+
+/** Trusted SQL parameter only; shared by window selection and the claim fence. */
+export function conciergeRouteEligibilitySql(cutoffParam: string): string {
+  return `(
+    COALESCE(julianday(tasks.created_at) >= julianday(${cutoffParam}), 0)
+    AND instr(COALESCE(tasks.result, ''), 'artifact_verification_failed') <> 1
+    AND (char(10) || COALESCE(tasks.body, '') || char(10)) NOT GLOB
+      ('*' || char(10) || 'steward-reissue-of:${STEWARD_REISSUE_UUID_GLOB}' || char(10) || '*')
+  )`
+}
+
+export type ConciergeSkipReason = 'stale_excluded' | 'starter_no_operator'
 
 /** Capabilities the concierge itself registers under. It is a dispatcher, never a
  * build target — CONCIERGE_IDENTITY_PREFIX + BUILD_CAPABILITY exclusion below is
@@ -109,9 +127,7 @@ export const CONCIERGE_STARTER_MARKER = '[concierge-starter]'
 /** Cap on projects driven per cron tick — mirrors loops/driver.ts's MAX_LOOPS_PER_TICK. */
 export const MAX_PROJECTS_PER_TICK = 25
 
-/** Fallback squad for a project that has no squad holding write/admin access yet.
- * Named per house style (single place defining the default). Mirrors the existing
- * 'squad-core' convention (src/channels/admin.ts's inbound-task default). */
+/** Legacy export for callers; automatic starters no longer invent an owning squad. */
 export const DEFAULT_DISPATCH_SQUAD_ID = 'squad-core'
 
 export function conciergeIdentity(projectId: string): string {
@@ -123,13 +139,14 @@ export type ConciergeNoopReason =
   | 'no_online_builder' // no roster entry is online with BUILD_CAPABILITY and resolves to a real active agent
   | 'has_advancing_work' // an open/in_progress/review/blocked task already exists for this project
   | 'already_dispatched' // a concierge starter for this project already exists in ANY status (dispatch-once-ever), or a concurrent tick just created one (migration 0067 unique-index race loss)
+  | ConciergeSkipReason
   | 'error' // a read seam (roster / dedup check) failed; fail-closed to no-op, never dispatch on uncertain state
 
 export type ConciergeDecision =
   | { action: 'dispatch'; agentId: string }
   // work-router: a BUSY project (has advancing work) with SITTING unassigned-open
   // tasks got `routed` of them assigned to online build agents this tick.
-  | { action: 'route'; routed: number }
+  | { action: 'route'; routed: number; skipReasons?: ConciergeSkipReason[] }
   | { action: 'noop'; reason: ConciergeNoopReason }
 
 export interface ConciergeCycleResult {
@@ -204,15 +221,35 @@ function isConciergeStarterUniqueViolation(error: unknown): boolean {
   )
 }
 
-async function defaultResolveDispatchSquad(env: Env, projectId: string): Promise<string> {
+async function defaultResolveDispatchSquad(env: Env, projectId: string): Promise<string | null> {
   const row = await env.DB.prepare(
-    `SELECT squad_id FROM project_squad_access
-      WHERE project_id = ?1 AND access_level IN ('write', 'admin')
-      ORDER BY squad_id LIMIT 1`,
-  )
-    .bind(projectId)
-    .first<{ squad_id: string }>()
-  return row?.squad_id ?? DEFAULT_DISPATCH_SQUAD_ID
+    `SELECT COALESCE(p.assigned_squad_id,
+       (SELECT a.squad_id FROM project_squad_access a WHERE a.project_id = p.id
+          AND a.access_level IN ('write', 'admin') ORDER BY a.squad_id LIMIT 1)) AS squad_id
+       FROM projects p WHERE p.id = ?1`,
+  ).bind(projectId).first<{ squad_id: string | null }>()
+  return row?.squad_id ?? null
+}
+
+/** Project-local membership, not a shared builder's broad cross-squad capability. */
+async function starterMemberIds(env: Env, squadId: string, candidates: readonly string[]): Promise<Set<string>> {
+  const rows = await env.DB.prepare(`SELECT a.id FROM agents a WHERE a.id IN (SELECT value FROM json_each(?1))
+    AND (a.squad_id = ?2 OR EXISTS (SELECT 1 FROM memberships sm
+      WHERE sm.agent_id = a.id AND sm.squad_id = ?2 AND sm.capability IN ('member','lead','admin','owner')
+        AND ${CAPABILITY_LIVE_PREDICATE('sm', '?3')}))`)
+    .bind(JSON.stringify(candidates), squadId, nowSqlUtc()).all<{id:string}>()
+  return new Set((rows.results ?? []).map(row => row.id))
+}
+
+/** Existence only: a skip reason, never an unbounded count of old cards. */
+async function hasStaleRouteWork(env: Env, projectId: string, cutoff: string, taskId?: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 FROM tasks
+    WHERE project_id = ?1 AND status = 'open' AND assignee_agent_id IS NULL AND assignee_member_id IS NULL
+      AND source_pot IS NULL AND external_source IS NULL AND ${TASK_NOT_ARCHIVED_SQL()}
+      AND NOT ${conciergeRouteEligibilitySql('?2')}
+      ${taskId ? 'AND id = ?3' : ''} LIMIT 1`)
+    .bind(projectId, cutoff, ...(taskId ? [taskId] : [])).first()
+  return row !== null
 }
 
 const defaultListProjects = (env: Env): Promise<Project[]> => listProjects(env, { status: 'active' })
@@ -227,7 +264,7 @@ export interface ConciergeDeps {
   hasAdvancingTask?: (env: Env, projectId: string) => Promise<boolean>
   hasConciergeStarter?: (env: Env, projectId: string) => Promise<boolean>
   resolveAgent?: (env: Env, identity: string) => Promise<ResolvedAgent | null>
-  resolveDispatchSquad?: (env: Env, projectId: string) => Promise<string>
+  resolveDispatchSquad?: (env: Env, projectId: string) => Promise<string | null>
   createTask?: (env: Env, input: CreateTaskInput) => Promise<Task>
   registerPresence?: (
     env: Env,
@@ -296,7 +333,8 @@ async function routeUnassignedWork(
   roster: ModulePresence[],
   selfIdentity: string,
   resolveAgent: (env: Env, identity: string) => Promise<ResolvedAgent | null>,
-): Promise<Array<{ taskId: string; agentId: string }>> {
+  now: Date,
+): Promise<{ routed: Array<{ taskId: string; agentId: string }>; staleExcluded: boolean }> {
   // Online active agents (any role capability) — the effort router picks by ladder.
   // Known harness caps (agy=research only, etc.) are enforced inside routeByEffort.
   const candidates: OnlineRouteCandidate[] = []
@@ -310,7 +348,7 @@ async function routeUnassignedWork(
       candidates.push({ agent, capabilities: module.capabilities })
     }
   }
-  if (candidates.length === 0) return []
+  if (candidates.length === 0) return { routed: [], staleExcluded: false }
 
   const bySlug = new Map<string, OnlineRouteCandidate>()
   for (const candidate of candidates) {
@@ -334,6 +372,8 @@ async function routeUnassignedWork(
   // reading its attacker-controlled title/body, routed to a specific agent CLASS) on the
   // very next tick with zero human step. external_source IS NULL closes it the same way
   // source_pot IS NULL already does for cross-pot tasks.
+  const cutoff = new Date(now.getTime() - STALE_ROUTE_DAYS * 86400000).toISOString()
+  let staleExcluded = await hasStaleRouteWork(env, project.id, cutoff)
   const rows = await env.DB.prepare(
     // migrations/0150: assignee_member_id IS NULL is load-bearing here, and its
     // absence was a HEAD-OF-LINE STALL, not a missed row. Without it the first
@@ -349,6 +389,7 @@ async function routeUnassignedWork(
         AND source_pot IS NULL
         AND external_source IS NULL
         AND ${TASK_NOT_ARCHIVED_SQL()}
+        AND ${conciergeRouteEligibilitySql('?5')}
         -- Held gates must not occupy the bounded scan window. The per-candidate
         -- check below is precise; this coarse check asks whether any holder exists.
         AND (
@@ -362,7 +403,7 @@ async function routeUnassignedWork(
       ORDER BY created_at ASC
       LIMIT ?2`,
   )
-    .bind(project.id, MAX_ROUTES_PER_TICK, env.TENANT_SLUG, nowSqlUtc())
+    .bind(project.id, MAX_ROUTES_PER_TICK, env.TENANT_SLUG, nowSqlUtc(), cutoff)
     .all<UnassignedTaskRow>()
 
   const routed: Array<{ taskId: string; agentId: string }> = []
@@ -417,9 +458,10 @@ async function routeUnassignedWork(
             tenantParam: '?6', nowParam: '?7',
           })}
           AND ${assignmentLivenessProofSql(env,{tenant:'?6',agentId:'?1',now:'?7'})}
-          AND ${TASK_NOT_ARCHIVED_SQL()}`,
+          AND ${TASK_NOT_ARCHIVED_SQL()}
+          AND ${conciergeRouteEligibilitySql('?8')}`,
     )
-      .bind(picked.agent.id, task.id, assignedAt, project.id, task.squad_id, env.TENANT_SLUG, assignedAt)
+      .bind(picked.agent.id, task.id, assignedAt, project.id, task.squad_id, env.TENANT_SLUG, assignedAt, cutoff)
       .run()
     if (upd.meta.changes === 1) {
       // Wake-on-assign: the work-router assigns from a cron tick, so without this the builder is only told when it
@@ -428,9 +470,11 @@ async function routeUnassignedWork(
       routed.push({ taskId: task.id, agentId: picked.agent.id })
       perAgent.set(picked.agent.id, (perAgent.get(picked.agent.id) ?? 0) + 1)
       loadBySlug.set(picked.agent.slug, (loadBySlug.get(picked.agent.slug) ?? 0) + 1)
+    } else if (await hasStaleRouteWork(env, project.id, cutoff, task.id)) {
+      staleExcluded = true
     }
   }
-  return routed
+  return { routed, staleExcluded }
 }
 
 /**
@@ -441,7 +485,7 @@ async function routeUnassignedWork(
  *     dispatch-safety issue).
  *  b. Read state: goal, roster.
  *  c. Decide (heuristic, idempotent): non-empty goal AND an online build-capable
- *     agent AND no prior concierge starter for this project (any status) AND zero
+ *     project-squad member agent AND no prior concierge starter (any status) AND zero
  *     advancing tasks -> dispatch one starter task. Otherwise no-op.
  *  d. Dispatch: create the task via the existing createTask() path (never a raw
  *     INSERT) so every invariant it enforces (done_when required, project/squad
@@ -544,18 +588,18 @@ export async function runProjectConcierge(
     // received a starter must still get its SITTING work routed). Assign open+unassigned
     // tasks to online builders (bounded + gated). Fail-soft: a routing error must not
     // break the tick; sitting work self-corrects next tick.
-    let routed: Array<{ taskId: string; agentId: string }> = []
+    let work: Awaited<ReturnType<typeof routeUnassignedWork>> = { routed: [], staleExcluded: false }
     try {
-      routed = await routeUnassignedWork(env, project, roster, identity, liveResolve)
+      work = await routeUnassignedWork(env, project, roster, identity, liveResolve, now())
     } catch {
-      routed = []
+      work = { routed: [], staleExcluded: false }
     }
     return {
       registered,
       decision:
-        routed.length > 0
-          ? { action: 'route', routed: routed.length }
-          : { action: 'noop', reason: 'has_advancing_work' },
+        work.routed.length > 0
+          ? { action: 'route', routed: work.routed.length, ...(work.staleExcluded ? { skipReasons: ['stale_excluded' as const] } : {}) }
+          : { action: 'noop', reason: work.staleExcluded ? 'stale_excluded' : 'has_advancing_work' },
       taskId: null,
     }
   }
@@ -579,6 +623,12 @@ export async function runProjectConcierge(
   // check (and migration 0067's unique index) can recognize this row as "already
   // nudged this project" for the rest of its life, regardless of status.
   const squadId = await resolveDispatchSquad(env, project.id)
+  if (!squadId) return { registered, decision: { action: 'noop', reason: 'starter_no_operator' }, taskId: null }
+  const members = await starterMemberIds(env, squadId, [...new Set([...resolved.values()].map(agent => agent.id))])
+  const starterRoster = roster.filter(module => members.has(resolved.get(module.identity)?.id ?? ''))
+  const starterBuilder = await pickOnlineBuilder(env, starterRoster, identity, liveResolve)
+  if (!starterBuilder) return { registered, decision: { action: 'noop', reason: 'starter_no_operator' }, taskId: null }
+
   let task: Task
   try {
     task = await create(env, {
@@ -587,8 +637,8 @@ export async function runProjectConcierge(
       title: `Starter: ${project.name}`,
       body: `Concierge dispatch (MVP heuristic) — project has capacity and no active work.\n\nProject goal: ${goal}\n\n${CONCIERGE_STARTER_MARKER}`,
       done_when: `Progress made toward the project goal: ${goal}`,
-      assignee_agent_id: builder.id,
-      gate_owner: 'gate:kasra-core',
+      assignee_agent_id: starterBuilder.id,
+      gate_owner: null,
       status: 'open',
     })
   } catch (error) {
@@ -604,7 +654,7 @@ export async function runProjectConcierge(
     throw error
   }
 
-  return { registered, decision: { action: 'dispatch', agentId: builder.id }, taskId: task.id }
+  return { registered, decision: { action: 'dispatch', agentId: starterBuilder.id }, taskId: task.id }
 }
 
 export interface ConciergeTickResult {
@@ -616,6 +666,8 @@ export interface ConciergeTickResult {
   routed: number
   noop: number
   errors: number
+  /** Counts project cycles reporting a reason, not distinct cards or a total card count. */
+  skippedProjects?: Partial<Record<ConciergeSkipReason, number>>
 }
 
 /**
@@ -641,11 +693,17 @@ export async function runConciergeTick(env: Env, deps: ConciergeDeps = {}): Prom
   let routed = 0
   let noop = 0
   let errors = 0
+  const skippedProjects: Partial<Record<ConciergeSkipReason, number>> = {}
 
   for (const project of batch) {
     try {
       const result = await runProjectConcierge(env, project, deps)
       if (result.registered) registered++
+      const reasons = result.decision.action === 'route' ? result.decision.skipReasons ?? []
+        : result.decision.action === 'noop' && (result.decision.reason === 'stale_excluded' || result.decision.reason === 'starter_no_operator')
+          ? [result.decision.reason] : []
+      for (const reason of new Set(reasons)) skippedProjects[reason] = (skippedProjects[reason] ?? 0) + 1
+
       if (result.decision.action === 'dispatch') dispatched++
       else if (result.decision.action === 'route') routed += result.decision.routed
       else noop++
@@ -654,5 +712,5 @@ export async function runConciergeTick(env: Env, deps: ConciergeDeps = {}): Prom
     }
   }
 
-  return { ok: true, projects: batch.length, registered, dispatched, routed, noop, errors }
+  return { ok: true, projects: batch.length, registered, dispatched, routed, noop, errors, ...(Object.keys(skippedProjects).length ? { skippedProjects } : {}) }
 }
