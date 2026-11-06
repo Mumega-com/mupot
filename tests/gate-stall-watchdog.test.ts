@@ -96,6 +96,23 @@ describe('gate-stall watchdog', () => {
     harness.close()
   })
 
+  it.each(['status','episode'])('does not recover a stale candidate after its %s changes',async change=>{
+    const {env,sqlite,harness}=setup();seedReviewTask(sqlite,'changed-during-claim')
+    sqlite.exec("UPDATE tasks SET gate_wake_notice=NULL WHERE id='changed-during-claim'")
+    const prepare=harness.db.prepare.bind(harness.db);let changed=false
+    harness.db.prepare=((query:string)=>{
+      if(!changed&&query.includes('INSERT INTO gate_stall_rewakes')){
+        changed=true
+        if(change==='status')sqlite.exec("UPDATE tasks SET status='approved' WHERE id='changed-during-claim'")
+        else sqlite.prepare("UPDATE tasks SET updated_at=? WHERE id='changed-during-claim'").run(minutes(120).toISOString())
+      }
+      return prepare(query)
+    }) as typeof harness.db.prepare
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:0,recorded:1})
+    expect(changed).toBe(true);expect(wakeCount(sqlite,'changed-during-claim')).toBe(0)
+    harness.close()
+  })
+
   it('keeps the first gate wake but records later stalls without sending mail', async () => {
     const {env,sqlite,harness}=setup()
     seedReviewTask(sqlite,'quiet')
@@ -416,6 +433,15 @@ describe('gate-stall watchdog: member-held gate decision card (mupot#2015)', () 
     const env = { ...base.env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: 'tok-kay' } as Env
     return { ...base, env }
   }
+
+  it('does not mistake a previous member holder card for delivery to the current member',async()=>{
+    const {env,sqlite,harness}=memberSetup();seedReviewTask(sqlite,'member-changed',{gateOwner:'gate:hm'})
+    sqlite.prepare("UPDATE tasks SET gate_wake_notice=? WHERE id='member-changed'").run("Decision card queued to stale's inbox (not yet acknowledged): gate:hm is held by member mem-h.previous. A verdict still needs the member's own decision.")
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:1,undelivered:0})
+    expect(sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()).toEqual({n:1})
+    expect(await sweepAt(env,minutes(31))).toMatchObject({rewoken:0,undelivered:0})
+    harness.close()
+  })
 
   it('recovers a failed member decision-card delivery and then stays quiet',async()=>{
     const {env,sqlite,harness}=memberSetup();seedReviewTask(sqlite,'member-recovery',{gateOwner:'gate:hm'})

@@ -239,7 +239,7 @@ describe('approval expiry', () => {
     })
 
     it('keeps a maximum-size sweep digest under the inbox body cap without dropping task receipts',async()=>{
-      for(let i=0;i<200;i++)seedReview(`digest-bounded-${i}`,30)
+      for(let i=0;i<200;i++)seedReview(`digest-bounded-${i}`,30,{gateOwner:`gate:${'g'.repeat(120)}`})
       expect(await sweepExpiredApprovals(env,{via:'cron',limit:200})).toMatchObject({expired:200,notified:200,errors:0})
       const messages=sql("SELECT body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'") as Array<{body:string}>
       expect(messages.length).toBeGreaterThan(1)
@@ -293,7 +293,7 @@ describe('approval expiry', () => {
       const messages=sql("SELECT body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'") as Array<{body:string}>
       expect(messages).toHaveLength(1)
       expect(JSON.parse(messages[0].body).entries.map((e:{task_id:string})=>e.task_id)).toEqual(['stable-task','stable-task-z'])
-      await sendApprovalSweepDigest(env,BUILDER,'system:sweeper',[{...entry,episode:'2026-02-01T00:00:00.000Z',receipt_id:'new-review'}])
+      expect(await sendApprovalSweepDigest(env,BUILDER,'system:sweeper',[{...entry,episode:'2026-02-01T00:00:00.000Z',receipt_id:'new-review'},{...second,episode:'2026-02-01T00:00:00.000Z',receipt_id:'new-review-z'}])).toBe(2)
       expect(sql("SELECT body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'")).toHaveLength(2)
     })
 
