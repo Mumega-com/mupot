@@ -343,6 +343,7 @@ export async function loadElevationRequestById(
  *  to call on every read path (list/decide) — a pending-request ceiling
  *  reader must never see a decision window that has silently lapsed as if
  *  it were still open. */
+// Each caller drains at most 100 rows; list callers accept a partial persisted sweep.
 export async function expireStaleElevationRequests(
   env: Env,
   tenant: string,
@@ -352,7 +353,10 @@ export async function expireStaleElevationRequests(
     const nowIso = new Date(nowMs).toISOString()
     const result = await env.DB.prepare(
       `UPDATE elevation_requests SET status = 'expired'
-        WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at <= ?2`,
+        WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at <= ?2
+          AND id IN (SELECT id FROM elevation_requests
+            WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at <= ?2
+            ORDER BY created_at, id LIMIT 100)`,
     )
       .bind(tenant, nowIso)
       .run()

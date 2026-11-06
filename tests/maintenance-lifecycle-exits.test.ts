@@ -30,6 +30,27 @@ async function tick(env: Env, label: string): Promise<void> {
 }
 
 describe('maintenance lifecycle exits',()=>{
+  it('expires elevation requests from its reachable maintenance slot without any list or decision request',async()=>{
+    const h=createSqliteD1();applyAllMigrations(h.sqlite)
+    const env={DB:h.db,TENANT_SLUG:'tenant'} as Env
+    try {
+      h.sqlite.exec(`INSERT INTO departments(id,slug,name) VALUES('d','d','D');
+        INSERT INTO squads(id,department_id,slug,name) VALUES('s','d','s','S');
+        INSERT INTO agents(id,squad_id,slug,name,status) VALUES('a','s','a','A','active');
+        INSERT INTO members(id,tenant,display_name,status) VALUES('m','tenant','M','active');
+        INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('tenant','a','m',datetime('now'));
+        INSERT INTO member_tokens(id,tenant,member_id,agent_id,token_hash,channel) VALUES('t','tenant','m','a','fixture-hash','workspace');`)
+      const {createAgentSession}=await import('../src/auth/agent-sessions')
+      const session=await createAgentSession(env,{tenant:'tenant',agentId:'a',memberId:'m',authKind:'workspace_token',credentialId:'t'})
+      h.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
+        VALUES('cron-expired','tenant',?,'a','m','["action:manage_access"]','squad','s',60,'expiry','pending','2020-01-01T00:00:00.000Z','2020-01-01T00:10:00.000Z')`).run(session.id)
+      await tick(env,'elevation-expiry')
+      expect(h.sqlite.prepare("SELECT status FROM elevation_requests WHERE id='cron-expired'").get()).toEqual({status:'expired'})
+      await tick(env,'elevation-expiry')
+      expect(h.sqlite.prepare('SELECT count(*) AS n FROM elevation_grants').get()).toEqual({n:0})
+    } finally {h.close()}
+  })
+
   it('expires stale proposals from its reachable maintenance slot without archiving tasks',async()=>{
     const h=createSqliteD1();applyAllMigrations(h.sqlite)
     try {

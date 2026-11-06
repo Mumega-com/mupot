@@ -17,6 +17,7 @@ import { createAgentSession, evaluateAgentSession, loadAgentSessionById } from '
 import { createWebSession, revokeWebSession, hashWebSessionId } from '../src/auth/web-sessions'
 import {
   createElevationRequest,
+  expireStaleElevationRequests,
   decideElevationRequest,
   evaluateElevationGrant,
   hasElevatedAction,
@@ -121,6 +122,22 @@ describe('elevation ledger (D1, real migration chain)', () => {
   }
 
   const capabilities = [{ member_id: ADMIN_MEMBER, scope_type: 'squad' as const, scope_id: SQUAD, capability: 'admin' as const }]
+
+  it('expires overdue requests in bounded tenant-scoped idempotent batches', async () => {
+    const now=Date.now(),session=await seedAgentSession(now)
+    const insert=harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
+      VALUES(?,?,?,?,?,'["action:manage_access"]','squad',?,60,'expiry fixture',?,?,?)`)
+    const old=new Date(now-60000).toISOString(),future=new Date(now+60000).toISOString()
+    for(let i=0;i<101;i++)insert.run(`expire-${i}`,TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,'pending',old,old)
+    insert.run('expiry-fresh',TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,'pending',old,future)
+    insert.run('expiry-foreign','foreign',session.id,AGENT_ID,AGENT_MEMBER,SQUAD,'pending',old,old)
+    insert.run('expiry-decided',TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,'approved',old,old)
+    expect(await expireStaleElevationRequests(env,TENANT,now)).toEqual({expiredCount:100})
+    expect(await expireStaleElevationRequests(env,TENANT,now)).toEqual({expiredCount:1})
+    expect(await expireStaleElevationRequests(env,TENANT,now)).toEqual({expiredCount:0})
+    expect(harness.sqlite.prepare("SELECT status FROM elevation_requests WHERE id IN ('expiry-fresh','expiry-foreign') ORDER BY id").all()).toEqual([{status:'pending'},{status:'pending'}])
+    expect(harness.sqlite.prepare("SELECT status FROM elevation_requests WHERE id='expiry-decided'").get()).toEqual({status:'approved'})
+  })
 
   it('rejects a request naming an unknown action or the word "admin"', async () => {
     const nowMs = Date.parse('2026-09-01T00:00:00.000Z')
