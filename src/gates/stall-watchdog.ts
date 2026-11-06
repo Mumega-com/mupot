@@ -1,15 +1,24 @@
 // src/gates/stall-watchdog.ts — gate-stall watchdog (mupot#1705).
 //
-// Review entry owns the first wake. A delivered/queued wake stays quiet; a failed
-// or missing wake can recover within the existing bounded claim budget.
-// Task status, verdicts, the initial wake and its gate-holder resolution are unchanged.
+// A task in 'review' with a gate_owner is waiting on a gate seat. The wake sent on review entry
+// is best-effort: a seat can ACK it and never record a verdict (task d9f6b672: ~7.5h silent). This
+// sweep notices that state and re-sends the SAME wake (wakeGateOwnerOnReview — reused, not copied),
+// bounded and recorded durably.
+//
+// INVARIANTS
+//  - Never changes task status, never writes or reverses a verdict. The only task write is the
+//    gate_wake_notice column that wakeGateOwnerOnReview already owns.
+//  - Wakes only whoever wakeGateOwnerOnReview resolves from the task's own gate_owner lane.
+//  - At most one re-wake per task per threshold window, at most maxRewakes per review episode.
+//    The bound is ONE atomic UPSERT…WHERE claim (changes === 1 wins); never read-compare-write.
+//  - After the cap nothing is sent; the stall stays visible in the Needs You 'stuck' view reason
+//    (src/attention/service.ts reads gate_stall_rewakes).
 
 import type { Env, Task } from '../types'
-import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { safeConsole } from '../lib/log'
-import { resolveSoleGateOwnerAgent } from './grants'
-// Keep this static: a lazy MCP import previously produced an invalid Worker initializer.
+// Static import: a dynamic import('../mcp') here made esbuild lazy-wrap the module graph and emit a
+// top-level await inside a sync initializer ("Unexpected reserved word" at Worker startup).
 import { wakeGateOwnerOnReview } from '../mcp'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export const DEFAULT_GATE_STALL_THRESHOLD_MINUTES = 30
 export const DEFAULT_GATE_STALL_MAX_REWAKES = 3
@@ -18,7 +27,6 @@ const WATCHDOG_ID = 'mupot-gate-stall-watchdog'
 
 export interface GateStallSweepResult {
   scanned: number
-  recorded: number
   rewoken: number
   undelivered: number
   skipped_claimed: number
@@ -30,25 +38,12 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   return Number.isSafeInteger(n) && n > 0 ? n : fallback
 }
 
-/** The recorded delivery must belong to the currently resolved holder, not just this capability. */
-async function wakeWasDelivered(env:Env,task:Task):Promise<boolean>{
-  try {
-    const r=await resolveSoleGateOwnerAgent(env,task.gate_owner??'')
-    if(r.status!=='resolved')return false
-    const notice=task.gate_wake_notice??''
-    if(r.principal.type==='agent')return notice.startsWith(`Gate wake delivered: ${r.capability} -> agent ${r.principal.id} (`)
-    const member=`): ${r.capability} is held by member ${r.principal.id}`
-    const suffix=". A verdict still needs the member's own decision."
-    return notice.startsWith('Decision card queued to ') && (notice.endsWith(member+suffix)||notice.endsWith(member+'; already queued for this review entry'+suffix))
-  } catch {return false}
-}
-
 export async function sweepStalledGateReviews(env: Env, now: Date = new Date()): Promise<GateStallSweepResult> {
   const thresholdMin = positiveInt(env.GATE_STALL_THRESHOLD_MINUTES, DEFAULT_GATE_STALL_THRESHOLD_MINUTES)
   const maxRewakes = positiveInt(env.GATE_STALL_MAX_REWAKES, DEFAULT_GATE_STALL_MAX_REWAKES)
   const nowIso = now.toISOString()
   const cutoffIso = new Date(now.getTime() - thresholdMin * 60_000).toISOString()
-  const result: GateStallSweepResult = { scanned: 0, recorded: 0, rewoken: 0, undelivered: 0, skipped_claimed: 0, errors: 0 }
+  const result: GateStallSweepResult = { scanned: 0, rewoken: 0, undelivered: 0, skipped_claimed: 0, errors: 0 }
 
   // Candidates: review + gate_owner + older than the threshold + no LIVE verdict since entering
   // review (reversed verdicts do not count; datetime() normalises 'YYYY-MM-DD HH:MM:SS' vs ISO).
@@ -95,20 +90,29 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
         result.skipped_claimed += 1
         continue
       }
-      // Re-read after claiming: a first wake may have finished since the candidate scan.
-      const current=await env.DB.prepare('SELECT * FROM tasks WHERE id=?1').bind(task.id).first<Task>()
-      let outcome='logged_no_mail', delivered=false
-      if(current && current.status==='review' && current.updated_at===task.updated_at && !(await wakeWasDelivered(env,current))){
-        const recovery=await wakeGateOwnerOnReview(env,current,{kind:'agent',id:WATCHDOG_ID},WATCHDOG_ID)
-        outcome=recovery.status
-        delivered=recovery.status==='delivered'||recovery.status==='partial'||(recovery.status==='queued_to_owner_agent'&&(recovery.new_sends??1)>0)
-        if(delivered)result.rewoken+=1
-        else if(recovery.status!=='queued_to_owner_agent')result.undelivered+=1
-      }
-      await env.DB.prepare(`UPDATE gate_stall_rewakes SET last_outcome=?1, delivered_count=delivered_count+?2 WHERE task_id=?3`)
-        .bind(outcome,delivered?1:0,task.id).run()
-      result.recorded += 1
-      safeConsole.info('[gate-stall]', { actor: WATCHDOG_ID, task_id: task.id, review_since: task.updated_at, outcome })
+      const outcome = await wakeGateOwnerOnReview(
+        env,
+        task,
+        { kind: 'agent', id: WATCHDOG_ID },
+        WATCHDOG_ID,
+      )
+      // Only a wake that reached a holder counts as a re-wake. requires_human / no_live_holder /
+      // ambiguous / delivery_failed spend the attempt budget but are never reported as re-wakes —
+      // a counter shown to humans must count deliveries, not attempts (#1706 adversarial P1).
+      // A decision-card re-wake (queued_to_owner_agent) counts only if it inserted a NEW message; a
+      // duplicate / request_id_conflict card is already queued and was not delivered again (#2015).
+      const delivered = outcome.status === 'delivered' || outcome.status === 'partial'
+        || (outcome.status === 'queued_to_owner_agent' && (outcome.new_sends ?? 1) > 0)
+      await env.DB.prepare(
+        `UPDATE gate_stall_rewakes
+            SET last_outcome = ?1,
+                delivered_count = delivered_count + ?3
+          WHERE task_id = ?2`,
+      )
+        .bind(outcome.status, task.id, delivered ? 1 : 0)
+        .run()
+      if (delivered) result.rewoken += 1
+      else result.undelivered += 1
     } catch {
       result.errors += 1
     }
