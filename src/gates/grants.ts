@@ -260,12 +260,12 @@ const MAX_GATE_WAKE_NOTICE_CHARS = 2000
  * show why a review was not delivered. This is operational metadata only: it
  * never changes task status or verdict authority.
  */
-export async function persistGateWakeNotice(env: Env, taskId: string, notice: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET gate_wake_notice = ?1 WHERE id = ?2 AND ${TASK_NOT_ARCHIVED_SQL()}`,
-  )
-    .bind(notice.slice(0, MAX_GATE_WAKE_NOTICE_CHARS), taskId)
-    .run()
+export async function persistGateWakeNotice(env: Env, taskId: string, notice: string, expectedUpdatedAt?: string): Promise<boolean> {
+  const result=await env.DB.prepare(
+    `UPDATE tasks SET gate_wake_notice = ?1, gate_wake_notice_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?2 AND ${TASK_NOT_ARCHIVED_SQL()} AND (?3 IS NULL OR updated_at=?3)`,
+  ).bind(notice.slice(0, MAX_GATE_WAKE_NOTICE_CHARS), taskId,expectedUpdatedAt??null).run()
+  return Number(result.meta?.changes??0)>0
 }
 
 /**
