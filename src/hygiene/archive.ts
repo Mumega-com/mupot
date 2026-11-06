@@ -814,10 +814,10 @@ async function unarchiveProject(env: Env, input: UnarchiveInput): Promise<Unarch
 // every reachable case, since a guarded writer cannot move the status meanwhile; it
 // repairs a direct D1 edit rather than trusting that).
 
-// Non-terminal flight statuses: flights.status CHECK is
-// ('preflight','held','running','waiting','sleeping','landed','failed') —
-// only landed/failed are terminal.
-const IN_AIR_FLIGHT_STATUSES_SQL = `f.status NOT IN ('landed','failed')`
+// Flights that may execute still protect their tasks. A held flight stopped at
+// the preflight NO-GO gate and does not block archive; the task's action guards
+// remain in force even if that flight is later re-queued.
+const IN_AIR_FLIGHT_STATUSES_SQL = `f.status NOT IN ('held','landed','failed')`
 
 // A standing record is identified today ONLY by a title prefix (case-insensitive, optional leading bracket/space):
 // there is no retention_class column yet (later migration). The SQL and the JS predicate below must agree.
@@ -827,7 +827,7 @@ export function isStandingTitle(title: string | null | undefined): boolean {
 }
 
 /**
- * The ONE definition of "flight `flightAlias` is in the air for task `taskIdExpr`": a non-terminal
+ * The ONE definition of "flight `flightAlias` is in the air for task `taskIdExpr`": an execution-capable
  * flight linked to the task by lane, by assignment, or by `meta.task_ids`. Used by the archive
  * blocker, the archive INSERT guard, and the read-only gardener preview so they cannot drift.
  * `flightAlias` must be `f` (IN_AIR_FLIGHT_STATUSES_SQL names it).
