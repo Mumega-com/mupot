@@ -223,6 +223,32 @@ describe('approval expiry', () => {
   })
 
   describe('the sweep', () => {
+    it('sends one digest per assignee while keeping each expired task receipt and notice',async()=>{
+      seedReview('digest-a',30);seedReview('digest-b',30);seedReview('digest-c',30,{assignee:SEAT})
+      const r=await sweepExpiredApprovals(env,{via:'cron'})
+      expect(r).toMatchObject({expired:3,notified:3,errors:0})
+      const messages=sql("SELECT to_agent,body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'") as Array<{to_agent:string;body:string}>
+      expect(messages).toHaveLength(2)
+      expect(messages.map(m=>m.to_agent).sort()).toEqual([BUILDER,SEAT].sort())
+      const builder=JSON.parse(messages.find(m=>m.to_agent===BUILDER)!.body)
+      expect(builder).toMatchObject({type:'approval_sweeper_digest',total:2,omitted:0})
+      expect(builder.entries.map((e:{task_id:string})=>e.task_id).sort()).toEqual(['digest-a','digest-b'])
+      for(const id of ['digest-a','digest-b','digest-c']){expect(receipts(id)).toHaveLength(1);expect(task(id)).toMatchObject({status:'blocked',expired_count:1});expect(String(task(id).gate_wake_notice)).toContain('approval expired unanswered')}
+      await sweepExpiredApprovals(env,{via:'cron'})
+      expect(sql("SELECT id FROM agent_messages WHERE from_agent='mupot-approval-sweeper'")).toHaveLength(2)
+    })
+
+    it('keeps a maximum-size sweep digest under the inbox body cap without dropping task receipts',async()=>{
+      for(let i=0;i<200;i++)seedReview(`digest-bounded-${i}`,30)
+      expect(await sweepExpiredApprovals(env,{via:'cron',limit:200})).toMatchObject({expired:200,notified:200,errors:0})
+      const messages=sql("SELECT body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'") as Array<{body:string}>
+      expect(messages).toHaveLength(1);expect(messages[0].body.length).toBeLessThanOrEqual(8000)
+      const digest=JSON.parse(messages[0].body)
+      expect(digest.total).toBe(200);expect(digest.omitted).toBeGreaterThan(0)
+      expect(digest.entries.length+digest.omitted).toBe(200)
+      expect(receipts()).toHaveLength(200)
+    })
+
     it('moves an expired ask review -> blocked, receipts it (system:sweeper), notifies the assignee', async () => {
       seedReview('t1', APPROVAL_EXPIRY.gate_verdict_days + 1)
       const res = await sweepExpiredApprovals(env, { via: 'cron' })
@@ -236,7 +262,7 @@ describe('approval expiry', () => {
       })
       expect(r.created_at).toBeTruthy()
       expect(r.expires_at).toBeTruthy()
-      const msg = one(`SELECT body, to_agent FROM agent_messages WHERE request_id LIKE 'approval-expired:t1:%'`)
+      const msg = one(`SELECT body, to_agent FROM agent_messages WHERE from_agent='mupot-approval-sweeper' AND body LIKE '%t1%'`)
       expect(msg.to_agent).toBe(BUILDER)
       expect(String(msg.body)).toContain('approval expired unanswered')
       // never a verdict

@@ -1449,12 +1449,12 @@ describe('slice1 notice boundaries',()=>{
   const {expireStaleElevationRequests,listPendingElevationRequests}=await import('../src/auth/elevation')
   expect((await expireStaleElevationRequests(env,TENANT)).expiredCount).toBe(27)
   expect(notes()).toHaveLength(0)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(25)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(1)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(2)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(2)
   for(const note of notes()){
    expect(note.to_agent).toBe('agent-x');expect(note.from_member).toBe('system:approval-bot')
-   expect(JSON.parse(note.body)).toMatchObject({type:'elevation_approval_bot',event:'expired'})
+   const digest=JSON.parse(note.body);expect(digest).toMatchObject({type:'approval_sweeper_digest',omitted:0});expect(digest.entries.every((e:{event:string})=>e.event==='expired')).toBe(true)
    expect(note.body).not.toContain(BOT_TOKEN)
   }
  })
@@ -1610,4 +1610,27 @@ it('round2 notice scheduling failures never reject a closed tap',async()=>{
  const result=await handleApprovalBotUpdate(env,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}),{waitUntil:()=>{throw new Error('scheduler unavailable')}})
  expect(result.kind).toBe('closed');expect(status(f.requestId).status).toBe('denied');expect(grants(f.requestId)).toBe(0)
  expect(sentTo('answerCallbackQuery')).toHaveLength(1);expect(sentTo('editMessageText')).toHaveLength(1);expect(sentTo('sendMessage')).toHaveLength(0)
+})
+
+
+describe('approval sweeper ceremony digest',()=>{
+  it('batches lapse notices per requesting agent and dedupes later sweeps and direct reads',async()=>{
+    const ids:string[]=[]
+    for(let i=0;i<2;i++){
+      const f=await file({reason:`digest ${i}`});ids.push(f.requestId)
+      harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=?,decided_at=NULL WHERE id=?").run(new Date(Date.now()-1000).toISOString(),f.requestId)
+    }
+    const {notifyLapsedApprovalBotRequests}=await import('../src/approval-bot/status')
+    await Promise.all([notifyLapsedApprovalBotRequests(env,TENANT),notifyLapsedApprovalBotRequests(env,TENANT)])
+    const notes=()=>harness.sqlite.prepare("SELECT body FROM agent_messages WHERE tenant=? AND from_agent='mupot-approval-sweeper'").all(TENANT) as Array<{body:string}>
+    expect(notes()).toHaveLength(1)
+    const digest=JSON.parse(notes()[0].body)
+    expect(digest).toMatchObject({type:'approval_sweeper_digest',total:2,omitted:0})
+    expect(digest.entries.map((e:{request_id:string})=>e.request_id).sort()).toEqual([...ids].sort())
+    await notifyLapsedApprovalBotRequests(env,TENANT)
+    const {loadElevationRequestById}=await import('../src/auth/elevation')
+    for(const id of ids)await loadElevationRequestById(env,TENANT,id)
+    expect(notes()).toHaveLength(1)
+    expect(count('elevation_grants')).toBe(0)
+  })
 })
