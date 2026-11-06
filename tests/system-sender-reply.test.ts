@@ -22,7 +22,7 @@ const EXPECTED_VIA: Record<string, string | null> = {
   'mupot-assignment-wake': null,
   'mupot-onboarding': null,
   'mupot-task-reclaim': null,
-  'mupot-routines': null,
+  'mupot-routines': 'routine_proposal_submit',
 }
 
 describe('registry', () => {
