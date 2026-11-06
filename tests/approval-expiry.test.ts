@@ -239,7 +239,10 @@ describe('approval expiry', () => {
     })
 
     it('keeps a maximum-size sweep digest under the inbox body cap without dropping task receipts',async()=>{
-      for(let i=0;i<200;i++)seedReview(`digest-bounded-${i}`,30,{gateOwner:`gate:${'g'.repeat(120)}`})
+      const longGate=`gate:${'g'.repeat(120)}`
+      harness.sqlite.prepare("INSERT INTO agents(id,squad_id,slug,name,status) VALUES('old-gate-holder',?,'old-gate-holder','Old gate holder','inactive')").run(SQUAD)
+      harness.sqlite.prepare("INSERT INTO gate_grants(id,capability,principal_type,principal_id,granted_by,created_at) VALUES('long-dead-gate',?,'agent','old-gate-holder','owner','2026-01-01')").run(longGate)
+      for(let i=0;i<200;i++)seedReview(`digest-bounded-${i}`,30,{gateOwner:longGate})
       expect(await sweepExpiredApprovals(env,{via:'cron',limit:200})).toMatchObject({expired:200,notified:200,errors:0})
       const messages=sql("SELECT body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'") as Array<{body:string}>
       expect(messages.length).toBeGreaterThan(1)
