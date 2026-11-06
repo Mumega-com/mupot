@@ -269,9 +269,9 @@ describe('runProjectConcierge — stalled project dispatches exactly one starter
       `INSERT INTO members (id, email, display_name, status)
        VALUES ('mem-human', 'human@x.test', 'A Human', 'active');
        INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, assignee_member_id, created_at)
-       VALUES ('task-human', 'squad-a', '${p.id}', 'Needs a browser session', '', 'done', 'open', NULL, 'mem-human', '2026-01-01T00:00:00.000Z');
+       VALUES ('task-human', 'squad-a', '${p.id}', 'Needs a browser session', '', 'done', 'open', NULL, 'mem-human', '${new Date(Date.now()-2*86400000).toISOString()}');
        INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, created_at)
-       VALUES ('task-behind', 'squad-a', '${p.id}', 'Ordinary routable work', '', 'done', 'open', NULL, '2026-01-02T00:00:00.000Z')`,
+       VALUES ('task-behind', 'squad-a', '${p.id}', 'Ordinary routable work', '', 'done', 'open', NULL, '${new Date(Date.now()-86400000).toISOString()}')`,
     )
     await registerBuilderShared(env)
 

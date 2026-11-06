@@ -170,7 +170,7 @@ it('concierge selection scopes the gate check to the requested task',async () =>
 describe('concierge round2 bounded task and candidate reads', () => {
  it('five older tasks with unheld gates do not starve newer ungated work',async () => {
   h.sqlite.prepare("UPDATE tasks SET created_at='2099-01-01T00:00:00.000Z' WHERE id=?").run(TASK)
-  for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held work','done','open',?,'2020-01-01T00:00:00.000Z')").run(`held-${i}`,SQUAD,GATE)
+  for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held work','done','open',?,?)").run(`held-${i}`,SQUAD,GATE,new Date(Date.now()-86400000).toISOString())
   expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
   expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id LIKE 'held-%' AND assignee_agent_id IS NULL").get()).toEqual({n:5})
  })
@@ -204,7 +204,7 @@ it('bulk eligibility is scoped to the requested task and online roster',async ()
 it('expired gate standing does not occupy the concierge task window',async () => {
  humanGate(); h.sqlite.exec("UPDATE capabilities SET expires_at='2026-07-01T00:00:00.000Z' WHERE id='assignment-reviewer-cap'")
  h.sqlite.prepare("UPDATE tasks SET gate_owner=NULL,created_at='2099-01-01T00:00:00.000Z' WHERE id=?").run(TASK)
- for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held','done','open',?,'2020-01-01T00:00:00.000Z')").run(`expired-gate-${i}`,SQUAD,GATE)
+ for(let i=0;i<5;i++) h.sqlite.prepare("INSERT INTO tasks(id,squad_id,project_id,title,done_when,status,gate_owner,created_at) VALUES(?,?,'assignment-project','Held','done','open',?,?)").run(`expired-gate-${i}`,SQUAD,GATE,new Date(Date.now()-86400000).toISOString())
  expect(await run('concierge')).toBe(1); expect(row().assignee_agent_id).toBe(AGENT)
  expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE id LIKE 'expired-gate-%' AND assignee_agent_id IS NULL").get()).toEqual({n:5})
 })
