@@ -44,11 +44,11 @@ describe('onboarding_next: one legal step per case', () => {
     expect(held).toMatchObject({ case: 'own_chat', next_tool: 'needs_you_list' })
   })
 
-  it('attached chat: peek the inbox only; never attach/select again; non-routable', () => {
+  it('attached chat: peek or lease the inbox; never attach/select again; non-routable', () => {
     const n = next(authOf({ boundAgentId: 'ag', seatBinding: { ...SEAT, attached: ATTACHED } }), { actsAs: 'athena' })
     expect(n).toMatchObject({ case: 'attached_chat', who_acts: 'self', next_tool: 'inbox' })
     expect(n.next_step).toContain('peek')
-    expect(n.next_step).toMatch(/cannot ack or lease/)
+    expect(n.next_step).toMatch(/inbox_lease.*attempt_id.*inbox_lease_ack/)
     expect(n.next_tool).not.toBe('seat_attach')
   })
 

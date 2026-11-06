@@ -48,6 +48,7 @@ function seed(sqlite: SqliteD1Harness['sqlite'], staleAt: string): void {
     INSERT INTO agents (id, squad_id, slug, name, status, created_at)
       VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'poller-agent', 'Poller Agent', 'active', '${T0}');
     INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Poller', 'active', '${TENANT}');
+    INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('poll-cap','${MEMBER_ID}','squad','${SQUAD_ID}','member');
     INSERT INTO fleet_agents (
       agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type,
       presence_mode, presence_ttl_sec, last_reported_at, updated_at

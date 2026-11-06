@@ -51,6 +51,7 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
     VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'touch-runner', 'Touch Runner', 'generic', '@cf/test', 'active', '2026-08-01T00:00:00Z');
     INSERT INTO members (id, display_name, email, status, tenant)
     VALUES ('${MEMBER_ID}', 'Touch Operator', 'touch@example.com', 'active', '${TENANT}');
+    INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('poll-cap','${MEMBER_ID}','squad','${SQUAD_ID}','member');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
     VALUES ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '2026-08-01T00:00:00Z');
     INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)

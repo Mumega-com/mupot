@@ -149,7 +149,7 @@ const SEAT_SELECT_STEP = `this connection is a harness session with no agent yet
  * so naming it would send the human to a dead end (#2178).
  */
 const ATTACH_ADMIT =
-  "seat_attach {agent, reason}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it cannot ack or lease."
+  "seat_attach {agent, reason}: it returns pending_admission and an attach code; your human admits that code on /connections; call seat_attach again and it returns attached. boot_context then shows acts_as. An attached connection peeks the inbox with inbox {peek:true} and records what it handled with inbox_mark_handled; it may use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat."
 
 /** Next step for a human without current designation standing. */
 export const ASK_ADMIN_TO_DESIGNATE =
@@ -165,7 +165,7 @@ export function attachConnectOrder(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENR
 
 /** boot_context available_doors seat_attach copy. Same designation gate as attachConnectOrder (#2178). */
 const SEAT_ATTACH_DOOR_TAIL =
-  "seat_attach {agent, reason}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and cannot ack or lease."
+  "seat_attach {agent, reason}: pending_admission; your human approves once with their passkey (an approve_url, or they admit the attach code on /connections), then call seat_attach again and your NEXT request acts as that agent. The attached connection peeks the inbox (inbox_mark_handled) and may use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat."
 
 export function seatAttachDoor(env: Pick<Env, 'SEAT_ATTACH' | 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH_DESIGNATED'>, humanCanDesignate?: boolean): { does: string; requires: string } {
   if (seatAttachDesignatedEnabled(env) && humanCanDesignate === false) {
@@ -205,7 +205,7 @@ export function plainNextStep(
     const handle = auth.seatBinding?.source === 'handle'
       ? 'keep passing your seat handle with each request (this attachment is found through it)'
       : 'no seat handle needed'
-    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; ${handle}, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} (then inbox_mark_handled; you cannot ack or lease) or your open work with needs_you_list.`
+    return `You are ${as} (attached to your human's chat, ceiling ${ceiling}). Nothing to set up; your identity rides this connection; ${handle}, and never call seat_select or seat_attach from here. Next: read your inbox with inbox {peek:true} (then inbox_mark_handled; use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat) or your open work with needs_you_list.`
   }
   if (state === 'acting_as') {
     return `You are ${as} (your human consented this connection to it). Nothing to set up; no seat handle needed; the seat tools (seat_select, seat_attach) do not apply. Next: read your inbox or your open work with needs_you_list.`
@@ -296,7 +296,7 @@ export function onboardingNext(
     const m = missing[0]
     return m
       ? { case: 'attached_chat', who_acts: m.who_acts, next_step: m.next_step }
-      : { case: 'attached_chat', who_acts: 'self', next_tool: 'inbox', next_step: 'you act as the attached agent: read your inbox with inbox {peek:true} and record what you handled with inbox_mark_handled (you cannot ack or lease). This chat is not routable: never call seat_select or seat_attach from here.' }
+      : { case: 'attached_chat', who_acts: 'self', next_tool: 'inbox', next_step: 'you act as the attached agent: read your inbox with inbox {peek:true} and record what you handled with inbox_mark_handled (use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat). This chat is not routable: never call seat_select or seat_attach from here.' }
   }
   if (state === 'own_seat') {
     // Same sentence plainNextStep prints for this state (attachConnectOrder), so the two cannot disagree. When designation is required

@@ -4816,9 +4816,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0272_runtime_receipt_attribution.sql",
+    sha256: "fd64ea757ad0d06359f89001125c54c4573fb850e9f3087f85ebba64730a5628",
+    statements: [
+      "ALTER TABLE task_dispatch_runtime_receipts ADD COLUMN seat_id TEXT;",
+      "ALTER TABLE task_dispatch_runtime_receipts ADD COLUMN attachment_id TEXT;",
+      "ALTER TABLE task_dispatch_runtime_receipts ADD COLUMN consenting_member_id TEXT;",
+      "CREATE INDEX idx_inbox_attempt_runtime_custody\n  ON agent_inbox_lease_attempts(tenant, agent_id, target_seat_key, message_id) WHERE state = 'leased';",
+    ],
+    objects: [
+      { type: "index", name: "idx_inbox_attempt_runtime_custody" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f8755b1bc5c4edf01411682d3f08a0a1987163407d9e668b8092075203ccb0e6"
+export const SCHEMA_CHAIN_DIGEST: string = "b28b32fcba361a14e4f3182c7bab6904a4e9a109c12343265fd7cf51dc38b560"

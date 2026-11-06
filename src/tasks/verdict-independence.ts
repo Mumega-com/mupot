@@ -154,6 +154,12 @@ function directConflictSqlRaw(): string {
         AND ${agentLinkedToMemberSql({ agentExpr: '@D', memberExpr: 'ca.consenting_member_id' })}
     )
     OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts dr WHERE dr.task_id = @T AND dr.stage IN ('runtime_consumed', 'completed', 'failed') AND (dr.agent_id = @D OR dr.member_id = @D))
+    OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts cr WHERE cr.task_id = @T AND cr.stage IN ('runtime_consumed', 'completed', 'failed') AND cr.consenting_member_id = @D)
+    OR EXISTS (
+      SELECT 1 FROM task_dispatch_runtime_receipts ca WHERE ca.task_id = @T AND ca.stage IN ('runtime_consumed', 'completed', 'failed')
+        AND ca.consenting_member_id IS NOT NULL
+        AND ${agentLinkedToMemberSql({ agentExpr: '@D', memberExpr: 'ca.consenting_member_id' })}
+    )
   )`
 }
 

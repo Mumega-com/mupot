@@ -61,6 +61,7 @@ function fixture() {
       VALUES (?, ?, ?, ?, ?, ?, 'workspace', ?, ?, ?)
     `).run(id, member, tenant, id.padEnd(64, '0').slice(0, 64), agent, values.label ?? '', T0,
       values.revokedAt ?? null, values.expiresAt ?? null)
+    harness.sqlite.prepare(`INSERT OR IGNORE INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES (?,?,'squad','squad-a','member')`).run(`cap-${member}`,member)
     return { id, member, agent, tenant }
   }
 
@@ -73,7 +74,7 @@ function fixture() {
     channel: 'workspace',
     boundAgentId: boundAgent,
     tokenId: token.id,
-    capabilities: [],
+    capabilities: [{member_id:token.member,scope_type:'squad',scope_id:'squad-a',capability:'member'}],
   })
 
   return { harness, env, seed, installToken, auth }
@@ -375,7 +376,7 @@ describe('authoritative attempt scope proof and ACK', () => {
       },
     ]
 
-    for (const scenario of scenarios) {
+    for (const [index, scenario] of scenarios.entries()) {
       const f = fixture()
       try {
         f.seed('m1')
@@ -384,11 +385,11 @@ describe('authoritative attempt scope proof and ACK', () => {
           .toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
         expect(await invokeTool(value.auth, value.env, 'inbox_lease', {
           attempt_id: A, limit: 1,
-        })).toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+        })).toMatchObject({ ok: false, status: index === 0 ? 403 : 500, error: index === 0 ? 'agent_not_authorized' : 'seat_resolution_failed' })
         expect(await invokeTool(value.auth, value.env, 'inbox_lease_reconcile', { attempt_id: A }))
-          .toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+          .toMatchObject({ ok: false, status: index === 0 ? 403 : 500, error: index === 0 ? 'agent_not_authorized' : 'seat_resolution_failed' })
         expect(await invokeTool(value.auth, value.env, 'inbox_lease_ack', { attempt_id: A }))
-          .toMatchObject({ ok: false, status: 500, error: 'seat_resolution_failed' })
+          .toMatchObject({ ok: false, status: index === 0 ? 403 : 500, error: index === 0 ? 'agent_not_authorized' : 'seat_resolution_failed' })
         expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_inbox_lease_attempts').get())
           .toEqual({ n: 0 })
         expect(f.harness.sqlite.prepare("SELECT read_at FROM agent_messages WHERE id='m1'").get())

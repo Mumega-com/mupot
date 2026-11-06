@@ -49,11 +49,16 @@ interface LiveRow {
 /**
  * Tri-state live check for a session that carries an agent weld. One D1 statement. 'live' when the session has no weld, or the
  * weld is backed by a live agent, live owner/consenter and (for a plain workspace-style session) at least one live capability.
+ * Default polling semantics permit paused agents; requireActive is the narrower agent-work check.
  */
+// The two-argument polling contract stays tri-state. Work callers may additionally distinguish a pause.
+export function boundAgentVerdict(env: Pick<Env, 'DB' | 'TENANT_SLUG'>, auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null }): Promise<BoundAgentVerdict>
+export function boundAgentVerdict(env: Pick<Env, 'DB' | 'TENANT_SLUG'>, auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null }, options: { requireActive?: boolean }): Promise<BoundAgentVerdict | 'paused'>
 export async function boundAgentVerdict(
   env: Pick<Env, 'DB' | 'TENANT_SLUG'>,
   auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null },
-): Promise<BoundAgentVerdict> {
+  options: { requireActive?: boolean } = {},
+): Promise<BoundAgentVerdict | 'paused'> {
   const agentId = auth.boundAgentId
   if (!agentId) return 'live'
   const consenter = auth.consentedByMemberId ?? null
@@ -81,6 +86,7 @@ export async function boundAgentVerdict(
     if (row.owner_member_id !== null && row.owner_status !== 'active') return 'refused'
     if (consenter !== null && row.consenter_status !== 'active') return 'refused'
     if (row.has_caps !== 1) return 'refused'
+    if (options.requireActive && row.status === 'paused') return 'paused'
     return 'live'
   } catch {
     return 'unavailable'

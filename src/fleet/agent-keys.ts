@@ -1,5 +1,6 @@
+import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 import type { Env } from '../types'
-import { boundAgentVerdict, BoundAgentCheckUnavailableError, type BoundAgentVerdict } from '../auth/bound-agent-live'
+import { BoundAgentCheckUnavailableError, type BoundAgentVerdict } from '../auth/bound-agent-live'
 
 const ED25519_PUBLIC_X_RE = /^[A-Za-z0-9_-]{43}$/
 
@@ -121,7 +122,9 @@ export async function signerVerdict(env: Env, agentId: string, key: ActiveAgentK
   try {
     const resolved = await resolveKeyedAgentId(env, agentId, key.member_id)
     if (resolved === null) return 'refused'
-    return await boundAgentVerdict(env, { boundAgentId: resolved, consentedByMemberId: null, memberId: key.member_id })
+    // Signed polling retains paused-as-live; parity operations require active.
+    const caller = await resolveBoundAgentCaller(env, { tenant: env.TENANT_SLUG, boundAgentId: resolved, consentedByMemberId: null, memberId: key.member_id }, { requireActive: false })
+    return caller.ok ? 'live' : caller.status === 503 ? 'unavailable' : 'refused'
   } catch {
     return 'unavailable'
   }
