@@ -186,16 +186,21 @@ describe('routine runtime-neutral dispatch', () => {
     expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-preferred' })
   })
 
-  it('waits for a human when no eligible welded teammate exists', async () => {
+  it('fails with a receipt instead of waiting forever when no eligible welded teammate exists', async () => {
     harness = makeHarness()
     harness.sqlite.prepare('DELETE FROM capabilities').run()
-
-    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
-
-    expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
-    expect(row(harness, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
-      status: 'waiting', waiting_reason: 'agent',
+    const env=envFor(harness)
+    const result = await dispatchRoutineRun(env, 'run-1', NOW)
+    expect(result).toEqual({ ok: true, status: 'failed', reason: 'no_eligible_agent', run_id: 'run-1' })
+    expect(row(harness, "SELECT status, waiting_reason, retry_at, finished_at, result_summary, lease_owner FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      status:'failed',waiting_reason:null,retry_at:null,finished_at:NOW.toISOString(),result_summary:'no_eligible_agent',lease_owner:null,
     })
+    expect(row(harness, "SELECT kind,json_extract(metadata_json,'$.reason') AS reason FROM routine_run_events WHERE run_id='run-1' AND kind='failed'"))
+      .toEqual({kind:'failed',reason:'no_eligible_agent'})
+    expect(await dispatchRoutineRun(env,'run-1',NOW)).toEqual({ok:false,error:'run_not_dispatchable'})
+    expect(row(harness,"SELECT count(*) AS n FROM routine_run_events WHERE run_id='run-1' AND kind='failed'")).toEqual({n:1})
+    expect(row(harness,'SELECT count(*) AS n FROM tasks')).toEqual({n:0})
+    expect(row(harness,'SELECT count(*) AS n FROM flights')).toEqual({n:0})
   })
 
   it('retries the same run when eligible runtimes are offline', async () => {
@@ -617,7 +622,7 @@ describe('routine runtime-neutral dispatch', () => {
 
       const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
 
-      expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
+      expect(result).toEqual({ ok: true, status: 'failed', reason: 'no_eligible_agent', run_id: 'run-1' })
     })
 
     it("DOES dispatch when the grant is department-admin on the TARGET squad's department", async () => {

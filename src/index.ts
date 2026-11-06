@@ -600,7 +600,7 @@ export default {
     //     no-op unless BOARD_WRITEBACK=1. Fail-soft by contract (the cron wrapper catches).
     const { runBoardSyncTick } = await import('./projects/board-sync')
     const { retryFailedWritebacks } = await import('./projects/board-writeback')
-    // Slot 19 of 20: minutes 24 and 54 of the existing maintenance cron.
+    // Slot 19 is retained; the maintenance array below records its current cadence.
     const { reclaimDeadAssignments } = await import('./tasks/dead-assignee-reclaim')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
@@ -622,7 +622,10 @@ export default {
       ['repo-key-heal', () => healProjectRepoKeys(env.DB, { limit: REPO_KEY_HEAL_PER_TICK })],
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
       ['board-latency-retention', () => pruneRouteLatency(env)],
+      // With 22 entries: slot 19 runs at minute 24; expiry slots 20/21 at 30/31.
       ['dead-assignee-reclaim', () => reclaimDeadAssignments(env)],
+      ['archive-proposal-expiry', async () => (await import('./hygiene/archive-proposals')).expireArchiveProposals(env)],
+      ['elevation-expiry', async () => (await import('./auth/elevation')).expireStaleElevationRequests(env, env.TENANT_SLUG)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

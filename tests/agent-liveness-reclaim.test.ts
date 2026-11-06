@@ -121,10 +121,12 @@ describe('dead-assignee reclaim',()=>{
  it('owner inbox failures do not undo committed reclaim',async()=>{dead();task();h.sqlite.exec("CREATE TRIGGER fail_reclaim_note BEFORE INSERT ON agent_messages BEGIN SELECT RAISE(ABORT,'inbox unavailable'); END;");expect((await sweep()).reclaimed).toBe(1);expect(audit()).toHaveLength(1);expect(row().assignee_agent_id).toBeNull()})
  it.each(['no-owner','no-other-agent'])('keeps an audit-only record for %s',async mode=>{dead();task();if(mode==='no-owner')h.sqlite.exec("UPDATE agents SET owner_member_id=NULL WHERE id='a'");else h.sqlite.exec("UPDATE agents SET owner_member_id=NULL WHERE id='owner-inbox'");expect((await sweep()).reclaimed).toBe(1);expect(audit()).toHaveLength(1);expect(notices()).toHaveLength(0)})
  it('reclaims at most 25 tasks per tick and makes progress on the next tick',async()=>{dead();for(let i=0;i<28;i++)task(`t${i}`);expect((await sweep()).reclaimed).toBe(25);expect((await sweep()).reclaimed).toBe(3);expect(audit()).toHaveLength(28)})
- it('is wired into slot 19 of 20, at minutes 24 and 54',()=>{
+ it('retains reclaim at slot 19 and pins the 22-job maintenance cadence',()=>{
   const source=readFileSync(new URL('../src/index.ts',import.meta.url),'utf8');const list=source.slice(source.indexOf('const maintenance:'))
-  const names=[...list.matchAll(/\['([^']+)',/g)].map(m=>m[1]);expect(names).toHaveLength(20);expect(names[19]).toBe('dead-assignee-reclaim'); for(let slot=0;slot<20;slot++)expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,20)===slot)).toHaveLength(2)
-  expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,names.length)===19)).toEqual([24,54])
+  const names=[...list.matchAll(/\['([^']+)',/g)].map(m=>m[1]);expect(names).toHaveLength(22);expect(names[19]).toBe('dead-assignee-reclaim');expect(names.slice(20)).toEqual(['archive-proposal-expiry','elevation-expiry']); for(let slot=0;slot<22;slot++)expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,22)===slot)).toHaveLength(slot<18?2:1)
+  expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,names.length)===19)).toEqual([24])
+  expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,names.length)===20)).toEqual([30])
+  expect(MAINTENANCE_FIRING_MINUTES.filter(m=>maintenanceSlot(m,names.length)===21)).toEqual([31])
  })
 })
 

@@ -340,6 +340,36 @@ describe('archive_propose visibility, cap and flag', () => {
     expect(rows(`SELECT COUNT(*) AS n FROM archive_proposals WHERE decision IS NULL`)[0]).toEqual({ n: MAX_PENDING_PER_AGENT })
   })
 
+  it('stale pending rows do not consume the per-agent cap and can be re-proposed', async () => {
+    const old=new Date(Date.now()-PROPOSAL_TTL_MS-60000).toISOString()
+    const stmt=harness.sqlite.prepare(`INSERT INTO archive_proposals(id,tenant,task_id,proposed_by_agent_id,reason,task_status_at_proposal,created_at) VALUES(?,? ,?,'agent-A','old','open',?)`)
+    for(let i=0;i<MAX_PENDING_PER_AGENT;i++)stmt.run(`old-${i}`,TENANT,i===0?'t-1':`old-task-${i}`,old)
+    const r=await propose(['t-1','t-2'])
+    expect(r).toMatchObject({ok:true,result:{proposed:['t-1','t-2'],already_pending:[],cap_reached:[]}})
+    expect(rows("SELECT decision FROM archive_proposals WHERE id='old-0'")).toEqual([{decision:'expired'}])
+    expect(await countPendingProposals(makeEnv('admin@x.test'))).toBe(2)
+    expect(archivedIds()).toEqual([])
+  })
+
+  it('expires proposals at the shared TTL cut in bounded tenant-scoped idempotent batches', async () => {
+    const now=Date.now(),cut=new Date(now-PROPOSAL_TTL_MS).toISOString(),old=new Date(now-PROPOSAL_TTL_MS-60000).toISOString()
+    const stmt=harness.sqlite.prepare(`INSERT INTO archive_proposals(id,tenant,task_id,proposed_by_agent_id,reason,task_status_at_proposal,created_at,decision) VALUES(?,? ,?,'agent-A','old','open',?,?)`)
+    for(let i=0;i<101;i++)stmt.run(`expiry-${i}`,TENANT,`expiry-task-${i}`,old,null)
+    stmt.run('at-cut',TENANT,'cut-task',cut,null)
+    stmt.run('fresh',TENANT,'fresh-task',new Date(now).toISOString(),null)
+    stmt.run('foreign','other-tenant','foreign-task',old,null)
+    stmt.run('decided',TENANT,'decided-task',old,'archived')
+    const {expireArchiveProposals}=await import('../src/hygiene/archive-proposals')
+    const env=makeEnv('admin@x.test')
+    expect(await expireArchiveProposals(env,now)).toEqual({expiredCount:100})
+    expect(await expireArchiveProposals(env,now)).toEqual({expiredCount:2})
+    expect(await expireArchiveProposals(env,now+1000)).toEqual({expiredCount:0})
+    expect(rows("SELECT COUNT(*) AS n FROM archive_proposals WHERE decision='expired' AND decided_at IS NOT NULL")).toEqual([{n:102}])
+    expect(rows("SELECT decision FROM archive_proposals WHERE id IN ('fresh','foreign')")).toEqual([{decision:null},{decision:null}])
+    expect(rows("SELECT decision FROM archive_proposals WHERE id='decided'")).toEqual([{decision:'archived'}])
+    expect(archivedIds()).toEqual([])
+  })
+
   it('refuses up front with not_supported when TASK_ARCHIVE_ENABLED is off', async () => {
     const env = { ...makeEnv('admin@x.test'), TASK_ARCHIVE_ENABLED: undefined } as Env
     const res = await invokeTool(agentAuth(), env, 'archive_propose', { task_ids: ['t-1'], reason: 'x' }, ORIGIN)

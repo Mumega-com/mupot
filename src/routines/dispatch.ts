@@ -102,6 +102,7 @@ export type RoutineDispatchResult =
       flight_id: string
       duplicate: boolean
     }
+  | { ok: true; status: 'failed'; reason: 'no_eligible_agent'; run_id: string }
   | { ok: true; status: 'waiting'; reason: 'agent' | 'budget'; run_id: string }
   | {
       ok: true
@@ -354,22 +355,23 @@ async function appendStateEvent(
   run: DispatchRunRow,
   now: string,
   input: {
-    status: 'queued' | 'waiting'
+    status: 'queued' | 'waiting' | 'failed'
     waitingReason: 'agent' | 'budget' | null
     resultSummary: string
     retryAt: string | null
-    eventKind: 'retry_scheduled' | 'agent_waiting' | 'budget_blocked'
+    eventKind: 'retry_scheduled' | 'agent_waiting' | 'budget_blocked' | 'failed'
   },
 ): Promise<boolean> {
   const outcomes = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = ?, waiting_reason = ?, retry_at = ?,
-              result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+              result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?,
+              finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
           AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       input.status, input.waitingReason, input.retryAt, input.resultSummary,
-      now, run.id, run.tenant,
+      now, input.status, now, run.id, run.tenant,
     ),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
@@ -408,7 +410,17 @@ async function waitForBudget(env: Env, run: DispatchRunRow, now: Date): Promise<
 async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: string): Promise<RoutineDispatchResult> {
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
-  if (run.attempt >= policy.max_attempts || reason === 'no_eligible_agent') {
+  // No eligible identity is a terminal dispatch failure; there is nothing to retry.
+  // Offline/paused/delivery cases retain their existing retry or human-wait policy.
+  if (reason === 'no_eligible_agent') {
+    const transitioned = await appendStateEvent(env, run, now.toISOString(), {
+      status: 'failed', waitingReason: null, resultSummary: reason,
+      retryAt: null, eventKind: 'failed',
+    })
+    if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
+    return { ok: true, status: 'failed', reason, run_id: run.id }
+  }
+  if (run.attempt >= policy.max_attempts) {
     const transitioned = await appendStateEvent(env, run, now.toISOString(), {
       status: 'waiting', waitingReason: 'agent', resultSummary: reason,
       retryAt: null, eventKind: 'agent_waiting',
