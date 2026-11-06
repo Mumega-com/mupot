@@ -3126,3 +3126,104 @@ describe('rework re-dispatch takes over a terminal execution pointer (mupot#1727
     } finally { f.harness.close() }
   })
 })
+
+describe('same-agent runtime receipt parity', () => {
+  it.each(['workspace', 'directory', 'attached'] as const)('%s settles own dispatch with the actual credential', async door => {
+    const f = runtimeFixture()
+    try {
+      if (door !== 'workspace') f.harness.sqlite.prepare("UPDATE member_tokens SET channel='directory' WHERE id=?").run(TOKEN_ID)
+      const actor: AuthContext = {...f.auth, channel: door === 'workspace' ? 'workspace' : 'directory',
+        ...(door !== 'attached' ? {} : {seatBinding:{seatId:'seat',label:'chat',harnessId:'h',grantTokenId:'grant',humanMemberId:MEMBER_ID,source:'handle' as const,
+          attached:{attachmentId:'att',admissionId:'adm',agentId:AGENT_ID,seatAgentId:'seat-agent',ceiling:'member' as const}}})}
+      const input = {taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,messageId:MESSAGE_ID,stage:'runtime_consumed' as const,runtimeReceiptHash:RUNTIME_HASH,attempt:1}
+      const consumed = await recordTaskDispatchRuntimeReceipt(f.env,actor,input)
+      expect(consumed.task_status).toBe('in_progress')
+      const completed = await recordTaskDispatchRuntimeReceipt(f.env,actor,{...input,stage:'completed',result:'Work complete'})
+      expect(completed.task_status).toBe('review')
+      expect(f.harness.sqlite.prepare('SELECT credential_id FROM task_dispatch_runtime_receipts').all()).toEqual([
+        {credential_id:TOKEN_ID},{credential_id:TOKEN_ID},
+      ])
+    } finally {f.harness.close()}
+  })
+})
+
+describe('runtime parity ceiling', () => {
+  it.each(['empty','other-scope'])('cannot use DB standing outside the %s authenticated ceiling, even to claim an unleased envelope', async ceiling => {
+    const f=runtimeFixture({unleased:true})
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,{...f.auth,channel:'directory',capabilities:ceiling === 'empty' ? [] : [{member_id:MEMBER_ID,scope_type:'squad',scope_id:'other-squad',capability:'member'}]},{taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,stage:'runtime_consumed',runtimeReceiptHash:RUNTIME_HASH,attempt:1}))
+        .rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(f.harness.sqlite.prepare('SELECT lease_expires_at,delivery_attempts FROM agent_messages WHERE id=?').get(MESSAGE_ID))
+        .toEqual({lease_expires_at:null,delivery_attempts:0})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('runtime parity resource and live boundary',()=>{
+  it.each(['workspace','directory','attached'] as const)('%s refuses another assignee and a paused own agent',async door=>{
+    const f=runtimeFixture()
+    try {
+      const actor={...f.auth,channel:door==='workspace'?'workspace' as const:'directory' as const}
+      if(door!=='workspace') f.harness.sqlite.prepare("UPDATE member_tokens SET channel='directory' WHERE id=?").run(TOKEN_ID)
+      const input={task_id:TASK_ID,dispatch_receipt_id:DISPATCH_ID,message_id:MESSAGE_ID,stage:'runtime_consumed',runtime_receipt_hash:RUNTIME_HASH,attempt:1}
+      f.harness.sqlite.prepare('UPDATE tasks SET assignee_agent_id=? WHERE id=?').run(GATE_AGENT_ID,TASK_ID)
+      expect(await invokeTool(actor,f.env,'task_dispatch_runtime_receipt',input)).toMatchObject({ok:false,status:404})
+      f.harness.sqlite.prepare("UPDATE tasks SET assignee_agent_id=? WHERE id=?").run(AGENT_ID,TASK_ID)
+      f.harness.sqlite.prepare("UPDATE agents SET status='paused' WHERE id=?").run(AGENT_ID)
+      expect(await invokeTool(actor,f.env,'task_dispatch_runtime_receipt',input)).toMatchObject({ok:false,status:403})
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts').get()).toEqual({n:0})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('runtime parity final ceiling',()=>{
+  it.each(['preleased','pair','recovery'])('rechecks the authenticated scope if the task moves after the early ceiling read (%s)',async mode=>{
+    const f=runtimeFixture({unleased:mode!=='preleased'})
+    try {
+      if(mode==='recovery') f.harness.sqlite.prepare('UPDATE agent_messages SET read_at=? WHERE id=?').run(T0,MESSAGE_ID)
+      const before=f.harness.sqlite.prepare('SELECT read_at,lease_expires_at,delivery_attempts FROM agent_messages WHERE id=?').get(MESSAGE_ID)
+      f.harness.sqlite.exec(`INSERT INTO squads(id,department_id,slug,name) VALUES ('scope-moved','department-runtime-1','moved','Moved');
+        INSERT INTO memberships(id,agent_id,squad_id,capability) VALUES ('scope-member','${AGENT_ID}','scope-moved','member');
+        INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('scope-cap','${MEMBER_ID}','squad','scope-moved','member')`)
+      let flipped=false
+      const env={...f.env,DB:{...f.env.DB,prepare(sql:string){
+        const stmt=f.env.DB.prepare(sql)
+        if(!sql.startsWith('SELECT squad_id FROM tasks')) return stmt
+        const wrap=(s:D1PreparedStatement):D1PreparedStatement=>({...s,bind(...values:unknown[]){return wrap(s.bind(...values))},async first<T>(){
+          const row=await s.first<T>()
+          if(!flipped){flipped=true;f.harness.sqlite.exec(`UPDATE tasks SET squad_id='scope-moved' WHERE id='${TASK_ID}'; UPDATE task_dispatch_receipts SET squad_id='scope-moved' WHERE id='${DISPATCH_ID}'; UPDATE agent_messages SET body=json_set(body,'$.squad_id','scope-moved') WHERE id='${MESSAGE_ID}'`)}
+          return row
+        }})
+        return wrap(stmt)
+      }}} as Env
+      await expect(recordTaskDispatchRuntimeReceipt(env,f.auth,{taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,messageId:mode==='pair'?undefined:MESSAGE_ID,stage:'runtime_consumed',runtimeReceiptHash:RUNTIME_HASH,attempt:1}))
+        .rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(flipped).toBe(true)
+      expect(f.harness.sqlite.prepare('SELECT read_at,lease_expires_at,delivery_attempts FROM agent_messages WHERE id=?').get(MESSAGE_ID)).toEqual(before)
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts').get()).toEqual({n:0})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('runtime parity owner and unavailable live verdict',()=>{
+  it('refuses settlement when the bound agent owner is suspended',async()=>{
+    const f=runtimeFixture()
+    try {
+      f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(GATE_MEMBER_ID,AGENT_ID)
+      f.harness.sqlite.prepare("UPDATE members SET status='suspended' WHERE id=?").run(GATE_MEMBER_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,f.auth,{taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,messageId:MESSAGE_ID,stage:'runtime_consumed',runtimeReceiptHash:RUNTIME_HASH,attempt:1}))
+        .rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+    } finally {f.harness.close()}
+  })
+  it('returns retryable 503 when live authorization cannot be checked',async()=>{
+    const f=runtimeFixture()
+    try {
+      const env={...f.env,DB:{...f.env.DB,prepare(sql:string){
+        if(sql.includes('AS consenter_status')) throw new Error('private DB details')
+        return f.env.DB.prepare(sql)
+      }}} as Env
+      expect(await invokeTool(f.auth,env,'task_dispatch_runtime_receipt',{task_id:TASK_ID,dispatch_receipt_id:DISPATCH_ID,message_id:MESSAGE_ID,stage:'runtime_consumed',runtime_receipt_hash:RUNTIME_HASH,attempt:1}))
+        .toMatchObject({ok:false,status:503,error:'agent_check_unavailable'})
+    } finally {f.harness.close()}
+  })
+})

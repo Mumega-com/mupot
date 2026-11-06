@@ -1,3 +1,4 @@
+import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 import { canOnSquad, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
@@ -467,6 +468,7 @@ export function noConflictingTerminalSql(
 
 export type TaskDispatchRuntimeReceiptErrorCode =
   | 'agent_bound_workspace_credential_required'
+  | 'agent_check_unavailable'
   | 'runtime_receipt_invalid'
   | 'runtime_delivery_not_found'
   | 'runtime_delivery_stale'
@@ -882,7 +884,7 @@ async function resolveMessageId(
  */
 async function claimUnleasedForPairSettlement(
   env: Env,
-  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string },
+  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; authorizedSquadId: string | null },
 ): Promise<boolean> {
   const leaseExpiresAt = new Date(Date.now() + MAX_LEASE_SECONDS * 1000).toISOString()
   const result = await env.DB.prepare(`
@@ -899,6 +901,7 @@ async function claimUnleasedForPairSettlement(
           WHERE dispatch.tenant = ?1 AND dispatch.id = ?5 AND dispatch.task_id = ?6
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
+            AND task.squad_id = ?7
             -- mupot#1780: no lease on an archived task's envelope (this runs before the archive refusal).
             AND ${TASK_NOT_ARCHIVED_SQL('task')}
        )
@@ -926,7 +929,7 @@ async function claimUnleasedForPairSettlement(
        )
   `).bind(
     env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
-    input.dispatchReceiptId, input.taskId,
+    input.dispatchReceiptId, input.taskId, input.authorizedSquadId,
   ).run()
   return result.meta?.changes === 1
 }
@@ -1007,7 +1010,7 @@ async function isOwnDispatchTaskArchived(
 
 async function claimReadEnvelopeForRecovery(
   env: Env,
-  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; attempt: number; now: string },
+  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; attempt: number; now: string; authorizedSquadId: string | null },
 ): Promise<void> {
   const leaseExpiresAt = new Date(Date.now() + MAX_LEASE_SECONDS * 1000).toISOString()
   await env.DB.prepare(`
@@ -1028,6 +1031,7 @@ async function claimReadEnvelopeForRecovery(
           WHERE dispatch.tenant = ?1 AND dispatch.id = ?5 AND dispatch.task_id = ?6
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
+            AND task.squad_id = ?9
             AND task.status IN ('open', 'blocked', 'rejected')
             -- mupot#1780: the claim runs BEFORE the isTaskArchived refusal; an archived task must not
             -- get a 1h lease written onto its envelope.
@@ -1039,7 +1043,7 @@ async function claimReadEnvelopeForRecovery(
        )
   `).bind(
     env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
-    input.dispatchReceiptId, input.taskId, input.attempt, input.now,
+    input.dispatchReceiptId, input.taskId, input.attempt, input.now, input.authorizedSquadId,
   ).run()
 }
 
@@ -1175,12 +1179,30 @@ export async function recordTaskDispatchRuntimeReceipt(
   options: { origin?: 'mcp' | 'rest' } = {},
 ): Promise<{ receipt: PublicTaskDispatchRuntimeReceipt; task_status: string }> {
   const memberId = auth.memberId?.trim() ?? ''
-  const credentialId = auth.tokenId?.trim() ?? ''
   const agentId = auth.boundAgentId?.trim() ?? ''
-  if (
-    auth.channel !== 'workspace' || auth.tenant !== env.TENANT_SLUG
-    || memberId === '' || credentialId === '' || agentId === ''
-  ) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
+  const credentialId = auth.tokenId?.trim() ?? ''
+  if (auth.tenant !== env.TENANT_SLUG || !memberId || !agentId || !credentialId) {
+    throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
+  }
+  // 0099: this is a credential gate on a WRITE path, so it consumes the one shared
+  // liveness export rather than a hand-written copy. The copy this replaces compared
+  // `expires_at > ?5` as TEXT against an ISO-shaped `now`, while member_tokens holds
+  // BOTH 'YYYY-MM-DD HH:MM:SS' and ISO rows. 'T' (0x54) sorts above ' ' (0x20), so a
+  // space-format token expiring later today compared as already dead — fail-closed,
+  // but only by accident: harmonizing `now` to nowSqlUtc() (the obvious tidy-up)
+  // would have flipped the same expression to fail-OPEN. TOKEN_LIVE_PREDICATE uses
+  // julianday() on both sides and has no such orientation.
+  const now = nowSqlUtc()
+  const token = await env.DB.prepare(`
+    SELECT t.id FROM member_tokens t
+     WHERE t.id = ?1 AND t.member_id = ?2 AND t.agent_id = ?3 AND t.tenant = ?4
+       AND t.channel IN ('workspace', 'directory')
+       AND ${TOKEN_LIVE_PREDICATE('?5')}
+  `).bind(credentialId, memberId, agentId, env.TENANT_SLUG, now).first<{ id: string }>()
+  if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
+
+  const caller = await resolveBoundAgentCaller(env, auth)
+  if (!caller.ok) throw new TaskDispatchRuntimeReceiptError(caller.error === 'agent_check_unavailable' ? 'agent_check_unavailable' : 'runtime_receipt_forbidden')
   if (
     !STAGES.has(input.stage)
     || !Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > 5
@@ -1256,22 +1278,13 @@ export async function recordTaskDispatchRuntimeReceipt(
      WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = ?3 AND attempt = ?4
   `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<ReceiptRow>()
 
-  // 0099: this is a credential gate on a WRITE path, so it consumes the one shared
-  // liveness export rather than a hand-written copy. The copy this replaces compared
-  // `expires_at > ?5` as TEXT against an ISO-shaped `now`, while member_tokens holds
-  // BOTH 'YYYY-MM-DD HH:MM:SS' and ISO rows. 'T' (0x54) sorts above ' ' (0x20), so a
-  // space-format token expiring later today compared as already dead — fail-closed,
-  // but only by accident: harmonizing `now` to nowSqlUtc() (the obvious tidy-up)
-  // would have flipped the same expression to fail-OPEN. TOKEN_LIVE_PREDICATE uses
-  // julianday() on both sides and has no such orientation.
-  const now = nowSqlUtc()
-  const token = await env.DB.prepare(`
-    SELECT t.id FROM member_tokens t
-     WHERE t.id = ?1 AND t.member_id = ?2 AND t.agent_id = ?3 AND t.tenant = ?4
-       AND t.channel = 'workspace'
-       AND ${TOKEN_LIVE_PREDICATE('?5')}
-  `).bind(credentialId, memberId, agentId, env.TENANT_SLUG, now).first<{ id: string }>()
-  if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
+  // The authenticated ceiling must pass before either lease-equivalent claim can write.
+  // Fresh DB standing is an additional revocation check, never an expansion of this ceiling.
+  const ownTask = await env.DB.prepare('SELECT squad_id FROM tasks WHERE id = ?1 AND assignee_agent_id = ?2')
+    .bind(input.taskId, agentId).first<{ squad_id: string }>()
+  if (ownTask && !(await canOnSquad(env, auth.capabilities ?? [], ownTask.squad_id, 'member'))) {
+    throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
+  }
 
   // mupot#1494 round 2 (P1-a) — a task_list-only runner's message has never been leased; give
   // it the lease-equivalent atomically, once, so validateEnvelope below sees exactly the shape
@@ -1284,6 +1297,7 @@ export async function recordTaskDispatchRuntimeReceipt(
       dispatchReceiptId: input.dispatchReceiptId,
       taskId: input.taskId,
       callerAgentId: agentId,
+      authorizedSquadId: ownTask?.squad_id ?? null,
     })
   }
 
@@ -1298,6 +1312,7 @@ export async function recordTaskDispatchRuntimeReceipt(
       dispatchReceiptId: input.dispatchReceiptId,
       taskId: input.taskId,
       callerAgentId: agentId,
+      authorizedSquadId: ownTask?.squad_id ?? null,
       attempt: input.attempt,
       now,
     })
@@ -1309,7 +1324,8 @@ export async function recordTaskDispatchRuntimeReceipt(
   }
   const grants = await resolveCapabilities(env, memberId)
   const assignee = await resolveTaskAssignee(env, agentId, delivery.task_squad_id)
-  if (!(await canOnSquad(env, grants, delivery.task_squad_id, 'member')) || assignee.value !== agentId) {
+  if (!(await canOnSquad(env, auth.capabilities ?? [], delivery.task_squad_id, 'member'))
+    || !(await canOnSquad(env, grants, delivery.task_squad_id, 'member')) || assignee.value !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
   const runtimeAddress = validateEnvelope(delivery, input, replay !== null)

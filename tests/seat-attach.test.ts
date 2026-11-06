@@ -818,6 +818,18 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     expect((await attach(env, g, 'conv-a', 'rava')).sc.status).toBe('pending_admission')
   })
 
+  it('a revoked-only admission from another chat permits a fresh ask, not approval_bound_to_other_chat', async () => {
+    const env=envFor(h)
+    const g=await grant(env,HUMAN)
+    await admitAndAttach(env,g,'conv-old')
+    const adm=one<{id:string}>(`SELECT id FROM agent_seat_admissions`)!
+    expect((await revokeAdmission(env,{admissionId:adm.id,humanMemberId:HUMAN})).ok).toBe(true)
+    await boot(env,g,'conv-new')
+    const asked=await attach(env,g,'conv-new','rava')
+    expect(asked.sc.status,JSON.stringify(asked.body)).toBe('pending_admission')
+    expect(JSON.stringify(asked.body)).not.toContain('approval_bound_to_other_chat')
+  })
+
   it('the per-request check is live even if the cleanup trigger never ran (admission revoked behind its back)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
@@ -1736,7 +1748,7 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     }
     expect(n(`SELECT COUNT(*) AS n FROM module_registry`)).toBe(0)
     h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) VALUES ('m-host', '${TENANT}', 'agent-rava', 'agent-x', 'mem-x', 'message', 'for the host')`)
-    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_lease', {}], ['inbox_lease_reconcile', { attempt_id: 'x' }], ['inbox_lease_ack', { attempt_id: 'x' }], ['inbox_ack', { ids: ['m-host'] }]] as Array<[string, Record<string, unknown>]>) {
+    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_ack', { ids: ['m-host'] }]] as Array<[string, Record<string, unknown>]>) {
       expect(JSON.stringify(await invokeTool(att, env, tool, a, 'https://pot.test'))).toContain('attached_seat_peek_only')
     }
     expect((h.sqlite.prepare(`SELECT read_at FROM agent_messages WHERE id = 'm-host'`).get() as { read_at: string | null } | undefined)?.read_at ?? null).toBeNull()
@@ -1745,6 +1757,23 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     // host telemetry: an attached chat cannot overwrite the host's capacity snapshot
     const cap = await invokeTool(att, env, 'harness_capacity_report', { harness: 'orca', host_key: 'h', observed_at: Date.now(), live_terminals: 1, agent_sessions: 1, busy_recent: 0, orphaned_terminals: 0, workers_active: 0, workers_release_unknown: 0, worktrees_with_live: 0 }, 'https://pot.test')
     expect(JSON.stringify(cap)).toContain('attached_seat_not_agent_host')
+  })
+
+  it('an admitted attached seat can lease and acknowledge; revoked admission stops its door', async () => {
+    const env = envFor(h)
+    const { invokeTool } = await import('../src/mcp/index')
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-parity')
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-parity', codexThreadId: null } })
+    h.sqlite.exec(`DELETE FROM agent_messages WHERE to_agent='agent-rava'; INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body) VALUES ('parity-mail','${TENANT}','agent-rava','agent-x','mem-x','message','own work')`)
+    const args = {limit:1,attempt_id:'parity_attempt_001'}
+    expect(await invokeTool(att,env,'inbox_lease',args)).toMatchObject({ok:true,result:{messages:[{id:'parity-mail'}]}})
+    expect(await invokeTool(att,env,'inbox_lease_ack',{attempt_id:args.attempt_id})).toMatchObject({ok:true,result:{consumed:true}})
+    const adm=one<{id:string}>(`SELECT id FROM agent_seat_admissions`)!
+    expect((await revokeAdmission(env,{admissionId:adm.id,humanMemberId:HUMAN})).ok).toBe(true)
+    const response=await rpc(env,g.ctx,'inbox_lease',args,{meta:thread('conv-parity')})
+    expect(JSON.stringify(response.body)).not.toContain('parity-mail')
+    expect(JSON.stringify(response.body)).not.toContain('"consumed":true')
   })
 
   it('idle sweep only detaches when the auto pool is full (a persistent connection survives while slots are free)', async () => {
@@ -2580,8 +2609,8 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     expect(idsOf(await call(host, 'inbox', { peek: true })).sort()).toEqual(['m-1', 'm-2'])
     expect(idsOf(await call(host, 'inbox', { limit: 10 })).sort()).toEqual(['m-1', 'm-2'])
     expect(n(`SELECT COUNT(*) AS n FROM agent_messages WHERE read_at IS NOT NULL`)).toBe(2)
-    // and the attached chat is still refused every consume path
-    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_lease', {}], ['inbox_ack', { ids: ['m-1'] }]] as Array<[string, Record<string, unknown>]>) {
+    // the attached chat is still refused legacy consume/ack paths
+    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_ack', { ids: ['m-1'] }]] as Array<[string, Record<string, unknown>]>) {
       expect(JSON.stringify(await call(att, tool, a))).toContain('attached_seat_peek_only')
     }
   })
@@ -2620,10 +2649,10 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     expect(one<{ handled_at: string }>(`SELECT handled_at FROM agent_attachment_handled`)!.handled_at).toBe(first)
   })
 
-  it('inbox_consumer_status is truthful: peek_only + the mark_handled path for an attached chat; the host keeps bearer_only', async () => {
+  it('inbox_consumer_status is truthful: lease_only + the mark_handled path for an attached chat; the host keeps bearer_only', async () => {
     const { att, call, host } = await setup()
     const a = (await call(att, 'inbox_consumer_status')) as { result: Record<string, unknown> }
-    expect(a.result).toMatchObject({ mode: 'peek_only', attached: true, can_consume: false, can_peek: true, can_mark_handled: true, mark_handled_tool: 'inbox_mark_handled' })
+    expect(a.result).toMatchObject({ mode: 'lease_only', attached: true, can_consume: true, can_peek: true, can_mark_handled: true, mark_handled_tool: 'inbox_mark_handled' })
     expect(JSON.stringify(a)).not.toContain('bearer_only')
     const hh = (await call(host, 'inbox_consumer_status')) as { result: Record<string, unknown> }
     expect(hh.result).toMatchObject({ mode: 'bearer_only', generation: 0 })
@@ -2634,7 +2663,7 @@ describe('inbox_mark_handled (attached chat per-attachment handled receipt, #193
     const { att, call } = await setup()
     h.sqlite.exec(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason) VALUES ('${TENANT}', 'agent-rava', 'signed_only', 7, '${'a'.repeat(64)}', '${HUMAN}', '2026-10-15T00:00:00.000Z', 'test')`)
     const r = (await call(att, 'inbox_consumer_status')) as { result: Record<string, unknown> }
-    expect(r.result).toMatchObject({ mode: 'peek_only', can_peek: false, can_mark_handled: false, can_consume: false, reason: 'consumer_fenced_signed_only' })
+    expect(r.result).toMatchObject({ mode: 'lease_only', can_peek: false, can_mark_handled: false, can_consume: false, reason: 'consumer_fenced_signed_only' })
     expect(JSON.stringify(r)).not.toContain('a'.repeat(64))
     expect(r.result.generation).toBeUndefined()
   })

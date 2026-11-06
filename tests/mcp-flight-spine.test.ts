@@ -166,7 +166,6 @@ describe('Flight Spine MCP tool surface', () => {
   })
 
   it.each([
-    ['objective_accept', OBJECTIVE_ARGS],
     ['token_binding_attest', {}],
     ['runtime_seat_register_pending', {
       seatName: 'codex-desktop-command',

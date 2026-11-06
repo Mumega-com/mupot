@@ -82,6 +82,7 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
     INSERT INTO members (id, email, display_name, status, tenant) VALUES
       ('${MEMBER_ID}', 'owner@pot.test', 'Owner', 'active', '${TENANT}'),
       ('${OTHER_MEMBER_ID}', 'other@pot.test', 'Other', 'active', '${TENANT}');
+    INSERT INTO capabilities (id,member_id,scope_type,scope_id,capability) VALUES ('doorbell-member-cap','${MEMBER_ID}','squad','${SQUAD_ID}','member');
   `)
 }
 

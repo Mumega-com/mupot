@@ -680,7 +680,7 @@ describe('sudo for attached chats: what stays refused WITH a live grant', () => 
     }
     expect(n(`SELECT COUNT(*) AS n FROM module_registry`)).toBe(0)
     h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) VALUES ('m-host', '${TENANT}', 'agent-rava', 'agent-x', 'mem-x', 'message', 'for the host')`)
-    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_lease', {}], ['inbox_lease_reconcile', { attempt_id: 'x' }], ['inbox_lease_ack', { attempt_id: 'x' }], ['inbox_ack', { ids: ['m-host'] }]] as Array<[string, Record<string, unknown>]>) {
+    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_ack', { ids: ['m-host'] }]] as Array<[string, Record<string, unknown>]>) {
       expect(await code(tool, a), tool).toContain('attached_seat_peek_only')
     }
     expect(one<{ read_at: string | null }>(`SELECT read_at FROM agent_messages WHERE id = 'm-host'`)!.read_at).toBeNull()

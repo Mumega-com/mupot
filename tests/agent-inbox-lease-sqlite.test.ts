@@ -47,8 +47,10 @@ function fixture() {
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
       ('agent-a', 'squad-a', 'agent-a', 'Agent Alpha', 'operator', 'test', 'active'),
       ('agent-b', 'squad-a', 'agent-b', 'Agent Beta', 'operator', 'test', 'active');
-    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+    INSERT OR IGNORE INTO members (id, email, display_name, status, tenant) VALUES
       ('owner', 'owner@pot.test', 'Owner', 'active', 'tenant-a');
+    INSERT INTO members(id,display_name,status,tenant) VALUES ('agent-member','Agent Member','active','tenant-a');
+    INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('lease-cap','agent-member','squad','squad-a','member');
   `)
 
   const env = { TENANT_SLUG: 'tenant-a', DB: harness.db } as unknown as Env
@@ -811,7 +813,7 @@ describe('authoritative inbox lease attempt reconciliation', () => {
     try {
       f.seed('m1')
       f.harness.sqlite.exec(`
-        INSERT INTO members (id, email, display_name, status, tenant)
+        INSERT OR IGNORE INTO members (id, email, display_name, status, tenant)
         VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
@@ -820,7 +822,7 @@ describe('authoritative inbox lease attempt reconciliation', () => {
       `)
       const auth: AuthContext = {
         userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
-        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [{member_id:'agent-member',scope_type:'squad',scope_id:'squad-a',capability:'member'}],
       }
       const leased = await invokeTool(auth, f.env, 'inbox_lease', {
         attempt_id: ATTEMPT, limit: 1, lease_seconds: 30,
@@ -863,7 +865,7 @@ describe('authoritative inbox lease attempt reconciliation', () => {
       const auth: AuthContext = {
         userId: 'agent-member', memberId: 'agent-member', email: null,
         tenant: 'tenant-a', role: 'member', channel: 'workspace',
-        boundAgentId: 'agent-a', tokenId: 'tok-unavailable', capabilities: [],
+        boundAgentId: 'agent-a', tokenId: 'tok-unavailable', capabilities: [{member_id:'agent-member',scope_type:'squad',scope_id:'squad-a',capability:'member'}],
       }
 
       expect(await invokeTool(auth, env, 'inbox_lease', {
@@ -892,7 +894,7 @@ describe('inbox honors a live lease exactly like inbox_lease (mupot#1494 round 3
     const f = fixture()
     try {
       f.harness.sqlite.exec(`
-        INSERT INTO members (id, email, display_name, status, tenant)
+        INSERT OR IGNORE INTO members (id, email, display_name, status, tenant)
         VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
@@ -901,7 +903,7 @@ describe('inbox honors a live lease exactly like inbox_lease (mupot#1494 round 3
       `)
       const auth: AuthContext = {
         userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
-        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [{member_id:'agent-member',scope_type:'squad',scope_id:'squad-a',capability:'member'}],
       }
       // The real production shape: agent_messages.id is a uuid, not a friendly slug.
       const uuid = 'a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6'
@@ -965,7 +967,7 @@ describe('the attempt-held carve-out never leaks into leaseAgentInbox, and never
     const f = fixture()
     try {
       f.harness.sqlite.exec(`
-        INSERT INTO members (id, email, display_name, status, tenant)
+        INSERT OR IGNORE INTO members (id, email, display_name, status, tenant)
         VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
@@ -978,7 +980,7 @@ describe('the attempt-held carve-out never leaks into leaseAgentInbox, and never
       `)
       const auth: AuthContext = {
         userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
-        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [{member_id:'agent-member',scope_type:'squad',scope_id:'squad-a',capability:'member'}],
       }
       const attemptId = 'b'.repeat(20)
       const attemptResult = await leaseAgentInbox(f.env, { agent: 'agent-a', limit: 1, attemptId })
@@ -997,7 +999,7 @@ describe('the attempt-held carve-out never leaks into leaseAgentInbox, and never
     const f = fixture()
     try {
       f.harness.sqlite.exec(`
-        INSERT INTO members (id, email, display_name, status, tenant)
+        INSERT OR IGNORE INTO members (id, email, display_name, status, tenant)
         VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
         VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
@@ -1007,7 +1009,7 @@ describe('the attempt-held carve-out never leaks into leaseAgentInbox, and never
       f.seed('m1')
       const auth: AuthContext = {
         userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
-        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [{member_id:'agent-member',scope_type:'squad',scope_id:'squad-a',capability:'member'}],
       }
       const attemptId = 'c'.repeat(20)
       const attemptResult = await leaseAgentInbox(f.env, { agent: 'agent-a', limit: 1, attemptId })

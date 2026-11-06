@@ -1,3 +1,4 @@
+import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 // Bounded Flight 2 control-plane surface. This module intentionally exposes only
 // objective acceptance/readback, visible receipt readback, current-token
 // attestation, and pending command-seat registration. Lease/process activation,
@@ -452,7 +453,7 @@ async function receiptIsVisible(
 
 const toolObjectiveAccept: ToolSpec = {
   name: 'objective_accept',
-  scope: 'agent-bound workspace objective acceptance',
+  scope: 'agent-bound objective acceptance',
   min: 'member',
   args: '{ squadId: string, projectId?: string|null, title: string, successContract: string, authorityEnvelope: object, policy: object, budgetMicroUsd: number, payload: object, idempotencyKey: string }',
   inputSchema: {
@@ -481,8 +482,8 @@ const toolObjectiveAccept: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const identity = boundWorkspaceIdentity(auth)
-    if (isToolFailure(identity)) return identity
+    const caller = await resolveBoundAgentCaller(env, auth)
+    if (!caller.ok) return caller
     const squadId = str(args.squadId)
     const title = str(args.title)
     const successContract = str(args.successContract)
@@ -539,6 +540,11 @@ const toolObjectiveGet: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (auth.tenant !== env.TENANT_SLUG) return fail(404, 'objective_not_found')
+    if (auth.boundAgentId) {
+      const caller = await resolveBoundAgentCaller(env, auth)
+      if (!caller.ok) return caller
+    }
     const objectiveId = str(args.objectiveId)
     if (!objectiveId) return fail(400, 'invalid_args')
     const objective = await visibleObjective(env, auth, objectiveId)
@@ -558,6 +564,11 @@ const toolExecutionReceiptGet: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (auth.tenant !== env.TENANT_SLUG) return fail(404, 'receipt_not_found')
+    if (auth.boundAgentId) {
+      const caller = await resolveBoundAgentCaller(env, auth)
+      if (!caller.ok) return caller
+    }
     const receiptId = str(args.receiptId)
     if (!receiptId) return fail(400, 'invalid_args')
     const receipt = await getExecutionReceipt(env, receiptId)

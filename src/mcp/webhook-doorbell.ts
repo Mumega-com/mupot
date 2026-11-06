@@ -1,3 +1,4 @@
+import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 // mupot — MCP tools for the per-agent Grok Bot webhook doorbell.
 //
 // Self for own agent; org-admin for others. Never accepts an identity from
@@ -51,7 +52,11 @@ async function resolveDoorbellTarget(
 
   if (auth.boundAgentId) {
     // W2: an attached thread is not the agent itself — the self lane would let it point the agent's wake bearer at its own URL.
-    if (auth.boundAgentId === resolved.value.id && !attachedAuthority(auth)) return { ok: true, agentId: resolved.value.id }
+    if (auth.boundAgentId === resolved.value.id && (!gate || !attachedAuthority(auth))) {
+      if (gate) return { ok: true, agentId: resolved.value.id } // workspace structural write stays unchanged
+      const caller = await resolveBoundAgentCaller(env, auth)
+      return caller.ok ? { ok: true, agentId: caller.agentId } : caller
+    }
     if (gate) {
       const verdict = await gate(resolved.value)
       if (verdict.kind === 'refused') return fail(verdict.status, verdict.error, verdict.detail) as ToolFailure

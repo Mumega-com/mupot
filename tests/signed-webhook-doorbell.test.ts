@@ -217,6 +217,7 @@ describe('signed webhook doorbell delivery', () => {
       INSERT INTO members (id, email, display_name, status, tenant) VALUES
         ('${MEMBER_ID}', 'owner@pot.test', 'Owner', 'active', '${TENANT}'),
         ('${OTHER_MEMBER_ID}', 'other@pot.test', 'Other', 'active', '${TENANT}');
+      INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('doorbell-cap','${MEMBER_ID}','squad','${SQUAD_ID}','member');
     `)
     fetched = []
     sent = []
