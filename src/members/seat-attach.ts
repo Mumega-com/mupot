@@ -325,10 +325,41 @@ export function weldAudit(env: Env, agentId: string, actorId: string, admissionI
     'EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?6 AND agent_id = ?2 AND member_id = ?7)', [env.TENANT_SLUG, memberId])
 }
 
+export interface BlockingAdmission {
+  id: string
+  agent_id: string
+  agent_name: string
+  agent_slug: string
+  harness_id: string
+  seat_id: string | null
+  seat_name: string
+  status: 'pending' | 'live'
+  created_at: string
+  last_used_at: string | null
+  can_move: boolean
+}
+
+/** Read a CURRENT blocker scoped to the same human/agent/install. Snapshots may have closed meanwhile. */
+async function otherChatBlocker(env: Env, p: {agentId:string;humanMemberId:string;harnessId:string;seatId:string}): Promise<EnsureAdmissionResult> {
+  const row = await env.DB.prepare(`SELECT adm.id, adm.agent_id, a.name AS agent_name, a.slug AS agent_slug,
+      adm.harness_id, adm.requested_seat_id AS seat_id, adm.status, adm.created_at,
+      COALESCE(tl.label, s.label_basename, 'Unavailable chat') AS seat_name,
+      s.last_used_at AS last_used_at, (a.owner_member_id = ?3 AND adm.status = 'live') AS can_move
+    FROM agent_seat_admissions adm JOIN agents a ON a.id = adm.agent_id
+    JOIN harnesses h ON h.id = adm.harness_id AND h.tenant = adm.tenant AND h.member_id = adm.human_member_id
+    LEFT JOIN agent_seats s ON s.id = adm.requested_seat_id AND s.tenant = adm.tenant AND s.member_id = adm.human_member_id
+    LEFT JOIN agent_seat_thread_labels tl ON tl.seat_id = s.id AND tl.tenant = adm.tenant AND tl.human_member_id = adm.human_member_id
+    WHERE adm.tenant = ?1 AND adm.agent_id = ?2 AND adm.human_member_id = ?3 AND adm.harness_id = ?4
+      AND adm.status IN ('pending','live') AND adm.scope = 'seat' AND adm.requested_seat_id IS NOT ?5 LIMIT 1`)
+    .bind(env.TENANT_SLUG,p.agentId,p.humanMemberId,p.harnessId,p.seatId).first<Omit<BlockingAdmission,'can_move'> & {can_move:number}>()
+  return row ? {ok:false,error:'approval_bound_to_other_chat',blocking_admission:{...row,can_move:row.can_move===1},requested_seat_id:p.seatId}
+    : {ok:false,error:'attach_refused'}
+}
+
 export type EnsureAdmissionResult =
   | { ok: true; state: 'live'; admission: AdmissionRow }
   | { ok: true; state: 'pending'; admission: AdmissionRow; approveUrl: string | null; alreadyPending: boolean; requiresHumanRelease?: boolean }
-  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch' }
+  | { ok: false; error: 'too_many_pending_admissions' | 'attach_refused' | 'attach_code_mismatch' | 'approval_bound_to_other_chat' | 'admission_scope_mismatch'; blocking_admission?: BlockingAdmission; requested_seat_id?: string }
 
 /**
  * A LIVE seat-scoped admission is returned only to the chat that asked for it. A harness-scoped admission (R1) covers
@@ -339,7 +370,7 @@ export type EnsureAdmissionResult =
 async function liveAdmissionFor(env: Env, open: AdmissionRow, p: { seatId: string; via: 'tool' | 'dashboard'; scope?: AdmissionScope; grantTokenId?: string | null }): Promise<EnsureAdmissionResult> {
   if (p.scope === 'harness' && open.scope !== 'harness') return { ok: false, error: 'admission_scope_mismatch' }
   if (open.scope === 'harness' && !p.grantTokenId) return { ok: false, error: 'attach_refused' }
-  if (open.scope !== 'harness' && open.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
+  if (open.scope !== 'harness' && open.requested_seat_id !== p.seatId) return otherChatBlocker(env,{...p,agentId:open.agent_id,humanMemberId:open.human_member_id,harnessId:open.harness_id})
   // An earlier approval cannot lift an observed chat, including one detached by the idle sweep.
   // A dashboard attach is itself a new human action; a tool must wait for this chat's Release.
   const seat = await loadHumanSeat(env, open.human_member_id, p.seatId)
@@ -376,7 +407,7 @@ export async function ensureAdmission(
 
   if (p.via === 'dashboard') {
     if (open && open.status === 'pending') {
-      if (open.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
+      if (open.requested_seat_id !== p.seatId) return otherChatBlocker(env,p)
       if (open.scope === 'harness') return { ok: false, error: 'attach_refused' } // a harness-wide approval is only ever the passkey tap
       if (attachCodeRefused(open, p.attachCode)) return { ok: false, error: 'attach_code_mismatch' }
       await promoteAdmission(env, open, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode)
@@ -402,8 +433,7 @@ export async function ensureAdmission(
       ])
     }
     const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
-    if (now && now.status === 'live' && now.requested_seat_id !== p.seatId) return { ok: false, error: 'approval_bound_to_other_chat' }
-    return now && now.status === 'live' ? { ok: true, state: 'live', admission: now } : { ok: false, error: 'attach_refused' }
+    return now && now.status === 'live' ? liveAdmissionFor(env,now,p) : { ok: false, error: 'attach_refused' }
   }
 
   // via 'tool'. A repeat ask while one is already pending NEVER mints or rotates a link: the human already has one (or can
@@ -811,7 +841,7 @@ export interface AttachPending {
   already_pending: boolean
 }
 /** `agent` is set only for agent_not_designated_for_you (the caller has standing over it, so naming it reveals nothing). */
-export interface AttachErr { ok: false; error: AttachFailure; agent?: { id: string; slug: string; name: string } }
+export interface AttachErr { ok: false; error: AttachFailure; blocking_admission?: BlockingAdmission; requested_seat_id?: string; agent?: { id: string; slug: string; name: string } }
 export type AttachResult = AttachOk | AttachPending | AttachErr
 
 async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: string; agent_id: string } | null> {
@@ -827,7 +857,7 @@ async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: str
  * additionally refuses when the seat already has a live attachment, so a unique-index hit can never roll back the admission.
  * Params: ?1 attachment ?2 tenant ?3 token ?4 now ?5 admission ?6 agent ?7 seat ?8 human.
  */
-function prepareAttachStatements(
+export function prepareAttachStatements(
   env: Env,
   p: { attachmentId: string; tokenId: string; tokenHash: string; nowIso: string; admissionId: string; agent: { id: string; slug: string }; seat: { id: string; harnessId: string }; humanMemberId: string; requireNoLiveAttachment: boolean; promotedAt?: string; grantTokenId: string | null; humanAction?: boolean },
 ): D1PreparedStatement[] {
@@ -918,7 +948,7 @@ export async function attachSeatToAgent(
   const admission = await ensureAdmission(env, {
     agentId: agent.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, seatId: seat.id, via: p.via, reason: p.reason, requesterAgentId: p.requesterAgentId, ceiling: p.ceiling, attachCode: p.attachCode, scope: p.scope, grantTokenId: p.grantTokenId,
   }, nowMs)
-  if (!admission.ok) return { ok: false, error: admission.error }
+  if (!admission.ok) return { ok: false, error: admission.error, blocking_admission: admission.blocking_admission, requested_seat_id: admission.requested_seat_id }
   if (admission.state === 'pending') {
     // Only the chat that filed the ask learns the code; a different chat hitting the same pending row gets none.
     const attachCode = !admission.requiresHumanRelease && admission.admission.requested_seat_id === seat.id ? admission.admission.attach_code : null
@@ -1070,6 +1100,13 @@ export interface ConnectionSeat {
 export interface ConnectionHarness { id: string; client_name: string; kind: string; credential_kind: string; seats: ConnectionSeat[] }
 export interface ConnectionAdmission extends AttachIdentity {
   id: string
+  agent_id: string
+  agent_slug: string
+  scope: AdmissionScope
+  last_used_at: string | null
+  newest_chat_name: string | null
+  newest_chat_created_at: string | null
+  stale: boolean
   status: 'pending' | 'live'
   agent_name: string
   harness_name: string
@@ -1099,7 +1136,17 @@ async function loadBoundConnections(env: Env, humanMemberId: string): Promise<Bo
   ).bind(env.TENANT_SLUG, humanMemberId).all<BoundConnection>()).results ?? []
 }
 
-export async function loadConnections(env: Env, humanMemberId: string): Promise<{ harnesses: ConnectionHarness[]; admissions: ConnectionAdmission[]; bound: BoundConnection[] }> {
+/** Read-only display freshness; it never revokes or widens an admission. */
+export const CONNECTION_STALE_DAYS = 7
+export function connectionActivityMillis(stamp:string):number {
+  const iso=stamp.replace(' ','T')
+  return Date.parse(/[zZ]$|[+-]\d{2}:\d{2}$/.test(iso)?iso:`${iso}Z`)
+}
+function latestConnectionActivity(...stamps:(string|null|undefined)[]):string|null {
+  return stamps.filter((s):s is string=>!!s&&Number.isFinite(connectionActivityMillis(s))).sort((a,b)=>connectionActivityMillis(b)-connectionActivityMillis(a))[0]??null
+}
+
+export async function loadConnections(env: Env, humanMemberId: string, nowMs=Date.now()): Promise<{ harnesses: ConnectionHarness[]; admissions: ConnectionAdmission[]; bound: BoundConnection[] }> {
   const hs = (await env.DB.prepare(
     `SELECT id, client_name, kind, credential_kind FROM harnesses WHERE tenant = ?1 AND member_id = ?2 ORDER BY created_at DESC LIMIT 50`,
   ).bind(env.TENANT_SLUG, humanMemberId).all<{ id: string; client_name: string; kind: string; credential_kind: string }>()).results ?? []
@@ -1121,10 +1168,16 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
     seats: seats.filter((s) => s.harness_id === h.id).map((s) => ({ ...s, connection_name: s.thread_label ?? defaultConnectionName(h, s.seat_label) })),
   }))
   const admissions = (await env.DB.prepare(
-    `SELECT adm.id AS id, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
+    `SELECT adm.id AS id, adm.agent_id AS agent_id, a.slug AS agent_slug, adm.scope AS scope, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
             a.name AS agentName, a.role AS agentRole, COALESCE(om.display_name, om.email, a.owner, 'unrecorded') AS ownerName,
             h.client_name AS harnessName, h.kind AS harness_kind, f.runtime AS runtime, COALESCE(NULLIF(rtl.label, ''), rs.label_basename) AS seatLabel, adm.reason AS reason,
             adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, adm.requested_seat_id AS requested_seat_id, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
+            rs.last_used_at AS seat_last_used_at,
+            (SELECT x.last_used_at FROM agent_seat_attachments x WHERE x.admission_id=adm.id AND x.last_used_at IS NOT NULL ORDER BY julianday(x.last_used_at) DESC LIMIT 1) AS attachment_last_used_at,
+            COALESCE((SELECT COALESCE(ntl.label,ns.label_basename) FROM agent_seat_attachments nx JOIN agent_seats ns ON ns.id=nx.seat_id AND ns.tenant=nx.tenant
+              LEFT JOIN agent_seat_thread_labels ntl ON ntl.seat_id=ns.id AND ntl.tenant=ns.tenant AND ntl.human_member_id=nx.human_member_id
+              WHERE nx.admission_id=adm.id ORDER BY julianday(ns.created_at) DESC LIMIT 1),rtl.label,rs.label_basename) AS newest_chat_name,
+            COALESCE((SELECT ns.created_at FROM agent_seat_attachments nx JOIN agent_seats ns ON ns.id=nx.seat_id AND ns.tenant=nx.tenant WHERE nx.admission_id=adm.id ORDER BY julianday(ns.created_at) DESC LIMIT 1),rs.created_at) AS newest_chat_created_at,
             (SELECT COUNT(*) FROM agent_seat_attachments x WHERE x.admission_id = adm.id AND x.detached_at IS NULL) AS live_threads
        FROM agent_seat_admissions adm
        JOIN agents a ON a.id = adm.agent_id
@@ -1135,6 +1188,10 @@ export async function loadConnections(env: Env, humanMemberId: string): Promise<
        LEFT JOIN fleet_agents f ON f.agent_id = a.id AND f.tenant = adm.tenant
       WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live')
       ORDER BY adm.created_at DESC LIMIT 200`,
-  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission & { runtime: string | null; harness_kind: string }>()).results ?? []
-  return { harnesses, admissions: admissions.map((a) => ({ ...a, runtimeMismatch: attachRuntimeMismatch(a.runtime, a.harness_kind) })), bound: await loadBoundConnections(env, humanMemberId) }
+  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission & { runtime: string | null; harness_kind: string;seat_last_used_at:string|null;attachment_last_used_at:string|null }>()).results ?? []
+  return { harnesses, admissions: admissions.map((a) => {
+    const last=latestConnectionActivity(a.seat_last_used_at,a.attachment_last_used_at)
+    const activity=latestConnectionActivity(last,a.seat_first_seen,a.newest_chat_created_at)
+    return {...a,last_used_at:last,stale:!activity||connectionActivityMillis(activity)<nowMs-CONNECTION_STALE_DAYS*86400000,runtimeMismatch:attachRuntimeMismatch(a.runtime,a.harness_kind)}
+  }), bound: await loadBoundConnections(env, humanMemberId) }
 }
