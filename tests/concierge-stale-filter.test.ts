@@ -37,7 +37,7 @@ const owner=(id:string)=>h.sqlite.prepare('SELECT assignee_agent_id FROM tasks W
 
 describe('concierge stale route eligibility',()=>{
  it.each(['age','artifact','steward'])('five %s exclusions cannot occupy the fresh tasks scan window',async kind=>{
-  for(let i=0;i<5;i++)task(`excluded-${i}`,kind==='age'?ago(60):ago(2),kind==='steward'?'Earlier context\nsteward-reissue-of:old-card\nBuild it':'Build it',kind==='artifact'?'artifact_verification_failed: missing receipt':null)
+  for(let i=0;i<5;i++)task(`excluded-${i}`,kind==='age'?ago(60):ago(2),kind==='steward'?'Earlier context\nsteward-reissue-of:12345678-1234-4234-8234-123456789abc\nBuild it':'Build it',kind==='artifact'?'artifact_verification_failed: missing receipt':null)
   task('fresh',ago(1))
   expect(await run()).toMatchObject({decision:{action:'route',routed:1,skipReasons:['stale_excluded']}})
   expect(owner('fresh')).toBe('builder')
@@ -63,7 +63,7 @@ describe('concierge stale route eligibility',()=>{
   hook=()=>{
    if(kind==='age')h.sqlite.prepare('UPDATE tasks SET created_at=? WHERE id=?').run(ago(60),'racing')
    if(kind==='artifact')h.sqlite.prepare('UPDATE tasks SET result=? WHERE id=?').run('artifact_verification_failed: changed','racing')
-   if(kind==='steward')h.sqlite.prepare('UPDATE tasks SET body=? WHERE id=?').run('steward-reissue-of:old-card','racing')
+   if(kind==='steward')h.sqlite.prepare('UPDATE tasks SET body=? WHERE id=?').run('steward-reissue-of:12345678-1234-4234-8234-123456789abc','racing')
   }
   expect(await run()).toMatchObject({decision:{action:'noop',reason:'stale_excluded'}})
   expect(claims).toBe(1);expect(owner('racing')).toBeNull()
@@ -120,5 +120,48 @@ describe('starter project ownership fallback',()=>{
  it('reports the missing operator ground in the tick summary',async()=>{
   h.sqlite.exec("UPDATE projects SET assigned_squad_id=NULL; DELETE FROM project_squad_access")
   expect(await runConciergeTick(env,{listProjects:async()=>[p()]})).toMatchObject({dispatched:0,skippedProjects:{starter_no_operator:1}})
+ })
+})
+
+
+describe('steward machine marker shape',()=>{
+ const uuid='12345678-1234-4234-8234-123456789abc'
+ it.each([
+  'Why does steward-reissue-of: dedupe miss cards?',
+  `Prose mentions steward-reissue-of:${uuid} without a machine line`,
+  'steward-reissue-of:short-id\n',
+  'steward-reissue-of:gggggggg-gggg-gggg-gggg-gggggggggggg\n',
+  `steward-reissue-of:${uuid}f\n`,
+  `steward-reissue-of:${uuid} quoted here\n`,
+  ` steward-reissue-of:${uuid}\n`,
+ ])('routes fresh prose or malformed markers: %s',async body=>{
+  task('mention',ago(1),body)
+  expect(await run()).toMatchObject({decision:{action:'route',routed:1}});expect(owner('mention')).toBe('builder')
+ })
+ it.each([`steward-reissue-of:${uuid}\n`,`Some work\n\nsteward-reissue-of:${uuid}\nSteward auto-reissue`,`steward-reissue-of:${uuid.toUpperCase()}`])('excludes a complete marker line: %s',async body=>{
+  task('machine',ago(1),body)
+  expect(await run()).toMatchObject({decision:{action:'noop',reason:'stale_excluded'}});expect(owner('machine')).toBeNull()
+ })
+})
+async function coreBuilder(){
+ h.sqlite.exec(`INSERT INTO squads(id,department_id,slug,name) VALUES('squad-core','d','core','Core');
+ INSERT INTO agents(id,squad_id,slug,name,status) VALUES('core-builder','squad-core','core-builder','Core builder','active');
+ INSERT INTO members(id,tenant,display_name,status) VALUES('core-member','t','Core member','active');
+ INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('t','core-builder','core-member','${NOW}');
+ INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES('core-cap','core-member','squad','squad-core','member');
+ INSERT INTO presence(tenant,member_id,display_name,source,label,agent_id,first_seen_at,last_seen_at) VALUES('t','core-seat','Core builder','test','test','core-builder','${NOW}','${NOW}');
+ UPDATE module_registry SET status='offline' WHERE identity='builder';`)
+ await online('core-builder')
+}
+describe('starter core defaults stay removed',()=>{
+ it('does not fall back to a live squad-core builder when the project has no ownership ground',async()=>{
+  await coreBuilder();h.sqlite.exec('UPDATE projects SET assigned_squad_id=NULL; DELETE FROM project_squad_access')
+  expect(await run()).toMatchObject({decision:{action:'noop',reason:'starter_no_operator'}})
+  expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks').get()).toEqual({n:0})
+ })
+ it('uses an explicitly configured core squad without inventing a kasra review gate',async()=>{
+  await coreBuilder();h.sqlite.exec("UPDATE projects SET assigned_squad_id='squad-core'; INSERT INTO project_squad_access(project_id,squad_id,access_level) VALUES('p','squad-core','write')")
+  const r=await run();expect(r).toMatchObject({decision:{action:'dispatch',agentId:'core-builder'}})
+  expect(h.sqlite.prepare('SELECT gate_owner FROM tasks WHERE id=?').get(r.taskId!)).toEqual({gate_owner:null})
  })
 })

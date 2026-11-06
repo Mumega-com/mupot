@@ -143,7 +143,7 @@ import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus, VerdictIndependenceWaiver } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
-import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../tasks/assignee'
+import { resolveTaskAssignee, resolveTaskAssigneeMember, assigneeChangesOwnGate } from '../tasks/assignee'
 import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
@@ -2278,6 +2278,16 @@ const toolTaskUpdate: ToolSpec = {
         next.gate_owner = trimmed
       } else {
         return fail(400, 'invalid_gate_owner')
+      }
+      // Current and resulting ownership both count: a combined reassignment cannot
+      // let the worker select its own reviewer. Existing locked/immutable gates above
+      // remain stricter; the squad-lead exception only permits otherwise legal changes.
+      if (assigneeChangesOwnGate(auth, existing, next) &&
+        !(await memberCanOnSquadAuth(env, auth, existing.squad_id, 'lead'))) {
+        return fail(403, 'gate_owner_assignee_requires_lead', {
+          need: 'lead', scope: 'squad',
+          next_step: 'Ask a lead or admin of this task squad to select the review gate.',
+        })
       }
       changed = true
     }

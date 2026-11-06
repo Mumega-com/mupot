@@ -79,12 +79,16 @@ export const MAX_ROUTES_PER_AGENT = 2
 /** Automatic routing only. Recent automation/notes must not revive an old card. */
 export const STALE_ROUTE_DAYS = 30
 
+/** UUID shape emitted by steward-worker.py; the marker must occupy a complete line. */
+const STEWARD_REISSUE_UUID_GLOB = [8, 4, 4, 4, 12].map(size => '[0-9A-Fa-f]'.repeat(size)).join('-')
+
 /** Trusted SQL parameter only; shared by window selection and the claim fence. */
 export function conciergeRouteEligibilitySql(cutoffParam: string): string {
   return `(
     COALESCE(julianday(tasks.created_at) >= julianday(${cutoffParam}), 0)
     AND instr(COALESCE(tasks.result, ''), 'artifact_verification_failed') <> 1
-    AND instr(COALESCE(tasks.body, ''), 'steward-reissue-of:') = 0
+    AND (char(10) || COALESCE(tasks.body, '') || char(10)) NOT GLOB
+      ('*' || char(10) || 'steward-reissue-of:${STEWARD_REISSUE_UUID_GLOB}' || char(10) || '*')
   )`
 }
 
