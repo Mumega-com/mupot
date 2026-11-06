@@ -623,6 +623,7 @@ export default {
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
       ['board-latency-retention', () => pruneRouteLatency(env)],
       ['dead-assignee-reclaim', () => reclaimDeadAssignments(env)],
+      ['archive-proposal-expiry', async () => (await import('./hygiene/archive-proposals')).expireArchiveProposals(env)],
     ]
     const heartbeat = maintenance[maintenanceSlot(scheduledAt.getUTCMinutes(), maintenance.length)]
     if (heartbeat) waitFor(heartbeat[0], heartbeat[1]())

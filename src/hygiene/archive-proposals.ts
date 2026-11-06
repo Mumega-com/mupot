@@ -22,6 +22,15 @@ function ttlCutoffIso(nowMs: number = Date.now()): string {
   return new Date(nowMs - PROPOSAL_TTL_MS).toISOString()
 }
 
+/** Bounded, idempotent retention of proposals no longer listable or decidable. */
+export async function expireArchiveProposals(env: Env, nowMs: number = Date.now()): Promise<{expiredCount:number}> {
+  const r=await env.DB.prepare(`UPDATE archive_proposals SET decision='expired', decided_at=?3
+    WHERE tenant=?1 AND decision IS NULL AND created_at<=?2
+      AND id IN (SELECT id FROM archive_proposals WHERE tenant=?1 AND decision IS NULL AND created_at<=?2 ORDER BY created_at,id LIMIT 100)`)
+    .bind(env.TENANT_SLUG,ttlCutoffIso(nowMs),new Date(nowMs).toISOString()).run()
+  return {expiredCount:Number(r.meta?.changes??0)}
+}
+
 export interface ProposeInput {
   agentId: string
   taskIds: string[]
@@ -61,7 +70,9 @@ export async function proposeArchives(env: Env, auth: AuthContext, input: Propos
   const alreadyPending: string[] = []
   const notProposable: string[] = []
   const capReached: string[] = []
-  const now = new Date().toISOString()
+  const nowMs = Date.now()
+  const now = new Date(nowMs).toISOString()
+  const cutoff = ttlCutoffIso(nowMs)
   for (const taskId of ids) {
     const task = await env.DB.prepare(`SELECT id, squad_id, status, updated_at FROM tasks WHERE id = ?1`)
       .bind(taskId).first<{ id: string; squad_id: string; status: string; updated_at: string }>()
@@ -71,17 +82,24 @@ export async function proposeArchives(env: Env, auth: AuthContext, input: Propos
     }
     // The per-agent cap is part of the INSERT itself (one statement), so concurrent calls cannot overshoot it.
     // The partial unique index makes a duplicate pending proposal a no-op rather than a second row.
-    const res = await env.DB.prepare(
+    const results = await env.DB.batch([
+      // Free the partial unique index for this task, retaining the old proposal as expired.
+      // At most one row can be pending for this tenant/task; unrelated backlog is left to maintenance.
+      env.DB.prepare(`UPDATE archive_proposals SET decision='expired', decided_at=?4
+        WHERE tenant=?1 AND task_id=?2 AND decision IS NULL AND created_at<=?3`).bind(env.TENANT_SLUG,taskId,cutoff,now),
+      env.DB.prepare(
       `INSERT INTO archive_proposals (id, tenant, task_id, proposed_by_agent_id, reason, evidence,
                                       task_status_at_proposal, task_updated_at_proposal, created_at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-        WHERE (SELECT COUNT(*) FROM archive_proposals WHERE tenant = ?2 AND proposed_by_agent_id = ?4 AND decision IS NULL) < ${MAX_PENDING_PER_AGENT}
+        WHERE (SELECT COUNT(*) FROM archive_proposals WHERE tenant = ?2 AND proposed_by_agent_id = ?4 AND decision IS NULL AND created_at > ?10) < ${MAX_PENDING_PER_AGENT}
        ON CONFLICT DO NOTHING`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, taskId, input.agentId, reason, evidence, task.status, task.updated_at, now).run()
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, taskId, input.agentId, reason, evidence, task.status, task.updated_at, now, cutoff),
+    ])
+    const res = results[1]
     if (Number(res.meta?.changes ?? 0) === 1) { proposed.push(taskId); continue }
     const dup = await env.DB.prepare(
-      `SELECT 1 AS x FROM archive_proposals WHERE tenant = ?1 AND task_id = ?2 AND decision IS NULL`,
-    ).bind(env.TENANT_SLUG, taskId).first<{ x: number }>()
+      `SELECT 1 AS x FROM archive_proposals WHERE tenant = ?1 AND task_id = ?2 AND decision IS NULL AND created_at > ?3`,
+    ).bind(env.TENANT_SLUG, taskId, cutoff).first<{ x: number }>()
     if (dup) alreadyPending.push(taskId)
     else capReached.push(taskId)
   }
