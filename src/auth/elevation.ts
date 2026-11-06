@@ -382,10 +382,10 @@ export async function listPendingElevationRequests(
   try {
     const rows = await env.DB.prepare(
       `SELECT ${REQUEST_COLUMNS} FROM elevation_requests
-        WHERE tenant = ?1 AND status = 'pending'
+        WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
         ORDER BY created_at ASC`,
     )
-      .bind(tenant)
+      .bind(tenant, new Date(nowMs).toISOString())
       .all<ElevationRequestRecord>()
     await notifyLapsedApprovalBotRequests(env, tenant, nowMs)
     return rows.results ?? []
