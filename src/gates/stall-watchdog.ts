@@ -1,12 +1,15 @@
 // src/gates/stall-watchdog.ts — gate-stall watchdog (mupot#1705).
 //
-// Review entry owns the first gate wake. Later stalls only update the bounded,
-// durable watchdog ledger and log; Needs You keeps the aged review visible.
+// Review entry owns the first wake. A delivered/queued wake stays quiet; a failed
+// or missing wake can recover within the existing bounded claim budget.
 // Task status, verdicts, the initial wake and its gate-holder resolution are unchanged.
 
 import type { Env, Task } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { safeConsole } from '../lib/log'
+import { resolveSoleGateOwnerAgent } from './grants'
+// Keep this static: a lazy MCP import previously produced an invalid Worker initializer.
+import { wakeGateOwnerOnReview } from '../mcp'
 
 export const DEFAULT_GATE_STALL_THRESHOLD_MINUTES = 30
 export const DEFAULT_GATE_STALL_MAX_REWAKES = 3
@@ -25,6 +28,19 @@ export interface GateStallSweepResult {
 function positiveInt(raw: string | undefined, fallback: number): number {
   const n = raw === undefined ? NaN : Number.parseInt(raw, 10)
   return Number.isSafeInteger(n) && n > 0 ? n : fallback
+}
+
+/** The recorded delivery must belong to the currently resolved holder, not just this capability. */
+async function wakeWasDelivered(env:Env,task:Task):Promise<boolean>{
+  try {
+    const r=await resolveSoleGateOwnerAgent(env,task.gate_owner??'')
+    if(r.status!=='resolved')return false
+    const notice=task.gate_wake_notice??''
+    if(r.principal.type==='agent')return notice.startsWith(`Gate wake delivered: ${r.capability} -> agent ${r.principal.id} (`)
+    const member=`): ${r.capability} is held by member ${r.principal.id}`
+    const suffix=". A verdict still needs the member's own decision."
+    return notice.startsWith('Decision card queued to ') && (notice.endsWith(member+suffix)||notice.endsWith(member+'; already queued for this review entry'+suffix))
+  } catch {return false}
 }
 
 export async function sweepStalledGateReviews(env: Env, now: Date = new Date()): Promise<GateStallSweepResult> {
@@ -79,10 +95,20 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
         result.skipped_claimed += 1
         continue
       }
-      await env.DB.prepare(`UPDATE gate_stall_rewakes SET last_outcome='logged_no_mail' WHERE task_id=?1`)
-        .bind(task.id).run()
+      // Re-read after claiming: a first wake may have finished since the candidate scan.
+      const current=await env.DB.prepare('SELECT * FROM tasks WHERE id=?1').bind(task.id).first<Task>()
+      let outcome='logged_no_mail', delivered=false
+      if(current && current.status==='review' && current.updated_at===task.updated_at && !(await wakeWasDelivered(env,current))){
+        const recovery=await wakeGateOwnerOnReview(env,current,{kind:'agent',id:WATCHDOG_ID},WATCHDOG_ID)
+        outcome=recovery.status
+        delivered=recovery.status==='delivered'||recovery.status==='partial'||(recovery.status==='queued_to_owner_agent'&&(recovery.new_sends??1)>0)
+        if(delivered)result.rewoken+=1
+        else if(recovery.status!=='queued_to_owner_agent')result.undelivered+=1
+      }
+      await env.DB.prepare(`UPDATE gate_stall_rewakes SET last_outcome=?1, delivered_count=delivered_count+?2 WHERE task_id=?3`)
+        .bind(outcome,delivered?1:0,task.id).run()
       result.recorded += 1
-      safeConsole.info('[gate-stall]', { actor: WATCHDOG_ID, task_id: task.id, review_since: task.updated_at, outcome: 'logged_no_mail' })
+      safeConsole.info('[gate-stall]', { actor: WATCHDOG_ID, task_id: task.id, review_since: task.updated_at, outcome })
     } catch {
       result.errors += 1
     }

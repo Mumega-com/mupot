@@ -1,8 +1,8 @@
 // src/gates/approval-expiry.ts — an unanswered gate ask expires (Hadi, org owner, 2026-10-16:
 // "if one didn't answer to the approval it expires").
 //
-// BEFORE: a task in `review` with a gate_owner waited forever. The only exit from review is a
-// verdict and nothing swept (the stall watchdog only re-wakes; it never closes).
+// The stall watchdog can recover an undelivered first wake but never closes an ask.
+// This expiry policy supplies the bounded review-to-blocked exit for unanswered asks.
 //
 // RULE (one config constant, below):
 //   - a gate verdict ask and a publish ask expire 14 days after the task ENTERED review;

@@ -111,8 +111,8 @@ export interface Env {
   // every human_origin. Read only via src/im/origin-attestors.ts.
   HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS?: string
   BRAND: string
-  // Gate-stall watchdog (mupot#1705): minutes a task may sit in review with no verdict before the
-  // gate wake is re-sent (default 30), and the max re-wakes per review episode (default 3).
+  // Gate-stall watchdog (mupot#1705): check after 30 minutes by default; recover only undelivered
+  // first wakes within the existing per-review claim budget (default 3). Delivered wakes stay quiet.
   GATE_STALL_THRESHOLD_MINUTES?: string
   GATE_STALL_MAX_REWAKES?: string
   // Approval expiry sweep (src/gates/approval-expiry.ts): the cron is a DRY RUN (logs counts, writes

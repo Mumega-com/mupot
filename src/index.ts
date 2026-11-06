@@ -579,8 +579,8 @@ export default {
     //     flight_reap_receipts table (migration 0109) to exist, or every reap
     //     would transition a flight with no audit trail.
     const { sweepStalledFlights } = await import('./flight/watchdog')
-    // 13. Gate-stall watchdog (mupot#1705) — re-send the gate wake for a review task whose gate
-    //     seat has not recorded a verdict past the threshold. Bounded + recorded durably; never
+    // 13. Gate-stall watchdog (mupot#1705) — recover an undelivered first gate wake within
+    //     the existing bounded claim budget; delivered/queued wakes stay mail-free. Never
     //     changes status or verdicts. Requires migration 0191 (gate_stall_rewakes).
     // 14. Approval expiry (migrations/0232) — a gate ask unanswered 14 days after review entry moves
     //     review -> blocked (approval_expired | gate_owner_dead), receipted, assignee notified. Bounded
