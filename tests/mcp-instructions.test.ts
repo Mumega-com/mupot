@@ -6,6 +6,13 @@ import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from '../src/mcp/instructions'
 import { TOOLS } from '../src/mcp/index'
 
 describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
+  it('names routine work action while keeping ACK status notices informational',()=>{
+    const section=MUPOT_MCP_INITIALIZE_INSTRUCTIONS.split('SYSTEM SENDERS TAKE NO REPLY.')[1].split('8. TASKS:')[0]
+    expect(section).toContain('routine_proposal_submit')
+    expect(section).toContain('non-ack work')
+    expect(section).toContain('kind:"ack" status notice is terminal and informational')
+  })
+
   it('is a non-empty string with substantive onboarding guidance', () => {
     expect(typeof MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toBe('string')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS.length).toBeGreaterThan(500)

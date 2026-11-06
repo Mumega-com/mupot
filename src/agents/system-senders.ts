@@ -12,6 +12,8 @@
 // These names are public constants in this repo, so naming them in a refusal is not an
 // existence oracle. Registering a literal here never makes it addressable or impersonable.
 
+import { ROUTINE_ACTOR } from '../routines/running-action'
+
 export const REVIEW_WAKE_SENDER = 'mupot-review-gate'
 // Informational only: a decision card tells a HUMAN something awaits them. It must not tell the
 // recipient model to act with a tool (reply_via null), unlike the review-wake delegation above.
@@ -41,6 +43,8 @@ export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.fr
   [ASSIGNMENT_WAKE_SENDER]: null,
   [ONBOARDING_SENDER]: null,
   [TASK_RECLAIM_SENDER]: null,
+  // The work order is acted on through routine tools, not an inbox message reply.
+  [ROUTINE_ACTOR]: 'routine_proposal_submit',
 })
 
 export function isSystemSender(ref: unknown): ref is string {

@@ -1449,12 +1449,12 @@ describe('slice1 notice boundaries',()=>{
   const {expireStaleElevationRequests,listPendingElevationRequests}=await import('../src/auth/elevation')
   expect((await expireStaleElevationRequests(env,TENANT)).expiredCount).toBe(27)
   expect(notes()).toHaveLength(0)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(25)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
-  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(27)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(1)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(2)
+  await listPendingElevationRequests(env,TENANT);expect(notes()).toHaveLength(2)
   for(const note of notes()){
    expect(note.to_agent).toBe('agent-x');expect(note.from_member).toBe('system:approval-bot')
-   expect(JSON.parse(note.body)).toMatchObject({type:'elevation_approval_bot',event:'expired'})
+   const digest=JSON.parse(note.body);expect(digest).toMatchObject({type:'approval_sweeper_digest',omitted:0});expect(digest.entries.every((e:{event:string})=>e.event==='expired')).toBe(true)
    expect(note.body).not.toContain(BOT_TOKEN)
   }
  })
@@ -1610,4 +1610,71 @@ it('round2 notice scheduling failures never reject a closed tap',async()=>{
  const result=await handleApprovalBotUpdate(env,tapUpdate(`ea:${f.shortId}`,{from:TG.owner,messageId:mid}),{waitUntil:()=>{throw new Error('scheduler unavailable')}})
  expect(result.kind).toBe('closed');expect(status(f.requestId).status).toBe('denied');expect(grants(f.requestId)).toBe(0)
  expect(sentTo('answerCallbackQuery')).toHaveLength(1);expect(sentTo('editMessageText')).toHaveLength(1);expect(sentTo('sendMessage')).toHaveLength(0)
+})
+
+
+describe('approval sweeper ceremony digest',()=>{
+  it('does not let a different recipient notice suppress the actual requester lapse',async()=>{
+    const f=await file()
+    harness.sqlite.exec("INSERT INTO agents(id,squad_id,slug,name,status) VALUES('observer-y','squad-a','observer-y','Observer','active')")
+    const {sendAgentMessage}=await import('../src/agents/messages')
+    const body=JSON.stringify({type:'approval_sweeper_digest',entries:[{request_id:f.requestId,event:'expired',notice:'observer copy'}]})
+    expect((await sendAgentMessage(env,{fromAgent:'mupot-approval-sweeper',fromMember:'system:approval-bot',toAgent:'observer-y',kind:'message',requestId:'other-recipient-notice',body},{system:true,reason:'other recipient fixture'})).ok).toBe(true)
+    harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=?,decided_at=NULL WHERE id=?").run(new Date(Date.now()-1000).toISOString(),f.requestId)
+    const {notifyLapsedApprovalBotRequests}=await import('../src/approval-bot/status')
+    expect(await notifyLapsedApprovalBotRequests(env,TENANT)).toBe(1)
+    expect(count('agent_messages',"from_agent='mupot-approval-sweeper' AND to_agent='agent-x'")).toBe(1)
+  })
+
+  it('keeps two requesting agents in separate lapse digests',async()=>{
+    const first=await file();const second=crypto.randomUUID()
+    harness.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,status,owner_member_id) VALUES('agent-y','squad-a','agent-y','Y','active','mem-owner');
+      INSERT INTO members(id,tenant,display_name,status) VALUES('member-y','${TENANT}','Y','active');
+      INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('${TENANT}','agent-y','member-y',datetime('now'));
+      INSERT INTO member_tokens(id,tenant,member_id,agent_id,token_hash,channel) VALUES('token-y','${TENANT}','member-y','agent-y','fixture-y','workspace');`)
+    const {createAgentSession}=await import('../src/auth/agent-sessions')
+    const session=await createAgentSession(env,{tenant:TENANT,agentId:'agent-y',memberId:'member-y',authKind:'workspace_token',credentialId:'token-y'})
+    harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
+      SELECT ?,tenant,?,'agent-y','member-y',requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at FROM elevation_requests WHERE id=?`).run(second,session.id,first.requestId)
+    harness.sqlite.prepare("INSERT INTO approval_bot_deliveries(id,tenant,request_id,member_id,chat_id,message_id,status,created_at) VALUES(?,?,?,'mem-owner',?,'901','sent',datetime('now'))").run(crypto.randomUUID(),TENANT,second,String(TG.owner))
+    for(const id of [first.requestId,second])harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=?,decided_at=NULL WHERE id=?").run(new Date(Date.now()-1000).toISOString(),id)
+    const {notifyLapsedApprovalBotRequests}=await import('../src/approval-bot/status')
+    expect(await notifyLapsedApprovalBotRequests(env,TENANT)).toBe(2)
+    const messages=harness.sqlite.prepare("SELECT to_agent,body FROM agent_messages WHERE from_agent='mupot-approval-sweeper'").all() as Array<{to_agent:string;body:string}>
+    expect(messages.map(m=>m.to_agent).sort()).toEqual(['agent-x','agent-y'])
+    for(const m of messages)expect(JSON.parse(m.body).entries.map((e:{request_id:string})=>e.request_id)).toEqual([m.to_agent==='agent-x'?first.requestId:second])
+  })
+
+  it('bounds recorded-notice dedupe to the last thirty days',async()=>{
+    const f=await file()
+    const {sendAgentMessage}=await import('../src/agents/messages')
+    const body=JSON.stringify({type:'approval_sweeper_digest',entries:[{request_id:f.requestId,event:'expired',notice:'previous lapse'}]})
+    expect((await sendAgentMessage(env,{fromAgent:'mupot-approval-sweeper',fromMember:'system:approval-bot',toAgent:'agent-x',kind:'message',requestId:'old-notice-window',body},{system:true,reason:'historical notice fixture'})).ok).toBe(true)
+    harness.sqlite.prepare("UPDATE agent_messages SET created_at=? WHERE request_id='old-notice-window'").run(new Date(Date.now()-31*86400000).toISOString())
+    harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=?,decided_at=NULL WHERE id=?").run(new Date(Date.now()-1000).toISOString(),f.requestId)
+    const {notifyLapsedApprovalBotRequests}=await import('../src/approval-bot/status')
+    expect(await notifyLapsedApprovalBotRequests(env,TENANT)).toBe(1)
+    expect(count('agent_messages',"from_agent='mupot-approval-sweeper'")).toBe(2)
+    expect(await notifyLapsedApprovalBotRequests(env,TENANT)).toBe(0)
+  })
+
+  it('batches lapse notices per requesting agent and dedupes later sweeps and direct reads',async()=>{
+    const ids:string[]=[]
+    for(let i=0;i<2;i++){
+      const f=await file({reason:`digest ${i}`});ids.push(f.requestId)
+      harness.sqlite.prepare("UPDATE elevation_requests SET status='expired',decision_expires_at=?,decided_at=NULL WHERE id=?").run(new Date(Date.now()-1000).toISOString(),f.requestId)
+    }
+    const {notifyLapsedApprovalBotRequests}=await import('../src/approval-bot/status')
+    await Promise.all([notifyLapsedApprovalBotRequests(env,TENANT),notifyLapsedApprovalBotRequests(env,TENANT)])
+    const notes=()=>harness.sqlite.prepare("SELECT body FROM agent_messages WHERE tenant=? AND from_agent='mupot-approval-sweeper'").all(TENANT) as Array<{body:string}>
+    expect(notes()).toHaveLength(1)
+    const digest=JSON.parse(notes()[0].body)
+    expect(digest).toMatchObject({type:'approval_sweeper_digest',total:2,omitted:0})
+    expect(digest.entries.map((e:{request_id:string})=>e.request_id).sort()).toEqual([...ids].sort())
+    await notifyLapsedApprovalBotRequests(env,TENANT)
+    const {loadElevationRequestById}=await import('../src/auth/elevation')
+    for(const id of ids)await loadElevationRequestById(env,TENANT,id)
+    expect(notes()).toHaveLength(1)
+    expect(count('elevation_grants')).toBe(0)
+  })
 })

@@ -22,10 +22,11 @@ const EXPECTED_VIA: Record<string, string | null> = {
   'mupot-assignment-wake': null,
   'mupot-onboarding': null,
   'mupot-task-reclaim': null,
+  'mupot-routines': 'routine_proposal_submit',
 }
 
 describe('registry', () => {
-  it('registers exactly the ten known literals with the right response tool', () => {
+  it('registers exactly the eleven known literals with the right response tool', () => {
     expect({ ...SYSTEM_SENDERS }).toEqual(EXPECTED_VIA)
   })
   it('does not treat prototype keys or lookalikes as system senders', () => {

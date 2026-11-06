@@ -1,8 +1,8 @@
 // src/gates/approval-expiry.ts — an unanswered gate ask expires (Hadi, org owner, 2026-10-16:
 // "if one didn't answer to the approval it expires").
 //
-// BEFORE: a task in `review` with a gate_owner waited forever. The only exit from review is a
-// verdict and nothing swept (the stall watchdog only re-wakes; it never closes).
+// The stall watchdog can recover an undelivered first wake but never closes an ask.
+// This expiry policy supplies the bounded review-to-blocked exit for unanswered asks.
 //
 // RULE (one config constant, below):
 //   - a gate verdict ask and a publish ask expire 14 days after the task ENTERED review;
@@ -26,8 +26,7 @@
 import type { Env, Task } from '../types'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { claimTimestamp } from '../lib/claim-timestamp'
-import { sendAgentMessage } from '../agents/messages'
-import { SWEEPER_SENDER } from '../agents/system-senders'
+import { sendApprovalSweepDigest, type ApprovalSweepEntry } from '../approval-bot/status'
 import { persistGateWakeNotice } from './grants'
 import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import {
@@ -78,6 +77,7 @@ export interface ExpirySweepResult {
   expired: number
   approval_expired: number
   gate_owner_dead: number
+  /** Tasks covered by successfully delivered digests, not the number of messages. */
   notified: number
   skipped_claimed: number
   errors: number
@@ -138,6 +138,11 @@ export async function sweepExpiredApprovals(env: Env, opts: ExpirySweepOptions =
     .first<{ n: number }>()
   result.remaining = Math.max(0, (total?.n ?? 0) - candidates.length)
 
+  const digests = new Map<string, ApprovalSweepEntry[]>()
+  const flushNotices=async()=>{
+    const ready=[...digests];digests.clear()
+    for(const [agent,entries] of ready)result.notified+=await sendApprovalSweepDigest(env,agent,SWEEPER_ACTOR,entries)
+  }
   for (const c of candidates) {
     result.scanned += 1
     const reason: ExpiryReason = Number(c.dead) === 1 ? 'gate_owner_dead' : 'approval_expired'
@@ -175,16 +180,19 @@ export async function sweepExpiredApprovals(env: Env, opts: ExpirySweepOptions =
       result.expired += 1
       result[reason] += 1
       result.task_ids.push(c.id)
-      if (await notifyExpired(env, c, reason, receiptId)) result.notified += 1
+      const entry=await expiryNotice(env,c,reason,receiptId)
+      if(c.assignee_agent_id){const items=digests.get(c.assignee_agent_id)??[];items.push(entry);digests.set(c.assignee_agent_id,items)}
     } catch {
       result.errors += 1
     }
+    if(result.expired>0 && result.expired%25===0)await flushNotices()
   }
+  await flushNotices()
   return result
 }
 
-/** Best-effort: tell the assignee through the existing inbox + the task's visible notice. */
-async function notifyExpired(env: Env, c: Candidate, reason: ExpiryReason, receiptId: string): Promise<boolean> {
+/** Best-effort per-task visible notice; receipts stay per task and mail is grouped after the sweep. */
+async function expiryNotice(env: Env, c: Candidate, reason: ExpiryReason, receiptId: string): Promise<ApprovalSweepEntry> {
   const notice = reason === 'gate_owner_dead'
     ? `${APPROVAL_EXPIRED_NOTICE} (gate ${c.gate_owner} had no live holder)`
     : APPROVAL_EXPIRED_NOTICE
@@ -193,24 +201,7 @@ async function notifyExpired(env: Env, c: Candidate, reason: ExpiryReason, recei
   } catch {
     // the receipt is the record; the notice is a convenience
   }
-  if (!c.assignee_agent_id) return false
-  try {
-    const delivery = await sendAgentMessage(
-      env,
-      {
-        fromAgent: SWEEPER_SENDER,
-        fromMember: SWEEPER_ACTOR,
-        toAgent: c.assignee_agent_id,
-        kind: 'message',
-        body: JSON.stringify({ type: 'approval_expired', task_id: c.id, gate_owner: c.gate_owner, reason, notice }),
-        requestId: `approval-expired:${c.id}:${receiptId}`,
-      },
-      { system: true, reason: 'target is the task assignee read from the row the sweeper just blocked, not caller input' },
-    )
-    return delivery.ok
-  } catch {
-    return false
-  }
+  return {task_id:c.id,gate_owner:c.gate_owner,reason,receipt_id:receiptId,episode:c.review_entered_at??c.updated_at,notice}
 }
 
 export interface CapResetResult {

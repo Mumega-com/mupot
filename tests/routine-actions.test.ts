@@ -426,7 +426,9 @@ describe('Routine proposal submission and governed actions', () => {
         request_id: 'routine-human:run-1:task-1',
         project_id: 'project-1',
         expects_reply: false,
-        reply_basis: 'ack_is_terminal',
+        // Registry classification precedes ACK classification; the ACK is still terminal.
+        reply_basis: 'system_sender',
+        reply_via: 'routine_proposal_submit',
       }],
     })
     await expect(submitRoutineProposal(notifyingEnv, fixture.principal, proposal)).resolves.toMatchObject({
