@@ -211,8 +211,8 @@ it('expired gate standing does not occupy the concierge task window',async () =>
 
 function fleetPresence(mode: 'resident' | 'poll', status: string, ageMs: number): void {
  const stamp=new Date(Date.now()-ageMs).toISOString()
- h.sqlite.prepare(`INSERT INTO fleet_agents(tenant,agent_id,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec)
-   VALUES(?,?,'Builder',?,'[]','always_on',?,'test',?,?,?,180)`)
+ h.sqlite.prepare(`INSERT INTO fleet_agents(tenant,agent_id,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec,connection_kind)
+   VALUES(?,?,'Builder',?,'[]','always_on',?,'test',?,?,?,180,'fleet_attach')`)
    .run(TENANT,AGENT,mode==='poll'?'':'claude-code',status,stamp,stamp,mode)
 }
 for(const writer of ['concierge','router'] as const) describe(`canonical candidate liveness: ${writer}`,()=>{
@@ -225,13 +225,13 @@ for(const writer of ['concierge','router'] as const) describe(`canonical candida
   h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01 00:00:00'; UPDATE module_registry SET last_heartbeat='2000-01-01T00:00:00.000Z'")
   expect(await run(writer)).toBe(1);expect(row().assignee_agent_id).toBe(AGENT)
  })
- it('does not assign a dead resident even when legacy presence is fresh',async()=>{
+ it('fresh presence keeps an attached resident assignable even when the fleet heartbeat is old',async()=>{
   fleetPresence('resident','running',20*60*1000)
-  expect(await run(writer)).toBe(0);expect(row().assignee_agent_id).toBeNull()
- })
- it('does not require an external heartbeat for an in-Worker agent',async()=>{
-  h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01 00:00:00'; UPDATE module_registry SET last_heartbeat='2000-01-01T00:00:00.000Z'")
   expect(await run(writer)).toBe(1);expect(row().assignee_agent_id).toBe(AGENT)
+ })
+ it('does not auto-assign an unproven Worker without any fresh source',async()=>{
+  h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01 00:00:00'; UPDATE module_registry SET last_heartbeat='2000-01-01T00:00:00.000Z'")
+  expect(await run(writer)).toBe(0);expect(row().assignee_agent_id).toBeNull();expect(claims).toBe(0)
  })
  it('fences an operator stop arriving between selection and commit',async()=>{
   fleetPresence('resident','running',0)
@@ -242,4 +242,9 @@ for(const writer of ['concierge','router'] as const) describe(`canonical candida
 it('concierge respects an explicit offline registration even when polling is fresh',async()=>{
  fleetPresence('poll','running',0);h.sqlite.exec("UPDATE module_registry SET status='offline'")
  expect(await run('concierge')).toBe(0);expect(row().assignee_agent_id).toBeNull()
+})
+
+for(const writer of ['concierge','router'] as const) it(`${writer} claim refuses when all freshness is removed after selection`,async()=>{
+ beforeClaim=()=>{h.sqlite.exec("UPDATE presence SET last_seen_at='2000-01-01'; UPDATE module_registry SET last_heartbeat='2000-01-01'")}
+ expect(await run(writer)).toBe(0);expect(claims).toBe(1);expect(row().assignee_agent_id).toBeNull()
 })

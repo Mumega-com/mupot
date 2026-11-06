@@ -1,7 +1,7 @@
 import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { enqueueAssignmentWake } from '../agents/assignment-wake'
 import { createBus } from '../bus'
-import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { independentGateHolderExistsSql } from '../tasks/runtime-receipts'
@@ -9,7 +9,7 @@ import type { BusEvent, Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { executionPausedSql } from '../agents/execution-brakes'
 import { safeConsole } from '../lib/log'
-import { agentLiveness } from '../agents/liveness'
+import { assignmentLivenessProofSql, agentLiveness } from '../agents/liveness'
 import { assignmentEligibilitySql, isAssignmentEligible } from '../tasks/assignment-eligibility'
 
 export interface RouterTickInput {
@@ -229,8 +229,9 @@ export async function runRouterTick(
                  AND project_now.status = 'active'
             )
           )
+          AND ${assignmentLivenessProofSql(env,{tenant:'?5',agentId:'?1',now:'?7'})}
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId, nowCapabilitySql()).run()
+    ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId, now).run()
 
     if (claim.meta.changes !== 1) {
       decisions.push({ task_id: task.id, outcome: 'lost_claim', agent_id: candidate.id })

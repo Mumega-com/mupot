@@ -327,15 +327,15 @@ describe('router_tick authorization and squad fencing', () => {
       .toEqual({ assignee_agent_id: null })
   })
 
-  it.each(['stale','removed'])('legacy presence %s does not block an eligible in-Worker claim', async mode => {
+  it.each(['stale','removed'])('claim refuses when its only fresh presence becomes %s', async mode => {
     insertTask(harness.sqlite, 'task-a', SQUAD_A)
     const { env } = makeEnv(harness, { beforeClaim: () => {
       if (mode === 'stale') harness.sqlite.prepare('UPDATE presence SET last_seen_at = ? WHERE agent_id = ?').run('2020-01-01T00:00:00Z', AGENT_A)
       else harness.sqlite.prepare('DELETE FROM presence WHERE agent_id = ?').run(AGENT_A)
     } })
     const result = await routerTick(auth('lead-a',[grant('lead-a','lead',SQUAD_A)]),env,{squad_id:SQUAD_A,dry_run:false})
-    expect(result).toMatchObject({ok:true,result:{assigned:1}})
-    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id=?').get('task-a')).toEqual({assignee_agent_id:AGENT_A})
+    expect(result).toMatchObject({ok:true,result:{assigned:0}})
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id=?').get('task-a')).toEqual({assignee_agent_id:null})
   })
 
   it.each([

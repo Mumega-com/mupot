@@ -16,13 +16,14 @@ beforeEach(()=>{
  h=createSqliteD1();applyAllMigrations(h.sqlite);interleave=undefined
  h.sqlite.exec(`INSERT INTO departments(id,slug,name) VALUES('d','d','D'); INSERT INTO squads(id,department_id,slug,name) VALUES('s','d','s','S');
  INSERT INTO members(id,tenant,display_name,status) VALUES('owner','${TENANT}','Owner','active');
- INSERT INTO agents(id,squad_id,slug,name,status,owner_member_id) VALUES('a','s','runner','Runner','active','owner'),('owner-inbox','s','owner-inbox','Owner inbox','active','owner');`)
+ INSERT INTO agents(id,squad_id,slug,name,status,owner_member_id) VALUES('a','s','runner','Runner','active','owner'),('owner-inbox','s','owner-inbox','Owner inbox','active','owner');
+ INSERT INTO presence(tenant,member_id,display_name,source,label,agent_id,first_seen_at,last_seen_at) VALUES('${TENANT}','owner','Owner','test','owner-inbox','owner-inbox','${new Date(NOW).toISOString()}','${new Date(NOW).toISOString()}');`)
  env={DB:{...h.db,batch:async statements=>{const hook=interleave;interleave=undefined;hook?.();return h.db.batch(statements)}},TENANT_SLUG:TENANT,BUS:{send:vi.fn(async()=>undefined)}} as unknown as Env
 })
 afterEach(()=>{vi.restoreAllMocks();h.close()})
 function fleet(age:number,mode='resident',status='running',key='a',ttl=180){
- h.sqlite.prepare(`INSERT INTO fleet_agents(tenant,agent_id,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec)
- VALUES(?,?,'Runner',?,'[]','always_on',?,'test',?,?,?,?) ON CONFLICT(tenant,agent_id) DO UPDATE SET runtime=excluded.runtime,status=excluded.status,last_reported_at=excluded.last_reported_at,presence_mode=excluded.presence_mode,presence_ttl_sec=excluded.presence_ttl_sec`)
+ h.sqlite.prepare(`INSERT INTO fleet_agents(tenant,agent_id,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec,connection_kind)
+ VALUES(?,?,'Runner',?,'[]','always_on',?,'test',?,?,?,?,'fleet_attach') ON CONFLICT(tenant,agent_id) DO UPDATE SET runtime=excluded.runtime,status=excluded.status,last_reported_at=excluded.last_reported_at,presence_mode=excluded.presence_mode,presence_ttl_sec=excluded.presence_ttl_sec`)
  .run(TENANT,key,mode==='poll'?'':'claude-code',status,new Date(NOW-age).toISOString(),new Date(NOW-age).toISOString(),mode,ttl)
 }
 function task(id='t',status='open'){h.sqlite.prepare("INSERT INTO tasks(id,squad_id,title,done_when,status,assignee_agent_id,created_at,updated_at) VALUES(?,'s','Work','done',?,'a','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')").run(id,status)}
@@ -47,8 +48,8 @@ describe('agentLiveness contract',()=>{
   expect(result.deliveryMode).toBe(resolveDispatchDeliveryMode(route,false));expect(result.fresh).toBe(route.live)
  })
  it('uses the registered per-row TTL',async()=>{fleet(3600000,'poll','running','a',7200);expect((await agentLiveness(env,['a'],NOW)).get('a')).toMatchObject({state:'live',ttlSeconds:7200})})
- it('in-Worker agents need no external heartbeat and have no death timestamp',async()=>{
-  const r=(await agentLiveness(env,['a'],NOW)).get('a')!;expect(r).toMatchObject({state:'live',mode:'in_worker',deliveryMode:'in_worker',executionEligible:true,deadSinceMs:null})
+ it('unproven in-Worker fallback has no auto-assignment or death proof',async()=>{
+  const r=(await agentLiveness(env,['a'],NOW)).get('a')!;expect(r).toMatchObject({state:'stale',mode:'in_worker',deliveryMode:'in_worker',executionEligible:true,assignmentEligible:false,deadSinceMs:null})
  })
  it('unknown agents and invalid stamps cannot supply reclaim evidence',async()=>{
   fleet(DAY*2)
@@ -129,11 +130,12 @@ describe('dead-assignee reclaim',()=>{
 
 it('owner notices reach every other owned agent and no foreign owner',async()=>{
  dead();task();h.sqlite.exec("INSERT INTO members(id,tenant,display_name,status) VALUES('foreign','liveness-pot','Foreign','active'); INSERT INTO agents(id,squad_id,slug,name,status,owner_member_id) VALUES('other-inbox','s','other-inbox','Other','active','owner'),('foreign-inbox','s','foreign-inbox','Foreign','active','foreign')")
+ h.sqlite.prepare("INSERT INTO presence(tenant,member_id,display_name,source,label,agent_id,first_seen_at,last_seen_at) VALUES(?,'owner','Other','test','other-inbox','other-inbox',?,?)").run(TENANT,new Date(NOW).toISOString(),new Date(NOW).toISOString())
  expect((await sweep()).reclaimed).toBe(1);expect(notices().map(n=>n.to_agent).sort()).toEqual(['other-inbox','owner-inbox'])
 })
 it('a foreign-tenant fleet row cannot establish death',async()=>{
  dead();h.sqlite.exec("UPDATE fleet_agents SET tenant='foreign-pot'");task()
- expect((await agentLiveness(env,['a'],NOW)).get('a')).toMatchObject({mode:'in_worker',state:'live',deadSinceMs:null})
+ expect((await agentLiveness(env,['a'],NOW)).get('a')).toMatchObject({mode:'in_worker',state:'stale',assignmentEligible:false,deadSinceMs:null})
  expect((await sweep()).reclaimed).toBe(0)
 })
 it('batch chunking returns every requested identity without silent truncation',async()=>{
@@ -160,6 +162,7 @@ it('an owner in another tenant receives no reclaim note',async()=>{
 })
 it('a rejected notification target does not prevent later owner targets',async()=>{
  dead();task();h.sqlite.exec("INSERT INTO agents(id,squad_id,slug,name,status,owner_member_id) VALUES('z-owner-inbox','s','z-owner-inbox','Other','active','owner')")
+ h.sqlite.prepare("INSERT INTO presence(tenant,member_id,display_name,source,label,agent_id,first_seen_at,last_seen_at) VALUES(?,'owner','Other','test','z-owner-inbox','z-owner-inbox',?,?)").run(TENANT,new Date(NOW).toISOString(),new Date(NOW).toISOString())
  vi.spyOn(messages,'sendAgentMessage').mockRejectedValueOnce(new Error('delivery unavailable'))
  const r=await sweep();expect(r.reclaimed).toBe(1);expect(r.failed).toBe(0);expect(r.notified).toBe(1);expect(notices().map(n=>n.to_agent)).toEqual(['z-owner-inbox'])
 })

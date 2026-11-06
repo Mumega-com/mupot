@@ -45,7 +45,7 @@
 // isConciergeStarterUniqueViolation below.
 
 import type { Env, Project } from '../types'
-import { agentLiveness } from '../agents/liveness'
+import { assignmentLivenessProofSql, agentLiveness } from '../agents/liveness'
 import { listProjects } from '../projects/service'
 import { createTask, type CreateTaskInput } from '../tasks/service'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -416,9 +416,10 @@ async function routeUnassignedWork(
             agentIdExpr: '?1', gateOwnerExpr: 'tasks.gate_owner', squadIdExpr: 'tasks.squad_id',
             tenantParam: '?6', nowParam: '?7',
           })}
+          AND ${assignmentLivenessProofSql(env,{tenant:'?6',agentId:'?1',now:'?7'})}
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
-      .bind(picked.agent.id, task.id, assignedAt, project.id, task.squad_id, env.TENANT_SLUG, nowSqlUtc())
+      .bind(picked.agent.id, task.id, assignedAt, project.id, task.squad_id, env.TENANT_SLUG, assignedAt)
       .run()
     if (upd.meta.changes === 1) {
       // Wake-on-assign: the work-router assigns from a cron tick, so without this the builder is only told when it
