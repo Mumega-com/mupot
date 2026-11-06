@@ -1,3 +1,5 @@
+import { resolveBoundSeatStrict } from '../agents/inbox-seat'
+import { attachmentAttribution } from '../auth/attached-ceiling'
 import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 import { canOnSquad, resolveCapabilities, CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
@@ -51,6 +53,9 @@ export interface TaskDispatchRuntimeReceipt {
   message_id: string
   member_id: string
   credential_id: string
+  seat_id?: string | null
+  attachment_id?: string | null
+  consenting_member_id?: string | null
   stage: TaskDispatchRuntimeReceiptStage
   attempt: number
   runtime_address: string
@@ -469,6 +474,7 @@ export function noConflictingTerminalSql(
 export type TaskDispatchRuntimeReceiptErrorCode =
   | 'agent_bound_workspace_credential_required'
   | 'agent_check_unavailable'
+  | 'agent_paused'
   | 'runtime_receipt_invalid'
   | 'runtime_delivery_not_found'
   | 'runtime_delivery_stale'
@@ -520,6 +526,7 @@ interface DeliveryRow {
   message_request_id: string | null
   message_project_id: string | null
   message_body: string
+  message_target_seat: string | null
   message_read_at: string | null
   message_delivery_attempts: number
   message_lease_expires_at: string | null
@@ -614,6 +621,7 @@ export function independentGateHolderExistsSql(p: {
    *  (directConflictSqlRaw), so counting it would let a task enter review with no eligible decider. Omit (or
    *  bind NULL) for a non-attached submit: behavior unchanged. */
   excludeAgentsLinkedToMemberExpr?: string
+  excludeRuntimeTaskIdExpr?: string
 }): string {
   const linkedExclusion = p.excludeAgentsLinkedToMemberExpr
     ? `
@@ -628,7 +636,11 @@ export function independentGateHolderExistsSql(p: {
          AND gate_agent.id = grant_row.principal_id
          AND gate_agent.status = 'active'
        WHERE grant_row.capability = ${p.gateOwnerExpr}
-         AND gate_agent.id <> ${p.assigneeIdExpr}${linkedExclusion}
+         AND gate_agent.id <> ${p.assigneeIdExpr}${linkedExclusion}${p.excludeRuntimeTaskIdExpr ? `
+         AND NOT EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts prior_run
+           WHERE prior_run.tenant = ${p.tenantParam} AND prior_run.task_id = ${p.excludeRuntimeTaskIdExpr}
+             AND prior_run.stage IN ('runtime_consumed','completed','failed') AND prior_run.consenting_member_id IS NOT NULL
+             AND ${agentLinkedToMemberSql({agentExpr:'gate_agent.id',memberExpr:'prior_run.consenting_member_id'})})` : ''}
          AND EXISTS (
            SELECT 1
              FROM member_tokens t
@@ -761,7 +773,7 @@ export async function hasIndependentRuntimeGate(
   gateOwner: string | null | undefined,
   assigneeAgentId: string,
   taskSquadId: string,
-  opts: { allowMemberHolders?: boolean; excludeAgentsLinkedToMemberId?: string | null } = {},
+  opts: { allowMemberHolders?: boolean; excludeAgentsLinkedToMemberId?: string | null; excludeRuntimeTaskId?: string } = {},
 ): Promise<boolean> {
   if (
     gateOwner === null || gateOwner === undefined
@@ -773,8 +785,9 @@ export async function hasIndependentRuntimeGate(
       gateOwnerExpr: '?1', assigneeIdExpr: '?2', tenantParam: '?3', squadIdExpr: '?4', nowParam: '?5',
       allowMemberHolders: opts.allowMemberHolders,
       excludeAgentsLinkedToMemberExpr: '?6',
+      excludeRuntimeTaskIdExpr: opts.excludeRuntimeTaskId ? '?7' : undefined,
     })}
-  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc(), opts.excludeAgentsLinkedToMemberId ?? null)
+  `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc(), opts.excludeAgentsLinkedToMemberId ?? null, ...(opts.excludeRuntimeTaskId ? [opts.excludeRuntimeTaskId] : []))
     .first<{ 1: number }>()
   return row !== null
 }
@@ -882,6 +895,19 @@ async function resolveMessageId(
  * WHERE makes a non-owner's (or inactive, or fenced-out) claim change ZERO rows atomically —
  * no side effect ever lands, regardless of what happens next in `recordTaskDispatchRuntimeReceipt`.
  */
+function attachedRuntimeAttemptHoldsSql(p: { tenant: string; agent: string; message: string; seat: string; now: string }): string {
+  return `EXISTS (
+    SELECT 1 FROM agent_messages am JOIN agent_inbox_lease_attempts la
+      ON la.tenant = am.tenant AND la.agent_id = am.to_agent AND la.message_id = am.id
+     AND la.message_seq = am.seq AND la.delivery_attempt = am.delivery_attempts
+     AND la.lease_expires_at = am.lease_expires_at AND la.state = 'leased'
+    WHERE am.tenant = ${p.tenant} AND am.to_agent = ${p.agent} AND am.id = ${p.message}
+      AND am.target_seat = ${p.seat} AND la.target_seat_key = ${p.seat}
+      AND ${p.seat} IS NOT NULL AND am.lease_attempt_id IS NOT NULL AND am.read_at IS NULL
+      AND ${LEASE_LIVE_PREDICATE('am.lease_expires_at', p.now)}
+  )`
+}
+
 async function claimUnleasedForPairSettlement(
   env: Env,
   input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; authorizedSquadId: string | null },
@@ -1072,6 +1098,7 @@ async function loadDelivery(
       message.request_id AS message_request_id,
       message.project_id AS message_project_id,
       message.body AS message_body,
+      message.target_seat AS message_target_seat,
       message.read_at AS message_read_at,
       message.delivery_attempts AS message_delivery_attempts,
       message.lease_expires_at AS message_lease_expires_at,
@@ -1202,7 +1229,14 @@ export async function recordTaskDispatchRuntimeReceipt(
   if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
 
   const caller = await resolveBoundAgentCaller(env, auth)
-  if (!caller.ok) throw new TaskDispatchRuntimeReceiptError(caller.error === 'agent_check_unavailable' ? 'agent_check_unavailable' : 'runtime_receipt_forbidden')
+  if (!caller.ok) throw new TaskDispatchRuntimeReceiptError(caller.error === 'agent_check_unavailable' ? 'agent_check_unavailable' : caller.error === 'agent_paused' ? 'agent_paused' : 'runtime_receipt_forbidden')
+  const attachment = attachmentAttribution(auth)
+  const seatId = auth.seatBinding?.seatId ?? null
+  const attachmentId = attachment?.attachmentId ?? null
+  const consentingMemberId = attachment?.consentingMemberId ?? auth.consentedByMemberId ?? null
+  const attachedSeat = attachment ? await resolveBoundSeatStrict(env, auth.tokenId, agentId) : null
+  if (attachedSeat && (!attachedSeat.ok || !attachedSeat.seat)) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
+  const attachedSeatLabel = attachedSeat?.ok ? attachedSeat.seat : null
   if (
     !STAGES.has(input.stage)
     || !Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > 5
@@ -1278,6 +1312,12 @@ export async function recordTaskDispatchRuntimeReceipt(
      WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = ?3 AND attempt = ?4
   `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<ReceiptRow>()
 
+  if (attachment && input.stage === 'runtime_consumed' && !replay) {
+    const proof = await env.DB.prepare(`SELECT 1 WHERE ${attachedRuntimeAttemptHoldsSql({tenant:'?1',agent:'?2',message:'?3',seat:'?4',now:'?5'})}`)
+      .bind(env.TENANT_SLUG,agentId,messageId,attachedSeatLabel,now).first()
+    if (!proof) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
+  }
+
   // The authenticated ceiling must pass before either lease-equivalent claim can write.
   // Fresh DB standing is an additional revocation check, never an expansion of this ceiling.
   const ownTask = await env.DB.prepare('SELECT squad_id FROM tasks WHERE id = ?1 AND assignee_agent_id = ?2')
@@ -1290,7 +1330,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   // it the lease-equivalent atomically, once, so validateEnvelope below sees exactly the shape
   // a resident agent's inbox_lease() would have produced. See claimUnleasedForPairSettlement's
   // doc comment. Credential-gated: this runs only after the token check above succeeds.
-  if (usedPairCorrelator && input.attempt === 1) {
+  if (!attachment && usedPairCorrelator && input.attempt === 1) {
     if (!replay && await isOwnDispatchTaskArchived(env, input, agentId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
     await claimUnleasedForPairSettlement(env, {
       messageId,
@@ -1303,7 +1343,7 @@ export async function recordTaskDispatchRuntimeReceipt(
 
   // mupot#1539 round 2 (P0-3) — recover a dispatch envelope that was marked read before
   // custody. No-op unless every condition in claimReadEnvelopeForRecovery holds.
-  if (input.stage === 'runtime_consumed') {
+  if (!attachment && input.stage === 'runtime_consumed') {
     // mupot#1780: refuse an archived task BEFORE the claim writes a lease onto its envelope (a stored-receipt
     // replay stays read-only and is exempt); the claim UPDATE re-asserts the same guard atomically.
     if (!replay && await isOwnDispatchTaskArchived(env, input, agentId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
@@ -1319,6 +1359,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   }
 
   const delivery = await loadDelivery(env, input, messageId, now, agentId)
+  if (attachment && delivery.message_target_seat !== attachedSeatLabel) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   if (delivery.dispatch_agent_id !== agentId || delivery.task_assignee_agent_id !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
@@ -1334,6 +1375,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     delivery.task_gate_owner,
     agentId,
     delivery.task_squad_id,
+    { excludeAgentsLinkedToMemberId: consentingMemberId, excludeRuntimeTaskId: input.taskId },
   ))) {
     throw new TaskDispatchRuntimeReceiptError(
       'runtime_gate_required',
@@ -1376,6 +1418,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     stage: input.stage,
     attempt: input.attempt,
     request_digest: requestDigest,
+    seat_id: seatId, attachment_id: attachmentId, consenting_member_id: consentingMemberId,
   })
   try {
     const mutation = input.stage === 'runtime_consumed'
@@ -1392,12 +1435,13 @@ export async function recordTaskDispatchRuntimeReceipt(
              -- task or for a paused agent / squad. In the SAME UPDATE as the claim, so a hold placed
              -- between dispatch and consume (or concurrently with this write) cannot slip through.
              AND ${dispatchBrakesClearSql('?4', 'tasks.id')}
+             AND (?8 IS NULL OR ${attachedRuntimeAttemptHoldsSql({tenant:'?5',agent:'?4',message:'?6',seat:'?8',now:'?2'})})
              -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time.
              AND ${envelopeHoldsSql('runtime_consumed', {
                tenant: '?5', messageId: '?6', dispatchId: '?1', attempt: '?7', agentId: '?4', now: '?2',
              })}
           RETURNING status
-        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG, messageId, input.attempt)
+        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG, messageId, input.attempt, attachedSeatLabel)
       : input.stage === 'completed'
         ? env.DB.prepare(`
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
@@ -1407,6 +1451,8 @@ export async function recordTaskDispatchRuntimeReceipt(
                AND ${independentGateHolderExistsSql({
                  gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
                  squadIdExpr: 'tasks.squad_id', tenantParam: '?6', nowParam: '?8',
+                 excludeAgentsLinkedToMemberExpr: '?10',
+                 excludeRuntimeTaskIdExpr: 'tasks.id',
                })}
                AND EXISTS (
                  SELECT 1 FROM task_dispatch_runtime_receipts consumed
@@ -1425,7 +1471,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                })}
             RETURNING status
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
-            env.TENANT_SLUG, input.attempt, nowSqlUtc(), messageId)
+            env.TENANT_SLUG, input.attempt, nowSqlUtc(), messageId, consentingMemberId)
         : env.DB.prepare(`
             -- mupot#1736 — a failed takeover moves the pointer to THIS dispatch in the same UPDATE
             -- (same pointerAvailableForSql guard), so result and pointer never name different runs.
@@ -1468,12 +1514,13 @@ export async function recordTaskDispatchRuntimeReceipt(
           id, tenant, dispatch_receipt_id, task_id, agent_id, message_id,
           member_id, credential_id, stage, attempt, runtime_address,
           runtime_receipt_hash, request_digest, artifact_refs_json,
-          artifact_sha256, result, reason, audit_entry_id, created_at
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+          artifact_sha256, result, reason, audit_entry_id, created_at,
+          seat_id, attachment_id, consenting_member_id
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
       `).bind(receiptId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId,
         agentId, messageId, memberId, credentialId, input.stage, input.attempt,
         runtimeAddress, input.runtimeReceiptHash, requestDigest, JSON.stringify(artifactRefs),
-        artifactSha256, result, reason, auditId, now),
+        artifactSha256, result, reason, auditId, now, seatId, attachmentId, consentingMemberId),
       // Loop brakes (mupot#1809, #1812): a runtime `failed` receipt for a dispatch whose runtime TOOK
       // CUSTODY counts toward the per-task ceiling - custody = a runtime_consumed receipt by the same
       // agent OR a delivered + leased envelope for the dispatch (the runtime cannot skip the lease).

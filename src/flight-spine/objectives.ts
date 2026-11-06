@@ -602,7 +602,14 @@ export async function acceptObjective(
       objectiveId,
       requestId: `objective:${input.idempotencyKey}:objective`,
       idempotencyKey: input.idempotencyKey,
-      evidence: { payloadDigest: input.payloadDigest } as JsonValue,
+      credentialId: auth.tokenId ?? null,
+      evidence: {
+        payloadDigest: input.payloadDigest,
+        credential_id: auth.tokenId ?? null,
+        seat_id: auth.seatBinding?.seatId ?? null,
+        attachment_id: auth.seatBinding?.attached?.attachmentId ?? null,
+        consenting_member_id: auth.seatBinding?.humanMemberId ?? auth.consentedByMemberId ?? null,
+      } as JsonValue,
     }),
   })
   const keyMutation = prepareAuditedDomainMutation(env.DB, {

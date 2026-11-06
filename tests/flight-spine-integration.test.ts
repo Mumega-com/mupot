@@ -1102,3 +1102,21 @@ describe('Flight Spine MCP integration', () => {
     await expectDraftsNotFound(drafts)
   })
 })
+
+describe('objective connection attribution',()=>{
+  it.each(['workspace','directory','attached'] as const)('records %s credential, seat and consenting human in the objective audit',async door=>{
+    const actor=primaryAuth({channel:door==='workspace'?'workspace':'directory',
+      ...(door==='workspace'?{}:{consentedByMemberId:OTHER_MEMBER_ID}),
+      ...(door!=='attached'?{}:{seatBinding:{seatId:'objective-seat',label:'chat',harnessId:'h',grantTokenId:'g',humanMemberId:OTHER_MEMBER_ID,source:'handle',
+        attached:{attachmentId:'objective-attachment',admissionId:'adm',agentId:PRIMARY_AGENT_ID,seatAgentId:'sa',ceiling:'member'}}})})
+    if(door!=='workspace') harness.sqlite.prepare("INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('human-primary',?,'squad',?,'member')").run(OTHER_MEMBER_ID,PRIMARY_SQUAD_ID)
+    const accepted=await invoke('objective_accept',objectiveArgs(),actor)
+    expect(accepted).toMatchObject({ok:true})
+    if(!accepted.ok)return
+    const id=(accepted.result as {objective:{id:string}}).objective.id
+    const audit=harness.sqlite.prepare("SELECT credential_id,evidence_json FROM mutation_audit_entries WHERE target_id=? AND target_kind='objective'").get(id) as {credential_id:string;evidence_json:string}
+    expect(audit.credential_id).toBe(PRIMARY_TOKEN_ID)
+    expect(JSON.parse(audit.evidence_json)).toMatchObject({credential_id:PRIMARY_TOKEN_ID,consenting_member_id:door==='workspace'?null:OTHER_MEMBER_ID,
+      seat_id:door==='attached'?'objective-seat':null,attachment_id:door==='attached'?'objective-attachment':null})
+  })
+})

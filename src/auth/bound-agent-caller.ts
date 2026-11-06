@@ -5,10 +5,12 @@
 import type { AuthContext, Env } from '../types'
 import { boundAgentVerdict, BOUND_AGENT_CHECK_UNAVAILABLE, BOUND_AGENT_NOT_AUTHORIZED } from './bound-agent-live'
 
+export const AGENT_PAUSED_NEXT_STEP = 'Ask the operator to resume this agent, then retry the same operation or attempt_id.'
+
 export type BoundAgentCaller = Pick<AuthContext, 'tenant' | 'memberId' | 'boundAgentId' | 'consentedByMemberId' | 'capabilities'>
 export type BoundAgentCallerResult =
   | { ok: true; agentId: string; memberId: string }
-  | { ok: false; status: 403 | 503; error: string }
+  | { ok: false; status: 403 | 503; error: string; detail?: { next_step: string } }
 
 export async function resolveBoundAgentCaller(
   env: Pick<Env, 'DB' | 'TENANT_SLUG'>,
@@ -22,6 +24,7 @@ export async function resolveBoundAgentCaller(
   if (auth.capabilities && auth.capabilities.length === 0) return { ok: false, status: 403, error: BOUND_AGENT_NOT_AUTHORIZED }
   const verdict = await boundAgentVerdict(env, auth, { requireActive: options.requireActive ?? true })
   if (verdict === 'unavailable') return { ok: false, status: 503, error: BOUND_AGENT_CHECK_UNAVAILABLE }
+  if (verdict === 'paused') return { ok: false, status: 403, error: 'agent_paused', detail: { next_step: AGENT_PAUSED_NEXT_STEP } }
   if (verdict !== 'live') return { ok: false, status: 403, error: BOUND_AGENT_NOT_AUTHORIZED }
   return { ok: true, agentId: auth.boundAgentId, memberId: auth.memberId }
 }

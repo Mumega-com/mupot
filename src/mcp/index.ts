@@ -1,4 +1,4 @@
-import { resolveBoundAgentCaller } from '../auth/bound-agent-caller'
+import { AGENT_PAUSED_NEXT_STEP, resolveBoundAgentCaller } from '../auth/bound-agent-caller'
 import { boundAgentVerdict, BOUND_AGENT_NOT_AUTHORIZED, BOUND_AGENT_CHECK_UNAVAILABLE } from '../auth/bound-agent-live'
 import { MCP_BASE_REQUEST_CAP_BYTES, MCP_REQUEST_CAP_BYTES, oversizeForTool, payloadTooLargeDetail, readBoundedText, toolTooLargeDetail } from './request-cap'
 import { withRoutineReviewDeadlines } from '../routines/review-window'
@@ -3336,6 +3336,7 @@ const toolTaskDispatch: ToolSpec = {
 }
 
 function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutcome {
+  if (error.code === 'agent_paused') return fail(403, error.code, { next_step: AGENT_PAUSED_NEXT_STEP })
   if (error.code === 'agent_check_unavailable') return fail(503, error.code)
   if (error.code === 'runtime_receipt_invalid') return fail(400, error.code)
   if (error.code === 'agent_bound_workspace_credential_required' || error.code === 'runtime_receipt_forbidden') {
@@ -5518,6 +5519,8 @@ const toolInboxLease: ToolSpec = {
   async run(auth, env, args, ctx) {
     const caller = await resolveBoundAgentCaller(env, auth)
     if (!caller.ok) return caller
+    const attached = attachedAuthority(auth) !== null
+    if (attached && args.attempt_id === undefined) return fail(403, 'attached_seat_attempt_required', "use inbox_lease with attempt_id and limit=1 for this chat's targeted mail")
     const agent = auth.boundAgentId
     if (!agent) {
       return fail(403, 'not_agent_bound', {
@@ -5552,6 +5555,7 @@ const toolInboxLease: ToolSpec = {
     const boundSeat = strictSeat?.ok
       ? strictSeat.seat
       : await resolveBoundSeat(env, auth.tokenId ?? null)
+    if (attached && !boundSeat) return fail(403, 'seat_not_bound', 'this attachment token has no inbox seat')
     const seatArg = resolveInboxSeatArg(
       typeof args.seat === 'string' ? args.seat.trim() : undefined,
       boundSeat,
@@ -5564,6 +5568,7 @@ const toolInboxLease: ToolSpec = {
       leaseSeconds,
       seat: seatArg.seat,
       attemptId: args.attempt_id as string | undefined,
+      exactSeatOnly: attached,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -5627,10 +5632,12 @@ const toolInboxLeaseReconcile: ToolSpec = {
 
     const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
     if (!strictSeat.ok) return fail(500, strictSeat.error)
+    if (attachedAuthority(auth) && !strictSeat.seat) return fail(403, 'seat_not_bound', 'this attachment token has no inbox seat')
     const boundSeat = strictSeat.seat
     const res = await reconcileAgentInboxLeaseAttempt(env, {
       agent,
       attemptId: args.attempt_id,
+      exactSeatOnly: attachedAuthority(auth) !== null,
       seat: boundSeat ?? undefined,
     })
     if (!res.ok) {
@@ -5672,9 +5679,11 @@ const toolInboxLeaseAck: ToolSpec = {
 
     const strictSeat = await resolveBoundSeatStrict(env, auth.tokenId ?? null, agent)
     if (!strictSeat.ok) return fail(500, strictSeat.error)
+    if (attachedAuthority(auth) && !strictSeat.seat) return fail(403, 'seat_not_bound', 'this attachment token has no inbox seat')
     const res = await ackAgentInboxLeaseAttempt(env, {
       agent,
       attemptId: args.attempt_id,
+      exactSeatOnly: attachedAuthority(auth) !== null,
       seat: strictSeat.seat ?? undefined,
     })
     if (!res.ok) {
@@ -5864,7 +5873,7 @@ const toolInboxFenceStatus: ToolSpec = {
         unread_total: unreadTotal,
         unread_cap: MAX_UNREAD_PER_RECIPIENT,
         near_cap: unreadTotal !== null && unreadTotal >= MAX_UNREAD_PER_RECIPIENT * INBOX_NEAR_CAP_RATIO,
-        note: 'This is an attached chat: read with inbox {peek:true}, then record what you handled with inbox_mark_handled {ids}. Use inbox_lease and inbox_lease_ack for durable consumption; legacy inbox consumption and inbox_ack belong to the host. unread_total counts messages the host has not consumed, including ones this chat marked handled; at unread_cap senders are refused (inbox_full).',
+        note: 'This is an attached chat: read with inbox {peek:true}, then record what you handled with inbox_mark_handled {ids}. Use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat; legacy inbox consumption and inbox_ack belong to the host. unread_total counts messages the host has not consumed, including ones this chat marked handled; at unread_cap senders are refused (inbox_full).',
         ...(strictSeat?.ok ? { strict_scope: true, tenant: env.TENANT_SLUG, effective_inbox_seat: strictSeat.seat } : {}),
       })
     }
@@ -6994,7 +7003,7 @@ function buildBootOnboarding(
       ...(fenced && first
         ? { next_step: `${first.next_step} Boot records no runtime, model or host for an attached thread.`, who_acts: first.who_acts }
         : {
-            next_step: `read the agent inbox with inbox { peek: true }${canMark ? ', then record what you handled with inbox_mark_handled { ids } so this thread stops re-reading it' : ''}. This thread may use inbox_lease and inbox_lease_ack for durable consumption (legacy inbox consume/ack remain host-only), and boot records no runtime, model or host for it.`,
+            next_step: `read the agent inbox with inbox { peek: true }${canMark ? ', then record what you handled with inbox_mark_handled { ids } so this thread stops re-reading it' : ''}. This thread may use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat (legacy inbox consume/ack remain host-only), and boot records no runtime, model or host for it.`,
             who_acts: 'self' as const,
           }),
       for_owner: ownerNote,
@@ -7557,7 +7566,7 @@ const toolBootContext: ToolSpec = {
           ? " You are observed: request admission with seat_attach {agent:'<slug>', reason:'<why this chat should act as that agent>'}; your human approves it. Show them the approval code you get back and wait while they approve it; until then you stay limited to the observed tools. Use mupot tools only (no browser or computer use)."
           : ` ${attachConnectOrder(env, whoamiFacts.humanCanDesignate)}`
       nextStepOut = auth.seatBinding.attached
-        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you may use inbox_lease and inbox_lease_ack for durable consumption. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority, per scope, is the lowest of your human's own standing, this agent's own grants, and the ceiling your human approved (${auth.seatBinding.attached.ceiling}); read identity_receipt.effective_capabilities for the result. You may give task_verdict reviews as this agent only if your human's admission allows it and the agent itself holds that review gate (never on work that is yours, your human's, or the agent's own); no other approval authority. The human can detach you on their Connections page at any time. Read the inbox with inbox {peek:true} and record what you handled with inbox_mark_handled; you may use inbox_lease with attempt_id and limit=1, then inbox_lease_ack for targeted mail addressed to this chat. Call orient (no args) for your agent's briefing: squad, tasks, inbox.`
         : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox.${attachOrder}`
         : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) for your agent's briefing: squad, tasks, inbox; it runs as this seat agent only while you keep passing your seat handle as the "seat" argument on every call (a harness that can set headers may send X-Mupot-Seat instead).${attachOrder}`

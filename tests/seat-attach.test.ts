@@ -1766,6 +1766,7 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     await admitAndAttach(env, g, 'conv-parity')
     const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-parity', codexThreadId: null } })
     h.sqlite.exec(`DELETE FROM agent_messages WHERE to_agent='agent-rava'; INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body) VALUES ('parity-mail','${TENANT}','agent-rava','agent-x','mem-x','message','own work')`)
+    h.sqlite.prepare('UPDATE agent_messages SET target_seat=(SELECT label FROM member_tokens WHERE id=?) WHERE id=?').run(att.tokenId,'parity-mail')
     const args = {limit:1,attempt_id:'parity_attempt_001'}
     expect(await invokeTool(att,env,'inbox_lease',args)).toMatchObject({ok:true,result:{messages:[{id:'parity-mail'}]}})
     expect(await invokeTool(att,env,'inbox_lease_ack',{attempt_id:args.attempt_id})).toMatchObject({ok:true,result:{consumed:true}})

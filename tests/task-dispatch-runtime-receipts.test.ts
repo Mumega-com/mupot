@@ -179,6 +179,9 @@ describe('task dispatch runtime receipt schema', () => {
         'reason',
         'audit_entry_id',
         'created_at',
+        'seat_id',
+        'attachment_id',
+        'consenting_member_id',
       ])
 
       const foreignKeys = harness.sqlite
@@ -3135,6 +3138,11 @@ describe('same-agent runtime receipt parity', () => {
       const actor: AuthContext = {...f.auth, channel: door === 'workspace' ? 'workspace' : 'directory',
         ...(door !== 'attached' ? {} : {seatBinding:{seatId:'seat',label:'chat',harnessId:'h',grantTokenId:'grant',humanMemberId:MEMBER_ID,source:'handle' as const,
           attached:{attachmentId:'att',admissionId:'adm',agentId:AGENT_ID,seatAgentId:'seat-agent',ceiling:'member' as const}}})}
+      if(door==='attached') {
+        f.harness.sqlite.prepare("UPDATE member_tokens SET label='attach:parity' WHERE id=?").run(TOKEN_ID)
+        f.harness.sqlite.prepare("UPDATE agent_messages SET to_agent=?,target_seat='attach:parity',body=json_set(body,'$.runtime_address',?),delivery_attempts=0,lease_expires_at=NULL WHERE id=?").run(AGENT_ID,AGENT_ID,MESSAGE_ID)
+        expect(await invokeTool(actor,f.env,'inbox_lease',{limit:1,attempt_id:'parity_receipt_0001'})).toMatchObject({ok:true,result:{messages:[{id:MESSAGE_ID}]}})
+      }
       const input = {taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,messageId:MESSAGE_ID,stage:'runtime_consumed' as const,runtimeReceiptHash:RUNTIME_HASH,attempt:1}
       const consumed = await recordTaskDispatchRuntimeReceipt(f.env,actor,input)
       expect(consumed.task_status).toBe('in_progress')
@@ -3224,6 +3232,220 @@ describe('runtime parity owner and unavailable live verdict',()=>{
       }}} as Env
       expect(await invokeTool(f.auth,env,'task_dispatch_runtime_receipt',{task_id:TASK_ID,dispatch_receipt_id:DISPATCH_ID,message_id:MESSAGE_ID,stage:'runtime_consumed',runtime_receipt_hash:RUNTIME_HASH,attempt:1}))
         .toMatchObject({ok:false,status:503,error:'agent_check_unavailable'})
+    } finally {f.harness.close()}
+  })
+})
+
+async function attachedReceiptActor(f:ReturnType<typeof runtimeFixture>):Promise<AuthContext> {
+  f.harness.sqlite.exec(`INSERT INTO members(id,display_name,status,tenant) VALUES ('receipt-human','Human','active','${TENANT}')`)
+  f.harness.sqlite.prepare("UPDATE member_tokens SET channel='directory',label='attach:runtime:seat' WHERE id=?").run(TOKEN_ID)
+  const actor:AuthContext = {...f.auth,channel:'directory',consentedByMemberId:'receipt-human',seatBinding:{seatId:'receipt-seat',label:'chat',harnessId:'h',grantTokenId:'grant',humanMemberId:'receipt-human',source:'handle',
+    attached:{attachmentId:'receipt-attachment',admissionId:'adm',agentId:AGENT_ID,seatAgentId:'chat-agent',ceiling:'member'}}}
+  f.harness.sqlite.prepare("UPDATE agent_messages SET target_seat='attach:runtime:seat',to_agent=?,body=json_set(body,'$.runtime_address',?),delivery_attempts=0,lease_expires_at=NULL WHERE id=?").run(AGENT_ID,AGENT_ID,MESSAGE_ID)
+  expect(await invokeTool(actor,f.env,'inbox_lease',{limit:1,attempt_id:'runtime_attach_0001'})).toMatchObject({ok:true,result:{messages:[{id:MESSAGE_ID}]}})
+  return actor
+}
+const attachedReceiptInput={taskId:TASK_ID,dispatchReceiptId:DISPATCH_ID,messageId:MESSAGE_ID,stage:'runtime_consumed' as const,runtimeReceiptHash:RUNTIME_HASH,attempt:1}
+
+describe('runtime attached attribution and independence',()=>{
+  it('persists the canonical seat, attachment and consenting human on every runtime stage',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})
+      const rows=f.harness.sqlite.prepare('SELECT seat_id,attachment_id,consenting_member_id,credential_id FROM task_dispatch_runtime_receipts ORDER BY rowid').all()
+      expect(rows).toEqual([0,1].map(()=>({seat_id:'receipt-seat',attachment_id:'receipt-attachment',consenting_member_id:'receipt-human',credential_id:TOKEN_ID})))
+    } finally {f.harness.close()}
+  })
+  it('does not count a gate agent owned by the attaching human as independent',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run('receipt-human',GATE_AGENT_ID)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toMatchObject({code:'runtime_gate_required'})
+    } finally {f.harness.close()}
+  })
+  it('rejects an attaching humans gate agent as verdict giver after another independent gate permits completion',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})
+      f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run('receipt-human',GATE_AGENT_ID)
+      expect(await invokeTool(f.gateAuth,f.env,'task_verdict',{task_id:TASK_ID,verdict:'approved',note:'Review'})).toMatchObject({ok:false,error:'self_verdict'})
+      expect(f.harness.sqlite.prepare('SELECT status FROM tasks WHERE id=?').get(TASK_ID)).toEqual({status:'review'})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('attached runtime custody',()=>{
+  it.each(['pair','recovery'])('cannot create a legacy %s lease on host mail',async mode=>{
+    const f=runtimeFixture({unleased:true})
+    try {
+      const actor=await attachedReceiptActor(f)
+      // Preserve the genuine identity but reset the row to a host legacy envelope.
+      f.harness.sqlite.prepare('UPDATE agent_messages SET target_seat=NULL,delivery_attempts=0,lease_expires_at=NULL,lease_attempt_id=NULL,read_at=? WHERE id=?').run(mode==='recovery'?T0:null,MESSAGE_ID)
+      const before=f.harness.sqlite.prepare('SELECT read_at,delivery_attempts,lease_expires_at FROM agent_messages WHERE id=?').get(MESSAGE_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,messageId:mode==='pair'?undefined:MESSAGE_ID})).rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(f.harness.sqlite.prepare('SELECT read_at,delivery_attempts,lease_expires_at FROM agent_messages WHERE id=?').get(MESSAGE_ID)).toEqual(before)
+    } finally {f.harness.close()}
+  })
+  it('also excludes the recorded attaching human when a host credential completes later',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run('receipt-human',GATE_AGENT_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,{...f.auth,channel:'directory'},{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toMatchObject({code:'runtime_gate_required'})
+    } finally {f.harness.close()}
+  })
+})
+
+
+describe('runtime connection attribution migration',()=>{
+  it('keeps host metadata NULL and rolls columns back without deleting receipts or append-only guards',async()=>{
+    const f=runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(f.env,f.auth,attachedReceiptInput)
+      expect(f.harness.sqlite.prepare('SELECT seat_id,attachment_id,consenting_member_id FROM task_dispatch_runtime_receipts').get()).toEqual({seat_id:null,attachment_id:null,consenting_member_id:null})
+      f.harness.sqlite.exec(readFileSync(join(dirname(fileURLToPath(import.meta.url)),'../docs/rollback/0272_runtime_receipt_attribution.sql'),'utf8'))
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts').get()).toEqual({n:1})
+      const cols=f.harness.sqlite.prepare("SELECT name FROM pragma_table_info('task_dispatch_runtime_receipts')").all().map(r=>r.name)
+      expect(cols).not.toContain('seat_id');expect(cols).not.toContain('attachment_id');expect(cols).not.toContain('consenting_member_id')
+      expect(f.harness.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_inbox_attempt_runtime_custody'").get()).toBeUndefined()
+      expect(()=>f.harness.sqlite.exec("UPDATE task_dispatch_runtime_receipts SET reason='changed'" )).toThrow(/append-only/)
+    } finally {f.harness.close()}
+  })
+})
+
+describe('runtime human independence fences',()=>{
+  it('also requires an independent gate for a newly attaching completing human',async()=>{
+    const f=runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(f.env,f.auth,attachedReceiptInput)
+      const actor=await attachedReceiptActor(f)
+      f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run('receipt-human',GATE_AGENT_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toMatchObject({code:'runtime_gate_required'})
+    } finally {f.harness.close()}
+  })
+  it.each(['current','prior'])('rechecks %s human affiliation at completion commit time',async kind=>{
+    const f=runtimeFixture()
+    try {
+      let actor:AuthContext
+      if(kind==='current') {
+        await recordTaskDispatchRuntimeReceipt(f.env,f.auth,attachedReceiptInput)
+        actor=await attachedReceiptActor(f)
+      } else {
+        const attached=await attachedReceiptActor(f)
+        await recordTaskDispatchRuntimeReceipt(f.env,attached,attachedReceiptInput)
+        actor={...f.auth,channel:'directory'}
+      }
+      let flipped=false
+      const env={...f.env,DB:{...f.env.DB,prepare(sql:string){
+        if(!flipped && sql.includes("UPDATE tasks SET status = 'review'")) {
+          flipped=true
+          f.harness.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run('receipt-human',GATE_AGENT_ID)
+        }
+        return f.env.DB.prepare(sql)
+      }}} as Env
+      await expect(recordTaskDispatchRuntimeReceipt(env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toBeInstanceOf(Error)
+      expect(flipped).toBe(true)
+      expect(f.harness.sqlite.prepare('SELECT status FROM tasks WHERE id=?').get(TASK_ID)).toEqual({status:'in_progress'})
+      expect(f.harness.sqlite.prepare("SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE stage='completed'").get()).toEqual({n:0})
+    } finally {f.harness.close()}
+  })
+  it('considers the recorded consenting human a direct work party',async()=>{
+    const {findVerdictIndependenceConflict}=await import('../src/tasks/verdict-independence')
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      expect(await findVerdictIndependenceConflict(f.env,'receipt-human',TASK_ID)).toBe('direct')
+    } finally {f.harness.close()}
+  })
+})
+
+describe('attached runtime lease phase fences',()=>{
+  it.each(['pair','recovery'])('cannot enter the %s lease helper if a durable proof changes immediately after its read',async mode=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      let flipped=false;let afterFlip:unknown
+      const env={...f.env,DB:{...f.env.DB,prepare(sql:string){
+        const stmt=f.env.DB.prepare(sql)
+        if(!sql.startsWith('SELECT 1 WHERE EXISTS (') || !sql.includes('agent_messages am JOIN agent_inbox_lease_attempts'))return stmt
+        const wrap=(s:D1PreparedStatement):D1PreparedStatement=>({...s,bind(...v:unknown[]){return wrap(s.bind(...v))},async first<T>(){
+          const row=await s.first<T>()
+          if(!flipped){flipped=true;f.harness.sqlite.prepare('UPDATE agent_messages SET target_seat=NULL,delivery_attempts=0,lease_expires_at=NULL,lease_attempt_id=NULL,read_at=? WHERE id=?').run(mode==='recovery'?T0:null,MESSAGE_ID)
+            afterFlip=f.harness.sqlite.prepare('SELECT read_at,delivery_attempts,lease_expires_at FROM agent_messages WHERE id=?').get(MESSAGE_ID)}
+          return row
+        }})
+        return wrap(stmt)
+      }}} as Env
+      await expect(recordTaskDispatchRuntimeReceipt(env,actor,{...attachedReceiptInput,messageId:mode==='pair'?undefined:MESSAGE_ID})).rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(flipped).toBe(true)
+      expect(f.harness.sqlite.prepare('SELECT read_at,delivery_attempts,lease_expires_at FROM agent_messages WHERE id=?').get(MESSAGE_ID)).toEqual(afterFlip)
+    } finally {f.harness.close()}
+  })
+  it('requires the durable attempt before taking custody of an exact-target legacy lease',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      f.harness.sqlite.prepare('UPDATE agent_messages SET lease_attempt_id=NULL WHERE id=?').run(MESSAGE_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)).rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(f.harness.sqlite.prepare('SELECT status FROM tasks WHERE id=?').get(TASK_ID)).toEqual({status:'open'})
+    } finally {f.harness.close()}
+  })
+  it('reasserts exact-target durable custody at the state-changing UPDATE',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      let flipped=false
+      const env={...f.env,DB:{...f.env.DB,prepare(sql:string){
+        if(!flipped && sql.includes("UPDATE tasks SET status = 'in_progress', execution_receipt_id")) {
+          flipped=true;f.harness.sqlite.prepare("UPDATE agent_messages SET target_seat='another-chat' WHERE id=?").run(MESSAGE_ID)
+        }
+        return f.env.DB.prepare(sql)
+      }}} as Env
+      await expect(recordTaskDispatchRuntimeReceipt(env,actor,attachedReceiptInput)).rejects.toBeInstanceOf(Error)
+      expect(flipped).toBe(true)
+      expect(f.harness.sqlite.prepare('SELECT status FROM tasks WHERE id=?').get(TASK_ID)).toEqual({status:'open'})
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts').get()).toEqual({n:0})
+    } finally {f.harness.close()}
+  })
+  it('surfaces a typed pause and operator next step for runtime receipt callers',async()=>{
+    const f=runtimeFixture()
+    try {
+      f.harness.sqlite.prepare("UPDATE agents SET status='paused' WHERE id=?").run(AGENT_ID)
+      expect(await invokeTool(f.auth,f.env,'task_dispatch_runtime_receipt',{task_id:TASK_ID,dispatch_receipt_id:DISPATCH_ID,message_id:MESSAGE_ID,stage:'runtime_consumed',runtime_receipt_hash:RUNTIME_HASH,attempt:1})).toMatchObject({ok:false,status:403,error:'agent_paused',detail:{next_step:expect.stringMatching(/resume.*retry/i)}})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('attached completion target scope',()=>{
+  it('cannot complete work through a message now targeted to another seat',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      f.harness.sqlite.prepare("UPDATE agent_messages SET target_seat='other-seat' WHERE id=?").run(MESSAGE_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toMatchObject({code:'runtime_receipt_forbidden'})
+      expect(f.harness.sqlite.prepare('SELECT status FROM tasks WHERE id=?').get(TASK_ID)).toEqual({status:'in_progress'})
+    } finally {f.harness.close()}
+  })
+})
+
+describe('attached runtime bound seat',()=>{
+  it('fails closed on completion when the attachment credential loses its bound seat label',async()=>{
+    const f=runtimeFixture()
+    try {
+      const actor=await attachedReceiptActor(f)
+      await recordTaskDispatchRuntimeReceipt(f.env,actor,attachedReceiptInput)
+      f.harness.sqlite.prepare("UPDATE member_tokens SET label='' WHERE id=?").run(TOKEN_ID)
+      f.harness.sqlite.prepare('UPDATE agent_messages SET target_seat=NULL WHERE id=?').run(MESSAGE_ID)
+      await expect(recordTaskDispatchRuntimeReceipt(f.env,actor,{...attachedReceiptInput,stage:'completed',result:'Done'})).rejects.toMatchObject({code:'runtime_receipt_forbidden'})
     } finally {f.harness.close()}
   })
 })

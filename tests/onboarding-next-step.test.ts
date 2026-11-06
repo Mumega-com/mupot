@@ -48,7 +48,7 @@ describe('onboarding_next: one legal step per case', () => {
     const n = next(authOf({ boundAgentId: 'ag', seatBinding: { ...SEAT, attached: ATTACHED } }), { actsAs: 'athena' })
     expect(n).toMatchObject({ case: 'attached_chat', who_acts: 'self', next_tool: 'inbox' })
     expect(n.next_step).toContain('peek')
-    expect(n.next_step).toMatch(/inbox_lease and inbox_lease_ack/)
+    expect(n.next_step).toMatch(/inbox_lease.*attempt_id.*inbox_lease_ack/)
     expect(n.next_tool).not.toBe('seat_attach')
   })
 

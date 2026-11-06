@@ -51,11 +51,14 @@ interface LiveRow {
  * weld is backed by a live agent, live owner/consenter and (for a plain workspace-style session) at least one live capability.
  * Default polling semantics permit paused agents; requireActive is the narrower agent-work check.
  */
+// The two-argument polling contract stays tri-state. Work callers may additionally distinguish a pause.
+export function boundAgentVerdict(env: Pick<Env, 'DB' | 'TENANT_SLUG'>, auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null }): Promise<BoundAgentVerdict>
+export function boundAgentVerdict(env: Pick<Env, 'DB' | 'TENANT_SLUG'>, auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null }, options: { requireActive?: boolean }): Promise<BoundAgentVerdict | 'paused'>
 export async function boundAgentVerdict(
   env: Pick<Env, 'DB' | 'TENANT_SLUG'>,
   auth: Pick<AuthContext, 'boundAgentId' | 'consentedByMemberId'> & { memberId?: string | null },
   options: { requireActive?: boolean } = {},
-): Promise<BoundAgentVerdict> {
+): Promise<BoundAgentVerdict | 'paused'> {
   const agentId = auth.boundAgentId
   if (!agentId) return 'live'
   const consenter = auth.consentedByMemberId ?? null
@@ -79,10 +82,11 @@ export async function boundAgentVerdict(
         WHERE a.id = ?1
         LIMIT 1`,
     ).bind(agentId, env.TENANT_SLUG, consenter, capMember, nowCapabilitySql()).first<LiveRow>()
-    if (!row || (row.status !== 'active' && (options.requireActive || row.status !== 'paused'))) return 'refused'
+    if (!row || (row.status !== 'active' && row.status !== 'paused')) return 'refused'
     if (row.owner_member_id !== null && row.owner_status !== 'active') return 'refused'
     if (consenter !== null && row.consenter_status !== 'active') return 'refused'
     if (row.has_caps !== 1) return 'refused'
+    if (options.requireActive && row.status === 'paused') return 'paused'
     return 'live'
   } catch {
     return 'unavailable'

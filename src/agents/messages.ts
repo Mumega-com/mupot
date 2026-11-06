@@ -1301,7 +1301,12 @@ type StoredLeaseAttempt = {
   checksum_sha256: string | null
 }
 
-const ATTEMPT_RESULT_SELECT = `
+/** Server-selected exact attachment partition; the legacy host predicate remains separate. */
+function exactAttemptSeatSql(prefix: '' | 'm.' = ''): string {
+  return `(${prefix}target_seat = ?3 AND ?3 <> '')`
+}
+
+function attemptResultSelect(exactSeatOnly = false): string { return `
   SELECT a.tenant AS attempt_tenant, a.agent_id AS attempt_agent_id,
          a.target_seat_key, a.attempt_id, a.request_digest, a.state AS attempt_state,
          a.lease_expires_at AS attempt_lease_expires_at,
@@ -1319,10 +1324,11 @@ const ATTEMPT_RESULT_SELECT = `
      AND m.lease_attempt_id = ?5
      AND m.lease_expires_at = a.lease_expires_at
      AND m.read_at IS NULL
+     ${exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''}
    WHERE a.tenant = ?1 AND a.agent_id = ?2
      AND a.target_seat_key = ?3 AND a.attempt_id = ?4
      AND ${bearerFencePredicate('?1', '?2')}
-   LIMIT 1`
+   LIMIT 1` }
 
 function validAttemptId(value: unknown): value is string {
   return typeof value === 'string' && ATTEMPT_ID_RE.test(value)
@@ -1471,7 +1477,7 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
 
 async function leaseAgentInboxWithAttempt(
   env: Env,
-  input: { agent: string; leaseSeconds: number; seat?: string; attemptId: string },
+  input: { agent: string; leaseSeconds: number; seat?: string; attemptId: string; exactSeatOnly?: boolean },
   nowIso: string,
   expiresIso: string,
 ): Promise<LeaseAttemptResult | LeaseFailure> {
@@ -1480,8 +1486,9 @@ async function leaseAgentInboxWithAttempt(
   const digest = await attemptDigest(input.leaseSeconds, targetSeatKey)
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
   const fence = bearerFencePredicate('?1', '?2')
-  const seat = `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
+  const seat = input.exactSeatOnly ? exactAttemptSeatSql() : `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
   const attemptOpening = `EXISTS (
     SELECT 1 FROM agent_inbox_lease_attempts a
      WHERE a.tenant = ?1 AND a.agent_id = ?2 AND a.target_seat_key = ?3
@@ -1582,7 +1589,7 @@ async function leaseAgentInboxWithAttempt(
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND EXISTS (SELECT 1 FROM agent_messages m
-              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.read_at IS NOT NULL)
             AND ${fence}`,
       ).bind(...scope, digest, nowIso),
@@ -1593,13 +1600,13 @@ async function leaseAgentInboxWithAttempt(
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND NOT EXISTS (SELECT 1 FROM agent_messages m
-              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
                 AND m.lease_attempt_id = ?9 AND m.lease_expires_at = a.lease_expires_at
                 AND m.read_at IS NULL AND m.lease_expires_at > ?6)
             AND ${fence}`,
       ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
-      env.DB.prepare(ATTEMPT_RESULT_SELECT).bind(...scope, stamp),
+      env.DB.prepare(attemptResultSelect(input.exactSeatOnly)).bind(...scope, stamp),
     ]
     const results = await env.DB.batch<StoredLeaseAttempt>(statements)
     const row = results.at(-1)?.results?.[0]
@@ -1618,7 +1625,7 @@ async function leaseAgentInboxWithAttempt(
 
 export async function reconcileAgentInboxLeaseAttempt(
   env: Env,
-  input: { agent: string; attemptId: string; seat?: string },
+  input: { agent: string; attemptId: string; seat?: string; exactSeatOnly?: boolean },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseAttemptResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -1633,6 +1640,7 @@ export async function reconcileAgentInboxLeaseAttempt(
   const targetSeatKey = input.seat?.trim() || ''
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
   const fence = bearerFencePredicate('?1', '?2')
 
   try {
@@ -1651,7 +1659,7 @@ export async function reconcileAgentInboxLeaseAttempt(
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND EXISTS (SELECT 1 FROM agent_messages m
-              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.read_at IS NOT NULL)
             AND ${fence}`,
       ).bind(...scope, nowIso),
@@ -1662,13 +1670,13 @@ export async function reconcileAgentInboxLeaseAttempt(
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state = 'leased'
             AND NOT EXISTS (SELECT 1 FROM agent_messages m
-              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+              WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
                 AND m.lease_attempt_id = ?6 AND m.lease_expires_at = a.lease_expires_at
                 AND m.read_at IS NULL AND m.lease_expires_at > ?5)
             AND ${fence}`,
       ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(ATTEMPT_RESULT_SELECT).bind(...scope, stamp),
+      env.DB.prepare(attemptResultSelect(input.exactSeatOnly)).bind(...scope, stamp),
     ])
     const row = results.at(-1)?.results?.[0]
     if (!row) {
@@ -1683,7 +1691,7 @@ export async function reconcileAgentInboxLeaseAttempt(
 
 export async function ackAgentInboxLeaseAttempt(
   env: Env,
-  input: { agent: string; attemptId: string; seat?: string },
+  input: { agent: string; attemptId: string; seat?: string; exactSeatOnly?: boolean },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseAttemptAckResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -1698,8 +1706,9 @@ export async function ackAgentInboxLeaseAttempt(
   const targetSeatKey = input.seat?.trim() || ''
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
   const fence = bearerFencePredicate('?1', '?2')
-  const seat = `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
+  const seat = input.exactSeatOnly ? exactAttemptSeatSql() : `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
 
   try {
     const results = await env.DB.batch<{
@@ -1722,7 +1731,7 @@ export async function ackAgentInboxLeaseAttempt(
       env.DB.prepare(
         `UPDATE agent_messages AS m
             SET read_at = ?5, lease_expires_at = NULL
-          WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.read_at IS NULL
+          WHERE m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat} AND m.read_at IS NULL
             AND m.lease_attempt_id = ?6 AND m.lease_expires_at > ?5
             AND ${seat} AND ${fence}
             AND EXISTS (
@@ -1743,7 +1752,7 @@ export async function ackAgentInboxLeaseAttempt(
             AND a.attempt_id = ?4 AND a.state = 'leased' AND ${fence}
             AND EXISTS (
               SELECT 1 FROM agent_messages m
-               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                  AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
                  AND m.read_at IS NOT NULL
                  AND (m.lease_attempt_id = ?6 OR m.lease_attempt_id IS NULL)
@@ -1757,7 +1766,7 @@ export async function ackAgentInboxLeaseAttempt(
             AND a.attempt_id = ?4 AND a.state = 'leased' AND ${fence}
             AND NOT EXISTS (
               SELECT 1 FROM agent_messages m
-               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2
+               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                  AND m.seq = a.message_seq AND m.delivery_attempts = a.delivery_attempt
                  AND m.lease_attempt_id = ?6 AND m.lease_expires_at = a.lease_expires_at
                  AND m.read_at IS NULL AND m.lease_expires_at > ?5
@@ -1776,7 +1785,7 @@ export async function ackAgentInboxLeaseAttempt(
                      AND a.message_id = m.id AND a.message_seq = m.seq
                      AND a.delivery_attempt = m.delivery_attempts
                 )
-          WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.read_at = ?5
+          WHERE m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat} AND m.read_at = ?5
             AND m.lease_expires_at IS NULL
             AND m.lease_attempt_id = ?6 AND ${seat}
             AND NOT (${fence})
@@ -1791,7 +1800,7 @@ export async function ackAgentInboxLeaseAttempt(
       env.DB.prepare(
         `UPDATE agent_messages AS m
             SET lease_attempt_id = NULL
-          WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.lease_attempt_id = ?6
+          WHERE m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat} AND m.lease_attempt_id = ?6
             AND m.read_at IS NOT NULL AND ${seat} AND ${fence}
             AND EXISTS (
               SELECT 1 FROM agent_inbox_lease_attempts a
@@ -1837,13 +1846,15 @@ export async function ackAgentInboxLeaseAttempt(
  */
 export async function leaseAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string; attemptId?: string },
+  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string; attemptId?: string; exactSeatOnly?: boolean },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseResult | LeaseAttemptResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return { ok: false, reason: 'no_tenant' }
   if (typeof input.agent !== 'string' || !isRef(input.agent))
     return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
+
+  if (input.exactSeatOnly && (!input.seat?.trim() || !input.attemptId)) return { ok: false, reason: 'invalid_attempt', detail: 'exact-seat leasing requires a bound seat and attempt_id' }
 
   let limit = DEFAULT_INBOX_LIMIT
   if (input.limit !== undefined) {
@@ -1877,6 +1888,7 @@ export async function leaseAgentInbox(
       leaseSeconds,
       seat: targetSeat ?? undefined,
       attemptId: input.attemptId,
+      exactSeatOnly: input.exactSeatOnly,
     }, nowIso, expiresIso)
   }
 

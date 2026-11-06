@@ -18,8 +18,8 @@ function fixture(door: Door) {
     INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES ('t','a','m','2026-01-01'),('t','other','other-m','2026-01-01');
     INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('c','m','squad','s','member'),('human-c','human','squad','s','member'),('other-c','other-m','squad','other-s','member');
     INSERT INTO member_tokens(id,member_id,token_hash,label,channel,agent_id,tenant,expires_at)
-      VALUES ('tok','m','hash','','${door === 'bearer' ? 'workspace' : 'directory'}','a','t','2099-01-01');
-    INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body) VALUES ('mail','t','a','sender','sender','message','hello');
+      VALUES ('tok','m','hash','${door === 'attached' ? 'attach:a:seat' : ''}','${door === 'bearer' ? 'workspace' : 'directory'}','a','t','2099-01-01');
+    INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body,target_seat) VALUES ('mail','t','a','sender','sender','message','hello',${door === 'attached' ? "'attach:a:seat'" : 'NULL'});
   `)
   const auth: AuthContext = { userId: 'm', memberId: 'm', email: null, role: 'member', tenant: 't',
     channel: door === 'bearer' ? 'workspace' : 'directory', tokenId: 'tok', boundAgentId: 'a',
@@ -59,7 +59,7 @@ describe.each(doors)('%s bound-agent parity', door => {
       expect(await f.call('inbox_lease_ack',{attempt_id:'attempt_parity_001'})).toMatchObject({ok:true,result:{consumed:true}})
       f.h.sqlite.exec(`INSERT INTO agent_inbox_fences(tenant,agent_id,mode,generation,updated_by_member_id,reason,updated_at,key_fingerprint) VALUES ('t','a','signed_only',1,'m','test','2026-01-01','${'a'.repeat(64)}')`)
       if(door==='attached') expect(await f.call('inbox_consumer_status')).toMatchObject({ok:true,result:{can_consume:false}})
-      expect(await f.call('inbox_lease',{limit:1})).toMatchObject({ok:false,status:409,error:'consumer_fenced'})
+      expect(await f.call('inbox_lease',{limit:1,attempt_id:'attempt_fence_001'})).toMatchObject({ok:false,status:409,error:'consumer_fenced'})
     } finally {f.h.close()}
   })
   it.each(['get_agent_webhook_doorbell','list_agent_webhook_doorbell_receipts'])('reads own redacted %s and refuses another agent',async tool=>{
