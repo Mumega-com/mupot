@@ -694,6 +694,63 @@ describe('archive substrate (mupot#1496)', () => {
     expect(match.ok).toBe(true)
   })
 
+  describe('tasks linked to held flights', () => {
+    const flightMeta = {
+      schema: 'mupot.flight.meta/v1', goal_id: 'g', objective_id: 'o', squad_ids: ['squad-1'], task_ids: ['task-2'],
+      done_when: ['done'], artifact_refs: [], receipt_refs: [], confidentiality: 'internal', publication_target: 'none', parent_flight_id: null,
+    }
+    function linkedFlight(status: string): void {
+      harness.sqlite.prepare(`INSERT INTO flights(id,tenant,agent,goal,status,gate_verdict,meta) VALUES('board-flight',?,'agent-1','g',?,'no_go',?)`)
+        .run(TENANT, status, JSON.stringify(flightMeta))
+    }
+    const archiveTask = () => invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'board cleanup' })
+
+    it.each(['held', 'landed', 'failed'])('%s flight permits receipted task archive without changing the flight', async status => {
+      linkedFlight(status)
+      expect(await archiveTask()).toMatchObject({ ok: true, result: { status: 'archived' } })
+      expect(harness.sqlite.prepare("SELECT prior_status,archived_by_member_id FROM tasks_archive_state WHERE task_id='task-2'").get())
+        .toEqual({ prior_status: 'open', archived_by_member_id: OPERATOR })
+      expect(harness.sqlite.prepare("SELECT action FROM archive_receipts WHERE entity_table='tasks' AND entity_id='task-2'").all()).toEqual([{ action: 'archive' }])
+      expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id='task-2'").get()).toEqual({ status: 'open' })
+      expect(harness.sqlite.prepare("SELECT status FROM flights WHERE id='board-flight'").get()).toEqual({ status })
+    })
+
+    it.each(['preflight', 'running', 'waiting', 'sleeping'])('%s flight still protects its task from archive', async status => {
+      linkedFlight(status)
+      expect(await archiveTask()).toMatchObject({ ok: false, status: 409, error: 'in_air_flight' })
+      expect(harness.sqlite.prepare('SELECT count(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+      expect(harness.sqlite.prepare("SELECT count(*) AS n FROM archive_receipts WHERE entity_table='tasks'").get()).toEqual({ n: 0 })
+    })
+
+    it('keeps archive authority unchanged for a task under a held flight', async () => {
+      linkedFlight('held')
+      expect((await invoke(auth({ capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }] }), 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })).ok).toBe(false)
+      expect(await invoke(auth({ boundAgentId: 'agent-1' }), 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' }))
+        .toMatchObject({ ok: false, error: 'operator_principal_required' })
+      expect(harness.sqlite.prepare('SELECT count(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+    })
+
+    it('reactivating a held flight cannot update or dispatch its archived task', async () => {
+      linkedFlight('held')
+      expect(await archiveTask()).toMatchObject({ ok: true })
+      // No public release API exists. Model re-queuing the held flight, then use the real GO writer.
+      harness.sqlite.exec("UPDATE flights SET status='preflight' WHERE id='board-flight'")
+      const { applyPreflight } = await import('../src/flight/service')
+      const { preflightCheck } = await import('../src/flight/preflight')
+      const signals = { contextComplete: true, toolsReachable: true, budgetRemainingMicroUsd: 999000, budgetEstimateMicroUsd: 1, recentProgress: 0.9, progressPerStep: 0.8, wastePerStep: 0.1, stepSeconds: 10 }
+      await applyPreflight(env, 'board-flight', preflightCheck(signals))
+      expect(harness.sqlite.prepare("SELECT status FROM flights WHERE id='board-flight'").get()).toEqual({ status: 'running' })
+      expect(await invoke(ORG_ADMIN, 'task_update', { task_id: 'task-2', status: 'in_progress' })).toMatchObject({ ok: false, error: 'task_archived' })
+      expect(await invoke(ORG_ADMIN, 'task_dispatch', { task_id: 'task-2' })).toMatchObject({ ok: false, error: 'task_archived' })
+      const agent = auth({ boundAgentId: 'agent-1', capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: 'squad-1', capability: 'lead' }] })
+      expect(await invoke(agent, 'flight_dispatch', { squad_id: 'squad-1', goal: 'g', meta_json: JSON.stringify(flightMeta), signals_json: JSON.stringify(signals), budget_micro_usd: 1000 }))
+        .toMatchObject({ ok: false, error: 'task_archived' })
+      expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id='task-2'").get()).toEqual({ status: 'open' })
+      expect(harness.sqlite.prepare("SELECT count(*) AS n FROM task_dispatch_receipts WHERE task_id='task-2'").get()).toEqual({ n: 0 })
+      expect(harness.sqlite.prepare('SELECT count(*) AS n FROM flights').get()).toEqual({ n: 1 })
+    })
+  })
+
   it('archive_row(tasks) keeps the org-admin / operator gate', async () => {
     const memberOnly = auth({ capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }] })
     const refused = await invoke(memberOnly, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
