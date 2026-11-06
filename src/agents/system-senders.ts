@@ -41,6 +41,8 @@ export const SYSTEM_SENDERS: Readonly<Record<string, string | null>> = Object.fr
   [ASSIGNMENT_WAKE_SENDER]: null,
   [ONBOARDING_SENDER]: null,
   [TASK_RECLAIM_SENDER]: null,
+  // The work order is acted on through routine tools, not an inbox message reply.
+  'mupot-routines': null,
 })
 
 export function isSystemSender(ref: unknown): ref is string {

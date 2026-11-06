@@ -367,8 +367,9 @@ describe('routine runtime-neutral dispatch', () => {
         kind: 'request',
         request_id: 'routine-run:run-1',
         project_id: 'project-1',
-        expects_reply: true,
-        reply_basis: 'request_id_field',
+        expects_reply: false,
+        reply_basis: 'system_sender',
+        reply_via: null,
       }],
     })
     // mumega-com#970: this dispatch's own sendAgentMessage insert (asserted above via the
