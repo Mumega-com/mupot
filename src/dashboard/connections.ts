@@ -1,3 +1,4 @@
+import { moveSeatApproval, loadApprovalMoveOffer, type ApprovalMoveOffer } from '../members/approval-move'
 // src/dashboard/connections.ts — "Connections": the human dashboard view of the threads running through each connected
 // app (ChatGPT, claude.ai, Grok, Cursor ...) and which agent each one is acting as. W2 (SEAT_ATTACH).
 //
@@ -18,7 +19,7 @@ import type { AuthContext, Env } from '../types'
 import { checkWebSession } from '../secure-moments/enrol-mint'
 import { isAttachCeiling } from '../auth/attached-ceiling'
 import {
-  attachSeatToAgent, decideAdmissionDirect, detachAttachment, listAttachableAgents, loadConnections, renameThread, revokeAdmission, seatAttachEnabled, ATTACH_IDLE_DAYS,
+  attachSeatToAgent, loadAdmission, connectionActivityMillis, type ConnectionAdmission, decideAdmissionDirect, detachAttachment, listAttachableAgents, loadConnections, renameThread, revokeAdmission, seatAttachEnabled, ATTACH_IDLE_DAYS,
 } from '../members/seat-attach'
 import { changeSeatAdmission, isSeatHoldAction, listObservedSeats, SEAT_TRANSITIONS } from '../members/seat-hold-release'
 import { vipLaneEnabled } from '../members/vip-lane'
@@ -68,7 +69,7 @@ function connectionsScript(): Html {
           if (!status) return;
           status.textContent = '';
           rowNote('Confirm it is you first, then try again.');
-          var a = document.createElement('a'); a.href = '/auth/reauth?return=/connections'; a.textContent = 'Confirm it is you first';
+          var a = document.createElement('a'); a.href = '/auth/reauth?return='+encodeURIComponent(window.location.pathname+window.location.search+window.location.hash); a.textContent = 'Confirm it is you first';
           status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.'));
         }
         async function post(url, body, confirmText) {
@@ -80,10 +81,15 @@ function connectionsScript(): Html {
             if (res.ok) { window.location.reload(); return; }
             if (data.error === 'reauth_required') reauthLink();
             else if (data.error === 'attach_code_mismatch') say('That code does not match. A chat asked for this agent: use Admit on the Waiting for your decision card and type the code the chat showed you.');
-            else if (data.error === 'approval_bound_to_other_chat') say('This agent is approved (or requested) for a different chat. Revoke or deny that first, then have this chat ask again.');
+            else if (data.error === 'approval_bound_to_other_chat' && data.connections_url) { window.location.assign(data.connections_url); }
+            else if (data.error === 'approval_bound_to_other_chat') say('The approval changed. Retry the chat request to locate its current approval.');
             else say('Could not do that (' + (data.error || res.status) + ').');
           } catch (e) { say('Network error — try again.'); }
         }
+        var search=document.getElementById('cx-agent-search');
+        if(search)search.addEventListener('input',function(){var q=search.value.toLowerCase();document.querySelectorAll('[data-cx-agent-group]').forEach(function(g){g.hidden=(g.getAttribute('data-cx-agent-name')||'').toLowerCase().indexOf(q)===-1;});});
+        var focused=document.getElementById(window.location.hash.slice(1));if(focused&&focused.tagName==='DETAILS')focused.open=true;
+        document.querySelectorAll('[data-cx-move]').forEach(function(b){b.addEventListener('click',function(){post('/connections/admissions/'+encodeURIComponent(b.getAttribute('data-cx-move'))+'/move',{agent_id:b.getAttribute('data-cx-move-agent'),harness_id:b.getAttribute('data-cx-move-harness'),seat_id:b.getAttribute('data-cx-move-seat')},'Move this approval to this chat? The old approval and its attached chats will end.');});});
         var att = document.querySelectorAll('button[data-cx-attach]');
         for (var i = 0; i < att.length; i++) att[i].addEventListener('click', function (ev) {
           var seat = ev.currentTarget.getAttribute('data-cx-attach');
@@ -121,14 +127,40 @@ function connectionsScript(): Html {
         simple.forEach(function (s) {
           var nodes = document.querySelectorAll(s[0]);
           for (var j = 0; j < nodes.length; j++) nodes[j].addEventListener('click', function (ev) {
-            post(s[2](ev.currentTarget.getAttribute(s[1])), {}, s[3]);
+            post(s[2](ev.currentTarget.getAttribute(s[1])), {}, ev.currentTarget.getAttribute('data-cx-stale')==='1'?null:s[3]);
           });
         });
       })();
     </script>`)
 }
 
-async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
+function groupedAdmissions(admissions:ConnectionAdmission[],offer:ApprovalMoveOffer|null):Html {
+  const groups=new Map<string,ConnectionAdmission[]>()
+  for(const a of admissions)groups.set(a.agent_id,[...(groups.get(a.agent_id)??[]),a])
+  if(groups.size===0)return emptyState({title:'No admissions yet',detail:'A chat can ask for an agent; your confirmation decides which chat may act as it.'})
+  return html`<label>Find an agent <input id="cx-agent-search" type="search" placeholder="Agent name, slug or id"></label>
+    ${[...groups.entries()].sort(([,a],[,b])=>a[0].agent_name.localeCompare(b[0].agent_name)).map(([id,rows])=>{
+      const newest=[...rows].sort((a,b)=>connectionActivityMillis(b.newest_chat_created_at??b.created_at)-connectionActivityMillis(a.newest_chat_created_at??a.created_at))[0]
+      const moving=offer?.agent_id===id?offer:null
+      const open=!!moving||rows.some(a=>a.status==='pending')
+      return html`<details id="agent-${id}" data-cx-agent-group="${id}" data-cx-agent-name="${`${rows[0].agent_name} ${rows[0].agent_slug} ${id}`}" ${open?html`open`:html``}>
+        <summary><strong>${rows[0].agent_name}</strong> <span class="ui-sub">${rows[0].agent_slug} · Newest chat: ${newest.newest_chat_name??'Unavailable chat'} · Created ${formatWhen(newest.newest_chat_created_at??newest.created_at)} · Last activity ${newest.last_used_at?formatWhen(newest.last_used_at):'Never recorded'}</span></summary>
+        ${moving?html`<div class="notice"><strong>Move this agent's approval to this chat</strong>
+          <p>From ${moving.old_seat_name} to ${moving.new_seat_name}. Level ${moving.ceiling}; review authority ${moving.gate_authority?'enabled':'off'} is retained. The previous approval and its attached chats will end.</p>
+          <button class="btn" data-cx-move="${moving.admission_id}" data-cx-move-agent="${moving.agent_id}" data-cx-move-harness="${moving.harness_id}" data-cx-move-seat="${moving.new_seat_id}">Move approval to this chat</button></div>`:html``}
+        ${dataTable({cols:[{label:'App / chat',width:'2fr'},{label:'Level',width:'0.7fr'},{label:'Created',width:'1fr'},{label:'Last used',width:'1fr'},{label:'State',width:'1fr'},{label:'Actions',width:'2fr'}],rows:rows.map(a=>[
+          html`${a.harness_name} · ${a.seatLabel??a.seat_label??'Unavailable chat'}<div class="ui-sub">${a.id} · first seen ${a.seat_first_seen?formatWhen(a.seat_first_seen):'Not recorded'}</div>${a.status==='pending'?attachIdentityCard(a):html``}`,
+          html`${a.ceiling}`,html`${formatWhen(a.created_at)}`,html`${a.last_used_at?formatWhen(a.last_used_at):'Never recorded'}`,
+          html`${pill(a.status==='live'?'Live':'Waiting',a.status==='live'?'primary':'dim')} ${a.stale?html`${pill('Stale','dim')}<span class="ui-sub">No recorded chat activity in 7 days</span>`:html``}`,
+          a.status==='live'?html`<button class="btn danger" data-cx-revoke="${a.id}" data-cx-stale="${a.stale?'1':'0'}">Revoke</button>`:
+            html`${a.has_code?html`<span>Type the code the chat showed you.</span> <input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat">`:html`${pill('no code (older request)','dim')}`}
+              <select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`,
+        ]),empty:''})}
+      </details>`
+    })}`
+}
+
+async function connectionsPageBody(env: Env, auth: AuthContext, focus?:{admissionId:string;seatId:string}): Promise<Html> {
   const memberId = auth.memberId
   if (!memberId) return emptyState({ title: 'Sign in', detail: 'Connections are shown to a signed-in member.' })
   const enabled = seatAttachEnabled(env)
@@ -139,40 +171,16 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
   const agents = enabled ? await listAttachableAgents(env, memberId) : []
 
   const pending = admissions.filter((a) => a.status === 'pending')
-  const live = admissions.filter((a) => a.status === 'live')
   const askingSeats = new Set(pending.filter((a) => a.has_code && a.requested_seat_id).map((a) => a.requested_seat_id))
 
-  const pendingBody = pending.length === 0
-    ? emptyState({ title: 'Nothing waiting', detail: 'When a thread asks to act as an agent you have not admitted yet, it appears here (and as a one-time passkey link it hands you).' })
-    : dataTable({
-      cols: [{ label: 'Attach code', width: '1fr' }, { label: 'Agent', width: '1.2fr' }, { label: 'App / chat', width: '1.4fr' }, { label: 'Asked', width: '1fr' }, { label: 'Decide', width: '1.8fr' }],
-      rows: pending.map((a) => [
-        a.has_code
-          ? html`${pill('Code required', 'primary')} <span>Type the code the chat showed you.</span>`
-          : html`${pill('no code (older request)', 'dim')}`,
-        html`${attachIdentityCard(a)}`,
-        html`${a.harness_name}${a.seat_label ? html` · ${a.seat_label}` : ''}${a.seat_first_seen ? html` (first seen ${formatWhen(a.seat_first_seen)})` : ''}`,
-        html`${formatWhen(a.created_at)}`,
-        enabled
-          ? html`${a.has_code ? html`<input data-cx-acode="${a.id}" placeholder="code" maxlength="12" size="6" autocomplete="off" aria-label="Attach code shown by the chat"> ` : ''}<select data-cx-aceiling="${a.id}"><option value="member">Member</option><option value="lead">Lead</option><option value="full">Full (agent's own standing)</option></select> <button class="btn" data-cx-approve="${a.id}">Admit</button> <button class="btn danger" data-cx-deny="${a.id}">Deny</button>`
-          : html`${pill('Disabled', 'dim')}`,
-      ]),
-      empty: '',
-    })
-
-  const liveBody = live.length === 0
-    ? emptyState({ title: 'No admissions yet', detail: 'Admitting an agent once lets every later thread from that app attach to it straight away.' })
-    : dataTable({
-      cols: [{ label: 'Agent', width: '1.2fr' }, { label: 'App', width: '1.2fr' }, { label: 'Level', width: '0.7fr' }, { label: 'Threads on it', width: '0.8fr' }, { label: '', width: '1fr' }],
-      rows: live.map((a) => [
-        html`${a.agent_name}`,
-        html`${a.harness_name}`,
-        html`${a.ceiling}`,
-        html`${String(a.live_threads)}`,
-        html`<button class="btn danger" data-cx-revoke="${a.id}">Revoke</button>`,
-      ]),
-      empty: '',
-    })
+  let offer:ApprovalMoveOffer|null=null
+  if(enabled&&focus){
+    const adm=await loadAdmission(env,focus.admissionId)
+    if(adm)offer=await loadApprovalMoveOffer(env,{admissionId:adm.id,agentId:adm.agent_id,harnessId:adm.harness_id,seatId:focus.seatId,humanMemberId:memberId})
+  }
+  const pendingBody=pending.length===0?emptyState({title:'Nothing waiting',detail:'Chats waiting for admission appear under their agent below.'}):html`<p>${pending.length} request(s) are grouped under their agent below. Type the code the asking chat showed you when admitting it.</p>`
+  const liveBody=groupedAdmissions(admissions,offer)
+  const moveNotice=focus&&!offer?html`<p role="status">That approval changed or is not available to move. Ask the chat to retry seat_attach, or use the agent's current approvals below.</p>`:html``
 
   const harnessBlocks = harnesses.length === 0
     ? emptyState({ title: 'No connected apps', detail: 'Connect an app and choose "Many chats: each chat picks its agent"; its threads show up here.' })
@@ -246,8 +254,9 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
     ${enabled ? '' : sectionPanel({ title: 'Attaching is off', body: emptyState({ title: 'Attach is not enabled on this pot', detail: 'Threads keep their own seat agents. You can still detach or revoke anything below.' }) })}
     ${sectionPanel({ title: 'Waiting for your decision', body: pendingBody })}
     ${observedBlock}
+    ${moveNotice}
+    ${sectionPanel({ title: 'Admitted agents and requests', body: liveBody })}
     ${harnessBlocks}
-    ${sectionPanel({ title: 'Admitted agents', body: liveBody })}
     <p class="ui-sub">A level is chosen when an agent is admitted (Member, Lead, or Full = the agent's own standing, never more than yours). If the agent holds a review gate, an attached thread may also review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own; detaching the thread or revoking the admission ends that. To change a level, revoke the admission and admit again. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
     ${boundBlock}
     <div class="status-line" id="cx-status"></div>
@@ -274,7 +283,8 @@ export function makeConnectionsApp(shell: ShellFn) {
   const app = new Hono<AppEnv>()
 
   app.get('/connections', async (c) => {
-    const body = await connectionsPageBody(c.env, c.get('auth'))
+    const admissionId=c.req.query('move_admission'),seatId=c.req.query('move_seat')
+    const body = await connectionsPageBody(c.env, c.get('auth'),admissionId&&seatId?{admissionId,seatId}:undefined)
     return c.html(shell(c.env, 'Connections', body))
   })
 
@@ -307,8 +317,19 @@ export function makeConnectionsApp(shell: ShellFn) {
     const r = await attachSeatToAgent(c.env, {
       humanMemberId: g.memberId, seatId: body.seat_id.trim(), agentRef: body.agent_id.trim(), via: 'dashboard', moveIfAttached: true, ceiling: isAttachCeiling(body.ceiling) ? body.ceiling : 'member', attachCode: body.attach_code,
     })
-    if (!r.ok) return c.json({ error: r.error }, ATTACH_STATUS[r.error] ?? 400)
+    if (!r.ok) return c.json({ error: r.error,blocking_admission:r.blocking_admission,requested_seat_id:r.requested_seat_id,connections_url:r.blocking_admission&&r.requested_seat_id?`/connections?move_admission=${encodeURIComponent(r.blocking_admission.id)}&move_seat=${encodeURIComponent(r.requested_seat_id)}#agent-${encodeURIComponent(r.blocking_admission.agent_id)}`:undefined }, ATTACH_STATUS[r.error] ?? 400)
     return c.json(r)
+  })
+
+  app.post('/connections/admissions/:id/move',async(c)=>{
+    const g=await guard(c,true)
+    if(!g.ok)return g.res
+    if(!seatAttachEnabled(c.env))return c.json({error:'seat_attach_disabled'},403)
+    let body:Record<string,unknown>
+    try{body=await c.req.json()}catch{return c.json({error:'bad_request'},400)}
+    if(!body||typeof body!=='object'||Array.isArray(body)||typeof body.agent_id!=='string'||typeof body.harness_id!=='string'||typeof body.seat_id!=='string')return c.json({error:'bad_request'},400)
+    const r=await moveSeatApproval(c.env,{admissionId:c.req.param('id'),humanMemberId:g.memberId,agentId:body.agent_id,harnessId:body.harness_id,seatId:body.seat_id})
+    return r.ok?c.json(r):c.json({error:r.error},r.error==='admission_not_found'?404:409)
   })
 
   app.post('/connections/attachments/:id/detach', async (c) => {

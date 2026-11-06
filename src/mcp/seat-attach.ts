@@ -115,8 +115,13 @@ export async function attachOutcome(env: Env, humanMemberId: string, r: AttachRe
       return fail(409, r.error, 'This thread has no live seat.')
     case 'admission_scope_mismatch':
       return fail(409, r.error, 'This agent is already approved (or being asked) for a different scope than the one you requested. An approval is never widened silently: ask your human to revoke the old admission on their Connections page (or deny the old ask), then ask again with the scope you want.')
-    case 'approval_bound_to_other_chat':
-      return fail(409, r.error, 'This agent is approved for a different chat; ask the human to approve this one (they revoke the old admission on their Connections page, then this chat asks again and gets its own code).')
+    case 'approval_bound_to_other_chat': {
+      if (!r.blocking_admission || !r.requested_seat_id) return fail(409, 'attach_refused', 'The approval changed; retry seat_attach.')
+      const a=r.blocking_admission
+      const url=`${connectionsLink(env)}?move_admission=${encodeURIComponent(a.id)}&move_seat=${encodeURIComponent(r.requested_seat_id)}#agent-${encodeURIComponent(a.agent_id)}`
+      return fail(409,r.error,{blocking_admission:a,requested_seat_id:r.requested_seat_id,connections_url:url,
+        next_step:a.can_move ? 'Show your human this Connections link to confirm moving this exact approval to this chat.' : 'Show your human the exact blocking approval on Connections; they can revoke or deny it there.'})
+    }
     case 'attach_code_mismatch':
       return fail(403, r.error)
     case 'attach_refused':

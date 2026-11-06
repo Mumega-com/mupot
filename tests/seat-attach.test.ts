@@ -1054,6 +1054,176 @@ describe('dashboard: Connections', () => {
   const fresh = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString()) }
   const stale = (): void => { h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60 * 1000)).toISOString()) }
 
+  it('moves an owned approval to a new chat in one fresh confirmation, retaining ceiling and review opt-in',async()=>{
+    const env=envFor(h);const g=await grant(env,HUMAN)
+    const cookie=await session(env,`${HUMAN}@example.test`)
+    h.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(HUMAN,'agent-rava')
+    await admitAndAttach(env,g,'move-old');await boot(env,g,'move-new')
+    const old=one<{id:string;ceiling:string;gate_authority:number}>("SELECT id,ceiling,gate_authority FROM agent_seat_admissions WHERE status='live'")!
+    const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    fresh()
+    const res=await dash(env,cookie,`/connections/admissions/${old.id}/move`,{agent_id:'agent-rava',harness_id:g.harnessId,seat_id:seat.id})
+    expect(res.status,await res.clone().text()).toBe(200)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',old.id)?.status).toBe('revoked')
+    const next=one<{id:string;requested_seat_id:string;ceiling:string;gate_authority:number}>("SELECT id,requested_seat_id,ceiling,gate_authority FROM agent_seat_admissions WHERE status='live'")!
+    expect(next).toMatchObject({requested_seat_id:seat.id,ceiling:old.ceiling,gate_authority:old.gate_authority})
+    expect(next.id).not.toBe(old.id)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(1)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE admission_id=? AND detached_at IS NULL',next.id)).toBe(1)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE admission_id=? AND detached_at IS NULL',old.id)).toBe(0)
+    expect((await boot(env,g,'move-new')).sc.bound_agent_id).toBe('agent-rava')
+  })
+
+  it('groups approvals under agent names and shows newest chat and seven-day stale activity',async()=>{
+    const env=envFor(h);const cookie=await session(env,`${HUMAN}@example.test`)
+    const {renameThread}=await import('../src/members/seat-attach')
+    const now=Date.now()
+    try {
+      vi.useFakeTimers({toFake:['Date']})
+      for(const [i,days] of [[0,10],[1,1]]) {
+        vi.setSystemTime(now-days*86400000)
+        const g=await grant(env,HUMAN,`client-group-${i}`,`App ${i}`)
+        await boot(env,g,`group-${i}`)
+        const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+        await renameThread(env,{humanMemberId:HUMAN,seatId:seat.id,label:i===0?'Old chat':'Newest chat'})
+        expect((await attachSeatToAgent(env,{humanMemberId:HUMAN,seatId:seat.id,agentRef:'rava',via:'dashboard'})).ok).toBe(true)
+      }
+    } finally {vi.useRealTimers()}
+    const page=await (await dash(env,cookie,'/connections')).text()
+    expect((page.match(/data-cx-agent-group="agent-rava"/g)??[])).toHaveLength(1)
+    expect(page).toContain('Newest chat');expect(page).toContain('Last used');expect(page).toContain('Created');expect(page).toContain('Stale')
+    expect(page).toContain('Find an agent')
+    expect(page).toContain('data-cx-stale="1"')
+  })
+
+  async function ownedMoveSetup(){
+    const env=envFor(h);const g=await grant(env,HUMAN);const cookie=await session(env,`${HUMAN}@example.test`)
+    h.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(HUMAN,'agent-rava')
+    await admitAndAttach(env,g,'owned-old');await boot(env,g,'owned-new')
+    const old=one<{id:string;requested_seat_id:string}>("SELECT id,requested_seat_id FROM agent_seat_admissions WHERE status='live'")!
+    const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    fresh();return {env,g,cookie,old,seat,body:{agent_id:'agent-rava',harness_id:g.harnessId,seat_id:seat.id}}
+  }
+  it('bases stale badges on the latest recorded seat or attachment activity and the seven-day boundary',async()=>{
+    const f=await ownedMoveSetup()
+    const {loadConnections,connectionActivityMillis}=await import('../src/members/seat-attach')
+    const created=one<{created_at:string}>('SELECT created_at FROM agent_seats WHERE id=?',f.old.requested_seat_id)!.created_at
+    const start=connectionActivityMillis(created)
+    expect(connectionActivityMillis('2026-11-01 12:00:00')).toBe(connectionActivityMillis('2026-11-01T13:00:00+01:00'))
+    const snapshot=async(now:number)=>(await loadConnections(f.env,HUMAN,now)).admissions.find(a=>a.id===f.old.id)!
+    expect((await snapshot(start+6*86400000)).stale).toBe(false)
+    expect((await snapshot(start+8*86400000)).stale).toBe(true)
+    const touch=new Date(start+8*86400000).toISOString()
+    h.sqlite.prepare('UPDATE agent_seat_attachments SET last_used_at=? WHERE admission_id=?').run(touch,f.old.id)
+    const freshRow=await snapshot(start+9*86400000)
+    expect(freshRow.last_used_at).toBe(touch);expect(freshRow.stale).toBe(false)
+  })
+  it('retains non-default ceiling and gate opt-in instead of recomputing them on move',async()=>{
+    const env=envFor(h);const g=await grant(env,HUMAN);const cookie=await session(env,`${HUMAN}@example.test`)
+    h.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(HUMAN,'agent-rava')
+    h.sqlite.prepare("INSERT INTO gate_grants(id,capability,principal_type,principal_id,granted_by,created_at) VALUES('move-review','gate:ops','agent','agent-rava','x','2026-01-01')").run()
+    await boot(env,g,'lead-old');const oldSeat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    fresh();expect((await dash(env,cookie,'/connections/attach',{seat_id:oldSeat.id,agent_id:'agent-rava',ceiling:'lead'})).status).toBe(200)
+    const old=one<{id:string;ceiling:string;gate_authority:number}>("SELECT id,ceiling,gate_authority FROM agent_seat_admissions WHERE status='live'")!
+    expect(old).toMatchObject({ceiling:'lead',gate_authority:1})
+    h.sqlite.prepare("DELETE FROM gate_grants WHERE id='move-review'").run()
+    await boot(env,g,'lead-new');const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    const r=await dash(env,cookie,`/connections/admissions/${old.id}/move`,{agent_id:'agent-rava',harness_id:g.harnessId,seat_id:seat.id})
+    expect(r.status,await r.clone().text()).toBe(200)
+    expect(one("SELECT ceiling,gate_authority,scope FROM agent_seat_admissions WHERE status='live'")).toEqual({ceiling:'lead',gate_authority:1,scope:'seat'})
+  })
+  it('does not read admissions from a move preview when seat attach is disabled',async()=>{
+    const env=envFor(h);const cookie=await session(env,`${HUMAN}@example.test`)
+    const off={...env,SEAT_ATTACH:undefined,DB:{...env.DB,prepare(sql:string){
+      if(sql.includes('agent_seat_admissions'))throw new Error('disabled admission read')
+      return env.DB.prepare(sql)
+    }}} as Env
+    const r=await dash(off,cookie,'/connections?move_admission=gone&move_seat=gone')
+    expect(r.status).toBe(200)
+  })
+  it('links an exact blocker to a read-only move preview without silently changing approval',async()=>{
+    const f=await ownedMoveSetup()
+    const blocked=await attach(f.env,f.g,'owned-new','rava')
+    expect(blocked.sc).toMatchObject({ok:false,error:'approval_bound_to_other_chat',detail:{blocking_admission:{id:f.old.id,agent_id:'agent-rava',seat_id:f.old.requested_seat_id,seat_name:expect.any(String),created_at:expect.any(String),can_move:true},requested_seat_id:f.seat.id,connections_url:expect.stringContaining('move_admission=')}})
+    const page=await (await dash(f.env,f.cookie,`/connections?move_admission=${f.old.id}&move_seat=${f.seat.id}#agent-agent-rava`)).text()
+    expect(page).toContain(`data-cx-move="${f.old.id}"`)
+    expect(page).toContain(`data-cx-move-seat="${f.seat.id}"`)
+    expect(page).toContain('Move approval to this chat')
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+  })
+  it.each(['other-human','other-agent','other-harness','seat-other-harness','not-agent-owner','already-attached'])('refuses an approval move for %s',async scenario=>{
+    const f=await ownedMoveSetup();let cookie=f.cookie;const body={...f.body}
+    if(scenario==='other-human'){cookie=await session(f.env,`${HUMAN2}@example.test`);fresh()}
+    if(scenario==='other-agent')body.agent_id='agent-hadi-admin'
+    if(scenario==='other-harness')body.harness_id='another-harness'
+    if(scenario==='seat-other-harness'){
+      const other=await grant(f.env,HUMAN,'other-move-app','Other app');await boot(f.env,other,'other-app-chat')
+      body.seat_id=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!.id
+    }
+    if(scenario==='not-agent-owner')h.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(HUMAN2,'agent-rava')
+    if(scenario==='already-attached')expect((await attachSeatToAgent(f.env,{humanMemberId:HUMAN,seatId:f.seat.id,agentRef:'hadi-admin',via:'dashboard'})).ok).toBe(true)
+    const r=await dash(f.env,cookie,`/connections/admissions/${f.old.id}/move`,body)
+    expect(r.status,await r.clone().text()).toBe(404)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(0)
+  })
+  it('requires a fresh same-origin human session for move confirmation',async()=>{
+    const f=await ownedMoveSetup();const path=`/connections/admissions/${f.old.id}/move`
+    expect((await dash(f.env,f.cookie,path,f.body,'https://evil.test')).status).toBe(403)
+    expect((await dash(f.env,'',path,f.body)).status).toBe(302)
+    stale();const r=await dash(f.env,f.cookie,path,f.body)
+    expect(r.status).toBe(403);expect(await r.json()).toMatchObject({error:'reauth_required'})
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+  })
+  it('ignores client attempts to raise the old ceiling or review opt-in during a move',async()=>{
+    const f=await ownedMoveSetup()
+    const r=await dash(f.env,f.cookie,`/connections/admissions/${f.old.id}/move`,{...f.body,ceiling:'full',gate_authority:1,scope:'harness'})
+    expect(r.status).toBe(200)
+    expect(one("SELECT ceiling,gate_authority,scope FROM agent_seat_admissions WHERE status='live'")).toEqual({ceiling:'member',gate_authority:0,scope:'seat'})
+  })
+  it('does not resurrect an approval revoked in the same millisecond before its move batch',async()=>{
+    const f=await ownedMoveSetup();const now=Date.now();let raced=false
+    const env={...f.env,DB:{...f.env.DB,async batch(stmts:Parameters<Env['DB']['batch']>[0]){
+      if(!raced){raced=true;expect((await revokeAdmission(f.env,{admissionId:f.old.id,humanMemberId:HUMAN},now)).ok).toBe(true)}
+      return f.env.DB.batch(stmts)
+    }}} as Env
+    const {moveSeatApproval}=await import('../src/members/approval-move')
+    expect(await moveSeatApproval(env,{admissionId:f.old.id,agentId:'agent-rava',humanMemberId:HUMAN,harnessId:f.g.harnessId,seatId:f.seat.id},now)).toMatchObject({ok:false,error:'attach_refused'})
+    expect(raced).toBe(true)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('revoked')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(0)
+  })
+  it.each(['retire-target','change-owner','suspend-human','revoke-capability'])('rolls the old approval back if %s changes during the atomic move',async change=>{
+    const f=await ownedMoveSetup();let flipped=false
+    const raced={...f.env,DB:{...f.env.DB,prepare(sql:string){
+      const stmt=f.env.DB.prepare(sql)
+      const wrap=(s:typeof stmt):typeof stmt=>new Proxy(s,{get(target,key){
+        if(key==='bind')return(...v:unknown[])=>wrap(target.bind(...v))
+        if(key==='executeAll')return(...v:unknown[])=>{
+          const result=Reflect.get(target,key).apply(target,v)
+          if(!flipped&&sql.startsWith("UPDATE agent_seat_admissions SET status='revoked',revoked_at=?7")){
+            flipped=true
+            if(change==='retire-target')h.sqlite.prepare('UPDATE agent_seats SET retired_at=? WHERE id=?').run(new Date().toISOString(),f.seat.id)
+            if(change==='change-owner')h.sqlite.prepare('UPDATE agents SET owner_member_id=? WHERE id=?').run(HUMAN2,'agent-rava')
+            if(change==='suspend-human')h.sqlite.prepare("UPDATE members SET status='suspended' WHERE id=?").run(HUMAN)
+            if(change==='revoke-capability')h.sqlite.prepare('DELETE FROM capabilities WHERE member_id=?').run(HUMAN)
+          }
+          return result
+        }
+        const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+      }})
+      return wrap(stmt)
+    }}} as Env
+    const r=await dash(raced,f.cookie,`/connections/admissions/${f.old.id}/move`,f.body)
+    expect(flipped).toBe(true);expect(r.status).toBe(409)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE admission_id=? AND detached_at IS NULL',f.old.id)).toBe(1)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(0)
+  })
+
   it('GET lists the app, each thread with the agent it is acting as, and the attachable agents', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
@@ -1358,8 +1528,9 @@ describe('dashboard: Connections', () => {
       const files = [...walk('src').filter((p) => !p.endsWith('schema-chain.generated.ts')), ...readdirSync('migrations').filter((f) => f.endsWith('.sql')).map((f) => join('migrations', f))]
       for (const col of ['requested_seat_id', 'attach_code']) expect(files.filter((p) => setsColumn(readFileSync(p, 'utf8'), col) > 0), col).toEqual([])
       expect(setsColumn(`UPDATE agent_seat_admissions AS a SET requested_seat_id = ?1 WHERE id = ?2`, 'requested_seat_id')).toBe(1)
-      // 2. the only INSERT of a row born live (dashboard attach with NO pending request: no chat asked, nothing to match)
-      expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/seat-attach.ts:2'])
+      // 2. Existing asks/dashboard admission plus explicit, fresh owner-confirmed move.
+      // The move copies only an existing live seat approval; its own tests pin the owner/tuple and atomic rollback.
+      expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/approval-move.ts:1', 'src/members/seat-attach.ts:2'])
       // 3. every caller of promoteAdmission (each must pass the typed code): exactly these three
       const src = readFileSync('src/members/seat-attach.ts', 'utf8')
       expect(src.match(/await promoteAdmission\(env, [^\n]*attachCode\)/g)?.length).toBe(3)
@@ -1383,7 +1554,7 @@ describe('dashboard: Connections', () => {
       await boot(env, g, 'conv-b')
       const b = await attach(env, g, 'conv-b', 'rava')
       expect(errOf(b)).toBe('approval_bound_to_other_chat')
-      expect(JSON.stringify(b.body)).toContain('different chat')
+      expect(b.sc.detail).toMatchObject({blocking_admission:{agent_id:'agent-rava',seat_id:expect.any(String)},connections_url:expect.stringContaining('/connections?move_admission=')})
       expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
       expect((await boot(env, g, 'conv-b')).sc.bound_agent_id).not.toBe('agent-rava')
       // Human Detach ends the seat approval: the same chat now needs a new coded request.
@@ -1429,7 +1600,7 @@ describe('dashboard: Connections', () => {
       const seats = (h.sqlite.prepare(`SELECT id FROM agent_seats ORDER BY created_at, rowid`).all() as Array<{ id: string }>).map((r) => r.id)
       expect((await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[0], agentRef: 'rava', via: 'dashboard' })).ok).toBe(true)
       expect(one<{ requested_seat_id: string }>(`SELECT requested_seat_id FROM agent_seat_admissions`)?.requested_seat_id).toBe(seats[0])
-      expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[1], agentRef: 'rava', via: 'dashboard' })).toEqual({ ok: false, error: 'approval_bound_to_other_chat' })
+      expect(await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seats[1], agentRef: 'rava', via: 'dashboard' })).toMatchObject({ ok: false, error: 'approval_bound_to_other_chat', blocking_admission:{agent_id:'agent-rava',id:expect.any(String)} })
     })
 
     it('stranded-pending recovery re-mints the link ONLY for the requesting chat; another chat gets no link, no code, and the "different chat" note', async () => {
@@ -1486,7 +1657,7 @@ describe('dashboard: Connections', () => {
       await boot(env, g, 'conv-b')
       const seatB = one<{ id: string }>(`SELECT id FROM agent_seats WHERE id <> (SELECT requested_seat_id FROM agent_seat_admissions) LIMIT 1`)!.id
       const out = await attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'dashboard', attachCode: r.sc.attach_code })
-      expect(out).toEqual({ ok: false, error: 'approval_bound_to_other_chat' })
+      expect(out).toMatchObject({ ok: false, error: 'approval_bound_to_other_chat', blocking_admission:{agent_id:'agent-rava',id:expect.any(String)} })
       expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     })
 
@@ -3351,5 +3522,54 @@ describe('attached session gate authority: gate_authority opt-in, live chain, bu
     const { attached: _d, ...noAttach } = att.seatBinding!
     void _d
     expect(await callerHoldsGateCapability(env, { ...att, seatBinding: noAttach }, 'squad-core', 'gate:ops')).toBe(true)
+  })
+})
+
+describe('reattach refusal evidence',()=>{
+  it('does not report another-chat approval after that admission was revoked between read and refusal',async()=>{
+    const env=envFor(h);const g=await grant(env,HUMAN)
+    await admitAndAttach(env,g,'race-old');await boot(env,g,'race-new')
+    const seat=one<{id:string}>("SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1")!
+    const old=one<{id:string}>("SELECT id FROM agent_seat_admissions WHERE status='live'")!
+    let flipped=false
+    const raced={...env,DB:{...env.DB,prepare(sql:string){
+      const stmt=env.DB.prepare(sql)
+      if(!sql.includes("status IN ('pending', 'live')")||!sql.includes('FROM agent_seat_admissions'))return stmt
+      const wrap=(s:typeof stmt):typeof stmt=>new Proxy(s,{get(target,key){
+        if(key==='bind')return(...v:unknown[])=>wrap(target.bind(...v))
+        if(key==='first')return async()=>{const row=await target.first();if(!flipped&&row){flipped=true;h.sqlite.prepare("UPDATE agent_seat_admissions SET status='revoked',revoked_at=?,revoked_by_member_id=? WHERE id=?").run(new Date().toISOString(),HUMAN,old.id)}return row}
+        const v=Reflect.get(target,key);return typeof v==='function'?v.bind(target):v
+      }})
+      return wrap(stmt)
+    }}} as Env
+    const r=await ensureAdmission(raced,{agentId:'agent-rava',humanMemberId:HUMAN,harnessId:g.harnessId,seatId:seat.id,via:'tool',grantTokenId:g.tokenId})
+    expect(flipped).toBe(true);expect(n("SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status IN ('pending','live')")).toBe(0)
+    expect(r).not.toMatchObject({ok:false,error:'approval_bound_to_other_chat'})
+  })
+  it('respects a harness-wide approval that appears during the dashboard insert race',async()=>{
+    const env=envFor(h);const g=await grant(env,HUMAN)
+    await admitAndAttach(env,g,'scope-old')
+    const old=one<{id:string;requested_seat_id:string}>("SELECT id,requested_seat_id FROM agent_seat_admissions WHERE status='live'")!
+    await revokeAdmission(env,{admissionId:old.id,humanMemberId:HUMAN});await boot(env,g,'scope-new')
+    const seat=one<{id:string}>("SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1")!
+    let flipped=false
+    const raced={...env,DB:{...env.DB,async batch(stmts:Parameters<Env['DB']['batch']>[0]){
+      if(!flipped){flipped=true;h.sqlite.prepare(`INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,gates,gate_authority,ceiling,requested_via,requested_seat_id,created_at,decided_at,decided_by_member_id,decided_via,scope)
+        VALUES('concurrent-harness',?,'agent-rava',?,?,'live',0,0,'member','tool',?,?,?,?,'webauthn','harness')`).run(TENANT,HUMAN,g.harnessId,old.requested_seat_id,new Date().toISOString(),new Date().toISOString(),HUMAN)}
+      return env.DB.batch(stmts)
+    }}} as Env
+    const r=await ensureAdmission(raced,{agentId:'agent-rava',humanMemberId:HUMAN,harnessId:g.harnessId,seatId:seat.id,via:'dashboard',grantTokenId:g.tokenId})
+    expect(flipped).toBe(true);expect(r).toMatchObject({ok:true,state:'live',admission:{id:'concurrent-harness',scope:'harness'}})
+  })
+  it('does not confuse a draft seat agent with a normal agent that has only a revoked admission',async()=>{
+    const env=envFor(h);const g=await grant(env,HUMAN)
+    await admitAndAttach(env,g,'draft-old');const old=one<{id:string}>("SELECT id FROM agent_seat_admissions WHERE status='live'")!
+    await revokeAdmission(env,{admissionId:old.id,humanMemberId:HUMAN});await boot(env,g,'draft-new')
+    const draft=one<{agent_id:string}>('SELECT agent_id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    h.sqlite.prepare("UPDATE agents SET name='Rava' WHERE id=?").run(draft.agent_id)
+    const r=await attach(env,g,'draft-new','rava')
+    expect(r.sc.status).toBe('pending_admission')
+    expect(one<{agent_id:string}>("SELECT agent_id FROM agent_seat_admissions WHERE status='pending'")?.agent_id).toBe('agent-rava')
+    expect(errOf(await attach(env,g,'draft-new',draft.agent_id))).toBe('agent_not_found')
   })
 })
