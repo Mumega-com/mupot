@@ -87,7 +87,7 @@ export async function reclaimDeadAssignments(env: Env, opts: { nowMs?: number; l
       const writes = await env.DB.batch([
         env.DB.prepare(`UPDATE tasks AS t SET assignee_agent_id = NULL,status = 'open',updated_at = ?8,
           execution_receipt_id = NULL,execution_claim_expires_at = NULL
-          WHERE ${where}`).bind(task.id,env.TENANT_SLUG,now,task.assignee_agent_id,task.status,task.updated_at,state.snapshot,iso,task.execution_receipt_id,task.execution_claim_expires_at),
+          WHERE ${where} AND ${TASK_NOT_ARCHIVED_SQL('t')}`).bind(task.id,env.TENANT_SLUG,now,task.assignee_agent_id,task.status,task.updated_at,state.snapshot,iso,task.execution_receipt_id,task.execution_claim_expires_at),
         env.DB.prepare(`INSERT INTO mutation_audit_entries(id,tenant,principal_kind,principal_id,member_id,agent_id,
           origin,handler,operation,target_kind,target_id,task_id,request_id,evidence_json,recorded_at)
           SELECT ?1,?2,'system','dead-assignee-reclaim',?3,?4,'scheduled_job','dead-assignee-reclaim','dead_assignee_reclaim',
