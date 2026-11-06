@@ -4829,9 +4829,20 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_inbox_attempt_runtime_custody" },
     ],
   },
+  {
+    file: "0273_gate_wake_notice_stamp.sql",
+    sha256: "9b9fd374b4801425c572d3bb2839df92a748aa94c2215b3a9469072cc194b06b",
+    statements: [
+      "ALTER TABLE tasks ADD COLUMN gate_wake_notice_at TEXT;",
+      "CREATE TRIGGER tasks_gate_wake_notice_review_reset\nAFTER UPDATE OF status ON tasks\nWHEN NEW.status='review' AND OLD.status<>'review'\nBEGIN\n  UPDATE tasks SET gate_wake_notice_at=NULL WHERE id=NEW.id;\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "tasks_gate_wake_notice_review_reset" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "b28b32fcba361a14e4f3182c7bab6904a4e9a109c12343265fd7cf51dc38b560"
+export const SCHEMA_CHAIN_DIGEST: string = "29d983562f2ccc050c18dbefc6e0e8fd929ee5fac5d8b5f85b695bba24af7f5f"
