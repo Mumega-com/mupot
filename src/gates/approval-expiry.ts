@@ -1,8 +1,8 @@
 // src/gates/approval-expiry.ts — an unanswered gate ask expires (Hadi, org owner, 2026-10-16:
 // "if one didn't answer to the approval it expires").
 //
-// BEFORE: a task in `review` with a gate_owner waited forever. The only exit from review is a
-// verdict and nothing swept (the stall watchdog only re-wakes; it never closes).
+// The stall watchdog can recover an undelivered first wake but never closes an ask.
+// This expiry policy supplies the bounded review-to-blocked exit for unanswered asks.
 //
 // RULE (one config constant, below):
 //   - a gate verdict ask and a publish ask expire 14 days after the task ENTERED review;
@@ -139,6 +139,10 @@ export async function sweepExpiredApprovals(env: Env, opts: ExpirySweepOptions =
   result.remaining = Math.max(0, (total?.n ?? 0) - candidates.length)
 
   const digests = new Map<string, ApprovalSweepEntry[]>()
+  const flushNotices=async()=>{
+    const ready=[...digests];digests.clear()
+    for(const [agent,entries] of ready)result.notified+=await sendApprovalSweepDigest(env,agent,SWEEPER_ACTOR,entries)
+  }
   for (const c of candidates) {
     result.scanned += 1
     const reason: ExpiryReason = Number(c.dead) === 1 ? 'gate_owner_dead' : 'approval_expired'
@@ -181,8 +185,9 @@ export async function sweepExpiredApprovals(env: Env, opts: ExpirySweepOptions =
     } catch {
       result.errors += 1
     }
+    if(result.expired>0 && result.expired%25===0)await flushNotices()
   }
-  for(const [agent,entries] of digests)if(await sendApprovalSweepDigest(env,agent,SWEEPER_ACTOR,entries))result.notified+=entries.length
+  await flushNotices()
   return result
 }
 
@@ -196,7 +201,7 @@ async function expiryNotice(env: Env, c: Candidate, reason: ExpiryReason, receip
   } catch {
     // the receipt is the record; the notice is a convenience
   }
-  return {task_id:c.id,gate_owner:c.gate_owner,reason,receipt_id:receiptId,notice}
+  return {task_id:c.id,gate_owner:c.gate_owner,reason,receipt_id:receiptId,episode:c.review_entered_at??c.updated_at,notice}
 }
 
 export interface CapResetResult {
