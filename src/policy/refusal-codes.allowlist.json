@@ -22,7 +22,6 @@
     "agent_not_found",
     "agent_not_visible",
     "agent_paused",
-    "attached_seat_attempt_required",
     "agent_principal_required",
     "agent_required",
     "agent_setup_in_progress",

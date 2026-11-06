@@ -195,6 +195,7 @@ export const POLICY_RULES: readonly PolicyRule[] = [
     sites: ['src/members/seat-attach.ts'],
     todo: 'TODO(R1 builder PR): wire onto the bar when the thread-attach PR lands; values here are placeholders (strict) until then.',
   },
+  floor('inbox.attached-seat.exact-target', 'An attached chat may lease, reconcile and ack only messages targeted at its own seat, in attempt_id mode with limit 1, and only when its attachment token carries an inbox seat (mupot#2356).', ['src/mcp/index.ts:inbox_lease', 'src/mcp/index.ts:inbox_lease_reconcile', 'src/mcp/index.ts:inbox_lease_ack'], ['attached_seat_attempt_required', 'seat_not_bound']),
   floor('seat.connection-check.attached-only', 'connection_check runs only from an attached chat; an unattached chat is refused with the seat_attach next step.', ['src/mcp/seat-attach.ts:toolConnectionCheck'], ['not_attached']),
 ]
 
