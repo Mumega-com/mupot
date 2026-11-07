@@ -70,6 +70,10 @@ describe('constant public authentication guidance', () => {
     expect(await withUnauthenticatedGuidance(request(), response).catch(error => error)).toBe(response)
     expect(await response.text()).toBe(text)
   })
+  it('preserves a JSON-labelled REST refusal with no body stream', async () => {
+    const response = new Response(null,{status:401,headers:{'content-type':'application/json'}})
+    expect(await withUnauthenticatedGuidance(request(),response).catch(error => error)).toBe(response)
+  })
   it('does not consume non-JSON REST challenges', async () => {
     const response = new Response('{"error":"unauthenticated"}',{status:401})
     expect(await withUnauthenticatedGuidance(request(), response).catch(error => error)).toBe(response)
