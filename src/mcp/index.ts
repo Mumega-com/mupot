@@ -9456,7 +9456,7 @@ function openApiSpec(origin: string, tools: ToolSpec[], description: string): Re
   return {
     openapi: '3.0.3',
     info: {
-      title: 'Mupot Digid Actions',
+      title: 'Mupot Actions',
       version: MUPOT_PUBLIC_API_VERSION,
       description,
     },
@@ -9474,7 +9474,7 @@ function openApiSpec(origin: string, tools: ToolSpec[], description: string): Re
 }
 
 const PUBLIC_OPENAPI_DESCRIPTION =
-  'Custom GPT Actions facade for the Digid Mupot tool surface — public, unauthenticated ' +
+  'Custom GPT Actions facade for the Mupot tool surface — public, unauthenticated ' +
   'discovery. Lists only tools at member capability or below (PUBLIC_TOOL_ALLOWLIST in ' +
   'src/mcp/openapi-public-allowlist.ts); every tool still enforces its own authz server-side. ' +
   'For the full tool registry (including admin-tier tools), see GET /openapi.full.json ' +
