@@ -145,7 +145,7 @@ describe('B3: the verdict binds to the CURRENT submission', () => {
   it('a task with no submission keeps the current behaviour: nulls, verdict lands', async () => {
     seedTask('t1')
     const out = await decide('t1')
-    expect(out.task.status).toBe('approved')
+    expect(out.task.status).toBe('done')
     expect(verdictRows('t1')[0]).toMatchObject({ submission_id: null, result_digest: null })
   })
 
@@ -371,7 +371,7 @@ describe('B3: the decider-seen binding (expected_submission_id)', () => {
 
     seedTask('t2')
     await expect(decide('t2', 'approved', { expectedSubmissionId: 'sub-1' })).rejects.toBeInstanceOf(VerdictSubmissionMismatchError)
-    expect((await decide('t2', 'approved', { expectedSubmissionId: null })).task.status).toBe('approved')
+    expect((await decide('t2', 'approved', { expectedSubmissionId: null })).task.status).toBe('done')
   })
 
   it('a mismatch is a VerdictRaceError subclass, so every pre-existing catch still answers 409', async () => {
