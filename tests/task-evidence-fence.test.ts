@@ -248,7 +248,7 @@ describe('#399 — writeVerdict (verdict flip) evidence fence', () => {
     const env = envFor(harness)
 
     const result = await writeVerdict(env, { task, verdict: 'approved', note: 'LGTM', decidedBy: 'member-1' })
-    expect(result.task.status).toBe('approved')
+    expect(result.task.status).toBe('done')
     expect(await evidenceVerdictRows(env, result.verdict.id)).toHaveLength(1)
   })
 
@@ -288,7 +288,7 @@ describe('#399 — writeVerdict (verdict flip) evidence fence', () => {
     const env = envFor(harness)
 
     const result = await writeVerdict(env, { task, verdict: 'approved', note: null, decidedBy: 'member-1' })
-    expect(result.task.status).toBe('approved')
+    expect(result.task.status).toBe('done')
   })
 })
 

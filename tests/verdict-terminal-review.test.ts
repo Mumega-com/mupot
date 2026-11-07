@@ -68,6 +68,12 @@ describe('executor-free review completion', () => {
     expect((await approve()).task.status).toBe('done')
   })
 
+  it('leaves durable department proposals for their executor', async () => {
+    h.sqlite.exec(`INSERT INTO department_proposals(gate_id,tenant_id,department_key,action,payload_json)
+      VALUES ('task','test','growth','content-publish','{}')`)
+    expect((await approve()).task.status).toBe('approved')
+  })
+
   it('leaves outbound effects approved', async () => {
     h.sqlite.exec(`INSERT INTO outbound_acts(id,task_id,kind,payload,status,created_at) VALUES ('act','task','send_email','{}','pending',datetime('now'))`)
     expect((await approve()).task.status).toBe('approved')
