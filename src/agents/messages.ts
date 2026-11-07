@@ -242,6 +242,8 @@ interface Opts {
    *  run was assigned to (mupot#1814 r2): the envelope's `toAgent` is the fleet row's agent_id, which can
    *  be the agent's SLUG, so the execution pause must be evaluated on the canonical id, never on toAgent. */
   routineRunFence?: { runId: string; projectId: string; agentId: string }
+  /** Queue task envelopes must not be recreated after a dispatch is terminally settled. */
+  taskDispatchFence?: { receiptId: string; taskId: string; agentId: string }
   /** Current durable guest-membership authority must still exist in the message INSERT. */
   guestVisibilityFence?: GuestVisibilityFence
   /**
@@ -464,6 +466,11 @@ export async function sendAgentMessage(
     return { ok: false, reason: 'dispatch_fenced' }
   }
 
+  const taskFence=opts.taskDispatchFence
+  const taskDispatchAllowed=async()=>!taskFence||!!await env.DB.prepare(`SELECT 1 FROM task_dispatch_receipts WHERE tenant=?1 AND id=?2 AND task_id=?3 AND agent_id=?4 AND settled_at IS NULL`)
+    .bind(tenant,taskFence.receiptId,taskFence.taskId,taskFence.agentId).first()
+  if(!await taskDispatchAllowed())return {ok:false,reason:'dispatch_fenced'}
+
   // replay-once, SENDER-SCOPED: if THIS sender already used this rid, it's idempotent only
   // when the content is identical — otherwise it's a conflict (a reused key with a different
   // message), rejected loudly so a sender is never told "delivered" for a message that wasn't.
@@ -552,8 +559,13 @@ export async function sendAgentMessage(
                        WHERE tenant = ?2 AND from_agent = ?4 AND to_agent = ?3
                          AND in_reply_to IN (?${values.length - 2}, ?${values.length - 1})) < ?${values.length}`
     }
+    let taskDispatchSql=''
+    if(taskFence){
+      values.push(taskFence.receiptId,taskFence.taskId,taskFence.agentId)
+      taskDispatchSql=`AND EXISTS(SELECT 1 FROM task_dispatch_receipts td WHERE td.tenant=?2 AND td.id=?${values.length-2} AND td.task_id=?${values.length-1} AND td.agent_id=?${values.length} AND td.settled_at IS NULL)`
+    }
     const routineRunParam = values.length + 1
-    const fenced = receiverFence !== undefined || brakeFence !== undefined
+    const fenced = receiverFence !== undefined || brakeFence !== undefined || taskFence !== undefined
     const returningSql = fenced ? ' RETURNING seq' : ''
     const statement = routineFence
       ? env.DB.prepare(
@@ -565,6 +577,7 @@ export async function sendAgentMessage(
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
+                 ${taskDispatchSql}
                  -- mupot#1814: the routine envelope is a mupot-mediated start; a pause (agent, or the
                  -- canonical agent's CURRENT squad) landing after the observing UPDATE must refuse the insert
                  AND NOT ${executionPausedSql(`?${routineRunParam + 1}`)}
@@ -592,7 +605,8 @@ export async function sendAgentMessage(
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
-                 ${replyFenceSql}${returningSql}`,
+                 ${replyFenceSql}
+                 ${taskDispatchSql}${returningSql}`,
       ).bind(...values)
     // Fenced writes decide from RETURNING rows (never meta.changes); unfenced keep meta.changes.
     let landedRows: number
@@ -607,6 +621,7 @@ export async function sendAgentMessage(
       landedSeq = Number(ran.meta?.last_row_id ?? 0)
     }
     if (landedRows === 0) {
+      if(!await taskDispatchAllowed())return {ok:false,reason:'dispatch_fenced'}
       if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
         return { ok: false, reason: 'dispatch_fenced' }
       }

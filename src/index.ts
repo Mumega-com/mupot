@@ -623,7 +623,12 @@ export default {
       ['board-sync', async () => ({ sync: await runBoardSyncTick(env), retried: await retryFailedWritebacks(env) })],
       ['board-latency-retention', () => pruneRouteLatency(env)],
       // With 22 entries: slot 19 runs at minute 24; expiry slots 20/21 at 30/31.
-      ['dead-assignee-reclaim', () => reclaimDeadAssignments(env)],
+      ['dead-assignee-reclaim', async () => {
+        let dispatchExpiry:unknown
+        try {dispatchExpiry=await (await import('./tasks/dispatch-expiry')).expireAbandonedDispatches(env)}
+        catch(error){safeConsole.error('[dispatch-expiry]',error);dispatchExpiry={failed:1}}
+        return {...(await reclaimDeadAssignments(env)),dispatchExpiry}
+      }],
       ['archive-proposal-expiry', async () => (await import('./hygiene/archive-proposals')).expireArchiveProposals(env)],
       ['elevation-expiry', async () => (await import('./auth/elevation')).expireStaleElevationRequests(env, env.TENANT_SLUG)],
     ]

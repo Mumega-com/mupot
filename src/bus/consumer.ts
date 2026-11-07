@@ -226,7 +226,7 @@ async function claimTaskDispatchReceipt(env: Env, event: BusEvent, now: number):
     `UPDATE task_dispatch_receipts
         SET claimed_at = ?, claim_expires_at = ?, last_error = NULL
       WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?
-        AND consumed_at IS NULL
+        AND consumed_at IS NULL AND settled_at IS NULL
         AND (claimed_at IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)`,
   ).bind(
     new Date().toISOString(),
@@ -472,6 +472,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       const leaseExpiresAt = await claimTaskDispatchReceipt(env, event, Date.now())
       if (leaseExpiresAt === null) {
         const current = await readTaskDispatchReceipt(env, event)
+        if(current?.settled_at)return true
         if (current?.claim_expires_at !== null && current?.claim_expires_at !== undefined
           && current.claim_expires_at > Date.now()) {
           const remainingMs = current.claim_expires_at - Date.now()
