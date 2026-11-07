@@ -2158,12 +2158,15 @@ export async function assertVerdictWritable(env: Env, task: Task): Promise<void>
 export interface VerdictStatementsResult {
   statements: D1PreparedStatement[]
   verdictRow: TaskVerdict
+  /** Verdict transition; completionIndex may subsequently move approved to done. */
   newStatus: TaskStatus
   now: string
+  verdictInsertIndex: number
+  completionIndex: number
 }
 
 /**
- * Builds the two-statement write (conditional status flip + verdict receipt)
+ * Builds the atomic verdict write (conditional status flip + verdict receipt + optional completion)
  * WITHOUT executing it, so a caller that needs to batch OTHER statements
  * alongside it (origin-verdict.ts's commitOriginDecision, mupot#1425 P0-B)
  * can append these to its OWN `env.DB.batch([...])` — one atomic unit, no
@@ -2345,7 +2348,34 @@ export function buildVerdictStatements(
     ),
   ]
 
-  return { statements, verdictRow, newStatus, now }
+  // There is no explicit "no executor" field. Close only locally authored,
+  // unassigned ordinary reviews with no execution/effect binding. Reserved gates,
+  // assigned work, owed chain receipts and historical custody retain the approved→done path.
+  // Re-evaluate every exclusion at commit, not from the caller's Task snapshot.
+  statements.push(env.DB.prepare(`
+    UPDATE tasks SET status = 'done', completed_at = ?1
+     WHERE id = ?2 AND status = 'approved' AND updated_at = ?1
+       AND EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?3 AND task_id = tasks.id AND verdict = 'approved' AND receipt_actor_kind IS NULL)
+       AND ?4 = 1 AND done_when = ?5
+       AND assignee_agent_id IS NULL AND assignee_member_id IS NULL
+       AND (gate_owner IS NULL OR (gate_owner NOT IN ('gate:office','gate:routines','gate:loops','gate:agent-self-completion','gate:project-completion') AND gate_owner NOT LIKE 'gate:addons%'))
+       AND workflow_instance_id IS NULL
+       AND execution_receipt_id IS NULL AND execution_claim_expires_at IS NULL
+       AND source_pot IS NULL AND external_source IS NULL
+       AND NOT EXISTS (SELECT 1 FROM outbound_acts WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM routine_runs WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM routine_run_actions WHERE source_type = 'task' AND source_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM task_dispatch_receipts WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM flight_lanes WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM flight_task_assignments WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM flights WHERE json_valid(meta)
+         AND EXISTS (SELECT 1 FROM json_each(meta, '$.task_ids') WHERE value = tasks.id))
+       AND ${TASK_NOT_ARCHIVED_SQL()}
+  `).bind(now, input.task.id, verdictRow.id,
+    isDoneWhenValid(input.task.done_when) && !isPlaceholderDoneWhen(input.task.done_when) ? 1 : 0,
+    input.task.done_when))
+
+  return { statements, verdictRow, newStatus, now, verdictInsertIndex: 1, completionIndex: 2 }
 }
 
 export async function emitVerdictBusEvent(
@@ -2457,7 +2487,7 @@ export async function writeVerdict(
   assertExpectedSubmission(input.task.id, submission, input.expectedSubmissionId)
   // seed B4: chain scope decided from trusted rows at write time; the marker rides the verdict INSERT (atomic with it).
   const receiptActorKind: ReceiptActorKind | null = (await resolveGateVerdictScope(env, input.task.id)) ? decider.kind : null
-  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, { ...resolvedInput, submission, receiptActorKind })
+  const { statements, verdictRow, newStatus, now, completionIndex } = buildVerdictStatements(env, { ...resolvedInput, submission, receiptActorKind })
   const results = await env.DB.batch(statements)
 
   if (!results[0]?.meta?.changes) {
@@ -2490,10 +2520,13 @@ export async function writeVerdict(
     throw new VerdictRaceError(input.task.id)
   }
 
-  const updatedTask: Task = { ...input.task, status: newStatus, updated_at: now }
+  const completed = (results[completionIndex]?.meta?.changes ?? 0) > 0
+  const finalStatus = completed ? 'done' : newStatus
+  const updatedTask: Task = { ...input.task, status: finalStatus, updated_at: now,
+    ...(completed ? { completed_at: now } : {}) }
 
   // Emit verdict event (non-fatal — the verdict is already written).
-  await emitVerdictBusEvent(env, input.task, input, newStatus, now, actor)
+  await emitVerdictBusEvent(env, input.task, input, finalStatus, now, actor)
 
   // seed B4: gate.verdict onto the receipt chain (objective-chain tasks and mumega-bounty:* tasks only). Never throws, never
   // rolls the verdict back; a failure is logged and surfaced as gate_receipt:{status:'failed'}. null = no receipt owed.
