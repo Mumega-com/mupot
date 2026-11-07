@@ -5,13 +5,23 @@
 // from what actually ships. See src/mcp/openapi-public-allowlist.ts's module header for the
 // full design rationale.
 import { describe, expect, it } from 'vitest'
-import { publicToolSpecs, TOOLS } from '../src/mcp'
+import { mcpActionsApp, publicToolSpecs, TOOLS } from '../src/mcp'
 import { PUBLIC_TOOL_ALLOWLIST } from '../src/mcp/openapi-public-allowlist'
 
 const MEMBER_TIER_OR_BELOW = new Set(['authenticated', 'observer', 'member'])
 const ABOVE_MEMBER = new Set(['lead', 'admin', 'owner'])
 
 describe('mupot#1596 — public OpenAPI allowlist invariants (real TOOLS registry)', () => {
+  it('uses generic Mupot branding in public Actions discovery', async () => {
+    const response = await mcpActionsApp.request('https://pot.test/openapi.json')
+    expect(response.status).toBe(200)
+    const spec = await response.json() as { info: { title: string; description: string }; servers: Array<{ url: string }> }
+    expect(spec.info.title).toBe('Mupot Actions')
+    expect(spec.info.description).toContain('Mupot tool surface')
+    expect(JSON.stringify(spec.info)).not.toMatch(/digid/i)
+    expect(spec.servers).toEqual([{ url: 'https://pot.test' }])
+  })
+
   it('publicToolSpecs() returns exactly the tools named in PUBLIC_TOOL_ALLOWLIST', () => {
     const publicNames = publicToolSpecs()
       .map((t) => t.name)
