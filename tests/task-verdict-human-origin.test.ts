@@ -426,6 +426,26 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.verdict.decided_by).toBe('agent-conflict-harness')
   })
 
+  it.each([true, false])('reports the committed human-origin state (executor-free=%s) without losing the verdict anchor', async (executorFree) => {
+    seedAgent(harness.sqlite, 'agent-terminal')
+    seedMember(harness.sqlite, 'member-terminal', { telegramChatId: '5551234' })
+    setAgentOwner(harness.sqlite, 'agent-terminal', 'member-terminal')
+    seedSquadMemberCapability(harness.sqlite, 'member-terminal')
+    seedAgent(harness.sqlite, 'agent-other-executor')
+    seedReviewTask(harness.sqlite, 'task-terminal', executorFree ? null : 'agent-other-executor')
+    seedGateGrant(harness.sqlite, 'member', 'member-terminal')
+    const response = await invokeVerdict(env, harnessAuth('agent-terminal'), {
+      task_id: 'task-terminal', verdict: 'approved', human_origin: origin({ text: 'approve task-terminal' }),
+    })
+    expect(response.ok).toBe(true)
+    const result = expectApplied(response)
+    expect(result.human_origin).toEqual({ applied: true })
+    const expected = executorFree ? 'done' : 'approved'
+    expect(result.task.status).toBe(expected)
+    expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id='task-terminal'").get()).toEqual({ status: expected })
+    expect(result.verdict.verdict).toBe('approved')
+  })
+
   // ── positive path: owner already bound to this exact chat via /account ────────────────────
   it('applied:true — owner already bound to this exact chat_id, verdict decided_by the MEMBER, no bind receipt written', async () => {
     seedAgent(harness.sqlite, 'agent-prebound')
