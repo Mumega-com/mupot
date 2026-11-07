@@ -2,7 +2,7 @@ import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest'
 import {createSqliteD1,type SqliteD1Harness} from './helpers/sqlite-d1'
 import {applyAllMigrations} from './helpers/migrations'
 import {hasArchiveBlockingDispatch} from '../src/tasks/runtime-receipts'
-import {deliverDispatchToInbox,DISPATCH_BRIDGE_SENDER,dispatchInboxRequestId} from '../src/bus/fleet-bridge'
+import {deliverDispatchToInbox,DISPATCH_BRIDGE_SENDER,dispatchInboxRequestId,ReceiverNotLiveError} from '../src/bus/fleet-bridge'
 import type {Env,BusEvent} from '../src/types'
 import type {MessageBatch} from '@cloudflare/workers-types'
 import {handleQueue} from '../src/bus/consumer'
@@ -95,6 +95,13 @@ describe('dispatch expiry with proven receiver death',()=>{
    expect((await sendAgentMessage(e,{fromAgent:from,fromMember:'owner',toAgent:'a',kind:'message',requestId:dispatchInboxRequestId('r'),body:'quoted control reference'},{system:true,reason:'independent message scope fixture'})).ok).toBe(true)
   expect(await sweep()).toMatchObject({expired:1})
   expect(h.sqlite.prepare("SELECT dead_lettered_at FROM agent_messages WHERE tenant='foreign' OR from_agent='b'").all()).toEqual([{dead_lettered_at:null},{dead_lettered_at:null}])
+ })
+ it.each(['missing','settled'])('keeps the stopped receiver diagnosis when the dispatch receipt is %s',async kind=>{
+  if(kind==='settled'){receipt();h.sqlite.prepare("UPDATE task_dispatch_receipts SET settled_at=?,settled_stage='failed' WHERE id='r'").run(new Date(NOW).toISOString())}
+  h.sqlite.exec("UPDATE fleet_agents SET status='stopped' WHERE agent_id='a'")
+  const error=await envelope().then(()=>null,error=>error)
+  expect(error).toBeInstanceOf(ReceiverNotLiveError)
+  expect(h.sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()).toEqual({n:0})
  })
  it('settlement between bridge precheck and INSERT prevents an envelope from being recreated',async()=>{
   receipt();const prepare=h.db.prepare.bind(h.db);let changed=false

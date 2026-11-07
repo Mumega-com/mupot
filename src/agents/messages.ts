@@ -469,7 +469,17 @@ export async function sendAgentMessage(
   const taskFence=opts.taskDispatchFence
   const taskDispatchAllowed=async()=>!taskFence||!!await env.DB.prepare(`SELECT 1 FROM task_dispatch_receipts WHERE tenant=?1 AND id=?2 AND task_id=?3 AND agent_id=?4 AND settled_at IS NULL`)
     .bind(tenant,taskFence.receiptId,taskFence.taskId,taskFence.agentId).first()
-  if(!await taskDispatchAllowed())return {ok:false,reason:'dispatch_fenced'}
+  // Keep the existing stop diagnosis when both fences refuse. This does not
+  // authorize delivery: the receipt and receiver predicates still fence INSERT.
+  const taskDispatchRefusal = async (): Promise<SendFailure | null> => {
+    if (await taskDispatchAllowed()) return null
+    if (opts.receiverNotStopped && !await receiverNotStopped(env, opts.receiverNotStopped.agentId)) {
+      return { ok: false, reason: 'receiver_not_live' }
+    }
+    return { ok: false, reason: 'dispatch_fenced' }
+  }
+  const taskRefusal = await taskDispatchRefusal()
+  if (taskRefusal) return taskRefusal
 
   // replay-once, SENDER-SCOPED: if THIS sender already used this rid, it's idempotent only
   // when the content is identical — otherwise it's a conflict (a reused key with a different
@@ -621,7 +631,8 @@ export async function sendAgentMessage(
       landedSeq = Number(ran.meta?.last_row_id ?? 0)
     }
     if (landedRows === 0) {
-      if(!await taskDispatchAllowed())return {ok:false,reason:'dispatch_fenced'}
+      const taskRefusal = await taskDispatchRefusal()
+      if (taskRefusal) return taskRefusal
       if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
         return { ok: false, reason: 'dispatch_fenced' }
       }
