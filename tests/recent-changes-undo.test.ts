@@ -157,7 +157,9 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     expect(countReceipts('unarchive')).toBe(1)
   })
 
-  it('task verdict -> task_verdict_reverse (reversed_at stamped, task back in review, reversal receipt)', async () => {
+  it('executor-owned task verdict -> task_verdict_reverse (reversed_at stamped, task back in review, reversal receipt)', async () => {
+    // This task retains an executor step, so approval remains reversible.
+    harness.sqlite.exec("UPDATE tasks SET assignee_member_id='mem-other' WHERE id='t-r1'")
     await adminVerdict('t-r1', 'approved')
     expect(rows(`SELECT status FROM tasks WHERE id='t-r1'`)[0]?.status).toBe('approved')
     const { env, cookie } = await login('admin@x.test')
@@ -171,6 +173,21 @@ describe('each supported inverse undoes, from the page, and writes its own recei
     const receipts = rows(`SELECT actor_id, from_status FROM verdict_reversals WHERE task_id='t-r1'`)
     expect(receipts).toHaveLength(1)
     expect(receipts[0]?.actor_id).toBe('mem-admin')
+  })
+})
+
+describe('executor-free terminal approval', () => {
+  it('keeps the existing done reversal boundary instead of widening Undo authority', async () => {
+    await adminVerdict('t-r1', 'approved')
+    expect(rows("SELECT status FROM tasks WHERE id='t-r1'")[0]?.status).toBe('done')
+    const response = await invokeTool(adminToolAuth(), makeEnv('admin@x.test'), 'task_verdict_reverse', {
+      task_id: 't-r1', reason: 'Try to reopen terminal completion',
+    }, ORIGIN)
+    expect(response.ok).toBe(false)
+    if (response.ok) throw new Error('expected terminal refusal')
+    expect(response.error).toBe('invalid_transition')
+    expect(rows("SELECT reversed_at FROM task_verdicts WHERE task_id='t-r1'")[0]?.reversed_at).toBeNull()
+    expect(rows("SELECT status FROM tasks WHERE id='t-r1'")[0]?.status).toBe('done')
   })
 })
 

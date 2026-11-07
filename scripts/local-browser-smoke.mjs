@@ -820,8 +820,10 @@ async function runHermesApprovalWorkflow(hermes) {
     timeout: 20_000,
   })
   const read = await readResponse.json().catch(() => null)
-  if (readResponse.status() !== 200 || read?.task?.status !== 'approved') {
-    fail('Hermes-approved task did not persist approved status', { status: readResponse.status(), read })
+  // This ordinary review has no assignee or executor/effect binding: the
+  // approved verdict now completes it in the same transaction.
+  if (readResponse.status() !== 200 || read?.task?.status !== 'done' || !read?.task?.completed_at) {
+    fail('Hermes-approved executor-free task did not persist completion', { status: readResponse.status(), read })
   }
 
   workflows.push({

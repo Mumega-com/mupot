@@ -2363,6 +2363,7 @@ export function buildVerdictStatements(
        AND execution_receipt_id IS NULL AND execution_claim_expires_at IS NULL
        AND source_pot IS NULL AND external_source IS NULL
        AND NOT EXISTS (SELECT 1 FROM outbound_acts WHERE task_id = tasks.id)
+       AND NOT EXISTS (SELECT 1 FROM department_proposals WHERE gate_id = tasks.id)
        AND NOT EXISTS (SELECT 1 FROM routine_runs WHERE task_id = tasks.id)
        AND NOT EXISTS (SELECT 1 FROM routine_run_actions WHERE source_type = 'task' AND source_id = tasks.id)
        AND NOT EXISTS (SELECT 1 FROM task_dispatch_receipts WHERE task_id = tasks.id)
