@@ -493,11 +493,8 @@ async function handleRequest(req: Request, env: Env, ctx: ExecutionContext): Pro
 export default {
   // mupot#1928 choke point: strip a forged prefix header, then re-root a path-routed tenant's response.
   // The internal auth-context header is Worker-internal: drop it from every external request first.
-  fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
-    const clean = stripInternalAuthContext(req)
-    const response = await withTenantPrefix(clean, env, (r) => handleRequest(r, env, ctx))
-    return withUnauthenticatedGuidance(clean, response)
-  },
+  fetch: (req: Request, env: Env, ctx: ExecutionContext) => withTenantPrefix(stripInternalAuthContext(req), env, (r) => handleRequest(r, env, ctx))
+    .then((response) => withUnauthenticatedGuidance(req, response)),
 
   // Queue delivery remains owned by the bus component.
   queue: handleQueue,
