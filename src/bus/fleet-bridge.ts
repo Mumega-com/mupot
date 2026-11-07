@@ -273,6 +273,7 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
     reason: 'target is the internally-resolved task assignee (input.agentId), not attacker input',
   }, {
     systemProjectAttribution: input.projectId != null,
+    ...(input.receiverFenceAgentId?{taskDispatchFence:{receiptId:input.receiptId,taskId:input.taskId,agentId:input.receiverFenceAgentId}}:{}),
     // Same correlation as task_dispatch's task.assigned ring for this receipt: one doorbell POST, not two.
     doorbellCorrelation: dispatchDoorbellCorrelation(input.receiptId),
     ...(input.receiverFenceAgentId ? { receiverNotStopped: { agentId: input.receiverFenceAgentId } } : {}),
