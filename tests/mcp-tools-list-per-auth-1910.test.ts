@@ -175,7 +175,9 @@ describe('a call through the name a Codex client sends (#1910)', () => {
     }
   })
 
-  it('an unauthenticated tools/call is -32001 unauthenticated BEFORE tool lookup (the only source of -32001)', async () => {
+  it('keeps the inner MCP app -32001 refusal before tool lookup', async () => {
+    // This intentionally tests mcpApp's adapter contract. The deployed OAuth
+    // wrapper's 401 representation is asserted separately by composition tests.
     const res = await mcpApp.fetch(new Request('https://pot.test/', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'mupot.boot_context', arguments: {} } }) }), envFor())
     const body = (await res.json()) as { error?: { code: number; message: string } }
     expect(body.error).toMatchObject({ code: -32001, message: 'unauthenticated' })
