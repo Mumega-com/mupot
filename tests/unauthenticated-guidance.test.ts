@@ -13,9 +13,9 @@ describe('constant public authentication guidance', () => {
     const response = refusal()
     expect(await withUnauthenticatedGuidance(request(path), response)).toBe(response)
   })
-  it('preserves the complete challenge and other headers while removing stale entity metadata', async () => {
+  it('preserves the complete challenge and other headers while rewriting a safe provider refusal', async () => {
     const challenge = 'Bearer realm="Test", resource_metadata="https://pot.test/meta?q=one", error="invalid_token"'
-    const response = refusal({ error: 'invalid_token', token_exists: true },401,
+    const response = refusal({ error: 'invalid_token' },401,
       { 'www-authenticate': challenge, 'retry-after': '5', 'x-preserved': 'yes', 'content-length': '99', etag: '"old"', 'content-encoding': 'gzip' })
     const result = await withUnauthenticatedGuidance(request('/mcp'), response)
     expect(result.status).toBe(401)
@@ -25,29 +25,76 @@ describe('constant public authentication guidance', () => {
     for (const header of ['etag','content-length','content-encoding']) expect(result.headers.has(header)).toBe(false)
     const body = await result.json() as { error: string }
     expect(body.error).toBe('invalid_token')
-    expect(JSON.stringify(body)).not.toContain('token_exists')
+    expect(body).toMatchObject({ who_acts: 'owner' })
   })
-  it('uses JSON content type even when an MCP authentication refusal had another entity format', async () => {
+  it('leaves an MCP refusal with an RPC envelope untouched', async () => {
+    const response = refusal({ jsonrpc: '2.0', id: 7, error: { code: -32001, message: 'unauthenticated' } })
+    expect(await withUnauthenticatedGuidance(request('/mcp'), response)).toBe(response)
+  })
+  it('leaves an MCP authentication refusal with another entity format untouched', async () => {
     const response = new Response('old authentication text',{status:401,headers:{'content-type':'text/plain'}})
     const result = await withUnauthenticatedGuidance(request('/mcp'),response)
-    expect(result.headers.get('content-type')).toBe('application/json')
-    expect(await result.json()).toMatchObject({error:'invalid_token',who_acts:'owner'})
+    expect(result).toBe(response)
+    expect(await result.text()).toBe('old authentication text')
   })
-  it('canonicalizes a revoked OAuth adapter RPC 401 exactly like a pre-handler provider 401', async () => {
+  it('canonicalizes only a safe-key provider MCP 401', async () => {
     const a = await withUnauthenticatedGuidance(request('/mcp'), refusal({ error: 'invalid_token' }))
-    const b = await withUnauthenticatedGuidance(request('/mcp'), refusal({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'unauthenticated' } }))
-    expect(await a.text()).toBe(await b.text())
+    expect(await a.json()).toMatchObject({ error: 'invalid_token', who_acts: 'owner' })
   })
-  it('does not reflect identity, lookup results, request origin, query, or old response fields', async () => {
-    const a = await withUnauthenticatedGuidance(request(), refusal({ error:'unauthenticated', agent:'existing-agent', tenant:'secret-tenant', exists:true }))
-    const b = await withUnauthenticatedGuidance(new Request('https://other.test/actions/status?agent=missing'), refusal({ error:'invalid_token', exists:false }))
+  it('leaves extra-key refusals byte-for-byte unchanged instead of reflecting them', async () => {
+    for (const [requestValue, body] of [
+      [request(), { error:'unauthenticated', agent:'existing-agent', tenant:'secret-tenant', exists:true }],
+      [new Request('https://other.test/actions/status?agent=missing'), { error:'invalid_token', exists:false }],
+    ] as const) {
+      const original = refusal(body)
+      const text = await original.clone().text()
+      expect(await withUnauthenticatedGuidance(requestValue, original)).toBe(original)
+      expect(await original.text()).toBe(text)
+    }
+  })
+  it('does not reflect request data or the safe original error code into rewritten guidance', async () => {
+    const a = await withUnauthenticatedGuidance(request('/actions/status'), refusal({ error:'unauthenticated' }))
+    const b = await withUnauthenticatedGuidance(new Request('https://other.test/actions/status?agent=missing'), refusal({ error:'invalid_token' }))
     const text = await a.text()
     expect(text).toBe(await b.text())
-    for (const value of ['existing-agent','secret-tenant','other.test','exists']) expect(text).not.toContain(value)
+    for (const value of ['other.test','missing']) expect(text).not.toContain(value)
     expect(JSON.parse(text)).toMatchObject({ error:'unauthenticated', what_happened:'This request could not be authenticated.', who_acts:'owner', help_url:'https://mumega.com/docs/how-to-connect/' })
-    expect(JSON.parse(text).next_step).toContain('your human')
-    expect(JSON.parse(text).next_step).toContain('workspace admin')
-    expect(JSON.parse(text).next_step).toContain('Do not paste credentials into chat')
+  })
+  it.each([
+    ['clock skew', { error: 'unauthorized', detail: 'signature timestamp out of window' }],
+    ['bad signature', { error: 'unauthorized', detail: 'signature verification failed' }],
+  ])('leaves the signed inbox %s refusal byte-for-byte unchanged', async (_name, body) => {
+    const original = refusal(body)
+    const expected = await original.clone().text()
+    const actual = await withUnauthenticatedGuidance(request('/api/inbox/signed'), original)
+    expect(actual).toBe(original)
+    expect(await actual.text()).toBe(expected)
+  })
+  it('leaves a bare signed inbox unauthorized refusal untouched', async () => {
+    const original = refusal({ error: 'unauthorized' })
+    expect(await withUnauthenticatedGuidance(request('/api/inbox/signed'), original)).toBe(original)
+  })
+  it('never rewrites an in-scope refusal with extra keys', async () => {
+    const original = refusal({ error: 'unauthenticated', detail: 'keep this diagnostic' })
+    expect(await withUnauthenticatedGuidance(request('/api/tasks'), original)).toBe(original)
+  })
+  it('uses API-specific next steps without offering OAuth consent', async () => {
+    const result = await withUnauthenticatedGuidance(request('/api/tasks'), refusal({ error: 'unauthenticated' }))
+    const body = await result.json() as { next_step: string }
+    expect(body.next_step).toContain('sign in at this pot')
+    expect(body.next_step).toContain('admin-issued agent key')
+    expect(body.next_step).not.toContain('OAuth consent flow')
+  })
+  it('keeps cookie-only and signed-agent API next steps accurate', async () => {
+    const cookieOnly = await withUnauthenticatedGuidance(request('/api/agents'), refusal({ error: 'unauthenticated' }))
+    const cookieBody = await cookieOnly.json() as { next_step: string }
+    expect(cookieBody.next_step).toContain('sign in at this pot')
+    expect(cookieBody.next_step).not.toContain('agent key')
+
+    const inbox = await withUnauthenticatedGuidance(request('/api/inbox'), refusal({ error: 'unauthorized' }))
+    const inboxBody = await inbox.json() as { next_step: string }
+    expect(inboxBody.next_step).toContain('admin-issued agent key')
+    expect(inboxBody.next_step).not.toContain('sign in at this pot')
   })
   it('retains the inbox unauthorized code and leaves other shared-secret refusals alone', async () => {
     const inbox = await withUnauthenticatedGuidance(request('/api/inbox'),refusal({error:'unauthorized'}))

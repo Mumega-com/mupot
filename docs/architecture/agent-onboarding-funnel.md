@@ -29,7 +29,7 @@ A brand-new agent given only a URL finds nothing machine-readable. Live, 2026-10
 
 - `GET /` returns the human sign-in HTML.
 - `GET /llms.txt` and `GET /.well-known/mcp.json` answer `302` to sign-in.
-- `POST /mcp` unauthenticated answers `401`, `www-authenticate: Bearer ... resource_metadata=".../.well-known/oauth-protected-resource/mcp"`, body `{"error":"invalid_token"}`. The resource metadata lists scopes only; nothing says "to onboard, read X".
+- `POST /mcp` unauthenticated answers `401`, `www-authenticate: Bearer ... resource_metadata=".../.well-known/oauth-protected-resource/mcp"`. Safe provider-style refusals carry the actionable `invalid_token` guidance body; rich JSON-RPC refusals retain their own envelope. The resource metadata lists scopes only; nothing says "to onboard, read X".
 - `GET /openapi.json` answers a public subset of tools (`src/mcp/openapi-public-allowlist.ts`), no onboarding text.
 - The initialize `instructions` are the real first-contact text, but the public endpoint answered an unauthenticated initialize with `401` (live; deployment behaviour of the OAuth front layer, not a handler guarantee, since the handler treats initialize as bearerless), so a cold agent did not reach them. The comment at `src/mcp/instructions.ts:3` is reworded in this PR to say both and to keep the static-payload rule explicit.
 

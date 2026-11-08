@@ -7,6 +7,7 @@ import { sha256Hex } from '../../src/lib/canonical-json'
 const bindings = cfEnv as unknown as { MUPOT_DB: D1Database; TEST_MIGRATIONS: never; ST_OAUTH_KV: KVNamespace; ST_SESSIONS: KVNamespace }
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
 const revoked = 'mupot_beta_revoked_test_fixture'
+const expired = 'mupot_beta_expired_test_fixture'
 const live = 'mupot_beta_live_test_fixture'
 const origin = 'https://pot.test'
 const env = () => ({ DB: bindings.MUPOT_DB, OAUTH_KV: bindings.ST_OAUTH_KV, SESSIONS: bindings.ST_SESSIONS,
@@ -19,9 +20,13 @@ beforeAll(async () => {
   await bindings.MUPOT_DB.exec("INSERT OR IGNORE INTO members(id,tenant,display_name,status) VALUES ('beta-m','mumega','Beta','active')")
   await bindings.MUPOT_DB.exec("INSERT OR IGNORE INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('beta-cap','beta-m','squad','beta-s','member')")
   await bindings.MUPOT_DB.exec("INSERT OR IGNORE INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES ('mumega','beta-a','beta-m',datetime('now'))")
-  for (const [id, raw, dead] of [['beta-revoked', revoked, true], ['beta-live', live, false]] as const) {
-    await bindings.MUPOT_DB.prepare(`INSERT OR IGNORE INTO member_tokens(id,tenant,member_id,agent_id,token_hash,channel,revoked_at)
-      VALUES (?,'mumega','beta-m','beta-a',?,'workspace',?)`).bind(id, await sha256Hex(raw), dead ? '2020-01-01' : null).run()
+  for (const [id, raw, revokedAt, expiresAt] of [
+    ['beta-revoked', revoked, '2020-01-01', null],
+    ['beta-expired', expired, null, '2020-01-01'],
+    ['beta-live', live, null, null],
+  ] as const) {
+    await bindings.MUPOT_DB.prepare(`INSERT OR IGNORE INTO member_tokens(id,tenant,member_id,agent_id,token_hash,channel,revoked_at,expires_at)
+      VALUES (?,'mumega','beta-m','beta-a',?,'workspace',?,?)`).bind(id, await sha256Hex(raw), revokedAt, expiresAt).run()
   }
 }, 120_000)
 
@@ -32,10 +37,21 @@ function request(path: string, token?: string) {
     ...(isPost ? { body: path.startsWith('/actions/') ? '{}' : JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) } : {}) })
 }
 
+const b64url = (bytes: Uint8Array) =>
+  btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+function signedInboxRequest(body: Record<string, unknown>) {
+  return new Request(origin + '/api/inbox/signed', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
 describe('cold authentication guidance at the deployed HTTP boundary', () => {
-  it.each(['/mcp','/mcp/tools','/mcp/health','/mcp/profile/needs-you','/actions/status','/openapi.full.json','/api/inbox?peek=1','/api/tasks'])('%s refuses equally without, with unknown, and with revoked credentials', async path => {
+  it.each(['/mcp','/mcp/tools','/mcp/health','/mcp/profile/needs-you','/actions/status','/openapi.full.json','/api/inbox?peek=1','/api/tasks'])('%s refuses equally without, with unknown, revoked, and expired credentials', async path => {
     const bodies: string[] = [], challenges: Array<string | null> = []
-    for (const token of [undefined, 'mupot_beta_unknown_test_fixture', revoked]) {
+    for (const token of [undefined, 'mupot_beta_unknown_test_fixture', revoked, expired]) {
       const response = await worker.fetch(request(path, token), env(), ctx)
       expect(response.status).toBe(401)
       challenges.push(response.headers.get('www-authenticate'))
@@ -44,7 +60,10 @@ describe('cold authentication guidance at the deployed HTTP boundary', () => {
       expect(body).toMatchObject({ who_acts: 'owner', what_happened: 'This request could not be authenticated.',
         help_url: 'https://mumega.com/docs/how-to-connect/' })
       expect(body.next_step).toContain('your human')
-      expect(body.next_step).toContain('workspace admin')
+      if (path.startsWith('/api/')) {
+        expect(body.next_step).toContain(path.startsWith('/api/inbox') ? 'admin-issued agent key' : 'sign in at this pot')
+        expect(body.next_step).not.toContain('OAuth consent flow')
+      } else expect(body.next_step).toContain('workspace admin')
       for (const value of ['beta-m','beta-a',revoked,'mupot_beta_unknown_test_fixture']) expect(text).not.toContain(value)
     }
     expect(new Set(bodies).size).toBe(1)
@@ -55,7 +74,7 @@ describe('cold authentication guidance at the deployed HTTP boundary', () => {
         const description = i === 0 ? ', error_description="Missing or invalid access token"' : ''
         expect(challenges[i]).toBe(`Bearer realm="OAuth", resource_metadata="${origin}/.well-known/oauth-protected-resource${path}", error="invalid_token"${description}`)
       }
-    } else expect(challenges).toEqual([null,null,null])
+    } else expect(challenges).toEqual([null, null, null, null])
   })
 
   it('shares one body shape across the public authentication surfaces', async () => {
@@ -81,5 +100,28 @@ describe('cold authentication guidance at the deployed HTTP boundary', () => {
     expect((await discovery.json() as { resource: string }).resource).toBe(origin + '/mcp')
     const publicSpec = await worker.fetch(request('/openapi.json'), env(), ctx)
     expect(publicSpec.status).toBe(200)
+  })
+
+  it.each([
+    ['clock skew', async () => ({
+      agent_id: 'beta-a', peek: true, limit: 1, ts: 1,
+      nonce: b64url(crypto.getRandomValues(new Uint8Array(24))),
+      sig: b64url(crypto.getRandomValues(new Uint8Array(64))),
+    }), 'signature timestamp out of window'],
+    ['bad signature', async () => {
+      const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])
+      const publicKey = await crypto.subtle.exportKey('jwk', pair.publicKey)
+      await bindings.MUPOT_DB.prepare(`INSERT OR REPLACE INTO agent_keys(tenant,agent_id,pubkey,algo,member_id,created_at)
+        VALUES ('mumega','beta-a',?,'Ed25519','beta-m',?)`).bind(publicKey.x, Math.floor(Date.now() / 1000)).run()
+      return {
+        agent_id: 'beta-a', peek: true, limit: 1, ts: Math.floor(Date.now() / 1000),
+        nonce: b64url(crypto.getRandomValues(new Uint8Array(24))),
+        sig: b64url(crypto.getRandomValues(new Uint8Array(64))),
+      }
+    }, 'signature verification failed'],
+  ])('keeps signed inbox %s detail through the composed worker', async (_case, bodyFor, detail) => {
+    const response = await worker.fetch(signedInboxRequest(await bodyFor()), env(), ctx)
+    expect(response.status).toBe(401)
+    expect(await response.text()).toBe(JSON.stringify({ error: 'unauthorized', detail }))
   })
 })

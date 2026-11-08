@@ -99,7 +99,10 @@ describe('profile tools/list', () => {
     }
   })
 
-  it('requires authentication (the profile never discloses even its own list anonymously)', async () => {
+  it('keeps the inner MCP app RPC refusal for the OAuth adapter contract', async () => {
+    // This is deliberately below the OAuthProvider wrapper: the adapter needs an
+    // RPC envelope before the public edge decides whether to replace a safe-key 401.
+    // Production wrapper behavior is pinned in composition/unauthenticated-guidance.
     const { status, json } = await rpc(PROFILE, 'tools/list', undefined, {}, makeEnv())
     expect(status).toBe(401)
     expect(json!.error.code).toBe(-32001)
