@@ -64,7 +64,7 @@ import { studioApp } from './dashboard/studio'
 import { studioDataApp } from './dashboard/studio-data-api'
 import { orientApp } from './orient/routes'
 import { handleOAuthAuthorize, resolveExternalToken as memberKeyResolver } from './mcp/oauth-authorize'
-import { deviceApp } from './auth/device-routes'
+import { deviceRetiredApp } from './auth/device-retired'
 import { McpOAuthApiHandler } from './mcp/oauth-api-handler'
 import { brainPhysicsIngestApp } from './dashboard/brain-ingest'
 import { billingAdminApp } from './billing/admin'
@@ -292,7 +292,9 @@ app.route('/api/presence', presenceApp)
 app.all('/authorize', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/google-callback', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
 app.all('/oauth/consent', async (c) => handleOAuthAuthorize(c.req.raw, c.env))
-app.route('/device', deviceApp)
+// /device is RETIRED (Option B task 0, mupot#2374): one constant 410 for every method/path, no service behind it.
+// Kept as an explicit route ahead of the dashboard '/' catch-all so it never falls through to a login redirect.
+app.route('/device', deviceRetiredApp)
 
 // Project sub-worker preview (`/preview/:project_id/*`) must precede the
 // dashboard '/' catch-all so the iframe is not redirected through login HTML.
