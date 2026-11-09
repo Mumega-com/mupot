@@ -818,6 +818,18 @@ describe('signed webhook doorbell delivery', () => {
   })
 
   it('prunes expired receipts and enqueue locks when a signed doorbell rings', async () => {
+    // pruneReceipts cuts off against the real clock (isoAgo), not nowMs: pin Date to T0 (#2375).
+    // Only Date is faked so timers and awaits keep working.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(T0))
+    try {
+      await runPruneCase()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  async function runPruneCase(): Promise<void> {
     await register()
     const old = new Date(Date.parse(T0) - RECEIPT_RETENTION_MS - 60_000).toISOString()
     const fresh = new Date(Date.parse(T0) - 1000).toISOString()
@@ -840,7 +852,7 @@ describe('signed webhook doorbell delivery', () => {
     expect(ids).not.toContain('old-receipt')
     expect(ids).not.toContain('old-lock')
     expect(ids).toContain('fresh-receipt')
-  })
+  }
 
   it('a flag rollback does not POST the signed key', async () => {
     await register()
