@@ -34,7 +34,7 @@
 import { findInFlightWork } from '../fleet/in-flight-work'
 import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { brandSquadScope, canOnSquad, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   createDepartment,
   updateDepartment,
@@ -817,23 +817,43 @@ const toolCreateAgent: ToolSpec = {
 }
 
 // ── resolve_agent ───────────────────────────────────────────────────────────────
+// Directory visibility (board a90ff195, P0 2026-11-10). The directory used to read the
+// whole `agents` table for any caller holding observer on ANY scope, which a stranger's
+// OAuth home squad satisfies. The rule now:
+//   - an org admin (isOrgAdmin) sees every agent, as before;
+//   - everyone else sees an agent only if they hold observer-or-above on THAT agent's
+//     squad through canOnSquad, the same primitive squad_member_list and peers use, so a
+//     home squad grant unlocks only that home squad (planeCoversScope), and observer
+//     means what it means for those reads: it may read the squad roster;
+//   - a bound agent always sees itself.
+// Callers answer "not visible" exactly as "not found".
+function agentVisibility(env: Env, auth: AuthContext): (agent: { id: string; squad_id: string }) => Promise<boolean> {
+  if (isOrgAdmin(auth)) return async () => true
+  const grants = auth.capabilities ?? []
+  const bySquad = new Map<string, Promise<boolean>>()
+  return async (agent) => {
+    if (auth.boundAgentId && agent.id === auth.boundAgentId) return true
+    let verdict = bySquad.get(agent.squad_id)
+    if (!verdict) {
+      verdict = canOnSquad(env, grants, agent.squad_id, 'observer')
+      bySquad.set(agent.squad_id, verdict)
+    }
+    return verdict
+  }
+}
+
 // resolve-before-mint (Port 1.3): before minting a new agent, search existing agents
 // by name/slug across the whole pot so onboarding SEES the roles that already exist
 // and doesn't fork a duplicate identity. This is the anti-sprawl primitive — the
 // 2026-07-21 3-hermes incident (agent-hermes + kayhermes + hadi-hermes, distinct
 // roles, retired as "duplicates") is exactly what pot-wide resolve prevents.
 //
-// Scope: observer FLOOR (not 'authenticated'). Deliberately pot-wide (not caller-
-// squad-scoped): the sprawl this fixes spans squads, so a squad-scoped search would
-// miss the case. Agents live in a single-tenant pot (the `agents` table has no tenant
-// column — one pot = one tenant), so this discloses no cross-tenant data, only agent
-// metadata (name/role/purpose/model/capabilities/lineage). It is min:'observer', NOT
-// 'authenticated': `min:'authenticated'` would SKIP the AAGATE capability floor
-// (src/mcp/index.ts) and let a ZERO-GRANT OAuth member enumerate the whole pot's agent
-// inventory — a broadening a grantless token should not have (cursor gate,
-// 2026-07-22; the earlier "presence-roster parity" claim was wrong — a grantless
-// member never gets the roster either). 'observer' requires the caller hold observer
-// on SOME scope, enforced centrally at the dispatch chokepoint.
+// Scope: observer FLOOR (not 'authenticated') AND per-agent visibility (agentVisibility
+// above): an org admin searches the whole pot, everyone else only the squads they can
+// read. The earlier "deliberately pot-wide" reasoning predates several customers sharing
+// one pot (P0, 2026-11-10). min:'observer', NOT 'authenticated': `min:'authenticated'`
+// would SKIP the AAGATE capability floor (src/mcp/index.ts) and let a ZERO-GRANT OAuth
+// member in at all (cursor gate, 2026-07-22).
 const toolResolveAgent: ToolSpec = {
   name: 'resolve_agent',
   scope: 'org (read)',
@@ -861,14 +881,13 @@ const toolResolveAgent: ToolSpec = {
       }
       limit = args.limit
     }
-    const matches = await findAgentsByName(env, query, { includeInactive, limit })
+    const matches = await findAgentsByName(env, query, { includeInactive, limit, canSee: agentVisibility(env, auth) })
     return done({ matches })
   },
 }
 
 // ── get_agent_profile ───────────────────────────────────────────────────────────
-// Read one agent's full profile by id. Same pot-internal, metadata-only disclosure
-// rationale as resolve_agent above — and the same observer FLOOR: min:'observer' so
+// Read one agent's full profile by id. Same visibility rule as resolve_agent above, and the same observer FLOOR: min:'observer' so
 // the AAGATE capability floor rejects a zero-grant member (min:'authenticated' would
 // skip it). cursor gate, 2026-07-22.
 const toolGetAgentProfile: ToolSpec = {
@@ -887,7 +906,8 @@ const toolGetAgentProfile: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
     const profile = await getAgentProfile(env, agentId)
-    if (!profile) return fail(404, 'agent_not_found')
+    // A hidden agent answers exactly as a missing one: same status, same body.
+    if (!profile || !(await agentVisibility(env, auth)(profile))) return fail(404, 'agent_not_found')
     return done({ profile })
   },
 }
