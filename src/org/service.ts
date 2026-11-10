@@ -1091,29 +1091,44 @@ export async function getAgentProfile(env: Env, agentId: string): Promise<AgentP
   return row ? rowToProfileSummary(row) : null
 }
 
-// resolve-before-mint: find existing agents matching a name/slug query, across ALL
-// squads, so onboarding surfaces existing ROLES before minting a duplicate identity.
-// This is the anti-sprawl primitive (the 2026-07-21 3-hermes incident). Case-
-// insensitive substring match on name OR slug; excludes 'inactive' by default.
+// resolve-before-mint: find existing agents matching a name/slug query so onboarding
+// surfaces existing ROLES before minting a duplicate identity (the 2026-07-21 3-hermes
+// incident). Case-insensitive substring match on name OR slug; excludes 'inactive' by
+// default.
+//
+// `canSee` is the caller's visibility predicate (the MCP tools pass one; see
+// agentVisibility in src/mcp/provision.ts). Without it the lookup is tenant-wide, which
+// is only correct for an org admin. The predicate is applied BEFORE the limit, by
+// paging, so a hidden agent can neither consume a result slot nor change the response.
 export async function findAgentsByName(
   env: Env,
   query: string,
-  opts: { includeInactive?: boolean; limit?: number } = {},
+  opts: { includeInactive?: boolean; limit?: number; canSee?: (agent: AgentProfileSummary) => Promise<boolean> } = {},
 ): Promise<AgentProfileSummary[]> {
   const q = query.trim().toLowerCase()
   if (q === '') return []
   const like = `%${q.replace(/[%_\\]/g, (ch) => `\\${ch}`)}%`
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100)
   const statusClause = opts.includeInactive ? '' : " AND status != 'inactive'"
-  const rows = await env.DB.prepare(
-    `SELECT ${PROFILE_COLUMNS} FROM agents
-      WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(slug) LIKE ?1 ESCAPE '\\')${statusClause}
-      ORDER BY name ASC, slug ASC
-      LIMIT ?2`,
-  )
-    .bind(like, limit)
-    .all<AgentProfileRow>()
-  return (rows.results ?? []).map(rowToProfileSummary)
+  const pageSize = opts.canSee ? 200 : limit
+  const out: AgentProfileSummary[] = []
+  for (let offset = 0; out.length < limit; offset += pageSize) {
+    const rows = await env.DB.prepare(
+      `SELECT ${PROFILE_COLUMNS} FROM agents
+        WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(slug) LIKE ?1 ESCAPE '\\')${statusClause}
+        ORDER BY name ASC, slug ASC
+        LIMIT ?2 OFFSET ?3`,
+    )
+      .bind(like, pageSize, offset)
+      .all<AgentProfileRow>()
+    const page = (rows.results ?? []).map(rowToProfileSummary)
+    for (const agent of page) {
+      if (out.length >= limit) break
+      if (!opts.canSee || (await opts.canSee(agent))) out.push(agent)
+    }
+    if (page.length < pageSize) break
+  }
+  return out
 }
 
 // ── work-unit helpers ─────────────────────────────────────────────────────────
