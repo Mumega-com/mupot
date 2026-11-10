@@ -445,6 +445,40 @@ export async function resolveConnector(
 }
 
 /**
+ * Decrypt ONE connector selected by its OWN id (tenant-scoped, type-checked, not revoked).
+ *
+ * Unlike resolveConnector(), the argument is a connector id, never a scope id. The caller
+ * MUST have authorised the principal against the connector's scope BEFORE calling this
+ * (see src/mcp/supabase-tools.ts) — this function performs no authorisation of its own.
+ * Same fail-closed behaviour: no master key / no row / decrypt failure → null.
+ */
+export async function resolveConnectorById(
+  env: Env,
+  connectorId: string,
+  type: ConnectorType,
+): Promise<string | null> {
+  if (!isConnectorType(type)) return null
+  const masterKey = env.CONNECTOR_MASTER_KEY
+  if (!masterKey) return null
+
+  const row = await env.DB.prepare(
+    `SELECT id, type, encrypted_secret
+       FROM connectors
+      WHERE tenant = ?1 AND id = ?2 AND type = ?3 AND revoked_at IS NULL
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, connectorId, type)
+    .first<{ id: string; type: ConnectorType; encrypted_secret: string }>()
+  if (!row) return null
+
+  try {
+    return await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
+  } catch {
+    return null
+  }
+}
+
+/**
  * Resolve a connector credential AND its non-secret `meta` field together.
  *
  * Same scope-priority query + fail-closed discipline as resolveConnector() (agent >
