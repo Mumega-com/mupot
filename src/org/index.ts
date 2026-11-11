@@ -37,6 +37,7 @@ import { csrf } from 'hono/csrf'
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
 import { resolveCapabilities, hasCapability, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
+import { squadVisibility } from './visibility'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
@@ -198,15 +199,24 @@ orgApp.post('/departments', async (c) => {
 
 orgApp.get('/departments/:id/squads', async (c) => {
   const departmentId = c.req.param('id')
-  const dept = await getById<Department>(c.env, 'departments', departmentId)
+  const dept = await getById<Department & { kind: OrgKind }>(c.env, 'departments', departmentId)
   if (!dept) return c.json({ error: 'department_not_found' }, 404)
 
+  // Only squads the caller may read (observer+ on THAT squad; see ./visibility). A home
+  // squad is never returned to anyone but its owner.
+  const canSee = squadVisibility(c.env, c.get('auth'))
   const rows = await c.env.DB.prepare(
-    'SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE department_id = ? ORDER BY created_at ASC, slug ASC',
+    'SELECT id, department_id, slug, name, charter, kind, created_at FROM squads WHERE department_id = ? ORDER BY created_at ASC, slug ASC',
   )
     .bind(departmentId)
     .all<Squad>()
-  return c.json({ squads: rows.results ?? [] })
+  const squads: Omit<Squad, 'kind'>[] = []
+  for (const { kind, ...squad } of rows.results ?? []) {
+    if (await canSee({ id: squad.id, department_id: squad.department_id, kind })) squads.push(squad)
+  }
+  // A home department answers exactly as a missing one unless the caller can see a squad in it.
+  if (dept.kind === 'home' && squads.length === 0) return c.json({ error: 'department_not_found' }, 404)
+  return c.json({ squads })
 })
 
 interface CreateSquadBody {
@@ -296,7 +306,8 @@ orgApp.post('/departments/:id/squads', async (c) => {
 orgApp.get('/squads/:id/agents', async (c) => {
   const squadId = c.req.param('id')
   const squad = await getById<Squad>(c.env, 'squads', squadId)
-  if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+  // A squad the caller may not read answers exactly as a missing one (same status, same body).
+  if (!squad || !(await squadVisibility(c.env, c.get('auth'))(squad))) return c.json({ error: 'squad_not_found' }, 404)
 
   const rows = await c.env.DB.prepare(
     'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents WHERE squad_id = ? ORDER BY created_at ASC, slug ASC',
@@ -475,10 +486,10 @@ orgApp.get('/tree', async (c) => {
   //
   // Pull every table once, then assemble in-memory. The pot is small (one org),
   // so four scans beat N+1 round-trips.
-  const [depts, squads, agents, memberships] = await Promise.all([
+  const [depts, squadRows, agents, memberships] = await Promise.all([
     c.env.DB.prepare(`SELECT id, slug, name, created_at FROM departments WHERE kind != 'home'`).all<Department>(),
     c.env.DB.prepare(
-      `SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE kind != 'home'`,
+      `SELECT id, department_id, slug, name, charter, kind, created_at FROM squads WHERE kind != 'home'`,
     ).all<Squad>(),
     c.env.DB.prepare(
       'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents',
@@ -488,8 +499,24 @@ orgApp.get('/tree', async (c) => {
     ).all<Membership>(),
   ])
 
+  // Prune to what the caller may read: a squad only with observer+ on it (an org admin
+  // covers every work squad by inheritance), agents only inside a visible squad, and a
+  // membership only when ITS squad is visible too (an agent in a visible squad can hold a
+  // membership on a hidden one). See ./visibility for the rule.
+  const canSee = squadVisibility(c.env, c.get('auth'))
+  const visibleIds = new Set<string>()
+  const squads: Squad[] = []
+  for (const s of squadRows.results ?? []) {
+    if (await canSee(s)) {
+      visibleIds.add(s.id)
+      const { kind: _kind, ...rest } = s // kind was only selected for the check; the tree never exposed it
+      squads.push(rest as Squad) // as: Squad's type still lists kind; the runtime shape is unchanged from before
+    }
+  }
+
   const membershipsByAgent = new Map<string, Membership[]>()
   for (const m of memberships.results ?? []) {
+    if (!visibleIds.has(m.squad_id)) continue
     const list = membershipsByAgent.get(m.agent_id) ?? []
     list.push(m)
     membershipsByAgent.set(m.agent_id, list)
@@ -497,6 +524,7 @@ orgApp.get('/tree', async (c) => {
 
   const agentsBySquad = new Map<string, AgentNode[]>()
   for (const a of agents.results ?? []) {
+    if (!visibleIds.has(a.squad_id)) continue
     const node: AgentNode = { ...a, memberships: membershipsByAgent.get(a.id) ?? [] }
     const list = agentsBySquad.get(a.squad_id) ?? []
     list.push(node)
@@ -504,7 +532,7 @@ orgApp.get('/tree', async (c) => {
   }
 
   const squadsByDept = new Map<string, SquadNode[]>()
-  for (const s of squads.results ?? []) {
+  for (const s of squads) {
     const node: SquadNode = { ...s, agents: agentsBySquad.get(s.id) ?? [] }
     const list = squadsByDept.get(s.department_id) ?? []
     list.push(node)
