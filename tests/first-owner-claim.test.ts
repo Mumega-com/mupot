@@ -76,7 +76,16 @@ function provision(h: SqliteD1Harness, tenant = TENANT): void {
   h.sqlite.exec(`
     INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-owner','realowner@customer.test','Real Owner','active','${tenant}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via) VALUES ('cap-owner','mem-owner','org',NULL,'owner','pot_provision');
-    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-lead',NULL,'Lead Agent','active','${tenant}');`)
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-lead',NULL,'Lead Agent','active','${tenant}');
+    -- the real provisioning admin token (src/pots/service.ts): unbound, label 'admin', channel 'dashboard' (the documented exemption)
+    INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-admin','mem-owner','hash-admin','admin','dashboard','2026-01-01T00:00:00.000Z','${tenant}');`)
+}
+
+/** Bind the provisioned owner's member row to a live login identity (as MCP OAuth or an earlier web sign-in does). */
+function bindIdentity(h: SqliteD1Harness, provider: string, subject: string, verifiedEmail: string): void {
+  h.sqlite.exec(`INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+    VALUES ('hli-${provider}-${subject}','${TENANT}','${provider}','${subject}','${verifiedEmail}','mem-owner','2026-01-01T00:00:00.000Z')`)
 }
 
 /** An agent identity weld as src/members/service.ts writes it: a NULL-email member bound to an agent. */
@@ -236,12 +245,84 @@ describe('truly empty pot', () => {
   })
 })
 
+describe('provisioned owner is matched by IDENTITY, not email alone (gate 2387 P0)', () => {
+  const noOwnerClaim = (h: SqliteD1Harness) => expect(count(h, 'SELECT COUNT(*) AS n FROM owner_bootstrap_claim')).toBe(0)
+
+  it('R1: owner bound to Google S1 whose email has since changed; a different Google account S2 presents the OLD address -> member, no owner row, no claim', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    bindIdentity(h, 'google', 'sub-S1', 'new@y.test')
+    h.sqlite.exec(`INSERT INTO users (id, email, role) VALUES ('u-owner','new@y.test','owner')`)
+    const env = mkEnv(h)
+    const res = await webSignIn(env, 'sub-S2', 'realowner@customer.test')
+    expect(res.status).toBe(302)
+    expect(userRole(h, 'realowner@customer.test')).toBe('member')
+    expect(await meRole(env, res)).toBe('member')
+    noOwnerClaim(h)
+    expect(count(h, `SELECT COUNT(*) AS n FROM users WHERE role='owner'`)).toBe(1) // only the pre-existing one
+  })
+
+  it('R2: owner bound to Google S1 via MCP (no users row), another member HAS a users row; S2 with the owner email -> member', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    bindIdentity(h, 'google', 'sub-S1', 'realowner@customer.test')
+    h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-other','other@customer.test','O','active','${TENANT}');
+      INSERT INTO users (id, email, role) VALUES ('u-other','other@customer.test','member')`)
+    const env = mkEnv(h)
+    const res = await webSignIn(env, 'sub-S2', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('member')
+    expect(await meRole(env, res)).toBe('member')
+    noOwnerClaim(h)
+  })
+
+  it('R2b: same with NO users rows at all (provisioned pot, owner bound to S1 via MCP): S2 is member', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    bindIdentity(h, 'google', 'sub-S1', 'realowner@customer.test')
+    await webSignIn(mkEnv(h), 'sub-S2', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('member')
+  })
+
+  it('owner with NO identity yet, correct email, real provisioning seed token present -> owner (still works)', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    const env = mkEnv(h)
+    const res = await webSignIn(env, 'sub-first', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('owner')
+    expect(await meRole(env, res)).toBe('owner')
+  })
+
+  it('owner bound to Google S1 signs in as S1 -> owner', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    bindIdentity(h, 'google', 'sub-S1', 'realowner@customer.test')
+    const env = mkEnv(h)
+    const res = await webSignIn(env, 'sub-S1', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('owner')
+    expect(await meRole(env, res)).toBe('owner')
+  })
+
+  it('PINNED DECISION: an owner bound only to a NON-Google identity (Telegram login identity) is NOT matched on a Google sign-in -> member. Ownership is not widened.', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    bindIdentity(h, 'telegram', 'tg-777', 'realowner@customer.test')
+    await webSignIn(mkEnv(h), 'sub-anyone', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('member')
+  })
+
+  it('PINNED DECISION: an owner whose member row carries a Telegram bind (telegram_chat_id) is NOT matched -> member', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    h.sqlite.exec(`UPDATE members SET telegram_chat_id='555' WHERE id='mem-owner'`)
+    await webSignIn(mkEnv(h), 'sub-anyone', 'realowner@customer.test')
+    expect(userRole(h, 'realowner@customer.test')).toBe('member')
+  })
+
+  it('no subject (no join key) never matches: isProvisionedOwnerEmail(email, undefined) is false', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
+    expect(await isProvisionedOwnerEmail(mkEnv(h), 'realowner@customer.test', undefined)).toBe(false)
+  })
+})
+
 describe('isProvisionedOwnerEmail', () => {
   it('null / unknown email is false', async () => {
     const h = createSqliteD1(); applyAllMigrations(h.sqlite); provision(h)
-    expect(await isProvisionedOwnerEmail(mkEnv(h), null)).toBe(false)
-    expect(await isProvisionedOwnerEmail(mkEnv(h), 'nobody@x.test')).toBe(false)
-    expect(await isProvisionedOwnerEmail(mkEnv(h), 'realowner@customer.test')).toBe(true)
-    expect(await isProvisionedOwnerEmail(mkEnv(h), '  RealOwner@Customer.TEST ')).toBe(true)
+    expect(await isProvisionedOwnerEmail(mkEnv(h), null, { provider: 'google', subject: 's' })).toBe(false)
+    expect(await isProvisionedOwnerEmail(mkEnv(h), 'nobody@x.test', { provider: 'google', subject: 's' })).toBe(false)
+    expect(await isProvisionedOwnerEmail(mkEnv(h), 'realowner@customer.test', { provider: 'google', subject: 's' })).toBe(true)
+    expect(await isProvisionedOwnerEmail(mkEnv(h), '  RealOwner@Customer.TEST ', { provider: 'google', subject: 's' })).toBe(true)
   })
 })

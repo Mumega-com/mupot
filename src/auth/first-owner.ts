@@ -57,13 +57,30 @@ export async function claimFirstOwner(env: Env, userId: string, email: string | 
 }
 
 /**
- * True when this verified email is the provisioned owner: the SHARED resolver (never a raw email read, mupot#1578/#1583)
- * resolves it to an ACTIVE member of this tenant, and that member holds a live org-scope `owner` capability and is not archived
- * or superseded. `denied`/`ambiguous` (a competing credential, an email collision) is NOT owner here.
+ * True when this Google sign-in is the provisioned owner. Resolved through the SHARED resolver's JOIN-KEY branch
+ * (provider + subject), never email alone (mupot#1266 P0-2 / 0143: authorization binds to (tenant, provider, subject), not a
+ * display email):
+ *   - this exact (provider, subject) already has a live identity -> that member (a returning owner signing in as themselves);
+ *   - no live identity for this subject -> the member row matching the verified email, ONLY if it is under nobody's exclusive
+ *     control: no live login identity under ANY subject or provider, no Telegram bind, no live unbound bearer (the provisioning
+ *     seed token is the documented exemption). A member already bound to Google subject S1 therefore does NOT match a different
+ *     subject S2 that presents the same email, whatever the email says.
+ * and that member is ACTIVE, not archived or superseded, and holds a live org-scope `owner` capability.
+ * `denied`/`ambiguous` is NOT owner. Without a subject there is no join key, so there is no match (fail closed).
+ * Telegram-bound or non-Google-identity-bound owners are therefore NOT matched here: they stay `member` (the existing link
+ * denial; their door is the Telegram login link). Ownership is deliberately not widened to cover them.
  */
-export async function isProvisionedOwnerEmail(env: Env, email: string | null): Promise<boolean> {
-  if (!email) return false
-  const resolved = await resolveHumanMemberForAttach(env, { tenant: env.TENANT_SLUG, email: email.trim().toLowerCase() }, true)
+export async function isProvisionedOwnerEmail(
+  env: Env,
+  email: string | null,
+  loginIdentity: { provider: string; subject: string } | undefined,
+): Promise<boolean> {
+  if (!email || !loginIdentity?.subject) return false
+  const resolved = await resolveHumanMemberForAttach(
+    env,
+    { tenant: env.TENANT_SLUG, provider: loginIdentity.provider, providerSubject: loginIdentity.subject, email: email.trim().toLowerCase() },
+    true,
+  )
   if (resolved.kind !== 'resolved') return false
   const row = await env.DB.prepare(
     `SELECT 1 AS present FROM members m JOIN capabilities c ON c.member_id = m.id

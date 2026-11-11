@@ -732,7 +732,7 @@ authApp.get('/dev-login', async (c) => {
 
   const email = (env.LOCAL_TEST_AUTH_EMAIL ?? 'local-owner@mupot.test').trim().toLowerCase()
   const preferredId = await deriveUserId('local-test', email)
-  const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true)
+  const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true, { provider: 'local-test', subject: email })
 
   await mintSession(c, userId, email, role, {
     secure: false,
@@ -935,7 +935,7 @@ authApp.get('/callback', async (c) => {
   // created this user — reuse that row so one human = one mupot user. `userId` is
   // canonical (may differ from derivedId if email-matched). allowBootstrapOwner=true:
   // the pot's own Google login is the legitimate first-owner path.
-  const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true, { provider: 'google', subject: info.sub })
 
   // Mint the session: random opaque id → server-side record in KV.
   // Fresh only on a PRESENT auth_time inside the reauth window (same verdict fn as reauth). Absent/stale/forged -> not fresh.
@@ -2222,6 +2222,9 @@ export async function upsertUserByEmail(
   preferredId: string,
   email: string | null,
   allowBootstrapOwner = false,
+  // The verified login identity (provider + subject) the caller authenticated with. Required for the provisioned-owner match,
+  // which must bind to the identity, never the email alone. Absent = no provisioned-owner match.
+  loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; role: OrgRole }> {
   const normEmail = email ? email.trim().toLowerCase() : null
 
@@ -2245,7 +2248,7 @@ export async function upsertUserByEmail(
     if (await claimFirstOwner(env, preferredId, normEmail)) {
       return { id: preferredId, role: 'owner' }
     }
-    if (await isProvisionedOwnerEmail(env, normEmail)) role = 'owner'
+    if (await isProvisionedOwnerEmail(env, normEmail, loginIdentity)) role = 'owner'
   }
 
   // INSERT … ON CONFLICT(id) suppresses an id race, but NOT a UNIQUE(email) violation
