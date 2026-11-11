@@ -14,6 +14,7 @@
 
 import type { Env } from '../types'
 import { humanDur } from '../flight/board'
+import { anySquadHasProjectWrite } from '../projects/access'
 
 // ── tunables ───────────────────────────────────────────────────────────────────────────────
 const MAX_AGENT = 128
@@ -22,7 +23,7 @@ const MAX_GATE = 300
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 200
 // A project (destination) is a slug-ish name: starts alnum, then [a-z0-9._-]. Linear regex.
-const PROJECT_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i
+export const PROJECT_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i
 const STATUSES = ['boarding', 'departed', 'arrived', 'delayed', 'cancelled'] as const
 export type JourneyStatus = (typeof STATUSES)[number]
 // Live = still on the board (not yet history). arrived/cancelled fall off into history.
@@ -178,10 +179,39 @@ export async function updateJourney(
   }
 }
 
+// ── project authorization (write) ───────────────────────────────────────────────────────────
+// A journey names its destination project as free text, so on its own the board lets any agent
+// post under another customer's project name (P0, board dee4b1f4). The route calls this BEFORE
+// boardJourney. Rule: an org admin may use any name (they can read every project anyway); anyone
+// else must post for an agent whose squad holds write/admin on the project the name resolves to
+// (project_squad_access). A name that resolves to no project and a project the squad has no access
+// to are the SAME refusal, so the answer reveals nothing about which projects exist.
+export async function canBoardUnderProject(
+  env: Env,
+  who: { isAdmin: boolean; agentId: string },
+  project: string,
+): Promise<boolean> {
+  if (who.isAdmin) return true
+  const agent = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1').bind(who.agentId).first<{ squad_id: string }>()
+  if (!agent?.squad_id) return false
+  const proj = await env.DB.prepare('SELECT id FROM projects WHERE LOWER(slug) = LOWER(?1) OR id = ?1 LIMIT 1')
+    .bind(project)
+    .first<{ id: string }>()
+  if (!proj) return false
+  return anySquadHasProjectWrite(env, proj.id, [agent.squad_id])
+}
+
 // ── list: read the board ───────────────────────────────────────────────────────────────────────
+// `canSee` is REQUIRED: the board is only ever read through a caller's visibility (agentVisibility
+// in src/mcp/provision.ts: org admin sees all, a bound agent sees itself, anyone else needs
+// observer-or-above on the agent's squad). It is applied BEFORE the limit, by paging, so a hidden
+// journey can neither take a slot nor change the response. A journey whose agent row is gone has no
+// squad and is visible only to an org admin.
+const LIST_PAGE = 200
+const LIST_MAX_PAGES = 20
 export async function listJourneys(
   env: Env,
-  opts: { scope?: 'live' | 'all'; limit?: number } = {},
+  opts: { scope?: 'live' | 'all'; limit?: number; canSee: (agent: { id: string; squad_id: string }) => Promise<boolean> },
 ): Promise<JourneyRow[]> {
   const tenant = env.TENANT_SLUG
   if (!tenant) return []
@@ -189,13 +219,21 @@ export async function listJourneys(
   if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) {
     limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(opts.limit)))
   }
-  const cols = 'id, tenant, agent, project, goal, status, gate, departed_at, eta, arrived_at, created_at, updated_at'
-  const sql =
-    opts.scope === 'live'
-      ? `SELECT ${cols} FROM journeys WHERE tenant = ?1 AND status IN ('boarding','departed','delayed') ORDER BY created_at DESC LIMIT ?2`
-      : `SELECT ${cols} FROM journeys WHERE tenant = ?1 ORDER BY created_at DESC LIMIT ?2`
-  const rows = await env.DB.prepare(sql).bind(tenant, limit).all<JourneyRow>()
-  return rows.results ?? []
+  const cols = 'j.id, j.tenant, j.agent, j.project, j.goal, j.status, j.gate, j.departed_at, j.eta, j.arrived_at, j.created_at, j.updated_at'
+  const live = opts.scope === 'live' ? " AND j.status IN ('boarding','departed','delayed')" : ''
+  const sql = `SELECT ${cols}, a.squad_id AS squad_id FROM journeys j LEFT JOIN agents a ON a.id = j.agent
+                WHERE j.tenant = ?1${live} ORDER BY j.created_at DESC, j.id ASC LIMIT ?2 OFFSET ?3`
+  const out: JourneyRow[] = []
+  for (let page = 0; page < LIST_MAX_PAGES && out.length < limit; page++) {
+    const rows = await env.DB.prepare(sql).bind(tenant, LIST_PAGE, page * LIST_PAGE).all<JourneyRow & { squad_id: string | null }>()
+    const batch = rows.results ?? []
+    for (const { squad_id, ...row } of batch) {
+      if (out.length >= limit) break
+      if (await opts.canSee({ id: row.agent, squad_id: squad_id ?? '' })) out.push(row)
+    }
+    if (batch.length < LIST_PAGE) break
+  }
+  return out
 }
 
 // ── board view model (pure — airport departures cards) ──────────────────────────────────────────
