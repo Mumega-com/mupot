@@ -54,7 +54,7 @@ describe('#1579 Telegram-first member web login', () => {
       INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-minter', 'minter@example.test', 'Minter', 'active', '${TENANT}');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-minter', 'member-minter', 'squad', 'squad-1', 'admin');
     `)
-    env = { DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN, SESSIONS: kv(),
+    env = { DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN, SESSIONS: kv(), OPEN_SIGNUP_ENABLED: 'true', /* these tests sign in brand-new emails; invite-only is covered by invite-only-signin.test.ts */
       OAUTH_PROVIDER: 'google', OAUTH_CLIENT_ID: 'cid', OAUTH_CLIENT_SECRET: 'sec' } as unknown as Env
   })
   afterEach(() => h.close())

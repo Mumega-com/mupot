@@ -45,7 +45,7 @@ import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
 import { ipRateLimitKey } from '../agents/seat-events'
 import { MemberAttachDeniedError, NewMemberRefusedError, type BeforeCreateGuard } from '../members/human-identity'
-import { INVITE_ONLY_TEXT, isOpenSignup } from '../auth/invite-only'
+import { decideSignIn, refusalText } from '../auth/invite-only'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
@@ -1909,18 +1909,20 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // 'unknown' if absent (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
     const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
 
+    // Invite-only (the SAME decision function the web doors use, src/auth/invite-only.ts): refused BEFORE any member row, signup
+    // grant, consent nonce, rate-limit counter or token. A real owner (active member, or a legacy owner/admin) passes; so does
+    // an invitee whose invite was redeemed. The first-owner claim is web-only, so it is not offered here.
+    const signIn = await decideSignIn(env, { door: 'oauth_mcp', email: googleUser.email, provider: 'google', subject: googleUser.id })
+    if (!signIn.allowed) {
+      return new Response(refusalText(signIn.reason), { status: 403, headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } })
+    }
+
     // Find-or-create the mupot member row for this verified email.
     let memberId: string
     // mupot#1022: true only when THIS login created the member row, so the consent screen can say so once, in-band.
     let memberJustCreated = false
     try {
-      // Invite-only: this guard runs only when no existing member matched (resolveHumanMemberForAttach said not_found),
-      // so existing and invite-accepted members never reach it. A stranger is refused here, before the rate-limit
-      // counter, the members INSERT, the signup-default grant, the consent nonce, or any token.
-      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, async () => {
-        if (!isOpenSignup(env)) return { allowed: false, retryAfter: 0, reason: 'invite_only' as const }
-        return checkOAuthRegRateLimit(env, ip)
-      }, {
+      const found = await findOrCreateMember(env, googleUser.email, googleUser.name, () => checkOAuthRegRateLimit(env, ip), {
         provider: 'google',
         subject: googleUser.id,
       })
@@ -1928,9 +1930,6 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       memberJustCreated = found.created
     } catch (err) {
       // B2: the guard refused a NEW member before any row was written.
-      if (err instanceof NewMemberRefusedError && err.reason === 'invite_only') {
-        return new Response(INVITE_ONLY_TEXT, { status: 403, headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } })
-      }
       if (err instanceof NewMemberRefusedError) {
         return new Response(
           'Too many new accounts have been created from this network recently, so we cannot create another one right now. '

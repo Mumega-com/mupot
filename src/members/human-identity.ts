@@ -36,18 +36,15 @@ export class MemberAttachDeniedError extends Error {
  */
 export class NewMemberRefusedError extends Error {
   readonly retryAfter: number
-  /** 'invite_only': the pot does not open accounts to strangers. Absent: a rate-limit refusal. */
-  readonly reason: 'invite_only' | undefined
-  constructor(retryAfter: number, reason?: 'invite_only') {
+  constructor(retryAfter: number) {
     super('new member creation refused by the pre-create guard')
     this.name = 'NewMemberRefusedError'
     this.retryAfter = retryAfter
-    this.reason = reason
   }
 }
 
 /** Runs immediately before the members INSERT, only when no existing member was found. `allowed: false` aborts the create. */
-export type BeforeCreateGuard = () => Promise<{ allowed: boolean; retryAfter: number; reason?: 'invite_only' }>
+export type BeforeCreateGuard = () => Promise<{ allowed: boolean; retryAfter: number }>
 
 export async function resolveVerifiedHumanMemberId(
   env: Env,
@@ -106,7 +103,7 @@ export async function findOrCreateHumanMemberDetailed(
   // so the guard sees exactly this function's creations: resolved/denied/ambiguous returned or threw above without it.
   // (Other code paths write members rows too; they are not metered here.)
   const guard = await beforeCreate()
-  if (!guard.allowed) throw new NewMemberRefusedError(guard.retryAfter, guard.reason)
+  if (!guard.allowed) throw new NewMemberRefusedError(guard.retryAfter)
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(

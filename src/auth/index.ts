@@ -32,7 +32,7 @@ import {
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
 import { claimFirstOwner, isProvisionedOwnerEmail } from './first-owner'
-import { hasSignInStanding, inviteOnlyBody } from './invite-only'
+import { decideSignIn, inviteOnlyBody } from './invite-only'
 import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
 import { linkSignIn, planLinkSignIn, unlinkSignIn } from './link-signin'
 import { checkWebSession } from '../secure-moments/enrol-mint'
@@ -934,10 +934,11 @@ authApp.get('/callback', async (c) => {
 
   // Invite-only: a person the pot does not already know (no live identity, no members row, no legacy owner/admin,
   // and not the first-owner ceremony of an empty pot) is refused BEFORE any write below (users row, session).
-  if (!(await hasSignInStanding(env, { email, provider: 'google', subject: info.sub, allowFirstOwner: true }))) {
+  const signIn = await decideSignIn(env, { door: 'google_web', email, provider: 'google', subject: info.sub, newUserId: derivedId })
+  if (!signIn.allowed) {
     c.header('Cache-Control', 'no-store')
     c.header('Referrer-Policy', 'no-referrer')
-    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG), 403)
+    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG, signIn.reason), 403)
   }
 
   // Dedup on verified email (#262): a prior mumega SSO handoff may have already
@@ -1386,8 +1387,9 @@ authApp.get('/handoff', async (c) => {
   // own-Google login OR this handoff = one user). preferredId for a handoff-first
   // user is hash(mumega:email); email-match reconciles it to any existing row.
   // allowBootstrapOwner defaults FALSE here — a handoff never mints the first owner.
-  if (!(await hasSignInStanding(env, { email: res.claim.email, provider: 'mumega', subject: res.claim.email }))) {
-    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG), 403)
+  const handoffDecision = await decideSignIn(env, { door: 'handoff', email: res.claim.email, provider: 'mumega', subject: res.claim.email })
+  if (!handoffDecision.allowed) {
+    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG, handoffDecision.reason), 403)
   }
   const preferredId = await deriveUserId('mumega', res.claim.email)
   const { id: userId, role } = await upsertUserByEmail(env, preferredId, res.claim.email)
@@ -1469,8 +1471,9 @@ async function finishEmailLoginSuccess(
   c.header('Referrer-Policy', 'no-referrer')
 
   // Invite-only: refuse an email the pot does not already know BEFORE upsertUserByEmail or any other write.
-  if (!(await hasSignInStanding(env, { email: emailNormalized, provider: 'email', subject: emailNormalized }))) {
-    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG), 403)
+  const emailDecision = await decideSignIn(env, { door: 'email', email: emailNormalized, provider: 'email', subject: emailNormalized })
+  if (!emailDecision.allowed) {
+    return c.html(inviteOnlyBody(env.BRAND || env.TENANT_SLUG, emailDecision.reason), 403)
   }
 
   // mupot#1564 adversarial gate round 2 (kasra-review + Athena BLOCK,

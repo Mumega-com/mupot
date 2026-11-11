@@ -758,8 +758,9 @@ describe('GET /auth/callback (Google login) — exclusive-control attach end to 
     const env = envFor(harness, memoryKv())
 
     const res = await googleLogin(env, 'suspendedclean@example.com', 'google-sub-suspended-clean')
-    expect(res.status).toBe(302) // login itself still succeeds, KV-only
-    expect(identityCountForEmail(harness)).toBe(0) // but no D1 identity/attach
+    // invite-only (src/auth/invite-only.ts): a suspended member is refused outright (it used to succeed KV-only). Still no attach.
+    expect(res.status).toBe(403)
+    expect(identityCountForEmail(harness)).toBe(0) // and no D1 identity/attach
   })
 
   it('P1-b: a competing bearer inserted INSIDE the callback\'s own race window makes the attach fail — proved through the real route, not a direct linkLoginIdentity call', async () => {
