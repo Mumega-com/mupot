@@ -102,6 +102,7 @@ beforeEach(async () => {
     DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN,
     OAUTH_CLIENT_ID: 'x.apps.googleusercontent.com', OAUTH_CLIENT_SECRET: 's',
     SESSIONS: kv, EMAIL_LOGIN_ENABLED: 'true', EMAIL_PROVIDER: 'console',
+    OPEN_SIGNUP_ENABLED: 'true', // the walk-in case below models an open-sign-up pot; invite-only itself is tested in invite-only-signin.test.ts
     AGENT: {
       idFromName: (n: string) => n,
       get: () => ({ fetch: async () => new Response(JSON.stringify({ cycles: 0 }), { headers: { 'content-type': 'application/json' } }) }),
