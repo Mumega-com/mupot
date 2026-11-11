@@ -17,6 +17,7 @@ import { listFleetAgentRuntimeView } from '../fleet/registry'
 import { listPresence } from '../fleet/presence'
 import { loadMotherboardData } from './motherboard'
 import { listJourneys, buildDepartureBoard } from '../coordination/journeys'
+import { agentVisibility } from '../auth/agent-visibility'
 import { listRunners } from '../runners/service'
 import { loadBrainPhysics } from './brain'
 import type { PhysicsSnapshot } from './brain'
@@ -57,7 +58,7 @@ export function makeMissionControlApp(shell: ShellFn) {
       listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
       listPresence(c.env, Date.now(), squadIds, true),
       loadMotherboardData(c.env, tenant, auth),
-      listJourneys(c.env, { scope: 'live' }).catch(() => []),
+      listJourneys(c.env, { scope: 'live', canSee: agentVisibility(c.env, auth) }).catch(() => []),
       loadBrainPhysics(c.env),
       loadTodaySpendScalar(c.env),
       listRunners(c.env, { squad_ids: squadIds, limit: 100 }),

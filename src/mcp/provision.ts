@@ -34,7 +34,8 @@
 import { findInFlightWork } from '../fleet/in-flight-work'
 import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { brandSquadScope, canOnSquad, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
+import { agentVisibility } from '../auth/agent-visibility'
+import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   createDepartment,
   updateDepartment,
@@ -817,30 +818,8 @@ const toolCreateAgent: ToolSpec = {
 }
 
 // ── resolve_agent ───────────────────────────────────────────────────────────────
-// Directory visibility (board a90ff195, P0 2026-11-10). The directory used to read the
-// whole `agents` table for any caller holding observer on ANY scope, which a stranger's
-// OAuth home squad satisfies. The rule now:
-//   - an org admin (isOrgAdmin) sees every agent, as before;
-//   - everyone else sees an agent only if they hold observer-or-above on THAT agent's
-//     squad through canOnSquad, the same primitive squad_member_list and peers use, so a
-//     home squad grant unlocks only that home squad (planeCoversScope), and observer
-//     means what it means for those reads: it may read the squad roster;
-//   - a bound agent always sees itself.
-// Callers answer "not visible" exactly as "not found".
-function agentVisibility(env: Env, auth: AuthContext): (agent: { id: string; squad_id: string }) => Promise<boolean> {
-  if (isOrgAdmin(auth)) return async () => true
-  const grants = auth.capabilities ?? []
-  const bySquad = new Map<string, Promise<boolean>>()
-  return async (agent) => {
-    if (auth.boundAgentId && agent.id === auth.boundAgentId) return true
-    let verdict = bySquad.get(agent.squad_id)
-    if (!verdict) {
-      verdict = canOnSquad(env, grants, agent.squad_id, 'observer')
-      bySquad.set(agent.squad_id, verdict)
-    }
-    return verdict
-  }
-}
+// Directory visibility (board a90ff195, P0 2026-11-10): see agentVisibility in ../auth/agent-visibility
+// (moved there so the coordination board shares the one rule without importing this module).
 
 // resolve-before-mint (Port 1.3): before minting a new agent, search existing agents
 // by name/slug across the whole pot so onboarding SEES the roles that already exist
