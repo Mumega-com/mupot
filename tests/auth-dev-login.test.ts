@@ -65,6 +65,10 @@ function seedCleanMemberRow(harness: SqliteD1Harness, email: string): void {
   harness.sqlite.exec(`
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('mem-local-owner', '${email}', 'Local Owner', 'active', '${TENANT}');
+    -- the provisioned-owner shape (src/pots/service.ts): the owner's member row holds an org owner grant, and there is no
+    -- users row yet. Owner on the first Google/dev sign-in comes from that grant, not from "first row in users".
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, granted_via)
+      VALUES ('cap-local-owner', 'mem-local-owner', 'org', NULL, 'owner', 'pot_provision');
   `)
 }
 

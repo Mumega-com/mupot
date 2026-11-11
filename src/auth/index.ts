@@ -31,6 +31,7 @@ import {
 } from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
+import { claimFirstOwner, isProvisionedOwnerEmail } from './first-owner'
 import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
 import { linkSignIn, planLinkSignIn, unlinkSignIn } from './link-signin'
 import { checkWebSession } from '../secure-moments/enrol-mint'
@@ -2235,10 +2236,17 @@ export async function upsertUserByEmail(
     .first<{ role: OrgRole }>()
   if (byId) return { id: preferredId, role: byId.role }
 
-  // 3. New user → bootstrap-owner only if the caller allows it (own-Google path).
-  const countRow = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>()
-  const isFirst = (countRow?.n ?? 0) === 0
-  const role: OrgRole = isFirst && allowBootstrapOwner ? 'owner' : 'member'
+  // 3. New user → owner ONLY on the Google web door (allowBootstrapOwner) and only for (a) the provisioned owner (an
+  //    active member of this tenant with a live org owner grant) or (b) an atomic claim on a truly empty pot. The old
+  //    "COUNT(*) FROM users = 0" test made the first STRANGER owner of every provisioned or MCP-only pot (those have
+  //    members but no users rows). See src/auth/first-owner.ts.
+  let role: OrgRole = 'member'
+  if (allowBootstrapOwner) {
+    if (await claimFirstOwner(env, preferredId, normEmail)) {
+      return { id: preferredId, role: 'owner' }
+    }
+    if (await isProvisionedOwnerEmail(env, normEmail)) role = 'owner'
+  }
 
   // INSERT … ON CONFLICT(id) suppresses an id race, but NOT a UNIQUE(email) violation
   // — two concurrent first-logins for the same email both pass step 1, both INSERT,
