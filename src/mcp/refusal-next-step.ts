@@ -92,6 +92,12 @@ const NEEDS_MINT = 'an admin to mint it an agent-bound workspace token with mint
 /** Rendered per request; the most specific matching row wins (tool 2, kinds 1). */
 export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
   // ── harness token with no seat ────────────────────────────────────────────────────────────────
+  // update_agent from a bound chat/agent session that is not the row's own self lane (an attached chat aiming at ANOTHER agent's row).
+  { error: 'operator_principal_required', tool: 'update_agent', who_acts: 'admin', next_tool: 'check_in',
+    next_step: 'update_agent from a bound session edits only that session\'s OWN agent row (pass your own agent id). Another agent\'s profile is edited by a squad admin or the owner. To say what you are running, call check_in { model, machine, harness, provider?, effort? }.' },
+  // An attached (human-confirmed) chat editing its OWN row, but a routing/authority field.
+  { error: 'forbidden', tool: 'update_agent', reasonIs: 'attached_seat_field_not_self_editable', overridesReason: true, who_acts: 'admin', next_tool: 'check_in',
+    next_step: 'an attached chat may update only its own purpose (a name is an address other agents send to, so it is not changed from a chat). Say what YOU run (model, host, harness) with check_in { model, machine, harness, provider?, effort? }: it is recorded per chat, so other chats on this agent are not overwritten. Routing and authority fields (slug, role, squad, owner, capabilities, skills, model_fallback, budget, autonomy, designation, credentials) are changed by a squad admin or the owner.' },
   { error: 'harness_session_seat_required', who_acts: 'self', next_tool: 'seat_select', next_step: SEAT_SELECT_STEP },
 
   // ── seat_select ───────────────────────────────────────────────────────────────────────────────

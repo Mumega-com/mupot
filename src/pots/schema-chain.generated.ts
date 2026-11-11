@@ -4829,9 +4829,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_inbox_attempt_runtime_custody" },
     ],
   },
+  {
+    file: "0273_attached_runtime.sql",
+    sha256: "15fbec7e5c87831bc5792b6a9b9a9e33cc9cca475ac00323dfba3b8908a8aa24",
+    statements: [
+      "CREATE TABLE IF NOT EXISTS agent_reported_runtime (\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL,\n  attachment_id         TEXT NOT NULL,\n  reported_by_member_id TEXT NOT NULL,\n  harness               TEXT,\n  machine               TEXT,\n  model                 TEXT,\n  provider              TEXT,\n  effort                TEXT,\n  first_reported_at     TEXT NOT NULL DEFAULT (datetime('now')),\n  reported_at           TEXT NOT NULL DEFAULT (datetime('now')),\n  PRIMARY KEY (tenant, agent_id, attachment_id)\n);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_reported_runtime_agent ON agent_reported_runtime(tenant, agent_id, reported_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "agent_reported_runtime" },
+      { type: "index", name: "idx_agent_reported_runtime_agent" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "b28b32fcba361a14e4f3182c7bab6904a4e9a109c12343265fd7cf51dc38b560"
+export const SCHEMA_CHAIN_DIGEST: string = "48974219b201b4edef2979417add119fc85ccfc4dc54f6cd93e44513aa3c1ce3"

@@ -311,6 +311,7 @@ import { recordNegotiation, describeRequestedVersion } from './negotiation-log'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { loadRuntimeTruth } from '../fleet/runtime-truth'
+import { attachedRuntimeSince, attachmentHasReported, type AttachedRuntimeRow, cleanAttachedRuntime, loadAttachedRuntime, recordAttachedRuntime } from './attached-runtime'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
@@ -6137,6 +6138,8 @@ const toolPeers: ToolSpec = {
     const nowMs = Date.now()
     // fca29748: the live self-reported runtime (check_in first), beside the unchanged profile `model`.
     const truth = await loadRuntimeTruth(env, (rows.results ?? []).map((r) => ({ id: r.id, slug: r.slug, model: r.model })), nowMs)
+    // What attached chats SAY they run, per attachment and self-reported. Kept out of live_model/live_runtime on purpose: one chat's claim is not the agent's runtime.
+    const attachedReports = await loadAttachedRuntime(env, (rows.results ?? []).map((r) => r.id), attachedRuntimeSince(nowMs)).catch(() => new Map<string, AttachedRuntimeRow[]>()) // advisory read
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
       const live = truth.get(row.id)
@@ -6146,6 +6149,7 @@ const toolPeers: ToolSpec = {
         name: row.name,
         role: row.role,
         model: row.model, // PROFILE value, meaning unchanged
+        attached_runtime: (attachedReports.get(row.id) ?? []).map((r) => ({ trust: 'self_reported', scope: 'attachment', harness: r.harness, machine: r.machine, model: r.model, provider: r.provider, effort: r.effort, reported_at: r.reported_at })),
         live_model: live?.model && live.model.trust !== 'profile' ? live.model.value : null,
         live_runtime: live ?? null,
         status: row.status,
@@ -6382,15 +6386,32 @@ const toolCheckIn: ToolSpec = {
     // held_harness is the non-routing inventory of that server row (id, stored kind, and the
     // same display canonical used everywhere else). It is not written to `presence`, and the
     // caller's harness argument is not an input to it.
-    if (attachedAuthority(auth)) {
+    const attachedCheckIn = attachedAuthority(auth)
+    if (attachedCheckIn) {
       const binding = auth.seatBinding
       const held = binding
         ? await loadHarness(env, binding.humanMemberId, binding.harnessId).catch(() => null)
         : null
+      // What the chat SAYS it runs is recorded as its own self-reported fact (agent_reported_runtime, keyed by the server-derived
+      // attachment). It is not `presence`: no liveness, no routing, no host claim. It never touches agents.* (the profile).
+      // Validated for storage from the RAW args (an omitted field is null and keeps its earlier value; an invalid one is dropped and named).
+      const { values: said, rejected } = cleanAttachedRuntime(args)
+      const saidSomething = Object.values(said).some((v) => v !== null)
+      let runtimeRecorded = false
+      if (saidSomething) {
+        try {
+          await recordAttachedRuntime(env, { agentId: attachedCheckIn.agentId, attachmentId: attachedCheckIn.attachmentId, memberId: attachedCheckIn.humanMemberId }, said)
+          runtimeRecorded = true
+        } catch {
+          // fail-soft like the rest of check_in: the echo below says it was not recorded
+        }
+      }
       return done({
         ...echo,
         debounced: false,
         presence_recorded: false,
+        runtime_recorded: runtimeRecorded,
+        ...(rejected.length > 0 ? { runtime_rejected: rejected } : {}),
         held_harness: held
           ? { id: held.id, kind: held.kind, kind_canonical: canonicalHarness(held.kind) }
           : null,
@@ -6939,7 +6960,18 @@ async function gatherWhoamiFacts(
     : undefined
   // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
   const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
+  // Runtime fact for the report_runtime onboarding step: ONLY for an attached chat (boot cannot record a runtime for it, and its report is keyed
+  // by its own attachment). Every other caller gets no fact, so no step. A failed read gives no step.
+  let runtime: WhoamiFacts['runtime']
+  const attachedForFacts = attachedAuthority(auth)
+  if (agentId && attachedForFacts) {
+    try {
+      runtime = { reported: await attachmentHasReported(env, attachedForFacts.agentId, attachedForFacts.attachmentId) }
+    } catch {
+      runtime = undefined
+    }
+  }
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(runtime ? { runtime } : {}), ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */

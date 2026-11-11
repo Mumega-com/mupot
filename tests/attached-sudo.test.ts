@@ -671,8 +671,8 @@ describe('sudo for attached chats: what stays refused WITH a live grant', () => 
     const bell = await code('set_agent_webhook_doorbell', { webhook_url: 'https://hooks.example.test/wake', bearer: 'x'.repeat(24) }, { ...env, WEBHOOK_DOORBELL: '1' } as Env)
     expect(bell).toContain('"ok":false')
     expect(n(`SELECT COUNT(*) AS n FROM agent_webhook_doorbells`)).toBe(0)
-    expect(await code('update_agent', { agent: 'agent-rava', purpose: 'hijacked purpose' })).toContain('"ok":false')
-    expect(one<{ purpose: string | null }>(`SELECT purpose FROM agents WHERE id = 'agent-rava'`)!.purpose).not.toBe('hijacked purpose')
+    expect(await code('update_agent', { agent: 'agent-rava', name: 'hijacked name' })).toContain('"ok":false')
+    expect(one<{ name: string | null }>(`SELECT name FROM agents WHERE id = 'agent-rava'`)!.name).not.toBe('hijacked name')
     expect(await code('check_in', { presence_mode: 'poll', poll_interval_sec: 30 })).toContain('attached_seat_cannot_set_presence_mode')
     expect(await code('check_in', { presence_mode: 'resident' })).toContain('attached_seat_cannot_set_presence_mode')
     for (const [tool, a] of [['presence_register', { adapter: 'x' }], ['presence_heartbeat', {}], ['presence_deregister', {}], ['report_run_usage', { run_id: 'r1', model: 'm', input: 1, output: 1 }], ['list_agent_sessions', {}]] as Array<[string, Record<string, unknown>]>) {

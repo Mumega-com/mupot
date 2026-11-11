@@ -1404,6 +1404,9 @@ export interface AuditActor {
   type: 'agent' | 'user' | 'system'
   /** Server authorization result, never copied from request arguments. Recorded with the owner change. */
   ownerAssignmentOrgAdmin?: boolean
+  /** Set only for a write made through a human-confirmed ATTACHED chat: server-derived (never from args). The audit row's after_state
+   *  then carries `_attached_by_member_id` and `_attachment_id`, so the write is traceable to the confirming human and the attachment. */
+  attachment?: { attachmentId: string; confirmingMemberId: string }
 }
 
 // A call that supplies no actor is a system-initiated correction — migrations,
@@ -1732,9 +1735,14 @@ export async function updateAgentProfile(
   const expectBinds: (string | null)[] = expect ? [expect.attach_designated_member_id,
     ...(expect.owner_member_id !== undefined ? [expect.owner_member_id] : []),
     ...(expect.ownerAuditId !== undefined ? [expect.ownerAuditId] : [])] : []
-  const afterSnapshot = patch.owner_member_id !== undefined
+  const baseSnapshot = patch.owner_member_id !== undefined
     ? `json_set(${AGENT_SNAPSHOT_JSON}, '$._owner_assignment_org_admin', ${actor.ownerAssignmentOrgAdmin === true && actor.type === 'user' ? 1 : 0})`
     : AGENT_SNAPSHOT_JSON
+  // Both ids are server-derived; they are inlined as SQL literals (quotes doubled) because the statement's positional binds are fixed below.
+  const sqlLiteral = (v: string): string => `'${v.replace(/'/g, "''")}'`
+  const afterSnapshot = actor.attachment
+    ? `json_set(${baseSnapshot}, '$._attached_by_member_id', ${sqlLiteral(actor.attachment.confirmingMemberId)}, '$._attachment_id', ${sqlLiteral(actor.attachment.attachmentId)})`
+    : baseSnapshot
   let changes = 0
   try {
     // No updated_at column on `agents` — 0049 rebuilt the table without one and
