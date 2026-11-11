@@ -79,6 +79,16 @@ function provision(h: SqliteD1Harness, tenant = TENANT): void {
     INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-lead',NULL,'Lead Agent','active','${tenant}');`)
 }
 
+/** An agent identity weld as src/members/service.ts writes it: a NULL-email member bound to an agent. */
+function agentMember(h: SqliteD1Harness, memberId: string, tenant = TENANT): void {
+  h.sqlite.exec(`
+    INSERT OR IGNORE INTO departments (id, slug, name) VALUES ('d-ag','d-ag','D');
+    INSERT OR IGNORE INTO squads (id, department_id, slug, name) VALUES ('sq-ag','d-ag','sq-ag','S');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-${memberId}','sq-ag','ag-${memberId}','Agent','active');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('${memberId}',NULL,'Agent','active','${tenant}');
+    INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${tenant}','ag-${memberId}','${memberId}','2026-01-01T00:00:00.000Z');`)
+}
+
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 describe('provisioned pot (members + org owner grant, zero users rows)', () => {
@@ -146,10 +156,17 @@ describe('MCP-only pot (human members, no users rows, no owner grant)', () => {
 describe('other signals of a non-empty pot', () => {
   it('an org admin grant held by an email-less (agent) member keeps the pot non-empty', async () => {
     const h = createSqliteD1(); applyAllMigrations(h.sqlite)
-    h.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-agent',NULL,'Agent','active','${TENANT}');
-      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-a','mem-agent','org',NULL,'admin')`)
+    agentMember(h, 'mem-agent')
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('c-a','mem-agent','org',NULL,'admin')`)
     await webSignIn(mkEnv(h), 'sub-s', 's@gmail.test')
     expect(userRole(h, 's@gmail.test')).toBe('member')
+  })
+
+  it('agent-bound members alone (no human, no org grant) do NOT make the pot non-empty: the first human is owner', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite)
+    agentMember(h, 'mem-agent')
+    await webSignIn(mkEnv(h), 'sub-first', 'first@here.test')
+    expect(userRole(h, 'first@here.test')).toBe('owner')
   })
 
   it('an existing owner_bootstrap_claim keeps the pot non-empty even with no users or members rows', async () => {
