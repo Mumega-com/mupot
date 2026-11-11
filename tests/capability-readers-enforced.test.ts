@@ -85,6 +85,10 @@ function fingerprint(sql: string): string {
  *  query, never the file — a file is not the unit of authority, a query is. */
 const NON_AUTHORIZING_READS: ReadonlyArray<{ fingerprint: string; why: string }> = [
   {
+    fingerprint: 'f6f453bec3c6',
+    why: "auth/first-owner POT_IS_EMPTY_SQL — decides whether the pot is EMPTY before the first Google sign-in may claim ownership. It grants nothing from the row; a lapsed org owner/admin grant must still count as 'not empty' (fail closed), so filtering on expiry here would re-open first-owner capture.",
+  },
+  {
     fingerprint: 'aa4c890eaf7d',
     why: "auth/grant-events capabilityReviewedEvents — snapshots the row being reviewed into grant_events. A history write must record the stored row whether or not it has lapsed.",
   },
