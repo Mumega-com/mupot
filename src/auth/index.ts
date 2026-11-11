@@ -31,6 +31,7 @@ import {
 } from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { decideIdentitylessAttach } from '../members/exclusive-control'
+import { claimFirstOwner, isProvisionedOwnerEmail } from './first-owner'
 import { previewTelegramLoginLink, redeemTelegramLoginLink, telegramLoginTokenHash } from './telegram-login-link'
 import { linkSignIn, planLinkSignIn, unlinkSignIn } from './link-signin'
 import { checkWebSession } from '../secure-moments/enrol-mint'
@@ -731,7 +732,7 @@ authApp.get('/dev-login', async (c) => {
 
   const email = (env.LOCAL_TEST_AUTH_EMAIL ?? 'local-owner@mupot.test').trim().toLowerCase()
   const preferredId = await deriveUserId('local-test', email)
-  const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true)
+  const { id: userId, role } = await upsertUserByEmail(env, preferredId, email, true, { provider: 'local-test', subject: email })
 
   await mintSession(c, userId, email, role, {
     secure: false,
@@ -934,7 +935,7 @@ authApp.get('/callback', async (c) => {
   // created this user — reuse that row so one human = one mupot user. `userId` is
   // canonical (may differ from derivedId if email-matched). allowBootstrapOwner=true:
   // the pot's own Google login is the legitimate first-owner path.
-  const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true)
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, email, true, { provider: 'google', subject: info.sub })
 
   // Mint the session: random opaque id → server-side record in KV.
   // Fresh only on a PRESENT auth_time inside the reauth window (same verdict fn as reauth). Absent/stale/forged -> not fresh.
@@ -2221,6 +2222,9 @@ export async function upsertUserByEmail(
   preferredId: string,
   email: string | null,
   allowBootstrapOwner = false,
+  // The verified login identity (provider + subject) the caller authenticated with. Required for the provisioned-owner match,
+  // which must bind to the identity, never the email alone. Absent = no provisioned-owner match.
+  loginIdentity?: { provider: string; subject: string },
 ): Promise<{ id: string; role: OrgRole }> {
   const normEmail = email ? email.trim().toLowerCase() : null
 
@@ -2235,10 +2239,17 @@ export async function upsertUserByEmail(
     .first<{ role: OrgRole }>()
   if (byId) return { id: preferredId, role: byId.role }
 
-  // 3. New user → bootstrap-owner only if the caller allows it (own-Google path).
-  const countRow = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>()
-  const isFirst = (countRow?.n ?? 0) === 0
-  const role: OrgRole = isFirst && allowBootstrapOwner ? 'owner' : 'member'
+  // 3. New user → owner ONLY on the Google web door (allowBootstrapOwner) and only for (a) the provisioned owner (an
+  //    active member of this tenant with a live org owner grant) or (b) an atomic claim on a truly empty pot. The old
+  //    "COUNT(*) FROM users = 0" test made the first STRANGER owner of every provisioned or MCP-only pot (those have
+  //    members but no users rows). See src/auth/first-owner.ts.
+  let role: OrgRole = 'member'
+  if (allowBootstrapOwner) {
+    if (await claimFirstOwner(env, preferredId, normEmail)) {
+      return { id: preferredId, role: 'owner' }
+    }
+    if (await isProvisionedOwnerEmail(env, normEmail, loginIdentity)) role = 'owner'
+  }
 
   // INSERT … ON CONFLICT(id) suppresses an id race, but NOT a UNIQUE(email) violation
   // — two concurrent first-logins for the same email both pass step 1, both INSERT,
