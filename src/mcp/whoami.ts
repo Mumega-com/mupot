@@ -39,7 +39,7 @@ export interface WhoamiMissing {
 }
 
 /** The six onboarding cases (mupot 13f6b7e8) plus the unseated harness, which is the one state none of them covers. */
-export type OnboardingCase = 'existing_oauth' | 'workspace_bearer' | 'own_chat' | 'attached_chat' | 'wrong_expected_principal' | 'revoked_consent' | 'harness_unseated'
+export type OnboardingCase = 'existing_oauth' | 'workspace_bearer' | 'own_chat' | 'attached_chat' | 'wrong_expected_principal' | 'revoked_consent' | 'harness_unseated' | 'report_runtime'
 
 /** The ONE legal next step for this caller. Derived from the same state and missing[] as the rest of whoami; a read only. */
 export interface OnboardingNext {
@@ -91,6 +91,9 @@ export interface WhoamiFacts {
   report?: { missingFields: string[]; outcome?: string; detail?: string }
   /** Admission status of this request's seat (ADMISSION_TAPE on, seat has a status). Absent otherwise. */
   admission?: { status: 'observed' | 'trusted' | 'held'; reason_class: string }
+  /** An ATTACHED chat only: has this attachment made any runtime report (a check_in with at least one valid field)? Absent = not an attached chat,
+   *  or not read, which asks for nothing (never a step on a guess). */
+  runtime?: { reported: boolean }
   /** Seat sessions only: can the human behind this seat press 'Allow for me' (org admin)? Absent = unknown (the original copy). */
   humanCanDesignate?: boolean
   /** HINT ONLY (mupot#2309): the human behind this connection holds org admin standing, so never send them to "ask an admin". */
@@ -291,6 +294,11 @@ export function onboardingNext(
   if (missing.some((m) => m.code === 'consent_lapsed')) {
     const m = missing.find((x) => x.code === 'consent_lapsed')
     return { case: 'revoked_consent', who_acts: 'owner', next_step: m?.next_step ?? `your human reconnects the connector and picks ${labels.one}.`, link: consentUrl }
+  }
+  // After identity is settled and before the steady-state step: an attached chat that has not yet reported what it runs. One step, shown until this
+  // attachment makes any valid report (a check_in with no model still clears it), then never again. Stored facts only.
+  if (state === 'acting_as' && basis === 'attached' && facts.runtime && !facts.runtime.reported && missing.length === 0) {
+    return { case: 'report_runtime', who_acts: 'self', next_tool: 'check_in', next_step: 'tell the pot what you are running: call check_in { model, machine, harness } (provider and effort if you know them). Use your real model id, the host or machine name and the harness (for example orca, claude-code, chatgpt). It is recorded for this chat as self-reported and does not change the agent profile. A model, provider or harness containing spaces or markup is refused.' }
   }
   if (state === 'acting_as' && basis === 'attached') {
     const m = missing[0]

@@ -2155,6 +2155,18 @@ async function readAuditDiff(
 // the same two checks — whether hasWorkspaceAdmin is ALSO redundant there is
 // a question about the shared floor, not about this tool, and simplifying
 // the shared floor is out of scope here. Match it, don't improve on it.
+// What a human-confirmed ATTACHED seat may change on its own row. DESCRIPTIVE only. Every other update_agent field is refused:
+//   refused (routing/authority): slug (resolves identity), role (system prompt + rank), owner/owner_member_id (whose identity a
+//   verdict may carry), attach_designated_member_id, qnft_ref, capabilities, budget_cap_cents, budget_window, autonomy.
+//   refused (ambiguous, listed for the owner): skills and model_fallback (a runtime may read them to choose work or a model).
+//   refused (by design): name. It is an ADDRESS, not a description: send resolves by display name, IM and channel routing read it, and
+//   it goes raw into the agent's system prompt (PR #1289 took it out of the agent's own self lane for the same reasons). A chat could
+//   rename itself onto another agent's id, slug or name and cut that agent's mail. Renaming returns later as a designed feature (board task 8fe4aaf6).
+//   refused (by design): model. Several chats can attach to one agent on different models; one agent-row value would be overwritten
+//   by the last writer. Each attachment reports its own live runtime with check_in (agent_reported_runtime) instead.
+/** The machine reason carried in the detail of a 403 forbidden (the refusal table keys the next step on it). */
+export const ATTACHED_FIELD_REFUSAL = 'attached_seat_field_not_self_editable'
+export const ATTACHED_SELF_PATCHABLE_FIELDS = ['purpose'] as const
 export const SELF_PATCHABLE_FIELDS = ['model', 'model_fallback', 'purpose', 'skills'] as const
 export const SELF_FORBIDDEN_FIELDS = [
   'slug',
@@ -2217,6 +2229,8 @@ const toolUpdateAgent: ToolSpec = {
     ' identity a harness-attested human_origin on task_verdict may carry (a self-write would be a' +
     ' self-grant), so all three are deliberately excluded from the self lane. Every non-self call' +
     ' (a different agent-bound target, or a non-bound member) needs admin on the target agent squad or org.' +
+    ' ATTACHED SEAT LANE: a chat whose attachment a human confirmed may edit only purpose on its OWN row (the audit row names the confirming human and the attachment);' +
+    ' everything else, name included, is refused with a next step. It reports model/host/harness with check_in instead (recorded per chat).' +
     ' owner_member_id: null clears it (squad-admin suffices, same as any other admin-lane field); a' +
     ' non-null value must be an existing member id in this tenant with no leading/trailing/inner' +
     ' whitespace (invalid_args otherwise), and the caller must ALSO hold admin on the ORG scope' +
@@ -2299,13 +2313,24 @@ const toolUpdateAgent: ToolSpec = {
     // carries, unchanged from before this fix.
     // W2: an ATTACHED thread shares the agent's boundAgentId but is not the agent: it gets no self lane (it would rewrite
     // agents.model/purpose/skills, which feed routing) and falls to the structural gate like any other non-self caller.
-    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id && !attachedAuthority(auth)
-    if (auth.boundAgentId && !isSelf) {
+    const attached = attachedAuthority(auth)
+    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id && !attached
+    // Owner decision (2026-11-11): a seat whose attachment a human CONFIRMED (attachedAuthority is non-null only for a live, admitted
+    // attachment; a pending one never carries it) may correct its OWN descriptive profile, within ATTACHED_SELF_PATCHABLE_FIELDS.
+    const isAttachedSelf = attached !== null && auth.boundAgentId === agent.id && attached.agentId === agent.id
+    if (auth.boundAgentId && !isSelf && !isAttachedSelf) {
       const updateGate = await structuralGate(env, auth, 'update_agent')
       return updateGate.kind === 'refused' ? structuralFail(updateGate) : fail(403, 'operator_principal_required')
     }
 
-    if (isSelf) {
+    if (isAttachedSelf) {
+      // Everything that is not descriptive is refused with a next step, BEFORE any write, in the admin list's fixed order.
+      for (const field of ADMIN_PATCHABLE_FIELDS) {
+        if (field in args && !(ATTACHED_SELF_PATCHABLE_FIELDS as readonly string[]).includes(field)) {
+          return fail(403, 'forbidden', { reason: ATTACHED_FIELD_REFUSAL, field })
+        }
+      }
+    } else if (isSelf) {
       // Authority / identity-reference fields (including name/role — see the
       // block comment above toolUpdateAgent) stay admin-gated even on the
       // caller's own row. Checked BEFORE any write (patch isn't even built
@@ -2332,7 +2357,7 @@ const toolUpdateAgent: ToolSpec = {
       }
     }
 
-    const PATCHABLE = isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
+    const PATCHABLE = isAttachedSelf ? ATTACHED_SELF_PATCHABLE_FIELDS : isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
 
     const patch: AgentProfilePatch = {}
     for (const key of PATCHABLE) {
@@ -2401,7 +2426,10 @@ const toolUpdateAgent: ToolSpec = {
     // emitProvisioned below) and can be lost on a bus failure while the audit
     // row still commits. self_report is a same-request convenience for a live
     // listener, not the record of truth. No schema change in this PR.
-    const actor: AuditActor = isSelf
+    const actor: AuditActor = isAttachedSelf
+      // The agent is the actor of record; the confirming human and the attachment ride in the same atomic audit row (after_state).
+      ? { id: auth.boundAgentId as string, type: 'agent', attachment: { attachmentId: attached.attachmentId, confirmingMemberId: attached.humanMemberId } }
+      : isSelf
       ? { id: auth.boundAgentId as string, type: 'agent' }
       : { id: auth.memberId as string, type: 'user', ownerAssignmentOrgAdmin: ownerGate.ownerAssignmentOrgAdmin }
 
@@ -2437,6 +2465,7 @@ const toolUpdateAgent: ToolSpec = {
       changed,
       reason: str(args.reason) || undefined,
       ...(isSelf ? { self_report: true } : {}),
+      ...(isAttachedSelf ? { attachment_id: attached.attachmentId, attached_human_member_id: attached.humanMemberId } : {}),
     })
 
     return done({ agent: result.value, changed, audit_id: result.auditId })
