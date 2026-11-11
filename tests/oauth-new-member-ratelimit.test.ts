@@ -48,7 +48,7 @@ function setup(kvOpts: { throwOn?: 'get' | 'put' | 'both' } = {}) {
     lookupClient: vi.fn(async () => ({ clientName: 'Claude' })),
   }
   const env = {
-    DB: h.db, TENANT_SLUG: 'mumega', BRAND: 'mupot', POT_TIER: 'scale',
+    DB: h.db, TENANT_SLUG: 'mumega', BRAND: 'mupot', POT_TIER: 'scale', OPEN_SIGNUP_ENABLED: 'true',
     GOOGLE_CLIENT_ID: 'cid.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'secret',
     SESSIONS: sessions, OAUTH_PROVIDER: provider, BUS: { send: async () => {} },
   } as unknown as Env

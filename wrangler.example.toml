@@ -73,6 +73,7 @@ POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout 
                                   # checkout_unavailable. Keep "false" until the create_pot webhook
                                   # provisions the pot (today a buyer is billed and gets no pot).
 # EMAIL_LOGIN_ENABLED = "true"    # mupot#1564/#1442: email one-time link/code sign-in beside Google
+# OPEN_SIGNUP_ENABLED = "true"     # DEFAULT CLOSED (invite-only). Set only to let strangers sign in/create a member row (src/auth/invite-only.ts)
                                   # (POST /auth/email/start, GET/POST /auth/email/verify). ONLY the
                                   # exact string "true" enables; anything else/unset = 404 on those
                                   # routes and the landing page hides the "Continue with email" form.

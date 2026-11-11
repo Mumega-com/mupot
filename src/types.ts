@@ -357,6 +357,9 @@ export interface Env {
   // isEmailLoginEnabled() in src/auth/email-login.ts. Landing hides the email
   // option and /auth/email/* 404s when unset/false.
   EMAIL_LOGIN_ENABLED?: string
+  // Invite-only sign-in (src/auth/invite-only.ts): sign-in by a person the pot does not already know is refused
+  // unless this is EXACTLY "true" (explicit opt-in to open sign-up). Unset = closed.
+  OPEN_SIGNUP_ENABLED?: string
   // 'console' (dev/test — logs the link+code, never sends real mail) or unset
   // (Resend, the only real provider today). LOCAL_TEST_AUTH=1 also forces the
   // console sender regardless of this value. See src/auth/email-sender.ts.
