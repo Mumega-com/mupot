@@ -10,6 +10,7 @@ import { csrf } from 'hono/csrf'
 import type { Env, Agent, AuthContext, BusEvent } from '../types'
 import { requireAuth } from '../auth'
 import { createBus } from '../bus'
+import { squadVisibility } from '../org/visibility'
 // Fine-grained RBAC. /wake targets the agent's SQUAD scope (lead+). The squad id
 // is only known after the agent row loads, so we check inline rather than as
 // route middleware (the scope is data-derived, not static).
@@ -128,6 +129,15 @@ agentsApp.get('/:agentId/status', async (c) => {
   const agentId = c.req.param('agentId')
   const agent = await loadAgent(c.env, agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
+
+  // Visibility: a bound agent sees itself; everyone else needs observer+ on the agent's squad
+  // (./org/visibility; an org admin covers work squads, never another member's home squad).
+  // A hidden agent answers exactly as a missing one.
+  const auth = c.get('auth')
+  if (!(auth.boundAgentId && auth.boundAgentId === agent.id)) {
+    const scope = await loadSquadScope(c.env, agent.squad_id)
+    if (!scope || !(await squadVisibility(c.env, auth)(scope))) return c.json({ error: 'agent_not_found' }, 404)
+  }
 
   const stub = c.env.AGENT.get(c.env.AGENT.idFromName(agent.id))
   const res = await stub.fetch('https://agent/status')
