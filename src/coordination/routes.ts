@@ -74,11 +74,13 @@ coordinationApp.post('/', async (c) => {
   const project = typeof b.project === 'string' ? b.project : ''
   const eta = typeof b.eta_ms === 'number' ? b.eta_ms : undefined
 
-  // Format first (400 invalid_project says nothing about existence), then standing on the project.
-  if (!PROJECT_RE.test(project)) return c.json({ error: 'invalid_project' }, 400)
-  const auth = await callerAuth(c.env, id)
-  if (!(await canBoardUnderProject(c.env, { isAdmin: isOrgAdmin(auth), agentId: id.boundAgentId }, project))) {
-    return c.json({ error: 'project_not_found' }, 404)
+  // Standing on the project is checked only for a well-formed name; a malformed one falls through to
+  // boardJourney, which answers 400 invalid_project exactly as before (no existence information).
+  if (PROJECT_RE.test(project)) {
+    const auth = await callerAuth(c.env, id)
+    if (!(await canBoardUnderProject(c.env, { isAdmin: isOrgAdmin(auth), agentId: id.boundAgentId }, project))) {
+      return c.json({ error: 'project_not_found' }, 404)
+    }
   }
 
   const res = await boardJourney(c.env, {
