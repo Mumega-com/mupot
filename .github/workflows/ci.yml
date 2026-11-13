@@ -79,6 +79,12 @@ jobs:
         run: npx vitest run --config vitest.composition.config.ts
       - name: Bearer push Durable Object tests (workerd)
         run: npx vitest run --config vitest.bearer.config.ts
+      # The cross-customer boundary suite (tests/boundary/): the isolation reviewers' probes, kept as one
+      # named suite. It also runs inside the sharded default run (so it cannot be skipped there); this step
+      # gives it its own name and puts it in the required `build` lane. A red here reads "one customer can
+      # see or change another's data", not "some unit test failed".
+      - name: Boundary suite (cross-customer isolation)
+        run: npm run test:boundary
       - name: Fleet runtime tests
         run: node --test 'fleet-runtime/**/*.test.mjs'
       # Router routing-rule tests. Wired here rather than left to vitest because

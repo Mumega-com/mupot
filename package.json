@@ -15,6 +15,8 @@
     "gen:cli-bundle": "node scripts/gen-cli-bundle.mjs",
     "pretest": "node scripts/generate-build-info.mjs",
     "test": "vitest run",
+    "pretest:boundary": "node scripts/generate-build-info.mjs",
+    "test:boundary": "vitest run tests/boundary",
     "migrate:local": "wrangler d1 migrations apply mupot --local",
     "migrate:local:test": "wrangler d1 migrations apply mupot-local-test --local --config wrangler-local-test.toml",
     "seed:local:test": "wrangler d1 execute mupot-local-test --local --config wrangler-local-test.toml --file scripts/local-test-seed.sql",
