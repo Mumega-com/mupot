@@ -131,6 +131,7 @@ function envFor(harness: SqliteD1Harness, kv: KvStore, overrides: Partial<Env> =
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
+    OPEN_SIGNUP_ENABLED: 'true',
     BRAND,
     PUBLIC_ORIGIN: ORIGIN,
     OAUTH_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',

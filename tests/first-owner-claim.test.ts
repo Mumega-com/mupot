@@ -35,6 +35,7 @@ function memoryKv() {
 const mkEnv = (h: SqliteD1Harness) => ({
   DB: h.db, TENANT_SLUG: TENANT, BRAND: 'Test Pot', PUBLIC_ORIGIN: ORIGIN,
   OAUTH_CLIENT_ID: 'cid.apps.googleusercontent.com', OAUTH_CLIENT_SECRET: 'secret', SESSIONS: memoryKv(),
+  OPEN_SIGNUP_ENABLED: 'true', // PR B: this suite pins the OWNER rule (who becomes owner); strangers' refusal is invite-only-signin.test.ts
 }) as unknown as Env
 
 function stubGoogle(users: Record<string, { sub: string; email: string }>) {

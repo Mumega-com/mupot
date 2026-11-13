@@ -79,6 +79,9 @@ POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout 
                                   # Requires RESEND_API_KEY (secret, below) + RESEND_FROM_EMAIL (var,
                                   # below) in production, or EMAIL_PROVIDER="console"/LOCAL_TEST_AUTH=1
                                   # for local dev (logs the link+code instead of sending real mail).
+# OPEN_SIGNUP_ENABLED = "true"   # DEFAULT CLOSED = invite-only sign-in. ONLY the exact string "true" lets people the pot does
+                                  # not already know sign in (Google web, email, handoff, MCP OAuth). Leave unset in production.
+                                  # Strangers see "This pot is invite-only"; invite them from the dashboard. src/auth/invite-only.ts
 # EMAIL_PROVIDER = "console"      # dev/test only — see src/auth/email-sender.ts. Leave unset in prod
                                   # (Resend is the only real provider today).
 # RESEND_FROM_EMAIL = "Mumega <login@mumega.com>"  # non-secret from-address. SAME var name as

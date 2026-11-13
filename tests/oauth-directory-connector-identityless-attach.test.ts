@@ -91,6 +91,7 @@ function httpEnv(harnessRef: SqliteD1Harness, oauthProvider: ReturnType<typeof s
   const env = {
     DB: harnessRef.db,
     TENANT_SLUG: TENANT,
+    OPEN_SIGNUP_ENABLED: 'true',
     BRAND: 'mupot',
     POT_TIER: 'scale',
     GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
@@ -220,6 +221,7 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
     const webEnv = {
       DB: harness.db,
       TENANT_SLUG: TENANT,
+      OPEN_SIGNUP_ENABLED: 'true',
       BRAND: 'mupot',
       PUBLIC_ORIGIN: ORIGIN,
       OAUTH_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',

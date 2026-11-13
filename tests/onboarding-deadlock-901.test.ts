@@ -89,6 +89,7 @@ function httpEnv(harnessRef: SqliteD1Harness, oauthProvider: ReturnType<typeof s
   const env = {
     DB: harnessRef.db,
     TENANT_SLUG: TENANT,
+    OPEN_SIGNUP_ENABLED: 'true',
     BRAND: 'mupot',
     GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
     GOOGLE_CLIENT_SECRET: 'client-secret',
