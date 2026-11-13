@@ -18,6 +18,7 @@ import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context } from 'hono'
+import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { csrf } from 'hono/csrf'
@@ -56,6 +57,8 @@ export interface StudioDispatchInput {
   prompt: string
   repoUrl?: string
   model?: string
+  /** Target squad. Omitted: the caller's bound agent's squad, else their first squad at member rank. */
+  squadId?: string
 }
 
 export interface StudioDispatchOk {
@@ -149,7 +152,8 @@ export async function loadStudioData(env: Env, auth: AuthContext): Promise<Studi
   let supabaseTables: StudioTableSummary[] = []
   let hasSupabase = false
   try {
-    const raw = await resolveConnector(env, 'pot', 'supabase')
+    // Finding 2778c210: the pot-scope connector credential is decrypted for org admins only, never for a member.
+    const raw = isOrgAdmin(auth) ? await resolveConnector(env, 'pot', 'supabase') : null
     if (raw) {
       hasSupabase = true
       const parsed = JSON.parse(raw)
@@ -190,7 +194,7 @@ export async function dispatchStudioFlight(
   env: Env,
   auth: AuthContext,
   input: StudioDispatchInput,
-): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 409 | 429; error: string }> {
+): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 403 | 409 | 429; error: string; next_step?: string }> {
   const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : ''
   if (!prompt) return { ok: false, status: 400, error: 'prompt_required' }
 
@@ -208,8 +212,12 @@ export async function dispatchStudioFlight(
   }
 
   const model = normalizeStudioModel(input.model)
-  const home = await resolveStudioHome(env, auth)
-  if (!home) return { ok: false, status: 409, error: 'no_squad' }
+  const home = await resolveStudioHome(env, auth, typeof input.squadId === 'string' ? input.squadId.trim() : '')
+  if (home === 'forbidden') {
+    // One answer for "no such squad", "hidden squad" and "squad you cannot write to": no existence oracle.
+    return { ok: false, status: 403, error: 'squad_forbidden', next_step: STUDIO_SQUAD_FORBIDDEN_NEXT_STEP }
+  }
+  if (!home) return { ok: false, status: 409, error: 'no_squad', next_step: STUDIO_NO_SQUAD_NEXT_STEP }
 
   const title = prompt.length > 80 ? `${prompt.slice(0, 77)}…` : prompt
   const reservedFlightId = crypto.randomUUID()
@@ -273,7 +281,8 @@ export async function dispatchStudioFlight(
   // Not itself clearance-gated either way (would self-block Deploy -> Studio).
   const flightId = await createFlight(env, {
     agent: home.agentId,
-    dispatched_by: auth.boundAgentId ?? home.agentId,
+    // The caller's own identity, never the target agent's (that would impersonate it as dispatcher).
+    dispatched_by: auth.boundAgentId ?? `member:${auth.memberId ?? auth.userId}`,
     goal: prompt,
     trigger_source: 'api',
     meta: {
@@ -1044,27 +1053,53 @@ export function isSafeRepoUrl(value: string): boolean {
   }
 }
 
+const STUDIO_SQUAD_FORBIDDEN_NEXT_STEP =
+  'Dispatch needs member rank on the target squad. Ask an org admin or the squad lead for a member grant on that squad, or omit squad_id to use one of your own squads.'
+const STUDIO_NO_SQUAD_NEXT_STEP =
+  'You hold member rank on no squad with an agent to take this. Ask an org admin for a member grant on a squad.'
+
+// Resolves where a Studio dispatch lands, and refuses ('forbidden') unless the caller holds at least member rank on
+// that TARGET squad (the same resolveAccessibleSquadIds predicate the peers/fleet surfaces use). There is no pot-wide
+// fallback: a caller with no standing gets nothing, never "the first agent by name" in someone else's squad.
 async function resolveStudioHome(
   env: Env,
   auth: AuthContext,
-): Promise<{ agentId: string; squadId: string } | null> {
-  if (auth.boundAgentId) {
-    const bound = await env.DB.prepare(
-      `SELECT id, squad_id FROM agents WHERE id = ?1 AND status = 'active' LIMIT 1`,
-    )
+  requestedSquadId: string,
+): Promise<{ agentId: string; squadId: string } | 'forbidden' | null> {
+  const accessible = await resolveAccessibleSquadIds(env, auth, 'member')
+  const mayWrite = (squadId: string): boolean => accessible === null || accessible.includes(squadId)
+
+  let squadId = requestedSquadId
+  if (!squadId && auth.boundAgentId) {
+    const bound = await env.DB.prepare(`SELECT squad_id FROM agents WHERE id = ?1 AND status = 'active' LIMIT 1`)
       .bind(auth.boundAgentId)
-      .first<{ id: string; squad_id: string }>()
-    if (bound) return { agentId: bound.id, squadId: bound.squad_id }
+      .first<{ squad_id: string }>()
+    if (bound) {
+      // A bound agent always dispatches into its own squad.
+      return { agentId: auth.boundAgentId, squadId: bound.squad_id }
+    }
   }
+  if (!squadId) {
+    if (accessible === null) {
+      const agent = await env.DB.prepare(
+        `SELECT a.id, a.squad_id FROM agents a JOIN squads s ON s.id = a.squad_id
+          WHERE a.status = 'active' AND s.kind != 'home' ORDER BY a.name LIMIT 1`,
+      ).first<{ id: string; squad_id: string }>()
+      if (agent) return { agentId: agent.id, squadId: agent.squad_id }
+      const squad = await env.DB.prepare(`SELECT id FROM squads WHERE kind != 'home' ORDER BY name LIMIT 1`).first<{ id: string }>()
+      return squad ? { agentId: 'studio', squadId: squad.id } : null
+    }
+    if (accessible.length === 0) return 'forbidden'
+    squadId = [...accessible].sort()[0] ?? ''
+  }
+  if (!squadId || !mayWrite(squadId)) return 'forbidden'
 
+  const exists = await env.DB.prepare(`SELECT id FROM squads WHERE id = ?1`).bind(squadId).first<{ id: string }>()
+  if (!exists) return 'forbidden'
   const agent = await env.DB.prepare(
-    `SELECT id, squad_id FROM agents WHERE status = 'active' ORDER BY name LIMIT 1`,
-  ).first<{ id: string; squad_id: string }>()
-  if (agent) return { agentId: agent.id, squadId: agent.squad_id }
-
-  const squad = await env.DB.prepare(`SELECT id FROM squads ORDER BY name LIMIT 1`).first<{ id: string }>()
-  if (squad) return { agentId: 'studio', squadId: squad.id }
-  return null
+    `SELECT id FROM agents WHERE squad_id = ?1 AND status = 'active' ORDER BY name LIMIT 1`,
+  ).bind(squadId).first<{ id: string }>()
+  return { agentId: agent?.id ?? 'studio', squadId }
 }
 
 function sessionAuth(c: { get: (key: 'auth') => AuthContext | undefined }): AuthContext | null {
@@ -1163,7 +1198,10 @@ studioApp.post('/dispatch', async (c) => {
       : undefined
   const model = typeof body.model === 'string' ? body.model : undefined
 
-  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model })
-  if (!result.ok) return c.json({ ok: false, error: result.error }, result.status)
+  const squadId = typeof body.squad_id === 'string' ? body.squad_id : typeof body.squadId === 'string' ? body.squadId : undefined
+  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model, squadId })
+  if (!result.ok) {
+    return c.json({ ok: false, error: result.error, ...(result.next_step ? { next_step: result.next_step } : {}) }, result.status)
+  }
   return c.json(result.result)
 })

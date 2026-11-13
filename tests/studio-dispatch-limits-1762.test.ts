@@ -7,7 +7,7 @@ import { dispatchStudioFlight } from '../src/dashboard/studio'
 import { launchCursorAgent } from '../src/cursor/client'
 
 const REPO = 'https://github.com/Mumega-com/mupot'
-const auth = (memberId: string): AuthContext => ({ userId: `u-${memberId}`, email: `${memberId}@pot.test`, role: 'member', tenant: 'pot-a', memberId })
+const auth = (memberId: string): AuthContext => ({ userId: `u-${memberId}`, email: `${memberId}@pot.test`, role: 'member', tenant: 'pot-a', memberId, capabilities: [{ member_id: memberId, scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }] as AuthContext['capabilities'] })
 
 let harness: SqliteD1Harness | undefined
 afterEach(() => { harness?.close(); harness = undefined; vi.unstubAllGlobals() })
