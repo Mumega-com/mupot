@@ -6,7 +6,7 @@ import type { AuthContext, Env } from '../src/types'
 import type { CapabilityGrant } from '../src/auth/capability'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { dispatchStudioFlight, loadStudioData, studioApp } from '../src/dashboard/studio'
+import { dispatchStudioFlight, loadStudioData, studioApp, studioPageHtml } from '../src/dashboard/studio'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
 
 let harness: SqliteD1Harness | undefined
@@ -40,10 +40,12 @@ describe('Studio dispatch squad standing', () => {
     expect(count(env, 'flights')).toBe(0)
   })
 
-  it('refuses an unscoped member (no squad grant) with no squad_id, instead of the pot-wide first agent', async () => {
+  it('refuses an unscoped member (no squad grant) with no squad_id as no_squad, not omit-squad_id', async () => {
     const env = pot()
     const r = await dispatchStudioFlight(env, who('m-x', [grant('m-x', 'squad', 'sq-a', 'observer')]), { prompt: 'x' })
-    expect(r).toMatchObject({ ok: false, status: 403, error: 'squad_forbidden' })
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'no_squad' })
+    expect(r.ok === false && r.next_step).toMatch(/member grant on a squad/)
+    expect(r.ok === false && r.next_step).not.toMatch(/omit squad_id/)
     expect(count(env, 'tasks')).toBe(0)
     expect(count(env, 'flights')).toBe(0)
   })
@@ -157,6 +159,59 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
     expect(res.status).toBe(400)
     expect(await res.json()).toMatchObject({ error: 'invalid_squad_id' })
     expect(count(env, 'tasks')).toBe(0)
+  })
+})
+
+describe('Studio dispatch P2 follow-ups (#2397)', () => {
+  it('a caller with zero member-rank squads gets no_squad next_step, never omit squad_id', async () => {
+    const env = pot()
+    const r = await dispatchStudioFlight(env, who('m-none', []), { prompt: 'ship it' })
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'no_squad' })
+    expect(r.ok === false && r.next_step).toBe(
+      'You hold member rank on no squad with an agent to take this. Ask an org admin for a member grant on a squad.',
+    )
+    expect(String(r.ok === false && r.next_step)).not.toContain('omit squad_id')
+  })
+
+  it('Studio page client prefers next_step over the bare error code on refusal', async () => {
+    const html = String(await studioPageHtml({
+      brand: 'Mupot',
+      tenant: 'pot',
+      operator: 'm@pot.test',
+      branch: 'main',
+      flights: [],
+      authorityRole: 'member',
+    }))
+    expect(html).toContain('data.next_step || data.error')
+    expect(html).not.toMatch(/statusEl\.textContent = 'Dispatch failed' \+ \(data\.error \? ': ' \+ data\.error/)
+  })
+
+  it('dashboardApp POST /api/studio/dispatch is studioApp (ok+next_step), not the removed shadow', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const indexSrc = readFileSync(join(process.cwd(), 'src/dashboard/index.ts'), 'utf8')
+    // The late duplicate handler is gone; only the mount remains.
+    expect(indexSrc).toMatch(/dashboardApp\.route\('\/api\/studio',\s*studioApp\)/)
+    expect(indexSrc).not.toMatch(/dashboardApp\.post\('\/api\/studio\/dispatch'/)
+
+    const env = pot()
+    const app = new Hono<{ Variables: { auth: AuthContext } }>()
+    app.use('*', async (c, next) => {
+      c.set('auth', who('m-a', [grant('m-a', 'squad', 'sq-a', 'member')]))
+      await next()
+    })
+    // Same mount shape as dashboard: studioApp first under /api/studio.
+    app.route('/api/studio', studioApp)
+    const res = await app.request('/api/studio/dispatch', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'x', squad_id: 'sq-b' }),
+    }, env)
+    expect(res.status).toBe(403)
+    const body = await res.json() as { ok?: boolean; error?: string; next_step?: string }
+    // studioApp shape (ok + next_step). The removed shadow returned only { error }.
+    expect(body).toMatchObject({ ok: false, error: 'squad_forbidden' })
+    expect(body.next_step).toMatch(/omit squad_id/)
   })
 })
 

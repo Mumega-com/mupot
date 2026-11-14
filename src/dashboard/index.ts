@@ -327,7 +327,7 @@ import { makeWakeApp, loadAgentWakeCard } from './wake-card'
 import { makeImSettingsApp } from './im-settings'
 import { makeSecurityBarApp } from './security-bar'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
-import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
+import { getAuthContext, loadStudioData, studioPageHtml, isSafeRepoUrl } from './studio'
 import { deployProject, isDeployPolicyError } from '../projects/deploy'
 
 const DEPLOY_POLICY_HINT = 'a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool, or POST /api/projects/:id/deploy with canary_receipt and rollback (Studio dispatch is refused for such a project).'
@@ -1689,23 +1689,9 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
   return c.redirect(`/projects/${encodeURIComponent(detail.project.id)}`, 303)
 })
 
-// POST /api/studio/dispatch — create a flight + task from a Studio prompt.
-dashboardApp.post('/api/studio/dispatch', async (c) => {
-  const auth = getAuthContext(c)
-  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown }
-  try {
-    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown }
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
-  const result = await dispatchStudioFlight(c.env, auth, {
-    prompt: typeof body.prompt === 'string' ? body.prompt : '',
-    repoUrl: typeof body.repoUrl === 'string' ? body.repoUrl : undefined,
-    model: typeof body.model === 'string' ? body.model : undefined,
-  })
-  if (!result.ok) return c.json({ error: result.error }, result.status)
-  return c.json(result.result)
-})
+// POST /api/studio/dispatch lives on studioApp (mounted at /api/studio above). A second
+// handler here was registered later and never ran — Hono matches the mount first. Removed
+// so refusals keep next_step from studioApp.post('/dispatch').
 
 // GET /copilot and GET /chat — full-height Deep Chat card (session auth).
 dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody(getAuthContext(c)))))
