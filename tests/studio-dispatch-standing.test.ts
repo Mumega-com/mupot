@@ -1,5 +1,6 @@
 // Task 875e3de5 — POST /api/studio/dispatch must refuse a caller without member rank on the TARGET squad
 // (isolation-review-lens2-20261110 P1-1). Real schema; no pot-wide "first agent by name" fallback.
+import { Hono } from 'hono'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import type { CapabilityGrant } from '../src/auth/capability'
@@ -93,6 +94,68 @@ describe('Studio dispatch squad standing', () => {
     }, env)
     // No credential at all: refused before any write.
     expect([401, 403]).toContain(res.status)
+    expect(count(env, 'tasks')).toBe(0)
+  })
+})
+
+describe('Studio dispatch: home squads stay private, archived squads take no work (#2397)', () => {
+  function withHome(): Env {
+    const env = pot()
+    harness!.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('sq-home-x', 'd', 'home-x', 'Home X', 'home'), ('sq-home-m', 'd', 'home-m', 'Home M', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-home-x', 'sq-home-x', 'ag-home-x', 'HomeX', 'active'), ('ag-home-m', 'sq-home-m', 'ag-home-m', 'HomeM', 'active');
+      INSERT INTO members (id, tenant, email, display_name, status) VALUES ('m-own', 'pot', 'own@pot.test', 'Own', 'active');
+      INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('m-own', 'squad', 'sq-home-m', 'admin');
+    `)
+    return env
+  }
+  const refused = { ok: false, status: 403, error: 'squad_forbidden' }
+
+  it('refuses an org-scope member naming another member home squad: 403, no task', async () => {
+    const env = withHome()
+    const a = who('m-org', [grant('m-org', 'org', null, 'member')])
+    const r = await dispatchStudioFlight(env, a, { prompt: 'x', squadId: 'sq-home-x' })
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+    // Same body as a squad that does not exist: no existence oracle.
+    expect(await dispatchStudioFlight(env, a, { prompt: 'x', squadId: 'sq-ghost' })).toEqual(r)
+  })
+
+  it('refuses an org admin naming another member home squad', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(env, who('m-adm', [grant('m-adm', 'org', null, 'admin')]), { prompt: 'x', squadId: 'sq-home-x' })
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+  })
+
+  it('allows a member naming their own home squad', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(env, who('m-own', [grant('m-own', 'squad', 'sq-home-m', 'admin')]), { prompt: 'x', squadId: 'sq-home-m' })
+    expect(r.ok).toBe(true)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-home-m')
+  })
+
+  it('refuses an archived squad on the explicit path, and the default path skips it', async () => {
+    const env = pot()
+    harness!.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = 'sq-a'`)
+    const adm = who('m-adm', [grant('m-adm', 'org', null, 'admin')])
+    expect(await dispatchStudioFlight(env, adm, { prompt: 'x', squadId: 'sq-a' })).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+    const d = await dispatchStudioFlight(env, adm, { prompt: 'x' })
+    expect(d.ok).toBe(true)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-b')
+  })
+
+  it('HTTP: a non-string squad_id is 400, not silently dropped', async () => {
+    const env = pot()
+    const app = new Hono<{ Variables: { auth: AuthContext } }>()
+    app.use('*', async (c, next) => { c.set('auth', who('m-adm', [grant('m-adm', 'org', null, 'admin')])); await next() })
+    app.route('/', studioApp)
+    const res = await app.request('/dispatch', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'x', squad_id: 42 }),
+    }, env)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'invalid_squad_id' })
     expect(count(env, 'tasks')).toBe(0)
   })
 })

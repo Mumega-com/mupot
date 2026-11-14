@@ -19,7 +19,7 @@ import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { Context } from 'hono'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
-import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
+import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { csrf } from 'hono/csrf'
 import { launchCursorAgent, resolveCursorApiToken } from '../cursor/client'
@@ -1083,10 +1083,10 @@ async function resolveStudioHome(
     if (accessible === null) {
       const agent = await env.DB.prepare(
         `SELECT a.id, a.squad_id FROM agents a JOIN squads s ON s.id = a.squad_id
-          WHERE a.status = 'active' AND s.kind != 'home' ORDER BY a.name LIMIT 1`,
+          WHERE a.status = 'active' AND s.kind != 'home' AND s.status = 'active' ORDER BY a.name LIMIT 1`,
       ).first<{ id: string; squad_id: string }>()
       if (agent) return { agentId: agent.id, squadId: agent.squad_id }
-      const squad = await env.DB.prepare(`SELECT id FROM squads WHERE kind != 'home' ORDER BY name LIMIT 1`).first<{ id: string }>()
+      const squad = await env.DB.prepare(`SELECT id FROM squads WHERE kind != 'home' AND status = 'active' ORDER BY name LIMIT 1`).first<{ id: string }>()
       return squad ? { agentId: 'studio', squadId: squad.id } : null
     }
     if (accessible.length === 0) return 'forbidden'
@@ -1094,8 +1094,19 @@ async function resolveStudioHome(
   }
   if (!squadId || !mayWrite(squadId)) return 'forbidden'
 
-  const exists = await env.DB.prepare(`SELECT id FROM squads WHERE id = ?1`).bind(squadId).first<{ id: string }>()
+  // Archived squads take no new work. A home squad (a member's private room, Hadi 2026-11-11) is reachable only by
+  // its own member, even for an org admin or an org-scope grant; anything else gets the same 'forbidden' as a ghost.
+  const exists = await env.DB.prepare(`SELECT id, kind FROM squads WHERE id = ?1 AND status = 'active'`).bind(squadId).first<{ id: string; kind: string }>()
   if (!exists) return 'forbidden'
+  if (exists.kind === 'home') {
+    const memberId = auth.memberId ?? auth.userId
+    const own = await env.DB.prepare(
+      `SELECT 1 AS ok FROM capabilities c
+        WHERE c.member_id = ?1 AND c.scope_type = 'squad' AND c.scope_id = ?2 AND c.capability IN ('admin', 'owner')
+          AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')} LIMIT 1`,
+    ).bind(memberId, squadId, nowCapabilitySql()).first<{ ok: number }>()
+    if (!own) return 'forbidden'
+  }
   const agent = await env.DB.prepare(
     `SELECT id FROM agents WHERE squad_id = ?1 AND status = 'active' ORDER BY name LIMIT 1`,
   ).bind(squadId).first<{ id: string }>()
@@ -1198,7 +1209,9 @@ studioApp.post('/dispatch', async (c) => {
       : undefined
   const model = typeof body.model === 'string' ? body.model : undefined
 
-  const squadId = typeof body.squad_id === 'string' ? body.squad_id : typeof body.squadId === 'string' ? body.squadId : undefined
+  const rawSquadId = body.squad_id ?? body.squadId
+  if (rawSquadId !== undefined && typeof rawSquadId !== 'string') return c.json({ ok: false, error: 'invalid_squad_id' }, 400)
+  const squadId = rawSquadId
   const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model, squadId })
   if (!result.ok) {
     return c.json({ ok: false, error: result.error, ...(result.next_step ? { next_step: result.next_step } : {}) }, result.status)
