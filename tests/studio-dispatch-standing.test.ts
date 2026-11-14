@@ -98,18 +98,48 @@ describe('Studio dispatch squad standing', () => {
   })
 })
 
-describe('Studio dispatch: home squads stay private, archived squads take no work (#2397)', () => {
+describe('Studio dispatch: home squads stay private, archived squads take no work (#2397/#2399)', () => {
+  // Foreign home sq-home-x carries ITS OWNER's live admin row. Without that row,
+  // dropping c.member_id or c.scope_id from the home-squad guard still leaves every
+  // test green (#2399). Caller m-own holds admin on a DIFFERENT home (sq-home-m).
   function withHome(): Env {
     const env = pot()
     harness!.sqlite.exec(`
-      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('sq-home-x', 'd', 'home-x', 'Home X', 'home'), ('sq-home-m', 'd', 'home-m', 'Home M', 'home');
-      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-home-x', 'sq-home-x', 'ag-home-x', 'HomeX', 'active'), ('ag-home-m', 'sq-home-m', 'ag-home-m', 'HomeM', 'active');
-      INSERT INTO members (id, tenant, email, display_name, status) VALUES ('m-own', 'pot', 'own@pot.test', 'Own', 'active');
-      INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('m-own', 'squad', 'sq-home-m', 'admin');
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES
+        ('sq-home-x', 'd', 'home-x', 'Home X', 'home'),
+        ('sq-home-m', 'd', 'home-m', 'Home M', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+        ('ag-home-x', 'sq-home-x', 'ag-home-x', 'HomeX', 'active'),
+        ('ag-home-m', 'sq-home-m', 'ag-home-m', 'HomeM', 'active');
+      INSERT INTO members (id, tenant, email, display_name, status) VALUES
+        ('m-x-own', 'pot', 'xown@pot.test', 'XOwn', 'active'),
+        ('m-own', 'pot', 'own@pot.test', 'Own', 'active'),
+        ('m-member-home', 'pot', 'memhome@pot.test', 'MemHome', 'active'),
+        ('m-expired', 'pot', 'expired@pot.test', 'Expired', 'active');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-x-own', 'm-x-own', 'squad', 'sq-home-x', 'admin'),
+        ('cap-m-own', 'm-own', 'squad', 'sq-home-m', 'admin'),
+        ('cap-m-member', 'm-member-home', 'squad', 'sq-home-m', 'member');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES
+        ('cap-expired', 'm-expired', 'squad', 'sq-home-m', 'admin', '2020-01-01 00:00:00');
     `)
     return env
   }
   const refused = { ok: false, status: 403, error: 'squad_forbidden' }
+
+  // Org-scope so mayWrite passes and the home-squad SQL guard is the one that bites.
+  // Auth also carries admin on sq-home-m so a scope_id-blind mutant finds that row.
+  const otherHomeAdmin = () => who('m-own', [
+    grant('m-own', 'org', null, 'member'),
+    grant('m-own', 'squad', 'sq-home-m', 'admin'),
+  ])
+
+  it('refuses a caller who holds admin on a DIFFERENT home naming the foreign home: 403, no task', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(env, otherHomeAdmin(), { prompt: 'x', squadId: 'sq-home-x' })
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+  })
 
   it('refuses an org-scope member naming another member home squad: 403, no task', async () => {
     const env = withHome()
@@ -128,11 +158,35 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
     expect(count(env, 'tasks')).toBe(0)
   })
 
-  it('allows a member naming their own home squad', async () => {
+  it('allows the owner to dispatch into their own home squad', async () => {
     const env = withHome()
     const r = await dispatchStudioFlight(env, who('m-own', [grant('m-own', 'squad', 'sq-home-m', 'admin')]), { prompt: 'x', squadId: 'sq-home-m' })
     expect(r.ok).toBe(true)
     expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-home-m')
+  })
+
+  it('refuses a lesser rank (member, not admin) on a home squad', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-member-home', [grant('m-member-home', 'squad', 'sq-home-m', 'member')]),
+      { prompt: 'x', squadId: 'sq-home-m' },
+    )
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+  })
+
+  it('refuses an expired admin grant on a home squad', async () => {
+    const env = withHome()
+    // Auth carries admin so mayWrite passes; the DB row is expired so the live-grant
+    // predicate must refuse. Dropping CAPABILITY_LIVE_PREDICATE would reopen this.
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-expired', [grant('m-expired', 'squad', 'sq-home-m', 'admin')]),
+      { prompt: 'x', squadId: 'sq-home-m' },
+    )
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
   })
 
   it('refuses an archived squad on the explicit path, and the default path skips it', async () => {
