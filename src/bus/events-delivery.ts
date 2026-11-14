@@ -5,8 +5,8 @@
 // same source publishSeatHint consumes). handleQueue's `message.created` case calls
 // enqueueMessageCreatedDeliveries() when EVENTS_ENABLED === 'true'; with the flag off that call is
 // not made at all, so the send path and the consumer do no subscription read and enqueue nothing.
-// NOTE the queue is NOT a trust boundary: other producers can put a `message.created` (org-admin
-// /bus/emit, the shared-secret sos addon) or forge any job on it. So nothing in the event or in a
+// NOTE the queue is NOT a trust boundary: other producers can put a `message.created` (the
+// shared-secret sos addon) or forge any job on it. So nothing in the event or in a
 // job is trusted: the delivery re-derives recipient/seq/kind/request_id/time from the
 // agent_messages row and derives the attempt number from the receipts table (see below).
 //

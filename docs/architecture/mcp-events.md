@@ -142,8 +142,8 @@ the attempt number from the receipts table (a job-supplied `attempt` is ignored,
 forged value cannot bypass the cap). A finished `(subscription, event)` (any receipt other than
 `retry`) is never delivered again: duplicate, replayed or forged jobs are dropped without a POST or a
 new receipt. `mcp.event.delivery` is refused by every producer that forwards a caller-chosen type:
-`createBus().emit`, the sos addon `/publish` and `/bridge`, and the `/bus/emit` allowlist. Other
-producers can still put a `message.created` on the queue (org-admin `/bus/emit`, the shared-secret sos
+`createBus().emit` and the sos addon `/publish` and `/bridge`. Other
+producers can still put a `message.created` on the queue (the shared-secret sos
 addon); that can only cause delivery of a real inbox row, never of attacker-chosen data.
 There is deliberately NO enqueue-side marker or compensating write (a stale marker could suppress a retry and
 lose the event). A retry of the whole `message.created` queue message (for example because the Hermes leg threw)
