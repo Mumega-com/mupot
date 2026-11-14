@@ -109,7 +109,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'This connection carries no verified harness, so it cannot get a seat. Your human re-consents the connector (remove and add it again) and picks {many} on the consent screen; then call seat_select again. {reach}' },
   { error: 'member_not_active', tool: 'seat_select', who_acts: 'org_admin',
     next_step: 'The human behind this connection is not an active member of this pot. An org admin reactivates the membership; nothing you call changes that. {reach}' },
-  { error: 'home_rank_insufficient', tool: 'seat_select', who_acts: 'org_admin',
+  { error: 'home_rank_insufficient', tool: 'seat_select', who_acts: 'org_admin', next_tool: 'seat_select',
     next_step: 'The human does not hold admin on their own home squad, so a seat agent cannot be placed there. An org admin restores that grant; then call seat_select again. {reach}' },
   { error: 'seat_cap_reached', tool: 'seat_select', who_acts: 'self', next_tool: 'seat_select',
     next_step: 'This connection holds the maximum number of seats. Reuse one: call seat_select with the same project, folder and thread labels as a seat you already have. If you need more seats than the cap, an org admin raises it.' },
@@ -137,7 +137,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'bootstrap_self only runs for a chat session that has no agent yet; this is an unbound member token. An admin mints it an agent: mint_agent_token { agent }. {reach}' },
   { error: 'not_unbound_directory_session', tool: 'bootstrap_self', who_acts: 'self', next_tool: 'boot_context',
     next_step: 'bootstrap_self only runs for a chat session that has no agent yet. This credential is already an agent or a seat: call boot_context to see which. Do not retry bootstrap_self.' },
-  { error: 'rate_limited', tool: 'bootstrap_self', who_acts: 'self',
+  { error: 'rate_limited', tool: 'bootstrap_self', who_acts: 'self', next_tool: 'bootstrap_self',
     next_step: 'You hit the bootstrap rate limit. Stop retrying in a loop: wait, then call bootstrap_self once more.' },
 
   // ── agent-bound credential refusals ───────────────────────────────────────────────────────────
@@ -167,8 +167,8 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so it was not landed, and done tasks can no longer take a verdict: a held flight cannot be landed. A squad lead or admin cancels it (flight_cancel), then the task is re-dispatched with a gate owner who is not the assignee. Left alone it expires to failed (unverified_expired) 7 days after it started. {reach}' },
 
   // ── pot features off ──────────────────────────────────────────────────────────────────────────
-  { error: 'seat_attach_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
-  { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
+  { error: 'seat_attach_disabled', who_acts: 'org_admin', next_tool: 'boot_context', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
+  { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_tool: 'boot_context', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
 
   // ── check_in / inbox ──────────────────────────────────────────────────────────────────────────
   { error: 'not_member_bound', tool: 'check_in', who_acts: 'org_admin',
@@ -220,9 +220,15 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'You hit a rate or budget limit. Stop retrying in a loop: wait, then try again once.' },
 ]
 
-/** Who acts when no table entry matches: a 4xx the agent can usually read and fix itself. */
-function defaultWhoActs(error: string, status: number): WhoActs {
-  if (error === 'forbidden' || status === 403) return 'admin'
+/**
+ * Envelope filler when no table row and no detail names who_acts.
+ *
+ * This is NOT a guess about the refusal: status/code no longer pick admin vs self.
+ * New refusal codes must land a GUIDANCE_TABLE row (who_acts + next_tool) or CI fails —
+ * see scripts/check-refusal-next-step.mjs. Pre-existing codes without a row sit on the
+ * shrink-only allowlist next to that script.
+ */
+function defaultWhoActs(_error: string, _status: number): WhoActs {
   return 'self'
 }
 
