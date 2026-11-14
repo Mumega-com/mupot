@@ -55,10 +55,8 @@
 //     (empty) picker; step 8's happy-path consent and step 9's mint are both driven
 //     by ADMIN, exactly as production would require today.
 //
-//   FINDING D — task_verdict's status transition on 'approved' sets tasks.status to
-//     the literal string 'approved' (src/tasks/service.ts buildVerdictStatements),
-//     never 'closed'. The spec table's step 12 says "task closed" informally; this
-//     file asserts the real value.
+//   FINDING D — approval records an approved verdict. This unassigned review
+//     has no executor step, so the verdict batch now finishes it as 'done'.
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -780,10 +778,10 @@ describe('Step 11 — task_create + task_update, visible on task_board', () => {
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-// Step 12 — Pass a gate (FINDING D: status lands as 'approved', not 'closed')
+// Step 12 — Pass a gate (approved verdict, executor-free task becomes done)
 // ════════════════════════════════════════════════════════════════════════════
 describe('Step 12 — task_update status=review, ADMIN task_verdict', () => {
-  it('verdict row decided_by = ADMIN; task status is approved (the real value, not "closed")', async () => {
+  it('verdict row decided_by = ADMIN; executor-free task finishes done', async () => {
     const agentAuth: AuthContext = {
       userId: agentMemberId, memberId: agentMemberId, email: null, role: 'member', tenant: TENANT,
       channel: 'workspace', boundAgentId: agentId,
@@ -822,9 +820,8 @@ describe('Step 12 — task_update status=review, ADMIN task_verdict', () => {
     const taskRow = harness.sqlite
       .prepare(`SELECT status FROM tasks WHERE id = ?`)
       .get(taskId) as { status: string }
-    // FINDING D: the real status value is 'approved', never the literal 'closed'
-    // the spec doc's step 12 uses informally.
-    expect(taskRow.status).toBe('approved')
+    // The independent approval and terminal task transition share a batch.
+    expect(taskRow.status).toBe('done')
   })
 })
 
