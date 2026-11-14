@@ -14,8 +14,8 @@ afterEach(() => { harness?.close(); harness = undefined })
 
 const grant = (memberId: string, scope_type: 'org' | 'squad', scope_id: string | null, capability: CapabilityGrant['capability']): CapabilityGrant =>
   ({ member_id: memberId, scope_type, scope_id, capability }) as CapabilityGrant
-const who = (memberId: string, capabilities: CapabilityGrant[]): AuthContext =>
-  ({ userId: memberId, email: `${memberId}@pot.test`, role: 'member', tenant: 'pot', memberId, capabilities })
+const who = (memberId: string, capabilities: CapabilityGrant[], userId = memberId): AuthContext =>
+  ({ userId, email: `${memberId}@pot.test`, role: 'member', tenant: 'pot', memberId, capabilities })
 
 function pot(): Env {
   const h = createSqliteD1()
@@ -117,11 +117,15 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
         ('m-x-own', 'pot', 'xown@pot.test', 'XOwn', 'active'),
         ('m-own', 'pot', 'own@pot.test', 'Own', 'active'),
         ('m-member-home', 'pot', 'memhome@pot.test', 'MemHome', 'active'),
-        ('m-expired', 'pot', 'expired@pot.test', 'Expired', 'active');
+        ('m-expired', 'pot', 'expired@pot.test', 'Expired', 'active'),
+        ('m-rank-owner', 'pot', 'rankown@pot.test', 'RankOwn', 'active'),
+        ('m-org-poison', 'pot', 'orgpoison@pot.test', 'OrgPoison', 'active');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-x-own', 'm-x-own', 'squad', 'sq-home-x', 'admin'),
         ('cap-m-own', 'm-own', 'squad', 'sq-home-m', 'admin'),
-        ('cap-m-member', 'm-member-home', 'squad', 'sq-home-m', 'member');
+        ('cap-m-member', 'm-member-home', 'squad', 'sq-home-m', 'member'),
+        ('cap-rank-owner', 'm-rank-owner', 'squad', 'sq-home-m', 'owner'),
+        ('cap-org-poison', 'm-org-poison', 'org', 'sq-home-x', 'admin');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, expires_at) VALUES
         ('cap-expired', 'm-expired', 'squad', 'sq-home-m', 'admin', '2020-01-01 00:00:00');
     `)
@@ -167,11 +171,68 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
     expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-home-m')
   })
 
+  // Positive control for capability='owner' (not only admin). Narrowing
+  // IN ('admin','owner') → IN ('admin') must fail this (#2408).
+  it('allows an owner-rank capability holder to dispatch into their own home', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-rank-owner', [grant('m-rank-owner', 'squad', 'sq-home-m', 'owner')]),
+      { prompt: 'x', squadId: 'sq-home-m' },
+    )
+    expect(r.ok).toBe(true)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-home-m')
+  })
+
+  // Auth carries org-scope so mayWrite passes (accessible === null). DB has an
+  // org-typed row with scope_id = the foreign home — that must NOT count as standing.
+  it('refuses a scope_type=org capability whose scope_id equals a home squad id', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-org-poison', [grant('m-org-poison', 'org', null, 'member')]),
+      { prompt: 'x', squadId: 'sq-home-x' },
+    )
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+  })
+
+  // who() normally sets userId === memberId; a mutant that reads only auth.userId
+  // survives until they differ (#2408).
+  it('uses auth.memberId for the home-squad standing check when it differs from userId', async () => {
+    const env = withHome()
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-own', [grant('m-own', 'squad', 'sq-home-m', 'admin')], 'm-user-id-only'),
+      { prompt: 'x', squadId: 'sq-home-m' },
+    )
+    expect(r.ok).toBe(true)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-home-m')
+  })
+
   it('refuses a lesser rank (member, not admin) on a home squad', async () => {
     const env = withHome()
     const r = await dispatchStudioFlight(
       env,
       who('m-member-home', [grant('m-member-home', 'squad', 'sq-home-m', 'member')]),
+      { prompt: 'x', squadId: 'sq-home-m' },
+    )
+    expect(r).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(0)
+  })
+
+  // Home guard must run for scoped callers too. Limiting it to
+  // `if (accessible === null)` would let a member-rank home grant through (#2399/#2408).
+  it('home guard still runs when accessible is a squad list, not only when accessible === null', async () => {
+    const env = withHome()
+    // Work-squad grant makes accessible a non-null list; home member grant would
+    // pass mayWrite if the home admin/owner check were skipped for scoped callers.
+    const r = await dispatchStudioFlight(
+      env,
+      who('m-member-home', [
+        grant('m-member-home', 'squad', 'sq-a', 'member'),
+        grant('m-member-home', 'squad', 'sq-home-m', 'member'),
+      ]),
       { prompt: 'x', squadId: 'sq-home-m' },
     )
     expect(r).toMatchObject(refused)
@@ -207,11 +268,15 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
     const app = new Hono<{ Variables: { auth: AuthContext } }>()
     app.use('*', async (c, next) => { c.set('auth', who('m-adm', [grant('m-adm', 'org', null, 'admin')])); await next() })
     app.route('/', studioApp)
-    const res = await app.request('/dispatch', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'x', squad_id: 42 }),
-    }, env)
-    expect(res.status).toBe(400)
-    expect(await res.json()).toMatchObject({ error: 'invalid_squad_id' })
+    // Numbers AND other non-strings (boolean/object). A mutant that only rejects
+    // typeof === 'number' would let true/{} through and silently default (#2399/#2408).
+    for (const squad_id of [42, true, { id: 'sq-a' }] as unknown[]) {
+      const res = await app.request('/dispatch', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: 'x', squad_id }),
+      }, env)
+      expect(res.status).toBe(400)
+      expect(await res.json()).toMatchObject({ error: 'invalid_squad_id' })
+    }
     expect(count(env, 'tasks')).toBe(0)
   })
 })
