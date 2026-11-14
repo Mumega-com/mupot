@@ -12,13 +12,8 @@ import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../
 import { failFlight, getFlight, landGovernedFlight } from '../flight/service'
 import {
   assertCompletableDoneWhen,
-  checkTransition,
   createTask,
-  emitTaskEvent,
   patchToDoneBypassesGate,
-  persistTaskUpdate,
-  stampTaskUpdate,
-  TaskUpdateConflictError,
   verdictIsHuman,
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
@@ -36,6 +31,7 @@ import {
 } from './proposal'
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
 import { routineControlId } from './identity'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
@@ -1340,27 +1336,22 @@ async function loadTask(env: Env, taskId: string): Promise<Task | null> {
 
 async function completeControlTask(env: Env, run: RunContext): Promise<void> {
   if (!run.task_id) throw new Error('routine control Task missing')
-  let task = await loadTask(env, run.task_id)
+  const task = await loadTask(env, run.task_id)
   if (!task || task.project_id !== run.project_id) throw new Error('routine control Task ownership mismatch')
-  if (task.status === 'done') return
+  if (task.status === 'done') {
+    const closed = await closeRoutineControlTask(env, run, controlTaskOutcome('succeeded'))
+    if (!closed) throw new Error('routine control Task could not complete')
+    return
+  }
   assertCompletableDoneWhen(task.done_when)
-  if (patchToDoneBypassesGate(task.status, task.gate_owner, 'done')) {
-    throw new Error('routine control Task gate is incomplete')
+  // Human gates need a verdict; gate:routines is cleared inside the system close.
+  if (task.gate_owner && task.gate_owner !== ROUTINE_GATE) {
+    if (patchToDoneBypassesGate(task.status, task.gate_owner, 'done')) {
+      throw new Error('routine control Task gate is incomplete')
+    }
   }
-  const transitionError = checkTransition(task.status, 'done')
-  if (transitionError) throw new Error(`routine control Task ${transitionError.from} cannot complete`)
-  const existing = task
-  task = { ...task, status: 'done' }
-  stampTaskUpdate(task, existing.status, new Date().toISOString())
-  try {
-    await persistTaskUpdate(env, existing, task)
-  } catch (error) {
-    if (!(error instanceof TaskUpdateConflictError)) throw error
-    const raced = await loadTask(env, run.task_id)
-    if (raced?.status === 'done') return
-    throw error
-  }
-  await emitTaskEvent(env, 'task.updated', task, { kind: 'agent', id: run.assigned_agent_id ?? ROUTINE_ACTOR })
+  const closed = await closeRoutineControlTask(env, run, controlTaskOutcome('succeeded'))
+  if (!closed) throw new Error('routine control Task could not complete')
 }
 
 async function landControlFlight(env: Env, run: RunContext): Promise<void> {
@@ -1393,38 +1384,16 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
   if (existing?.status !== 'landed' || !outbox) throw new Error('routine control Flight could not land')
 }
 
-async function cancelControlTask(env: Env, run: Pick<RunContext, 'task_id' | 'project_id'>): Promise<boolean> {
+/** Whether the control task can be treated as confirmably stoppable (no live human gate). */
+async function controlTaskConfirmable(
+  env: Env,
+  run: Pick<RunContext, 'task_id' | 'project_id'>,
+): Promise<boolean> {
   if (!run.task_id) return true
-  let task = await loadTask(env, run.task_id)
+  const task = await loadTask(env, run.task_id)
   if (!task || task.project_id !== run.project_id) return false
-  if (task.status === 'blocked' || task.status === 'done') return true
-  if (task.status === 'open') {
-    const existing = task
-    task = { ...task, status: 'in_progress' }
-    stampTaskUpdate(task, existing.status, new Date().toISOString())
-    try {
-      await persistTaskUpdate(env, existing, task)
-      await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
-    } catch (error) {
-      if (!(error instanceof TaskUpdateConflictError)) throw error
-      const raced = await loadTask(env, run.task_id)
-      if (raced?.status === 'blocked' || raced?.status === 'done') return true
-      if (raced?.status !== 'in_progress') return false
-      task = raced
-    }
-  }
-  if (checkTransition(task.status, 'blocked')) return false
-  const existing = task
-  task = { ...task, status: 'blocked', result: 'Routine cancelled by operator.' }
-  stampTaskUpdate(task, existing.status, new Date().toISOString())
-  try {
-    await persistTaskUpdate(env, existing, task)
-  } catch (error) {
-    if (!(error instanceof TaskUpdateConflictError)) throw error
-    const raced = await loadTask(env, run.task_id)
-    return raced?.status === 'blocked' || raced?.status === 'done'
-  }
-  await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
+  if (task.status === 'done' || task.status === 'blocked') return true
+  if (task.gate_owner && task.gate_owner !== ROUTINE_GATE) return false
   return true
 }
 
@@ -1532,6 +1501,9 @@ async function classifyActionFailure(
     ),
   ])
   if (wrote(outcomes[0]) && wrote(outcomes[1]) && wrote(outcomes[2])) {
+    // Close after the guarded run transition so a failed batch cannot leave a
+    // done task beside a live run (P1-F).
+    await closeRoutineControlTask(env, run, controlTaskOutcome('failed', reason))
     return retryAt
       ? { ok: true, status: 'retry_scheduled', reason: 'execution_failed', run_id: run.id, action_key: action.action_key, duplicate: false }
       : { ok: false, error: 'action_failed' }
@@ -2225,11 +2197,11 @@ export async function cancelRoutineRun(
   const deliveredMessage = await env.DB.prepare(
     `SELECT 1 WHERE ${routineMessageDeliveredExistsSql('?1', '?2', '?3')}`,
   ).bind(live.id, live.tenant, live.project_id).first()
-  const taskConfirmed = await cancelControlTask(env, children)
+  const taskConfirmable = await controlTaskConfirmable(env, children)
   const flightCancel = await cancelControlFlight(env, children)
   // A delivered inbox request is external work unless the runtime supplies an acknowledgement.
   const outcome =
-    runningAction === null && deliveredMessage === null && taskConfirmed && flightCancel.confirmable
+    runningAction === null && deliveredMessage === null && taskConfirmable && flightCancel.confirmable
       ? 'confirmed'
       : 'unconfirmed'
   const terminalStatus = outcome === 'confirmed' ? 'cancelled' : 'failed'
@@ -2261,7 +2233,7 @@ export async function cancelRoutineRun(
       crypto.randomUUID(), `cancellation_${outcome}`, principal.actor_type, principal.actor_id, now,
       JSON.stringify({
         reason: 'operator_cancelled',
-        task_confirmed: taskConfirmed,
+        task_confirmed: taskConfirmable,
         flight_stopped: flightCancel.stopped,
         flight_confirmable: flightCancel.confirmable,
         message_delivered: deliveredMessage !== null,
@@ -2271,6 +2243,14 @@ export async function cancelRoutineRun(
     ),
   ])
   if (wrote(outcomes[0]) && wrote(outcomes[2])) {
+    // Close after the run-row transition (P1-F). Unconfirmed must not read as a confirmed cancel.
+    await closeRoutineControlTask(
+      env,
+      children,
+      outcome === 'confirmed'
+        ? controlTaskOutcome('cancelled', 'operator')
+        : controlTaskOutcome('failed', 'cancellation_unconfirmed'),
+    )
     return { ok: true, run_id: live.id, duplicate: !wrote(requested), outcome }
   }
 

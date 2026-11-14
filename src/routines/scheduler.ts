@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
 import { safeConsole } from '../lib/log'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
@@ -53,6 +54,7 @@ interface RecoverableRun {
   project_id: string
   attempt: number
   policy_json: string
+  task_id: string | null
 }
 
 export interface RoutineSchedulerSummary {
@@ -404,7 +406,7 @@ export async function recoverExpiredRoutineLeases(
 ): Promise<number> {
   const nowIso = now.toISOString()
   const result = await env.DB.prepare(
-    `SELECT id, tenant, project_id, attempt, policy_json FROM routine_runs
+    `SELECT id, tenant, project_id, attempt, policy_json, task_id FROM routine_runs
       WHERE tenant = ? AND status IN ('leased','observing') AND lease_expires_at <= ?
         AND ${sqlNotCancellationPending('routine_runs')}
       ORDER BY lease_expires_at ASC, id ASC LIMIT ?`,
@@ -447,7 +449,16 @@ export async function recoverExpiredRoutineLeases(
         run.id, env.TENANT_SLUG, exhausted ? 'failed' : 'queued', eventKind, run.attempt,
       ),
     ])
-    if (wrote(outcomes[0]) && wrote(outcomes[1])) recovered++
+    if (wrote(outcomes[0]) && wrote(outcomes[1])) {
+      // Close after the guarded recovery transition (P1-F): a raced observe→running
+      // update leaves the batch at 0 changes and must not settle the live run's task.
+      await closeRoutineControlTask(
+        env,
+        { task_id: run.task_id, project_id: run.project_id },
+        controlTaskOutcome('failed', 'lease_expired'),
+      )
+      recovered++
+    }
   }
   return recovered
 }
