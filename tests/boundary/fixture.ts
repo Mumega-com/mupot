@@ -52,6 +52,8 @@ export interface Boundary {
   all(sql: string, ...values: unknown[]): Array<Record<string, unknown>>
   /** `SELECT COUNT(*) n ...` as a number. */
   count(sql: string, ...values: unknown[]): number
+  /** The real id (a UUID) of customer B's seeded Supabase connector. */
+  connectorIdB: string
   /** The attacker: customer A's agent. */
   attacker(): Promise<AuthContext>
   close(): void
@@ -211,7 +213,7 @@ export async function buildBoundary(extraEnv: Record<string, unknown> = {}): Pro
   }
 
   return {
-    h, env, bus, signIn,
+    h, env, bus, signIn, connectorIdB: seeded.connector.id,
     agent: bound, human,
     call: async (auth, tool, args = {}) => JSON.parse(JSON.stringify(await invokeTool(auth, env, tool, args, ctx))) as ToolResult,
     all: (sql, ...values) => h.sqlite.prepare(sql).all(...values),
@@ -269,7 +271,10 @@ export function snapshotB(b: Boundary): string {
   return JSON.stringify([
     q(`SELECT * FROM tasks WHERE squad_id = 'sq-b' ORDER BY id`),
     q(`SELECT * FROM task_verdicts WHERE task_id LIKE 't-b%' ORDER BY id`),
-    q(`SELECT * FROM engrams WHERE id IN ('e-proj','e-squad','e-member') OR text LIKE '%${B_SECRET}%' ORDER BY id`),
+    // Every memory row in a B-owned scope, whether or not the fixture seeded it: B's squad, project, members and agents.
+    // (engrams.agent_id is the scope key: squad:<id>, project:<id>, member:<id>, or an agent id.)
+    q(`SELECT * FROM engrams WHERE agent_id IN ('squad:sq-b','project:p-b') OR agent_id LIKE 'member:mem-b-%'
+         OR agent_id LIKE 'ag-b%' OR agent_id LIKE 'agent:ag-b%' OR text LIKE '%${B_SECRET}%' ORDER BY id`),
     q(`SELECT id, to_agent, from_agent, body FROM agent_messages WHERE to_agent LIKE 'ag-b%' OR from_agent LIKE 'ag-b%' ORDER BY id`),
     q(`SELECT * FROM flights WHERE agent LIKE 'ag-b%' OR project_id = 'p-b' ORDER BY id`),
     q(`SELECT * FROM agents WHERE squad_id = 'sq-b' ORDER BY id`),

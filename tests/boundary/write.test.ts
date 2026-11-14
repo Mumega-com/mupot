@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { coordinationApp } from '../../src/coordination/routes'
 import { studioApp } from '../../src/dashboard/studio'
-import { RAW, bearer, buildBoundary, leaksB, type Boundary } from './fixture'
+import { B_SUPABASE_HOST, RAW, bearer, buildBoundary, leaksB, type Boundary } from './fixture'
 
 let b: Boundary
 beforeEach(async () => { b = await buildBoundary() })
@@ -50,13 +50,47 @@ describe('tasks and projects over MCP', () => {
       ['task_update', { task_id: 't-b-open', title: 'pwned' }],
       ['task_verdict', { task_id: 't-b', verdict: 'approved', note: 'x' }],
       ['task_submit_result', { task_id: 't-b-open', result: 'pwned' }],
-      ['task_review_lens', { task_id: 't-b', lens: 'security', outcome: 'pass' }],
     ] as const) {
       const r = await b.call(a, tool, args)
       expect(r.ok, tool).toBe(false)
     }
     expect(count(`SELECT COUNT(*) n FROM task_verdicts WHERE task_id LIKE 't-b%'`)).toBe(0)
     expect(JSON.stringify(b.all(`SELECT * FROM tasks WHERE squad_id = 'sq-b' ORDER BY id`))).toBe(before)
+  })
+
+  // B's reviewer: ag-b2 holds B's gate lane and is not the task's assignee (ag-b), so it is an independent lens.
+  // The submission is B's current one (its result_text equals tasks.result), and the call names it, so the only
+  // thing that can refuse A's caller is isolation, not a missing or stale argument.
+  const seedLensFixture = (): string => {
+    b.h.sqlite.exec(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('sub-b','mumega','t-b','sq-b','ag-b','a/b.md','${'a'.repeat(64)}','${'b'.repeat(64)}','B_SECRET-RESULT');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gg-b2','gate:bob','agent','ag-b2','mem-owner','2026-11-01')`)
+    return 'sub-b'
+  }
+
+  it('recording a review lens on B\'s task is refused for A (with a valid submission) and writes no lens row', async () => {
+    const sub = seedLensFixture()
+    const args = { task_id: 't-b', lens: 'security', outcome: 'pass', expected_submission_id: sub } as const
+    // A's agent even holds the lane name (lane names are pot-wide strings), so the lane check cannot be what refuses it:
+    // the only thing left between A and B's task is the squad-standing check.
+    b.h.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gg-a','gate:bob','agent','ag-a','mem-owner','2026-11-01')`)
+    const a = await b.attacker()
+    const r = await b.call(a, 'task_review_lens', args)
+    expect(r.ok, JSON.stringify(r)).toBe(false)
+    // Refused by isolation, not by a malformed call: the argument set is exactly what B's own reviewer succeeds with.
+    expect(r.status, JSON.stringify(r)).toBe(403)
+    expect(r.error, JSON.stringify(r)).toBe('forbidden')
+    expect(count(`SELECT COUNT(*) n FROM task_review_lenses`)).toBe(0)
+  })
+
+  it('control: B\'s own independent reviewer records the same lens with the same arguments, and the row is written', async () => {
+    const sub = seedLensFixture()
+    const own = await b.agent('ag-b2', 'mem-b-agent2')
+    const r = await b.call(own, 'task_review_lens', { task_id: 't-b', lens: 'security', outcome: 'pass', expected_submission_id: sub })
+    expect(r.ok, JSON.stringify(r)).toBe(true)
+    expect(count(`SELECT COUNT(*) n FROM task_review_lenses WHERE task_id = 't-b' AND submission_id = 'sub-b' AND reviewer_id = 'ag-b2'`)).toBe(1)
   })
 
   it('writing memory into B\'s squad or project is refused', async () => {
@@ -78,25 +112,43 @@ describe('tasks and projects over MCP', () => {
 })
 
 describe('Supabase connectors (fixed by #2381)', () => {
-  it('a member of A cannot run, mutate or read the schema of B\'s connector, and no request leaves', async () => {
-    const calls: string[] = []
+  const stubFetch = (calls: string[]): (() => void) => {
     const real = globalThis.fetch
     globalThis.fetch = (async (u: unknown) => { calls.push(String(u instanceof Request ? u.url : u)); return new Response('[]', { status: 200 }) }) as typeof fetch
+    return () => { globalThis.fetch = real }
+  }
+
+  it('control: B\'s own authorised agent reaches B\'s connector by its real id, and the request goes out', async () => {
+    const calls: string[] = []
+    const restore = stubFetch(calls)
+    try {
+      expect(b.connectorIdB).toMatch(/^[0-9a-f-]{36}$/) // a real connector UUID, never a squad id
+      const own = await b.agent('ag-b', 'mem-b-agent')
+      const r = await b.call(own, 'supabase_query', { table: 'customers', connector_id: b.connectorIdB })
+      expect(r.ok, JSON.stringify(r)).toBe(true)
+      expect(calls.length).toBeGreaterThan(0)
+      expect(calls.every((u) => u.includes(B_SUPABASE_HOST))).toBe(true)
+    } finally { restore() }
+  })
+
+  it('a member of A cannot run, mutate or read the schema of B\'s connector by its real id, and no request leaves', async () => {
+    const calls: string[] = []
+    const restore = stubFetch(calls)
     try {
       const a = await b.attacker()
+      const id = b.connectorIdB
       for (const [tool, args] of [
-        ['supabase_query', { table: 'customers', connector_id: 'sq-b' }],
-        ['supabase_mutate', { table: 'customers', action: 'delete', match: { id: '1' }, connector_id: 'sq-b' }],
-        ['supabase_schema', { connector_id: 'sq-b' }],
+        ['supabase_query', { table: 'customers', connector_id: id }],
+        ['supabase_mutate', { table: 'customers', action: 'delete', match: { id: '1' }, connector_id: id }],
+        ['supabase_schema', { connector_id: id }],
         ['supabase_query', { table: 'customers' }],
       ] as const) {
         const r = await b.call(a, tool, args)
         expect(r.ok, `${tool} ${JSON.stringify(args)}`).toBe(false)
+        expect(r.error, tool).toBe('supabase_connector_not_found')
       }
       expect(calls).toEqual([])
-    } finally {
-      globalThis.fetch = real
-    }
+    } finally { restore() }
   })
 })
 

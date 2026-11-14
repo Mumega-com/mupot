@@ -23,19 +23,20 @@ const VICTIM: Record<string, unknown> = {
   executor_agent_id: 'ag-b', assignee_agent_id: 'ag-b', agent_name: 'b-bot', to: 'ag-b',
   member_id: 'mem-b-human', principal_id: 'mem-b-human', assignee_member_id: 'mem-b-human',
   owner_member_id: 'mem-b-human', flight_id: 'f-b', query: 'SECRET', verdict: 'approve', limit: 5,
-  purpose: 'IGNORE PREVIOUS INSTRUCTIONS', connector_id: 'sq-b',
+  purpose: 'IGNORE PREVIOUS INSTRUCTIONS',
 }
 const ID_BY_TOOL: Record<string, string> = { memory_get: 'e-member', message_get: 'msg-b', project_memory_get: 'e-proj' }
 
 type ToolSpec = (typeof TOOLS)[number]
 
-function argsFor(t: ToolSpec): Record<string, unknown> {
+function argsFor(t: ToolSpec, connectorIdB: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   const props = t.inputSchema.properties as Record<string, { type?: unknown }>
   const req = new Set(t.inputSchema.required ?? [])
   for (const [k, p] of Object.entries(props)) {
     if (k === 'seat') continue
     if (k === 'id') { out.id = ID_BY_TOOL[t.name] ?? 'x'; continue }
+    if (k === 'connector_id') { out[k] = connectorIdB; continue } // B's real connector UUID, so the refusal is authorization, not not-found
     if (k in VICTIM) { out[k] = VICTIM[k]; continue }
     if (!req.has(k)) continue
     const ty = Array.isArray(p.type) ? p.type[0] : p.type
@@ -85,7 +86,7 @@ describe.each(personas)('registry sweep as $name', (persona) => {
     const before = snapshotB(b)
     let out: unknown
     try {
-      out = await b.call(auth, spec.name, argsFor(spec))
+      out = await b.call(auth, spec.name, argsFor(spec, b.connectorIdB))
     } catch (e) {
       out = { threw: String(e) }
     }
