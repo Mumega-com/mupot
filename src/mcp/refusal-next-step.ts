@@ -220,15 +220,9 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'You hit a rate or budget limit. Stop retrying in a loop: wait, then try again once.' },
 ]
 
-/**
- * Envelope filler when no table row and no detail names who_acts.
- *
- * This is NOT a guess about the refusal: status/code no longer pick admin vs self.
- * New refusal codes must land a GUIDANCE_TABLE row (who_acts + next_tool) or CI fails —
- * see scripts/check-refusal-next-step.mjs. Pre-existing codes without a row sit on the
- * shrink-only allowlist next to that script.
- */
-function defaultWhoActs(_error: string, _status: number): WhoActs {
+/** Who acts when no table entry matches: a 4xx the agent can usually read and fix itself. */
+function defaultWhoActs(error: string, status: number): WhoActs {
+  if (error === 'forbidden' || status === 403) return 'admin'
   return 'self'
 }
 
