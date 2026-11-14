@@ -378,7 +378,8 @@ export interface ReapPrincipalContext {
  * Studio writes `member:<id>` for human dispatchers; MCP builds `{ kind:'member', id:<bare> }`.
  */
 export function sameDispatcherId(actor: FlightActor, dispatchedByAgentId: string): boolean {
-  if (!dispatchedByAgentId) return false
+  // Empty actor.id must not match a dispatcher of exactly `member:` via the prefix rule.
+  if (!dispatchedByAgentId || !actor.id) return false
   if (actor.id === dispatchedByAgentId) return true
   return actor.kind === 'member' && dispatchedByAgentId === `member:${actor.id}`
 }

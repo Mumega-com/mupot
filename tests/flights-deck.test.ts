@@ -314,4 +314,10 @@ describe('flightsBody — KPI cards, table, badges, artifacts', () => {
     expect(out).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
     expect(out).not.toContain('<script>alert(1)</script>')
   })
+
+  it('dispatch client prefers next_step over the bare error code on refusal (#2410)', async () => {
+    const out = await render()
+    expect(out).toContain('r.data.next_step || r.data.error')
+    expect(out).not.toMatch(/status\.textContent = \(r\.data && r\.data\.error\) \|\| 'dispatch failed'/)
+  })
 })

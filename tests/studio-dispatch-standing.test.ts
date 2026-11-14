@@ -287,7 +287,7 @@ describe('Studio dispatch P2 follow-ups (#2397)', () => {
     const r = await dispatchStudioFlight(env, who('m-none', []), { prompt: 'ship it' })
     expect(r).toMatchObject({ ok: false, status: 409, error: 'no_squad' })
     expect(r.ok === false && r.next_step).toBe(
-      'You hold member rank on no squad with an agent to take this. Ask an org admin for a member grant on a squad.',
+      'You hold member rank on no squad. Ask an org admin for a member grant on a squad.',
     )
     expect(String(r.ok === false && r.next_step)).not.toContain('omit squad_id')
   })
