@@ -34,6 +34,17 @@ const FIXED: Record<string, Record<string, unknown>> = {
   task_list: { assignee_member_id: undefined },
   task_update: { assignee_member_id: undefined },
   supabase_mutate: { action: 'delete', match: { id: '1' } },
+  // One-argument-away (or a small FIXED set): get past shape validation so a legitimate caller can
+  // succeed, or so B's agent is told apart from A's agent. Without these every caller hits the same
+  // invalid_args / invalid_status / invalid_outcome and the refusal proves nothing.
+  project_wiki_get: { slug: 'secret-notes' },
+  project_wiki_upsert: {
+    slug: 'secret-notes', title: 'Secret Notes', summary: 'notes for B', purpose: 'runbook',
+    tier: 'project', expected_version: 0,
+  },
+  advance_node: { new_state: 'done' },
+  runner_record: { status: 'running' },
+  'office.reconcile_stalled_publish': { outcome: 'failed' },
 }
 
 type ToolSpec = (typeof TOOLS)[number]
@@ -64,6 +75,7 @@ function argsFor(t: ToolSpec, connectorIdB: string): Record<string, unknown> {
 
 const personas: Array<{ name: string; make: (b: Boundary) => Promise<AuthContext>; connectorCode: string }> = [
   { name: "customer A's agent (squad member)", make: (b) => b.attacker(), connectorCode: 'supabase_connector_not_found' },
+  { name: "customer A's lead (squad lead)", make: async (b) => { promoteToLead(b, 'a'); return b.agent('ag-a', 'mem-a-agent') }, connectorCode: 'supabase_connector_not_found' },
   { name: "customer A's human (squad member, no agent)", make: (b) => b.human('mem-a-human'), connectorCode: 'supabase_connector_not_found' },
   { name: 'a member holding no grants at all', make: (b) => b.human('mem-zero'), connectorCode: 'forbidden' },
   { name: 'a stranger after bootstrap_self (the unbound session)', make: async (b) => (await bootstrapStranger(b)).member, connectorCode: 'supabase_connector_not_found' },
@@ -85,12 +97,13 @@ beforeAll(() => {
 })
 afterAll(() => { globalThis.fetch = realFetch })
 
-// THE RULE: a refusal for the intruder proves nothing if the same call is refused, in the same words, for everyone.
-// So before the intruder sweeps, the same calls (same arguments) are made by B's legitimate callers (B's agent and
-// B's member, each raised to lead; the org admin; the org owner) and by customer A's agent. A tool is PROVEN when a
-// legitimate caller succeeds, or when at least one of them is answered differently from A's agent (the guard tells
-// them apart). A tool where every one of them gets A's exact refusal is VACUOUS: its refusal says nothing about
-// isolation. Every vacuous tool must be named in UNPROVEN below with the reason, or given arguments that work.
+// THE RULE: a tool counts as PROVEN only if a legitimate caller succeeds. A refusal that differs only
+// agent-vs-human (A's agent and B's agent get the same words; B's human hits a credential floor) is not
+// proof. So before the intruder sweeps, the same calls (same arguments) are made by B's legitimate
+// callers (B's agent and B's member, each raised to lead; the org admin; the org owner) and by customer
+// A's agent. Success for any legitimate caller → live. Otherwise, if B's own agent gets A's exact
+// refusal, the tool is VACUOUS: its refusal says nothing about isolation. Every vacuous tool must be
+// named in UNPROVEN below with the reason, or given arguments that work.
 const controls: Array<(b: Boundary) => Promise<AuthContext>> = [
   async (b) => { promoteToLead(b, 'b'); return b.agent('ag-b', 'mem-b-agent') },
   async (b) => { promoteToLead(b, 'b'); return b.human('mem-b-human') },
@@ -103,7 +116,9 @@ const verdictOf = (o: { ok?: boolean; error?: string; status?: number }): string
 function liveTools(): Promise<Liveness> {
   liveMemo ??= (async () => {
     const live = new Set<string>()
-    const answers = new Map<string, Set<string>>() // tool -> every distinct answer a legitimate caller or A got
+    // Only B's agent answers count toward "same refusal" — human/admin credential floors must not
+    // make a tool look proven when A's agent and B's agent still hear the same words (#2396).
+    const bAgentAnswer = new Map<string, string>()
     const attackerAnswer = new Map<string, string>()
     controlPhase = true
     try {
@@ -112,6 +127,7 @@ function liveTools(): Promise<Liveness> {
         try {
           const auth = await make(b)
           const asAttacker = auth.boundAgentId === 'ag-a'
+          const asBAgent = auth.boundAgentId === 'ag-b'
           for (const spec of TOOLS) {
             let v: string
             try {
@@ -120,7 +136,7 @@ function liveTools(): Promise<Liveness> {
               v = verdictOf(out)
             } catch (e) { v = `threw ${String(e).slice(0, 40)}` }
             if (asAttacker) attackerAnswer.set(spec.name, v)
-            else (answers.get(spec.name) ?? answers.set(spec.name, new Set()).get(spec.name))?.add(v)
+            else if (asBAgent) bAgentAnswer.set(spec.name, v)
           }
         } finally { b.close() }
       }
@@ -128,8 +144,7 @@ function liveTools(): Promise<Liveness> {
     const vacuous = new Set<string>()
     for (const spec of TOOLS) {
       if (live.has(spec.name)) continue
-      const a = attackerAnswer.get(spec.name)
-      if ([...(answers.get(spec.name) ?? [])].every((v) => v === a)) vacuous.add(spec.name)
+      if (bAgentAnswer.get(spec.name) === attackerAnswer.get(spec.name)) vacuous.add(spec.name)
     }
     return { live, vacuous }
   })()
@@ -147,19 +162,44 @@ const UNPROVEN: Record<string, string> = {
     'owner_call', 'worktree_list', 'worktree_open', 'seed_attach_request', 'squad_join_request', 'moment_miniapp_link',
   ]),
   ...group('needs a session shape the fixture personas do not have (an unbound directory session or an attached seat)', [
-    'bootstrap_self', 'seat_select', 'seat_attach', 'connection_check', 'inbox_mark_handled', 'join_squad',
+    'bootstrap_self', 'seat_select', 'seat_attach', 'connection_check', 'inbox_mark_handled',
   ]),
-  ...group('the fixture seeds no such object of B (routine, run, objective, receipt, circuit, claim, runner): every caller gets not_found', [
+  ...group('the fixture seeds no such object of B (routine, run, objective, receipt, circuit, claim): every caller gets not_found', [
     'routine_get', 'routine_run_now', 'routine_run_get', 'routine_run_answer', 'routine_proposal_observe', 'routine_proposal_submit',
-    'report_run_usage', 'objective_get', 'execution_receipt_get', 'get_circuit_state', 'advance_node', 'reveal_credential_claim', 'runner_record',
+    'report_run_usage', 'objective_get', 'execution_receipt_get', 'get_circuit_state', 'reveal_credential_claim',
   ]),
   ...group('arguments are shape-validated beyond what the generic builder produces, or need state the fixture lacks', [
-    'cursor_run_status', 'secret_env_request', 'seed_attach', 'seed_draft', 'project_wiki_get', 'project_wiki_upsert',
-    'flight_reap_stalled', 'office.publish_post', 'office.review_approval', 'office.reconcile_stalled_publish', 'task_verdict_reverse',
+    'cursor_run_status', 'secret_env_request', 'seed_attach', 'seed_draft', 'join_squad',
+    'flight_reap_stalled', 'office.publish_post', 'office.review_approval', 'task_verdict_reverse',
     'task_dispatch_runtime_receipt', 'project_access_reintake_authorize',
+  ]),
+  ...group('FIXED args clear shape validation, but the circuits addon is inactive in the fixture: every caller gets addon_inactive', [
+    'advance_node',
+  ]),
+  ...group('FIXED args clear shape validation, but B\'s task has no stalled office publish claim: every caller gets wrong_gate', [
+    'office.reconcile_stalled_publish',
   ]),
   ...group('needs a live gate holder plus a current submission on B\'s task; proven by the paired probes in write.test.ts instead', [
     'task_verdict', 'task_review_lens',
+  ]),
+  // #2396: under the old rule these looked proven because a human or admin control got a different
+  // credential/floor refusal than an agent. A's agent and B's agent still hear the same words — not
+  // isolation proof. The twelve named in the issue come first; the rest are the same false-positive
+  // class the stricter B-agent-vs-A-agent comparison exposes.
+  ...group('B\'s agent and A\'s agent get the same refusal; agent-vs-human/admin answer differences are not proof (#2396)', [
+    'cursor_dispatch', 'elevation_status', 'flight_land', 'harness_capacity_report', 'inbox_lease_ack',
+    'inbox_lease_reconcile', 'message_get', 'operator_revoke', 'request_elevation', 'runtime_seat_register_pending',
+    'token_binding_attest', 'verify_agent_connection',
+    'addon_activate', 'addon_archive', 'addon_configure', 'addon_disable', 'addon_install', 'addon_setup',
+    'agent_lifecycle', 'approval_resubmit_cap_reset', 'approve_gate_edge', 'archive_plan_expand', 'archive_row',
+    'create_department', 'create_squad', 'define_circuit', 'execution_pause', 'execution_resume',
+    'grant_agent_capability', 'grant_gate_capability', 'loop_set_status', 'move_agent_squad', 'office.health',
+    'operator_delegate', 'pot_list', 'pot_provision', 'pot_release', 'project_create', 'project_deploy',
+    'project_recommit', 'project_squad_set', 'provision_agent_connection', 'register_agent_key',
+    'revoke_agent_token', 'revoke_gate_capability', 'routine_archive', 'routine_create', 'routine_enable',
+    'routine_pause', 'routine_run_cancel', 'routine_update', 'set_agent_inbox_consumer',
+    'task_dispatch_lease_reset', 'task_incident_revert', 'team_bootstrap', 'team_bootstrap_release',
+    'unarchive_row', 'update_department', 'update_squad',
   ]),
 }
 function group(reason: string, names: string[]): Record<string, string> {
@@ -184,7 +224,7 @@ describe.each(personas)('registry sweep as $name', (persona) => {
     const spec = TOOLS.find((t) => t.name === toolName)
     if (!spec) throw new Error(`tool ${toolName} vanished`)
     expect(!live.vacuous.has(spec.name) || spec.name in UNPROVEN,
-      `${spec.name}: B's own callers, the org admin and the org owner all get the same answer as customer A's agent, so this refusal proves nothing. Fix the arguments in FIXED, or list the tool in UNPROVEN with the reason`).toBe(true)
+      `${spec.name}: B's agent gets the same answer as customer A's agent (and no legitimate caller succeeds), so this refusal proves nothing. Fix the arguments in FIXED, or list the tool in UNPROVEN with the reason`).toBe(true)
     const forms = takesConnector(spec) ? CONNECTOR_FORMS(b.connectorIdB) : [undefined]
     for (const form of forms) {
       outbound = []
