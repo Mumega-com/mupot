@@ -179,6 +179,20 @@ export async function buildBoundary(extraEnv: Record<string, unknown> = {}): Pro
       ('msg-b','${TENANT}','ag-b','ag-b2','mem-b-agent2','message','${B_SECRET}-MSG');
     INSERT INTO flights (id, tenant, agent, goal, status, meta, project_id, dispatched_by_agent_id) VALUES
       ('f-b','${TENANT}','ag-b','${B_SECRET}-FLIGHT-GOAL','running','${JSON.stringify(FLIGHT_META_B)}','p-b','ag-b');
+    -- Snapshot tables (#2411/#2396): seed B rows so updates/deletes (and not only inserts) are visible.
+    -- IDs are *-snap so write.test.ts can still insert its own sub-b / lens / verdict for paired probes.
+    INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at) VALUES
+      ('sub-b-snap','${TENANT}','t-b','sq-b','ag-b','artifacts/${B_SECRET}.md','${'c'.repeat(64)}','${'d'.repeat(64)}','${B_SECRET}-SUBMISSION','2026-11-01T00:00:00.000Z');
+    INSERT INTO task_review_lenses (id, task_id, submission_id, result_digest, gate_owner, lens, reviewer_kind, reviewer_id, outcome, note, created_at) VALUES
+      ('lens-b-snap','t-b','sub-b-snap','${'d'.repeat(64)}','gate:bob','adversarial','member','mem-b-human','pass','${B_SECRET}-LENS','2026-11-01T00:00:00.000Z');
+    INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, submission_id, result_digest) VALUES
+      ('ver-b-snap','t-b','rejected','${B_SECRET}-VERDICT','mem-b-human','2026-11-01T00:00:00.000Z','sub-b-snap','${'d'.repeat(64)}');
+    -- A grant authored by a B member onto a non-B principal must still show up in snapshotB.
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES
+      ('gg-b-self','gate:bob','member','mem-b-human','mem-b-human','2026-11-01T00:00:00.000Z'),
+      ('gg-b-to-a','gate:bob','member','mem-a-human','mem-b-human','2026-11-01T00:00:00.000Z');
+    INSERT INTO journeys (id, tenant, agent, project, goal, status, gate, created_at, updated_at) VALUES
+      ('j-b','${TENANT}','ag-b','p-b','${B_SECRET}-SNAP-JOURNEY','boarding','t-b',1700000000000,1700000000000);
   `)
 
   const seeded = await addConnector(env, {
@@ -277,10 +291,12 @@ export function snapshotB(b: Boundary): string {
   const q = (sql: string): unknown => b.all(sql)
   return JSON.stringify([
     q(`SELECT * FROM tasks WHERE squad_id = 'sq-b' ORDER BY id`),
-    q(`SELECT * FROM task_verdicts WHERE task_id LIKE 't-b%' ORDER BY id`),
-    q(`SELECT * FROM task_review_lenses WHERE task_id LIKE 't-b%' ORDER BY id`),
-    q(`SELECT * FROM task_result_submissions WHERE task_id LIKE 't-b%' ORDER BY id`),
-    q(`SELECT * FROM gate_grants WHERE principal_id LIKE 'mem-b-%' OR principal_id LIKE 'ag-b%' ORDER BY id`),
+    q(`SELECT * FROM task_verdicts WHERE task_id IN (SELECT id FROM tasks WHERE squad_id = 'sq-b') ORDER BY id`),
+    q(`SELECT * FROM task_review_lenses WHERE task_id IN (SELECT id FROM tasks WHERE squad_id = 'sq-b') ORDER BY id`),
+    q(`SELECT * FROM task_result_submissions WHERE task_id IN (SELECT id FROM tasks WHERE squad_id = 'sq-b') ORDER BY id`),
+    // Principal on B, or a grant a B member authored (even onto a non-B principal).
+    q(`SELECT * FROM gate_grants WHERE principal_id LIKE 'mem-b-%' OR principal_id LIKE 'ag-b%'
+         OR granted_by LIKE 'mem-b-%' ORDER BY id`),
     q(`SELECT * FROM journeys WHERE agent LIKE 'ag-b%' OR project IN ('p-b', 'proj-b') ORDER BY id`),
     // Every memory row in a B-owned scope, whether or not the fixture seeded it: B's squad, project, members and agents.
     // (engrams.agent_id is the scope key: squad:<id>, project:<id>, member:<id>, or an agent id.)

@@ -97,19 +97,21 @@ beforeAll(() => {
 })
 afterAll(() => { globalThis.fetch = realFetch })
 
-// THE RULE: a tool counts as PROVEN only if a legitimate caller succeeds. A refusal that differs only
-// agent-vs-human (A's agent and B's agent get the same words; B's human hits a credential floor) is not
-// proof. So before the intruder sweeps, the same calls (same arguments) are made by B's legitimate
-// callers (B's agent and B's member, each raised to lead; the org admin; the org owner) and by customer
-// A's agent. Success for any legitimate caller → live. Otherwise, if B's own agent gets A's exact
-// refusal, the tool is VACUOUS: its refusal says nothing about isolation. Every vacuous tool must be
-// named in UNPROVEN below with the reason, or given arguments that work.
+// THE RULE (#2411): a tool counts as PROVEN only when a legitimate caller of B succeeds — B's own
+// agent or B's member acting in B's scope. An org admin/owner success alone is not proof: those
+// principals sit above every squad, so their OK says nothing about cross-customer isolation. A
+// refusal that is identical for B's agent and A's agent (compared like-for-like: both raised to
+// lead, because B's control is promoted) is VACUOUS even when an admin succeeds. Every tool that
+// is not live must be named in UNPROVEN with the reason, or given arguments that work.
 const controls: Array<(b: Boundary) => Promise<AuthContext>> = [
   async (b) => { promoteToLead(b, 'b'); return b.agent('ag-b', 'mem-b-agent') },
   async (b) => { promoteToLead(b, 'b'); return b.human('mem-b-human') },
-  (b) => b.human('mem-admin'),
-  (b) => b.human('mem-owner'),
 ]
+// Like-for-like baseline: B's agent is a lead, so A's agent must be a lead too (#2411 / #2396).
+const aLeadBaseline = async (b: Boundary): Promise<AuthContext> => {
+  promoteToLead(b, 'a')
+  return b.agent('ag-a', 'mem-a-agent')
+}
 interface Liveness { live: Set<string>; vacuous: Set<string> }
 let liveMemo: Promise<Liveness> | undefined
 const verdictOf = (o: { ok?: boolean; error?: string; status?: number }): string => (o.ok ? 'OK' : `${o.status} ${o.error}`)
@@ -117,25 +119,27 @@ function liveTools(): Promise<Liveness> {
   liveMemo ??= (async () => {
     const live = new Set<string>()
     // Only B's agent answers count toward "same refusal" — human/admin credential floors must not
-    // make a tool look proven when A's agent and B's agent still hear the same words (#2396).
+    // make a tool look proven when A's lead and B's lead still hear the same words (#2396/#2411).
     const bAgentAnswer = new Map<string, string>()
-    const attackerAnswer = new Map<string, string>()
+    const aLeadAnswer = new Map<string, string>()
     controlPhase = true
     try {
-      for (const make of [...controls, (b: Boundary) => b.attacker()]) {
+      for (const make of [...controls, aLeadBaseline]) {
         const b = await buildBoundary()
         try {
           const auth = await make(b)
-          const asAttacker = auth.boundAgentId === 'ag-a'
+          const asALead = auth.boundAgentId === 'ag-a'
           const asBAgent = auth.boundAgentId === 'ag-b'
+          const asBMember = !auth.boundAgentId && auth.memberId === 'mem-b-human'
           for (const spec of TOOLS) {
             let v: string
             try {
               const out = await b.call(auth, spec.name, argsFor(spec, b.connectorIdB))
-              if (out.ok && !asAttacker) live.add(spec.name)
+              // Admin/owner are deliberately absent: only B's agent or B's member success proves.
+              if (out.ok && (asBAgent || asBMember)) live.add(spec.name)
               v = verdictOf(out)
             } catch (e) { v = `threw ${String(e).slice(0, 40)}` }
-            if (asAttacker) attackerAnswer.set(spec.name, v)
+            if (asALead) aLeadAnswer.set(spec.name, v)
             else if (asBAgent) bAgentAnswer.set(spec.name, v)
           }
         } finally { b.close() }
@@ -144,7 +148,7 @@ function liveTools(): Promise<Liveness> {
     const vacuous = new Set<string>()
     for (const spec of TOOLS) {
       if (live.has(spec.name)) continue
-      if (bAgentAnswer.get(spec.name) === attackerAnswer.get(spec.name)) vacuous.add(spec.name)
+      if (bAgentAnswer.get(spec.name) === aLeadAnswer.get(spec.name)) vacuous.add(spec.name)
     }
     return { live, vacuous }
   })()
@@ -183,10 +187,10 @@ const UNPROVEN: Record<string, string> = {
     'task_verdict', 'task_review_lens',
   ]),
   // #2396: under the old rule these looked proven because a human or admin control got a different
-  // credential/floor refusal than an agent. A's agent and B's agent still hear the same words — not
+  // credential/floor refusal than an agent. A's lead and B's lead still hear the same words — not
   // isolation proof. The twelve named in the issue come first; the rest are the same false-positive
-  // class the stricter B-agent-vs-A-agent comparison exposes.
-  ...group('B\'s agent and A\'s agent get the same refusal; agent-vs-human/admin answer differences are not proof (#2396)', [
+  // class the stricter B-lead-vs-A-lead comparison exposes.
+  ...group('B\'s lead and A\'s lead get the same refusal; agent-vs-human/admin answer differences are not proof (#2396)', [
     'cursor_dispatch', 'elevation_status', 'flight_land', 'harness_capacity_report', 'inbox_lease_ack',
     'inbox_lease_reconcile', 'message_get', 'operator_revoke', 'request_elevation', 'runtime_seat_register_pending',
     'token_binding_attest', 'verify_agent_connection',
@@ -200,6 +204,24 @@ const UNPROVEN: Record<string, string> = {
     'routine_pause', 'routine_run_cancel', 'routine_update', 'set_agent_inbox_consumer',
     'task_dispatch_lease_reset', 'task_incident_revert', 'team_bootstrap', 'team_bootstrap_release',
     'unarchive_row', 'update_department', 'update_squad',
+  ]),
+  // #2411: admin/owner success alone used to count as PROVEN. B's lead and A's lead hear the same
+  // refusal; the admin OK is above every squad and is not isolation proof.
+  ...group('admin-floor only: B\'s lead and A\'s lead get the same refusal; org admin/owner success is not proof (#2411)', [
+    'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
+    'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
+    'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+  ]),
+  // #2411: B was promoted to lead while A's baseline was a plain member — rank asymmetry made these
+  // look non-vacuous. Compared lead-to-lead both hear the same words.
+  ...group('rank-asymmetric false proof: B-lead vs A-member differed; B-lead vs A-lead match (#2411)', [
+    'loop_control', 'seat_event_grant', 'squad_member_add', 'squad_member_remove',
+  ]),
+  // #2411: nobody on B succeeds; B's lead and A's lead get different refusals (so not vacuous), but
+  // the sweep still cannot claim isolation proof. Honest UNPROVEN until FIXED/fixture can drive them.
+  ...group('B\'s lead cannot succeed yet; refusal differs from A\'s lead so not vacuous — still not proof (#2411)', [
+    'flight_dispatch', 'task_dispatch', 'task_submit_result', 'create_agent', 'update_agent',
+    'set_agent_webhook_doorbell', 'project_wiki', 'project_wiki_get', 'project_wiki_upsert',
   ]),
 }
 function group(reason: string, names: string[]): Record<string, string> {
@@ -223,8 +245,10 @@ describe.each(personas)('registry sweep as $name', (persona) => {
   it.each(TOOLS.map((t) => t.name))('%s neither shows nor changes customer B', async (toolName) => {
     const spec = TOOLS.find((t) => t.name === toolName)
     if (!spec) throw new Error(`tool ${toolName} vanished`)
+    expect(live.live.has(spec.name) || spec.name in UNPROVEN,
+      `${spec.name}: not PROVEN (no B agent/member success) and not listed in UNPROVEN. Every tool must be exactly one. Fix FIXED, or add it to UNPROVEN with the reason`).toBe(true)
     expect(!live.vacuous.has(spec.name) || spec.name in UNPROVEN,
-      `${spec.name}: B's agent gets the same answer as customer A's agent (and no legitimate caller succeeds), so this refusal proves nothing. Fix the arguments in FIXED, or list the tool in UNPROVEN with the reason`).toBe(true)
+      `${spec.name}: B's lead gets the same answer as customer A's lead (and no B agent/member succeeds), so this refusal proves nothing. Fix the arguments in FIXED, or list the tool in UNPROVEN with the reason`).toBe(true)
     const forms = takesConnector(spec) ? CONNECTOR_FORMS(b.connectorIdB) : [undefined]
     for (const form of forms) {
       outbound = []
@@ -255,11 +279,38 @@ describe.each(personas)('registry sweep as $name', (persona) => {
 })
 
 describe('the control list is honest', () => {
-  it('every UNPROVEN tool really is undrivable (an entry that turned live is deleted)', async () => {
-    const { vacuous } = await liveTools()
-    const stale = Object.keys(UNPROVEN).filter((n) => !vacuous.has(n))
-    expect(stale, 'these tools are told apart from the intruder now: remove them from UNPROVEN').toEqual([])
-    const known = new Set(TOOLS.map((t) => t.name))
-    expect(Object.keys(UNPROVEN).filter((n) => !known.has(n)), 'UNPROVEN names a tool that no longer exists').toEqual([])
+  it('every tool is exactly one of PROVEN or UNPROVEN; UNPROVEN entries stay undrivable', async () => {
+    const { live, vacuous } = await liveTools()
+    const known = TOOLS.map((t) => t.name)
+    const unproven = new Set(Object.keys(UNPROVEN))
+    // Stale = listed UNPROVEN but a B agent/member now succeeds → delete from UNPROVEN.
+    const stale = [...unproven].filter((n) => live.has(n))
+    expect(stale, 'these tools are now PROVEN (B agent/member succeeds): remove them from UNPROVEN').toEqual([])
+    expect([...unproven].filter((n) => !known.includes(n)), 'UNPROVEN names a tool that no longer exists').toEqual([])
+    // Full accounting: 197 tools, each in exactly one bucket (#2411). Vacuous tools that differ
+    // from A only by rank/admin floor must still land in UNPROVEN; so must the "neither" set
+    // (B and A refuse differently, but nobody on B succeeds).
+    const neither = known.filter((n) => !live.has(n) && !unproven.has(n))
+    expect(neither, 'these tools are in neither PROVEN nor UNPROVEN — add them to UNPROVEN with a reason').toEqual([])
+    const both = known.filter((n) => live.has(n) && unproven.has(n))
+    expect(both, 'these tools are in both PROVEN and UNPROVEN').toEqual([])
+    expect(live.size + unproven.size, 'PROVEN + UNPROVEN must equal the registry').toBe(known.length)
+    // Vacuous (same refusal as A's lead) is a subset of UNPROVEN — the honesty signal for #2396.
+    const vacuousMissing = [...vacuous].filter((n) => !unproven.has(n))
+    expect(vacuousMissing, 'vacuous tools (B-lead == A-lead refusal) must be listed in UNPROVEN').toEqual([])
+    // Like-for-like guard (#2411): these looked non-vacuous only when B-lead was compared to A-member.
+    // If the baseline regresses to A-member, they leave `vacuous` and this fails.
+    for (const n of ['loop_control', 'seat_event_grant', 'squad_member_add', 'squad_member_remove']) {
+      expect(vacuous.has(n), `${n}: B-lead vs A-lead must match (rank-asymmetric false proof)`).toBe(true)
+    }
+    // Admin-floor guard (#2411): these must not be live, and B-lead vs A-lead must match.
+    for (const n of [
+      'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
+      'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
+      'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+    ]) {
+      expect(live.has(n), `${n}: admin-floor success must not count as PROVEN`).toBe(false)
+      expect(vacuous.has(n), `${n}: B-lead vs A-lead must match for admin-floor tools`).toBe(true)
+    }
   }, 300_000)
 })
