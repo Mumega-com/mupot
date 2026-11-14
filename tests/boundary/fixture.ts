@@ -278,6 +278,10 @@ export function snapshotB(b: Boundary): string {
   return JSON.stringify([
     q(`SELECT * FROM tasks WHERE squad_id = 'sq-b' ORDER BY id`),
     q(`SELECT * FROM task_verdicts WHERE task_id LIKE 't-b%' ORDER BY id`),
+    q(`SELECT * FROM task_review_lenses WHERE task_id LIKE 't-b%' ORDER BY id`),
+    q(`SELECT * FROM task_result_submissions WHERE task_id LIKE 't-b%' ORDER BY id`),
+    q(`SELECT * FROM gate_grants WHERE principal_id LIKE 'mem-b-%' OR principal_id LIKE 'ag-b%' ORDER BY id`),
+    q(`SELECT * FROM journeys WHERE agent LIKE 'ag-b%' OR project IN ('p-b', 'proj-b') ORDER BY id`),
     // Every memory row in a B-owned scope, whether or not the fixture seeded it: B's squad, project, members and agents.
     // (engrams.agent_id is the scope key: squad:<id>, project:<id>, member:<id>, or an agent id.)
     q(`SELECT * FROM engrams WHERE agent_id IN ('squad:sq-b','project:p-b') OR agent_id LIKE 'member:mem-b-%'
@@ -293,6 +297,7 @@ export function snapshotB(b: Boundary): string {
     q(`SELECT * FROM projects WHERE id = 'p-b'`),
     q(`SELECT * FROM project_squad_access WHERE project_id = 'p-b' OR squad_id = 'sq-b' ORDER BY project_id, squad_id`),
     q(`SELECT * FROM connectors WHERE scope_id = 'sq-b' ORDER BY id`),
+    b.bus,
   ])
 }
 
@@ -318,8 +323,6 @@ export interface BoundaryProbe {
   ownerArgs?: Record<string, unknown>
   /** Runs right after the intruder's refusal, before the owner's call (e.g. "nothing went out on the wire"). */
   afterIntruder?: () => void
-  /** Extra check on the owner's success. */
-  ownerCheck?: (r: ToolResult) => void
 }
 
 /**
@@ -340,6 +343,5 @@ export async function expectBoundary(b: Boundary, tool: string, args: Record<str
   probe.afterIntruder?.()
   const owner = await b.call(probe.owner, tool, probe.ownerArgs ?? args)
   expect(owner.ok, `${label}: CONTROL, the legitimate owner must succeed (else the refusal above proves nothing): ${JSON.stringify(owner)}`).toBe(true)
-  probe.ownerCheck?.(owner)
   return { owner, intruder }
 }
