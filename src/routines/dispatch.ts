@@ -12,6 +12,12 @@ import { createTask, TaskCreateFenceError } from '../tasks/service'
 import type { CapabilityGrant, Env, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
+import {
+  closeRoutineControlTask,
+  controlTaskOutcome,
+  maybePauseAfterUnclaimedRuns,
+  UNCLAIMED_RESULT_SUMMARY,
+} from './control-task'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 
@@ -88,7 +94,8 @@ export type RoutineDispatchResult =
       flight_id: string
       duplicate: boolean
     }
-  | { ok: true; status: 'waiting'; reason: 'agent' | 'budget'; run_id: string }
+  | { ok: true; status: 'waiting'; reason: 'budget'; run_id: string }
+  | { ok: true; status: 'skipped'; reason: 'unclaimed'; run_id: string }
   | {
       ok: true
       status: 'retry_scheduled'
@@ -324,27 +331,42 @@ async function selectAgent(
   return { kind: 'offline' }
 }
 
+async function abandonDispatchChildren(env: Env, run: DispatchRunRow, outcome: string): Promise<void> {
+  await closeRoutineControlTask(env, run, outcome)
+  if (run.flight_id) {
+    try { await failFlight(env, run.flight_id, 'routine_unclaimed') } catch { /* best-effort */ }
+  }
+}
+
 async function appendStateEvent(
   env: Env,
   run: DispatchRunRow,
   now: string,
   input: {
-    status: 'queued' | 'waiting'
+    status: 'queued' | 'waiting' | 'skipped'
     waitingReason: 'agent' | 'budget' | null
     resultSummary: string
     retryAt: string | null
-    eventKind: 'retry_scheduled' | 'agent_waiting' | 'budget_blocked'
+    finishedAt: string | null
+    eventKind: 'retry_scheduled' | 'agent_waiting' | 'budget_blocked' | 'skipped'
+    clearChildren?: boolean
   },
 ): Promise<boolean> {
   const outcomes = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = ?, waiting_reason = ?, retry_at = ?,
-              result_summary = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+              result_summary = ?, lease_owner = NULL, lease_expires_at = NULL,
+              finished_at = ?, updated_at = ?,
+              task_id = CASE WHEN ? THEN NULL ELSE task_id END,
+              flight_id = CASE WHEN ? THEN NULL ELSE flight_id END,
+              situation_digest = CASE WHEN ? THEN NULL ELSE situation_digest END
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
           AND ${sqlNotCancellationPending('routine_runs')}`,
     ).bind(
       input.status, input.waitingReason, input.retryAt, input.resultSummary,
-      now, run.id, run.tenant,
+      input.finishedAt, now,
+      input.clearChildren ? 1 : 0, input.clearChildren ? 1 : 0, input.clearChildren ? 1 : 0,
+      run.id, run.tenant,
     ),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
@@ -374,7 +396,7 @@ async function appendStateEvent(
 async function waitForBudget(env: Env, run: DispatchRunRow, now: Date): Promise<RoutineDispatchResult> {
   const transitioned = await appendStateEvent(env, run, now.toISOString(), {
     status: 'waiting', waitingReason: 'budget', resultSummary: 'budget_exhausted',
-    retryAt: null, eventKind: 'budget_blocked',
+    retryAt: null, finishedAt: null, eventKind: 'budget_blocked',
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
   return { ok: true, status: 'waiting', reason: 'budget', run_id: run.id }
@@ -383,18 +405,22 @@ async function waitForBudget(env: Env, run: DispatchRunRow, now: Date): Promise<
 async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: string): Promise<RoutineDispatchResult> {
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
+  const nowIso = now.toISOString()
   if (run.attempt >= policy.max_attempts || reason === 'no_eligible_agent') {
-    const transitioned = await appendStateEvent(env, run, now.toISOString(), {
-      status: 'waiting', waitingReason: 'agent', resultSummary: reason,
-      retryAt: null, eventKind: 'agent_waiting',
+    await abandonDispatchChildren(env, run, controlTaskOutcome('unclaimed', reason))
+    const transitioned = await appendStateEvent(env, run, nowIso, {
+      status: 'skipped', waitingReason: null, resultSummary: UNCLAIMED_RESULT_SUMMARY,
+      retryAt: null, finishedAt: nowIso, eventKind: 'skipped', clearChildren: true,
     })
     if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
-    return { ok: true, status: 'waiting', reason: 'agent', run_id: run.id }
+    await maybePauseAfterUnclaimedRuns(env, run.routine_id)
+    return { ok: true, status: 'skipped', reason: 'unclaimed', run_id: run.id }
   }
+  await abandonDispatchChildren(env, run, controlTaskOutcome('failed', reason))
   const retryAt = new Date(now.getTime() + policy.retry_backoff_seconds * 1000).toISOString()
-  const transitioned = await appendStateEvent(env, run, now.toISOString(), {
+  const transitioned = await appendStateEvent(env, run, nowIso, {
     status: 'queued', waitingReason: null, resultSummary: reason,
-    retryAt, eventKind: 'retry_scheduled',
+    retryAt, finishedAt: null, eventKind: 'retry_scheduled', clearChildren: true,
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
   const publicReason = reason === 'agent_offline' || reason === 'inbox_full'
@@ -616,6 +642,11 @@ export async function dispatchRoutineRun(
     ),
   ])
   if (!wrote(observed[0])) return { ok: false, error: 'run_not_dispatchable' }
+  // Keep the in-memory run aligned with the durable observe write so delivery
+  // failures can settle the children that were just created.
+  run.task_id = task.id
+  run.flight_id = flightId
+  run.situation_digest = situationDigest
 
   const response = humanResponse(run)
   const body = JSON.stringify({

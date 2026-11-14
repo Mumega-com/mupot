@@ -1,8 +1,10 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { failFlight } from '../flight/service'
 import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
 // bounded below that ceiling before an external dispatch processor does any work.
@@ -27,6 +29,8 @@ interface RecoverableRun {
   project_id: string
   attempt: number
   policy_json: string
+  task_id: string | null
+  flight_id: string | null
 }
 
 export interface RoutineSchedulerSummary {
@@ -375,7 +379,7 @@ export async function recoverExpiredRoutineLeases(
 ): Promise<number> {
   const nowIso = now.toISOString()
   const result = await env.DB.prepare(
-    `SELECT id, tenant, project_id, attempt, policy_json FROM routine_runs
+    `SELECT id, tenant, project_id, attempt, policy_json, task_id, flight_id FROM routine_runs
       WHERE tenant = ? AND status IN ('leased','observing') AND lease_expires_at <= ?
         AND ${sqlNotCancellationPending('routine_runs')}
       ORDER BY lease_expires_at ASC, id ASC LIMIT ?`,
@@ -389,10 +393,19 @@ export async function recoverExpiredRoutineLeases(
       : new Date(now.getTime() + policy.backoffSeconds * 1000).toISOString()
     const eventKind = exhausted ? 'failed' : 'retry_scheduled'
     const eventId = crypto.randomUUID()
+    await closeRoutineControlTask(
+      env,
+      run,
+      controlTaskOutcome(exhausted ? 'failed' : 'failed', 'lease_expired'),
+    )
+    if (run.flight_id) {
+      try { await failFlight(env, run.flight_id, 'lease_expired') } catch { /* best-effort */ }
+    }
     const outcomes = await env.DB.batch([
       env.DB.prepare(
         `UPDATE routine_runs SET status = ?, lease_owner = NULL, lease_expires_at = NULL,
-                retry_at = ?, result_summary = ?, finished_at = ?, updated_at = ?
+                retry_at = ?, result_summary = ?, finished_at = ?, updated_at = ?,
+                task_id = NULL, flight_id = NULL, situation_digest = NULL
           WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
             AND lease_expires_at <= ?
             AND ${sqlNotCancellationPending('routine_runs')}`,

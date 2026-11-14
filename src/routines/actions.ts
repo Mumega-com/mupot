@@ -9,11 +9,7 @@ import {
   assertCompletableDoneWhen,
   checkTransition,
   createTask,
-  emitTaskEvent,
   patchToDoneBypassesGate,
-  persistTaskUpdate,
-  stampTaskUpdate,
-  TaskUpdateConflictError,
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
 import { projectVisibilityClause } from '../projects/access'
@@ -26,6 +22,7 @@ import {
 } from './proposal'
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
 import { routineControlId } from './identity'
 
 const ROUTINE_GATE = 'gate:routines'
@@ -806,25 +803,19 @@ async function completeControlTask(env: Env, run: RunContext): Promise<void> {
   if (!run.task_id) throw new Error('routine control Task missing')
   let task = await loadTask(env, run.task_id)
   if (!task || task.project_id !== run.project_id) throw new Error('routine control Task ownership mismatch')
-  if (task.status === 'done') return
+  if (task.status === 'done') {
+    await closeRoutineControlTask(env, run, controlTaskOutcome('succeeded'))
+    return
+  }
   assertCompletableDoneWhen(task.done_when)
   if (patchToDoneBypassesGate(task.status, task.gate_owner, 'done')) {
     throw new Error('routine control Task gate is incomplete')
   }
   const transitionError = checkTransition(task.status, 'done')
   if (transitionError) throw new Error(`routine control Task ${transitionError.from} cannot complete`)
-  const existing = task
-  task = { ...task, status: 'done' }
-  stampTaskUpdate(task, existing.status, new Date().toISOString())
-  try {
-    await persistTaskUpdate(env, existing, task)
-  } catch (error) {
-    if (!(error instanceof TaskUpdateConflictError)) throw error
-    const raced = await loadTask(env, run.task_id)
-    if (raced?.status === 'done') return
-    throw error
-  }
-  await emitTaskEvent(env, 'task.updated', task, { kind: 'agent', id: run.assigned_agent_id ?? ROUTINE_ACTOR })
+  // System close writes result (persistTaskUpdate does not) and clears any gate.
+  const closed = await closeRoutineControlTask(env, run, controlTaskOutcome('succeeded'))
+  if (!closed) throw new Error('routine control Task could not complete')
 }
 
 async function landControlFlight(env: Env, run: RunContext): Promise<void> {
@@ -858,38 +849,11 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
 }
 
 async function cancelControlTask(env: Env, run: Pick<RunContext, 'task_id' | 'project_id'>): Promise<boolean> {
-  if (!run.task_id) return true
-  let task = await loadTask(env, run.task_id)
-  if (!task || task.project_id !== run.project_id) return false
-  if (task.status === 'blocked' || task.status === 'done') return true
-  if (task.status === 'open') {
-    const existing = task
-    task = { ...task, status: 'in_progress' }
-    stampTaskUpdate(task, existing.status, new Date().toISOString())
-    try {
-      await persistTaskUpdate(env, existing, task)
-      await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
-    } catch (error) {
-      if (!(error instanceof TaskUpdateConflictError)) throw error
-      const raced = await loadTask(env, run.task_id)
-      if (raced?.status === 'blocked' || raced?.status === 'done') return true
-      if (raced?.status !== 'in_progress') return false
-      task = raced
-    }
-  }
-  if (checkTransition(task.status, 'blocked')) return false
-  const existing = task
-  task = { ...task, status: 'blocked', result: 'Routine cancelled by operator.' }
-  stampTaskUpdate(task, existing.status, new Date().toISOString())
-  try {
-    await persistTaskUpdate(env, existing, task)
-  } catch (error) {
-    if (!(error instanceof TaskUpdateConflictError)) throw error
-    const raced = await loadTask(env, run.task_id)
-    return raced?.status === 'blocked' || raced?.status === 'done'
-  }
-  await emitTaskEvent(env, 'task.updated', task, { kind: 'member', id: ROUTINE_ACTOR })
-  return true
+  return closeRoutineControlTask(
+    env,
+    run,
+    controlTaskOutcome('cancelled', 'Routine cancelled by operator.'),
+  )
 }
 
 async function cancelControlFlight(env: Env, run: Pick<RunContext, 'flight_id' | 'project_id'>): Promise<{
@@ -944,6 +908,10 @@ async function classifyActionFailure(
   const resultJson = canonicalJson({ reason, attempt: run.attempt, retry_at: retryAt })
   const eventKind = retryAt ? 'retry_scheduled' : 'failed'
   const runStatus = retryAt ? 'queued' : 'failed'
+  await closeRoutineControlTask(env, run, controlTaskOutcome('failed', reason))
+  if (run.flight_id) {
+    try { await failFlight(env, run.flight_id, reason) } catch { /* best-effort */ }
+  }
   const outcomes = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_run_actions
@@ -958,7 +926,9 @@ async function classifyActionFailure(
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = ?, waiting_reason = NULL, retry_at = ?, result_summary = ?,
-              proposal_json = NULL, finished_at = ?, updated_at = ?
+              proposal_json = NULL, finished_at = ?, updated_at = ?,
+              task_id = NULL, flight_id = NULL, situation_digest = NULL,
+              lease_owner = NULL, lease_expires_at = NULL
         WHERE id = ? AND tenant = ? AND status IN ('running','waiting')
           AND ${sqlNotCancellationPending('routine_runs')}
           AND EXISTS (

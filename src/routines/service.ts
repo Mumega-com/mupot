@@ -18,6 +18,7 @@ import {
   type RoutinePrincipal,
 } from './access'
 import { hasCapability } from '../auth/capability'
+import { closeUnclaimedPauseNotice } from './control-task'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -482,6 +483,9 @@ async function transitionRoutine(
     now.toISOString(), now.toISOString(), id, env.TENANT_SLUG, existing.revision,
   ).run()
   if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+  if (target === 'enabled') {
+    await closeUnclaimedPauseNotice(env, id, existing.project_id)
+  }
   const updated = await directRoutine(env, id)
   return updated ? { ok: true, value: updated } : { ok: false, error: 'receipt_failed' }
 }

@@ -180,16 +180,17 @@ describe('routine runtime-neutral dispatch', () => {
     expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-preferred' })
   })
 
-  it('waits for a human when no eligible welded teammate exists', async () => {
+  it('skips as unclaimed when no eligible welded teammate exists', async () => {
     harness = makeHarness()
     harness.sqlite.prepare('DELETE FROM capabilities').run()
 
     const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
 
-    expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
-    expect(row(harness, "SELECT status, waiting_reason FROM routine_runs WHERE id = 'run-1'")).toEqual({
-      status: 'waiting', waiting_reason: 'agent',
+    expect(result).toEqual({ ok: true, status: 'skipped', reason: 'unclaimed', run_id: 'run-1' })
+    expect(row(harness, "SELECT status, waiting_reason, result_summary FROM routine_runs WHERE id = 'run-1'")).toEqual({
+      status: 'skipped', waiting_reason: null, result_summary: 'unclaimed',
     })
+    expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 0 })
   })
 
   it('retries the same run when eligible runtimes are offline', async () => {
@@ -227,8 +228,10 @@ describe('routine runtime-neutral dispatch', () => {
       }),
     )
     expect(row(harness, "SELECT COUNT(*) AS count FROM routine_runs WHERE routine_id = 'routine-1'")).toEqual({ count: 1 })
-    expect(row(harness, 'SELECT status FROM flights LIMIT 1')).toEqual({ status: 'preflight' })
-    expect(row(harness, 'SELECT status FROM tasks LIMIT 1')).toEqual({ status: 'open' })
+    expect(row(harness, 'SELECT status FROM flights LIMIT 1')).toEqual({ status: 'failed' })
+    expect(row(harness, 'SELECT status, result FROM tasks LIMIT 1')).toEqual({
+      status: 'done', result: 'failed: inbox_full',
+    })
   })
 
   it('waits for a budget decision instead of asserting headroom for a zero budget', async () => {
@@ -383,7 +386,9 @@ describe('routine runtime-neutral dispatch', () => {
     await expect(cancelRoutineRun(base, administrator, 'run-1')).resolves.toEqual({
       ok: true, run_id: 'run-1', duplicate: false, outcome: 'unconfirmed',
     })
-    expect(row(harness, 'SELECT status FROM tasks LIMIT 1')).toEqual({ status: 'blocked' })
+    expect(row(harness, 'SELECT status, result FROM tasks LIMIT 1')).toEqual({
+      status: 'done', result: 'cancelled: Routine cancelled by operator.',
+    })
     expect(row(harness, 'SELECT status, gate_reason FROM flights LIMIT 1')).toEqual({
       status: 'failed', gate_reason: 'routine_cancelled',
     })
@@ -551,7 +556,7 @@ describe('routine runtime-neutral dispatch', () => {
 
       const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
 
-      expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
+      expect(result).toEqual({ ok: true, status: 'skipped', reason: 'unclaimed', run_id: 'run-1' })
     })
 
     it("DOES dispatch when the grant is department-admin on the TARGET squad's department", async () => {
