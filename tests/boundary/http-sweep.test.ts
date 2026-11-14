@@ -107,11 +107,11 @@ const PATHS = getRoutes(root)
 
 // Leaks this sweep found that are not fixed yet. Each is excluded from the generic assertion above, and pinned
 // by its own it.fails below, so the day the route is fixed that test goes red and the entry is deleted.
-// task 22db3773 is the audit of tenant-wide surfaces a bootstrap_self identity can reach; these two are what
-// the audit finds, and they are reachable by every squad member, not only by a bootstrapped stranger.
+// Two tenant-wide surfaces a bootstrap_self identity can reach, each with its own board task (c0c8a19f kanban,
+// bd4b7fc4 join page); both are reachable by every squad member, not only by a bootstrapped stranger.
 const KNOWN_OPEN: Array<{ task: string; path: string; what: string }> = [
-  { task: '22db3773', path: '/dashboard/kanban', what: 'the board selector lists every project name in the pot, including other customers\'' },
-  { task: '22db3773', path: '/squads/sq-b/agents/join', what: 'the refusal page for a squad the caller cannot see prints that squad\'s name in its title' },
+  { task: 'c0c8a19f', path: '/dashboard/kanban', what: 'the board selector lists every project name in the pot, including other customers\'' },
+  { task: 'bd4b7fc4', path: '/squads/sq-b/agents/join', what: 'the refusal page for a squad the caller cannot see prints that squad\'s name in its title' },
 ]
 const OPEN_PATHS = new Set(KNOWN_OPEN.map((k) => k.path))
 
@@ -128,29 +128,53 @@ describe('route enumeration', () => {
   })
 })
 
+interface RouteSweep { leaks: string[]; answered: number }
+/** Request every enumerated GET route with `headers`; list the routes whose body shows customer B, and count the 2xx answers. */
+async function sweepRoutes(b: Boundary, headers: Record<string, string>): Promise<RouteSweep> {
+  const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
+  const leaks: string[] = []
+  let answered = 0
+  for (const path of PATHS) {
+    if (OPEN_PATHS.has(path)) continue
+    let res: Response
+    try {
+      res = await root.fetch(new Request(`https://pot.test${path}`, { headers }), b.env, ctx)
+    } catch {
+      continue // a handler that throws answers 500; that is not a boundary finding
+    }
+    const type = res.headers.get('content-type') ?? ''
+    if (type.includes('event-stream')) { await res.body?.cancel(); continue }
+    if (res.status >= 200 && res.status < 300) answered += 1
+    const body = await res.text()
+    if (body.includes(B_SECRET) || body.includes(B_SUPABASE_HOST) || body.includes(B_SUPABASE_KEY)) leaks.push(`${path} -> ${res.status}`)
+  }
+  return { leaks, answered }
+}
+
 describe.each(credentials)('GET sweep, $name', (cred) => {
-  it('no route shows or changes customer B', async () => {
+  it('no route shows or changes customer B, and the credential is live (it is answered 2xx somewhere)', async () => {
     const b = await buildBoundary()
     try {
       const headers = await cred.headers(b)
       const before = snapshotB(b)
-      const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
-      const leaks: string[] = []
-      for (const path of PATHS) {
-        if (OPEN_PATHS.has(path)) continue
-        let res: Response
-        try {
-          res = await root.fetch(new Request(`https://pot.test${path}`, { headers }), b.env, ctx)
-        } catch {
-          continue // a handler that throws answers 500; that is not a boundary finding
-        }
-        const type = res.headers.get('content-type') ?? ''
-        if (type.includes('event-stream')) { await res.body?.cancel(); continue }
-        const body = await res.text()
-        if (body.includes(B_SECRET) || body.includes(B_SUPABASE_HOST) || body.includes(B_SUPABASE_KEY)) leaks.push(`${path} -> ${res.status}`)
-      }
+      const { leaks, answered } = await sweepRoutes(b, headers)
+      expect(answered, 'a credential that is refused everywhere would pass this sweep vacuously').toBeGreaterThan(0)
       expect(leaks, 'routes that showed customer B to a caller with no standing').toEqual([])
       expect(snapshotB(b)).toBe(before)
+    } finally {
+      b.close()
+    }
+  }, 120_000)
+})
+
+describe('control: the sweep can see a leak', () => {
+  // The same sweep, as customer B's OWN agent bearer, must find B's data on many routes. If this found nothing, the
+  // empty leak lists above would prove only that the detector is blind (B_SECRET unreachable by any route).
+  it('as B\'s own agent, the same routes show B\'s marker', async () => {
+    const b = await buildBoundary()
+    try {
+      const { leaks } = await sweepRoutes(b, { authorization: `Bearer ${RAW.agentB}` })
+      expect(leaks.length, JSON.stringify(leaks)).toBeGreaterThanOrEqual(5)
     } finally {
       b.close()
     }

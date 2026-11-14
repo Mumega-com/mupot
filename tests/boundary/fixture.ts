@@ -8,7 +8,7 @@
 //   an org admin (mem-admin) and an org owner (mem-owner).
 // Nobody on side A holds any grant on squad B, and the reverse. The schema is the whole migration
 // chain (applyAllMigrations); every MCP call goes through invokeTool, the chokepoint real callers use.
-import { vi } from 'vitest'
+import { expect, vi } from 'vitest'
 import { invokeTool } from '../../src/mcp/index'
 import { resolveCapabilities } from '../../src/auth/capability'
 import { hashMemberToken } from '../../src/auth/member-bearer'
@@ -25,6 +25,13 @@ export const B_SECRET = 'B_SECRET'
 /** Customer B's Supabase connector: a request carrying this host or key is customer B's credential in use. */
 export const B_SUPABASE_HOST = 'b-secret.supabase.co'
 export const B_SUPABASE_KEY = 'B_SECRET-SERVICE-ROLE-KEY'
+
+/** Customer B's flight meta. It must pass parseFlightMetaV1, or flight_get is "not found" for everyone, owner included. */
+const FLIGHT_META_B = {
+  schema: 'mupot.flight.meta/v1', goal_id: 'goal-b', objective_id: 'obj-b', squad_ids: ['sq-b'], task_ids: ['t-b'],
+  done_when: ['B_SECRET-DONE'], artifact_refs: [], receipt_refs: [], confidentiality: 'private',
+  publication_target: 'none', parent_flight_id: null,
+}
 
 export const RAW = {
   agentA: 'raw-token-agent-a',
@@ -171,7 +178,7 @@ export async function buildBoundary(extraEnv: Record<string, unknown> = {}): Pro
     INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) VALUES
       ('msg-b','${TENANT}','ag-b','ag-b2','mem-b-agent2','message','${B_SECRET}-MSG');
     INSERT INTO flights (id, tenant, agent, goal, status, meta, project_id, dispatched_by_agent_id) VALUES
-      ('f-b','${TENANT}','ag-b','${B_SECRET}-FLIGHT-GOAL','running','{"v":1,"squad_ids":["sq-b"]}','p-b','ag-b');
+      ('f-b','${TENANT}','ag-b','${B_SECRET}-FLIGHT-GOAL','running','${JSON.stringify(FLIGHT_META_B)}','p-b','ag-b');
   `)
 
   const seeded = await addConnector(env, {
@@ -287,4 +294,52 @@ export function snapshotB(b: Boundary): string {
     q(`SELECT * FROM project_squad_access WHERE project_id = 'p-b' OR squad_id = 'sq-b' ORDER BY project_id, squad_id`),
     q(`SELECT * FROM connectors WHERE scope_id = 'sq-b' ORDER BY id`),
   ])
+}
+
+/** Raise a squad's two seeded agents from member to lead (the floor wake_agent, update_agent etc. ask for). */
+export function promoteToLead(b: Boundary, side: 'a' | 'b'): void {
+  b.h.sqlite.exec(`UPDATE capabilities SET capability = 'lead' WHERE id IN ('c-${side}', 'c-${side}2', 'c-${side}h');
+    UPDATE memberships SET capability = 'lead' WHERE id IN ('ms-${side}', 'ms-${side}2')`)
+}
+
+export interface BoundaryProbe {
+  /** B's legitimate caller: the one the guard expects (B's agent, B's member, B's lead, B's gate holder). */
+  owner: AuthContext
+  /** The cross-customer caller. */
+  intruder: AuthContext
+  /** The exact error code of the boundary guard that must refuse the intruder. */
+  code: string
+  /** Optional: the HTTP-ish status that goes with `code`. */
+  status?: number
+  /**
+   * Only when the probe moves something of A's INTO B (so the owner cannot make the identical call): the owner's
+   * mirror call in its own world, same tool. Default: the same arguments.
+   */
+  ownerArgs?: Record<string, unknown>
+  /** Runs right after the intruder's refusal, before the owner's call (e.g. "nothing went out on the wire"). */
+  afterIntruder?: () => void
+  /** Extra check on the owner's success. */
+  ownerCheck?: (r: ToolResult) => void
+}
+
+/**
+ * THE RULE of this suite: a refusal proves nothing unless the same call, with the same arguments, succeeds for
+ * the legitimate caller. So every cross-customer probe is a pair. The intruder goes first (a successful owner
+ * call may change state the guard keys on): it must be refused with the EXACT code of the guard, and B's rows
+ * must be byte-identical afterwards. Then the owner makes the call and must succeed.
+ */
+export async function expectBoundary(b: Boundary, tool: string, args: Record<string, unknown>, probe: BoundaryProbe): Promise<{ owner: ToolResult; intruder: ToolResult }> {
+  const label = `${tool} ${JSON.stringify(args)}`
+  const before = snapshotB(b)
+  const intruder = await b.call(probe.intruder, tool, args)
+  expect(intruder.ok, `${label}: intruder must be refused: ${JSON.stringify(intruder)}`).toBe(false)
+  expect(intruder.error, `${label}: wrong refusal: ${JSON.stringify(intruder)}`).toBe(probe.code)
+  if (probe.status !== undefined) expect(intruder.status, `${label}: wrong status`).toBe(probe.status)
+  expect(leaksB(intruder), `${label}: the refusal leaks B`).toBe(false)
+  expect(snapshotB(b), `${label}: the refused call changed B's rows`).toBe(before)
+  probe.afterIntruder?.()
+  const owner = await b.call(probe.owner, tool, probe.ownerArgs ?? args)
+  expect(owner.ok, `${label}: CONTROL, the legitimate owner must succeed (else the refusal above proves nothing): ${JSON.stringify(owner)}`).toBe(true)
+  probe.ownerCheck?.(owner)
+  return { owner, intruder }
 }
