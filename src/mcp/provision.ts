@@ -295,7 +295,6 @@ function agentTokenMintResponse(
       agent.id,
       agent.squad_id,
       env.TENANT_SLUG,
-      canonicalOrigin,
     ),
     note:
       'the raw token is NOT in this result. Call reveal_credential_claim '

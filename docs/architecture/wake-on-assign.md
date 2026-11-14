@@ -14,8 +14,8 @@ The assigning request must stay cheap (a 20-task router tick used to pay ~10 D1 
 | **inline** `enqueueAssignmentWake` | the assigning request / tick, after the assignment committed | ONE conditional `INSERT ... ON CONFLICT DO NOTHING RETURNING outcome` into the ledger, then a queue send (no D1). Written right after the assignment commits and BEFORE the mirror / bus event, so a queue outage leaves a committed `queued` row for the sweep. Never throws, never touches the assignment. |
 | **off-path** `processAssignmentWakes` | the queue consumer (`assignment.wake` job, `src/bus/consumer.ts`); `sweepAssignmentWakes` is the cron backstop | everything else: re-checks, reader lookup, fold or send |
 
-The `assignment.wake` job carries no authority: it is internal-only (`src/bus/internal-events.ts`; the shared emitter and
-`/bus/emit` refuse it) and the consumer rebuilds every fact from the ledger.
+The `assignment.wake` job carries no authority: it is internal-only (`src/bus/internal-events.ts`; the shared emitter
+refuses it) and the consumer rebuilds every fact from the ledger.
 
 ## What is sent
 
