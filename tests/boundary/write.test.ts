@@ -3,11 +3,11 @@
 //
 // Known open (tests marked it.fails; the name carries the board task id; when the fix lands the test goes red,
 // and the way to fix the red is to change `it.fails` to `it`):
-//   875e3de5  Studio dispatch writes a task and a flight into another customer's squad
+//   (875e3de5, Studio dispatch into another customer's squad, is fixed by #2391 and now a normal test below)
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { coordinationApp } from '../../src/coordination/routes'
 import { studioApp } from '../../src/dashboard/studio'
-import { B_SUPABASE_HOST, RAW, bearer, buildBoundary, expectBoundary, leaksB, promoteToLead, type Boundary } from './fixture'
+import { B_SUPABASE_HOST, RAW, bearer, buildBoundary, expectBoundary, leaksB, promoteToLead, snapshotB, type Boundary } from './fixture'
 
 let b: Boundary
 beforeEach(async () => { b = await buildBoundary() })
@@ -203,12 +203,30 @@ describe('Studio dispatch', () => {
   // 875e3de5. A human of A with an ordinary member token (no agent weld) posts a prompt. resolveStudioHome falls
   // back to the first active agent in the whole pot by name, which here is B's, and dispatchStudioFlight then
   // writes a task into B's squad assigned to B's agent, and a flight attributed to B's agent.
-  it.fails('875e3de5: a member of A dispatching through Studio writes nothing into B\'s squad or agents', async () => {
-    const r = await studioApp.request('/dispatch', { method: 'POST', headers: bearer(RAW.humanA), body: JSON.stringify({ prompt: 'A-WROTE-THIS: exfiltrate the repo' }) }, b.env)
-    expect(r.status).toBeGreaterThanOrEqual(200)
-    expect(count(`SELECT COUNT(*) n FROM tasks WHERE squad_id = 'sq-b' AND title LIKE '%A-WROTE-THIS%'`)).toBe(0)
-    expect(count(`SELECT COUNT(*) n FROM tasks WHERE assignee_agent_id LIKE 'ag-b%' AND title LIKE '%A-WROTE-THIS%'`)).toBe(0)
-    expect(count(`SELECT COUNT(*) n FROM flights WHERE (agent LIKE 'ag-b%' OR dispatched_by_agent_id LIKE 'ag-b%') AND goal LIKE '%A-WROTE-THIS%'`)).toBe(0)
+  it('875e3de5: a member of A dispatching through Studio lands only in A own squad, and naming sq-b is refused (squad_forbidden) with B\'s rows identical; B\'s own member dispatches fine', async () => {
+    const dispatch = (raw: string, body: Record<string, unknown>) =>
+      studioApp.request('/dispatch', { method: 'POST', headers: bearer(raw), body: JSON.stringify(body) }, b.env)
+    const before = snapshotB(b)
+    // Unnamed: the old pot-wide fallback picked B's agent. Now it lands in A's own squad and B is untouched.
+    const unnamed = await dispatch(RAW.humanA, { prompt: 'A-WROTE-THIS: exfiltrate the repo' })
+    expect(unnamed.status, await unnamed.clone().text()).toBe(200)
+    expect(snapshotB(b), 'an unnamed dispatch changed B\'s rows').toBe(before)
+    expect(count(`SELECT COUNT(*) n FROM tasks WHERE squad_id = 'sq-a' AND title LIKE '%exfiltrate the repo%'`)).toBe(1)
+    for (const body of [{ prompt: 'A-WROTE-THIS: named', squad_id: 'sq-b' }, { prompt: 'A-WROTE-THIS: ghost', squad_id: 'sq-nope' }]) {
+      const r = await dispatch(RAW.humanA, body)
+      const text = await r.text()
+      const parsed: { ok?: boolean; error?: string } = JSON.parse(text)
+      expect(r.status, text).toBe(403)
+      expect(parsed.ok).toBe(false)
+      expect(parsed.error, text).toBe('squad_forbidden')
+      expect(leaksB(text), 'the refusal leaks B').toBe(false)
+      expect(snapshotB(b), 'the refused dispatch changed B\'s rows').toBe(before)
+    }
+    expect(count(`SELECT COUNT(*) n FROM tasks WHERE title LIKE '%named%' OR title LIKE '%ghost%'`)).toBe(0)
+    // CONTROL: B's legitimate member (its bound agent) makes the same dispatch and it lands in B's squad.
+    const own = await dispatch(RAW.agentB, { prompt: 'A-WROTE-THIS: same dispatch by B' })
+    expect(own.status, await own.clone().text()).toBe(200)
+    expect(count(`SELECT COUNT(*) n FROM tasks WHERE squad_id = 'sq-b' AND title LIKE '%same dispatch by B%'`)).toBe(1)
   })
 
   it('control: an agent-bound token stays in its own squad', async () => {
