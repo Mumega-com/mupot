@@ -42,9 +42,11 @@ export interface SignInInput {
   newUserId?: string
 }
 
+export type SignInRefusalReason = 'invite_only' | 'inactive' | 'email_required'
+
 export type SignInDecision =
   | { allowed: true; via: 'open' | 'identity' | 'member' | 'legacy_admin' | 'first_owner' }
-  | { allowed: false; reason: 'invite_only' | 'inactive' }
+  | { allowed: false; reason: SignInRefusalReason }
 
 export async function decideSignIn(env: Env, input: SignInInput): Promise<SignInDecision> {
   if (isOpenSignup(env)) return { allowed: true, via: 'open' }
@@ -59,8 +61,11 @@ export async function decideSignIn(env: Env, input: SignInInput): Promise<SignIn
       false,
     )
     if (byIdentity.kind === 'resolved') {
+      // #2392: an inactive subject-bound identity must refuse immediately. Do not consult
+      // email standing — a different active member sharing the verified email must not
+      // override the subject-bound refusal (downstream still prefers the inactive identity).
       if (await isLiveMemberId(env, tenant, byIdentity.member.id)) return { allowed: true, via: 'identity' }
-      inactive = true
+      return { allowed: false, reason: 'inactive' }
     }
   }
 
@@ -78,24 +83,36 @@ export async function decideSignIn(env: Env, input: SignInInput): Promise<SignIn
   }
 
   if (input.door === 'google_web' && input.newUserId && !inactive) {
-    if (await claimFirstOwner(env, input.newUserId, email || null)) return { allowed: true, via: 'first_owner' }
+    // #2392: refuse first-owner without a verified email. claimFirstOwner can write an
+    // emailless owner users row, but registerWebSession skips identity registration without
+    // email and the legacy-owner rung needs one — so the next sign-in locks them out and
+    // the pot is no longer empty. Do not invent a subject-only identity path; require email.
+    if (!email) return { allowed: false, reason: 'email_required' }
+    if (await claimFirstOwner(env, input.newUserId, email)) return { allowed: true, via: 'first_owner' }
   }
   return { allowed: false, reason: inactive ? 'inactive' : 'invite_only' }
 }
 
-/** Plain-text refusal for the MCP OAuth callback (nothing was written). */
-export function refusalText(reason: 'invite_only' | 'inactive'): string {
-  return reason === 'inactive'
-    ? 'This account is not active in this pot (suspended or removed), so it cannot connect. Contact an org admin.'
-    : 'This pot is invite-only. Ask an org admin for an invite, open your invite link, then connect again. '
-      + 'If you set this pot up and cannot sign in, contact whoever operates it; an invite will not help you.'
+/** Plain-text refusal for the MCP OAuth callback (nothing was written). Every reason ends with a next step. */
+export function refusalText(reason: SignInRefusalReason): string {
+  if (reason === 'inactive') {
+    return 'This account is not active in this pot (suspended or removed), so it cannot connect. Contact an org admin.'
+  }
+  if (reason === 'email_required') {
+    return 'A verified email is required to sign in to this pot. Sign in again with a Google account that shares a verified email (grant the email scope), then try again.'
+  }
+  return 'This pot is invite-only. Ask an org admin for an invite, open your invite link, then connect again. '
+    + 'If you set this pot up and cannot sign in, contact whoever operates it; an invite will not help you.'
 }
 
 /** Browser page for web sign-in refusals. Never says whether the email is known, except the 'inactive' case, which only the
  *  holder of the verified email can reach. */
-export function inviteOnlyBody(brand: string, reason: 'invite_only' | 'inactive' = 'invite_only'): string {
+export function inviteOnlyBody(brand: string, reason: SignInRefusalReason = 'invite_only'): string {
   const b = escapeHtml(brand)
-  const heading = reason === 'inactive' ? 'This account is not active' : 'This pot is invite-only'
+  const heading =
+    reason === 'inactive' ? 'This account is not active'
+    : reason === 'email_required' ? 'A verified email is required'
+    : 'This pot is invite-only'
   const text = escapeHtml(refusalText(reason).replace(/ connect again/, ' sign in again').replace('cannot connect', 'cannot sign in'))
   return `<!doctype html>
 <html lang="en">
