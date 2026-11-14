@@ -103,7 +103,8 @@ describe('tasks and projects over MCP', () => {
     await expectBoundary(b, 'task_verdict', { task_id: 't-b', verdict: 'approved', note: 'x', expected_submission_id: sub }, {
       owner: await b.agent('ag-b2', 'mem-b-agent2'), intruder: await b.attacker(), code: 'forbidden', status: 403,
     })
-    expect(count(`SELECT COUNT(*) n FROM task_verdicts WHERE task_id = 't-b'`)).toBe(1)
+    // Fixture seeds ver-b-snap on t-b (#2411); this probe adds one more.
+    expect(count(`SELECT COUNT(*) n FROM task_verdicts WHERE task_id = 't-b'`)).toBe(2)
   })
 
   it('writing memory into B\'s squad or project is refused; B\'s lead writes the same memory', async () => {
