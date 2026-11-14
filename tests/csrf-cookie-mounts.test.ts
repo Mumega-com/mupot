@@ -17,7 +17,6 @@ import { potsApp } from '../src/pots/routes'
 import { routerApp } from '../src/router/routes'
 import { resellerApp } from '../src/reseller/routes'
 import { ssoApp } from '../src/auth/sso-routes'
-import { busApp } from '../src/bus/index'
 import { studioApp } from '../src/dashboard/studio'
 import { inviteApp } from '../src/dashboard/invite'
 import type { Env } from '../src/types'
@@ -41,7 +40,7 @@ const CASES: Case[] = [
   { name: 'reseller: create', app: resellerApp, path: '/', body: {} },
   { name: 'sso: config write', app: ssoApp, path: '/config', body: { default_role: 'admin' } },
   { name: 'sso: enroll', app: ssoApp, path: '/enroll', body: { email: 'attacker@evil.test' } },
-  { name: 'bus: emit', app: busApp, path: '/emit', body: { type: 'x' } },
+  // mupot#2395: bus POST /emit removed (dead auth slot); no cookie mutation left on busApp.
   { name: 'studio: chat', app: studioApp, path: '/chat', body: { message: 'hi' } },
   { name: 'studio: dispatch', app: studioApp, path: '/dispatch', body: {} },
   // mupot#1436 round 2 P1-D(3): inviteApp is unauthenticated (no session

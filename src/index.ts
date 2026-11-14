@@ -15,6 +15,7 @@
 // then mount it below. Do NOT change other components' mounts.
 
 import { Hono } from 'hono'
+import { TrieRouter } from 'hono/router/trie-router'
 import { appErrorHandler } from './app-error'
 import { withUnauthenticatedGuidance } from './auth/unauthenticated-guidance'
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
@@ -107,7 +108,13 @@ export { TaskWorkflow, BackupWorkflow } from './workflows/task-workflow'
 // OAuth API handler WorkerEntrypoint — referenced by the OAuthProvider's apiHandler.
 export { McpOAuthApiHandler }
 
-export const app = new Hono<{ Bindings: Env }>()
+// mupot#2395: pin TrieRouter explicitly. Hono's default SmartRouter prefers
+// RegExpRouter, then falls back to TrieRouter when a path is unsupported
+// (today: POST /auth/link-signin/:id/unlink). Leaving that implicit meant a
+// future route could silently flip the active router and change which
+// wildcard middleware runs where. Runtime check: after the first match on the
+// unpinned app, activeRouter is TrieRouter — pin that choice.
+export const app = new Hono<{ Bindings: Env }>({ router: new TrieRouter() })
 
 // mupot#2343: the agent-bearer liveness read failed -> retryable 503; everything else is Hono's default (src/app-error.ts).
 app.onError(appErrorHandler)
