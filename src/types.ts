@@ -676,6 +676,8 @@ export interface Task {
   // This is surfaced by task, board, and list reads; it is not execution output
   // and never authorizes a verdict.
   gate_wake_notice?: string | null
+  gate_wake_notice_at?: string | null
+  review_entered_at?: string | null
   // #142 capsule keystone: a checkable success predicate (e.g. "test X passes",
   // "GET /url returns 200", "migration applied"). Required on creation; the DB
   // column carries a sentinel default for rows pre-dating this migration.
