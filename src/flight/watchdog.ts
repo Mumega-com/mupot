@@ -373,6 +373,16 @@ export interface ReapPrincipalContext {
   leadSquadIds?: string[]
 }
 
+/**
+ * True when the principal is the flight's recorded dispatcher.
+ * Studio writes `member:<id>` for human dispatchers; MCP builds `{ kind:'member', id:<bare> }`.
+ */
+export function sameDispatcherId(actor: FlightActor, dispatchedByAgentId: string): boolean {
+  if (!dispatchedByAgentId) return false
+  if (actor.id === dispatchedByAgentId) return true
+  return actor.kind === 'member' && dispatchedByAgentId === `member:${actor.id}`
+}
+
 /** Squad lead (or squad admin) on one of the flight's squads, per meta.squad_ids. */
 function leadsFlightSquad(flight: FlightRow, ctx: ReapPrincipalContext): boolean {
   if (!ctx.leadSquadIds || ctx.leadSquadIds.length === 0) return false
@@ -419,7 +429,9 @@ export function canReapFlight(
   }
 
   // 3. Flight Dispatcher
-  if (flight.dispatched_by_agent_id && ctx.actor.id === flight.dispatched_by_agent_id) {
+  // Studio stores humans as `member:<id>`; MCP/dashboard principals present the bare member id.
+  // Treat those as the same dispatcher — do not grant a stranger who only shares a suffix.
+  if (flight.dispatched_by_agent_id && sameDispatcherId(ctx.actor, flight.dispatched_by_agent_id)) {
     return true
   }
 

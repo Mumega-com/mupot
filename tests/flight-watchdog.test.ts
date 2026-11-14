@@ -394,6 +394,20 @@ describe('canReapFlight — authorization, on a row read from the real schema', 
     expect(flight.dispatched_by_agent_id).toBe('')
     expect(canReapFlight(flight, { actor: { kind: 'agent', id: '' } })).toBe(false)
   })
+
+  it('allows a bare member id when Studio stored member:<id> as dispatched_by (#2397)', async () => {
+    const flight = await seedAndLoad({
+      id: 'fl-studio-member',
+      agent: 'agent-flying',
+      dispatched_by_agent_id: 'member:human-1',
+    })
+    expect(canReapFlight(flight, { actor: { kind: 'member', id: 'human-1' } })).toBe(true)
+    // Exact prefixed form still matches; a different member does not.
+    expect(canReapFlight(flight, { actor: { kind: 'member', id: 'member:human-1' } })).toBe(true)
+    expect(canReapFlight(flight, { actor: { kind: 'member', id: 'human-2' } })).toBe(false)
+    // An agent whose id equals the bare member must not inherit via the member: prefix rule.
+    expect(canReapFlight(flight, { actor: { kind: 'agent', id: 'human-1' } })).toBe(false)
+  })
 })
 
 // ───────────────────────────────────────────────────────────────────────────────
