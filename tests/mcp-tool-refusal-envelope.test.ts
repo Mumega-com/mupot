@@ -64,12 +64,15 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
     expect(outcome).toMatchObject({ status: 403, error: 'forbidden', isToolRefusal: true })
   })
 
-  it('unauthenticated tools/call stays HTTP 401 with a JSON-RPC error', async () => {
+  it('unauthenticated tools/call stays HTTP 401 with a JSON-RPC error (WWW-Authenticate is OAuthProvider-owned)', async () => {
     const res = await call(mcpApp, 'https://pot.example/', rpcCall, false)
     expect(res.status).toBe(401)
     const body = await res.json() as { error: { message: string }; result?: unknown }
     expect(body.error.message).toBe('unauthenticated')
     expect(body.result).toBeUndefined()
+    // #2409: bare mcpApp has no OAuthProvider challenge. The WWW-Authenticate +
+    // resource_metadata mutation proof is tests/composition/mcp-profile-needs-you-wrapper.test.ts.
+    expect(res.headers.get('www-authenticate')).toBeNull()
   })
 
   it('REST /actions refusal keeps its HTTP status and body', async () => {
