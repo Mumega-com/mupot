@@ -3,7 +3,7 @@ import type { Env } from '../types'
 import { nextRoutineOccurrence, routineOccurrenceKey } from './schedule'
 import type { Routine, RoutinePolicySnapshot, RoutineSchedule } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
-import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
+import { closeRoutineControlTask, controlTaskOutcome, resolveAttemptControlTaskId } from './control-task'
 import { safeConsole } from '../lib/log'
 
 // D1 free-tier invocations allow 50 SQL statements. Worst-case scheduler work is
@@ -11,6 +11,9 @@ import { safeConsole } from '../lib/log'
 export const MAX_DUE_ROUTINES_PER_TICK = 2
 export const MAX_RECOVERIES_PER_TICK = 2
 export const MAX_CLAIMS_PER_TICK = 1
+// Recovery batch is 2 statements per run. Post-transition control-task close
+// (~3 stmts) is NOT reserved here: raising above 19 drops dispatch below its
+// measured 32-stmt floor under the D1 free-tier 50-stmt ceiling (PR #2425).
 export const MAX_SCHEDULER_DB_STATEMENTS = 3
   + MAX_RECOVERIES_PER_TICK * 2
   + MAX_DUE_ROUTINES_PER_TICK * 3
@@ -452,9 +455,12 @@ export async function recoverExpiredRoutineLeases(
     if (wrote(outcomes[0]) && wrote(outcomes[1])) {
       // Close after the guarded recovery transition (P1-F): a raced observe→running
       // update leaves the batch at 0 changes and must not settle the live run's task.
+      const taskId = await resolveAttemptControlTaskId(env, {
+        id: run.id, attempt: run.attempt, task_id: run.task_id, project_id: run.project_id,
+      })
       await closeRoutineControlTask(
         env,
-        { task_id: run.task_id, project_id: run.project_id },
+        { task_id: taskId, project_id: run.project_id },
         controlTaskOutcome('failed', 'lease_expired'),
       )
       recovered++

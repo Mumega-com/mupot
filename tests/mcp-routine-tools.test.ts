@@ -635,7 +635,7 @@ describe('routine MCP tools', () => {
     expect(ready.harness.sqlite.prepare("SELECT status FROM flights WHERE id = 'control-flight'").get())
       .toEqual({ status: 'failed' })
     expect(ready.harness.sqlite.prepare("SELECT status, result FROM tasks WHERE id = 'control-task'").get())
-      .toEqual({ status: 'done', result: 'failed: cancellation_unconfirmed' })
+      .toEqual({ status: 'blocked', result: null })
   })
 
   it('continues opaque run pagination and Needs You cursors through JSON-RPC', async () => {

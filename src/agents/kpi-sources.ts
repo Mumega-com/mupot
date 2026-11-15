@@ -96,9 +96,12 @@ export async function taskCounterSource(
   if (target === null) {
     return { ok: false, reason: 'no_target', source: 'task_counter' }
   }
+  // Success = done with an outcome that starts with 'succeeded' (routine control
+  // closes write `succeeded`; failed/cancelled/unclaimed prefixes must not credit).
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS cnt FROM tasks
-       WHERE assignee_agent_id = ? AND status = 'done' LIMIT 1`,
+       WHERE assignee_agent_id = ? AND status = 'done'
+         AND result LIKE 'succeeded%' LIMIT 1`,
   )
     .bind(agent.id)
     .first<{ cnt: number }>()

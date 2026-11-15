@@ -1083,7 +1083,7 @@ describe('Routine proposal submission and governed actions', () => {
       status: 'queued', result_summary: 'flight_clearance_hold', retry_at: expect.any(String),
     })
     expect(row(fixture, "SELECT status, result, assignee_agent_id FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'failed: flight_clearance_hold', assignee_agent_id: null,
+      status: 'done', result: 'failed: flight_clearance_hold', assignee_agent_id: 'agent-1',
     })
     expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'running' })
 
@@ -1139,7 +1139,7 @@ describe('Routine proposal submission and governed actions', () => {
       status: 'failed', result_summary: 'execution_failed', retry_at: null,
     })
     expect(row(fixture, "SELECT status, result, assignee_agent_id FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'failed: execution_failed', assignee_agent_id: null,
+      status: 'done', result: 'failed: execution_failed', assignee_agent_id: 'agent-1',
     })
     expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'running' })
   })
@@ -1233,7 +1233,7 @@ describe('Routine proposal submission and governed actions', () => {
     expect(row(fixture, "SELECT status FROM routine_run_actions WHERE id = 'action-cancel'")).toEqual({ status: 'cancelled' })
     expect(row(fixture, "SELECT status, gate_reason FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'failed', gate_reason: 'routine_cancelled' })
     expect(row(fixture, "SELECT status, result, assignee_agent_id FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'failed: cancellation_unconfirmed', assignee_agent_id: null,
+      status: 'blocked', result: null, assignee_agent_id: 'agent-1',
     })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_requested'")).toEqual({ count: 1 })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_unconfirmed'")).toEqual({ count: 1 })
@@ -1265,7 +1265,7 @@ describe('Routine proposal submission and governed actions', () => {
       status: 'cancelled', result_summary: 'cancellation_confirmed',
     })
     expect(row(fixture, "SELECT status, result, assignee_agent_id FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'cancelled: operator', assignee_agent_id: null,
+      status: 'done', result: 'cancelled: operator', assignee_agent_id: 'agent-1',
     })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_confirmed'")).toEqual({ count: 1 })
   })
@@ -1494,7 +1494,7 @@ describe('Routine proposal submission and governed actions', () => {
     expect(row(fixture, "SELECT status FROM routine_run_actions WHERE id = 'action-claimed'")).toEqual({ status: 'cancelled' })
     expect(row(fixture, "SELECT status FROM flights WHERE id = 'control-flight'")).toEqual({ status: 'failed' })
     expect(row(fixture, "SELECT status, result FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'failed: cancellation_unconfirmed',
+      status: 'blocked', result: null,
     })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_requested'")).toEqual({ count: 1 })
     expect(row(fixture, "SELECT COUNT(*) AS count FROM routine_run_events WHERE run_id = 'run-1' AND kind = 'cancellation_unconfirmed'")).toEqual({ count: 1 })
@@ -1512,7 +1512,7 @@ describe('Routine proposal submission and governed actions', () => {
     fixture.harness.sqlite.exec("UPDATE flights SET status = 'landed', ended_at = 1752940900000 WHERE id = 'control-flight'")
     await expect(cancelRoutineRun(fixture.env, administrator, 'run-1')).resolves.toMatchObject({ ok: true, outcome: 'unconfirmed' })
     expect(row(fixture, "SELECT status, result FROM tasks WHERE id = 'control-task'")).toEqual({
-      status: 'done', result: 'failed: cancellation_unconfirmed',
+      status: 'blocked', result: null,
     })
     expect(row(fixture, "SELECT status FROM routine_runs WHERE id = 'run-1'")).toEqual({ status: 'failed' })
 

@@ -591,7 +591,8 @@ export async function updateKpiProgress(
   // FUTURE: replace with domain-specific signal (e.g. GitHub PRs, revenue events).
   const doneRow = await env.DB.prepare(
     `SELECT COUNT(*) AS cnt FROM tasks
-       WHERE assignee_agent_id = ? AND status = 'done' LIMIT 1`,
+       WHERE assignee_agent_id = ? AND status = 'done'
+         AND result LIKE 'succeeded%' LIMIT 1`,
   )
     .bind(agentId)
     .first<{ cnt: number }>()

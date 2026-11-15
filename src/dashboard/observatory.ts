@@ -50,7 +50,7 @@ export async function loadAgentStats(env: Env): Promise<Map<string, AgentStat>> 
     `SELECT
        a.id                                                      AS agent_id,
        COUNT(t.id)                                               AS task_count,
-       COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done_count,
+       COALESCE(SUM(CASE WHEN t.status = 'done' AND t.result LIKE 'succeeded%' THEN 1 ELSE 0 END), 0) AS done_count,
        COALESCE(SUM(CASE WHEN t.status IN ('open','in_progress') THEN 1 ELSE 0 END), 0) AS in_flight,
        COALESCE(SUM(t.cost_micro_usd), 0)                             AS spend_micro_usd
      FROM agents a

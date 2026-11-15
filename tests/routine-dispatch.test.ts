@@ -294,10 +294,10 @@ describe('routine runtime-neutral dispatch', () => {
     expect(row(harness, "SELECT assigned_agent_id FROM routine_runs WHERE id = 'run-1'")).toEqual({
       assigned_agent_id: 'agent-preferred',
     })
-    // Attempt 1's control task was closed after the inbox_full retry (assignee cleared so
-    // a failed close cannot credit KPI). Attempt 2 never minted a new task (agent offline).
-    expect(row(harness, 'SELECT status, assignee_agent_id FROM tasks LIMIT 1')).toEqual({
-      status: 'done', assignee_agent_id: null,
+    // Attempt 1's control task was closed after the inbox_full retry (assignee kept;
+    // KPI honesty uses result LIKE 'succeeded%'). Attempt 2 never minted a new task.
+    expect(row(harness, 'SELECT status, assignee_agent_id, result FROM tasks LIMIT 1')).toEqual({
+      status: 'done', assignee_agent_id: 'agent-preferred', result: 'failed: inbox_full',
     })
   })
 
@@ -460,7 +460,7 @@ describe('routine runtime-neutral dispatch', () => {
       ok: true, run_id: 'run-1', duplicate: false, outcome: 'unconfirmed',
     })
     expect(row(harness, 'SELECT status, result FROM tasks LIMIT 1')).toEqual({
-      status: 'done', result: 'failed: cancellation_unconfirmed',
+      status: 'blocked', result: null,
     })
     expect(row(harness, 'SELECT status, gate_reason FROM flights LIMIT 1')).toEqual({
       status: 'failed', gate_reason: 'routine_cancelled',
@@ -1184,7 +1184,7 @@ describe('routine dispatch respects execution_pauses', () => {
       const result = await dispatchRoutineRun(windowRace(h, 'INSERT INTO agent_messages', () => undefined, () => drainOne(h)), 'run-1', NOW)
       expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'inbox_full' })
       expect(audits(h)).toBe(0)
-      expect(tasksOf(h)).toEqual([{ status: 'done', a: null }])
+      expect(tasksOf(h)).toEqual([{ status: 'done', a: 'agent-preferred' }])
     })
 
     it('a pause that ended BEFORE the write does not turn a drained-cap refusal into a pause', async () => {
@@ -1220,7 +1220,7 @@ describe('routine dispatch respects execution_pauses', () => {
         'run-1', NOW)
       expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'inbox_full' })
       expect(audits(h)).toBe(0)
-      expect(tasksOf(h)).toEqual([{ status: 'done', a: null }])
+      expect(tasksOf(h)).toEqual([{ status: 'done', a: 'agent-preferred' }])
     })
 
     it('a pause that lands between the refusal-time stamp and the write (active now, paused_at later) still releases', async () => {

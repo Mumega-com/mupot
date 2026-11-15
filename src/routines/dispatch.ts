@@ -15,7 +15,7 @@ import { createTask, TaskCreateFenceError } from '../tasks/service'
 import type { CapabilityGrant, Env, OrgKind, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
-import { closeRoutineControlTask, controlTaskOutcome } from './control-task'
+import { closeRoutineControlTask, controlTaskOutcome, resolveAttemptControlTaskId } from './control-task'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
@@ -413,13 +413,20 @@ async function closeDispatchControlTask(
   run: DispatchRunRow,
   outcome: string,
 ): Promise<void> {
-  // Prefer the durable row: in-memory run may predate the observe write that set task_id.
+  // Close ONLY this attempt's control task. Never a prior-attempt pause orphan
+  // still hanging on routine_runs.task_id (lens P1).
   const live = await env.DB.prepare(
-    `SELECT task_id FROM routine_runs WHERE id = ? AND tenant = ?`,
-  ).bind(run.id, run.tenant).first<{ task_id: string | null }>()
+    `SELECT task_id, attempt FROM routine_runs WHERE id = ? AND tenant = ?`,
+  ).bind(run.id, run.tenant).first<{ task_id: string | null; attempt: number }>()
+  const taskId = await resolveAttemptControlTaskId(env, {
+    id: run.id,
+    attempt: live?.attempt ?? run.attempt,
+    task_id: live?.task_id ?? run.task_id,
+    project_id: run.project_id,
+  })
   await closeRoutineControlTask(
     env,
-    { task_id: live?.task_id ?? run.task_id, project_id: run.project_id },
+    { task_id: taskId, project_id: run.project_id },
     outcome,
   )
 }
