@@ -51,6 +51,7 @@ function seedReviewTask(sqlite: Sqlite, id: string, opts: { gateOwner?: string |
        VALUES (?, ?, 'T', 'b', 'done', ?, ?, ?)`,
     )
     .run(id, SQUAD_ID, opts.status ?? 'review', opts.gateOwner === undefined ? LANE : opts.gateOwner, opts.updatedAt ?? REVIEW_ENTERED)
+  sqlite.prepare("UPDATE tasks SET gate_wake_notice=?,gate_wake_notice_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(`Gate wake delivered: ${opts.gateOwner??LANE} -> agent ${AGENT} (bus=sent, inbox=sent).`,id)
 }
 
 function wakeCount(sqlite: Sqlite, taskId: string): number {
@@ -65,12 +66,75 @@ function taskRow(sqlite: Sqlite, id: string): Record<string, unknown> {
 }
 
 describe('gate-stall watchdog', () => {
-  it('re-wakes a stalled review task once and records the claim', async () => {
+  it.each([
+    null,
+    'Gate wake resolution failed for gate:athena; no wake was attempted.',
+    'Gate wake delivery_failed: gate:athena -> agent agent-gate-seat (bus=failed, inbox=failed).',
+    'Gate wake partial: gate:athena -> agent agent-gate-seat (bus=sent, inbox=failed).',
+    'Gate wake delivered: gate:athena -> agent previous-holder (bus=sent, inbox=sent).',
+  ])('recovers an undelivered or wrong-holder first wake once after success (%s)',async notice=>{
+    const {env,sqlite,harness}=setup();seedReviewTask(sqlite,'recover')
+    sqlite.prepare("UPDATE tasks SET gate_wake_notice=? WHERE id='recover'").run(notice)
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:1,undelivered:0,recorded:1})
+    expect(wakeCount(sqlite,'recover')).toBe(1)
+    expect(await sweepAt(env,minutes(31))).toMatchObject({rewoken:0,undelivered:0,recorded:1})
+    expect(wakeCount(sqlite,'recover')).toBe(1)
+    expect(sqlite.prepare("SELECT delivered_count FROM gate_stall_rewakes WHERE task_id='recover'").get()).toEqual({delivered_count:1})
+    harness.close()
+  })
+
+  it('recovers when the grant was not live at review entry and later becomes live',async()=>{
+    const {env,sqlite,harness}=setup();seedReviewTask(sqlite,'late-grant')
+    sqlite.exec("DELETE FROM gate_grants WHERE id='g1'")
+    const {wakeGateOwnerOnReview}=await import('../src/mcp')
+    const task=sqlite.prepare("SELECT * FROM tasks WHERE id='late-grant'").get() as never
+    expect((await wakeGateOwnerOnReview(env,task,{kind:'agent',id:'review-entry'},'review-entry')).status).toBe('no_live_holder')
+    sqlite.prepare("INSERT INTO gate_grants(id,capability,principal_type,principal_id,granted_by,created_at) VALUES('g1',?,'agent',?,'owner-1','2026-08-15T00:00:00.000Z')").run(LANE,AGENT)
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:1,undelivered:0})
+    expect(wakeCount(sqlite,'late-grant')).toBe(1)
+    await sweepAt(env,minutes(31));expect(wakeCount(sqlite,'late-grant')).toBe(1)
+    harness.close()
+  })
+
+  it.each(['status','episode'])('does not recover a stale candidate after its %s changes',async change=>{
+    const {env,sqlite,harness}=setup();seedReviewTask(sqlite,'changed-during-claim')
+    sqlite.exec("UPDATE tasks SET gate_wake_notice=NULL WHERE id='changed-during-claim'")
+    const prepare=harness.db.prepare.bind(harness.db);let changed=false
+    harness.db.prepare=((query:string)=>{
+      if(!changed&&query.includes('INSERT INTO gate_stall_rewakes')){
+        changed=true
+        if(change==='status')sqlite.exec("UPDATE tasks SET status='approved' WHERE id='changed-during-claim'")
+        else sqlite.prepare("UPDATE tasks SET updated_at=? WHERE id='changed-during-claim'").run(minutes(120).toISOString())
+      }
+      return prepare(query)
+    }) as typeof harness.db.prepare
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:0,recorded:1})
+    expect(changed).toBe(true);expect(wakeCount(sqlite,'changed-during-claim')).toBe(0)
+    harness.close()
+  })
+
+  it('keeps the first gate wake but records later stalls without sending mail', async () => {
+    const {env,sqlite,harness}=setup()
+    seedReviewTask(sqlite,'quiet')
+    const {wakeGateOwnerOnReview}=await import('../src/mcp')
+    const task=sqlite.prepare("SELECT * FROM tasks WHERE id='quiet'").get() as never
+    await wakeGateOwnerOnReview(env,task,{kind:'agent',id:'initial-review'},'initial-review')
+    expect(wakeCount(sqlite,'quiet')).toBe(1)
+    const before=taskRow(sqlite,'quiet')
+    const r=await sweepAt(env,T0)
+    expect(wakeCount(sqlite,'quiet')).toBe(1)
+    expect(r).toMatchObject({rewoken:0,undelivered:0,recorded:1})
+    expect(sqlite.prepare("SELECT rewake_count,delivered_count,last_outcome FROM gate_stall_rewakes WHERE task_id='quiet'").get()).toEqual({rewake_count:1,delivered_count:0,last_outcome:'logged_no_mail'})
+    expect(taskRow(sqlite,'quiet')).toEqual(before)
+    harness.close()
+  })
+
+  it('records a stalled review without sending a second wake', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 't1')
     const res = await sweepAt(env, T0)
-    expect(res).toMatchObject({ scanned: 1, rewoken: 1, errors: 0 })
-    expect(wakeCount(sqlite, 't1')).toBe(1)
+    expect(res).toMatchObject({ scanned: 1, recorded: 1, rewoken: 0, errors: 0 })
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     const claim = sqlite.prepare(`SELECT * FROM gate_stall_rewakes WHERE task_id = 't1'`).get() as Record<string, unknown>
     expect(claim).toMatchObject({ rewake_count: 1, review_since: REVIEW_ENTERED })
     expect(claim.last_outcome).toBeTruthy()
@@ -85,26 +149,26 @@ describe('gate-stall watchdog', () => {
     harness.close()
   })
 
-  it('does not re-send inside the window, and re-sends once the window elapses', async () => {
+  it('records only once per threshold window', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 't1')
     await sweepAt(env, T0)
     const second = await sweepAt(env, minutes(10))
-    expect(second.rewoken).toBe(0)
-    expect(wakeCount(sqlite, 't1')).toBe(1)
+    expect(second.recorded).toBe(0)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     // Window (30 min default) elapsed.
     const third = await sweepAt(env, minutes(31))
-    expect(third.rewoken).toBe(1)
-    expect(wakeCount(sqlite, 't1')).toBe(2)
+    expect(third.recorded).toBe(1)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     harness.close()
   })
 
-  it('two concurrent sweeps send exactly once', async () => {
+  it('two concurrent sweeps record exactly once without mail', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 't1')
     const [a, b] = await Promise.all([sweepAt(env, T0), sweepAt(env, T0)])
-    expect(a.rewoken + b.rewoken).toBe(1)
-    expect(wakeCount(sqlite, 't1')).toBe(1)
+    expect(a.recorded + b.recorded).toBe(1)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     harness.close()
   })
 
@@ -114,7 +178,7 @@ describe('gate-stall watchdog', () => {
     await sweepAt(env, T0)
     // Simulate a racer that already listed the candidate (stale read) and now sweeps at the same instant.
     const res = await sweepAt(env, T0)
-    expect(res.rewoken).toBe(0)
+    expect(res.recorded).toBe(0)
     expect((sqlite.prepare(`SELECT rewake_count FROM gate_stall_rewakes WHERE task_id='t1'`).get() as { rewake_count: number }).rewake_count).toBe(1)
     harness.close()
   })
@@ -127,7 +191,7 @@ describe('gate-stall watchdog', () => {
     sqlite.prepare(`INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at, reversed_at) VALUES ('v2','reversed','approved','a','2026-10-06T11:00:00.000Z','2026-10-06T11:30:00.000Z')`).run()
     await sweepAt(env, T0)
     expect(wakeCount(sqlite, 'live')).toBe(0)
-    expect(wakeCount(sqlite, 'reversed')).toBe(1)
+    expect(wakeCount(sqlite, 'reversed')).toBe(0)
     harness.close()
   })
 
@@ -146,7 +210,7 @@ describe('gate-stall watchdog', () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 't1')
     for (let i = 0; i < 6; i += 1) await sweepAt(env, minutes(i * 31))
-    expect(wakeCount(sqlite, 't1')).toBe(3)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     expect((sqlite.prepare(`SELECT rewake_count FROM gate_stall_rewakes WHERE task_id='t1'`).get() as { rewake_count: number }).rewake_count).toBe(3)
     harness.close()
   })
@@ -157,7 +221,7 @@ describe('gate-stall watchdog', () => {
     expect((await sweepAt(env, T0)).scanned).toBe(0)
     await sweepAt(env, minutes(90))
     await sweepAt(env, minutes(400))
-    expect(wakeCount(sqlite, 't1')).toBe(1)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     harness.close()
   })
 
@@ -172,13 +236,13 @@ describe('gate-stall watchdog', () => {
     harness.close()
   })
 
-  it('wakes only the resolved gate_owner lane holder', async () => {
+  it('sends no stall mail to any gate lane holder', async () => {
     const { env, sqlite, harness } = setup()
     sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('bystander', '${SQUAD_ID}', 'bystander', 'bystander', 'active')`)
     seedReviewTask(sqlite, 't1')
     await sweepAt(env, T0)
     const to = sqlite.prepare(`SELECT DISTINCT to_agent FROM agent_messages WHERE request_id LIKE 'review-wake:t1:%'`).all() as { to_agent: string }[]
-    expect(to.map((r) => r.to_agent)).toEqual([AGENT])
+    expect(to).toEqual([])
     harness.close()
   })
 
@@ -194,7 +258,7 @@ describe('gate-stall watchdog', () => {
       (await listNeedsYou(env, routinePrincipal(auth), { view: 'stuck', auth }, T0.toISOString())).items.map((i) => i.reason)
     expect(await reasons()).toEqual(['Approval required by gate:athena'])
     await sweepAt(env, T0)
-    expect(await reasons()).toEqual(['Approval required by gate:athena (no verdict after 1 gate re-wake)'])
+    expect(await reasons()).toEqual(['Approval required by gate:athena'])
     harness.close()
   })
 
@@ -209,10 +273,10 @@ describe('gate-stall watchdog', () => {
     let undelivered = 0
     for (let i = 0; i < 4; i += 1) {
       const r = await sweepAt(env, minutes(i * 31))
-      rewoken += r.rewoken
+      rewoken += r.recorded
       undelivered += r.undelivered
     }
-    expect(rewoken).toBe(0)
+    expect(rewoken).toBe(3)
     expect(undelivered).toBe(3)
     expect(wakeCount(sqlite, 't1')).toBe(0)
     const row = sqlite.prepare(`SELECT rewake_count, delivered_count, last_outcome FROM gate_stall_rewakes WHERE task_id='t1'`).get() as Record<string, unknown>
@@ -227,16 +291,16 @@ describe('gate-stall watchdog', () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 't1')
     for (let i = 0; i < 4; i += 1) await sweepAt(env, minutes(i * 31))
-    expect(wakeCount(sqlite, 't1')).toBe(3)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     // Old round's verdict (unreversed, decided before re-entry) must not suppress the new round.
     sqlite.exec(`INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
                  VALUES ('v-old', 't1', 'rejected', 'x', '2026-10-06T09:00:00.000Z')`)
     const reentered = minutes(150).toISOString()
     sqlite.exec(`UPDATE tasks SET updated_at = '${reentered}' WHERE id = 't1'`)
     await sweepAt(env, minutes(190))
-    expect(wakeCount(sqlite, 't1')).toBe(4)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
     const row = sqlite.prepare(`SELECT rewake_count, delivered_count, review_since FROM gate_stall_rewakes WHERE task_id='t1'`).get() as Record<string, unknown>
-    expect(row).toMatchObject({ rewake_count: 1, delivered_count: 1, review_since: reentered })
+    expect(row).toMatchObject({ rewake_count: 1, delivered_count: 0, review_since: reentered })
     harness.close()
   })
 })
@@ -268,21 +332,22 @@ describe('gate-stall watchdog: archive is an action boundary (mupot#1780)', () =
     harness.close()
   })
 
-  it('SELECT guard is what stops the sweep: an un-archived sibling still wakes', async () => {
+  it('SELECT guard stops archived accounting while an un-archived sibling is recorded', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 'arch')
     seedReviewTask(sqlite, 'live')
     archive(sqlite, 'arch')
     const res = await sweepAt(env, T0)
-    expect(res).toMatchObject({ scanned: 1, rewoken: 1 })
+    expect(res).toMatchObject({ scanned: 1, recorded: 1, rewoken: 0 })
     expect(wakeCount(sqlite, 'arch')).toBe(0)
-    expect(wakeCount(sqlite, 'live')).toBe(1)
+    expect(wakeCount(sqlite, 'live')).toBe(0)
     harness.close()
   })
 
   it('wakeGateOwnerOnReview itself refuses an archived task: no rows, no notice, no bus event', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 'arch')
+    sqlite.exec("UPDATE tasks SET gate_wake_notice=NULL WHERE id='arch'")
     archive(sqlite, 'arch')
     const task = sqlite.prepare(`SELECT * FROM tasks WHERE id = 'arch'`).get() as never
     const { wakeGateOwnerOnReview } = await import('../src/mcp')
@@ -369,16 +434,42 @@ describe('gate-stall watchdog: member-held gate decision card (mupot#2015)', () 
     return { ...base, env }
   }
 
-  it('counts the first card as a re-wake, but a duplicate card (same review entry) is NOT counted delivered', async () => {
-    const { env, sqlite, harness } = memberSetup()
-    seedReviewTask(sqlite, 'tm1', { gateOwner: 'gate:hm' })
-    const first = await sweepAt(env, T0)
-    expect(first.rewoken).toBe(1)
-    const second = await sweepAt(env, minutes(31))
-    expect(second.rewoken).toBe(0)
-    expect(second.undelivered).toBe(1)
-    const row = sqlite.prepare(`SELECT delivered_count, last_outcome FROM gate_stall_rewakes WHERE task_id='tm1'`).get() as Record<string, unknown>
-    expect(row).toMatchObject({ delivered_count: 1, last_outcome: 'queued_to_owner_agent' })
+  it('does not mistake a previous member holder card for delivery to the current member',async()=>{
+    const {env,sqlite,harness}=memberSetup();seedReviewTask(sqlite,'member-changed',{gateOwner:'gate:hm'})
+    sqlite.prepare("UPDATE tasks SET gate_wake_notice=? WHERE id='member-changed'").run("Decision card queued to stale's inbox (not yet acknowledged): gate:hm is held by member mem-h.previous. A verdict still needs the member's own decision.")
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:1,undelivered:0})
+    expect(sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()).toEqual({n:1})
+    expect(await sweepAt(env,minutes(31))).toMatchObject({rewoken:0,undelivered:0})
+    harness.close()
+  })
+
+  it('recovers a failed member decision-card delivery and then stays quiet',async()=>{
+    const {env,sqlite,harness}=memberSetup();seedReviewTask(sqlite,'member-recovery',{gateOwner:'gate:hm'})
+    sqlite.exec("CREATE TRIGGER fail_first_card BEFORE INSERT ON agent_messages BEGIN SELECT RAISE(ABORT,'card unavailable'); END;")
+    const {wakeGateOwnerOnReview}=await import('../src/mcp')
+    const task=sqlite.prepare("SELECT * FROM tasks WHERE id='member-recovery'").get() as never
+    expect((await wakeGateOwnerOnReview(env,task,{kind:'agent',id:'review-entry'},'review-entry')).status).toBe('owner_agent_delivery_failed')
+    sqlite.exec('DROP TRIGGER fail_first_card')
+    expect(await sweepAt(env,T0)).toMatchObject({rewoken:1,undelivered:0})
+    expect(sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()).toEqual({n:1})
+    expect(await sweepAt(env,minutes(31))).toMatchObject({rewoken:0,undelivered:0})
+    expect(sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()).toEqual({n:1})
+    harness.close()
+  })
+
+  it('the first member-held gate wake delivers a decision card and later stalls stay quiet', async () => {
+    const {env,sqlite,harness}=memberSetup()
+    seedReviewTask(sqlite,'tm1',{gateOwner:'gate:hm'})
+    const {wakeGateOwnerOnReview}=await import('../src/mcp')
+    const task=sqlite.prepare("SELECT * FROM tasks WHERE id='tm1'").get() as never
+    const initial=await wakeGateOwnerOnReview(env,task,{kind:'agent',id:'review-entry'},'review-entry')
+    expect(initial.status).toBe('queued_to_owner_agent')
+    const count=()=>sqlite.prepare('SELECT count(*) AS n FROM agent_messages').get()
+    expect(count()).toEqual({n:1})
+    expect(await sweepAt(env,T0)).toMatchObject({recorded:1,rewoken:0})
+    expect(await sweepAt(env,minutes(31))).toMatchObject({recorded:1,rewoken:0,undelivered:0})
+    expect(count()).toEqual({n:1})
+    expect(sqlite.prepare("SELECT delivered_count,last_outcome FROM gate_stall_rewakes WHERE task_id='tm1'").get()).toEqual({delivered_count:0,last_outcome:'logged_no_mail'})
     harness.close()
   })
 })

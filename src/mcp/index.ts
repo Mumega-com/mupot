@@ -2508,12 +2508,12 @@ export type GateWakeOutcome = {
 
 async function surfaceGateWakeOutcome(
   env: Env,
-  taskId: string,
+  task: Task,
   outcome: Omit<GateWakeOutcome, 'notice_persisted'>,
 ): Promise<GateWakeOutcome> {
   let noticePersisted = true
   try {
-    await persistGateWakeNotice(env, taskId, outcome.notice)
+    noticePersisted = await persistGateWakeNotice(env, task.id, outcome.notice, task.updated_at)
   } catch {
     noticePersisted = false
   }
@@ -2543,7 +2543,7 @@ export async function wakeGateOwnerOnReview(
   }
   const gateOwner = task.gate_owner
   if (!gateOwner) {
-    return surfaceGateWakeOutcome(env, task.id, {
+    return surfaceGateWakeOutcome(env, task, {
       status: 'no_live_holder',
       capability: '',
       active_holders: [],
@@ -2557,7 +2557,7 @@ export async function wakeGateOwnerOnReview(
   try {
     resolution = await resolveSoleGateOwnerAgent(env, gateOwner)
   } catch {
-    return surfaceGateWakeOutcome(env, task.id, {
+    return surfaceGateWakeOutcome(env, task, {
       status: 'resolution_failed',
       capability: gateOwner,
       active_holders: [],
@@ -2574,14 +2574,14 @@ export async function wakeGateOwnerOnReview(
     grant_count: resolution.grant_count,
   }
   if (resolution.status === 'ambiguous') {
-    return surfaceGateWakeOutcome(env, task.id, {
+    return surfaceGateWakeOutcome(env, task, {
       ...baseOutcome,
       status: 'ambiguous',
       notice: `Gate wake refused: ${gateOwner} has multiple live holders (${resolution.active_holders.map((holder) => `${holder.type}:${holder.id}`).join(', ')}); operator decision required.`,
     })
   }
   if (resolution.status === 'no_live_holder') {
-    return surfaceGateWakeOutcome(env, task.id, {
+    return surfaceGateWakeOutcome(env, task, {
       ...baseOutcome,
       status: 'no_live_holder',
       notice: `Gate wake not delivered: ${gateOwner} has no live holder (${resolution.inactive_holders.length} stale or missing grant${resolution.inactive_holders.length === 1 ? '' : 's'}).`,
@@ -2594,7 +2594,7 @@ export async function wakeGateOwnerOnReview(
       (): DecisionCardOutcome => ({ status: 'delivery_failed', agent_ids: [] }),
     )
     if (card.status === 'delivered') {
-      return surfaceGateWakeOutcome(env, task.id, {
+      return surfaceGateWakeOutcome(env, task, {
         ...baseOutcome,
         status: 'queued_to_owner_agent',
         principal: resolution.principal,
@@ -2603,14 +2603,14 @@ export async function wakeGateOwnerOnReview(
       })
     }
     if (card.status === 'delivery_failed') {
-      return surfaceGateWakeOutcome(env, task.id, {
+      return surfaceGateWakeOutcome(env, task, {
         ...baseOutcome,
         status: 'owner_agent_delivery_failed',
         principal: resolution.principal,
         notice: `Gate wake requires human: ${gateOwner} is held by active member ${resolution.principal.id}; decision card delivery to owned agent(s) failed.`,
       })
     }
-    return surfaceGateWakeOutcome(env, task.id, {
+    return surfaceGateWakeOutcome(env, task, {
       ...baseOutcome,
       status: 'requires_human',
       principal: resolution.principal,
@@ -2666,7 +2666,7 @@ export async function wakeGateOwnerOnReview(
     : busDelivered || inboxDelivered
       ? 'partial'
       : 'delivery_failed'
-  return surfaceGateWakeOutcome(env, task.id, {
+  return surfaceGateWakeOutcome(env, task, {
     ...baseOutcome,
     status,
     principal: resolution.principal,

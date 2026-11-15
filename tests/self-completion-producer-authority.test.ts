@@ -120,6 +120,33 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect(row().status).toBe('rejected')
   }
 
+  it.each(['execute','REST'] as const)('recovers a new rejected/reworked review episode through %s without repeating delivered wakes',async path=>{
+    await produce('A','old-episode')
+    sql().prepare("INSERT INTO gate_grants(id,capability,principal_type,principal_id,granted_by,created_at) VALUES('episode-gate',?,'agent','G','ADMIN',datetime('now'))").run(LANE)
+    const {wakeGateOwnerOnReview}=await import('../src/mcp')
+    const {sweepStalledGateReviews}=await import('../src/gates/stall-watchdog')
+    const first=sql().prepare('SELECT * FROM tasks WHERE id=?').get(TASK) as unknown as Task
+    expect((await wakeGateOwnerOnReview(env,first,{kind:'member',id:'ADMIN'},'ADMIN')).status).toBe('delivered')
+    const wakes=()=>Number((sql().prepare("SELECT count(*) AS n FROM agent_messages WHERE from_agent='mupot-review-gate' AND to_agent='G'").get() as {n:number}).n)
+    expect(wakes()).toBe(1)
+    expect((await verdict(adminAuth(),'rejected')).ok).toBe(true)
+    // The existing watchdog verdict comparison has second precision. Real rework takes time;
+    // do not make this episode test depend on two transitions landing in the same SQL second.
+    await new Promise(resolve=>setTimeout(resolve,1100))
+    if(path==='execute')await produce('A','new-episode')
+    else {
+      // Human operational review uses the real PATCH path without claiming an agent artifact.
+      expect((await rest(adminAuth(),'PATCH','',{status:'in_progress',assignee_agent_id:null})).status).toBe(200)
+      expect((await rest(adminAuth(),'PATCH','',{status:'review'})).status).toBe(200)
+    }
+    expect(row().status).toBe('review');expect(wakes()).toBe(1)
+    const now=Date.now()
+    expect(await sweepStalledGateReviews(env,new Date(now+31*60000))).toMatchObject({rewoken:1})
+    expect(wakes()).toBe(2)
+    expect(await sweepStalledGateReviews(env,new Date(now+62*60000))).toMatchObject({rewoken:0})
+    expect(wakes()).toBe(2)
+  })
+
   // ── the producer record ──────────────────────────────────────────────────────
   it('the real execute landing writes the producer receipt in the same batch as review', async () => {
     await produce('A')
