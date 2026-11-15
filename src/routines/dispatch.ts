@@ -15,6 +15,7 @@ import { createTask, TaskCreateFenceError } from '../tasks/service'
 import type { CapabilityGrant, Env, OrgKind, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome, resolveAttemptControlTaskId } from './control-task'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
@@ -407,6 +408,29 @@ async function waitForBudget(env: Env, run: DispatchRunRow, now: Date): Promise<
   return { ok: true, status: 'waiting', reason: 'budget', run_id: run.id }
 }
 
+async function closeDispatchControlTask(
+  env: Env,
+  run: DispatchRunRow,
+  outcome: string,
+): Promise<void> {
+  // Close ONLY this attempt's control task. Never a prior-attempt pause orphan
+  // still hanging on routine_runs.task_id (lens P1).
+  const live = await env.DB.prepare(
+    `SELECT task_id, attempt FROM routine_runs WHERE id = ? AND tenant = ?`,
+  ).bind(run.id, run.tenant).first<{ task_id: string | null; attempt: number }>()
+  const taskId = await resolveAttemptControlTaskId(env, {
+    id: run.id,
+    attempt: live?.attempt ?? run.attempt,
+    task_id: live?.task_id ?? run.task_id,
+    project_id: run.project_id,
+  })
+  await closeRoutineControlTask(
+    env,
+    { task_id: taskId, project_id: run.project_id },
+    outcome,
+  )
+}
+
 async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: string): Promise<RoutineDispatchResult> {
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
@@ -418,6 +442,7 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
       retryAt: null, eventKind: 'failed',
     })
     if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
+    await closeDispatchControlTask(env, run, controlTaskOutcome('failed', reason))
     return { ok: true, status: 'failed', reason, run_id: run.id }
   }
   if (run.attempt >= policy.max_attempts) {
@@ -426,6 +451,11 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
       retryAt: null, eventKind: 'agent_waiting',
     })
     if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
+    // Pause-released orphans stay blocked (#1814/#1823). Other exhausted
+    // causes close so the board cannot keep an open control task forever.
+    if (reason !== EXECUTION_PAUSED_ERROR) {
+      await closeDispatchControlTask(env, run, controlTaskOutcome('unclaimed', reason))
+    }
     return { ok: true, status: 'waiting', reason: 'agent', run_id: run.id }
   }
   const retryAt = new Date(now.getTime() + policy.retry_backoff_seconds * 1000).toISOString()
@@ -434,6 +464,13 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
     retryAt, eventKind: 'retry_scheduled',
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
+  // Delivery/offline retry: close this attempt's control task after the run
+  // transition; the next attempt mints a new task id keyed on run:attempt.
+  // Do NOT close on EXECUTION_PAUSED_ERROR — releasePausedControlTask already
+  // left the orphan blocked+unassigned for humans (#1814).
+  if (reason !== EXECUTION_PAUSED_ERROR) {
+    await closeDispatchControlTask(env, run, controlTaskOutcome('failed', reason))
+  }
   const publicReason = reason === 'agent_offline' || reason === 'inbox_full' || reason === EXECUTION_PAUSED_ERROR
     ? reason
     : 'delivery_failed'

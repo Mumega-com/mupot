@@ -31,6 +31,7 @@
 // matches the S4a episodic pattern.
 
 import type { Env, Agent } from '../types'
+import { TASK_RESULT_NOT_FAILURE_SQL } from '../hygiene/filters'
 
 // ── Source identifier ─────────────────────────────────────────────────────────
 
@@ -96,9 +97,12 @@ export async function taskCounterSource(
   if (target === null) {
     return { ok: false, reason: 'no_target', source: 'task_counter' }
   }
+  // Success = done unless the result is a routine failure close (failed:/cancelled:/
+  // unclaimed: prefixes must not credit; free-text or NULL results still count).
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS cnt FROM tasks
-       WHERE assignee_agent_id = ? AND status = 'done' LIMIT 1`,
+       WHERE assignee_agent_id = ? AND status = 'done'
+         AND ${TASK_RESULT_NOT_FAILURE_SQL()} LIMIT 1`,
   )
     .bind(agent.id)
     .first<{ cnt: number }>()
