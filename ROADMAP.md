@@ -123,3 +123,43 @@ already name stable cuts while defect flow continued on `main`.
 GitHub issues `#2408`–`#2427`, `#2430`, `#2431` as `gh issue view` returned them on
 2026-11-15. Deploy receipts named `deploy-*.md` are records of deploys, not a substitute for
 `/health`.
+
+## Release history (kept for the release-contract tests)
+
+The blocks below are **historical release metadata** retained so CI release-contract receipts
+keep stable anchors. They are not the forward queue above. Read live `/health` for
+production; read `git rev-parse origin/main` for the moving preview line — nothing here pins
+a current `main` or production commit.
+
+## Current version
+
+| State | Version | Meaning |
+|---|---|---|
+| Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
+| Current production version | Read live `/health` | Version and deployed SHA move independently of `main` and tags; this roadmap does not pin current production. Historical observations remain in their release evidence records. |
+| Last tagged stable release | `v0.31.0` | "Office", annotated tag at `52299bab` (tagged 2026-09-28) with a GitHub Release of the same name. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). Read the tag, not a SHA copied here as current production. |
+| Next stable candidate | `v0.32.0` | "Agents as themselves and governed autonomy" — cut from a single frozen `main` SHA onto `release/v0.32.0`, per the release contract in the v0.32.0 section below. `release/v0.31.0` was never cut, so there is no `v0.31.x` patch path; `main` has moved far past the tag. |
+| Following targets | `v0.33.0`, `v0.34.0` | `v0.33.0` "Compounding Project Knowledge"; `v0.34.0` "Distribution and Commercial Operations" (addon/package compatibility, marketplace distribution, and signed distribution receipts). |
+
+### v0.23.0: Trusted Runtime - stable
+
+**Promise:** A self-hosted pot can connect a bound runtime, grant scoped authority, run and
+approve work, retain evidence, recover state, and prove the exact release.
+
+Anything merged after the `v0.23.0` tag remains preview until a later release owns it.
+Trusted Runtime release detail and evidence live in
+[docs/releases/v0.23.0-trusted-runtime.md](docs/releases/v0.23.0-trusted-runtime.md).
+
+Explicitly not in the v0.23-era release definition (historical exclusions, not current
+queue): economy features, new departments, full SOS retirement, GCP portability,
+autonomous-brain expansion, and marketplace-scale distribution work.
+
+## v0.30.0 stabilization train — ordered (updates by PR only)
+
+> Historical ordered release queue from the September 2026 contract. The forward queue is
+> **Now / Next / Later** above; this table is kept as an integrity anchor only.
+
+| Capability | Release state | Activation |
+|---|---|---|
+| Identity, squads, tasks, gates, flights, receipts | `v0.23.0` | Default-on |
+| Console consolidation (project-centered nav) | `preview; post-v0.30 target required` | Default-on only after its own release gate |
