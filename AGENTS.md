@@ -51,10 +51,13 @@ file, not the site repo.
   live token authenticates as the *other* kasra, `c855f82c-…` (squad-core). `agent_offline` here
   means "assigned to a ghost identity", not "host down". Root cause: per-agent-name binding, no
   per-session binding — **mupot#544** is the fix.
-- **A 400 from an admin-gated tool is NOT evidence about authorization.** `validateArgs` runs
-  BEFORE the AAGATE capability floor, so a member-tier caller gets `400 missing required field`
-  which reads like the gate is gone. Test capability boundaries with an argument-free admin tool
-  (#722).
+- **MCP dispatch: floor before args (#2431).** In `src/mcp/index.ts`, `invokeTool` runs
+  `holdsCapabilityFloor` (AAGATE) before `validateArgs`. A member-tier caller without the floor
+  gets `403 forbidden` with `need: <spec.min>`; they do not reach `400 invalid_args` for
+  missing fields first. A `400 missing required field` on an admin-min tool means the caller
+  already passed the floor and failed schema validation — that is not a substitute for a floor
+  test. To probe capability boundaries, call an argument-free admin-min tool (or one with valid
+  args) and read the `403` (#722).
 - **No admin-capable credential exists on this host.** `~/.fleet/agents/kasra-admin.token` is
   invalid against the live pot; `~/.fleet/agents/kasra-agent.token` works but is member-tier.
 - **Open gaps:** brain bypasses hexagonal ports (#267), tier enforcement on recall surface
