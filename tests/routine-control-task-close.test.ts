@@ -53,24 +53,17 @@ describe('routine control task close (11e2a810, close-only)', () => {
     const fixture = await makeReadyRoutineFixture('execute_internal')
     harness = fixture.harness
     fixture.harness.sqlite.prepare("UPDATE routine_runs SET attempt = 3 WHERE id = 'run-1'").run()
-    const db = fixture.env.DB
-    const failingEnv = {
-      ...fixture.env,
-      DB: {
-        prepare(sql: string) {
-          if (/INSERT INTO flights/.test(sql)) {
-            return {
-              bind() { return this },
-              async run() { throw new Error('simulated flight execution failure') },
-            }
-          }
-          return db.prepare(sql)
-        },
-        batch: db.batch.bind(db),
-      },
-    } as unknown as Env
+    // Real-schema failure: abort the flight INSERT on the migration-backed DB
+    // (no env.DB prepare interception / SQL-string match — AGENTS.md / #721).
+    fixture.harness.sqlite.exec(`
+      CREATE TRIGGER test_fail_flight_insert
+      BEFORE INSERT ON flights
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated flight execution failure');
+      END;
+    `)
 
-    const result = await submitRoutineProposal(failingEnv, fixture.principal, fixture.proposal({
+    const result = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
       key: 'flight-throws', kind: 'dispatch_flight',
       input: { goal: 'Throw during dispatch', task_ids: ['control-task'], artifact_refs: [], budget_micro_usd: 1000 },
     }))
@@ -78,6 +71,7 @@ describe('routine control task close (11e2a810, close-only)', () => {
     expect(row(fixture.harness, "SELECT status, result, assignee_agent_id FROM tasks WHERE id = 'control-task'")).toEqual({
       status: 'done', result: 'failed: execution_failed', assignee_agent_id: 'agent-1',
     })
+    fixture.harness.sqlite.exec('DROP TRIGGER IF EXISTS test_fail_flight_insert')
   })
 
   it('closes as cancelled: operator on confirmed cancel; unconfirmed stays blocked (main)', async () => {
@@ -584,27 +578,51 @@ describe('routine control task close (11e2a810, close-only)', () => {
         'agent-1', '${NOW.toISOString()}', '${NOW.toISOString()}'
       );
     `)
+    // Concurrent edit cannot be expressed as a RAISE(ABORT) trigger on the same
+    // row: SQLite evaluates UPDATE … WHERE updated_at = ? before BEFORE UPDATE
+    // triggers, so a same-row trigger cannot un-match the fence. Inject the
+    // human write immediately before every D1 .run() (call-order seam, no SQL
+    // text match) so the optimistic-concurrency WHERE misses — same mechanism
+    // tasks-gate uses for batch races.
     const realDb = harness.db
+    let editSeq = 0
+    const humanEditBeforeWrite = (): void => {
+      editSeq += 1
+      harness!.sqlite.prepare(
+        "UPDATE tasks SET title = 'human-edited', updated_at = ? WHERE id = 'fenced'",
+      ).run(new Date(NOW.getTime() + editSeq * 1000).toISOString())
+    }
+    type Stmt = {
+      bind: (...args: unknown[]) => Stmt
+      run: (...args: unknown[]) => Promise<unknown>
+      first: (...args: unknown[]) => Promise<unknown>
+      all: (...args: unknown[]) => Promise<unknown>
+    }
+    const wrapStmt = (stmt: Stmt): Stmt => {
+      const wrapBound = (bound: Stmt): Stmt => ({
+        bind: (...args: unknown[]) => wrapBound(bound.bind(...args)),
+        first: (...args: unknown[]) => bound.first(...args),
+        all: (...args: unknown[]) => bound.all(...args),
+        run: async (...args: unknown[]) => {
+          humanEditBeforeWrite()
+          return bound.run(...args)
+        },
+      })
+      return {
+        bind: (...args: unknown[]) => wrapBound(stmt.bind(...args)),
+        first: (...args: unknown[]) => stmt.first(...args),
+        all: (...args: unknown[]) => stmt.all(...args),
+        run: async (...args: unknown[]) => {
+          humanEditBeforeWrite()
+          return stmt.run(...args)
+        },
+      }
+    }
     const env = {
       TENANT_SLUG: 'tenant-a',
       DB: {
-        prepare(sql: string) {
-          const stmt = realDb.prepare(sql)
-          if (/UPDATE tasks\s+SET title/.test(sql) || (/UPDATE tasks/.test(sql) && /updated_at = \?/.test(sql) && /status = \?/.test(sql))) {
-            return {
-              bind(...args: unknown[]) {
-                // Human edits the row between read and write.
-                harness!.sqlite.prepare(
-                  "UPDATE tasks SET title = 'human-edited', updated_at = ? WHERE id = 'fenced'",
-                ).run(new Date(NOW.getTime() + 1000).toISOString())
-                return stmt.bind(...args)
-              },
-              run: stmt.run.bind(stmt),
-              first: stmt.first.bind(stmt),
-              all: stmt.all.bind(stmt),
-            }
-          }
-          return stmt
+        prepare(_sql: string) {
+          return wrapStmt(realDb.prepare(_sql) as unknown as Stmt)
         },
         batch: realDb.batch.bind(realDb),
       },
@@ -612,13 +630,11 @@ describe('routine control task close (11e2a810, close-only)', () => {
     await closeRoutineControlTask(
       env, { task_id: 'fenced', project_id: 'project-1' }, controlTaskOutcome('failed', 'lease_expired'),
     )
-    const t = row(harness, "SELECT status, title, result FROM tasks WHERE id = 'fenced'")
-    // Either still in_progress (fence refused) or done only if the raced reload succeeded —
-    // never a silent overwrite of the human title without a fresh fence.
-    expect(t?.title === 'human-edited' || t?.status === 'done').toBe(true)
-    if (t?.status !== 'done') {
-      expect(t).toMatchObject({ status: 'in_progress', title: 'human-edited', result: null })
-    }
+    // Exact outcome: every close write races the human edit, so the updated_at
+    // fence refuses and the control task stays open with the human title.
+    expect(row(harness, "SELECT status, title, result FROM tasks WHERE id = 'fenced'")).toEqual({
+      status: 'in_progress', title: 'human-edited', result: null,
+    })
   })
 
   it('project check: close refuses a task owned by another project', async () => {
