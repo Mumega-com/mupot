@@ -223,20 +223,22 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
 
   // Home guard must run for scoped callers too. Limiting it to
   // `if (accessible === null)` would let a member-rank home grant through (#2399/#2408).
+  // Discriminates alone: work-squad success proves accessible is a live list (mayWrite
+  // works), while the same caller's member-rank home grant is still refused (#2418).
   it('home guard still runs when accessible is a squad list, not only when accessible === null', async () => {
     const env = withHome()
-    // Work-squad grant makes accessible a non-null list; home member grant would
-    // pass mayWrite if the home admin/owner check were skipped for scoped callers.
-    const r = await dispatchStudioFlight(
-      env,
-      who('m-member-home', [
-        grant('m-member-home', 'squad', 'sq-a', 'member'),
-        grant('m-member-home', 'squad', 'sq-home-m', 'member'),
-      ]),
-      { prompt: 'x', squadId: 'sq-home-m' },
-    )
-    expect(r).toMatchObject(refused)
-    expect(count(env, 'tasks')).toBe(0)
+    const scoped = who('m-member-home', [
+      grant('m-member-home', 'squad', 'sq-a', 'member'),
+      grant('m-member-home', 'squad', 'sq-home-m', 'member'),
+    ])
+    // Positive control: accessible includes sq-a at member rank → dispatch lands.
+    const work = await dispatchStudioFlight(env, scoped, { prompt: 'x', squadId: 'sq-a' })
+    expect(work.ok).toBe(true)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-a')
+    // Home at member rank only is still refused even though mayWrite would pass.
+    const home = await dispatchStudioFlight(env, scoped, { prompt: 'x', squadId: 'sq-home-m' })
+    expect(home).toMatchObject(refused)
+    expect(count(env, 'tasks')).toBe(1)
   })
 
   it('refuses an expired admin grant on a home squad', async () => {
@@ -278,6 +280,52 @@ describe('Studio dispatch: home squads stay private, archived squads take no wor
       expect(await res.json()).toMatchObject({ error: 'invalid_squad_id' })
     }
     expect(count(env, 'tasks')).toBe(0)
+  })
+
+  // #2418: camelCase squadId is a real alias of squad_id (studio.ts:1215). Dropping
+  // `?? body.squadId` leaves every other test green.
+  it('HTTP: camelCase squadId is accepted like squad_id (non-string 400; foreign home refused)', async () => {
+    const env = withHome()
+    const app = new Hono<{ Variables: { auth: AuthContext } }>()
+    app.use('*', async (c, next) => {
+      c.set('auth', who('m-own', [
+        grant('m-own', 'org', null, 'member'),
+        grant('m-own', 'squad', 'sq-home-m', 'admin'),
+      ]))
+      await next()
+    })
+    app.route('/', studioApp)
+    const bad = await app.request('/dispatch', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'x', squadId: 42 }),
+    }, env)
+    expect(bad.status).toBe(400)
+    expect(await bad.json()).toMatchObject({ error: 'invalid_squad_id' })
+    const home = await app.request('/dispatch', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'x', squadId: 'sq-home-x' }),
+    }, env)
+    expect(home.status).toBe(403)
+    expect(await home.json()).toMatchObject({ ok: false, error: 'squad_forbidden' })
+    expect(count(env, 'tasks')).toBe(0)
+  })
+
+  // #2418: `{squad_id: null}` is nullish-coalesced to omitted (body.squad_id ?? body.squadId).
+  // Pin that intentional omit behaviour — not a 400, and the caller defaults to their squad.
+  it('HTTP: null squad_id is treated as omitted, not invalid', async () => {
+    const env = pot()
+    const app = new Hono<{ Variables: { auth: AuthContext } }>()
+    app.use('*', async (c, next) => {
+      c.set('auth', who('m-b', [grant('m-b', 'squad', 'sq-b', 'member')]))
+      await next()
+    })
+    app.route('/', studioApp)
+    const res = await app.request('/dispatch', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'x', squad_id: null }),
+    }, env)
+    expect(res.status).toBe(200)
+    expect((harness!.sqlite.prepare(`SELECT squad_id FROM tasks`).get() as { squad_id: string }).squad_id).toBe('sq-b')
   })
 })
 

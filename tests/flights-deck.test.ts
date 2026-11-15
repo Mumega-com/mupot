@@ -315,9 +315,97 @@ describe('flightsBody — KPI cards, table, badges, artifacts', () => {
     expect(out).not.toContain('<script>alert(1)</script>')
   })
 
-  it('dispatch client prefers next_step over the bare error code on refusal (#2410)', async () => {
+  // #2420: exercise the real DECK_SCRIPT against a stub DOM/fetch — a harmless
+  // reformat of the source string must not turn this RED; dropping next_step preference must.
+  it('dispatch client prefers next_step over the bare error code on refusal (#2410/#2420)', async () => {
     const out = await render()
-    expect(out).toContain('r.data.next_step || r.data.error')
-    expect(out).not.toMatch(/status\.textContent = \(r\.data && r\.data\.error\) \|\| 'dispatch failed'/)
+    const openStart = out.toLowerCase().indexOf('<script')
+    const openEnd = out.indexOf('>', openStart)
+    const closeStart = out.toLowerCase().indexOf('</script>', openEnd)
+    expect(openStart).toBeGreaterThanOrEqual(0)
+    expect(closeStart).toBeGreaterThan(openEnd)
+    const script = out.slice(openEnd + 1, closeStart).trim()
+
+    type El = {
+      id: string
+      value: string
+      textContent: string
+      hidden: boolean
+      classList: { contains: (c: string) => boolean; toggle: (c: string, on?: boolean) => void }
+      setAttribute: (k: string, v: string) => void
+      getAttribute: (k: string) => string | null
+      addEventListener: (ev: string, fn: (...args: unknown[]) => void) => void
+      focus: () => void
+      querySelector: (sel: string) => unknown
+      querySelectorAll: (sel: string) => unknown[]
+      listeners: Record<string, Array<(...args: unknown[]) => void>>
+    }
+    const els = new Map<string, El>()
+    const makeEl = (id: string): El => {
+      const classes = new Set<string>()
+      const attrs: Record<string, string> = {}
+      const listeners: Record<string, Array<(...args: unknown[]) => void>> = {}
+      const el: El = {
+        id,
+        value: '',
+        textContent: '',
+        hidden: false,
+        classList: {
+          contains: (c) => classes.has(c),
+          toggle: (c, on) => { if (on === false) classes.delete(c); else if (on === true) classes.add(c); else if (classes.has(c)) classes.delete(c); else classes.add(c) },
+        },
+        setAttribute: (k, v) => { attrs[k] = v },
+        getAttribute: (k) => attrs[k] ?? null,
+        addEventListener: (ev, fn) => { (listeners[ev] ||= []).push(fn) },
+        focus: () => {},
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        listeners,
+      }
+      if (id === 'fd-deck') attrs['data-fd-poll'] = '12000'
+      els.set(id, el)
+      return el
+    }
+    const get = (id: string) => els.get(id) ?? makeEl(id)
+    // Seed the nodes the dispatch path touches before the script runs.
+    for (const id of [
+      'fd-deck', 'fd-search', 'fd-dispatch-backdrop', 'fd-dispatch', 'fd-dispatch-open',
+      'fd-dispatch-close', 'fd-dispatch-cancel', 'fd-repo-custom', 'fd-repo-custom-wrap',
+      'fd-repo-select', 'fd-dispatch-form', 'fd-dispatch-status', 'fd-dispatch-goal',
+      'fd-empty-filter',
+    ]) get(id)
+    get('fd-dispatch-goal').value = 'prove next_step wins'
+
+    const doc = {
+      getElementById: (id: string) => get(id),
+      querySelectorAll: (sel: string) => {
+        if (sel === '[data-fd-tab]') return []
+        if (sel === '[data-fd-row]') return []
+        return []
+      },
+      querySelector: () => null,
+      addEventListener: () => {},
+    }
+    const win = { location: { reload: () => {} } }
+    const fetchStub = async () => ({
+      ok: false,
+      json: async () => ({
+        ok: false,
+        error: 'squad_forbidden',
+        next_step: 'Ask an org admin for a member grant on that squad.',
+      }),
+    })
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- running the rendered deck script against stubs is the behavioural proof
+    new Function('document', 'fetch', 'window', script)(doc, fetchStub, win)
+
+    const submit = get('fd-dispatch-form').listeners.submit?.[0]
+    expect(submit).toBeTypeOf('function')
+    submit!({ preventDefault() {} })
+    await new Promise((r) => setTimeout(r, 0))
+
+    const status = get('fd-dispatch-status').textContent
+    expect(status).toBe('Ask an org admin for a member grant on that squad.')
+    expect(status).not.toBe('squad_forbidden')
+    expect(status).not.toBe('dispatch failed')
   })
 })
