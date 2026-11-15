@@ -1,8 +1,9 @@
 // 11e2a810 — close the control board task on DEAD routine end states (close-only).
 // Final scope cut (PR #2425): no review→rejected walk; keep assignee; attempt-keyed
-// close only; unconfirmed cancel stays blocked; KPI counts result LIKE 'succeeded%'.
+// close only; unconfirmed cancel stays blocked; KPI counts every done task except failed:/cancelled:/unclaimed: results.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { updateKpiProgress } from '../src/agents/loop'
 import { taskCounterSource } from '../src/agents/kpi-sources'
 import { loadAgentStats } from '../src/dashboard/observatory'
 import { cancelRoutineRun, submitRoutineProposal } from '../src/routines/actions'
@@ -287,6 +288,62 @@ describe('routine control task close (11e2a810, close-only)', () => {
     expect(kpi).toMatchObject({ ok: true, count: 1, source: 'task_counter' })
     const stats = await loadAgentStats(env)
     expect(stats.get('agent-1')).toMatchObject({ task_count: 1, done_count: 1 })
+  })
+
+  it('credits every ordinary done task and excludes only failed:/cancelled:/unclaimed: closes (KPI source, loop counter, observatory)', async () => {
+    harness = createSqliteD1()
+    applyMigrations(harness)
+    const recent = new Date().toISOString()
+    const doneTask = (id: string, result: string | null): string => `
+      INSERT INTO tasks (
+        id, squad_id, project_id, title, body, done_when, status, result, assignee_agent_id,
+        created_at, updated_at
+      ) VALUES (
+        '${id}', 'squad-1', 'project-1', 'T ${id}', '', 'Done', 'done', ${result === null ? 'NULL' : `'${result}'`},
+        'agent-1', '${recent}', '${recent}'
+      );`
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'delivery', 'Delivery');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'core', 'Core');
+      INSERT INTO agents (id, squad_id, slug, name, status, kpi_target)
+        VALUES ('agent-1', 'squad-1', 'agent-1', 'Agent One', 'active', '10 tasks');
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-1', 'project-1', 'P', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('project-1', 'squad-1', 'write');
+      ${doneTask('t-free', 'Merged PR #123 and deployed')}
+      ${doneTask('t-null', null)}
+      ${doneTask('t-ok', 'succeeded')}
+      ${doneTask('t-failed', 'failed: lease_expired')}
+      ${doneTask('t-cancelled', 'cancelled: operator')}
+      ${doneTask('t-unclaimed', 'unclaimed: agent_offline')}
+    `)
+    const env = { DB: harness.db, TENANT_SLUG: 'tenant-a' } as unknown as Env
+    const agent = row(harness, "SELECT id, kpi_target FROM agents WHERE id = 'agent-1'") as unknown as Agent
+    const kpi = await taskCounterSource(env, agent)
+    expect(kpi).toMatchObject({ ok: true, count: 3, source: 'task_counter' })
+    // loop.ts runs the REAL updateKpiProgress count query. Its follow-up
+    // `UPDATE agents SET kpi_progress = ?, updated_at = ?` names agents.updated_at, a column the
+    // real schema does not have (migration 0086 header) — a separate pre-existing defect out of
+    // scope here — so only that write is intercepted; every other statement hits the real DB.
+    const realDb = harness.db
+    const written: unknown[][] = []
+    const loopEnv = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          if (sql.startsWith('UPDATE agents SET kpi_progress')) {
+            return { bind: (...v: unknown[]) => ({ run: async () => { written.push(v); return { success: true } } }) }
+          }
+          return realDb.prepare(sql)
+        },
+      },
+    } as unknown as Env
+    const loop = await updateKpiProgress(loopEnv, 'agent-1', '10 tasks')
+    expect(loop).toMatchObject({ ok: true, updated: true, current: 30 })
+    expect(written).toHaveLength(1)
+    expect(written[0]?.[0]).toBe(30)
+    const stats = await loadAgentStats(env)
+    expect(stats.get('agent-1')).toMatchObject({ task_count: 6, done_count: 3 })
   })
 
   it('closes the control task as unclaimed when attempts are exhausted while keeping the specific run cause', async () => {
