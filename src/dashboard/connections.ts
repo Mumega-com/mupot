@@ -148,8 +148,9 @@ function groupedAdmissions(admissions:ConnectionAdmission[],offer:ApprovalMoveOf
         ${moving?html`<div class="notice"><strong>Move this agent's approval to this chat</strong>
           <p>From ${moving.old_seat_name} to ${moving.new_seat_name}. Level ${moving.ceiling}; review authority ${moving.gate_authority?'enabled':'off'} is retained. The previous approval and its attached chats will end.</p>
           <button class="btn" data-cx-move="${moving.admission_id}" data-cx-move-agent="${moving.agent_id}" data-cx-move-harness="${moving.harness_id}" data-cx-move-seat="${moving.new_seat_id}">Move approval to this chat</button></div>`:html``}
-        ${dataTable({cols:[{label:'App / chat',width:'2fr'},{label:'Level',width:'0.7fr'},{label:'Created',width:'1fr'},{label:'Last used',width:'1fr'},{label:'State',width:'1fr'},{label:'Actions',width:'2fr'}],rows:rows.map(a=>[
+        ${dataTable({cols:[{label:'App / chat',width:'2fr'},{label:'Access',width:'1fr'},{label:'Rank ceiling',width:'0.7fr'},{label:'Created',width:'1fr'},{label:'Last used',width:'1fr'},{label:'State',width:'1fr'},{label:'Actions',width:'2fr'}],rows:rows.map(a=>[
           html`${a.harness_name} · ${a.seatLabel??a.seat_label??'Unavailable chat'}<div class="ui-sub">${a.id} · first seen ${a.seat_first_seen?formatWhen(a.seat_first_seen):'Not recorded'}</div>${a.status==='pending'?attachIdentityCard(a):html``}`,
+          html`${a.status==='live'?html`${a.authority_level==='full'?'Full':'Helper'}${a.authority_expires_at?html`<div class="ui-sub">until ${formatWhen(a.authority_expires_at)}</div>`:html`<div class="ui-sub">no expiry (legacy)</div>`}`:html`${pill('choose on claim','dim')}`}`,
           html`${a.ceiling}`,html`${formatWhen(a.created_at)}`,html`${a.last_used_at?formatWhen(a.last_used_at):'Never recorded'}`,
           html`${pill(a.status==='live'?'Live':'Waiting',a.status==='live'?'primary':'dim')} ${a.stale?html`${pill('Stale','dim')}<span class="ui-sub">No recorded chat activity in 7 days</span>`:html``}`,
           a.status==='live'?html`<button class="btn danger" data-cx-revoke="${a.id}" data-cx-stale="${a.stale?'1':'0'}">Revoke</button>`:
@@ -257,7 +258,7 @@ async function connectionsPageBody(env: Env, auth: AuthContext, focus?:{admissio
     ${moveNotice}
     ${sectionPanel({ title: 'Admitted agents and requests', body: liveBody })}
     ${harnessBlocks}
-    <p class="ui-sub">A level is chosen when an agent is admitted (Member, Lead, or Full = the agent's own standing, never more than yours). If the agent holds a review gate, an attached thread may also review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own; detaching the thread or revoking the admission ends that. To change a level, revoke the admission and admit again. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
+    <p class="ui-sub">Helper/Full is chosen on the claim link (default Helper; Full is never preselected). Rank ceiling (Member, Lead, or Full = the agent's own standing, never more than yours) is separate. Revoke stops this attachment on the next request. To change Helper/Full, revoke and connect again with a new decision — an old Helper approval is never reinterpreted as Full. Legacy connections with no expiry keep working as Helper until you change them. An attached thread unused for ${ATTACH_IDLE_DAYS} days is detached automatically when its app has no free thread slots.</p>
     ${boundBlock}
     <div class="status-line" id="cx-status"></div>
     ${connectionsScript()}

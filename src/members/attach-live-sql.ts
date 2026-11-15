@@ -39,6 +39,12 @@ export function liveAttachmentConditionsSql(env: Env, ph: LivePh): string {
         AND adm.agent_id = att.agent_id
         AND adm.human_member_id = att.human_member_id
         AND adm.harness_id = att.harness_id
+        -- mupot#980005ac: authority expiry fail-closed on the NEXT request. NULL = grandfathered
+        -- (pre-0274 live rows keep working with no retroactive cutoff). julianday on BOTH sides
+        -- (same reason as TOKEN_LIVE_PREDICATE: mixed timestamp shapes).
+        AND (adm.authority_expires_at IS NULL OR julianday(adm.authority_expires_at) > julianday(${ph('now')}))
+        -- Confirming human must still be an active member (suspension / loss of standing stops the seat).
+        AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = att.human_member_id AND hm.tenant = att.tenant AND hm.status = 'active')
         AND ${ADMISSION_BOUND_TO_SEAT_SQL}
         AND (adm.scope = 'seat' OR (${ph('grantToken')} IS NOT NULL AND hr.credential_kind = 'oauth' AND hr.grant_id = 'oauth:' || ${ph('grantToken')})) -- R1: a harness-wide admission needs THIS request's grant to be the install's own
         AND s.retired_at IS NULL

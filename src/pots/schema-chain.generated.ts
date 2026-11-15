@@ -4841,9 +4841,31 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_reported_runtime_agent" },
     ],
   },
+  {
+    file: "0274_attached_authority_decision.sql",
+    sha256: "14659977af7c2245109e87fbf63aee549ae899e221a92464730c7b0074fa4991",
+    statements: [
+      "ALTER TABLE agent_seat_admissions ADD COLUMN authority_level TEXT NOT NULL DEFAULT 'helper'\n  CHECK (authority_level IN ('helper', 'full'));",
+      "ALTER TABLE agent_seat_admissions ADD COLUMN authority_expires_at TEXT;",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_admissions_authority_immutable\nBEFORE UPDATE OF authority_level, authority_expires_at ON agent_seat_admissions\nFOR EACH ROW\nWHEN (NEW.authority_level IS NOT OLD.authority_level OR\n      (NEW.authority_expires_at IS NOT OLD.authority_expires_at\n       AND (NEW.authority_expires_at IS NOT NULL OR OLD.authority_expires_at IS NOT NULL)))\n  AND OLD.status <> 'pending'\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_authority_immutable');\nEND;",
+      "CREATE TABLE IF NOT EXISTS agent_seat_authority_decisions (\n  id                      TEXT PRIMARY KEY,\n  tenant                  TEXT NOT NULL,\n  admission_id            TEXT NOT NULL REFERENCES agent_seat_admissions(id) ON DELETE RESTRICT,\n  attachment_id           TEXT,\n  seat_id                 TEXT,\n  agent_id                TEXT NOT NULL,\n  harness_id              TEXT NOT NULL,\n  project_id              TEXT,\n  machine_key             TEXT,\n  decided_by_member_id    TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  authority_level         TEXT NOT NULL CHECK (authority_level IN ('helper', 'full')),\n  authority_expires_at    TEXT NOT NULL,\n  decided_at              TEXT NOT NULL,\n  decided_via             TEXT NOT NULL CHECK (decided_via IN ('webauthn', 'dashboard')),\n  replaces_decision_id    TEXT REFERENCES agent_seat_authority_decisions(id) ON DELETE RESTRICT\n);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_seat_authority_decisions_admission\n  ON agent_seat_authority_decisions(tenant, admission_id, decided_at DESC);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_seat_authority_decisions_member\n  ON agent_seat_authority_decisions(tenant, decided_by_member_id, decided_at DESC);",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_authority_decisions_no_update\nBEFORE UPDATE ON agent_seat_authority_decisions\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_authority_decisions is append-only: UPDATE is forbidden');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_authority_decisions_no_delete\nBEFORE DELETE ON agent_seat_authority_decisions\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_authority_decisions is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_authority_immutable" },
+      { type: "table", name: "agent_seat_authority_decisions" },
+      { type: "index", name: "idx_agent_seat_authority_decisions_admission" },
+      { type: "index", name: "idx_agent_seat_authority_decisions_member" },
+      { type: "trigger", name: "agent_seat_authority_decisions_no_update" },
+      { type: "trigger", name: "agent_seat_authority_decisions_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "48974219b201b4edef2979417add119fc85ccfc4dc54f6cd93e44513aa3c1ce3"
+export const SCHEMA_CHAIN_DIGEST: string = "02443d4508274bde282ea8a682d556651635f13ebdd8ba0edc5b3acb28ed42f1"

@@ -122,7 +122,7 @@ describe('observed seat can FILE a request, and only that', () => {
     const adm = String(r.sc.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
     const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
-    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
     const boot = await rpc(c.ctx, 'boot_context', {}, c.session)
     const ob = boot.sc.attached_onboarding as Record<string, unknown> | undefined
@@ -135,7 +135,7 @@ describe('observed seat can FILE a request, and only that', () => {
   it('a denied request attaches nothing and the chat stays limited', async () => {
     const c = await chat('observed')
     const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
-    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'deny' })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'deny' })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
     expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
   })
@@ -191,7 +191,7 @@ describe('chat approval boundaries', () => {
     expect(again.sc.admission_id).not.toBe(att.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
     expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
-    expect(await decideAdmissionDirect(env, { admissionId: String(again.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: again.sc.attach_code })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: String(again.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: again.sc.attach_code })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
   })
 
@@ -422,14 +422,14 @@ describe('agent page: Connect a chat checklist', () => {
     expect(agentPage).toContain('id="background-connect-prompt"')
   })
 
-  it('a pending request shows with Approve and Reject; plain words only', async () => {
+  it('a pending request shows with Connect and Reject; plain words only', async () => {
     const c = await chat('observed')
     const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const p = await get(env, cookie, '/agents/agent-coo')
     expect(p).toContain(`data-cx-deny="${String(r.sc.admission_id)}"`)
-    expect(p).toContain('>Approve<')
+    expect(p).toContain('data-claim-connect>Connect<')
     expect(p).not.toContain('No chat has asked yet')
     // Inspect the generated panel's text, including the copy prompt. Its inline
     // script follows all UI markup; no HTML is rewritten or used as sanitized output.
@@ -440,7 +440,7 @@ describe('agent page: Connect a chat checklist', () => {
     const visible = [...p.slice(start, end).matchAll(/>([^<>]*)</g)]
       .map((match) => match[1]).join(' ')
     expect(visible).toContain('Requests from your chats')
-    expect(visible).toContain('Approve')
+    expect(visible).toContain('Connect')
     expect(visible).toContain('Reject')
     expect(visible.toLowerCase()).not.toMatch(/admission|\bseat\b/)
   })
