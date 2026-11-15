@@ -4,8 +4,8 @@
 //   - unknown_tool / invalid_args / invalid_request → JSON-RPC -32602 at HTTP 200
 //   - 5xx stay JSON-RPC errors carrying their HTTP status (#1692 / #2345)
 //   - missing auth → real HTTP 401 (WWW-Authenticate is added by the OAuthProvider
-//     wrapper; asserted in tests/composition/mcp-profile-needs-you-wrapper.test.ts
-//     and, for this file's 401 path, only when a challenge is present — see #2409)
+//     wrapper; asserted in tests/composition/mcp-profile-needs-you-wrapper.test.ts.
+//     This file's bare mcpApp 401 path asserts the challenge is ABSENT — see #2409/#2419)
 //
 // Historical hang root cause (two layers, both already closed):
 //   1. Client-side: tools/call returned HTTP 4xx for tool refusals; connector
@@ -33,7 +33,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { callToolOutcome } from './helpers/mcp-call'
 import { seedLiveToken } from './helpers/live-token'
 import { hashMemberToken } from '../src/auth/member-bearer'
-import { setAgentWebhookDoorbell, DOORBELL_TIMEOUT_MS } from '../src/agents/webhook-doorbell'
+import { setAgentWebhookDoorbell } from '../src/agents/webhook-doorbell'
 
 const TENANT = 'digid'
 const T0 = '2026-08-01T00:00:00.000Z'
@@ -290,7 +290,9 @@ describe('1e6d566f MCP error envelopes stay bounded', () => {
     expect(body.error.message).toBe('agent_check_unavailable')
   }, TEST_TIMEOUT_MS)
 
-  it('send_target_not_visible is HTTP 200 + isError with status 404 (not -32602)', async () => {
+  // 404 tool refusals go through mcpToolRefusalResult (isError). jsonRpcCodeForToolFailure
+  // is only reached for status >= 500 — covered by tests/mcp-jsonrpc.test.ts (#2419).
+  it('send_target_not_visible is HTTP 200 + isError with status 404', async () => {
     const headers = {
       'content-type': 'application/json',
       authorization: `Bearer ${AGENT_TOKEN}`,
@@ -417,9 +419,10 @@ describe('1e6d566f hang-proof bounds on create/dispatch (#2409)', () => {
       ),
     )
     expect(dispatched.ok, JSON.stringify(dispatched)).toBe(true)
-    // DOORBELL_TIMEOUT_MS (3s) + AWAIT_CEILING (+1s) = 4s; BOUND_MS is 5s.
+    // Literal 3000 — not the imported DOORBELL_TIMEOUT_MS — so lowering the constant
+    // to 10ms cannot keep this green (#2419). Ceiling: 3s + AWAIT_CEILING (+1s) = 4s; BOUND_MS is 5s.
     expect(ms).toBeLessThan(BOUND_MS)
-    expect(ms).toBeGreaterThanOrEqual(DOORBELL_TIMEOUT_MS)
+    expect(ms).toBeGreaterThanOrEqual(3000)
   }, TEST_TIMEOUT_MS)
 })
 
