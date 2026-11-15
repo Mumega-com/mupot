@@ -6,7 +6,7 @@
 // agentId metadata so an agent never recalls another agent's memory — isolation
 // is enforced at the vector query, not just at the join.
 
-import type { Env, MemoryPort, MemoryHit, MemoryEngram } from '../types'
+import type { Env, MemoryPort, MemoryHit, MemoryEngram, MemoryRetrieval, MemoryRecallResult } from '../types'
 import { safeConsole } from '../lib/log'
 
 // 768-dim to match the `mupot-memory` Vectorize index (see wrangler.toml / README:
@@ -88,8 +88,50 @@ function toEngram(r: EngramRow): MemoryEngram {
   return { id: r.id, text: r.text, concepts: parseConcepts(r.concepts), created_at: r.created_at }
 }
 
-export function createMemory(env: Env): MemoryPort {
-  return {
+export const SEMANTIC_RECALL_TIMEOUT_MS = 2000
+
+type SemanticMatch = { id: string; score: number }
+type SemanticResult = { matches: SemanticMatch[]; retrieval: MemoryRetrieval }
+
+/** A provider outage has bounded coverage, not a successful exhaustive search. */
+async function semanticRecall(env: Env, agentId: string, query: string, limit: number): Promise<SemanticResult> {
+  const unavailable = (reason: NonNullable<MemoryRetrieval['reason']>): SemanticResult => ({
+    matches: [], retrieval: { semantic: 'unavailable', coverage: 'bounded-text-only', reason },
+  })
+  let stage: 'embedding_failed' | 'vector_query_failed' = 'embedding_failed'
+  // Attach the rejection handler immediately. Timing out a binding cannot cancel its work;
+  // a later resolve/reject is consumed and never changes the already returned fallback.
+  const work = (async (): Promise<SemanticResult> => {
+    const values = await embed(env, query)
+    stage = 'vector_query_failed'
+    const result = await env.VEC.query(values, {
+      topK: limit,
+      filter: { agentId, tenant: env.TENANT_SLUG },
+      returnMetadata: 'none',
+    })
+    const matches = result.matches ?? []
+    if (!Array.isArray(matches) || matches.some(m => typeof m.id !== 'string' || !Number.isFinite(m.score))) {
+      throw new Error('invalid vector query result')
+    }
+    return { matches, retrieval: { semantic: 'available', coverage: 'semantic-only' } }
+  })().catch(() => unavailable(stage))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([
+      work,
+      new Promise<SemanticResult>(resolve => { timer = setTimeout(() => resolve(unavailable('timeout')), SEMANTIC_RECALL_TIMEOUT_MS) }),
+    ])
+    if (result.retrieval.semantic === 'unavailable') {
+      safeConsole.warn('memory.semantic_unavailable', { reason: result.retrieval.reason })
+    }
+    return result
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+export function createMemory(env: Env): MemoryPort & { recallDetailed(agentId: string, query: string, limit?: number): Promise<MemoryRecallResult> } {
+  const memory: MemoryPort & { recallDetailed(agentId: string, query: string, limit?: number): Promise<MemoryRecallResult> } = {
     async remember(agentId: string, text: string, concepts?: string[], opts?: { waitUntil?: (p: Promise<unknown>) => void }): Promise<string> {
       const id = crypto.randomUUID()
       const conceptsJson = concepts && concepts.length > 0 ? JSON.stringify(concepts) : null
@@ -129,16 +171,11 @@ export function createMemory(env: Env): MemoryPort {
     },
 
     async recall(agentId: string, query: string, limit = 5): Promise<MemoryHit[]> {
-      const values = await embed(env, query)
-      const result = await env.VEC.query(values, {
-        topK: limit,
-        // Scope to this agent's engrams AND this tenant — cross-agent AND
-        // cross-tenant recall are both prevented at the vector query.
-        filter: { agentId, tenant: env.TENANT_SLUG },
-        returnMetadata: 'none',
-      })
+      return (await memory.recallDetailed(agentId, query, limit)).hits
+    },
 
-      const matches = result.matches ?? []
+    async recallDetailed(agentId: string, query: string, limit = 5): Promise<MemoryRecallResult> {
+      const { matches, retrieval } = await semanticRecall(env, agentId, query, limit)
 
       // Join back to D1 for the canonical text. Preserve Vectorize's score order.
       const hits: MemoryHit[] = []
@@ -168,7 +205,7 @@ export function createMemory(env: Env): MemoryPort {
       // D1 fallback (read-your-writes). Runs when the vector leg came back short or the
       // query is a single exact token (the case a semantic index handles worst).
       const term = exactTokenOf(query)
-      if (hits.length >= limit && term === null) return hits
+      if (hits.length >= limit && term === null) return { hits, degraded: false, retrieval }
 
       const cutoff = sqliteTimestamp(Date.now() - RECENT_WINDOW_MS)
       // Two bounded queries, so recent non-matching rows can never hide an older exact match.
@@ -201,7 +238,11 @@ export function createMemory(env: Env): MemoryPort {
         if (!prior || h.score > prior.score) best.set(h.id, h)
       }
       const merged = [...best.values()].sort((x, y) => y.score - x.score)
-      return merged.slice(0, limit)
+      return {
+        hits: merged.slice(0, limit),
+        degraded: retrieval.semantic === 'unavailable',
+        retrieval: { ...retrieval, coverage: retrieval.semantic === 'available' ? 'semantic-and-bounded-text' : 'bounded-text-only' },
+      }
     },
 
     async recent(agentId: string, limit = 5): Promise<MemoryEngram[]> {
@@ -222,4 +263,5 @@ export function createMemory(env: Env): MemoryPort {
       return row ? toEngram(row) : null
     },
   }
+  return memory
 }

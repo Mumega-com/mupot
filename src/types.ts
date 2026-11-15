@@ -1090,10 +1090,24 @@ export interface MemoryPort {
    *  recall's recent/lexical legs cover the gap). Without it the vector write is awaited as before. */
   remember(agentId: string, text: string, concepts?: string[], opts?: { waitUntil?: (p: Promise<unknown>) => void }): Promise<string>
   recall(agentId: string, query: string, limit?: number): Promise<MemoryHit[]>
+  /** Optional detailed read; array-only ports and callers remain compatible. */
+  recallDetailed?(agentId: string, query: string, limit?: number): Promise<MemoryRecallResult>
   /** Newest engrams in ONE scope (read-your-writes; does not depend on the vector index). */
   recent?(agentId: string, limit?: number): Promise<MemoryEngram[]>
   /** One engram by id, ONLY if it lives in `agentId`'s scope; null for missing and foreign alike. */
   get?(agentId: string, id: string): Promise<MemoryEngram | null>
+}
+
+export interface MemoryRetrieval {
+  semantic: 'available' | 'unavailable'
+  coverage: 'semantic-only' | 'semantic-and-bounded-text' | 'bounded-text-only'
+  reason?: 'embedding_failed' | 'vector_query_failed' | 'timeout'
+}
+
+export interface MemoryRecallResult {
+  hits: MemoryHit[]
+  degraded: boolean
+  retrieval: MemoryRetrieval
 }
 
 export type MemoryHitSource = 'vector' | 'recent' | 'lexical'

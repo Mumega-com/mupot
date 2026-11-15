@@ -4698,8 +4698,8 @@ const toolRecall: ToolSpec = {
     }
 
     const scope = memberMemoryScope(auth.memberId as string)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done(result)
   },
 }
 
@@ -4816,8 +4816,8 @@ const toolSquadRecall: ToolSpec = {
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ squad_id: squadRes.squad.id, scope, hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done({ squad_id: squadRes.squad.id, scope, ...result })
   },
 }
 
@@ -4891,8 +4891,8 @@ const toolProjectRecall: ToolSpec = {
     if (!project) return fail(404, 'project_not_found')
 
     const scope = projectMemoryScope(projectId)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ project_id: projectId, scope, hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done({ project_id: projectId, scope, ...result })
   },
 }
 
