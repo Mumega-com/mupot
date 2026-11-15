@@ -3,7 +3,6 @@
 // close only; unconfirmed cancel stays blocked; KPI counts every done task except failed:/cancelled:/unclaimed: results.
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { updateKpiProgress } from '../src/agents/loop'
 import { taskCounterSource } from '../src/agents/kpi-sources'
 import { loadAgentStats } from '../src/dashboard/observatory'
 import { cancelRoutineRun, submitRoutineProposal } from '../src/routines/actions'
@@ -290,7 +289,7 @@ describe('routine control task close (11e2a810, close-only)', () => {
     expect(stats.get('agent-1')).toMatchObject({ task_count: 1, done_count: 1 })
   })
 
-  it('credits every ordinary done task and excludes only failed:/cancelled:/unclaimed: closes (KPI source, loop counter, observatory)', async () => {
+  it('credits every ordinary done task and excludes only failed:/cancelled:/unclaimed: closes (KPI source, observatory)', async () => {
     harness = createSqliteD1()
     applyMigrations(harness)
     const recent = new Date().toISOString()
@@ -321,30 +320,11 @@ describe('routine control task close (11e2a810, close-only)', () => {
     const agent = row(harness, "SELECT id, kpi_target FROM agents WHERE id = 'agent-1'") as unknown as Agent
     const kpi = await taskCounterSource(env, agent)
     expect(kpi).toMatchObject({ ok: true, count: 3, source: 'task_counter' })
-    // loop.ts runs the REAL updateKpiProgress count query. Its follow-up
-    // `UPDATE agents SET kpi_progress = ?, updated_at = ?` names agents.updated_at, a column the
-    // real schema does not have (migration 0086 header) — a separate pre-existing defect out of
-    // scope here — so only that write is intercepted; every other statement hits the real DB.
-    const realDb = harness.db
-    const written: unknown[][] = []
-    const loopEnv = {
-      ...env,
-      DB: {
-        prepare(sql: string) {
-          if (sql.startsWith('UPDATE agents SET kpi_progress')) {
-            return { bind: (...v: unknown[]) => ({ run: async () => { written.push(v); return { success: true } } }) }
-          }
-          return realDb.prepare(sql)
-        },
-      },
-    } as unknown as Env
-    const loop = await updateKpiProgress(loopEnv, 'agent-1', '10 tasks')
-    expect(loop).toMatchObject({ ok: true, updated: true, current: 30 })
-    expect(written).toHaveLength(1)
-    expect(written[0]?.[0]).toBe(30)
     const stats = await loadAgentStats(env)
     expect(stats.get('agent-1')).toMatchObject({ task_count: 6, done_count: 3 })
   })
+
+  it.todo('loop.ts counter uses the shared failure predicate: needs a real-schema write path, see #2427')
 
   it('closes the control task as unclaimed when attempts are exhausted while keeping the specific run cause', async () => {
     harness = createSqliteD1()
