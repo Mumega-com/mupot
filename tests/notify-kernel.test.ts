@@ -101,7 +101,7 @@ describe('guard: rate cap', () => {
     const r = await notify(envOf(), ev({ dedupe_key: 'k3' }), opts)
     expect(pushed).toHaveLength(3)
     expect(r.rate_capped).toEqual([OWNER_RECIPIENT])
-    expect(r.deliveries.find((d) => d.channel === 'telegram_dm')).toMatchObject({ status: 'failed', error_code: 'rate_capped' })
+    expect(r.deliveries.find((d) => d.channel === 'telegram_dm')).toMatchObject({ status: 'capped', error_code: 'rate_capped' })
     expect(r.deliveries.find((d) => d.channel === 'dashboard')?.status).toBe('sent')
   })
 
@@ -117,6 +117,55 @@ describe('guard: rate cap', () => {
   it('pure: isRateCapped', () => {
     expect(isRateCapped('attention', 19)).toBe(false)
     expect(isRateCapped('attention', 20)).toBe(true)
+  })
+})
+
+describe('guard: rate cap scope', () => {
+  const opts = { adapters, rateCapPerHour: 20 }
+  it('20 task.blocked do not suppress the next task.review (cap is per event type)', async () => {
+    for (let i = 0; i < 20; i++) await notify(envOf(), ev({ type: 'task.blocked', dedupe_key: `b${i}` }), opts)
+    const blockedExtra = await notify(envOf(), ev({ type: 'task.blocked', dedupe_key: 'b20' }), opts)
+    expect(blockedExtra.rate_capped).toEqual([OWNER_RECIPIENT])
+    const review = await notify(envOf(), ev({ type: 'task.review', dedupe_key: 'r1' }), opts)
+    expect(wasDelivered(review, 'telegram_dm')).toBe(true)
+  })
+
+  it('failed deliveries do not count toward the cap', async () => {
+    pushOk = false
+    for (let i = 0; i < 25; i++) await notify(envOf(), ev({ dedupe_key: `f${i}` }), opts)
+    pushOk = true
+    const r = await notify(envOf(), ev({ dedupe_key: 'ok' }), opts)
+    expect(wasDelivered(r, 'telegram_dm')).toBe(true)
+  })
+
+  it('the cap is per tenant: another tenant at its cap does not cap this one', async () => {
+    for (let i = 0; i < 20; i++) await notify(envOf(), ev({ tenant: 'other', dedupe_key: `o${i}` }), opts)
+    const r = await notify(envOf(), ev({ tenant: 't1', dedupe_key: 'mine' }), opts)
+    expect(wasDelivered(r, 'telegram_dm')).toBe(true)
+  })
+
+  it('a capped event does not keep its dedupe claim and is recorded as capped', async () => {
+    const small = { adapters, rateCapPerHour: 1 }
+    await notify(envOf(), ev({ dedupe_key: 'a' }), small)
+    const capped = await notify(envOf(), ev({ dedupe_key: 'b' }), small)
+    expect(capped.rate_capped).toEqual([OWNER_RECIPIENT])
+    const rows = h.sqlite.prepare("SELECT status FROM notif_delivery WHERE status = 'capped'").all()
+    expect(rows).toHaveLength(1)
+    const claim = h.sqlite.prepare("SELECT 1 FROM notif_dedupe WHERE dedupe_key = 'b'").get()
+    expect(claim).toBeUndefined()
+  })
+})
+
+describe('guard: dedupe scope', () => {
+  it('the same task in a different event type is not deduped (blocked then review both send)', async () => {
+    await notify(envOf(), ev({ type: 'task.blocked', dedupe_key: 'task.blocked:1' }), { adapters })
+    await notify(envOf(), ev({ type: 'task.review', dedupe_key: 'task.review:1' }), { adapters })
+    expect(pushed).toHaveLength(2)
+  })
+  it('the same key in another tenant is not deduped', async () => {
+    await notify(envOf(), ev({ tenant: 'a' }), { adapters })
+    await notify(envOf(), ev({ tenant: 'b' }), { adapters })
+    expect(pushed).toHaveLength(2)
   })
 })
 

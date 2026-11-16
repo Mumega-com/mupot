@@ -18,7 +18,6 @@ export interface NotifyOptions {
   rateCapPerHour?: number
 }
 
-const RATE_CAPPED = 'rate_capped'
 
 /** Claim the dedupe window for (tenant, recipient, key). True = this caller owns the send. */
 async function claimDedupe(env: Env, tenant: string, recipient: Recipient, key: string, nowMs: number): Promise<boolean> {
@@ -35,14 +34,15 @@ async function releaseDedupe(env: Env, tenant: string, recipient: Recipient, key
     .bind(tenant, recipient, key).run()
 }
 
-async function recentPushCount(env: Env, tenant: string, recipient: Recipient, nowMs: number): Promise<number> {
+/** Per (tenant, recipient, event type): one noisy type must not mute another. Failed and capped rows never count. */
+async function recentPushCount(env: Env, tenant: string, recipient: Recipient, type: string, nowMs: number): Promise<number> {
   const cutoff = new Date(nowMs - RATE_WINDOW_MS).toISOString()
   const pushList = [...PUSH_CHANNELS].map((c) => `'${c}'`).join(',') // constants from carry.ts, not input
   const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM notif_delivery
-     WHERE tenant = ?1 AND recipient = ?2 AND channel IN (${pushList})
-       AND status IN ('sent','edited','acked') AND created_at >= ?3`,
-  ).bind(tenant, recipient, cutoff).first<{ n: number }>()
+    `SELECT COUNT(*) AS n FROM notif_delivery d JOIN notif_event e ON e.id = d.event_id
+     WHERE d.tenant = ?1 AND d.recipient = ?2 AND e.type = ?4 AND d.channel IN (${pushList})
+       AND d.status IN ('sent','edited','acked') AND d.created_at >= ?3`,
+  ).bind(tenant, recipient, cutoff, type).first<{ n: number }>()
   return row?.n ?? 0
 }
 
@@ -99,7 +99,7 @@ export async function notify(env: Env, event: NotifyEvent, opts: NotifyOptions =
     let capped = false
     if (storeOk && event.severity !== 'critical') {
       try {
-        capped = isRateCapped(event.severity, await recentPushCount(env, event.tenant, recipient, nowMs), cap)
+        capped = isRateCapped(event.severity, await recentPushCount(env, event.tenant, recipient, event.type, nowMs), cap)
       } catch (err) {
         safeConsole.error('notify: rate count unavailable, not capping', String(err).slice(0, 200))
       }
@@ -113,7 +113,7 @@ export async function notify(env: Env, event: NotifyEvent, opts: NotifyOptions =
       if (!adapter) continue
       const isPush = PUSH_CHANNELS.has(channel)
       const outcome: DeliveryOutcome = capped && isPush
-        ? { status: 'failed', error_code: RATE_CAPPED }
+        ? { status: 'capped', error_code: 'rate_capped' }
         : await adapter.deliver(env, event, recipient)
       if (isPush && !(capped)) {
         pushAttempts += 1
@@ -129,8 +129,9 @@ export async function notify(env: Env, event: NotifyEvent, opts: NotifyOptions =
         }
       }
     }
-    // Every push attempt failed: free the dedupe window so the caller's retry is not swallowed.
-    if (storeOk && pushAttempts > 0 && pushSent === 0) {
+    // Every push attempt failed, or the cap held them back: free the dedupe window so a retry (or the next
+    // occurrence once the cap clears) is not swallowed.
+    if (storeOk && ((pushAttempts > 0 && pushSent === 0) || capped)) {
       try { await releaseDedupe(env, event.tenant, recipient, event.dedupe_key) } catch { /* window expires on its own */ }
     }
   }

@@ -23,7 +23,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   'workflow-circuits': '3e7e7084eb77f6cc8f27f93d3370294c1ed6d399a674acc1a8d272053f0dd661',
   // External manifests hash addonApiCompatibility, so this moved from
   // 9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f (migration 0190).
-  'mupot-notify': 'bb322f7deea0849eacb91d7c0a67ba24f566755da4f6ebf80f0e9f3e6b2a02e0',
+  'mupot-notify': 'ceb2538560c0afcfc909b7207d768543bafa6ce9cc66396391e6144054e447bc',
   'mcpwp-office': '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2',
 }
 

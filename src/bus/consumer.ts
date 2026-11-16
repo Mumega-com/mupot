@@ -624,7 +624,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // Through the notify kernel: same Telegram message as before, plus dedupe (same task + state within
       // 10 min sends once) and the per-recipient rate cap. A notify failure never fails the queue message.
       const taskId: string | undefined = (event.payload as any)?.task_id
-      const taskTitle: string | undefined = (event.payload as any)?.task_title
+      // execute.ts emits `title`; older producers used `task_title`.
+      const taskTitle: string | undefined = (event.payload as any)?.title ?? (event.payload as any)?.task_title
       try {
         await notify(env, {
           tenant: event.tenant,
@@ -632,8 +633,9 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           severity: 'attention',
           subject_ref: taskId ? `task:${taskId}` : `squad:${event.squad_id ?? 'none'}`,
           recipients: [OWNER_RECIPIENT],
-          // No task id and no title means nothing identifies the event: a unique key keeps it un-deduped.
-          dedupe_key: `${event.type}:${taskId ?? taskTitle ?? crypto.randomUUID()}`,
+          // The key names the event type, so blocked-then-review on one task both send. No task id means nothing
+          // identifies the event: a unique key keeps it un-deduped (free text never goes into the key).
+          dedupe_key: `${event.type}:${taskId ?? crypto.randomUUID()}`,
           context: {
             task_id: taskId,
             title: taskTitle,

@@ -21,7 +21,7 @@ const manifests: Record<string, AddonManifestV1> = { 'ext-addon': external, 'nat
 const lookup = (k: string) => (manifests[k] ? { manifest: manifests[k] } : undefined)
 const evt = (type: BusEvent['type']): BusEvent => ({ type, tenant: 't1', payload: {}, ts: '2026-11-16T00:00:00Z' })
 
-function install(key: string, state: string): void {
+function install(key: string, state: string, tenant = 't1'): void {
   h.sqlite.exec('PRAGMA foreign_keys = OFF')
   // The lifecycle triggers forbid fabricating a state; this test only needs rows the dispatcher can read.
   const triggers = h.sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'addon_installations'").all() as Array<{ name: string }>
@@ -29,16 +29,16 @@ function install(key: string, state: string): void {
   h.sqlite.prepare(
     `INSERT INTO addon_installations (id, tenant, addon_key, installed_version, publisher, trust_class, manifest_sha256, mupot_compatibility,
        state, installed_by, latest_actor_id, latest_receipt_id, installed_at, updated_at)
-     VALUES (?, 't1', ?, '1.0.0', 'mumega', 'native_reviewed', ?, '^0.30.0', 'installed', 'u', 'u', 'r', 'now', 'now')`,
-  ).run(`i-${key}`, key, 'a'.repeat(64))
-  if (state !== 'installed') h.sqlite.prepare('UPDATE addon_installations SET state = ? WHERE addon_key = ?').run(state, key)
+     VALUES (?, ?, ?, '1.0.0', 'mumega', 'native_reviewed', ?, '^0.30.0', 'installed', 'u', 'u', 'r', 'now', 'now')`,
+  ).run(`i-${key}`, tenant, key, 'a'.repeat(64))
+  if (state !== 'installed') h.sqlite.prepare('UPDATE addon_installations SET state = ? WHERE addon_key = ? AND tenant = ?').run(state, key, tenant)
 }
 
 describe('mupot-notify manifest', () => {
   it('is registered, native_reviewed, and subscribes to the three events', () => {
     const entry = getRegisteredAddon('mupot-notify')
     expect(entry?.manifest.trustClass).toBe('native_reviewed')
-    expect(entry?.manifest.eventSubscriptions).toEqual(['task.review', 'task.blocked', 'backup.result'])
+    expect(entry?.manifest.eventSubscriptions).toEqual(['task.review', 'task.blocked'])
     expect(NotifyAddon.key).toBe('mupot-notify')
   })
 })
@@ -75,6 +75,13 @@ describe('dispatchAddonEvent', () => {
     const handler = vi.fn<NativeAddonEventHandler>(async () => {})
     const got = await dispatchAddonEvent({ DB: h.db } as unknown as Env, evt('task.review'), { handlers: { 'ext-addon': handler }, lookup })
     expect(got).toEqual([])
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('GUARD: an active install in another tenant receives nothing', async () => {
+    install('nat-addon', 'active', 'other-tenant')
+    const handler = vi.fn<NativeAddonEventHandler>(async () => {})
+    expect(await dispatchAddonEvent({ DB: h.db } as unknown as Env, evt('task.review'), { handlers: { 'nat-addon': handler }, lookup })).toEqual([])
     expect(handler).not.toHaveBeenCalled()
   })
 

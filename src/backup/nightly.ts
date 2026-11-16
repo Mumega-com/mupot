@@ -260,8 +260,15 @@ export async function verifyDump(bucket: R2Bucket, date: string): Promise<{ ok: 
 
 const redact = (s: string): string => s.replace(/https?:\/\/\S+/g, '<url>').slice(0, 500)
 
+/** Short stable digest of the (already redacted) reason, so two different failures on one date both alert. */
+async function reasonDigest(message: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(redact(message)))
+  return Array.from(new Uint8Array(buf).slice(0, 6)).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message: string): Promise<boolean> {
   try {
+    const reason = await reasonDigest(message)
     const r = await notify(env, {
       tenant: env.TENANT_SLUG,
       type: `backup.${kind}`,
@@ -269,7 +276,7 @@ async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message
       severity: kind === 'failed' ? 'critical' : 'attention',
       subject_ref: `backup:${date}`,
       recipients: [OWNER_RECIPIENT],
-      dedupe_key: `backup.${kind}:${date}`,
+      dedupe_key: `backup.${kind}:${date}:${reason}`,
       context: { title: `D1 nightly backup ${date}`, message },
     })
     return wasDelivered(r, 'telegram_dm')

@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS notif_delivery (
   tenant       TEXT NOT NULL,
   recipient    TEXT NOT NULL,
   channel      TEXT NOT NULL,
-  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed')),
+  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed','capped')),
   retry_after  TEXT,
   external_ref TEXT,
   error_code   TEXT,

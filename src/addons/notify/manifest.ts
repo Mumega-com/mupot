@@ -23,7 +23,7 @@ export const NotifyAddon = Object.freeze<AddonManifestV1>({
   playbooks: [],
   loops: [],
   consoleSections: [],
-  eventSubscriptions: ['task.review', 'task.blocked', 'backup.result'],
+  eventSubscriptions: ['task.review', 'task.blocked'],
   approvalPolicies: [],
   healthChecks: [],
   retention: { disablePreservesData: true, purgeRequiresOwner: true },

@@ -4865,11 +4865,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0275_notify_kernel.sql",
-    sha256: "fb90a1cee88b1b258c9dffdc408f392d1bd6bf8c184a3c826001ff45ba23fd6a",
+    sha256: "af608e1aeafc6999590b25760d2cdfb70fa818caa599fc730ec206567cc54ae0",
     statements: [
       "CREATE TABLE IF NOT EXISTS notif_event (\n  id              TEXT NOT NULL PRIMARY KEY,\n  tenant          TEXT NOT NULL,\n  type            TEXT NOT NULL,\n  severity        TEXT NOT NULL CHECK (severity IN ('info','attention','decision','critical')),\n  subject_ref     TEXT NOT NULL,\n  recipients_json TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  action_class    TEXT CHECK (action_class IS NULL OR action_class IN ('reversible','high_risk')),\n  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
       "CREATE INDEX IF NOT EXISTS idx_notif_event_tenant_created ON notif_event (tenant, created_at);",
-      "CREATE TABLE IF NOT EXISTS notif_delivery (\n  id           TEXT NOT NULL PRIMARY KEY,\n  event_id     TEXT NOT NULL REFERENCES notif_event (id) ON DELETE CASCADE,\n  tenant       TEXT NOT NULL,\n  recipient    TEXT NOT NULL,\n  channel      TEXT NOT NULL,\n  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed')),\n  retry_after  TEXT,\n  external_ref TEXT,\n  error_code   TEXT,\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
+      "CREATE TABLE IF NOT EXISTS notif_delivery (\n  id           TEXT NOT NULL PRIMARY KEY,\n  event_id     TEXT NOT NULL REFERENCES notif_event (id) ON DELETE CASCADE,\n  tenant       TEXT NOT NULL,\n  recipient    TEXT NOT NULL,\n  channel      TEXT NOT NULL,\n  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed','capped')),\n  retry_after  TEXT,\n  external_ref TEXT,\n  error_code   TEXT,\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
       "CREATE INDEX IF NOT EXISTS idx_notif_delivery_event ON notif_delivery (event_id);",
       "CREATE INDEX IF NOT EXISTS idx_notif_delivery_rate ON notif_delivery (tenant, recipient, channel, created_at);",
       "CREATE TABLE IF NOT EXISTS notif_dedupe (\n  tenant          TEXT NOT NULL,\n  recipient       TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  window_start_ms INTEGER NOT NULL,\n  PRIMARY KEY (tenant, recipient, dedupe_key)\n);",
@@ -4888,4 +4888,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "8e44ca77001ed4faba64d05f5a3f8b9c90753aa6c91d5e847f68a7bba3178767"
+export const SCHEMA_CHAIN_DIGEST: string = "1d0d60d9fac0f2450073bcedbb5f9941c91187018537b15ca96dafd3cfef5785"

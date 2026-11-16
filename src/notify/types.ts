@@ -27,7 +27,7 @@ export interface NotifyEvent {
   context?: NotifyContext
 }
 
-export type DeliveryStatus = 'sent' | 'edited' | 'acked' | 'failed'
+export type DeliveryStatus = 'sent' | 'edited' | 'acked' | 'failed' | 'capped'
 
 export interface DeliveryOutcome {
   status: DeliveryStatus
