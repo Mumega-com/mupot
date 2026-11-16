@@ -22,7 +22,7 @@
 //     manifest stored next to it). A failed verification deletes nothing.
 
 import type { Env } from '../types'
-import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { notify, wasDelivered, OWNER_RECIPIENT } from '../notify'
 import { safeConsole } from '../lib/log'
 
 export const BACKUP_CRON = '17 3 * * *'
@@ -262,8 +262,17 @@ const redact = (s: string): string => s.replace(/https?:\/\/\S+/g, '<url>').slic
 
 async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message: string): Promise<boolean> {
   try {
-    const r = await notifyHadi(env, { type: `backup.${kind}`, title: `D1 nightly backup ${date}`, message })
-    return r.delivered
+    const r = await notify(env, {
+      tenant: env.TENANT_SLUG,
+      type: `backup.${kind}`,
+      // A failed backup is critical (exempt from the rate cap); a skip is only worth attention.
+      severity: kind === 'failed' ? 'critical' : 'attention',
+      subject_ref: `backup:${date}`,
+      recipients: [OWNER_RECIPIENT],
+      dedupe_key: `backup.${kind}:${date}`,
+      context: { title: `D1 nightly backup ${date}`, message },
+    })
+    return wasDelivered(r, 'telegram_dm')
   } catch (err) {
     safeConsole.error('[backup] alert threw', redact(String(err)))
     return false

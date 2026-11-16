@@ -8,6 +8,7 @@ import '../src/addons/modules/fixture-with-loop'
 import '../src/addons/project-link/manifest'
 import '../src/addons/workflow-circuits/manifest'
 import '../src/addons/office/manifest'
+import '../src/addons/notify/manifest'
 
 // Digests of every registered addon. The five native digests are as computed on
 // main BEFORE ADDON_API_VERSION existed (e07f938d): decoupling must not move
@@ -22,6 +23,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   'workflow-circuits': '3e7e7084eb77f6cc8f27f93d3370294c1ed6d399a674acc1a8d272053f0dd661',
   // External manifests hash addonApiCompatibility, so this moved from
   // 9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f (migration 0190).
+  'mupot-notify': 'bb322f7deea0849eacb91d7c0a67ba24f566755da4f6ebf80f0e9f3e6b2a02e0',
   'mcpwp-office': '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2',
 }
 
@@ -128,6 +130,7 @@ describe('product version bump does not touch addons', () => {
       await import('../src/addons/project-link/manifest')
       await import('../src/addons/workflow-circuits/manifest')
       await import('../src/addons/office/manifest')
+      await import('../src/addons/notify/manifest')
       const actual = Object.fromEntries(registry.listRegisteredAddons().map((e) => [e.manifest.key, e.manifestSha256]))
       expect(actual).toEqual(PINNED_DIGESTS)
     } finally {

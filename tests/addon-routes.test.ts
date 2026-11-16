@@ -435,6 +435,16 @@ describe('addon lifecycle routes', () => {
         description: 'WordPress as each pot’s office — publish and review content through the mcpwp MCP endpoint under gate.',
         state: null,
       },
+      {
+        key: 'mupot-notify',
+        name: 'Notify',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'native_reviewed',
+        kind: 'native',
+        description: 'Notification kernel: one outbox, one carry table.',
+        state: null,
+      },
     ])
     for (const addon of body.addons) {
       expect(Object.keys(addon).sort()).toEqual([
