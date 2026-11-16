@@ -4863,9 +4863,29 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_seat_authority_decisions_no_delete" },
     ],
   },
+  {
+    file: "0275_notify_kernel.sql",
+    sha256: "fb90a1cee88b1b258c9dffdc408f392d1bd6bf8c184a3c826001ff45ba23fd6a",
+    statements: [
+      "CREATE TABLE IF NOT EXISTS notif_event (\n  id              TEXT NOT NULL PRIMARY KEY,\n  tenant          TEXT NOT NULL,\n  type            TEXT NOT NULL,\n  severity        TEXT NOT NULL CHECK (severity IN ('info','attention','decision','critical')),\n  subject_ref     TEXT NOT NULL,\n  recipients_json TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  action_class    TEXT CHECK (action_class IS NULL OR action_class IN ('reversible','high_risk')),\n  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_event_tenant_created ON notif_event (tenant, created_at);",
+      "CREATE TABLE IF NOT EXISTS notif_delivery (\n  id           TEXT NOT NULL PRIMARY KEY,\n  event_id     TEXT NOT NULL REFERENCES notif_event (id) ON DELETE CASCADE,\n  tenant       TEXT NOT NULL,\n  recipient    TEXT NOT NULL,\n  channel      TEXT NOT NULL,\n  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed')),\n  retry_after  TEXT,\n  external_ref TEXT,\n  error_code   TEXT,\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_delivery_event ON notif_delivery (event_id);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_delivery_rate ON notif_delivery (tenant, recipient, channel, created_at);",
+      "CREATE TABLE IF NOT EXISTS notif_dedupe (\n  tenant          TEXT NOT NULL,\n  recipient       TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  window_start_ms INTEGER NOT NULL,\n  PRIMARY KEY (tenant, recipient, dedupe_key)\n);",
+    ],
+    objects: [
+      { type: "table", name: "notif_event" },
+      { type: "index", name: "idx_notif_event_tenant_created" },
+      { type: "table", name: "notif_delivery" },
+      { type: "index", name: "idx_notif_delivery_event" },
+      { type: "index", name: "idx_notif_delivery_rate" },
+      { type: "table", name: "notif_dedupe" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "02443d4508274bde282ea8a682d556651635f13ebdd8ba0edc5b3acb28ed42f1"
+export const SCHEMA_CHAIN_DIGEST: string = "8e44ca77001ed4faba64d05f5a3f8b9c90753aa6c91d5e847f68a7bba3178767"

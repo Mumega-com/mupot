@@ -139,13 +139,13 @@ describe('guard: no secrets in rendered text', () => {
   it('redacts secret-shaped content from every field before an adapter renders it', () => {
     const ctx = renderContext({
       title: 'deploy with token=abc123SECRETvalue ok',
-      message: 'Authorization: Bearer sk-live-1234567890abcdefghij and password=hunter2hunter2',
+      message: 'Authorization: Bearer abcdefghij1234567890QQQQ and password=hunter2hunter2',
       task_id: 't-1',
     })
     const all = JSON.stringify(ctx)
     expect(all).not.toContain('abc123SECRETvalue')
     expect(all).not.toContain('hunter2hunter2')
-    expect(all).not.toContain('sk-live-1234567890abcdefghij')
+    expect(all).not.toContain('abcdefghij1234567890QQQQ')
     expect(ctx.task_id).toBe('t-1')
   })
 
