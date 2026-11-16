@@ -48,6 +48,16 @@ import { mintRawToken, prepareConditionalIdentityWeld, resolveAgentMemberBinding
 import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
+import {
+  authorityLiveSql,
+  authorityExpiresAtIso,
+  ATTACH_AUTHORITY_DEFAULT_DAYS,
+  ATTACH_AUTHORITY_MAX_DAYS,
+  isAttachAuthorityLevel,
+  parseAttachAuthorityDays,
+  parseAttachAuthorityLevel,
+  type AttachAuthorityLevel,
+} from '../auth/attached-authority'
 import { loadHarness, sanitizeLabel } from './harness'
 import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 import { sendClaimWelcome } from './claim-welcome'
@@ -228,6 +238,10 @@ export interface AdmissionRow {
   /** 0255: 'seat' = tied to the one chat that asked (every legacy row); 'harness' = the human approved it for every chat of this one install (R1). Immutable. */
   scope: AdmissionScope
   ceiling: AttachCeiling
+  /** mupot#980005ac: Helper/Full mode. Distinct from `ceiling` (member|lead|full rank clamp). */
+  authority_level: AttachAuthorityLevel
+  /** Absolute authority expiry. NULL only for pre-0274 grandfathered live rows (no retroactive cutoff). */
+  authority_expires_at: string | null
   requested_via: 'tool' | 'dashboard'
   requested_seat_id: string | null
   /** Short human code the asking chat displays; null on legacy admissions (and dashboard-made rows). Not a credential. */
@@ -254,8 +268,11 @@ export function autoGateAuthoritySql(agentIdExpr: string): string {
        THEN 1 ELSE 0 END`
 }
 
-const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, scope, ceiling, requested_via, requested_seat_id, attach_code, reason,
+const ADMISSION_COLUMNS = `id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, scope, ceiling, authority_level, authority_expires_at, requested_via, requested_seat_id, attach_code, reason,
   created_at, expires_at, decided_at, decided_by_member_id, decided_via, revoked_at, revoked_by_member_id`
+
+export { parseAttachAuthorityLevel, parseAttachAuthorityDays, isAttachAuthorityLevel, authorityExpiresAtIso, ATTACH_AUTHORITY_DEFAULT_DAYS }
+export type { AttachAuthorityLevel }
 
 export async function loadAdmission(env: Env, id: string): Promise<AdmissionRow | null> {
   return env.DB.prepare(`SELECT ${ADMISSION_COLUMNS} FROM agent_seat_admissions WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
@@ -300,12 +317,13 @@ export function admissionIsPendingLive(row: AdmissionRow, nowMs: number): boolea
   return row.status === 'pending' && row.expires_at !== null && Date.parse(row.expires_at) > nowMs
 }
 
-async function findOpenAdmission(env: Env, agentId: string, humanMemberId: string, harnessId: string): Promise<AdmissionRow | null> {
+async function findOpenAdmission(env: Env, agentId: string, humanMemberId: string, harnessId: string, nowMs = Date.now()): Promise<AdmissionRow | null> {
   return env.DB.prepare(
     `SELECT ${ADMISSION_COLUMNS} FROM agent_seat_admissions
       WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4 AND status IN ('pending', 'live')
+        AND (status <> 'live' OR ${authorityLiveSql('agent_seat_admissions','?5')})
       LIMIT 1`,
-  ).bind(env.TENANT_SLUG, agentId, humanMemberId, harnessId).first<AdmissionRow>()
+  ).bind(env.TENANT_SLUG, agentId, humanMemberId, harnessId, new Date(nowMs).toISOString()).first<AdmissionRow>()
 }
 
 function auditInsert(env: Env, agentId: string, actorId: string, action: string, after: Record<string, unknown>, guardSql: string, guardBinds: unknown[]): D1PreparedStatement {
@@ -350,8 +368,8 @@ async function otherChatBlocker(env: Env, p: {agentId:string;humanMemberId:strin
     LEFT JOIN agent_seats s ON s.id = adm.requested_seat_id AND s.tenant = adm.tenant AND s.member_id = adm.human_member_id
     LEFT JOIN agent_seat_thread_labels tl ON tl.seat_id = s.id AND tl.tenant = adm.tenant AND tl.human_member_id = adm.human_member_id
     WHERE adm.tenant = ?1 AND adm.agent_id = ?2 AND adm.human_member_id = ?3 AND adm.harness_id = ?4
-      AND adm.status IN ('pending','live') AND adm.scope = 'seat' AND adm.requested_seat_id IS NOT ?5 LIMIT 1`)
-    .bind(env.TENANT_SLUG,p.agentId,p.humanMemberId,p.harnessId,p.seatId).first<Omit<BlockingAdmission,'can_move'> & {can_move:number}>()
+      AND adm.status IN ('pending','live') AND (adm.status <> 'live' OR ${authorityLiveSql('adm','?6')}) AND adm.scope = 'seat' AND adm.requested_seat_id IS NOT ?5 LIMIT 1`)
+    .bind(env.TENANT_SLUG,p.agentId,p.humanMemberId,p.harnessId,p.seatId,new Date().toISOString()).first<Omit<BlockingAdmission,'can_move'> & {can_move:number}>()
   return row ? {ok:false,error:'approval_bound_to_other_chat',blocking_admission:{...row,can_move:row.can_move===1},requested_seat_id:p.seatId}
     : {ok:false,error:'attach_refused'}
 }
@@ -380,6 +398,18 @@ async function liveAdmissionFor(env: Env, open: AdmissionRow, p: { seatId: strin
   return { ok: true, state: 'live', admission: open }
 }
 
+/** Release an elapsed authority decision through the existing live -> revoked transition.
+ * The schema forbids live -> expired; revocation also retires attachments and their tokens atomically. */
+async function expireAdmissions(env: Env, agentId: string, humanId: string, harnessId: string, nowIso: string): Promise<void> {
+  const scope = [env.TENANT_SLUG, agentId, humanId, harnessId, nowIso]
+  await env.DB.prepare(`UPDATE agent_seat_admissions SET status = 'expired'
+      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4
+        AND status = 'pending' AND julianday(expires_at) <= julianday(?5)`).bind(...scope).run()
+  await env.DB.prepare(`UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = ?5
+      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4
+        AND status = 'live' AND NOT COALESCE(${authorityLiveSql('agent_seat_admissions','?5')},0)`).bind(...scope).run()
+}
+
 /**
  * Find or create the admission for (agent, human, harness).
  *  - live  -> returned as is (a later thread attaches immediately).
@@ -394,13 +424,9 @@ export async function ensureAdmission(
   nowMs: number = Date.now(),
 ): Promise<EnsureAdmissionResult> {
   const nowIso = new Date(nowMs).toISOString()
-  // A pending row past its expiry must not hold the unique slot.
-  await env.DB.prepare(
-    `UPDATE agent_seat_admissions SET status = 'expired'
-      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4 AND status = 'pending' AND expires_at <= ?5`,
-  ).bind(env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, nowIso).run()
+  await expireAdmissions(env, p.agentId, p.humanMemberId, p.harnessId, nowIso)
 
-  const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+  const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
   // An admission is bound to the ONE chat (seat) that asked: the unique (agent, human, harness) slot means a second chat gets
   // no row of its own, so it is refused (the human revokes, then it asks again and gets its own coded ask).
   if (open && open.status === 'live') return liveAdmissionFor(env, open, p)
@@ -416,23 +442,31 @@ export async function ensureAdmission(
       const agentRow = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id FROM agents a WHERE a.id = ?1 LIMIT 1`)
         .bind(p.agentId).first<{ name: string; squad_id: string }>()
       const weld = agentRow && !(await hasBindingRow(env, p.agentId)) ? prepareConditionalIdentityWeld(env, { id, agent_id: p.agentId }, agentRow, nowIso, 'direct') : null
+      const authorityExpiresAt = authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS, nowMs)
       await env.DB.batch([
         env.DB.prepare(
           `INSERT INTO agent_seat_admissions
-             (id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
-           SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ${autoGateAuthoritySql('?3')}, ?8, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
+             (id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, authority_level, authority_expires_at, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
+           SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ${autoGateAuthoritySql('?3')}, ?8, 'helper', ?9, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
             WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
            ON CONFLICT DO NOTHING`,
-        ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member'),
+        ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member', authorityExpiresAt),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
         ...(weld ? weld.statements : []),
         auditInsert(env, p.agentId, p.humanMemberId, 'seat_admit',
-          { admission_id: id, harness_id: p.harnessId, human_member_id: p.humanMemberId, via: 'dashboard' },
+          { admission_id: id, harness_id: p.harnessId, human_member_id: p.humanMemberId, via: 'dashboard', authority_level: 'helper', authority_expires_at: authorityExpiresAt },
           'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\')', [id]),
+        env.DB.prepare(
+          `INSERT INTO agent_seat_authority_decisions
+             (id, tenant, admission_id, attachment_id, seat_id, agent_id, harness_id, project_id, machine_key,
+              decided_by_member_id, authority_level, authority_expires_at, decided_at, decided_via)
+           SELECT ?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, NULL, ?7, 'helper', ?8, ?9, 'dashboard'
+            WHERE EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?3 AND status = 'live')`,
+        ).bind(crypto.randomUUID(), env.TENANT_SLUG, id, p.seatId, p.agentId, p.harnessId, p.humanMemberId, authorityExpiresAt, nowIso),
         ...(weld ? [weldAudit(env, p.agentId, p.humanMemberId, id, weld.memberId)] : []),
       ])
     }
-    const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
     return now && now.status === 'live' ? liveAdmissionFor(env,now,p) : { ok: false, error: 'attach_refused' }
   }
 
@@ -469,7 +503,7 @@ export async function ensureAdmission(
        ON CONFLICT DO NOTHING`,
     ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat', p.reason ?? null).run()
     const inserted = res.meta.changes === 1
-    pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
     if (!pending) {
       // The insert also refuses when the designation changed after the caller resolved the agent: that is not a flood.
       const stillDesignated = await env.DB.prepare(`SELECT 1 AS x FROM agents ag WHERE ag.id = ?1 ${attachDesignatedClause(env, 'ag', '?2')}`)
@@ -489,12 +523,27 @@ export async function ensureAdmission(
   return { ok: true, state: 'pending', admission: pending, approveUrl: link?.url ?? null, alreadyPending: false }
 }
 
+export type DecideAdmissionAuthority = {
+  authorityLevel?: AttachAuthorityLevel
+  /** Absolute days until authority expiry (1..7). Default 7. */
+  authorityDays?: number
+}
+
 /** The human's decision on a PENDING admission (dashboard path: no secure moment). */
 export async function decideAdmissionDirect(
   env: Env,
-  p: { admissionId: string; humanMemberId: string; decision: 'approve' | 'deny'; ceiling?: AttachCeiling; attachCode?: unknown },
+  p: {
+    admissionId: string
+    humanMemberId: string
+    decision: 'approve' | 'deny'
+    ceiling?: AttachCeiling
+    attachCode?: unknown
+  } & DecideAdmissionAuthority,
   nowMs: number = Date.now(),
-): Promise<{ ok: true } | { ok: false; error: 'admission_not_found' | 'not_pending' | 'attach_refused' | 'attach_code_mismatch' }> {
+): Promise<
+  | { ok: true; authorityLevel?: AttachAuthorityLevel; authorityExpiresAt?: string }
+  | { ok: false; error: 'admission_not_found' | 'not_pending' | 'attach_refused' | 'attach_code_mismatch' | 'invalid_authority_days' }
+> {
   const adm = await loadAdmission(env, p.admissionId)
   if (!adm || adm.human_member_id !== p.humanMemberId) return { ok: false, error: 'admission_not_found' }
   if (!admissionIsPendingLive(adm, nowMs)) return { ok: false, error: 'not_pending' }
@@ -513,7 +562,24 @@ export async function decideAdmissionDirect(
   if (adm.scope === 'harness') return { ok: false, error: 'attach_refused' }
   const refusal = await admissionRefusal(env, adm)
   if (refusal) return { ok: false, error: 'attach_refused' }
-  return (await promoteAdmission(env, adm, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode)) ? { ok: true } : { ok: false, error: 'not_pending' }
+  // Helper is the default; Full is never inferred. Days default to 7 and never exceed 7.
+  const authorityLevel = p.authorityLevel && isAttachAuthorityLevel(p.authorityLevel) ? p.authorityLevel : 'helper'
+  const days = p.authorityDays ?? ATTACH_AUTHORITY_DEFAULT_DAYS
+  if (!Number.isInteger(days) || days < 1 || days > ATTACH_AUTHORITY_MAX_DAYS) {
+    return { ok: false, error: 'invalid_authority_days' }
+  }
+  const authorityExpiresAt = authorityExpiresAtIso(days, nowMs)
+  const promoted = await promoteAdmission(env, adm, p.humanMemberId, 'dashboard', nowIso, p.ceiling ?? 'member', p.attachCode, {
+    authorityLevel, authorityExpiresAt,
+  })
+  if (!promoted) return { ok: false, error: 'not_pending' }
+  // Read back the actual stored level (never echo the form).
+  const stored = await loadAdmission(env, adm.id)
+  return {
+    ok: true,
+    authorityLevel: stored?.authority_level ?? authorityLevel,
+    authorityExpiresAt: stored?.authority_expires_at ?? authorityExpiresAt,
+  }
 }
 
 /** Why a pending admission may not be promoted NOW (agent gone/inactive/unwelded, harness gone, human lost admin). */
@@ -547,8 +613,25 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
 export type AttachSkipReason = 'no_requested_seat' | 'seat_gone' | 'seat_already_attached' | 'guard_refused'
 export interface PromoteResult { landed: boolean; attachmentId: string | null; attachSkipped?: AttachSkipReason }
 
-export async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<boolean> {
-  return (await promoteAdmissionDetailed(env, adm, humanMemberId, via, nowIso, ceiling, attachCode)).landed
+export type PromoteAuthority = {
+  authorityLevel: AttachAuthorityLevel
+  authorityExpiresAt: string
+}
+
+export async function promoteAdmission(
+  env: Env,
+  adm: AdmissionRow,
+  humanMemberId: string,
+  via: 'webauthn' | 'dashboard',
+  nowIso: string,
+  ceiling: AttachCeiling,
+  attachCode: unknown,
+  authority: PromoteAuthority = {
+    authorityLevel: 'helper',
+    authorityExpiresAt: authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS, Date.parse(nowIso) || Date.now()),
+  },
+): Promise<boolean> {
+  return (await promoteAdmissionDetailed(env, adm, humanMemberId, via, nowIso, ceiling, attachCode, authority)).landed
 }
 
 /**
@@ -557,11 +640,25 @@ export async function promoteAdmission(env: Env, adm: AdmissionRow, humanMemberI
  * on its next call. Any guard failure leaves the admission live with NO attachment (reported in attachSkipped) and the chat's
  * next seat_attach works exactly as before. Never attaches any seat other than adm.requested_seat_id.
  */
-export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, humanMemberId: string, via: 'webauthn' | 'dashboard', nowIso: string, ceiling: AttachCeiling, attachCode: unknown): Promise<PromoteResult> {
+export async function promoteAdmissionDetailed(
+  env: Env,
+  adm: AdmissionRow,
+  humanMemberId: string,
+  via: 'webauthn' | 'dashboard',
+  nowIso: string,
+  ceiling: AttachCeiling,
+  attachCode: unknown,
+  authority: PromoteAuthority = {
+    authorityLevel: 'helper',
+    authorityExpiresAt: authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS, Date.parse(nowIso) || Date.now()),
+  },
+): Promise<PromoteResult> {
   // The code is enforced HERE so no caller can forget it.
   if (attachCodeRefused(adm, attachCode)) return { landed: false, attachmentId: null }
   // Admin-level power is never carried across threads: a harness-wide approval stops at 'lead'. Enforced here so no caller can forget it.
   if (adm.scope === 'harness' && ceiling === 'full') return { landed: false, attachmentId: null }
+  const authorityLevel: AttachAuthorityLevel = authority.authorityLevel === 'full' ? 'full' : 'helper'
+  const authorityExpiresAt = authority.authorityExpiresAt
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id, a.slug AS slug FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string; slug: string }>()
@@ -579,18 +676,37 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
         grantTokenId,
       })
     : []
+  const decisionId = crypto.randomUUID()
+  const machineKey = await env.DB.prepare(
+    `SELECT h.client_name || CASE WHEN s.label_basename IS NOT NULL AND s.label_basename <> '' THEN ' / ' || s.label_basename ELSE '' END AS machine_key
+       FROM harnesses h
+       LEFT JOIN agent_seats s ON s.id = ?3 AND s.tenant = h.tenant AND s.member_id = h.member_id
+      WHERE h.id = ?1 AND h.tenant = ?2 LIMIT 1`,
+  ).bind(adm.harness_id, env.TENANT_SLUG, adm.requested_seat_id).first<{ machine_key: string | null }>()
   const out = await env.DB.batch([
     ...(weld ? weld.statements : []),
     env.DB.prepare(
       `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6,
+              authority_level = ?7, authority_expires_at = ?8,
               gate_authority = CASE WHEN agent_seat_admissions.scope = 'harness' THEN 0 ELSE ${autoGateAuthoritySql('agent_seat_admissions.agent_id')} END -- gate power is never inherited by other threads
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
                         ${attachDesignatedClause(env, 'ag', '?3')})`,
-    ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling),
+    ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
-      { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling },
+      { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, authority_level: authorityLevel, authority_expires_at: authorityExpiresAt },
       'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\' AND decided_at = ?7)', [adm.id, nowIso]),
+    // Append-only provenance: only when the admission actually went live (same guard as the audit row).
+    env.DB.prepare(
+      `INSERT INTO agent_seat_authority_decisions
+         (id, tenant, admission_id, attachment_id, seat_id, agent_id, harness_id, project_id, machine_key,
+          decided_by_member_id, authority_level, authority_expires_at, decided_at, decided_via)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13
+        WHERE EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?3 AND status = 'live' AND decided_at = ?12)`,
+    ).bind(
+      decisionId, env.TENANT_SLUG, adm.id, attachmentId, adm.requested_seat_id, adm.agent_id, adm.harness_id,
+      machineKey?.machine_key ?? null, humanMemberId, authorityLevel, authorityExpiresAt, nowIso, via,
+    ),
     ...attach,
     ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
@@ -598,8 +714,10 @@ export async function promoteAdmissionDetailed(env: Env, adm: AdmissionRow, huma
   if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null }
   // The claim landed (and only then): the agent hears it once. Best effort, after the batch; a failure never undoes the claim.
   try { await sendClaimWelcome(env, adm) } catch { /* the claim stands; the welcome is a nicety */ }
+  // attach statements start after: UPDATE + audit + decision = 3
+  const attachBase = base + 3
   if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat' }
-  if (out[base + 2].meta.changes === 1) return { landed: true, attachmentId }
+  if (out[attachBase].meta.changes === 1) return { landed: true, attachmentId }
   // The admission is live but the guarded INSERT wrote nothing: name the guard, so the human/chat is told why seat_attach is still needed.
   const seat = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
     .bind(adm.requested_seat_id, env.TENANT_SLUG, adm.human_member_id).first<{ x: number }>()
@@ -757,6 +875,9 @@ export interface LiveAttachmentRow {
   harness_id: string
   seat_token_id: string
   ceiling: AttachCeiling
+  /** Display/audit only in stage 1 — Full does not widen capability beyond Helper. */
+  authority_level: AttachAuthorityLevel
+  authority_expires_at: string | null
   seat_admission_status?: string | null
   /** adm.gate_authority: the owner's opt-in for gate authority on this attached seat (0247). */
   gate_authority: number
@@ -774,7 +895,9 @@ export interface LiveAttachmentRow {
 export async function findLiveAttachment(env: Env, human: { memberId: string; tokenId: string | null }, seatId: string): Promise<LiveAttachmentRow | null> {
   const ph: LivePh = (k) => ({ tenant: '?1', seat: '?2', grantToken: '?3', human: '?4', now: '?5' })[k]
   const row = await env.DB.prepare(
-    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling, adm.gate_authority AS gate_authority, adm.requested_seat_id AS requested_seat_id, s.admission_status AS seat_admission_status, s.id AS seat_id,
+    `SELECT att.id AS attachment_id, adm.id AS admission_id, att.last_used_at AS last_used_at, adm.ceiling AS ceiling,
+            adm.authority_level AS authority_level, adm.authority_expires_at AS authority_expires_at,
+            adm.gate_authority AS gate_authority, adm.requested_seat_id AS requested_seat_id, s.admission_status AS seat_admission_status, s.id AS seat_id,
             s.label_basename AS seat_label, s.agent_id AS seat_agent_id, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, att.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t WHERE ${seatTokenLiveSql(ph)}) AS seat_token_id
@@ -929,6 +1052,7 @@ export async function attachSeatToAgent(
       WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_attachments.agent_id ${attachDesignatedClause(env, 'ag', 'agent_seat_attachments.human_member_id')})`,
   ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
+  await expireAdmissions(env, agent.id, p.humanMemberId, seat.harness_id, new Date(nowMs).toISOString())
   const current = await liveAttachmentOfSeat(env, seat.id)
   if (current) {
     // Same agent already attached to THIS seat (e.g. Admit completed it for the asking chat): idempotent success, not already_attached.
@@ -938,7 +1062,7 @@ export async function attachSeatToAgent(
       // live admission, live server-held token, active agent, ...). A dead one (e.g. its token revoked) is refused, not reported attached.
       const live = await findLiveAttachment(env, { memberId: p.humanMemberId, tokenId: p.grantTokenId ?? null }, seat.id)
       if (!live || live.attachment_id !== current.id) return { ok: false, error: 'attach_refused' }
-      const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id)
+      const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id, nowMs)
       return adm && adm.status === 'live'
         ? { ok: true, status: 'attached', attachment_id: current.id, admission_id: adm.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
         : { ok: false, error: 'attach_refused' }
@@ -1111,6 +1235,8 @@ export interface ConnectionAdmission extends AttachIdentity {
   agent_name: string
   harness_name: string
   ceiling: AttachCeiling
+  authority_level: AttachAuthorityLevel
+  authority_expires_at: string | null
   created_at: string
   expires_at: string | null
   has_code: number
@@ -1168,7 +1294,8 @@ export async function loadConnections(env: Env, humanMemberId: string, nowMs=Dat
     seats: seats.filter((s) => s.harness_id === h.id).map((s) => ({ ...s, connection_name: s.thread_label ?? defaultConnectionName(h, s.seat_label) })),
   }))
   const admissions = (await env.DB.prepare(
-    `SELECT adm.id AS id, adm.agent_id AS agent_id, a.slug AS agent_slug, adm.scope AS scope, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling, adm.created_at AS created_at,
+    `SELECT adm.id AS id, adm.agent_id AS agent_id, a.slug AS agent_slug, adm.scope AS scope, adm.status AS status, a.name AS agent_name, h.client_name AS harness_name, adm.ceiling AS ceiling,
+            adm.authority_level AS authority_level, adm.authority_expires_at AS authority_expires_at, adm.created_at AS created_at,
             a.name AS agentName, a.role AS agentRole, COALESCE(om.display_name, om.email, a.owner, 'unrecorded') AS ownerName,
             h.client_name AS harnessName, h.kind AS harness_kind, f.runtime AS runtime, COALESCE(NULLIF(rtl.label, ''), rs.label_basename) AS seatLabel, adm.reason AS reason,
             adm.expires_at AS expires_at, (adm.attach_code IS NOT NULL) AS has_code, adm.requested_seat_id AS requested_seat_id, rs.label_basename AS seat_label, rs.created_at AS seat_first_seen,
@@ -1186,9 +1313,9 @@ export async function loadConnections(env: Env, humanMemberId: string, nowMs=Dat
        LEFT JOIN agent_seat_thread_labels rtl ON rtl.tenant = adm.tenant AND rtl.seat_id = rs.id AND rtl.human_member_id = adm.human_member_id
        LEFT JOIN members om ON om.id = a.owner_member_id AND om.tenant = adm.tenant
        LEFT JOIN fleet_agents f ON f.agent_id = a.id AND f.tenant = adm.tenant
-      WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live')
+      WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live') AND (adm.status <> 'live' OR ${authorityLiveSql('adm','?3')})
       ORDER BY adm.created_at DESC LIMIT 200`,
-  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission & { runtime: string | null; harness_kind: string;seat_last_used_at:string|null;attachment_last_used_at:string|null }>()).results ?? []
+  ).bind(env.TENANT_SLUG, humanMemberId, new Date(nowMs).toISOString()).all<ConnectionAdmission & { runtime: string | null; harness_kind: string;seat_last_used_at:string|null;attachment_last_used_at:string|null }>()).results ?? []
   return { harnesses, admissions: admissions.map((a) => {
     const last=latestConnectionActivity(a.seat_last_used_at,a.attachment_last_used_at)
     const activity=latestConnectionActivity(last,a.seat_first_seen,a.newest_chat_created_at)

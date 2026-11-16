@@ -2133,7 +2133,15 @@ dashboardApp.get('/agents/:id', async (c) => {
   const wakeCard = await loadAgentWakeCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   const onboardingCards = claimCard || wakeCard ? html`${claimCard ?? ''}${wakeCard ?? ''}` : null
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, {
+      resume,
+      fresh: freshNow,
+      claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null,
+      reissued: c.req.query('reissued') === '1',
+      // Read-back of the STORED authority decision (query params set after the server re-read the row).
+      authorityLevel: (() => { const a = c.req.query('authority'); return a === 'full' || a === 'helper' ? a : null })(),
+      authorityExpires: c.req.query('expires') || null,
+    })),
   )
 })
 
@@ -6192,7 +6200,14 @@ function agentConsoleBody(
   ownerView: AgentOwnerView | null = null,
   liveRuntime: FleetBelief | null = null,
   onboardingCard: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
-  flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
+  flash: {
+    resume: 'claim' | 'allow' | 'push' | null
+    fresh: boolean
+    claimed: 'attached' | 'partial' | null
+    reissued: boolean
+    authorityLevel?: 'helper' | 'full' | null
+    authorityExpires?: string | null
+  } = { resume: null, fresh: false, claimed: null, reissued: false, authorityLevel: null, authorityExpires: null },
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -6262,8 +6277,8 @@ function agentConsoleBody(
       <pre style="white-space:pre-wrap"><code id="background-connect-prompt">${`You are ${agent.slug}. Connect to mupot by OAuth as ${agent.slug} (choose 'This connection is ${agent.name}'), then run connection_check.`}</code></pre>
       <button type="button" class="btn secondary" onclick="navigator.clipboard.writeText(document.getElementById('background-connect-prompt').textContent).then(() => { this.textContent = 'Copied'; })">Copy</button>
     </div>
-    ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
-    ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
+    ${flash.claimed === 'attached' ? html`<div class="card" role="status" data-claim-authority="${flash.authorityLevel ?? ''}"><p><strong>Connected.</strong> The chat is now acting as ${agent.name}${flash.authorityLevel ? html` as <strong>${flash.authorityLevel === 'full' ? 'Full' : 'Helper'}</strong>` : ''}${flash.authorityExpires ? html` until ${flash.authorityExpires}` : ''}.</p></div>` : ''}
+    ${flash.claimed === 'partial' ? html`<div class="card" role="status" data-claim-authority="${flash.authorityLevel ?? ''}"><p><strong>Admitted, but the chat is not attached yet.</strong> Stored access: ${flash.authorityLevel === 'full' ? 'Full' : 'Helper'}${flash.authorityExpires ? html` until ${flash.authorityExpires}` : ''}. The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
     ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}
     ${onboardingCard ?? ''}
     ${liveRuntimeCard(liveRuntime)}
