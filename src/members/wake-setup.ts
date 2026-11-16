@@ -1,3 +1,5 @@
+import { authorityLiveSql } from '../auth/attached-authority'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 // mupot — "Set up wake": what the human can do, on the agent's page, to make the claimed agent reachable without polling.
 //
 // WHAT DECIDES THE CARD. Server-held CAPABILITY FACTS about the agent, never a harness or runtime NAME:
@@ -62,9 +64,9 @@ async function viewerClaimedAgent(env: Env, memberId: string, agentId: string): 
   const row = await env.DB.prepare(
     `SELECT 1 AS x FROM agents a
       WHERE a.id = ?2 AND (a.owner_member_id = ?1
-            OR EXISTS (SELECT 1 FROM agent_seat_admissions d WHERE d.tenant = ?3 AND d.agent_id = a.id AND d.human_member_id = ?1 AND d.status = 'live'))
+            OR EXISTS (SELECT 1 FROM agent_seat_admissions d WHERE d.tenant = ?3 AND d.agent_id = a.id AND d.human_member_id = ?1 AND d.status = 'live' AND ${authorityLiveSql('d','?4')}))
       LIMIT 1`,
-  ).bind(memberId, agentId, env.TENANT_SLUG).first<{ x: number }>()
+  ).bind(memberId, agentId, env.TENANT_SLUG, nowSqlUtc()).first<{ x: number }>()
   return row !== null
 }
 

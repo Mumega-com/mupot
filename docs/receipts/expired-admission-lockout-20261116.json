@@ -1,0 +1,121 @@
+{
+  "base": "9aed8b036cd8a3f1b844e5776f419f7a74133393",
+  "scope": "P2-A four readers plus M30/M43 only; remaining78776453 criteria held",
+  "mutations": [
+    {
+      "name": "elevation",
+      "file": "src/auth/elevation.ts",
+      "mutation": {
+        "from": "${authorityLiveSql('adm','?3')}",
+        "to": "1"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lockout delta: expired admission stops elevation origin liveness"
+      ],
+      "log_sha256": "8276d3e24beb4d79702a24ae3cba37c965fa20e6dd6058c7dc032c7e577c2a95"
+    },
+    {
+      "name": "wake",
+      "file": "src/members/wake-setup.ts",
+      "mutation": {
+        "from": "${authorityLiveSql('d','?4')}",
+        "to": "1"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lockout delta: expired non-owner claim no longer shows a wake setup card"
+      ],
+      "log_sha256": "5ee39d5e563e0ede3575639c3f218123ea53f3e067b9549084439be44bc38fb1"
+    },
+    {
+      "name": "claim",
+      "file": "src/members/claim.ts",
+      "mutation": {
+        "from": "${authorityLiveSql('agent_seat_admissions','?4')}",
+        "to": "1"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lockout delta: expired authority is not an already-claimed claim link"
+      ],
+      "log_sha256": "e423795cd57a4a04dd592e24af3ca8bcfe8542684f5ca45a64ee581eb5548de4"
+    },
+    {
+      "name": "seat-cleanup",
+      "file": "src/members/seat-attach.ts",
+      "mutation": {
+        "from": "AND NOT COALESCE(${authorityLiveSql('agent_seat_admissions','?3')},0)",
+        "to": "AND 0"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lockout delta: expired A can ask for B and cleanup retires the hidden expired approval"
+      ],
+      "log_sha256": "37f0f7287d14b469675ae190f0ad5b0d286aca9a45466ac81dfedd5669b53c06"
+    },
+    {
+      "name": "M30",
+      "file": "src/dashboard/claim.ts",
+      "mutation": {
+        "from": "invalid_authority_days: 400",
+        "to": "invalid_authority_days: 409"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lockout delta M30: agent-page invalid days returns HTTP400 without a decision"
+      ],
+      "log_sha256": "3e70613bd23bcc9d32003c9f86b093c1d3a025b5fdaebbac6f98f16f2fba817d"
+    },
+    {
+      "name": "M43",
+      "file": "src/members/approval-move.ts",
+      "mutation": {
+        "from": "AND EXISTS(SELECT 1 FROM agent_seat_authority_decisions d WHERE d.tenant=?2 AND d.admission_id=?8 AND d.attachment_id=?9)",
+        "to": "AND 1"
+      },
+      "killed": true,
+      "exit": 1,
+      "failed_tests": [
+        "tests/seat-attach.test.ts > dashboard: Connections > lockout delta M43: a zero-row move decision insert rolls the whole move back"
+      ],
+      "log_sha256": "1b90aaf08e1de1710db5ee0b1dcabfc8c6374d59896827ee195b04603f5b677e"
+    }
+  ],
+  "source_sha256": {
+    "src/auth/elevation.ts": "01d090075d5fbaff23e66b286cc55cb9d14deece706d0ea3a0edb57b90173692",
+    "src/members/claim.ts": "63c5e9274cdb39afbac55559a93a990e71821b9305d63e5d632791875aa44b67",
+    "src/members/seat-attach.ts": "efd20316ae0ff49987ca78698a14a9231d0317bf795f933787aaf5f590508f8e",
+    "src/members/wake-setup.ts": "37fe9e2f9cd03c4828207bc15ac47f43b3b3e74cceac3b857afa1d06d260f144",
+    "tests/attached-authority-stage1.test.ts": "8e98982e93f3a54f21e111e96eef3355d96ee534ad139f8470d7ac5dfd8b0d88",
+    "tests/seat-attach.test.ts": "f2644135c37f8d954df4f9513168f595d10f72397a36d7f08d762350ebb7f328"
+  },
+  "restored_verification": {
+    "unique_suites": 4,
+    "passed": 340,
+    "partitions": [
+      {
+        "log": "restored-dashboard.log",
+        "passed": 60,
+        "sha256": "5ddfcf7b7be09fb1f29d1b0ac4060995a7cca16528cb43e5b63d91537dce44c9"
+      },
+      {
+        "log": "restored-other.log",
+        "passed": 182,
+        "sha256": "0a9225c897aa6417c827fc9a1f0bc757dfdc3d89677a8b5ce4e5d319850f2e51"
+      },
+      {
+        "log": "restored-three.log",
+        "passed": 98,
+        "sha256": "414fe1d7b9dda4ce2730f7f68c5bb96db8d8798d143f4a78c5855cc3302e5dac"
+      }
+    ],
+    "typecheck_exit": 0,
+    "long_run_interruptions": "SIGTERM; no full post-mutation single-run completion claimed"
+  }
+}
