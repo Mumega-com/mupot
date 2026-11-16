@@ -49,6 +49,7 @@ import { issueMomentLink } from '../secure-moments/issue'
 import type { HumanProof, Outcome, WaitUntil, Gate } from '../access/decision-core'
 import { type AttachCeiling } from '../auth/attached-ceiling'
 import {
+  authorityLiveSql,
   authorityExpiresAtIso,
   ATTACH_AUTHORITY_DEFAULT_DAYS,
   ATTACH_AUTHORITY_MAX_DAYS,
@@ -316,12 +317,13 @@ export function admissionIsPendingLive(row: AdmissionRow, nowMs: number): boolea
   return row.status === 'pending' && row.expires_at !== null && Date.parse(row.expires_at) > nowMs
 }
 
-async function findOpenAdmission(env: Env, agentId: string, humanMemberId: string, harnessId: string): Promise<AdmissionRow | null> {
+async function findOpenAdmission(env: Env, agentId: string, humanMemberId: string, harnessId: string, nowMs = Date.now()): Promise<AdmissionRow | null> {
   return env.DB.prepare(
     `SELECT ${ADMISSION_COLUMNS} FROM agent_seat_admissions
       WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4 AND status IN ('pending', 'live')
+        AND (status <> 'live' OR ${authorityLiveSql('agent_seat_admissions','?5')})
       LIMIT 1`,
-  ).bind(env.TENANT_SLUG, agentId, humanMemberId, harnessId).first<AdmissionRow>()
+  ).bind(env.TENANT_SLUG, agentId, humanMemberId, harnessId, new Date(nowMs).toISOString()).first<AdmissionRow>()
 }
 
 function auditInsert(env: Env, agentId: string, actorId: string, action: string, after: Record<string, unknown>, guardSql: string, guardBinds: unknown[]): D1PreparedStatement {
@@ -366,8 +368,8 @@ async function otherChatBlocker(env: Env, p: {agentId:string;humanMemberId:strin
     LEFT JOIN agent_seats s ON s.id = adm.requested_seat_id AND s.tenant = adm.tenant AND s.member_id = adm.human_member_id
     LEFT JOIN agent_seat_thread_labels tl ON tl.seat_id = s.id AND tl.tenant = adm.tenant AND tl.human_member_id = adm.human_member_id
     WHERE adm.tenant = ?1 AND adm.agent_id = ?2 AND adm.human_member_id = ?3 AND adm.harness_id = ?4
-      AND adm.status IN ('pending','live') AND adm.scope = 'seat' AND adm.requested_seat_id IS NOT ?5 LIMIT 1`)
-    .bind(env.TENANT_SLUG,p.agentId,p.humanMemberId,p.harnessId,p.seatId).first<Omit<BlockingAdmission,'can_move'> & {can_move:number}>()
+      AND adm.status IN ('pending','live') AND (adm.status <> 'live' OR ${authorityLiveSql('adm','?6')}) AND adm.scope = 'seat' AND adm.requested_seat_id IS NOT ?5 LIMIT 1`)
+    .bind(env.TENANT_SLUG,p.agentId,p.humanMemberId,p.harnessId,p.seatId,new Date().toISOString()).first<Omit<BlockingAdmission,'can_move'> & {can_move:number}>()
   return row ? {ok:false,error:'approval_bound_to_other_chat',blocking_admission:{...row,can_move:row.can_move===1},requested_seat_id:p.seatId}
     : {ok:false,error:'attach_refused'}
 }
@@ -396,6 +398,18 @@ async function liveAdmissionFor(env: Env, open: AdmissionRow, p: { seatId: strin
   return { ok: true, state: 'live', admission: open }
 }
 
+/** Release an elapsed authority decision through the existing live -> revoked transition.
+ * The schema forbids live -> expired; revocation also retires attachments and their tokens atomically. */
+async function expireAdmissions(env: Env, agentId: string, humanId: string, harnessId: string, nowIso: string): Promise<void> {
+  const scope = [env.TENANT_SLUG, agentId, humanId, harnessId, nowIso]
+  await env.DB.prepare(`UPDATE agent_seat_admissions SET status = 'expired'
+      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4
+        AND status = 'pending' AND julianday(expires_at) <= julianday(?5)`).bind(...scope).run()
+  await env.DB.prepare(`UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = ?5
+      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4
+        AND status = 'live' AND NOT COALESCE(${authorityLiveSql('agent_seat_admissions','?5')},0)`).bind(...scope).run()
+}
+
 /**
  * Find or create the admission for (agent, human, harness).
  *  - live  -> returned as is (a later thread attaches immediately).
@@ -410,13 +424,9 @@ export async function ensureAdmission(
   nowMs: number = Date.now(),
 ): Promise<EnsureAdmissionResult> {
   const nowIso = new Date(nowMs).toISOString()
-  // A pending row past its expiry must not hold the unique slot.
-  await env.DB.prepare(
-    `UPDATE agent_seat_admissions SET status = 'expired'
-      WHERE tenant = ?1 AND agent_id = ?2 AND human_member_id = ?3 AND harness_id = ?4 AND status = 'pending' AND expires_at <= ?5`,
-  ).bind(env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, nowIso).run()
+  await expireAdmissions(env, p.agentId, p.humanMemberId, p.harnessId, nowIso)
 
-  const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+  const open = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
   // An admission is bound to the ONE chat (seat) that asked: the unique (agent, human, harness) slot means a second chat gets
   // no row of its own, so it is refused (the human revokes, then it asks again and gets its own coded ask).
   if (open && open.status === 'live') return liveAdmissionFor(env, open, p)
@@ -456,7 +466,7 @@ export async function ensureAdmission(
         ...(weld ? [weldAudit(env, p.agentId, p.humanMemberId, id, weld.memberId)] : []),
       ])
     }
-    const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    const now = await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
     return now && now.status === 'live' ? liveAdmissionFor(env,now,p) : { ok: false, error: 'attach_refused' }
   }
 
@@ -493,7 +503,7 @@ export async function ensureAdmission(
        ON CONFLICT DO NOTHING`,
     ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN, generateAttachCode(), p.scope === 'harness' ? 'harness' : 'seat', p.reason ?? null).run()
     const inserted = res.meta.changes === 1
-    pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId, nowMs)
     if (!pending) {
       // The insert also refuses when the designation changed after the caller resolved the agent: that is not a flood.
       const stillDesignated = await env.DB.prepare(`SELECT 1 AS x FROM agents ag WHERE ag.id = ?1 ${attachDesignatedClause(env, 'ag', '?2')}`)
@@ -1042,6 +1052,7 @@ export async function attachSeatToAgent(
       WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_attachments.agent_id ${attachDesignatedClause(env, 'ag', 'agent_seat_attachments.human_member_id')})`,
   ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
+  await expireAdmissions(env, agent.id, p.humanMemberId, seat.harness_id, new Date(nowMs).toISOString())
   const current = await liveAttachmentOfSeat(env, seat.id)
   if (current) {
     // Same agent already attached to THIS seat (e.g. Admit completed it for the asking chat): idempotent success, not already_attached.
@@ -1051,7 +1062,7 @@ export async function attachSeatToAgent(
       // live admission, live server-held token, active agent, ...). A dead one (e.g. its token revoked) is refused, not reported attached.
       const live = await findLiveAttachment(env, { memberId: p.humanMemberId, tokenId: p.grantTokenId ?? null }, seat.id)
       if (!live || live.attachment_id !== current.id) return { ok: false, error: 'attach_refused' }
-      const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id)
+      const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id, nowMs)
       return adm && adm.status === 'live'
         ? { ok: true, status: 'attached', attachment_id: current.id, admission_id: adm.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
         : { ok: false, error: 'attach_refused' }
@@ -1302,9 +1313,9 @@ export async function loadConnections(env: Env, humanMemberId: string, nowMs=Dat
        LEFT JOIN agent_seat_thread_labels rtl ON rtl.tenant = adm.tenant AND rtl.seat_id = rs.id AND rtl.human_member_id = adm.human_member_id
        LEFT JOIN members om ON om.id = a.owner_member_id AND om.tenant = adm.tenant
        LEFT JOIN fleet_agents f ON f.agent_id = a.id AND f.tenant = adm.tenant
-      WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live')
+      WHERE adm.tenant = ?1 AND adm.human_member_id = ?2 AND adm.status IN ('pending', 'live') AND (adm.status <> 'live' OR ${authorityLiveSql('adm','?3')})
       ORDER BY adm.created_at DESC LIMIT 200`,
-  ).bind(env.TENANT_SLUG, humanMemberId).all<ConnectionAdmission & { runtime: string | null; harness_kind: string;seat_last_used_at:string|null;attachment_last_used_at:string|null }>()).results ?? []
+  ).bind(env.TENANT_SLUG, humanMemberId, new Date(nowMs).toISOString()).all<ConnectionAdmission & { runtime: string | null; harness_kind: string;seat_last_used_at:string|null;attachment_last_used_at:string|null }>()).results ?? []
   return { harnesses, admissions: admissions.map((a) => {
     const last=latestConnectionActivity(a.seat_last_used_at,a.attachment_last_used_at)
     const activity=latestConnectionActivity(last,a.seat_first_seen,a.newest_chat_created_at)

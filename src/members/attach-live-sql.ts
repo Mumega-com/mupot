@@ -6,6 +6,7 @@
 // The fragments need the aliases: att (agent_seat_attachments), adm (agent_seat_admissions), s (agent_seats), a (agents),
 // b (agent_member_bindings), am (members), hr (harnesses). Each placeholder is requested through `ph`, so a caller with
 // numbered binds (?1..?5) and a caller with positional binds (an UPDATE's WHERE) share the same text.
+import { authorityLiveSql } from '../auth/attached-authority'
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from './attach-designated'
@@ -42,7 +43,7 @@ export function liveAttachmentConditionsSql(env: Env, ph: LivePh): string {
         -- mupot#980005ac: authority expiry fail-closed on the NEXT request. NULL = grandfathered
         -- (pre-0274 live rows keep working with no retroactive cutoff). julianday on BOTH sides
         -- (same reason as TOKEN_LIVE_PREDICATE: mixed timestamp shapes).
-        AND (adm.authority_expires_at IS NULL OR julianday(adm.authority_expires_at) > julianday(${ph('now')}))
+        AND ${authorityLiveSql('adm',ph('now'))}
         -- Confirming human must still be an active member (suspension / loss of standing stops the seat).
         AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = att.human_member_id AND hm.tenant = att.tenant AND hm.status = 'active')
         AND ${ADMISSION_BOUND_TO_SEAT_SQL}

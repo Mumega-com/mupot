@@ -50,3 +50,8 @@ export function authorityExpiresAtIso(days: number, nowMs: number = Date.now()):
   const d = Math.min(Math.max(1, Math.floor(days)), ATTACH_AUTHORITY_MAX_DAYS)
   return new Date(nowMs + d * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
 }
+
+/** Shared absolute-expiry rule. NULL is a pre-migration grandfathered decision; malformed dates fail closed. */
+export function authorityLiveSql(alias: string, now: string): string {
+  return `(${alias}.authority_expires_at IS NULL OR julianday(${alias}.authority_expires_at) > julianday(${now}))`
+}

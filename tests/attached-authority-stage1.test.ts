@@ -1,7 +1,7 @@
 // mupot#980005ac stage 1 — Helper/Full choice + expiry on /claim; Connections shows level+expiry; fail-closed
 // on expiry/revoke/suspension; Full == Helper in effect (no authority widen). Real-schema sqlite D1 + real
 // dashboardApp / MCP seat_attach seam. Mutation targets listed in the PR body.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 import { ATTACHED_SUDO_ACTIONS, attachedAuthority, ceilingCapability } from '../src/auth/attached-ceiling'
@@ -9,11 +9,10 @@ import {
   parseAttachAuthorityDays,
   parseAttachAuthorityLevel,
   authorityExpiresAtIso,
-  ATTACH_AUTHORITY_MAX_DAYS,
 } from '../src/auth/attached-authority'
 import { dashboardApp } from '../src/dashboard/index'
 import { upsertHarness } from '../src/members/harness'
-import { findLiveAttachment } from '../src/members/seat-attach'
+import { ensureAdmission, decideAdmissionDirect, loadConnections, findLiveAttachment } from '../src/members/seat-attach'
 import { resolveSeatCapabilities } from '../src/members/seat-handle'
 import { buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { mcpApp } from '../src/mcp/index'
@@ -122,7 +121,7 @@ beforeEach(async () => {
   setReauth('mem-admin', fresh())
   expect((await post('/agents/ag1/designation', a, { action: 'allow' })).status).toBe(303)
 })
-afterEach(() => h.close())
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); h.close() })
 
 describe('parse helpers (Helper default, Full never inferred)', () => {
   it('defaults to helper; never upgrades from harness/model/label/tool text', () => {
@@ -134,7 +133,7 @@ describe('parse helpers (Helper default, Full never inferred)', () => {
     expect(parseAttachAuthorityLevel('full')).toBe('full')
     expect(parseAttachAuthorityDays(undefined)).toEqual({ ok: true, days: 7 })
     expect(parseAttachAuthorityDays('3')).toEqual({ ok: true, days: 3 })
-    expect(parseAttachAuthorityDays('99')).toEqual({ ok: true, days: ATTACH_AUTHORITY_MAX_DAYS })
+    expect(parseAttachAuthorityDays('99')).toEqual({ ok: true, days: 7 })
     expect(parseAttachAuthorityDays('0').ok).toBe(false)
     expect(authorityExpiresAtIso(7, Date.parse('2026-11-15T00:00:00.000Z')).startsWith('2026-11-22')).toBe(true)
   })
@@ -372,4 +371,83 @@ describe('Full == Helper in effect (stage 1: no widen)', () => {
     // Even if a pending ask somehow existed, designation/admin refusal at promote keeps the rank floor.
     void humanGrants
   })
+})
+
+
+describe('round 1 expiry and decision regressions',()=>{
+  async function claimed(thread:string){
+    const p=await fileAsk(thread); const a=await login('admin@x.test');setReauth('mem-admin',fresh())
+    expect((await post(p.path,a,{admission_id:p.admissionId,agent_id:'ag1',authority_days:'1'})).status).toBe(303)
+    const att=one<{seat_id:string;seat_token_id:string;human_member_id:string}>('SELECT seat_id,seat_token_id,human_member_id FROM agent_seat_attachments WHERE admission_id=?',p.admissionId)!
+    return {p,a,att}
+  }
+  it('request and subscription liveness both stop exactly at authority expiry',async()=>{
+    const {p,att}=await claimed('event-expiry')
+    const expiry=one<{authority_expires_at:string}>('SELECT authority_expires_at FROM agent_seat_admissions WHERE id=?',p.admissionId)!.authority_expires_at
+    const tok=one<{member_id:string}>('SELECT member_id FROM member_tokens WHERE id=?',att.seat_token_id)!
+    const sub={token_id:att.seat_token_id,member_id:tok.member_id,agent_id:'ag1',grant_token_id:adminCtx.tokenId,consented_by_member_id:'mem-admin'}
+    const {subscriberAccessLive}=await import('../src/mcp/events-subscriptions')
+    vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(Date.parse(expiry+'Z')-1000)
+    expect(await subscriberAccessLive(adminEnv,sub as never)).toEqual({live:true})
+    expect(await findLiveAttachment(adminEnv,{memberId:'mem-admin',tokenId:adminCtx.tokenId!},att.seat_id)).not.toBeNull()
+    vi.setSystemTime(Date.parse(expiry+'Z'))
+    expect(await subscriberAccessLive(adminEnv,sub as never)).toEqual({live:false,reason:'authority_expired'})
+    expect(await findLiveAttachment(adminEnv,{memberId:'mem-admin',tokenId:adminCtx.tokenId!},att.seat_id)).toBeNull()
+  })
+  it('expired live admission is hidden before renewal and no longer holds its unique slot',async()=>{
+    const {p,a}=await claimed('renew-expiry')
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=? WHERE id=?').run('2020-01-01 00:00:00',p.admissionId)
+    expect((await loadConnections(adminEnv,'mem-admin')).admissions.some(a=>a.id===p.admissionId)).toBe(false)
+    expect(await (await get('/connections',a)).text()).not.toContain(`data-cx-revoke="${p.admissionId}"`)
+    const result=await rpc(adminEnv,adminCtx,'seat_attach',{agent:'ag1',reason:'Renew this expired connection.'},'renew-expiry')
+    expect(result).toMatchObject({status:'pending_admission'})
+    expect(result.admission_id).not.toBe(p.admissionId)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',p.admissionId)?.status).toBe('revoked')
+  })
+  it.each([0,8,1.5])('direct approval refuses invalid duration %s before persistence',async days=>{
+    const p=await fileAsk('bad-direct-days')
+    expect(await decideAdmissionDirect(adminEnv,{admissionId:p.admissionId,humanMemberId:'mem-admin',decision:'approve',attachCode:p.code,authorityDays:days})).toEqual({ok:false,error:'invalid_authority_days'})
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',p.admissionId)?.status).toBe('pending')
+  })
+  it('invalid claim duration returns HTTP 400 and leaves admission pending',async()=>{
+    const p=await fileAsk('bad-http-days');const a=await login('admin@x.test');setReauth('mem-admin',fresh())
+    expect((await post(p.path,a,{admission_id:p.admissionId,agent_id:'ag1',authority_days:'-1'})).status).toBe(400)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',p.admissionId)?.status).toBe('pending')
+  })
+  it('agent-page default confirmation stores helper rather than hardwiring full',async()=>{
+    const p=await fileAsk('agent-default');const {confirmClaimOnAgentPage}=await import('../src/members/claim')
+    expect(await confirmClaimOnAgentPage(adminEnv,{memberId:'mem-admin',agentId:'ag1',shownAdmissionId:p.admissionId,attachCode:p.code})).toMatchObject({ok:true,authorityLevel:'helper'})
+    expect(one('SELECT authority_level FROM agent_seat_admissions WHERE id=?',p.admissionId)).toEqual({authority_level:'helper'})
+  })
+  it('direct dashboard admission writes an absolute expiry and matching decision',async()=>{
+    await rpc(adminEnv,adminCtx,'boot_context',{},'direct-no-ask')
+    const seat=one<{id:string;harness_id:string}>('SELECT id,harness_id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
+    const result=await ensureAdmission(adminEnv,{agentId:'ag1',humanMemberId:'mem-admin',harnessId:seat.harness_id,seatId:seat.id,via:'dashboard'})
+    expect(result).toMatchObject({ok:true,state:'live'})
+    if(!result.ok)throw new Error('admission failed')
+    expect(result.admission.authority_expires_at).toEqual(expect.any(String))
+    expect(one<{authority_expires_at:string}>('SELECT authority_expires_at FROM agent_seat_authority_decisions WHERE admission_id=?',result.admission.id)?.authority_expires_at).toBe(result.admission.authority_expires_at)
+  })
+  it('lost promotion race writes no decision for a denied admission',async()=>{
+    const p=await fileAsk('ledger-race')
+    const env={...adminEnv,DB:{...adminEnv.DB,batch(stmts:Parameters<Env['DB']['batch']>[0]){
+      h.sqlite.prepare("UPDATE agent_seat_admissions SET status='denied' WHERE id=?").run(p.admissionId)
+      return adminEnv.DB.batch(stmts)
+    }}} as Env
+    expect(await decideAdmissionDirect(env,{admissionId:p.admissionId,humanMemberId:'mem-admin',decision:'approve',attachCode:p.code})).toMatchObject({ok:false})
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE admission_id=?',p.admissionId)).toBe(0)
+  })
+  it.each(['code','agent'])('refuses absent stored expiry after an incomplete %s promotion result',async path=>{
+    const p=await fileAsk('missing-expiry')
+    // Inject only the failed collaborator response; actual claim lookup/readback uses real SQLite.
+    const admissions=await import('../src/members/seat-attach')
+    vi.spyOn(admissions,'decideAdmissionDirect').mockResolvedValue({ok:true})
+    const claims=await import('../src/members/claim')
+    const result=path==='code'
+      ? await claims.confirmClaimByCode(adminEnv,{memberId:'mem-admin',code:p.code,shownAdmissionId:p.admissionId,shownAgentId:'ag1'})
+      : await claims.confirmClaimOnAgentPage(adminEnv,{memberId:'mem-admin',agentId:'ag1',shownAdmissionId:p.admissionId,attachCode:p.code})
+    expect(result).toEqual({ok:false,error:'attach_refused'})
+  })
+
 })

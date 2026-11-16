@@ -1087,6 +1087,9 @@ describe('dashboard: Connections', () => {
         const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
         await renameThread(env,{humanMemberId:HUMAN,seatId:seat.id,label:i===0?'Old chat':'Newest chat'})
         expect((await attachSeatToAgent(env,{humanMemberId:HUMAN,seatId:seat.id,agentRef:'rava',via:'dashboard'})).ok).toBe(true)
+        // Exercise old-chat ordering with grandfathered authority; expiring authority has separate boundary tests.
+        h.sqlite.exec('DROP TRIGGER IF EXISTS agent_seat_admissions_authority_immutable')
+        h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=NULL WHERE requested_seat_id=?').run(seat.id)
       }
     } finally {vi.useRealTimers()}
     const page=await (await dash(env,cookie,'/connections')).text()
@@ -1104,8 +1107,53 @@ describe('dashboard: Connections', () => {
     const seat=one<{id:string}>('SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1')!
     fresh();return {env,g,cookie,old,seat,body:{agent_id:'agent-rava',harness_id:g.harnessId,seat_id:seat.id}}
   }
+  it.each(['helper','full'])('move preserves %s absolute expiry and records its replacement decision',async level=>{
+    const f=await ownedMoveSetup()
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    const expiry=new Date(Date.now()+3600000).toISOString()
+    h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_level=?,authority_expires_at=? WHERE id=?').run(level,expiry,f.old.id)
+    const r=await dash(f.env,f.cookie,`/connections/admissions/${f.old.id}/move`,f.body)
+    expect(r.status,await r.clone().text()).toBe(200)
+    const next=one<{id:string;authority_level:string;authority_expires_at:string}>("SELECT id,authority_level,authority_expires_at FROM agent_seat_admissions WHERE status='live'")!
+    expect(next).toMatchObject({authority_level:level,authority_expires_at:expiry})
+    expect(one('SELECT authority_level,authority_expires_at,seat_id,attachment_id FROM agent_seat_authority_decisions WHERE admission_id=?',next.id)).toMatchObject({authority_level:level,authority_expires_at:expiry,seat_id:f.seat.id,attachment_id:expect.any(String)})
+  })
+  it('refuses an expired source move without replacing its admission',async()=>{
+    const f=await ownedMoveSetup()
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=? WHERE id=?').run('2020-01-01 00:00:00',f.old.id)
+    expect((await dash(f.env,f.cookie,`/connections/admissions/${f.old.id}/move`,f.body)).status).not.toBe(200)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+  })
+  it('refuses a source that expires after preview before the move batch',async()=>{
+    const f=await ownedMoveSetup()
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    const env={...f.env,DB:{...f.env.DB,batch(stmts:Parameters<Env['DB']['batch']>[0]){
+      h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=? WHERE id=?').run('2020-01-01 00:00:00',f.old.id)
+      return f.env.DB.batch(stmts)
+    }}} as Env
+    const {moveSeatApproval}=await import('../src/members/approval-move')
+    expect(await moveSeatApproval(env,{admissionId:f.old.id,agentId:'agent-rava',humanMemberId:HUMAN,harnessId:f.g.harnessId,seatId:f.seat.id})).toMatchObject({ok:false,error:'attach_refused'})
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(0)
+  })
+  it('moves legacy helper consent into a bounded new decision without changing the legacy cutoff',async()=>{
+    const f=await ownedMoveSetup();const start=Date.now()
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=NULL WHERE id=?').run(f.old.id)
+    expect((await dash(f.env,f.cookie,`/connections/admissions/${f.old.id}/move`,f.body)).status).toBe(200)
+    const next=one<{authority_expires_at:string;authority_level:string}>("SELECT authority_expires_at,authority_level FROM agent_seat_admissions WHERE status='live'")!
+    expect(next.authority_level).toBe('helper')
+    const duration=Date.parse(next.authority_expires_at+'Z')-start
+    expect(duration).toBeGreaterThan(7*86400000-2000);expect(duration).toBeLessThanOrEqual(7*86400000+1000)
+    expect(one<{authority_expires_at:string|null}>('SELECT authority_expires_at FROM agent_seat_admissions WHERE id=?',f.old.id)?.authority_expires_at).toBeNull()
+  })
   it('bases stale badges on the latest recorded seat or attachment activity and the seven-day boundary',async()=>{
     const f=await ownedMoveSetup()
+    // This stale-activity test needs a grandfathered admission: new decisions expire at seven days.
+    h.sqlite.exec('DROP TRIGGER agent_seat_admissions_authority_immutable')
+    h.sqlite.prepare('UPDATE agent_seat_admissions SET authority_expires_at=NULL WHERE id=?').run(f.old.id)
     const {loadConnections,connectionActivityMillis}=await import('../src/members/seat-attach')
     const created=one<{created_at:string}>('SELECT created_at FROM agent_seats WHERE id=?',f.old.requested_seat_id)!.created_at
     const start=connectionActivityMillis(created)

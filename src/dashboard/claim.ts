@@ -84,7 +84,7 @@ export function authorityChoiceFields(agentName: string): Html {
   return html`<fieldset class="authority-choice" data-authority-choice>
       <legend>How this chat may act as ${agentName}</legend>
       <label><input type="radio" name="authority_level" value="helper" checked> Helper: can read and draft, asks before acting</label>
-      <label><input type="radio" name="authority_level" value="full"> Full ${agentName}: does everything ${agentName} can do, never more than you</label>
+      <label><input type="radio" name="authority_level" value="full"> Full ${agentName}: records your Full choice; current access stays the same as Helper</label>
       <p class="ui-sub" data-full-warning>Full is a deliberate choice. Money, keys, deletes and publishing still ask you. In this release Full does not yet widen tools beyond Helper — it is recorded and expiry-bound only.</p>
       <label>Lasts
         <select name="authority_days" aria-label="How long this connection lasts">

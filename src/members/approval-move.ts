@@ -1,5 +1,6 @@
 // Explicit human move of an existing seat approval. Called only after the
 // dashboard's fresh web-session check; tool requests can only offer its link.
+import { authorityLiveSql, authorityExpiresAtIso, ATTACH_AUTHORITY_DEFAULT_DAYS } from '../auth/attached-authority'
 import type { Env } from '../types'
 import { CAPABILITY_LIVE_PREDICATE, resolveCapabilities, canOnSquad } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
@@ -16,10 +17,11 @@ export interface ApprovalMoveOffer {
 type MoveFailure={ok:false;error:'admission_not_found'|'attach_refused'}
 
 /** Preview is read-only and scoped just as narrowly as confirmation. */
-export async function loadApprovalMoveOffer(env:Env,p:ApprovalMoveRequest):Promise<ApprovalMoveOffer|null>{
+export async function loadApprovalMoveOffer(env:Env,p:ApprovalMoveRequest,nowMs=Date.now()):Promise<ApprovalMoveOffer|null>{
   if(!seatAttachEnabled(env))return null
   const adm=await loadAdmission(env,p.admissionId)
   if(!adm||adm.human_member_id!==p.humanMemberId||adm.agent_id!==p.agentId||adm.harness_id!==p.harnessId||adm.status!=='live'||adm.scope!=='seat'||adm.requested_seat_id===p.seatId)return null
+  if(!(await env.DB.prepare(`SELECT 1 FROM agent_seat_admissions adm WHERE adm.id=?1 AND adm.tenant=?2 AND ${authorityLiveSql('adm','?3')}`).bind(adm.id,env.TENANT_SLUG,new Date(nowMs).toISOString()).first()))return null
   const seat=await loadHumanSeat(env,p.humanMemberId,p.seatId)
   if(!seat||seat.harness_id!==adm.harness_id||(vipLaneEnabled(env)&&seat.admission_status==='held'))return null
   const agent=await resolveAttachableAgent(env,p.humanMemberId,p.agentId)
@@ -58,7 +60,7 @@ function moveAuthoritySql(env:Env,ownAttachment?:string):string{
 }
 
 export async function moveSeatApproval(env:Env,p:ApprovalMoveRequest,nowMs=Date.now()):Promise<{ok:true;old_admission_id:string;admission_id:string;attachment_id:string}|MoveFailure>{
- const offer=await loadApprovalMoveOffer(env,p)
+ const offer=await loadApprovalMoveOffer(env,p,nowMs)
  if(!offer)return {ok:false,error:'admission_not_found'}
  // Reuse the same human scope checker before the atomic SQL revocation check.
  const grants=await resolveCapabilities(env,p.humanMemberId)
@@ -72,20 +74,30 @@ export async function moveSeatApproval(env:Env,p:ApprovalMoveRequest,nowMs=Date.
   await env.DB.batch([
    env.DB.prepare(`UPDATE agent_seat_admissions SET status='revoked',revoked_at=?7,revoked_by_member_id=?3
      WHERE id=?1 AND tenant=?2 AND human_member_id=?3 AND agent_id=?4 AND harness_id=?5
-       AND status='live' AND scope='seat' AND requested_seat_id IS NOT ?6 AND ${moveAuthoritySql(env)}`).bind(...common),
+       AND status='live' AND scope='seat' AND ${authorityLiveSql('agent_seat_admissions','?7')} AND requested_seat_id IS NOT ?6 AND ${moveAuthoritySql(env)}`).bind(...common),
    // changes() ties the new row to THIS batch's revocation. A conflict throws and rolls the whole move back.
-   env.DB.prepare(`INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,gates,gate_authority,ceiling,requested_via,requested_seat_id,created_at,decided_at,decided_by_member_id,decided_via,scope,reason)
-     SELECT ?8,tenant,agent_id,human_member_id,harness_id,'live',gates,gate_authority,ceiling,'dashboard',?6,?7,?7,?3,'dashboard','seat',reason
+   env.DB.prepare(`INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,gates,gate_authority,ceiling,requested_via,requested_seat_id,created_at,decided_at,decided_by_member_id,decided_via,scope,reason,authority_level,authority_expires_at)
+     SELECT ?8,tenant,agent_id,human_member_id,harness_id,'live',gates,gate_authority,ceiling,'dashboard',?6,?7,?7,?3,'dashboard','seat',reason,authority_level,COALESCE(authority_expires_at,?9)
      FROM agent_seat_admissions WHERE id=?1 AND tenant=?2 AND human_member_id=?3 AND agent_id=?4 AND harness_id=?5
-       AND status='revoked' AND revoked_at=?7 AND revoked_by_member_id=?3 AND changes()=1`).bind(...common,id),
+       AND status='revoked' AND revoked_at=?7 AND revoked_by_member_id=?3 AND changes()=1`).bind(...common,id,authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS,nowMs)),
    ...prepareAttachStatements(env,{attachmentId:att,tokenId,tokenHash,nowIso:now,admissionId:id,agent:{id:p.agentId,slug:offer.agent_slug},seat:{id:p.seatId,harnessId:p.harnessId},humanMemberId:p.humanMemberId,requireNoLiveAttachment:true,promotedAt:now,grantTokenId:null,humanAction:true}),
+   // A moved decision retains the source cutoff. A legacy NULL gets the new-decision default, never a perpetual grant.
+   env.DB.prepare(`INSERT INTO agent_seat_authority_decisions
+     (id,tenant,admission_id,attachment_id,seat_id,agent_id,harness_id,project_id,machine_key,decided_by_member_id,authority_level,authority_expires_at,decided_at,decided_via,replaces_decision_id)
+     SELECT ?10,tenant,id,?9,?6,agent_id,harness_id,NULL,
+       (SELECT h.client_name || ' / ' || s.label_basename FROM harnesses h JOIN agent_seats s ON s.harness_id=h.id AND s.tenant=h.tenant WHERE h.id=?5 AND h.tenant=?2 AND s.id=?6),?3,authority_level,authority_expires_at,?7,'dashboard',
+       (SELECT d.id FROM agent_seat_authority_decisions d WHERE d.tenant=?2 AND d.admission_id=?1 ORDER BY d.decided_at DESC,d.id DESC LIMIT 1)
+     FROM agent_seat_admissions WHERE id=?8 AND tenant=?2 AND status='live'
+       AND EXISTS (SELECT 1 FROM agent_seat_attachments WHERE id=?9 AND admission_id=?8 AND detached_at IS NULL)`)
+       .bind(...common,id,att,crypto.randomUUID()),
    // A zero-row insertion, changed scope or failed attachment must roll back the old revocation too.
    // agent_audit.action is NOT NULL, so this is the same fail-closed audit fence as other atomic writers.
    env.DB.prepare(`INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state)
      VALUES(?10,?4,?3,'user',CASE WHEN
-       EXISTS(SELECT 1 FROM agent_seat_admissions old WHERE old.id=?1 AND old.tenant=?2 AND old.status='revoked' AND old.revoked_at=?7 AND old.revoked_by_member_id=?3)
+       EXISTS(SELECT 1 FROM agent_seat_admissions old WHERE old.id=?1 AND old.tenant=?2 AND old.status='revoked' AND old.revoked_at=?7 AND old.revoked_by_member_id=?3 AND ${authorityLiveSql('old','?7')})
        AND EXISTS(SELECT 1 FROM agent_seat_admissions next WHERE next.id=?8 AND next.tenant=?2 AND next.status='live' AND next.agent_id=?4 AND next.human_member_id=?3 AND next.harness_id=?5 AND next.requested_seat_id=?6)
        AND EXISTS(SELECT 1 FROM agent_seat_attachments a JOIN member_tokens t ON t.id=a.seat_token_id WHERE a.id=?9 AND a.admission_id=?8 AND a.seat_id=?6 AND a.detached_at IS NULL AND ${TOKEN_LIVE_PREDICATE('?7')})
+       AND EXISTS(SELECT 1 FROM agent_seat_authority_decisions d WHERE d.tenant=?2 AND d.admission_id=?8 AND d.attachment_id=?9)
        AND ${moveAuthoritySql(env,'?9')}
        THEN 'seat_approval_move' ELSE NULL END,'["seat"]','{}',?11)`).bind(...common,id,att,crypto.randomUUID(),after),
   ])

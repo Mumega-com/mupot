@@ -1,0 +1,186 @@
+{
+  "base": "64297d5587642450f05ead33f60c5abd8a2138a3",
+  "mutations": [
+    {
+      "mutation": "max-days",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > parse helpers (Helper default, Full never inferred) > defaults to helper; never upgrades from harness/model/label/tool text"
+      ],
+      "log_sha256": "9b2c3f9f31cbf0d3cdafa44ce9e9897b853af6f85ea91182784f332a1f1cc243"
+    },
+    {
+      "mutation": "expiry-boundary",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > request and subscription liveness both stop exactly at authority expiry"
+      ],
+      "log_sha256": "c8b20ba823948fa2fea08e2f0c5920901cf1f042ae4d939f35f18c5485fa55f7"
+    },
+    {
+      "mutation": "direct-range",
+      "killed": true,
+      "exit": 1,
+      "tests": "3 failed | 22 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > direct approval refuses invalid duration 0 before persistence",
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > direct approval refuses invalid duration 1.5 before persistence",
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > direct approval refuses invalid duration 8 before persistence"
+      ],
+      "log_sha256": "b3b0f3ba5e6e4f0527e0674a47e92d26d6e29ca9b5242679d6eb6b5799a43a96"
+    },
+    {
+      "mutation": "direct-null",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > direct dashboard admission writes an absolute expiry and matching decision"
+      ],
+      "log_sha256": "27fe8409a5005ac4883496a7ce6ea0c3d6625532e6485a15437d777d7370a399"
+    },
+    {
+      "mutation": "ledger-guard",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > lost promotion race writes no decision for a denied admission"
+      ],
+      "log_sha256": "95c5dccd93531e4331288ea6045e645600520640be10df1c309645b3bcccdc9d"
+    },
+    {
+      "mutation": "stored-expiry-code",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 1 passed | 23 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > refuses absent stored expiry after an incomplete code promotion result"
+      ],
+      "log_sha256": "542a98ae1ed43429e4655614931072700d15d4c6293de7cfca51c590544ab31e"
+    },
+    {
+      "mutation": "stored-expiry-agent",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 1 passed | 23 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > refuses absent stored expiry after an incomplete agent promotion result"
+      ],
+      "log_sha256": "a4b6ebb5b20624014af2a12e678476ad79004eff2ff463bde30c63b478483061"
+    },
+    {
+      "mutation": "invalid-days-http",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > invalid claim duration returns HTTP 400 and leaves admission pending"
+      ],
+      "log_sha256": "9ef90a5e1d6559dd835f9323a8a827a0c02b27281d820e6b82c3089b39918704"
+    },
+    {
+      "mutation": "agent-hardwired-full",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > agent-page default confirmation stores helper rather than hardwiring full"
+      ],
+      "log_sha256": "eac8d9bd32f7aeea8981b4734e70d71f2ee1ed620fb620b0ec7082c2fd257e77"
+    },
+    {
+      "mutation": "event-expiry",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > request and subscription liveness both stop exactly at authority expiry"
+      ],
+      "log_sha256": "d0d5554b66ef1e070e835bdb412be3c4c8a3399ebdf270f7bcb854d55d3dff42"
+    },
+    {
+      "mutation": "renew-slot",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > expired live admission is hidden before renewal and no longer holds its unique slot"
+      ],
+      "log_sha256": "4f74e83861041835a8bb14d29a45dec7a4cc71314e997802996ead86b6657abe"
+    },
+    {
+      "mutation": "expired-list",
+      "killed": true,
+      "exit": 1,
+      "tests": "1 failed | 24 skipped (25)",
+      "failed_tests": [
+        "tests/attached-authority-stage1.test.ts > round 1 expiry and decision regressions > expired live admission is hidden before renewal and no longer holds its unique slot"
+      ],
+      "log_sha256": "aaa40380084129a60109f16aece4be21d12fb3a3b212e8023af76479e33b7a76"
+    },
+    {
+      "mutation": "move-copy",
+      "killed": true,
+      "exit": 1,
+      "tests": "2 failed | 237 skipped (239)",
+      "failed_tests": [
+        "tests/seat-attach.test.ts > dashboard: Connections > move preserves helper absolute expiry and records its replacement decision",
+        "tests/seat-attach.test.ts > dashboard: Connections > move preserves full absolute expiry and records its replacement decision"
+      ],
+      "log_sha256": "10f2ff38c838c0496daabe7d9be5a3fc8728cc3d0e689ade01cfd61b26a6c2bb"
+    },
+    {
+      "mutation": "move-ledger",
+      "killed": true,
+      "exit": 1,
+      "tests": "2 failed | 237 skipped (239)",
+      "failed_tests": [
+        "tests/seat-attach.test.ts > dashboard: Connections > move preserves helper absolute expiry and records its replacement decision",
+        "tests/seat-attach.test.ts > dashboard: Connections > move preserves full absolute expiry and records its replacement decision"
+      ],
+      "log_sha256": "9a8928a86af7624be3a3270112294ffde5c503659f6cdf004eddaaebb1d93746"
+    },
+    {
+      "mutation": "move-source-expiry",
+      "killed": true,
+      "exit": 1,
+      "tests": "2 failed | 239 skipped (241)",
+      "failed_tests": [
+        "tests/seat-attach.test.ts > dashboard: Connections > refuses an expired source move without replacing its admission",
+        "tests/seat-attach.test.ts > dashboard: Connections > refuses a source that expires after preview before the move batch"
+      ],
+      "log_sha256": "6c34b7460c3a96c678723d11cde9e1fac147cd8ddca7d3e1bd61c8f51cfed691"
+    }
+  ],
+  "restored_source_sha256": {
+    "src/auth/attached-authority.ts": "32f65e0d98843b1cf21029e74bd8bb857435c590f49d214f66151c011262fa5e",
+    "src/dashboard/claim.ts": "4128ca0741d419ed08f0aa906be0d12fb62e7ec2a8294a97a16cb53153b0c958",
+    "src/mcp/events-subscriptions.ts": "156947e991103dd38f642a6e97afdecdab045a862dc18b6e19fdb8323f332468",
+    "src/members/approval-move.ts": "185b00dad0959ee9356d458f9cace64c90cbb13abe268bcf8ca792084ed422bc",
+    "src/members/attach-live-sql.ts": "64d53d5b638a6ad2872a35365bc1e0a1e24e84d38498a113975378cc7edd1ef8",
+    "src/members/seat-attach.ts": "c380778d422624528b0a9da6be73e54991152970ec4fa541510f1fc8dd9b1bac",
+    "tests/attached-authority-stage1.test.ts": "73cd8095d8e4501d098d24226d776214ba334b8b3aee672727e7d2d27ca4a8dc",
+    "tests/seat-attach.test.ts": "e8c3508b4a0948d514a95c3982c9ed8832740c0cd969cc1ab2738c4100e75584"
+  },
+  "validation": {
+    "four_pr_suites": {
+      "passed": 334,
+      "failed": 0,
+      "exit": 0
+    },
+    "typecheck_exit": 0
+  },
+  "log_sha256": {
+    "red.log": "e82ab053125d1fc56c65a958815a0c63224ff8247e91ff918d6bf16a227330e9",
+    "final-four.log": "fddea307792f15ae97ef8f769cc49de53139b1f1b82ae7c9f48562f8a5a912f2",
+    "typecheck-restored.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "verified-four.log": "010cebcadaffce6ed82041ff625ce67f86fa37a03f3f58c9988ffc06d2753a34",
+    "verified-typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "migration-numbering.log": "fe099974d401a77dc431807a4be425092b480c540a0a0c5c71aa664e72c92297"
+  }
+}
