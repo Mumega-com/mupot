@@ -722,7 +722,7 @@ export async function promoteAdmissionDetailed(
   const seat = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
     .bind(adm.requested_seat_id, env.TENANT_SLUG, adm.human_member_id).first<{ x: number }>()
   if (!seat) return { landed: true, attachmentId: null, attachSkipped: 'seat_gone' }
-  const other = await liveAttachmentOfSeat(env, adm.requested_seat_id as string) // as: attach is non-empty only when requested_seat_id is set
+  const other = await liveAttachmentOfSeat(env, adm.requested_seat_id as string, Date.parse(nowIso)) // as: attach is non-empty only when requested_seat_id is set
   return { landed: true, attachmentId: null, attachSkipped: other ? 'seat_already_attached' : 'guard_refused' }
 }
 
@@ -967,7 +967,15 @@ export interface AttachPending {
 export interface AttachErr { ok: false; error: AttachFailure; blocking_admission?: BlockingAdmission; requested_seat_id?: string; agent?: { id: string; slug: string; name: string } }
 export type AttachResult = AttachOk | AttachPending | AttachErr
 
-async function liveAttachmentOfSeat(env: Env, seatId: string): Promise<{ id: string; agent_id: string } | null> {
+async function liveAttachmentOfSeat(env: Env, seatId: string, nowMs = Date.now()): Promise<{ id: string; agent_id: string } | null> {
+  // A different requested agent must not leave the expired occupant blocking this seat.
+  // The existing revocation trigger detaches its attachments and revokes their tokens.
+  await env.DB.prepare(`UPDATE agent_seat_admissions SET status = 'revoked', revoked_at = ?3
+    WHERE tenant = ?1 AND status = 'live'
+      AND NOT COALESCE(${authorityLiveSql('agent_seat_admissions','?3')},0)
+      AND id IN (SELECT admission_id FROM agent_seat_attachments
+                 WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL)`)
+    .bind(env.TENANT_SLUG, seatId, new Date(nowMs).toISOString()).run()
   return env.DB.prepare(`SELECT id, agent_id FROM agent_seat_attachments WHERE tenant = ?1 AND seat_id = ?2 AND detached_at IS NULL LIMIT 1`)
     .bind(env.TENANT_SLUG, seatId).first<{ id: string; agent_id: string }>()
 }
@@ -1053,7 +1061,7 @@ export async function attachSeatToAgent(
         AND NOT EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_attachments.agent_id ${attachDesignatedClause(env, 'ag', 'agent_seat_attachments.human_member_id')})`,
   ).bind(env.TENANT_SLUG, seat.id, new Date(nowMs).toISOString(), p.humanMemberId).run()
   await expireAdmissions(env, agent.id, p.humanMemberId, seat.harness_id, new Date(nowMs).toISOString())
-  const current = await liveAttachmentOfSeat(env, seat.id)
+  const current = await liveAttachmentOfSeat(env, seat.id, nowMs)
   if (current) {
     // Same agent already attached to THIS seat (e.g. Admit completed it for the asking chat): idempotent success, not already_attached.
     if (current.agent_id !== agent.id && !p.moveIfAttached) return { ok: false, error: 'already_attached' }
@@ -1082,7 +1090,7 @@ export async function attachSeatToAgent(
   // ensureAdmission may have just PROMOTED a pending admission, and promotion completes the attachment for the asking seat in the same batch:
   // that attachment is exactly what this call would create, so report it instead of colliding with it.
   if (!current) {
-    const completed = await liveAttachmentOfSeat(env, seat.id)
+    const completed = await liveAttachmentOfSeat(env, seat.id, nowMs)
     if (completed && completed.agent_id === agent.id) {
       return { ok: true, status: 'attached', attachment_id: completed.id, admission_id: admission.admission.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
     }

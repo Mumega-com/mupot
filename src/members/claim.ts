@@ -1,3 +1,4 @@
+import { authorityLiveSql } from '../auth/attached-authority'
 // mupot — claim link: the pending admission a chat filed (seat_attach), seen from the human's side as ONE link and ONE click.
 //
 // This module adds NO authority. A "claim" is the existing pending agent_seat_admissions row; claiming it is the existing
@@ -109,10 +110,10 @@ export async function lookupClaim(env: Env, memberId: string, rawCode: unknown, 
   const code = normalizeClaimCode(rawCode)
   if (!code) return { state: 'not_found' }
   const ids = (await env.DB.prepare(
-    `SELECT id FROM agent_seat_admissions
+    `SELECT id, CASE WHEN ${authorityLiveSql('agent_seat_admissions','?4')} THEN 1 ELSE 0 END AS authority_live FROM agent_seat_admissions
       WHERE tenant = ?1 AND human_member_id = ?2 AND attach_code IS NOT NULL AND replace(attach_code, '-', '') = ?3
       ORDER BY created_at DESC, id DESC LIMIT 6`,
-  ).bind(env.TENANT_SLUG, memberId, code).all<{ id: string }>()).results ?? []
+  ).bind(env.TENANT_SLUG, memberId, code, new Date(nowMs).toISOString()).all<{ id: string; authority_live: number }>()).results ?? []
   const rows: AdmissionRow[] = []
   for (const r of ids) {
     const a = await loadAdmission(env, r.id)
@@ -126,7 +127,7 @@ export async function lookupClaim(env: Env, memberId: string, rawCode: unknown, 
   const state: ClaimState = admissionIsPendingLive(adm, nowMs)
     ? 'pending'
     : adm.status === 'live'
-      ? 'already_claimed'
+      ? ids.find(r => r.id === adm.id)?.authority_live === 1 ? 'already_claimed' : 'expired'
       : adm.status === 'expired' || (adm.status === 'pending' && !admissionIsPendingLive(adm, nowMs))
         ? 'expired'
         : 'closed'

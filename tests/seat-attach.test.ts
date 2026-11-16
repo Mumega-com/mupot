@@ -1149,6 +1149,16 @@ describe('dashboard: Connections', () => {
     expect(duration).toBeGreaterThan(7*86400000-2000);expect(duration).toBeLessThanOrEqual(7*86400000+1000)
     expect(one<{authority_expires_at:string|null}>('SELECT authority_expires_at FROM agent_seat_admissions WHERE id=?',f.old.id)?.authority_expires_at).toBeNull()
   })
+  it('lockout delta M43: a zero-row move decision insert rolls the whole move back',async()=>{
+    const f=await ownedMoveSetup()
+    h.sqlite.exec(`CREATE TRIGGER test_ignore_move_decision BEFORE INSERT ON agent_seat_authority_decisions BEGIN SELECT RAISE(IGNORE); END;`)
+    const r=await dash(f.env,f.cookie,`/connections/admissions/${f.old.id}/move`,f.body)
+    expect(r.status).toBe(409)
+    expect(one<{status:string}>('SELECT status FROM agent_seat_admissions WHERE id=?',f.old.id)?.status).toBe('live')
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_admissions')).toBe(1)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE admission_id=? AND detached_at IS NULL',f.old.id)).toBe(1)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='seat_approval_move'")).toBe(0)
+  })
   it('bases stale badges on the latest recorded seat or attachment activity and the seven-day boundary',async()=>{
     const f=await ownedMoveSetup()
     // This stale-activity test needs a grandfathered admission: new decisions expire at seven days.
