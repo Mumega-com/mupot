@@ -1,11 +1,12 @@
 // mupot — add-on event dispatch (notify kernel slice 1). The bus consumer calls dispatchAddonEvent() for events that
 // add-ons may subscribe to. Delivery is to ACTIVE installations only, and only along a path the manifest's trust class
-// allows. There is no outbound transport for external add-ons here: they stay on EXTERNAL_ADDON_EVENT_ALLOWLIST and
+// allows. (Imports only leaf modules: pulling addons/service into the bus consumer's graph created a top-level-await
+// cycle that broke the Workers bundle.) There is no outbound transport for external add-ons here: they stay on EXTERNAL_ADDON_EVENT_ALLOWLIST and
 // receive nothing from this dispatcher.
 import type { Env, BusEvent } from '../types'
 import type { AddonManifestV1 } from './contract'
 import { getRegisteredAddon } from './registry'
-import { EXTERNAL_ADDON_EVENT_ALLOWLIST } from './service'
+import { EXTERNAL_ADDON_EVENT_ALLOWLIST } from './event-allowlist'
 import { safeConsole } from '../lib/log'
 
 export type NativeAddonEventHandler = (env: Env, event: BusEvent) => Promise<void>
