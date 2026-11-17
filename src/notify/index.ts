@@ -1,7 +1,8 @@
 // mupot — notify kernel, slice 1: one outbox. policy -> route -> adapter -> delivery row.
 //
-// notify() never throws. If the store itself is unavailable it degrades to "send without dedupe/cap" (the behaviour
-// before the kernel existed) rather than dropping a notification.
+// A store failure never throws: it degrades to "send without dedupe/cap" (the behaviour before the kernel existed)
+// rather than dropping a notification. An ADAPTER that throws is released (its dedupe claims are freed) and rethrown;
+// callers (consumer, backup alert) catch it.
 import type { Env } from '../types'
 import { safeConsole } from '../lib/log'
 import { carryChannels, PUSH_CHANNELS, type Channel } from './carry'
@@ -95,6 +96,10 @@ export async function notify(env: Env, event: NotifyEvent, opts: NotifyOptions =
     }
   }
 
+  // A recipient whose send has not finished holds a dedupe claim for a message that may never have gone out. If an
+  // adapter throws, free every unfinished claim (this one and the ones after it) so the retry still alerts.
+  const unfinished = new Set<Recipient>(live)
+  try {
   for (const recipient of live) {
     let capped = false
     if (storeOk && event.severity !== 'critical') {
@@ -134,6 +139,15 @@ export async function notify(env: Env, event: NotifyEvent, opts: NotifyOptions =
     if (storeOk && ((pushAttempts > 0 && pushSent === 0) || capped)) {
       try { await releaseDedupe(env, event.tenant, recipient, event.dedupe_key) } catch { /* window expires on its own */ }
     }
+    unfinished.delete(recipient)
+  }
+  } catch (err) {
+    if (storeOk) {
+      for (const r of unfinished) {
+        try { await releaseDedupe(env, event.tenant, r, event.dedupe_key) } catch { /* window expires on its own */ }
+      }
+    }
+    throw err
   }
   return result
 }

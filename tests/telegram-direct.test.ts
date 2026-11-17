@@ -60,7 +60,7 @@ describe('notifyHadi — direct Telegram delivery', () => {
     expect(url).not.toContain('webhook.test')
   })
 
-  it('retries as PLAIN TEXT when Telegram rejects the markdown', async () => {
+  it('retries as PLAIN TEXT when Telegram rejects the HTML', async () => {
     // Task titles are agent-authored and routinely contain _ * [ — a 400 here must not
     // lose the notification.
     const fetchMock = vi
@@ -73,7 +73,7 @@ describe('notifyHadi — direct Telegram delivery', () => {
 
     expect(result).toEqual({ delivered: true })
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(JSON.parse((fetchMock.mock.calls[0] as any)[1].body).parse_mode).toBe('Markdown')
+    expect(JSON.parse((fetchMock.mock.calls[0] as any)[1].body).parse_mode).toBe('HTML')
     expect(JSON.parse((fetchMock.mock.calls[1] as any)[1].body).parse_mode).toBeUndefined()
   })
 

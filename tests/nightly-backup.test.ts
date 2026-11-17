@@ -195,6 +195,24 @@ describe('nightly backup', () => {
     expect(calls.telegram).toHaveLength(1)
   })
 
+  it('alerted=0 when the alert send fails (M35)', async () => {
+    stubFetch([EXPORT_ERR])
+    const inner = globalThis.fetch
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).startsWith('https://api.telegram.org/') ? new Response('nope', { status: 500 }) : inner(input, init))
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(rows()[0]).toMatchObject({ status: 'failed', alerted: 0 })
+  })
+
+  it('a re-run whose identical alert was deduped records alerted=1: the alert already went out (M35, item 7)', async () => {
+    stubFetch([EXPORT_ERR, EXPORT_ERR])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    const all = rows()
+    expect(all).toHaveLength(2)
+    expect(all.map((r) => r.alerted)).toEqual([1, 1])
+  })
+
   it('a failed backup is critical: it alerts even when the recipient is at the rate cap', async () => {
     const tenant = envOf().TENANT_SLUG
     const now = new Date().toISOString()
