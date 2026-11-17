@@ -23,7 +23,7 @@
 //      not honour the same rule it would be a way around the signature requirement, and
 //      the weaker door would win simply by being newer.
 
-import { writeRuntimeWithProofFence } from './runtime-proof-fence'
+import { writeRuntimeWithEchoFence } from './runtime-echo-fence'
 import type { Env } from '../types'
 import { hasRegisteredKey } from './agent-keys'
 import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
@@ -144,7 +144,7 @@ export async function selfReportAtBoot(
   if (host !== null && host !== (belief?.host ?? '')) changed.push('host')
 
   if (belief === null) {
-    await writeRuntimeWithProofFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot',insertOnly:true},env.DB.prepare(
+    await writeRuntimeWithEchoFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot',insertOnly:true},env.DB.prepare(
       `INSERT INTO fleet_agents
              (agent_id, tenant, runtime, runtime_canonical, status, reported_by, model, host,
               connection_kind, last_boot_at, last_reported_at, updated_at)
@@ -154,7 +154,7 @@ export async function selfReportAtBoot(
     ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind))
   } else {
     // COALESCE so an unclaimed field keeps its stored value rather than being blanked.
-    await writeRuntimeWithProofFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot'},env.DB.prepare(
+    await writeRuntimeWithEchoFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot'},env.DB.prepare(
       `UPDATE fleet_agents
           SET runtime           = COALESCE(?3, runtime),
               runtime_canonical = COALESCE(?4, runtime_canonical),

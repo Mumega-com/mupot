@@ -24,7 +24,7 @@ import { resolveBoundSeat } from '../agents/inbox-seat'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { findLiveAttachment } from '../members/seat-attach'
 import { runConnectionCheck } from '../members/connection-check'
-import { finishWakeEcho, loadWakeProof, startWakeEcho } from '../members/wake-echo'
+import { finishConnectionEcho, loadConnectionEcho, startConnectionEcho } from '../members/connection-echo'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
 
 /** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
@@ -285,9 +285,9 @@ export async function connectionSubject(auth: AuthContext, env: Env) {
 
 const toolConnectionCheck: ToolSpec = {
   name:'connection_check',
-  scope:'self (identity step 0, own send/receive, and observed wake delivery proof; never selects another agent)',
+  scope:'self (identity step 0, own send/receive, and inbox echo; never selects another agent)',
   min:'authenticated',
-  args:'{ fresh?: boolean, echo?: boolean, echo_reply?: string } // echo starts a challenge: end your turn and wait for wake; reply with the inbox nonce',
+  args:'{ fresh?: boolean, echo?: boolean, echo_reply?: string } // echo starts an inbox roundtrip; reply with the inbox nonce',
   inputSchema:{type:'object',properties:{fresh:{type:'boolean'},echo:{type:'boolean'},echo_reply:{type:'string',minLength:1,maxLength:128}},additionalProperties:false},
   async run(auth,env,args) {
     if ((args.echo===true && args.echo_reply!==undefined) || (args.fresh===true && (args.echo===true || args.echo_reply!==undefined))) return fail(400,'invalid_args','Choose a receive check, echo start, or echo reply.')
@@ -295,14 +295,14 @@ const toolConnectionCheck: ToolSpec = {
     if(!subject.ok) return fail(403,subject.error,{identity:subject.identity,next_step:subject.next_step})
     const {identity,context}=subject
     if(args.echo===true || typeof args.echo_reply==='string') {
-      const echo=args.echo===true ? await startWakeEcho(env,context) : await finishWakeEcho(env,context,args.echo_reply as string)
+      const echo=args.echo===true ? await startConnectionEcho(env,context) : await finishConnectionEcho(env,context,args.echo_reply as string)
       if(!echo.ok) return fail(409,echo.error,{identity})
-      return done({identity,echo,wake_proof:await loadWakeProof(env,context)})
+      return done({identity,echo_status:echo})
     }
-    const wake_proof=await loadWakeProof(env,context)
+    const echoStatus=await loadConnectionEcho(env,context)
     const r=await runConnectionCheck(env,{attachmentId:context.attachmentId ?? undefined,credentialId:context.credentialId,
-      agentId:context.agentId,humanMemberId:subject.actorMemberId,fresh:args.fresh===true,wakeProof:wake_proof})
-    return done({identity,...r,wake_proof,tell_your_human:r.summary})
+      agentId:context.agentId,humanMemberId:subject.actorMemberId,fresh:args.fresh===true,echoStatus})
+    return done({identity,...r,echo_status:echoStatus,tell_your_human:r.summary})
   },
 }
 

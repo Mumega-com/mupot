@@ -253,21 +253,20 @@ describe('connection_check (full-duplex)', () => {
     expect(o.text).toContain('seat_attach')
   })
 
-  it('attached, no wake path: send ok, receive pending then ok after inbox_mark_handled, wake none with the enable line; recorded on the agent', async () => {
+  it('attached check reports send/receive and a not-returned inbox echo; it remains recorded on the agent', async () => {
     const c = await attachedChat()
-    const r1 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { send: { ok: boolean }; receive: { state: string; message_id: string }; wake: { path: string; live: boolean; enable: string }; summary: string }
+    const r1 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { send: { ok: boolean }; receive: { state: string; message_id: string }; echo_status: { state: string }; summary: string }
     expect(r1.send.ok).toBe(true)
     expect(r1.receive.state).toBe('pending')
-    expect(r1.wake).toMatchObject({ path: 'none', live: false })
-    expect(r1.wake.enable).toContain("say 'monitor my mupot inbox' to enable")
-    expect(r1.summary).toBe(`send ✓ receive pending wake: none — ${r1.wake.enable}; wake not proven`)
+    expect(r1.echo_status).toMatchObject({ state: 'not_returned' })
+    expect(r1.summary).toBe('send ✓ receive pending; echo not returned')
     // the probe really is in the agent's inbox, from the system sender
     expect(one<{ f: string }>(`SELECT from_agent AS f FROM agent_messages WHERE id = ?`, r1.receive.message_id)?.f).toBe('mupot-onboarding')
     const mh = await rpc(c.ctx, 'inbox_mark_handled', { ids: [r1.receive.message_id] }, c.session)
     expect(mh.text).not.toContain('"error"')
     const r2 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { receive: { state: string }; summary: string }
     expect(r2.receive.state).toBe('ok')
-    expect(r2.summary.startsWith('send ✓ receive ✓ wake: none')).toBe(true)
+    expect(r2.summary).toBe('send ✓ receive ✓; echo not returned')
     const rec = one<{ a: string }>(`SELECT after_state AS a FROM agent_audit WHERE action = 'connection_check' ORDER BY seq DESC LIMIT 1`)
     expect(JSON.parse(rec!.a).summary).toBe(r2.summary)
   })
@@ -295,13 +294,15 @@ describe('connection_check (full-duplex)', () => {
     expect(next.receive.message_id).not.toBe(first.receive.message_id)
   })
 
-  it('attached with a live wake path (webhook doorbell) reports it', async () => {
+  it('attached check keeps send/receive semantics when a webhook configuration exists', async () => {
     const c = await attachedChat()
     h.sqlite.prepare(`INSERT INTO agent_webhook_doorbells (tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at) VALUES (?, 'agent-coo', 'https://hook.example.test/x', 'ct', '1234', ?, '2026-10-26T00:00:00.000Z')`).run(TENANT, HUMAN)
     const on = envFor(h, { WEBHOOK_DOORBELL: '1' })
-    const r = (await rpc(c.ctx, 'connection_check', {}, c.session, on)).sc as { wake: { path: string; live: boolean; enable: string | null }; summary: string }
-    expect(r.wake).toEqual({ path: 'webhook_doorbell', live: true, enable: null })
-    expect(r.summary).toContain('wake: webhook_doorbell')
+    const r = (await rpc(c.ctx, 'connection_check', {}, c.session, on)).sc as { send: { ok: boolean }; receive: { state: string }; echo_status: { state: string }; summary: string }
+    expect(r.send.ok).toBe(true)
+    expect(r.receive.state).toBe('pending')
+    expect(r.echo_status).toMatchObject({ state: 'not_returned' })
+    expect(r.summary).toBe('send ✓ receive pending; echo not returned')
   })
 
   it('the first boot_context after approval tells the agent to run the check', async () => {
@@ -545,23 +546,24 @@ describe('agent identity diagnostic step zero',()=>{
     expect(r.text).toContain('unauthenticated');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
   })
 
-  it('starts and finishes an agent-bound echo without claiming an unreceipted wake',async()=>{
+  it('starts and finishes an agent-bound inbox echo',async()=>{
     const ctx=await native();const off={...env,SEAT_ATTACH:undefined,SEAT_AUTO_ENROLL:undefined} as Env
     const first=await rpc(ctx,'connection_check',{echo:true},'echo-native',off)
-    expect(first.sc).toMatchObject({identity:{credential_kind:'agent-bound'},echo:{ok:true,state:'pending'}})
-    const echo=first.sc.echo as {message_id:string}
+    expect(first.sc).toMatchObject({identity:{credential_kind:'agent-bound'},echo_status:{ok:true,state:'pending'}})
+    const echo=first.sc.echo_status as {message_id:string}
     const body=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',echo.message_id)!.body
     const nonce=body.match(/: ([0-9a-f-]{36})$/)![1]
     expect(first.text).not.toContain(nonce)
     const reply=await rpc(ctx,'connection_check',{echo_reply:nonce},'echo-native',off)
-    expect(reply.sc).toMatchObject({echo:{ok:true,state:'echo_roundtrip'},wake_proof:{state:'unproven'}})
+    expect(reply.sc).toMatchObject({echo_status:{ok:true,state:'echo_roundtrip',path:'inbox_echo'}})
+    expect(JSON.stringify(reply.sc)).not.toContain('wake_proof')
   })
-  it('boot tells a native agent to prove wake and fleet read reports not proven',async()=>{
+  it('boot tells a native agent to complete its inbox echo and fleet reports echo status',async()=>{
     const ctx=await native()
     const boot=await rpc(ctx,'boot_context',{},'unproven-native')
-    expect(boot.sc).toMatchObject({wake_verification:{state:'unproven'}})
-    expect(String(boot.sc.next_step)).toContain('prove your wake path')
-    expect((await rpc(ctx,'fleet_agent_get',{},'unproven-native')).sc).toMatchObject({wake_proof:{state:'unproven'}})
+    expect(boot.sc).toMatchObject({echo_status:{state:'not_returned'}})
+    expect(String(boot.sc.next_step)).toContain('complete inbox echo')
+    expect((await rpc(ctx,'fleet_agent_get',{},'unproven-native')).sc).toMatchObject({echo_status:{state:'not_returned'}})
   })
   it.each([{echo:true,echo_reply:'not-a-reply'},{fresh:true,echo:true},{fresh:true,echo_reply:'reply'}])('does not create an echo for ambiguous echo/echo_reply intent %j',async args=>{
     const ctx=await native()
@@ -578,30 +580,30 @@ describe('agent identity diagnostic step zero',()=>{
   it('an attached chat receives only its own agent challenge',async()=>{
     const c=await attachedChat()
     const first=await rpc(c.ctx,'connection_check',{echo:true},c.session)
-    expect(first.sc).toMatchObject({identity:{credential_kind:'attached',bound_agent_id:'agent-coo'},echo:{state:'pending'}})
-    const id=(first.sc.echo as {message_id:string}).message_id
+    expect(first.sc).toMatchObject({identity:{credential_kind:'attached',bound_agent_id:'agent-coo'},echo_status:{state:'pending'}})
+    const id=(first.sc.echo_status as {message_id:string}).message_id
     const row=one<{body:string;to_agent:string}>('SELECT body,to_agent FROM agent_messages WHERE id=?',id)!
     expect(row.to_agent).toBe('agent-coo')
     const nonce=row.body.match(/: ([0-9a-f-]{36})$/)![1]
-    expect((await rpc(c.ctx,'connection_check',{echo_reply:nonce},c.session)).sc).toMatchObject({echo:{state:'echo_roundtrip'},wake_proof:{state:'unproven'}})
+    expect((await rpc(c.ctx,'connection_check',{echo_reply:nonce},c.session)).sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo'}})
   })
-  it('a receipted native echo clears boot guidance and reaches fleet metadata',async()=>{
+  it('a native completed receipt still yields inbox echo metadata and clears boot guidance',async()=>{
     const ctx=await native();const t0=Date.now();const clock=vi.spyOn(Date,'now').mockReturnValue(t0)
     const first=await rpc(ctx,'connection_check',{echo:true},'proof-api')
-    const messageId=(first.sc.echo as {message_id:string}).message_id
+    const messageId=(first.sc.echo_status as {message_id:string}).message_id
     const nonce=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',messageId)!.body.match(/: ([0-9a-f-]{36})$/)![1]
     const {eventIdFor}=await import('../src/bus/events-delivery')
     h.sqlite.prepare("INSERT INTO event_subscriptions(id,tenant,agent_id,member_id,token_id,event_name,callback_url,secret_ciphertext,secret_fingerprint,status,refresh_before,created_at,last_refreshed_at) VALUES('proof-sub',?,?,?,?, 'message.created','https://wake.example','cipher','12345678','active','2030-01-01','2026-01-01','2026-01-01')").run(TENANT,'agent-coo',ctx.memberId,ctx.tokenId)
     h.sqlite.prepare("INSERT INTO event_delivery_receipts(id,subscription_id,event_id,attempt,outcome,http_status,created_at) VALUES('proof-receipt','proof-sub',?,1,'delivered',204,?)").run(await eventIdFor('proof-sub',messageId),new Date(t0+100).toISOString())
     clock.mockReturnValue(t0+200)
-    expect((await rpc(ctx,'connection_check',{echo_reply:nonce},'proof-api')).sc).toMatchObject({echo:{state:'wake_proven'},wake_proof:{state:'proven',evidence_scope:'agent_transport',runtime_turn_attested:false}})
+    expect((await rpc(ctx,'connection_check',{echo_reply:nonce},'proof-api')).sc).toMatchObject({echo_status:{ok:true,state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
     const boot=await rpc(ctx,'boot_context',{},'proof-api')
-    expect(boot.sc).toMatchObject({wake_verification:{state:'proven'}})
-    expect(String(boot.sc.next_step)).not.toContain('prove your wake path')
+    expect(boot.sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
+    expect(String(boot.sc.next_step)).not.toContain('complete inbox echo')
     const fleet=await rpc(ctx,'fleet_agent_get',{},'proof-api')
-    expect(fleet.sc).toMatchObject({wake_proof:{state:'proven',path:'native_wake',delivery_to_reply_ms:100}})
-    expect(JSON.stringify(fleet.sc.wake_proof)).not.toContain(nonce)
-    expect(JSON.stringify(fleet.sc.wake_proof)).not.toContain(ctx.tokenId)
+    expect(fleet.sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
+    expect(JSON.stringify(fleet.sc.echo_status)).not.toContain(nonce)
+    expect(JSON.stringify(fleet.sc.echo_status)).not.toContain(ctx.tokenId)
   })
 
   it.each(['attachment','agent'] as const)('round2: stale attached %s cannot borrow a different live attachment context',async mismatch=>{

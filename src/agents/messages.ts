@@ -1,4 +1,3 @@
-import { activeWakeChallengesSql, recordWakeInboxRead, wakeChallengeCutoff, withWakeInboxObservation } from './wake-echo-observer'
 // mupot — agent↔agent durable messaging (squad → mupot migration, S3).
 //
 // The pure service behind the `send` / `inbox` / `message_get` MCP tools: persist a
@@ -929,10 +928,7 @@ async function readAgentInboxForReader(
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
-  const foldedWake = peek && reader==='bearer'
   try {
-    const observedAt=now()
-    const read=async():Promise<InboxResult | InboxFailure>=>{
     let messages: InboxMessage[]
     if (peek) {
       if (reader === 'signed') {
@@ -956,30 +952,16 @@ async function readAgentInboxForReader(
           ? [tenant, input.agent, sinceSeq, limit, targetSeat]
           : [tenant, input.agent, sinceSeq, limit]
         const handledSql = handledHideSql(input.handledByAttachment, binds)
-        const readSql = `SELECT ${cols} FROM agent_messages
+        const rows = await env.DB.prepare(
+          `SELECT ${cols} FROM agent_messages
             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
               ${seatSql}
               ${handledSql}
               AND COALESCE((SELECT mode FROM agent_inbox_fences
                              WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
-            ORDER BY seq ASC LIMIT ?4`
-        // A sentinel row carries the active flag even for an empty or fenced read.
-        // Idle SSE stays one statement; an active echo adds its durable witness
-        // before any rows are exposed. No isolate cache or caller-supplied hint.
-        const activeNow = observedAt
-        const atParam = '?' + (binds.length+1)
-        const cutoffParam = '?' + (binds.length+2)
-        if(foldedWake) binds.push(activeNow,wakeChallengeCutoff(activeNow))
-        const sql = foldedWake ? `WITH inbox_rows AS (${readSql})
-          SELECT r.*, w.wake_challenge_active FROM
-            (SELECT EXISTS(${activeWakeChallengesSql({tenant:'?1',agent:'?2',observed:atParam,cutoff:cutoffParam})}) AS wake_challenge_active) w
-          LEFT JOIN inbox_rows r ON 1 ORDER BY r.seq ASC` : readSql
-        const rows = await env.DB.prepare(sql).bind(...binds).all<InboxMessage & {wake_challenge_active?:number}>()
-        if(foldedWake && rows.results?.[0]?.wake_challenge_active===1) await recordWakeInboxRead(env,input.agent,reader,peek,activeNow)
-        messages = (rows.results ?? []).filter(row=>row.seq!=null).map(row=>{
-          const {wake_challenge_active: _active,...message}=row
-          return message
-        })
+            ORDER BY seq ASC LIMIT ?4`,
+        ).bind(...binds).all<InboxMessage>()
+        messages = rows.results ?? []
       }
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.
@@ -1121,8 +1103,6 @@ async function readAgentInboxForReader(
     // back. Same meaning either way afterwards: what is LEFT OVER.
     const leftOver = peek ? Math.max(0, remaining - messages.length) : remaining
     return { ok: true, messages, remaining: leftOver, complete: leftOver === 0 }
-    }
-    return foldedWake ? await read() : await withWakeInboxObservation(env,input.agent,reader,peek,observedAt,read)
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -1902,9 +1882,6 @@ export async function leaseAgentInbox(
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
 
-  try {
-    return await withWakeInboxObservation(env,input.agent,input.attemptId ? 'lease_attempt' : 'lease',false,nowIso,async():Promise<LeaseResult | LeaseAttemptResult | LeaseFailure>=>{
-
   if (input.attemptId !== undefined) {
     return leaseAgentInboxWithAttempt(env, {
       agent: input.agent,
@@ -2002,8 +1979,6 @@ export async function leaseAgentInbox(
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
-    })
-  } catch {return {ok:false,reason:'db_error',detail:'wake observation unavailable'}}
 }
 
 /**

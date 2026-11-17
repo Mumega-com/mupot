@@ -1,10 +1,10 @@
 import type { Env } from '../types'
 
-/** Keep runtime transitions durable even if the label later changes back. The witness and
- * registry write commit together; unchanged reports do not invalidate wake evidence. */
-export async function writeRuntimeWithProofFence(env:Env, input:{agentId:string;runtime:string|null;actorId:string;source:string;insertOnly?:boolean}, mutation:D1PreparedStatement) {
+/** Keep runtime transitions durable even if the label later changes back. The transition audit and
+ * registry write commit together; unchanged reports do not invalidate echo status. */
+export async function writeRuntimeWithEchoFence(env:Env, input:{agentId:string;runtime:string|null;actorId:string;source:string;insertOnly?:boolean}, mutation:D1PreparedStatement) {
   if(input.runtime===null) return mutation.run()
-  // Fleet discovery also holds external/unresolved labels. They have no canonical agent or wake proof.
+  // Fleet discovery also holds external/unresolved labels. They have no canonical agent or echo status.
   const canonical=await env.DB.prepare('SELECT 1 FROM agents WHERE id = ?1 LIMIT 1').bind(input.agentId).first()
   if(!canonical) return mutation.run()
   const audit=env.DB.prepare(`INSERT INTO agent_audit

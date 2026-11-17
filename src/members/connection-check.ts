@@ -1,65 +1,25 @@
-// mupot — connection_check: the self diagnostic an agent-bound or attached connection runs (SEND, RECEIVE, WAKE), and the record the agent page shows.
-//
-//   SEND     the agent's own message is stored (a row from the agent, found by id) so a peer reading its mail can see it.
-//   RECEIVE  the server drops a check message from the fixed system sender into the agent's inbox; the chat peeks it and marks it
-//            handled for an attachment or acknowledged for an agent-bound credential. This is an inbox roundtrip.
-//   WAKE     is there a live wake path for this agent: native wake (MCP Events subscription), a push host grant (seatlink), or a
-//            webhook doorbell. Reported as which one, or none with the one line that enables it.
-//
-// Everything is derived from the live principal the SERVER resolved; no argument names an agent. The result is appended to agent_audit
-// (action 'connection_check') so the panel can read the latest one. Authority: it writes one self-addressed message and one
-// system-sender message to the agent's OWN inbox and one audit row; it widens nothing.
-
-import type { loadWakeProof } from './wake-echo'
+// Self-only SEND/RECEIVE diagnostic. Echo status reports an inbox roundtrip, not wake.
+import type { ConnectionEchoStatus } from './connection-echo'
 import { sha256Hex } from './service'
 import type { Env } from '../types'
 import { sendAgentMessage } from '../agents/messages'
 import { ONBOARDING_SENDER } from '../agents/system-senders'
-import { isEventsEnabled } from '../mcp/events'
-import { nativeWakeState } from '../bus/events-delivery'
-import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from '../agents/seat-events'
-import { getAgentWebhookDoorbell, webhookDoorbellEnabled } from '../agents/webhook-doorbell'
-
-export type WakePath = 'native_wake' | 'push_host' | 'webhook_doorbell' | 'none'
-
-export const WAKE_ENABLE_LINE = "say 'monitor my mupot inbox' to enable (the chat then checks inbox {peek:true} while it is open), or your human sets up push on the agent page"
-
 export interface ConnectionCheckResult {
-  send: { ok: boolean; message_id: string | null }
-  receive: { state: 'ok' | 'pending'; message_id: string | null; next: string | null }
-  wake: { path: WakePath; live: boolean; enable: string | null }
-  summary: string
-  checked_at: string
+  send:{ok:boolean;message_id:string|null}
+  receive:{state:'ok'|'pending';message_id:string|null;next:string|null}
+  summary:string
+  checked_at:string
 }
 
-/** Pure: the plain one-liner. */
-export function summarizeCheck(r: Pick<ConnectionCheckResult, 'send' | 'receive' | 'wake'>): string {
-  const wake = r.wake.live ? `wake: ${r.wake.path}` : `wake: none — ${r.wake.enable ?? WAKE_ENABLE_LINE}`
-  return `send ${r.send.ok ? '✓' : '✗'} receive ${r.receive.state === 'ok' ? '✓' : 'pending'} ${wake}`
+export function summarizeCheck(r:Pick<ConnectionCheckResult,'send'|'receive'>):string {
+  return `send ${r.send.ok?'✓':'✗'} receive ${r.receive.state==='ok'?'✓':'pending'}`
 }
 
-export async function wakeLeg(env: Env, agentId: string, nowIso: string): Promise<ConnectionCheckResult['wake']> {
-  const tenant = env.TENANT_SLUG
-  if (isEventsEnabled(env)) {
-    const s = await nativeWakeState(env, tenant, agentId, nowIso).catch(() => null)
-    if (s?.state === 'live') return { path: 'native_wake', live: true, enable: null }
-  }
-  if (isSeatEventsEnabled(env)) {
-    const g = await activeSeatEventGrant(env, agentId).catch(() => null)
-    if (g && (await authorizeSeatDelivery(env, g.host_agent_id, agentId).catch(() => null)) === 'granted') return { path: 'push_host', live: true, enable: null }
-  }
-  if (webhookDoorbellEnabled(env)) {
-    const d = await getAgentWebhookDoorbell(env, agentId).catch(() => null)
-    if (d) return { path: 'webhook_doorbell', live: true, enable: null }
-  }
-  return { path: 'none', live: false, enable: WAKE_ENABLE_LINE }
-}
-
-const SYSTEM_REASON = 'connection_check probe addressed to the attached agent itself, resolved from the live attachment, not caller input'
+const SYSTEM_REASON = 'connection_check probe addressed to the server-resolved agent itself, not caller input'
 
 export async function runConnectionCheck(
   env: Env,
-  p: { attachmentId?: string; credentialId?: string; agentId: string; humanMemberId: string; fresh?: boolean; wakeProof?: Awaited<ReturnType<typeof loadWakeProof>> },
+  p: { attachmentId?: string; credentialId?: string; agentId: string; humanMemberId: string; fresh?: boolean; echoStatus?: ConnectionEchoStatus },
   nowMs: number = Date.now(),
 ): Promise<ConnectionCheckResult> {
   const nowIso = new Date(nowMs).toISOString()
@@ -88,13 +48,12 @@ export async function runConnectionCheck(
     const round = recvId === null ? 1 : Number((await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_messages WHERE tenant = ?1 AND to_agent = ?2 AND from_agent = ?3 AND request_id LIKE ?4`).bind(env.TENANT_SLUG, p.agentId, ONBOARDING_SENDER, like).first<{ n: number }>())?.n ?? 0) + 1
     const r = await sendAgentMessage(
       env,
-      { fromAgent: ONBOARDING_SENDER, fromMember: p.humanMemberId, toAgent: p.agentId, kind: 'message', body: p.attachmentId ? 'connection_check: receive probe. Read it with inbox {peek:true}, then call inbox_mark_handled with this message id, then call connection_check again.' : 'connection_check: receive probe. Read your own inbox, acknowledge this message with inbox_ack, then run connection_check again. This is an inbox roundtrip, not proof that the runtime was woken.', requestId: `check-recv:${checkKey}:${round}` },
+      { fromAgent: ONBOARDING_SENDER, fromMember: p.humanMemberId, toAgent: p.agentId, kind: 'message', body: p.attachmentId ? 'connection_check: receive probe. Read it with inbox {peek:true}, then call inbox_mark_handled with this message id, then call connection_check again.' : 'connection_check: receive probe. Read your own inbox, acknowledge this message with inbox_ack, then run connection_check again.', requestId: `check-recv:${checkKey}:${round}` },
       { system: true, reason: SYSTEM_REASON },
     )
     recvId = r.ok ? r.id : null
     recvOk = false
   }
-  const wake = await wakeLeg(env, p.agentId, nowIso)
   const partial = {
     send: { ok: sendId !== null, message_id: sendId },
     receive: {
@@ -102,12 +61,11 @@ export async function runConnectionCheck(
       message_id: recvId,
       next: recvOk || recvId === null ? null : `Call inbox {peek:true}, then ${p.attachmentId ? 'inbox_mark_handled' : 'inbox_ack'} {ids:["${recvId}"]}, then call connection_check again.`,
     },
-    wake,
   }
-  const result: ConnectionCheckResult = { ...partial, summary: summarizeCheck(partial)+(p.wakeProof ? `; wake ${p.wakeProof.state==='proven' ? 'delivery proven' : p.wakeProof.state==='stale' ? 'proof stale; re-prove' : 'not proven'}` : ''), checked_at: nowIso }
+  const result: ConnectionCheckResult = { ...partial, summary: summarizeCheck(partial)+`; ${p.echoStatus?.state==='echo_roundtrip'?'echo returned':p.echoStatus?.state==='stale'?'echo stale':'echo not returned'}`, checked_at: nowIso }
   await env.DB.prepare(
     `INSERT INTO agent_audit (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state) VALUES (?1, ?2, ?3, 'system', 'connection_check', '["connection"]', '{}', ?4)`,
-  ).bind(crypto.randomUUID(), p.agentId, p.humanMemberId, JSON.stringify({ attachment_id: p.attachmentId ?? null, connection_kind: p.attachmentId ? 'attached' : 'agent-bound', send: result.send.ok, receive: result.receive.state, wake: wake.path, wake_proof: p.wakeProof ?? null, summary: result.summary })).run().catch(() => undefined)
+  ).bind(crypto.randomUUID(), p.agentId, p.humanMemberId, JSON.stringify({ attachment_id: p.attachmentId ?? null, connection_kind: p.attachmentId ? 'attached' : 'agent-bound', send: result.send.ok, receive: result.receive.state, echo_status: p.echoStatus ?? null, summary: result.summary })).run().catch(() => undefined)
   return result
 }
 

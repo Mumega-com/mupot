@@ -1,6 +1,6 @@
 // tests/inbox-stream-poll-cost.test.ts — the SSE tick must stay cheap (prod 2026-10-25: 97% of D1 queries
 // were /api/inbox/stream at 1 s x ~86 streams). Real migration schema; statements counted via a prepare proxy.
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { STREAM_REVALIDATE_MS, streamInboxEvents, type InboxStreamEvent } from '../src/agents/inbox-routes'
@@ -41,15 +41,7 @@ beforeEach(() => {
   })
   env = { DB: wrapped, TENANT_SLUG: TENANT } as unknown as Env
 })
-afterEach(() => {harness.close();vi.useRealTimers()})
-
-function canonicalAgent():void {
-  harness.sqlite.exec(`INSERT INTO departments(id,slug,name) VALUES('audit-dept','audit-dept','Audit');
-    INSERT INTO squads(id,department_id,slug,name) VALUES('audit-squad','audit-dept','audit-squad','Audit');
-    INSERT INTO members(id,tenant,display_name,status) VALUES('audit-member','${TENANT}','Audit','active');
-    INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES('${AGENT}','audit-squad','audit-agent','Audit','member','test','active');
-    INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES('${TENANT}','${AGENT}','audit-member','2026-01-01T00:00:00Z');`)
-}
+afterEach(() => harness.close())
 
 describe('inbox stream poll cost', () => {
   it('idle stream over 60 s: 1 statement per tick after the connect flush, one revalidate', async () => {
@@ -68,18 +60,6 @@ describe('inbox stream poll cost', () => {
     expect(total).toBeLessThanOrEqual(3 + 6)
     expect(total - afterConnect).toBeLessThanOrEqual(9)
     expect(revalidations).toBe(1)
-    await gen.return(undefined)
-  })
-
-  it('records active empty polls with two statements, then returns to one after expiry',async()=>{
-    vi.useFakeTimers();const t0=Date.parse('2026-11-17T12:00:00Z');vi.setSystemTime(t0);canonicalAgent()
-    harness.sqlite.prepare("INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state,created_at) VALUES('active-echo',?,'audit-member','system','connection_wake_challenge','[]','{}',?,?)").run(AGENT,JSON.stringify({expires_at:new Date(t0+600000).toISOString()}),new Date(t0).toISOString())
-    const c=clock();const gen=streamInboxEvents(env,{agent:AGENT,since:0},{sleep:c.sleep,nowMs:c.nowMs})
-    await nextOf(gen);let before=n
-    expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat');expect(n-before).toBe(2)
-    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").get()).toMatchObject({n:1})
-    vi.setSystemTime(t0+600001);before=n
-    expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat');expect(n-before).toBe(1)
     await gen.return(undefined)
   })
 
@@ -161,39 +141,4 @@ describe('inbox stream poll cost', () => {
     for (let i = 0; i < 3; i++) expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat')
     await gen.return(undefined)
   })
-  it.each(['folded','observer'] as const)('round2: %s audit lookup uses an actor/time range instead of scanning old history',async mode=>{
-    canonicalAgent();const at='2026-11-17T12:00:00.000Z'
-    const insert=harness.sqlite.prepare("INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state,created_at) VALUES(?,?,?,'system','update_agent','[]','{}','{}',?)")
-    harness.sqlite.exec('BEGIN')
-    for(let i=0;i<5000;i++)insert.run('old-'+i,AGENT,'audit-member','2026-11-16T12:00:00.000Z')
-    harness.sqlite.exec('COMMIT')
-    const trace:Array<{sql:string;values:unknown[];method:string}>=[]
-    const wrap=(stmt:D1PreparedStatement,sql:string,values:unknown[]=[]):D1PreparedStatement=>new Proxy(stmt,{get(target,key){
-      if(key==='bind')return (...args:unknown[])=>wrap(target.bind(...args),sql,args)
-      if(key==='all'||key==='run'||key==='first')return async(...args:unknown[])=>{trace.push({sql,values,method:String(key)});return (target[key] as (...a:unknown[])=>Promise<unknown>).apply(target,args)}
-      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
-    }})
-    const traced={...env,DB:new Proxy(env.DB,{get(target,key){
-      if(key==='prepare')return (sql:string)=>wrap(target.prepare(sql),sql)
-      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
-    }})} as Env
-    if(mode==='folded') {const {readAgentInbox}=await import('../src/agents/messages');expect(await readAgentInbox(traced,{agent:AGENT,peek:true,skipRemaining:true},{now:()=>at})).toMatchObject({ok:true,messages:[]})}
-    else {const {recordWakeInboxRead}=await import('../src/agents/wake-echo-observer');await recordWakeInboxRead(traced,AGENT,'bearer',true,at)}
-    const lookup=trace.find(x=>x.sql.includes('connection_wake_challenge'));expect(lookup).toBeDefined()
-    const plan=await harness.db.prepare('EXPLAIN QUERY PLAN '+lookup!.sql).bind(...lookup!.values).all<{detail:string}>()
-    const details=(plan.results??[]).map(x=>x.detail).join('\n')
-    expect(details).toMatch(/SEARCH c USING INDEX idx_agent_audit_actor_changes \(actor_id=\? AND created_at>\?\)/)
-    expect(details).not.toMatch(/SEARCH c USING INDEX idx_agent_audit_agent \(agent_id=\?\)/)
-  })
-  it('round2: dense recent audit rows cannot hide an active challenge behind a candidate limit',async()=>{
-    canonicalAgent();const at='2026-11-17T12:00:00.000Z'
-    harness.sqlite.prepare("INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state,created_at) VALUES('dense-challenge',?,'audit-member','system','connection_wake_challenge','[]','{}',?,?)").run(AGENT,JSON.stringify({expires_at:'2026-11-17T12:10:00Z'}),at)
-    const insert=harness.sqlite.prepare("INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state,created_at) VALUES(?,?,'audit-member','system','update_agent','[]','{}','{}','2026-11-17T12:00:01Z')")
-    for(let i=0;i<300;i++)insert.run('recent-'+i,AGENT)
-    const {readAgentInbox}=await import('../src/agents/messages')
-    const before=n;expect(await readAgentInbox(env,{agent:AGENT,peek:true,skipRemaining:true},{now:()=> '2026-11-17T12:00:02Z'})).toMatchObject({ok:true,messages:[]})
-    expect(n-before).toBe(2)
-    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").get()).toMatchObject({n:1})
-  })
-
 })

@@ -295,7 +295,7 @@ describe('every bearer door consumes the shared predicate', () => {
   // Queries that read member_tokens WITHOUT granting anything, and must therefore be
   // able to see a non-live row. Pinned to the query, not the file.
   const NON_AUTH_QUERIES: ReadonlyArray<{ fingerprint: string; why: string }> = [
-    { fingerprint: 'b0481e6edbea', why: 'wake proof token-set inventory: deliberately includes retained revoked rows so issuing then revoking a token cannot resurrect stale proof. The exact credential is separately checked through TOKEN_LIVE_PREDICATE, and commit rechecks both its lifecycle and this inventory. This query grants no authority.' },
+    { fingerprint: 'b0481e6edbea', why: 'inbox echo token-set inventory: deliberately includes retained revoked rows so issuing then revoking a token cannot resurrect stale echo status. The exact credential is separately checked through TOKEN_LIVE_PREDICATE, and commit rechecks both its lifecycle and this inventory. This query grants no authority.' },
     { fingerprint: 'dd4c5c20f09a', why: 'control-center: aggregate of member/channel pairs for an operator view. Grants nothing.' },
     { fingerprint: '426f3c16d874', why: 'dashboard: DISTINCT member/channel listing. Grants nothing.' },
     { fingerprint: '87a0ace21487', why: 'keys page: lists a tenant preset-labelled keys. Display only.' },
