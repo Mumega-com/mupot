@@ -5,6 +5,7 @@ import type { BusEvent, Env } from '../src/types'
 import { notify, OWNER_RECIPIENT } from '../src/notify'
 import { renderContext, safeField, type ChannelAdapter } from '../src/notify/adapters'
 import { REVERSIBLE_ACTIONS } from '../src/notify/carry'
+import { redactSecretPatterns, redactSecretPatternsForDisplay } from '../src/lib/redact'
 import type { NotifyEvent } from '../src/notify/types'
 import { APPROVAL_BOT_ACTIONS } from '../src/approval-bot/policy'
 import { escapeTelegramMarkdown, formatTelegram } from '../src/telegram-bridge/bus_notify'
@@ -29,11 +30,13 @@ afterEach(() => { h.close(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe('item 1: caller text is never Markdown', () => {
   const EVIL = '[Approve now](https://evil.example)'
+  // Anything in `text` that legacy Markdown could read as markup: an unescaped [ _ * ` outside a code span.
+  const strip = (t: string): string => t.replace(/`[^`]*`/g, '').replace(/\\[_*`[]/g, '')
 
   it('a markdown link in a title is escaped, so it cannot become a link', () => {
     const text = formatTelegram({ type: 'task.review', title: EVIL })
-    expect(text).toContain('\\[Approve now\\](https://evil.example)')
-    expect(text).not.toMatch(/(^|[^\\])\[Approve now\]/)
+    expect(text).toContain('\\[Approve now](https://evil.example)')
+    expect(strip(text)).not.toContain('[')
   })
 
   it('underscores, asterisks and backticks in a title or message are escaped', () => {
@@ -42,8 +45,30 @@ describe('item 1: caller text is never Markdown', () => {
     expect(text).toContain('x\\_y \\*z\\* \\`q\\`')
   })
 
-  it('a backslash cannot cancel the escape of the bracket after it', () => {
-    expect(escapeTelegramMarkdown('\\[x](u)')).toBe('\\\\\\[x\\](u)')
+  it('only characters legacy Markdown honours are escaped: ] and \\ render as typed', () => {
+    expect(escapeTelegramMarkdown('[WIP] fix')).toBe('\\[WIP] fix')
+    expect(escapeTelegramMarkdown('Fix [P1] bug, C:\\Users, [redacted]')).toBe('Fix \\[P1] bug, C:\\Users, \\[redacted]')
+  })
+
+  it('fuzz: no combination of hostile characters leaves a raw [ _ * ` outside a code span', () => {
+    const atoms = ['[', ']', '(', ')', '_', '*', '`', '\\', 'https://evil.example', 'a', ' ']
+    let seed = 12345
+    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n }
+    for (let k = 0; k < 2000; k++) {
+      const t = Array.from({ length: 1 + rnd(14) }, () => atoms[rnd(atoms.length)]).join('')
+      // task.created has no italic trailer, so every [ _ * ` after the constant header is caller text.
+      const body = formatTelegram({ type: 'task.created', title: t, message: t }).split('\n').slice(1).join('\n')
+      expect(strip(body)).not.toMatch(/[[_*`]/)
+    }
+  })
+
+  it('the bold header holds only constants: a hostile type or id never sits inside bold', () => {
+    const text = formatTelegram({ type: 'task.x*', task_id: '[Approve](https://evil.example)' })
+    const [header, idLine] = text.split('\n')
+    expect(header).toBe('📌 *Task* x\\*')
+    expect(idLine).toBe('`[Approve](https://evil.example)`')
+    const known = formatTelegram({ type: 'task.review' }).split('\n')[0]
+    expect(known).toBe('🔍 *Task review*')
   })
 
   it('ids in code spans cannot break out of the span', () => {
@@ -52,14 +77,13 @@ describe('item 1: caller text is never Markdown', () => {
     expect(text).not.toContain('`](https://evil.example)')
   })
 
-  it('the real telegram path sends the escaped title, then the same plain-text retry still carries no link markup', async () => {
+  it('the real telegram path sends the escaped title as Markdown', async () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, text: async () => '{}' }) as unknown as Response)
     vi.stubGlobal('fetch', fetchMock)
     await notify(envOf(), ev({ context: { title: EVIL } }))
     const body = JSON.parse(((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body as string) as { text: string; parse_mode?: string }
     expect(body.parse_mode).toBe('Markdown')
-    expect(body.text).toContain('\\[Approve now\\]')
-    expect(body.text).not.toMatch(/(^|[^\\])\[Approve now\]/)
+    expect(body.text).toContain('\\[Approve now](https://evil.example)')
   })
 })
 
@@ -86,6 +110,24 @@ describe('item 3: a throwing send frees the dedupe claim', () => {
     expect(sent).toEqual([OWNER_RECIPIENT, 'member-2'])
   })
 
+  it('M11: a recipient that already sent keeps its claim when a later recipient throws; the retry does not resend', async () => {
+    const sent: string[] = []
+    let thrown = false
+    const tg: ChannelAdapter = {
+      channel: 'telegram_dm',
+      deliver: async (_e, _ev, r) => {
+        if (r === 'member-2' && !thrown) { thrown = true; throw new Error('boom') }
+        sent.push(r)
+        return { status: 'sent' }
+      },
+    }
+    const event = ev({ recipients: [OWNER_RECIPIENT, 'member-2'] })
+    await expect(notify(envOf(), event, { adapters: [tg] })).rejects.toThrow('boom')
+    const r = await notify(envOf(), event, { adapters: [tg] })
+    expect(sent).toEqual([OWNER_RECIPIENT, 'member-2'])
+    expect(r.deduped).toEqual([OWNER_RECIPIENT])
+  })
+
   it('a successful send still dedupes the repeat', async () => {
     const sent: string[] = []
     const ok: ChannelAdapter = { channel: 'telegram_dm', deliver: async (_e, _ev, r) => { sent.push(r); return { status: 'sent' } } }
@@ -96,20 +138,67 @@ describe('item 3: a throwing send frees the dedupe claim', () => {
   })
 })
 
-describe('item 5: only real secret patterns are redacted', () => {
-  it('ordinary words survive', () => {
+describe('item 5: display redaction', () => {
+  const gone = (input: string, secret: string): void => {
+    expect(safeField(input), input).not.toContain(secret)
+  }
+
+  it('prose after the bare key token survives (letters and spaces, two or more words)', () => {
     expect(safeField('Update token: rotation runbook')).toBe('Update token: rotation runbook')
-    expect(safeField('Rotate the password policy: quarterly review')).toBe('Rotate the password policy: quarterly review')
-    expect(safeField('secret: handling guide')).toBe('secret: handling guide')
+    expect(safeField('Tokens: rotation schedule for the fleet')).toBe('Tokens: rotation schedule for the fleet')
   })
 
-  it('real secret shapes are still redacted', () => {
-    expect(safeField('x token=abc123SECRETvalue y')).not.toContain('abc123SECRETvalue')
-    expect(safeField('password: hunter2hunter2')).not.toContain('hunter2hunter2')
-    expect(safeField('Authorization: Bearer abcdefghij1234567890QQQQ')).not.toContain('abcdefghij1234567890QQQQ')
+  it('anything else after token: / token= is redacted', () => {
+    gone('x token=abc123SECRETvalue y', 'abc123SECRETvalue')
+    gone('token: rotation', 'rotation') // one word
+    gone('token: rotation runbook 2026', 'runbook')
+    gone('token: 12345678:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw', 'AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw')
+    gone('access_token: rotation runbook', 'runbook') // only the bare key is relaxed
+  })
+
+  it('credential keys always redact, any shape: both gate reports leak lists', () => {
+    gone('Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpwYXNzd29yZA')
+    gone('Authorization: Token 0123456789abcdef0123', '0123456789abcdef0123')
+    gone('authorization: Bot MTIzNDU2GabcDE.xyz', 'MTIzNDU2GabcDE')
+    gone('db password: hunter2', 'hunter2')
+    gone('password: hunter2', 'hunter2')
+    gone('password: correcthorsebatterystaple', 'correcthorsebatterystaple')
+    gone('password: "letmeinplease"', 'letmeinplease')
+    gone('{"password":"Sunshine"}', 'Sunshine')
+    gone('secret: is a8f9d0c1e2b3f4a5b6c7', 'a8f9d0c1e2b3f4a5b6c7')
+    gone('api_key: the value X9f8Y7w6', 'X9f8Y7w6')
+    gone('apikey=AbCdEfGhIjKlMnOp', 'AbCdEfGhIjKlMnOp')
+    gone('api-key: abc', 'abc')
+    gone('connection_string: Server=db;Password=pw12', 'pw12')
+    gone('Server=db;Password=pw12', 'pw12')
+    gone('client_secret: AbCdEfGhIjKlMnOpQrSt', 'AbCdEfGhIjKlMnOpQrSt')
+    gone('client_secret: 7f3a9c', '7f3a9c')
+    gone('pwd=letmein', 'letmein')
+    gone('passwd: letmein', 'letmein')
+    gone('auth: letmein', 'letmein')
+    gone('cookie: session=abcdef', 'abcdef')
+    gone('set-cookie: sid=zzz', 'zzz')
+    gone('private_key: MIIEvQIBADANBg', 'MIIEvQIBADANBg')
+    gone('access_key: AKIAxyz', 'AKIAxyz')
+  })
+
+  it('the word after an auth scheme is always redacted, case-insensitive', () => {
+    for (const scheme of ['Basic', 'bearer', 'TOKEN', 'Bot', 'digest', 'ApiKey']) {
+      gone(`curl -H ${scheme} zXy9`, 'zXy9')
+    }
+  })
+
+  it('prefix-shaped secrets are still redacted', () => {
     const sk = ['sk', 'abcdefghijklmnop1234'].join('-') // built at runtime so the secret scanner does not flag the fixture
-    expect(safeField(`key ${sk}`)).not.toContain(sk)
-    expect(safeField('https://x.test/cb?token=zzzz')).not.toContain('zzzz')
+    gone(`key ${sk}`, sk)
+    gone('https://x.test/cb?token=zzzz', 'zzzz')
+    gone('Authorization: Bearer abcdefghij1234567890QQQQ', 'abcdefghij1234567890QQQQ')
+  })
+
+  it('M18: the strict redactor (logs, audit, projections) does NOT adopt the display relaxation', () => {
+    expect(redactSecretPatterns('Update token: rotation runbook')).not.toContain('rotation')
+    expect(redactSecretPatterns('x Basic dXNlcjpwYXNz y')).toContain('dXNlcjpwYXNz') // scheme rule is display-only, as before
+    expect(redactSecretPatternsForDisplay('Update token: rotation runbook')).toContain('rotation')
   })
 })
 
@@ -122,6 +211,12 @@ describe('item 4: one policy source', () => {
   it('the bot allow list is the carry table list, and equals the list the bot carried before the switch, in order', () => {
     expect(APPROVAL_BOT_ACTIONS).toBe(REVERSIBLE_ACTIONS)
     expect([...APPROVAL_BOT_ACTIONS]).toEqual(TODAY_LIST)
+  })
+
+  it('the shared list is frozen: a runtime push throws', () => {
+    expect(Object.isFrozen(REVERSIBLE_ACTIONS)).toBe(true)
+    // as: the declared type is readonly; the cast is the point, proving the runtime freeze.
+    expect(() => (APPROVAL_BOT_ACTIONS as string[]).push('action:mint_token')).toThrow(TypeError)
   })
 })
 

@@ -21,7 +21,7 @@ export const PLAIN_BUTTON_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['ap
  * is high_risk: mint_token, manage_access, grants, money, publish, deletes, deploys, home access, structure that
  * outlives a grant.
  */
-export const REVERSIBLE_ACTIONS: readonly string[] = [
+export const REVERSIBLE_ACTIONS: readonly string[] = Object.freeze([
   'action:project_lifecycle',
   'action:org_structure',
   'action:workspace_project',
@@ -31,7 +31,7 @@ export const REVERSIBLE_ACTIONS: readonly string[] = [
   'action:sudo_squad_dyad_pin',
   'action:sudo_grant_gate_capability',
   'action:sudo_seat_event_grant',
-]
+])
 
 /** Fail closed: a key that is not on the reversible list (including a typo) is high_risk. */
 export function classifyAction(actionKey: string): ActionClass {

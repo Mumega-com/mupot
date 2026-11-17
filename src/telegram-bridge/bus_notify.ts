@@ -58,17 +58,21 @@ export async function hmacSign(secret: string, body: string): Promise<string> {
 }
 
 /**
- * Caller-supplied text (titles, messages, ids, type) is data, never markup. Legacy Markdown turns `[text](url)` into a
- * link from the trusted bot, so every untrusted field is escaped before it joins the template: `_ * ` [` get a
- * backslash. Inside a code span there is no escape, so ids drop backticks and backslashes instead.
+ * Caller-supplied text (titles, messages, type) is data, never markup. Legacy Markdown turns `[text](url)` into a link
+ * from the trusted bot, so every untrusted field is escaped before it joins the template. Legacy Markdown honours a
+ * backslash only before `_ * ` [` (tdlib parse_markdown), so only those are escaped: `]` and `\` stay as typed, and
+ * "[WIP] fix", "[redacted]" and "C:\Users" render cleanly. Escapes do nothing inside an entity (bold, code), so
+ * caller text is never placed inside one: ids in code spans lose backticks and backslashes instead.
  */
 export function escapeTelegramMarkdown(s: string): string {
-  return s.replace(/([_*`[\]\\])/g, '\\$1')
+  return s.replace(/([_*`[])/g, '\\$1')
 }
 
 function codeSafe(s: string): string {
   return s.replace(/[`\\]/g, '')
 }
+
+const KNOWN_LABELS: ReadonlySet<string> = new Set(['review', 'blocked', 'verdict', 'created', 'completed', 'failed', 'skipped'])
 
 export function formatTelegram(n: TaskNotification): string {
   const icons: Record<string, string> = {
@@ -80,9 +84,12 @@ export function formatTelegram(n: TaskNotification): string {
   }
   const isBackup = n.type.startsWith('backup.')
   const icon = isBackup ? '⚠️' : icons[n.type] || '📌'
-  const label = escapeTelegramMarkdown(n.type.replace('task.', '').replace('backup.', ''))
+  const label = n.type.replace('task.', '').replace('backup.', '')
 
-  const lines: string[] = [isBackup ? `${icon} *Backup ${label}*` : `${icon} *Task ${label}*`]
+  // Bold holds only constants: a known label is bolded with the noun; anything else follows the bold noun as escaped text.
+  const noun = isBackup ? 'Backup' : 'Task'
+  const header = KNOWN_LABELS.has(label) ? `*${noun} ${label}*` : `*${noun}* ${escapeTelegramMarkdown(label)}`
+  const lines: string[] = [`${icon} ${header}`]
   if (n.title) lines.push(escapeTelegramMarkdown(n.title))
   if (n.task_id) lines.push('`' + codeSafe(n.task_id) + '`')
   if (n.agent_id) lines.push('👤 agent: `' + codeSafe(n.agent_id) + '`')
@@ -123,10 +130,9 @@ async function postJson(url: string, body: string, headers: Record<string, strin
 /**
  * Send straight to the Telegram Bot API.
  *
- * Task titles are user/agent-authored and routinely contain `_`, `*` and `[`, which
- * Telegram's Markdown parser rejects with a 400 ("can't parse entities"). Rather than
- * escape — which silently mangles the text and is easy to get subtly wrong — we retry
- * once as PLAIN TEXT. A notification that arrives unformatted beats one that vanishes.
+ * Caller text is escaped in formatTelegram, so a parse failure should not happen. If Telegram still rejects the
+ * Markdown (400 "can't parse entities"), we retry once as PLAIN TEXT: the escapes then show as backslashes, but a
+ * notification that arrives unformatted beats one that vanishes.
  */
 async function sendDirect(
   token: string,

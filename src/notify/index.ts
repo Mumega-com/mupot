@@ -1,7 +1,8 @@
 // mupot — notify kernel, slice 1: one outbox. policy -> route -> adapter -> delivery row.
 //
-// notify() never throws. If the store itself is unavailable it degrades to "send without dedupe/cap" (the behaviour
-// before the kernel existed) rather than dropping a notification.
+// A store failure never throws: it degrades to "send without dedupe/cap" (the behaviour before the kernel existed)
+// rather than dropping a notification. An ADAPTER that throws is released (its dedupe claims are freed) and rethrown;
+// callers (consumer, backup alert) catch it.
 import type { Env } from '../types'
 import { safeConsole } from '../lib/log'
 import { carryChannels, PUSH_CHANNELS, type Channel } from './carry'
