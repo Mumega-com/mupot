@@ -17,10 +17,6 @@ const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g
 // Bounded scheme, and user/password classes that cannot cross quotes or delimiters (linear, no JSON bleed).
 const URL_PASSWORD_RE = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/?#"'<>,;&{}]*:)[^\s@/?#"'<>,;&{}]+@/gi
-// A bare scheme word followed by a credential-shaped value (not prose), with or without a header.
-const BASIC_CREDENTIAL_RE = /\b(Basic)\s+(?=[A-Za-z0-9+/]*[0-9+/=])[A-Za-z0-9+/]{16,}={0,2}/gi
-const APIKEY_CREDENTIAL_RE = /\b(ApiKey)\s+(?=[A-Za-z0-9_.~+/=-]*[0-9])[A-Za-z0-9_.~+/=-]{16,}/gi
-
 export function isSensitiveDetailKey(key: string): boolean {
   const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
   return normalized.endsWith('apikey')
@@ -74,8 +70,6 @@ export function redactSecretPatterns(text: string): string {
     ))
     .replace(/^[\s\S]*$/, redactAssignments)
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-    .replace(BASIC_CREDENTIAL_RE, '$1 [redacted]')
-    .replace(APIKEY_CREDENTIAL_RE, '$1 [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
     // Cloudflare API tokens — live on this host as ~/.fleet/agents/*.token and passed to
