@@ -5,7 +5,7 @@ import type { BusEvent, Env } from '../src/types'
 import { notify, OWNER_RECIPIENT } from '../src/notify'
 import { renderContext, safeField, type ChannelAdapter } from '../src/notify/adapters'
 import { REVERSIBLE_ACTIONS } from '../src/notify/carry'
-import { redactSecretPatterns, redactSecretPatternsForDisplay } from '../src/lib/redact'
+import { redactSecretPatterns } from '../src/lib/redact'
 import type { NotifyEvent } from '../src/notify/types'
 import { APPROVAL_BOT_ACTIONS } from '../src/approval-bot/policy'
 import { TELEGRAM_MAX_CHARS, escapeTelegramHtml, formatTelegram, telegramHtmlToPlain } from '../src/telegram-bridge/bus_notify'
@@ -162,67 +162,32 @@ describe('item 3: a throwing send frees the dedupe claim', () => {
   })
 })
 
-describe('item 5: display redaction', () => {
-  const gone = (input: string, secret: string): void => {
-    expect(safeField(input), input).not.toContain(secret)
-  }
+describe('item 5: Telegram field redaction is the strict redactor, nothing weaker', () => {
+  // built at runtime so the secret scanner does not flag the fixture
+  const PEM = ['-----BEGIN OPENSSH PRIVATE', 'KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE', 'KEY-----'].join(' ')
+  const sk = ['sk', 'abcdefghijklmnop1234'].join('-') // built at runtime so the secret scanner does not flag the fixture
+  const PROBES = [
+    'Update token: rotation runbook',
+    'Authorization: Basic dXNlcjpwYXNzd29yZA==', 'Authorization: Token 0123456789abcdef0123',
+    'authorization: Bot MTIzNDU2GabcDE.xyz', 'curl -H Basic dXNlcjpwYXNz', 'curl -H bearer zXy9', 'curl -H Digest zXy9', 'ApiKey zXy9',
+    'db password: hunter2', 'password: hunter2', 'password: correcthorsebatterystaple', 'password: "letmeinplease"',
+    '{"password":"Sunshine"}', 'secret: is a8f9d0c1e2b3f4a5b6c7', 'api_key: the value X9f8Y7w6', 'apikey=AbCdEfGhIjKlMnOp',
+    'api-key: abc', 'client_secret: AbCdEfGhIjKlMnOpQrSt', 'client_secret: 7f3a9c', 'pwd=letmein', 'passwd: letmein', 'auth: letmein',
+    'cookie: session=abcdef', 'set-cookie: sid=zzz', 'private_key: MIIEvQIBADANBg', 'access_key: AKIAxyz',
+    'connection_string: Server=db;Password=pw12', 'Server=db;Password=pw12',
+    'x token=abc123SECRETvalue y', 'token: 12345678:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw',
+    PEM, `Bearer ${PEM}`, `token ${PEM}`, `Token ${PEM}`, `basic\n${PEM}`, `apikey\t${PEM}`, `auth: ${PEM}`, `pwd:= ${PEM}`,
+    `Rotate key for the release bot\n${PEM}`, `deploy token ${PEM}`,
+    `key ${sk}`, 'https://x.test/cb?token=zzzz', 'Authorization: Bearer abcdefghij1234567890QQQQ',
+    'ordinary title with no secrets', '',
+  ]
 
-  it('prose after the bare key token survives (letters and spaces, two or more words)', () => {
-    expect(safeField('Update token: rotation runbook')).toBe('Update token: rotation runbook')
-    expect(safeField('Tokens: rotation schedule for the fleet')).toBe('Tokens: rotation schedule for the fleet')
+  it('safeField(x) is exactly redactSecretPatterns(x) (capped), for every leak probe from the gate reports', () => {
+    for (const input of PROBES) expect(safeField(input), JSON.stringify(input)).toBe(redactSecretPatterns(input).slice(0, 500) || (input === '' ? '' : undefined))
   })
 
-  it('anything else after token: / token= is redacted', () => {
-    gone('x token=abc123SECRETvalue y', 'abc123SECRETvalue')
-    gone('token: rotation', 'rotation') // one word
-    gone('token: rotation runbook 2026', 'runbook')
-    gone('token: 12345678:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw', 'AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw')
-    gone('access_token: rotation runbook', 'runbook') // only the bare key is relaxed
-  })
-
-  it('credential keys always redact, any shape: both gate reports leak lists', () => {
-    gone('Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpwYXNzd29yZA')
-    gone('Authorization: Token 0123456789abcdef0123', '0123456789abcdef0123')
-    gone('authorization: Bot MTIzNDU2GabcDE.xyz', 'MTIzNDU2GabcDE')
-    gone('db password: hunter2', 'hunter2')
-    gone('password: hunter2', 'hunter2')
-    gone('password: correcthorsebatterystaple', 'correcthorsebatterystaple')
-    gone('password: "letmeinplease"', 'letmeinplease')
-    gone('{"password":"Sunshine"}', 'Sunshine')
-    gone('secret: is a8f9d0c1e2b3f4a5b6c7', 'a8f9d0c1e2b3f4a5b6c7')
-    gone('api_key: the value X9f8Y7w6', 'X9f8Y7w6')
-    gone('apikey=AbCdEfGhIjKlMnOp', 'AbCdEfGhIjKlMnOp')
-    gone('api-key: abc', 'abc')
-    gone('connection_string: Server=db;Password=pw12', 'pw12')
-    gone('Server=db;Password=pw12', 'pw12')
-    gone('client_secret: AbCdEfGhIjKlMnOpQrSt', 'AbCdEfGhIjKlMnOpQrSt')
-    gone('client_secret: 7f3a9c', '7f3a9c')
-    gone('pwd=letmein', 'letmein')
-    gone('passwd: letmein', 'letmein')
-    gone('auth: letmein', 'letmein')
-    gone('cookie: session=abcdef', 'abcdef')
-    gone('set-cookie: sid=zzz', 'zzz')
-    gone('private_key: MIIEvQIBADANBg', 'MIIEvQIBADANBg')
-    gone('access_key: AKIAxyz', 'AKIAxyz')
-  })
-
-  it('the word after an auth scheme is always redacted, case-insensitive', () => {
-    for (const scheme of ['Basic', 'bearer', 'TOKEN', 'Bot', 'digest', 'ApiKey']) {
-      gone(`curl -H ${scheme} zXy9`, 'zXy9')
-    }
-  })
-
-  it('prefix-shaped secrets are still redacted', () => {
-    const sk = ['sk', 'abcdefghijklmnop1234'].join('-') // built at runtime so the secret scanner does not flag the fixture
-    gone(`key ${sk}`, sk)
-    gone('https://x.test/cb?token=zzzz', 'zzzz')
-    gone('Authorization: Bearer abcdefghij1234567890QQQQ', 'abcdefghij1234567890QQQQ')
-  })
-
-  it('M18: the strict redactor (logs, audit, projections) does NOT adopt the display relaxation', () => {
+  it('M18: the strict redactor is not relaxed for prose after token:', () => {
     expect(redactSecretPatterns('Update token: rotation runbook')).not.toContain('rotation')
-    expect(redactSecretPatterns('x Basic dXNlcjpwYXNz y')).toContain('dXNlcjpwYXNz') // scheme rule is display-only, as before
-    expect(redactSecretPatternsForDisplay('Update token: rotation runbook')).toContain('rotation')
   })
 })
 

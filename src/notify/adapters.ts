@@ -1,7 +1,7 @@
 // mupot — notify kernel adapters. Each wraps an EXISTING sender without changing it.
 import type { Env } from '../types'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
-import { redactSecretPatterns, redactSecretPatternsForDisplay } from '../lib/redact'
+import { redactSecretPatterns } from '../lib/redact'
 import { safeConsole } from '../lib/log'
 import type { Channel } from './carry'
 import { OWNER_RECIPIENT, type DeliveryOutcome, type NotifyContext, type NotifyEvent, type Recipient } from './types'
@@ -17,7 +17,7 @@ const FIELD_MAX = 500
 export function safeField(value: unknown): string | undefined {
   // Bus payloads are untyped: execute.ts emits project_id: null for a task with no project. null/undefined are absent.
   if (value === null || value === undefined) return undefined
-  return redactSecretPatternsForDisplay(typeof value === 'string' ? value : String(value)).slice(0, FIELD_MAX)
+  return redactSecretPatterns(typeof value === 'string' ? value : String(value)).slice(0, FIELD_MAX)
 }
 
 export function renderContext(ctx: NotifyContext | undefined): NotifyContext {

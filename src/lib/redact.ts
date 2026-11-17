@@ -36,27 +36,7 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
-// Display mode (notification text shown to a person). Credential keys ALWAYS redact their value, whatever its shape.
-// The one relaxation: the bare key `token`/`tokens` followed by plain prose (letters and spaces, two or more words), so
-// "Update token: rotation runbook" survives. Anything else after `token:` / `token=` is redacted.
-const EXTRA_DISPLAY_KEYS: ReadonlySet<string> = new Set(['auth', 'pwd'])
-const PROSE_VALUE_RE = /^[A-Za-z]+(?: +[A-Za-z]+)+$/
-const AUTH_SCHEME_RE = /\b(Basic|Bearer|Token|Bot|Digest|ApiKey)(\s+)(?!\[redacted\])[^\s"']+/gi
-
-function normalizeKey(key: string): string {
-  return key.replace(/[^a-z0-9]/gi, '').toLowerCase()
-}
-
-function isDisplayCredentialKey(key: string): boolean {
-  return isSensitiveDetailKey(key) || EXTRA_DISPLAY_KEYS.has(normalizeKey(key))
-}
-
-function isBareTokenKey(key: string): boolean {
-  const n = normalizeKey(key)
-  return n === 'token' || n === 'tokens'
-}
-
-function redactAssignments(text: string, display = false): string {
+function redactAssignments(text: string): string {
   let out = ''
   let cursor = 0
   ASSIGNMENT_HEAD_RE.lastIndex = 0
@@ -64,10 +44,9 @@ function redactAssignments(text: string, display = false): string {
     const head = m[1] ?? ''
     const key = m[2] ?? ''
     const valueStart = m.index + head.length
-    if (!(display ? isDisplayCredentialKey(key) : isSensitiveDetailKey(key))) continue // lastIndex is already at the value start: keep scanning inside it
+    if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
     const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
     if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
-    if (display && isBareTokenKey(key) && PROSE_VALUE_RE.test(valueMatch[0].trim())) continue
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
     ASSIGNMENT_HEAD_RE.lastIndex = cursor
@@ -75,26 +54,12 @@ function redactAssignments(text: string, display = false): string {
   return out + text.slice(cursor)
 }
 
-/**
- * For prose shown to a person (notification titles). Same as redactSecretPatterns, plus: the word after an auth scheme
- * (Basic, Bearer, Token, Bot, Digest, ApiKey) is always redacted, and the prose relaxation for the bare key `token`
- * described above. The strict redactSecretPatterns (logs, audit, projections) does NOT use this rule.
- */
-export function redactSecretPatternsForDisplay(text: string): string {
-  return redactWith(text, true)
-}
-
 export function redactSecretPatterns(text: string): string {
-  return redactWith(text, false)
-}
-
-function redactWith(text: string, display: boolean): string {
-  const staged = text
+  return text
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
-    .replace(/^[\s\S]*$/, (t) => redactAssignments(t, display))
-  return (display ? staged.replace(AUTH_SCHEME_RE, '$1$2[redacted]') : staged)
+    .replace(/^[\s\S]*$/, redactAssignments)
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
