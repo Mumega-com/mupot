@@ -58,6 +58,15 @@ describe('redact: bare scheme words', () => {
     expect(redactSecretPatterns(`basic ${b64}`)).not.toContain(b64)
     expect(redactSecretPatterns(`APIKEY ${b64}`)).not.toContain(b64)
   })
+  it('removes padded and symbol-bearing credentials', () => {
+    expect(redactSecretPatterns('Basic YWRtaW46aHVudGVyMg==')).not.toContain('YWRtaW46')
+    expect(redactSecretPatterns('Basic QWxhZGRpbjpvcGVuU2VzYW1l')).not.toContain('QWxhZGRpbjpvcGVu')
+  })
+  it('leaves prose unchanged', () => {
+    for (const text of ['Add basic pagination', 'basic authentication', 'ApiKey required', 'ApiKey authentication-required', 'Basic paginationsettings', 'Basic configuration overview here']) {
+      expect(redactSecretPatterns(text)).toBe(text)
+    }
+  })
 })
 
 describe('redact: pwd key', () => {
@@ -104,6 +113,39 @@ describe('redact: ordinary text is unchanged', () => {
       'error: connection refused at 10.0.0.1:5432',
     ]) {
       expect(redactSecretPatterns(text)).toBe(text)
+    }
+  })
+})
+
+describe('redact: delimiters and structure', () => {
+  it('removes a JSON password after a url field', () => {
+    const out = redactSecretPatterns('{"url":"http://db:5432","password":"hunter@2025tail"}')
+    expect(out).not.toContain('hunter')
+    expect(out).not.toContain('2025tail')
+    expect(out).toContain('http://db:5432')
+  })
+  it('keeps a url field followed by an email field intact', () => {
+    const text = '{"url":"http://db:5432/x","email":"a@b.co"}'
+    expect(redactSecretPatterns(text)).toBe(text)
+  })
+  it('handles an uppercase scheme', () => {
+    expect(redactSecretPatterns('HTTPS://bob:s3cr3tPassw0rd@x.test/a')).not.toContain('s3cr3tPassw0rd')
+  })
+  it('removes a key glued to a PEM end marker', () => {
+    const out = redactSecretPatterns(`${PEM}token:GLUEDSECRETVALUE`)
+    expect(out).not.toContain('GLUEDSECRETVALUE')
+    expect(out).not.toContain(BODY)
+  })
+  it('removes a PGP block private key', () => {
+    const out = redactSecretPatterns(`-----BEGIN PGP PRIVATE KEY BLOCK-----\n${BODY}\n-----END PGP PRIVATE KEY BLOCK-----`)
+    expect(out).not.toContain(BODY)
+  })
+  it('stays fast on large pathological input', () => {
+    for (const unit of ['a.', 'com.example.', 'word-']) {
+      const input = unit.repeat(Math.ceil(100_000 / unit.length))
+      const start = performance.now()
+      redactSecretPatterns(input)
+      expect(performance.now() - start).toBeLessThan(50)
     }
   })
 })
