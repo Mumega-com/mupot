@@ -279,7 +279,8 @@ async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message
       dedupe_key: `backup.${kind}:${date}:${reason}`,
       context: { title: `D1 nightly backup ${date}`, message },
     })
-    return wasDelivered(r, 'telegram_dm')
+    // A deduped owner means this exact alert already went out inside the window (a failed send frees its claim).
+    return wasDelivered(r, 'telegram_dm') || r.deduped.includes(OWNER_RECIPIENT)
   } catch (err) {
     safeConsole.error('[backup] alert threw', redact(String(err)))
     return false

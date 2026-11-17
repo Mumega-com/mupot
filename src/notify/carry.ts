@@ -1,7 +1,7 @@
 // mupot — notify kernel: the ONE carry table. Which channels may carry which kind of event.
 //
-// Pure data and pure functions; no I/O. Slice 1 does not make src/approval-bot/policy.ts read this table (its allow
-// list is unchanged); tests/notify-carry.test.ts proves the two agree, so slice 2 can switch policy.ts over.
+// Pure data and pure functions; no I/O. src/approval-bot/policy.ts derives its allow list from REVERSIBLE_ACTIONS here
+// (one source); tests/notify-carry.test.ts pins the list to the exact set the bot carried before the switch.
 import { ALL_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
 
 export type Severity = 'info' | 'attention' | 'decision' | 'critical'
@@ -16,8 +16,8 @@ export const PUSH_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['telegram_d
 export const PLAIN_BUTTON_CHANNELS: ReadonlySet<Channel> = new Set<Channel>(['approval_bot'])
 
 /**
- * Elevation actions whose decision may ride plain buttons. This mirrors APPROVAL_BOT_ACTIONS in
- * src/approval-bot/policy.ts; the carry test fails if the two drift. Every other action, including every unknown key,
+ * Elevation actions whose decision may ride plain buttons. This is the single source: APPROVAL_BOT_ACTIONS in
+ * src/approval-bot/policy.ts is this array. Every other action, including every unknown key,
  * is high_risk: mint_token, manage_access, grants, money, publish, deletes, deploys, home access, structure that
  * outlives a grant.
  */

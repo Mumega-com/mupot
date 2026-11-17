@@ -36,7 +36,7 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
-function redactAssignments(text: string): string {
+function redactAssignments(text: string, valueLooksSecret?: (value: string) => boolean): string {
   let out = ''
   let cursor = 0
   ASSIGNMENT_HEAD_RE.lastIndex = 0
@@ -47,6 +47,7 @@ function redactAssignments(text: string): string {
     if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
     const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
     if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
+    if (valueLooksSecret && !valueLooksSecret(valueMatch[0])) continue
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
     ASSIGNMENT_HEAD_RE.lastIndex = cursor
@@ -54,12 +55,27 @@ function redactAssignments(text: string): string {
   return out + text.slice(cursor)
 }
 
-export function redactSecretPatterns(text: string): string {
+/**
+ * For prose shown to a person (notification titles): a sensitive-looking key redacts its value only when the value is
+ * shaped like a secret (its first word is 8+ chars with a digit or symbol). "Update token: rotation runbook" is a
+ * title, not a credential. Prefix-shaped secrets (Bearer, sk-, ghp_, cfat_, JWT, PEM ...) are always redacted.
+ */
+export function redactSecretPatternsForDisplay(text: string): string {
+  return redactSecretPatterns(text, looksLikeSecretValue)
+}
+
+function looksLikeSecretValue(value: string): boolean {
+  // The first word decides: prose after "token:" starts with a plain word, a credential starts with a code-shaped run.
+  const first = value.trim().split(/\s+/, 1)[0] ?? ''
+  return first.length >= 8 && /[0-9_\-+/=.!@#$%^&]/.test(first)
+}
+
+export function redactSecretPatterns(text: string, valueLooksSecret?: (value: string) => boolean): string {
   return text
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
-    .replace(/^[\s\S]*$/, redactAssignments)
+    .replace(/^[\s\S]*$/, (t) => redactAssignments(t, valueLooksSecret))
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')

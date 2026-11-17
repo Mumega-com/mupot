@@ -144,7 +144,7 @@ describe('nightly backup', () => {
     expect(rows()).toHaveLength(1)
     expect(rows()[0]).toMatchObject({ status: 'skipped:no_credential', alerted: 1 })
     expect(calls.telegram).toHaveLength(1)
-    expect(calls.telegram[0]).toContain('BACKUP_CF_API_TOKEN')
+    expect(calls.telegram[0]).toContain('BACKUP\\_CF\\_API\\_TOKEN') // underscores are Markdown-escaped
     expect(calls.urls.some((u) => u.includes('/export'))).toBe(false)
     expect(r2.objects.size).toBe(0)
   })
@@ -193,6 +193,24 @@ describe('nightly backup', () => {
     await runNightlyBackup(envOf(), { runDate: TODAY }, step)
     await runNightlyBackup(envOf(), { runDate: TODAY }, step)
     expect(calls.telegram).toHaveLength(1)
+  })
+
+  it('alerted=0 when the alert send fails (M35)', async () => {
+    stubFetch([EXPORT_ERR])
+    const inner = globalThis.fetch
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).startsWith('https://api.telegram.org/') ? new Response('nope', { status: 500 }) : inner(input, init))
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(rows()[0]).toMatchObject({ status: 'failed', alerted: 0 })
+  })
+
+  it('a re-run whose identical alert was deduped records alerted=1: the alert already went out (M35, item 7)', async () => {
+    stubFetch([EXPORT_ERR, EXPORT_ERR])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    const all = rows()
+    expect(all).toHaveLength(2)
+    expect(all.map((r) => r.alerted)).toEqual([1, 1])
   })
 
   it('a failed backup is critical: it alerts even when the recipient is at the rate cap', async () => {
@@ -331,7 +349,7 @@ describe('nightly backup', () => {
       const calls = stubFetch([])
       await startNightlyBackup(envOf(), new Date('2026-10-26T03:17:00Z'))
       expect(calls.telegram).toHaveLength(1)
-      expect(calls.telegram[0]).toContain('BACKUP_WORKFLOW')
+      expect(calls.telegram[0]).toContain('BACKUP\\_WORKFLOW') // underscores are Markdown-escaped
     })
   })
 })

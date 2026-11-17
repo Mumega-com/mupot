@@ -57,6 +57,19 @@ export async function hmacSign(secret: string, body: string): Promise<string> {
     .join('')
 }
 
+/**
+ * Caller-supplied text (titles, messages, ids, type) is data, never markup. Legacy Markdown turns `[text](url)` into a
+ * link from the trusted bot, so every untrusted field is escaped before it joins the template: `_ * ` [` get a
+ * backslash. Inside a code span there is no escape, so ids drop backticks and backslashes instead.
+ */
+export function escapeTelegramMarkdown(s: string): string {
+  return s.replace(/([_*`[\]\\])/g, '\\$1')
+}
+
+function codeSafe(s: string): string {
+  return s.replace(/[`\\]/g, '')
+}
+
 export function formatTelegram(n: TaskNotification): string {
   const icons: Record<string, string> = {
     'task.review': '🔍',
@@ -67,15 +80,15 @@ export function formatTelegram(n: TaskNotification): string {
   }
   const isBackup = n.type.startsWith('backup.')
   const icon = isBackup ? '⚠️' : icons[n.type] || '📌'
-  const label = n.type.replace('task.', '').replace('backup.', '')
+  const label = escapeTelegramMarkdown(n.type.replace('task.', '').replace('backup.', ''))
 
   const lines: string[] = [isBackup ? `${icon} *Backup ${label}*` : `${icon} *Task ${label}*`]
-  if (n.title) lines.push(`${n.title}`)
-  if (n.task_id) lines.push('`' + n.task_id + '`')
-  if (n.agent_id) lines.push('👤 agent: `' + n.agent_id + '`')
-  if (n.squad_id) lines.push('🏠 squad: `' + n.squad_id + '`')
-  if (n.project_id) lines.push('📁 project: `' + n.project_id + '`')
-  if (n.message) lines.push(n.message)
+  if (n.title) lines.push(escapeTelegramMarkdown(n.title))
+  if (n.task_id) lines.push('`' + codeSafe(n.task_id) + '`')
+  if (n.agent_id) lines.push('👤 agent: `' + codeSafe(n.agent_id) + '`')
+  if (n.squad_id) lines.push('🏠 squad: `' + codeSafe(n.squad_id) + '`')
+  if (n.project_id) lines.push('📁 project: `' + codeSafe(n.project_id) + '`')
+  if (n.message) lines.push(escapeTelegramMarkdown(n.message))
   if (n.type === 'task.review') lines.push('', '_Waiting for your verdict._')
   if (n.type === 'task.blocked') lines.push('', '_May need your input._')
 
