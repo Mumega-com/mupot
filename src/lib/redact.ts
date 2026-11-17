@@ -40,6 +40,17 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
+// Re-scan the original span, preserving the real lookbehind and base output.
+// Only an empty sensitive head at its end can add a later redaction.
+const CHAIN_HEAD_RE = new RegExp(ASSIGNMENT_HEAD_RE.source, 'g')
+function trailingSensitiveHead(text: string, start: number, end: number): number | null {
+  CHAIN_HEAD_RE.lastIndex = start
+  for (let m = CHAIN_HEAD_RE.exec(text); m !== null && m.index < end; m = CHAIN_HEAD_RE.exec(text)) {
+    if (m.index + (m[1] ?? '').length >= end && isSensitiveDetailKey(m[2] ?? '')) return m.index
+  }
+  return null
+}
+
 function redactAssignments(text: string): string {
   let out = ''
   let cursor = 0
@@ -53,7 +64,8 @@ function redactAssignments(text: string): string {
     if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
-    ASSIGNMENT_HEAD_RE.lastIndex = cursor
+    const chain = trailingSensitiveHead(text, valueStart, cursor)
+    ASSIGNMENT_HEAD_RE.lastIndex = chain !== null ? chain : cursor
   }
   return out + text.slice(cursor)
 }
