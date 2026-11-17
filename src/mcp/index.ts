@@ -234,7 +234,8 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { NAMED_INTENT_TOOLS } from './named-intent'
 import { namedIntentEnabled } from '../members/named-intent'
-import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { connectionSubject, SEAT_ATTACH_TOOLS } from './seat-attach'
+import { loadConnectionEcho } from '../members/connection-echo'
 import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
 import { attachedOnboarding } from '../members/attached-onboarding'
@@ -6870,8 +6871,11 @@ const toolFleetAgentGet: ToolSpec = {
 
     // Observed facts boot recorded (migration 0235). Raw as reported; *_canonical is a hint, never a gate.
     const observed = row ? await readFleetBelief(env, row.agent_id) : null
+    const selfSubject = isSelf ? await connectionSubject(auth,env) : null
+    const echoStatus = await loadConnectionEcho(env,selfSubject?.ok ? selfSubject.context : {agentId:targetAgent.id})
     return done({
       agent_id: targetAgent.id,
+      echo_status: echoStatus,
       agent_slug: targetAgent.slug,
       squad_id: targetAgent.squad_id,
       runtime: routeInfo.runtime,
@@ -7627,6 +7631,12 @@ const toolBootContext: ToolSpec = {
       nextStepOut = `${nextStepOut} SHOW YOUR HUMAN THIS LINK to claim ${pendingClaim.agent}: ${pendingClaim.claim_url ?? `attach code ${pendingClaim.attach_code} (on their Connections page)`} (valid until ${pendingClaim.expires_at}). After they press Confirm, call seat_attach again.`
     }
 
+    // Only the authenticated agent's own returned inbox nonce clears this step.
+    const echoSubject = !ctx?.sideEffectFree && !wrongPrincipal && (auth.seatBinding?.attached || (!auth.seatBinding && auth.boundAgentId))
+      ? await connectionSubject(auth,env).catch(()=>null) : null
+    const echoStatus = echoSubject?.ok ? await loadConnectionEcho(env,echoSubject.context) : null
+    if(echoStatus && echoStatus.state!=='echo_roundtrip') nextStepOut += ' Next: complete inbox echo with connection_check {echo:true}, then reply with the nonce from your own inbox.'
+
     // First-steps from mupot itself for a freshly ATTACHED chat (server rows only; absent once the attachment is older than the window). A failed read degrades to "no block".
     const attachedOnboardingBlock = auth.seatBinding?.attached && !ctx?.sideEffectFree
       ? await attachedOnboarding(env, { attachmentId: auth.seatBinding.attached.attachmentId, agentId: auth.seatBinding.attached.agentId }).catch(() => null)
@@ -7658,6 +7668,7 @@ const toolBootContext: ToolSpec = {
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,
+      ...(echoStatus ? {echo_status:echoStatus} : {}),
       ...(ctx?.sideEffectFree ? {} : await joinNextStepsField(env, auth)),
       ...(ctx?.sideEffectFree ? {} : await squadChoiceField(env, auth)),
       ...(isMinted ? {} : { enroll_url: enrollHref }),
@@ -8232,7 +8243,7 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
 // drift from the others.
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
 // W2: seat_attach is advertised only while SEAT_ATTACH (and SEAT_AUTO_ENROLL) is on (flag off => tools/list unchanged).
-const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.map((t) => t.name))
+const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.filter(t => t.name !== 'connection_check').map((t) => t.name))
 // NAMED_INTENT_CONNECT: connect_intent is advertised only while its own flag (and both seat flags) is on (flag off => tools/list unchanged).
 const NAMED_INTENT_FLAG_TOOLS: ReadonlySet<string> = new Set(NAMED_INTENT_TOOLS.map((t) => t.name))
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page

@@ -1,19 +1,15 @@
 // tests/agent-messages.test.ts — agent↔agent durable inbox (squad → mupot migration, S3).
-// Service (send/inbox) + the send/inbox MCP tools. Uses a FAITHFUL in-memory D1 that mirrors
-// the real SQL semantics (auto seq, UNIQUE(tenant,request_id), consume-once, agents resolve).
+// Service (send/inbox) + the send/inbox MCP tools. Every fixture uses the real migration
+// chain: SQL changes in messages, fences, wake audit, or capability reads must be exercised
+// against the production schema rather than a SQL-matching mock.
 
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect } from 'vitest'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import { TOOLS } from '../src/mcp/index'
 import type { Env, AuthContext, CapabilityGrant } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-// SQLite's lower() is ASCII-only — it does not fold Unicode case. Use this, never
-// String.prototype.toLowerCase(), when mocking a `lower(...)` SQL predicate.
-function asciiLower(s: string): string {
-  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32))
-}
-
-// ── faithful in-memory D1 ─────────────────────────────────────────────────────────────────
 interface MsgRow {
   seq: number
   id: string
@@ -29,214 +25,99 @@ interface MsgRow {
   read_at: string | null
 }
 
+interface AgentRow {
+  id: string
+  squad_id: string
+  slug: string
+  name: string
+}
+
+interface TestDb {
+  db: SqliteD1Harness['db']
+  sqlite: SqliteD1Harness['sqlite']
+  readonly messages: MsgRow[]
+  readonly fences: Array<{ agent_id: string; mode: string; generation: number; key_fingerprint: string | null; updated_at: string }>
+  readonly agents: AgentRow[]
+}
+
+const openHarnesses = new Set<SqliteD1Harness>()
+
+afterEach(() => {
+  for (const harness of openHarnesses) harness.close()
+  openHarnesses.clear()
+})
+
+// ── real D1 fixture ────────────────────────────────────────────────────────────────────────
 function makeDb(
   opts: {
     agents?: Array<{ id: string; squad_id: string; slug: string; name: string }>
-    /** Force the first N findBySenderRequestId lookups to MISS — simulates the race where a
-     *  concurrent writer's row isn't visible to the pre-check but exists by re-check time. */
-    missDedupCalls?: number
     signedOnlyAgents?: string[]
     activeKeyAgents?: string[]
     /** squad_id -> department_id, for canOnSquad's department-inheritance lookup (gate 1). */
     squadDepartments?: Record<string, string | null>
   } = {},
 ) {
-  const messages: MsgRow[] = []
-  const agents = opts.agents ?? []
-  const signedOnlyAgents = new Set(opts.signedOnlyAgents ?? [])
-  const fences = new Map<string, {
-    mode: 'bearer_only' | 'signed_only'; generation: number; key_fingerprint: string | null; updated_at: string
-  }>([...signedOnlyAgents].map((agent) => [agent, {
-    mode: 'signed_only', generation: 1, key_fingerprint: 'f'.repeat(64), updated_at: '2026-06-19T12:00:00.000Z',
-  }]))
-  const activeKeyAgents = new Set(opts.activeKeyAgents ?? [])
-  let missLeft = opts.missDedupCalls ?? 0
-  let seqCounter = 0
+  const harness = createSqliteD1()
+  openHarnesses.add(harness)
+  applyAllMigrations(harness.sqlite)
+  const sqlite = harness.sqlite
+  sqlite.prepare(`INSERT INTO members (id, tenant, display_name, status, created_at) VALUES ('m1', 't', 'Member One', 'active', datetime('now'))`).run()
+  sqlite.prepare(`INSERT INTO members (id, tenant, display_name, status, created_at) VALUES ('owner-member', 't', 'Owner', 'active', datetime('now'))`).run()
 
-  function runRun(sql: string, b: unknown[]) {
-    if (sql.includes('INSERT INTO agent_inbox_fences')) {
-      const [, agent, mode, keyFingerprint, , updatedAt, , expectedGeneration] = b as [
-        string, string, 'bearer_only' | 'signed_only', string | null, string, string, string, number,
-      ]
-      const prior = fences.get(agent)
-      if ((prior?.generation ?? 0) !== expectedGeneration) return { meta: { changes: 0 } }
-      fences.set(agent, {
-        mode, generation: (prior?.generation ?? 0) + 1, key_fingerprint: keyFingerprint, updated_at: updatedAt,
-      })
-      return { meta: { changes: 1 } }
+  const departments = new Set<string>()
+  const squads = new Set<string>()
+  const agentIds = new Set<string>()
+  const squadDepartments = opts.squadDepartments ?? {}
+  const fixtureAgents: AgentRow[] = [
+    ...(opts.agents ?? []),
+    ...[...(opts.activeKeyAgents ?? []), ...(opts.signedOnlyAgents ?? [])]
+      .filter((id) => !(opts.agents ?? []).some((agent) => agent.id === id))
+      .map((id) => ({ id, squad_id: 'fixture-squad', slug: id, name: id })),
+  ]
+  for (const agent of fixtureAgents) {
+    const departmentId = squadDepartments[agent.squad_id] ?? `dept-${agent.squad_id}`
+    if (!departments.has(departmentId)) {
+      sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES (?1, ?2, ?3)`).run(departmentId, departmentId, departmentId)
+      departments.add(departmentId)
     }
-    if (sql.includes('DELETE FROM agent_inbox_fences')) {
-      const [, agent] = b as [string, string]
-      const changes = fences.delete(agent) ? 1 : 0
-      return { meta: { changes } }
+    if (!squads.has(agent.squad_id)) {
+      sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name, kind) VALUES (?1, ?2, ?3, ?4, 'work')`).run(agent.squad_id, departmentId, agent.squad_id, agent.squad_id)
+      squads.add(agent.squad_id)
     }
-    if (sql.includes('UPDATE agent_inbox_fences') && sql.includes("mode = 'bearer_only'")) {
-      const [, agent, updatedAt] = b as [string, string, string, string]
-      const prior = fences.get(agent)
-      fences.set(agent, {
-        mode: 'bearer_only', generation: (prior?.generation ?? 0) + 1, key_fingerprint: null, updated_at: updatedAt,
-      })
-      return { meta: { changes: 1 } }
+    if (!agentIds.has(agent.id)) {
+      sqlite.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES (?1, ?2, ?3, ?4, 'member', 'test', 'active')`).run(agent.id, agent.squad_id, agent.slug, agent.name)
+      agentIds.add(agent.id)
     }
-    if (sql.includes('INSERT INTO agent_messages')) {
-      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
-        b as [string, string, string, string, string, string, string, string | null, string | null, string, number]
-      // atomic cap guard — the real INSERT…SELECT…WHERE (unread count) < cap. At cap → 0 rows.
-      const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
-      if (typeof maxUnread === 'number' && unread >= maxUnread) {
-        return { meta: { changes: 0 } }
-      }
-      if (
-        request_id != null &&
-        messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)
-      ) {
-        throw new Error('UNIQUE constraint failed: idx_agent_messages_rid')
-      }
-      const seq = ++seqCounter
-      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null })
-      return { meta: { last_row_id: seq, changes: 1 } }
-    }
-    throw new Error('unhandled run sql: ' + sql)
+  }
+  for (const agent of opts.activeKeyAgents ?? []) {
+    sqlite.prepare(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES ('t', ?1, ?2, 'Ed25519', 'm1', 0)`).run(agent, 'A'.repeat(43))
+  }
+  for (const agent of opts.signedOnlyAgents ?? []) {
+    sqlite.prepare(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason)
+      VALUES ('t', ?1, 'signed_only', 1, ?2, 'owner-member', '2026-06-19T12:00:00.000Z', 'fixture')`).run(agent, 'f'.repeat(64))
   }
 
-  function runFirst(sql: string, b: unknown[]) {
-    if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
-      const [, agent] = b as [string, string]
-      return activeKeyAgents.has(agent)
-        ? { pubkey: 'A'.repeat(43), algo: 'Ed25519', member_id: 'm1' }
-        : null
-    }
-    if (/^\s*SELECT mode, generation(?:, key_fingerprint)?(?:, updated_at)? FROM agent_inbox_fences/.test(sql)) {
-      const [tenant, agent] = b as [string, string]
-      return tenant === 't' ? fences.get(agent) ?? null : null
-    }
-    if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
-      if (missLeft > 0) {
-        missLeft--
-        return null // forced pre-check miss (race simulation)
-      }
-      const [tenant, from_agent, request_id] = b as [string, string, string]
-      const m = messages.find(
-        (x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id,
-      )
-      return m
-        ? { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to }
-        : null
-    }
-    if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
-      const [tenant, to_agent] = b as [string, string]
-      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
-      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return { n: 0 }
-      const n = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
-      return { n }
-    }
-    if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
-      const [ref] = b as [string]
-      return agents.find((a) => a.id === ref) ?? null
-    }
-    if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
-      const [squadId] = b as [string]
-      const dept = (opts.squadDepartments ?? {})[squadId]
-      return dept === undefined ? null : { department_id: dept }
-    }
-    // loadSquadScope (src/auth/capability.ts) — canOnSquad's squad-scope
-    // load, used by recipientVisibilityOnSenderSquads. Every squad this test
-    // file references is treated as EXISTING (kind='work') even when
-    // `opts.squadDepartments` never set an entry for it — that map is only
-    // meaningful for the SEPARATE department-inheritance query above; a
-    // squad's own EXISTENCE (needed for the exact-match branch every squad-
-    // scope check now requires) is not the same fact as "does it have a
-    // configured department for inheritance testing". Falls back to an
-    // empty-string department id, which can never collide with a real one.
-    if (sql.includes('SELECT id, department_id, kind FROM squads WHERE id = ?1')) {
-      const [squadId] = b as [string]
-      const dept = (opts.squadDepartments ?? {})[squadId]
-      return { id: squadId, department_id: dept ?? '', kind: 'work' }
-    }
-    throw new Error('unhandled first sql: ' + sql)
-  }
-
-  function runAll(sql: string, b: unknown[]) {
-    if (sql.includes('INSERT INTO agent_inbox_fences')) {
-      const [, agent, mode, keyFingerprint, , updatedAt, , expectedGeneration] = b as [
-        string, string, 'bearer_only' | 'signed_only', string | null, string, string, string, number,
-      ]
-      const prior = fences.get(agent)
-      if ((prior?.generation ?? 0) !== expectedGeneration) return []
-      const row = {
-        mode, generation: (prior?.generation ?? 0) + 1, key_fingerprint: keyFingerprint, updated_at: updatedAt,
-      }
-      fences.set(agent, row)
-      return [row]
-    }
-    if (sql.includes('UPDATE agent_messages SET read_at')) {
-      const [readAt, tenant, to_agent, limit] = b as [string, string, string, number]
-      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
-      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return []
-      const claimed = messages
-        .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
-        .sort((x, y) => x.seq - y.seq)
-        .slice(0, limit)
-      for (const m of claimed) m.read_at = readAt
-      // RETURNING order is unspecified — shuffle to prove the service re-sorts by seq.
-      return claimed.slice().reverse().map((m) => ({ ...m }))
-    }
-    if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
-      const [tenant, to_agent, sinceSeq, limit] = b as [string, string, number, number]
-      const effectiveMode = fences.get(to_agent)?.mode ?? 'bearer_only'
-      if (!sql.includes("mode = 'signed_only'") && effectiveMode !== 'bearer_only') return []
-      return messages
-        .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > (sinceSeq ?? 0))
-        .sort((x, y) => x.seq - y.seq)
-        .slice(0, limit)
-        .map((m) => ({ ...m }))
-    }
-    if (sql.includes('FROM agents WHERE slug = ?1')) {
-      const [ref] = b as [string]
-      return agents.filter((a) => a.slug === ref)
-    }
-    if (sql.includes('WHERE lower(name) = lower(?1)')) {
-      // F4, 2026-09: SQLite's lower() is ASCII-only — it does NOT fold Unicode case (e.g.
-      // Élodie/ÉLODIE never match in real D1). JS .toLowerCase() folds Unicode, so a naive
-      // mock here would pass a test that fails in production. Mirror D1 with an ASCII-only fold.
-      const [ref] = b as [string]
-      return agents.filter((a) => asciiLower(a.name) === asciiLower(String(ref)))
-    }
-    throw new Error('unhandled all sql: ' + sql)
-  }
-
-  const db = {
-    _messages: messages,
-    _fences: fences,
-    prepare(sql: string) {
-      const binds: unknown[] = []
-      const api = {
-        bind(...a: unknown[]) {
-          binds.push(...a)
-          return api
-        },
-        async first<T>() {
-          return runFirst(sql, binds) as T
-        },
-        async all<T>() {
-          return { results: runAll(sql, binds) as T[] }
-        },
-        async run() {
-          return runRun(sql, binds)
-        },
-      }
-      return api
+  return {
+    db: harness.db,
+    sqlite,
+    get messages() {
+      return sqlite.prepare(`SELECT seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at FROM agent_messages ORDER BY seq`).all() as MsgRow[]
+    },
+    get fences() {
+      return sqlite.prepare(`SELECT agent_id, mode, generation, key_fingerprint, updated_at FROM agent_inbox_fences ORDER BY agent_id`).all() as TestDb['fences']
+    },
+    get agents() {
+      return sqlite.prepare(`SELECT id, squad_id, slug, name FROM agents ORDER BY id`).all() as AgentRow[]
     },
   }
-  return db
 }
 
-function envWith(db: ReturnType<typeof makeDb>, tenant: string = 't'): Env {
-  return { TENANT_SLUG: tenant, DB: db } as unknown as Env
+function envWith(fixture: TestDb, tenant: string = 't'): Env {
+  return { TENANT_SLUG: tenant, DB: fixture.db } as unknown as Env
 }
 // Explicit no-tenant env (a defaulted param would swallow `undefined` back to 't').
-function envNoTenant(db: ReturnType<typeof makeDb>): Env {
-  return { DB: db } as unknown as Env
+function envNoTenant(fixture: TestDb): Env {
+  return { DB: fixture.db } as unknown as Env
 }
 
 const fixedClock = { now: () => '2026-06-19T12:00:00.000Z', idGen: (() => { let n = 0; return () => `id-${++n}` })() }
@@ -245,6 +126,21 @@ const fixedClock = { now: () => '2026-06-19T12:00:00.000Z', idGen: (() => { let 
 // follow-up) — this file exercises the raw primitive directly, not through sendToRef's
 // confinement, so every call below asserts that plainly.
 const TEST_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
+
+// Commit a competing real SQLite write after lookup, before the next run().
+// Every statement/result still comes from D1; no SQL matching or lookup stubs.
+function interleaveNextRun(env:Env, effect:()=>void):void {
+  const real=env.DB;let fired=false
+  const wrap=(stmt:D1PreparedStatement):D1PreparedStatement=>new Proxy(stmt,{get(target,key){
+    if(key==='bind') return (...args:unknown[])=>wrap(target.bind(...args))
+    if(key==='run') return async()=>{if(!fired){fired=true;effect()}return target.run()}
+    const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+  }})
+  env.DB=new Proxy(real,{get(target,key){
+    if(key==='prepare') return (sql:string)=>wrap(target.prepare(sql))
+    const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+  }})
+}
 
 // ── service: send ─────────────────────────────────────────────────────────────────────────
 describe('sendAgentMessage', () => {
@@ -255,7 +151,7 @@ describe('sendAgentMessage', () => {
     if (!r.ok) return
     expect(r.seq).toBe(1)
     expect(r.duplicate).toBe(false)
-    const row = db._messages[0]
+    const row = db.messages[0]
     expect(row.tenant).toBe('t')
     expect(row.to_agent).toBe('ag-review')
     expect(row.from_agent).toBe('ag-code')
@@ -275,7 +171,7 @@ describe('sendAgentMessage', () => {
     expect(b.duplicate).toBe(true)
     expect(b.id).toBe(a.id)
     expect(b.seq).toBe(a.seq)
-    expect(db._messages.length).toBe(1)
+    expect(db.messages.length).toBe(1)
   })
 
   it('replay-once is SENDER-SCOPED — a different sender reusing the same rid is NOT a collision', async () => {
@@ -287,8 +183,8 @@ describe('sendAgentMessage', () => {
     expect(a.ok && b.ok).toBe(true)
     if (!a.ok || !b.ok) return
     expect(b.duplicate).toBe(false) // ag-b's send is NOT swallowed by ag-a's rid
-    expect(db._messages.length).toBe(2)
-    expect(db._messages.map((m) => m.body).sort()).toEqual(['from A', 'from B'])
+    expect(db.messages.length).toBe(2)
+    expect(db.messages.map((m) => m.body).sort()).toEqual(['from A', 'from B'])
   })
 
   it('an agent CANNOT pre-seed an rid to silently drop another agent‘s later send (anti-poison)', async () => {
@@ -315,7 +211,7 @@ describe('sendAgentMessage', () => {
     expect(reused.ok).toBe(false)
     if (reused.ok) return
     expect(reused.reason).toBe('request_id_conflict')
-    expect(db._messages.length).toBe(1) // the conflicting second send did NOT persist
+    expect(db.messages.length).toBe(1) // the conflicting second send did NOT persist
   })
 
   it('same sender + same rid + SAME content → idempotent duplicate', async () => {
@@ -339,41 +235,40 @@ describe('sendAgentMessage', () => {
     expect(third.ok).toBe(false)
     if (third.ok) return
     expect(third.reason).toBe('inbox_full')
-    expect(db._messages.length).toBe(2) // the capped send did NOT persist (atomic guard)
+    expect(db.messages.length).toBe(2) // the capped send did NOT persist (atomic guard)
     // consume one → budget frees → next send accepted
     await readAgentInbox(env, { agent: 'ag-x', limit: 1 })
     expect((await send('4')).ok).toBe(true)
   })
 
   it('dedup wins over the cap: a same-rid duplicate arriving while at cap resolves as duplicate, NOT inbox_full', async () => {
-    // Race: a concurrent writer already landed (rid r1, fills the cap of 1); THIS send is the
-    // same (sender, rid, content) but its pre-check misses the not-yet-visible row. The cap
-    // guard then refuses the insert (changes=0) — it must re-check and return the original.
-    const db = makeDb({ missDedupCalls: 1 })
-    db._messages.push({
-      seq: 1, id: 'A', tenant: 't', to_agent: 'ag-y', from_agent: 'ag-x', from_member: 'm',
-      kind: 'message', body: 'hi', request_id: 'r1', in_reply_to: null, created_at: 't0', read_at: null,
+    // The pre-check sees no row; writer A fills the cap before this INSERT.
+    const db = makeDb();const env=envWith(db);let interleaved=false
+    interleaveNextRun(env,()=>{
+      db.sqlite.prepare(`INSERT INTO agent_messages
+        (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at)
+        VALUES ('A', 't', 'ag-y', 'ag-x', 'm', 'message', 'hi', 'r1', NULL, 't0')`).run()
+      interleaved=true
     })
-    const env = envWith(db)
     const b = await sendAgentMessage(
       env,
       { fromAgent: 'ag-x', fromMember: 'm', toAgent: 'ag-y', body: 'hi', requestId: 'r1' },
       TEST_AUTHZ,
       { maxUnread: 1 },
     )
+    expect(interleaved).toBe(true)
     expect(b.ok).toBe(true)
     if (!b.ok) return
     expect(b.duplicate).toBe(true) // NOT inbox_full — the message actually landed (writer A)
     expect(b.id).toBe('A')
-    expect(db._messages.length).toBe(1) // no second row
+    expect(db.messages.length).toBe(1) // no second row
   })
 
   it('at cap with a NON-duplicate rid still returns inbox_full', async () => {
-    const db = makeDb({ missDedupCalls: 1 }) // force the (empty) pre-check + re-check to miss
-    db._messages.push({
-      seq: 1, id: 'X', tenant: 't', to_agent: 'ag-y', from_agent: 'ag-other', from_member: 'm',
-      kind: 'message', body: 'filler', request_id: null, in_reply_to: null, created_at: 't0', read_at: null,
-    })
+    const db = makeDb()
+    db.sqlite.prepare(`INSERT INTO agent_messages
+      (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at)
+      VALUES ('X', 't', 'ag-y', 'ag-other', 'm', 'message', 'filler', NULL, NULL, 't0')`).run()
     const env = envWith(db)
     const r = await sendAgentMessage(
       env,
@@ -415,8 +310,8 @@ describe('sendAgentMessage', () => {
     const req = await sendAgentMessage(env, { fromAgent: 'a', fromMember: 'm', toAgent: 'b', body: 'do X', kind: 'request', requestId: 'q1' }, TEST_AUTHZ)
     const ack = await sendAgentMessage(env, { fromAgent: 'b', fromMember: 'm', toAgent: 'a', body: 'done', kind: 'ack', inReplyTo: 'q1' }, TEST_AUTHZ)
     expect(req.ok && ack.ok).toBe(true)
-    expect(db._messages[1].kind).toBe('ack')
-    expect(db._messages[1].in_reply_to).toBe('q1')
+    expect(db.messages[1].kind).toBe('ack')
+    expect(db.messages[1].in_reply_to).toBe('q1')
   })
 })
 
@@ -460,7 +355,7 @@ describe('readAgentInbox', () => {
 
     const bearer = await readAgentInbox(env, { agent: 'ag-review' })
     expect(bearer).toMatchObject({ ok: false, reason: 'consumer_fenced' })
-    expect(db._messages[0].read_at).toBeNull()
+    expect(db.messages[0].read_at).toBeNull()
 
   })
 
@@ -551,7 +446,7 @@ describe('send / inbox tools', () => {
     expect(r.ok).toBe(true)
     if (!r.ok) return
     expect((r.result as { to: string }).to).toBe('ag-review')
-    expect(db._messages[0].from_agent).toBe('ag-code')
+    expect(db.messages[0].from_agent).toBe('ag-code')
   })
 
   it('inbox: a non-agent-bound token is refused (403)', async () => {
@@ -587,7 +482,7 @@ describe('send / inbox tools', () => {
 
     const blocked = await toolInbox.run(auth('ag-review'), env, {}, CTX)
     expect(blocked).toMatchObject({ ok: false, status: 409, error: 'consumer_fenced' })
-    expect(db._messages[0].read_at).toBeNull()
+    expect(db.messages[0].read_at).toBeNull()
 
     const opened = await toolInboxFenceSet.run(ownerAuth(), env, {
       agent: 'ag-review', mode: 'bearer_only', expected_generation: 1, reason: 'rollback to legacy subscriber',

@@ -12,23 +12,13 @@
 // So it is said HERE, in the one response that always succeeds on this channel.
 
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { invokeTool } from '../src/mcp/index'
 import type { AuthContext, Env } from '../src/types'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const ORIGIN = 'https://pot.test'
 
-function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
-  const failures: string[] = []
-  for (const f of readdirSync(MIGRATIONS_DIR).filter((x) => x.endsWith('.sql')).sort()) {
-    try { sqlite.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8')) }
-    catch (e) { failures.push(`${f}: ${String(e)}`) }
-  }
-  if (failures.length) throw new Error(`migrations did not apply cleanly:\n${failures.join('\n')}`)
-}
 
 let harness: SqliteD1Harness
 let env: Env

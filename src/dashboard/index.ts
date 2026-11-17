@@ -22,6 +22,8 @@
 // another pot. The wake action is performed by the browser POSTing to the
 // RBAC-gated /api/agents/:id/wake endpoint owned by the agents component.
 
+import { loadConnectionEcho } from '../members/connection-echo'
+import { agentEchoStatus } from './agent-echo-status'
 import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { Hono, type Context } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -2131,7 +2133,8 @@ dashboardApp.get('/agents/:id', async (c) => {
   // The Connect checklist lists (and approves) pending requests itself; the older single-purpose card would duplicate them.
   const claimCard = ownerView.connect && ownerView.connect.pending.length > 0 ? null : await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   const wakeCard = await loadAgentWakeCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
-  const onboardingCards = claimCard || wakeCard ? html`${claimCard ?? ''}${wakeCard ?? ''}` : null
+  const echoCard = agentEchoStatus(await loadConnectionEcho(c.env,{agentId:agent.id}))
+  const onboardingCards = html`${claimCard ?? ''}${wakeCard ?? ''}${echoCard}`
   return c.html(
     shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, {
       resume,

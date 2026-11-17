@@ -86,6 +86,14 @@ it('offers the background OAuth copy from the agent record', async () => {
   expect(body).toContain("You are ag1. Connect to mupot by OAuth as ag1 (choose &#39;This connection is Agent One&#39;), then run connection_check.")
 })
 
+it('shows inbox echo separately from the human connection checklist', async()=>{
+  const {env}=setup()
+  authState.current={...as('m-admin','admin'),boundAgentId:'ag1'}
+  const res=await dashboardApp.request(`${ORIGIN}/agents/ag1`,{},env)
+  expect(res.status).toBe(200)
+  expect(await res.text()).toContain('Echo not returned')
+})
+
 describe('agent Owner row + POST /agents/:id/owner', () => {
   it('shows No owner, then the owner name; admin sees the control', async () => {
     const { harness, env } = setup()
