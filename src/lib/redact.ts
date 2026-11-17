@@ -14,6 +14,11 @@ const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
 const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
+const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g
+const URL_PASSWORD_RE = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/?#]*:)[^\s@/?#]+@/gi
+// A bare scheme word with a credential-shaped value, with or without an Authorization header.
+const SCHEME_CREDENTIAL_RE = /\b(Basic|ApiKey)\s+(?!\[redacted\])[A-Za-z0-9+/=_.~-]{8,}/gi
+
 export function isSensitiveDetailKey(key: string): boolean {
   const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
   return normalized.endsWith('apikey')
@@ -30,6 +35,8 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('sharedaccesssignature')
     || normalized.endsWith('password')
     || normalized === 'passwd'
+    || normalized === 'pwd'
+    || normalized.endsWith('pwd')
     || normalized.endsWith('secret')
     || normalized.endsWith('cookie')
     || normalized.endsWith('credential')
@@ -56,11 +63,17 @@ function redactAssignments(text: string): string {
 
 export function redactSecretPatterns(text: string): string {
   return text
+    // PEM blocks FIRST: later rules (Bearer, key assignments) would otherwise consume or break the
+    // BEGIN marker so this rule no longer matched. An unterminated block redacts to end of input.
+    .replace(PEM_BLOCK_RE, '[redacted]')
+    // Credentials embedded in a URL authority: keep scheme, user and host.
+    .replace(URL_PASSWORD_RE, '$1[redacted]@')
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
     .replace(/^[\s\S]*$/, redactAssignments)
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+    .replace(SCHEME_CREDENTIAL_RE, '$1 [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
     // Cloudflare API tokens — live on this host as ~/.fleet/agents/*.token and passed to
@@ -73,7 +86,6 @@ export function redactSecretPatterns(text: string): string {
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
     .replace(/\bAKIA[A-Z0-9]{16}\b/g, '[redacted]')
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]')
-    .replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, '[redacted]')
 }
 
 export function redactStructuredDetail(value: unknown): unknown {
