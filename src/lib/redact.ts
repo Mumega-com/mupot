@@ -10,6 +10,9 @@
 // The delimiter is a lookbehind so a head's trailing whitespace never eats the delimiter of the next pair.
 const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=][ \t]*)/g
 const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
+// Continuation: a sensitive key with an EMPTY value whose value sits on the next, indented line
+// (`password:\n  value`). Applies only when that line is not itself a `key[:=]` head.
+const CONTINUATION_RE = /^(\r?\n[ \t]+)(?=[^ \t\r\n])(?!["']?[A-Za-z][A-Za-z0-9_.-]*["']?[ \t]*[:=])([^,;}&\r\n]+)/
 // A literal flag is not a secret: `has_token=true`.
 const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
@@ -49,8 +52,17 @@ function redactAssignments(text: string): string {
     const key = m[2] ?? ''
     const valueStart = m.index + head.length
     if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
-    const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
-    if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
+    const rest = text.slice(valueStart)
+    const valueMatch = ASSIGNMENT_VALUE_RE.exec(rest)
+    if (valueMatch === null) {
+      const cont = CONTINUATION_RE.exec(rest)
+      if (cont === null || LITERAL_FLAG_RE.test(cont[2] ?? '')) continue
+      out += text.slice(cursor, valueStart) + (cont[1] ?? '') + '[redacted]'
+      cursor = valueStart + cont[0].length
+      ASSIGNMENT_HEAD_RE.lastIndex = cursor
+      continue
+    }
+    if (LITERAL_FLAG_RE.test(valueMatch[0])) continue
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
     ASSIGNMENT_HEAD_RE.lastIndex = cursor

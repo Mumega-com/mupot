@@ -53,6 +53,35 @@ describe('redact: assignment values stop at end of line', () => {
     expect(redactSecretPatterns('password=')).toBe('password=')
   })
 
+  describe('indented continuation of an empty sensitive value', () => {
+    const cases: Array<[string, string]> = [
+      ['password:{E}  hunter2-fake', 'hunter2-fake'],
+      ['token={E}\tfake-tab-value', 'fake-tab-value'],
+      ['"secret":{E}  "fake-json-value"', 'fake-json-value'],
+    ]
+    for (const [tpl, secret] of cases) {
+      for (const eol of ['\n', '\r\n']) {
+        it(`redacts ${JSON.stringify(tpl)} with ${eol === '\n' ? 'LF' : 'CRLF'}`, () => {
+          expect(redactSecretPatterns(tpl.replace('{E}', eol))).not.toContain(secret)
+        })
+      }
+    }
+    for (const eol of ['\n', '\r\n']) {
+      it(`indented key head is its own head (${eol === '\n' ? 'LF' : 'CRLF'})`, () => {
+        const out = redactSecretPatterns(`password:${eol}  token=fake2`)
+        expect(out).not.toContain('fake2')
+        expect(out).toContain('token')
+      })
+      it(`non-sensitive empty key leaves indented line intact (${eol === '\n' ? 'LF' : 'CRLF'})`, () => {
+        const out = redactSecretPatterns(`name:${eol}  visible`)
+        expect(out).toBe(`name:${eol}  visible`)
+      })
+    }
+    it('does not continue onto a non-indented line', () => {
+      expect(redactSecretPatterns('password:\nvisible-plain')).toBe('password:\nvisible-plain')
+    })
+  })
+
   it('leaves ordinary prose unchanged', () => {
     const prose = 'The token was refreshed. Status: ok.\nNote: the password policy changed; see docs.\nTime: 10:30'
     expect(redactSecretPatterns(prose)).toBe(prose)
