@@ -8,12 +8,15 @@
 // key is sensitive: a head that is NOT sensitive (`Error: ...`, `status: 401 ...`) must leave its value
 // in place to be scanned, or a later `secret=...` inside it would be swallowed and never redacted.
 // The delimiter is a lookbehind so a head's trailing whitespace never eats the delimiter of the next pair.
-const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)/g
+const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)/g
 const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
 // A literal flag is not a secret: `has_token=true`.
 const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
 
+const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)/g
+// Bounded scheme, and user/password classes that cannot cross quotes or delimiters (linear, no JSON bleed).
+const URL_PASSWORD_RE = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/?#"'<>,;&{}]*:)[^\s@/?#"'<>,;&{}]+@/gi
 export function isSensitiveDetailKey(key: string): boolean {
   const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
   return normalized.endsWith('apikey')
@@ -30,6 +33,7 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('sharedaccesssignature')
     || normalized.endsWith('password')
     || normalized === 'passwd'
+    || normalized.endsWith('pwd')
     || normalized.endsWith('secret')
     || normalized.endsWith('cookie')
     || normalized.endsWith('credential')
@@ -56,6 +60,11 @@ function redactAssignments(text: string): string {
 
 export function redactSecretPatterns(text: string): string {
   return text
+    // PEM blocks FIRST: later rules (Bearer, key assignments) would otherwise consume or break the
+    // BEGIN marker so this rule no longer matched. An unterminated block redacts to end of input.
+    .replace(PEM_BLOCK_RE, '[redacted]')
+    // Credentials embedded in a URL authority: keep scheme, user and host.
+    .replace(URL_PASSWORD_RE, '$1[redacted]@')
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
@@ -73,7 +82,6 @@ export function redactSecretPatterns(text: string): string {
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
     .replace(/\bAKIA[A-Z0-9]{16}\b/g, '[redacted]')
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[redacted]')
-    .replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, '[redacted]')
 }
 
 export function redactStructuredDetail(value: unknown): unknown {
