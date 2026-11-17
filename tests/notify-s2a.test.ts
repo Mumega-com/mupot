@@ -8,7 +8,7 @@ import { REVERSIBLE_ACTIONS } from '../src/notify/carry'
 import { redactSecretPatterns, redactSecretPatternsForDisplay } from '../src/lib/redact'
 import type { NotifyEvent } from '../src/notify/types'
 import { APPROVAL_BOT_ACTIONS } from '../src/approval-bot/policy'
-import { escapeTelegramMarkdown, formatTelegram } from '../src/telegram-bridge/bus_notify'
+import { TELEGRAM_MAX_CHARS, escapeTelegramHtml, formatTelegram, telegramHtmlToPlain } from '../src/telegram-bridge/bus_notify'
 import { handleQueue } from '../src/bus/consumer'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -28,62 +28,86 @@ beforeEach(() => {
 })
 afterEach(() => { h.close(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-describe('item 1: caller text is never Markdown', () => {
+describe('item 1: caller text is never markup (parse_mode HTML)', () => {
   const EVIL = '[Approve now](https://evil.example)'
-  // Anything in `text` that legacy Markdown could read as markup: an unescaped [ _ * ` outside a code span.
-  const strip = (t: string): string => t.replace(/`[^`]*`/g, '').replace(/\\[_*`[]/g, '')
+  const FIXED_TAG_RE = /<\/?(?:b|i|code)>/g
+  // After removing the fixed constants, no < or > may remain, and every & must start a known entity.
+  const leftovers = (html: string): string => html.replace(FIXED_TAG_RE, '')
+  const wellFormed = (html: string): boolean => {
+    const rest = leftovers(html)
+    return !/[<>]/.test(rest) && !/&(?!(?:amp|lt|gt|quot);)/.test(rest)
+  }
 
-  it('a markdown link in a title is escaped, so it cannot become a link', () => {
-    const text = formatTelegram({ type: 'task.review', title: EVIL })
-    expect(text).toContain('\\[Approve now](https://evil.example)')
-    expect(strip(text)).not.toContain('[')
-  })
-
-  it('underscores, asterisks and backticks in a title or message are escaped', () => {
-    const text = formatTelegram({ type: 'task.blocked', title: 'a_b *bold* `code`', message: 'x_y *z* `q`' })
-    expect(text).toContain('a\\_b \\*bold\\* \\`code\\`')
-    expect(text).toContain('x\\_y \\*z\\* \\`q\\`')
-  })
-
-  it('only characters legacy Markdown honours are escaped: ] and \\ render as typed', () => {
-    expect(escapeTelegramMarkdown('[WIP] fix')).toBe('\\[WIP] fix')
-    expect(escapeTelegramMarkdown('Fix [P1] bug, C:\\Users, [redacted]')).toBe('Fix \\[P1] bug, C:\\Users, \\[redacted]')
-  })
-
-  it('fuzz: no combination of hostile characters leaves a raw [ _ * ` outside a code span', () => {
-    const atoms = ['[', ']', '(', ')', '_', '*', '`', '\\', 'https://evil.example', 'a', ' ']
-    let seed = 12345
-    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n }
-    for (let k = 0; k < 2000; k++) {
-      const t = Array.from({ length: 1 + rnd(14) }, () => atoms[rnd(atoms.length)]).join('')
-      // task.created has no italic trailer, so every [ _ * ` after the constant header is caller text.
-      const body = formatTelegram({ type: 'task.created', title: t, message: t }).split('\n').slice(1).join('\n')
-      expect(strip(body)).not.toMatch(/[[_*`]/)
+  it('hostile titles render literally: tags, entities, markdown links and code-span breakouts', () => {
+    for (const t of ['<a href="https://evil.example">Approve</a>', '&lt;b&gt;', EVIL, '</code><b>x</b>', '"><script>', 'a & b']) {
+      const html = formatTelegram({ type: 'task.review', title: t, message: t, task_id: t, agent_id: t })
+      expect(wellFormed(html), t).toBe(true)
+      expect(html).not.toContain('<a ')
+      expect(telegramHtmlToPlain(html)).toContain(t) // renders back to exactly what was typed
     }
   })
 
-  it('the bold header holds only constants: a hostile type or id never sits inside bold', () => {
-    const text = formatTelegram({ type: 'task.x*', task_id: '[Approve](https://evil.example)' })
-    const [header, idLine] = text.split('\n')
-    expect(header).toBe('📌 *Task* x\\*')
-    expect(idLine).toBe('`[Approve](https://evil.example)`')
-    const known = formatTelegram({ type: 'task.review' }).split('\n')[0]
-    expect(known).toBe('🔍 *Task review*')
+  it('[WIP], C:\\Users, underscores and asterisks need no escaping and appear as typed', () => {
+    const html = formatTelegram({ type: 'task.blocked', title: '[WIP] C:\\Users a_b *c* `d` [redacted]' })
+    expect(html).toContain('[WIP] C:\\Users a_b *c* `d` [redacted]')
+    expect(html).not.toContain('\\\\')
   })
 
-  it('ids in code spans cannot break out of the span', () => {
-    const text = formatTelegram({ type: 'task.review', task_id: 'a`](https://evil.example)[`', agent_id: 'b`c', squad_id: 's\\', project_id: 'p`' })
-    for (const line of text.split('\n').filter((l) => l.includes('`'))) expect((line.match(/`/g) ?? []).length % 2).toBe(0)
-    expect(text).not.toContain('`](https://evil.example)')
+  it('escaper covers & < > and " (the & first, so entities are not double-decoded)', () => {
+    expect(escapeTelegramHtml('<a href="x">&amp;</a>')).toBe('&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;')
+    expect(telegramHtmlToPlain(escapeTelegramHtml('&lt; &amp;lt; <b>'))).toBe('&lt; &amp;lt; <b>')
   })
 
-  it('the real telegram path sends the escaped title as Markdown', async () => {
+  it('fuzz: the rendered HTML contains no tag other than the fixed constants', () => {
+    const atoms = ['<', '>', '&', '"', "'", '</code>', '<b>', '<a href="x">', '&lt;', '&#60;', '[', ']', '(', ')', '`', '\\', 'a', ' ', '\n']
+    let seed = 987654
+    const rnd = (n: number): number => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n }
+    for (let k = 0; k < 3000; k++) {
+      const t = Array.from({ length: 1 + rnd(14) }, () => atoms[rnd(atoms.length)]).join('')
+      const html = formatTelegram({ type: rnd(2) ? 'task.created' : `task.${t}`, title: t, message: t, task_id: t, agent_id: t, squad_id: t, project_id: t })
+      expect(wellFormed(html), JSON.stringify(t)).toBe(true)
+    }
+  })
+
+  it('the bold header holds only constants: a hostile type or id never sits inside <b>', () => {
+    const html = formatTelegram({ type: 'task.x*', task_id: '</code><b>[Approve](https://evil.example)' })
+    const [header, idLine] = html.split('\n')
+    expect(header).toBe('📌 <b>Task</b> x*')
+    expect(idLine).toBe('<code>&lt;/code&gt;&lt;b&gt;[Approve](https://evil.example)</code>')
+    expect(formatTelegram({ type: 'task.review' }).split('\n')[0]).toBe('🔍 <b>Task review</b>')
+    expect(formatTelegram({ type: 'task.<b>' }).split('\n')[0]).toBe('📌 <b>Task</b> &lt;b&gt;')
+  })
+
+  it('over the length cap the HTML is clipped before escaping: never a cut tag or entity', () => {
+    const t = '&<'.repeat(250)
+    // vary the prefix so a naive cut would land inside a tag or entity at some offset
+    for (let pad = 0; pad < 12; pad++) {
+      const html = formatTelegram({ type: 'task.review', title: 'x'.repeat(pad) + t, message: t, task_id: t, agent_id: t, squad_id: t, project_id: t })
+      expect(html.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS + 20)
+      expect(wellFormed(html.replace('\n…(truncated)', '')), `pad ${pad}`).toBe(true)
+    }
+  })
+
+  it('the real telegram path sends parse_mode HTML with the title escaped', async () => {
     const fetchMock = vi.fn(async () => ({ ok: true, status: 200, text: async () => '{}' }) as unknown as Response)
     vi.stubGlobal('fetch', fetchMock)
-    await notify(envOf(), ev({ context: { title: EVIL } }))
+    await notify(envOf(), ev({ context: { title: '<a href="https://evil.example">Approve</a>' } }))
     const body = JSON.parse(((fetchMock.mock.calls[0] as unknown[])[1] as RequestInit).body as string) as { text: string; parse_mode?: string }
-    expect(body.parse_mode).toBe('Markdown')
-    expect(body.text).toContain('\\[Approve now](https://evil.example)')
+    expect(body.parse_mode).toBe('HTML')
+    expect(body.text).toContain('&lt;a href=&quot;https://evil.example&quot;&gt;Approve&lt;/a&gt;')
+    expect(body.text).not.toContain('<a ')
+  })
+
+  it('a 400 parse error retries once as plain text with the fixed tags dropped and entities decoded', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 400, text: async () => "can't parse entities" } as unknown as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '{}' } as unknown as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    await notify(envOf(), ev({ type: 'task.review', context: { title: 'a < b & c' } }))
+    const second = JSON.parse(((fetchMock.mock.calls[1] as unknown[])[1] as RequestInit).body as string) as { text: string; parse_mode?: string }
+    expect(second.parse_mode).toBeUndefined()
+    expect(second.text).toContain('a < b & c')
+    expect(second.text).not.toMatch(/<\/?(?:b|i|code)>/)
   })
 })
 

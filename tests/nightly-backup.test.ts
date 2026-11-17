@@ -144,7 +144,7 @@ describe('nightly backup', () => {
     expect(rows()).toHaveLength(1)
     expect(rows()[0]).toMatchObject({ status: 'skipped:no_credential', alerted: 1 })
     expect(calls.telegram).toHaveLength(1)
-    expect(calls.telegram[0]).toContain('BACKUP\\_CF\\_API\\_TOKEN') // underscores are Markdown-escaped
+    expect(calls.telegram[0]).toContain('BACKUP_CF_API_TOKEN')
     expect(calls.urls.some((u) => u.includes('/export'))).toBe(false)
     expect(r2.objects.size).toBe(0)
   })
@@ -349,7 +349,7 @@ describe('nightly backup', () => {
       const calls = stubFetch([])
       await startNightlyBackup(envOf(), new Date('2026-10-26T03:17:00Z'))
       expect(calls.telegram).toHaveLength(1)
-      expect(calls.telegram[0]).toContain('BACKUP\\_WORKFLOW') // underscores are Markdown-escaped
+      expect(calls.telegram[0]).toContain('BACKUP_WORKFLOW')
     })
   })
 })

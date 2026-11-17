@@ -58,23 +58,32 @@ export async function hmacSign(secret: string, body: string): Promise<string> {
 }
 
 /**
- * Caller-supplied text (titles, messages, type) is data, never markup. Legacy Markdown turns `[text](url)` into a link
- * from the trusted bot, so every untrusted field is escaped before it joins the template. Legacy Markdown honours a
- * backslash only before `_ * ` [` (tdlib parse_markdown), so only those are escaped: `]` and `\` stay as typed, and
- * "[WIP] fix", "[redacted]" and "C:\Users" render cleanly. Escapes do nothing inside an entity (bold, code), so
- * caller text is never placed inside one: ids in code spans lose backticks and backslashes instead.
+ * Owner notifications are sent with parse_mode HTML. Caller-supplied text (titles, messages, ids, type) is data,
+ * never markup: it is run through this complete escaper before it joins the template, so it can only ever be text.
+ * Fixed markup (<b>, <i>, <code>) comes from constants in formatTelegram and nowhere else. No attributes and no links
+ * are ever emitted, so `"` needs no special handling inside tags; it is escaped anyway.
  */
-export function escapeTelegramMarkdown(s: string): string {
-  return s.replace(/([_*`[])/g, '\\$1')
+export function escapeTelegramHtml(s: string): string {
+  const map: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }
+  return s.replace(/[&<>"]/g, (c) => map[c] ?? c)
 }
 
-function codeSafe(s: string): string {
-  return s.replace(/[`\\]/g, '')
+/** The same message with the fixed tags dropped and entities decoded: what the plain-text retry and the webhook send. */
+export function telegramHtmlToPlain(html: string): string {
+  return html
+    .replace(/<\/?(?:b|i|code)>/g, '')
+    .replace(/&(lt|gt|quot|amp);/g, (_m, e: string) => ({ lt: '<', gt: '>', quot: '"', amp: '&' })[e] ?? _m)
 }
 
 const KNOWN_LABELS: ReadonlySet<string> = new Set(['review', 'blocked', 'verdict', 'created', 'completed', 'failed', 'skipped'])
 
-export function formatTelegram(n: TaskNotification): string {
+function clip(v: string | undefined, max: number): string | undefined {
+  if (v === undefined || v.length <= max) return v
+  const cut = v.slice(0, max)
+  return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut // never leave half a surrogate pair
+}
+
+function buildHtml(n: TaskNotification, fieldMax: number): string {
   const icons: Record<string, string> = {
     'task.review': '🔍',
     'task.blocked': '🚧',
@@ -85,24 +94,36 @@ export function formatTelegram(n: TaskNotification): string {
   const isBackup = n.type.startsWith('backup.')
   const icon = isBackup ? '⚠️' : icons[n.type] || '📌'
   const label = n.type.replace('task.', '').replace('backup.', '')
+  const e = (v: string): string => escapeTelegramHtml(clip(v, fieldMax) ?? '')
 
-  // Bold holds only constants: a known label is bolded with the noun; anything else follows the bold noun as escaped text.
+  // <b> holds only constants: a known label is bolded with the noun; anything else follows the bold noun as escaped text.
   const noun = isBackup ? 'Backup' : 'Task'
-  const header = KNOWN_LABELS.has(label) ? `*${noun} ${label}*` : `*${noun}* ${escapeTelegramMarkdown(label)}`
+  const header = KNOWN_LABELS.has(label) ? `<b>${noun} ${label}</b>` : `<b>${noun}</b> ${e(label)}`
   const lines: string[] = [`${icon} ${header}`]
-  if (n.title) lines.push(escapeTelegramMarkdown(n.title))
-  if (n.task_id) lines.push('`' + codeSafe(n.task_id) + '`')
-  if (n.agent_id) lines.push('👤 agent: `' + codeSafe(n.agent_id) + '`')
-  if (n.squad_id) lines.push('🏠 squad: `' + codeSafe(n.squad_id) + '`')
-  if (n.project_id) lines.push('📁 project: `' + codeSafe(n.project_id) + '`')
-  if (n.message) lines.push(escapeTelegramMarkdown(n.message))
-  if (n.type === 'task.review') lines.push('', '_Waiting for your verdict._')
-  if (n.type === 'task.blocked') lines.push('', '_May need your input._')
+  if (n.title) lines.push(e(n.title))
+  if (n.task_id) lines.push(`<code>${e(n.task_id)}</code>`)
+  if (n.agent_id) lines.push(`👤 agent: <code>${e(n.agent_id)}</code>`)
+  if (n.squad_id) lines.push(`🏠 squad: <code>${e(n.squad_id)}</code>`)
+  if (n.project_id) lines.push(`📁 project: <code>${e(n.project_id)}</code>`)
+  if (n.message) lines.push(e(n.message))
+  if (n.type === 'task.review') lines.push('', '<i>Waiting for your verdict.</i>')
+  if (n.type === 'task.blocked') lines.push('', '<i>May need your input.</i>')
+  return lines.join('\n')
+}
 
-  const text = lines.join('\n')
-  return text.length > TELEGRAM_MAX_CHARS
-    ? text.slice(0, TELEGRAM_MAX_CHARS - 20) + '\n…(truncated)'
-    : text
+/**
+ * HTML for Telegram (parse_mode HTML). Over the length cap, every caller field is clipped (halving) BEFORE escaping so
+ * a tag or entity is never cut in half; the notice is appended after.
+ */
+export function formatTelegram(n: TaskNotification): string {
+  let text = buildHtml(n, Number.POSITIVE_INFINITY)
+  if (text.length <= TELEGRAM_MAX_CHARS) return text
+  let max = 2000
+  do {
+    text = buildHtml(n, max) + '\n…(truncated)'
+    max = Math.floor(max / 2)
+  } while (text.length > TELEGRAM_MAX_CHARS && max > 0)
+  return text
 }
 
 /**
@@ -130,9 +151,9 @@ async function postJson(url: string, body: string, headers: Record<string, strin
 /**
  * Send straight to the Telegram Bot API.
  *
- * Caller text is escaped in formatTelegram, so a parse failure should not happen. If Telegram still rejects the
- * Markdown (400 "can't parse entities"), we retry once as PLAIN TEXT: the escapes then show as backslashes, but a
- * notification that arrives unformatted beats one that vanishes.
+ * Caller text is HTML-escaped in formatTelegram, so a parse failure should not happen. If Telegram still rejects it
+ * (400 "can't parse entities"), we retry once as PLAIN TEXT (tags dropped, entities decoded): a notification that
+ * arrives unformatted beats one that vanishes.
  */
 async function sendDirect(
   token: string,
@@ -144,7 +165,7 @@ async function sendDirect(
   const url = `${TELEGRAM_API}/bot${token}/sendMessage`
   const base = { chat_id: chatId, disable_web_page_preview: true }
 
-  for (const attempt of [{ ...base, text, parse_mode: 'Markdown' }, { ...base, text }]) {
+  for (const attempt of [{ ...base, text, parse_mode: 'HTML' }, { ...base, text: telegramHtmlToPlain(text) }]) {
     let resp: Response
     try {
       resp = await postJson(url, JSON.stringify(attempt), { 'Content-Type': 'application/json' })
@@ -160,7 +181,7 @@ async function sendDirect(
     const detail = await resp.text().catch(() => '')
     // Only a parse failure is worth retrying; 401/403/429 will not improve on attempt 2.
     if (resp.status === 400 && detail.includes('parse')) {
-      safeConsole.warn('telegram-bridge: markdown rejected, retrying as plain text')
+      safeConsole.warn('telegram-bridge: html rejected, retrying as plain text')
       continue
     }
     safeConsole.error('telegram-bridge: telegram returned', resp.status, detail.slice(0, 200))
@@ -189,7 +210,7 @@ export async function notifyHadi(
   if (webhookUrl && secret) {
     const body = JSON.stringify({
       type: 'task_event',
-      notification: { ...notification, text },
+      notification: { ...notification, text: telegramHtmlToPlain(text) },
     })
     const signature = await hmacSign(secret, body)
     try {
