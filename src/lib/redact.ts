@@ -8,11 +8,10 @@
 // key is sensitive: a head that is NOT sensitive (`Error: ...`, `status: 401 ...`) must leave its value
 // in place to be scanned, or a later `secret=...` inside it would be swallowed and never redacted.
 // The delimiter is a lookbehind so a head's trailing whitespace never eats the delimiter of the next pair.
-const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=][ \t]*)/g
+const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)/g
 const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
-// Continuation: a sensitive key with an EMPTY value whose value sits on the next, indented line
-// (`password:\n  value`). Applies only when that line is not itself a `key[:=]` head.
-const CONTINUATION_RE = /^(\r?\n[ \t]+)(?=[^ \t\r\n])(?!["']?[A-Za-z][A-Za-z0-9_.-]*["']?[ \t]*[:=])([^,;}&\r\n]+)/
+// Whether a head's trailing whitespace crossed a line break (the value then starts on a later line).
+const LINE_BREAK_RE = /[\r\n\u2028\u2029]/
 // A literal flag is not a secret: `has_token=true`.
 const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
 const QUERY_ASSIGNMENT_RE = /([?&])([A-Za-z][A-Za-z0-9_.-]*)(=)[^&#\s]*/g
@@ -43,6 +42,17 @@ export function isSensitiveDetailKey(key: string): boolean {
     || normalized.endsWith('credentials')
 }
 
+// Private copy so the outer scan's lastIndex is untouched (synchronous use only).
+const INNER_HEAD_RE = new RegExp(ASSIGNMENT_HEAD_RE.source, 'g')
+// Offset of the first SENSITIVE key head inside `line`, or -1. Same head shape and boundary as ASSIGNMENT_HEAD_RE.
+function firstSensitiveHead(line: string): number {
+  INNER_HEAD_RE.lastIndex = 0
+  for (let m = INNER_HEAD_RE.exec(line); m !== null; m = INNER_HEAD_RE.exec(line)) {
+    if (isSensitiveDetailKey(m[2] ?? '')) return m.index
+  }
+  return -1
+}
+
 function redactAssignments(text: string): string {
   let out = ''
   let cursor = 0
@@ -52,17 +62,21 @@ function redactAssignments(text: string): string {
     const key = m[2] ?? ''
     const valueStart = m.index + head.length
     if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
-    const rest = text.slice(valueStart)
-    const valueMatch = ASSIGNMENT_VALUE_RE.exec(rest)
-    if (valueMatch === null) {
-      const cont = CONTINUATION_RE.exec(rest)
-      if (cont === null || LITERAL_FLAG_RE.test(cont[2] ?? '')) continue
-      out += text.slice(cursor, valueStart) + (cont[1] ?? '') + '[redacted]'
-      cursor = valueStart + cont[0].length
-      ASSIGNMENT_HEAD_RE.lastIndex = cursor
-      continue
+    const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
+    if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
+    // The value began on a later line and holds a sensitive key head: do not consume that head as this
+    // key's value. Redact only what precedes it, and let the scan redact the inner key on its own.
+    if (LINE_BREAK_RE.test(head)) {
+      const inner = firstSensitiveHead(valueMatch[0])
+      if (inner >= 0) {
+        if (inner > 0) {
+          out += text.slice(cursor, valueStart) + '[redacted]'
+          cursor = valueStart + inner
+        }
+        ASSIGNMENT_HEAD_RE.lastIndex = valueStart + inner
+        continue
+      }
     }
-    if (LITERAL_FLAG_RE.test(valueMatch[0])) continue
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
     ASSIGNMENT_HEAD_RE.lastIndex = cursor
