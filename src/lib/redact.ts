@@ -8,7 +8,7 @@
 // key is sensitive: a head that is NOT sensitive (`Error: ...`, `status: 401 ...`) must leave its value
 // in place to be scanned, or a later `secret=...` inside it would be swallowed and never redacted.
 // The delimiter is a lookbehind so a head's trailing whitespace never eats the delimiter of the next pair.
-const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=]\s*)/g
+const ASSIGNMENT_HEAD_RE = /(?<=^|[\s,;{?&\]])(["']?([A-Za-z][A-Za-z0-9_.-]*)["']?\s*[:=][ \t]*)/g
 const ASSIGNMENT_VALUE_RE = /^[^,;}&\r\n]+/
 // A literal flag is not a secret: `has_token=true`.
 const LITERAL_FLAG_RE = /^\s*["']?(?:true|false|null|undefined)["']?\s*$/i
