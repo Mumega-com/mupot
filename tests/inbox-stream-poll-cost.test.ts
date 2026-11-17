@@ -1,6 +1,6 @@
 // tests/inbox-stream-poll-cost.test.ts — the SSE tick must stay cheap (prod 2026-10-25: 97% of D1 queries
 // were /api/inbox/stream at 1 s x ~86 streams). Real migration schema; statements counted via a prepare proxy.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { STREAM_REVALIDATE_MS, streamInboxEvents, type InboxStreamEvent } from '../src/agents/inbox-routes'
@@ -41,7 +41,7 @@ beforeEach(() => {
   })
   env = { DB: wrapped, TENANT_SLUG: TENANT } as unknown as Env
 })
-afterEach(() => harness.close())
+afterEach(() => {harness.close();vi.useRealTimers()})
 
 describe('inbox stream poll cost', () => {
   it('idle stream over 60 s: 1 statement per tick after the connect flush, one revalidate', async () => {
@@ -60,6 +60,18 @@ describe('inbox stream poll cost', () => {
     expect(total).toBeLessThanOrEqual(3 + 6)
     expect(total - afterConnect).toBeLessThanOrEqual(9)
     expect(revalidations).toBe(1)
+    await gen.return(undefined)
+  })
+
+  it('records active empty polls with two statements, then returns to one after expiry',async()=>{
+    vi.useFakeTimers();const t0=Date.parse('2026-11-17T12:00:00Z');vi.setSystemTime(t0)
+    harness.sqlite.prepare("INSERT INTO agent_audit(id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state) VALUES('active-echo',?,'system','system','connection_wake_challenge','[]','{}',?)").run(AGENT,JSON.stringify({expires_at:new Date(t0+600000).toISOString()}))
+    const c=clock();const gen=streamInboxEvents(env,{agent:AGENT,since:0},{sleep:c.sleep,nowMs:c.nowMs})
+    await nextOf(gen);let before=n
+    expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat');expect(n-before).toBe(2)
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").get()).toMatchObject({n:1})
+    vi.setSystemTime(t0+600001);before=n
+    expect(((await nextOf(gen)).value as InboxStreamEvent).type).toBe('heartbeat');expect(n-before).toBe(1)
     await gen.return(undefined)
   })
 

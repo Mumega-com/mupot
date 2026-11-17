@@ -261,7 +261,6 @@ export async function connectionSubject(auth: AuthContext, env: Env) {
         return { ok: false as const, error: 'connection_not_live', identity, next_step }
       }
       credentialId = live.seat_token_id
-      memberId = (await env.DB.prepare('SELECT member_id FROM member_tokens WHERE id=?1 AND tenant=?2').bind(credentialId,env.TENANT_SLUG).first<{member_id:string}>())?.member_id ?? null
     } else {
       // The token/member/agent weld is re-read here; a supplied label or target cannot select a principal.
       const live = await env.DB.prepare(`SELECT a.slug FROM agents a

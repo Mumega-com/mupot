@@ -204,14 +204,14 @@ describe('wake echo proof', () => {
     await receipt(pending.message_id,T0+1000)
     expect(await finishWakeEcho(env,context,pending.nonce,T0+2000)).toMatchObject({state:'echo_roundtrip',reason:'inbox_read_before_delivery'})
   })
-  it.each(['bearer','signed','lease','lease_attempt'] as const)('fails %s before exposing or consuming the nonce when observation cannot persist',async mode=>{
+  it.each(['bearer','bearer-peek','signed','lease','lease_attempt'] as const)('fails %s before exposing or consuming the nonce when observation cannot persist',async mode=>{
     const pending=await challenge()
     const {readAgentInbox,readVerifiedSignedAgentInbox,leaseAgentInbox}=await import('../src/agents/messages')
     if(mode==='signed') await env.DB.prepare("INSERT INTO agent_inbox_fences(tenant,agent_id,mode,key_fingerprint,updated_by_member_id,updated_at,reason) VALUES(?,?,?,?,?,'2026-11-17T12:00:00Z','test')").bind(TENANT,'agent-1','signed_only','f'.repeat(64),'member-1').run()
     db.sqlite.exec("CREATE TRIGGER test_no_poll BEFORE INSERT ON agent_audit WHEN NEW.action='connection_wake_inbox_read' BEGIN SELECT RAISE(ABORT,'observation unavailable'); END;")
     const clock={now:()=>new Date(T0+100).toISOString()}
     const result=mode==='signed' ? await readVerifiedSignedAgentInbox(env,{agent:'agent-1',peek:false,keyFingerprint:'f'.repeat(64)},clock)
-      : mode==='bearer' ? await readAgentInbox(env,{agent:'agent-1',peek:false},clock)
+      : (mode==='bearer'||mode==='bearer-peek') ? await readAgentInbox(env,{agent:'agent-1',peek:mode==='bearer-peek'},clock)
       : await leaseAgentInbox(env,{agent:'agent-1',limit:1,...(mode==='lease_attempt'?{attemptId:'attempt_unavailable_01'}:{})},clock)
     expect(result).toMatchObject({ok:false,reason:'db_error'})
     const row=await env.DB.prepare('SELECT read_at,lease_expires_at FROM agent_messages WHERE id=?1').bind(pending.message_id).first<{read_at:string|null;lease_expires_at:string|null}>()
@@ -353,6 +353,15 @@ describe('wake echo proof', () => {
     expect(signed.signedAtIso).toBe(new Date(T0).toISOString())
     await receipt(pending.message_id,T0+500,{signedAt:signed.signedAtIso})
     expect(await finishWakeEcho(env,context,pending.nonce,T0+800)).toMatchObject({state:'wake_proven',path:'native_wake',delivery_to_reply_ms:300})
+  })
+
+  it('retains one earliest poll witness per challenge across repeated later polls',async()=>{
+    const pending=await challenge();const {recordWakeInboxRead}=await import('../src/agents/wake-echo-observer')
+    await recordWakeInboxRead(env,'agent-1','bearer',true,new Date(T0+100).toISOString())
+    await receipt(pending.message_id,T0+1000)
+    for(let i=0;i<5;i++) await recordWakeInboxRead(env,'agent-1','bearer',true,new Date(T0+1500+i).toISOString())
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").first<number>('n')).toBe(1)
+    expect(await finishWakeEcho(env,context,pending.nonce,T0+2000)).toMatchObject({state:'echo_roundtrip',reason:'inbox_read_before_delivery'})
   })
 
 })

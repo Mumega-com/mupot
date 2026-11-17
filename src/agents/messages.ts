@@ -929,8 +929,9 @@ async function readAgentInboxForReader(
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
+  const foldedWake = peek && reader==='bearer'
   try {
-    await recordWakeInboxRead(env, input.agent, reader, peek, now())
+    if(!foldedWake) await recordWakeInboxRead(env, input.agent, reader, peek, now())
     let messages: InboxMessage[]
     if (peek) {
       if (reader === 'signed') {
@@ -954,16 +955,31 @@ async function readAgentInboxForReader(
           ? [tenant, input.agent, sinceSeq, limit, targetSeat]
           : [tenant, input.agent, sinceSeq, limit]
         const handledSql = handledHideSql(input.handledByAttachment, binds)
-        const rows = await env.DB.prepare(
-          `SELECT ${cols} FROM agent_messages
+        const readSql = `SELECT ${cols} FROM agent_messages
             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
               ${seatSql}
               ${handledSql}
               AND COALESCE((SELECT mode FROM agent_inbox_fences
                              WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
-            ORDER BY seq ASC LIMIT ?4`,
-        ).bind(...binds).all<InboxMessage>()
-        messages = rows.results ?? []
+            ORDER BY seq ASC LIMIT ?4`
+        // A sentinel row carries the active flag even for an empty or fenced read.
+        // Idle SSE stays one statement; an active echo adds its durable witness
+        // before any rows are exposed. No isolate cache or caller-supplied hint.
+        const activeNow = foldedWake ? now() : null
+        const atParam = '?' + (binds.length+1)
+        if(foldedWake) binds.push(activeNow)
+        const sql = foldedWake ? `WITH inbox_rows AS (${readSql})
+          SELECT r.*, w.wake_challenge_active FROM
+            (SELECT EXISTS(SELECT 1 FROM agent_audit c WHERE c.agent_id=?2
+              AND c.action='connection_wake_challenge'
+              AND julianday(json_extract(CASE WHEN json_valid(c.after_state) THEN c.after_state ELSE '{}' END,'$.expires_at'))>julianday(${atParam})) AS wake_challenge_active) w
+          LEFT JOIN inbox_rows r ON 1 ORDER BY r.seq ASC` : readSql
+        const rows = await env.DB.prepare(sql).bind(...binds).all<InboxMessage & {wake_challenge_active?:number}>()
+        if(foldedWake && rows.results?.[0]?.wake_challenge_active===1) await recordWakeInboxRead(env,input.agent,reader,peek,now())
+        messages = (rows.results ?? []).filter(row=>row.seq!=null).map(row=>{
+          const {wake_challenge_active: _active,...message}=row
+          return message
+        })
       }
     } else {
       // Atomic consume: mark the oldest `limit` unread as read and return exactly those rows.

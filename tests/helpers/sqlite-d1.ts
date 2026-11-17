@@ -35,7 +35,7 @@ function normalizeD1Bindings(sql: string, values: readonly unknown[]): {
   return { sql: rewritten, values: remapped }
 }
 
-function result<T>(rows: T[], changes: number): D1Result<T> {
+function result<T>(rows: T[], changes: number, lastRowId=0): D1Result<T> {
   return {
     success: true,
     results: rows,
@@ -44,7 +44,7 @@ function result<T>(rows: T[], changes: number): D1Result<T> {
       size_after: 0,
       rows_read: rows.length,
       rows_written: changes,
-      last_row_id: 0,
+      last_row_id: lastRowId,
       changed_db: changes > 0,
       changes,
     },
@@ -84,7 +84,7 @@ class SqliteD1Statement {
   async run<T = SqliteRow>(): Promise<D1Result<T>> {
     const { statement, values } = this.prepared()
     const info = statement.run(...values)
-    return result([], Number(info.changes)) as D1Result<T>
+    return result([], Number(info.changes), Number(info.lastInsertRowid)) as D1Result<T>
   }
 
   async raw<T = unknown[]>(): Promise<T[]> {

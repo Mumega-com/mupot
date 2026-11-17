@@ -9,11 +9,10 @@ export async function recordWakeInboxRead(
   // expose a nonce and later let an absent witness look like evidence of no poll.
   // This is conservative: a validated read attempt that later fails can only make
   // the current echo unproven. No proof or dispatch permission is created here.
-  await env.DB.prepare(`INSERT INTO agent_audit
+  await env.DB.prepare(`INSERT OR IGNORE INTO agent_audit
     (id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state)
-    SELECT ?1,?2,'system:wake_echo_observer','system','connection_wake_inbox_read','[]','{}',?3
-    WHERE EXISTS (SELECT 1 FROM agent_audit c
-      WHERE c.agent_id=?2 AND c.action='connection_wake_challenge'
-        AND julianday(json_extract(CASE WHEN json_valid(c.after_state) THEN c.after_state ELSE '{}' END,'$.expires_at')) > julianday(?4))`)
-    .bind(crypto.randomUUID(),agentId,JSON.stringify({ observed_at: observedAt, reader, peek }),observedAt).run()
+    SELECT c.id||':poll',?1,'system:wake_echo_observer','system','connection_wake_inbox_read','[]','{}',?2
+    FROM agent_audit c WHERE c.agent_id=?1 AND c.action='connection_wake_challenge'
+      AND julianday(json_extract(CASE WHEN json_valid(c.after_state) THEN c.after_state ELSE '{}' END,'$.expires_at')) > julianday(?3)`)
+    .bind(agentId,JSON.stringify({ observed_at: observedAt, reader, peek }),observedAt).run()
 }

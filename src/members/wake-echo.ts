@@ -224,7 +224,7 @@ export async function loadWakeProof(env: Env, query: { agentId: string; credenti
     || (query.attachmentId !== undefined && query.attachmentId !== (stored.attachmentId ?? null))) {
     return { evidence_scope:'agent_transport',runtime_turn_attested:false, state: 'unproven', wake_proven_at: null, path: 'none', delivery_to_reply_ms: null, t0_to_delivery_ms: null, reason: 'wake_context_unverified' }
   }
-  const live = await env.DB.prepare(`SELECT member_id FROM member_tokens WHERE tenant = ?1 AND id = ?2 AND agent_id = ?3 AND revoked_at IS NULL LIMIT 1`).bind(env.TENANT_SLUG, stored.credentialId, query.agentId).first<{ member_id: string }>()
+  const live = await env.DB.prepare(`SELECT t.member_id FROM member_tokens t WHERE t.tenant=?1 AND t.id=?2 AND t.agent_id=?3 AND ${TOKEN_LIVE_PREDICATE('?4')} LIMIT 1`).bind(env.TENANT_SLUG, stored.credentialId, query.agentId,iso(nowMs)).first<{ member_id: string }>()
   if (!live) return { evidence_scope:'agent_transport',runtime_turn_attested:false, state: 'unproven', wake_proven_at: null, path: 'none', delivery_to_reply_ms: null, t0_to_delivery_ms: null, reason: 'wake_context_unverified' }
   const current = await bindingHash(env, { ...stored, memberId: live.member_id }, nowMs)
   if (!current || current.hash !== proof.binding_hash) return { evidence_scope:'agent_transport',runtime_turn_attested:false, state: 'unproven', wake_proven_at: null, path: 'none', delivery_to_reply_ms: null, t0_to_delivery_ms: null, reason: 'wake_binding_changed' }
