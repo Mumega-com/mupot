@@ -1,3 +1,4 @@
+import { recordWakeInboxRead } from './wake-echo-observer'
 // mupot — agent↔agent durable messaging (squad → mupot migration, S3).
 //
 // The pure service behind the `send` / `inbox` / `message_get` MCP tools: persist a
@@ -929,6 +930,7 @@ async function readAgentInboxForReader(
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
   try {
+    await recordWakeInboxRead(env, input.agent, reader, peek, now())
     let messages: InboxMessage[]
     if (peek) {
       if (reader === 'signed') {
@@ -1881,6 +1883,10 @@ export async function leaseAgentInbox(
   const expiresIso = new Date(nowMs + leaseSeconds * 1000).toISOString()
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
+
+  try {
+    await recordWakeInboxRead(env, input.agent, input.attemptId ? 'lease_attempt' : 'lease', false, nowIso)
+  } catch { return { ok: false, reason: 'db_error', detail: 'wake observation unavailable' } }
 
   if (input.attemptId !== undefined) {
     return leaseAgentInboxWithAttempt(env, {

@@ -5,6 +5,7 @@
 // separately owner-gated + signature-verified, so a stale/forged status row can only mislead the
 // panel, never authorize a host action. Reports are accepted ONLY from the configured consumer agent.
 
+import { writeRuntimeWithProofFence } from './runtime-proof-fence'
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
 import { cleanReported, isNonAdoptedRuntime, MAX_REPORTED } from './reported-values'
@@ -599,7 +600,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     // `upsertPollFleetPresence` (keyed on `auth.boundAgentId`, always a uuid) can never
     // create two rows for the same real agent. See resolveFleetWriteAgentId's doc comment.
     const writeAgentId = await resolveFleetWriteAgentId(env, v.agent_id)
-    await env.DB.prepare(
+    await writeRuntimeWithProofFence(env,{agentId:writeAgentId,runtime:v.runtime ?? '',actorId:reportedBy,source:'report'},env.DB.prepare(
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO UPDATE SET
@@ -615,7 +616,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
             last_reported_at=excluded.last_reported_at, updated_at=excluded.updated_at`,
     )
       .bind(writeAgentId, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null, v.host ?? '')
-      .run()
+      )
     written++
   }
   return skipped > 0 ? { ok: true, count: written, skipped } : { ok: true, count: written }

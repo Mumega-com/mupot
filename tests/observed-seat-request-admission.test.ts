@@ -240,12 +240,12 @@ describe('chat approval boundaries', () => {
 })
 
 describe('connection_check (full-duplex)', () => {
-  it('refused for an unattached chat with the attach next step (own seat, and observed via the floor)', async () => {
+  it('refused for an unattached person with stop guidance (observed floor unchanged)', async () => {
     const plain = await chat(null)
     const r = await rpc(plain.ctx, 'connection_check', {}, plain.session)
-    expect(r.text).toContain('not_attached')
-    expect(r.text).toContain("seat_attach {agent:'<slug>', reason:'why this chat should act as that agent'}")
-    expect(r.text).toContain('approval code')
+    expect(r.text).toContain('not_agent')
+    expect(r.text).toContain('this connection is not an agent; stop and ask your human')
+    expect(r.text).toContain('"error":"not_agent"')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'connection_check'`)).toBe(0)
     const obs = await chat('observed', 'conv-obs')
     const o = await rpc(obs.ctx, 'connection_check', {}, obs.session)
@@ -260,7 +260,7 @@ describe('connection_check (full-duplex)', () => {
     expect(r1.receive.state).toBe('pending')
     expect(r1.wake).toMatchObject({ path: 'none', live: false })
     expect(r1.wake.enable).toContain("say 'monitor my mupot inbox' to enable")
-    expect(r1.summary).toBe(`send ✓ receive pending wake: none — ${r1.wake.enable}`)
+    expect(r1.summary).toBe(`send ✓ receive pending wake: none — ${r1.wake.enable}; wake not proven`)
     // the probe really is in the agent's inbox, from the system sender
     expect(one<{ f: string }>(`SELECT from_agent AS f FROM agent_messages WHERE id = ?`, r1.receive.message_id)?.f).toBe('mupot-onboarding')
     const mh = await rpc(c.ctx, 'inbox_mark_handled', { ids: [r1.receive.message_id] }, c.session)
@@ -495,4 +495,113 @@ describe('agent page: Connect a chat checklist', () => {
     h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(c.seatId)
     expect(await page()).toContain(`data-cx-return="${c.seatId}"`)
   })
+})
+
+
+describe('agent identity diagnostic step zero',()=>{
+  async function native(){
+    const tokenId=`bound-check-${++tok}`
+    h.sqlite.prepare("INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant,agent_id) VALUES(?,?,?,?,?,?,?,?)").run(tokenId,'mem-agent-coo','fixture-'+tokenId,'self diagnostic','workspace',new Date().toISOString(),TENANT,'agent-coo')
+    const ctx=await buildAuthContextFromProps(env,{memberId:'mem-agent-coo',tokenId,email:null,channel:'workspace',boundAgentId:'agent-coo'})
+    if(!ctx)throw new Error('agent credential fixture failed')
+    return ctx
+  }
+  it('agent-bound identity and self SEND/RECEIVE work without attachment flags',async()=>{
+    const ctx=await native();const off={...env,SEAT_ATTACH:undefined,SEAT_AUTO_ENROLL:undefined} as Env
+    const first=await rpc(ctx,'connection_check',{},'bound-check',off)
+    expect(first.sc).toMatchObject({identity:{step:0,bound_agent_id:'agent-coo',slug:'hadi-coo',credential_kind:'agent-bound'},send:{ok:true},receive:{state:'pending'}})
+    const receive=first.sc.receive as {message_id:string}
+    const ack=await rpc(ctx,'inbox_ack',{ids:[receive.message_id]},'bound-check',off)
+    expect(ack.text).not.toContain('isError":true')
+    expect((await rpc(ctx,'connection_check',{},'bound-check',off)).sc).toMatchObject({receive:{state:'ok'}})
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent<>'agent-coo'")).toBe(0)
+  })
+  it('a person credential is refused with identity and stop guidance before writes',async()=>{
+    const tokenId=`person-check-${++tok}`
+    h.sqlite.prepare("INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant) VALUES(?,?,?,?,?,?,?)").run(tokenId,HUMAN,'fixture-'+tokenId,'person owner','workspace',new Date().toISOString(),TENANT)
+    const ctx=await buildAuthContextFromProps(env,{memberId:HUMAN,tokenId,email:null,channel:'workspace',boundAgentId:null})
+    if(!ctx)throw new Error('person credential fixture failed')
+    const r=await rpc(ctx,'connection_check',{},'person-check')
+    expect(r.text).toContain('this connection is not an agent; stop and ask your human')
+    expect(r.text).toContain('"error":"not_agent"')
+    expect(r.text).toContain('"credential_kind":"person"')
+    expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_check'")).toBe(0)
+  })
+  it('diagnostic discovery does not require attachment enrollment',async()=>{
+    const {advertisedTools}=await import('../src/mcp/index')
+    const names=advertisedTools({} as Env).map(t=>t.name)
+    expect(names).toContain('connection_check');expect(names).not.toContain('seat_attach')
+  })
+  it('caller arguments cannot choose another diagnostic agent',async()=>{
+    const ctx=await native()
+    const r=await rpc(ctx,'connection_check',{agent:'not-self'},'argument-forgery')
+    expect(r.text).toContain('invalid_args');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+  it('a revoked native credential cannot borrow a live sibling token',async()=>{
+    const stale=await native();await native()
+    h.sqlite.prepare('UPDATE member_tokens SET revoked_at=? WHERE id=?').run(new Date().toISOString(),stale.tokenId)
+    const r=await rpc(stale,'connection_check',{},'revoked-native')
+    expect(r.text).toContain('unauthenticated');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+
+  it('starts and finishes an agent-bound echo without claiming an unreceipted wake',async()=>{
+    const ctx=await native();const off={...env,SEAT_ATTACH:undefined,SEAT_AUTO_ENROLL:undefined} as Env
+    const first=await rpc(ctx,'connection_check',{echo:true},'echo-native',off)
+    expect(first.sc).toMatchObject({identity:{credential_kind:'agent-bound'},echo:{ok:true,state:'pending'}})
+    const echo=first.sc.echo as {message_id:string}
+    const body=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',echo.message_id)!.body
+    const nonce=body.match(/: ([0-9a-f-]{36})$/)![1]
+    expect(first.text).not.toContain(nonce)
+    const reply=await rpc(ctx,'connection_check',{echo_reply:nonce},'echo-native',off)
+    expect(reply.sc).toMatchObject({echo:{ok:true,state:'echo_roundtrip'},wake_proof:{state:'unproven'}})
+  })
+  it('boot tells a native agent to prove wake and fleet read reports not proven',async()=>{
+    const ctx=await native()
+    const boot=await rpc(ctx,'boot_context',{},'unproven-native')
+    expect(boot.sc).toMatchObject({wake_verification:{state:'unproven'}})
+    expect(String(boot.sc.next_step)).toContain('prove your wake path')
+    expect((await rpc(ctx,'fleet_agent_get',{},'unproven-native')).sc).toMatchObject({wake_proof:{state:'unproven'}})
+  })
+  it.each([{echo:true,echo_reply:'not-a-reply'},{fresh:true,echo:true},{fresh:true,echo_reply:'reply'}])('does not create an echo for ambiguous echo/echo_reply intent %j',async args=>{
+    const ctx=await native()
+    const r=await rpc(ctx,'connection_check',args,'ambiguous-echo')
+    expect(r.text).toContain('invalid_args');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+
+  it('a detached or revoked subject cannot use the handler with stale authentication',async()=>{
+    const {connectionSubject}=await import('../src/mcp/seat-attach')
+    const ctx=await native();await native()
+    h.sqlite.prepare('UPDATE member_tokens SET revoked_at=? WHERE id=?').run(new Date().toISOString(),ctx.tokenId)
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:false,error:'connection_not_live'})
+  })
+  it('an attached chat receives only its own agent challenge',async()=>{
+    const c=await attachedChat()
+    const first=await rpc(c.ctx,'connection_check',{echo:true},c.session)
+    expect(first.sc).toMatchObject({identity:{credential_kind:'attached',bound_agent_id:'agent-coo'},echo:{state:'pending'}})
+    const id=(first.sc.echo as {message_id:string}).message_id
+    const row=one<{body:string;to_agent:string}>('SELECT body,to_agent FROM agent_messages WHERE id=?',id)!
+    expect(row.to_agent).toBe('agent-coo')
+    const nonce=row.body.match(/: ([0-9a-f-]{36})$/)![1]
+    expect((await rpc(c.ctx,'connection_check',{echo_reply:nonce},c.session)).sc).toMatchObject({echo:{state:'echo_roundtrip'},wake_proof:{state:'unproven'}})
+  })
+  it('a receipted native echo clears boot guidance and reaches fleet metadata',async()=>{
+    const ctx=await native();const t0=Date.now();const clock=vi.spyOn(Date,'now').mockReturnValue(t0)
+    const first=await rpc(ctx,'connection_check',{echo:true},'proof-api')
+    const messageId=(first.sc.echo as {message_id:string}).message_id
+    const nonce=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',messageId)!.body.match(/: ([0-9a-f-]{36})$/)![1]
+    const {eventIdFor}=await import('../src/bus/events-delivery')
+    h.sqlite.prepare("INSERT INTO event_subscriptions(id,tenant,agent_id,member_id,token_id,event_name,callback_url,secret_ciphertext,secret_fingerprint,status,refresh_before,created_at,last_refreshed_at) VALUES('proof-sub',?,?,?,?, 'message.created','https://wake.example','cipher','12345678','active','2030-01-01','2026-01-01','2026-01-01')").run(TENANT,'agent-coo',ctx.memberId,ctx.tokenId)
+    h.sqlite.prepare("INSERT INTO event_delivery_receipts(id,subscription_id,event_id,attempt,outcome,http_status,created_at) VALUES('proof-receipt','proof-sub',?,1,'delivered',204,?)").run(await eventIdFor('proof-sub',messageId),new Date(t0+100).toISOString())
+    clock.mockReturnValue(t0+200)
+    expect((await rpc(ctx,'connection_check',{echo_reply:nonce},'proof-api')).sc).toMatchObject({echo:{state:'wake_proven'},wake_proof:{state:'proven',evidence_scope:'agent_transport',runtime_turn_attested:false}})
+    const boot=await rpc(ctx,'boot_context',{},'proof-api')
+    expect(boot.sc).toMatchObject({wake_verification:{state:'proven'}})
+    expect(String(boot.sc.next_step)).not.toContain('prove your wake path')
+    const fleet=await rpc(ctx,'fleet_agent_get',{},'proof-api')
+    expect(fleet.sc).toMatchObject({wake_proof:{state:'proven',path:'native_wake',delivery_to_reply_ms:100}})
+    expect(JSON.stringify(fleet.sc.wake_proof)).not.toContain(nonce)
+    expect(JSON.stringify(fleet.sc.wake_proof)).not.toContain(ctx.tokenId)
+  })
+
 })

@@ -20,6 +20,7 @@
 // POST /api/fleet/detach         — bearer detach for token-welded agents.
 // POST /api/fleet/detach-signed  — key proof detach for signed agents.
 
+import { writeRuntimeWithProofFence } from './runtime-proof-fence'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
@@ -73,7 +74,7 @@ async function upsertRunning(
   preserveUnreportedModel = false,
 ): Promise<string> {
   const writeAgentId = await resolveFleetWriteAgentId(env, agentId)
-  await env.DB.prepare(
+  await writeRuntimeWithProofFence(env,{agentId:writeAgentId,runtime,actorId:memberId ?? writeAgentId,source:'attach'},env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
            status, reported_by, agent_type, member_id, host, model, runtime_canonical, connection_kind, last_reported_at, updated_at)
@@ -93,7 +94,7 @@ async function upsertRunning(
           updated_at       = excluded.updated_at`,
   )
     .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model, canonicalHarness(runtime), preserveUnreportedModel ? 1 : 0)
-    .run()
+    )
 
   // Runtime truth reaches the identity record too (harness-native-mupot lane A): the Fleet
   // Activity dashboard reads agents.model, so a stale identity model (the grok-4.5 class)

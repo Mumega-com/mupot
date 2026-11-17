@@ -23,6 +23,7 @@
 //      not honour the same rule it would be a way around the signature requirement, and
 //      the weaker door would win simply by being newer.
 
+import { writeRuntimeWithProofFence } from './runtime-proof-fence'
 import type { Env } from '../types'
 import { hasRegisteredKey } from './agent-keys'
 import { canonicalHarness, cleanReported, isNonAdoptedRuntime, NON_ADOPTED_DETAIL, MAX_REPORTED, MAX_REPORTED_MODEL } from './reported-values'
@@ -143,17 +144,17 @@ export async function selfReportAtBoot(
   if (host !== null && host !== (belief?.host ?? '')) changed.push('host')
 
   if (belief === null) {
-    await env.DB.prepare(
+    await writeRuntimeWithProofFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot',insertOnly:true},env.DB.prepare(
       `INSERT INTO fleet_agents
              (agent_id, tenant, runtime, runtime_canonical, status, reported_by, model, host,
               connection_kind, last_boot_at, last_reported_at, updated_at)
        VALUES (?1, ?2, COALESCE(?3, ''), COALESCE(?4, ''), 'running', ?1, ?5, COALESCE(?6, ''),
                ?7, datetime('now'), datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO NOTHING`,
-    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind).run()
+    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind))
   } else {
     // COALESCE so an unclaimed field keeps its stored value rather than being blanked.
-    await env.DB.prepare(
+    await writeRuntimeWithProofFence(env,{agentId,runtime:runtime ?? (belief===null?'':null),actorId:agentId,source:'boot'},env.DB.prepare(
       `UPDATE fleet_agents
           SET runtime           = COALESCE(?3, runtime),
               runtime_canonical = COALESCE(?4, runtime_canonical),
@@ -166,7 +167,7 @@ export async function selfReportAtBoot(
               last_reported_at  = datetime('now'),
               updated_at        = datetime('now')
         WHERE tenant = ?2 AND agent_id = ?1`,
-    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind).run()
+    ).bind(agentId, env.TENANT_SLUG, runtime, runtimeCanonical, model, host, connectionKind))
   }
 
   // The identity record is what the dashboard reads, so a truthful runtime report must
