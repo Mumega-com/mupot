@@ -4,6 +4,7 @@
  * transport delivery.  It does not attest that a runtime took a turn.
  */
 import type { Env } from '../types'
+import { WAKE_ECHO_WINDOW_MS } from '../agents/wake-echo-observer'
 import { sendAgentMessage } from '../agents/messages'
 import { ONBOARDING_SENDER } from '../agents/system-senders'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
@@ -40,7 +41,7 @@ type Proof = {
   context: WakeEchoContext
 }
 
-const TEN_MINUTES = 10 * 60_000
+const TEN_MINUTES = WAKE_ECHO_WINDOW_MS
 const SEVEN_DAYS = 7 * 24 * 60 * 60_000
 
 function iso(ms: number): string { return new Date(ms).toISOString() }
@@ -97,8 +98,8 @@ async function writeAudit(env: Env, id: string, ctx: WakeEchoContext, action: st
           AND (NOT json_valid(p.after_state) OR julianday(json_extract(CASE WHEN json_valid(p.after_state) THEN p.after_state ELSE '{}' END,'$.observed_at')) IS NULL
             OR (julianday(json_extract(p.after_state,'$.observed_at'))>=julianday(?13)
               AND julianday(json_extract(p.after_state,'$.observed_at'))<julianday(?14)))))` : ''
-    const stmt = env.DB.prepare(`INSERT INTO agent_audit (id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state)
-      SELECT ?1,?2,?3,'system',?4,'["connection_wake"]','{}',?5${guard}`)
+    const stmt = env.DB.prepare(`INSERT INTO agent_audit (id,agent_id,actor_id,actor_type,action,fields_changed,before_state,after_state,created_at)
+      SELECT ?1,?2,?3,'system',?4,'["connection_wake"]','{}',?5,CASE WHEN ?4='connection_wake_challenge' THEN json_extract(?5,'$.created_at') ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END${guard}`)
     const common = [id,ctx.agentId,ctx.memberId,action,JSON.stringify(after)]
     const result = await stmt.bind(...common,...(fence ? [env.TENANT_SLUG,ctx.credentialId,fence.now,JSON.stringify(fence.binding.tokens),fence.binding.runtime,fence.state,fence.seq,fence.t0,fence.deliveryAt,fence.binding.runtimeSeq] : [])).run()
     return Number(result.meta.changes) === 1

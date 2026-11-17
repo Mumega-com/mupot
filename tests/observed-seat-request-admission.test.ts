@@ -604,4 +604,28 @@ describe('agent identity diagnostic step zero',()=>{
     expect(JSON.stringify(fleet.sc.wake_proof)).not.toContain(ctx.tokenId)
   })
 
+  it.each(['attachment','agent'] as const)('round2: stale attached %s cannot borrow a different live attachment context',async mismatch=>{
+    const c=await attachedChat();const messagesBefore=n('SELECT COUNT(*) AS n FROM agent_messages');const {findLiveAttachment}=await import('../src/members/seat-attach');const {connectionSubject}=await import('../src/mcp/seat-attach')
+    const live=await findLiveAttachment(env,{memberId:HUMAN,tokenId:c.ctx.tokenId!},c.seatId);expect(live).not.toBeNull();if(!live)throw new Error('missing live attachment')
+    const ctx:AuthContext={...c.ctx,memberId:live.agent_member_id,boundAgentId:live.agent_id,tokenId:live.seat_token_id,
+      seatBinding:{seatId:c.seatId,label:live.seat_label,harnessId:live.harness_id,grantTokenId:c.ctx.tokenId!,humanMemberId:HUMAN,source:'auto:openai_session',
+        attached:{attachmentId:live.attachment_id,admissionId:live.admission_id,agentId:live.agent_id,seatAgentId:live.seat_agent_id,ceiling:live.ceiling}}}
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:true})
+    if(mismatch==='attachment') ctx.seatBinding!.attached!.attachmentId='previous-attachment'
+    else {seedAgent('agent-old','old-agent','Previous agent','squad-core');ctx.seatBinding!.attached!.agentId='agent-old';ctx.boundAgentId='agent-old'}
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:false,error:'connection_not_live'})
+    expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(messagesBefore)
+  })
+  it('round2: native subject query explicitly welds the exact token to the agent as well as the member',async()=>{
+    const ctx=await native();const {connectionSubject}=await import('../src/mcp/seat-attach');const queries:string[]=[]
+    const traced={...env,DB:new Proxy(env.DB,{get(target,key){
+      if(key==='prepare')return (sql:string)=>{queries.push(sql);return target.prepare(sql)}
+      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+    }})} as Env
+    expect(await connectionSubject(ctx,traced)).toMatchObject({ok:true})
+    // Defense in depth: current binding uniqueness also rejects a cross-agent member.
+    // Pin the explicit credential/agent join even while that schema constraint is redundant.
+    expect(queries.some(sql=>/\bt\.agent_id\s*=\s*a\.id\b/.test(sql))).toBe(true)
+  })
+
 })

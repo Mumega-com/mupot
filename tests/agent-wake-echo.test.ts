@@ -60,6 +60,20 @@ function beforeNextWrite(effect:()=>void):Env {
   }})}
 }
 
+/** Observe an actual D1 statement boundary; do not match SQL or stub results. */
+function afterFirstStatement(method:'run'|'all',effect:()=>Promise<void>):Env {
+  let fired=false
+  const wrap=(stmt:D1PreparedStatement):D1PreparedStatement=>new Proxy(stmt,{get(target,key){
+    if(key==='bind') return (...args:unknown[])=>wrap(target.bind(...args))
+    if(key===method) return async()=>{const result=await (target[key] as ()=>Promise<unknown>).call(target);if(!fired){fired=true;await effect()}return result}
+    const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+  }})
+  return {...env,DB:new Proxy(env.DB,{get(target,key){
+    if(key==='prepare') return (sql:string)=>wrap(target.prepare(sql))
+    const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+  }})}
+}
+
 describe('wake echo proof', () => {
   beforeEach(() => {
     db = createSqliteD1()
@@ -185,7 +199,7 @@ describe('wake echo proof', () => {
     expect(await finishWakeEcho(env,context,nonce,T0+4000)).toMatchObject({state:'echo_roundtrip'})
     expect(await loadWakeProof(env,{agentId:'agent-1'},T0+5000)).toMatchObject({state:'proven',wake_proven_at:new Date(T0+2000).toISOString()})
   })
-  it.each([false,true])('matching signed=%s doorbell receipts prove the ordered echo',async signed=>{
+  it.each([false,true])('matching signed=%s doorbell receipts do not prove the ordered echo',async signed=>{
     const pending=await challenge()
     await env.DB.prepare("INSERT INTO agent_webhook_doorbell_receipts(id,tenant,agent_id,event_type,ref_id,outcome,http_status,attempted_at,signed_at) VALUES(?,?,?,?,?,?,?,?,?)").bind('doorbell',TENANT,'agent-1','mupot.inbox.wake',pending.message_id,'posted',204,new Date(T0+1000).toISOString(),signed?new Date(T0+900).toISOString():null).run()
     expect(await finishWakeEcho(env,context,pending.nonce,T0+2000)).toMatchObject({state:'echo_roundtrip',path:'webhook_doorbell',reason:'delivery_timestamp_unavailable',delivery_to_reply_ms:null,t0_to_delivery_ms:null})
@@ -222,7 +236,7 @@ describe('wake echo proof', () => {
     const {agentWakeProof}=await import('../src/dashboard/agent-wake-proof')
     const pending=await challenge();await receipt(pending.message_id,T0+1000);await finishWakeEcho(env,context,pending.nonce,T0+2000)
     const html=String(await agentWakeProof(await loadWakeProof(env,{agentId:'agent-1'},T0+3000),T0+3000))
-    expect(html).toContain('Wake proven');expect(html).toContain('Native wake');expect(html).toContain('delivery to reply 1000 ms')
+    expect(html).toContain('Wake proven');expect(html).toContain('own wake path returned');expect(html).toContain('Native wake');expect(html).toContain('delivery to reply 1000 ms')
     expect(html).not.toMatch(/token-1|harness-1|nonce_hash/)
     const stale=String(await agentWakeProof(await loadWakeProof(env,{agentId:'agent-1'},T0+2000+7*86400000),T0+2000+7*86400000))
     expect(stale).toContain('7d ago, re-prove')
@@ -362,6 +376,72 @@ describe('wake echo proof', () => {
     for(let i=0;i<5;i++) await recordWakeInboxRead(env,'agent-1','bearer',true,new Date(T0+1500+i).toISOString())
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").first<number>('n')).toBe(1)
     expect(await finishWakeEcho(env,context,pending.nonce,T0+2000)).toMatchObject({state:'echo_roundtrip',reason:'inbox_read_before_delivery'})
+  })
+
+  it.each(['consume','signed-peek','signed-consume','lease','lease-attempt'] as const)('round2: %s cannot leak a challenge created after its first witness without a poll receipt',async mode=>{
+    const {readAgentInbox,readVerifiedSignedAgentInbox,leaseAgentInbox}=await import('../src/agents/messages')
+    if(mode.startsWith('signed')) await env.DB.prepare("INSERT INTO agent_inbox_fences(tenant,agent_id,mode,key_fingerprint,updated_by_member_id,updated_at,reason) VALUES(?,?,?,?,?,?,?)").bind(TENANT,'agent-1','signed_only','f'.repeat(64),'member-1',new Date(T0).toISOString(),'test').run()
+    let readTime=T0;let messageId=''
+    const raced=afterFirstStatement('run',async()=>{
+      const issued=await startWakeEcho(env,context,T0+100);expect(issued).toMatchObject({ok:true});if(!issued.ok)throw new Error(issued.error)
+      messageId=issued.message_id;readTime=T0+200
+    })
+    const clock={now:()=>new Date(readTime).toISOString()}
+    const read=mode==='consume' ? await readAgentInbox(raced,{agent:'agent-1'},clock)
+      : mode.startsWith('signed') ? await readVerifiedSignedAgentInbox(raced,{agent:'agent-1',peek:mode==='signed-peek',keyFingerprint:'f'.repeat(64)},clock)
+      : await leaseAgentInbox(raced,{agent:'agent-1',limit:1,...(mode==='lease-attempt'?{attemptId:'round2_create_race_0001'}:{})},clock)
+    expect(read).toMatchObject({ok:true});if(!read.ok)throw new Error(read.reason)
+    const message=read.messages.find(m=>m.id===messageId);expect(message).toBeDefined()
+    const nonce=message!.body.match(/: ([0-9a-f-]{36})$/)![1]
+    await receipt(messageId,T0+1000)
+    expect(await finishWakeEcho(env,context,nonce,T0+2000)).toMatchObject({ok:true,state:'echo_roundtrip',reason:'inbox_read_before_delivery'})
+    const witness=await env.DB.prepare("SELECT after_state FROM agent_audit WHERE action='connection_wake_inbox_read' ORDER BY seq DESC LIMIT 1").first<string>('after_state')
+    expect(Date.parse(JSON.parse(witness!).observed_at)).toBeGreaterThanOrEqual(T0+100)
+  })
+  it('round2: folded SSE read keeps its snapshot time when delivery lands before witness persistence',async()=>{
+    const pending=await challenge();const {readAgentInbox}=await import('../src/agents/messages')
+    let readTime=T0+100
+    const raced=afterFirstStatement('all',async()=>{await receipt(pending.message_id,T0+1000);readTime=T0+1500})
+    const read=await readAgentInbox(raced,{agent:'agent-1',peek:true,skipRemaining:true},{now:()=>new Date(readTime).toISOString()})
+    expect(read).toMatchObject({ok:true});if(!read.ok)throw new Error(read.reason)
+    expect(read.messages.some(m=>m.body.includes(pending.nonce))).toBe(true)
+    expect(await finishWakeEcho(env,context,pending.nonce,T0+2000)).toMatchObject({state:'echo_roundtrip',reason:'inbox_read_before_delivery'})
+    const witness=await env.DB.prepare("SELECT after_state FROM agent_audit WHERE action='connection_wake_inbox_read'").first<string>('after_state')
+    expect(JSON.parse(witness!).observed_at).toBe(new Date(T0+100).toISOString())
+  })
+  it('round2: an inactive folded snapshot cannot expose a nonce created after that snapshot',async()=>{
+    const {readAgentInbox}=await import('../src/agents/messages');let messageId='';let readTime=T0
+    const raced=afterFirstStatement('all',async()=>{const issue=await startWakeEcho(env,context,T0+100);if(!issue.ok)throw new Error(issue.error);messageId=issue.message_id;readTime=T0+200})
+    const before=await readAgentInbox(raced,{agent:'agent-1',peek:true,skipRemaining:true},{now:()=>new Date(readTime).toISOString()})
+    expect(before).toMatchObject({ok:true,messages:[]})
+    const after=await readAgentInbox(env,{agent:'agent-1',peek:true,skipRemaining:true},{now:()=>new Date(T0+300).toISOString()})
+    expect(after).toMatchObject({ok:true});if(!after.ok)throw new Error(after.reason)
+    const nonce=after.messages.find(m=>m.id===messageId)!.body.match(/: ([0-9a-f-]{36})$/)![1]
+    await receipt(messageId,T0+1000)
+    expect(await finishWakeEcho(env,context,nonce,T0+2000)).toMatchObject({state:'echo_roundtrip'})
+  })
+
+  it('round2: observer expiry guard refuses a challenge at its exact deadline',async()=>{
+    await challenge();const {recordWakeInboxRead}=await import('../src/agents/wake-echo-observer')
+    await recordWakeInboxRead(env,'agent-1','bearer',true,new Date(T0+600000).toISOString())
+    expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_wake_inbox_read'").first<number>('n')).toBe(0)
+  })
+  it('round2: post-witness persistence failure never exposes a raced nonce',async()=>{
+    const {readAgentInbox}=await import('../src/agents/messages');let messageId='';let readTime=T0
+    const raced=afterFirstStatement('run',async()=>{
+      const issue=await startWakeEcho(env,context,T0+100);if(!issue.ok)throw new Error(issue.error);messageId=issue.message_id;readTime=T0+200
+      db.sqlite.exec("CREATE TRIGGER round2_post_witness_failure BEFORE INSERT ON agent_audit WHEN NEW.action='connection_wake_inbox_read' BEGIN SELECT RAISE(ABORT,'post witness unavailable'); END;")
+    })
+    const result=await readAgentInbox(raced,{agent:'agent-1'},{now:()=>new Date(readTime).toISOString()})
+    expect(result).toMatchObject({ok:false,reason:'db_error'})
+    const body=await env.DB.prepare('SELECT body FROM agent_messages WHERE id=?1').bind(messageId).first<string>('body')
+    const nonce=body!.match(/: ([0-9a-f-]{36})$/)![1]
+    expect(JSON.stringify(result)).not.toContain(nonce)
+  })
+
+  it('round2: audit issue time matches the challenge clock used by its indexed TTL window',async()=>{
+    await challenge()
+    expect(await env.DB.prepare("SELECT created_at FROM agent_audit WHERE action='connection_wake_challenge'").first<string>('created_at')).toBe(new Date(T0).toISOString())
   })
 
 })
