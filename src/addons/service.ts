@@ -5,6 +5,7 @@ import {
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules'
+import { EXTERNAL_ADDON_EVENT_ALLOWLIST } from './event-allowlist'
 import type { AddonManifestV1 } from './contract'
 import {
   assertAddonRuntimeContract,
@@ -150,13 +151,6 @@ function nativeCoreDepartmentKeys(): ReadonlySet<string> {
   return keys
 }
 
-// The only event topics an external addon may subscribe to. Deliberately narrow and
-// hand-enumerated (not "whatever the bus happens to define today") — widening this set
-// is a review-worthy decision, not a side effect of adding an unrelated event elsewhere.
-const EXTERNAL_ADDON_EVENT_ALLOWLIST: ReadonlySet<string> = new Set([
-  'task.completed',
-  'message.created',
-])
 
 /** True iff `value` is namespaced under `moduleKey` — i.e. is `moduleKey` followed by a
  *  literal '.', never a same-prefix lookalike ('growth' must not match 'growthx.foo'),

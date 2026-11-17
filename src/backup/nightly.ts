@@ -22,7 +22,7 @@
 //     manifest stored next to it). A failed verification deletes nothing.
 
 import type { Env } from '../types'
-import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { notify, wasDelivered, OWNER_RECIPIENT } from '../notify'
 import { safeConsole } from '../lib/log'
 
 export const BACKUP_CRON = '17 3 * * *'
@@ -260,10 +260,26 @@ export async function verifyDump(bucket: R2Bucket, date: string): Promise<{ ok: 
 
 const redact = (s: string): string => s.replace(/https?:\/\/\S+/g, '<url>').slice(0, 500)
 
+/** Short stable digest of the (already redacted) reason, so two different failures on one date both alert. */
+async function reasonDigest(message: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(redact(message)))
+  return Array.from(new Uint8Array(buf).slice(0, 6)).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 async function alert(env: Env, kind: 'failed' | 'skipped', date: string, message: string): Promise<boolean> {
   try {
-    const r = await notifyHadi(env, { type: `backup.${kind}`, title: `D1 nightly backup ${date}`, message })
-    return r.delivered
+    const reason = await reasonDigest(message)
+    const r = await notify(env, {
+      tenant: env.TENANT_SLUG,
+      type: `backup.${kind}`,
+      // A failed backup is critical (exempt from the rate cap); a skip is only worth attention.
+      severity: kind === 'failed' ? 'critical' : 'attention',
+      subject_ref: `backup:${date}`,
+      recipients: [OWNER_RECIPIENT],
+      dedupe_key: `backup.${kind}:${date}:${reason}`,
+      context: { title: `D1 nightly backup ${date}`, message },
+    })
+    return wasDelivered(r, 'telegram_dm')
   } catch (err) {
     safeConsole.error('[backup] alert threw', redact(String(err)))
     return false
