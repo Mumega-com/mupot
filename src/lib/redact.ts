@@ -43,6 +43,9 @@ export function isSensitiveDetailKey(key: string): boolean {
 // Re-scan the original span, preserving the real lookbehind and base output.
 // Only an empty sensitive head at its end can add a later redaction.
 const CHAIN_HEAD_RE = new RegExp(ASSIGNMENT_HEAD_RE.source, 'g')
+// Conservative starts for every recognizer after the assignment pass. Keep in
+// step with those stages; PEM, URL-password and query stages already ran.
+const LATER_REDACTION_START_RE = /bearer|xox[baprs]-|mupot_|cfat_|pot_(?:adm|agt)_|gh[pousr]_|sk-|AKIA|eyJ/i
 function trailingSensitiveHead(text: string, start: number, end: number): number | null {
   CHAIN_HEAD_RE.lastIndex = start
   for (let m = CHAIN_HEAD_RE.exec(text); m !== null && m.index < end; m = CHAIN_HEAD_RE.exec(text)) {
@@ -51,20 +54,30 @@ function trailingSensitiveHead(text: string, start: number, end: number): number
   return null
 }
 
-function redactAssignments(text: string): string {
+function redactAssignments(text: string, allowRewind = true): string {
   let out = ''
   let cursor = 0
+  let rewinding = false
   ASSIGNMENT_HEAD_RE.lastIndex = 0
   for (let m = ASSIGNMENT_HEAD_RE.exec(text); m !== null; m = ASSIGNMENT_HEAD_RE.exec(text)) {
+    const chainHop = rewinding
+    rewinding = false
     const head = m[1] ?? ''
     const key = m[2] ?? ''
     const valueStart = m.index + head.length
     if (!isSensitiveDetailKey(key)) continue // lastIndex is already at the value start: keep scanning inside it
     const valueMatch = ASSIGNMENT_VALUE_RE.exec(text.slice(valueStart))
     if (valueMatch === null || LITERAL_FLAG_RE.test(valueMatch[0])) continue
+    // A new hop must not consume context needed by a later recognizer.
+    // Earlier hops may also have hidden a base assignment head: restart the
+    // whole pass once without rewinding to preserve all base redactions.
+    if (chainHop && LATER_REDACTION_START_RE.test(valueMatch[0])) {
+      return redactAssignments(text, false)
+    }
     out += text.slice(cursor, valueStart) + '[redacted]'
     cursor = valueStart + valueMatch[0].length
-    const chain = trailingSensitiveHead(text, valueStart, cursor)
+    const chain = allowRewind ? trailingSensitiveHead(text, valueStart, cursor) : null
+    rewinding = chain !== null
     ASSIGNMENT_HEAD_RE.lastIndex = chain !== null ? chain : cursor
   }
   return out + text.slice(cursor)
@@ -80,7 +93,7 @@ export function redactSecretPatterns(text: string): string {
     .replace(QUERY_ASSIGNMENT_RE, (match, delimiter: string, key: string, equals: string) => (
       isSensitiveDetailKey(key) ? `${delimiter}${key}${equals}[redacted]` : match
     ))
-    .replace(/^[\s\S]*$/, redactAssignments)
+    .replace(/^[\s\S]*$/, value => redactAssignments(value))
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/gi, '[redacted]')
     .replace(/\bmupot_[A-Za-z0-9_-]+\b/g, '[redacted]')
