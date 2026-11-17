@@ -2503,6 +2503,8 @@ export type GateWakeOutcome = {
   grant_count: number
   notice: string
   notice_persisted: boolean
+  skipped_holders?: readonly (GatePrincipalRef & { reason: 'task_assignee' | 'not_live' })[]
+  deliveries?: readonly { principal: GatePrincipalRef; bus_delivered: boolean; inbox_delivered: boolean }[]
   // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
   new_sends?: number
 }
@@ -2575,9 +2577,41 @@ export async function wakeGateOwnerOnReview(
     grant_count: resolution.grant_count,
   }
   if (resolution.status === 'ambiguous') {
+    // Wake routing only: keep the authority resolver and verdict predicates unchanged.
+    // Members retain their needs_you item; only independently live agents get wakes.
+    const skipped: NonNullable<GateWakeOutcome['skipped_holders']>[number][] = []
+    const targets: GatePrincipalRef[] = []
+    for (const holder of resolution.active_holders) {
+      if (holder.type !== 'agent') continue
+      if (holder.id === task.assignee_agent_id) {
+        skipped.push({ ...holder, reason: 'task_assignee' })
+        continue
+      }
+      let live = false
+      try { live = (await getFleetAgentLiveness(env, holder.id)).live } catch { /* unproven presence is not live */ }
+      if (live) targets.push(holder)
+      else skipped.push({ ...holder, reason: 'not_live' })
+    }
+    if (targets.length > 0) {
+      const ts = new Date().toISOString()
+      const deliveries: NonNullable<GateWakeOutcome['deliveries']>[number][] = []
+      for (const principal of targets) {
+        // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
+        const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
+        deliveries.push({ principal, ...await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId) })
+      }
+      const status = deliveries.every(d => d.bus_delivered && d.inbox_delivered)
+        ? 'delivered'
+        : deliveries.some(d => d.bus_delivered || d.inbox_delivered) ? 'partial' : 'delivery_failed'
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status, deliveries, skipped_holders: skipped,
+        notice: `Gate wake ${status}: ${gateOwner} -> ${deliveries.map(d => `agent ${d.principal.id} (bus=${d.bus_delivered ? 'sent' : 'failed'}, inbox=${d.inbox_delivered ? 'sent' : 'failed'})`).join(', ')}.${skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''}`,
+      })
+    }
     return surfaceGateWakeOutcome(env, task.id, {
       ...baseOutcome,
       status: 'ambiguous',
+      skipped_holders: skipped,
       notice: `Gate wake refused: ${gateOwner} has multiple live holders (${resolution.active_holders.map((holder) => `${holder.type}:${holder.id}`).join(', ')}); operator decision required.`,
     })
   }
@@ -2620,9 +2654,40 @@ export async function wakeGateOwnerOnReview(
   }
 
   const agentId = resolution.principal.id
-
+  if (agentId === task.assignee_agent_id) {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome, status: 'no_live_holder',
+      skipped_holders: [{ ...resolution.principal, reason: 'task_assignee' }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} skipped (task_assignee).`,
+    })
+  }
   const ts = new Date().toISOString()
+  const { bus_delivered: busDelivered, inbox_delivered: inboxDelivered } = await deliverGateAgentWake(
+    env, task, actor, byId, agentId, ts, reviewWakeRequestId(task.id, ts),
+  )
 
+  const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
+    ? 'delivered'
+    : busDelivered || inboxDelivered
+      ? 'partial'
+      : 'delivery_failed'
+  return surfaceGateWakeOutcome(env, task.id, {
+    ...baseOutcome,
+    status,
+    principal: resolution.principal,
+    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).`,
+  })
+}
+
+async function deliverGateAgentWake(
+  env: Env,
+  task: Task,
+  actor: { kind: 'member' | 'agent'; id: string },
+  byId: string,
+  agentId: string,
+  ts: string,
+  requestId: string,
+): Promise<{ bus_delivered: boolean; inbox_delivered: boolean }> {
   let busDelivered = false
   try {
     const event: BusEvent<{ task_id: string; gate_owner: string; by: string }> = {
@@ -2631,7 +2696,7 @@ export async function wakeGateOwnerOnReview(
       squad_id: task.squad_id,
       agent_id: agentId,
       actor,
-      payload: { task_id: task.id, gate_owner: gateOwner, by: byId },
+      payload: { task_id: task.id, gate_owner: task.gate_owner!, by: byId },
       ts,
     }
     await createBus(env).emit(event)
@@ -2649,12 +2714,12 @@ export async function wakeGateOwnerOnReview(
         fromMember: byId,
         toAgent: agentId,
         kind: 'request',
-        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: gateOwner, squad_id: task.squad_id }),
-        requestId: reviewWakeRequestId(task.id, ts),
+        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: task.gate_owner!, squad_id: task.squad_id }),
+        requestId,
       },
       {
         system: true,
-        reason: 'target is the sole gate_grants holder resolved server-side, not attacker input',
+        reason: 'target is an independent gate_grants holder resolved server-side, not attacker input',
       },
     )
     inboxDelivered = delivery.ok
@@ -2662,17 +2727,7 @@ export async function wakeGateOwnerOnReview(
     // best-effort — the visible task notice records this failure.
   }
 
-  const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
-    ? 'delivered'
-    : busDelivered || inboxDelivered
-      ? 'partial'
-      : 'delivery_failed'
-  return surfaceGateWakeOutcome(env, task.id, {
-    ...baseOutcome,
-    status,
-    principal: resolution.principal,
-    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).`,
-  })
+  return { bus_delivered: busDelivered, inbox_delivered: inboxDelivered }
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of
