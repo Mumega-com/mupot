@@ -575,7 +575,7 @@ export async function sendAgentMessage(
       JOIN member_tokens g ON g.id = cs.source_grant_token_id
       JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
-      WHERE ${liveRecipientContinuityScopeSql(env, '?18', '?2', "datetime('now')", '?3')}
+      WHERE ${liveRecipientContinuityScopeSql(env, '?18', '?2', "'now'", '?3')}
     )`
     const fenced = receiverFence !== undefined || brakeFence !== undefined
     const returningSql = fenced ? ' RETURNING seq' : ''

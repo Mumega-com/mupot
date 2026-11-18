@@ -716,7 +716,7 @@ describe('#1756 control flight cancelled before the run observes it', () => {
     expect(delivered(harness)).toBe(1)
   })
 
-  it('does not land or consume an observing routine when its logical recipient scope revokes at the fenced insert', async () => {
+  it('does not land or consume an observing routine when its grant expires at the fenced insert', async () => {
     const h = makeHarness()
     h.sqlite.exec(`
       INSERT INTO members(id,display_name,status,tenant) VALUES ('scope-human','Scope human','active','tenant-a');
@@ -727,11 +727,11 @@ describe('#1756 control flight cancelled before the run observes it', () => {
       INSERT INTO attachment_continuity_scopes(id,tenant,admission_id,agent_id,human_member_id,harness_id,source_grant_token_id,authority_decision_id,created_at) VALUES ('scope-routine','tenant-a','scope-admission','agent-preferred','scope-human','scope-harness','scope-grant','scope-decision',datetime('now'));
       INSERT INTO flights (id,tenant,agent,goal,status,budget_micro_usd,meta,cost_metered,created_at,project_id) VALUES ('cf-scope','tenant-a','agent-preferred','g','running',100,'{}',1,1,'project-1');
       UPDATE routine_runs SET status='observing', flight_id='cf-scope' WHERE id='run-1';`)
-    const base = envFor(h); const db = h.db; let revoked = false
-    const env = { ...base, DB: { prepare(sql: string) { const statement=db.prepare(sql); if (!revoked && sql.includes('INSERT INTO agent_messages')) return { bind(...v: unknown[]) { const b=statement.bind(...v); return { async run(){revoked=true;h.sqlite.exec("UPDATE attachment_continuity_scopes SET revoked_at=datetime('now') WHERE id='scope-routine'");return b.run()}, async first<T>(){return b.first<T>()}, async all<T>(){return b.all<T>()} } as unknown as D1PreparedStatement } } as unknown as D1PreparedStatement; return statement }, batch: db.batch.bind(db) } as unknown as D1Database } as Env
+    const base = envFor(h); const db = h.db; let expired = false
+    const env = { ...base, DB: { prepare(sql: string) { const statement=db.prepare(sql); if (!expired && sql.includes('INSERT INTO agent_messages')) return { bind(...v: unknown[]) { const b=statement.bind(...v); const expire=()=>{ if(!expired){expired=true;h.sqlite.exec("UPDATE member_tokens SET expires_at=datetime('now','-1 second') WHERE id='scope-grant'")} }; return { async run(){expire();return b.run()}, async first<T>(){return b.first<T>()}, async all<T>(){expire();return b.all<T>()} } as unknown as D1PreparedStatement } } as unknown as D1PreparedStatement; return statement }, batch: db.batch.bind(db) } as unknown as D1Database } as Env
     const result = await sendAgentMessage(env, { fromAgent:'mupot-routines',fromMember:'system:routines',toAgent:'agent-preferred',body:'scope routine',kind:'request',requestId:'scope-routine-run',projectId:'project-1',inboxTarget:continuityTarget('scope-routine') }, {system:true,reason:'scope routine race'}, {systemProjectAttribution:true,routineRunFence:{runId:'run-1',projectId:'project-1',agentId:'agent-preferred'}})
     expect(result).toMatchObject({ok:false,reason:'send_target_not_visible'})
-    expect(revoked).toBe(true)
+    expect(expired).toBe(true)
     expect(row(h,"SELECT count(*) AS n FROM agent_messages WHERE request_id='scope-routine-run'")).toEqual({n:0})
     expect(row(h,"SELECT status FROM routine_runs WHERE id='run-1'")).toEqual({status:'observing'})
   })
