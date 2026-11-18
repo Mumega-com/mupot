@@ -128,11 +128,11 @@ async function enrolPasskey(e: Env, memberId: string): Promise<SoftAuthenticator
   return a
 }
 
-async function decideMoment(e: Env, url: string, a: SoftAuthenticator, ceiling?: string): Promise<{ status: number; body: J }> {
+async function decideMoment(e: Env, url: string, a: SoftAuthenticator, ceiling?: string, continuityApproved?: unknown): Promise<{ status: number; body: J }> {
   const path = new URL(url).pathname
   const csrf = csrfOf(await (await hit(path, e)).text())
   const code = one<{ attach_code: string | null }>(`SELECT attach_code FROM agent_seat_admissions ORDER BY (status = 'pending') DESC, created_at DESC LIMIT 1`)?.attach_code
-  const extra = { ...(ceiling ? { ceiling } : {}), ...(code ? { attach_code: code } : {}) }
+  const extra = { ...(ceiling ? { ceiling } : {}), ...(continuityApproved !== undefined ? { continuity_approved: continuityApproved } : {}), ...(code ? { attach_code: code } : {}) }
   const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision: 'approve', csrf, ...extra } })).json()) as J
   const credential = await a.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey?.challenge ?? '' })
   const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision: 'approve', csrf, credential, ...extra } })
@@ -142,12 +142,12 @@ async function decideMoment(e: Env, url: string, a: SoftAuthenticator, ceiling?:
 }
 
 /** Day 1: the human taps ONCE, approving `agent` for every chat of this install (scope harness). Returns the passkey. */
-async function admitForAllChats(env: Env, g: Grant, session: string, agent = 'rava', ceiling?: string): Promise<SoftAuthenticator> {
+async function admitForAllChats(env: Env, g: Grant, session: string, agent = 'rava', ceiling?: string, continuityApproved?: unknown): Promise<SoftAuthenticator> {
   await boot(env, g, session)
   const pend = await attach(env, g, session, agent, 'harness')
   expect(pend.sc.status, errOf(pend)).toBe('pending_admission')
   const key = await enrolPasskey(env, g.memberId).catch(() => { throw new Error('passkey') })
-  const res = await decideMoment(env, String(pend.sc.approve_url), key, ceiling)
+  const res = await decideMoment(env, String(pend.sc.approve_url), key, ceiling, continuityApproved)
   expect(res.status, JSON.stringify(res.body)).toBe(200)
   const done = await attach(env, g, session, agent)
   expect(done.sc.status, errOf(done)).toBe('attached')
@@ -876,6 +876,50 @@ describe('gate authority is not inherited through grant continuity', () => {
     const { NO_HINTS } = await import('../src/members/seat-handle')
     const a = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
     expect(await callerHoldsGateCapability(env, a, 'squad-core', 'gate:review')).toBe(true)
+  })
+})
+
+describe('Rava continuity approval: fresh passkey opt-in only', () => {
+  it('a true, challenge-bound R1 choice creates one scope and gives later explicitly attached chats one alias', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'continuity-day1', 'rava', undefined, true)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(1)
+    expect(one<{ continuity_approved: number }>(`SELECT continuity_approved FROM agent_seat_authority_decisions ORDER BY rowid DESC LIMIT 1`)!.continuity_approved).toBe(1)
+    const first = await attach(env, g, 'continuity-day1', 'rava')
+    const next = await attach(env, g, 'continuity-day2', 'rava')
+    expect(typeof first.sc.inbox_target).toBe('string')
+    expect(next.sc.inbox_target).toBe(first.sc.inbox_target)
+    const rows = attachments()
+    expect(rows).toHaveLength(2)
+    expect(rows[0].seat_token_id).not.toBe(rows[1].seat_token_id)
+  })
+
+  it('absent, false, invalid, seat-scoped, and old R1 approvals never enroll', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'legacy-absent')
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET status='revoked', revoked_at=datetime('now')`)
+    await admitForAllChats(env, g, 'legacy-false', 'rava', undefined, false)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    const g2 = await grant(env, HUMAN, 'client-other')
+    await boot(env, g2, 'invalid')
+    const p = await attach(env, g2, 'invalid', 'rava', 'harness')
+    const key = await enrolPasskey(env, HUMAN)
+    expect((await decideMoment(env, String(p.sc.approve_url), key, undefined, 'false')).status).toBe(400)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('a challenge minted for false cannot be upgraded to true', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await boot(env, g, 'tamper'); const p = await attach(env, g, 'tamper', 'rava', 'harness'); const key = await enrolPasskey(env, HUMAN)
+    const path = new URL(String(p.sc.approve_url)).pathname; const csrf = csrfOf(await (await hit(path, env)).text())
+    const code = one<{ attach_code: string }>(`SELECT attach_code FROM agent_seat_admissions`)!.attach_code
+    const ch = await (await hit(`${path}/challenge`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code: code, continuity_approved: false } })).json() as J
+    const credential = await key.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey!.challenge })
+    expect((await hit(`${path}/decide`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code: code, continuity_approved: true, credential } })).status).toBe(403)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
 })
 
