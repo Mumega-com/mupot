@@ -38,7 +38,8 @@ FOR EACH ROW
 WHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant
   OR NEW.admission_id IS NOT OLD.admission_id OR NEW.agent_id IS NOT OLD.agent_id
   OR NEW.human_member_id IS NOT OLD.human_member_id OR NEW.harness_id IS NOT OLD.harness_id
-  OR NEW.source_grant_token_id IS NOT OLD.source_grant_token_id OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.source_grant_token_id IS NOT OLD.source_grant_token_id OR NEW.authority_decision_id IS NOT OLD.authority_decision_id
+  OR NEW.created_at IS NOT OLD.created_at
   OR (OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS NOT OLD.revoked_at OR NEW.revoked_by_member_id IS NOT OLD.revoked_by_member_id))
   OR (OLD.revoked_at IS NULL AND NEW.revoked_at IS NULL AND NEW.revoked_by_member_id IS NOT OLD.revoked_by_member_id)
 BEGIN
@@ -94,6 +95,20 @@ BEGIN
   SELECT RAISE(ABORT, 'agent_message_continuity_target_invalid');
 END;
 
+-- A scoped delivery is addressed to an immutable logical epoch.  Delivery
+-- bookkeeping remains mutable, but a caller must not turn a scoped message
+-- into an unscoped one or retarget it after it has entered the inbox.
+CREATE TRIGGER IF NOT EXISTS agent_messages_continuity_target_immutable
+BEFORE UPDATE OF target_continuity_scope_id, target_seat, to_agent, tenant ON agent_messages
+FOR EACH ROW WHEN OLD.target_continuity_scope_id IS NOT NULL
+  AND (NEW.target_continuity_scope_id IS NOT OLD.target_continuity_scope_id
+    OR NEW.target_seat IS NOT OLD.target_seat
+    OR NEW.to_agent IS NOT OLD.to_agent
+    OR NEW.tenant IS NOT OLD.tenant)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_message_continuity_target_immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS agent_continuity_handled (
   scope_id             TEXT NOT NULL REFERENCES attachment_continuity_scopes(id) ON DELETE RESTRICT,
   message_id           TEXT NOT NULL,
@@ -113,7 +128,11 @@ FOR EACH ROW WHEN NOT EXISTS (
    WHERE s.id = NEW.scope_id AND s.tenant = NEW.tenant
      AND s.agent_id = a.agent_id AND s.human_member_id = a.human_member_id
      AND s.harness_id = a.harness_id AND s.admission_id = a.admission_id
-     AND m.target_continuity_scope_id = s.id AND m.to_agent = s.agent_id
+     AND m.to_agent = s.agent_id
+     AND (
+       (m.target_continuity_scope_id = s.id AND m.target_seat = 'continuity:' || s.id)
+       OR (m.target_continuity_scope_id IS NULL AND m.target_seat IS NULL)
+     )
 )
 BEGIN
   SELECT RAISE(ABORT, 'agent_continuity_handled_scope_message_invalid');
