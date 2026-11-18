@@ -943,6 +943,64 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id IN ('rpc-unknown','rpc-revoked')")).toBe(0)
   })
 
+  it('MCP refuses a live scope belonging to a different recipient agent without fallback', async () => {
+    const env = envFor(h); const ravaGrant = await grant(env, HUMAN)
+    await admitForAllChats(env, ravaGrant, 'wrong-recipient-rava', 'rava', undefined, true)
+    const otherHuman = 'member-human-routing-other'
+    seedHuman(otherHuman)
+    h.sqlite.prepare("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-routing-other', ?, 'squad', 'squad-core', 'admin')").run(otherHuman)
+    const hadiGrant = await grant(env, otherHuman, 'routing-other-install')
+    await admitForAllChats(env, hadiGrant, 'wrong-recipient-hadi', 'hadi-dev', undefined, true)
+    const hadiScope = one<{ id: string }>("SELECT id FROM attachment_continuity_scopes WHERE agent_id='agent-hadi-dev'")!
+    const denied = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'wrong recipient', request_id: 'rpc-wrong-recipient', inbox_target: `continuity:${hadiScope.id}` })
+    expect(denied.status).toBe(200)
+    expect(errOf(denied)).toContain('send_target_not_visible')
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='rpc-wrong-recipient'")).toBe(0)
+    const control = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'ordinary control', request_id: 'rpc-wrong-recipient-control' })
+    expect(control.status, errOf(control)).toBe(200)
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='rpc-wrong-recipient-control'")).toBe(1)
+  })
+
+  it('keeps physical continuity-looking labels physical and refuses a logical idempotency upgrade', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'physical-alias', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    const alias = `continuity:${scope.id}`
+    // A live physical label can happen to equal the reserved-looking string. The
+    // real write path must preserve that as legacy physical routing, never infer scope.
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, agent_id, label, channel, created_at, tenant)
+      VALUES ('physical-alias-token', 'mem-agent-rava', 'physical-alias-token', 'agent-rava', ?, 'workspace', datetime('now'), ?)`)
+      .run(alias, TENANT)
+    const physical = await sendAgentMessage(env, {
+      fromAgent: 'agent-hadi-dev', fromMember: 'mem-agent-hadi-dev', toAgent: 'agent-rava',
+      body: 'physical alias', requestId: 'physical-alias-rid', targetSeat: alias,
+    }, { system: true, reason: 'real migration-backed physical selector contract' })
+    expect(physical).toMatchObject({ ok: true, duplicate: false })
+    expect(one<{ target_seat: string; target_continuity_scope_id: string | null }>("SELECT target_seat, target_continuity_scope_id FROM agent_messages WHERE request_id='physical-alias-rid'"))
+      .toEqual({ target_seat: alias, target_continuity_scope_id: null })
+    const upgrade = await sendAgentMessage(env, {
+      fromAgent: 'agent-hadi-dev', fromMember: 'mem-agent-hadi-dev', toAgent: 'agent-rava',
+      body: 'physical alias', requestId: 'physical-alias-rid', inboxTarget: alias,
+    }, { system: true, reason: 'real migration-backed idempotency contract' })
+    expect(upgrade).toMatchObject({ ok: false, reason: 'request_id_conflict' })
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='physical-alias-rid'")).toBe(1)
+  })
+
+  it('deduplicates an exact logical retry without a second row or publication', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'logical-retry', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    const published: unknown[] = []
+    ;(env as unknown as { BUS: { send: (event: unknown) => Promise<void> } }).BUS = { send: async event => { published.push(event) } }
+    const input = { fromAgent: 'agent-hadi-dev', fromMember: 'mem-agent-hadi-dev', toAgent: 'agent-rava', body: 'logical retry', requestId: 'logical-retry-rid', inboxTarget: `continuity:${scope.id}` }
+    const first = await sendAgentMessage(env, input, { system: true, reason: 'logical retry contract' })
+    const second = await sendAgentMessage(env, input, { system: true, reason: 'logical retry contract' })
+    expect(first).toMatchObject({ ok: true, duplicate: false })
+    expect(second).toMatchObject({ ok: true, duplicate: true })
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='logical-retry-rid'")).toBe(1)
+    expect(published).toHaveLength(1)
+  })
+
   it('routes an explicit logical inbox target to its live recipient scope', async () => {
     const env = envFor(h)
     const published: Array<{ payload: { target_seat: string | null } }> = []
