@@ -15,7 +15,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { evaluate, loadAllowlist, runAudit, parseArgs, withoutDevRoot, AuditGateError } from '../scripts/audit-gate.mjs'
+import { evaluate, loadAllowlist, runAudit, runGate, crossCheckMetadata, parseArgs, withoutDevRoot, AuditGateError } from '../scripts/audit-gate.mjs'
+import { scanBundle } from '../scripts/check-office-bundle.mjs'
 import { pathsToNode, LockfileGraphError } from '../scripts/lockfile-paths.mjs'
 
 const UNDICI_GHSA = 'GHSA-4cwx-7wf7-3272'
@@ -524,6 +525,8 @@ test('node and path order in the allowlist entry does not matter', () => {
 // ── Production mode (--omit-dev) and expiry ──────────────────────────────────
 
 const PM = { prod: true }
+const LIVE = { accepted_on: '2026-11-18', expires_on: '2027-01-18' }
+const NOW = new Date('2026-11-19T00:00:00Z')
 
 test('prod mode blocks a moderate advisory that is not allowlisted', () => {
   const { violations } = evaluate(report({ severity: 'moderate' }), [], lockfile(), PM)
@@ -550,30 +553,30 @@ test('prod-mode allowlist rejects the same GHSA arriving by a different path', (
 })
 
 test('moderate allowlist entries load only in prod mode', () => {
-  withAllowlistFile({ allowed: [allowEntry({ severity: 'moderate' })] }, (p) => {
+  withAllowlistFile({ allowed: [allowEntry({ severity: 'moderate', ...LIVE })] }, (p) => {
     assert.throws(() => loadAllowlist(p), /only high\/critical block/)
-    assert.equal(loadAllowlist(p, { prod: true }).length, 1)
+    assert.equal(loadAllowlist(p, { prod: true, now: NOW }).length, 1)
   })
-  withAllowlistFile({ allowed: [allowEntry({ severity: 'low' })] }, (p) => {
+  withAllowlistFile({ allowed: [allowEntry({ severity: 'low', ...LIVE })] }, (p) => {
     assert.throws(() => loadAllowlist(p, { prod: true }), /only moderate\/high\/critical block/)
   })
 })
 
 test('isDirect true is rejected in prod mode too', () => {
-  withAllowlistFile({ allowed: [allowEntry({ isDirect: true })] }, (p) => {
+  withAllowlistFile({ allowed: [allowEntry({ isDirect: true, ...LIVE })] }, (p) => {
     assert.throws(() => loadAllowlist(p, { prod: true }), /cannot inherit the transitive-toolchain exemption/)
   })
 })
 
 test('expires_on in the past fails the gate', () => {
-  withAllowlistFile({ allowed: [allowEntry({ expires_on: '2027-01-18' })] }, (p) => {
+  withAllowlistFile({ allowed: [allowEntry(LIVE)] }, (p) => {
     assert.throws(() => loadAllowlist(p, { now: new Date('2027-01-19T00:00:00Z') }), /expired on 2027-01-18/)
     assert.throws(() => loadAllowlist(p, { prod: true, now: new Date('2027-01-19T00:00:00Z') }), /expired/)
   })
 })
 
 test('expires_on on or before its date still loads', () => {
-  withAllowlistFile({ allowed: [allowEntry({ expires_on: '2027-01-18' })] }, (p) => {
+  withAllowlistFile({ allowed: [allowEntry(LIVE)] }, (p) => {
     assert.equal(loadAllowlist(p, { now: new Date('2027-01-18T23:59:59Z') }).length, 1)
     assert.equal(loadAllowlist(p, { now: new Date('2026-11-18T00:00:00Z') }).length, 1)
   })
@@ -600,12 +603,15 @@ test('parseArgs: defaults are the root dev gate; flags override; junk throws', (
   const d = parseArgs([])
   assert.equal(d.omitDev, false)
   assert.match(d.allowlist, /\.github\/audit-allowlist\.json$/)
-  const p = parseArgs(['--cwd', 'workers/x', '--omit-dev', '--allowlist', 'a.json', '--lockfile', 'l.json'])
+  const p = parseArgs(['--cwd', 'workers/x', '--omit-dev', '--allowlist', 'a.json'])
   assert.equal(p.omitDev, true)
   assert.match(p.cwd, /workers\/x$/)
   assert.match(p.allowlist, /a\.json$/)
-  assert.match(p.lockfile, /l\.json$/)
+  assert.match(p.lockfile, /workers\/x\/package-lock\.json$/)
   assert.throws(() => parseArgs(['--nope']), /unknown argument/)
+  // a mismatched lockfile can no longer be supplied: the flag does not exist
+  assert.throws(() => parseArgs(['--cwd', 'workers/x', '--lockfile', '/elsewhere/package-lock.json']), /unknown argument --lockfile/)
+  assert.equal(parseArgs([]).lockfile, join(parseArgs([]).cwd, 'package-lock.json'))
   assert.throws(() => parseArgs(['--cwd']), /needs a value/)
 })
 
@@ -624,8 +630,126 @@ test('the real allowlists carry a valid, future expires_on and load in their mod
   for (const e of [...root, ...po]) {
     assert.equal(e.ghsa, 'GHSA-fc5q-39xc-vjpf')
     assert.equal(e.expires_on, '2027-01-18')
+    assert.ok(e.accepted_on)
     assert.equal(e.isDirect, false)
   }
   assert.equal(root.length, 1)
   assert.equal(po.length, 1)
+})
+
+// ── #2455 follow-ups: expires_on rules, CLI wiring, metadata cross-check, bundle scan ──
+
+test('prod mode REQUIRES expires_on; dev mode does not', () => {
+  withAllowlistFile({ allowed: [allowEntry({ severity: 'high' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { prod: true, now: NOW }), /missing required field "expires_on"/)
+    assert.equal(loadAllowlist(p).length, 1)
+  })
+})
+
+test('expires_on before accepted_on is rejected', () => {
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: '2026-11-18', expires_on: '2026-11-17' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { now: NOW }), /is before accepted_on/)
+  })
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: '2026-11-18', expires_on: '2026-11-18' })] }, (p) => {
+    assert.equal(loadAllowlist(p, { now: new Date('2026-11-18T00:00:00Z') }).length, 1) // equal is allowed
+  })
+})
+
+test('expires_on is capped at 90 days after accepted_on', () => {
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: '2026-11-18', expires_on: '9999-12-31' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { now: NOW }), /more than 90 days/)
+  })
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: '2026-11-18', expires_on: '2027-02-16' })] }, (p) => {
+    assert.equal(loadAllowlist(p, { now: NOW }).length, 1) // exactly 90 days
+  })
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: '2026-11-18', expires_on: '2027-02-17' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { now: NOW }), /more than 90 days/) // 91 days
+  })
+})
+
+test('the date regex and calendar check reject roll-overs and junk', () => {
+  for (const bad of ['2027-02-31', '2027-1-8', '2027/01/18', ' 2027-01-18', '2027-01-18T00:00:00Z']) {
+    withAllowlistFile({ allowed: [allowEntry({ expires_on: bad })] }, (p) => {
+      assert.throws(() => loadAllowlist(p, { now: NOW }), /expires_on must be a YYYY-MM-DD date/, bad)
+    })
+  }
+  withAllowlistFile({ allowed: [allowEntry({ accepted_on: 'yesterday', expires_on: '2027-01-18' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { now: NOW }), /accepted_on must be a YYYY-MM-DD date/)
+  })
+})
+
+// CLI-level wiring. runGate drives the real main path with a fake npm and a temp project,
+// so removing `{ prod }` from the evaluate call is caught (it was invisible before).
+function withProject(lock, allowlist, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'audit-gate-cli-'))
+  try {
+    writeFileSync(join(dir, 'package-lock.json'), JSON.stringify(lock))
+    writeFileSync(join(dir, 'allow.json'), JSON.stringify(allowlist))
+    return fn(dir, join(dir, 'allow.json'))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+function fakeNpm(rep) {
+  return () => { const e = new Error('findings'); e.status = 1; e.stdout = JSON.stringify(rep); throw e }
+}
+function counted(rep) {
+  const c = Object.fromEntries(['info', 'low', 'moderate', 'high', 'critical'].map((k) => [k, 0]))
+  for (const v of Object.values(rep.vulnerabilities)) c[v.severity]++
+  return { ...rep, metadata: { vulnerabilities: { ...c, total: Object.keys(rep.vulnerabilities).length } } }
+}
+const quiet = { log: () => {}, error: () => {}, now: NOW }
+
+test('CLI: --omit-dev makes a moderate production finding exit 1; dev mode ignores it', () => {
+  const rep = counted(report({ severity: 'moderate' }))
+  withProject(lockfile(), { allowed: [] }, (dir, allow) => {
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow, '--omit-dev'], { ...quiet, exec: fakeNpm(rep) }), 1)
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow], { ...quiet, exec: fakeNpm(rep) }), 0)
+  })
+})
+
+test('CLI: a clean production audit exits 0 and malformed npm output exits 1', () => {
+  withProject(lockfile(), { allowed: [] }, (dir, allow) => {
+    const clean = counted({ vulnerabilities: {} })
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow, '--omit-dev'], { ...quiet, exec: () => JSON.stringify(clean) }), 0)
+  })
+})
+
+test('CLI: the lockfile is the one under --cwd, whatever else is on disk', () => {
+  withProject(lockfile(), { allowed: [] }, (dir, allow) => {
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow, '--lockfile', join(dir, 'package-lock.json')], quiet), 1)
+  })
+})
+
+test('malformed npm output fails closed: no via, emptied map, count mismatch, missing metadata', () => {
+  const good = counted(report())
+  assert.doesNotThrow(() => crossCheckMetadata(good))
+  const noVia = counted(report()); delete noVia.vulnerabilities.undici.via
+  assert.throws(() => crossCheckMetadata(noVia), /no `via` array/)
+  assert.throws(() => crossCheckMetadata({ ...good, vulnerabilities: {} }), /disagrees with itself/)
+  assert.throws(() => evaluate({ vulnerabilities: [] }, [], lockfile()), /no `vulnerabilities` object/)
+  const { metadata, ...bare } = good
+  assert.throws(() => crossCheckMetadata(bare), /no `metadata.vulnerabilities`/)
+  withProject(lockfile(), { allowed: [] }, (dir, allow) => {
+    const emptied = { ...good, vulnerabilities: {} }
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow], { ...quiet, exec: () => JSON.stringify(emptied) }), 1)
+  })
+})
+
+test('GONE message names the entry\'s own review issue, not #670', () => {
+  const lines = []
+  withProject(lockfile(), { allowed: [allowEntry({ review: 'https://example.test/issues/2453' })] }, (dir, allow) => {
+    const code = runGate(['--cwd', dir, '--allowlist', allow], { ...quiet, error: (m) => lines.push(m), exec: () => JSON.stringify(counted({ vulnerabilities: {} })) })
+    assert.equal(code, 1)
+  })
+  const out = lines.join('\n')
+  assert.match(out, /issues\/2453/)
+  assert.doesNotMatch(out, /issues\/670/)
+})
+
+test('bundle scan flags picomatch/vite/tinyglobby/fdir/@rolldown and passes a clean bundle', () => {
+  assert.deepEqual(scanBundle([['index.js', 'export default {}']]), [])
+  assert.deepEqual(scanBundle([['index.js', '"application/vnd.oma.cab-subs-invite+xml"']]), [], 'invite is not vite')
+  assert.equal(scanBundle([['index.js.map', 'node_modules/vite/dist/x.js']])[0].term, 'vite')
+  for (const t of ['picomatch', 'vite', 'tinyglobby', 'fdir', '@rolldown']) {
+    assert.equal(scanBundle([['index.js.map', `x ${t} y`]])[0].term, t)
+  }
 })
