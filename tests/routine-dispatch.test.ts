@@ -716,7 +716,10 @@ describe('#1756 control flight cancelled before the run observes it', () => {
     expect(delivered(harness)).toBe(1)
   })
 
-  it('does not land or consume an observing routine when its welded recipient member suspends at the fenced insert', async () => {
+  it.each([
+    ['the welded recipient member suspends', "UPDATE members SET status='suspended' WHERE id='member-preferred'"],
+    ['the source grant expires', "UPDATE member_tokens SET expires_at=datetime('now','-1 second') WHERE id='scope-grant'"],
+  ])('does not land or consume an observing routine when %s at the fenced insert', async (_label, boundarySql) => {
     const h = makeHarness()
     h.sqlite.exec(`
       INSERT INTO members(id,display_name,status,tenant) VALUES ('scope-human','Scope human','active','tenant-a');
@@ -727,11 +730,33 @@ describe('#1756 control flight cancelled before the run observes it', () => {
       INSERT INTO attachment_continuity_scopes(id,tenant,admission_id,agent_id,human_member_id,harness_id,source_grant_token_id,authority_decision_id,created_at) VALUES ('scope-routine','tenant-a','scope-admission','agent-preferred','scope-human','scope-harness','scope-grant','scope-decision',datetime('now'));
       INSERT INTO flights (id,tenant,agent,goal,status,budget_micro_usd,meta,cost_metered,created_at,project_id) VALUES ('cf-scope','tenant-a','agent-preferred','g','running',100,'{}',1,1,'project-1');
       UPDATE routine_runs SET status='observing', flight_id='cf-scope' WHERE id='run-1';`)
-    const base = envFor(h); const db = h.db; let expired = false
-    const env = { ...base, DB: { prepare(sql: string) { const statement=db.prepare(sql); if (!expired && sql.includes('INSERT INTO agent_messages')) return { bind(...v: unknown[]) { const b=statement.bind(...v); const expire=()=>{ if(!expired){expired=true;h.sqlite.exec("UPDATE members SET status='suspended' WHERE id='member-preferred'")} }; return { async run(){expire();return b.run()}, async first<T>(){return b.first<T>()}, async all<T>(){expire();return b.all<T>()} } as unknown as D1PreparedStatement } } as unknown as D1PreparedStatement; return statement }, batch: db.batch.bind(db) } as unknown as D1Database } as Env
+    const base = envFor(h); const db = h.db; let changed = false
+    const mutateAtInsert = () => {
+      if (!changed) { changed = true; h.sqlite.exec(boundarySql) }
+    }
+    const env = {
+      ...base,
+      DB: {
+        prepare(sql: string) {
+          const statement = db.prepare(sql)
+          if (!changed && sql.includes('INSERT INTO agent_messages')) return {
+            bind(...values: unknown[]) {
+              const bound = statement.bind(...values)
+              return {
+                async run() { mutateAtInsert(); return bound.run() },
+                async first<T>() { return bound.first<T>() },
+                async all<T>() { mutateAtInsert(); return bound.all<T>() },
+              } as unknown as D1PreparedStatement
+            },
+          } as unknown as D1PreparedStatement
+          return statement
+        },
+        batch: db.batch.bind(db),
+      } as unknown as D1Database,
+    } as Env
     const result = await sendAgentMessage(env, { fromAgent:'mupot-routines',fromMember:'system:routines',toAgent:'agent-preferred',body:'scope routine',kind:'request',requestId:'scope-routine-run',projectId:'project-1',inboxTarget:continuityTarget('scope-routine') }, {system:true,reason:'scope routine race'}, {systemProjectAttribution:true,routineRunFence:{runId:'run-1',projectId:'project-1',agentId:'agent-preferred'}})
     expect(result).toMatchObject({ok:false,reason:'send_target_not_visible'})
-    expect(expired).toBe(true)
+    expect(changed).toBe(true)
     expect(row(h,"SELECT count(*) AS n FROM agent_messages WHERE request_id='scope-routine-run'")).toEqual({n:0})
     expect(row(h,"SELECT status FROM routine_runs WHERE id='run-1'")).toEqual({status:'observing'})
   })
