@@ -753,3 +753,43 @@ test('bundle scan flags picomatch/vite/tinyglobby/fdir/@rolldown and passes a cl
     assert.equal(scanBundle([['index.js.map', `x ${t} y`]])[0].term, t)
   }
 })
+
+// --- #2457 follow-ups ---
+test('loadAllowlist: accepted_on later than today (UTC) is rejected', () => {
+  withProject(lockfile(), { allowed: [allowEntry({ accepted_on: '2026-12-01', expires_on: '2027-02-01' })] }, (dir, allow) => {
+    assert.throws(() => loadAllowlist(allow, { now: NOW }), /accepted_on .* in the future/)
+  })
+  withProject(lockfile(), { allowed: [allowEntry({ accepted_on: '2026-12-01' })] }, (dir, allow) => {
+    assert.throws(() => loadAllowlist(allow, { now: NOW }), /in the future/)
+  })
+})
+
+test('crossCheckMetadata: unknown severity (incl. prototype keys) throws', () => {
+  for (const severity of ['constructor', '__proto__', 'toString', 'bogus']) {
+    const rep = { metadata: { vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 1 } },
+      vulnerabilities: { p: { severity, via: [] } } }
+    assert.throws(() => crossCheckMetadata(rep), /unknown severity/)
+  }
+})
+
+test('crossCheckMetadata: per-severity and total mismatches throw distinct errors', () => {
+  const z = { info: 0, low: 0, moderate: 0, high: 0, critical: 0 }
+  const vulns = { p: { severity: 'high', via: [] } }
+  assert.throws(() => crossCheckMetadata({ metadata: { vulnerabilities: { ...z, high: 0, total: 1 } }, vulnerabilities: vulns }), /metadata says 0 high, vulnerabilities lists 1/)
+  assert.throws(() => crossCheckMetadata({ metadata: { vulnerabilities: { ...z, high: 1, total: 2 } }, vulnerabilities: vulns }), /metadata total 2, vulnerabilities lists 1/)
+  assert.doesNotThrow(() => crossCheckMetadata({ metadata: { vulnerabilities: { ...z, high: 1, total: 1 } }, vulnerabilities: vulns }))
+})
+
+test('CLI: prod mode still requires expires_on (dev mode does not)', () => {
+  const rep = counted(report({ severity: 'moderate' }))
+  withProject(lockfile(), { allowed: [allowEntry({ severity: 'moderate' })] }, (dir, allow) => {
+    assert.equal(runGate(['--cwd', dir, '--allowlist', allow, '--omit-dev'], { ...quiet, exec: fakeNpm(rep) }), 1)
+  })
+  const clean = counted({ vulnerabilities: {} })
+  withProject(lockfile(), { allowed: [allowEntry({ severity: 'moderate' })] }, (dir, allow) => {
+    // exits 1 for the missing expires_on, not for STALE: capture the message
+    let msg = ''
+    runGate(['--cwd', dir, '--allowlist', allow, '--omit-dev'], { ...quiet, error: (m) => { msg += m }, exec: () => JSON.stringify(clean) })
+    assert.match(msg, /missing required field "expires_on"/)
+  })
+})

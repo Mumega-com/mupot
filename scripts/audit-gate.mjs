@@ -69,7 +69,7 @@
 // not contain picomatch (see the bundle check in the project-office job of ci.yml).
 
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { pathsToNode, LockfileGraphError } from './lockfile-paths.mjs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join, resolve, relative } from 'node:path'
@@ -166,6 +166,13 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST, { prod = false, now = ne
     }
     if (prod && entry.expires_on === undefined) {
       throw new AuditGateError(`${path}: allowed[${i}] is missing required field "expires_on" (required in production mode)`)
+    }
+    {
+      // A future accepted_on would defeat the MAX_EXPIRY_DAYS cap (expiry is measured from it).
+      const accDay = parseDay(entry.accepted_on)
+      if (accDay !== null && entry.accepted_on > now.toISOString().slice(0, 10)) {
+        throw new AuditGateError(`${path}: allowed[${i}].accepted_on ${entry.accepted_on} is in the future (UTC)`)
+      }
     }
     if (entry.expires_on !== undefined) {
       const exp = parseDay(entry.expires_on)
@@ -271,7 +278,7 @@ export function crossCheckMetadata(report) {
       throw new AuditGateError(`audit output: ${pkg} has no \`via\` array — malformed, refusing to interpret it`)
     }
     const sev = String(vuln.severity ?? '').toLowerCase()
-    if (!(sev in tally)) throw new AuditGateError(`audit output: ${pkg} has unknown severity "${vuln.severity}"`)
+    if (!Object.hasOwn(tally, sev)) throw new AuditGateError(`audit output: ${pkg} has unknown severity "${vuln.severity}"`)
     tally[sev]++
     total++
   }
@@ -497,4 +504,9 @@ function main() {
   process.exit(runGate(process.argv.slice(2)))
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) main()
+// Fail-closed entry guard: compare real paths so symlinks and spaces still run main().
+function isEntryPoint() {
+  if (!process.argv[1]) return false
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])) } catch { return false }
+}
+if (isEntryPoint()) main()

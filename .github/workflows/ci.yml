@@ -68,7 +68,7 @@ jobs:
       # so each stays shut. A gate whose tests need a working registry cannot be trusted
       # to run when the registry is what is broken.
       - name: Audit-gate self-tests
-        run: node --test tests/audit-gate.test.mjs
+        run: node --test tests/audit-gate.test.mjs tests/check-office-bundle.test.mjs
       - name: Typecheck
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
