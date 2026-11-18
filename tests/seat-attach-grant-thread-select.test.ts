@@ -882,6 +882,27 @@ describe('gate authority is not inherited through grant continuity', () => {
 })
 
 describe('Rava continuity approval: fresh passkey opt-in only', () => {
+  it('renders the account-wide Rava warning only for harness scope', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'render-r1')
+    const harnessAsk=await attach(env,g,'render-r1','rava','harness')
+    const harnessPage=await (await hit(new URL(String(harnessAsk.sc.approve_url)).pathname,env)).text()
+    expect(harnessPage).toContain('any ChatGPT or Codex surface on your account')
+    expect(harnessPage).toContain('Rava')
+    expect(harnessPage).toContain('never grants review-gate authority')
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET status='denied' WHERE status='pending'`)
+    await boot(env,g,'render-seat'); const seatAsk=await attach(env,g,'render-seat','rava')
+    const seatPage=await (await hit(new URL(String(seatAsk.sc.approve_url)).pathname,env)).text()
+    expect(seatPage).toContain('This approval is for the one chat shown above')
+    expect(seatPage).not.toContain('any ChatGPT or Codex surface on your account')
+  })
+
+  it('refuses a continuity opt-in when another historical harness seat has no target attachment', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'history-current'); await boot(env,g,'history-other')
+    const ask=await attach(env,g,'history-current','rava','harness'); const key=await enrolPasskey(env,HUMAN)
+    expect((await decideMoment(env,String(ask.sc.approve_url),key,undefined,true)).status).toBe(409)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
   const peerSender = async (env: Env): Promise<AuthContext> => {
     const tokenId = `peer-send-${crypto.randomUUID()}`
     h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, agent_id, label, channel, created_at, tenant)
@@ -1194,12 +1215,13 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
 
-  it('a stale revoked-admission scope does not reserve the harness against a fresh agent', async () => {
+  it('a stale revoked-admission scope does not reserve the harness against an unchecked fresh-agent approval', async () => {
     const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'stale-rava','rava',undefined,true)
     h.sqlite.exec(`UPDATE agent_seat_admissions SET status='revoked', revoked_at=datetime('now') WHERE agent_id='agent-rava'`)
     await boot(env,g,'stale-other'); const p=await attach(env,g,'stale-other','hadi-dev','harness'); const key=await enrolPasskey(env,HUMAN)
-    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,true)).status).toBe(200)
-    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes WHERE agent_id='agent-hadi-dev'`)).toBe(1)
+    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,false)).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes WHERE agent_id='agent-hadi-dev'`)).toBe(0)
+    expect(one<{status:string}>(`SELECT status FROM agent_seat_admissions WHERE agent_id='agent-hadi-dev'`)!.status).toBe('live')
   })
 
   it('an unchecked route approval cannot promote another agent on a reserved harness', async () => {
