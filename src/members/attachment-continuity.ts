@@ -236,7 +236,7 @@ export async function findLiveRecipientContinuityScope(env: Env, scopeId: string
       JOIN member_tokens g ON g.id = cs.source_grant_token_id
       JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
-      JOIN members am ON am.id = b.member_id AND am.tenant = cs.tenant AND am.status = 'active'
+       JOIN members am ON am.id = b.member_id AND am.tenant = cs.tenant AND am.status = 'active'
      WHERE ${liveRecipientContinuityScopeSql(env, '?1', '?2', '?3', '?4')}
      LIMIT 1`,
   ).bind(scopeId, env.TENANT_SLUG, nowIso, recipientAgentId).first<ContinuityScopeRow>()

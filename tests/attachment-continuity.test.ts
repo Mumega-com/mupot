@@ -189,6 +189,14 @@ describe('attachment continuity scopes', () => {
     await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
+  it('fails recipient lookup closed when the welded recipient member is deactivated', async () => {
+    const x = seed()
+    await enroll(approveContinuity(x))
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toMatchObject({ id: 'scope-a' })
+    h.sqlite.prepare("UPDATE members SET status = 'inactive' WHERE id = 'agent-member'").run()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
+  })
+
   it('fails recipient lookup closed when the active human or harness grant anchor no longer matches', async () => {
     const x = seed()
     await enroll(approveContinuity(x))

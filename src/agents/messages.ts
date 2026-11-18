@@ -575,7 +575,7 @@ export async function sendAgentMessage(
       JOIN member_tokens g ON g.id = cs.source_grant_token_id
       JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
-      WHERE ${liveRecipientContinuityScopeSql(env, '?18', '?2', '?10', '?3')}
+      WHERE ${liveRecipientContinuityScopeSql(env, '?18', '?2', "datetime('now')", '?3')}
     )`
     const fenced = receiverFence !== undefined || brakeFence !== undefined
     const returningSql = fenced ? ' RETURNING seq' : ''
@@ -649,7 +649,7 @@ export async function sendAgentMessage(
       // The logical target was preflighted above, but its authority is also part
       // of the INSERT predicate.  Name a changed/revoked scope as invisible,
       // rather than pretending a non-message consumed recipient capacity.
-      if (resolvedScopeId !== null && !await findLiveRecipientContinuityScope(env, resolvedScopeId, input.toAgent, createdAt)) {
+      if (resolvedScopeId !== null && !await findLiveRecipientContinuityScope(env, resolvedScopeId, input.toAgent)) {
         return { ok: false, reason: 'send_target_not_visible' }
       }
       if (replyFence) {
