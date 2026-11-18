@@ -16,6 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import { applyAllMigrations } from './helpers/migrations'
 import { SoftAuthenticator } from './helpers/webauthn-authenticator'
 import { upsertHarness } from '../src/members/harness'
@@ -999,6 +1000,43 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(second).toMatchObject({ ok: true, duplicate: true })
     expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='logical-retry-rid'")).toBe(1)
     expect(published).toHaveLength(1)
+  })
+
+  it('refuses a logical send when its recipient scope is revoked after lookup but before the actual insert', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'scope-write-race', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    const published: unknown[] = []
+    ;(env as unknown as { BUS: { send: (event: unknown) => Promise<void> } }).BUS = { send: async event => { published.push(event) } }
+    const db = env.DB
+    let changed = false
+    env.DB = {
+      prepare(sql: string) {
+        const statement = db.prepare(sql)
+        if (!changed && sql.includes('INSERT INTO agent_messages')) {
+          return {
+            bind(...values: unknown[]) {
+              const bound = statement.bind(...values)
+              return {
+                async run() { changed = true; h.sqlite.prepare('UPDATE attachment_continuity_scopes SET revoked_at=datetime(\'now\') WHERE id=?').run(scope.id); return bound.run() },
+                async first<T>() { return bound.first<T>() },
+                async all<T>() { return bound.all<T>() },
+              } as unknown as D1PreparedStatement
+            },
+          } as unknown as D1PreparedStatement
+        }
+        return statement
+      },
+      batch: db.batch.bind(db),
+    } as unknown as D1Database
+    const denied = await sendAgentMessage(env, {
+      fromAgent: 'agent-hadi-dev', fromMember: 'mem-agent-hadi-dev', toAgent: 'agent-rava',
+      body: 'race refused', requestId: 'scope-write-race-rid', inboxTarget: `continuity:${scope.id}`,
+    }, { system: true, reason: 'real sqlite write-time scope race' })
+    expect(changed).toBe(true)
+    expect(denied).toMatchObject({ ok: false, reason: 'send_target_not_visible' })
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id='scope-write-race-rid'")).toBe(0)
+    expect(published).toHaveLength(0)
   })
 
   it('routes an explicit logical inbox target to its live recipient scope', async () => {

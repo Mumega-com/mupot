@@ -646,6 +646,12 @@ export async function sendAgentMessage(
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind, resolvedTargetSeat, resolvedScopeId)
       }
+      // The logical target was preflighted above, but its authority is also part
+      // of the INSERT predicate.  Name a changed/revoked scope as invisible,
+      // rather than pretending a non-message consumed recipient capacity.
+      if (resolvedScopeId !== null && !await findLiveRecipientContinuityScope(env, resolvedScopeId, input.toAgent, createdAt)) {
+        return { ok: false, reason: 'send_target_not_visible' }
+      }
       if (replyFence) {
         const used = await env.DB.prepare(
           `SELECT COUNT(*) AS n FROM agent_messages
