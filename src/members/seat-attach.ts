@@ -612,7 +612,7 @@ async function hasBindingRow(env: Env, agentId: string): Promise<boolean> {
 }
 
 export type AttachSkipReason = 'no_requested_seat' | 'seat_gone' | 'seat_already_attached' | 'guard_refused'
-export interface PromoteResult { landed: boolean; attachmentId: string | null; attachSkipped?: AttachSkipReason }
+export interface PromoteResult { landed: boolean; attachmentId: string | null; attachSkipped?: AttachSkipReason; continuityRequested?: boolean; continuityEnrolled?: boolean }
 
 export type PromoteAuthority = {
   authorityLevel: AttachAuthorityLevel
@@ -695,7 +695,8 @@ export async function promoteAdmissionDetailed(
               gate_authority = CASE WHEN agent_seat_admissions.scope = 'harness' THEN 0 ELSE ${autoGateAuthoritySql('agent_seat_admissions.agent_id')} END -- gate power is never inherited by other threads
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
-                        ${attachDesignatedClause(env, 'ag', '?3')})`,
+                        ${attachDesignatedClause(env, 'ag', '?3')})
+          ${continuityApproved ? `AND NOT EXISTS (SELECT 1 FROM agent_seat_admissions other WHERE other.tenant = ?5 AND other.harness_id = agent_seat_admissions.harness_id AND other.status = 'live' AND other.agent_id <> agent_seat_admissions.agent_id AND ${authorityLiveSql('other', '?2')})` : ''}`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, authority_level: authorityLevel, authority_expires_at: authorityExpiresAt },
@@ -719,19 +720,27 @@ export async function promoteAdmissionDetailed(
     ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
   const base = weld ? weld.statements.length : 0
-  if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null }
+  if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null, continuityRequested: continuityApproved, continuityEnrolled: false }
   // The claim landed (and only then): the agent hears it once. Best effort, after the batch; a failure never undoes the claim.
   try { await sendClaimWelcome(env, adm) } catch { /* the claim stands; the welcome is a nicety */ }
   // attach statements start after: UPDATE + audit + decision = 3
   const attachBase = base + 3
-  if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat' }
-  if (out[attachBase].meta.changes === 1) return { landed: true, attachmentId }
+  const scopeBase = attachBase + attach.length
+  const continuityEnrolled = continuityApproved && attachmentId && grantTokenId ? out[scopeBase + 1]?.meta.changes === 1 : false
+  if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat', continuityRequested: continuityApproved, continuityEnrolled }
+  if (out[attachBase].meta.changes === 1) return { landed: true, attachmentId, continuityRequested: continuityApproved, continuityEnrolled }
   // The admission is live but the guarded INSERT wrote nothing: name the guard, so the human/chat is told why seat_attach is still needed.
   const seat = await env.DB.prepare(`SELECT 1 AS x FROM agent_seats WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND retired_at IS NULL LIMIT 1`)
     .bind(adm.requested_seat_id, env.TENANT_SLUG, adm.human_member_id).first<{ x: number }>()
-  if (!seat) return { landed: true, attachmentId: null, attachSkipped: 'seat_gone' }
+  if (!seat) return { landed: true, attachmentId: null, attachSkipped: 'seat_gone', continuityRequested: continuityApproved, continuityEnrolled }
   const other = await liveAttachmentOfSeat(env, adm.requested_seat_id as string, Date.parse(nowIso)) // as: attach is non-empty only when requested_seat_id is set
-  return { landed: true, attachmentId: null, attachSkipped: other ? 'seat_already_attached' : 'guard_refused' }
+  return { landed: true, attachmentId: null, attachSkipped: other ? 'seat_already_attached' : 'guard_refused', continuityRequested: continuityApproved, continuityEnrolled }
+}
+
+async function continuityConflict(env: Env, adm: AdmissionRow, nowIso: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM agent_seat_admissions other WHERE other.tenant=?1 AND other.harness_id=?2 AND other.status='live' AND other.agent_id<>?3 AND ${authorityLiveSql('other','?4')} LIMIT 1`)
+    .bind(env.TENANT_SLUG, adm.harness_id, adm.agent_id, nowIso).first<{ x: number }>()
+  return !!row
 }
 
 /** Revoke a live admission (or deny a pending one). Live -> revoked cascades to every live attachment (trigger). */
@@ -857,15 +866,21 @@ export async function decideSeatAdmission(
     if (adm.scope !== 'harness' && input.continuityApproved === true) {
       return { status: 409, title: 'Cannot admit', message: 'Inbox continuity can only be approved for every chat of one app connection. Nothing was changed.', tone: 'warn' }
     }
+    if (input.continuityApproved === true && await continuityConflict(env, adm, nowIso)) {
+      return { status: 409, title: 'Cannot admit', message: 'This connection already has a live approval for another agent, so inbox continuity cannot be enabled. Nothing was changed.', tone: 'warn' }
+    }
     // Before the one-time gate: a wrong code never burns the link.
     if (attachCodeRefused(adm, input.attachCode)) {
       return { status: 403, title: 'Wrong attach code', message: 'The attach code does not match the one the chat showed. Nothing was changed.', tone: 'warn' }
     }
     if (!(await input.gate())) return CLOSED
-    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member', input.attachCode, {
+    const promoted = await promoteAdmissionDetailed(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member', input.attachCode, {
       authorityLevel: 'helper', authorityExpiresAt: authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS, nowMs), continuityApproved: input.continuityApproved === true,
     })
-    if (!landed) return CLOSED
+    if (!promoted.landed) return CLOSED
+    if (promoted.continuityRequested && !promoted.continuityEnrolled) {
+      return { status: 200, title: 'Admitted without inbox continuity', message: 'The chat approval succeeded, but inbox continuity was not activated because the connection changed before enrollment. No shared inbox address was created; retry with a fresh approval if needed.', tone: 'warn' }
+    }
     // The write already landed: a failed name lookup must not turn a successful approval into an error page.
     const who = (await admissionView(env, adm).then((v) => v.agentName, () => null)) ?? 'this agent'
     return { status: 200, title: 'Admitted', message: `Chats from this app can now act as ${who} (ceiling: ${input.ceiling ?? 'member'}). Paste the message below into the chat that asked: it attaches to ${who} by name, immediately.`, tone: 'ok' }

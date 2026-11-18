@@ -955,6 +955,64 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE continuity_approved = 1`)).toBe(0)
   })
+
+  it('revoked source grant after the challenge yields no scope or address', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); await boot(env, g, 'grant-revoke')
+    const p = await attach(env, g, 'grant-revoke', 'rava', 'harness'); const key = await enrolPasskey(env, HUMAN)
+    const path = new URL(String(p.sc.approve_url)).pathname; const csrf = csrfOf(await (await hit(path, env)).text()); const code = one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions`)!.attach_code
+    const ch = await (await hit(`${path}/challenge`, env, {method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
+    const credential = await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge})
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at=datetime('now') WHERE id=?`).run(g.tokenId)
+    const res = await hit(`${path}/decide`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})
+    expect(res.status).toBe(200); expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('a real harness re-anchor between challenge and decide leaves no usable scope', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); await boot(env, g, 'reanchor')
+    const p = await attach(env, g, 'reanchor', 'rava', 'harness'); const key = await enrolPasskey(env, HUMAN)
+    const path = new URL(String(p.sc.approve_url)).pathname; const csrf = csrfOf(await (await hit(path, env)).text()); const code = one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions`)!.attach_code
+    const ch = await (await hit(`${path}/challenge`, env, {method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
+    const credential = await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge})
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at=datetime('now') WHERE id=?`).run(g.tokenId); await grant(env,HUMAN)
+    expect((await hit(`${path}/decide`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})).status).not.toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('an already-live other agent refuses continuity before consuming the passkey moment', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'other','hadi-dev'); await boot(env,g,'conflict')
+    const p=await attach(env,g,'conflict','rava','harness'); const key=await enrolPasskey(env,HUMAN)
+    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,true)).status).toBe(409)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,false)).status).toBe(200)
+  })
+
+  it('a retired requested seat makes enrollment skip truthfully without publishing a target', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'seat-race'); const p=await attach(env,g,'seat-race','rava','harness'); const key=await enrolPasskey(env,HUMAN)
+    const path=new URL(String(p.sc.approve_url)).pathname; const csrf=csrfOf(await (await hit(path,env)).text()); const code=one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions`)!.attach_code
+    const ch=await (await hit(`${path}/challenge`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
+    const credential=await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge}); h.sqlite.exec(`UPDATE agent_seats SET retired_at=datetime('now')`)
+    const body=await (await hit(`${path}/decide`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})).json() as J
+    expect(body.title).toBe('Admitted without inbox continuity'); expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('an other-agent admission racing after preflight is stopped by the promotion write guard', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'atomic-race'); const p=await attach(env,g,'atomic-race','rava','harness')
+    await boot(env,g,'atomic-other'); await attach(env,g,'atomic-other','hadi-dev','harness'); const key=await enrolPasskey(env,HUMAN)
+    const path=new URL(String(p.sc.approve_url)).pathname; const csrf=csrfOf(await (await hit(path,env)).text()); const code=one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions WHERE agent_id='agent-rava'`)!.attach_code
+    const ch=await (await hit(`${path}/challenge`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
+    const credential=await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge}); const db=env.DB
+    const proxy=new Proxy(db,{get(t,k){if(k==='batch')return async (s: Parameters<typeof db.batch>[0])=>{h.sqlite.exec(`UPDATE agent_seat_admissions SET status='live', decided_at=datetime('now'), authority_expires_at=datetime('now','+1 day') WHERE agent_id='agent-hadi-dev' AND status='pending'`);return t.batch(s)};const v=Reflect.get(t,k);return typeof v==='function'?v.bind(t):v}})
+    expect((await hit(`${path}/decide`,{...env,DB:proxy},{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})).status).not.toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('a stale revoked-admission scope does not reserve the harness against a fresh agent', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'stale-rava','rava',undefined,true)
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET status='revoked', revoked_at=datetime('now') WHERE agent_id='agent-rava'`)
+    await boot(env,g,'stale-other'); const p=await attach(env,g,'stale-other','hadi-dev','harness'); const key=await enrolPasskey(env,HUMAN)
+    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,true)).status).toBe(200)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes WHERE agent_id='agent-hadi-dev'`)).toBe(1)
+  })
 })
 
 // keep imports that the scenarios above use only for typing/ratchets referenced
