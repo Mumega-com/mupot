@@ -181,6 +181,7 @@ import {
   agentUnreadTotal, MAX_UNREAD_PER_RECIPIENT, INBOX_NEAR_CAP_RATIO,
 } from '../agents/messages'
 import { routeAgentWake } from '../agents/wake-routing'
+import { attachedInboxContext } from '../members/attachment-inbox'
 import { authorizeExecutionScope } from '../auth/execution-scope'
 import { runRouterTick } from '../router/engine'
 import { verifyTaskEvidence } from '../tasks/evidence'
@@ -5480,6 +5481,7 @@ const toolInbox: ToolSpec = {
       seat: seatArg.seat,
       // #1937: an attached chat's peek hides what THAT attachment marked handled (inbox_mark_handled).
       handledByAttachment: attachedAuthority(auth)?.attachmentId,
+      continuity: attachedInboxContext(auth) ?? undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller

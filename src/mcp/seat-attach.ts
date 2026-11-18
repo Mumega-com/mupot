@@ -26,6 +26,7 @@ import { findLiveAttachment } from '../members/seat-attach'
 import { runConnectionCheck } from '../members/connection-check'
 import { finishConnectionEcho, loadConnectionEcho, startConnectionEcho } from '../members/connection-echo'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
+import { attachedInboxContext } from '../members/attachment-inbox'
 
 /** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
 function claimFields(env: Env, code: string): { claim_url?: string; tell_the_person: string } {
@@ -235,12 +236,20 @@ const toolInboxMarkHandled: ToolSpec = {
     if (!ids) return fail(400, 'invalid_args', { field: 'ids', detail: `1..${MAX_MARK_HANDLED_IDS} non-empty message ids` })
     // The seat partition is the attachment token's OWN label (never a client claim): the same value its peek uses.
     const seat = await resolveBoundSeat(env, auth.tokenId ?? null)
-    const r = await markMessagesHandledByAttachment(env, { attachmentId: att.attachmentId, agentId: att.agentId, seat, ids })
+    const continuity = attachedInboxContext(auth)
+    if (!continuity) return fail(403, 'not_attached_seat')
+    const r = await markMessagesHandledByAttachment(env, {
+      attachmentId: att.attachmentId,
+      agentId: att.agentId,
+      seat,
+      ids,
+      continuity,
+    })
     if (!r.ok) return r.error === 'invalid_ids' ? fail(400, 'invalid_args', { field: 'ids' }) : fail(500, r.error)
     return done({
       handled: r.handled,
       not_visible: r.not_visible,
-      note: 'Recorded for THIS chat only: your own peek now hides these. The host and other chats still see them; nothing was consumed.',
+      note: 'Recorded without consuming: physical mail is hidden only for this chat; a continuity-scoped or broadcast receipt is shared by current chats in the same live scope. The host still sees all mail.',
     })
   },
 }

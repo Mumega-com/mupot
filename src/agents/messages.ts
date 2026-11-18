@@ -29,6 +29,8 @@ import { isSystemSender, systemSenderReplyVia } from './system-senders'
 import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 import { safeConsole } from '../lib/log'
 import { continuityTarget, findLiveRecipientContinuityScope, liveRecipientContinuityScopeSql } from '../members/attachment-continuity'
+import { resolveAttachmentContinuity } from '../members/attachment-continuity'
+import type { AttachedInboxContext } from '../members/attachment-inbox'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -927,15 +929,32 @@ function readerCanRead(
  * attachment id onto `binds` and returns the predicate; '' when the caller is not an attached chat (host reads are
  * byte-for-byte unchanged). Only the bearer reader uses it: an attachment is never a signed consumer.
  */
-function handledHideSql(attachmentId: string | undefined, binds: (string | number | null)[]): string {
+function handledHideSql(attachmentId: string | undefined, scopeId: string | null, binds: (string | number | null)[]): string {
   if (!attachmentId) return ''
   binds.push(attachmentId)
-  return `AND NOT EXISTS (SELECT 1 FROM agent_attachment_handled hh WHERE hh.attachment_id = ?${binds.length} AND hh.message_id = agent_messages.id)`
+  const attachment = `NOT EXISTS (SELECT 1 FROM agent_attachment_handled hh WHERE hh.attachment_id = ?${binds.length} AND hh.message_id = agent_messages.id)`
+  if (!scopeId) return `AND ${attachment}`
+  binds.push(scopeId)
+  return `AND ${attachment}
+    AND NOT EXISTS (SELECT 1 FROM agent_continuity_handled ch WHERE ch.scope_id = ?${binds.length} AND ch.message_id = agent_messages.id)`
+}
+
+/** Attached callers keep physical mail attachment-local while a live continuity
+ * scope sees its logical target and true broadcasts.  The caller context is
+ * authenticated upstream; scope resolution is fail-closed before this query. */
+function attachedSeatVisibilitySql(targetSeat: string | null, scopeId: string | null, binds: (string | number | null)[]): string {
+  const physical = targetSeat ? `(target_seat = ?${binds.length + 1} OR target_seat IS NULL)` : 'target_seat IS NULL'
+  if (targetSeat) binds.push(targetSeat)
+  if (!scopeId) return `AND target_continuity_scope_id IS NULL AND ${physical}`
+  binds.push(scopeId)
+  const scope = `?${binds.length}`
+  return `AND ((target_continuity_scope_id IS NULL AND ${physical})
+    OR (target_continuity_scope_id = ${scope} AND target_seat = 'continuity:' || ${scope}))`
 }
 
 async function readAgentInboxForReader(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; handledByAttachment?: string; skipRemaining?: boolean },
+  input: { agent: string; limit?: number; peek?: boolean; keyFingerprint?: string; sinceSeq?: number; seat?: string; handledByAttachment?: string; continuity?: AttachedInboxContext; skipRemaining?: boolean },
   reader: InboxReader,
   opts: Opts,
 ): Promise<InboxResult | InboxFailure> {
@@ -962,6 +981,12 @@ async function readAgentInboxForReader(
   const now = opts.now ?? (() => new Date().toISOString())
 
   const targetSeat = typeof input.seat === 'string' && input.seat.trim().length > 0 ? input.seat.trim() : null
+  let continuityScopeId: string | null = null
+  if (input.continuity) {
+    const continuity = await resolveAttachmentContinuity(env, input.continuity)
+    if (continuity.kind === 'refused') return { ok: true, messages: [], remaining: 0, complete: true }
+    if (continuity.kind === 'scope') continuityScopeId = continuity.scope.id
+  }
 
   const cols = 'seq, id, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256'
   try {
@@ -983,11 +1008,13 @@ async function readAgentInboxForReader(
         ).bind(...binds).all<InboxMessage>()
         messages = rows.results ?? []
       } else {
-        const seatSql = targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-        const binds: (string | number | null)[] = targetSeat
+        const binds: (string | number | null)[] = targetSeat && !input.continuity
           ? [tenant, input.agent, sinceSeq, limit, targetSeat]
           : [tenant, input.agent, sinceSeq, limit]
-        const handledSql = handledHideSql(input.handledByAttachment, binds)
+        const seatSql = input.continuity
+          ? attachedSeatVisibilitySql(targetSeat, continuityScopeId, binds)
+          : targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const handledSql = handledHideSql(input.handledByAttachment, continuityScopeId, binds)
         const rows = await env.DB.prepare(
           `SELECT ${cols} FROM agent_messages
             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
@@ -1109,13 +1136,15 @@ async function readAgentInboxForReader(
       ).bind(...binds).first<{ n: number }>()
       remaining = Number(remainingRow?.n ?? 0)
     } else {
-      const seatSql = targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
-      const binds: (string | number | null)[] = targetSeat
+      const binds: (string | number | null)[] = targetSeat && !input.continuity
         ? [tenant, input.agent, targetSeat]
         : [tenant, input.agent]
+      const seatSql = input.continuity
+        ? attachedSeatVisibilitySql(targetSeat, continuityScopeId, binds)
+        : targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
       const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
       if (sinceSeq > 0) binds.push(sinceSeq)
-      const handledSql = handledHideSql(input.handledByAttachment, binds)
+      const handledSql = handledHideSql(input.handledByAttachment, continuityScopeId, binds)
       const remainingRow = await env.DB.prepare(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
@@ -1146,7 +1175,7 @@ async function readAgentInboxForReader(
 
 export function readAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; handledByAttachment?: string; skipRemaining?: boolean },
+  input: { agent: string; limit?: number; peek?: boolean; sinceSeq?: number; seat?: string; handledByAttachment?: string; continuity?: AttachedInboxContext; skipRemaining?: boolean },
   opts: Opts = {},
 ): Promise<InboxResult | InboxFailure> {
   return readAgentInboxForReader(env, input, 'bearer', opts)
