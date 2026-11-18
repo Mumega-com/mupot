@@ -217,6 +217,8 @@ interface Params {
   sealed?: { encB64u: string; ctB64u: string; digestHex: string }
   /** seat_admit approve only: the ceiling the human chose (bound into the challenge digest). */
   ceiling?: AttachCeiling
+  /** Harness R1 only: explicit fresh human inbox-continuity choice. */
+  continuityApproved?: boolean
   /** seat_admit approve only: the attach code the human typed (not bound into the digest; checked before the one-time gate). */
   attachCode?: string
   /** sha256 hex of the canonical decision: the digest the challenge is bound to. */
@@ -256,9 +258,15 @@ async function readParams(m: MomentRow, body: JsonBody): Promise<Params | null> 
     const raw = body.ceiling
     const ceiling: AttachCeiling | null = raw === undefined || raw === null || raw === '' ? 'member' : isAttachCeiling(raw) ? raw : null
     if (ceiling === null) return null
-    const d = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, ceiling })))
+    const rawContinuity = body.continuity_approved
+    if (rawContinuity !== undefined && typeof rawContinuity !== 'boolean') return null
+    const continuityApproved = rawContinuity === true
+    // False/absent retains the exact legacy challenge payload.
+    const d = hex(await sha256(JSON.stringify(continuityApproved
+      ? { v: 1, kind: m.kind, subject: m.subject_id, decision, ceiling, continuity_approved: true }
+      : { v: 1, kind: m.kind, subject: m.subject_id, decision, ceiling })))
     const attachCode = typeof body.attach_code === 'string' ? body.attach_code.slice(0, 32) : undefined
-    return { decision, actions, duration, ceiling, attachCode, payload: d }
+    return { decision, actions, duration, ceiling, attachCode, continuityApproved, payload: d }
   }
   const digest = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, actions, duration: duration ?? null })))
   return { decision, actions, duration, payload: digest }
@@ -445,6 +453,7 @@ ${subject.adm.scope === 'harness' ? '' : '<label class="choice"><input type="rad
 ${subject.adm.scope === 'harness'
   ? `<h2>Scope: every chat of this app</h2><p>This one approval covers <strong>every chat, now and later, that comes through this same connection of this app</strong>. Each new chat still has to ask to become ${escapeHtml(v.agentName)} by name, and nothing else is opened: other agents need their own approval, and the Full level is not offered here. It stops for all chats at once when you revoke it or disconnect the app.</p>`
   : '<h2>Scope: the chat that asked</h2><p>This approval is for the one chat shown above. A later chat needs its own approval.</p>'}
+${subject.adm.scope === 'harness' ? '<label class="choice"><input type="checkbox" name="continuity_approved" value="true"><span><strong>Share addressed inbox continuity across approved chats</strong>: new addressed messages and handled status may be shared by chats you later approve on this connection. This does not add consumer or review-gate power, does not change old messages, and does not promise wake notifications.</span></label>' : ''}
 <h2>What approving does</h2><p>Lets ${subject.adm.scope === 'harness' ? 'chats of <strong>this connected app</strong>' : 'the chat that asked'} act as <strong>${escapeHtml(v.agentName)}</strong>, until you revoke it on your Connections page. If this agent holds a review gate, approving also lets these chats review (give approve or reject verdicts) on its behalf, never on work that is yours or the agent's own, and detaching a chat or revoking this ends that. They never hold more than you yourself may do. To change the level later you revoke and approve again.</p>`
     title = `Let ${v.agentName} work in your chat`
     approveLabel = 'Admit'
@@ -617,7 +626,7 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   if (subject.kind === 'credential') return decideCredential(c, { m, token, p, subject: subject.drop, auth, passkeyId: passkey.id, memberId: passkey.member_id })
   if (p.decision === 'provide') return fail(c, 400, 'Invalid decision parameters.', 'Bad request') // provide exists only for credential moments
   if (subject.kind === 'seat_admit') {
-    return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling, attachCode: p.attachCode }, now))
+    return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling, attachCode: p.attachCode, continuityApproved: p.continuityApproved }, now))
   }
   if (subject.kind === 'squad_join') {
     return outcomeJson(c, await decideSquadJoin(c.env, { req: subject.req, decision: p.decision, proof, gate, waitUntil }, now))

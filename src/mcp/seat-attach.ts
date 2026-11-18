@@ -44,6 +44,7 @@ export async function attachOutcome(env: Env, humanMemberId: string, r: AttachRe
       attachment_id: r.attachment_id,
       admission_id: r.admission_id,
       agent: r.agent,
+      ...(r.inbox_target ? { inbox_target: r.inbox_target } : {}),
       note: `Attached. Your NEXT request acts as ${r.agent.slug || r.agent.name}: call boot_context to see the identity_receipt. You hold at most the access level your human approved (member unless they chose higher) and, only if the admission allows it and the agent holds a review gate, task_verdict reviews as the agent (never on work that is yours, your human's, or the agent's own). Your human can detach you at any time.`,
     })
   }

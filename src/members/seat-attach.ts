@@ -61,6 +61,7 @@ import {
 import { loadHarness, sanitizeLabel } from './harness'
 import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 import { sendClaimWelcome } from './claim-welcome'
+import { continuityHarnessReservationSql, prepareContinuityEnrollmentStatements, resolveAttachmentContinuity } from './attachment-continuity'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
@@ -616,6 +617,8 @@ export interface PromoteResult { landed: boolean; attachmentId: string | null; a
 export type PromoteAuthority = {
   authorityLevel: AttachAuthorityLevel
   authorityExpiresAt: string
+  /** Set only by the passkey route after its challenge-bound human choice. */
+  continuityApproved?: boolean
 }
 
 export async function promoteAdmission(
@@ -659,6 +662,7 @@ export async function promoteAdmissionDetailed(
   if (adm.scope === 'harness' && ceiling === 'full') return { landed: false, attachmentId: null }
   const authorityLevel: AttachAuthorityLevel = authority.authorityLevel === 'full' ? 'full' : 'helper'
   const authorityExpiresAt = authority.authorityExpiresAt
+  const continuityApproved = via === 'webauthn' && adm.scope === 'harness' && authority.continuityApproved === true
   // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id, a.slug AS slug FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string; slug: string }>()
@@ -700,14 +704,18 @@ export async function promoteAdmissionDetailed(
     env.DB.prepare(
       `INSERT INTO agent_seat_authority_decisions
          (id, tenant, admission_id, attachment_id, seat_id, agent_id, harness_id, project_id, machine_key,
-          decided_by_member_id, authority_level, authority_expires_at, decided_at, decided_via)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13
+          decided_by_member_id, authority_level, authority_expires_at, decided_at, decided_via, continuity_approved)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14
         WHERE EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?3 AND status = 'live' AND decided_at = ?12)`,
     ).bind(
       decisionId, env.TENANT_SLUG, adm.id, attachmentId, adm.requested_seat_id, adm.agent_id, adm.harness_id,
-      machineKey?.machine_key ?? null, humanMemberId, authorityLevel, authorityExpiresAt, nowIso, via,
+      machineKey?.machine_key ?? null, humanMemberId, authorityLevel, authorityExpiresAt, nowIso, via, continuityApproved ? 1 : 0,
     ),
     ...attach,
+    ...(continuityApproved && attachmentId && grantTokenId ? prepareContinuityEnrollmentStatements(env, {
+      scopeId: crypto.randomUUID(), attachmentId, admissionId: adm.id, agentId: adm.agent_id, humanMemberId: adm.human_member_id,
+      harnessId: adm.harness_id, sourceGrantTokenId: grantTokenId, authorityDecisionId: decisionId, promotedAt: nowIso, nowIso,
+    }) : []),
     ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
   const base = weld ? weld.statements.length : 0
@@ -816,7 +824,7 @@ function durablyLocal<T>(waitUntil: WaitUntil | undefined, fn: () => Promise<T>)
  */
 export async function decideSeatAdmission(
   env: Env,
-  input: { adm: AdmissionRow; decision: 'approve' | 'deny'; proof: HumanProof; gate: Gate; waitUntil?: WaitUntil; ceiling?: AttachCeiling; attachCode?: unknown },
+  input: { adm: AdmissionRow; decision: 'approve' | 'deny'; proof: HumanProof; gate: Gate; waitUntil?: WaitUntil; ceiling?: AttachCeiling; attachCode?: unknown; continuityApproved?: boolean },
   nowMs: number,
 ): Promise<Outcome> {
   const { adm, decision, proof } = input
@@ -851,7 +859,9 @@ export async function decideSeatAdmission(
       return { status: 403, title: 'Wrong attach code', message: 'The attach code does not match the one the chat showed. Nothing was changed.', tone: 'warn' }
     }
     if (!(await input.gate())) return CLOSED
-    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member', input.attachCode)
+    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member', input.attachCode, {
+      authorityLevel: 'helper', authorityExpiresAt: authorityExpiresAtIso(ATTACH_AUTHORITY_DEFAULT_DAYS, nowMs), continuityApproved: input.continuityApproved === true,
+    })
     if (!landed) return CLOSED
     // The write already landed: a failed name lookup must not turn a successful approval into an error page.
     const who = (await admissionView(env, adm).then((v) => v.agentName, () => null)) ?? 'this agent'
@@ -950,6 +960,8 @@ export interface AttachOk {
   admission_id: string
   agent: { id: string; slug: string; name: string }
   seat_id: string
+  /** Server-resolved only; omitted unless this exact live attachment has a live scope. */
+  inbox_target?: string
 }
 export interface AttachPending {
   ok: true
@@ -966,6 +978,13 @@ export interface AttachPending {
 /** `agent` is set only for agent_not_designated_for_you (the caller has standing over it, so naming it reveals nothing). */
 export interface AttachErr { ok: false; error: AttachFailure; blocking_admission?: BlockingAdmission; requested_seat_id?: string; agent?: { id: string; slug: string; name: string } }
 export type AttachResult = AttachOk | AttachPending | AttachErr
+
+async function attachedResult(env: Env, p: { attachmentId: string; admissionId: string; agent: AttachableAgent; seatId: string; humanMemberId: string; harnessId: string; grantTokenId?: string | null }): Promise<AttachOk> {
+  const base: AttachOk = { ok: true, status: 'attached', attachment_id: p.attachmentId, admission_id: p.admissionId, agent: { id: p.agent.id, slug: p.agent.slug, name: p.agent.name }, seat_id: p.seatId }
+  if (!p.grantTokenId) return base
+  const continuity = await resolveAttachmentContinuity(env, { attachmentId: p.attachmentId, seatId: p.seatId, agentId: p.agent.id, humanMemberId: p.humanMemberId, harnessId: p.harnessId, sourceGrantTokenId: p.grantTokenId })
+  return continuity.kind === 'scope' ? { ...base, inbox_target: continuity.target } : base
+}
 
 async function liveAttachmentOfSeat(env: Env, seatId: string, nowMs = Date.now()): Promise<{ id: string; agent_id: string } | null> {
   // A different requested agent must not leave the expired occupant blocking this seat.
@@ -1012,7 +1031,8 @@ export function prepareAttachStatements(
           AND NOT EXISTS (SELECT 1 FROM agent_seats x WHERE x.agent_id = a.id)
           ${approvalGuard} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
           ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
-          ${attachDesignatedClause(env, 'a', '?8')}`,
+          ${attachDesignatedClause(env, 'a', '?8')}
+          AND ${continuityHarnessReservationSql('?4', 's.harness_id', 'a.id')}`,
     ).bind(...[p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId,
       ...(p.promotedAt !== undefined ? [p.promotedAt] : []),
       p.grantTokenId]),
@@ -1072,7 +1092,7 @@ export async function attachSeatToAgent(
       if (!live || live.attachment_id !== current.id) return { ok: false, error: 'attach_refused' }
       const adm = await findOpenAdmission(env, agent.id, p.humanMemberId, seat.harness_id, nowMs)
       return adm && adm.status === 'live'
-        ? { ok: true, status: 'attached', attachment_id: current.id, admission_id: adm.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
+        ? attachedResult(env, { attachmentId: current.id, admissionId: adm.id, agent, seatId: seat.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, grantTokenId: p.grantTokenId })
         : { ok: false, error: 'attach_refused' }
     }
   }
@@ -1092,7 +1112,7 @@ export async function attachSeatToAgent(
   if (!current) {
     const completed = await liveAttachmentOfSeat(env, seat.id, nowMs)
     if (completed && completed.agent_id === agent.id) {
-      return { ok: true, status: 'attached', attachment_id: completed.id, admission_id: admission.admission.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
+      return attachedResult(env, { attachmentId: completed.id, admissionId: admission.admission.id, agent, seatId: seat.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, grantTokenId: p.grantTokenId })
     }
   }
 
@@ -1123,7 +1143,7 @@ export async function attachSeatToAgent(
     if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) return { ok: false, error: 'already_attached' }
     throw err
   }
-  return { ok: true, status: 'attached', attachment_id: attachmentId, admission_id: admission.admission.id, agent: { id: agent.id, slug: agent.slug, name: agent.name }, seat_id: seat.id }
+  return attachedResult(env, { attachmentId, admissionId: admission.admission.id, agent, seatId: seat.id, humanMemberId: p.humanMemberId, harnessId: seat.harness_id, grantTokenId: p.grantTokenId })
 }
 
 /** The human detaches a thread and ends its seat-scoped approval. Harness approvals remain available to other chats. */
