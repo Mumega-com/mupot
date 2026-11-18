@@ -21,6 +21,19 @@ function fixture(door: Door) {
       VALUES ('tok','m','hash','${door === 'attached' ? 'attach:a:seat' : ''}','${door === 'bearer' ? 'workspace' : 'directory'}','a','t','2099-01-01');
     INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body,target_seat) VALUES ('mail','t','a','sender','sender','message','hello',${door === 'attached' ? "'attach:a:seat'" : 'NULL'});
   `)
+  if (door === 'attached') h.sqlite.exec(`
+    INSERT INTO agents(id,squad_id,slug,name,status) VALUES ('seat-agent','s','seat-agent','Seat','active');
+    INSERT INTO member_tokens(id,member_id,token_hash,label,channel,tenant,expires_at)
+      VALUES ('grant','human','grant-hash','consent','directory','t','2099-01-01');
+    INSERT INTO harnesses(id,tenant,member_id,oauth_client_id,client_name,kind,grant_id)
+      VALUES ('h','t','human','fixture-client','Fixture','chatgpt','oauth:grant');
+    INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,max_live)
+      VALUES ('seat','t','human','h',lower(hex(zeroblob(32))),'seat-agent',1);
+    INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,requested_via,requested_seat_id,created_at)
+      VALUES ('adm','t','a','human','h','live','tool','seat',datetime('now'));
+    INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at)
+      VALUES ('att','t','seat','human','h','a','adm','tok',datetime('now'));
+  `)
   const auth: AuthContext = { userId: 'm', memberId: 'm', email: null, role: 'member', tenant: 't',
     channel: door === 'bearer' ? 'workspace' : 'directory', tokenId: 'tok', boundAgentId: 'a',
     capabilities: [{member_id:'m',scope_type:'squad',scope_id:'s',capability:'member'}],

@@ -131,6 +131,29 @@ function runtimeFixture(opts: { unleased?: boolean } = {}) {
   return { harness, env: { TENANT_SLUG: TENANT, LAND_REQUIRES_EVIDENCE: '0', DB: harness.db } as Env, auth, gateAuth }
 }
 
+function seedRuntimeAttachment(fixture: ReturnType<typeof runtimeFixture>, actor: AuthContext): void {
+  const binding = actor.seatBinding!
+  const attachment = binding.attached!
+  const db = fixture.harness.sqlite
+  db.prepare(`INSERT INTO agents (id,squad_id,slug,name,status) VALUES (?1,?2,?1,'Runtime seat','active')`)
+    .run(attachment.seatAgentId, SQUAD_ID)
+  db.prepare(`INSERT INTO member_tokens (id,member_id,token_hash,label,channel,tenant,expires_at)
+    VALUES (?1,?2,'runtime-grant-hash','Consent','directory',?3,'2099-01-01')`)
+    .run(binding.grantTokenId, binding.humanMemberId, TENANT)
+  db.prepare(`INSERT INTO harnesses (id,tenant,member_id,oauth_client_id,client_name,kind,grant_id)
+    VALUES (?1,?2,?3,'runtime-fixture','Runtime fixture','chatgpt','oauth:' || ?4)`)
+    .run(binding.harnessId, TENANT, binding.humanMemberId, binding.grantTokenId)
+  db.prepare(`INSERT INTO agent_seats (id,tenant,member_id,harness_id,key_hash,agent_id,max_live)
+    VALUES (?1,?2,?3,?4,lower(hex(zeroblob(32))),?5,1)`)
+    .run(binding.seatId, TENANT, binding.humanMemberId, binding.harnessId, attachment.seatAgentId)
+  db.prepare(`INSERT INTO agent_seat_admissions (id,tenant,agent_id,human_member_id,harness_id,status,requested_via,requested_seat_id,created_at)
+    VALUES (?1,?2,?3,?4,?5,'live','tool',?6,?7)`)
+    .run(attachment.admissionId, TENANT, attachment.agentId, binding.humanMemberId, binding.harnessId, binding.seatId, T0)
+  db.prepare(`INSERT INTO agent_seat_attachments (id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at)
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)`)
+    .run(attachment.attachmentId, TENANT, binding.seatId, binding.humanMemberId, binding.harnessId, attachment.agentId, attachment.admissionId, actor.tokenId!, T0)
+}
+
 /** Shared org-admin auth builder for adminResetDispatchLease tests (mupot#1494 v4) — same
  *  shape as the local `adminAuth` defined inside the "operator repair" describe block below,
  *  hoisted to module scope so the new P0/P1-a describe blocks can use it too without
@@ -3140,6 +3163,7 @@ describe('same-agent runtime receipt parity', () => {
           attached:{attachmentId:'att',admissionId:'adm',agentId:AGENT_ID,seatAgentId:'seat-agent',ceiling:'member' as const}}})}
       if(door==='attached') {
         f.harness.sqlite.prepare("UPDATE member_tokens SET label='attach:parity' WHERE id=?").run(TOKEN_ID)
+        seedRuntimeAttachment(f, actor)
         f.harness.sqlite.prepare("UPDATE agent_messages SET to_agent=?,target_seat='attach:parity',body=json_set(body,'$.runtime_address',?),delivery_attempts=0,lease_expires_at=NULL WHERE id=?").run(AGENT_ID,AGENT_ID,MESSAGE_ID)
         expect(await invokeTool(actor,f.env,'inbox_lease',{limit:1,attempt_id:'parity_receipt_0001'})).toMatchObject({ok:true,result:{messages:[{id:MESSAGE_ID}]}})
       }
@@ -3241,6 +3265,7 @@ async function attachedReceiptActor(f:ReturnType<typeof runtimeFixture>):Promise
   f.harness.sqlite.prepare("UPDATE member_tokens SET channel='directory',label='attach:runtime:seat' WHERE id=?").run(TOKEN_ID)
   const actor:AuthContext = {...f.auth,channel:'directory',consentedByMemberId:'receipt-human',seatBinding:{seatId:'receipt-seat',label:'chat',harnessId:'h',grantTokenId:'grant',humanMemberId:'receipt-human',source:'handle',
     attached:{attachmentId:'receipt-attachment',admissionId:'adm',agentId:AGENT_ID,seatAgentId:'chat-agent',ceiling:'member'}}}
+  seedRuntimeAttachment(f, actor)
   f.harness.sqlite.prepare("UPDATE agent_messages SET target_seat='attach:runtime:seat',to_agent=?,body=json_set(body,'$.runtime_address',?),delivery_attempts=0,lease_expires_at=NULL WHERE id=?").run(AGENT_ID,AGENT_ID,MESSAGE_ID)
   expect(await invokeTool(actor,f.env,'inbox_lease',{limit:1,attempt_id:'runtime_attach_0001'})).toMatchObject({ok:true,result:{messages:[{id:MESSAGE_ID}]}})
   return actor
