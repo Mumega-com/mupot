@@ -3,6 +3,11 @@
 -- Additive only.  NULL on existing messages means the physical/legacy inbox path;
 -- no attachment, token, label, admission, or historical handled receipt is rewritten.
 -- A scope is an opaque server-owned routing selector, never a bearer credential.
+-- The append-only authority decision records an explicit fresh human opt-in;
+-- historical WebAuthn/R1 decisions remain default-zero and cannot enroll.
+
+ALTER TABLE agent_seat_authority_decisions ADD COLUMN continuity_approved INTEGER NOT NULL DEFAULT 0
+  CHECK (continuity_approved IN (0, 1));
 
 CREATE TABLE IF NOT EXISTS attachment_continuity_scopes (
   id                    TEXT PRIMARY KEY,
@@ -12,10 +17,12 @@ CREATE TABLE IF NOT EXISTS attachment_continuity_scopes (
   human_member_id       TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
   harness_id            TEXT NOT NULL REFERENCES harnesses(id) ON DELETE RESTRICT,
   source_grant_token_id TEXT NOT NULL REFERENCES member_tokens(id) ON DELETE RESTRICT,
+  authority_decision_id TEXT NOT NULL REFERENCES agent_seat_authority_decisions(id) ON DELETE RESTRICT,
   created_at            TEXT NOT NULL,
   revoked_at            TEXT,
   revoked_by_member_id  TEXT REFERENCES members(id) ON DELETE RESTRICT,
-  UNIQUE (tenant, admission_id, source_grant_token_id)
+  UNIQUE (tenant, admission_id, source_grant_token_id),
+  UNIQUE (tenant, authority_decision_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_attachment_continuity_scopes_harness
@@ -46,7 +53,12 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS attachment_continuity_scopes_no_replace
 BEFORE INSERT ON attachment_continuity_scopes
-FOR EACH ROW WHEN EXISTS (SELECT 1 FROM attachment_continuity_scopes s WHERE s.id = NEW.id)
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM attachment_continuity_scopes s
+   WHERE s.id = NEW.id
+      OR (s.tenant = NEW.tenant AND s.admission_id = NEW.admission_id AND s.source_grant_token_id = NEW.source_grant_token_id)
+      OR (s.tenant = NEW.tenant AND s.authority_decision_id = NEW.authority_decision_id)
+)
 BEGIN
   SELECT RAISE(ABORT, 'attachment_continuity_scope_immutable');
 END;

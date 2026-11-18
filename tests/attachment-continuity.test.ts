@@ -21,6 +21,18 @@ function one<T>(sql: string, ...values: unknown[]): T | undefined {
   return h.sqlite.prepare(sql).get(...values) as T | undefined
 }
 
+function tamperMemberToken(sql: string): void {
+  const triggers = h.sqlite.prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'member_tokens'`).all() as Array<{ name: string }>
+  for (const trigger of triggers) h.sqlite.exec(`DROP TRIGGER ${trigger.name}`)
+  h.sqlite.exec(sql)
+}
+
+function tamperHarness(sql: string): void {
+  const triggers = h.sqlite.prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'harnesses'`).all() as Array<{ name: string }>
+  for (const trigger of triggers) h.sqlite.exec(`DROP TRIGGER ${trigger.name}`)
+  h.sqlite.exec(sql)
+}
+
 function seed(o: { grant?: string; admission?: string; attachment?: string; agent?: string } = {}) {
   const grant = o.grant ?? 'grant-a'
   const admission = o.admission ?? 'admission-a'
@@ -44,8 +56,10 @@ function seed(o: { grant?: string; admission?: string; attachment?: string; agen
     INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,agent_id,tenant) VALUES ('seat-token','agent-member','seat-hash','seat','directory','${NOW}','${agent}','${TENANT}');
     INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at)
     VALUES ('${attachment}','${TENANT}','seat','human','harness','${agent}','${admission}','seat-token','${NOW}');
+    INSERT INTO agent_seat_authority_decisions(id,tenant,admission_id,attachment_id,seat_id,agent_id,harness_id,decided_by_member_id,authority_level,authority_expires_at,decided_at,decided_via)
+    VALUES ('decision-${admission}','${TENANT}','${admission}','${attachment}','seat','${agent}','harness','human','helper','2099-01-01 00:00:00','${NOW}','webauthn');
   `)
-  return { grant, admission, attachment, agent }
+  return { grant, admission, attachment, agent, decision: `decision-${admission}` }
 }
 
 function request(x: ReturnType<typeof seed>) {
@@ -56,8 +70,17 @@ async function enroll(x: ReturnType<typeof seed>, scopeId = 'scope-a') {
   await h.db.batch(prepareContinuityEnrollmentStatements(env(), {
     scopeId, attachmentId: x.attachment, admissionId: x.admission, agentId: x.agent,
     humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: x.grant,
-    promotedAt: NOW, nowIso: NOW,
+    authorityDecisionId: x.decision, promotedAt: NOW, nowIso: NOW,
   }))
+}
+
+function approveContinuity(x: ReturnType<typeof seed>) {
+  const decision = `${x.decision}-continuity`
+  h.sqlite.prepare(`INSERT INTO agent_seat_authority_decisions
+    (id,tenant,admission_id,attachment_id,seat_id,agent_id,harness_id,decided_by_member_id,authority_level,authority_expires_at,decided_at,decided_via,continuity_approved)
+    VALUES (?,'${TENANT}',? ,?,'seat',?,'harness','human','helper','2099-01-01 00:00:00','${NOW}','webauthn',1)`)
+    .run(decision, x.admission, x.attachment, x.agent)
+  return { ...x, decision }
 }
 
 function attachLater(x: ReturnType<typeof seed>) {
@@ -79,12 +102,17 @@ afterEach(() => h.close())
 describe('attachment continuity scopes', () => {
   it('enrolls only the exact fresh WebAuthn R1 promotion and resolves later physical attachments to its stable target', async () => {
     const x = seed()
+    // An old WebAuthn decision is not continuity consent.  Task 2 will set this
+    // bit only from the fresh, checkbox-bound passkey promotion.
+    await enroll(x)
+    expect(one<{ n: number }>(`SELECT count(*) AS n FROM attachment_continuity_scopes`)?.n).toBe(0)
+    const approved = approveContinuity(x)
     await h.db.batch(prepareContinuityEnrollmentStatements(env(), {
       scopeId: 'wrong-promotion', attachmentId: x.attachment, admissionId: x.admission, agentId: x.agent,
-      humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: x.grant, promotedAt: 'wrong', nowIso: NOW,
+      humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: x.grant, authorityDecisionId: approved.decision, promotedAt: 'wrong', nowIso: NOW,
     }))
     expect(one<{ n: number }>(`SELECT count(*) AS n FROM attachment_continuity_scopes`)?.n).toBe(0)
-    await enroll(x)
+    await enroll(approved)
     expect(one(`SELECT id, admission_id, source_grant_token_id FROM attachment_continuity_scopes`)).toEqual({ id: 'scope-a', admission_id: x.admission, source_grant_token_id: x.grant })
     expect(continuityTarget('scope-a')).toBe('continuity:scope-a')
     // The immutable scope outlives one physical chat.  It is still a recipient
@@ -99,7 +127,8 @@ describe('attachment continuity scopes', () => {
   it('keeps old physical attachments legacy and refuses scope lookup when tuple, grant, or liveness changes', async () => {
     const x = seed()
     await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toEqual({ kind: 'legacy' })
-    await enroll(x)
+    const approved = approveContinuity(x)
+    await enroll(approved)
     await expect(resolveAttachmentContinuity(env(), { ...request(x), humanMemberId: 'other' })).resolves.toMatchObject({ kind: 'refused' })
     h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = ?`).run(NOW, x.grant)
     await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toMatchObject({ kind: 'refused' })
@@ -108,13 +137,57 @@ describe('attachment continuity scopes', () => {
 
   it('never revives an immutable epoch and refuses racing live scope collisions', async () => {
     const x = seed()
-    await enroll(x)
+    const approved = approveContinuity(x)
+    await enroll(approved)
     expect(() => h.sqlite.prepare(`UPDATE attachment_continuity_scopes SET source_grant_token_id = 'other' WHERE id = 'scope-a'`).run()).toThrow(/immutable/)
     await expect(h.db.batch(prepareContinuityEnrollmentStatements(env(), {
       scopeId: 'scope-race', attachmentId: x.attachment, admissionId: x.admission, agentId: x.agent,
-      humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: x.grant, promotedAt: NOW, nowIso: NOW,
+      humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: x.grant, authorityDecisionId: approved.decision, promotedAt: NOW, nowIso: NOW,
     }))).resolves.toBeTruthy()
     expect(one<{ n: number }>(`SELECT count(*) AS n FROM attachment_continuity_scopes`)?.n).toBe(1)
+  })
+
+  it('blocks REPLACE for both live and revoked immutable epochs', async () => {
+    const x = seed()
+    const approved = approveContinuity(x)
+    await enroll(approved)
+    const replace = () => h.sqlite.exec(`INSERT OR REPLACE INTO attachment_continuity_scopes
+      (id,tenant,admission_id,agent_id,human_member_id,harness_id,source_grant_token_id,authority_decision_id,created_at)
+      VALUES ('replacement','${TENANT}','${x.admission}','${x.agent}','human','harness','${x.grant}','${approved.decision}','${NOW}')`)
+    expect(replace).toThrow(/immutable/)
+    h.sqlite.prepare(`UPDATE attachment_continuity_scopes SET revoked_at = ? WHERE id = 'scope-a'`).run(NOW)
+    expect(replace).toThrow(/immutable/)
+  })
+
+  it('refuses a physical request whose own seat token is revoked, expired, or bound to another weld', async () => {
+    const x = seed()
+    const approved = approveContinuity(x)
+    await enroll(approved)
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = 'seat-token'`).run(NOW)
+    await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toMatchObject({ kind: 'refused', reason: 'attachment_not_live' })
+    h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = NULL, expires_at = ? WHERE id = 'seat-token'`).run('2000-01-01 00:00:00')
+    await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toMatchObject({ kind: 'refused', reason: 'attachment_not_live' })
+    tamperMemberToken(`UPDATE member_tokens SET expires_at = NULL, agent_id = 'seat-agent' WHERE id = 'seat-token'`)
+    await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toMatchObject({ kind: 'refused', reason: 'attachment_not_live' })
+  })
+
+  it('fails recipient lookup closed on authority expiry or an inactive recipient agent', async () => {
+    const x = seed()
+    await enroll(approveContinuity(x))
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', '2100-01-01 00:00:00')).resolves.toBeNull()
+    h.sqlite.prepare(`UPDATE agents SET status = 'paused' WHERE id = ?`).run(x.agent)
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+  })
+
+  it('fails recipient lookup closed when the active human or harness grant anchor no longer matches', async () => {
+    const x = seed()
+    await enroll(approveContinuity(x))
+    h.sqlite.prepare(`UPDATE members SET status = 'suspended' WHERE id = 'human'`).run()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+    h.sqlite.prepare(`UPDATE members SET status = 'active' WHERE id = 'human'`).run()
+    h.sqlite.prepare(`INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant) VALUES ('other-grant','human','other','other','directory','${NOW}','${TENANT}')`).run()
+    tamperHarness(`UPDATE harnesses SET grant_id = 'oauth:other-grant' WHERE id = 'harness'`)
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
   })
 
   it('keeps legacy message scope null and enforces scoped handled tuple and foreign-recipient invariants in SQLite', () => {

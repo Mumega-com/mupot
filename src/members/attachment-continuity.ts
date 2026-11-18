@@ -4,7 +4,8 @@ import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { authorityLiveSql } from '../auth/attached-authority'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import type { Env } from '../types'
-import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, type LivePh } from './attach-live-sql'
+import { attachDesignatedClause } from './attach-designated'
+import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from './attach-live-sql'
 
 export interface ContinuityScopeRow {
   id: string
@@ -14,6 +15,7 @@ export interface ContinuityScopeRow {
   human_member_id: string
   harness_id: string
   source_grant_token_id: string
+  authority_decision_id: string
   created_at: string
   revoked_at: string | null
   revoked_by_member_id: string | null
@@ -27,6 +29,8 @@ export interface ContinuityRequest {
   humanMemberId: string
   harnessId: string
   sourceGrantTokenId: string
+  /** The fresh, one-use authority-decision row carrying the human's continuity opt-in. */
+  authorityDecisionId: string
   nowIso?: string
 }
 
@@ -103,10 +107,11 @@ export function prepareContinuityEnrollmentStatements(env: Env, p: ContinuityEnr
     ).bind(now, p.humanMemberId, env.TENANT_SLUG, p.harnessId, p.agentId),
     env.DB.prepare(
       `INSERT INTO attachment_continuity_scopes
-          (id, tenant, admission_id, agent_id, human_member_id, harness_id, source_grant_token_id, created_at)
-       SELECT ?1, ?2, adm.id, adm.agent_id, adm.human_member_id, adm.harness_id, ?3, ?4
+          (id, tenant, admission_id, agent_id, human_member_id, harness_id, source_grant_token_id, authority_decision_id, created_at)
+       SELECT ?1, ?2, adm.id, adm.agent_id, adm.human_member_id, adm.harness_id, ?3, decision.id, ?4
          FROM agent_seat_attachments att
          JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
+         JOIN agent_seat_authority_decisions decision ON decision.id = ?11 AND decision.tenant = att.tenant
          JOIN harnesses h ON h.id = adm.harness_id AND h.tenant = adm.tenant AND h.member_id = adm.human_member_id
          JOIN member_tokens g ON g.id = ?3
          JOIN agents a ON a.id = adm.agent_id AND a.status = 'active'
@@ -116,6 +121,10 @@ export function prepareContinuityEnrollmentStatements(env: Env, p: ContinuityEnr
           AND att.admission_id = ?6 AND att.agent_id = ?7 AND att.human_member_id = ?8 AND att.harness_id = ?9
           AND adm.status = 'live' AND adm.scope = 'harness' AND adm.decided_at = ?10
           AND adm.decided_by_member_id = ?8 AND adm.decided_via = 'webauthn'
+          AND decision.admission_id = adm.id AND decision.attachment_id = att.id AND decision.seat_id = att.seat_id
+          AND decision.agent_id = adm.agent_id AND decision.harness_id = adm.harness_id
+          AND decision.decided_by_member_id = ?8 AND decision.decided_at = ?10
+          AND decision.decided_via = 'webauthn' AND decision.continuity_approved = 1
           AND ${authorityLiveSql('adm', '?4')}
           AND h.credential_kind = 'oauth' AND h.grant_id = 'oauth:' || ?3
           AND g.tenant = ?2 AND g.member_id = ?8 AND g.channel = 'directory' AND g.agent_id IS NULL
@@ -137,23 +146,25 @@ export function prepareContinuityEnrollmentStatements(env: Env, p: ContinuityEnr
                AND live_g.tenant = live.tenant AND live_g.member_id = live.human_member_id
                AND live_g.channel = 'directory' AND live_g.agent_id IS NULL AND ${TOKEN_LIVE_PREDICATE('?4', 'live_g')}
           )`,
-    ).bind(p.scopeId, env.TENANT_SLUG, p.sourceGrantTokenId, now, p.attachmentId, p.admissionId, p.agentId, p.humanMemberId, p.harnessId, p.promotedAt),
+    ).bind(p.scopeId, env.TENANT_SLUG, p.sourceGrantTokenId, now, p.attachmentId, p.admissionId, p.agentId, p.humanMemberId, p.harnessId, p.promotedAt, p.authorityDecisionId),
   ]
 }
 
 const rowColumns = `cs.id, cs.tenant, cs.admission_id, cs.agent_id, cs.human_member_id, cs.harness_id,
-  cs.source_grant_token_id, cs.created_at, cs.revoked_at, cs.revoked_by_member_id`
+  cs.source_grant_token_id, cs.authority_decision_id, cs.created_at, cs.revoked_at, cs.revoked_by_member_id`
 
 export async function resolveAttachmentContinuity(env: Env, request: ContinuityRequest): Promise<AttachmentContinuityResolution> {
   const ph: LivePh = (key) => ({ tenant: '?1', seat: '?2', grantToken: '?3', human: '?4', now: '?5' })[key]
   const binds = [env.TENANT_SLUG, request.seatId, request.sourceGrantTokenId, request.humanMemberId, request.nowIso ?? nowSqlUtc()]
   const live = await env.DB.prepare(
     `SELECT att.id FROM ${LIVE_ATTACHMENT_FROM_SQL}
+      JOIN member_tokens t ON ${seatTokenLiveSql(ph)}
       WHERE att.id = ?6 AND att.agent_id = ?7 AND att.harness_id = ?8 AND ${liveAttachmentConditionsSql(env, ph)} LIMIT 1`,
   ).bind(...binds, request.attachmentId, request.agentId, request.harnessId).first<{ id: string }>()
   if (!live) return { kind: 'refused', reason: 'attachment_not_live' }
   const scoped = await env.DB.prepare(
     `SELECT ${rowColumns} FROM attachment_continuity_scopes cs JOIN ${LIVE_ATTACHMENT_FROM_SQL}
+      JOIN member_tokens t ON ${seatTokenLiveSql(ph)}
       WHERE att.id = ?6 AND att.agent_id = ?7 AND att.harness_id = ?8
         AND ${continuityScopeAuthoritySql(env, ph)} LIMIT 1`,
   ).bind(...binds, request.attachmentId, request.agentId, request.harnessId).first<ContinuityScopeRow>()
@@ -177,11 +188,14 @@ export async function findLiveRecipientContinuityScope(env: Env, scopeId: string
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
       JOIN members am ON am.id = b.member_id AND am.tenant = cs.tenant AND am.status = 'active'
      WHERE cs.id = ?1 AND cs.tenant = ?2 AND cs.revoked_at IS NULL
-       AND adm.status = 'live' AND ${authorityLiveSql('adm', '?3')}
+       AND adm.status = 'live' AND adm.scope = 'harness' AND adm.agent_id = cs.agent_id
+       AND adm.human_member_id = cs.human_member_id AND adm.harness_id = cs.harness_id
+       AND ${authorityLiveSql('adm', '?3')}
        AND h.credential_kind = 'oauth' AND h.grant_id = 'oauth:' || cs.source_grant_token_id
        AND g.tenant = cs.tenant AND g.member_id = cs.human_member_id AND g.channel = 'directory' AND g.agent_id IS NULL
        AND ${TOKEN_LIVE_PREDICATE('?3', 'g')}
        AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = cs.human_member_id AND hm.tenant = cs.tenant AND hm.status = 'active')
+       ${attachDesignatedClause(env, 'a', 'cs.human_member_id')}
      LIMIT 1`,
   ).bind(scopeId, env.TENANT_SLUG, nowIso).first<ContinuityScopeRow>()
 }
