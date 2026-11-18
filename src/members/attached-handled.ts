@@ -16,7 +16,7 @@
 
 import { attachDesignatedClause } from './attach-designated'
 import { continuityScopeAuthoritySql, resolveAttachmentContinuity, type ContinuityRequest } from './attachment-continuity'
-import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from './attach-live-sql'
+import { LIVE_ATTACHMENT_FROM_SQL, seatTokenLiveSql, type LivePh } from './attach-live-sql'
 import { attachmentPhysicalVisibleSql, continuityGroupVisibleSql } from './attachment-inbox'
 import type { Env } from '../types'
 
@@ -128,11 +128,11 @@ async function markScopedMessagesHandled(
     await env.DB.prepare(
       `INSERT OR IGNORE INTO agent_attachment_handled (attachment_id, tenant, message_id, handled_at)
        SELECT ?2, ?1, m.id, datetime('now')
-         FROM agent_messages m JOIN ${LIVE_ATTACHMENT_FROM_SQL} JOIN member_tokens t ON ${seatTokenLiveSql(ph)}
+         FROM agent_messages m JOIN ${liveFrom}
         WHERE att.id = ?2 AND att.agent_id = ?3 AND m.tenant = ?1 AND m.to_agent = ?3 AND m.read_at IS NULL
           AND m.id IN (${idsSql}) AND ${attachmentPhysicalVisibleSql('m', 't.label')}
           AND COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
-          AND ${liveAttachmentConditionsSql(env, ph)}`,
+          AND ${liveScope}`,
     ).bind(...binds).run()
     // Source attachment is provenance only.  This joins the CURRENT caller's
     // physical attachment, so another live chat in the same scope can read a
@@ -149,11 +149,11 @@ async function markScopedMessagesHandled(
     ).bind(...binds).all<{ message_id: string }>()
     const physical = await env.DB.prepare(
       `SELECT h.message_id FROM agent_attachment_handled h JOIN agent_messages m ON m.id = h.message_id AND m.tenant = h.tenant
-         JOIN ${LIVE_ATTACHMENT_FROM_SQL} JOIN member_tokens t ON ${seatTokenLiveSql(ph)}
+         JOIN ${liveFrom}
         WHERE h.attachment_id = ?2 AND h.tenant = ?1 AND att.id = ?2 AND att.agent_id = ?3
           AND m.id IN (${idsSql}) AND ${attachmentPhysicalVisibleSql('m', 't.label')} AND m.to_agent = ?3 AND m.read_at IS NULL
           AND COALESCE((SELECT mode FROM agent_inbox_fences WHERE tenant = ?1 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
-          AND ${liveAttachmentConditionsSql(env, ph)}`,
+          AND ${liveScope}`,
     ).bind(...binds).all<{ message_id: string }>()
     const have = new Set([...(rows.results ?? []), ...(physical.results ?? [])].map((r) => r.message_id))
     return { ok: true, handled: ids.filter((id) => have.has(id)), not_visible: ids.filter((id) => !have.has(id)) }
