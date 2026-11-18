@@ -971,6 +971,30 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(one<{ n: number }>(`SELECT COUNT(*) AS n FROM agent_messages WHERE request_id IN ('r1-logical','r1-broadcast') AND read_at IS NOT NULL`)!.n).toBe(0)
   })
 
+  it('keeps group receipts isolated to their exact continuity scope across two harnesses', async () => {
+    const env = envFor(h)
+    const first = await grant(env, HUMAN, 'continuity-a')
+    const second = await grant(env, HUMAN, 'continuity-b')
+    await admitForAllChats(env, first, 'scope-a', 'rava', undefined, true)
+    await admitForAllChats(env, second, 'scope-b', 'rava', undefined, true)
+    const scopes = h.sqlite.prepare(`SELECT id, harness_id FROM attachment_continuity_scopes ORDER BY rowid`).all() as Array<{ id: string; harness_id: string }>
+    const oneScope = scopes.find(s => s.harness_id === first.harnessId)!.id
+    const peer = await peerSender(env)
+    expect((await rpc(env, peer, 'send', { to: 'agent-rava', body: 'private scope', request_id: 'scope-isolated', inbox_target: `continuity:${oneScope}` })).status).toBe(200)
+    expect((await rpc(env, peer, 'send', { to: 'agent-rava', body: 'shared broadcast', request_id: 'scope-broadcast' })).status).toBe(200)
+    const ids = async (g: Grant, session: string) => ((await rpc(env, g.ctx, 'inbox', { peek: true }, thread(session))).sc.messages as Array<{ id: string }>).map(m => m.id)
+    const scoped = one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='scope-isolated'`)!.id
+    const broadcast = one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='scope-broadcast'`)!.id
+    expect(await ids(first, 'scope-a')).toEqual(expect.arrayContaining([scoped, broadcast]))
+    expect(await ids(second, 'scope-b')).toEqual(expect.arrayContaining([broadcast]))
+    expect(await ids(second, 'scope-b')).not.toContain(scoped)
+    const marked = await rpc(env, first.ctx, 'inbox_mark_handled', { ids: [broadcast] }, thread('scope-a'))
+    expect(marked.status).toBe(200); expect(marked.sc.handled).toEqual([broadcast])
+    expect(await ids(first, 'scope-a')).not.toContain(broadcast)
+    expect(await ids(second, 'scope-b')).toContain(broadcast)
+    expect(one<{ n: number }>(`SELECT COUNT(*) AS n FROM agent_messages WHERE id=? AND read_at IS NOT NULL`, broadcast)!.n).toBe(0)
+  })
+
   it('MCP send preserves physical labels and refuses competing selectors without accepting raw scope metadata', async () => {
     const env = envFor(h); const g = await grant(env, HUMAN)
     await admitForAllChats(env, g, 'rpc-physical', 'rava', undefined, true)

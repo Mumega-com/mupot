@@ -74,6 +74,28 @@ describe('attached continuity inbox handled receipts', () => {
     expect(h.sqlite.prepare(`SELECT read_at FROM agent_messages WHERE id='physical'`).get()).toEqual({ read_at: null })
   })
 
+  it('rechecks a scope-only revoke at the physical INSERT boundary', async () => {
+    let revoked = false
+    const db = new Proxy(h.db, { get(target, key) {
+      const value = Reflect.get(target, key)
+      if (key !== 'prepare' || typeof value !== 'function') return typeof value === 'function' ? value.bind(target) : value
+      return (sql: string) => {
+        if (!revoked && sql.includes('INSERT OR IGNORE INTO agent_attachment_handled')) {
+          revoked = true
+          h.sqlite.prepare(`UPDATE attachment_continuity_scopes SET revoked_at = ? WHERE id = 'scope'`).run(NOW)
+        }
+        return value.call(target, sql)
+      }
+    } })
+    const result = await markMessagesHandledByAttachment({ ...env(), DB: db }, {
+      attachmentId: 'attachment', agentId: 'rava', seat: 'physical-token-label', ids: ['physical'],
+      continuity: { attachmentId: 'attachment', seatId: 'seat', agentId: 'rava', humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: 'grant', nowIso: NOW },
+    })
+    expect(revoked).toBe(true)
+    expect(result).toEqual({ ok: true, handled: [], not_visible: ['physical'] })
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_attachment_handled').get()).toEqual({ n: 0 })
+  })
+
   it('rechecks live scope authority in the page statement after preflight', async () => {
     let revoked = false
     const db = new Proxy(h.db, {
