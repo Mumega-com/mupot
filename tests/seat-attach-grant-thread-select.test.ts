@@ -1039,6 +1039,19 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status='live'`)).toBe(2)
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
+
+  it('contract: approval-move preview preserves its old seat admission when another agent reserves the harness', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'move-scope','rava',undefined,true)
+    await boot(env,g,'move-old'); const old=one<{id:string}>(`SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1`)!
+    await boot(env,g,'move-new'); const target=one<{id:string}>(`SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1`)!
+    h.sqlite.prepare(`UPDATE agents SET owner_member_id=? WHERE id='agent-hadi-dev'`).run(HUMAN)
+    h.sqlite.prepare(`INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,gates,gate_authority,scope,ceiling,authority_level,authority_expires_at,requested_via,requested_seat_id,created_at,decided_at,decided_by_member_id,decided_via)
+      VALUES('move-contract',?,'agent-hadi-dev',?,?, 'live',0,0,'seat','member','helper',datetime('now','+1 day'),'dashboard',?,datetime('now'),datetime('now'),?,'dashboard')`).run(TENANT,HUMAN,g.harnessId,old.id,HUMAN)
+    const {loadApprovalMoveOffer}=await import('../src/members/approval-move')
+    expect(await loadApprovalMoveOffer(env,{admissionId:'move-contract',agentId:'agent-hadi-dev',harnessId:g.harnessId,seatId:target.id,humanMemberId:HUMAN})).toBeNull()
+    expect(one<{status:string}>(`SELECT status FROM agent_seat_admissions WHERE id='move-contract'`)!.status).toBe('live')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE admission_id='move-contract'`)).toBe(0)
+  })
 })
 
 // keep imports that the scenarios above use only for typing/ratchets referenced
