@@ -4883,9 +4883,43 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "notif_dedupe" },
     ],
   },
+  {
+    file: "0276_attachment_continuity.sql",
+    sha256: "5a83f211deb085c92cd0f98e1ea98d2b32cfb5b45627882822d08c61c5a23aca",
+    statements: [
+      "ALTER TABLE agent_seat_authority_decisions ADD COLUMN continuity_approved INTEGER NOT NULL DEFAULT 0\n  CHECK (continuity_approved IN (0, 1));",
+      "CREATE TABLE IF NOT EXISTS attachment_continuity_scopes (\n  id                    TEXT PRIMARY KEY,\n  tenant                TEXT NOT NULL,\n  admission_id          TEXT NOT NULL REFERENCES agent_seat_admissions(id) ON DELETE RESTRICT,\n  agent_id              TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  human_member_id       TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  harness_id            TEXT NOT NULL REFERENCES harnesses(id) ON DELETE RESTRICT,\n  source_grant_token_id TEXT NOT NULL REFERENCES member_tokens(id) ON DELETE RESTRICT,\n  authority_decision_id TEXT NOT NULL REFERENCES agent_seat_authority_decisions(id) ON DELETE RESTRICT,\n  created_at            TEXT NOT NULL,\n  revoked_at            TEXT,\n  revoked_by_member_id  TEXT REFERENCES members(id) ON DELETE RESTRICT,\n  UNIQUE (tenant, admission_id, source_grant_token_id),\n  UNIQUE (tenant, authority_decision_id)\n);",
+      "CREATE INDEX IF NOT EXISTS idx_attachment_continuity_scopes_harness\n  ON attachment_continuity_scopes(tenant, harness_id, revoked_at);",
+      "CREATE INDEX IF NOT EXISTS idx_attachment_continuity_scopes_recipient\n  ON attachment_continuity_scopes(tenant, agent_id, revoked_at);",
+      "CREATE TRIGGER IF NOT EXISTS attachment_continuity_scopes_immutable\nBEFORE UPDATE ON attachment_continuity_scopes\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant\n  OR NEW.admission_id IS NOT OLD.admission_id OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.human_member_id IS NOT OLD.human_member_id OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.source_grant_token_id IS NOT OLD.source_grant_token_id OR NEW.authority_decision_id IS NOT OLD.authority_decision_id\n  OR NEW.created_at IS NOT OLD.created_at\n  OR (OLD.revoked_at IS NOT NULL AND (NEW.revoked_at IS NOT OLD.revoked_at OR NEW.revoked_by_member_id IS NOT OLD.revoked_by_member_id))\n  OR (OLD.revoked_at IS NULL AND NEW.revoked_at IS NULL AND NEW.revoked_by_member_id IS NOT OLD.revoked_by_member_id)\nBEGIN\n  SELECT RAISE(ABORT, 'attachment_continuity_scope_immutable');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS attachment_continuity_scopes_no_delete\nBEFORE DELETE ON attachment_continuity_scopes\nFOR EACH ROW BEGIN\n  SELECT RAISE(ABORT, 'attachment_continuity_scope_immutable');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS attachment_continuity_scopes_no_replace\nBEFORE INSERT ON attachment_continuity_scopes\nFOR EACH ROW WHEN EXISTS (\n  SELECT 1 FROM attachment_continuity_scopes s\n   WHERE s.id = NEW.id\n      OR (s.tenant = NEW.tenant AND s.admission_id = NEW.admission_id AND s.source_grant_token_id = NEW.source_grant_token_id)\n      OR (s.tenant = NEW.tenant AND s.authority_decision_id = NEW.authority_decision_id)\n)\nBEGIN\n  SELECT RAISE(ABORT, 'attachment_continuity_scope_immutable');\nEND;",
+      "ALTER TABLE agent_messages ADD COLUMN target_continuity_scope_id TEXT REFERENCES attachment_continuity_scopes(id) ON DELETE RESTRICT;",
+      "CREATE INDEX IF NOT EXISTS idx_agent_messages_continuity_scope\n  ON agent_messages(tenant, target_continuity_scope_id, to_agent, read_at, seq)\n  WHERE target_continuity_scope_id IS NOT NULL;",
+      "CREATE TRIGGER IF NOT EXISTS agent_messages_continuity_target_insert\nBEFORE INSERT ON agent_messages\nFOR EACH ROW WHEN NEW.target_continuity_scope_id IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM attachment_continuity_scopes s\n     WHERE s.id = NEW.target_continuity_scope_id AND s.tenant = NEW.tenant\n       AND s.agent_id = NEW.to_agent AND NEW.target_seat = 'continuity:' || s.id\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'agent_message_continuity_target_invalid');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS agent_messages_continuity_target_update\nBEFORE UPDATE OF target_continuity_scope_id, target_seat, to_agent, tenant ON agent_messages\nFOR EACH ROW WHEN NEW.target_continuity_scope_id IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM attachment_continuity_scopes s\n     WHERE s.id = NEW.target_continuity_scope_id AND s.tenant = NEW.tenant\n       AND s.agent_id = NEW.to_agent AND NEW.target_seat = 'continuity:' || s.id\n  )\nBEGIN\n  SELECT RAISE(ABORT, 'agent_message_continuity_target_invalid');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS agent_messages_continuity_target_immutable\nBEFORE UPDATE OF target_continuity_scope_id, target_seat, to_agent, tenant ON agent_messages\nFOR EACH ROW WHEN OLD.target_continuity_scope_id IS NOT NULL\n  AND (NEW.target_continuity_scope_id IS NOT OLD.target_continuity_scope_id\n    OR NEW.target_seat IS NOT OLD.target_seat\n    OR NEW.to_agent IS NOT OLD.to_agent\n    OR NEW.tenant IS NOT OLD.tenant)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_message_continuity_target_immutable');\nEND;",
+      "CREATE TABLE IF NOT EXISTS agent_continuity_handled (\n  scope_id             TEXT NOT NULL REFERENCES attachment_continuity_scopes(id) ON DELETE RESTRICT,\n  message_id           TEXT NOT NULL,\n  tenant               TEXT NOT NULL,\n  handled_at           TEXT NOT NULL,\n  source_attachment_id TEXT NOT NULL REFERENCES agent_seat_attachments(id) ON DELETE RESTRICT,\n  PRIMARY KEY (scope_id, message_id)\n);",
+      "CREATE TRIGGER IF NOT EXISTS agent_continuity_handled_scope_message\nBEFORE INSERT ON agent_continuity_handled\nFOR EACH ROW WHEN NOT EXISTS (\n  SELECT 1\n    FROM attachment_continuity_scopes s\n    JOIN agent_seat_attachments a ON a.id = NEW.source_attachment_id AND a.tenant = NEW.tenant\n    JOIN agent_messages m ON m.id = NEW.message_id AND m.tenant = NEW.tenant\n   WHERE s.id = NEW.scope_id AND s.tenant = NEW.tenant\n     AND s.agent_id = a.agent_id AND s.human_member_id = a.human_member_id\n     AND s.harness_id = a.harness_id AND s.admission_id = a.admission_id\n     AND m.to_agent = s.agent_id\n     AND (\n       (m.target_continuity_scope_id = s.id AND m.target_seat = 'continuity:' || s.id)\n       OR (m.target_continuity_scope_id IS NULL AND m.target_seat IS NULL)\n     )\n)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_continuity_handled_scope_message_invalid');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "attachment_continuity_scopes" },
+      { type: "index", name: "idx_attachment_continuity_scopes_harness" },
+      { type: "index", name: "idx_attachment_continuity_scopes_recipient" },
+      { type: "trigger", name: "attachment_continuity_scopes_immutable" },
+      { type: "trigger", name: "attachment_continuity_scopes_no_delete" },
+      { type: "trigger", name: "attachment_continuity_scopes_no_replace" },
+      { type: "index", name: "idx_agent_messages_continuity_scope" },
+      { type: "trigger", name: "agent_messages_continuity_target_insert" },
+      { type: "trigger", name: "agent_messages_continuity_target_update" },
+      { type: "trigger", name: "agent_messages_continuity_target_immutable" },
+      { type: "table", name: "agent_continuity_handled" },
+      { type: "trigger", name: "agent_continuity_handled_scope_message" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "1d0d60d9fac0f2450073bcedbb5f9941c91187018537b15ca96dafd3cfef5785"
+export const SCHEMA_CHAIN_DIGEST: string = "5fc7174fcbae228ed306dcfe69f8c9a5cbcdcd7769ee3bc15b3964a50120d59b"
