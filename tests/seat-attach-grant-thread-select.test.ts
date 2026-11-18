@@ -946,6 +946,31 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
       .toEqual({ target_seat: null, target_continuity_scope_id: null })
   })
 
+  it('real MCP attached chats share scoped and broadcast handled receipts but not a root physical target', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'r1-root', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    // Two later chats explicitly attach under the same human/harness approval.
+    await boot(env, g, 'r1-child'); expect((await attach(env, g, 'r1-child', 'rava')).sc.status).toBe('attached')
+    await boot(env, g, 'r1-rotated'); expect((await attach(env, g, 'r1-rotated', 'rava')).sc.status).toBe('attached')
+    const physical = one<{ label: string }>(`SELECT t.label FROM attachment_continuity_scopes cs JOIN agent_seat_attachments a ON a.admission_id=cs.admission_id JOIN member_tokens t ON t.id=a.seat_token_id WHERE cs.id=? LIMIT 1`, scope.id)!
+    const peer = await peerSender(env)
+    expect((await rpc(env, peer, 'send', { to: 'agent-rava', body: 'logical', request_id: 'r1-logical', inbox_target: `continuity:${scope.id}` })).status).toBe(200)
+    expect((await rpc(env, peer, 'send', { to: 'agent-rava', body: 'broadcast', request_id: 'r1-broadcast' })).status).toBe(200)
+    expect((await rpc(env, peer, 'send', { to: 'agent-rava', body: 'physical', request_id: 'r1-physical', seat: physical.label })).status).toBe(200)
+    const inbox = async (s: string) => rpc(env, g.ctx, 'inbox', { peek: true, limit: 10 }, thread(s))
+    const ids = (r: Rpc) => (((r.sc.messages ?? []) as Array<{ id: string }>).map(m => m.id).sort())
+    expect(ids(await inbox('r1-root'))).toEqual(expect.arrayContaining([expect.any(String), expect.any(String)]))
+    expect(ids(await inbox('r1-child'))).toEqual(expect.arrayContaining([one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='r1-logical'`)!.id, one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='r1-broadcast'`)!.id]))
+    expect(ids(await inbox('r1-child'))).not.toContain(one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='r1-physical'`)!.id)
+    const logical = one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='r1-logical'`)!.id
+    const broadcast = one<{ id: string }>(`SELECT id FROM agent_messages WHERE request_id='r1-broadcast'`)!.id
+    expect((await rpc(env, g.ctx, 'inbox_mark_handled', { ids: [logical, broadcast] }, thread('r1-root'))).status).toBe(200)
+    expect(ids(await inbox('r1-child'))).not.toContain(logical)
+    expect(ids(await inbox('r1-rotated'))).not.toContain(broadcast)
+    expect(one<{ n: number }>(`SELECT COUNT(*) AS n FROM agent_messages WHERE request_id IN ('r1-logical','r1-broadcast') AND read_at IS NOT NULL`)!.n).toBe(0)
+  })
+
   it('MCP send preserves physical labels and refuses competing selectors without accepting raw scope metadata', async () => {
     const env = envFor(h); const g = await grant(env, HUMAN)
     await admitForAllChats(env, g, 'rpc-physical', 'rava', undefined, true)

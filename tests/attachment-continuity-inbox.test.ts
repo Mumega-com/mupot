@@ -63,6 +63,17 @@ describe('attached continuity inbox handled receipts', () => {
     expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_continuity_handled').get()).toEqual({ n: 1 })
   })
 
+  it('does not fall back to a physical receipt when only the continuity scope is revoked', async () => {
+    h.sqlite.prepare(`UPDATE attachment_continuity_scopes SET revoked_at = ? WHERE id = 'scope'`).run(NOW)
+    const result = await markMessagesHandledByAttachment(env(), {
+      attachmentId: 'attachment', agentId: 'rava', seat: 'physical-token-label', ids: ['physical'],
+      continuity: { attachmentId: 'attachment', seatId: 'seat', agentId: 'rava', humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: 'grant', nowIso: NOW },
+    })
+    expect(result).toEqual({ ok: true, handled: [], not_visible: ['physical'] })
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_attachment_handled').get()).toEqual({ n: 0 })
+    expect(h.sqlite.prepare(`SELECT read_at FROM agent_messages WHERE id='physical'`).get()).toEqual({ read_at: null })
+  })
+
   it('rechecks live scope authority in the page statement after preflight', async () => {
     let revoked = false
     const db = new Proxy(h.db, {
