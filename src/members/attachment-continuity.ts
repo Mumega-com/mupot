@@ -29,8 +29,6 @@ export interface ContinuityRequest {
   humanMemberId: string
   harnessId: string
   sourceGrantTokenId: string
-  /** The fresh, one-use authority-decision row carrying the human's continuity opt-in. */
-  authorityDecisionId: string
   nowIso?: string
 }
 
@@ -47,6 +45,8 @@ export interface ContinuityEnrollment {
   humanMemberId: string
   harnessId: string
   sourceGrantTokenId: string
+  /** The fresh, one-use authority-decision row carrying the human's continuity opt-in. */
+  authorityDecisionId: string
   /** Exact `agent_seat_admissions.decided_at` from the just-completed WebAuthn promotion. */
   promotedAt: string
   nowIso?: string
