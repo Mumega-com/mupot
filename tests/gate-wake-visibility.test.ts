@@ -359,6 +359,129 @@ describe('gate wake outcomes are visible on task reads', () => {
     }
   })
 
+  it('#2458-2: a stopped fleet row never receives (bus or inbox) and is recorded stopped_skipped, on both paths', async () => {
+    for (const sole of [false, true]) {
+      const { harness, env, events, task } = fanoutFixture()
+      try {
+        // The #2451 round-2 repro: the holder's fleet row is keyed by its slug and operator-stopped (fresh report).
+        harness.sqlite.prepare(`UPDATE agents SET slug = 'kb-slug' WHERE id = 'agent-live-b'`).run()
+        harness.sqlite.prepare(`UPDATE fleet_agents SET agent_id = 'kb-slug', status = 'stopped' WHERE agent_id = 'agent-live-b'`).run()
+        if (sole) harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id <> 'agent-live-b'`).run()
+        const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+        const rows = (harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all() as Array<{ to_agent: string }>).map(r => r.to_agent)
+        expect(rows).not.toContain('kb-slug')
+        expect(rows).not.toContain('agent-live-b')
+        expect(events.filter(e => e.type === 'agent.wake').map(e => e.agent_id)).not.toContain('agent-live-b')
+        expect(outcome.holders).toEqual(expect.arrayContaining([{ type: 'agent', id: 'agent-live-b', status: 'stopped_skipped' }]))
+        if (sole) {
+          expect(outcome.status).toBe('no_live_holder')
+          expect(outcome.notice).toBe('Gate wake not delivered: gate:kasra-core holder agent agent-live-b is stopped.')
+        } else {
+          expect(outcome.status).toBe('delivered')
+          expect(rows.sort()).toEqual(['agent-live-a', 'agent-stale'])
+          expect(outcome.notice).toContain('Stopped: agent-live-b.')
+        }
+      } finally { harness.close() }
+    }
+  })
+
+  it('#2458-2: every eligible fan-out holder stopped reports no_live_holder, never delivered', async () => {
+    const { harness, env, events, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id NOT IN ('agent-live-a', 'agent-live-b', 'agent-builder')`).run()
+      harness.sqlite.prepare(`UPDATE fleet_agents SET status = 'stopped' WHERE agent_id IN ('agent-live-a', 'agent-live-b')`).run()
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(outcome.status).toBe('no_live_holder')
+      expect(outcome.holders).toEqual([
+        { type: 'agent', id: 'agent-builder', status: 'skipped_task_assignee' },
+        { type: 'agent', id: 'agent-live-a', status: 'stopped_skipped' },
+        { type: 'agent', id: 'agent-live-b', status: 'stopped_skipped' },
+      ])
+      expect(events).toEqual([])
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_messages').get()).toEqual({ n: 0 })
+    } finally { harness.close() }
+  })
+
+  it('#2458-3: a stale slug-keyed registration falls back to agents.id for the inbox row, on both paths', async () => {
+    for (const sole of [false, true]) {
+      const { harness, env, events, task } = fanoutFixture()
+      try {
+        // Resident (non-poll) runtime registered under its slug, last report long past the TTL: a dead address.
+        harness.sqlite.prepare(`UPDATE agents SET slug = 'kb-slug' WHERE id = 'agent-live-b'`).run()
+        harness.sqlite.prepare(`UPDATE fleet_agents SET agent_id = 'kb-slug', last_reported_at = '2000-01-01T00:00:00.000Z' WHERE agent_id = 'agent-live-b'`).run()
+        if (sole) harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id <> 'agent-live-b'`).run()
+        const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+        expect(outcome.status).toBe('delivered')
+        const rows = (harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all() as Array<{ to_agent: string }>).map(r => r.to_agent)
+        expect(rows).toContain('agent-live-b')
+        expect(rows).not.toContain('kb-slug')
+        expect(events.filter(e => e.type === 'agent.wake').map(e => e.agent_id)).toContain('agent-live-b')
+      } finally { harness.close() }
+    }
+  })
+
+  it('#2458-3: an active poll-mode slug registration keeps the fleet identity even when stale (mailbox route)', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`UPDATE agents SET slug = 'kb-slug' WHERE id = 'agent-live-b'`).run()
+      harness.sqlite.prepare(`UPDATE fleet_agents SET agent_id = 'kb-slug', presence_mode = 'poll', last_reported_at = '2000-01-01T00:00:00.000Z' WHERE agent_id = 'agent-live-b'`).run()
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id <> 'agent-live-b'`).run()
+      expect((await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)).status).toBe('delivered')
+      expect(harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all()).toEqual([{ to_agent: 'kb-slug' }])
+    } finally { harness.close() }
+  })
+
+  function seedSelfVerdictHolders(harness: ReturnType<typeof createSqliteD1>, task: Task, count: number): string[] {
+    const ids: string[] = []
+    for (let i = 0; i < count; i++) {
+      const id = `agent-inel-${String(i).padStart(2, '0')}`
+      seedAgent(harness.sqlite, id)
+      seedGrant(harness.sqlite, `grant-${id}`, 'gate:kasra-core', 'agent', id)
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+        VALUES (?, ?, ?, ?, ?, 'docs/result.md', ?, ?, 'reviewed result', '2026-10-01T00:00:00.000Z')`).run(`submission-${id}`, TENANT, task.id, SQUAD_ID, id, 'a'.repeat(64), 'b'.repeat(64))
+      ids.push(id)
+    }
+    return ids
+  }
+
+  it('#2458-4: 21 provably ineligible holders after an eligible one: reads capped at 20, the wake is partial', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id = 'agent-builder'`).run()
+      seedAgent(harness.sqlite, 'agent-aa-first')
+      seedGrant(harness.sqlite, 'grant-agent-aa-first', 'gate:kasra-core', 'agent', 'agent-aa-first')
+      seedSelfVerdictHolders(harness, task, 21)
+      liveness.calls = 0
+      eligibility.calls = 0
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      // Stable order: aa-first (eligible), inel-00..18 (19 ineligible) = 20 reads; inel-19, inel-20, live-a, live-b, stale unread.
+      expect(eligibility.calls).toBe(20)
+      expect(liveness.calls).toBe(1)
+      expect(outcome).toMatchObject({ status: 'partial', width_cap: { limit: 10, omitted: 5 } })
+      expect(harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all()).toEqual([{ to_agent: 'agent-aa-first' }])
+      expect(outcome.holders?.filter(h => h.status === 'skipped_width_cap').map(h => h.id)).toEqual(['agent-inel-19', 'agent-inel-20', 'agent-live-a', 'agent-live-b', 'agent-stale'])
+      expect(outcome.holders?.filter(h => h.status === 'skipped_self_verdict')).toHaveLength(19)
+      expect(outcome.notice).toContain('read cap 20 reached; 5 agent holders not read or woken')
+    } finally { harness.close() }
+  })
+
+  it('#2458-4: 21 provably ineligible holders ahead of every eligible one: 20 reads, eligibility_unknown, nobody woken', async () => {
+    const { harness, env, events, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id = 'agent-builder'`).run()
+      seedSelfVerdictHolders(harness, task, 21)
+      liveness.calls = 0
+      eligibility.calls = 0
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(eligibility.calls).toBe(20)
+      expect(liveness.calls).toBe(0)
+      expect(outcome.status).toBe('eligibility_unknown')
+      expect(outcome.holders?.filter(h => h.status === 'skipped_width_cap').map(h => h.id)).toEqual(['agent-inel-20', 'agent-live-a', 'agent-live-b', 'agent-stale'])
+      expect(events).toEqual([])
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_messages').get()).toEqual({ n: 0 })
+    } finally { harness.close() }
+  })
+
   it('#2450-3: with no member holder, the all-ineligible notice does not mention member holders', async () => {
     const { harness, env, task } = fanoutFixture()
     try {

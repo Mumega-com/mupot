@@ -2519,6 +2519,8 @@ export type GateWakeOutcome = {
 export type GateHolderWakeStatus =
   | 'delivered' | 'partial' | 'delivery_failed'
   | 'skipped_task_assignee' | 'skipped_self_verdict' | 'skipped_eligibility_unknown' | 'skipped_width_cap'
+  // mupot#2458: the holder's fleet row is operator-stopped; neither the bus wake nor the inbox row is sent.
+  | 'stopped_skipped'
 
 /**
  * mupot#2450 item 6: the most holders one review wake fans out to. The cap bounds the per-holder D1 reads too:
@@ -2538,6 +2540,27 @@ async function gateHolderSkipReason(env: Env, task: Task, agentId: string): Prom
     return await agentGateHolderIneligibility(env, task, agentId)
   } catch {
     return 'eligibility_unknown'
+  }
+}
+
+type GateWakeRoute = { stopped: boolean; live: boolean; inboxId: string }
+
+/**
+ * mupot#2458: where (and whether) a gate wake reaches an agent holder. ONE presence read per holder.
+ * - A stopped fleet row never receives (the #1729 receiver fence): stopped = true, nothing is sent.
+ * - The inbox row goes to the fleet identity (route.agentId) ONLY when the consumer's own delivery-mode resolver
+ *   would deliver to that inbox: a live runtime or an active poll route (bus/consumer.ts resolveDispatchDeliveryMode).
+ *   Otherwise, e.g. a stale slug-keyed resident registration, it goes to agents.id: a dead address is never "delivered".
+ * - A failed read is unproven presence: not live, not stopped, inbox row to agents.id.
+ */
+async function resolveGateWakeRoute(env: Env, agentId: string): Promise<GateWakeRoute> {
+  try {
+    const route = await getFleetAgentLiveness(env, agentId)
+    if (route.stopped) return { stopped: true, live: false, inboxId: agentId }
+    const inboxId = resolveDispatchDeliveryMode(route, false) === 'inbox' ? route.agentId || agentId : agentId
+    return { stopped: false, live: route.live, inboxId }
+  } catch {
+    return { stopped: false, live: false, inboxId: agentId }
   }
 }
 
@@ -2637,39 +2660,52 @@ export async function wakeGateOwnerOnReview(
     })
     const unknownCount = skipped.filter((h) => h.reason === 'eligibility_unknown').length
 
+    // The read cap (not the holder cap) stopped the walk: name the bound that actually tripped.
+    const capText = unread.length
+      ? ` ${eligibleCount >= GATE_WAKE_FANOUT_MAX_HOLDERS ? `width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS}` : `read cap ${GATE_WAKE_FANOUT_MAX_READS}`} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
+      : ''
+    // One presence read per eligible holder (mupot#2458): it fences stopped receivers, ranks the delivery order and
+    // picks the inbox address with the consumer's delivery-mode rule.
+    const routes = await Promise.all(targets.map((holder) => resolveGateWakeRoute(env, holder.id)))
+    const stoppedHolders = targets.filter((_, i) => routes[i].stopped)
+    const stoppedText = stoppedHolders.length ? ` Stopped: ${stoppedHolders.map(h => h.id).join(', ')}.` : ''
+    if (targets.length > 0 && stoppedHolders.length === targets.length) {
+      // Every eligible holder is stopped: nobody can receive, so nothing is sent and nothing is "delivered".
+      const statusById = new Map<string, GateHolderWakeStatus>([
+        ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
+        ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
+        ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
+      ])
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status: 'no_live_holder',
+        holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
+        ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
+        ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
+        notice: `Gate wake not delivered: every eligible agent holder of ${gateOwner} is stopped.${capText}${stoppedText}`,
+      })
+    }
     if (targets.length > 0) {
-      // One presence read per target: it ranks the delivery order and yields the fleet identity the runtime's
-      // own inbox poll reads by (mupot#2450 item 7; same rule as bus/consumer.ts).
-      const routes = await Promise.all(targets.map(async (holder) => {
-        try {
-          const route = await getFleetAgentLiveness(env, holder.id)
-          return { live: route.live, inboxId: route.agentId || holder.id }
-        } catch {
-          return { live: false, inboxId: holder.id } // unproven presence is not live
-        }
-      }))
       const order = targets.map((_, i) => i).sort((x, y) => Number(routes[y].live) - Number(routes[x].live) || x - y)
       const ts = new Date().toISOString()
       const statusOf = new Map<string, 'delivered' | 'partial' | 'delivery_failed'>()
       for (const i of order) {
+        if (routes[i].stopped) continue
         const principal = targets[i]
         // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
         const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
         statusOf.set(principal.id, channelStatus(await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId, routes[i].inboxId)))
       }
-      const delivered = targets.map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
+      const delivered = targets.filter((_, i) => !routes[i].stopped).map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
       const presence = { live: routes.filter((r) => r.live).length, total: targets.length }
       // A holder left unwoken that might be eligible (cap, unreadable eligibility) keeps the wake from being "delivered".
       const complete = unread.length === 0 && unknownCount === 0
       const status = delivered.every(d => d.status === 'delivered') && complete
         ? 'delivered'
         : delivered.some(d => d.status !== 'delivery_failed') ? 'partial' : 'delivery_failed'
-      const capText = unread.length
-        ? ` width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
-        : ''
       const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
       const statusById = new Map<string, GateHolderWakeStatus>([
         ...delivered.map((d) => [d.id, d.status] as const),
+        ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
         ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
         ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
       ])
@@ -2678,7 +2714,7 @@ export async function wakeGateOwnerOnReview(
         holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
         ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
         ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
-        notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}`,
+        notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}${stoppedText}`,
       })
     }
     if (agentHolders.length > 0) {
@@ -2760,9 +2796,17 @@ export async function wakeGateOwnerOnReview(
       notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is not an eligible decider (${soleSkip}).`,
     })
   }
-  // Item 7: address the inbox row to the fleet identity the runtime reads by; no row (or a failed read) = agents.id.
-  let inboxId = agentId
-  try { inboxId = (await getFleetAgentLiveness(env, agentId)).agentId || agentId } catch { /* agents.id */ }
+  // mupot#2458: a stopped receiver gets nothing; otherwise the inbox row goes to the fleet identity only for a live or
+  // active poll route (the consumer's rule), else agents.id. A failed read = agents.id (resolveGateWakeRoute).
+  const soleRoute = await resolveGateWakeRoute(env, agentId)
+  if (soleRoute.stopped) {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome, status: 'no_live_holder', principal: resolution.principal,
+      holders: [{ ...resolution.principal, status: 'stopped_skipped' }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is stopped.`,
+    })
+  }
+  const inboxId = soleRoute.inboxId
   const ts = new Date().toISOString()
   const { bus_delivered: busDelivered, inbox_delivered: inboxDelivered } = await deliverGateAgentWake(
     env, task, actor, byId, agentId, ts, reviewWakeRequestId(task.id, ts), inboxId,
