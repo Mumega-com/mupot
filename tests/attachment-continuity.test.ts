@@ -193,7 +193,7 @@ describe('attachment continuity scopes', () => {
     const x = seed()
     await enroll(approveContinuity(x))
     await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toMatchObject({ id: 'scope-a' })
-    h.sqlite.prepare("UPDATE members SET status = 'inactive' WHERE id = 'agent-member'").run()
+    h.sqlite.prepare("UPDATE members SET status = 'suspended' WHERE id = 'agent-member'").run()
     await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
