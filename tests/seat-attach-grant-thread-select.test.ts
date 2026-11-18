@@ -903,6 +903,17 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
 
+  it('atomically refuses continuity when an un-attached historical seat appears after preflight', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'history-race-current')
+    const ask=await attach(env,g,'history-race-current','rava','harness'); const key=await enrolPasskey(env,HUMAN)
+    const path=new URL(String(ask.sc.approve_url)).pathname; const csrf=csrfOf(await (await hit(path,env)).text()); const code=one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions WHERE agent_id='agent-rava'`)!.attach_code
+    const ch=await (await hit(`${path}/challenge`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
+    const credential=await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge}); const db=env.DB; let injected=false
+    const proxy=new Proxy(db,{get(t,k){if(k==='batch')return async(s:Parameters<typeof db.batch>[0])=>{if(!injected){injected=true;h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('history-race-seat-agent','squad-core','history-race-seat-agent','History race seat','r','m','active'); INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,label_basename,max_live,created_at) VALUES ('history-race-seat','${TENANT}','${HUMAN}','${g.harnessId}','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','history-race-seat-agent','history race',4,datetime('now'));`)}return t.batch(s)};const v=Reflect.get(t,k);return typeof v==='function'?v.bind(t):v}})
+    expect((await hit(`${path}/decide`,{...env,DB:proxy},{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})).status).not.toBe(200)
+    expect(injected).toBe(true); expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
   const peerSender = async (env: Env): Promise<AuthContext> => {
     const tokenId = `peer-send-${crypto.randomUUID()}`
     h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, agent_id, label, channel, created_at, tenant)
