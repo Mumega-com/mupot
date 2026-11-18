@@ -43,7 +43,7 @@ import type {
 import { resolveCapabilities, hasCapability, displayRole, isOrgAdmin, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
-import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { evaluateVerdictGates, canViewTaskReceipts, agentGateHolderIneligibility } from '../tasks/index'
 import { recordReviewLens } from '../tasks/lenses'
 import { resolveDyadGateDefault } from '../gates/dyad'
 import { isSubsystemReservedLane } from '../gates/lanes'
@@ -2495,7 +2495,8 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
 export type GateWakeOutcome = {
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
+  // no_eligible_holder (mupot#2450): every agent holder would be refused by task_verdict (assignee / self_verdict).
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'no_eligible_holder' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2503,10 +2504,35 @@ export type GateWakeOutcome = {
   grant_count: number
   notice: string
   notice_persisted: boolean
-  skipped_holders?: readonly (GatePrincipalRef & { reason: 'task_assignee' | 'not_live' })[]
-  deliveries?: readonly { principal: GatePrincipalRef; bus_delivered: boolean; inbox_delivered: boolean }[]
+  // mupot#2450: one status per agent holder considered (woken holders first, live ones ranked ahead). Presence is
+  // reported only as counts over the eligible holders; no per-holder presence or channel detail leaves the server.
+  holders?: readonly (GatePrincipalRef & { status: GateHolderWakeStatus })[]
+  presence?: { live: number; total: number }
+  width_cap?: { limit: number; omitted: number }
   // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
   new_sends?: number
+}
+
+export type GateHolderWakeStatus =
+  | 'delivered' | 'partial' | 'delivery_failed'
+  | 'skipped_task_assignee' | 'skipped_self_verdict' | 'skipped_eligibility_unknown' | 'skipped_width_cap'
+
+/** mupot#2450 item 6: the most holders one review wake fans out to. Hitting it is recorded on the outcome. */
+export const GATE_WAKE_FANOUT_MAX_HOLDERS = 10
+
+type HolderSkipReason = 'task_assignee' | 'self_verdict' | 'eligibility_unknown'
+
+// Fail closed: an eligibility read that throws is not proof of eligibility, so the holder is skipped, never "delivered".
+async function gateHolderSkipReason(env: Env, task: Task, agentId: string): Promise<HolderSkipReason | null> {
+  try {
+    return await agentGateHolderIneligibility(env, task, agentId)
+  } catch {
+    return 'eligibility_unknown'
+  }
+}
+
+function channelStatus(d: { bus_delivered: boolean; inbox_delivered: boolean }): 'delivered' | 'partial' | 'delivery_failed' {
+  return d.bus_delivered && d.inbox_delivered ? 'delivered' : d.bus_delivered || d.inbox_delivered ? 'partial' : 'delivery_failed'
 }
 
 async function surfaceGateWakeOutcome(
@@ -2577,41 +2603,58 @@ export async function wakeGateOwnerOnReview(
     grant_count: resolution.grant_count,
   }
   if (resolution.status === 'ambiguous') {
-    // Wake routing only: keep the authority resolver and verdict predicates unchanged.
-    // Members retain their needs_you item; only independently live agents get wakes.
-    const skipped: NonNullable<GateWakeOutcome['skipped_holders']>[number][] = []
-    const targets: GatePrincipalRef[] = []
-    for (const holder of resolution.active_holders) {
-      if (holder.type !== 'agent') continue
-      if (holder.id === task.assignee_agent_id) {
-        skipped.push({ ...holder, reason: 'task_assignee' })
-        continue
-      }
-      let live = false
-      try { live = (await getFleetAgentLiveness(env, holder.id)).live } catch { /* unproven presence is not live */ }
-      if (live) targets.push(holder)
-      else skipped.push({ ...holder, reason: 'not_live' })
+    // Wake routing only: keep the authority resolver and verdict predicates unchanged. Members retain their needs_you
+    // item. mupot#2450: every ELIGIBLE agent holder gets the durable inbox row whatever its presence (in-Worker and
+    // inbox-woken seats have no fleet_agents row); presence only ranks live holders first and is reported as counts.
+    const skipped: (GatePrincipalRef & { reason: HolderSkipReason })[] = []
+    const eligible: GatePrincipalRef[] = []
+    const agentHolders = resolution.active_holders.filter((holder) => holder.type === 'agent')
+    for (const holder of agentHolders) {
+      const reason = await gateHolderSkipReason(env, task, holder.id)
+      if (reason) skipped.push({ ...holder, reason })
+      else eligible.push(holder)
     }
+    const live = await Promise.all(eligible.map(async (holder) => {
+      try { return (await getFleetAgentLiveness(env, holder.id)).live } catch { return false /* unproven presence is not live */ }
+    }))
+    const ranked = [...eligible.filter((_, i) => live[i]), ...eligible.filter((_, i) => !live[i])]
+    const targets = ranked.slice(0, GATE_WAKE_FANOUT_MAX_HOLDERS)
+    const overflow = ranked.slice(GATE_WAKE_FANOUT_MAX_HOLDERS)
+    const presence = { live: live.filter(Boolean).length, total: eligible.length }
+    const skippedHolders = skipped.map(({ reason, ...holder }) => ({ ...holder, status: `skipped_${reason}` as const }))
+    const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
+
     if (targets.length > 0) {
       const ts = new Date().toISOString()
-      const deliveries: NonNullable<GateWakeOutcome['deliveries']>[number][] = []
+      const delivered: (GatePrincipalRef & { status: 'delivered' | 'partial' | 'delivery_failed' })[] = []
       for (const principal of targets) {
         // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
         const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
-        deliveries.push({ principal, ...await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId) })
+        delivered.push({ ...principal, status: channelStatus(await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId)) })
       }
-      const status = deliveries.every(d => d.bus_delivered && d.inbox_delivered)
+      const status = delivered.every(d => d.status === 'delivered')
         ? 'delivered'
-        : deliveries.some(d => d.bus_delivered || d.inbox_delivered) ? 'partial' : 'delivery_failed'
+        : delivered.some(d => d.status !== 'delivery_failed') ? 'partial' : 'delivery_failed'
+      const capText = overflow.length
+        ? ` width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS} reached; ${overflow.length} eligible holder${overflow.length === 1 ? '' : 's'} not woken (${overflow.map(h => h.id).join(', ')}).`
+        : ''
       return surfaceGateWakeOutcome(env, task.id, {
-        ...baseOutcome, status, deliveries, skipped_holders: skipped,
-        notice: `Gate wake ${status}: ${gateOwner} -> ${deliveries.map(d => `agent ${d.principal.id} (bus=${d.bus_delivered ? 'sent' : 'failed'}, inbox=${d.inbox_delivered ? 'sent' : 'failed'})`).join(', ')}.${skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''}`,
+        ...baseOutcome, status, presence,
+        holders: [...delivered, ...overflow.map(h => ({ ...h, status: 'skipped_width_cap' as const })), ...skippedHolders],
+        ...(overflow.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: overflow.length } } : {}),
+        notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}`,
+      })
+    }
+    if (agentHolders.length > 0) {
+      // Every agent holder is one task_verdict would refuse: say so, not "no live holder" or "multiple live holders".
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status: 'no_eligible_holder', holders: skippedHolders,
+        notice: `Gate wake not delivered: every agent holder of ${gateOwner} is ineligible (${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}); member holders keep their needs_you item.`,
       })
     }
     return surfaceGateWakeOutcome(env, task.id, {
       ...baseOutcome,
       status: 'ambiguous',
-      skipped_holders: skipped,
       notice: `Gate wake refused: ${gateOwner} has multiple live holders (${resolution.active_holders.map((holder) => `${holder.type}:${holder.id}`).join(', ')}); operator decision required.`,
     })
   }
@@ -2654,11 +2697,14 @@ export async function wakeGateOwnerOnReview(
   }
 
   const agentId = resolution.principal.id
-  if (agentId === task.assignee_agent_id) {
+  // mupot#2450: the sole holder is judged by the same task_verdict predicate as a fan-out target; a live but
+  // ineligible holder is no_eligible_holder, never no_live_holder. Delivery below is otherwise unchanged.
+  const soleSkip = await gateHolderSkipReason(env, task, agentId)
+  if (soleSkip) {
     return surfaceGateWakeOutcome(env, task.id, {
-      ...baseOutcome, status: 'no_live_holder',
-      skipped_holders: [{ ...resolution.principal, reason: 'task_assignee' }],
-      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} skipped (task_assignee).`,
+      ...baseOutcome, status: 'no_eligible_holder',
+      holders: [{ ...resolution.principal, status: `skipped_${soleSkip}` }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is not an eligible decider (${soleSkip}).`,
     })
   }
   const ts = new Date().toISOString()

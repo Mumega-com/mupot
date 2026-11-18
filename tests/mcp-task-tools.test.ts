@@ -1263,7 +1263,7 @@ describe('MCP task cutover tools', () => {
       expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(0)
     })
 
-    it('emits no wake when multiple agents hold the gate capability (ambiguous holder)', async () => {
+    it('wakes every eligible agent holder of a multi-holder gate, presence or not (mupot#2450)', async () => {
       const { env, events, updates } = makeEnv(
         [task({ status: 'in_progress', gate_owner: null, result: VALID_ARTIFACT_RESULT })],
         {},
@@ -1280,8 +1280,10 @@ describe('MCP task cutover tools', () => {
       )
 
       expect(res.ok).toBe(true)
-      expect(events.filter((e) => (e as { type: string }).type === 'agent.wake')).toEqual([])
-      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(0)
+      expect((res.result as { gate_wake: { status: string } }).gate_wake.status).toBe('delivered')
+      expect(events.filter((e) => (e as { type: string }).type === 'agent.wake').map((e) => (e as { agent_id: string }).agent_id).sort())
+        .toEqual(['agent-reviewer', 'agent-second'])
+      expect(updates.filter((u) => u.sql.includes('INSERT INTO agent_messages'))).toHaveLength(2)
     })
 
     it('a bus emit failure does not fail the review transition (best-effort wake)', async () => {

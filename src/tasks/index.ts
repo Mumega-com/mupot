@@ -1862,6 +1862,29 @@ export async function evaluateVerdictGates(
   return independenceWaiver ? { allowed: true, principal, independenceWaiver } : { allowed: true, principal }
 }
 
+/**
+ * mupot#2450 — would task_verdict refuse this AGENT gate holder as a decider (policy rule 3)? Wake routing asks it
+ * before fanning a review wake out, so an agent that would be refused `self_verdict` is skipped, not reported
+ * "delivered". It is the agent-principal branch of evaluateVerdictGates above, built from the same parts: the
+ * self-completion producer exemption, the caller-side assignee check, then the stored party set
+ * (findVerdictIndependenceConflict, the same fragment the verdict UPDATE re-asserts). For an agent principal
+ * 'affiliated' refuses as well: the owner_self / admin_supervisory waivers exist only for member principals.
+ * Holding the lane is the caller's business (the wake resolver already read gate_grants); member holders are never
+ * woken, so the attached-human and member legs do not apply.
+ */
+export async function agentGateHolderIneligibility(
+  env: Env,
+  task: { id: string; gate_owner: string | null; assignee_agent_id: string | null },
+  agentId: string,
+): Promise<'task_assignee' | 'self_verdict' | null> {
+  if (task.gate_owner === 'gate:agent-self-completion' && agentId === task.assignee_agent_id
+    && await isCurrentSelfCompletionProducer(env, { task: { id: task.id, gate_owner: task.gate_owner }, decidedBy: agentId })) {
+    return null
+  }
+  if (agentId === task.assignee_agent_id) return 'task_assignee'
+  return (await findVerdictIndependenceConflict(env, agentId, task.id)) !== null ? 'self_verdict' : null
+}
+
 tasksApp.post('/:id/verdict', async (c) => {
   const id = c.req.param('id')
   const task = await getById<import('../types').Task>(c.env, 'tasks', id)

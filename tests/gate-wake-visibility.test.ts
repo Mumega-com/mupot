@@ -1,4 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+// #2450: a controllable seam over the presence read so a THROWING lookup can be proven to count as not-live.
+const liveness = vi.hoisted(() => ({ throwFor: new Set<string>() }))
+vi.mock('../src/fleet/registry', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/fleet/registry')>()
+  return {
+    ...actual,
+    getFleetAgentLiveness: async (...args: Parameters<typeof actual.getFleetAgentLiveness>) => {
+      if (liveness.throwFor.has(args[1])) throw new Error('presence read failed')
+      return actual.getFleetAgentLiveness(...args)
+    },
+  }
+})
+
 import { invokeTool, wakeGateOwnerOnReview } from '../src/mcp'
 import { ackAgentMessages } from '../src/agents/messages'
 import { listNeedsYou } from '../src/attention/service'
@@ -101,11 +115,11 @@ describe('gate wake outcomes are visible on task reads', () => {
   it('fans out kasra-core to both live agents, keeps member needs_you, and isolates acknowledgements', async () => {
     const { harness, env, events, task } = fanoutFixture()
     try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id = 'agent-stale'`).run()
       const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
-      expect(outcome).toMatchObject({ status: 'delivered', skipped_holders: [
-        { type: 'agent', id: 'agent-builder', reason: 'task_assignee' },
-        { type: 'agent', id: 'agent-stale', reason: 'not_live' },
-      ] })
+      expect(outcome).toMatchObject({ status: 'delivered', holders: expect.arrayContaining([
+        { type: 'agent', id: 'agent-builder', status: 'skipped_task_assignee' },
+      ]) })
       const messages = harness.sqlite.prepare('SELECT id, to_agent, body, request_id, read_at FROM agent_messages ORDER BY to_agent').all() as Array<{ id: string; to_agent: string; body: string; request_id: string; read_at: string | null }>
       expect(messages.map(m => m.to_agent)).toEqual(['agent-live-a', 'agent-live-b'])
       expect(messages[0].body).toBe(messages[1].body)
@@ -116,6 +130,131 @@ describe('gate wake outcomes are visible on task reads', () => {
       await ackAgentMessages(env, { agent: 'agent-live-a', ids: [messages[0].id] })
       const unread = harness.sqlite.prepare('SELECT to_agent FROM agent_messages WHERE read_at IS NULL').all()
       expect(unread).toEqual([{ to_agent: 'agent-live-b' }])
+    } finally { harness.close() }
+  })
+
+  it('#2450-1: wakes holders with no or stale presence; presence only counts and ranks', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM fleet_agents WHERE agent_id = 'agent-live-a'`).run()
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(harness.sqlite.prepare('SELECT to_agent FROM agent_messages ORDER BY to_agent').all()).toEqual([
+        { to_agent: 'agent-live-a' }, { to_agent: 'agent-live-b' }, { to_agent: 'agent-stale' },
+      ])
+      expect(outcome).toMatchObject({ status: 'delivered', presence: { live: 1, total: 3 } })
+      // live first (agent-live-b), then holders without fresh presence, then skipped holders
+      expect(outcome.holders).toEqual([
+        { type: 'agent', id: 'agent-live-b', status: 'delivered' },
+        { type: 'agent', id: 'agent-live-a', status: 'delivered' },
+        { type: 'agent', id: 'agent-stale', status: 'delivered' },
+        { type: 'agent', id: 'agent-builder', status: 'skipped_task_assignee' },
+      ])
+      // Response detail is trimmed: no per-holder presence or channel internals.
+      expect(outcome).not.toHaveProperty('deliveries')
+      expect(outcome).not.toHaveProperty('skipped_holders')
+    } finally { harness.close() }
+  })
+
+  it('#2450-2: skips a non-assignee submitter with the task_verdict self_verdict reason, never delivered', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+        VALUES ('submission-by-b', ?, ?, ?, 'agent-live-b', 'docs/result.md', ?, ?, 'reviewed result', '2026-10-01T00:00:00.000Z')`).run(TENANT, task.id, SQUAD_ID, 'a'.repeat(64), 'b'.repeat(64))
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(harness.sqlite.prepare('SELECT to_agent FROM agent_messages ORDER BY to_agent').all()).toEqual([
+        { to_agent: 'agent-live-a' }, { to_agent: 'agent-stale' },
+      ])
+      expect(outcome.holders).toEqual(expect.arrayContaining([{ type: 'agent', id: 'agent-live-b', status: 'skipped_self_verdict' }]))
+      expect(outcome.notice).toContain('agent-live-b (self_verdict)')
+      // The predicate the fan-out reused agrees with task_verdict itself.
+      const decide = await invokeTool({ ...auth(), boundAgentId: 'agent-live-b' }, env, 'task_verdict', {
+        task_id: task.id, verdict: 'rejected', note: 'n', expected_submission_id: 'submission-by-b',
+      })
+      expect(decide).toMatchObject({ ok: false, error: 'self_verdict' })
+    } finally { harness.close() }
+  })
+
+  it('#2450-2: skips a sole holder who submitted the result as no_eligible_holder', async () => {
+    const { harness, env, events, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id <> 'agent-live-a'`).run()
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+        VALUES ('submission-by-a', ?, ?, ?, 'agent-live-a', 'docs/result.md', ?, ?, 'reviewed result', '2026-10-01T00:00:00.000Z')`).run(TENANT, task.id, SQUAD_ID, 'a'.repeat(64), 'b'.repeat(64))
+      expect(await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)).toMatchObject({
+        status: 'no_eligible_holder', holders: [{ type: 'agent', id: 'agent-live-a', status: 'skipped_self_verdict' }],
+        notice: 'Gate wake not delivered: gate:kasra-core holder agent agent-live-a is not an eligible decider (self_verdict).',
+      })
+      expect(events).toEqual([])
+    } finally { harness.close() }
+  })
+
+  it('#2450-5: a throwing liveness lookup counts as not live (still woken, ranked after live holders)', async () => {
+    const { harness, env, task } = fanoutFixture()
+    liveness.throwFor.add('agent-live-a')
+    try {
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(outcome).toMatchObject({ status: 'delivered', presence: { live: 1, total: 3 } })
+      expect(outcome.holders?.slice(0, 2).map(h => h.id)).toEqual(['agent-live-b', 'agent-live-a'])
+    } finally { liveness.throwFor.clear(); harness.close() }
+  })
+
+  it('#2450-5: one holder failing on both channels while another succeeds is partial (some, not every)', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.exec(`CREATE TRIGGER fail_stale_inbox BEFORE INSERT ON agent_messages WHEN NEW.to_agent = 'agent-stale'
+        BEGIN SELECT RAISE(ABORT, 'inbox down'); END;`)
+      const failingEnv = { ...env, BUS: { send: async (event: BusEvent) => { if (event.agent_id === 'agent-stale') throw new Error('bus down') } } } as unknown as Env
+      const outcome = await wakeGateOwnerOnReview(failingEnv, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(outcome.status).toBe('partial')
+      expect(outcome.holders).toEqual(expect.arrayContaining([
+        { type: 'agent', id: 'agent-stale', status: 'delivery_failed' },
+        { type: 'agent', id: 'agent-live-a', status: 'delivered' },
+      ]))
+      expect(outcome.notice).toBe('Gate wake partial: gate:kasra-core -> agent agent-live-a (delivered), agent agent-live-b (delivered), agent agent-stale (delivery_failed); live 2 of 3. Skipped: agent-builder (task_assignee).')
+    } finally { harness.close() }
+  })
+
+  it('#2450-5: a multi-holder gate with exactly one eligible target still fans out to it', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id NOT IN ('agent-live-a', 'agent-builder')`).run()
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(outcome).toMatchObject({ status: 'delivered', presence: { live: 1, total: 1 } })
+      expect(outcome.notice).toBe('Gate wake delivered: gate:kasra-core -> agent agent-live-a (delivered); live 1 of 1. Skipped: agent-builder (task_assignee).')
+      expect(harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all()).toEqual([{ to_agent: 'agent-live-a' }])
+    } finally { harness.close() }
+  })
+
+  it('#2450-3: every agent holder ineligible gets its own status and a notice naming that outcome', async () => {
+    const { harness, env, events, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id NOT IN ('agent-live-a', 'agent-builder', ?)`).run(ACTOR_ID)
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+        VALUES ('submission-by-a', ?, ?, ?, 'agent-live-a', 'docs/result.md', ?, ?, 'reviewed result', '2026-10-01T00:00:00.000Z')`).run(TENANT, task.id, SQUAD_ID, 'a'.repeat(64), 'b'.repeat(64))
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      expect(outcome.status).toBe('no_eligible_holder')
+      expect(outcome.notice).toBe('Gate wake not delivered: every agent holder of gate:kasra-core is ineligible (agent-builder (task_assignee), agent-live-a (self_verdict)); member holders keep their needs_you item.')
+      expect(outcome.notice).not.toContain('live holders')
+      expect(events).toEqual([])
+    } finally { harness.close() }
+  })
+
+  it('#2450-6: caps the fan-out at 10 holders, live first, and records the cap', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      for (let i = 0; i < 10; i++) {
+        const id = `agent-extra-${String(i).padStart(2, '0')}`
+        seedAgent(harness.sqlite, id)
+        seedGrant(harness.sqlite, `grant-${id}`, 'gate:kasra-core', 'agent', id)
+      }
+      const outcome = await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)
+      // 13 eligible (live-a, live-b, stale, 10 extras without presence): 10 woken, the live two among them.
+      expect(outcome).toMatchObject({ status: 'delivered', presence: { live: 2, total: 13 }, width_cap: { limit: 10, omitted: 3 } })
+      const woken = (harness.sqlite.prepare('SELECT to_agent FROM agent_messages').all() as Array<{ to_agent: string }>).map(r => r.to_agent)
+      expect(woken).toHaveLength(10)
+      expect(woken).toEqual(expect.arrayContaining(['agent-live-a', 'agent-live-b']))
+      expect(outcome.holders?.filter(h => h.status === 'skipped_width_cap')).toHaveLength(3)
+      expect(outcome.notice).toContain('width cap 10 reached; 3 eligible holders not woken')
     } finally { harness.close() }
   })
 
@@ -157,7 +296,8 @@ describe('gate wake outcomes are visible on task reads', () => {
     try {
       harness.sqlite.prepare(`DELETE FROM gate_grants WHERE principal_id <> 'agent-builder'`).run()
       expect(await wakeGateOwnerOnReview(env, task, { kind: 'member', id: ACTOR_ID }, ACTOR_ID)).toMatchObject({
-        status: 'no_live_holder', skipped_holders: [{ type: 'agent', id: 'agent-builder', reason: 'task_assignee' }],
+        status: 'no_eligible_holder', holders: [{ type: 'agent', id: 'agent-builder', status: 'skipped_task_assignee' }],
+        notice: 'Gate wake not delivered: gate:kasra-core holder agent agent-builder is not an eligible decider (task_assignee).',
       })
       expect(events).toEqual([])
       expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_messages').get()).toEqual({ n: 0 })
@@ -184,14 +324,35 @@ describe('gate wake outcomes are visible on task reads', () => {
     } finally { harness.close() }
   })
 
+  it('#2450-5: two holders deciding concurrently: exactly one verdict lands, the other is refused', async () => {
+    const { harness, env, task } = fanoutFixture()
+    try {
+      harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+        VALUES ('submission-race', ?, ?, ?, 'agent-builder', 'docs/result.md', ?, ?, 'reviewed result', '2026-10-01T00:00:00.000Z')`).run(TENANT, task.id, SQUAD_ID, 'a'.repeat(64), 'b'.repeat(64))
+      const decide = (agentId: string, verdict: 'approved' | 'rejected') => invokeTool({ ...auth(), boundAgentId: agentId }, env, 'task_verdict', {
+        task_id: task.id, verdict, note: `race ${agentId}`, expected_submission_id: 'submission-race',
+      })
+      // Both calls start before either writes: neither sees the other's verdict at its pre-checks.
+      const results = await Promise.all([decide('agent-live-a', 'rejected'), decide('agent-live-b', 'rejected')])
+      const winners = results.filter(r => (r as { ok: boolean }).ok)
+      const losers = results.filter(r => !(r as { ok: boolean }).ok) as Array<{ error: string }>
+      expect(winners).toHaveLength(1)
+      expect(losers).toHaveLength(1)
+      expect(losers[0].error).toBe('verdict_race')
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = ?').get(task.id)).toEqual({ n: 1 })
+    } finally { harness.close() }
+  })
+
   it('persists an ambiguous live-holder outcome with the capability and holders', async () => {
     const harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedOrg(harness.sqlite)
-    seedAgent(harness.sqlite, 'agent-live-a')
-    seedAgent(harness.sqlite, 'agent-live-b')
-    seedGrant(harness.sqlite, 'g1', 'gate:kayhermes', 'agent', 'agent-live-a')
-    seedGrant(harness.sqlite, 'g2', 'gate:kayhermes', 'agent', 'agent-live-b')
+    // #2450: multiple AGENT holders are woken (even without presence); only a gate with no agent holder to wake
+    // (here: two members) stays an operator-decision ambiguity.
+    seedMember(harness.sqlite, 'member-a')
+    seedMember(harness.sqlite, 'member-b')
+    seedGrant(harness.sqlite, 'g1', 'gate:kayhermes', 'member', 'member-a')
+    seedGrant(harness.sqlite, 'g2', 'gate:kayhermes', 'member', 'member-b')
     seedTask(harness.sqlite, 'task-ambiguous', 'gate:kayhermes')
 
     const res = await updateToReview(harness, 'task-ambiguous')
@@ -202,8 +363,8 @@ describe('gate wake outcomes are visible on task reads', () => {
           status: 'ambiguous',
           capability: 'gate:kayhermes',
           active_holders: [
-            { type: 'agent', id: 'agent-live-a' },
-            { type: 'agent', id: 'agent-live-b' },
+            { type: 'member', id: 'member-a' },
+            { type: 'member', id: 'member-b' },
           ],
         },
       },
