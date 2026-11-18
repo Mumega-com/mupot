@@ -43,7 +43,7 @@ import type {
 import { resolveCapabilities, hasCapability, displayRole, isOrgAdmin, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
-import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { evaluateVerdictGates, canViewTaskReceipts, agentGateHolderIneligibility } from '../tasks/index'
 import { recordReviewLens } from '../tasks/lenses'
 import { resolveDyadGateDefault } from '../gates/dyad'
 import { isSubsystemReservedLane } from '../gates/lanes'
@@ -2495,7 +2495,9 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
 export type GateWakeOutcome = {
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
+  // mupot#2450: no_eligible_holder = every agent holder is one task_verdict would refuse (assignee / self_verdict);
+  // eligibility_unknown = no holder was woken and at least one could not be judged (read failed or beyond the read cap).
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'no_eligible_holder' | 'eligibility_unknown' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2503,10 +2505,44 @@ export type GateWakeOutcome = {
   grant_count: number
   notice: string
   notice_persisted: boolean
-  skipped_holders?: readonly (GatePrincipalRef & { reason: 'task_assignee' | 'not_live' })[]
-  deliveries?: readonly { principal: GatePrincipalRef; bus_delivered: boolean; inbox_delivered: boolean }[]
+  // mupot#2450: one status per agent holder considered (woken holders first, live ones ranked ahead). Presence is
+  // reported only as counts over the eligible holders; no per-holder presence or channel detail leaves the server.
+  holders?: readonly (GatePrincipalRef & { status: GateHolderWakeStatus })[]
+  presence?: { live: number; total: number }
+  width_cap?: { limit: number; omitted: number }
+  // Holders whose eligibility read failed. Fan-out: skipped (fail closed). Sole holder: still woken, as on base.
+  eligibility_unknown?: number
   // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
   new_sends?: number
+}
+
+export type GateHolderWakeStatus =
+  | 'delivered' | 'partial' | 'delivery_failed'
+  | 'skipped_task_assignee' | 'skipped_self_verdict' | 'skipped_eligibility_unknown' | 'skipped_width_cap'
+
+/**
+ * mupot#2450 item 6: the most holders one review wake fans out to. The cap bounds the per-holder D1 reads too:
+ * holders are walked in the resolver's stable order and walking stops once this many are eligible, so at most this
+ * many presence reads and eligibility reads happen (plus one per proven-ineligible holder, bounded by
+ * GATE_WAKE_FANOUT_MAX_READS). Hitting either bound is recorded as width_cap and makes the wake partial.
+ */
+export const GATE_WAKE_FANOUT_MAX_HOLDERS = 10
+export const GATE_WAKE_FANOUT_MAX_READS = 2 * GATE_WAKE_FANOUT_MAX_HOLDERS
+
+type HolderSkipReason = 'task_assignee' | 'self_verdict' | 'eligibility_unknown'
+
+// An eligibility read that throws is not proof of eligibility: the fan-out skips the holder (fail closed), and the
+// outcome names it eligibility_unknown, never ineligible.
+async function gateHolderSkipReason(env: Env, task: Task, agentId: string): Promise<HolderSkipReason | null> {
+  try {
+    return await agentGateHolderIneligibility(env, task, agentId)
+  } catch {
+    return 'eligibility_unknown'
+  }
+}
+
+function channelStatus(d: { bus_delivered: boolean; inbox_delivered: boolean }): 'delivered' | 'partial' | 'delivery_failed' {
+  return d.bus_delivered && d.inbox_delivered ? 'delivered' : d.bus_delivered || d.inbox_delivered ? 'partial' : 'delivery_failed'
 }
 
 async function surfaceGateWakeOutcome(
@@ -2577,41 +2613,100 @@ export async function wakeGateOwnerOnReview(
     grant_count: resolution.grant_count,
   }
   if (resolution.status === 'ambiguous') {
-    // Wake routing only: keep the authority resolver and verdict predicates unchanged.
-    // Members retain their needs_you item; only independently live agents get wakes.
-    const skipped: NonNullable<GateWakeOutcome['skipped_holders']>[number][] = []
-    const targets: GatePrincipalRef[] = []
-    for (const holder of resolution.active_holders) {
-      if (holder.type !== 'agent') continue
-      if (holder.id === task.assignee_agent_id) {
-        skipped.push({ ...holder, reason: 'task_assignee' })
-        continue
-      }
-      let live = false
-      try { live = (await getFleetAgentLiveness(env, holder.id)).live } catch { /* unproven presence is not live */ }
-      if (live) targets.push(holder)
-      else skipped.push({ ...holder, reason: 'not_live' })
+    // Wake routing only: keep the authority resolver and verdict predicates unchanged. Members retain their needs_you
+    // item. mupot#2450: every ELIGIBLE agent holder gets the durable inbox row whatever its presence (in-Worker and
+    // inbox-woken seats have no fleet_agents row). Presence only orders the deliveries (live first) and is reported as
+    // counts; holders[] and the saved notice use the resolver's stable order, so neither reveals who is live.
+    const agentHolders = resolution.active_holders.filter((holder) => holder.type === 'agent')
+    const hasMemberHolder = resolution.active_holders.some((holder) => holder.type === 'member')
+    const verdictOf = new Map<string, HolderSkipReason | null>()
+    let reads = 0
+    let eligibleCount = 0
+    for (const holder of agentHolders) {
+      if (eligibleCount >= GATE_WAKE_FANOUT_MAX_HOLDERS || reads >= GATE_WAKE_FANOUT_MAX_READS) break
+      reads++
+      const reason = await gateHolderSkipReason(env, task, holder.id)
+      verdictOf.set(holder.id, reason)
+      if (!reason) eligibleCount++
     }
+    const targets = agentHolders.filter((holder) => verdictOf.has(holder.id) && verdictOf.get(holder.id) === null)
+    const unread = agentHolders.filter((holder) => !verdictOf.has(holder.id))
+    const skipped = agentHolders.flatMap((holder) => {
+      const reason = verdictOf.get(holder.id)
+      return reason ? [{ ...holder, reason }] : []
+    })
+    const unknownCount = skipped.filter((h) => h.reason === 'eligibility_unknown').length
+
     if (targets.length > 0) {
+      // One presence read per target: it ranks the delivery order and yields the fleet identity the runtime's
+      // own inbox poll reads by (mupot#2450 item 7; same rule as bus/consumer.ts).
+      const routes = await Promise.all(targets.map(async (holder) => {
+        try {
+          const route = await getFleetAgentLiveness(env, holder.id)
+          return { live: route.live, inboxId: route.agentId || holder.id }
+        } catch {
+          return { live: false, inboxId: holder.id } // unproven presence is not live
+        }
+      }))
+      const order = targets.map((_, i) => i).sort((x, y) => Number(routes[y].live) - Number(routes[x].live) || x - y)
       const ts = new Date().toISOString()
-      const deliveries: NonNullable<GateWakeOutcome['deliveries']>[number][] = []
-      for (const principal of targets) {
+      const statusOf = new Map<string, 'delivered' | 'partial' | 'delivery_failed'>()
+      for (const i of order) {
+        const principal = targets[i]
         // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
         const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
-        deliveries.push({ principal, ...await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId) })
+        statusOf.set(principal.id, channelStatus(await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId, routes[i].inboxId)))
       }
-      const status = deliveries.every(d => d.bus_delivered && d.inbox_delivered)
+      const delivered = targets.map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
+      const presence = { live: routes.filter((r) => r.live).length, total: targets.length }
+      // A holder left unwoken that might be eligible (cap, unreadable eligibility) keeps the wake from being "delivered".
+      const complete = unread.length === 0 && unknownCount === 0
+      const status = delivered.every(d => d.status === 'delivered') && complete
         ? 'delivered'
-        : deliveries.some(d => d.bus_delivered || d.inbox_delivered) ? 'partial' : 'delivery_failed'
+        : delivered.some(d => d.status !== 'delivery_failed') ? 'partial' : 'delivery_failed'
+      const capText = unread.length
+        ? ` width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
+        : ''
+      const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
+      const statusById = new Map<string, GateHolderWakeStatus>([
+        ...delivered.map((d) => [d.id, d.status] as const),
+        ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
+        ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
+      ])
       return surfaceGateWakeOutcome(env, task.id, {
-        ...baseOutcome, status, deliveries, skipped_holders: skipped,
-        notice: `Gate wake ${status}: ${gateOwner} -> ${deliveries.map(d => `agent ${d.principal.id} (bus=${d.bus_delivered ? 'sent' : 'failed'}, inbox=${d.inbox_delivered ? 'sent' : 'failed'})`).join(', ')}.${skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''}`,
+        ...baseOutcome, status, presence,
+        holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
+        ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
+        ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
+        notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}`,
+      })
+    }
+    if (agentHolders.length > 0) {
+      const memberText = hasMemberHolder ? ' Member holders keep their needs_you item.' : ''
+      const holders = agentHolders.map((h) => {
+        const reason = verdictOf.get(h.id)
+        return { ...h, status: (reason ? `skipped_${reason}` : 'skipped_width_cap') as GateHolderWakeStatus }
+      })
+      const unknown = [...skipped.filter((h) => h.reason === 'eligibility_unknown'), ...unread]
+      if (unknown.length > 0) {
+        // Nobody was woken and some holder could not be judged: never report that as "ineligible".
+        const proven = skipped.filter((h) => h.reason !== 'eligibility_unknown')
+        return surfaceGateWakeOutcome(env, task.id, {
+          ...baseOutcome, status: 'eligibility_unknown', holders,
+          ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
+          ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
+          notice: `Gate wake not delivered: eligibility of ${gateOwner} agent holders could not be read (${unknown.map(h => h.id).join(', ')}); skipped as unknown, not ineligible.${proven.length ? ` Also skipped: ${proven.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''}${memberText}`,
+        })
+      }
+      // Every agent holder is one task_verdict would refuse: say so, not "no live holder" or "multiple live holders".
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status: 'no_eligible_holder', holders,
+        notice: `Gate wake not delivered: every agent holder of ${gateOwner} is ineligible (${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}).${memberText}`,
       })
     }
     return surfaceGateWakeOutcome(env, task.id, {
       ...baseOutcome,
       status: 'ambiguous',
-      skipped_holders: skipped,
       notice: `Gate wake refused: ${gateOwner} has multiple live holders (${resolution.active_holders.map((holder) => `${holder.type}:${holder.id}`).join(', ')}); operator decision required.`,
     })
   }
@@ -2654,16 +2749,23 @@ export async function wakeGateOwnerOnReview(
   }
 
   const agentId = resolution.principal.id
-  if (agentId === task.assignee_agent_id) {
+  // mupot#2450: the sole holder is judged by the same task_verdict predicate as a fan-out target; a live but
+  // ineligible holder is no_eligible_holder, never no_live_holder. A FAILED eligibility read keeps base behaviour
+  // (the sole holder is woken) and is reported as eligibility_unknown on the outcome and in the notice.
+  const soleSkip = await gateHolderSkipReason(env, task, agentId)
+  if (soleSkip && soleSkip !== 'eligibility_unknown') {
     return surfaceGateWakeOutcome(env, task.id, {
-      ...baseOutcome, status: 'no_live_holder',
-      skipped_holders: [{ ...resolution.principal, reason: 'task_assignee' }],
-      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} skipped (task_assignee).`,
+      ...baseOutcome, status: 'no_eligible_holder',
+      holders: [{ ...resolution.principal, status: `skipped_${soleSkip}` }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is not an eligible decider (${soleSkip}).`,
     })
   }
+  // Item 7: address the inbox row to the fleet identity the runtime reads by; no row (or a failed read) = agents.id.
+  let inboxId = agentId
+  try { inboxId = (await getFleetAgentLiveness(env, agentId)).agentId || agentId } catch { /* agents.id */ }
   const ts = new Date().toISOString()
   const { bus_delivered: busDelivered, inbox_delivered: inboxDelivered } = await deliverGateAgentWake(
-    env, task, actor, byId, agentId, ts, reviewWakeRequestId(task.id, ts),
+    env, task, actor, byId, agentId, ts, reviewWakeRequestId(task.id, ts), inboxId,
   )
 
   const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
@@ -2675,7 +2777,8 @@ export async function wakeGateOwnerOnReview(
     ...baseOutcome,
     status,
     principal: resolution.principal,
-    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).`,
+    ...(soleSkip ? { eligibility_unknown: 1 } : {}),
+    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).${soleSkip ? ' Eligibility could not be read; delivered unverified.' : ''}`,
   })
 }
 
@@ -2687,6 +2790,9 @@ async function deliverGateAgentWake(
   agentId: string,
   ts: string,
   requestId: string,
+  // The inbox recipient: the fleet identity the runtime polls by (mupot#2450 item 7). The bus wake keeps agents.id,
+  // the in-Worker AgentDO key.
+  inboxAgentId: string,
 ): Promise<{ bus_delivered: boolean; inbox_delivered: boolean }> {
   let busDelivered = false
   try {
@@ -2712,7 +2818,7 @@ async function deliverGateAgentWake(
       {
         fromAgent: REVIEW_WAKE_SENDER,
         fromMember: byId,
-        toAgent: agentId,
+        toAgent: inboxAgentId,
         kind: 'request',
         body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: task.gate_owner!, squad_id: task.squad_id }),
         requestId,
