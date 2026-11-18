@@ -5644,6 +5644,7 @@ const toolInboxLease: ToolSpec = {
       seat: seatArg.seat,
       attemptId: args.attempt_id as string | undefined,
       exactSeatOnly: attached,
+      continuity: attachedInboxContext(auth) ?? undefined,
     })
     if (!res.ok) {
       if (res.reason === 'db_error') return fail(500, res.reason) // no raw DB string to caller
@@ -5713,6 +5714,7 @@ const toolInboxLeaseReconcile: ToolSpec = {
       agent,
       attemptId: args.attempt_id,
       exactSeatOnly: attachedAuthority(auth) !== null,
+      continuity: attachedInboxContext(auth) ?? undefined,
       seat: boundSeat ?? undefined,
     })
     if (!res.ok) {
@@ -5759,6 +5761,7 @@ const toolInboxLeaseAck: ToolSpec = {
       agent,
       attemptId: args.attempt_id,
       exactSeatOnly: attachedAuthority(auth) !== null,
+      continuity: attachedInboxContext(auth) ?? undefined,
       seat: strictSeat.seat ?? undefined,
     })
     if (!res.ok) {

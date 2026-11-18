@@ -15,6 +15,7 @@
 //     with different content it is rejected (request_id_conflict), never a silent drop. Scoping
 //     by from_agent stops one agent poisoning another's rid namespace. Dedup wins over the cap.
 
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
@@ -28,8 +29,7 @@ import { evaluateReplyExpectation, replyViaFor, type ReplyBasis } from './reply-
 import { isSystemSender, systemSenderReplyVia } from './system-senders'
 import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 import { safeConsole } from '../lib/log'
-import { continuityTarget, findLiveRecipientContinuityScope, liveRecipientContinuityScopeSql } from '../members/attachment-continuity'
-import { resolveAttachmentContinuity } from '../members/attachment-continuity'
+import { continuityTarget, findLiveRecipientContinuityScope, liveRecipientContinuityScopeSql, resolveAttachmentContinuity } from '../members/attachment-continuity'
 import { attachedInboxLiveSql, type AttachedInboxContext } from '../members/attachment-inbox'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
@@ -1377,7 +1377,62 @@ function exactAttemptSeatSql(prefix: '' | 'm.' = ''): string {
   return `(${prefix}target_seat = ?3 AND ?3 <> '')`
 }
 
-function attemptResultSelect(exactSeatOnly = false): string { return `
+interface InboxAttemptInput {
+  agent: string
+  attemptId: string
+  seat?: string
+  exactSeatOnly?: boolean
+  continuity?: AttachedInboxContext
+}
+
+type AttemptSql = {
+  ok: true
+  fence: string
+  target(prefix?: '' | 'm.'): string
+  prepare(sql: string, ...values: (string | number | null)[]): D1PreparedStatement
+}
+
+/** Logical routing changes eligibility while each attempt keeps its physical seat key. */
+async function inboxAttemptSql(env: Env, input: InboxAttemptInput): Promise<AttemptSql | LeaseFailure> {
+  const bearerFence = bearerFencePredicate('?1', '?2')
+  if (!input.continuity) return {
+    ok: true,
+    fence: bearerFence,
+    target: (prefix = '') => input.exactSeatOnly
+      ? exactAttemptSeatSql(prefix)
+      : `(CASE WHEN ?3 = '' THEN ${prefix}target_seat IS NULL
+                ELSE (${prefix}target_seat = ?3 OR ${prefix}target_seat IS NULL) END)`,
+    prepare: (sql, ...values) => env.DB.prepare(sql).bind(...values),
+  }
+  if (!input.exactSeatOnly || !input.seat?.trim() || input.continuity.agentId !== input.agent)
+    return { ok: false, reason: 'invalid_attempt', detail: 'attached attempt requires its bound agent and seat' }
+
+  try {
+    const resolved = await resolveAttachmentContinuity(env, input.continuity)
+    if (resolved.kind === 'refused') return { ok: false, reason: 'invalid_attempt', detail: resolved.reason }
+    const scopeId = resolved.kind === 'scope' ? resolved.scope.id : null
+    // The existing attempt statements use at most ?9. Reserve ?10 for the target
+    // scope and append the same caller-authority bindings to each guarded query.
+    const attemptParams = 9
+    const binds: (string | number | null)[] = Array(attemptParams).fill(null)
+    binds.push(scopeId)
+    const live = attachedInboxLiveSql(env, input.continuity, scopeId, binds)
+    const attachedParams = binds.slice(attemptParams)
+    return {
+      ok: true,
+      fence: `(${bearerFence} AND ${live})`,
+      target: (prefix = '') => `((${prefix}target_continuity_scope_id IS NULL AND ${exactAttemptSeatSql(prefix)})
+        OR (?10 IS NOT NULL AND ${prefix}target_continuity_scope_id = ?10 AND ${prefix}target_seat = 'continuity:' || ?10))`,
+      prepare: (sql, ...values) => env.DB.prepare(sql).bind(
+        ...values, ...Array(attemptParams - values.length).fill(null), ...attachedParams,
+      ),
+    }
+  } catch (error) {
+    return { ok: false, reason: 'db_error', detail: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+function attemptResultSelect(attempt: AttemptSql, exactSeatOnly = false): string { return `
   SELECT a.tenant AS attempt_tenant, a.agent_id AS attempt_agent_id,
          a.target_seat_key, a.attempt_id, a.request_digest, a.state AS attempt_state,
          a.lease_expires_at AS attempt_lease_expires_at,
@@ -1395,10 +1450,10 @@ function attemptResultSelect(exactSeatOnly = false): string { return `
      AND m.lease_attempt_id = ?5
      AND m.lease_expires_at = a.lease_expires_at
      AND m.read_at IS NULL
-     ${exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''}
+     ${exactSeatOnly ? `AND ${attempt.target('m.')}` : ''}
    WHERE a.tenant = ?1 AND a.agent_id = ?2
      AND a.target_seat_key = ?3 AND a.attempt_id = ?4
-     AND ${bearerFencePredicate('?1', '?2')}
+     AND ${attempt.fence}
    LIMIT 1` }
 
 function validAttemptId(value: unknown): value is string {
@@ -1548,7 +1603,7 @@ async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promi
 
 async function leaseAgentInboxWithAttempt(
   env: Env,
-  input: { agent: string; leaseSeconds: number; seat?: string; attemptId: string; exactSeatOnly?: boolean },
+  input: InboxAttemptInput & { leaseSeconds: number },
   nowIso: string,
   expiresIso: string,
 ): Promise<LeaseAttemptResult | LeaseFailure> {
@@ -1557,9 +1612,11 @@ async function leaseAgentInboxWithAttempt(
   const digest = await attemptDigest(input.leaseSeconds, targetSeatKey)
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
-  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
-  const fence = bearerFencePredicate('?1', '?2')
-  const seat = input.exactSeatOnly ? exactAttemptSeatSql() : `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
+  const attempt = await inboxAttemptSql(env, input)
+  if (!attempt.ok) return attempt
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${attempt.target('m.')}` : ''
+  const fence = attempt.fence
+  const seat = attempt.target()
   const attemptOpening = `EXISTS (
     SELECT 1 FROM agent_inbox_lease_attempts a
      WHERE a.tenant = ?1 AND a.agent_id = ?2 AND a.target_seat_key = ?3
@@ -1568,14 +1625,15 @@ async function leaseAgentInboxWithAttempt(
 
   try {
     const statements = [
-      env.DB.prepare(
+      attempt.prepare(
         `INSERT INTO agent_inbox_lease_attempts
           (tenant, agent_id, target_seat_key, attempt_id, request_digest, state, created_at)
          SELECT ?1, ?2, ?3, ?4, ?5, 'opening', ?6
           WHERE ${fence}
          ON CONFLICT(tenant, agent_id, target_seat_key, attempt_id) DO NOTHING`,
-      ).bind(...scope, digest, nowIso),
-      env.DB.prepare(
+        ...scope, digest, nowIso,
+      ),
+      attempt.prepare(
         `UPDATE agent_messages
             SET dead_lettered_at = ?6,
                 dead_letter_reason = 'max_delivery_attempts_exceeded:' || delivery_attempts,
@@ -1585,8 +1643,9 @@ async function leaseAgentInboxWithAttempt(
             AND (lease_expires_at IS NULL OR lease_expires_at <= ?6)
             AND delivery_attempts >= ?7 AND ${seat}
             AND ${attemptOpening} AND ${fence}`,
-      ).bind(...scope, digest, nowIso, MAX_DELIVERY_ATTEMPTS),
-      env.DB.prepare(
+        ...scope, digest, nowIso, MAX_DELIVERY_ATTEMPTS,
+      ),
+      attempt.prepare(
         `UPDATE agent_messages
             SET delivery_attempts = delivery_attempts + 1,
                 lease_expires_at = ?7,
@@ -1601,8 +1660,9 @@ async function leaseAgentInboxWithAttempt(
              ORDER BY seq ASC LIMIT 1
           )
             AND ${attemptOpening} AND ${fence}`,
-      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
-      env.DB.prepare(
+        ...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'leased',
                 message_id = (SELECT id FROM agent_messages
@@ -1622,8 +1682,9 @@ async function leaseAgentInboxWithAttempt(
               WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
                 AND lease_expires_at = ?7)
             AND ${fence}`,
-      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
-      env.DB.prepare(
+        ...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'empty', resolved_at = ?6
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
@@ -1632,12 +1693,12 @@ async function leaseAgentInboxWithAttempt(
               WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
                 AND lease_expires_at = ?7)
             AND ${fence}`,
-      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
-      // A fence transition cannot interleave a real D1 batch, but keeping the fence inside
-      // every write also protects against database-side triggers and future batch adapters.
-      // If it flips after the claim statement, roll the unreturned hand-out back before the
-      // opening receipt is tombstoned: no body escaped, so delivery_attempts must not advance.
-      env.DB.prepare(
+        ...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp,
+      ),
+      // If the fence or attachment authority is lost after claiming, roll the unreturned
+      // lease back before cancelling the opening receipt. No body escaped, so delivery_attempts
+      // must not advance. The stamp and destination identify the exact tentative write.
+      attempt.prepare(
         `UPDATE agent_messages
             SET delivery_attempts = CASE WHEN delivery_attempts > 0 THEN delivery_attempts - 1 ELSE 0 END,
                 lease_expires_at = NULL,
@@ -1645,15 +1706,18 @@ async function leaseAgentInboxWithAttempt(
           WHERE tenant = ?1 AND to_agent = ?2 AND lease_attempt_id = ?9
             AND lease_expires_at = ?7
             AND ${attemptOpening}
+            ${input.continuity ? `AND ${seat}` : ''}
             AND NOT (${fence})`,
-      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
+        ...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp,
+      ),
+      // Cancel only the exact unfinished receipt, even if the caller lost authority mid-batch.
       env.DB.prepare(
         `UPDATE agent_inbox_lease_attempts
             SET state = 'cancelled', resolved_at = ?6
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND request_digest = ?5 AND state = 'opening'`,
       ).bind(...scope, digest, nowIso),
-      env.DB.prepare(
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'acked', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?6
@@ -1663,8 +1727,9 @@ async function leaseAgentInboxWithAttempt(
               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.read_at IS NOT NULL)
             AND ${fence}`,
-      ).bind(...scope, digest, nowIso),
-      env.DB.prepare(
+        ...scope, digest, nowIso,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'expired', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?6
@@ -1676,13 +1741,15 @@ async function leaseAgentInboxWithAttempt(
                 AND m.lease_attempt_id = ?9 AND m.lease_expires_at = a.lease_expires_at
                 AND m.read_at IS NULL AND m.lease_expires_at > ?6)
             AND ${fence}`,
-      ).bind(...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp),
-      env.DB.prepare(attemptResultSelect(input.exactSeatOnly)).bind(...scope, stamp),
+        ...scope, digest, nowIso, expiresIso, MAX_DELIVERY_ATTEMPTS, stamp,
+      ),
+      attempt.prepare(attemptResultSelect(attempt, input.exactSeatOnly), ...scope, stamp),
     ]
     const results = await env.DB.batch<StoredLeaseAttempt>(statements)
     const row = results.at(-1)?.results?.[0]
     if (!row) {
       if (await bearerFenceBlocks(env, tenant, input.agent)) return { ok: false, reason: 'consumer_fenced' }
+      if (input.continuity) return { ok: false, reason: 'invalid_attempt', detail: 'attached attempt authority changed' }
       return { ok: false, reason: 'db_error', detail: 'lease attempt receipt missing' }
     }
     if (row.attempt_state !== 'cancelled' && row.request_digest !== digest) {
@@ -1696,7 +1763,7 @@ async function leaseAgentInboxWithAttempt(
 
 export async function reconcileAgentInboxLeaseAttempt(
   env: Env,
-  input: { agent: string; attemptId: string; seat?: string; exactSeatOnly?: boolean },
+  input: InboxAttemptInput,
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseAttemptResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -1711,19 +1778,22 @@ export async function reconcileAgentInboxLeaseAttempt(
   const targetSeatKey = input.seat?.trim() || ''
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
-  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
-  const fence = bearerFencePredicate('?1', '?2')
+  const attempt = await inboxAttemptSql(env, input)
+  if (!attempt.ok) return attempt
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${attempt.target('m.')}` : ''
+  const fence = attempt.fence
 
   try {
     const results = await env.DB.batch<StoredLeaseAttempt>([
-      env.DB.prepare(
+      attempt.prepare(
         `INSERT INTO agent_inbox_lease_attempts
           (tenant, agent_id, target_seat_key, attempt_id, request_digest, state, created_at, resolved_at)
          SELECT ?1, ?2, ?3, ?4, ?5, 'cancelled', ?6, ?6
           WHERE ${fence}
          ON CONFLICT(tenant, agent_id, target_seat_key, attempt_id) DO NOTHING`,
-      ).bind(...scope, CANCELLED_ATTEMPT_DIGEST, nowIso),
-      env.DB.prepare(
+        ...scope, CANCELLED_ATTEMPT_DIGEST, nowIso,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'acked', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?5
@@ -1733,8 +1803,9 @@ export async function reconcileAgentInboxLeaseAttempt(
               WHERE m.id = a.message_id AND m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat}
                 AND m.read_at IS NOT NULL)
             AND ${fence}`,
-      ).bind(...scope, nowIso),
-      env.DB.prepare(
+        ...scope, nowIso,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'expired', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?5
@@ -1746,12 +1817,14 @@ export async function reconcileAgentInboxLeaseAttempt(
                 AND m.lease_attempt_id = ?6 AND m.lease_expires_at = a.lease_expires_at
                 AND m.read_at IS NULL AND m.lease_expires_at > ?5)
             AND ${fence}`,
-      ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(attemptResultSelect(input.exactSeatOnly)).bind(...scope, stamp),
+        ...scope, nowIso, stamp,
+      ),
+      attempt.prepare(attemptResultSelect(attempt, input.exactSeatOnly), ...scope, stamp),
     ])
     const row = results.at(-1)?.results?.[0]
     if (!row) {
       if (await bearerFenceBlocks(env, tenant, input.agent)) return { ok: false, reason: 'consumer_fenced' }
+      if (input.continuity) return { ok: false, reason: 'invalid_attempt', detail: 'attached attempt authority changed' }
       return { ok: false, reason: 'db_error', detail: 'lease attempt receipt missing' }
     }
     return materializeAttempt(row)
@@ -1762,7 +1835,7 @@ export async function reconcileAgentInboxLeaseAttempt(
 
 export async function ackAgentInboxLeaseAttempt(
   env: Env,
-  input: { agent: string; attemptId: string; seat?: string; exactSeatOnly?: boolean },
+  input: InboxAttemptInput,
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseAttemptAckResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -1777,9 +1850,11 @@ export async function ackAgentInboxLeaseAttempt(
   const targetSeatKey = input.seat?.trim() || ''
   const stamp = await attemptStamp(tenant, input.agent, targetSeatKey, input.attemptId)
   const scope = [tenant, input.agent, targetSeatKey, input.attemptId] as const
-  const exactMessageSeat = input.exactSeatOnly ? `AND ${exactAttemptSeatSql('m.')}` : ''
-  const fence = bearerFencePredicate('?1', '?2')
-  const seat = input.exactSeatOnly ? exactAttemptSeatSql() : `(CASE WHEN ?3 = '' THEN target_seat IS NULL ELSE (target_seat = ?3 OR target_seat IS NULL) END)`
+  const attempt = await inboxAttemptSql(env, input)
+  if (!attempt.ok) return attempt
+  const exactMessageSeat = input.exactSeatOnly ? `AND ${attempt.target('m.')}` : ''
+  const fence = attempt.fence
+  const seat = attempt.target()
 
   try {
     const results = await env.DB.batch<{
@@ -1789,17 +1864,18 @@ export async function ackAgentInboxLeaseAttempt(
       attempt_id: string
       state: 'empty' | 'cancelled' | 'expired' | 'acked'
     }>([
-      env.DB.prepare(
+      attempt.prepare(
         `INSERT INTO agent_inbox_lease_attempts
           (tenant, agent_id, target_seat_key, attempt_id, request_digest, state, created_at, resolved_at)
          SELECT ?1, ?2, ?3, ?4, ?5, 'cancelled', ?6, ?6
           WHERE ${fence}
          ON CONFLICT(tenant, agent_id, target_seat_key, attempt_id) DO NOTHING`,
-      ).bind(...scope, CANCELLED_ATTEMPT_DIGEST, nowIso),
+        ...scope, CANCELLED_ATTEMPT_DIGEST, nowIso,
+      ),
       // Keep lease_attempt_id until the receipt is terminal below. That stamp is the
       // proof connecting this write to the exact attempt; clearing it here would reopen
       // the same ambiguity this tool exists to close.
-      env.DB.prepare(
+      attempt.prepare(
         `UPDATE agent_messages AS m
             SET read_at = ?5, lease_expires_at = NULL
           WHERE m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat} AND m.read_at IS NULL
@@ -1814,8 +1890,9 @@ export async function ackAgentInboxLeaseAttempt(
                  AND a.lease_expires_at = m.lease_expires_at
             )
          RETURNING id`,
-      ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(
+        ...scope, nowIso, stamp,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'acked', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?5
@@ -1828,8 +1905,9 @@ export async function ackAgentInboxLeaseAttempt(
                  AND m.read_at IS NOT NULL
                  AND (m.lease_attempt_id = ?6 OR m.lease_attempt_id IS NULL)
             )`,
-      ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(
+        ...scope, nowIso, stamp,
+      ),
+      attempt.prepare(
         `UPDATE agent_inbox_lease_attempts AS a
             SET state = 'expired', terminal_message_id = message_id,
                 message_id = NULL, resolved_at = ?5
@@ -1842,11 +1920,11 @@ export async function ackAgentInboxLeaseAttempt(
                  AND m.lease_attempt_id = ?6 AND m.lease_expires_at = a.lease_expires_at
                  AND m.read_at IS NULL AND m.lease_expires_at > ?5
             )`,
-      ).bind(...scope, nowIso, stamp),
-      // A database-side fence transition can fire after the message UPDATE but
-      // before receipt terminalization. Restore the exact lease while the
-      // attempt is still live so a fenced bearer never consumes by losing that race.
-      env.DB.prepare(
+        ...scope, nowIso, stamp,
+      ),
+      // If authority is lost after the message UPDATE but before receipt terminalization,
+      // restore the exact lease while the attempt is still live.
+      attempt.prepare(
         `UPDATE agent_messages AS m
             SET read_at = NULL,
                 lease_expires_at = (
@@ -1867,8 +1945,9 @@ export async function ackAgentInboxLeaseAttempt(
                  AND a.message_id = m.id AND a.message_seq = m.seq
                  AND a.delivery_attempt = m.delivery_attempts
             )`,
-      ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(
+        ...scope, nowIso, stamp,
+      ),
+      attempt.prepare(
         `UPDATE agent_messages AS m
             SET lease_attempt_id = NULL
           WHERE m.tenant = ?1 AND m.to_agent = ?2 ${exactMessageSeat} AND m.lease_attempt_id = ?6
@@ -1880,19 +1959,22 @@ export async function ackAgentInboxLeaseAttempt(
                  AND a.terminal_message_id = m.id AND a.message_seq = m.seq
                  AND a.delivery_attempt = m.delivery_attempts
             )`,
-      ).bind(...scope, nowIso, stamp),
-      env.DB.prepare(
+        ...scope, nowIso, stamp,
+      ),
+      attempt.prepare(
         `SELECT tenant, agent_id, target_seat_key, attempt_id, state
            FROM agent_inbox_lease_attempts
           WHERE tenant = ?1 AND agent_id = ?2 AND target_seat_key = ?3
             AND attempt_id = ?4 AND state IN ('empty','cancelled','expired','acked')
             AND ${fence}
           LIMIT 1`,
-      ).bind(...scope),
+        ...scope,
+      ),
     ])
     const row = results.at(-1)?.results?.[0]
     if (!row) {
       if (await bearerFenceBlocks(env, tenant, input.agent)) return { ok: false, reason: 'consumer_fenced' }
+      if (input.continuity) return { ok: false, reason: 'invalid_attempt', detail: 'attached attempt authority changed' }
       return { ok: false, reason: 'db_error', detail: 'lease attempt ACK did not resolve terminally' }
     }
     return {
@@ -1917,7 +1999,7 @@ export async function ackAgentInboxLeaseAttempt(
  */
 export async function leaseAgentInbox(
   env: Env,
-  input: { agent: string; limit?: number; leaseSeconds?: number; seat?: string; attemptId?: string; exactSeatOnly?: boolean },
+  input: Omit<InboxAttemptInput, 'attemptId'> & { limit?: number; leaseSeconds?: number; attemptId?: string },
   opts: Pick<Opts, 'now'> = {},
 ): Promise<LeaseResult | LeaseAttemptResult | LeaseFailure> {
   const tenant = env.TENANT_SLUG
@@ -1925,7 +2007,7 @@ export async function leaseAgentInbox(
   if (typeof input.agent !== 'string' || !isRef(input.agent))
     return { ok: false, reason: 'invalid_agent', detail: 'agent required' }
 
-  if (input.exactSeatOnly && (!input.seat?.trim() || !input.attemptId)) return { ok: false, reason: 'invalid_attempt', detail: 'exact-seat leasing requires a bound seat and attempt_id' }
+  if ((input.exactSeatOnly || input.continuity) && (!input.seat?.trim() || !input.attemptId)) return { ok: false, reason: 'invalid_attempt', detail: 'exact-seat leasing requires a bound seat and attempt_id' }
 
   let limit = DEFAULT_INBOX_LIMIT
   if (input.limit !== undefined) {
@@ -1960,6 +2042,7 @@ export async function leaseAgentInbox(
       seat: targetSeat ?? undefined,
       attemptId: input.attemptId,
       exactSeatOnly: input.exactSeatOnly,
+      continuity: input.continuity,
     }, nowIso, expiresIso)
   }
 

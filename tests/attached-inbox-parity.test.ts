@@ -12,12 +12,25 @@ function fixture() {
     INSERT INTO departments(id,slug,name) VALUES ('d','d','D');
     INSERT INTO squads(id,department_id,slug,name) VALUES ('s','d','s','S');
     INSERT INTO members(id,tenant,display_name,status) VALUES ('m','t','M','active'),('human','t','Human','active');
-    INSERT INTO agents(id,squad_id,slug,name,status) VALUES ('a','s','a','A','active');
+    INSERT INTO agents(id,squad_id,slug,name,status) VALUES
+      ('a','s','a','A','active'),('sa','s','sa','Seat A','active'),('sb','s','sb','Seat B','active');
     INSERT INTO memberships(id,agent_id,squad_id,capability) VALUES ('am','a','s','member');
     INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES ('t','a','m','2026-01-01');
     INSERT INTO capabilities(id,member_id,scope_type,scope_id,capability) VALUES ('c','m','squad','s','member');
-    INSERT INTO member_tokens(id,member_id,token_hash,label,channel,agent_id,tenant,expires_at)
-      VALUES ('tok','m','hash','attach:a:xyz','directory','a','t','2099-01-01');
+    INSERT INTO member_tokens(id,member_id,token_hash,label,channel,agent_id,tenant,expires_at) VALUES
+      ('tok','m','hash','attach:a:xyz','directory','a','t','2099-01-01'),
+      ('tok-other','m','hash-other','attach:a:other','directory','a','t','2099-01-01'),
+      ('grant','human','hash-grant','consent','directory',NULL,'t','2099-01-01');
+    INSERT INTO harnesses(id,tenant,member_id,oauth_client_id,client_name,kind,grant_id)
+      VALUES ('h','t','human','fixture-client','Fixture','chatgpt','oauth:grant');
+    INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,max_live) VALUES
+      ('seat','t','human','h',lower(hex(zeroblob(32))),'sa',2),
+      ('other-seat','t','human','h',lower(hex(zeroblob(31))) || '01','sb',2);
+    INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,requested_via,created_at,scope)
+      VALUES ('adm','t','a','human','h','live','tool',datetime('now'),'harness');
+    INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at) VALUES
+      ('att','t','seat','human','h','a','adm','tok',datetime('now')),
+      ('other-att','t','other-seat','human','h','a','adm','tok-other',datetime('now'));
     INSERT INTO agent_messages(id,tenant,to_agent,from_agent,from_member,kind,body,target_seat) VALUES
       ('host-mail','t','a','sender','sender','message','host-only work',NULL),
       ('host-targeted','t','a','sender','sender','message','host-targeted work','daemon'),
@@ -77,8 +90,7 @@ describe('attached inbox ownership',()=>{
   it('does not let another attachment token spoof the first chats seat label',async()=>{
     const f=fixture()
     try {
-      f.h.sqlite.exec(`INSERT INTO member_tokens(id,member_id,token_hash,label,channel,agent_id,tenant,expires_at) VALUES ('tok-other','m','hash-other','attach:a:other','directory','a','t','2099-01-01')`)
-      const other={...f.auth,tokenId:'tok-other',seatBinding:{...f.auth.seatBinding!,seatId:'other-seat',label:'attach:a:xyz',attached:{...f.auth.seatBinding!.attached!,attachmentId:'other-att'}}}
+      const other={...f.auth,tokenId:'tok-other',seatBinding:{...f.auth.seatBinding!,seatId:'other-seat',label:'attach:a:xyz',attached:{...f.auth.seatBinding!.attached!,attachmentId:'other-att',seatAgentId:'sb'}}}
       expect(await f.call('inbox_lease',{limit:1,attempt_id:'other_attempt_0001',seat:'attach:a:xyz'},other)).toMatchObject({ok:false})
       expect(await f.call('inbox_lease',{limit:1,attempt_id:'other_attempt_0001'},other)).toMatchObject({ok:true,result:{effective_inbox_seat:'attach:a:other',messages:[{id:'other-chat'}]}})
       expect(f.h.sqlite.prepare("SELECT delivery_attempts FROM agent_messages WHERE id='own-mail'").get()).toEqual({delivery_attempts:0})
