@@ -71,6 +71,28 @@ export function continuityHarnessReservationSql(nowExpr: string, harnessExpr: st
   )`
 }
 
+/** Historical seats are conservative separation evidence, never caller identity. */
+export function continuityHistoricalSeatsClearSql(tenantExpr: string, harnessExpr: string, agentExpr: string, prospectiveSeatExpr?: string): string {
+  const missingTarget = prospectiveSeatExpr
+    ? `(s.id IS NOT ${prospectiveSeatExpr}
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_seat_attachments target
+           WHERE target.tenant = s.tenant AND target.seat_id = s.id AND target.agent_id = ${agentExpr}
+        ))`
+    : `NOT EXISTS (SELECT 1 FROM agent_seat_attachments target WHERE target.tenant=s.tenant AND target.seat_id=s.id AND target.agent_id=${agentExpr})`
+  return `NOT EXISTS (
+    SELECT 1 FROM agent_seats s
+     WHERE s.tenant = ${tenantExpr} AND s.harness_id = ${harnessExpr}
+       AND (
+         ${missingTarget}
+         OR EXISTS (
+           SELECT 1 FROM agent_seat_attachments other
+            WHERE other.tenant = s.tenant AND other.seat_id = s.id AND other.agent_id <> ${agentExpr}
+         )
+       )
+  )`
+}
+
 /**
  * Shared liveness predicate for a scope AND the physical request context.  It
  * deliberately composes the attachment chokepoint instead of recopying its
@@ -144,6 +166,7 @@ export function prepareContinuityEnrollmentStatements(env: Env, p: ContinuityEnr
           AND g.tenant = ?2 AND g.member_id = ?8 AND g.channel = 'directory' AND g.agent_id IS NULL
           AND ${TOKEN_LIVE_PREDICATE('?4', 'g')}
           AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = ?8 AND hm.tenant = ?2 AND hm.status = 'active')
+          AND ${continuityHistoricalSeatsClearSql('?2', '?9', '?7')}
           AND NOT EXISTS (
             SELECT 1 FROM agent_seat_admissions other
              WHERE other.tenant = ?2 AND other.harness_id = ?9 AND other.status = 'live'

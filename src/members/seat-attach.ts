@@ -61,7 +61,7 @@ import {
 import { loadHarness, sanitizeLabel } from './harness'
 import { seatRowIsHeld, vipLaneEnabled } from './vip-lane'
 import { sendClaimWelcome } from './claim-welcome'
-import { continuityHarnessReservationSql, prepareContinuityEnrollmentStatements, resolveAttachmentContinuity } from './attachment-continuity'
+import { continuityHarnessReservationSql, continuityHistoricalSeatsClearSql, prepareContinuityEnrollmentStatements, resolveAttachmentContinuity } from './attachment-continuity'
 
 // The flag predicates and the designation clause live in the leaf module attach-designated.ts (no heavy imports), so the
 // events / elevation readers can use the SAME predicate without pulling this module's graph. Re-exported here unchanged.
@@ -698,6 +698,7 @@ export async function promoteAdmissionDetailed(
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
                         ${attachDesignatedClause(env, 'ag', '?3')})
           ${continuityApproved ? `AND NOT EXISTS (SELECT 1 FROM agent_seat_admissions other WHERE other.tenant = ?5 AND other.harness_id = agent_seat_admissions.harness_id AND other.status = 'live' AND other.agent_id <> agent_seat_admissions.agent_id AND ${authorityLiveSql('other', '?2')})` : ''}
+          ${continuityApproved ? `AND ${continuityHistoricalSeatsClearSql('?5', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id', 'agent_seat_admissions.requested_seat_id')}` : ''}
           AND ${continuityHarnessReservationSql('?2', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id', '?5')}`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
@@ -742,6 +743,11 @@ export async function promoteAdmissionDetailed(
 async function continuityConflict(env: Env, adm: AdmissionRow, nowIso: string): Promise<boolean> {
   const row = await env.DB.prepare(`SELECT 1 AS x FROM agent_seat_admissions other WHERE other.tenant=?1 AND other.harness_id=?2 AND other.status='live' AND other.agent_id<>?3 AND ${authorityLiveSql('other','?4')} LIMIT 1`)
     .bind(env.TENANT_SLUG, adm.harness_id, adm.agent_id, nowIso).first<{ x: number }>()
+  return !!row
+}
+
+async function continuityHistoryConflict(env: Env, adm: AdmissionRow): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM agent_seat_admissions a WHERE a.id=?1 AND a.tenant=?2 AND NOT (${continuityHistoricalSeatsClearSql('?2', 'a.harness_id', 'a.agent_id', 'a.requested_seat_id')}) LIMIT 1`).bind(adm.id, env.TENANT_SLUG).first()
   return !!row
 }
 
@@ -879,6 +885,9 @@ export async function decideSeatAdmission(
     }
     if (input.continuityApproved === true && await continuityConflict(env, adm, nowIso)) {
       return { status: 409, title: 'Cannot admit', message: 'This connection already has a live approval for another agent, so inbox continuity cannot be enabled. Nothing was changed.', tone: 'warn' }
+    }
+    if (input.continuityApproved === true && await continuityHistoryConflict(env, adm)) {
+      return { status: 409, title: 'Cannot admit', message: 'Historical seat attachment separation prevents inbox continuity on this connection. Nothing was changed.', tone: 'warn' }
     }
     // Before the one-time gate: a wrong code never burns the link.
     if (attachCodeRefused(adm, input.attachCode)) {

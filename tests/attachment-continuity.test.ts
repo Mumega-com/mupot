@@ -135,6 +135,16 @@ describe('attachment continuity scopes', () => {
     await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
+  it('refuses enrollment for any historical harness seat without target attachment or with other-agent history', async () => {
+    const x = approveContinuity(seed())
+    h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('history-seat-agent','squad','history-seat-agent','History seat','r','m','active'); INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,label_basename,max_live,created_at) VALUES ('history-seat','${TENANT}','human','harness','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','history-seat-agent','history',4,'${NOW}')`)
+    await enroll(x)
+    expect(one<{n:number}>(`SELECT count(*) n FROM attachment_continuity_scopes`)!.n).toBe(0)
+    h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('other-agent','squad','other-agent','Other','r','m','active'); INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at) VALUES ('other-history','${TENANT}','history-seat','human','harness','other-agent','${x.admission}','seat-token','${NOW}')`)
+    await enroll(x, 'scope-other-history')
+    expect(one<{n:number}>(`SELECT count(*) n FROM attachment_continuity_scopes`)!.n).toBe(0)
+  })
+
   it('never revives an immutable epoch and refuses racing live scope collisions', async () => {
     const x = seed()
     const approved = approveContinuity(x)
