@@ -450,7 +450,7 @@ export async function ensureAdmission(
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, authority_level, authority_expires_at, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
            SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ${autoGateAuthoritySql('?3')}, ?8, 'helper', ?9, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
             WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
-              AND ${continuityHarnessReservationSql('?7', '?5', '?3')}
+              AND ${continuityHarnessReservationSql('?7', '?5', '?3', '?2')}
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member', authorityExpiresAt),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
@@ -746,7 +746,7 @@ async function continuityConflict(env: Env, adm: AdmissionRow, nowIso: string): 
 }
 
 async function harnessReservedForAnotherAgent(env: Env, adm: AdmissionRow, nowIso: string): Promise<boolean> {
-  const row = await env.DB.prepare(`SELECT 1 AS x FROM harnesses h WHERE h.id=?1 AND h.tenant=?2 AND NOT (${continuityHarnessReservationSql('?3', 'h.id', '?4')}) LIMIT 1`)
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM harnesses h WHERE h.id=?1 AND h.tenant=?2 AND NOT (${continuityHarnessReservationSql('?3', 'h.id', '?4', '?2')}) LIMIT 1`)
     .bind(adm.harness_id, env.TENANT_SLUG, nowIso, adm.agent_id).first<{ x: number }>()
   return !!row
 }
@@ -1061,7 +1061,7 @@ export function prepareAttachStatements(
           ${approvalGuard} -- promote path: tied to THIS batch's promotion (a later concurrent approval cannot recreate a detached attachment)
           ${p.requireNoLiveAttachment ? 'AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments live WHERE live.seat_id = s.id AND live.detached_at IS NULL)' : ''}
           ${attachDesignatedClause(env, 'a', '?8')}
-          AND ${continuityHarnessReservationSql('?4', 's.harness_id', 'a.id')}`,
+          AND ${continuityHarnessReservationSql('?4', 's.harness_id', 'a.id', '?2')}`,
     ).bind(...[p.attachmentId, env.TENANT_SLUG, p.tokenId, p.nowIso, p.admissionId, p.agent.id, p.seat.id, p.humanMemberId,
       ...(p.promotedAt !== undefined ? [p.promotedAt] : []),
       p.grantTokenId]),

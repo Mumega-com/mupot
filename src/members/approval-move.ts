@@ -22,7 +22,7 @@ export async function loadApprovalMoveOffer(env:Env,p:ApprovalMoveRequest,nowMs=
   if(!seatAttachEnabled(env))return null
   const adm=await loadAdmission(env,p.admissionId)
   if(!adm||adm.human_member_id!==p.humanMemberId||adm.agent_id!==p.agentId||adm.harness_id!==p.harnessId||adm.status!=='live'||adm.scope!=='seat'||adm.requested_seat_id===p.seatId)return null
-  if(!(await env.DB.prepare(`SELECT 1 FROM agent_seat_admissions adm WHERE adm.id=?1 AND adm.tenant=?2 AND ${authorityLiveSql('adm','?3')} AND ${continuityHarnessReservationSql('?3','?4','?5')}`).bind(adm.id,env.TENANT_SLUG,new Date(nowMs).toISOString(),adm.harness_id,adm.agent_id).first()))return null
+  if(!(await env.DB.prepare(`SELECT 1 FROM agent_seat_admissions adm WHERE adm.id=?1 AND adm.tenant=?2 AND ${authorityLiveSql('adm','?3')} AND ${continuityHarnessReservationSql('?3','?4','?5','?2')}`).bind(adm.id,env.TENANT_SLUG,new Date(nowMs).toISOString(),adm.harness_id,adm.agent_id).first()))return null
   const seat=await loadHumanSeat(env,p.humanMemberId,p.seatId)
   if(!seat||seat.harness_id!==adm.harness_id||(vipLaneEnabled(env)&&seat.admission_status==='held'))return null
   const agent=await resolveAttachableAgent(env,p.humanMemberId,p.agentId)
@@ -53,7 +53,7 @@ function moveAuthoritySql(env:Env,ownAttachment?:string):string{
       AND NOT EXISTS (SELECT 1 FROM agent_seats managed WHERE managed.agent_id=ag.id)
       AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments current WHERE current.tenant=?2 AND current.seat_id=?6 AND current.detached_at IS NULL ${ownAttachment?`AND current.id<>${ownAttachment}`:''})
       AND EXISTS (SELECT 1 FROM member_tokens st WHERE st.id=ns.seat_token_id AND st.tenant=?2 AND st.agent_id=ns.agent_id AND st.channel='directory' AND ${TOKEN_LIVE_PREDICATE('?7','st')})
-      AND ${continuityHarnessReservationSql('?7','?5','?4')}
+      AND ${continuityHarnessReservationSql('?7','?5','?4','?2')}
       ${attachDesignatedClause(env,'ag','?3')}
       AND (EXISTS (SELECT 1 FROM capabilities c WHERE c.member_id=?3 AND c.capability IN ('admin','owner')
         AND ${CAPABILITY_LIVE_PREDICATE('c','?7')}
