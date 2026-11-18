@@ -450,6 +450,7 @@ export async function ensureAdmission(
              (id, tenant, agent_id, human_member_id, harness_id, status, gates, gate_authority, ceiling, authority_level, authority_expires_at, requested_via, requested_seat_id, created_at, decided_at, decided_by_member_id, decided_via)
            SELECT ?1, ?2, ?3, ?4, ?5, 'live', 0, ${autoGateAuthoritySql('?3')}, ?8, 'helper', ?9, 'dashboard', ?6, ?7, ?7, ?4, 'dashboard'
             WHERE EXISTS (SELECT 1 FROM agents ag WHERE ag.id = ?3 AND ag.status = 'active' ${attachDesignatedClause(env, 'ag', '?4')})
+              AND ${continuityHarnessReservationSql('?7', '?5', '?3')}
            ON CONFLICT DO NOTHING`,
         ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, p.ceiling ?? 'member', authorityExpiresAt),
         // The weld comes AFTER the admission insert and is guarded on that exact row existing live: a lost conflict welds nothing.
@@ -696,7 +697,8 @@ export async function promoteAdmissionDetailed(
         WHERE id = ?1 AND tenant = ?5 AND human_member_id = ?3 AND status = 'pending' AND expires_at > ?2
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
                         ${attachDesignatedClause(env, 'ag', '?3')})
-          ${continuityApproved ? `AND NOT EXISTS (SELECT 1 FROM agent_seat_admissions other WHERE other.tenant = ?5 AND other.harness_id = agent_seat_admissions.harness_id AND other.status = 'live' AND other.agent_id <> agent_seat_admissions.agent_id AND ${authorityLiveSql('other', '?2')})` : ''}`,
+          ${continuityApproved ? `AND NOT EXISTS (SELECT 1 FROM agent_seat_admissions other WHERE other.tenant = ?5 AND other.harness_id = agent_seat_admissions.harness_id AND other.status = 'live' AND other.agent_id <> agent_seat_admissions.agent_id AND ${authorityLiveSql('other', '?2')})` : ''}
+          AND ${continuityHarnessReservationSql('?2', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id')}`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, authority_level: authorityLevel, authority_expires_at: authorityExpiresAt },
@@ -740,6 +742,12 @@ export async function promoteAdmissionDetailed(
 async function continuityConflict(env: Env, adm: AdmissionRow, nowIso: string): Promise<boolean> {
   const row = await env.DB.prepare(`SELECT 1 AS x FROM agent_seat_admissions other WHERE other.tenant=?1 AND other.harness_id=?2 AND other.status='live' AND other.agent_id<>?3 AND ${authorityLiveSql('other','?4')} LIMIT 1`)
     .bind(env.TENANT_SLUG, adm.harness_id, adm.agent_id, nowIso).first<{ x: number }>()
+  return !!row
+}
+
+async function harnessReservedForAnotherAgent(env: Env, adm: AdmissionRow, nowIso: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM harnesses h WHERE h.id=?1 AND h.tenant=?2 AND NOT (${continuityHarnessReservationSql('?3', 'h.id', '?4')}) LIMIT 1`)
+    .bind(adm.harness_id, env.TENANT_SLUG, nowIso, adm.agent_id).first<{ x: number }>()
   return !!row
 }
 
@@ -865,6 +873,9 @@ export async function decideSeatAdmission(
     }
     if (adm.scope !== 'harness' && input.continuityApproved === true) {
       return { status: 409, title: 'Cannot admit', message: 'Inbox continuity can only be approved for every chat of one app connection. Nothing was changed.', tone: 'warn' }
+    }
+    if (await harnessReservedForAnotherAgent(env, adm, nowIso)) {
+      return { status: 409, title: 'Cannot admit', message: 'This connection is reserved for another agent’s approved inbox continuity. Nothing was changed.', tone: 'warn' }
     }
     if (input.continuityApproved === true && await continuityConflict(env, adm, nowIso)) {
       return { status: 409, title: 'Cannot admit', message: 'This connection already has a live approval for another agent, so inbox continuity cannot be enabled. Nothing was changed.', tone: 'warn' }

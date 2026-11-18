@@ -1013,6 +1013,32 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,true)).status).toBe(200)
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes WHERE agent_id='agent-hadi-dev'`)).toBe(1)
   })
+
+  it('an unchecked route approval cannot promote another agent on a reserved harness', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'reserved-rava','rava',undefined,true)
+    await boot(env,g,'reserved-b'); const p=await attach(env,g,'reserved-b','hadi-dev','harness'); const key=await enrolPasskey(env,HUMAN)
+    const before=n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE agent_id='agent-hadi-dev'`)
+    expect((await decideMoment(env,String(p.sc.approve_url),key,undefined,false)).status).toBe(409)
+    expect(one<{status:string}>(`SELECT status FROM agent_seat_admissions WHERE agent_id='agent-hadi-dev'`)!.status).toBe('pending')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE agent_id='agent-hadi-dev'`)).toBe(before)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE agent_id='agent-hadi-dev' AND detached_at IS NULL`)).toBe(0)
+  })
+
+  it('the dashboard/direct admission writer cannot create another live admission on a reserved harness', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'direct-rava','rava',undefined,true); await boot(env,g,'direct-b')
+    const seat=one<{id:string}>(`SELECT id FROM agent_seats ORDER BY rowid DESC LIMIT 1`)!
+    const result=await ensureAdmission(env,{agentId:'agent-hadi-dev',humanMemberId:HUMAN,harnessId:g.harnessId,seatId:seat.id,via:'dashboard',grantTokenId:g.tokenId})
+    expect(result).toEqual({ok:false,error:'attach_refused'})
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE agent_id='agent-hadi-dev' AND status='live'`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE agent_id='agent-hadi-dev'`)).toBe(0)
+  })
+
+  it('a harness with no continuity scope preserves legacy multi-agent approvals', async () => {
+    const env=envFor(h); const g=await grant(env,HUMAN); await admitForAllChats(env,g,'legacy-rava')
+    await admitForAllChats(env,g,'legacy-b','hadi-dev')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_admissions WHERE status='live'`)).toBe(2)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
 })
 
 // keep imports that the scenarios above use only for typing/ratchets referenced
