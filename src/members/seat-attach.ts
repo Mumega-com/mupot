@@ -664,10 +664,13 @@ export async function promoteAdmissionDetailed(
   const authorityLevel: AttachAuthorityLevel = authority.authorityLevel === 'full' ? 'full' : 'helper'
   const authorityExpiresAt = authority.authorityExpiresAt
   const continuityApproved = via === 'webauthn' && adm.scope === 'harness' && authority.continuityApproved === true
-  // An identity-only agent is welded IN THE SAME BATCH as the admission going live, before it, so a refused/expired admission welds nothing.
+  // For continuity opt-in, weld only after the guarded promotion actually lands.
+  // The history guard can fail after preflight while the admission is still pending.
   const agent = await env.DB.prepare(`SELECT a.name AS name, a.squad_id AS squad_id, a.slug AS slug FROM agents a WHERE a.id = ?1 LIMIT 1`)
     .bind(adm.agent_id).first<{ name: string; squad_id: string; slug: string }>()
-  const weld = agent && !(await hasBindingRow(env, adm.agent_id)) ? prepareConditionalIdentityWeld(env, adm, agent, nowIso) : null
+  const weld = agent && !(await hasBindingRow(env, adm.agent_id))
+    ? prepareConditionalIdentityWeld(env, adm, agent, nowIso, continuityApproved ? 'direct' : 'promote') : null
+  const weldStatements = weld?.statements ?? []
   // Pin the consent the human is approving. The INSERT re-reads this exact anchor in the batch; a changed/revoked grant
   // cannot attach the asking chat. Re-consent also revokes this pending admission in the harness re-anchor transaction.
   const harness = adm.scope === 'harness' ? await loadHarness(env, adm.human_member_id, adm.harness_id) : null
@@ -689,7 +692,7 @@ export async function promoteAdmissionDetailed(
       WHERE h.id = ?1 AND h.tenant = ?2 LIMIT 1`,
   ).bind(adm.harness_id, env.TENANT_SLUG, adm.requested_seat_id).first<{ machine_key: string | null }>()
   const out = await env.DB.batch([
-    ...(weld ? weld.statements : []),
+    ...(!continuityApproved ? weldStatements : []),
     env.DB.prepare(
       `UPDATE agent_seat_admissions SET status = 'live', decided_at = ?2, decided_by_member_id = ?3, decided_via = ?4, ceiling = ?6,
               authority_level = ?7, authority_expires_at = ?8,
@@ -701,6 +704,7 @@ export async function promoteAdmissionDetailed(
           ${continuityApproved ? `AND ${continuityHistoricalSeatsClearSql('?5', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id', 'agent_seat_admissions.requested_seat_id')}` : ''}
           AND ${continuityHarnessReservationSql('?2', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id', '?5')}`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
+    ...(continuityApproved ? weldStatements : []),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, authority_level: authorityLevel, authority_expires_at: authorityExpiresAt },
       'EXISTS (SELECT 1 FROM agent_seat_admissions WHERE id = ?6 AND status = \'live\' AND decided_at = ?7)', [adm.id, nowIso]),
@@ -722,12 +726,12 @@ export async function promoteAdmissionDetailed(
     }) : []),
     ...(weld ? [weldAudit(env, adm.agent_id, humanMemberId, adm.id, weld.memberId)] : []),
   ])
-  const base = weld ? weld.statements.length : 0
+  const base = continuityApproved ? 0 : weldStatements.length
   if (out[base].meta.changes !== 1) return { landed: false, attachmentId: null, continuityRequested: continuityApproved, continuityEnrolled: false }
   // The claim landed (and only then): the agent hears it once. Best effort, after the batch; a failure never undoes the claim.
   try { await sendClaimWelcome(env, adm) } catch { /* the claim stands; the welcome is a nicety */ }
-  // attach statements start after: UPDATE + audit + decision = 3
-  const attachBase = base + 3
+  // Either weld ordering places all weld statements before the physical attachment.
+  const attachBase = weldStatements.length + 3
   const scopeBase = attachBase + attach.length
   const continuityEnrolled = continuityApproved && attachmentId && grantTokenId ? out[scopeBase + 1]?.meta.changes === 1 : false
   if (attach.length === 0) return { landed: true, attachmentId: null, attachSkipped: 'no_requested_seat', continuityRequested: continuityApproved, continuityEnrolled }

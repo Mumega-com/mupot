@@ -903,15 +903,32 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
 
-  it('atomically refuses continuity when an un-attached historical seat appears after preflight', async () => {
+  it.each(['rava', 'identity-only'])('atomically refuses %s continuity when an unattached historical seat appears after preflight', async (agent) => {
+    if (agent === 'identity-only') {
+      h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status)
+        VALUES ('agent-identity-only','squad-core','identity-only','Identity Only','r','m','active')`)
+    }
+    const agentId = `agent-${agent}`
+    const bindingsBefore = n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id=?`, agentId)
     const env=envFor(h); const g=await grant(env,HUMAN); await boot(env,g,'history-race-current')
-    const ask=await attach(env,g,'history-race-current','rava','harness'); const key=await enrolPasskey(env,HUMAN)
-    const path=new URL(String(ask.sc.approve_url)).pathname; const csrf=csrfOf(await (await hit(path,env)).text()); const code=one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions WHERE agent_id='agent-rava'`)!.attach_code
+    const ask=await attach(env,g,'history-race-current',agent,'harness'); const key=await enrolPasskey(env,HUMAN)
+    const path=new URL(String(ask.sc.approve_url)).pathname; const csrf=csrfOf(await (await hit(path,env)).text()); const code=one<{attach_code:string}>(`SELECT attach_code FROM agent_seat_admissions WHERE agent_id=?`, agentId)!.attach_code
     const ch=await (await hit(`${path}/challenge`,env,{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true}})).json() as J
     const credential=await key.assert({rpId:HOST,origin:ORIGIN,challenge:ch.publicKey!.challenge}); const db=env.DB; let injected=false
     const proxy=new Proxy(db,{get(t,k){if(k==='batch')return async(s:Parameters<typeof db.batch>[0])=>{if(!injected){injected=true;h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('history-race-seat-agent','squad-core','history-race-seat-agent','History race seat','r','m','active'); INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,label_basename,max_live,created_at) VALUES ('history-race-seat','${TENANT}','${HUMAN}','${g.harnessId}','dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd','history-race-seat-agent','history race',4,datetime('now'));`)}return t.batch(s)};const v=Reflect.get(t,k);return typeof v==='function'?v.bind(t):v}})
     expect((await hit(`${path}/decide`,{...env,DB:proxy},{method:'POST',json:{decision:'approve',csrf,attach_code:code,continuity_approved:true,credential}})).status).not.toBe(200)
     expect(injected).toBe(true); expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id=?`, agentId)).toBe(bindingsBefore)
+  })
+
+  it('can weld an identity-only agent as part of a successful continuity promotion', async () => {
+    h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status)
+      VALUES ('agent-identity-only','squad-core','identity-only','Identity Only','r','m','active')`)
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'identity-only-continuity', 'identity-only', undefined, true)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_member_bindings WHERE agent_id='agent-identity-only'`)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes WHERE agent_id='agent-identity-only'`)).toBe(1)
   })
 
   const peerSender = async (env: Env): Promise<AuthContext> => {
