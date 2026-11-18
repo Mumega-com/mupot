@@ -31,6 +31,7 @@ import { linkLoginIdentity } from '../src/auth/login-identity'
 import { attachSeatToAgent, decideAdmissionDirect, detachAttachment, ensureAdmission, findLiveAttachment, loadAdmission, promoteAdmissionDetailed, revokeAdmission } from '../src/members/seat-attach'
 import { listLiveAttachmentsForEvents } from '../src/mcp/events-attached'
 import { TOKEN_LIVE_PREDICATE } from '../src/auth/token-lifecycle'
+import { sendAgentMessage } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -880,6 +881,35 @@ describe('gate authority is not inherited through grant continuity', () => {
 })
 
 describe('Rava continuity approval: fresh passkey opt-in only', () => {
+  it('routes an explicit logical inbox target to its live recipient scope', async () => {
+    const env = envFor(h)
+    const published: Array<{ payload: { target_seat: string | null } }> = []
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'routing-day1', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    ;(env as unknown as { BUS: { send: (event: unknown) => Promise<void> } }).BUS = {
+      send: async (event) => { published.push(event as { payload: { target_seat: string | null } }) },
+    }
+
+    const sent = await sendAgentMessage(env, {
+      fromAgent: 'agent-hadi-dev',
+      fromMember: 'mem-agent-hadi-dev',
+      toAgent: 'agent-rava',
+      body: 'scope-addressed',
+      requestId: 'scope-addressed-1',
+      inboxTarget: `continuity:${scope.id}`,
+    }, { system: true, reason: 'routing regression fixture' })
+
+    expect(sent).toMatchObject({ ok: true, duplicate: false })
+    expect(one<{ target_seat: string; target_continuity_scope_id: string }>(
+      'SELECT target_seat, target_continuity_scope_id FROM agent_messages WHERE request_id = ?',
+      'scope-addressed-1',
+    )).toEqual({ target_seat: `continuity:${scope.id}`, target_continuity_scope_id: scope.id })
+    // The published DTO must name the committed reserved alias, never NULL/broadcast.
+    expect(published).toHaveLength(1)
+    expect(published[0].payload.target_seat).toBe(`continuity:${scope.id}`)
+  })
+
   it('a true, challenge-bound R1 choice creates one scope and gives later explicitly attached chats one alias', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)

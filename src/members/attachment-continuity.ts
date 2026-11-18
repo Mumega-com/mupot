@@ -191,8 +191,27 @@ export async function resolveAttachmentContinuity(env: Env, request: ContinuityR
   return knownScope ? { kind: 'refused', reason: 'scope_not_live' } : { kind: 'legacy' }
 }
 
+/** Shared recipient-side resource predicate. It does not authenticate a sender. */
+export function liveRecipientContinuityScopeSql(env: Env, scope: string, tenant: string, now: string, recipient: string): string {
+  return `cs.id = ${scope} AND cs.tenant = ${tenant} AND cs.revoked_at IS NULL AND cs.agent_id = ${recipient}
+       AND adm.status = 'live' AND adm.scope = 'harness' AND adm.agent_id = cs.agent_id
+       AND adm.human_member_id = cs.human_member_id AND adm.harness_id = cs.harness_id
+       AND ${authorityLiveSql('adm', now)}
+       AND h.credential_kind = 'oauth' AND h.grant_id = 'oauth:' || cs.source_grant_token_id
+       AND g.tenant = cs.tenant AND g.member_id = cs.human_member_id AND g.channel = 'directory' AND g.agent_id IS NULL
+       AND ${TOKEN_LIVE_PREDICATE(now, 'g')}
+       AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = cs.human_member_id AND hm.tenant = cs.tenant AND hm.status = 'active')
+       ${attachDesignatedClause(env, 'a', 'cs.human_member_id')}`
+}
+
 /** Recipient routing lookup only: it does not authenticate a caller or choose a physical attachment. */
-export async function findLiveRecipientContinuityScope(env: Env, scopeId: string, nowIso = nowSqlUtc()): Promise<ContinuityScopeRow | null> {
+export function findLiveRecipientContinuityScope(env: Env, scopeId: string, nowIso?: string): Promise<ContinuityScopeRow | null>
+export function findLiveRecipientContinuityScope(env: Env, scopeId: string, recipientAgentId: string, nowIso?: string): Promise<ContinuityScopeRow | null>
+export async function findLiveRecipientContinuityScope(env: Env, scopeId: string, recipientOrNow = nowSqlUtc(), suppliedNow?: string): Promise<ContinuityScopeRow | null> {
+  // Keep Task1's lookup API for its focused tests; SEND always supplies the recipient.
+  const legacyLookup = suppliedNow === undefined && /^\d{4}-\d\d-\d\d/.test(recipientOrNow)
+  const nowIso = legacyLookup ? recipientOrNow : suppliedNow ?? nowSqlUtc()
+  const recipient = legacyLookup ? 'cs.agent_id' : '?4'
   return env.DB.prepare(
     `SELECT ${rowColumns} FROM attachment_continuity_scopes cs
       JOIN agent_seat_admissions adm ON adm.id = cs.admission_id AND adm.tenant = cs.tenant
@@ -201,15 +220,7 @@ export async function findLiveRecipientContinuityScope(env: Env, scopeId: string
       JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
       JOIN members am ON am.id = b.member_id AND am.tenant = cs.tenant AND am.status = 'active'
-     WHERE cs.id = ?1 AND cs.tenant = ?2 AND cs.revoked_at IS NULL
-       AND adm.status = 'live' AND adm.scope = 'harness' AND adm.agent_id = cs.agent_id
-       AND adm.human_member_id = cs.human_member_id AND adm.harness_id = cs.harness_id
-       AND ${authorityLiveSql('adm', '?3')}
-       AND h.credential_kind = 'oauth' AND h.grant_id = 'oauth:' || cs.source_grant_token_id
-       AND g.tenant = cs.tenant AND g.member_id = cs.human_member_id AND g.channel = 'directory' AND g.agent_id IS NULL
-       AND ${TOKEN_LIVE_PREDICATE('?3', 'g')}
-       AND EXISTS (SELECT 1 FROM members hm WHERE hm.id = cs.human_member_id AND hm.tenant = cs.tenant AND hm.status = 'active')
-       ${attachDesignatedClause(env, 'a', 'cs.human_member_id')}
+     WHERE ${liveRecipientContinuityScopeSql(env, '?1', '?2', '?3', recipient)}
      LIMIT 1`,
-  ).bind(scopeId, env.TENANT_SLUG, nowIso).first<ContinuityScopeRow>()
+  ).bind(scopeId, env.TENANT_SLUG, nowIso, legacyLookup ? null : recipientOrNow).first<ContinuityScopeRow>()
 }

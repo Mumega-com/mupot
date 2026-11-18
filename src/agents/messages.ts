@@ -28,6 +28,7 @@ import { evaluateReplyExpectation, replyViaFor, type ReplyBasis } from './reply-
 import { isSystemSender, systemSenderReplyVia } from './system-senders'
 import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 import { safeConsole } from '../lib/log'
+import { continuityTarget, findLiveRecipientContinuityScope, liveRecipientContinuityScopeSql } from '../members/attachment-continuity'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -72,6 +73,8 @@ export interface SendInput {
   inReplyTo?: string
   projectId?: string
   targetSeat?: string
+  /** Explicit logical destination; never derived from metadata or a raw scope id. */
+  inboxTarget?: string
   /** mupot#2006: set ONLY from attachmentAttribution(auth) (server-resolved); NULL columns otherwise. */
   attribution?: { attachmentId: string; consentingMemberId: string } | null
 }
@@ -444,7 +447,18 @@ export async function sendAgentMessage(
   // that `sendToRef` collapses non-admin/invisible-target failures onto, #401) — no detail, no
   // distinguishing shape. A sender cannot tell "bad seat" from "bad recipient" from any other
   // reason this string already covers.
-  if (input.targetSeat !== undefined) {
+  if (input.targetSeat !== undefined && input.inboxTarget !== undefined)
+    return { ok: false, reason: 'invalid_body', detail: 'target_seat and inbox_target are mutually exclusive' }
+  let resolvedTargetSeat: string | null = input.targetSeat ?? null
+  let resolvedScopeId: string | null = null
+  if (input.inboxTarget !== undefined) {
+    if (typeof input.inboxTarget !== 'string' || !input.inboxTarget.startsWith('continuity:') || !isRef(input.inboxTarget.slice(11)))
+      return { ok: false, reason: 'invalid_body', detail: 'inbox_target must be continuity:<opaque-id>' }
+    const scope = await findLiveRecipientContinuityScope(env, input.inboxTarget.slice(11), input.toAgent, now())
+    if (!scope) return { ok: false, reason: 'send_target_not_visible' }
+    resolvedTargetSeat = continuityTarget(scope.id)
+    resolvedScopeId = scope.id
+  } else if (input.targetSeat !== undefined) {
     if (!isRef(input.targetSeat))
       return { ok: false, reason: 'invalid_body', detail: 'target_seat must be a valid reference string' }
     const liveSeatToken = await env.DB.prepare(
@@ -470,7 +484,7 @@ export async function sendAgentMessage(
   // Scoping by from_agent means another agent's rid namespace can't poison this one.
   if (input.requestId !== undefined) {
     const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
-    if (existing) return idempotentOrConflict(existing, input, kind)
+    if (existing) return idempotentOrConflict(existing, input, kind, resolvedTargetSeat, resolvedScopeId)
   }
 
   // Backpressure / anti-DoS: the unread cap is enforced ATOMICALLY inside the INSERT —
@@ -498,11 +512,12 @@ export async function sendAgentMessage(
       createdAt,
       maxUnread,
       input.projectId ?? null,
-      input.targetSeat ?? null,
+      resolvedTargetSeat,
       bodyLength,
       bodyChecksum,
       input.attribution?.attachmentId ?? null,
       input.attribution?.consentingMemberId ?? null,
+      resolvedScopeId,
     ]
     let guestVisibilitySql = ''
     const guestVisibilityFence = opts.guestVisibilityFence
@@ -553,18 +568,28 @@ export async function sendAgentMessage(
                          AND in_reply_to IN (?${values.length - 2}, ?${values.length - 1})) < ?${values.length}`
     }
     const routineRunParam = values.length + 1
+    const continuityScopeFenceSql = resolvedScopeId === null ? '' : `AND EXISTS (
+      SELECT 1 FROM attachment_continuity_scopes cs
+      JOIN agent_seat_admissions adm ON adm.id = cs.admission_id AND adm.tenant = cs.tenant
+      JOIN harnesses h ON h.id = cs.harness_id AND h.tenant = cs.tenant AND h.member_id = cs.human_member_id
+      JOIN member_tokens g ON g.id = cs.source_grant_token_id
+      JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
+      JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
+      WHERE ${liveRecipientContinuityScopeSql(env, '?18', '?2', '?10', '?3')}
+    )`
     const fenced = receiverFence !== undefined || brakeFence !== undefined
     const returningSql = fenced ? ' RETURNING seq' : ''
     const statement = routineFence
       ? env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id, target_continuity_scope_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?18
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
+                 ${continuityScopeFenceSql}
                  -- mupot#1814: the routine envelope is a mupot-mediated start; a pause (agent, or the
                  -- canonical agent's CURRENT squad) landing after the observing UPDATE must refuse the insert
                  AND NOT ${executionPausedSql(`?${routineRunParam + 1}`)}
@@ -584,14 +609,15 @@ export async function sendAgentMessage(
                  )${returningSql}`,
       ).bind(...values, routineFence.runId, routineFence.agentId)
       : env.DB.prepare(
-        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id)
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17
+        `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256, attachment_id, consenting_member_id, target_continuity_scope_id)
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15, ?16, ?17, ?18
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
+                 ${continuityScopeFenceSql}
                  ${replyFenceSql}${returningSql}`,
       ).bind(...values)
     // Fenced writes decide from RETURNING rows (never meta.changes); unfenced keep meta.changes.
@@ -618,7 +644,7 @@ export async function sendAgentMessage(
       // spurious inbox_full for a message that actually landed.
       if (input.requestId !== undefined) {
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
-        if (existing) return idempotentOrConflict(existing, input, kind)
+        if (existing) return idempotentOrConflict(existing, input, kind, resolvedTargetSeat, resolvedScopeId)
       }
       if (replyFence) {
         const used = await env.DB.prepare(
@@ -697,7 +723,7 @@ export async function sendAgentMessage(
           message_id: id,
           seq,
           to_agent: input.toAgent,
-          target_seat: input.targetSeat ?? null,
+          target_seat: resolvedTargetSeat,
           from_agent: input.fromAgent,
           from_member: input.fromMember,
           kind,
@@ -749,7 +775,7 @@ export async function sendAgentMessage(
     // rid (a concurrent retry) — re-read and apply the same idempotent-or-conflict decision.
     if (input.requestId !== undefined) {
       const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
-      if (existing) return idempotentOrConflict(existing, input, kind)
+      if (existing) return idempotentOrConflict(existing, input, kind, resolvedTargetSeat, resolvedScopeId)
     }
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }
   }
@@ -764,6 +790,7 @@ interface ExistingMessage {
   in_reply_to: string | null
   project_id: string | null
   target_seat: string | null
+  target_continuity_scope_id?: string | null
 }
 
 /** A same-(tenant, from_agent, request_id) row: idempotent no-op iff every immutable field
@@ -773,6 +800,8 @@ function idempotentOrConflict(
   existing: ExistingMessage,
   input: SendInput,
   kind: MessageKind,
+  targetSeat: string | null,
+  scopeId: string | null,
 ): SendResult | SendFailure {
   const same =
     existing.to_agent === input.toAgent &&
@@ -780,7 +809,8 @@ function idempotentOrConflict(
     existing.body === input.body &&
     (existing.in_reply_to ?? null) === (input.inReplyTo ?? null) &&
     (existing.project_id ?? null) === (input.projectId ?? null) &&
-    (existing.target_seat ?? null) === (input.targetSeat ?? null)
+    (existing.target_seat ?? null) === targetSeat &&
+    (existing.target_continuity_scope_id ?? null) === scopeId
   return same
     ? { ok: true, id: existing.id, seq: Number(existing.seq), duplicate: true }
     : { ok: false, reason: 'request_id_conflict', detail: 'request_id reused with different content' }
@@ -793,7 +823,7 @@ async function findBySenderRequestId(
   requestId: string,
 ): Promise<ExistingMessage | null> {
   const row = await env.DB.prepare(
-    `SELECT id, seq, to_agent, kind, body, in_reply_to, project_id, target_seat FROM agent_messages
+    `SELECT id, seq, to_agent, kind, body, in_reply_to, project_id, target_seat, target_continuity_scope_id FROM agent_messages
       WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
   )
     .bind(tenant, fromAgent, requestId)
@@ -2926,6 +2956,7 @@ export async function sendToRef(
     inReplyTo?: string
     projectId?: string
     targetSeat?: string
+    inboxTarget?: string
     attribution?: { attachmentId: string; consentingMemberId: string } | null
   },
   authz: SendTargetAuthz,
@@ -2952,6 +2983,7 @@ async function sendInferredReply(
   }
   const eligible =
     input.targetSeat === undefined &&
+    input.inboxTarget === undefined &&
     input.projectId === undefined &&
     (authz.isAdmin || nonAdminGrantsSingleMember(authz.grants, input.fromMember))
   if (!eligible) return { ok: false, reason: 'send_target_not_visible' }
@@ -3087,6 +3119,7 @@ async function sendToResolvedRef(
       // seat the caller cannot see), a caller that is a single coherent member when non-admin.
       const eligible =
         input.targetSeat === undefined &&
+        input.inboxTarget === undefined &&
         input.projectId === undefined &&
         (authz.isAdmin || nonAdminGrantsSingleMember(authz.grants, input.fromMember))
       const reply = await resolveReplyTarget(env, input, (opts.now ?? (() => new Date().toISOString()))())
@@ -3119,6 +3152,7 @@ async function sendToResolvedRef(
       inReplyTo: input.inReplyTo,
       projectId: input.projectId,
       targetSeat: input.targetSeat,
+      inboxTarget: input.inboxTarget,
       attribution: input.attribution,
     },
     authz,

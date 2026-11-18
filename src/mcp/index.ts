@@ -5200,7 +5200,7 @@ const toolSend: ToolSpec = {
   name: 'send',
   scope: 'agent→agent (this pot); sender must be agent-bound',
   min: 'authenticated',
-  args: '{ to?: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label; optional ONLY when in_reply_to cites a message sent to you: the reply then goes to that message\'s original sender), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string (a message id, or the sender\'s request_id), project_id?: string, seat?: string }',
+  args: '{ to?: string (agent id, unique slug, or display name unique among agents you can already see — not a harness seat label; optional ONLY when in_reply_to cites a message sent to you: the reply then goes to that message\'s original sender), body: string, kind?: "message"|"request"|"ack", request_id?: string, in_reply_to?: string (a message id, or the sender\'s request_id), project_id?: string, seat?: string, inbox_target?: string (continuity:<opaque-id>; mutually exclusive with seat) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -5211,6 +5211,7 @@ const toolSend: ToolSpec = {
       in_reply_to: STRING_SCHEMA,
       project_id: STRING_SCHEMA,
       seat: STRING_SCHEMA,
+      inbox_target: STRING_SCHEMA,
     },
     required: ['body'],
     additionalProperties: false,
@@ -5240,6 +5241,10 @@ const toolSend: ToolSpec = {
       return fail(400, 'invalid_args', 'project_id must be a string')
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
+    if (args.inbox_target !== undefined && typeof args.inbox_target !== 'string')
+      return fail(400, 'invalid_args', 'inbox_target must be a string')
+    if (args.seat !== undefined && args.inbox_target !== undefined)
+      return fail(400, 'invalid_args', 'seat and inbox_target are mutually exclusive')
 
     // Gate 1 (#392): confine the send target for non-admin welded tokens (see the docstring on
     // sendToRef in src/agents/messages.ts). hasWorkspaceAdmin already handles the legacy-role
@@ -5257,6 +5262,7 @@ const toolSend: ToolSpec = {
         inReplyTo: typeof args.in_reply_to === 'string' ? args.in_reply_to : undefined,
         projectId: typeof args.project_id === 'string' ? args.project_id : undefined,
         targetSeat: typeof args.seat === 'string' && args.seat.trim().length > 0 ? args.seat.trim() : undefined,
+        inboxTarget: typeof args.inbox_target === 'string' ? args.inbox_target : undefined,
         attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
       },
       { isAdmin: hasWorkspaceAdmin(auth), grants: auth.capabilities ?? [] },
@@ -5285,7 +5291,7 @@ const toolSend: ToolSpec = {
       duplicate: res.duplicate,
       to: res.toAgent,
       project_id: typeof args.project_id === 'string' ? args.project_id : null,
-      target_seat: typeof args.seat === 'string' ? args.seat.trim() : null,
+      target_seat: typeof args.inbox_target === 'string' ? args.inbox_target : typeof args.seat === 'string' ? args.seat.trim() : null,
     })
   },
 }
