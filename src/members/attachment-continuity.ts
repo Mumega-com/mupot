@@ -205,13 +205,7 @@ export function liveRecipientContinuityScopeSql(env: Env, scope: string, tenant:
 }
 
 /** Recipient routing lookup only: it does not authenticate a caller or choose a physical attachment. */
-export function findLiveRecipientContinuityScope(env: Env, scopeId: string, nowIso?: string): Promise<ContinuityScopeRow | null>
-export function findLiveRecipientContinuityScope(env: Env, scopeId: string, recipientAgentId: string, nowIso?: string): Promise<ContinuityScopeRow | null>
-export async function findLiveRecipientContinuityScope(env: Env, scopeId: string, recipientOrNow = nowSqlUtc(), suppliedNow?: string): Promise<ContinuityScopeRow | null> {
-  // Keep Task1's lookup API for its focused tests; SEND always supplies the recipient.
-  const legacyLookup = suppliedNow === undefined && /^\d{4}-\d\d-\d\d/.test(recipientOrNow)
-  const nowIso = legacyLookup ? recipientOrNow : suppliedNow ?? nowSqlUtc()
-  const recipient = legacyLookup ? 'cs.agent_id' : '?4'
+export async function findLiveRecipientContinuityScope(env: Env, scopeId: string, recipientAgentId: string, nowIso = nowSqlUtc()): Promise<ContinuityScopeRow | null> {
   return env.DB.prepare(
     `SELECT ${rowColumns} FROM attachment_continuity_scopes cs
       JOIN agent_seat_admissions adm ON adm.id = cs.admission_id AND adm.tenant = cs.tenant
@@ -220,7 +214,7 @@ export async function findLiveRecipientContinuityScope(env: Env, scopeId: string
       JOIN agents a ON a.id = cs.agent_id AND a.status = 'active'
       JOIN agent_member_bindings b ON b.tenant = cs.tenant AND b.agent_id = a.id
       JOIN members am ON am.id = b.member_id AND am.tenant = cs.tenant AND am.status = 'active'
-     WHERE ${liveRecipientContinuityScopeSql(env, '?1', '?2', '?3', recipient)}
+     WHERE ${liveRecipientContinuityScopeSql(env, '?1', '?2', '?3', '?4')}
      LIMIT 1`,
-  ).bind(scopeId, env.TENANT_SLUG, nowIso, legacyLookup ? null : recipientOrNow).first<ContinuityScopeRow>()
+  ).bind(scopeId, env.TENANT_SLUG, nowIso, recipientAgentId).first<ContinuityScopeRow>()
 }

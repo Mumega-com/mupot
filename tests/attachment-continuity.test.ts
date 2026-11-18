@@ -118,10 +118,10 @@ describe('attachment continuity scopes', () => {
     // The immutable scope outlives one physical chat.  It is still a recipient
     // destination while no chat is attached, but access requires a later attach.
     h.sqlite.prepare(`UPDATE agent_seat_attachments SET detached_at = ? WHERE id = ?`).run(NOW, x.attachment)
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toMatchObject({ agent_id: x.agent })
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toMatchObject({ agent_id: x.agent })
     const later = attachLater(x)
     await expect(resolveAttachmentContinuity(env(), { ...request(later), seatId: 'seat-later' })).resolves.toMatchObject({ kind: 'scope', target: 'continuity:scope-a' })
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toMatchObject({ agent_id: x.agent })
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toMatchObject({ agent_id: x.agent })
   })
 
   it('keeps old physical attachments legacy and refuses scope lookup when tuple, grant, or liveness changes', async () => {
@@ -132,7 +132,7 @@ describe('attachment continuity scopes', () => {
     await expect(resolveAttachmentContinuity(env(), { ...request(x), humanMemberId: 'other' })).resolves.toMatchObject({ kind: 'refused' })
     h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = ?`).run(NOW, x.grant)
     await expect(resolveAttachmentContinuity(env(), request(x))).resolves.toMatchObject({ kind: 'refused' })
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
   it('never revives an immutable epoch and refuses racing live scope collisions', async () => {
@@ -174,20 +174,28 @@ describe('attachment continuity scopes', () => {
   it('fails recipient lookup closed on authority expiry or an inactive recipient agent', async () => {
     const x = seed()
     await enroll(approveContinuity(x))
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', '2100-01-01 00:00:00')).resolves.toBeNull()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, '2100-01-01 00:00:00')).resolves.toBeNull()
     h.sqlite.prepare(`UPDATE agents SET status = 'paused' WHERE id = ?`).run(x.agent)
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
   it('fails recipient lookup closed when the active human or harness grant anchor no longer matches', async () => {
     const x = seed()
     await enroll(approveContinuity(x))
     h.sqlite.prepare(`UPDATE members SET status = 'suspended' WHERE id = 'human'`).run()
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
     h.sqlite.prepare(`UPDATE members SET status = 'active' WHERE id = 'human'`).run()
     h.sqlite.prepare(`INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant) VALUES ('other-grant','human','other','other','directory','${NOW}','${TENANT}')`).run()
     tamperHarness(`UPDATE harnesses SET grant_id = 'oauth:other-grant' WHERE id = 'harness'`)
-    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', NOW)).resolves.toBeNull()
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toBeNull()
+  })
+
+  it('recipient lookup is tenant-scoped (resource contract, not a forged cross-tenant MCP principal)', async () => {
+    const x = seed()
+    await enroll(approveContinuity(x))
+    await expect(findLiveRecipientContinuityScope(env(), 'scope-a', x.agent, NOW)).resolves.toMatchObject({ id: 'scope-a' })
+    const foreignEnv = { ...env(), TENANT_SLUG: 'tenant-foreign' } as Env
+    await expect(findLiveRecipientContinuityScope(foreignEnv, 'scope-a', x.agent, NOW)).resolves.toBeNull()
   })
 
   it('keeps legacy message scope null and enforces scoped handled tuple and foreign-recipient invariants in SQLite', () => {
