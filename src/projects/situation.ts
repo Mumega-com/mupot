@@ -169,6 +169,8 @@ export interface ProjectSituationOptions {
    * an explicit server-chosen list. Archived tasks are excluded in both cases.
    */
   taskScope?: { readonly squadIds: readonly string[] }
+  /** Server-derived attached-seat context; preserves legacy physical messages only. */
+  excludeContinuityScopedMessages?: boolean
   excludeTaskIds?: string[]
   excludeFlightIds?: string[]
   excludeMessageIds?: string[]
@@ -708,6 +710,7 @@ export async function loadProjectSituation(
       projectId: project.id,
       readableSquadIds,
       taskSquadIds: options.taskScope?.squadIds,
+      excludeContinuityScopedMessages: options.excludeContinuityScopedMessages,
       excludeRoutineEvents: skipRoutineSlices,
       limit: Math.min(100, excludedActivity.size + 1),
     }),

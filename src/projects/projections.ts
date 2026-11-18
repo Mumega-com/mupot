@@ -64,6 +64,8 @@ export interface ProjectProjectionCursor {
 export interface ProjectProjectionInput {
   projectId: string
   readableSquadIds: string[] | null
+  /** An attached seat must not read deliveries reserved for a continuity scope. */
+  excludeContinuityScopedMessages?: boolean
   /** Visible-task scope from the shared chokepoint (src/tasks/visibility.ts, mupot#1647). When
    *  given, the TASK rows of the activity feed read only these squads (never unrestricted). */
   taskSquadIds?: readonly string[]
@@ -321,7 +323,7 @@ export async function listProjectActivity(
   const taskIds = input.taskSquadIds ? JSON.stringify([...new Set(input.taskSquadIds)]) : ids
   const taskAdmin = input.taskSquadIds ? 0 : isAdmin
   const taskAfter = afterClause(input, epochMs('t.created_at'), 't.id', 'task', 4)
-  const messageAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message', 7)
+  const messageAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message', 8)
   const flightAfter = afterClause(input, 'f.created_at', 'f.id', 'flight', 5)
   const linkOccurredAt = projectLinkLatestEventMsSql()
   const linkSuccessAt = projectLinkTimestampMsSql('last_success_at')
@@ -350,6 +352,7 @@ export async function listProjectActivity(
             ${messageReadableSql('m', '?4', '?3')}
             OR ${dispatchMessageReadableSql('m', '?4', '?3', '?5', '?6')}
           )
+          AND (?7 = 0 OR m.target_continuity_scope_id IS NULL)
           ${messageAfter.sql}
         ORDER BY ${epochMs('m.created_at')} DESC, m.id ASC LIMIT ?${messageAfter.nextParam}`,
     ).bind(
@@ -359,6 +362,7 @@ export async function listProjectActivity(
       ids,
       DISPATCH_BRIDGE_SENDER,
       DISPATCH_INBOX_PREFIX,
+      input.excludeContinuityScopedMessages ? 1 : 0,
       ...messageAfter.binds,
       sourceLimit,
     ).all<{
@@ -495,7 +499,7 @@ export async function listProjectEvidence(
   const workflowAfter = afterClause(input, epochMs('w.created_at'), 'w.id', 'workflow_receipt', 4)
   const dispatchAfter = afterClause(input, epochMs('d.created_at'), 'd.id', 'dispatch_receipt', 5)
   const landingAfter = afterClause(input, epochMs('o.created_at'), 'o.id', 'flight_receipt', 5)
-  const acknowledgementAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message_ack', 5)
+  const acknowledgementAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message_ack', 6)
   const linkReceiptAfter = afterClause(input, epochMs('r.created_at'), 'r.id', 'project_link_receipt', 5)
   const routineOutcomeAfter = afterClause(input, epochMs('COALESCE(rr.finished_at, rr.updated_at)'), 'rr.id', 'routine_run_outcome', 5)
   const routineActionAfter = afterClause(input, epochMs('a.updated_at'), 'a.id', 'routine_action_receipt', 5)
@@ -573,9 +577,10 @@ export async function listProjectEvidence(
         FROM agent_messages m
        WHERE m.tenant = ?1 AND m.project_id = ?2 AND m.kind = 'ack'
           AND ${messageReadableSql('m', '?4', '?3')}
+          AND (?5 = 0 OR m.target_continuity_scope_id IS NULL)
           ${acknowledgementAfter.sql}
         ORDER BY ${epochMs('m.created_at')} DESC, m.id ASC LIMIT ?${acknowledgementAfter.nextParam}`,
-    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, ...acknowledgementAfter.binds, sourceLimit).all<{
+    ).bind(env.TENANT_SLUG, input.projectId, isAdmin, ids, input.excludeContinuityScopedMessages ? 1 : 0, ...acknowledgementAfter.binds, sourceLimit).all<{
       id: string; from_agent: string; to_agent: string; body: string; in_reply_to: string | null; created_at: string
     }>(),
   ])

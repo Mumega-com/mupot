@@ -1,5 +1,6 @@
 import type { AuthContext, BusEvent, Env, Project, ProjectSquadAccess, ProjectStatus } from '../types'
 import { hasCapability } from '../auth/capability'
+import { attachedAuthority } from '../auth/attached-ceiling'
 import {
   elevationHint,
   elevationRemedyMessage,
@@ -432,7 +433,10 @@ const toolProjectGet: ToolSpec = {
     if (!project) return fail(404, 'project_not_found')
     const readableSquadIds = await projectionReadableSquads(env, access)
     const taskScope = await resolveVisibleTaskScope(env, auth)
-    const situation = await loadProjectSituation(env, project, readableSquadIds, { taskScope })
+    const situation = await loadProjectSituation(env, project, readableSquadIds, {
+      taskScope,
+      excludeContinuityScopedMessages: attachedAuthority(auth) !== null,
+    })
     return done({ project, situation })
   },
 }
@@ -465,7 +469,10 @@ const toolProjectContext: ToolSpec = {
     const readableSquadIds = await projectionReadableSquads(env, access)
     const taskScope = await resolveVisibleTaskScope(env, auth)
     const [situation, roster, boardBindings] = await Promise.all([
-      loadProjectSituation(env, project, readableSquadIds, { taskScope }),
+      loadProjectSituation(env, project, readableSquadIds, {
+        taskScope,
+        excludeContinuityScopedMessages: attachedAuthority(auth) !== null,
+      }),
       listPresence(env, { projectId }),
       listProjectBindings(env, projectId),
     ])
