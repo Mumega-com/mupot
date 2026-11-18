@@ -1,6 +1,6 @@
 {
   "_comment": "Production-dependency advisories for workers/project-office accepted ONLY because no fixed version exists. Read by scripts/audit-gate.mjs --omit-dev (prod mode: moderate and above block; entries may be moderate/high/critical). Fails on NEW, STALE (fix shipped: delete the entry), and past expires_on. The root production audit has NO allowlist and is unchanged.",
-  "_scope": "Exactly one advisory, picomatch GHSA-fc5q-39xc-vjpf, reached via the prod dependency agents -> @rolldown/plugin-babel / vite -> picomatch. Evidence it does not ship: the built Worker bundle (wrangler deploy --dry-run) contains no picomatch code; only the sourcemap names it. paths are the prod-only chains (root devDependencies excluded), compared exactly. isDirect true is rejected.",
+  "_scope": "Exactly one advisory, picomatch GHSA-fc5q-39xc-vjpf, reached via the prod dependency agents -> @rolldown/plugin-babel / vite -> picomatch. Evidence it does not ship: the built Worker bundle (wrangler deploy --dry-run --outdir) and its sourcemap contain no picomatch code (0 hits); CI fails if picomatch, vite, tinyglobby, fdir or @rolldown ever appear in the bundle (project-office job, bundle check). paths are the prod-only chains (root devDependencies excluded), compared exactly. isDirect true is rejected.",
   "_review": "https://github.com/Mumega-com/mupot/issues/2453",
   "allowed": [
     {
@@ -57,7 +57,7 @@
           "node_modules/picomatch@4.0.7#sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA=="
         ]
       ],
-      "why": "No fixed picomatch exists (<=4.0.7 affected, 4.0.7 is the latest release, first_patched_version null). Arrives via the agents SDK (agents -> @rolldown/plugin-babel / vite -> picomatch), a build-time path: the bundled Worker contains no picomatch code, only the sourcemap mentions it.",
+      "why": "No fixed picomatch exists (<=4.0.7 affected, 4.0.7 is the latest release, first_patched_version null). Arrives via the agents SDK (agents -> @rolldown/plugin-babel / vite -> picomatch), a build-time path: the bundled Worker and its sourcemap contain no picomatch code (0 hits), enforced by the CI bundle check.",
       "accepted_on": "2026-11-18",
       "expires_on": "2027-01-18",
       "review": "https://github.com/Mumega-com/mupot/issues/2453"
