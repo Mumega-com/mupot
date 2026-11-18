@@ -1877,11 +1877,13 @@ export async function agentGateHolderIneligibility(
   task: { id: string; gate_owner: string | null; assignee_agent_id: string | null },
   agentId: string,
 ): Promise<'task_assignee' | 'self_verdict' | null> {
-  if (task.gate_owner === 'gate:agent-self-completion' && agentId === task.assignee_agent_id
-    && await isCurrentSelfCompletionProducer(env, { task: { id: task.id, gate_owner: task.gate_owner }, decidedBy: agentId })) {
-    return null
+  if (agentId === task.assignee_agent_id) {
+    // The ONE assignee exemption: the producer of the current result on the self-completion lane. The predicate
+    // re-reads the lane (gate_owner, in memory and stored) and the CURRENT assignee + submission itself.
+    return await isCurrentSelfCompletionProducer(env, { task: { id: task.id, gate_owner: task.gate_owner }, decidedBy: agentId })
+      ? null
+      : 'task_assignee'
   }
-  if (agentId === task.assignee_agent_id) return 'task_assignee'
   return (await findVerdictIndependenceConflict(env, agentId, task.id)) !== null ? 'self_verdict' : null
 }
 
