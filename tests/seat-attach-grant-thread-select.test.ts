@@ -921,6 +921,40 @@ describe('Rava continuity approval: fresh passkey opt-in only', () => {
     expect((await hit(`${path}/decide`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code: code, continuity_approved: true, credential } })).status).toBe(403)
     expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
   })
+
+  it('a different human passkey cannot approve or enroll the scope', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); seedHuman('member-wrong')
+    await boot(env, g, 'wrong-human'); const p = await attach(env, g, 'wrong-human', 'rava', 'harness')
+    const wrong = await enrolPasskey(env, 'member-wrong')
+    expect((await decideMoment(env, String(p.sc.approve_url), wrong, undefined, true)).status).toBe(403)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('a wrong attach code refuses before consuming the moment or enrolling', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); await boot(env, g, 'wrong-code')
+    const p = await attach(env, g, 'wrong-code', 'rava', 'harness'); const key = await enrolPasskey(env, HUMAN)
+    const path = new URL(String(p.sc.approve_url)).pathname; const csrf = csrfOf(await (await hit(path, env)).text())
+    const ch = await (await hit(`${path}/challenge`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code: 'ZZZZ', continuity_approved: true } })).json() as J
+    const credential = await key.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey!.challenge })
+    expect((await hit(`${path}/decide`, env, { method: 'POST', json: { decision: 'approve', csrf, attach_code: 'ZZZZ', continuity_approved: true, credential } })).status).toBe(403)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    expect((await decideMoment(env, String(p.sc.approve_url), key, undefined, true)).status).toBe(200)
+  })
+
+  it('Full plus continuity is refused for R1 with no scope', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); await boot(env, g, 'full')
+    const p = await attach(env, g, 'full', 'rava', 'harness'); const key = await enrolPasskey(env, HUMAN)
+    expect((await decideMoment(env, String(p.sc.approve_url), key, 'full', true)).status).toBe(409)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+  })
+
+  it('seat-scoped continuity input is refused and cannot write scope authority', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN); await boot(env, g, 'seat-mode')
+    const p = await attach(env, g, 'seat-mode', 'rava'); const key = await enrolPasskey(env, HUMAN)
+    expect((await decideMoment(env, String(p.sc.approve_url), key, undefined, true)).status).toBe(409)
+    expect(n(`SELECT COUNT(*) AS n FROM attachment_continuity_scopes`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_authority_decisions WHERE continuity_approved = 1`)).toBe(0)
+  })
 })
 
 // keep imports that the scenarios above use only for typing/ratchets referenced

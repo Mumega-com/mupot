@@ -854,6 +854,9 @@ export async function decideSeatAdmission(
     if (adm.scope === 'harness' && input.ceiling === 'full') {
       return { status: 409, title: 'Cannot admit', message: 'An approval for every chat of this app cannot carry the Full level. Choose Member or Lead, or approve a single chat instead. Nothing was changed.', tone: 'warn' }
     }
+    if (adm.scope !== 'harness' && input.continuityApproved === true) {
+      return { status: 409, title: 'Cannot admit', message: 'Inbox continuity can only be approved for every chat of one app connection. Nothing was changed.', tone: 'warn' }
+    }
     // Before the one-time gate: a wrong code never burns the link.
     if (attachCodeRefused(adm, input.attachCode)) {
       return { status: 403, title: 'Wrong attach code', message: 'The attach code does not match the one the chat showed. Nothing was changed.', tone: 'warn' }
