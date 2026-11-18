@@ -30,7 +30,7 @@ import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 import { safeConsole } from '../lib/log'
 import { continuityTarget, findLiveRecipientContinuityScope, liveRecipientContinuityScopeSql } from '../members/attachment-continuity'
 import { resolveAttachmentContinuity } from '../members/attachment-continuity'
-import type { AttachedInboxContext } from '../members/attachment-inbox'
+import { attachedInboxLiveSql, type AttachedInboxContext } from '../members/attachment-inbox'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -970,6 +970,8 @@ async function readAgentInboxForReader(
     limit = Math.min(MAX_INBOX_LIMIT, Math.max(1, Math.floor(input.limit)))
   }
   const peek = input.peek === true
+  if (input.continuity && (!peek || input.continuity.agentId !== input.agent))
+    return { ok: false, reason: 'invalid_agent', detail: 'attached inbox reads must be peek-only and self-scoped' }
   // Cursor for streaming consumers: only rows STRICTLY above this seq are returned. This is
   // what lets an SSE stream advance past a pinned unread window (see inbox-routes /stream):
   // without it, once unread >= limit the oldest-`limit` rows never move and the stream starves.
@@ -1014,11 +1016,13 @@ async function readAgentInboxForReader(
         const seatSql = input.continuity
           ? attachedSeatVisibilitySql(targetSeat, continuityScopeId, binds)
           : targetSeat ? 'AND (target_seat = ?5 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+        const liveSql = input.continuity ? attachedInboxLiveSql(env, input.continuity, continuityScopeId, binds) : ''
         const handledSql = handledHideSql(input.handledByAttachment, continuityScopeId, binds)
         const rows = await env.DB.prepare(
           `SELECT ${cols} FROM agent_messages
             WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL AND seq > ?3
               ${seatSql}
+              ${liveSql ? `AND ${liveSql}` : ''}
               ${handledSql}
               AND COALESCE((SELECT mode FROM agent_inbox_fences
                              WHERE tenant = ?1 AND agent_id = ?2), 'bearer_only') = 'bearer_only'
@@ -1142,6 +1146,7 @@ async function readAgentInboxForReader(
       const seatSql = input.continuity
         ? attachedSeatVisibilitySql(targetSeat, continuityScopeId, binds)
         : targetSeat ? 'AND (target_seat = ?3 OR target_seat IS NULL)' : 'AND target_seat IS NULL'
+      const liveSql = input.continuity ? attachedInboxLiveSql(env, input.continuity, continuityScopeId, binds) : ''
       const sinceSql = sinceSeq > 0 ? `AND seq > ?${binds.length + 1}` : ''
       if (sinceSeq > 0) binds.push(sinceSeq)
       const handledSql = handledHideSql(input.handledByAttachment, continuityScopeId, binds)
@@ -1149,6 +1154,7 @@ async function readAgentInboxForReader(
         `SELECT COUNT(*) AS n FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
             ${seatSql}
+            ${liveSql ? `AND ${liveSql}` : ''}
             ${sinceSql}
             ${handledSql}
             AND COALESCE((SELECT mode FROM agent_inbox_fences

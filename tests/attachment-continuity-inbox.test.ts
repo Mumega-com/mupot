@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { markMessagesHandledByAttachment } from '../src/members/attached-handled'
+import { readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
 
 const TENANT = 'tenant-a'
@@ -60,5 +61,31 @@ describe('attached continuity inbox handled receipts', () => {
     h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = 'grant'`).run(NOW)
     expect(await markMessagesHandledByAttachment(env(), input)).toEqual({ ok: true, handled: [], not_visible: ['scoped'] })
     expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agent_continuity_handled').get()).toEqual({ n: 1 })
+  })
+
+  it('rechecks live scope authority in the page statement after preflight', async () => {
+    let revoked = false
+    const db = new Proxy(h.db, {
+      get(target, key) {
+        const value = Reflect.get(target, key)
+        if (key !== 'prepare' || typeof value !== 'function') return typeof value === 'function' ? value.bind(target) : value
+        return (sql: string) => {
+          // resolveAttachmentContinuity has already run by the time the page
+          // SELECT is prepared.  Revoke in that gap to prove the page's EXISTS
+          // guard, rather than the preflight, controls body/count visibility.
+          if (!revoked && sql.includes('SELECT seq, id, from_agent')) {
+            revoked = true
+            h.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = 'grant'`).run(NOW)
+          }
+          return value.call(target, sql)
+        }
+      },
+    })
+    const result = await readAgentInbox({ ...env(), DB: db }, {
+      agent: 'rava', peek: true, seat: 'physical-token-label', handledByAttachment: 'attachment',
+      continuity: { attachmentId: 'attachment', seatId: 'seat', agentId: 'rava', humanMemberId: 'human', harnessId: 'harness', sourceGrantTokenId: 'grant' },
+    })
+    expect(revoked).toBe(true)
+    expect(result).toMatchObject({ ok: true, messages: [], remaining: 0, complete: true })
   })
 })
