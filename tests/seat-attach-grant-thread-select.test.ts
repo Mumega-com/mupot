@@ -881,6 +881,68 @@ describe('gate authority is not inherited through grant continuity', () => {
 })
 
 describe('Rava continuity approval: fresh passkey opt-in only', () => {
+  const peerSender = async (env: Env): Promise<AuthContext> => {
+    const tokenId = `peer-send-${crypto.randomUUID()}`
+    h.sqlite.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, agent_id, label, channel, created_at, tenant)
+      VALUES (?, 'mem-agent-hadi-dev', ?, 'agent-hadi-dev', ?, 'workspace', datetime('now'), ?)`)
+      .run(tokenId, tokenId, tokenId, TENANT)
+    const ctx = await buildAuthContextFromProps(env, { memberId: 'mem-agent-hadi-dev', tokenId, email: null, channel: 'workspace', boundAgentId: 'agent-hadi-dev' })
+    if (!ctx) throw new Error('peer sender context unavailable')
+    return ctx
+  }
+
+  it('an ordinary peer sends to Rava by live logical address through the real MCP send tool', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'rpc-routing', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    const published: Array<{ payload: { target_seat: string | null } }> = []
+    ;(env as unknown as { BUS: { send: (event: unknown) => Promise<void> } }).BUS = { send: async event => { published.push(event as { payload: { target_seat: string | null } }) } }
+
+    const logical = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'peer logical', request_id: 'rpc-logical', inbox_target: `continuity:${scope.id}` })
+    expect(logical.status, errOf(logical)).toBe(200)
+    expect(one<{ from_agent: string; to_agent: string; target_seat: string; target_continuity_scope_id: string }>(
+      "SELECT from_agent, to_agent, target_seat, target_continuity_scope_id FROM agent_messages WHERE request_id='rpc-logical'",
+    )).toEqual({ from_agent: 'agent-hadi-dev', to_agent: 'agent-rava', target_seat: `continuity:${scope.id}`, target_continuity_scope_id: scope.id })
+    expect(published).toHaveLength(1)
+    expect(published[0].payload.target_seat).toBe(`continuity:${scope.id}`)
+
+    const untargeted = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'peer broadcast', request_id: 'rpc-broadcast' })
+    expect(untargeted.status, errOf(untargeted)).toBe(200)
+    expect(one<{ target_seat: string | null; target_continuity_scope_id: string | null }>("SELECT target_seat, target_continuity_scope_id FROM agent_messages WHERE request_id='rpc-broadcast'"))
+      .toEqual({ target_seat: null, target_continuity_scope_id: null })
+  })
+
+  it('MCP send preserves physical labels and refuses competing selectors without accepting raw scope metadata', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'rpc-physical', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    const physical = one<{ label: string }>(`SELECT t.label FROM agent_seat_attachments a JOIN member_tokens t ON t.id=a.seat_token_id LIMIT 1`)!
+    const normal = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'physical', request_id: 'rpc-physical', seat: physical.label })
+    expect(normal.status, errOf(normal)).toBe(200)
+    expect(one<{ target_seat: string; target_continuity_scope_id: string | null }>("SELECT target_seat, target_continuity_scope_id FROM agent_messages WHERE request_id='rpc-physical'"))
+      .toEqual({ target_seat: physical.label, target_continuity_scope_id: null })
+    const both = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'both', request_id: 'rpc-both', seat: physical.label, inbox_target: `continuity:${scope.id}` })
+    expect(both.status).toBe(200)
+    expect(errOf(both)).toContain('invalid_args')
+    const injected = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: 'injected', request_id: 'rpc-injected', target_continuity_scope_id: scope.id })
+    expect(injected.status).toBe(200)
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id IN ('rpc-both','rpc-injected')")).toBe(0)
+  })
+
+  it('MCP logical targets collapse unknown, revoked, and wrong-recipient scopes without fallback', async () => {
+    const env = envFor(h); const g = await grant(env, HUMAN)
+    await admitForAllChats(env, g, 'rpc-deny', 'rava', undefined, true)
+    const scope = one<{ id: string }>('SELECT id FROM attachment_continuity_scopes')!
+    h.sqlite.prepare('UPDATE attachment_continuity_scopes SET revoked_at=datetime(\'now\') WHERE id=?').run(scope.id)
+    for (const [rid, target] of [['rpc-unknown', 'continuity:unknown-scope'], ['rpc-revoked', `continuity:${scope.id}`]] as const) {
+      const denied = await rpc(env, await peerSender(env), 'send', { to: 'agent-rava', body: rid, request_id: rid, inbox_target: target })
+      expect(denied.status).toBe(200)
+      expect(errOf(denied)).toContain('send_target_not_visible')
+    }
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE request_id IN ('rpc-unknown','rpc-revoked')")).toBe(0)
+  })
+
   it('routes an explicit logical inbox target to its live recipient scope', async () => {
     const env = envFor(h)
     const published: Array<{ payload: { target_seat: string | null } }> = []
