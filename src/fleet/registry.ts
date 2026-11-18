@@ -820,6 +820,10 @@ export interface FleetAgentRouteInfo {
    *  what actually decides task_dispatch routing. '' means no row, or a legacy/daemon row that
    *  never declared a mode — resident semantics for that case are unchanged from pre-#1494. */
   presenceMode: string
+  /** mupot#2458: true iff the matched row is operator-stopped (status 'stopped', the same fence as
+   *  deriveReceiverLiveness). Lets a caller that already holds the route refuse a stopped receiver
+   *  without a second read. Optional so hand-built routes stay valid; absent = not stopped. */
+  stopped?: boolean
 }
 
 export interface FleetAgentIdentity {
@@ -1056,13 +1060,15 @@ export function deriveFleetAgentRoute(env: Env, row: FleetAgentRowIdentity | nul
   // regardless of `presenceMode` would have silently zeroed OUT the entire poll-mode dispatch
   // fix for every poll agent that never separately reported a runtime. Only bail when NEITHER
   // signal is present.
-  if (!runtime && presenceMode !== 'poll') return { runtime: '', live: false, agentId: '', presenceMode: '' }
+  // Present only when true, so a not-stopped route keeps its exact pre-#2458 shape.
+  const stopped = status === 'stopped' ? { stopped: true } : {}
+  if (!runtime && presenceMode !== 'poll') return { runtime: '', live: false, agentId: '', presenceMode: '', ...stopped }
   // Per-row TTL (poll-mode, mupot#1494) via resolveFleetPresenceTtlSec — THE ONE shared
   // resolution every fleet_agents presence reader now calls (round 2 P1-b).
   const ttlSec = resolveFleetPresenceTtlSec(env, row)
   const lastReportedAt = String(row?.last_reported_at ?? '')
   const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
-  return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
+  return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode, ...stopped }
 }
 
 /**

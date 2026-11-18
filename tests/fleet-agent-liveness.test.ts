@@ -266,7 +266,7 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
       addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
       addFleetRow(harness.sqlite, 'kasra', { runtime: 'claude-code', status: 'stopped', lastReportedAt: utcStamp(Date.now()) })
 
-      expect(await getFleetAgentLiveness(env, KASRA_UUID)).toEqual({ runtime: 'claude-code', live: false, agentId: 'kasra', presenceMode: '' })
+      expect(await getFleetAgentLiveness(env, KASRA_UUID)).toEqual({ runtime: 'claude-code', live: false, agentId: 'kasra', presenceMode: '', stopped: true })
     })
 
     it('no matching agents row → not external, not live, no delivery target', async () => {
