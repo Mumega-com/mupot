@@ -698,7 +698,7 @@ export async function promoteAdmissionDetailed(
           AND EXISTS (SELECT 1 FROM agents ag WHERE ag.id = agent_seat_admissions.agent_id AND ag.status = 'active'
                         ${attachDesignatedClause(env, 'ag', '?3')})
           ${continuityApproved ? `AND NOT EXISTS (SELECT 1 FROM agent_seat_admissions other WHERE other.tenant = ?5 AND other.harness_id = agent_seat_admissions.harness_id AND other.status = 'live' AND other.agent_id <> agent_seat_admissions.agent_id AND ${authorityLiveSql('other', '?2')})` : ''}
-          AND ${continuityHarnessReservationSql('?2', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id')}`,
+          AND ${continuityHarnessReservationSql('?2', 'agent_seat_admissions.harness_id', 'agent_seat_admissions.agent_id', '?5')}`,
     ).bind(adm.id, nowIso, humanMemberId, via, env.TENANT_SLUG, ceiling, authorityLevel, authorityExpiresAt),
     auditInsert(env, adm.agent_id, humanMemberId, 'seat_admit',
       { admission_id: adm.id, harness_id: adm.harness_id, human_member_id: adm.human_member_id, via, ceiling, authority_level: authorityLevel, authority_expires_at: authorityExpiresAt },

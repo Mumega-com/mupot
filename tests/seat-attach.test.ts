@@ -1589,11 +1589,13 @@ describe('dashboard: Connections', () => {
       // 2. Existing asks/dashboard admission plus explicit, fresh owner-confirmed move.
       // The move copies only an existing live seat approval; its own tests pin the owner/tuple and atomic rollback.
       expect(hits(/INSERT INTO agent_seat_admissions/g)).toEqual(['src/members/approval-move.ts:1', 'src/members/seat-attach.ts:2'])
-      // 3. every caller of promoteAdmission (each must pass the typed code): exactly these three
-      // (ensureAdmission, decideAdmissionDirect, decideSeatAdmission). Authority args may trail attachCode.
+      // 3. Every promotion path keeps the typed attach code: the two ordinary
+      // wrappers plus the secure-moment human path, which calls the detailed
+      // result API to report a skipped continuity enrollment truthfully.
       const src = readFileSync('src/members/seat-attach.ts', 'utf8')
-      expect(src.match(/await promoteAdmission\(env,/g)?.length).toBe(3)
-      expect(src.match(/promoteAdmission\(/g)?.length).toBe(4) // 3 calls + the definition
+      expect(src.match(/await promoteAdmission\(env,/g)?.length).toBe(2)
+      expect(src.match(/await promoteAdmissionDetailed\(env,/g)?.length).toBe(2) // wrapper delegation + human decision
+      expect(src.match(/promoteAdmission\(/g)?.length).toBe(3) // 2 calls + the wrapper definition
       expect(src.match(/attachCode/g)?.length).toBeGreaterThanOrEqual(3)
       // 4. no migration trigger or other SQL moves an admission to live
       const mig = readdirSync('migrations').filter((f) => f.endsWith('.sql')).filter((f) => /SET\s+status\s*=\s*'live'/i.test(readFileSync(join('migrations', f), 'utf8')) && /agent_seat_admissions/.test(readFileSync(join('migrations', f), 'utf8')))

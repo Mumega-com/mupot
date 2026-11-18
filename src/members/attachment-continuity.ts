@@ -58,12 +58,12 @@ export function continuityTarget(scopeId: string): string {
 }
 
 /** Shared writer guard: a live dedicated continuity harness is reserved for its enrolled agent. */
-export function continuityHarnessReservationSql(nowExpr: string, harnessExpr: string, agentExpr: string): string {
+export function continuityHarnessReservationSql(nowExpr: string, harnessExpr: string, agentExpr: string, tenantExpr = '?2'): string {
   return `NOT EXISTS (
     SELECT 1 FROM attachment_continuity_scopes reserved
     JOIN agent_seat_admissions reserved_adm ON reserved_adm.id = reserved.admission_id AND reserved_adm.tenant = reserved.tenant
     JOIN member_tokens reserved_grant ON reserved_grant.id = reserved.source_grant_token_id
-    WHERE reserved.tenant = ?2 AND reserved.harness_id = ${harnessExpr}
+    WHERE reserved.tenant = ${tenantExpr} AND reserved.harness_id = ${harnessExpr}
       AND reserved.agent_id <> ${agentExpr} AND reserved.revoked_at IS NULL
       AND reserved_adm.status = 'live' AND ${authorityLiveSql('reserved_adm', nowExpr)}
       AND reserved_grant.tenant = reserved.tenant AND reserved_grant.member_id = reserved.human_member_id
