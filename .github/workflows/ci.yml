@@ -58,6 +58,10 @@ jobs:
       # and it fails on an audit it cannot run or parse, rather than reading silence as
       # safety. The STALE direction is what `|| true` could never do, and it is what makes
       # #670 self-closing instead of dependent on someone remembering to check.
+      # The allowlist is non-empty again (2026-11-18): picomatch GHSA-fc5q-39xc-vjpf has no
+      # upstream fix and arrives only via vitest/vite/tinyglobby/fdir. The entry carries
+      # expires_on and goes STALE when a fix ships. See
+      # https://github.com/Mumega-com/mupot/issues/2453
       - name: Dependency audit (dev toolchain — allowlisted)
         run: node scripts/audit-gate.mjs
       # Hermetic — no registry, no lockfile. One case per bypass reproduced in review,
@@ -267,8 +271,17 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - name: Dependency audit (production)
-        run: npm audit --omit=dev --audit-level=moderate
+      # Same gate as the root dev audit, in production mode (--omit-dev): moderate and above
+      # block, exact lockfile-derived paths, NEW and STALE both fail, and the entry self-expires.
+      # The only accepted entry is picomatch GHSA-fc5q-39xc-vjpf (no upstream fix exists: 4.0.7
+      # is the latest release and no patched version is listed, so an overrides pin is
+      # impossible). It arrives via the agents SDK as a build-time path; the built Worker
+      # bundle contains no picomatch code. Rationale and close condition:
+      # https://github.com/Mumega-com/mupot/issues/2453
+      # Runs from the repo root so the script and allowlist resolve; --cwd points at the office.
+      - name: Dependency audit (production — allowlisted, expiring)
+        working-directory: .
+        run: node scripts/audit-gate.mjs --cwd workers/project-office --omit-dev --allowlist .github/audit-allowlist-project-office.json
       # The office imports the SDK-free modules in ../../src/projects (office-core, office-contract), and their
       # type imports reach the rest of src/. tsc resolves those files' packages (hono, workers-types) from the
       # ROOT node_modules, so the root install is needed for the typecheck only; it is NOT a dependency of the

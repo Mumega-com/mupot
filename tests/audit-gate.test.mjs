@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { evaluate, loadAllowlist, runAudit, AuditGateError } from '../scripts/audit-gate.mjs'
+import { evaluate, loadAllowlist, runAudit, parseArgs, withoutDevRoot, AuditGateError } from '../scripts/audit-gate.mjs'
 import { pathsToNode, LockfileGraphError } from '../scripts/lockfile-paths.mjs'
 
 const UNDICI_GHSA = 'GHSA-4cwx-7wf7-3272'
@@ -519,4 +519,113 @@ test('node and path order in the allowlist entry does not matter', () => {
   ]
   const { violations } = evaluate(report(), [allowEntry({ paths: [...paths].reverse() })], lock)
   assert.deepEqual(violations, [])
+})
+
+// ── Production mode (--omit-dev) and expiry ──────────────────────────────────
+
+const PM = { prod: true }
+
+test('prod mode blocks a moderate advisory that is not allowlisted', () => {
+  const { violations } = evaluate(report({ severity: 'moderate' }), [], lockfile(), PM)
+  assert.equal(violations.length, 1)
+  assert.match(violations[0], /moderate/)
+})
+
+test('default (dev) mode still ignores a moderate advisory', () => {
+  const { violations } = evaluate(report({ severity: 'moderate' }), [], lockfile())
+  assert.deepEqual(violations, [])
+})
+
+test('prod mode accepts the exact allowlisted moderate tuple and nothing else', () => {
+  const entry = allowEntry({ severity: 'moderate' })
+  assert.deepEqual(evaluate(report({ severity: 'moderate' }), [entry], lockfile(), PM).violations, [])
+  // same GHSA re-rated up: a different tuple
+  assert.equal(evaluate(report({ severity: 'high' }), [entry], lockfile(), PM).violations.length, 1)
+})
+
+test('prod-mode allowlist rejects the same GHSA arriving by a different path', () => {
+  const { violations, stale } = evaluate(report(), [allowEntry()], lockfile({ undiciDirect: true }), PM)
+  assert.equal(violations.length, 1)
+  assert.equal(stale[0].reason, 'moved')
+})
+
+test('moderate allowlist entries load only in prod mode', () => {
+  withAllowlistFile({ allowed: [allowEntry({ severity: 'moderate' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p), /only high\/critical block/)
+    assert.equal(loadAllowlist(p, { prod: true }).length, 1)
+  })
+  withAllowlistFile({ allowed: [allowEntry({ severity: 'low' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { prod: true }), /only moderate\/high\/critical block/)
+  })
+})
+
+test('isDirect true is rejected in prod mode too', () => {
+  withAllowlistFile({ allowed: [allowEntry({ isDirect: true })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { prod: true }), /cannot inherit the transitive-toolchain exemption/)
+  })
+})
+
+test('expires_on in the past fails the gate', () => {
+  withAllowlistFile({ allowed: [allowEntry({ expires_on: '2027-01-18' })] }, (p) => {
+    assert.throws(() => loadAllowlist(p, { now: new Date('2027-01-19T00:00:00Z') }), /expired on 2027-01-18/)
+    assert.throws(() => loadAllowlist(p, { prod: true, now: new Date('2027-01-19T00:00:00Z') }), /expired/)
+  })
+})
+
+test('expires_on on or before its date still loads', () => {
+  withAllowlistFile({ allowed: [allowEntry({ expires_on: '2027-01-18' })] }, (p) => {
+    assert.equal(loadAllowlist(p, { now: new Date('2027-01-18T23:59:59Z') }).length, 1)
+    assert.equal(loadAllowlist(p, { now: new Date('2026-11-18T00:00:00Z') }).length, 1)
+  })
+})
+
+test('a malformed expires_on throws rather than never expiring', () => {
+  for (const bad of ['soon', '2027-13-45', 20270118, '']) {
+    withAllowlistFile({ allowed: [allowEntry({ expires_on: bad })] }, (p) => {
+      assert.throws(() => loadAllowlist(p), /expires_on must be a YYYY-MM-DD date/)
+    })
+  }
+})
+
+test('runAudit adds --omit=dev only in prod mode', () => {
+  const seen = []
+  const exec = (cmd, args) => { seen.push(args); return '{"vulnerabilities":{}}' }
+  runAudit('.', exec)
+  runAudit('.', exec, { omitDev: true })
+  assert.deepEqual(seen[0], ['audit', '--json'])
+  assert.deepEqual(seen[1], ['audit', '--omit=dev', '--json'])
+})
+
+test('parseArgs: defaults are the root dev gate; flags override; junk throws', () => {
+  const d = parseArgs([])
+  assert.equal(d.omitDev, false)
+  assert.match(d.allowlist, /\.github\/audit-allowlist\.json$/)
+  const p = parseArgs(['--cwd', 'workers/x', '--omit-dev', '--allowlist', 'a.json', '--lockfile', 'l.json'])
+  assert.equal(p.omitDev, true)
+  assert.match(p.cwd, /workers\/x$/)
+  assert.match(p.allowlist, /a\.json$/)
+  assert.match(p.lockfile, /l\.json$/)
+  assert.throws(() => parseArgs(['--nope']), /unknown argument/)
+  assert.throws(() => parseArgs(['--cwd']), /needs a value/)
+})
+
+test('withoutDevRoot drops root devDependencies so dev-only chains are not accepted paths', () => {
+  const lock = lockfile()
+  assert.equal(evaluate(report(), [allowEntry()], lock).violations.length, 0)
+  const stripped = withoutDevRoot(lock)
+  // the now-unreachable chain can no longer match the accepted path: fails closed, not open
+  assert.equal(evaluate(report(), [allowEntry()], stripped, PM).violations.length, 1)
+  assert.ok(lock.packages[''].devDependencies, 'input lockfile is not mutated')
+})
+
+test('the real allowlists carry a valid, future expires_on and load in their modes', () => {
+  const root = loadAllowlist()
+  const po = loadAllowlist(new URL('../.github/audit-allowlist-project-office.json', import.meta.url).pathname, { prod: true })
+  for (const e of [...root, ...po]) {
+    assert.equal(e.ghsa, 'GHSA-fc5q-39xc-vjpf')
+    assert.equal(e.expires_on, '2027-01-18')
+    assert.equal(e.isDirect, false)
+  }
+  assert.equal(root.length, 1)
+  assert.equal(po.length, 1)
 })

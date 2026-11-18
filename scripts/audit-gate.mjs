@@ -69,12 +69,15 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { pathsToNode, LockfileGraphError } from './lockfile-paths.mjs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve, relative } from 'node:path'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_ALLOWLIST = join(repoRoot, '.github/audit-allowlist.json')
 const DEFAULT_LOCKFILE = join(repoRoot, 'package-lock.json')
 const BLOCKING = new Set(['high', 'critical'])
+// Production mode (--omit-dev) keeps the bar the plain `npm audit --omit=dev
+// --audit-level=moderate` step had: moderate and above block. Never lowered to high-only.
+const BLOCKING_PROD = new Set(['moderate', 'high', 'critical'])
 
 /** npm audit's documented exit codes: 0 = nothing found, 1 = vulnerabilities found. */
 const AUDIT_FINDINGS_EXIT = 1
@@ -99,7 +102,14 @@ function tupleKey({ ghsa, pkg, severity, nodes, isDirect, paths }) {
   return JSON.stringify([ghsa, pkg, severity, normalizeNodes(nodes), Boolean(isDirect), normalizePaths(paths)])
 }
 
-export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
+/**
+ * `opts.prod` allows 'moderate' entries (prod mode blocks at moderate). `opts.now` is
+ * injectable for tests. An entry with `expires_on` fails the gate once that date is
+ * past, so a no-upstream-fix exemption cannot sit forever; the field is optional
+ * for entries that have no review deadline, but must be a valid YYYY-MM-DD if present.
+ */
+export function loadAllowlist(path = DEFAULT_ALLOWLIST, { prod = false, now = new Date() } = {}) {
+  const blocking = prod ? BLOCKING_PROD : BLOCKING
   let parsed
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'))
@@ -137,11 +147,23 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
         `fixed or the dependency dropped — it cannot inherit the transitive-toolchain exemption.`,
       )
     }
-    if (!BLOCKING.has(String(entry.severity).toLowerCase())) {
-      // Only high/critical block, so allowlisting anything else is dead config that
+    if (entry.expires_on !== undefined) {
+      if (typeof entry.expires_on !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.expires_on) ||
+          Number.isNaN(Date.parse(`${entry.expires_on}T00:00:00Z`))) {
+        throw new AuditGateError(`${path}: allowed[${i}].expires_on must be a YYYY-MM-DD date`)
+      }
+      if (now.toISOString().slice(0, 10) > entry.expires_on) {
+        throw new AuditGateError(
+          `${path}: allowed[${i}] (${entry.ghsa}) expired on ${entry.expires_on}. Re-review: fix the ` +
+          `advisory if upstream shipped one, or extend expires_on with a fresh written justification.`,
+        )
+      }
+    }
+    if (!blocking.has(String(entry.severity).toLowerCase())) {
+      // Only blocking severities matter, so allowlisting anything else is dead config that
       // silently pre-forgives a future re-rating. Reject it rather than ignore it.
       throw new AuditGateError(
-        `${path}: allowed[${i}].severity is "${entry.severity}" — only high/critical block, ` +
+        `${path}: allowed[${i}].severity is "${entry.severity}" — only ${prod ? 'moderate/high/critical' : 'high/critical'} block, ` +
         `so this entry does nothing except pre-forgive a re-rating. Remove it.`,
       )
     }
@@ -163,9 +185,9 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
  * bad lockfile, EACCES), and a gate must never read that as a clean bill of health,
  * even when the process happened to emit parseable JSON on the way down.
  */
-export function runAudit(cwd = repoRoot, exec = execFileSync) {
+export function runAudit(cwd = repoRoot, exec = execFileSync, { omitDev = false } = {}) {
   try {
-    return JSON.parse(exec('npm', ['audit', '--json'], {
+    return JSON.parse(exec('npm', ['audit', ...(omitDev ? ['--omit=dev'] : []), '--json'], {
       cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     }))
   } catch (err) {
@@ -199,7 +221,8 @@ function pathsForFinding(lock, vuln) {
   return normalizePaths(all)
 }
 
-export function evaluate(report, allowed, lock) {
+export function evaluate(report, allowed, lock, { prod = false } = {}) {
+  const blocking = prod ? BLOCKING_PROD : BLOCKING
   if (!report || typeof report !== 'object' || typeof report.vulnerabilities !== 'object' || report.vulnerabilities === null) {
     throw new AuditGateError('audit output has no `vulnerabilities` object — refusing to interpret silence as safety')
   }
@@ -222,7 +245,7 @@ export function evaluate(report, allowed, lock) {
     for (const via of vuln?.via ?? []) {
       if (typeof via !== 'object' || via === null) continue
       const severity = String(via.severity ?? vuln.severity ?? '').toLowerCase()
-      if (!BLOCKING.has(severity)) continue
+      if (!blocking.has(severity)) continue
 
       const ghsa = String(via.url ?? '').split('/').filter(Boolean).pop()
       if (!ghsa || !ghsa.startsWith('GHSA-')) {
@@ -290,20 +313,50 @@ export function evaluate(report, allowed, lock) {
   return { violations, stale }
 }
 
+/** Minimal CLI: --cwd DIR, --allowlist FILE, --lockfile FILE, --omit-dev. Defaults = root dev gate. */
+export function parseArgs(argv) {
+  const opts = { cwd: repoRoot, allowlist: undefined, lockfile: undefined, omitDev: false }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--omit-dev') opts.omitDev = true
+    else if (a === '--cwd' || a === '--allowlist' || a === '--lockfile') {
+      const v = argv[++i]
+      if (!v || v.startsWith('--')) throw new AuditGateError(`${a} needs a value`)
+      opts[a.slice(2)] = resolve(v)
+    } else throw new AuditGateError(`unknown argument ${a}`)
+  }
+  opts.allowlist ??= opts.cwd === repoRoot ? DEFAULT_ALLOWLIST : join(opts.cwd, '.audit-allowlist.json')
+  opts.lockfile ??= join(opts.cwd, 'package-lock.json')
+  return opts
+}
+
+/** Prod mode: root dev edges are not part of what ships, so they are not accepted paths. */
+export function withoutDevRoot(lock) {
+  const root = { ...(lock?.packages?.[''] ?? {}) }
+  delete root.devDependencies
+  return { ...lock, packages: { ...lock.packages, '': root } }
+}
+
 function main() {
   let allowed
   let result
+  let opts
   try {
-    allowed = loadAllowlist()
-    const lock = JSON.parse(readFileSync(DEFAULT_LOCKFILE, 'utf8'))
-    result = evaluate(runAudit(), allowed, lock)
+    opts = parseArgs(process.argv.slice(2))
+    const prod = opts.omitDev
+    allowed = loadAllowlist(opts.allowlist, { prod })
+    let lock = JSON.parse(readFileSync(opts.lockfile, 'utf8'))
+    if (prod) lock = withoutDevRoot(lock)
+    result = evaluate(runAudit(opts.cwd, execFileSync, { omitDev: prod }), allowed, lock, { prod })
   } catch (err) {
     console.error(`\n✗ audit-gate: ${err.message}\n`)
     process.exit(1)
   }
+  const label = opts.omitDev ? 'moderate/high/critical production' : 'high/critical dev'
+  const listName = relative(repoRoot, opts.allowlist)
 
   if (result.violations.length > 0) {
-    console.error('\n✗ audit-gate: high/critical dev advisories not accepted in .github/audit-allowlist.json\n')
+    console.error(`\n✗ audit-gate: ${label} advisories not accepted in ${listName}\n`)
     for (const v of result.violations) console.error(`    ${v}`)
     console.error(
       '\n  Fix the advisory if a fixed version exists. Only add it to the allowlist if it is' +
@@ -323,7 +376,7 @@ function main() {
       console.error('  GONE — the advisory is no longer reported. A fix shipped.')
       for (const s of gone) console.error(line(s))
       console.error(
-        '\n    Delete these from .github/audit-allowlist.json. If the list becomes empty,' +
+        `\n    Delete these from ${listName}. If the list becomes empty,` +
         '\n    the carve-out has no reason to exist — close' +
         '\n    https://github.com/Mumega-com/mupot/issues/670 and fold this step back into' +
         '\n    the blocking production audit.\n',
@@ -358,8 +411,8 @@ function main() {
   }
 
   console.log(
-    `✓ audit-gate: no unaccepted high/critical dev advisories ` +
-    `(${allowed.length} accepted, all still present — see .github/audit-allowlist.json)`,
+    `✓ audit-gate: no unaccepted ${label} advisories ` +
+    `(${allowed.length} accepted, all still present — see ${listName})`,
   )
 }
 
