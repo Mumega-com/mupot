@@ -140,7 +140,19 @@ describe('attachment continuity scopes', () => {
     h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('history-seat-agent','squad','history-seat-agent','History seat','r','m','active'); INSERT INTO agent_seats(id,tenant,member_id,harness_id,key_hash,agent_id,label_basename,max_live,created_at) VALUES ('history-seat','${TENANT}','human','harness','cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc','history-seat-agent','history',4,'${NOW}')`)
     await enroll(x)
     expect(one<{n:number}>(`SELECT count(*) n FROM attachment_continuity_scopes`)!.n).toBe(0)
-    h.sqlite.exec(`INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('other-agent','squad','other-agent','Other','r','m','active'); INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at) VALUES ('other-history','${TENANT}','history-seat','human','harness','other-agent','${x.admission}','seat-token','${NOW}')`)
+    h.sqlite.exec(`
+      INSERT INTO members(id,display_name,status,tenant) VALUES ('other-member','Other','active','${TENANT}');
+      INSERT INTO agents(id,squad_id,slug,name,role,model,status) VALUES ('other-agent','squad','other-agent','Other','r','m','active');
+      INSERT INTO agent_member_bindings(tenant,agent_id,member_id,created_at) VALUES ('${TENANT}','other-agent','other-member','${NOW}');
+      INSERT INTO agent_seat_admissions(id,tenant,agent_id,human_member_id,harness_id,status,gates,gate_authority,scope,ceiling,authority_level,authority_expires_at,requested_via,requested_seat_id,created_at,decided_at,decided_by_member_id,decided_via,revoked_at)
+      VALUES ('other-admission','${TENANT}','other-agent','human','harness','revoked',0,0,'seat','member','helper','2099-01-01 00:00:00','tool','history-seat','${NOW}','${NOW}','human','webauthn','${NOW}');
+      INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,agent_id,tenant) VALUES
+        ('history-target-token','agent-member','hash-history-target','history-target','directory','${NOW}','${x.agent}','${TENANT}'),
+        ('history-other-token','other-member','hash-history-other','history-other','directory','${NOW}','other-agent','${TENANT}');
+      INSERT INTO agent_seat_attachments(id,tenant,seat_id,human_member_id,harness_id,agent_id,admission_id,seat_token_id,created_at,detached_at) VALUES
+        ('target-history','${TENANT}','history-seat','human','harness','${x.agent}','${x.admission}','history-target-token','${NOW}','${NOW}'),
+        ('other-history','${TENANT}','history-seat','human','harness','other-agent','other-admission','history-other-token','${NOW}','${NOW}');
+    `)
     await enroll(x, 'scope-other-history')
     expect(one<{n:number}>(`SELECT count(*) n FROM attachment_continuity_scopes`)!.n).toBe(0)
   })
