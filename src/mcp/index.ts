@@ -2497,7 +2497,9 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 export type GateWakeOutcome = {
   // mupot#2450: no_eligible_holder = every agent holder is one task_verdict would refuse (assignee / self_verdict);
   // eligibility_unknown = no holder was woken and at least one could not be judged (read failed or beyond the read cap).
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'no_eligible_holder' | 'eligibility_unknown' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
+  // mupot#2461: holders_stopped = agent holders exist and were judged eligible, but every one is operator-stopped, so
+  // nobody can be woken. Not no_live_holder (the resolver found holders) and never delivered.
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'no_eligible_holder' | 'eligibility_unknown' | 'holders_stopped' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2512,6 +2514,9 @@ export type GateWakeOutcome = {
   width_cap?: { limit: number; omitted: number }
   // Holders whose eligibility read failed. Fan-out: skipped (fail closed). Sole holder: still woken, as on base.
   eligibility_unknown?: number
+  // mupot#2461: eligible agent holders skipped because their fleet row is operator-stopped (status stopped_skipped).
+  // No inbox row is kept for them (no store-and-forward); recovery is a re-attach plus the stall watchdog's re-wake.
+  stopped?: number
   // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
   new_sends?: number
 }
@@ -2524,9 +2529,11 @@ export type GateHolderWakeStatus =
 
 /**
  * mupot#2450 item 6: the most holders one review wake fans out to. The cap bounds the per-holder D1 reads too:
- * holders are walked in the resolver's stable order and walking stops once this many are eligible, so at most this
- * many presence reads and eligibility reads happen (plus one per proven-ineligible holder, bounded by
- * GATE_WAKE_FANOUT_MAX_READS). Hitting either bound is recorded as width_cap and makes the wake partial.
+ * holders are walked in the resolver's stable order and walking stops once this many are eligible AND not stopped.
+ * mupot#2461: a stopped holder receives nothing, so it does not consume the width budget (otherwise 10 stopped
+ * holders sorting first would starve every live one, on every watchdog re-wake). Every holder walked costs one
+ * eligibility read and every eligible one one presence read; both are bounded by GATE_WAKE_FANOUT_MAX_READS.
+ * Hitting either bound is recorded as width_cap and makes the wake partial.
  */
 export const GATE_WAKE_FANOUT_MAX_HOLDERS = 10
 export const GATE_WAKE_FANOUT_MAX_READS = 2 * GATE_WAKE_FANOUT_MAX_HOLDERS
@@ -2643,16 +2650,24 @@ export async function wakeGateOwnerOnReview(
     const agentHolders = resolution.active_holders.filter((holder) => holder.type === 'agent')
     const hasMemberHolder = resolution.active_holders.some((holder) => holder.type === 'member')
     const verdictOf = new Map<string, HolderSkipReason | null>()
+    const routeOf = new Map<string, GateWakeRoute>()
     let reads = 0
-    let eligibleCount = 0
+    let wakeableCount = 0
     for (const holder of agentHolders) {
-      if (eligibleCount >= GATE_WAKE_FANOUT_MAX_HOLDERS || reads >= GATE_WAKE_FANOUT_MAX_READS) break
+      if (wakeableCount >= GATE_WAKE_FANOUT_MAX_HOLDERS || reads >= GATE_WAKE_FANOUT_MAX_READS) break
       reads++
       const reason = await gateHolderSkipReason(env, task, holder.id)
       verdictOf.set(holder.id, reason)
-      if (!reason) eligibleCount++
+      if (reason) continue
+      // One presence read per eligible holder (mupot#2458): it fences stopped receivers, ranks the delivery order and
+      // picks the inbox address with the consumer's delivery-mode rule. Read during the walk (mupot#2461) so a
+      // stopped holder is known before it could take a width-cap slot.
+      const route = await resolveGateWakeRoute(env, holder.id)
+      routeOf.set(holder.id, route)
+      if (!route.stopped) wakeableCount++
     }
-    const targets = agentHolders.filter((holder) => verdictOf.has(holder.id) && verdictOf.get(holder.id) === null)
+    const stoppedHolders = agentHolders.filter((holder) => routeOf.get(holder.id)?.stopped === true)
+    const targets = agentHolders.filter((holder) => routeOf.has(holder.id) && !routeOf.get(holder.id)!.stopped)
     const unread = agentHolders.filter((holder) => !verdictOf.has(holder.id))
     const skipped = agentHolders.flatMap((holder) => {
       const reason = verdictOf.get(holder.id)
@@ -2662,47 +2677,51 @@ export async function wakeGateOwnerOnReview(
 
     // The read cap (not the holder cap) stopped the walk: name the bound that actually tripped.
     const capText = unread.length
-      ? ` ${eligibleCount >= GATE_WAKE_FANOUT_MAX_HOLDERS ? `width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS}` : `read cap ${GATE_WAKE_FANOUT_MAX_READS}`} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
+      ? ` ${wakeableCount >= GATE_WAKE_FANOUT_MAX_HOLDERS ? `width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS}` : `read cap ${GATE_WAKE_FANOUT_MAX_READS}`} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
       : ''
-    // One presence read per eligible holder (mupot#2458): it fences stopped receivers, ranks the delivery order and
-    // picks the inbox address with the consumer's delivery-mode rule.
-    const routes = await Promise.all(targets.map((holder) => resolveGateWakeRoute(env, holder.id)))
-    const stoppedHolders = targets.filter((_, i) => routes[i].stopped)
     const stoppedText = stoppedHolders.length ? ` Stopped: ${stoppedHolders.map(h => h.id).join(', ')}.` : ''
-    if (targets.length > 0 && stoppedHolders.length === targets.length) {
-      // Every eligible holder is stopped: nobody can receive, so nothing is sent and nothing is "delivered".
+    const memberText = hasMemberHolder ? ' Member holders keep their needs_you item.' : ''
+    const widthCap = unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}
+    const unknownField = unknownCount ? { eligibility_unknown: unknownCount } : {}
+    const stoppedField = stoppedHolders.length ? { stopped: stoppedHolders.length } : {}
+    const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
+    if (targets.length === 0 && stoppedHolders.length > 0) {
+      // mupot#2461: every eligible holder READ is stopped, so nothing is sent. That is not no_live_holder (holders
+      // exist). While a holder is unread (cap) or unjudged (eligibility read failed) it might still be wakeable, so
+      // the wake is eligibility_unknown; only when every holder was judged is it holders_stopped.
+      const status = unread.length || unknownCount ? 'eligibility_unknown' : 'holders_stopped'
       const statusById = new Map<string, GateHolderWakeStatus>([
         ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
         ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
         ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
       ])
       return surfaceGateWakeOutcome(env, task.id, {
-        ...baseOutcome, status: 'no_live_holder',
+        ...baseOutcome, status,
         holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
-        ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
-        ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
-        notice: `Gate wake not delivered: every eligible agent holder of ${gateOwner} is stopped.${capText}${stoppedText}`,
+        ...widthCap, ...unknownField, ...stoppedField,
+        notice: `Gate wake not delivered: every eligible agent holder of ${gateOwner} that was read is stopped.${capText}${skippedText}${stoppedText}${memberText}`,
       })
     }
     if (targets.length > 0) {
+      const routes = targets.map((holder) => routeOf.get(holder.id)!)
       const order = targets.map((_, i) => i).sort((x, y) => Number(routes[y].live) - Number(routes[x].live) || x - y)
       const ts = new Date().toISOString()
       const statusOf = new Map<string, 'delivered' | 'partial' | 'delivery_failed'>()
       for (const i of order) {
-        if (routes[i].stopped) continue
         const principal = targets[i]
         // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
         const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
         statusOf.set(principal.id, channelStatus(await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId, routes[i].inboxId)))
       }
-      const delivered = targets.filter((_, i) => !routes[i].stopped).map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
+      const delivered = targets.map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
+      // mupot#2461: presence counts the holders a wake was sent to; stopped holders are reported separately.
       const presence = { live: routes.filter((r) => r.live).length, total: targets.length }
       // A holder left unwoken that might be eligible (cap, unreadable eligibility) keeps the wake from being "delivered".
+      // A stopped holder does not: it is a known non-receiver, like a proven-ineligible skip (decision, mupot#2461).
       const complete = unread.length === 0 && unknownCount === 0
       const status = delivered.every(d => d.status === 'delivered') && complete
         ? 'delivered'
         : delivered.some(d => d.status !== 'delivery_failed') ? 'partial' : 'delivery_failed'
-      const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
       const statusById = new Map<string, GateHolderWakeStatus>([
         ...delivered.map((d) => [d.id, d.status] as const),
         ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
@@ -2712,13 +2731,11 @@ export async function wakeGateOwnerOnReview(
       return surfaceGateWakeOutcome(env, task.id, {
         ...baseOutcome, status, presence,
         holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
-        ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
-        ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
+        ...widthCap, ...unknownField, ...stoppedField,
         notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}${stoppedText}`,
       })
     }
     if (agentHolders.length > 0) {
-      const memberText = hasMemberHolder ? ' Member holders keep their needs_you item.' : ''
       const holders = agentHolders.map((h) => {
         const reason = verdictOf.get(h.id)
         return { ...h, status: (reason ? `skipped_${reason}` : 'skipped_width_cap') as GateHolderWakeStatus }
@@ -2801,7 +2818,8 @@ export async function wakeGateOwnerOnReview(
   const soleRoute = await resolveGateWakeRoute(env, agentId)
   if (soleRoute.stopped) {
     return surfaceGateWakeOutcome(env, task.id, {
-      ...baseOutcome, status: 'no_live_holder', principal: resolution.principal,
+      // mupot#2461: the holder exists and is eligible but cannot be woken: holders_stopped, not no_live_holder.
+      ...baseOutcome, status: 'holders_stopped', principal: resolution.principal, stopped: 1,
       holders: [{ ...resolution.principal, status: 'stopped_skipped' }],
       notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is stopped.`,
     })
