@@ -4120,7 +4120,7 @@ describe('seed B4: office.review_approval emits the gate.verdict receipt and sur
 })
 
 // ── B3a: per-PROJECT office destination (wiki `office-per-customer`) ───────────────────
-// Two customers (A = DME/Preventous, B = Viamar) share one pot and one office addon.
+// Two customers (A and B) share one pot and one office addon.
 // Their WordPress sites are bound per project; neither may ever publish to the other's.
 describe('B3a: per-project office binding (cross-customer publish is impossible)', () => {
   const SITE_A = 'https://site-a.example.com'
@@ -4718,48 +4718,48 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       harness.close()
     })
   })
-  // B3b: office approval authority is scoped to the customer's OWN squad/project. squad-a/proj-a = "Viamar",
-  // squad-b/proj-b = "DME". A Viamar approver holds `lead` on squad-a only.
+  // B3b: office approval authority is scoped to the customer's OWN squad/project. squad-a/proj-a = "customer A",
+  // squad-b/proj-b = "customer B". A customer-A approver holds `lead` on squad-a only.
   describe('B3b: approval authority is per customer squad', () => {
-    const viamarLead = () => auth('viamar-lead', [grant('squad', 'squad-a', 'lead')])
-    // The verdict gate also needs a gate:office grant for the human; seeded for the Viamar approver.
-    const seedViamarGate = (harness: SqliteD1Harness) => {
-      harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('viamar-lead', 'vl@x.t', 'vl', 'active', ?)`).run(TENANT)
-      harness.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-vl', 'gate:office', 'member', 'viamar-lead', 'test', datetime('now'))`).run()
+    const custALead = () => auth('custa-lead', [grant('squad', 'squad-a', 'lead')])
+    // The verdict gate also needs a gate:office grant for the human; seeded for the customer A approver.
+    const seedCustAGate = (harness: SqliteD1Harness) => {
+      harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('custa-lead', 'vl@x.t', 'vl', 'active', ?)`).run(TENANT)
+      harness.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-vl', 'gate:office', 'member', 'custa-lead', 'test', datetime('now'))`).run()
     }
     const verdictRows = (harness: SqliteD1Harness, taskId: string) =>
       (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }).n
 
-    it('N2: a Viamar lead lists 0 DME tasks, is refused 403 on review/publish of a DME task (0 verdict rows, 0 fetches), and CAN review+publish a Viamar task', async () => {
+    it('N2: a customer-A lead lists 0 customer B tasks, is refused 403 on review/publish of a customer B task (0 verdict rows, 0 fetches), and CAN review+publish a customer A task', async () => {
       const { harness, testEnv } = await twoCustomers()
-      seedViamarGate(harness)
+      seedCustAGate(harness)
       const spy = okFetch()
       vi.stubGlobal('fetch', spy)
       const tv = await reviewTask(testEnv, 'squad-a', 'proj-a')
       const td = await reviewTask(testEnv, 'squad-b', 'proj-b')
-      const dmeHash = await officeFreezeHash(testEnv, td)
+      const custbHash = await officeFreezeHash(testEnv, td)
 
-      const listed = await invokeTool(viamarLead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      const listed = await invokeTool(custALead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
       expect(listed.ok).toBe(true)
       const ids = listed.ok ? (listed.result as { tasks: Array<{ id: string }> }).tasks.map((t) => t.id) : []
       expect(ids).toContain(tv)
       expect(ids).not.toContain(td)
 
-      const refusedReview = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: td, verdict: 'approved', expected_payload_sha256: dmeHash ?? undefined }, ORIGIN)
+      const refusedReview = await invokeTool(custALead(), testEnv, 'office.review_approval', { task_id: td, verdict: 'approved', expected_payload_sha256: custbHash ?? undefined }, ORIGIN)
       expect(refusedReview.ok).toBe(false)
       if (!refusedReview.ok) { expect(refusedReview.error).toBe('not_authorized'); expect(refusedReview.status).toBe(403) }
       expect(verdictRows(harness, td)).toBe(0)
 
-      await approveOfficeTask(testEnv, td) // DME's own approver (org owner fixture) approved it
-      const refusedPublish = await invokeTool(viamarLead(), testEnv, 'office.publish_post', { task_id: td }, ORIGIN)
+      await approveOfficeTask(testEnv, td) // customer B's own approver (org owner fixture) approved it
+      const refusedPublish = await invokeTool(custALead(), testEnv, 'office.publish_post', { task_id: td }, ORIGIN)
       expect(refusedPublish.ok).toBe(false)
       if (!refusedPublish.ok) { expect(refusedPublish.error).toBe('not_authorized'); expect(refusedPublish.status).toBe(403) }
       expect(spy).not.toHaveBeenCalled()
 
       const hash = await officeFreezeHash(testEnv, tv)
-      const approved = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: tv, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      const approved = await invokeTool(custALead(), testEnv, 'office.review_approval', { task_id: tv, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
       expect(approved.ok, JSON.stringify(approved)).toBe(true)
-      const published = await invokeTool(viamarLead(), testEnv, 'office.publish_post', { task_id: tv }, ORIGIN)
+      const published = await invokeTool(custALead(), testEnv, 'office.publish_post', { task_id: tv }, ORIGIN)
       expect(published.ok, JSON.stringify(published)).toBe(true)
       expect(fetchedOrigins(spy)).toEqual([SITE_A])
       harness.close()
@@ -4789,7 +4789,7 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
 
     it('a squad MEMBER (below the manifest publish capability) may list but not review or publish', async () => {
       const { harness, testEnv } = await twoCustomers()
-      const member = auth('viamar-member', [grant('squad', 'squad-a', 'member')])
+      const member = auth('custa-member', [grant('squad', 'squad-a', 'member')])
       const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
       const hash = await officeFreezeHash(testEnv, ta)
       const listed = await invokeTool(member, testEnv, 'office.list_pending_approvals', {}, ORIGIN)
@@ -4805,9 +4805,9 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
       const hash = await officeFreezeHash(testEnv, ta)
       harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-a' AND squad_id = 'squad-a'`).run()
-      const listed = await invokeTool(viamarLead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      const listed = await invokeTool(custALead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
       expect(listed.ok).toBe(false)
-      const review = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      const review = await invokeTool(custALead(), testEnv, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
       expect(review.ok).toBe(false)
       if (!review.ok) expect(review.error).toBe('not_authorized')
       harness.close()
@@ -4816,17 +4816,17 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
     it('a task with no project is never office-authorised (predicate is fail-closed on project_id)', async () => {
       const { harness, testEnv } = await twoCustomers()
       const { hasProjectOfficeCapability } = await import('../src/addons/office/service')
-      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: null, squad_id: 'squad-a' }, 'member')).toBe(false)
-      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-a', squad_id: 'squad-a' }, 'lead')).toBe(true)
-      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-b', squad_id: 'squad-b' }, 'member')).toBe(false)
+      expect(await hasProjectOfficeCapability(testEnv, custALead(), { project_id: null, squad_id: 'squad-a' }, 'member')).toBe(false)
+      expect(await hasProjectOfficeCapability(testEnv, custALead(), { project_id: 'proj-a', squad_id: 'squad-a' }, 'lead')).toBe(true)
+      expect(await hasProjectOfficeCapability(testEnv, custALead(), { project_id: 'proj-b', squad_id: 'squad-b' }, 'member')).toBe(false)
       // a squad that does NOT hold write on the project it claims is refused even for a lead on that squad
-      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-b', squad_id: 'squad-a' }, 'member')).toBe(false)
+      expect(await hasProjectOfficeCapability(testEnv, custALead(), { project_id: 'proj-b', squad_id: 'squad-a' }, 'member')).toBe(false)
       harness.close()
     })
 
     it('the verdict transaction re-checks squad/project write: access revoked between the check and the write -> verdict_race, 0 verdict rows', async () => {
       const { harness, testEnv } = await twoCustomers()
-      seedViamarGate(harness)
+      seedCustAGate(harness)
       const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
       const hash = await officeFreezeHash(testEnv, ta)
       const real = testEnv.DB
@@ -4838,11 +4838,148 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
         },
       // The wrapper implements exactly the D1Database surface the verdict path touches; cast to satisfy the Env type.
       } as unknown as D1Database
-      const review = await invokeTool(viamarLead(), { ...testEnv, DB: racing }, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      const review = await invokeTool(custALead(), { ...testEnv, DB: racing }, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
       expect(review.ok).toBe(false)
       if (!review.ok) expect(review.error).toBe('verdict_race')
       expect(verdictRows(harness, ta)).toBe(0)
       expect(harness.sqlite.prepare(`SELECT verdict_id FROM office_publish_freezes WHERE task_id = ?`).get(ta)).toEqual({ verdict_id: null })
+      harness.close()
+    })
+
+    // ── round 2: ONLY org owner/admin or a squad grant on the task's own squad carries authority ──
+    const listIds = async (who: AuthContext, testEnv: Env) => {
+      const r = await invokeTool(who, testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      return r.ok ? (r.result as { tasks: Array<{ id: string }> }).tasks.map((t) => t.id) : r.error
+    }
+    const refusedEverywhere = async (harness: SqliteD1Harness, testEnv: Env, who: AuthContext, taskId: string, spy: ReturnType<typeof okFetch>) => {
+      const hash = await officeFreezeHash(testEnv, taskId)
+      const review = await invokeTool(who, testEnv, 'office.review_approval', { task_id: taskId, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(review.ok).toBe(false)
+      if (!review.ok) { expect(review.error).toBe('not_authorized'); expect(review.status).toBe(403) }
+      expect(verdictRows(harness, taskId)).toBe(0)
+      if (hash) await approveOfficeTask(testEnv, taskId) // the legitimate approver approved it (a task with no bound site has no freeze)
+      const publish = await invokeTool(who, testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+      expect(publish.ok).toBe(false)
+      if (!publish.ok) expect(publish.error).toBe(hash ? 'not_authorized' : 'not_approved') // no freeze = nothing was approvable
+      expect(spy).not.toHaveBeenCalled()
+    }
+
+    it('an ORG-scope lead (non-admin, e.g. a door signup) is refused list/review/publish on another customer\'s task: 0 verdicts, 0 fetches', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedCustAGate(harness)
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const orgLead = auth('custa-lead', [grant('org', null, 'lead')])
+      const td = await reviewTask(testEnv, 'squad-b', 'proj-b')
+      expect(await listIds(orgLead, testEnv)).toBe('not_authorized')
+      await refusedEverywhere(harness, testEnv, orgLead, td, spy)
+      harness.close()
+    })
+
+    it('an ORG-scope lead who also holds a squad grant on ONE customer sees and acts on that customer only', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedCustAGate(harness)
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const mixed = auth('custa-lead', [grant('org', null, 'lead'), grant('squad', 'squad-a', 'lead')])
+      const tv = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const td = await reviewTask(testEnv, 'squad-b', 'proj-b')
+      expect(await listIds(mixed, testEnv)).toEqual([tv])
+      await refusedEverywhere(harness, testEnv, mixed, td, spy)
+      harness.close()
+    })
+
+    it('an ORG-scope member is refused list', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      await reviewTask(testEnv, 'squad-b', 'proj-b')
+      expect(await listIds(auth('signup-member', [grant('org', null, 'member')]), testEnv)).toBe('not_authorized')
+      harness.close()
+    })
+
+    it('a lead on a NON-office department that contains a customer squad is refused list/review/publish', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedCustAGate(harness)
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-growth', 'growth', 'Growth')`).run()
+      harness.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-c', 'dept-growth', 'cust-c', 'Cust c')`).run()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-c', 'squad-c', 'write')`).run()
+      const tc = await reviewTask(testEnv, 'squad-c', 'proj-c')
+      const deptLead = auth('custa-lead', [grant('department', 'dept-growth', 'lead')])
+      expect(await listIds(deptLead, testEnv)).toBe('not_authorized')
+      await refusedEverywhere(harness, testEnv, deptLead, tc, spy)
+      harness.close()
+    })
+
+    it('an org ADMIN (grant, not legacy role) still lists and approves every customer; a squad lead still acts on its own squad', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedCustAGate(harness)
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const tv = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const td = await reviewTask(testEnv, 'squad-b', 'proj-b')
+      const admin = auth('custa-lead', [grant('org', null, 'admin')])
+      expect((await listIds(admin, testEnv) as string[]).sort()).toEqual([tv, td].sort())
+      const hash = await officeFreezeHash(testEnv, td)
+      const approved = await invokeTool(admin, testEnv, 'office.review_approval', { task_id: td, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(approved.ok, JSON.stringify(approved)).toBe(true)
+      expect(await listIds(custALead(), testEnv)).toEqual([tv])
+      harness.close()
+    })
+
+    it('floor: a caller with a squad grant in a tenant of >200 writable squads is not refused, and query count does not grow with squads', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const deptId = (harness.sqlite.prepare(`SELECT department_id AS d FROM squads WHERE id = 'squad-a'`).get() as { d: string }).d
+      const counted = (): { env: Env; n: () => number } => {
+        let n = 0
+        const real = testEnv.DB
+        const db = { prepare: (sql: string) => { n += 1; return real.prepare(sql) }, batch: real.batch.bind(real) } as unknown as D1Database // counting wrapper: only prepare/batch are used here
+        return { env: { ...testEnv, DB: db }, n: () => n }
+      }
+      const one = counted()
+      expect((await listIds(custALead(), one.env)).length).toBeGreaterThanOrEqual(0)
+      const before = one.n()
+      // 250 other writable squads, inserted BEFORE squad-a in any unordered scan
+      const ins = harness.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, ?, ?)`)
+      const acc = harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-b', ?, 'write')`)
+      for (let i = 0; i < 250; i += 1) { ins.run(`squad-bulk-${i}`, deptId, `bulk-${i}`, `bulk ${i}`); acc.run(`squad-bulk-${i}`) }
+      const tv = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const big = counted()
+      expect(await listIds(custALead(), big.env)).toEqual([tv])
+      const health = await invokeTool(custALead(), big.env, 'office.health', {}, ORIGIN)
+      expect(health.ok === false && health.error === 'not_authorized').toBe(false)
+      const afterBig = big.n()
+      const small = counted()
+      await listIds(custALead(), small.env)
+      expect(afterBig).toBeLessThanOrEqual(before + 8 + small.n()) // bounded: same order as the small-tenant run, not +250
+      harness.close()
+    })
+
+    it('M15: the MCP list memo is keyed by (squad, project): one squad with write on X and only read on Y lists X rows only', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-y', 'proj-y', 'Y', 'active')`).run()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-y', 'squad-a', 'write')`).run()
+      const tx = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const ty = await reviewTask(testEnv, 'squad-a', 'proj-y')
+      harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-y'`).run()
+      expect(ty).not.toBe(tx)
+      expect(await listIds(custALead(), testEnv)).toEqual([tx])
+      harness.close()
+    })
+
+    it('M7: the list SQL itself drops rows whose squad lacks write on their project, so they cannot crowd authorised rows out of LIMIT', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-y', 'proj-y', 'Y', 'active')`).run()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-y', 'squad-a', 'write')`).run()
+      const ty = await reviewTask(testEnv, 'squad-a', 'proj-y')
+      const tx = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-y'`).run()
+      harness.sqlite.prepare(`UPDATE tasks SET created_at = '2026-01-01T00:00:00Z' WHERE id = ?`).run(ty)
+      harness.sqlite.prepare(`UPDATE tasks SET created_at = '2026-01-02T00:00:00Z' WHERE id = ?`).run(tx)
+      const { listOfficePendingApprovals } = await import('../src/addons/office/service')
+      const r = await listOfficePendingApprovals(testEnv, custALead(), 1)
+      expect(r.ok && r.value.map((t) => t.id)).toEqual([tx])
       harness.close()
     })
   })

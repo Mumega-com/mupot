@@ -58,7 +58,7 @@
 // collector, not a synchronous emit path any tool call can invoke. Reported, not
 // built around — see the PR body.
 
-import type { Env, AuthContext, Task, Capability, TaskVerdict, OrgKind } from '../../types'
+import type { Env, AuthContext, Task, Capability, CapabilityGrant, TaskVerdict } from '../../types'
 import { isGateAskExpired } from '../../gates/approval-expiry-rule'
 import { isOrgAdmin, resolveCapabilities } from '../../auth/capability'
 import { hasProjectWriteForSquads } from '../../projects/access'
@@ -137,25 +137,33 @@ const RECONCILE_MIN_STALENESS_MS = WP_PUBLISH_TIMEOUT_MS * 3
 
 // ── shared authority checks ──────────────────────────────────────────────────────
 
-const OFFICE_DEPARTMENT_SLUG = 'office'
+const OFFICE_CAP_ORDER: readonly Capability[] = ['observer', 'member', 'lead', 'admin', 'owner']
+const officeMeets = (have: Capability, min: Capability): boolean => OFFICE_CAP_ORDER.indexOf(have) >= OFFICE_CAP_ORDER.indexOf(min)
 
-/** B3b: a copy of `auth` whose capability list has no department-scope grant on the `office` department. canActOnSquad
- *  would otherwise let that grant inherit onto every customer squad in the department — exactly the cross-customer
- *  authority this predicate exists to remove. Squad-scope and org-scope grants are untouched. */
-async function withoutOfficeDepartmentGrants(env: Env, auth: AuthContext): Promise<AuthContext> {
-  const grants = auth.capabilities ?? (auth.memberId ? await resolveCapabilities(env, auth.memberId) : undefined)
-  if (!grants) return auth
-  const dept = await env.DB.prepare(`SELECT id FROM departments WHERE slug = ?1 LIMIT 1`).bind(OFFICE_DEPARTMENT_SLUG).first<{ id: string }>()
-  if (!dept) return { ...auth, capabilities: grants }
-  return { ...auth, capabilities: grants.filter((g) => !(g.scope_type === 'department' && g.scope_id === dept.id)) }
+/** B3b r2: the grants that may carry OFFICE authority, and nothing else. Exactly two sources survive: (a) an
+ *  org-scope grant at admin|owner (org admin standing) and (b) a SQUAD-scope grant. When `squadId` is given only a
+ *  squad grant on THAT squad survives. Every department-scope grant (any department, not just `office`) and every
+ *  org-scope member/lead grant is dropped: canActOnSquad would otherwise inherit them onto every non-home squad, i.e.
+ *  onto other customers' squads (signup doors write org-scope member|lead grants). */
+function officeAuthorityGrants(grants: readonly CapabilityGrant[], squadId: string | null): CapabilityGrant[] {
+  return grants.filter((g) =>
+    (g.scope_type === 'org' && (g.capability === 'admin' || g.capability === 'owner')) ||
+    (g.scope_type === 'squad' && (squadId === null || g.scope_id === squadId)))
+}
+
+async function loadOfficeGrants(env: Env, auth: AuthContext): Promise<readonly CapabilityGrant[] | null> {
+  if (auth.capabilities) return auth.capabilities
+  if (auth.memberId) return resolveCapabilities(env, auth.memberId)
+  return null
 }
 
 /** B3b (spec `office-per-customer` §2): the ONE office authority predicate. A caller may act on an office task only
  *  when (1) the task is in a project, (2) the task's squad holds write|admin on that project in project_squad_access,
- *  and (3) the caller holds at least `min` on THAT squad (canActOnSquad). The old department-scope grant on the
- *  `office` department is deliberately NOT a source of authority any more: a department grant inherits to every
- *  non-home squad in the department, so one customer's lead would have been lead over every customer's office squad.
- *  Fail-closed: no project, no project_squad_access row, or no squad grant means refused. */
+ *  and (3) the caller holds at least `min` on THAT squad through ONLY org owner/admin standing or a squad-scope grant
+ *  whose scope is the task's own squad (officeAuthorityGrants). No department-scope grant and no org-scope
+ *  member/lead grant is a source of authority: they inherit onto every non-home squad, so one customer's lead (or any
+ *  door signup) would have authority over every other customer's tasks.
+ *  Fail-closed: no project, no project_squad_access row, or no qualifying grant means refused. */
 export async function hasProjectOfficeCapability(
   env: Env,
   auth: AuthContext,
@@ -163,7 +171,9 @@ export async function hasProjectOfficeCapability(
   min: Capability,
 ): Promise<boolean> {
   if (task.project_id === null || task.project_id === undefined) return false
-  if (!(await canActOnSquad(env, await withoutOfficeDepartmentGrants(env, auth), task.squad_id, min))) return false
+  const grants = await loadOfficeGrants(env, auth)
+  const scoped: AuthContext = grants ? { ...auth, capabilities: officeAuthorityGrants(grants, task.squad_id) } : auth
+  if (!(await canActOnSquad(env, scoped, task.squad_id, min))) return false
   return hasProjectWriteForSquads(env, task.project_id, [task.squad_id])
 }
 
@@ -178,21 +188,25 @@ export async function hasOfficePublishCapability(
   return hasProjectOfficeCapability(env, auth, task, resolveOfficePublishRequiredCapability())
 }
 
-/** office.health has no task: authorised when the caller holds `member` on at least one squad that holds write|admin
- *  on some project (i.e. a squad that is actually a customer project squad). The probe returns a status only and is
- *  cooled down, so it needs a floor, not a per-customer check. */
+/** office.health / list floor (no task): org admin, or the caller's OWN squad-scope grant at >= `min` on a squad that
+ *  holds write|admin on some project. Driven by the caller's grants (one json_each lookup), never by a scan of
+ *  project_squad_access, so the cost is independent of tenant size. Status/list floor only; per-row authority still
+ *  applies to what a list returns. */
 async function hasAnyOfficeSquadCapability(env: Env, auth: AuthContext, min: Capability): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true // floor only: per-row authority below still applies to what a list returns
-  const scoped = await withoutOfficeDepartmentGrants(env, auth)
-  const rows = await env.DB.prepare(
-    `SELECT DISTINCT psa.squad_id AS squad_id
-       FROM project_squad_access psa
-      WHERE psa.access_level IN ('write', 'admin')
-      LIMIT 200`,
-  ).all<{ squad_id: string }>()
-  const cache = new Map<string, Promise<{ department_id: string; kind: OrgKind } | null>>()
-  const allowed = await Promise.all((rows.results ?? []).map((r) => canActOnSquad(env, scoped, r.squad_id, min, cache)))
-  return allowed.some(Boolean)
+  if (isOrgAdmin(auth)) return true
+  const grants = await loadOfficeGrants(env, auth)
+  if (!grants) return false
+  const squadIds = [...new Set(
+    officeAuthorityGrants(grants, null)
+      .filter((g) => g.scope_type === 'squad' && g.scope_id !== null && officeMeets(g.capability, min))
+      .map((g) => g.scope_id as string), // scope_id is non-null for squad scope (filtered on the line above)
+  )]
+  if (squadIds.length === 0) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok FROM project_squad_access
+      WHERE access_level IN ('write', 'admin') AND squad_id IN (SELECT value FROM json_each(?1)) LIMIT 1`,
+  ).bind(JSON.stringify(squadIds)).first<{ ok: number }>()
+  return row !== null
 }
 
 /** What the web approvals page needs to render a gate:office row: the live (non-voided) FROZEN payload the human

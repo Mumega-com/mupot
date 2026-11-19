@@ -231,6 +231,33 @@ describe('POST /approvals/office/:id/decide', () => {
     expect(taskRow(foreign).status).toBe('review')
   })
 
+  it('B3b r2: an ORG-scope lead (door-signup shape) cannot decide another customer\'s office task in the same department', async () => {
+    h.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-custb', ?, 'cust-b', 'Customer B')`).run(deptId)
+    const custbTask = await makeReviewTask(envFor('seed@x.test'), 'squad-custb', 'Publish: customer B post')
+    h.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-custb', 'proj-custb', 'Customer B', 'active')`).run()
+    h.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-custb', 'squad-custb', 'write')`).run()
+    h.sqlite.prepare(`UPDATE tasks SET project_id = 'proj-custb' WHERE id = ?`).run(custbTask)
+    member('mem-orglead', 'orglead@x.test', 'lead', 'org')
+    const { env, cookie } = await login('orglead@x.test')
+    const res = await decide(env, cookie, { verdict: 'approved', payload_sha256: frozenHash(custbTask) }, { id: custbTask })
+    expect(res.status).toBe(403)
+    expect(taskRow(custbTask).status).toBe('review')
+    expect(verdicts()).toEqual([])
+  })
+
+  it('B3b r2: a lead on a NON-office department holding a customer squad cannot decide that customer\'s task', async () => {
+    h.sqlite.exec(`INSERT INTO departments (id, slug, name) VALUES ('d-growth', 'growth', 'Growth');
+                   INSERT INTO squads (id, department_id, slug, name) VALUES ('s-growth', 'd-growth', 'growth-sq', 'Growth Squad');`)
+    const t = await makeReviewTask(envFor('seed@x.test'), 's-growth', 'Publish: growth customer')
+    h.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-gl', 'gl@x.test', 'gl', 'active', ?)`).run(TENANT)
+    h.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-gl', 'mem-gl', 'department', 'd-growth', 'lead')`).run()
+    h.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-gl', 'gate:office', 'member', 'mem-gl', 'test', datetime('now'))`).run()
+    const { env, cookie } = await login('gl@x.test')
+    const res = await decide(env, cookie, { verdict: 'approved', payload_sha256: frozenHash(t) }, { id: t })
+    expect(res.status).toBe(403)
+    expect(taskRow(t).status).toBe('review')
+  })
+
   it('cross-tenant: a session minted for another tenant cannot decide this pot\'s task', async () => {
     const { cookie } = await login('lead@x.test')
     const res = await decide(envFor('lead@x.test', 'other-pot'), cookie, { verdict: 'approved', payload_sha256: frozenHash() })
@@ -288,15 +315,15 @@ describe('/approvals office rows (what the human is shown)', () => {
   })
 
   it('B3b: Approve is offered only on the viewer\'s OWN squad\'s office rows, never another customer\'s (per-squad memo)', async () => {
-    h.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-dme', ?, 'cust-dme', 'DME')`).run(deptId)
-    const dmeTask = await makeReviewTask(envFor('seed@x.test'), 'squad-dme', 'Publish: DME post')
-    // ensureDefaultOfficeProject shares one project; give DME its own, so the squads are genuinely separate customers.
-    h.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-dme', 'proj-dme', 'DME', 'active')`).run()
-    h.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-dme', 'squad-dme', 'write')`).run()
-    h.sqlite.prepare(`UPDATE tasks SET project_id = 'proj-dme' WHERE id = ?`).run(dmeTask)
+    h.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-custb', ?, 'cust-b', 'Customer B')`).run(deptId)
+    const custbTask = await makeReviewTask(envFor('seed@x.test'), 'squad-custb', 'Publish: customer B post')
+    // ensureDefaultOfficeProject shares one project; give customer B its own, so the squads are genuinely separate customers.
+    h.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-custb', 'proj-custb', 'Customer B', 'active')`).run()
+    h.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-custb', 'squad-custb', 'write')`).run()
+    h.sqlite.prepare(`UPDATE tasks SET project_id = 'proj-custb' WHERE id = ?`).run(custbTask)
     const { html } = await authFor('lead@x.test') // mem-lead: lead on the default office squad only
     expect(html).toContain(`data-office-sha="${frozenHash(taskId)}"`)
-    expect(html).not.toContain(`data-office-sha="${frozenHash(dmeTask)}"`)
+    expect(html).not.toContain(`data-office-sha="${frozenHash(custbTask)}"`)
     // a department:office-only lead is offered nothing at all
     h.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-dept', 'dept@x.test', 'dept', 'active', ?)`).run(TENANT)
     h.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dept', 'mem-dept', 'department', ?, 'lead')`).run(deptId)

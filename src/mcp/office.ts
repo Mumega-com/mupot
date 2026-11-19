@@ -35,7 +35,7 @@ const STRING_SCHEMA = { type: 'string' }
 
 const toolOfficePublishPost: ToolSpec = {
   name: 'office.publish_post',
-  scope: 'department:office (lead) — WRITE, gated on an approved task_verdict',
+  scope: 'squad lead on the task\'s own squad (or org admin) — WRITE, gated on an approved task_verdict',
   min: 'member',
   // P0-1 (kasra-review + Athena, PR #1588 round 1): title/content are DELIBERATELY
   // NOT accepted here anymore. A human approval must authorize exactly one write
@@ -68,7 +68,7 @@ const toolOfficePublishPost: ToolSpec = {
 
 const toolOfficeListPendingApprovals: ToolSpec = {
   name: 'office.list_pending_approvals',
-  scope: 'department:office (member) — read-only',
+  scope: 'squad member on the task\'s own squad (or org admin) — read-only',
   min: 'member',
   args: '{ limit?: number }',
   inputSchema: {
@@ -91,7 +91,7 @@ const toolOfficeListPendingApprovals: ToolSpec = {
 // never lets the credential or a response body leave the connector vault call).
 const toolOfficeHealth: ToolSpec = {
   name: 'office.health',
-  scope: 'department:office (member) — read-only probe of the bound WordPress connector',
+  scope: 'squad member on a customer project squad (or org admin) — read-only probe of the bound WordPress connector',
   min: 'member',
   args: '{}',
   inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
