@@ -4147,8 +4147,8 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
     await seedConnector(harness, 'conn-a', SITE_A, 'squad', 'squad-a')
     await seedConnector(harness, 'conn-b', SITE_B, 'squad', 'squad-b')
     const owner = orgOwnerAuth()
-    expect((await bindProjectOfficeSlot(testEnv, owner, { projectId: 'proj-a', slot: 'wordpress_site', connectorId: 'conn-a', capability: 'write' })).ok).toBe(true)
-    expect((await bindProjectOfficeSlot(testEnv, owner, { projectId: 'proj-b', slot: 'wordpress_site', connectorId: 'conn-b', capability: 'write' })).ok).toBe(true)
+    expect((await bindProjectOfficeSlot(testEnv, owner, { projectId: 'proj-a', slot: 'wordpress_site', connectorId: 'conn-a' })).ok).toBe(true)
+    expect((await bindProjectOfficeSlot(testEnv, owner, { projectId: 'proj-b', slot: 'wordpress_site', connectorId: 'conn-b' })).ok).toBe(true)
     return { harness, testEnv, departmentId, owner }
   }
 
@@ -4250,7 +4250,7 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       await seedConnector(harness, 'conn-agent', SITE_A, 'agent', 'some-agent')
       await seedConnector(harness, 'conn-pot-shared', 'https://pot.example.com', 'pot', null)
       const bind = (projectId: string, connectorId: string, who = owner) =>
-        bindProjectOfficeSlot(testEnv, who, { projectId, slot: 'wordpress_site', connectorId, capability: 'write' })
+        bindProjectOfficeSlot(testEnv, who, { projectId, slot: 'wordpress_site', connectorId })
 
       expect(await bind('proj-a', 'conn-agent')).toEqual({ ok: false, reason: 'connector_scope_refused' })
       // customer B's squad connector onto customer A's project
@@ -4413,6 +4413,166 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       }
       harness.sqlite.exec(migration)
       expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM project_office_bindings`).get()).toEqual({ n: 0 })
+      harness.close()
+    })
+
+    it('fails closed: the only office-task project is ARCHIVED -> nothing is copied (no stranded binding)', async () => {
+      const { harness, migration } = await preMigrationDb()
+      const testEnv = env(harness)
+      const { squadId } = seedOfficeDepartmentAndSquad(harness)
+      const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 's')
+      seedActiveOfficeInstallation(harness, connectorId)
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('p1','p1','P1','active')`).run()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p1', ?, 'write')`).run(squadId)
+      await createTask(testEnv, { squad_id: squadId, project_id: 'p1', title: 't', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
+      harness.sqlite.prepare(`UPDATE projects SET status = 'archived' WHERE id = 'p1'`).run()
+      harness.sqlite.exec(migration)
+      expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM project_office_bindings`).get()).toEqual({ n: 0 })
+      harness.close()
+    })
+
+    it('an archived office project beside ONE active one: only the active project is bound', async () => {
+      const { harness, migration } = await preMigrationDb()
+      const testEnv = env(harness)
+      const { squadId } = seedOfficeDepartmentAndSquad(harness)
+      const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 's')
+      seedActiveOfficeInstallation(harness, connectorId)
+      for (const p of ['p1', 'p2']) {
+        harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES (?, ?, ?, 'active')`).run(p, p, p)
+        harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES (?, ?, 'write')`).run(p, squadId)
+        await createTask(testEnv, { squad_id: squadId, project_id: p, title: 't', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
+      }
+      harness.sqlite.prepare(`UPDATE projects SET status = 'archived' WHERE id = 'p1'`).run()
+      harness.sqlite.exec(migration)
+      expect(harness.sqlite.prepare(`SELECT project_id FROM project_office_bindings`).all()).toEqual([{ project_id: 'p2' }])
+      harness.close()
+    })
+
+    it('fails closed: more than one active addon-level wordpress_site binding -> nothing is guessed or copied', async () => {
+      const { harness, migration } = await preMigrationDb()
+      const testEnv = env(harness)
+      const { squadId } = seedOfficeDepartmentAndSquad(harness)
+      const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 's')
+      seedActiveOfficeInstallation(harness, connectorId)
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('p1','p1','P1','active')`).run()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p1', ?, 'write')`).run(squadId)
+      await createTask(testEnv, { squad_id: squadId, project_id: 'p1', title: 't', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
+      // a second live binding on the same installation (the unique live-slot index would forbid it)
+      harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+      harness.sqlite.exec('DROP INDEX idx_addon_live_binding_slot')
+      harness.sqlite.exec('DROP TRIGGER addon_connector_bindings_matches_generation')
+      const bind = harness.sqlite.prepare(`SELECT * FROM addon_connector_bindings WHERE slot = 'wordpress_site'`).get() as Record<string, unknown>
+      const bcols = Object.keys(bind)
+      const bdup = { ...bind, id: 'binding-office-dup', generation_id: 'gen-office-dup' }
+      harness.sqlite.prepare(`INSERT INTO addon_connector_bindings (${bcols.join(',')}) VALUES (${bcols.map(() => '?').join(',')})`).run(...bcols.map((c) => (bdup as Record<string, never>)[c]))
+      expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM addon_connector_bindings WHERE slot = 'wordpress_site' AND revoked_at IS NULL`).get()).toEqual({ n: 2 })
+      harness.sqlite.exec(migration)
+      expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM project_office_bindings`).get()).toEqual({ n: 0 })
+      harness.close()
+    })
+  })
+
+  describe('B3a round 2: office.bind_project_site / office.unbind_project_site', () => {
+    it('owner binds a customer project without SQL; capability comes from the manifest; publish reaches that site only', async () => {
+      const { harness, testEnv, departmentId, owner } = await twoCustomers()
+      await seedConnector(harness, 'conn-a-new', 'https://new-a.example.com', 'squad', 'squad-a')
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const bound = await invokeTool(owner, testEnv, 'office.bind_project_site', { project_id: 'proj-a', wordpress_connector_id: 'conn-a-new', capability: 'read' }, ORIGIN)
+      // the caller cannot choose a capability: unknown field is a hard invalid_args
+      expect(bound.ok).toBe(false)
+      const ok = await invokeTool(owner, testEnv, 'office.bind_project_site', { project_id: 'proj-a', wordpress_connector_id: 'conn-a-new' }, ORIGIN)
+      expect(ok.ok).toBe(true)
+      expect(harness.sqlite.prepare(`SELECT connector_id, capability FROM project_office_bindings WHERE project_id = 'proj-a' AND slot = 'wordpress_site'`).get())
+        .toEqual({ connector_id: 'conn-a-new', capability: 'write' })
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      await approveOfficeTask(testEnv, ta)
+      expect((await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)).ok).toBe(true)
+      expect(fetchedOrigins(spy)).toEqual(['https://new-a.example.com'])
+      harness.close()
+    })
+
+    it('non-admin is refused; the binding is untouched', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const member = auth('m1', [grant('squad', 'squad-a', 'lead')])
+      for (const tool of ['office.bind_project_site', 'office.unbind_project_site'] as const) {
+        const args = tool === 'office.bind_project_site' ? { project_id: 'proj-a', wordpress_connector_id: 'conn-a' } : { project_id: 'proj-a' }
+        const r = await invokeTool(member, testEnv, tool, args, ORIGIN)
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.status).toBe(403)
+      }
+      expect(harness.sqlite.prepare(`SELECT connector_id, revoked_at FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a', revoked_at: null })
+      harness.close()
+    })
+
+    it('agent-bound and attached-seat sessions are refused even with owner capabilities (operator_principal_required)', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      await seedConnector(harness, 'conn-a-new', 'https://new-a.example.com', 'squad', 'squad-a')
+      const agentBound: AuthContext = { ...orgOwnerAuth(), boundAgentId: 'agent-1' }
+      const attached: AuthContext = {
+        ...orgOwnerAuth(),
+        seatBinding: { seatId: 's', label: 'l', harnessId: 'h', grantTokenId: 't', humanMemberId: 'm', source: 'handle',
+          attached: { attachmentId: 'a', admissionId: 'ad', agentId: 'agent-1', seatAgentId: 'seat-1', ceiling: 'full' } },
+      }
+      for (const who of [agentBound, attached]) {
+        for (const [tool, args] of [
+          ['office.bind_project_site', { project_id: 'proj-a', wordpress_connector_id: 'conn-a-new' }],
+          ['office.unbind_project_site', { project_id: 'proj-a' }],
+        ] as const) {
+          const r = await invokeTool(who, testEnv, tool, args, ORIGIN)
+          expect(r.ok).toBe(false)
+          if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe('operator_principal_required') }
+        }
+      }
+      expect(harness.sqlite.prepare(`SELECT connector_id, revoked_at FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a', revoked_at: null })
+      harness.close()
+    })
+
+    it("binding another squad's connector is refused through the tool (confused deputy)", async () => {
+      const { harness, testEnv, owner } = await twoCustomers()
+      const r = await invokeTool(owner, testEnv, 'office.bind_project_site', { project_id: 'proj-a', wordpress_connector_id: 'conn-b' }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe('connector_scope_refused') }
+      expect(harness.sqlite.prepare(`SELECT connector_id FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a' })
+      harness.close()
+    })
+
+    it('revoke -> publish refuses project_not_bound with ZERO fetches; the claim is never taken', async () => {
+      const { harness, testEnv, departmentId, owner } = await twoCustomers()
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      await approveOfficeTask(testEnv, ta)
+      const un = await invokeTool(owner, testEnv, 'office.unbind_project_site', { project_id: 'proj-a' }, ORIGIN)
+      expect(un.ok).toBe(true)
+      const r = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.error).toBe('project_not_bound')
+      expect(spy).not.toHaveBeenCalled()
+      expect(harness.sqlite.prepare(`SELECT claimed_at FROM office_publish_freezes WHERE task_id = ?`).get(ta)).toEqual({ claimed_at: null })
+      // revoking an already-revoked / never-bound project is a clean refusal, not a silent ok
+      const again = await invokeTool(owner, testEnv, 'office.unbind_project_site', { project_id: 'proj-a' }, ORIGIN)
+      expect(again.ok).toBe(false)
+      harness.close()
+    })
+
+    it('M12: resolveProjectOfficeBinding ignores a revoked row (revoked_at set directly -> project_not_bound)', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const { resolveProjectOfficeBinding } = await import('../src/addons/office/project-binding')
+      expect((await resolveProjectOfficeBinding(testEnv, 'proj-a', 'wordpress_site')).ok).toBe(true)
+      harness.sqlite.prepare(`UPDATE project_office_bindings SET revoked_at = '2026-02-01T00:00:00Z' WHERE project_id = 'proj-a'`).run()
+      expect(await resolveProjectOfficeBinding(testEnv, 'proj-a', 'wordpress_site')).toEqual({ ok: false, reason: 'project_not_bound' })
+      harness.close()
+    })
+
+    it('MCP task_update cannot retarget project_id of a frozen office task (REST parity)', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-b', 'squad-a', 'write')`).run()
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const r = await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: ta, project_id: 'proj-b' }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) { expect(r.status).toBe(409); expect(r.error).toBe('office_payload_frozen') }
+      expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = ?`).get(ta)).toEqual({ project_id: 'proj-a' })
       harness.close()
     })
   })

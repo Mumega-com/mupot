@@ -33,20 +33,24 @@ UPDATE office_publish_freezes
  WHERE project_id IS NULL;
 
 -- Backfill: carry the single active addon-level wordpress_site binding over to its owning
--- project. "Owning project" = the ONE project that has gate:office tasks. If there is not
+-- project. "Owning project" = the ONE ACTIVE project that has gate:office tasks (an archived
+-- or otherwise inactive project is never bound: it would strand the only connector on a
+-- project nobody publishes for). If there is not
 -- exactly one active binding and exactly one such project, NOTHING is copied (fail closed:
 -- an operator binds explicitly) — guessing here would be the very confused-deputy bug.
 INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by)
 SELECT p.project_id, 'wordpress_site', b.connector_id, b.capability_v2, 'migration:0276'
-  FROM (SELECT DISTINCT project_id FROM tasks
-         WHERE gate_owner = 'gate:office' AND project_id IS NOT NULL) p
+  FROM (SELECT DISTINCT t.project_id FROM tasks t
+          JOIN projects pr ON pr.id = t.project_id AND pr.status = 'active'
+         WHERE t.gate_owner = 'gate:office' AND t.project_id IS NOT NULL) p
   JOIN addon_connector_bindings b
     ON b.slot = 'wordpress_site' AND b.revoked_at IS NULL AND b.connector_id IS NOT NULL
   JOIN addon_installations i
     ON i.id = b.installation_id AND i.tenant = b.tenant
    AND i.addon_key = 'mcpwp-office' AND i.state = 'active'
- WHERE (SELECT COUNT(DISTINCT project_id) FROM tasks
-         WHERE gate_owner = 'gate:office' AND project_id IS NOT NULL) = 1
+ WHERE (SELECT COUNT(DISTINCT t2.project_id) FROM tasks t2
+          JOIN projects pr2 ON pr2.id = t2.project_id AND pr2.status = 'active'
+         WHERE t2.gate_owner = 'gate:office' AND t2.project_id IS NOT NULL) = 1
    AND (SELECT COUNT(*) FROM addon_connector_bindings b2
           JOIN addon_installations i2 ON i2.id = b2.installation_id AND i2.tenant = b2.tenant
          WHERE b2.slot = 'wordpress_site' AND b2.revoked_at IS NULL AND b2.connector_id IS NOT NULL

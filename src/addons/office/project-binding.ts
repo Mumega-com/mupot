@@ -23,6 +23,15 @@
 
 import type { AuthContext, Env } from '../../types'
 import type { OfficeResult } from './freeze'
+import { isOrgAdmin } from '../../auth/capability'
+import { McpwpOfficeAddon } from './manifest'
+
+/** The capability a project's wordpress_site binding carries, taken from the addon manifest
+ *  (connectorRequirements), never from a caller. */
+export function manifestOfficeSlotCapability(slot: ProjectOfficeSlot): ProjectOfficeCapability | null {
+  const req = McpwpOfficeAddon.connectorRequirements.find((r) => r.slot === slot)
+  return req?.capability === 'write' ? 'write' : req?.capability === 'read' ? 'read' : null
+}
 
 export type ProjectOfficeSlot = 'wordpress_site' | 'inkwell_site'
 export type ProjectOfficeCapability = 'read' | 'write'
@@ -79,13 +88,16 @@ export async function assertProjectMayUseConnector(
   return { ok: true, value: true }
 }
 
-/** Owner/admin binds a project's office destination. No MCP tool wraps this yet (B3a). */
+/** Owner/admin binds a project's office destination (MCP: office.bind_project_site). The capability
+ *  is the manifest's for the slot, never the caller's. */
 export async function bindProjectOfficeSlot(
   env: Env,
   auth: AuthContext,
-  input: { projectId: string; slot: ProjectOfficeSlot; connectorId: string; capability: ProjectOfficeCapability },
+  input: { projectId: string; slot: ProjectOfficeSlot; connectorId: string },
 ): Promise<OfficeResult<ProjectOfficeBinding>> {
-  if (auth.role !== 'owner' && auth.role !== 'admin') return { ok: false, reason: 'not_authorized' }
+  if (!isOrgAdmin(auth)) return { ok: false, reason: 'not_authorized' }
+  const capability = manifestOfficeSlotCapability(input.slot)
+  if (!capability) return { ok: false, reason: 'invalid_site_config', hint: 'slot is not declared by the office manifest' }
   const project = await env.DB.prepare(`SELECT 1 FROM projects WHERE id = ?1`).bind(input.projectId).first()
   if (!project) return { ok: false, reason: 'project_not_bound', hint: 'project not found' }
   const guard = await assertProjectMayUseConnector(env, input.projectId, input.slot, input.connectorId)
@@ -97,10 +109,24 @@ export async function bindProjectOfficeSlot(
       connector_id = excluded.connector_id, capability = excluded.capability,
       bound_by = excluded.bound_by, bound_at = excluded.bound_at, revoked_at = NULL
   `).bind(
-    input.projectId, input.slot, input.connectorId, input.capability,
+    input.projectId, input.slot, input.connectorId, capability,
     auth.memberId ?? auth.userId, new Date().toISOString(),
   ).run()
-  return { ok: true, value: { projectId: input.projectId, slot: input.slot, connectorId: input.connectorId, capability: input.capability } }
+  return { ok: true, value: { projectId: input.projectId, slot: input.slot, connectorId: input.connectorId, capability } }
+}
+
+/** Owner/admin revokes a project's office destination; publishing then refuses project_not_bound. */
+export async function revokeProjectOfficeSlot(
+  env: Env,
+  auth: AuthContext,
+  input: { projectId: string; slot: ProjectOfficeSlot },
+): Promise<OfficeResult<{ projectId: string; slot: ProjectOfficeSlot }>> {
+  if (!isOrgAdmin(auth)) return { ok: false, reason: 'not_authorized' }
+  const res = await env.DB.prepare(
+    `UPDATE project_office_bindings SET revoked_at = ?3 WHERE project_id = ?1 AND slot = ?2 AND revoked_at IS NULL`,
+  ).bind(input.projectId, input.slot, new Date().toISOString()).run()
+  if (!res.meta?.changes) return { ok: false, reason: 'project_not_bound' }
+  return { ok: true, value: { projectId: input.projectId, slot: input.slot } }
 }
 
 /** Resolves (projectId, slot) to its connector, re-running the confused-deputy guard NOW. */

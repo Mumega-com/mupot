@@ -267,6 +267,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   'office.health': ADDX('getOfficeHealth caches the probe in org_settings (service.ts:213-233) after a vault-mediated external fetch (health.ts)'),
   'office.review_approval': MUT('reviewOfficeApproval records an approve/reject verdict via the task verdict path (addons/office/service.ts:347)'),
   'office.reconcile_stalled_publish': MUTX('reconcileStalledOfficePublish looks up WordPress, UPDATE office_publish_freezes outcome (addons/office/service.ts:1435,1470)'),
+  'office.bind_project_site': MUT('bindProjectOfficeSlot upserts project_office_bindings (addons/office/project-binding.ts)'),
+  'office.unbind_project_site': MUT('revokeProjectOfficeSlot sets project_office_bindings.revoked_at (addons/office/project-binding.ts)'),
 
   // ── routines ───────────────────────────────────────────────────────────────────────────────
   routine_list: RO('listRoutines SELECT only (routines/service.ts:389)'),

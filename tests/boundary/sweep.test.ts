@@ -211,6 +211,7 @@ const UNPROVEN: Record<string, string> = {
     'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
     'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
     'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+    'office.bind_project_site', 'office.unbind_project_site',
   ]),
   // #2411: B was promoted to lead while A's baseline was a plain member — rank asymmetry made these
   // look non-vacuous. Compared lead-to-lead both hear the same words.
@@ -308,6 +309,7 @@ describe('the control list is honest', () => {
       'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
       'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
       'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+      'office.bind_project_site', 'office.unbind_project_site',
     ]) {
       expect(live.has(n), `${n}: admin-floor success must not count as PROVEN`).toBe(false)
       expect(vacuous.has(n), `${n}: B-lead vs A-lead must match for admin-floor tools`).toBe(true)

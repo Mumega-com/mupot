@@ -4885,13 +4885,13 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0276_project_office_bindings.sql",
-    sha256: "197ad93e224d48abccd18018a7c6f74c68a88fcc6608626d06d9b08606a4e1be",
+    sha256: "c9e31eb8bd6b3f5fb83c01de6bc01c5f2a5686715fc9ba8128f133db14e8704b",
     statements: [
       "CREATE TABLE IF NOT EXISTS project_office_bindings (\n  project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,\n  slot         TEXT NOT NULL CHECK (slot IN ('wordpress_site', 'inkwell_site')),\n  connector_id TEXT NOT NULL,\n  capability   TEXT NOT NULL CHECK (capability IN ('read', 'write')),\n  bound_by     TEXT NOT NULL,\n  bound_at     TEXT NOT NULL DEFAULT (datetime('now')),\n  revoked_at   TEXT,\n  PRIMARY KEY (project_id, slot)\n);",
       "CREATE INDEX IF NOT EXISTS idx_project_office_bindings_connector\n  ON project_office_bindings (connector_id) WHERE revoked_at IS NULL;",
       "ALTER TABLE office_publish_freezes ADD COLUMN project_id TEXT;",
       "UPDATE office_publish_freezes\n   SET project_id = (SELECT t.project_id FROM tasks t WHERE t.id = office_publish_freezes.task_id)\n WHERE project_id IS NULL;",
-      "INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by)\nSELECT p.project_id, 'wordpress_site', b.connector_id, b.capability_v2, 'migration:0276'\n  FROM (SELECT DISTINCT project_id FROM tasks\n         WHERE gate_owner = 'gate:office' AND project_id IS NOT NULL) p\n  JOIN addon_connector_bindings b\n    ON b.slot = 'wordpress_site' AND b.revoked_at IS NULL AND b.connector_id IS NOT NULL\n  JOIN addon_installations i\n    ON i.id = b.installation_id AND i.tenant = b.tenant\n   AND i.addon_key = 'mcpwp-office' AND i.state = 'active'\n WHERE (SELECT COUNT(DISTINCT project_id) FROM tasks\n         WHERE gate_owner = 'gate:office' AND project_id IS NOT NULL) = 1\n   AND (SELECT COUNT(*) FROM addon_connector_bindings b2\n          JOIN addon_installations i2 ON i2.id = b2.installation_id AND i2.tenant = b2.tenant\n         WHERE b2.slot = 'wordpress_site' AND b2.revoked_at IS NULL AND b2.connector_id IS NOT NULL\n           AND i2.addon_key = 'mcpwp-office' AND i2.state = 'active') = 1;",
+      "INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by)\nSELECT p.project_id, 'wordpress_site', b.connector_id, b.capability_v2, 'migration:0276'\n  FROM (SELECT DISTINCT t.project_id FROM tasks t\n          JOIN projects pr ON pr.id = t.project_id AND pr.status = 'active'\n         WHERE t.gate_owner = 'gate:office' AND t.project_id IS NOT NULL) p\n  JOIN addon_connector_bindings b\n    ON b.slot = 'wordpress_site' AND b.revoked_at IS NULL AND b.connector_id IS NOT NULL\n  JOIN addon_installations i\n    ON i.id = b.installation_id AND i.tenant = b.tenant\n   AND i.addon_key = 'mcpwp-office' AND i.state = 'active'\n WHERE (SELECT COUNT(DISTINCT t2.project_id) FROM tasks t2\n          JOIN projects pr2 ON pr2.id = t2.project_id AND pr2.status = 'active'\n         WHERE t2.gate_owner = 'gate:office' AND t2.project_id IS NOT NULL) = 1\n   AND (SELECT COUNT(*) FROM addon_connector_bindings b2\n          JOIN addon_installations i2 ON i2.id = b2.installation_id AND i2.tenant = b2.tenant\n         WHERE b2.slot = 'wordpress_site' AND b2.revoked_at IS NULL AND b2.connector_id IS NOT NULL\n           AND i2.addon_key = 'mcpwp-office' AND i2.state = 'active') = 1;",
     ],
     objects: [
       { type: "table", name: "project_office_bindings" },
@@ -4903,4 +4903,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "9e02f115e4f35ae3a18d784cb5df839c6ed7a9c9f23c74172576e2e91fca9daa"
+export const SCHEMA_CHAIN_DIGEST: string = "01017221d13021a3f9d3e3cb203c051922c8f9b7b7ccf03103a31392fec8bdce"
