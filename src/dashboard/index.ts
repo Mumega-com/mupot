@@ -1145,13 +1145,20 @@ dashboardApp.post('/approvals/office/:id/decide', async (c) => {
   }
   const auth = c.get('auth')
   // A real signed-in human in a browser: a bearer / agent / OAuth caller has no web session.
-  const session = await checkWebSession(c.env, auth, { fresh: false })
-  if (!session.ok) return c.json({ error: session.error }, session.status)
   // An attached seat verdicts AS its bound agent; a human decision is never made by an agent.
+  const preSession = await checkWebSession(c.env, auth, { fresh: false })
+  if (!preSession.ok) return c.json({ error: preSession.error }, preSession.status)
   if (auth.boundAgentId) return c.json({ error: 'agent_approval_forbidden' }, 403)
   const form = await c.req.parseBody()
   const verdict = form.verdict
   if (verdict !== 'approved' && verdict !== 'rejected') return c.json({ error: 'invalid_verdict' }, 400)
+  // Approve authorises a public WordPress write: it needs a fresh step-up (same rule as /agents/:id/designation allow).
+  // Reject authorises nothing and stays non-fresh. The page script follows reauth_url and lands back on /approvals.
+  const session = await checkWebSession(c.env, auth, { fresh: verdict === 'approved' })
+  if (!session.ok) {
+    if (session.error === 'reauth_required') return c.json({ error: 'reauth_required', reauth_url: reauthRedirectUrl('/approvals') }, session.status)
+    return c.json({ error: session.error }, session.status)
+  }
   const note = typeof form.note === 'string' && form.note.trim() ? form.note.trim() : null
   const shownHash = typeof form.payload_sha256 === 'string' && form.payload_sha256 ? form.payload_sha256 : null
   const { resolveTaskEntity } = await import('../lib/entity-resolver')
@@ -5937,7 +5944,15 @@ export function opsHealthBody(data: OpsHealthData) {
 // gate:office rows decide through POST /approvals/office/:id/decide, binding to the frozen payload hash shown
 // on the card (data-office-sha). Empty for every other gate, so their wiring is unchanged.
 function officeShaAttr(t: ApprovalItem): string {
-  return t.office_payload_sha256 ? ` data-office-sha="${escAttr(t.office_payload_sha256)}"` : ''
+  const office = t.is_office ? ' data-office="1"' : ''
+  return office + (t.office_payload_sha256 ? ` data-office-sha="${escAttr(t.office_payload_sha256)}"` : '')
+}
+
+// gate:office rows: where Approve would publish (the frozen site_origin, inside the hashed payload).
+function officeDestinationHtml(t: ApprovalItem): string {
+  return t.is_office && t.office_site_origin
+    ? `<div class="appr-dest muted">Publishes to <code>${escHtml(t.office_site_origin)}</code></div>`
+    : ''
 }
 
 function approvalCardHtml(t: ApprovalItem): string {
@@ -5967,6 +5982,7 @@ function approvalCardHtml(t: ApprovalItem): string {
         <div class="appr-when">${when}</div>
       </div>
       <div class="appr-body">${escHtml(t.body)}</div>
+      ${officeDestinationHtml(t)}
       ${previewHtml}
       <div class="appr-actions">${actionsHtml}</div>
     </div>`
@@ -5996,9 +6012,10 @@ function obsQueueScript(): string {
             }
             card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
             status.textContent = '…';
-            var officeSha = card.getAttribute('data-office-sha');
-            // gate:office: form POST (csrf Origin check applies) to the office door, bound to the hash on this card.
-            var req = officeSha
+            var officeSha = card.getAttribute('data-office-sha') || '';
+            // gate:office (every office row, frozen or not): form POST (csrf Origin check applies) to the office door;
+            // approve is bound to the hash on this card, reject needs none.
+            var req = card.getAttribute('data-office') === '1'
               ? fetch('/approvals/office/' + encodeURIComponent(id) + '/decide', {
                   method: 'POST', credentials: 'same-origin',
                   headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -6015,6 +6032,9 @@ function obsQueueScript(): string {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved' : 'rejected';
                 card.classList.add('decided');
+              } else if (r.data && r.data.error === 'reauth_required' && r.data.reauth_url) {
+                status.textContent = 'signing you in again…';
+                window.location.href = r.data.reauth_url;
               } else {
                 status.textContent = (r.data && r.data.error) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
@@ -6970,6 +6990,7 @@ function approvalRowHtml(t: ApprovalItem, showGate = false): string {
         </div>
         <div class="appr-actions">${actions}</div>
       </div>
+      ${officeDestinationHtml(t)}
       ${detail}
     </div>`
 }
@@ -7172,9 +7193,10 @@ function approvalsScript() {
             }
             card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
             status.textContent = '…';
-            var officeSha = card.getAttribute('data-office-sha');
-            // gate:office: form POST (csrf Origin check applies) to the office door, bound to the hash on this card.
-            var req = officeSha
+            var officeSha = card.getAttribute('data-office-sha') || '';
+            // gate:office (every office row, frozen or not): form POST (csrf Origin check applies) to the office door;
+            // approve is bound to the hash on this card, reject needs none.
+            var req = card.getAttribute('data-office') === '1'
               ? fetch('/approvals/office/' + encodeURIComponent(id) + '/decide', {
                   method: 'POST', credentials: 'same-origin',
                   headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -7191,6 +7213,9 @@ function approvalsScript() {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved ✓' : 'rejected ✗';
                 card.classList.add('decided');
+              } else if (r.data && r.data.error === 'reauth_required' && r.data.reauth_url) {
+                status.textContent = 'signing you in again…';
+                window.location.href = r.data.reauth_url;
               } else {
                 status.textContent = (r.data && r.data.error) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });

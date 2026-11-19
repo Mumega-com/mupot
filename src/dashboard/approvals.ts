@@ -63,6 +63,10 @@ export interface ApprovalItem {
    *  then the frozen bytes, not the live row). The web Approve control posts this back so the decision binds
    *  to exactly what was displayed (mupot#1592 NEW-1). Null/absent: nothing frozen, approve is not offered. */
   office_payload_sha256?: string | null
+  /** True for every gate:office row (even with no live freeze), so the page routes it to the office door. */
+  is_office?: boolean
+  /** gate:office rows: the frozen site_origin (inside the hashed payload) - where Approve would publish. */
+  office_site_origin?: string | null
   // mupot#1081 — see module header. can_verdict = can_approve || can_reject;
   // kept as its own field because the card/queue UI decides whether to render
   // ANY action affordance at all (vs. the specific Approve/Reject buttons)
@@ -230,7 +234,7 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
     rows.map(async (row) => {
       const gateOwner = row.gate_owner
       if (!gateOwner || !(await canActOnSquad(env, auth, row.squad_id, 'member', deptCache))) {
-        return { ...row, can_verdict: false, can_approve: false, can_reject: false }
+        return { ...row, ...(gateOwner === OFFICE_GATE_OWNER ? { is_office: true } : {}), can_verdict: false, can_approve: false, can_reject: false }
       }
       // mupot#1592 NEW-2: a gate namespace with its OWN dedicated verdict tool
       // (today: gate:office → office.review_approval) can never be decided
@@ -269,7 +273,7 @@ async function decorateOfficeRow(
   row: ApprovalRow,
   gateCache: ReturnType<typeof createVerdictGateCache>,
 ): Promise<ApprovalItem> {
-  const none = { ...row, can_verdict: false, can_approve: false, can_reject: false }
+  const none = { ...row, is_office: true, can_verdict: false, can_approve: false, can_reject: false }
   if (auth.boundAgentId) return none
   const ctx = await loadOfficeDecisionContext(env, row.id)
   if (!ctx) return none
@@ -282,9 +286,11 @@ async function decorateOfficeRow(
     evaluateVerdictGates(env, auth, task, 'rejected', gateCache),
   ])
   const shown = ctx.frozen ? { ...row, title: ctx.frozen.title, body: ctx.frozen.content } : row
-  const can_approve = approveResult.allowed && ctx.frozen !== null
+  // A freeze that no longer matches the live title/body is stale: the server 409s payload_stale, so do not offer Approve.
+  const frozenIsLive = ctx.frozen !== null && ctx.frozen.title === row.title && ctx.frozen.content === row.body
+  const can_approve = approveResult.allowed && frozenIsLive
   const can_reject = rejectResult.allowed
-  return { ...shown, office_payload_sha256: ctx.frozen?.payload_sha256 ?? null, can_verdict: can_approve || can_reject, can_approve, can_reject }
+  return { ...shown, is_office: true, office_site_origin: ctx.frozen?.site_origin ?? null, office_payload_sha256: ctx.frozen?.payload_sha256 ?? null, can_verdict: can_approve || can_reject, can_approve, can_reject }
 }
 
 // mupot#1319 round 2, Codex FINDING 3 + FINDING 4/2: the caller-facing result

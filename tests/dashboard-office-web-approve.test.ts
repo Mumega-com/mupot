@@ -38,6 +38,7 @@ import { createTask } from '../src/tasks/service'
 import { invokeTool } from '../src/mcp/index'
 import '../src/mcp/office'
 import { loadApprovals } from '../src/dashboard/approvals'
+import { RECENT_REAUTH_WINDOW_MS } from '../src/auth/web-sessions'
 
 const TENANT = 'local'
 const ORIGIN = 'http://localhost'
@@ -69,8 +70,12 @@ async function login(email: string, tenant = TENANT): Promise<{ env: Env; cookie
   expect(res.status).toBe(302)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
+  // Approve needs a fresh step-up (round 2); every session starts fresh, tests that exercise the step-up make it stale.
+  h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString())
   return { env, cookie: `mupot_session=${m[1]}` }
 }
+const staleReauth = (): void =>
+  void h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date(Date.now() - (RECENT_REAUTH_WINDOW_MS + 60_000)).toISOString())
 const frozenHash = (id = taskId): string =>
   (h.sqlite.prepare('SELECT payload_sha256 AS s FROM office_publish_freezes WHERE task_id = ? AND voided_at IS NULL').get(id) as { s: string }).s
 const taskRow = (id = taskId) =>
@@ -266,7 +271,7 @@ describe('/approvals office rows (what the human is shown)', () => {
     const { html } = await authFor('lead@x.test')
     expect(html).toContain(`data-office-sha="${frozenHash()}"`)
     expect(html).toContain('the exact words')
-    expect(html).toContain('appr-approve')
+    expect(html).toContain('class="btn appr-approve"')
     expect(html).toContain('/approvals/office/')
   })
 
@@ -280,15 +285,108 @@ describe('/approvals office rows (what the human is shown)', () => {
     h.sqlite.prepare(`UPDATE tasks SET assignee_member_id = 'mem-lead' WHERE id = ?`).run(taskId)
     const { html } = await authFor('lead@x.test')
     expect(html).not.toContain(`data-office-sha="${frozenHash()}"`)
+    expect(html).not.toContain('class="btn appr-approve"')
+    expect(html).not.toContain('class="btn btn-reject appr-reject"')
   })
 
-  it('loadApprovals: an agent-bound caller gets no actions on an office row', async () => {
-    const env = envFor('seed@x.test')
-    const q = await loadApprovals(env, {
-      userId: 'mem-lead', email: null, role: 'member', tenant: TENANT, memberId: 'mem-lead', boundAgentId: 'agent-x',
-      capabilities: [{ member_id: 'mem-lead', scope_type: 'org', scope_id: null, capability: 'owner' }],
-    })
+  // An org owner passes every capability/gate check on its own (isOrgAdmin), so the UI's own pre-checks are the only thing
+  // that stops these two rows from offering a button the service would refuse. Each renders the real row.
+  const ownerAuth = (extra: { boundAgentId: string | null }) => ({
+    userId: 'mem-lead', email: null, role: 'owner' as const, tenant: TENANT, memberId: 'mem-lead', boundAgentId: extra.boundAgentId,
+    capabilities: [{ member_id: 'mem-lead', scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }],
+  })
+
+  it('loadApprovals control: an unbound owner is offered Approve and Reject on the row', async () => {
+    const q = await loadApprovals(envFor('seed@x.test'), ownerAuth({ boundAgentId: null }))
     const row = q.items.find((i) => i.id === taskId)
+    expect(row, 'office row must be visible to an owner').toBeDefined()
+    expect(row).toMatchObject({ is_office: true, can_approve: true, can_reject: true })
+  })
+
+  it('loadApprovals: an agent-bound caller gets no actions on an office row (UI boundAgentId check)', async () => {
+    const q = await loadApprovals(envFor('seed@x.test'), ownerAuth({ boundAgentId: 'agent-x' }))
+    const row = q.items.find((i) => i.id === taskId)
+    expect(row?.can_approve ?? false).toBe(false)
+    expect(row?.can_reject ?? false).toBe(false)
     expect(row?.can_verdict ?? false).toBe(false)
+  })
+
+  it('the card shows the FROZEN text, not the live row, when they differ', async () => {
+    // The live task text drifts after the freeze (title/body edited); the human must see the frozen bytes.
+    h.sqlite.prepare(`UPDATE tasks SET title = 'LIVE title drift', body = 'LIVE body drift' WHERE id = ?`).run(taskId)
+    const { html } = await authFor('lead@x.test')
+    expect(html).toContain('the exact words')
+    expect(html).toContain('Publish: Q4 recap')
+    expect(html).not.toContain('LIVE body drift')
+    expect(html).not.toContain('LIVE title drift')
+  })
+
+  it('a stale freeze (frozen text differs from live) offers no Approve button, but Reject stays', async () => {
+    h.sqlite.prepare(`UPDATE tasks SET body = 'edited after freeze' WHERE id = ?`).run(taskId)
+    const { html } = await authFor('lead@x.test')
+    expect(html).toContain('data-can-approve="0"')
+    expect(html).toContain('data-can-reject="1"')
+    expect(html).not.toContain('class="btn appr-approve"')
+    expect(html).toContain('class="btn btn-reject appr-reject"')
+  })
+
+  it('shows the destination (frozen site_origin) on the card', async () => {
+    const { html } = await authFor('lead@x.test')
+    expect(html).toContain('Publishes to')
+    expect(html).toContain('https://wordpress.example.com')
+  })
+
+  it('the destination is HTML-escaped', async () => {
+    h.sqlite.prepare(`UPDATE office_publish_freezes SET payload_json = json_set(payload_json, '$.site_origin', ?) WHERE task_id = ?`)
+      .run('https://x.test/"><script>alert(1)</script>', taskId)
+    const { html } = await authFor('lead@x.test')
+    expect(html).not.toContain('<script>alert(1)</script>')
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
+  })
+
+  it('an office row with NO freeze is still marked office (so Reject routes to the office door) and offers Reject only', async () => {
+    h.sqlite.prepare(`UPDATE office_publish_freezes SET voided_at = datetime('now') WHERE task_id = ?`).run(taskId)
+    const { html } = await authFor('lead@x.test')
+    expect(html).toContain('data-office="1"')
+    expect(html).not.toContain('data-office-sha=')
+    expect(html).toContain('data-can-approve="0"')
+    expect(html).toContain('data-can-reject="1"')
+    expect(html).not.toContain('class="btn appr-approve"')
+    // The page script routes every data-office row to the office door regardless of sha.
+    expect(html).toContain(`card.getAttribute('data-office') === '1'`)
+  })
+
+  it('no-freeze office row: Reject succeeds on the office route', async () => {
+    h.sqlite.prepare(`UPDATE office_publish_freezes SET voided_at = datetime('now') WHERE task_id = ?`).run(taskId)
+    const { env, cookie } = await login('lead@x.test')
+    const res = await decide(env, cookie, { verdict: 'rejected', note: 'not publishing', payload_sha256: '' })
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(taskRow().status).toBe('rejected')
+  })
+
+  it('the page script follows reauth_required to the re-auth redirect', async () => {
+    const { html } = await authFor('lead@x.test')
+    expect(html).toContain(`r.data.error === 'reauth_required'`)
+    expect(html).toContain('window.location.href = r.data.reauth_url')
+  })
+})
+
+describe('fresh step-up (approve only)', () => {
+  it('approve with a non-fresh session: reauth_required with a return-to-approvals URL, nothing written', async () => {
+    const { env, cookie } = await login('lead@x.test')
+    staleReauth()
+    const res = await decide(env, cookie, { verdict: 'approved', payload_sha256: frozenHash() })
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'reauth_required', reauth_url: `/auth/reauth?return=${encodeURIComponent('/approvals')}` })
+    expect(taskRow().status).toBe('review')
+    expect(verdicts()).toEqual([])
+  })
+
+  it('reject with a non-fresh session still succeeds', async () => {
+    const { env, cookie } = await login('lead@x.test')
+    staleReauth()
+    const res = await decide(env, cookie, { verdict: 'rejected', note: 'no' })
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(taskRow().status).toBe('rejected')
   })
 })

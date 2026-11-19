@@ -164,7 +164,7 @@ export async function hasOfficePublishCapability(env: Env, auth: AuthContext): P
  *  is shown and its hash, plus the human owner for the self-approval pre-check. Null = no such task. */
 export interface OfficeDecisionContext {
   readonly assignee_member_id: string | null
-  readonly frozen: { readonly title: string; readonly content: string; readonly payload_sha256: string } | null
+  readonly frozen: { readonly title: string; readonly content: string; readonly payload_sha256: string; readonly site_origin: string | null } | null
 }
 
 export async function loadOfficeDecisionContext(env: Env, taskId: string): Promise<OfficeDecisionContext | null> {
@@ -178,9 +178,9 @@ export async function loadOfficeDecisionContext(env: Env, taskId: string): Promi
   let frozen: OfficeDecisionContext['frozen'] = null
   if (row.payload_json && row.payload_sha256) {
     try {
-      const parsed = JSON.parse(row.payload_json) as { title?: unknown; content?: unknown }
+      const parsed = JSON.parse(row.payload_json) as { title?: unknown; content?: unknown; site_origin?: unknown }
       if (typeof parsed.title === 'string' && typeof parsed.content === 'string') {
-        frozen = { title: parsed.title, content: parsed.content, payload_sha256: row.payload_sha256 }
+        frozen = { title: parsed.title, content: parsed.content, payload_sha256: row.payload_sha256, site_origin: typeof parsed.site_origin === 'string' ? parsed.site_origin : null }
       }
     } catch {
       // Malformed payload_json never happens (canonicalJson); treat as nothing frozen rather than 500.
