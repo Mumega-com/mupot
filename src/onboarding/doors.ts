@@ -168,6 +168,13 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
   if ((CAPABILITY_RANK[input.capability] ?? 99) > (CAPABILITY_RANK[door.max_capability] ?? 0)) {
     return { ok: false, error: 'above_door_ceiling', detail: `max: ${door.max_capability}` }
   }
+  // B3b: the `office` department is never a self-selectable scope. Office approval authority is per customer squad
+  // (hasProjectOfficeCapability); a department grant would span every customer's squad.
+  if (input.scopeType === 'department') {
+    const office = await env.DB.prepare(`SELECT 1 FROM departments WHERE id = ?1 AND slug = 'office' LIMIT 1`)
+      .bind(input.scopeId).first()
+    if (office) return { ok: false, error: 'scope_not_allowed', detail: 'office access is granted per squad, not per department' }
+  }
   // G-FP1b point 4: no standing grant path into a kind='home' squad or
   // department except createHomeForMember. A door is org-boundary
   // self-service consent — it must never be how a member (or anyone else)

@@ -220,7 +220,7 @@ const UNPROVEN: Record<string, string> = {
   ...group('admin-floor only: B\'s lead and A\'s lead get the same refusal; org admin/owner success is not proof (#2411)', [
     'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
     'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
-    'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+    'grant_list_gate_capabilities', 'loop_list',
     'office.bind_project_site', 'office.unbind_project_site',
   ]),
   // #2411: B was promoted to lead while A's baseline was a plain member — rank asymmetry made these
@@ -321,7 +321,7 @@ describe('the control list is honest', () => {
     for (const n of [
       'project_update', 'project_squad_remove', 'mint_agent_token', 'list_agent_tokens', 'list_agent_sessions',
       'revoke_agent_session', 'deactivate_agent', 'operator_list', 'approval_expiry_sweep', 'execution_release',
-      'grant_list_gate_capabilities', 'loop_list', 'office.list_pending_approvals',
+      'grant_list_gate_capabilities', 'loop_list',
       'office.bind_project_site', 'office.unbind_project_site',
     ]) {
       expect(live.has(n), `${n}: admin-floor success must not count as PROVEN`).toBe(false)

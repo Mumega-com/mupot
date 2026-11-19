@@ -170,26 +170,84 @@ describe('decorateApprovals — bounded, memoized D1 cost (mupot#1319 gate BLOCK
     expect(count()).toBeLessThanOrEqual(6)
   })
 
-  it('gate:office rows (Codex P2): office capability is memoized and decision contexts are batch-read, so query count does NOT grow with N', async () => {
+  // B3b: office authority is per (squad, project) — a squad-scope lead on the customer's squad, and that squad must hold
+  // write on the task's project. The memo is keyed per (squad, project), so N rows of ONE customer cost the same as 1.
+  function seedOfficeCustomer(key: string): { squadId: string; projectId: string } {
+    const squadId = `squad-off-${key}`
+    const projectId = `proj-off-${key}`
+    harness.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES (?, 'dept-office', ?, ?)`).run(squadId, squadId, squadId)
+    harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES (?, ?, ?, 'active')`).run(projectId, projectId, projectId)
+    harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES (?, ?, 'write')`).run(projectId, squadId)
+    return { squadId, projectId }
+  }
+  function seedOfficeRow(id: string, squadId: string, projectId: string): void {
+    seedReviewTask(harness.sqlite, id, squadId, 'gate:office')
+    harness.sqlite.prepare(`UPDATE tasks SET project_id = ? WHERE id = ?`).run(projectId, id)
+  }
+
+  it('gate:office rows (Codex P2, B3b): per-squad authority is memoized and decision contexts are batch-read, so query count does NOT grow with N', async () => {
     harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-office', 'office', 'office')`).run()
-    harness.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-office', 'dept-office', 'squad-office', 'squad-office')`).run()
+    const { squadId, projectId } = seedOfficeCustomer('a')
     seedMember(harness.sqlite, 'member-office')
     seedGrant(harness.sqlite, 'gate:office', 'member-office')
-    const auth = memberAuthWithCapabilities('member-office', [{ member_id: 'member-office', scope_type: 'department', scope_id: 'dept-office', capability: 'lead' }])
+    const auth = memberAuthWithCapabilities('member-office', [{ member_id: 'member-office', scope_type: 'squad', scope_id: squadId, capability: 'lead' }])
     let total = 0
     const measure = async (n: number, prefix: string): Promise<number> => {
       total += n
-      for (let i = 0; i < n; i += 1) seedReviewTask(harness.sqlite, `${prefix}-${i}`, 'squad-office', 'gate:office')
+      for (let i = 0; i < n; i += 1) seedOfficeRow(`${prefix}-${i}`, squadId, projectId)
       const { env, count } = countingEnv(harness)
       const out = await loadApprovals(env, auth)
-      expect(out.items.filter((r) => r.is_office)).toHaveLength(total)
+      const office = out.items.filter((r) => r.is_office)
+      expect(office).toHaveLength(total)
+      // authority actually held on every row (Reject is offered: no freeze, so Approve is not) — the memo is exercised, not skipped
+      expect(office.every((r) => r.can_reject)).toBe(true)
       return count()
     }
     const small = await measure(5, 'o-small')
     const large = await measure(40, 'o-large') // table now holds 45 office rows
     // Linear growth would add ~2 queries per extra row (~70). Allow zero growth.
     expect(large).toBe(small)
-    expect(large).toBeLessThanOrEqual(10)
+    expect(large).toBeLessThanOrEqual(14)
+  })
+
+  it('B3b: office rows of a SECOND customer the viewer holds nothing on are not actionable, and cost does not grow per row either', async () => {
+    harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-office', 'office', 'office')`).run()
+    const mine = seedOfficeCustomer('mine')
+    const theirs = seedOfficeCustomer('theirs')
+    seedMember(harness.sqlite, 'member-office')
+    seedGrant(harness.sqlite, 'gate:office', 'member-office')
+    const auth = memberAuthWithCapabilities('member-office', [{ member_id: 'member-office', scope_type: 'squad', scope_id: mine.squadId, capability: 'lead' }])
+    const run = async (n: number, prefix: string): Promise<{ count: number; items: Awaited<ReturnType<typeof loadApprovals>>['items'] }> => {
+      for (let i = 0; i < n; i += 1) { seedOfficeRow(`${prefix}-m-${i}`, mine.squadId, mine.projectId); seedOfficeRow(`${prefix}-t-${i}`, theirs.squadId, theirs.projectId) }
+      const { env, count } = countingEnv(harness)
+      const out = await loadApprovals(env, auth)
+      return { count: count(), items: out.items }
+    }
+    const small = await run(3, 'a')
+    const large = await run(20, 'b')
+    for (const r of large.items.filter((x) => x.is_office)) {
+      expect(r.can_reject, r.id).toBe(r.squad_id === mine.squadId)
+    }
+    expect(large.count).toBe(small.count)
+  })
+
+  it('B3b: the memo is keyed by (squad, project), not squad alone — one squad with write on project X but only read on project Y is actionable on X rows only', async () => {
+    harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-office', 'office', 'office')`).run()
+    const x = seedOfficeCustomer('x')
+    harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-off-y', 'proj-off-y', 'Y', 'active')`).run()
+    harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-off-y', ?, 'write')`).run(x.squadId)
+    seedMember(harness.sqlite, 'member-office')
+    seedGrant(harness.sqlite, 'gate:office', 'member-office')
+    const auth = memberAuthWithCapabilities('member-office', [{ member_id: 'member-office', scope_type: 'squad', scope_id: x.squadId, capability: 'lead' }])
+    seedOfficeRow('row-x', x.squadId, x.projectId)
+    seedOfficeRow('row-y', x.squadId, 'proj-off-y')
+    // the task-project trigger only lets a row attach while the squad holds write; downgrade AFTER, as a later revoke would
+    harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-off-y'`).run()
+    const { env } = countingEnv(harness)
+    const out = await loadApprovals(env, auth)
+    const byId = new Map(out.items.map((r) => [r.id, r]))
+    expect(byId.get('row-x')?.can_reject).toBe(true)
+    expect(byId.get('row-y')?.can_reject ?? false).toBe(false)
   })
 
   it('BASE_SELECT candidate fetch is bounded at APPROVALS_FETCH_CEILING (non-admin path): seeding well past it still returns at most APPROVALS_QUEUE_LIMIT display rows, flagged as a lower bound', async () => {

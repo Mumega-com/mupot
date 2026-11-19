@@ -174,6 +174,38 @@ describe('ceilings — self-service is bounded, by allowlist not by prefix', () 
   })
 })
 
+describe('B3b: the office department is never a self-selectable scope', () => {
+  const seedOffice = (db: ReturnType<typeof makeDb>) => {
+    db.exec(`INSERT INTO departments (id, slug, name) VALUES ('dept-office-x', 'office', 'Office');
+             INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-cust', 'dept-office-x', 'cust', 'Customer');`)
+  }
+
+  it('refuses a department-scope self-grant on the office department even when the door allows department scope; writes nothing', async () => {
+    const db = makeDb()
+    seedOffice(db)
+    await open(db, { allowedScopes: ['squad', 'department'] })
+    const r = await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'department', scopeId: 'dept-office-x', capability: 'lead',
+    })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toBe('scope_not_allowed')
+    expect(db.capCount(SUBJECT)).toBe(0)
+  })
+
+  it('still allows the squad scope on a customer squad inside the office department', async () => {
+    const db = makeDb()
+    seedOffice(db)
+    await open(db)
+    const r = await selfGrant(db.env, {
+      actorMemberId: SUBJECT, subjectMemberId: SUBJECT,
+      scopeType: 'squad', scopeId: 'squad-cust', capability: 'lead',
+    })
+    expect(r.ok).toBe(true)
+    expect(db.cap(SUBJECT, 'squad-cust')?.capability).toBe('lead')
+  })
+})
+
 describe('lifecycle (migration 0230)', () => {
   it('a self-grant onto a LAPSED row refreshes it instead of being swallowed, and is attributed', async () => {
     const db = makeDb()

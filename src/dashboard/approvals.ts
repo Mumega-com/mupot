@@ -269,17 +269,26 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
 
 // gate:office row: show the FROZEN payload (the bytes the hash covers and the publish will send) and offer
 // Approve/Reject only to a human who could actually succeed. Mirrors, never replaces, reviewOfficeApproval's
-// own refusals (agent-bound, self-approval, office-department lead, gate verdict rules).
+// own refusals (agent-bound, self-approval, per-squad office lead, gate verdict rules).
 interface OfficeDecorationCtx {
   readonly contexts: Map<string, OfficeDecisionContext>
-  readonly hasPublishCapability: () => Promise<boolean>
+  /** B3b: per-(squad, project) — one customer's approver must not see Approve on another customer's rows. */
+  readonly hasPublishCapability: (task: { project_id: string | null; squad_id: string }) => Promise<boolean>
 }
 
 async function preloadOfficeContexts(env: Env, auth: AuthContext, rows: ApprovalRow[]): Promise<OfficeDecorationCtx> {
   const ids = auth.boundAgentId ? [] : rows.filter((r) => r.gate_owner === OFFICE_GATE_OWNER).map((r) => r.id)
   const contexts = ids.length > 0 ? await loadOfficeDecisionContexts(env, ids) : new Map<string, OfficeDecisionContext>()
-  let capability: Promise<boolean> | null = null
-  return { contexts, hasPublishCapability: () => (capability ??= hasOfficePublishCapability(env, auth)) }
+  const memo = new Map<string, Promise<boolean>>()
+  return {
+    contexts,
+    hasPublishCapability: (task) => {
+      const key = `${task.squad_id}|${task.project_id ?? ''}`
+      let hit = memo.get(key)
+      if (!hit) { hit = hasOfficePublishCapability(env, auth, task); memo.set(key, hit) }
+      return hit
+    },
+  }
 }
 
 async function decorateOfficeRow(
@@ -295,7 +304,7 @@ async function decorateOfficeRow(
   if (!ctx) return none
   const principalMemberId = auth.memberId ?? auth.userId
   if (ctx.assignee_member_id && ctx.assignee_member_id === principalMemberId) return none
-  if (!(await office.hasPublishCapability())) return none
+  if (!(await office.hasPublishCapability({ project_id: row.project_id ?? null, squad_id: row.squad_id }))) return none
   const task = { id: row.id, squad_id: row.squad_id, gate_owner: OFFICE_GATE_OWNER, assignee_agent_id: row.assignee_agent_id }
   const [approveResult, rejectResult] = await Promise.all([
     evaluateVerdictGates(env, auth, task, 'approved', gateCache),
