@@ -70,8 +70,6 @@ async function login(email: string, tenant = TENANT): Promise<{ env: Env; cookie
   expect(res.status).toBe(302)
   const m = /mupot_session=([^;]+)/.exec(res.headers.get('set-cookie') ?? '')
   if (!m) throw new Error('no session cookie')
-  // Approve needs a fresh step-up (round 2); every session starts fresh, tests that exercise the step-up make it stale.
-  h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = ?').run(new Date().toISOString())
   return { env, cookie: `mupot_session=${m[1]}` }
 }
 const staleReauth = (): void =>
@@ -363,26 +361,18 @@ describe('/approvals office rows (what the human is shown)', () => {
     expect(res.status, await res.clone().text()).toBe(200)
     expect(taskRow().status).toBe('rejected')
   })
-
-  it('the page script follows reauth_required to the re-auth redirect', async () => {
-    const { html } = await authFor('lead@x.test')
-    expect(html).toContain(`r.data.error === 'reauth_required'`)
-    expect(html).toContain('window.location.href = r.data.reauth_url')
-  })
 })
 
-describe('fresh step-up (approve only)', () => {
-  it('approve with a non-fresh session: reauth_required with a return-to-approvals URL, nothing written', async () => {
+describe('no step-up on approve (email-login users must be able to approve)', () => {
+  it('approve succeeds for a session that has never re-authed (recent_reauth_at null, as email login mints)', async () => {
     const { env, cookie } = await login('lead@x.test')
-    staleReauth()
+    h.sqlite.prepare('UPDATE web_sessions SET recent_reauth_at = NULL').run()
     const res = await decide(env, cookie, { verdict: 'approved', payload_sha256: frozenHash() })
-    expect(res.status).toBe(403)
-    expect(await res.json()).toEqual({ error: 'reauth_required', reauth_url: `/auth/reauth?return=${encodeURIComponent('/approvals')}` })
-    expect(taskRow().status).toBe('review')
-    expect(verdicts()).toEqual([])
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(taskRow().status).not.toBe('review')
   })
 
-  it('reject with a non-fresh session still succeeds', async () => {
+  it('reject with a stale-reauth session succeeds', async () => {
     const { env, cookie } = await login('lead@x.test')
     staleReauth()
     const res = await decide(env, cookie, { verdict: 'rejected', note: 'no' })

@@ -1152,13 +1152,8 @@ dashboardApp.post('/approvals/office/:id/decide', async (c) => {
   const form = await c.req.parseBody()
   const verdict = form.verdict
   if (verdict !== 'approved' && verdict !== 'rejected') return c.json({ error: 'invalid_verdict' }, 400)
-  // Approve authorises a public WordPress write: it needs a fresh step-up (same rule as /agents/:id/designation allow).
-  // Reject authorises nothing and stays non-fresh. The page script follows reauth_url and lands back on /approvals.
-  const session = await checkWebSession(c.env, auth, { fresh: verdict === 'approved' })
-  if (!session.ok) {
-    if (session.error === 'reauth_required') return c.json({ error: 'reauth_required', reauth_url: reauthRedirectUrl('/approvals') }, session.status)
-    return c.json({ error: session.error }, session.status)
-  }
+  // No fresh step-up on approve yet: /auth/reauth supports Google only, so it would lock out email-login users.
+  // It returns in a follow-up that supports every login method.
   const note = typeof form.note === 'string' && form.note.trim() ? form.note.trim() : null
   const shownHash = typeof form.payload_sha256 === 'string' && form.payload_sha256 ? form.payload_sha256 : null
   const { resolveTaskEntity } = await import('../lib/entity-resolver')
@@ -6032,9 +6027,6 @@ function obsQueueScript(): string {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved' : 'rejected';
                 card.classList.add('decided');
-              } else if (r.data && r.data.error === 'reauth_required' && r.data.reauth_url) {
-                status.textContent = 'signing you in again…';
-                window.location.href = r.data.reauth_url;
               } else {
                 status.textContent = (r.data && r.data.error) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
@@ -7213,9 +7205,6 @@ function approvalsScript() {
               if (r.ok) {
                 status.textContent = verdict === 'approved' ? 'approved ✓' : 'rejected ✗';
                 card.classList.add('decided');
-              } else if (r.data && r.data.error === 'reauth_required' && r.data.reauth_url) {
-                status.textContent = 'signing you in again…';
-                window.location.href = r.data.reauth_url;
               } else {
                 status.textContent = (r.data && r.data.error) || 'failed';
                 card.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
