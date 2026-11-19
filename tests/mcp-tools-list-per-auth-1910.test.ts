@@ -195,7 +195,7 @@ describe('inbox_consumer_status tells an attached chat how to refresh a stale ca
   })
 })
 
-const OFFICE = ['publish_post', 'list_pending_approvals', 'health', 'review_approval', 'reconcile_stalled_publish']
+const OFFICE = ['publish_post', 'list_pending_approvals', 'health', 'review_approval', 'reconcile_stalled_publish', 'bind_project_site', 'unbind_project_site']
 
 describe('wire-safe tool names: office.* underscore aliases (#1910)', () => {
   const ALL_ON = { SEAT_ATTACH: '1', SEAT_AUTO_ENROLL: '1', ACCESS_APPROVE_ENABLED: '1', SECURE_MOMENTS: '1', SECURE_DROP: '1', TELEGRAM_MINIAPP: '1', WORKSPACES: '1' }
@@ -214,7 +214,7 @@ describe('wire-safe tool names: office.* underscore aliases (#1910)', () => {
     for (const n of names) expect(n).toMatch(/^[A-Za-z0-9_-]{1,64}$/)
   })
 
-  it('the five office aliases are advertised, the dotted names are not', async () => {
+  it('the seven office aliases are advertised, the dotted names are not', async () => {
     const names = await namesOf(envFor(ALL_ON), SHAPES.workspace)
     for (const o of OFFICE) { expect(names).toContain(`office_${o}`); expect(names).not.toContain(`office.${o}`) }
     expect([...TOOL_WIRE_ALIASES.keys()].sort()).toEqual(OFFICE.map((o) => `office_${o}`).sort())
