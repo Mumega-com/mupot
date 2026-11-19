@@ -299,9 +299,9 @@ import {
   rotateConnector,
   revokeConnector,
   listConnectors,
-  resolveConnector,
   resolveConnectorWithMeta,
 } from '../connectors/service'
+import { resolveInkwellTargetForGate } from '../departments/inkwell-target'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
 import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
@@ -1514,17 +1514,18 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
 
   const executorEnv: NonNullable<KernelHandle['executorEnv']> = {}
 
-  // Inkwell: pot-scoped 'inkwell' connector. resolveConnector fails closed (null)
-  // when no CONNECTOR_MASTER_KEY or no row. Additive + non-fatal here — a pot with
-  // no INKWELL_API_URL / no inkwell connector simply doesn't get inkwell wired,
-  // it is not an error unless NO adapter resolves at all (checked below).
+  // Inkwell (B3c): resolved for the TASK behind this gate, never for the operator. The connector is the
+  // task's squad-scoped 'inkwell' connector and the destination tenant is that connector's own
+  // meta.tenantSlug. Fail-closed and additive: no task / no squad / no connector / no meta.tenantSlug →
+  // inkwell is simply not wired (the kernel then cannot dispatch to it), and it NEVER falls back to the
+  // pot-scoped connector or c.env.TENANT_SLUG (that is the operator's own tenant).
   if (c.env.INKWELL_API_URL) {
-    const token = await resolveConnector(c.env, dept, 'inkwell')
-    if (token) {
+    const target = await resolveInkwellTargetForGate(c.env, gateId)
+    if (target) {
       executorEnv.inkwell = {
         apiUrl: c.env.INKWELL_API_URL,
-        token,
-        tenantSlug: c.env.TENANT_SLUG,
+        token: target.token,
+        tenantSlug: target.tenantSlug,
         // Same-zone Inkwell → route through the service binding to dodge the CF 522
         // Worker→Worker edge loopback. Absent (cross-zone tenant) → public fetch.
         fetcher: c.env.INKWELL_SVC,
@@ -1544,7 +1545,7 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
 
   if (!executorEnv.inkwell && !executorEnv.mcpwp) {
     return c.json(
-      { error: 'executor_not_configured', reason: 'no inkwell or mcpwp adapter is configured for this pot' },
+      { error: 'executor_not_configured', reason: 'no inkwell (squad-scoped, with meta.tenantSlug) or mcpwp adapter is configured for this gate' },
       503,
     )
   }

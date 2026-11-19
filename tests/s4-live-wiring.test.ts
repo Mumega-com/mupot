@@ -19,10 +19,11 @@ vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
   resolveConnector: vi.fn(),
   resolveConnectorWithMeta: vi.fn(),
+  resolveSquadConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta } from '../src/connectors/service'
+import { resolveConnector, resolveConnectorWithMeta, resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import { inkwellContentWrite } from '../src/departments/executors/inkwell'
 import { wpContentWrite } from '../src/departments/executors/mcpwp'
 import type { Env } from '../src/types'
@@ -167,9 +168,20 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   })
 
   it('connector present but proposal not approved → 409 not_executable (gate holds)', async () => {
-    mockResolve.mockResolvedValue('tok')
+    // B3c: inkwell wires only for a task with a squad-scoped connector carrying meta.tenantSlug.
+    vi.mocked(resolveSquadConnectorWithMeta).mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
     mockResolveWithMeta.mockResolvedValue(null)
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner', INKWELL))
+    const env = envForRole('owner', INKWELL)
+    env.DB = {
+      prepare: vi.fn((sql: string) => ({
+        bind: (..._a: unknown[]) => ({
+          first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 1 } }),
+        }),
+      })),
+    } as unknown as Env['DB']
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
     expect(body.executed).toBe(false)

@@ -16,15 +16,18 @@ vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
   resolveConnector: vi.fn(),
   resolveConnectorWithMeta: vi.fn(),
+  resolveSquadConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta } from '../src/connectors/service'
+import { resolveConnector, resolveConnectorWithMeta, resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import type { Env } from '../src/types'
 
 const mockResolve = vi.mocked(resolveConnector)
 const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
 mockResolveWithMeta.mockResolvedValue(null)
+// B3c: Inkwell resolves via the task's squad-scoped connector (meta.tenantSlug), not the pot connector.
+vi.mocked(resolveSquadConnectorWithMeta).mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
 
 const INKWELL = { INKWELL_API_URL: 'https://inkwell-api.mumega.com' }
 const GATE_ID = 'task-content-1'
@@ -63,6 +66,7 @@ function envWithApprovedProposal(opts: { taskRow?: Record<string, unknown> | nul
       prepare: vi.fn((sql: string) => ({
         bind: (...args: unknown[]) => ({
           async first<T>() {
+            if (sql.includes('FROM tasks WHERE id')) return { squad_id: 'squad-a' } as unknown as T
             if (sql.includes('FROM task_verdicts')) {
               return { verdict: 'approved' } as unknown as T
             }
@@ -156,17 +160,19 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
     mockResolveWithMeta.mockResolvedValue(null)
     // No approved verdict this time: first() for task_verdicts and
     // department_proposals both return null.
-    const stmt = {
-      bind: (..._a: unknown[]) => stmt,
-      first: vi.fn(async () => null),
-      all: vi.fn(async () => ({ results: [] })),
-      run: vi.fn(async () => ({ meta: { changes: 1 } })),
-    }
+    // Inkwell wiring needs a task row; every other lookup (verdict/proposal) stays null → not_approved.
+    const dbPrepare = vi.fn((sql: string) => ({
+      bind: (..._a: unknown[]) => ({
+        first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
+        all: async () => ({ results: [] }),
+        run: async () => ({ meta: { changes: 1 } }),
+      }),
+    }))
     const updates: unknown[] = []
     const env = {
       TENANT_SLUG: 't',
       BRAND: 'Test',
-      DB: { prepare: vi.fn(() => stmt) },
+      DB: { prepare: dbPrepare },
       SESSIONS: {
         get: vi.fn(async () => JSON.stringify({ userId: 'u1', email: 'a@b.com', role: 'owner', createdAt: '2026-01-01T00:00:00Z' })),
       },
