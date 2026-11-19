@@ -122,7 +122,7 @@ describe('observed seat can FILE a request, and only that', () => {
     const adm = String(r.sc.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
     const code = one<{ c: string | null }>(`SELECT attach_code AS c FROM agent_seat_admissions WHERE id = ?`, adm)?.c
-    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'approve', attachCode: code })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
     const boot = await rpc(c.ctx, 'boot_context', {}, c.session)
     const ob = boot.sc.attached_onboarding as Record<string, unknown> | undefined
@@ -135,7 +135,7 @@ describe('observed seat can FILE a request, and only that', () => {
   it('a denied request attaches nothing and the chat stays limited', async () => {
     const c = await chat('observed')
     const adm = String((await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)).sc.admission_id)
-    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'deny' })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: adm, humanMemberId: HUMAN, decision: 'deny' })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments`)).toBe(0)
     expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
   })
@@ -191,7 +191,7 @@ describe('chat approval boundaries', () => {
     expect(again.sc.admission_id).not.toBe(att.admission_id)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
     expect((await rpc(c.ctx, 'request_elevation', {}, c.session)).text).toContain('observed_floor')
-    expect(await decideAdmissionDirect(env, { admissionId: String(again.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: again.sc.attach_code })).toEqual({ ok: true })
+    expect(await decideAdmissionDirect(env, { admissionId: String(again.sc.admission_id), humanMemberId: HUMAN, decision: 'approve', attachCode: again.sc.attach_code })).toMatchObject({ ok: true })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
   })
 
@@ -240,12 +240,12 @@ describe('chat approval boundaries', () => {
 })
 
 describe('connection_check (full-duplex)', () => {
-  it('refused for an unattached chat with the attach next step (own seat, and observed via the floor)', async () => {
+  it('refused for an unattached person with stop guidance (observed floor unchanged)', async () => {
     const plain = await chat(null)
     const r = await rpc(plain.ctx, 'connection_check', {}, plain.session)
-    expect(r.text).toContain('not_attached')
-    expect(r.text).toContain("seat_attach {agent:'<slug>', reason:'why this chat should act as that agent'}")
-    expect(r.text).toContain('approval code')
+    expect(r.text).toContain('not_agent')
+    expect(r.text).toContain('this connection is not an agent; stop and ask your human')
+    expect(r.text).toContain('"error":"not_agent"')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'connection_check'`)).toBe(0)
     const obs = await chat('observed', 'conv-obs')
     const o = await rpc(obs.ctx, 'connection_check', {}, obs.session)
@@ -253,21 +253,20 @@ describe('connection_check (full-duplex)', () => {
     expect(o.text).toContain('seat_attach')
   })
 
-  it('attached, no wake path: send ok, receive pending then ok after inbox_mark_handled, wake none with the enable line; recorded on the agent', async () => {
+  it('attached check reports send/receive and a not-returned inbox echo; it remains recorded on the agent', async () => {
     const c = await attachedChat()
-    const r1 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { send: { ok: boolean }; receive: { state: string; message_id: string }; wake: { path: string; live: boolean; enable: string }; summary: string }
+    const r1 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { send: { ok: boolean }; receive: { state: string; message_id: string }; echo_status: { state: string }; summary: string }
     expect(r1.send.ok).toBe(true)
     expect(r1.receive.state).toBe('pending')
-    expect(r1.wake).toMatchObject({ path: 'none', live: false })
-    expect(r1.wake.enable).toContain("say 'monitor my mupot inbox' to enable")
-    expect(r1.summary).toBe(`send ✓ receive pending wake: none — ${r1.wake.enable}`)
+    expect(r1.echo_status).toMatchObject({ state: 'not_returned' })
+    expect(r1.summary).toBe('send ✓ receive pending; echo not returned')
     // the probe really is in the agent's inbox, from the system sender
     expect(one<{ f: string }>(`SELECT from_agent AS f FROM agent_messages WHERE id = ?`, r1.receive.message_id)?.f).toBe('mupot-onboarding')
     const mh = await rpc(c.ctx, 'inbox_mark_handled', { ids: [r1.receive.message_id] }, c.session)
     expect(mh.text).not.toContain('"error"')
     const r2 = (await rpc(c.ctx, 'connection_check', {}, c.session)).sc as { receive: { state: string }; summary: string }
     expect(r2.receive.state).toBe('ok')
-    expect(r2.summary.startsWith('send ✓ receive ✓ wake: none')).toBe(true)
+    expect(r2.summary).toBe('send ✓ receive ✓; echo not returned')
     const rec = one<{ a: string }>(`SELECT after_state AS a FROM agent_audit WHERE action = 'connection_check' ORDER BY seq DESC LIMIT 1`)
     expect(JSON.parse(rec!.a).summary).toBe(r2.summary)
   })
@@ -295,13 +294,15 @@ describe('connection_check (full-duplex)', () => {
     expect(next.receive.message_id).not.toBe(first.receive.message_id)
   })
 
-  it('attached with a live wake path (webhook doorbell) reports it', async () => {
+  it('attached check keeps send/receive semantics when a webhook configuration exists', async () => {
     const c = await attachedChat()
     h.sqlite.prepare(`INSERT INTO agent_webhook_doorbells (tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at) VALUES (?, 'agent-coo', 'https://hook.example.test/x', 'ct', '1234', ?, '2026-10-26T00:00:00.000Z')`).run(TENANT, HUMAN)
     const on = envFor(h, { WEBHOOK_DOORBELL: '1' })
-    const r = (await rpc(c.ctx, 'connection_check', {}, c.session, on)).sc as { wake: { path: string; live: boolean; enable: string | null }; summary: string }
-    expect(r.wake).toEqual({ path: 'webhook_doorbell', live: true, enable: null })
-    expect(r.summary).toContain('wake: webhook_doorbell')
+    const r = (await rpc(c.ctx, 'connection_check', {}, c.session, on)).sc as { send: { ok: boolean }; receive: { state: string }; echo_status: { state: string }; summary: string }
+    expect(r.send.ok).toBe(true)
+    expect(r.receive.state).toBe('pending')
+    expect(r.echo_status).toMatchObject({ state: 'not_returned' })
+    expect(r.summary).toBe('send ✓ receive pending; echo not returned')
   })
 
   it('the first boot_context after approval tells the agent to run the check', async () => {
@@ -422,14 +423,14 @@ describe('agent page: Connect a chat checklist', () => {
     expect(agentPage).toContain('id="background-connect-prompt"')
   })
 
-  it('a pending request shows with Approve and Reject; plain words only', async () => {
+  it('a pending request shows with Connect and Reject; plain words only', async () => {
     const c = await chat('observed')
     const r = await rpc(c.ctx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'hadi-coo' }, c.session)
     const cookie = await session(env, `${HUMAN}@example.test`)
     fresh()
     const p = await get(env, cookie, '/agents/agent-coo')
     expect(p).toContain(`data-cx-deny="${String(r.sc.admission_id)}"`)
-    expect(p).toContain('>Approve<')
+    expect(p).toContain('data-claim-connect>Connect<')
     expect(p).not.toContain('No chat has asked yet')
     // Inspect the generated panel's text, including the copy prompt. Its inline
     // script follows all UI markup; no HTML is rewritten or used as sanitized output.
@@ -440,7 +441,7 @@ describe('agent page: Connect a chat checklist', () => {
     const visible = [...p.slice(start, end).matchAll(/>([^<>]*)</g)]
       .map((match) => match[1]).join(' ')
     expect(visible).toContain('Requests from your chats')
-    expect(visible).toContain('Approve')
+    expect(visible).toContain('Connect')
     expect(visible).toContain('Reject')
     expect(visible.toLowerCase()).not.toMatch(/admission|\bseat\b/)
   })
@@ -495,4 +496,138 @@ describe('agent page: Connect a chat checklist', () => {
     h.sqlite.prepare(`UPDATE agent_seats SET admission_status = 'held' WHERE id = ?`).run(c.seatId)
     expect(await page()).toContain(`data-cx-return="${c.seatId}"`)
   })
+})
+
+
+describe('agent identity diagnostic step zero',()=>{
+  async function native(){
+    const tokenId=`bound-check-${++tok}`
+    h.sqlite.prepare("INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant,agent_id) VALUES(?,?,?,?,?,?,?,?)").run(tokenId,'mem-agent-coo','fixture-'+tokenId,'self diagnostic','workspace',new Date().toISOString(),TENANT,'agent-coo')
+    const ctx=await buildAuthContextFromProps(env,{memberId:'mem-agent-coo',tokenId,email:null,channel:'workspace',boundAgentId:'agent-coo'})
+    if(!ctx)throw new Error('agent credential fixture failed')
+    return ctx
+  }
+  it('agent-bound identity and self SEND/RECEIVE work without attachment flags',async()=>{
+    const ctx=await native();const off={...env,SEAT_ATTACH:undefined,SEAT_AUTO_ENROLL:undefined} as Env
+    const first=await rpc(ctx,'connection_check',{},'bound-check',off)
+    expect(first.sc).toMatchObject({identity:{step:0,bound_agent_id:'agent-coo',slug:'hadi-coo',credential_kind:'agent-bound'},send:{ok:true},receive:{state:'pending'}})
+    const receive=first.sc.receive as {message_id:string}
+    const ack=await rpc(ctx,'inbox_ack',{ids:[receive.message_id]},'bound-check',off)
+    expect(ack.text).not.toContain('isError":true')
+    expect((await rpc(ctx,'connection_check',{},'bound-check',off)).sc).toMatchObject({receive:{state:'ok'}})
+    expect(n("SELECT COUNT(*) AS n FROM agent_messages WHERE to_agent<>'agent-coo'")).toBe(0)
+  })
+  it('a person credential is refused with identity and stop guidance before writes',async()=>{
+    const tokenId=`person-check-${++tok}`
+    h.sqlite.prepare("INSERT INTO member_tokens(id,member_id,token_hash,label,channel,created_at,tenant) VALUES(?,?,?,?,?,?,?)").run(tokenId,HUMAN,'fixture-'+tokenId,'person owner','workspace',new Date().toISOString(),TENANT)
+    const ctx=await buildAuthContextFromProps(env,{memberId:HUMAN,tokenId,email:null,channel:'workspace',boundAgentId:null})
+    if(!ctx)throw new Error('person credential fixture failed')
+    const r=await rpc(ctx,'connection_check',{},'person-check')
+    expect(r.text).toContain('this connection is not an agent; stop and ask your human')
+    expect(r.text).toContain('"error":"not_agent"')
+    expect(r.text).toContain('"credential_kind":"person"')
+    expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+    expect(n("SELECT COUNT(*) AS n FROM agent_audit WHERE action='connection_check'")).toBe(0)
+  })
+  it('diagnostic discovery does not require attachment enrollment',async()=>{
+    const {advertisedTools}=await import('../src/mcp/index')
+    const names=advertisedTools({} as Env).map(t=>t.name)
+    expect(names).toContain('connection_check');expect(names).not.toContain('seat_attach')
+  })
+  it('caller arguments cannot choose another diagnostic agent',async()=>{
+    const ctx=await native()
+    const r=await rpc(ctx,'connection_check',{agent:'not-self'},'argument-forgery')
+    expect(r.text).toContain('invalid_args');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+  it('a revoked native credential cannot borrow a live sibling token',async()=>{
+    const stale=await native();await native()
+    h.sqlite.prepare('UPDATE member_tokens SET revoked_at=? WHERE id=?').run(new Date().toISOString(),stale.tokenId)
+    const r=await rpc(stale,'connection_check',{},'revoked-native')
+    expect(r.text).toContain('unauthenticated');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+
+  it('starts and finishes an agent-bound inbox echo',async()=>{
+    const ctx=await native();const off={...env,SEAT_ATTACH:undefined,SEAT_AUTO_ENROLL:undefined} as Env
+    const first=await rpc(ctx,'connection_check',{echo:true},'echo-native',off)
+    expect(first.sc).toMatchObject({identity:{credential_kind:'agent-bound'},echo_status:{ok:true,state:'pending'}})
+    const echo=first.sc.echo_status as {message_id:string}
+    const body=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',echo.message_id)!.body
+    const nonce=body.match(/: ([0-9a-f-]{36})$/)![1]
+    expect(first.text).not.toContain(nonce)
+    const reply=await rpc(ctx,'connection_check',{echo_reply:nonce},'echo-native',off)
+    expect(reply.sc).toMatchObject({echo_status:{ok:true,state:'echo_roundtrip',path:'inbox_echo'}})
+    expect(JSON.stringify(reply.sc)).not.toContain('wake_proof')
+  })
+  it('boot tells a native agent to complete its inbox echo and fleet reports echo status',async()=>{
+    const ctx=await native()
+    const boot=await rpc(ctx,'boot_context',{},'unproven-native')
+    expect(boot.sc).toMatchObject({echo_status:{state:'not_returned'}})
+    expect(String(boot.sc.next_step)).toContain('complete inbox echo')
+    expect((await rpc(ctx,'fleet_agent_get',{},'unproven-native')).sc).toMatchObject({echo_status:{state:'not_returned'}})
+  })
+  it.each([{echo:true,echo_reply:'not-a-reply'},{fresh:true,echo:true},{fresh:true,echo_reply:'reply'}])('does not create an echo for ambiguous echo/echo_reply intent %j',async args=>{
+    const ctx=await native()
+    const r=await rpc(ctx,'connection_check',args,'ambiguous-echo')
+    expect(r.text).toContain('invalid_args');expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(0)
+  })
+
+  it('a detached or revoked subject cannot use the handler with stale authentication',async()=>{
+    const {connectionSubject}=await import('../src/mcp/seat-attach')
+    const ctx=await native();await native()
+    h.sqlite.prepare('UPDATE member_tokens SET revoked_at=? WHERE id=?').run(new Date().toISOString(),ctx.tokenId)
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:false,error:'connection_not_live'})
+  })
+  it('an attached chat receives only its own agent challenge',async()=>{
+    const c=await attachedChat()
+    const first=await rpc(c.ctx,'connection_check',{echo:true},c.session)
+    expect(first.sc).toMatchObject({identity:{credential_kind:'attached',bound_agent_id:'agent-coo'},echo_status:{state:'pending'}})
+    const id=(first.sc.echo_status as {message_id:string}).message_id
+    const row=one<{body:string;to_agent:string}>('SELECT body,to_agent FROM agent_messages WHERE id=?',id)!
+    expect(row.to_agent).toBe('agent-coo')
+    const nonce=row.body.match(/: ([0-9a-f-]{36})$/)![1]
+    expect((await rpc(c.ctx,'connection_check',{echo_reply:nonce},c.session)).sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo'}})
+  })
+  it('a native completed receipt still yields inbox echo metadata and clears boot guidance',async()=>{
+    const ctx=await native();const t0=Date.now();const clock=vi.spyOn(Date,'now').mockReturnValue(t0)
+    const first=await rpc(ctx,'connection_check',{echo:true},'proof-api')
+    const messageId=(first.sc.echo_status as {message_id:string}).message_id
+    const nonce=one<{body:string}>('SELECT body FROM agent_messages WHERE id=?',messageId)!.body.match(/: ([0-9a-f-]{36})$/)![1]
+    const {eventIdFor}=await import('../src/bus/events-delivery')
+    h.sqlite.prepare("INSERT INTO event_subscriptions(id,tenant,agent_id,member_id,token_id,event_name,callback_url,secret_ciphertext,secret_fingerprint,status,refresh_before,created_at,last_refreshed_at) VALUES('proof-sub',?,?,?,?, 'message.created','https://wake.example','cipher','12345678','active','2030-01-01','2026-01-01','2026-01-01')").run(TENANT,'agent-coo',ctx.memberId,ctx.tokenId)
+    h.sqlite.prepare("INSERT INTO event_delivery_receipts(id,subscription_id,event_id,attempt,outcome,http_status,created_at) VALUES('proof-receipt','proof-sub',?,1,'delivered',204,?)").run(await eventIdFor('proof-sub',messageId),new Date(t0+100).toISOString())
+    clock.mockReturnValue(t0+200)
+    expect((await rpc(ctx,'connection_check',{echo_reply:nonce},'proof-api')).sc).toMatchObject({echo_status:{ok:true,state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
+    const boot=await rpc(ctx,'boot_context',{},'proof-api')
+    expect(boot.sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
+    expect(String(boot.sc.next_step)).not.toContain('complete inbox echo')
+    const fleet=await rpc(ctx,'fleet_agent_get',{},'proof-api')
+    expect(fleet.sc).toMatchObject({echo_status:{state:'echo_roundtrip',path:'inbox_echo',latency_ms:200}})
+    expect(JSON.stringify(fleet.sc.echo_status)).not.toContain(nonce)
+    expect(JSON.stringify(fleet.sc.echo_status)).not.toContain(ctx.tokenId)
+  })
+
+  it.each(['attachment','agent'] as const)('round2: stale attached %s cannot borrow a different live attachment context',async mismatch=>{
+    const c=await attachedChat();const messagesBefore=n('SELECT COUNT(*) AS n FROM agent_messages');const {findLiveAttachment}=await import('../src/members/seat-attach');const {connectionSubject}=await import('../src/mcp/seat-attach')
+    const live=await findLiveAttachment(env,{memberId:HUMAN,tokenId:c.ctx.tokenId!},c.seatId);expect(live).not.toBeNull();if(!live)throw new Error('missing live attachment')
+    const ctx:AuthContext={...c.ctx,memberId:live.agent_member_id,boundAgentId:live.agent_id,tokenId:live.seat_token_id,
+      seatBinding:{seatId:c.seatId,label:live.seat_label,harnessId:live.harness_id,grantTokenId:c.ctx.tokenId!,humanMemberId:HUMAN,source:'auto:openai_session',
+        attached:{attachmentId:live.attachment_id,admissionId:live.admission_id,agentId:live.agent_id,seatAgentId:live.seat_agent_id,ceiling:live.ceiling}}}
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:true})
+    if(mismatch==='attachment') ctx.seatBinding!.attached!.attachmentId='previous-attachment'
+    else {seedAgent('agent-old','old-agent','Previous agent','squad-core');ctx.seatBinding!.attached!.agentId='agent-old';ctx.boundAgentId='agent-old'}
+    expect(await connectionSubject(ctx,env)).toMatchObject({ok:false,error:'connection_not_live'})
+    expect(n('SELECT COUNT(*) AS n FROM agent_messages')).toBe(messagesBefore)
+  })
+  it('round2: native subject query explicitly welds the exact token to the agent as well as the member',async()=>{
+    const ctx=await native();const {connectionSubject}=await import('../src/mcp/seat-attach');const queries:string[]=[]
+    const traced={...env,DB:new Proxy(env.DB,{get(target,key){
+      if(key==='prepare')return (sql:string)=>{queries.push(sql);return target.prepare(sql)}
+      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value
+    }})} as Env
+    expect(await connectionSubject(ctx,traced)).toMatchObject({ok:true})
+    // Defense in depth: current binding uniqueness also rejects a cross-agent member.
+    // Pin the explicit credential/agent join even while that schema constraint is redundant.
+    expect(queries.some(sql=>/\bt\.agent_id\s*=\s*a\.id\b/.test(sql))).toBe(true)
+  })
+
 })

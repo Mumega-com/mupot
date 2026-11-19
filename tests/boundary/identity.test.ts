@@ -129,7 +129,8 @@ describe('the coordination board, read side (fixed by #2384)', () => {
     expect(r.goals).toEqual([])
   })
   it('control: an org admin reads both', async () => {
-    expect((await board(RAW.admin)).goals).toEqual(['A-JOURNEY', 'B_SECRET-JOURNEY'])
+    // Fixture seeds j-b (B_SECRET-SNAP-JOURNEY) so snapshotB can see updates/deletes (#2411).
+    expect((await board(RAW.admin)).goals).toEqual(['A-JOURNEY', 'B_SECRET-JOURNEY', 'B_SECRET-SNAP-JOURNEY'])
   })
 })
 

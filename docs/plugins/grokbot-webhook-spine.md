@@ -14,7 +14,7 @@ Pot → Grok Bot **doorbell**. When agent A `send`s to agent B and B has a regis
 
 | Thing | Direction | What it is |
 |---|---|---|
-| `wake_contract.emit_url` from `mint_agent_token` | **Inbound** | `POST <origin>/bus/emit` with `type: agent.wake` and an **operator** bearer. Wakes AgentDO *inside* the pot. Opposite of a Bot doorbell. |
+| `wake_contract` from `mint_agent_token` | **Inbound (in-process)** | Documents `agent.wake` body shape + auth header for `createBus().emit`. No public HTTP emit URL (`emit_url` retired #2414). Wakes AgentDO *inside* the pot. Opposite of a Bot doorbell. |
 | Hermes `message.created` (`src/bus/hermes-delivery.ts`) | Outbound, pot-wide | HMAC `X-Hub-Signature-256`. Throws on 5xx so the Queue retries. A Bot 500 on that path would retry Hermes too — do not hang a per-agent doorbell there. |
 | Plugin #1343 | Install | MCP URL + skills. Not a retrieve / wake. |
 

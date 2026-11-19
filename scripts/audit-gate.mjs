@@ -61,23 +61,42 @@
 // self-closing: the day wrangler ships a fixed miniflare, undici drops out, the entry
 // goes stale, and CI tells us to delete it rather than waiting for someone to check.
 //
-// Production dependencies are NOT handled here — they get a plain blocking
-// `npm audit --omit=dev --audit-level=moderate` in ci.yml, with no allowlist and no
-// exceptions. Nothing that ships is tolerated at any severity.
+// PRODUCTION MODE (--omit-dev). The root Worker's production audit is still a plain
+// blocking `npm audit --omit=dev --audit-level=moderate` in ci.yml with no allowlist.
+// workers/project-office runs THIS gate in production mode instead: moderate and above
+// block, same tuple/NEW/STALE rules, and every entry MUST carry a capped expires_on.
+// Its one entry (picomatch) is only acceptable because CI proves the built bundle does
+// not contain picomatch (see the bundle check in the project-office job of ci.yml).
 
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { pathsToNode, LockfileGraphError } from './lockfile-paths.mjs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve, relative } from 'node:path'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const DEFAULT_ALLOWLIST = join(repoRoot, '.github/audit-allowlist.json')
 const DEFAULT_LOCKFILE = join(repoRoot, 'package-lock.json')
 const BLOCKING = new Set(['high', 'critical'])
+// Production mode (--omit-dev) keeps the bar the plain `npm audit --omit=dev
+// --audit-level=moderate` step had: moderate and above block. Never lowered to high-only.
+const BLOCKING_PROD = new Set(['moderate', 'high', 'critical'])
 
 /** npm audit's documented exit codes: 0 = nothing found, 1 = vulnerabilities found. */
 const AUDIT_FINDINGS_EXIT = 1
+
+/** An exemption may not be granted for longer than this many days after accepted_on. */
+const MAX_EXPIRY_DAYS = 90
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const SEVERITIES = ['info', 'low', 'moderate', 'high', 'critical']
+
+/** Strict YYYY-MM-DD -> epoch ms, or null. Rejects roll-overs such as 2027-02-31. */
+function parseDay(v) {
+  if (typeof v !== 'string' || !DATE_RE.test(v)) return null
+  const t = Date.parse(`${v}T00:00:00Z`)
+  if (Number.isNaN(t) || new Date(t).toISOString().slice(0, 10) !== v) return null
+  return t
+}
 
 export class AuditGateError extends Error {}
 
@@ -99,7 +118,15 @@ function tupleKey({ ghsa, pkg, severity, nodes, isDirect, paths }) {
   return JSON.stringify([ghsa, pkg, severity, normalizeNodes(nodes), Boolean(isDirect), normalizePaths(paths)])
 }
 
-export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
+/**
+ * `opts.prod` allows 'moderate' entries (prod mode blocks at moderate). `opts.now` is
+ * injectable for tests. An entry with `expires_on` fails the gate once that date is
+ * past, so a no-upstream-fix exemption cannot sit forever. In prod mode expires_on is
+ * REQUIRED. Whenever present it must be a real YYYY-MM-DD date, >= accepted_on, and at
+ * most MAX_EXPIRY_DAYS after accepted_on.
+ */
+export function loadAllowlist(path = DEFAULT_ALLOWLIST, { prod = false, now = new Date() } = {}) {
+  const blocking = prod ? BLOCKING_PROD : BLOCKING
   let parsed
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'))
@@ -137,11 +164,45 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
         `fixed or the dependency dropped — it cannot inherit the transitive-toolchain exemption.`,
       )
     }
-    if (!BLOCKING.has(String(entry.severity).toLowerCase())) {
-      // Only high/critical block, so allowlisting anything else is dead config that
+    if (prod && entry.expires_on === undefined) {
+      throw new AuditGateError(`${path}: allowed[${i}] is missing required field "expires_on" (required in production mode)`)
+    }
+    {
+      // A future accepted_on would defeat the MAX_EXPIRY_DAYS cap (expiry is measured from it).
+      const accDay = parseDay(entry.accepted_on)
+      if (accDay !== null && entry.accepted_on > now.toISOString().slice(0, 10)) {
+        throw new AuditGateError(`${path}: allowed[${i}].accepted_on ${entry.accepted_on} is in the future (UTC)`)
+      }
+    }
+    if (entry.expires_on !== undefined) {
+      const exp = parseDay(entry.expires_on)
+      if (exp === null) {
+        throw new AuditGateError(`${path}: allowed[${i}].expires_on must be a YYYY-MM-DD date`)
+      }
+      const acc = parseDay(entry.accepted_on)
+      if (acc === null) {
+        throw new AuditGateError(`${path}: allowed[${i}].accepted_on must be a YYYY-MM-DD date`)
+      }
+      if (exp < acc) {
+        throw new AuditGateError(`${path}: allowed[${i}].expires_on ${entry.expires_on} is before accepted_on ${entry.accepted_on}`)
+      }
+      if ((exp - acc) / 86_400_000 > MAX_EXPIRY_DAYS) {
+        throw new AuditGateError(
+          `${path}: allowed[${i}].expires_on ${entry.expires_on} is more than ${MAX_EXPIRY_DAYS} days after accepted_on ${entry.accepted_on}`,
+        )
+      }
+      if (now.toISOString().slice(0, 10) > entry.expires_on) {
+        throw new AuditGateError(
+          `${path}: allowed[${i}] (${entry.ghsa}) expired on ${entry.expires_on}. Re-review: fix the ` +
+          `advisory if upstream shipped one, or extend expires_on with a fresh written justification.`,
+        )
+      }
+    }
+    if (!blocking.has(String(entry.severity).toLowerCase())) {
+      // Only blocking severities matter, so allowlisting anything else is dead config that
       // silently pre-forgives a future re-rating. Reject it rather than ignore it.
       throw new AuditGateError(
-        `${path}: allowed[${i}].severity is "${entry.severity}" — only high/critical block, ` +
+        `${path}: allowed[${i}].severity is "${entry.severity}" — only ${prod ? 'moderate/high/critical' : 'high/critical'} block, ` +
         `so this entry does nothing except pre-forgive a re-rating. Remove it.`,
       )
     }
@@ -163,9 +224,9 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST) {
  * bad lockfile, EACCES), and a gate must never read that as a clean bill of health,
  * even when the process happened to emit parseable JSON on the way down.
  */
-export function runAudit(cwd = repoRoot, exec = execFileSync) {
+export function runAudit(cwd = repoRoot, exec = execFileSync, { omitDev = false } = {}) {
   try {
-    return JSON.parse(exec('npm', ['audit', '--json'], {
+    return JSON.parse(exec('npm', ['audit', ...(omitDev ? ['--omit=dev'] : []), '--json'], {
       cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     }))
   } catch (err) {
@@ -199,8 +260,42 @@ function pathsForFinding(lock, vuln) {
   return normalizePaths(all)
 }
 
-export function evaluate(report, allowed, lock) {
-  if (!report || typeof report !== 'object' || typeof report.vulnerabilities !== 'object' || report.vulnerabilities === null) {
+/**
+ * Malformed npm output must fail closed. npm's own summary (`metadata.vulnerabilities`)
+ * counts packages per severity; the per-package map we evaluate must agree with it, and
+ * every entry must carry a `via` array. A report that disagrees with itself (vuln with
+ * no `via`, an emptied map) is a tool/format fault, not a clean audit.
+ */
+export function crossCheckMetadata(report) {
+  const counts = report?.metadata?.vulnerabilities
+  if (!counts || typeof counts !== 'object') {
+    throw new AuditGateError('audit output has no `metadata.vulnerabilities` counts — refusing to interpret it')
+  }
+  const tally = Object.fromEntries(SEVERITIES.map((s) => [s, 0]))
+  let total = 0
+  for (const [pkg, vuln] of Object.entries(report.vulnerabilities)) {
+    if (!Array.isArray(vuln?.via)) {
+      throw new AuditGateError(`audit output: ${pkg} has no \`via\` array — malformed, refusing to interpret it`)
+    }
+    const sev = String(vuln.severity ?? '').toLowerCase()
+    if (!Object.hasOwn(tally, sev)) throw new AuditGateError(`audit output: ${pkg} has unknown severity "${vuln.severity}"`)
+    tally[sev]++
+    total++
+  }
+  for (const sev of SEVERITIES) {
+    if (counts[sev] !== tally[sev]) {
+      throw new AuditGateError(`audit output disagrees with itself: metadata says ${counts[sev]} ${sev}, vulnerabilities lists ${tally[sev]}`)
+    }
+  }
+  if (counts.total !== total) {
+    throw new AuditGateError(`audit output disagrees with itself: metadata total ${counts.total}, vulnerabilities lists ${total}`)
+  }
+}
+
+export function evaluate(report, allowed, lock, { prod = false } = {}) {
+  const blocking = prod ? BLOCKING_PROD : BLOCKING
+  if (!report || typeof report !== 'object' || typeof report.vulnerabilities !== 'object' ||
+      report.vulnerabilities === null || Array.isArray(report.vulnerabilities)) {
     throw new AuditGateError('audit output has no `vulnerabilities` object — refusing to interpret silence as safety')
   }
 
@@ -222,7 +317,7 @@ export function evaluate(report, allowed, lock) {
     for (const via of vuln?.via ?? []) {
       if (typeof via !== 'object' || via === null) continue
       const severity = String(via.severity ?? vuln.severity ?? '').toLowerCase()
-      if (!BLOCKING.has(severity)) continue
+      if (!blocking.has(severity)) continue
 
       const ghsa = String(via.url ?? '').split('/').filter(Boolean).pop()
       if (!ghsa || !ghsa.startsWith('GHSA-')) {
@@ -290,51 +385,92 @@ export function evaluate(report, allowed, lock) {
   return { violations, stale }
 }
 
-function main() {
+/**
+ * Minimal CLI: --cwd DIR, --allowlist FILE, --omit-dev. Defaults = root dev gate.
+ * There is deliberately NO --lockfile: the lockfile is always <cwd>/package-lock.json,
+ * the one npm audits, so paths can never be taken from a different tree than the audit.
+ */
+export function parseArgs(argv) {
+  const opts = { cwd: repoRoot, allowlist: undefined, omitDev: false }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--omit-dev') opts.omitDev = true
+    else if (a === '--cwd' || a === '--allowlist') {
+      const v = argv[++i]
+      if (!v || v.startsWith('--')) throw new AuditGateError(`${a} needs a value`)
+      opts[a.slice(2)] = resolve(v)
+    } else throw new AuditGateError(`unknown argument ${a}`)
+  }
+  opts.allowlist ??= opts.cwd === repoRoot ? DEFAULT_ALLOWLIST : join(opts.cwd, '.audit-allowlist.json')
+  opts.lockfile = join(opts.cwd, 'package-lock.json')
+  return opts
+}
+
+/** Prod mode: root dev edges are not part of what ships, so they are not accepted paths. */
+export function withoutDevRoot(lock) {
+  const root = { ...(lock?.packages?.[''] ?? {}) }
+  delete root.devDependencies
+  return { ...lock, packages: { ...lock.packages, '': root } }
+}
+
+/**
+ * The whole CLI as a function, so tests can drive it end to end with a fake `exec`.
+ * Returns the process exit code; never calls process.exit itself.
+ */
+export function runGate(argv, { exec = execFileSync, now = new Date(), log = console.log, error = console.error } = {}) {
   let allowed
   let result
+  let opts
   try {
-    allowed = loadAllowlist()
-    const lock = JSON.parse(readFileSync(DEFAULT_LOCKFILE, 'utf8'))
-    result = evaluate(runAudit(), allowed, lock)
+    opts = parseArgs(argv)
+    const prod = opts.omitDev
+    allowed = loadAllowlist(opts.allowlist, { prod, now })
+    let lock = JSON.parse(readFileSync(opts.lockfile, 'utf8'))
+    if (prod) lock = withoutDevRoot(lock)
+    const audit = runAudit(opts.cwd, exec, { omitDev: prod })
+    crossCheckMetadata(audit)
+    result = evaluate(audit, allowed, lock, { prod })
   } catch (err) {
-    console.error(`\n✗ audit-gate: ${err.message}\n`)
-    process.exit(1)
+    error(`\n✗ audit-gate: ${err.message}\n`)
+    return 1
   }
+  const label = opts.omitDev ? 'moderate/high/critical production' : 'high/critical dev'
+  const listName = relative(repoRoot, opts.allowlist)
 
   if (result.violations.length > 0) {
-    console.error('\n✗ audit-gate: high/critical dev advisories not accepted in .github/audit-allowlist.json\n')
-    for (const v of result.violations) console.error(`    ${v}`)
-    console.error(
+    error(`\n✗ audit-gate: ${label} advisories not accepted in ${listName}\n`)
+    for (const v of result.violations) error(`    ${v}`)
+    error(
       '\n  Fix the advisory if a fixed version exists. Only add it to the allowlist if it is' +
-      '\n  genuinely unfixable AND dev-only, with the reason written in the entry.\n',
+      '\n  genuinely unfixable AND not shipped (dev toolchain, or proven absent from the built bundle),' +
+      '\n  with the reason written in the entry.\n',
     )
-    process.exit(1)
+    return 1
   }
 
   if (result.stale.length > 0) {
     const byReason = (r) => result.stale.filter((s) => s.reason === r)
     const line = (s) => `    ${s.ghsa} (${s.package}, ${s.severity}) — accepted ${s.accepted_on}`
 
-    console.error('\n✗ audit-gate: allowlist entries that no longer match the audit\n')
+    error('\n✗ audit-gate: allowlist entries that no longer match the audit\n')
 
     const gone = byReason('gone')
     if (gone.length > 0) {
-      console.error('  GONE — the advisory is no longer reported. A fix shipped.')
-      for (const s of gone) console.error(line(s))
-      console.error(
-        '\n    Delete these from .github/audit-allowlist.json. If the list becomes empty,' +
-        '\n    the carve-out has no reason to exist — close' +
-        '\n    https://github.com/Mumega-com/mupot/issues/670 and fold this step back into' +
-        '\n    the blocking production audit.\n',
+      error('  GONE — the advisory is no longer reported. A fix shipped.')
+      for (const s of gone) error(line(s))
+      error(
+        `\n    Delete these from ${listName}. If the list becomes empty,` +
+        '\n    the carve-out has no reason to exist — close its review issue' +
+        `\n    (${[...new Set(gone.map((s) => s.review ?? 'no review link in the entry'))].join(', ')}) and fold this step back into` +
+        '\n    the plain blocking audit.\n',
       )
     }
 
     const moved = byReason('moved')
     if (moved.length > 0) {
-      console.error('  MOVED — the advisory is STILL PRESENT, reached a different way.')
-      for (const s of moved) console.error(line(s))
-      console.error(
+      error('  MOVED — the advisory is STILL PRESENT, reached a different way.')
+      for (const s of moved) error(line(s))
+      error(
         '\n    DO NOT delete these to make the build green. The finding is live; only the' +
         '\n    route to it changed, and it is reported above as an unaccepted advisory.' +
         '\n    Decide whether the NEW shape is acceptable, and if it is, update the entry' +
@@ -345,22 +481,32 @@ function main() {
 
     const unknown = byReason('unknown')
     if (unknown.length > 0) {
-      console.error('  UNKNOWN — cannot determine whether this advisory is still present.')
-      for (const s of unknown) console.error(line(s))
-      console.error(
+      error('  UNKNOWN — cannot determine whether this advisory is still present.')
+      for (const s of unknown) error(line(s))
+      error(
         '\n    At least one blocking finding above has NO resolvable advisory id, so this' +
         '\n    exemption may or may not still apply. Verify by hand. Do NOT delete on the' +
         '\n    assumption that a fix shipped — this gate does not know that, and saying so' +
         '\n    would be the gate asserting something it cannot support.\n',
       )
     }
-    process.exit(1)
+    return 1
   }
 
-  console.log(
-    `✓ audit-gate: no unaccepted high/critical dev advisories ` +
-    `(${allowed.length} accepted, all still present — see .github/audit-allowlist.json)`,
+  log(
+    `✓ audit-gate: no unaccepted ${label} advisories ` +
+    `(${allowed.length} accepted, all still present — see ${listName})`,
   )
+  return 0
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) main()
+function main() {
+  process.exit(runGate(process.argv.slice(2)))
+}
+
+// Fail-closed entry guard: compare real paths so symlinks and spaces still run main().
+function isEntryPoint() {
+  if (!process.argv[1]) return false
+  try { return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])) } catch { return false }
+}
+if (isEntryPoint()) main()

@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
 import { acceptInvite } from '../src/members'
-import { decideSignIn, isOpenSignup } from '../src/auth/invite-only'
+import { decideSignIn, isOpenSignup, refusalText } from '../src/auth/invite-only'
 import { HANDOFF_AUD, HANDOFF_ISS } from '../src/auth/handoff-verify'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -549,5 +549,100 @@ describe('decideSignIn is read-only on its refusals and fails closed on a D1 err
   it('a throwing DB surfaces as a throw, never as an admit', async () => {
     const env = { TENANT_SLUG: TENANT, DB: { prepare: () => { throw new Error('d1 down') } } } as unknown as Env
     await expect(decideSignIn(env, { door: 'oauth_mcp', email: 'x@y.test', provider: 'google', subject: 's' })).rejects.toThrow('d1 down')
+  })
+})
+
+// #2392 — two P2 edges from the #2386 review: inactive subject must not ride an
+// unrelated active email, and an emailless first-owner claim must not lock out the pot.
+describe('decideSignIn #2392 edges (inactive subject; emailless first owner)', () => {
+  it('inactive Google subject is refused even when a different ACTIVE member shares the verified email', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); seed(h)
+    // Duplicate-member / email-drift shape: subject bound to suspended member-existing,
+    // while the current verified email belongs to a different live member.
+    h.sqlite.exec(`
+      UPDATE members SET status='suspended' WHERE id='member-existing';
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-drift', 'drift@pot.test', 'Drift Active', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('hli-inactive', '${TENANT}', 'google', 'sub-inactive', 'old@elsewhere.test', 'member-existing', '2026-01-01T00:00:00.000Z');
+    `)
+    const env = webEnv(h, memoryKv())
+    const decision = await decideSignIn(env, {
+      door: 'google_web',
+      email: 'drift@pot.test',
+      provider: 'google',
+      subject: 'sub-inactive',
+      newUserId: 'u-inactive',
+    })
+    expect(decision).toEqual({ allowed: false, reason: 'inactive' })
+  })
+
+  it('emailless google_web first-owner claim is refused with a next step (no claim written)', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite)
+    const env = webEnv(h, memoryKv())
+    const decision = await decideSignIn(env, {
+      door: 'google_web',
+      email: null,
+      provider: 'google',
+      subject: 'sub-no-email',
+      newUserId: 'u-no-email',
+    })
+    expect(decision).toEqual({ allowed: false, reason: 'email_required' })
+    expect(refusalText('email_required').toLowerCase()).toMatch(/sign in again|try again|email scope|verified email/)
+    expect((h.sqlite.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n).toBe(0)
+    expect((h.sqlite.prepare('SELECT COUNT(*) AS n FROM owner_bootstrap_claim').get() as { n: number }).n).toBe(0)
+  })
+
+  it('normal first owner with a verified email is still admitted', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite)
+    const env = webEnv(h, memoryKv())
+    expect(await decideSignIn(env, {
+      door: 'google_web',
+      email: 'first@pot.test',
+      provider: 'google',
+      subject: 'sub-first',
+      newUserId: 'u-first',
+    })).toEqual({ allowed: true, via: 'first_owner' })
+  })
+
+  it('invited (accepted) email is still admitted via member standing', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite); seed(h)
+    const env = webEnv(h, memoryKv())
+    expect((await acceptInvite(env, 'inv-1', 'Invitee')).ok).toBe(true)
+    expect(await decideSignIn(env, {
+      door: 'google_web',
+      email: 'invitee@example.com',
+      provider: 'google',
+      subject: 'sub-invitee',
+      newUserId: 'u-invitee',
+    })).toEqual({ allowed: true, via: 'member' })
+  })
+
+  it('web door: emailless Google profile on a virgin pot gets the email_required page, no session, no claim', async () => {
+    const h = createSqliteD1(); applyAllMigrations(h.sqlite)
+    const kv = memoryKv()
+    const env = webEnv(h, kv)
+    const login = await authApp.request(`${ORIGIN}/login`, {}, env)
+    const state = new URL(login.headers.get('location') ?? '').searchParams.get('state') ?? ''
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'g' }), { status: 200 })
+      if (url.includes('openidconnect.googleapis.com/v1/userinfo')) {
+        return new Response(JSON.stringify({ sub: 'sub-no-email', email_verified: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    }))
+    const res = await authApp.request(
+      `${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`,
+      { headers: { cookie: `mupot_login_state_${state}=1` } },
+      env,
+    )
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    expect(body).toContain('verified email')
+    expect(body).not.toContain('invite-only')
+    expect(sessionKeys(kv)).toEqual([])
+    expect((h.sqlite.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n).toBe(0)
+    expect((h.sqlite.prepare('SELECT COUNT(*) AS n FROM owner_bootstrap_claim').get() as { n: number }).n).toBe(0)
   })
 })

@@ -15,7 +15,7 @@ import { listObservedSeats, type ObservedSeatRow } from '../members/seat-hold-re
 import { vipLaneEnabled } from '../members/vip-lane'
 import { mcpEndpoint, requiredCanonicalOrigin } from './connect'
 import { pill, type Html } from './ui'
-import { reauthRedirectUrl } from './claim'
+import { authorityChoiceFields, reauthRedirectUrl } from './claim'
 
 export interface ConnectedChat { attachment_id: string; admission_id: string; label: string; harness: string; since: string }
 
@@ -95,9 +95,10 @@ export function renderAgentConnectPanel(
           <label>Enter the approval code
             <input name="attach_code" inputmode="text" autocomplete="off" maxlength="8" required aria-label="Approval code">
           </label>
+          ${authorityChoiceFields(agent.name)}
           ${fresh
-            ? html`<button type="submit" class="btn">${des.resumeClaim ? 'Confirm: Approve' : 'Approve'}</button>`
-            : html`<a class="btn" href="${reauthRedirectUrl(`/agents/${agent.id}?resume=claim`)}">Sign in again to approve</a>`}
+            ? html`<button type="submit" class="btn" data-claim-connect>${des.resumeClaim ? 'Confirm: Connect' : 'Connect'}</button>`
+            : html`<a class="btn" href="${reauthRedirectUrl(`/agents/${agent.id}?resume=claim`)}">Sign in again to connect</a>`}
           <button type="button" class="btn danger" data-cx-deny="${c.admissionId}">Reject</button>
         </form>`}</div>`)}`
   const connected = v.connected.length === 0

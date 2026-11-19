@@ -96,7 +96,7 @@ const TODAY = '2026-10-26'
 function envOf(over: Partial<Env> = {}): Env {
   // as: the test supplies only the bindings the backup reads; the rest of Env is irrelevant here.
   return {
-    DB: h.db, NIGHTLY_BACKUP: '1', BACKUPS: r2 as unknown as R2Bucket,
+    DB: h.db, TENANT_SLUG: 'mumega', NIGHTLY_BACKUP: '1', BACKUPS: r2 as unknown as R2Bucket,
     BACKUP_CF_API_TOKEN: TOKEN, BACKUP_ACCOUNT_ID: 'acct', BACKUP_D1_ID: 'dbid',
     TELEGRAM_BOT_TOKEN: '123456:telegramtoken', TELEGRAM_CHAT_ID: '42', ...over,
   } as unknown as Env
@@ -175,7 +175,56 @@ describe('nightly backup', () => {
       expect(r2.objects.has(manifestKey(TODAY))).toBe(false)
       expect(calls.telegram).toHaveLength(1)
       h.sqlite.prepare('DELETE FROM backup_runs').run()
+      h.sqlite.prepare('DELETE FROM notif_dedupe').run() // the identical alert is correctly deduped within 10 min
     }
+  })
+
+  it('two different failures on one date both alert (the dedupe key carries the reason)', async () => {
+    const calls = stubFetch([EXPORT_ERR, { ...EXPORT_ERR, result: { ...EXPORT_ERR.result, error: 'kaboom' } }])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(calls.telegram).toHaveLength(2)
+    expect(calls.telegram[0]).toContain('boom')
+    expect(calls.telegram[1]).toContain('kaboom')
+  })
+
+  it('the identical failure repeated within 10 minutes alerts once', async () => {
+    const calls = stubFetch([EXPORT_ERR, EXPORT_ERR])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(calls.telegram).toHaveLength(1)
+  })
+
+  it('alerted=0 when the alert send fails (M35)', async () => {
+    stubFetch([EXPORT_ERR])
+    const inner = globalThis.fetch
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).startsWith('https://api.telegram.org/') ? new Response('nope', { status: 500 }) : inner(input, init))
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(rows()[0]).toMatchObject({ status: 'failed', alerted: 0 })
+  })
+
+  it('a re-run whose identical alert was deduped records alerted=1: the alert already went out (M35, item 7)', async () => {
+    stubFetch([EXPORT_ERR, EXPORT_ERR])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    const all = rows()
+    expect(all).toHaveLength(2)
+    expect(all.map((r) => r.alerted)).toEqual([1, 1])
+  })
+
+  it('a failed backup is critical: it alerts even when the recipient is at the rate cap', async () => {
+    const tenant = envOf().TENANT_SLUG
+    const now = new Date().toISOString()
+    for (let i = 0; i < 25; i++) {
+      h.sqlite.prepare("INSERT INTO notif_event (id, tenant, type, severity, subject_ref, recipients_json, dedupe_key) VALUES (?, ?, 'backup.failed', 'attention', 's', '[]', ?)").run(`e${i}`, tenant, `k${i}`)
+      h.sqlite.prepare("INSERT INTO notif_delivery (id, event_id, tenant, recipient, channel, status, created_at) VALUES (?, ?, ?, 'owner', 'telegram_dm', 'sent', ?)").run(`d${i}`, `e${i}`, tenant, now)
+    }
+    const calls = stubFetch([EXPORT_ERR])
+    await runNightlyBackup(envOf(), { runDate: TODAY }, step)
+    expect(calls.telegram).toHaveLength(1)
+    const ev = h.sqlite.prepare("SELECT COUNT(*) AS n FROM notif_event WHERE severity = 'critical' AND type = 'backup.failed'").get() as { n: number }
+    expect(ev.n).toBe(1)
   })
 
   it('a failure in the begin step (D1 unavailable) still alerts and returns failed', async () => {

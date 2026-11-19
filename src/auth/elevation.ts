@@ -1,3 +1,4 @@
+import { authorityLiveSql } from './attached-authority'
 // mupot — the elevation ledger (SENSITIVE). Delivery Sequence step 3 (mupot
 // task f5fe1222-981c-4fb8-95c2-1eacd38f3cee, mumega-com#1173): "Fix the
 // ability that I can make agents admin by a safe way and time limited."
@@ -556,7 +557,7 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
   try {
     const row = await env.DB.prepare(
       `SELECT att.id AS attachment_id, att.human_member_id AS human_member_id, att.agent_id AS agent_id,
-              CASE WHEN att.detached_at IS NULL AND adm.status = 'live' AND ${ADMISSION_BOUND_TO_SEAT_SQL}
+              CASE WHEN att.detached_at IS NULL AND adm.status = 'live' AND ${authorityLiveSql('adm','?3')} AND ${ADMISSION_BOUND_TO_SEAT_SQL}
                     AND EXISTS (SELECT 1 FROM agent_seats s WHERE s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL
                                   AND s.member_id = att.human_member_id AND s.harness_id = att.harness_id)
                     AND EXISTS (SELECT 1 FROM agents a

@@ -30,22 +30,8 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../src/auth/token-lifecycle'
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
-  const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
-  for (const file of files) {
-    try {
-      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    } catch {
-      // Same tolerance as list-agent-tokens-real-schema.test.ts: some historical
-      // migrations are environment-specific. What matters is that 0099's columns
-      // exist afterwards, which the first test asserts explicitly rather than assuming.
-    }
-  }
-}
 
 /** The live-token lookup, built exactly the way both production doors build it. */
 const LOOKUP = `SELECT t.id FROM member_tokens t WHERE t.token_hash = ?1 AND ${TOKEN_LIVE_PREDICATE('?2')}`
@@ -309,6 +295,7 @@ describe('every bearer door consumes the shared predicate', () => {
   // Queries that read member_tokens WITHOUT granting anything, and must therefore be
   // able to see a non-live row. Pinned to the query, not the file.
   const NON_AUTH_QUERIES: ReadonlyArray<{ fingerprint: string; why: string }> = [
+    { fingerprint: 'b0481e6edbea', why: 'inbox echo token-set inventory: deliberately includes retained revoked rows so issuing then revoking a token cannot resurrect stale echo status. The exact credential is separately checked through TOKEN_LIVE_PREDICATE, and commit rechecks both its lifecycle and this inventory. This query grants no authority.' },
     { fingerprint: 'dd4c5c20f09a', why: 'control-center: aggregate of member/channel pairs for an operator view. Grants nothing.' },
     { fingerprint: '426f3c16d874', why: 'dashboard: DISTINCT member/channel listing. Grants nothing.' },
     { fingerprint: '87a0ace21487', why: 'keys page: lists a tenant preset-labelled keys. Display only.' },

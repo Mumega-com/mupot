@@ -1,13 +1,60 @@
 # Changelog
 
+## Release status — 2026-11-15
+
+- **Newest tagged stable release:** `v0.31.0` (annotated tag `52299bab`, dated 2026-09-28).
+  Prior stable tag: `v0.30.0` (`09ea48f6`, 2026-09-26).
+- **Source version on `main`:** `0.31.0` in `package.json` and `src/version.ts`
+  (`MUPOT_PUBLIC_API_VERSION`).
+- **Distance from tag:** `434` commits on `main` after `v0.31.0` (`git rev-list --count
+  v0.31.0..origin/main`). Summarized under `[Unreleased]` below, grouped by calendar week.
+- **Production deployment:** read live `/health` for `version`, `commit`, and `clean`. This
+  document does not pin a production commit or assert that production matches a tag.
+
+Older status blocks below remain as dated history; they are not current release truth.
+
 ## [Unreleased] — main since v0.31.0
 
-### Release-scope highlights after the v0.31.0 tag
+`434` commits after `v0.31.0` as of 2026-11-15. Grouped by ISO calendar week (Monday–Sunday);
+newest first. Summaries only — cited PRs hold exact heads, tests, and gate residuals. A merge
+is not a stable-release verdict.
 
-These entries summarize selected merged work; exact heads, tests, deployments and
-residual findings remain on the cited PRs. A merge is not a stable-release verdict.
+### Week 2026-11-10 → 2026-11-16
 
-- **Unreleased: actionable 401 guidance (#2371):** unauthenticated 401s on `/mcp`, `/actions/*` and the REST surfaces now carry one uniform JSON body that says what happened, who acts, the next step and a help URL. HTTP status and the OAuth challenge headers (`WWW-Authenticate`) are unchanged, and the body is identical whether the credential is missing, unknown, revoked or expired, so it reveals nothing about which accounts or tokens exist. `error_description` for a rejected token now reads "Missing or invalid access token". A 401 whose body already carries other fields keeps it unchanged (for example the signed-daemon inbox's `detail`, and JSON-RPC `-32001` bodies), and `/api/*` guidance names its actual sign-in or admin-issued-key route rather than suggesting OAuth where that API does not accept it. The CLI keeps keying on the status code.
+Gate and reliability follow-ups from the November boundary/routines/connect pass (#2408–#2429):
+honest MCP boundary proof (#2422, #2423 parent #2411), routines control-task close paths
+(#2425, #2426), connect/wake-contract dead instructions (#2414, #2416, #2421), studio and MCP
+test harness gaps (#2409–#2413), inactive-subject auth guard (#2404), refusal-next-step CI
+(#2415), and P2 test closures (#2428–#2429). Docs: Option B slice 1 brief (#2376).
+
+- **Actionable 401 guidance (#2371):** unauthenticated 401s on `/mcp`, `/actions/*` and the REST
+  surfaces now carry one uniform JSON body that says what happened, who acts, the next step and a
+  help URL. HTTP status and the OAuth challenge headers (`WWW-Authenticate`) are unchanged.
+
+### Week 2026-11-03 → 2026-11-09
+
+OAuth consent refusals with next steps (#2281 and follow-ons), routine human-review deadlines
+(#2278), inbox push via SeatEventsDO (#2188), and continued seat/attach hardening across
+#2282–#2319.
+
+### Week 2026-10-27 → 2026-11-02
+
+Bearer inbox push plumbing, routine scheduler follow-ups, and integration fixes (#2183–#2216
+cluster). Read the week's merge subjects on `main` for the exact PR list.
+
+### Week 2026-10-20 → 2026-10-26
+
+VIP lane, admission tape, installer window, seat attach to designated agents, reply-to-sender,
+and connections dashboard fixes (#2034–#2070 range). See also the detailed bullets under the
+week of 2026-10-18 below.
+
+### Week 2026-10-13 → 2026-10-19
+
+Selected merged highlights (October seat/onboarding work):
+
+Immediate post-tag work: office publishing follow-ups, OpenAPI allowlist, `task_get`,
+`task_submit_result`, loop brakes, and harness-seat activation. Detailed bullets below span
+this week through mid-October; PR numbers are the receipt.
 
 - **A landing requires evidence (#2025, part of the Orca gate):** `flight_land`, REST land, the watchdog's tasks-done close and the watchdog system land now share one SQL predicate that also requires, for every task, a result submission from the flight's own agent (text equals `tasks.result`) and an independent approved verdict (not the assignee or flight agent, not `gate:agent-self-completion`; a human verdict via `agent_attested_origin` counts). Refusals are distinct (`land_requires_result_submission`, `land_requires_independent_verdict`) with envelope guidance; a landing appends `task-result-submission:<id>` to `meta.receipt_refs` and the `flight.landed` payload. The watchdog no longer lands done-but-unevidenced flights: it records `watchdog_tasks_done_unverified` (`watchdog_system_land_unverified` for a parked flight; that one escalates once), keeps status, logs a HELD line, lists the flight in needs_you's stuck view (project-attached flights; admins only) and keeps it out of the reapable scan window so held flights cannot starve it; a held running flight expires to failed (`unverified_expired`) 7 days after it started. A PR-linked task whose result the CI sync overwrote with `CI: success|neutral|skipped` still satisfies the text match (the submitter binding is never waived). The system land (#1547 note) now also writes `receipt_refs`, still no outbox row. Routine control flights are exempt. **Rollback:** set `LAND_REQUIRES_EVIDENCE="0"` (default on); this also restores the old watchdog land.
 - **One refusal envelope on the MCP door (lane B, mupot task 7e0cb92d):** every `isError` refusal carries `who_acts` (`self|owner|admin|org_admin`); a table in `src/mcp/refusal-next-step.ts` gives each door code a `next_step` (+ `next_tool`, `link` only from the refusal's own detail). Fixes dead ends: orient/connect loop (orient names `orient { agent }` or `seat_select`), `seat_select` from an already-bound credential, `verify_agent_connection` from a seat (needs an admin-minted workspace token), `agent_bound_workspace_credential_required` (`token_binding_attest` first), `consumer_fenced` (peek / `set_agent_inbox_consumer`), `bootstrap_self` rate limit now 429, generic `forbidden{need}` names `grant_agent_capability`, connect after bootstrap (zero-capability refusal names the human re-consent or an admin-minted token). On JSON-RPC errors (`tool_not_in_profile`, `profile_args_not_allowed`, `harness_session_seat_required` -32003, orient/check_in `invalid_args`, 5xx) the envelope rides as SIBLING members of `error` (`error.who_acts`, `error.next_step`, `error.next_tool`) beside `data`, whose shape is unchanged; no reader of `error.data` exists under `src/` or `plugins/`. `who_acts` is pinned per connection kind (chat connector vs bearer), consent labels follow SEAT_ATTACH ("Me (auto)"/"Existing agent" when off, "Many chats"/"One agent" when on), and `link` is taken only from a dedicated detail field. connect DOOR A agrees with `seat_required` (seat_select only with a harness, else re-consent with "Many chats"); initialize instructions no longer carry a closed harness list. REST `/actions` bodies are unchanged.
@@ -38,7 +85,7 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
 - **Messaging:** inbox rows from system-sender literals (mupot-review-gate, mupot-flights, mupot-dispatch, ...) report `reply_basis: system_sender` with `reply_via`, and a send to one is refused as `system_sender_not_addressable` (#2003).
 - **Onboarding:** boot_context now records observed facts (runtime, model, host, server-derived connection kind, last boot; migration 0235) for agent-bound callers, returns an `onboarding.next_step` to attached threads and member tokens (which still write nothing), and the agent page shows a read-only Live runtime block; runtime/harness/model/host intake is graceful: any bounded string is kept as reported with a canonical hint (`other` when unknown), check_in `harness` is no longer an enum, only non-strings are refused, except the formally non-adopted goose/goosed which one shared check refuses on every intake; boot also gives keyed agents and fenced attached threads a truthful `next_step` with `who_acts`, and seat-handle sessions record connection kind `seat` (#2005).
 
-### Release-scope highlights, 2026-10-18 → 2026-10-19 (merged to `main`; unreleased)
+#### 2026-10-18 → 2026-10-19 (same week)
 
 Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.
 Migrations named here must be applied before the code that reads them is deployed.
@@ -61,7 +108,7 @@ this file. A merge is not a stable-release verdict.
 - **Events/subscribe refusals recorded (#2067, migration 0242, additive):** an early `events/subscribe` refusal now writes a structured log line and one bounded `event_subscribe_refusals` row.
 - **Data-hygiene audit (#2068):** a read-only classifier script for the #1496 data-hygiene audit.
 
-### Release-scope highlights, 2026-10-12 → 2026-10-16 (merged to `main`; unreleased)
+#### 2026-10-12 → 2026-10-16 (same week)
 
 Summaries only; each cited PR holds its exact head, tests, gate rounds and residuals.
 Migrations named here must be applied before the code that reads them is deployed.
@@ -208,14 +255,14 @@ next scope decision starts from measurement; none is a change in this entry.
   it). Not merged; state it as merged only once `gh pr view` on this PR
   reports `MERGED`.
 
-## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
+## [0.31.0] — 2026-09-28 (tagged `v0.31.0` at `52299bab`; see the tag, not a SHA copied here)
 
-`main` at `d954c1ab` is 14 commits ahead of the `v0.30.0` tag (`09ea48f6`),
+Fifteen commits sit between the `v0.30.0` tag (`09ea48f6`) and the `v0.31.0` tag (`52299bab`); the Office deploy commit was `d954c1ab` (#1604),
 verified via `git log 09ea48f6..origin/main` and each PR's merge commit
 confirmed against the GitHub API (`gh pr view <n> --json mergeCommit`). Hadi
 approved cutting `v0.31.0` "Office" for this window; `package.json`/
 `src/version.ts` moved to `0.31.0` in #1604, which merged and deployed
-2026-09-29. Live `/health` confirms `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}`.
+2026-09-28 (tag at `52299bab`, docs #1598). Deploy at `d954c1ab` predates the tag; read `/health` for what production runs today.
 Kasra-core cuts `release/v0.31.0` and the annotated tag against this commit
 range — this entry does not pin which exact commit the tag lands on (this
 document does not pin `main`, the same rule every prior entry follows); read
@@ -518,7 +565,7 @@ PR's own commit message, which in a few cases named a *different*, superseded PR
   routes `metadata.action='create_pot'` (residual since #1232; found in #1516's gate;
   this is why #1543 disabled checkout by default rather than shipping it live).
 
-## Release status — 2026-09-06
+## Release status — 2026-09-06 (historical; superseded by "Release status — 2026-11-15" above)
 
 - **Source version as of 2026-09-06:** `0.30.0` on `main`. **This document does not pin
   the `main` commit.** Any SHA written here is false the moment the commit writing it is

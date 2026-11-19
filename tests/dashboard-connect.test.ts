@@ -123,15 +123,13 @@ describe('grokSnippet', () => {
 })
 
 describe('wakeContractForAgent', () => {
-  const contract = wakeContractForAgent('agent-1', 'squad-1', 'digid', 'https://agents.digid.ca')
+  const contract = wakeContractForAgent('agent-1', 'squad-1', 'digid')
 
-  it('emit_url is <origin>/bus/emit (not /mcp — the bus endpoint, not the MCP endpoint)', () => {
-    expect(contract.emit_url).toBe('https://agents.digid.ca/bus/emit')
-  })
-
-  it('strips a trailing slash from the origin before joining', () => {
-    const c = wakeContractForAgent('a', 's', 't', 'https://agents.digid.ca/')
-    expect(c.emit_url).toBe('https://agents.digid.ca/bus/emit')
+  it('does not advertise emit_url (HTTP emit route retired #2414)', () => {
+    // Mutation: re-add emit_url on the wake contract → this assertion goes RED.
+    expect(contract).not.toHaveProperty('emit_url')
+    expect(JSON.stringify(contract)).not.toContain('emit_url')
+    expect(JSON.stringify(contract)).not.toContain('/bus/emit')
   })
 
   it('auth_header is the literal string "Authorization" (never a header value)', () => {

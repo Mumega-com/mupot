@@ -1,21 +1,17 @@
 // tests/inbox-routes.test.ts — the HTTP mirror of the agent inbox (GET /api/inbox, POST
 // /api/inbox/send) used by the bash wake-hooks. member-bearer auth is mocked to control the
-// caller's welded identity; the DB fake faithfully models agents + agent_messages.
+// caller's welded identity; inbox, seat and signed-fence SQL use the real migration chain.
 
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import type { Env, CapabilityGrant } from '../src/types'
-
-// SQLite's lower() is ASCII-only — it does not fold Unicode case. Use this, never
-// String.prototype.toLowerCase(), when mocking a `lower(...)` SQL predicate.
-function asciiLower(s: string): string {
-  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32))
-}
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // Mock the member-token auth so we drive the caller's weld directly. tokenId is included
 // (the real resolveMemberByToken always returns it — mupot#1325 P1: the earlier mock omitted
 // it, so no test in this file COULD fail for a missing token->seat binding check) and feeds
-// resolveBoundSeat's `SELECT label FROM member_tokens WHERE id = ?1` lookup in the DB fake below.
+// resolveBoundSeat's real token/seat lookup below.
 vi.mock('../src/auth/member-bearer', () => ({
   bearerToken: (h?: string) => (h && h.startsWith('Bearer ') ? h.slice(7) : null),
   resolveMemberByToken: async (_env: unknown, token: string | null) => {
@@ -39,6 +35,9 @@ interface MsgRow {
 
 interface KeyRow { pubkey: string; algo: string; member_id: string | null }
 
+const fixtures:Array<ReturnType<typeof createSqliteD1>>=[]
+afterEach(()=>{for(const fixture of fixtures.splice(0)) fixture.close()})
+
 function makeDb(
   agents: Array<{ id: string; squad_id: string; slug: string; name: string }>,
   keys: Record<string, KeyRow> = {},
@@ -48,185 +47,72 @@ function makeDb(
   capabilityGrants: Record<string, CapabilityGrant[]> = {},
   squadDepartments: Record<string, string | null> = {},
 ) {
-  const messages: MsgRow[] = []
-  const nonces = new Set<string>()
-  let seqCounter = 0
-  const keyFingerprint = (tenant: string, agentId: string) => {
-    const key = keys[`${tenant}:${agentId}`]
-    return key ? createHash('sha256').update(key.pubkey).digest('hex') : null
-  }
+  return makeRealDb(agents, keys, memberStatuses, signedOnlyAgents, capabilityGrants, squadDepartments)
 
-  function runRun(sql: string, b: unknown[]) {
-    if (sql.includes('INSERT INTO agent_messages')) {
-      const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread, _projectId, targetSeat] =
-        b as [string, string, string, string, string, string, string, string | null, string | null, string, number, string | null, string | null]
-      const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
-      if (typeof maxUnread === 'number' && unread >= maxUnread) return { meta: { changes: 0 } }
-      if (request_id != null && messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)) {
-        throw new Error('UNIQUE constraint failed')
+}
+
+function makeRealDb(
+  agents: Array<{ id: string; squad_id: string; slug: string; name: string }>,
+  keys: Record<string, KeyRow>,
+  memberStatuses: Record<string, string>,
+  signedOnlyAgents: ReadonlySet<string>,
+  capabilityGrants: Record<string, CapabilityGrant[]>,
+  squadDepartments: Record<string, string | null>,
+) {
+  const harness = createSqliteD1()
+  fixtures.push(harness)
+  applyAllMigrations(harness.sqlite)
+  const esc = (value: string) => value.replace(/'/g, "''")
+  harness.sqlite.exec("INSERT INTO departments (id, slug, name) VALUES ('dept-default','default','Default')")
+  const squadIds = new Set([...agents.map(a => a.squad_id), ...Object.keys(squadDepartments)])
+  for (const squadId of squadIds) {
+    const department = squadDepartments[squadId] ?? 'dept-default'
+    if (department !== 'dept-default') harness.sqlite.exec(`INSERT OR IGNORE INTO departments (id, slug, name) VALUES ('${esc(department)}','${esc(department)}','${esc(department)}')`)
+    harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('${esc(squadId)}','${esc(department)}','${esc(squadId)}','${esc(squadId)}')`)
+  }
+  for (const [id, name] of [['m-code', 'code'], ['m-rev', 'review'], ['m-h', 'human']] as const) {
+    const status = memberStatuses[id] === 'inactive' ? 'suspended' : (memberStatuses[id] ?? 'active')
+    harness.sqlite.exec(`INSERT INTO members (id, display_name, status, tenant) VALUES ('${id}','${name}','${status}','t')`)
+  }
+  for (const agent of agents) {
+    harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${esc(agent.id)}','${esc(agent.squad_id)}','${esc(agent.slug)}','${esc(agent.name)}','member','test','active')`)
+    harness.sqlite.exec(`INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('membership-${esc(agent.id)}','${esc(agent.id)}','${esc(agent.squad_id)}','member')`)
+  }
+  for (const [agentId, memberId] of [['ag-code', 'm-code'], ['ag-review', 'm-rev']] as const) {
+    if (agents.some(agent => agent.id === agentId)) harness.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('t','${agentId}','${memberId}','2026-01-01T00:00:00.000Z')`)
+  }
+  for (const [id, member, agent, label] of [['tid-code', 'm-code', 'ag-code', ''], ['tid-code-cli', 'm-code', 'ag-code', 'hadi-codex-cli'], ['tid-review', 'm-rev', 'ag-review', ''], ['tid-review-cli', 'm-rev', 'ag-review', 'hadi-codex-cli'], ['tid-unbound', 'm-h', '', '']] as const) {
+    harness.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('${id}','${member}','${id.padEnd(64, 'a')}','${label}','workspace','2026-01-01T00:00:00.000Z',${agent ? `'${agent}'` : 'NULL'},'t')`)
+  }
+  // A signed runtime must still have a live scoped capability; production's
+  // signer predicate checks this independently of the inbox fence.
+  if (Object.keys(keys).length > 0 && agents.some(agent => agent.id === 'ag-code')) {
+    const squadId = agents.find(agent => agent.id === 'ag-code')!.squad_id
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-signer','m-code','squad','${esc(squadId)}','member')`)
+  }
+  for (const [memberId, grants] of Object.entries(capabilityGrants)) for (const grant of grants) {
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-${esc(memberId)}-${Math.random().toString(36).slice(2)}','${esc(memberId)}','${grant.scope_type}',${grant.scope_id ? `'${esc(grant.scope_id)}'` : 'NULL'},'${grant.capability}')`)
+  }
+  for (const [key, value] of Object.entries(keys)) {
+    const [, agentId] = key.split(':')
+    harness.sqlite.exec(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES ('t','${esc(agentId)}','${esc(value.pubkey)}','${esc(value.algo)}',${value.member_id ? `'${esc(value.member_id)}'` : 'NULL'},1)`)
+  }
+  for (const agentId of signedOnlyAgents) {
+    const key = keys[`t:${agentId}`]
+    const fingerprint = key ? createHash('sha256').update(key.pubkey).digest('hex') : '0'.repeat(64)
+    harness.sqlite.exec(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason) VALUES ('t','${esc(agentId)}','signed_only',1,'${fingerprint}','m-code','2026-01-01T00:00:00.000Z','test fence')`)
+  }
+  const messages = new Proxy([] as MsgRow[], {
+    get(_target, property) {
+      const rows = harness.sqlite.prepare('SELECT seq,id,tenant,to_agent,from_agent,from_member,kind,body,request_id,in_reply_to,created_at,read_at,target_seat FROM agent_messages ORDER BY seq').all() as unknown as MsgRow[]
+      if (property === 'push') return (...items: MsgRow[]) => {
+        for (const item of items) harness.sqlite.prepare(`INSERT INTO agent_messages (id,tenant,to_agent,from_agent,from_member,kind,body,request_id,in_reply_to,created_at,target_seat) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(item.id,item.tenant,item.to_agent,item.from_agent,item.from_member,item.kind,item.body,item.request_id,item.in_reply_to,item.created_at,item.target_seat ?? null)
+        return rows.length + items.length
       }
-      const seq = ++seqCounter
-      messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null, target_seat: targetSeat ?? null })
-      return { meta: { last_row_id: seq, changes: 1 } }
-    }
-    throw new Error('unhandled run: ' + sql)
-  }
-
-  // Faithfully reflects the seatSql fragment shape (src/agents/messages.ts) rather than
-  // hardcoding "unscoped means broadcast-only" — a fake that always applied the correct
-  // filter regardless of the SQL text would never notice a dropped/fail-open predicate.
-  // Three shapes: "target_seat = ?N OR target_seat IS NULL" (scoped — seat is the last
-  // bind), "target_seat IS NULL" alone (broadcast-only default), or NEITHER present
-  // (mutated/fail-open — every unread row for the recipient matches, seat or not).
-  function seatMatches(sql: string, b: unknown[], m: MsgRow): boolean {
-    if (sql.includes('OR target_seat IS NULL')) {
-      const seat = b[b.length - 1] as string
-      return m.target_seat === seat || (m.target_seat ?? null) === null
-    }
-    if (sql.includes('target_seat IS NULL')) return (m.target_seat ?? null) === null
-    return true // no seat predicate in the SQL at all — matches everything (fail-open)
-  }
-  function runFirst(sql: string, b: unknown[]) {
-    // mupot#2345: the shared bound-agent verdict (signer key's agent is live: active, no owner, a capability).
-    if (sql.includes('has_caps')) return { status: 'active', owner_member_id: null, owner_status: null, consenter_status: null, has_caps: 1 }
-    if (/^\s*SELECT mode, generation, key_fingerprint FROM agent_inbox_fences/.test(sql)) {
-      const [tenant, agentId] = b as [string, string]
-      return tenant === 't' && signedOnlyAgents.has(agentId)
-        ? { mode: 'signed_only', generation: 1, key_fingerprint: keyFingerprint(tenant, agentId) }
-        : null
-    }
-    if (sql.includes('FROM agent_keys k') && sql.includes('JOIN members m')) {
-      const [tenant, agentId] = b as [string, string]
-      const key = keys[`${tenant}:${agentId}`]
-      return key?.member_id && memberStatuses[key.member_id] !== 'inactive' ? key : null
-    }
-    if (sql.includes('from_agent = ?2 AND request_id = ?3')) {
-      const [tenant, from_agent, request_id] = b as [string, string, string]
-      const m = messages.find((x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id)
-      return m ? { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to } : null
-    }
-    if (sql.includes('FROM member_tokens t') && sql.includes('t.agent_id = ?2') && sql.includes('t.label = ?3')) {
-      const [tenant, agentId, label] = b as [string, string, string]
-      return tenant === 't' && agentId === 'ag-review' && label === 'hadi-codex-cli' ? { 1: 1 } : null
-    }
-    // resolveBoundSeat's lookup (src/agents/inbox-seat.ts) — the same query the MCP inbox
-    // tools use, reused unmodified by the HTTP route (mupot#1325): resolve the CALLER's
-    // bound seat label from its own token id, never from anything the caller supplies.
-    if (sql.includes('SELECT label FROM member_tokens WHERE id = ?1 AND tenant = ?2')) {
-      const [tokenId, tenant] = b as [string, string]
-      if (tenant !== 't') return null
-      if (tokenId === 'tid-code-cli') return { label: 'hadi-codex-cli' }
-      return null // tok-code / tok-review / tok-unbound carry no seat label
-    }
-    if (sql.includes('COUNT(*) AS n FROM agent_messages')) {
-      const [tenant, to_agent] = b as [string, string]
-      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
-      const signed = sql.includes("mode = 'signed_only'")
-      const suppliedFingerprint = b[2] as string | undefined
-      if (signed) {
-        if (effectiveMode !== 'signed_only' || suppliedFingerprint !== keyFingerprint(tenant, to_agent)) return { n: 0 }
-      } else if (effectiveMode !== 'bearer_only') return { n: 0 }
-      return { n: messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).length }
-    }
-    if (sql.includes('FROM agents WHERE id = ?1 LIMIT 1')) {
-      const [ref] = b as [string]
-      return agents.find((a) => a.id === ref) ?? null
-    }
-    if (sql.includes('FROM agent_keys WHERE tenant')) {
-      const [tenant, agentId] = b as [string, string]
-      return keys[`${tenant}:${agentId}`] ?? null
-    }
-    if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
-      const [squadId] = b as [string]
-      const dept = squadDepartments[squadId]
-      return dept === undefined ? null : { department_id: dept }
-    }
-    // loadSquadScope (src/auth/capability.ts) — canOnSquad's squad-scope
-    // load. Every squad this test file references is treated as EXISTING
-    // (kind='work') even when `squadDepartments` never set an entry for it
-    // — that map is only meaningful for the SEPARATE department-inheritance
-    // query above; a squad's own EXISTENCE (needed for the exact-match
-    // branch every squad-scope check now requires) is not the same fact as
-    // "does it have a configured department for inheritance testing".
-    // Falls back to an empty-string department id, which can never collide
-    // with a real one.
-    if (sql.includes('SELECT id, department_id, kind FROM squads WHERE id = ?1')) {
-      const [squadId] = b as [string]
-      const dept = squadDepartments[squadId]
-      return { id: squadId, department_id: dept ?? '', kind: 'work' }
-    }
-    throw new Error('unhandled first: ' + sql)
-  }
-  function runAll(sql: string, b: unknown[]) {
-    // mupot#2345: the signer-key agent resolution (id, else unique slug); the fixture's keyed id IS the agents.id.
-    if (sql.includes('NOT EXISTS (SELECT 1 FROM agents WHERE id')) return [{ id: b[0] }]
-    if (sql.includes('FROM capabilities') && sql.includes('channel_capability_grants')) {
-      const [memberId] = b as [string]
-      return capabilityGrants[memberId] ?? []
-    }
-    if (sql.includes('UPDATE agent_messages SET read_at')) {
-      const [readAt, tenant, to_agent, limit] = b as [string, string, string, number]
-      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
-      const signed = sql.includes("mode = 'signed_only'")
-      if (signed) {
-        if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
-      } else if (effectiveMode !== 'bearer_only') return []
-      const claimed = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit)
-      for (const m of claimed) m.read_at = readAt
-      return claimed.map((m) => ({ ...m }))
-    }
-    if (sql.includes('FROM agent_messages') && sql.includes('read_at IS NULL') && sql.includes('ORDER BY seq ASC')) {
-      const [tenant, to_agent, sinceSeqOrLimit, maybeLimit] = b as [string, string, number, number?]
-      const effectiveMode = signedOnlyAgents.has(to_agent) ? 'signed_only' : 'bearer_only'
-      const signed = sql.includes("mode = 'signed_only'")
-      if (signed) {
-        if (effectiveMode !== 'signed_only' || b[4] !== keyFingerprint(tenant, to_agent)) return []
-      } else if (effectiveMode !== 'bearer_only') return []
-      const hasCursor = sql.includes('seq >')
-      const sinceSeq = hasCursor ? (sinceSeqOrLimit ?? 0) : 0
-      const limit = hasCursor ? (maybeLimit as number) : sinceSeqOrLimit
-      return messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > sinceSeq && seatMatches(sql, b, m)).sort((x, y) => x.seq - y.seq).slice(0, limit).map((m) => ({ ...m }))
-    }
-    if (sql.includes('FROM agents WHERE slug = ?1')) {
-      const [ref] = b as [string]
-      return agents.filter((a) => a.slug === ref)
-    }
-    if (sql.includes('WHERE lower(name) = lower(?1)')) {
-      // F4, 2026-09: SQLite's lower() is ASCII-only (does not fold Unicode case) — mirror
-      // that here with an ASCII-only fold instead of JS's Unicode-folding toLowerCase().
-      const [ref] = b as [string]
-      return agents.filter((a) => asciiLower(a.name) === asciiLower(String(ref)))
-    }
-    if (sql.includes('SELECT squad_id FROM memberships WHERE agent_id = ?1')) {
-      return []
-    }
-    throw new Error('unhandled all: ' + sql)
-  }
-  function runSigned(sql: string, b: unknown[]) {
-    if (sql.includes('DELETE FROM agent_attach_nonces')) return { meta: { changes: 0 } }
-    if (sql.includes('INSERT OR IGNORE INTO agent_attach_nonces')) {
-      const [nonce] = b as [string]
-      if (nonces.has(nonce)) return { meta: { changes: 0 } }
-      nonces.add(nonce)
-      return { meta: { changes: 1 } }
-    }
-    return null
-  }
-
-  const db = {
-    _messages: messages,
-    prepare(sql: string) {
-      const binds: unknown[] = []
-      const api = {
-        bind(...a: unknown[]) { binds.push(...a); return api },
-        async first<T>() { return runFirst(sql, binds) as T },
-        async all<T>() { return { results: runAll(sql, binds) as T[] } },
-        async run() { return runSigned(sql, binds) ?? runRun(sql, binds) },
-      }
-      return api
+      return Reflect.get(rows, property)
     },
-  }
-  return db
+  })
+  return { _messages: messages, db: harness.db, close: harness.close }
 }
 
 function env(
@@ -238,7 +124,7 @@ function env(
   squadDepartments: Record<string, string | null> = {},
 ): { env: Env; db: ReturnType<typeof makeDb> } {
   const db = makeDb(agents, keys, memberStatuses, signedOnlyAgents, capabilityGrants, squadDepartments)
-  return { env: { TENANT_SLUG: 't', DB: db } as unknown as Env, db }
+  return { env: { TENANT_SLUG: 't', DB: db.db } as unknown as Env, db }
 }
 
 function getReq(token?: string, query = ''): Request {
