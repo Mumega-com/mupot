@@ -167,14 +167,9 @@ export interface OfficeDecisionContext {
   readonly frozen: { readonly title: string; readonly content: string; readonly payload_sha256: string; readonly site_origin: string | null } | null
 }
 
-export async function loadOfficeDecisionContext(env: Env, taskId: string): Promise<OfficeDecisionContext | null> {
-  const row = await env.DB.prepare(
-    `SELECT t.assignee_member_id AS assignee_member_id, f.payload_json AS payload_json, f.payload_sha256 AS payload_sha256
-       FROM tasks t
-       LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL
-      WHERE t.id = ?1`,
-  ).bind(taskId).first<{ assignee_member_id: string | null; payload_json: string | null; payload_sha256: string | null }>()
-  if (!row) return null
+interface OfficeDecisionRow { id: string; assignee_member_id: string | null; payload_json: string | null; payload_sha256: string | null }
+
+function toOfficeDecisionContext(row: OfficeDecisionRow): OfficeDecisionContext {
   let frozen: OfficeDecisionContext['frozen'] = null
   if (row.payload_json && row.payload_sha256) {
     try {
@@ -187,6 +182,32 @@ export async function loadOfficeDecisionContext(env: Env, taskId: string): Promi
     }
   }
   return { assignee_member_id: row.assignee_member_id, frozen }
+}
+
+const OFFICE_CONTEXT_SELECT = `SELECT t.id AS id, t.assignee_member_id AS assignee_member_id, f.payload_json AS payload_json, f.payload_sha256 AS payload_sha256
+       FROM tasks t
+       LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL`
+
+// D1 caps bound parameters per statement (100); stay under it.
+const OFFICE_CONTEXT_CHUNK = 90
+
+export async function loadOfficeDecisionContext(env: Env, taskId: string): Promise<OfficeDecisionContext | null> {
+  const row = await env.DB.prepare(`${OFFICE_CONTEXT_SELECT} WHERE t.id = ?1`).bind(taskId).first<OfficeDecisionRow>()
+  return row ? toOfficeDecisionContext(row) : null
+}
+
+/** Batch form of loadOfficeDecisionContext for the approvals queue: one query per OFFICE_CONTEXT_CHUNK ids instead of one per row.
+ *  Absent ids are simply missing from the map (same as a null from the single read). */
+export async function loadOfficeDecisionContexts(env: Env, taskIds: readonly string[]): Promise<Map<string, OfficeDecisionContext>> {
+  const out = new Map<string, OfficeDecisionContext>()
+  const ids = [...new Set(taskIds)]
+  for (let i = 0; i < ids.length; i += OFFICE_CONTEXT_CHUNK) {
+    const chunk = ids.slice(i, i + OFFICE_CONTEXT_CHUNK)
+    const marks = chunk.map((_, k) => `?${k + 1}`).join(', ')
+    const rs = await env.DB.prepare(`${OFFICE_CONTEXT_SELECT} WHERE t.id IN (${marks})`).bind(...chunk).all<OfficeDecisionRow>()
+    for (const row of rs.results ?? []) out.set(row.id, toOfficeDecisionContext(row))
+  }
+  return out
 }
 
 // Shared by the MCP tools and the web approvals route so one refusal reason maps to one HTTP status everywhere.
