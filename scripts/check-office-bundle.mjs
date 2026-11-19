@@ -2,8 +2,8 @@
 // check-office-bundle — fail if the built project-office Worker bundle (or its sourcemap)
 // contains the build-toolchain packages behind the picomatch advisory.
 //
-// WHY THIS EXISTS: .github/audit-allowlist-project-office.json exempts picomatch
-// GHSA-fc5q-39xc-vjpf from the PRODUCTION audit only because picomatch (reached via
+// WHY THIS EXISTS: the project-office PRODUCTION audit once exempted picomatch
+// GHSA-fc5q-39xc-vjpf (exemption since removed) only because picomatch (reached via
 // agents -> vite / @rolldown/plugin-babel -> tinyglobby -> fdir) is build-time and never
 // ships. That claim is the sole reason the prod exemption is allowed, so CI must prove it
 // on every build instead of trusting a comment.
@@ -48,7 +48,7 @@ function main() {
     .map((n) => [n, readFileSync(join(dir, n), 'utf8')]))
   if (hits.length > 0) {
     for (const h of hits) console.error(`✗ check-office-bundle: ${h.file} contains "${h.term}"`)
-    console.error('  The picomatch exemption assumes the toolchain is not in the bundle. See .github/audit-allowlist-project-office.json.')
+    console.error('  The picomatch exemption assumes the toolchain is not in the bundle. See issue #2453.')
     return 1
   }
   console.log(`✓ check-office-bundle: no ${FORBIDDEN.join('/')} in any emitted file`)
