@@ -156,6 +156,112 @@ export async function hasOfficeCapability(
   return hasCapability(auth.capabilities ?? [], 'department', departmentId, min)
 }
 
+/** True iff `auth` holds the capability the manifest's 'office.publish' approval policy requires (read live from
+ *  the registered manifest, like reviewOfficeApproval). Read-side convenience for the web approvals page only;
+ *  reviewOfficeApproval re-checks it at write time. */
+export async function hasOfficePublishCapability(env: Env, auth: AuthContext): Promise<boolean> {
+  return hasOfficeCapability(env, auth, resolveOfficePublishRequiredCapability())
+}
+
+/** What the web approvals page needs to render a gate:office row: the live (non-voided) FROZEN payload the human
+ *  is shown and its hash, plus the human owner for the self-approval pre-check. Null = no such task. */
+export interface OfficeDecisionContext {
+  readonly assignee_member_id: string | null
+  readonly frozen: { readonly title: string; readonly content: string; readonly payload_sha256: string; readonly site_origin: string | null } | null
+}
+
+interface OfficeDecisionRow { id: string; assignee_member_id: string | null; payload_json: string | null; payload_sha256: string | null }
+
+function toOfficeDecisionContext(row: OfficeDecisionRow): OfficeDecisionContext {
+  let frozen: OfficeDecisionContext['frozen'] = null
+  if (row.payload_json && row.payload_sha256) {
+    try {
+      const parsed = JSON.parse(row.payload_json) as { title?: unknown; content?: unknown; site_origin?: unknown }
+      if (typeof parsed.title === 'string' && typeof parsed.content === 'string') {
+        frozen = { title: parsed.title, content: parsed.content, payload_sha256: row.payload_sha256, site_origin: typeof parsed.site_origin === 'string' ? parsed.site_origin : null }
+      }
+    } catch {
+      // Malformed payload_json never happens (canonicalJson); treat as nothing frozen rather than 500.
+    }
+  }
+  return { assignee_member_id: row.assignee_member_id, frozen }
+}
+
+const OFFICE_CONTEXT_SELECT = `SELECT t.id AS id, t.assignee_member_id AS assignee_member_id, f.payload_json AS payload_json, f.payload_sha256 AS payload_sha256
+       FROM tasks t
+       LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL`
+
+// D1 caps bound parameters per statement (100); stay under it.
+const OFFICE_CONTEXT_CHUNK = 90
+
+export async function loadOfficeDecisionContext(env: Env, taskId: string): Promise<OfficeDecisionContext | null> {
+  const row = await env.DB.prepare(`${OFFICE_CONTEXT_SELECT} WHERE t.id = ?1`).bind(taskId).first<OfficeDecisionRow>()
+  return row ? toOfficeDecisionContext(row) : null
+}
+
+/** Batch form of loadOfficeDecisionContext for the approvals queue: one query per OFFICE_CONTEXT_CHUNK ids instead of one per row.
+ *  Absent ids are simply missing from the map (same as a null from the single read). */
+export async function loadOfficeDecisionContexts(env: Env, taskIds: readonly string[]): Promise<Map<string, OfficeDecisionContext>> {
+  const out = new Map<string, OfficeDecisionContext>()
+  const ids = [...new Set(taskIds)]
+  for (let i = 0; i < ids.length; i += OFFICE_CONTEXT_CHUNK) {
+    const chunk = ids.slice(i, i + OFFICE_CONTEXT_CHUNK)
+    const marks = chunk.map((_, k) => `?${k + 1}`).join(', ')
+    const rs = await env.DB.prepare(`${OFFICE_CONTEXT_SELECT} WHERE t.id IN (${marks})`).bind(...chunk).all<OfficeDecisionRow>()
+    for (const row of rs.results ?? []) out.set(row.id, toOfficeDecisionContext(row))
+  }
+  return out
+}
+
+// Shared by the MCP tools and the web approvals route so one refusal reason maps to one HTTP status everywhere.
+export function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409 {
+  switch (reason) {
+    case 'not_authorized':
+    case 'connector_scope_refused':
+    case 'self_verdict':
+    case 'agent_approval_forbidden':
+      return 403
+    case 'task_not_found':
+      return 404
+    case 'addon_inactive':
+    case 'connector_not_bound':
+    case 'connector_capability_mismatch':
+    case 'department_not_active':
+    case 'wrong_gate':
+    case 'not_in_review':
+    case 'not_approved':
+    case 'payload_not_frozen':
+    case 'payload_mismatch':
+    case 'payload_stale':
+    case 'unreconciled_prior_publish':
+    case 'freeze_not_found':
+    case 'already_reconciled':
+    case 'reconcile_conflict':
+    case 'publish_unreconciled':
+    case 'unsupported_site_path':
+    case 'reconcile_candidate_found':
+    case 'reconcile_check_unavailable':
+    case 'reconcile_retry_required':
+    case 'binding_changed':
+    case 'publish_claimed':
+    case 'invalid_site_config':
+    case 'invalid_site_url':
+    case 'publish_outcome_unknown':
+    case 'write_failed':
+    case 'verdict_race':
+    case 'task_archived':
+    case 'approval_expired':
+    case 'project_required':
+    case 'project_not_bound':
+    case 'project_mismatch':
+      return 409
+    case 'expected_hash_required':
+      return 400
+    default:
+      return 400
+  }
+}
+
 // ── office.health (mupot#1662) ──────────────────────────────────────────────────
 
 /** The only fields an office health probe ever exposes: a status, a closed-set reason
