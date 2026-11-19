@@ -338,6 +338,26 @@ describe('/approvals office rows (what the human is shown)', () => {
     expect(html).not.toContain(`data-office-sha="${frozenHash()}"`)
   })
 
+  // #2471: a legacy gate:office task with no project can never freeze or publish. The card must say so, not just
+  // show "no action" (or a bare Reject).
+  it('a legacy office task with no project shows the project_required blocker on the card and the row, and offers no Approve', async () => {
+    h.sqlite.prepare(`UPDATE tasks SET project_id = NULL WHERE id = ?`).run(taskId)
+    // Not actionable for anyone, so it sits in the 'other' view (never the default "mine" one) - that is where the reason must show.
+    const { env: e2, cookie } = await login('lead@x.test')
+    const html = await (await dashboardApp.request('/approvals?view=other', { headers: { cookie } }, e2)).text()
+    expect(html).toContain('data-office-blocker="project_required"')
+    expect(html).toContain('this task has no project')
+    expect(html).not.toContain('class="btn appr-approve"')
+    const q = await loadApprovals(envFor('seed@x.test'), { userId: 'mem-lead', email: null, role: 'owner' as const, tenant: TENANT, memberId: 'mem-lead', boundAgentId: null, capabilities: [{ member_id: 'mem-lead', scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }] })
+    const row = q.items.find((i) => i.id === taskId)
+    expect(row).toMatchObject({ is_office: true, office_blocker: 'project_required', can_approve: false })
+  })
+
+  it('control: an office task WITH a project carries no blocker', async () => {
+    const { html } = await authFor('lead@x.test')
+    expect(html).not.toContain('data-office-blocker')
+  })
+
   it('the self-owner of the task is not offered Approve', async () => {
     h.sqlite.prepare(`UPDATE tasks SET assignee_member_id = 'mem-lead' WHERE id = ?`).run(taskId)
     const { html } = await authFor('lead@x.test')

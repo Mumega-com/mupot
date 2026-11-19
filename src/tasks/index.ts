@@ -34,7 +34,7 @@ import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleT
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { flightChildBlockedNextStep } from '../flight/child-disposition'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertIntakeWithBar, checkTransitionWithBar, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
+import { assertOfficeTaskHasProject, createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, ApprovalExpiredError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertIntakeWithBar, checkTransitionWithBar, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember, assigneeChangesOwnGate } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -1212,6 +1212,7 @@ tasksApp.patch('/:id', async (c) => {
       projectId: existing.project_id,
       result: existing.result,
     })
+    assertOfficeTaskHasProject(existing, next) // #2471
   } catch (error) {
     if (!(error instanceof TaskProjectError)) throw error
     const mapped = taskProjectErrorResponse(error)

@@ -66,6 +66,18 @@ const MASTER_KEY = '33'.repeat(32)
 const SHA = await manifestSha256(McpwpOfficeAddon)
 const ORIGIN = 'https://mupot.mumega.com'
 
+// #2471: createTask now refuses a gate:office task with no project, so a LEGACY row (gate set, no project, created
+// before the refusal) is seeded the way it really came to exist: ungated create, then the gate written directly.
+async function createLegacyOfficeTask(
+  testEnv: Env,
+  input: Parameters<typeof createTask>[1],
+  gateOwner = 'gate:office',
+): Promise<Task> {
+  const task = await createTask(testEnv, { ...input, gate_owner: null }, { skipMirror: true, skipEvent: true })
+  await testEnv.DB.prepare(`UPDATE tasks SET gate_owner = ?1 WHERE id = ?2`).bind(gateOwner, task.id).run()
+  return { ...task, gate_owner: gateOwner }
+}
+
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
@@ -1579,10 +1591,9 @@ describe('office.list_pending_approvals', () => {
     harness.sqlite.prepare(
       `INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, 'unrelated-squad', 'Unrelated Squad')`,
     ).run(unrelatedSquadId, unrelatedDepartmentId)
-    const crossSquadTask = await createTask(
+    const crossSquadTask = await createLegacyOfficeTask(
       testEnv,
-      { squad_id: unrelatedSquadId, title: 'Cross-squad leak', done_when: 'not applicable to this fixture', gate_owner: 'gate:office' },
-      { skipMirror: true, skipEvent: true },
+      { squad_id: unrelatedSquadId, title: 'Cross-squad leak', done_when: 'not applicable to this fixture' },
     )
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: crossSquadTask.id, status: 'in_progress' }, ORIGIN)
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: crossSquadTask.id, status: 'review' }, ORIGIN)
@@ -1712,13 +1723,12 @@ describe('office.review_approval', () => {
     harness.sqlite.prepare(
       `INSERT INTO members (id, email, display_name, status, tenant) VALUES ('requester-1', 'requester@x.t', 'requester', 'active', ?)`,
     ).run(TENANT)
-    const task = await createTask(
+    const task = await createLegacyOfficeTask(
       testEnv,
       {
         squad_id: squadId, title: 'Publish: self request', done_when: 'post is live',
-        gate_owner: 'gate:office', assignee_member_id: 'requester-1',
+        assignee_member_id: 'requester-1',
       },
-      { skipMirror: true, skipEvent: true },
     )
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'in_progress' }, ORIGIN)
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'review' }, ORIGIN)
@@ -3805,7 +3815,7 @@ describe('mupot#1616 gate r3: generic writers x claim state', () => {
     return { ...b, taskId }
   }
   async function bareApproved(b: Base, gateOwner: string): Promise<Ctx> {
-    const task = await createTask(b.testEnv, { squad_id: b.squadId, title: 'Bare approved', done_when: 'post is live', gate_owner: gateOwner }, { skipMirror: true, skipEvent: true })
+    const task = await createLegacyOfficeTask(b.testEnv, { squad_id: b.squadId, title: 'Bare approved', done_when: 'post is live' }, gateOwner)
     b.harness.sqlite.prepare(`UPDATE tasks SET status = 'approved' WHERE id = ?`).run(task.id)
     return { ...b, taskId: task.id }
   }
@@ -4159,10 +4169,9 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
   }
 
   async function reviewTask(testEnv: Env, squadId: string, projectId: string | null): Promise<string> {
-    const task = await createTask(
+    const task = await createLegacyOfficeTask(
       testEnv,
-      { squad_id: squadId, ...(projectId ? { project_id: projectId } : {}), title: 'Post for a customer', done_when: 'post is live', gate_owner: 'gate:office' },
-      { skipMirror: true, skipEvent: true },
+      { squad_id: squadId, ...(projectId ? { project_id: projectId } : {}), title: 'Post for a customer', done_when: 'post is live' },
     )
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'in_progress' }, ORIGIN)
     await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'review' }, ORIGIN)
@@ -4188,6 +4197,110 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
     const frozen = harness.sqlite.prepare(`SELECT task_id, project_id FROM office_publish_freezes ORDER BY project_id`).all() as Array<{ project_id: string }>
     expect(frozen.map((f) => f.project_id)).toEqual(['proj-a', 'proj-b'])
     harness.close()
+  })
+
+  describe('#2471: an office task must have a project', () => {
+    const rest = async (testEnv: Env, method: string, path: string, body: unknown) => {
+      restAuth.current = { ...orgOwnerAuth(), capabilities: undefined, channel: 'dashboard' }
+      const response = await tasksApp.fetch(new Request(`${ORIGIN}${path}`, { method, headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify(body) }), testEnv)
+      return { status: response.status, body: await response.json() as { error?: string; task?: { id: string } } }
+    }
+    const taskCount = (harness: SqliteD1Harness) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM tasks`).get() as { n: number }).n
+    const plain = async (testEnv: Env, projectId: string | null = null) => (await createTask(testEnv, { squad_id: 'squad-a', ...(projectId ? { project_id: projectId } : {}), title: 'Plain', done_when: 'it is done' }, { skipMirror: true, skipEvent: true }))
+    const readTask = (harness: SqliteD1Harness, id: string) => harness.sqlite.prepare(`SELECT gate_owner, project_id FROM tasks WHERE id = ?`).get(id) as { gate_owner: string | null; project_id: string | null }
+
+    it('createTask (service chokepoint) refuses gate:office without a project and writes nothing', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const before = taskCount(harness)
+      await expect(createTask(testEnv, { squad_id: 'squad-a', title: 'No project', done_when: 'x is done', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })).rejects.toMatchObject({ code: 'project_required' })
+      expect(taskCount(harness)).toBe(before)
+      harness.close()
+    })
+
+    it('MCP task_create cannot set gate:office at all (reserved lane, 403 gate_owner_reserved), project or not; nothing written', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const before = taskCount(harness)
+      for (const extra of [{}, { project_id: 'proj-a' }]) {
+        const refused = await invokeTool(orgOwnerAuth(), testEnv, 'task_create', { squad_id: 'squad-a', title: 'Office', done_when: 'x is done', gate_owner: 'gate:office', ...extra }, ORIGIN)
+        expect(refused.ok).toBe(false)
+        if (!refused.ok) { expect(refused.status).toBe(403); expect(refused.error).toBe('gate_owner_reserved') }
+      }
+      expect(taskCount(harness)).toBe(before)
+      harness.close()
+    })
+
+    it('REST POST /tasks refuses gate:office without a project (400 project_required), nothing written; with a project it still works', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const before = taskCount(harness)
+      const refused = await rest(testEnv, 'POST', '/', { squad_id: 'squad-a', title: 'No project', done_when: 'x is done', gate_owner: 'gate:office' })
+      expect(refused.status).toBe(400)
+      expect(refused.body.error).toBe('project_required')
+      expect(taskCount(harness)).toBe(before)
+      const ok = await rest(testEnv, 'POST', '/', { squad_id: 'squad-a', project_id: 'proj-a', title: 'With project', done_when: 'x is done', gate_owner: 'gate:office' })
+      expect(ok.status).toBe(201)
+      harness.close()
+    })
+
+    it('MCP task_update: setting gate:office on a project-less task is refused; so is removing the project from a gate:office task', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const t = await plain(testEnv)
+      const set = await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: t.id, gate_owner: 'gate:office' }, ORIGIN)
+      expect(set.ok).toBe(false)
+      if (!set.ok) { expect(set.status).toBe(400); expect(set.error).toBe('project_required') }
+      expect(readTask(harness, t.id).gate_owner).toBeNull()
+      const withProject = await plain(testEnv, 'proj-a')
+      expect((await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: withProject.id, gate_owner: 'gate:office' }, ORIGIN)).ok).toBe(true)
+      const detach = await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: withProject.id, project_id: null }, ORIGIN)
+      expect(detach.ok).toBe(false)
+      if (!detach.ok) expect(detach.error).toBe('project_required')
+      expect(readTask(harness, withProject.id).project_id).toBe('proj-a')
+      harness.close()
+    })
+
+    it('REST PATCH /tasks/:id: setting gate:office on a project-less task is refused; so is removing the project from a gate:office task', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const t = await plain(testEnv)
+      const set = await rest(testEnv, 'PATCH', `/${t.id}`, { gate_owner: 'gate:office' })
+      expect(set.status).toBe(400)
+      expect(set.body.error).toBe('project_required')
+      expect(readTask(harness, t.id).gate_owner).toBeNull()
+      const withProject = await plain(testEnv, 'proj-a')
+      expect((await rest(testEnv, 'PATCH', `/${withProject.id}`, { gate_owner: 'gate:office' })).status).toBe(200)
+      const detach = await rest(testEnv, 'PATCH', `/${withProject.id}`, { project_id: null })
+      expect(detach.status).toBe(400)
+      expect(detach.body.error).toBe('project_required')
+      expect(readTask(harness, withProject.id).project_id).toBe('proj-a')
+      harness.close()
+    })
+
+    it('persistTaskUpdate (the chokepoint every generic writer reaches) refuses the gate-without-project pair itself, even when a caller skips the pre-check', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const t = await plain(testEnv)
+      const existing = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(t.id) as unknown as Task
+      await expect(persistTaskUpdate(testEnv, existing, { ...existing, gate_owner: 'gate:office' }, false)).rejects.toMatchObject({ code: 'project_required' })
+      expect(readTask(harness, t.id).gate_owner).toBeNull()
+      harness.close()
+    })
+
+    it('a LEGACY office task already without a project is not bricked: an unrelated edit works, and giving it a project works', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const legacy = await createLegacyOfficeTask(testEnv, { squad_id: 'squad-a', title: 'Legacy', done_when: 'x is done' })
+      expect((await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: legacy.id, title: 'Legacy renamed' }, ORIGIN)).ok).toBe(true)
+      expect((await invokeTool(orgOwnerAuth(), testEnv, 'task_update', { task_id: legacy.id, project_id: 'proj-a' }, ORIGIN)).ok).toBe(true)
+      expect(readTask(harness, legacy.id).project_id).toBe('proj-a')
+      harness.close()
+    })
+
+    it('a legacy project-less task entering review: still 0 freezes, and approval names project_required (not payload_not_frozen / not_authorized)', async () => {
+      const { harness, testEnv, departmentId } = await twoCustomers()
+      const t = await reviewTask(testEnv, 'squad-a', null)
+      expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM office_publish_freezes WHERE task_id = ?`).get(t)).toEqual({ n: 0 })
+      const result = await invokeTool(officeLead(departmentId), testEnv, 'office.review_approval', { task_id: t, verdict: 'approved', expected_payload_sha256: 'a'.repeat(64) }, ORIGIN)
+      expect(result.ok).toBe(false)
+      if (!result.ok) { expect(result.error).toBe('project_required'); expect(result.status).toBe(409) }
+      expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM office_publish_freezes WHERE task_id = ?`).get(t)).toEqual({ n: 0 })
+      harness.close()
+    })
   })
 
   describe('N1: cross-customer publish is refused with zero fetches', () => {
@@ -4653,7 +4766,7 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       const { harness, testEnv, owner } = await twoCustomers()
       harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
       const { squadId } = readOfficeDepartmentAndSquad(harness)
-      const legacy = (await createTask(testEnv, { squad_id: squadId, title: 'legacy', done_when: 'legacy post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })).id
+      const legacy = (await createLegacyOfficeTask(testEnv, { squad_id: squadId, title: 'legacy', done_when: 'legacy post is live' })).id
       const freeze = (outcome: string | null, voided: string | null) => harness.sqlite.prepare(
         `INSERT OR REPLACE INTO office_publish_freezes (task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, outcome, voided_at, project_id)
          VALUES (?, '{}', 'h', 'i', 'conn-bootstrap', 'https://bootstrap.example.com', 'm', ?, ?, NULL)`,

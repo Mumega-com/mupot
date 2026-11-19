@@ -96,6 +96,9 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'A human decision is never made by an agent or a seat bound to one. The signed-in human opens the Approvals page in a browser session and approves or rejects there. An agent surfaces the item for that human with needs_you_list. {reach}' },
   { error: 'form_submissions_only', who_acts: 'owner', next_tool: 'needs_you_list',
     next_step: 'The web approval accepts only a browser form post (application/x-www-form-urlencoded or multipart/form-data). Submit the Approve or Reject button on the Approvals page rather than calling the endpoint with another content type. A non-browser caller cannot decide it: surface the item for the human with needs_you_list.' },
+  // ── office task with no project (#2471) ───────────────────────────────────────────────────────
+  { error: 'project_required', who_acts: 'self', next_tool: 'task_update',
+    next_step: "An office (gate:office) task is frozen and published against its project's WordPress binding, so it needs a project. Set project_id to the customer's project: task_update { task_id, project_id }. An office task is refused at create or update without one; a legacy one already in review gets a project the same way, then goes back through review." },
   // ── harness token with no seat ────────────────────────────────────────────────────────────────
   // update_agent from a bound chat/agent session that is not the row's own self lane (an attached chat aiming at ANOTHER agent's row).
   { error: 'operator_principal_required', tool: 'update_agent', who_acts: 'admin', next_tool: 'check_in',

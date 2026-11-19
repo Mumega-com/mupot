@@ -380,12 +380,35 @@ export type TaskProjectErrorCode =
   | 'archived_project'
   | 'project_access_forbidden'
   | 'detach_locked_result_present'
+  | 'project_required'
 
 export class TaskProjectError extends Error {
   constructor(readonly code: TaskProjectErrorCode) {
     super(code)
     this.name = 'TaskProjectError'
   }
+}
+
+/**
+ * #2471 item 1: an office (gate:office) task is frozen and published against its PROJECT's WordPress binding
+ * (B3a), so one with no project can never freeze and never publish. Refuse to create or produce one, up front
+ * and loudly, instead of letting it sit in review failing silently.
+ *
+ * `existing` is the stored row on an update, null on a create. An update is refused only when it INTRODUCES the
+ * pair (the gate was just set to gate:office, or the project was just removed): an unrelated edit to a legacy row
+ * that already has the gate and no project must keep working. The literal is the OFFICE_GATE_OWNER value
+ * (src/addons/office/freeze.ts); not imported because that module depends on this one's types.
+ */
+export function assertOfficeTaskHasProject(
+  existing: Pick<Task, 'gate_owner' | 'project_id'> | null,
+  next: Pick<Task, 'gate_owner' | 'project_id'>,
+): void {
+  if (next.gate_owner !== 'gate:office') return
+  if (next.project_id !== null && next.project_id !== undefined) return
+  const introduces = existing === null
+    || existing.gate_owner !== 'gate:office'
+    || (existing.project_id !== null && existing.project_id !== undefined)
+  if (introduces) throw new TaskProjectError('project_required')
 }
 
 export type TaskUpdateConflictCode = 'resubmit_cap_needs_human' | 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review' | 'assignee_change_with_reversal'
@@ -660,6 +683,7 @@ export async function persistTaskUpdate(
   }
 
   if (assigneeChangesInReview(existing, next)) throw new TaskUpdateConflictError('assignee_frozen_in_review')
+  assertOfficeTaskHasProject(existing, next) // #2471: chokepoint for any writer; REST/MCP pre-check for a clean refusal
   // Mirror of CLEAR_REJECTED_RESULT_SQL on the in-memory row the caller returns.
   if (existing.status === 'rejected' && next.status === 'in_progress') next.result = null
 
@@ -1582,6 +1606,7 @@ export async function prepareGuardedTaskInsert(
   await assertIntakeWithBar(env, input, { allowDeferredPredicate: options.allowDeferredPredicate }, options.actor ? `${options.actor.kind}:${options.actor.id}` : 'system:task-create')
 
   const projectId = input.project_id ?? null
+  assertOfficeTaskHasProject(null, { gate_owner: input.gate_owner ?? null, project_id: projectId })
   await validateTaskProjectAttribution(env, projectId, input.squad_id)
 
   const now = new Date().toISOString()

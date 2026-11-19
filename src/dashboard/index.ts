@@ -5945,6 +5945,9 @@ function officeShaAttr(t: ApprovalItem): string {
 
 // gate:office rows: where Approve would publish (the frozen site_origin, inside the hashed payload).
 function officeDestinationHtml(t: ApprovalItem): string {
+  if (t.is_office && t.office_blocker === 'project_required') {
+    return `<div class="appr-dest muted" data-office-blocker="project_required">Cannot be approved: this task has no project. Set its project to the customer's project (task_update project_id), then re-enter review.</div>`
+  }
   return t.is_office && t.office_site_origin
     ? `<div class="appr-dest muted">Publishes to <code>${escHtml(t.office_site_origin)}</code></div>`
     : ''
