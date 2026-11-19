@@ -1152,7 +1152,7 @@ dashboardApp.post('/approvals/office/:id/decide', async (c) => {
   const form = await c.req.parseBody()
   const verdict = form.verdict
   if (verdict !== 'approved' && verdict !== 'rejected') return c.json({ error: 'invalid_verdict' }, 400)
-  // No fresh step-up on approve yet: /auth/reauth supports Google only, so it would lock out email-login users.
+  // No fresh step-up on approve yet: the reauth route supports Google only, so it would lock out email-login users.
   // It returns in a follow-up that supports every login method.
   const note = typeof form.note === 'string' && form.note.trim() ? form.note.trim() : null
   const shownHash = typeof form.payload_sha256 === 'string' && form.payload_sha256 ? form.payload_sha256 : null
