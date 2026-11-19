@@ -92,6 +92,10 @@ async function activeOffice(site = 'https://wordpress.example.com') {
   const out = await invokeTool(orgOwner, env(harness), 'addon_setup', { key: KEY, bindings: bindings(connectorId) }, ORIGIN)
   if (!out.ok) throw new Error(`fixture: addon_setup failed ${JSON.stringify(out)}`)
   const deptId = (harness.sqlite.prepare(`SELECT id FROM departments WHERE slug = 'office'`).get() as { id: string }).id
+  // B3b: health authority = member on a customer project squad (a department:office grant confers none).
+  harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-cust', '${deptId}', 'cust', 'Customer');
+    INSERT INTO projects (id, slug, name, status) VALUES ('proj-cust', 'proj-cust', 'Cust', 'active');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-cust', 'squad-cust', 'write');`)
   return { harness, connectorId, deptId }
 }
 
@@ -109,7 +113,7 @@ describe('office.health', () => {
   ])('maps a %s from the site to %j', async (status, expected) => {
     const { harness, deptId } = await activeOffice()
     const spy = stubSite(() => new Response(`secret body ${SECRET}`, { status }))
-    const member = auth('member-1', [grant('department', deptId, 'member')])
+    const member = auth('member-1', [grant('squad', 'squad-cust', 'member')])
     const out = await invokeTool(member, env(harness), 'office.health', {}, ORIGIN)
     expect(out).toMatchObject({ ok: true, result: expected })
     expect(spy).toHaveBeenCalledTimes(1)
@@ -120,14 +124,14 @@ describe('office.health', () => {
   it('maps a thrown fetch (network failure) to failed/unreachable', async () => {
     const { harness, deptId } = await activeOffice()
     stubSite(() => { throw new TypeError('network down') })
-    const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    const out = await invokeTool(auth('m', [grant('squad', 'squad-cust', 'member')]), env(harness), 'office.health', {}, ORIGIN)
     expect(out).toMatchObject({ ok: true, result: { status: 'failed', reason: 'unreachable', connector_id: 'connector-wp' } })
   })
 
   it('keeps the SSRF guard: a private-host connector is never fetched', async () => {
     const { harness, deptId } = await activeOffice('https://10.0.0.5')
     const spy = stubSite(ok200)
-    const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    const out = await invokeTool(auth('m', [grant('squad', 'squad-cust', 'member')]), env(harness), 'office.health', {}, ORIGIN)
     expect(out).toMatchObject({ ok: true, result: { status: 'unavailable', reason: 'invalid_site_url', connector_id: 'connector-wp' } })
     expect(spy).not.toHaveBeenCalled()
   })
@@ -198,10 +202,23 @@ describe('addon_setup — rebind and disabled paths', () => {
   })
 })
 
+describe('office.health — B3b authority', () => {
+  it('a department:office-only member is refused (no squad grant), and a squad member on a squad with no project write is refused; no probe', async () => {
+    const { harness, deptId } = await activeOffice()
+    const spy = stubSite(ok200)
+    const deptOnly = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    expect(deptOnly.ok).toBe(false)
+    harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-noproj', '${deptId}', 'noproj', 'NoProj')`)
+    const noProject = await invokeTool(auth('m', [grant('squad', 'squad-noproj', 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    expect(noProject.ok).toBe(false)
+    expect(spy).not.toHaveBeenCalled()
+  })
+})
+
 describe('office.health — cooldown and eligibility', () => {
   it('allows one outbound probe per 60s per installation; inside the window returns the cached result', async () => {
     const { harness, deptId } = await activeOffice()
-    const member = auth('m', [grant('department', deptId, 'member')])
+    const member = auth('m', [grant('squad', 'squad-cust', 'member')])
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'))
@@ -239,7 +256,7 @@ describe('office.health — cooldown and eligibility', () => {
     for (const t of triggers) harness.sqlite.exec(`DROP TRIGGER "${t.name}"`)
     harness.sqlite.prepare(`UPDATE addon_installations SET manifest_sha256 = '${'0'.repeat(64)}' WHERE addon_key = ?`).run(KEY)
     const spy = stubSite(ok200)
-    const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    const out = await invokeTool(auth('m', [grant('squad', 'squad-cust', 'member')]), env(harness), 'office.health', {}, ORIGIN)
     expect(out.ok).toBe(false)
     if (!out.ok) expect(out.error).toBe('addon_inactive')
     expect(spy).not.toHaveBeenCalled()

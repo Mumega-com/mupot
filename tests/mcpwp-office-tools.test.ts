@@ -125,6 +125,9 @@ function orgOwnerAuth(memberId = 'owner-1'): AuthContext {
 
 /** Seeds the office department + a squad under it (departments/squads have no tenant
  *  column — single-tenant-per-DB, per migrations/0001_init.sql). Returns their ids. */
+// B3b: office authority is SQUAD-scoped (a department:office grant confers none); the fixtures' squads register here.
+const FIXTURE_OFFICE_SQUADS = new Set<string>(['squad-a', 'squad-b'])
+
 function seedOfficeDepartmentAndSquad(harness: SqliteD1Harness): { departmentId: string; squadId: string } {
   const departmentId = 'dept-office-1'
   const squadId = 'squad-office-1'
@@ -134,6 +137,7 @@ function seedOfficeDepartmentAndSquad(harness: SqliteD1Harness): { departmentId:
   harness.sqlite.prepare(
     `INSERT INTO squads (id, department_id, slug, name) VALUES (?, ?, 'site-operator', 'Site Operator')`,
   ).run(squadId, departmentId)
+  FIXTURE_OFFICE_SQUADS.add(squadId)
   return { departmentId, squadId }
 }
 
@@ -276,6 +280,7 @@ async function installConfigureActivateOffice(testEnv: Env, connectorId: string)
 function readOfficeDepartmentAndSquad(harness: SqliteD1Harness): { departmentId: string; squadId: string } {
   const department = harness.sqlite.prepare(`SELECT id FROM departments WHERE slug = 'office'`).get() as { id: string }
   const squad = harness.sqlite.prepare(`SELECT id FROM squads WHERE slug = 'site-operator'`).get() as { id: string }
+  FIXTURE_OFFICE_SQUADS.add(squad.id)
   return { departmentId: department.id, squadId: squad.id }
 }
 
@@ -374,8 +379,9 @@ function seedPriorReconcileAttempt(harness: SqliteD1Harness, taskId: string, sec
   ).run(JSON.stringify({ reconcileAttempts: [attemptAt] }), taskId)
 }
 
-const officeLead = (departmentId: string) => auth('lead-1', [grant('department', departmentId, 'lead')])
-const officeMember = (departmentId: string) => auth('member-1', [grant('department', departmentId, 'member')])
+// B3b: office authority is SQUAD-scoped (a department:office grant confers none). The fixtures' customer squads.
+const officeLead = (_departmentId: string) => auth('lead-1', [...FIXTURE_OFFICE_SQUADS].map((id) => grant('squad', id, 'lead')))
+const officeMember = (_departmentId: string) => auth('member-1', [...FIXTURE_OFFICE_SQUADS].map((id) => grant('squad', id, 'member')))
 const wrongDeptCaller = (unrelatedDepartmentId: string) => auth('outsider-1', [grant('department', unrelatedDepartmentId, 'lead')])
 
 beforeEach(() => {
@@ -1544,7 +1550,7 @@ describe('office.list_pending_approvals', () => {
     harness.close()
   })
 
-  it('refuses a caller with no office department capability', async () => {
+  it('refuses a caller with no office squad capability', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     seedOfficeDepartmentAndSquad(harness)
@@ -2486,7 +2492,7 @@ describe('mupot#1592 freeze/verdict binding', () => {
     harness.sqlite.prepare(
       `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-m4', 'gate:office', 'member', 'm4', 'test', datetime('now'))`,
     ).run()
-    const secondApprover = auth('m4', [grant('department', departmentId, 'lead'), grant('squad', squadId, 'member')])
+    const secondApprover = auth('m4', [grant('squad', squadId, 'lead')])
     const firstApprover = orgOwnerAuth()
 
     const results = await Promise.all([
@@ -4004,7 +4010,7 @@ describe('gate:office via task_submit_result (mupot#1663)', () => {
     const agentAuth: AuthContext = {
       ...auth(AGENT_MEMBER, [grant('squad', squadId, 'member')]), boundAgentId: AGENT,
     }
-    const humanAuth = (memberId: string) => auth(memberId, [grant('squad', squadId, 'member'), grant('department', departmentId, 'lead')])
+    const humanAuth = (memberId: string) => auth(memberId, [grant('squad', squadId, 'lead')])
     return { harness, testEnv, taskId: task.id, agentAuth, humanAuth }
   }
 
@@ -4244,7 +4250,7 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-a' AND squad_id = 'squad-a'`).run()
       const result = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)
       expect(result.ok).toBe(false)
-      if (!result.ok) { expect(result.error).toBe('connector_scope_refused'); expect(result.status).toBe(403) }
+      if (!result.ok) { expect(result.error).toBe('not_authorized'); expect(result.status).toBe(403) } // B3b: the squad predicate refuses before the connector re-check
       expect(spy).not.toHaveBeenCalled()
       harness.close()
     })
@@ -4709,6 +4715,134 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       expect(r.ok).toBe(false)
       if (!r.ok) { expect(r.status).toBe(409); expect(r.error).toBe('office_payload_frozen') }
       expect(harness.sqlite.prepare(`SELECT project_id FROM tasks WHERE id = ?`).get(ta)).toEqual({ project_id: 'proj-a' })
+      harness.close()
+    })
+  })
+  // B3b: office approval authority is scoped to the customer's OWN squad/project. squad-a/proj-a = "Viamar",
+  // squad-b/proj-b = "DME". A Viamar approver holds `lead` on squad-a only.
+  describe('B3b: approval authority is per customer squad', () => {
+    const viamarLead = () => auth('viamar-lead', [grant('squad', 'squad-a', 'lead')])
+    // The verdict gate also needs a gate:office grant for the human; seeded for the Viamar approver.
+    const seedViamarGate = (harness: SqliteD1Harness) => {
+      harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('viamar-lead', 'vl@x.t', 'vl', 'active', ?)`).run(TENANT)
+      harness.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-vl', 'gate:office', 'member', 'viamar-lead', 'test', datetime('now'))`).run()
+    }
+    const verdictRows = (harness: SqliteD1Harness, taskId: string) =>
+      (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }).n
+
+    it('N2: a Viamar lead lists 0 DME tasks, is refused 403 on review/publish of a DME task (0 verdict rows, 0 fetches), and CAN review+publish a Viamar task', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedViamarGate(harness)
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const tv = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const td = await reviewTask(testEnv, 'squad-b', 'proj-b')
+      const dmeHash = await officeFreezeHash(testEnv, td)
+
+      const listed = await invokeTool(viamarLead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      expect(listed.ok).toBe(true)
+      const ids = listed.ok ? (listed.result as { tasks: Array<{ id: string }> }).tasks.map((t) => t.id) : []
+      expect(ids).toContain(tv)
+      expect(ids).not.toContain(td)
+
+      const refusedReview = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: td, verdict: 'approved', expected_payload_sha256: dmeHash ?? undefined }, ORIGIN)
+      expect(refusedReview.ok).toBe(false)
+      if (!refusedReview.ok) { expect(refusedReview.error).toBe('not_authorized'); expect(refusedReview.status).toBe(403) }
+      expect(verdictRows(harness, td)).toBe(0)
+
+      await approveOfficeTask(testEnv, td) // DME's own approver (org owner fixture) approved it
+      const refusedPublish = await invokeTool(viamarLead(), testEnv, 'office.publish_post', { task_id: td }, ORIGIN)
+      expect(refusedPublish.ok).toBe(false)
+      if (!refusedPublish.ok) { expect(refusedPublish.error).toBe('not_authorized'); expect(refusedPublish.status).toBe(403) }
+      expect(spy).not.toHaveBeenCalled()
+
+      const hash = await officeFreezeHash(testEnv, tv)
+      const approved = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: tv, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(approved.ok, JSON.stringify(approved)).toBe(true)
+      const published = await invokeTool(viamarLead(), testEnv, 'office.publish_post', { task_id: tv }, ORIGIN)
+      expect(published.ok, JSON.stringify(published)).toBe(true)
+      expect(fetchedOrigins(spy)).toEqual([SITE_A])
+      harness.close()
+    })
+
+    it('a department:office-only lead (no squad grant) is refused list, review and publish', async () => {
+      const { harness, testEnv, departmentId } = await twoCustomers()
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const deptOnly = auth('dept-lead', [grant('department', departmentId, 'lead')])
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const hash = await officeFreezeHash(testEnv, ta)
+      const listed = await invokeTool(deptOnly, testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      expect(listed.ok).toBe(false)
+      if (!listed.ok) expect(listed.error).toBe('not_authorized')
+      const review = await invokeTool(deptOnly, testEnv, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(review.ok).toBe(false)
+      if (!review.ok) expect(review.error).toBe('not_authorized')
+      expect(verdictRows(harness, ta)).toBe(0)
+      await approveOfficeTask(testEnv, ta)
+      const publish = await invokeTool(deptOnly, testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)
+      expect(publish.ok).toBe(false)
+      if (!publish.ok) expect(publish.error).toBe('not_authorized')
+      expect(spy).not.toHaveBeenCalled()
+      harness.close()
+    })
+
+    it('a squad MEMBER (below the manifest publish capability) may list but not review or publish', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const member = auth('viamar-member', [grant('squad', 'squad-a', 'member')])
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const hash = await officeFreezeHash(testEnv, ta)
+      const listed = await invokeTool(member, testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      expect(listed.ok && (listed.result as { tasks: Array<{ id: string }> }).tasks.map((t) => t.id)).toEqual([ta])
+      const review = await invokeTool(member, testEnv, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(review.ok).toBe(false)
+      if (!review.ok) expect(review.error).toBe('not_authorized')
+      harness.close()
+    })
+
+    it('the squad holding only READ on the project confers no authority (project_squad_access guard)', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const hash = await officeFreezeHash(testEnv, ta)
+      harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-a' AND squad_id = 'squad-a'`).run()
+      const listed = await invokeTool(viamarLead(), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+      expect(listed.ok).toBe(false)
+      const review = await invokeTool(viamarLead(), testEnv, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(review.ok).toBe(false)
+      if (!review.ok) expect(review.error).toBe('not_authorized')
+      harness.close()
+    })
+
+    it('a task with no project is never office-authorised (predicate is fail-closed on project_id)', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      const { hasProjectOfficeCapability } = await import('../src/addons/office/service')
+      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: null, squad_id: 'squad-a' }, 'member')).toBe(false)
+      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-a', squad_id: 'squad-a' }, 'lead')).toBe(true)
+      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-b', squad_id: 'squad-b' }, 'member')).toBe(false)
+      // a squad that does NOT hold write on the project it claims is refused even for a lead on that squad
+      expect(await hasProjectOfficeCapability(testEnv, viamarLead(), { project_id: 'proj-b', squad_id: 'squad-a' }, 'member')).toBe(false)
+      harness.close()
+    })
+
+    it('the verdict transaction re-checks squad/project write: access revoked between the check and the write -> verdict_race, 0 verdict rows', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      seedViamarGate(harness)
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      const hash = await officeFreezeHash(testEnv, ta)
+      const real = testEnv.DB
+      const racing = {
+        prepare: real.prepare.bind(real),
+        batch: async (statements: Parameters<D1Database['batch']>[0]) => {
+          harness.sqlite.prepare(`UPDATE project_squad_access SET access_level = 'read' WHERE project_id = 'proj-a' AND squad_id = 'squad-a'`).run()
+          return real.batch(statements)
+        },
+      // The wrapper implements exactly the D1Database surface the verdict path touches; cast to satisfy the Env type.
+      } as unknown as D1Database
+      const review = await invokeTool(viamarLead(), { ...testEnv, DB: racing }, 'office.review_approval', { task_id: ta, verdict: 'approved', expected_payload_sha256: hash ?? undefined }, ORIGIN)
+      expect(review.ok).toBe(false)
+      if (!review.ok) expect(review.error).toBe('verdict_race')
+      expect(verdictRows(harness, ta)).toBe(0)
+      expect(harness.sqlite.prepare(`SELECT verdict_id FROM office_publish_freezes WHERE task_id = ?`).get(ta)).toEqual({ verdict_id: null })
       harness.close()
     })
   })

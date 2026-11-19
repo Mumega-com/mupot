@@ -129,10 +129,11 @@ async function makeReviewTask(env: Env, forSquad: string, title = 'Publish: Q4 r
   return task.id
 }
 
-function member(id: string, email: string, capability: 'lead' | 'member', scope: 'department' | 'org' = 'department'): void {
+// B3b: office authority is a SQUAD-scope grant on the customer's squad (a department:office grant confers none).
+function member(id: string, email: string, capability: 'lead' | 'member', scope: 'squad' | 'org' = 'squad', onSquad: string = squadId): void {
   h.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES (?, ?, ?, 'active', ?)`).run(id, email, id, TENANT)
   h.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)`)
-    .run(`cap-${id}`, id, scope, scope === 'department' ? deptId : null, capability)
+    .run(`cap-${id}`, id, scope, scope === 'squad' ? onSquad : null, capability)
   h.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES (?, 'gate:office', 'member', ?, 'test', datetime('now'))`).run(`gg-${id}`, id)
 }
 
@@ -284,6 +285,24 @@ describe('/approvals office rows (what the human is shown)', () => {
     expect(html).toContain('the exact words')
     expect(html).toContain('class="btn appr-approve"')
     expect(html).toContain('/approvals/office/')
+  })
+
+  it('B3b: Approve is offered only on the viewer\'s OWN squad\'s office rows, never another customer\'s (per-squad memo)', async () => {
+    h.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-dme', ?, 'cust-dme', 'DME')`).run(deptId)
+    const dmeTask = await makeReviewTask(envFor('seed@x.test'), 'squad-dme', 'Publish: DME post')
+    // ensureDefaultOfficeProject shares one project; give DME its own, so the squads are genuinely separate customers.
+    h.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-dme', 'proj-dme', 'DME', 'active')`).run()
+    h.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-dme', 'squad-dme', 'write')`).run()
+    h.sqlite.prepare(`UPDATE tasks SET project_id = 'proj-dme' WHERE id = ?`).run(dmeTask)
+    const { html } = await authFor('lead@x.test') // mem-lead: lead on the default office squad only
+    expect(html).toContain(`data-office-sha="${frozenHash(taskId)}"`)
+    expect(html).not.toContain(`data-office-sha="${frozenHash(dmeTask)}"`)
+    // a department:office-only lead is offered nothing at all
+    h.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('mem-dept', 'dept@x.test', 'dept', 'active', ?)`).run(TENANT)
+    h.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dept', 'mem-dept', 'department', ?, 'lead')`).run(deptId)
+    h.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('gg-dept', 'gate:office', 'member', 'mem-dept', 'test', datetime('now'))`).run()
+    const dept = await authFor('dept@x.test')
+    expect(dept.html).not.toContain('class="btn appr-approve"')
   })
 
   it('a non-lead member is not offered Approve (no buttons)', async () => {

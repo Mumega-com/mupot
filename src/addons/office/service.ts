@@ -9,9 +9,9 @@
 //   - connector binding: listAddonBindings (src/addons/bindings.ts) + useConnectorById
 //     (src/connectors/service.ts) — the SAME vault-mediated fetch path health.ts and
 //     the marketing mcpwp adapter already use. Credentials never leave useConnectorById.
-//   - department authority: hasCapability(..., 'department', ...) — the same predicate
-//     org/index.ts, mcp/provision.ts, and routines/service.ts already gate department
-//     writes with.
+//   - per-customer authority (B3b): hasProjectOfficeCapability — the task's squad must hold
+//     write|admin on the task's project AND the caller must hold the capability on that squad.
+//     A department:office grant is NOT authority (it would span every customer's squad).
 //   - the human gate on office.publish_post: task_verdicts, via the SAME
 //     evaluateVerdictGates/writeVerdict/findLatestVerdict functions the task_verdict
 //     MCP tool itself calls (src/tasks/index.ts, src/tasks/service.ts) — narrowed to
@@ -58,9 +58,10 @@
 // collector, not a synchronous emit path any tool call can invoke. Reported, not
 // built around — see the PR body.
 
-import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../types'
+import type { Env, AuthContext, Task, Capability, TaskVerdict, OrgKind } from '../../types'
 import { isGateAskExpired } from '../../gates/approval-expiry-rule'
-import { hasCapability, isOrgAdmin } from '../../auth/capability'
+import { isOrgAdmin, resolveCapabilities } from '../../auth/capability'
+import { hasProjectWriteForSquads } from '../../projects/access'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH, checkMcpwpOfficeHealth, type McpwpOfficeHealthResult } from './health'
@@ -97,7 +98,6 @@ import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../../hygiene/filters'
 export type { OfficeResult, OfficeRefusalReason } from './freeze'
 export { OFFICE_ADDON_KEY, OFFICE_GATE_OWNER, OFFICE_WORDPRESS_SLOT } from './freeze'
 
-const OFFICE_DEPARTMENT_SLUG = 'office'
 // mupot#1616: the office talks ONLY to MCPWP's own REST layer, authenticated
 // with the MCPWP API key (X-API-Key). Contract source (read-only, plugin 3.11.1
 // in /home/mumega/mcpwp; the live site ran 3.13.0 per the issue):
@@ -137,30 +137,62 @@ const RECONCILE_MIN_STALENESS_MS = WP_PUBLISH_TIMEOUT_MS * 3
 
 // ── shared authority checks ──────────────────────────────────────────────────────
 
-async function resolveOfficeDepartmentId(env: Env): Promise<string | null> {
-  const row = await env.DB.prepare(
-    `SELECT id FROM departments WHERE slug = ?1 LIMIT 1`,
-  ).bind(OFFICE_DEPARTMENT_SLUG).first<{ id: string }>()
-  return row?.id ?? null
+const OFFICE_DEPARTMENT_SLUG = 'office'
+
+/** B3b: a copy of `auth` whose capability list has no department-scope grant on the `office` department. canActOnSquad
+ *  would otherwise let that grant inherit onto every customer squad in the department — exactly the cross-customer
+ *  authority this predicate exists to remove. Squad-scope and org-scope grants are untouched. */
+async function withoutOfficeDepartmentGrants(env: Env, auth: AuthContext): Promise<AuthContext> {
+  const grants = auth.capabilities ?? (auth.memberId ? await resolveCapabilities(env, auth.memberId) : undefined)
+  if (!grants) return auth
+  const dept = await env.DB.prepare(`SELECT id FROM departments WHERE slug = ?1 LIMIT 1`).bind(OFFICE_DEPARTMENT_SLUG).first<{ id: string }>()
+  if (!dept) return { ...auth, capabilities: grants }
+  return { ...auth, capabilities: grants.filter((g) => !(g.scope_type === 'department' && g.scope_id === dept.id)) }
 }
 
-/** True iff `auth` holds at least `min` capability on the office department (or org admin). */
-export async function hasOfficeCapability(
+/** B3b (spec `office-per-customer` §2): the ONE office authority predicate. A caller may act on an office task only
+ *  when (1) the task is in a project, (2) the task's squad holds write|admin on that project in project_squad_access,
+ *  and (3) the caller holds at least `min` on THAT squad (canActOnSquad). The old department-scope grant on the
+ *  `office` department is deliberately NOT a source of authority any more: a department grant inherits to every
+ *  non-home squad in the department, so one customer's lead would have been lead over every customer's office squad.
+ *  Fail-closed: no project, no project_squad_access row, or no squad grant means refused. */
+export async function hasProjectOfficeCapability(
   env: Env,
   auth: AuthContext,
+  task: { readonly project_id: string | null; readonly squad_id: string },
   min: Capability,
 ): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
-  const departmentId = await resolveOfficeDepartmentId(env)
-  if (!departmentId) return false
-  return hasCapability(auth.capabilities ?? [], 'department', departmentId, min)
+  if (task.project_id === null || task.project_id === undefined) return false
+  if (!(await canActOnSquad(env, await withoutOfficeDepartmentGrants(env, auth), task.squad_id, min))) return false
+  return hasProjectWriteForSquads(env, task.project_id, [task.squad_id])
 }
 
 /** True iff `auth` holds the capability the manifest's 'office.publish' approval policy requires (read live from
- *  the registered manifest, like reviewOfficeApproval). Read-side convenience for the web approvals page only;
- *  reviewOfficeApproval re-checks it at write time. */
-export async function hasOfficePublishCapability(env: Env, auth: AuthContext): Promise<boolean> {
-  return hasOfficeCapability(env, auth, resolveOfficePublishRequiredCapability())
+ *  the registered manifest, like reviewOfficeApproval) on THIS task's squad/project. Read-side convenience for the
+ *  web approvals page only; reviewOfficeApproval re-checks it at write time. */
+export async function hasOfficePublishCapability(
+  env: Env,
+  auth: AuthContext,
+  task: { readonly project_id: string | null; readonly squad_id: string },
+): Promise<boolean> {
+  return hasProjectOfficeCapability(env, auth, task, resolveOfficePublishRequiredCapability())
+}
+
+/** office.health has no task: authorised when the caller holds `member` on at least one squad that holds write|admin
+ *  on some project (i.e. a squad that is actually a customer project squad). The probe returns a status only and is
+ *  cooled down, so it needs a floor, not a per-customer check. */
+async function hasAnyOfficeSquadCapability(env: Env, auth: AuthContext, min: Capability): Promise<boolean> {
+  if (isOrgAdmin(auth)) return true // floor only: per-row authority below still applies to what a list returns
+  const scoped = await withoutOfficeDepartmentGrants(env, auth)
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT psa.squad_id AS squad_id
+       FROM project_squad_access psa
+      WHERE psa.access_level IN ('write', 'admin')
+      LIMIT 200`,
+  ).all<{ squad_id: string }>()
+  const cache = new Map<string, Promise<{ department_id: string; kind: OrgKind } | null>>()
+  const allowed = await Promise.all((rows.results ?? []).map((r) => canActOnSquad(env, scoped, r.squad_id, min, cache)))
+  return allowed.some(Boolean)
 }
 
 /** What the web approvals page needs to render a gate:office row: the live (non-voided) FROZEN payload the human
@@ -319,7 +351,7 @@ function parseCachedHealth(value: string | null | undefined): CachedHealth | nul
  *  older than the window, so concurrent callers cannot both probe. Inside the window the
  *  last stored result is returned with cached:true. */
 export async function getOfficeHealth(env: Env, auth: AuthContext): Promise<OfficeResult<OfficeHealthReport>> {
-  if (!(await hasOfficeCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
+  if (!(await hasAnyOfficeSquadCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
   const eligible = await resolveEligibleActiveOfficeInstallationId(env)
   if (!eligible.ok) return eligible
   const key = `office_health_probe:${eligible.value}`
@@ -372,6 +404,7 @@ interface OfficePendingApprovalRow {
   body: string
   created_at: string
   squad_id: string
+  project_id: string | null
   payload_json: string | null
   payload_sha256: string | null
 }
@@ -381,7 +414,9 @@ export async function listOfficePendingApprovals(
   auth: AuthContext,
   limit = 50,
 ): Promise<OfficeResult<OfficePendingApproval[]>> {
-  if (!(await hasOfficeCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
+  // Floor: a caller with no `member` on any customer project squad is refused outright (same refusal as before);
+  // the per-row predicate below then scopes what a qualifying caller may see to its OWN squads/projects.
+  if (!(await hasAnyOfficeSquadCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
 
   const bounded = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 200) : 50
   // P3-1 (kasra-review adversarial round 1, PR #1588): squad-scoped, same as
@@ -403,17 +438,29 @@ export async function listOfficePendingApprovals(
   // NO freeze exists at all (nothing frozen to show instead) — office.
   // review_approval's own P2-2 fix refuses to approve in that state regardless.
   const candidates = await env.DB.prepare(`
-    SELECT t.id as id, t.title as title, t.body as body, t.created_at as created_at, t.squad_id as squad_id,
+    SELECT t.id as id, t.title as title, t.body as body, t.created_at as created_at, t.squad_id as squad_id, t.project_id as project_id,
            f.payload_json as payload_json, f.payload_sha256 as payload_sha256
       FROM tasks t
       LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL
      WHERE t.gate_owner = ?1 AND t.status = 'review' AND ${TASK_NOT_ARCHIVED_SQL('t')}
+       AND t.project_id IS NOT NULL
+       AND EXISTS (SELECT 1 FROM project_squad_access psa
+                    WHERE psa.project_id = t.project_id AND psa.squad_id = t.squad_id
+                      AND psa.access_level IN ('write', 'admin'))
      ORDER BY t.created_at ASC
      LIMIT ?2
   `).bind(OFFICE_GATE_OWNER, bounded).all<OfficePendingApprovalRow>()
 
   const rows = candidates.results ?? []
-  const allowed = await Promise.all(rows.map((row) => canActOnSquad(env, auth, row.squad_id)))
+  // B3b: per-row authority = the project/squad predicate (member). Memoised per (squad, project) so N rows of one
+  // customer cost one lookup, not N.
+  const authMemo = new Map<string, Promise<boolean>>()
+  const allowed = await Promise.all(rows.map((row) => {
+    const key = `${row.squad_id}|${row.project_id ?? ''}`
+    let hit = authMemo.get(key)
+    if (!hit) { hit = hasProjectOfficeCapability(env, auth, row, 'member'); authMemo.set(key, hit) }
+    return hit
+  }))
   const value = rows
     .filter((_row, index) => allowed[index])
     .map((row): OfficePendingApproval => {
@@ -494,23 +541,11 @@ export async function reviewOfficeApproval(
     return { ok: false, reason: 'self_verdict' }
   }
 
-  // Squad scope — P2-2 (kasra-review adversarial round 1): this call used to skip
-  // the base squad-membership guard task_verdict's own HTTP/MCP surfaces both run
-  // BEFORE evaluateVerdictGates (canActOnSquad, src/tasks/index.ts) — a caller who
-  // held a gate:office grant but belonged to a DIFFERENT squad only got 'ok' here
-  // while task_verdict correctly 403s the identical task/caller pair. One task, one
-  // verdict authority: this call site must never be looser than the generic one.
-  if (!(await canActOnSquad(env, auth, task.squad_id))) {
-    return { ok: false, reason: 'not_authorized' }
-  }
-
-  // The manifest's own approvalPolicies entry for 'office.publish'
-  // (requiredCapability, selfApproval:false — src/addons/office/manifest.ts) was
-  // declared but never actually read by this tool; a caller holding ONLY a
-  // gate:office grant (no department capability at all) could approve. Read live
-  // from the registered manifest, never hardcoded.
-  const requiredCapability = resolveOfficePublishRequiredCapability()
-  if (!(await hasOfficeCapability(env, auth, requiredCapability))) {
+  // B3b (spec office-per-customer §2): ONE predicate decides authority — the task's squad must hold write|admin on
+  // the task's project AND the caller must hold the manifest's 'office.publish' capability (read live from the
+  // registered manifest, never hardcoded) ON THAT SQUAD. This subsumes the old squad-membership guard (P2-2: never
+  // looser than task_verdict's canActOnSquad) and the old department:office check, which is no longer authority.
+  if (!(await hasProjectOfficeCapability(env, auth, task, resolveOfficePublishRequiredCapability()))) {
     return { ok: false, reason: 'not_authorized' }
   }
 
@@ -600,6 +635,14 @@ export async function reviewOfficeApproval(
 // verdict surface through this one) rather than duplicating its logic —
 // assertVerdictWritable/buildVerdictStatements/emitVerdictBusEvent are the SAME
 // shared primitives writeVerdict itself is built from.
+// B3b: the authority correlate re-read INSIDE the verdict transaction — the task's squad must STILL hold write|admin
+// on the task's project when the write lands (a squad-access revoke between check and write makes the verdict a no-op).
+const OFFICE_PROJECT_SQUAD_WRITE_SQL = (alias: string): string =>
+  `${alias}.project_id IS NOT NULL AND EXISTS (
+     SELECT 1 FROM project_squad_access psa
+      WHERE psa.project_id = ${alias}.project_id AND psa.squad_id = ${alias}.squad_id
+        AND psa.access_level IN ('write', 'admin'))`
+
 async function writeOfficeVerdictAndBindFreeze(
   env: Env,
   task: Task,
@@ -666,6 +709,7 @@ async function writeOfficeVerdictAndBindFreeze(
              AND title = json_extract(f.payload_json, '$.title')
              AND body = json_extract(f.payload_json, '$.content')
              AND (f.project_id IS NULL OR tasks.project_id IS f.project_id)
+             AND ${OFFICE_PROJECT_SQUAD_WRITE_SQL('tasks')}
         )`,
         params: [task.id, expectedPayloadSha256],
       }
@@ -697,6 +741,7 @@ async function writeOfficeVerdictAndBindFreeze(
                  AND t.title = json_extract(office_publish_freezes.payload_json, '$.title')
                  AND t.body = json_extract(office_publish_freezes.payload_json, '$.content')
                  AND (office_publish_freezes.project_id IS NULL OR t.project_id IS office_publish_freezes.project_id)
+                 AND ${OFFICE_PROJECT_SQUAD_WRITE_SQL('t')}
             )`,
       ).bind(verdictRow.id, task.id, expectedPayloadSha256, verdictRow.id),
     )
@@ -1240,16 +1285,9 @@ export async function publishOfficePost(
   // construction, either no verdict yet or a rejected/reversed one. No fetch either way.
   if (task.status !== 'approved') return { ok: false, reason: 'not_approved' }
 
-  // P3 (mupot#1592): publish_post had no squad check at all — a caller holding
-  // office department capability org-wide/department-wide but with no standing on
-  // THIS task's squad could still trigger its WordPress write. Same predicate
-  // office.review_approval's own P2-2 fix already applies to the decision; the
-  // execution deserves no less.
-  if (!(await canActOnSquad(env, auth, task.squad_id))) {
-    return { ok: false, reason: 'not_authorized' }
-  }
-
-  if (!(await hasOfficeCapability(env, auth, resolveOfficePublishRequiredCapability()))) {
+  // B3b: same predicate as reviewOfficeApproval (project/squad write access + the manifest's publish capability on
+  // THIS task's squad). Refused before any freeze read, fetch, or claim.
+  if (!(await hasProjectOfficeCapability(env, auth, task, resolveOfficePublishRequiredCapability()))) {
     return { ok: false, reason: 'not_authorized' }
   }
 
