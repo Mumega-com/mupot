@@ -77,11 +77,14 @@ import {
   type WriteVerdictInput,
 } from '../../tasks/service'
 import { claimTimestamp } from '../../lib/claim-timestamp'
+import { resolveProjectOfficeBinding } from './project-binding'
 import { emitGateVerdictReceipt, resolveGateVerdictScope, resolveVerdictSubmission, type GateVerdictReceiptOutcome } from '../../tasks/verdict-binding'
 import {
   OFFICE_GATE_OWNER,
+  OFFICE_WORDPRESS_SLOT,
   resolveEligibleActiveOfficeInstallationId,
   resolveOfficeConnectorBinding,
+  type OfficeConnectorBinding,
   resolveOfficeSiteOrigin,
   officeSiteUrlIsSubdirectory,
   officeConnectorSatisfiesRequirement,
@@ -556,6 +559,7 @@ async function writeOfficeVerdictAndBindFreeze(
            WHERE f.task_id = ? AND f.payload_sha256 = ? AND f.voided_at IS NULL AND f.verdict_id IS NULL
              AND title = json_extract(f.payload_json, '$.title')
              AND body = json_extract(f.payload_json, '$.content')
+             AND (f.project_id IS NULL OR tasks.project_id IS f.project_id)
         )`,
         params: [task.id, expectedPayloadSha256],
       }
@@ -586,6 +590,7 @@ async function writeOfficeVerdictAndBindFreeze(
                WHERE t.id = office_publish_freezes.task_id
                  AND t.title = json_extract(office_publish_freezes.payload_json, '$.title')
                  AND t.body = json_extract(office_publish_freezes.payload_json, '$.content')
+                 AND (office_publish_freezes.project_id IS NULL OR t.project_id IS office_publish_freezes.project_id)
             )`,
       ).bind(verdictRow.id, task.id, expectedPayloadSha256, verdictRow.id),
     )
@@ -1111,6 +1116,7 @@ interface OfficeFreezeRoutingRow {
   installation_id: string
   connector_id: string
   site_origin: string
+  project_id: string | null
 }
 
 export async function publishOfficePost(
@@ -1148,7 +1154,7 @@ export async function publishOfficePost(
   // review_approval entirely, which is itself refused since NEW-2 — fail closed
   // regardless) — fail closed.
   const freezeRow = await env.DB.prepare(`
-    SELECT frozen_at, installation_id, connector_id, site_origin
+    SELECT frozen_at, installation_id, connector_id, site_origin, project_id
       FROM office_publish_freezes WHERE task_id = ?1
   `).bind(task.id).first<OfficeFreezeRoutingRow>()
   if (!freezeRow) return { ok: false, reason: 'payload_not_frozen' }
@@ -1162,7 +1168,16 @@ export async function publishOfficePost(
   const eligibleInstallation = await resolveEligibleActiveOfficeInstallationId(env)
   if (!eligibleInstallation.ok) return eligibleInstallation
   const installationId = eligibleInstallation.value
-  const bindingResult = await resolveOfficeConnectorBinding(env, installationId)
+  // B3a: a freeze minted for a project resolves its destination from THAT project's binding
+  // (re-validated now) and is refused if the task's project moved since. A pre-migration
+  // freeze (project_id NULL) keeps the addon-level resolution and the connector/site match.
+  let bindingResult: OfficeResult<OfficeConnectorBinding>
+  if (freezeRow.project_id) {
+    if (task.project_id !== freezeRow.project_id) return { ok: false, reason: 'project_mismatch' }
+    bindingResult = await resolveProjectOfficeBinding(env, freezeRow.project_id, OFFICE_WORDPRESS_SLOT)
+  } else {
+    bindingResult = await resolveOfficeConnectorBinding(env, installationId)
+  }
   if (!bindingResult.ok) return bindingResult
   const siteOrigin = await resolveOfficeSiteOrigin(env, bindingResult.value.connectorId)
   if (!siteOrigin) {
@@ -1240,7 +1255,8 @@ export async function publishOfficePost(
           WHERE task_id = ?3 AND verdict = 'approved' AND reversed_at IS NULL
           ORDER BY decided_at DESC, id DESC LIMIT 1
        )
-       AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved' AND ${TASK_NOT_ARCHIVED_SQL()})
+       AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved' AND ${TASK_NOT_ARCHIVED_SQL()}
+                   AND (office_publish_freezes.project_id IS NULL OR tasks.project_id IS office_publish_freezes.project_id))
     RETURNING payload_json, payload_sha256, idempotency_key
   `).bind(claimant, claimTimestamp(), task.id, freezeRow.frozen_at, idempotencyKeyCandidate)
     .first<{ payload_json: string; payload_sha256: string; idempotency_key: string }>()

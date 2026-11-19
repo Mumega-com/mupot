@@ -42,6 +42,7 @@ import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { parseSiteConnectorConfig, isRootSiteUrl } from './health'
 import { canonicalJson, sha256Hex } from '../../lib/canonical-json'
 import { claimTimestamp } from '../../lib/claim-timestamp'
+import { resolveProjectOfficeBinding } from './project-binding'
 
 export const OFFICE_ADDON_KEY = 'mcpwp-office'
 export const OFFICE_GATE_OWNER = 'gate:office'
@@ -109,6 +110,15 @@ export type OfficeRefusalReason =
   | 'task_archived'
   // The gate ask expired unanswered (src/gates/approval-expiry.ts): never approvable, resubmit.
   | 'approval_expired'
+  // B3a (per-project office destination): the task has no project, so no destination can be chosen.
+  | 'project_required'
+  // B3a: the task's project has no (valid, unrevoked) wordpress_site binding.
+  | 'project_not_bound'
+  // B3a: confused-deputy guard — the connector is agent-scoped, its squad lacks write|admin on
+  // the project, or it is shared with another project.
+  | 'connector_scope_refused'
+  // B3a: the task's project/squad moved after the freeze was minted.
+  | 'project_mismatch'
 
 export type OfficeResult<T> =
   | { ok: true; value: T }
@@ -170,7 +180,7 @@ export async function resolveEligibleActiveOfficeInstallationId(env: Env): Promi
 
 export interface OfficeConnectorBinding {
   readonly connectorId: string
-  readonly capability: AddonBinding['capability']
+  readonly capability: AddonBinding['capability'] | 'read' | 'write'
 }
 
 export async function resolveOfficeConnectorBinding(env: Env, installationId: string): Promise<OfficeResult<OfficeConnectorBinding>> {
@@ -249,6 +259,8 @@ export function resolveOfficePublishRequiredCapability(): Capability {
 
 export interface OfficePublishFreezeRecord {
   readonly installationId: string
+  /** B3a: the project this freeze was minted for (pinned into payloadJson too). */
+  readonly projectId: string
   readonly connectorId: string
   readonly siteOrigin: string
   readonly payloadJson: string
@@ -297,7 +309,9 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
   const installationId = await resolveActiveOfficeInstallationId(env)
   if (!installationId) return { ok: false, reason: 'addon_inactive' }
 
-  const bindingResult = await resolveOfficeConnectorBinding(env, installationId)
+  // B3a: the destination is chosen by the TASK'S PROJECT, never by the addon-wide binding.
+  if (!task.project_id) return { ok: false, reason: 'project_required' }
+  const bindingResult = await resolveProjectOfficeBinding(env, task.project_id, OFFICE_WORDPRESS_SLOT)
   if (!bindingResult.ok) return bindingResult
 
   const siteOrigin = await resolveOfficeSiteOrigin(env, bindingResult.value.connectorId)
@@ -310,6 +324,7 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
     title: task.title,
     content: task.body,
     installation_id: installationId,
+    project_id: task.project_id,
     connector_id: bindingResult.value.connectorId,
     site_origin: siteOrigin,
   }
@@ -318,7 +333,7 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
 
   return {
     ok: true,
-    value: { installationId, connectorId: bindingResult.value.connectorId, siteOrigin, payloadJson, payloadSha256 },
+    value: { installationId, projectId: task.project_id, connectorId: bindingResult.value.connectorId, siteOrigin, payloadJson, payloadSha256 },
   }
 }
 
@@ -349,8 +364,8 @@ export async function persistOfficePublishFreeze(
 ): Promise<void> {
   await env.DB.prepare(`
     INSERT INTO office_publish_freezes (
-      task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, frozen_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, frozen_at, project_id
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
     ON CONFLICT(task_id) DO UPDATE SET
       payload_json = excluded.payload_json,
       payload_sha256 = excluded.payload_sha256,
@@ -359,6 +374,7 @@ export async function persistOfficePublishFreeze(
       site_origin = excluded.site_origin,
       frozen_by = excluded.frozen_by,
       frozen_at = excluded.frozen_at,
+      project_id = excluded.project_id,
       verdict_id = NULL,
       voided_at = NULL,
       voided_reason = NULL,
@@ -378,6 +394,7 @@ export async function persistOfficePublishFreeze(
     freeze.siteOrigin,
     frozenBy,
     claimTimestamp(),
+    freeze.projectId,
   ).run()
 }
 

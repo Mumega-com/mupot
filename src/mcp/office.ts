@@ -34,6 +34,7 @@ const STRING_SCHEMA = { type: 'string' }
 function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409 {
   switch (reason) {
     case 'not_authorized':
+    case 'connector_scope_refused':
     case 'self_verdict':
     case 'agent_approval_forbidden':
       return 403
@@ -67,6 +68,9 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'verdict_race':
     case 'task_archived':
     case 'approval_expired':
+    case 'project_required':
+    case 'project_not_bound':
+    case 'project_mismatch':
       return 409
     case 'expected_hash_required':
       return 400
