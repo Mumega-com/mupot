@@ -4191,6 +4191,9 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       vi.stubGlobal('fetch', spy)
       const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
       await approveOfficeTask(testEnv, ta)
+      // #2472: the unique active-connector index refuses two live rows on conn-b, so B's own row is revoked first;
+      // the squad-write guard (conn-b is squad-b's, not proj-a's) is what still has to stop this.
+      harness.sqlite.prepare(`UPDATE project_office_bindings SET revoked_at = '2026-02-01T00:00:00Z' WHERE project_id = 'proj-b'`).run()
       harness.sqlite.prepare(`UPDATE project_office_bindings SET connector_id = 'conn-b' WHERE project_id = 'proj-a'`).run()
       const result = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)
       expect(result.ok).toBe(false)
@@ -4204,6 +4207,9 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
       const { harness, testEnv, departmentId } = await twoCustomers()
       const spy = okFetch()
       vi.stubGlobal('fetch', spy)
+      // #2472: the unique active-connector index refuses two live rows on conn-b, so B's own row is revoked first;
+      // the squad-write guard (conn-b is squad-b's, not proj-a's) is what still has to stop this.
+      harness.sqlite.prepare(`UPDATE project_office_bindings SET revoked_at = '2026-02-01T00:00:00Z' WHERE project_id = 'proj-b'`).run()
       harness.sqlite.prepare(`UPDATE project_office_bindings SET connector_id = 'conn-b' WHERE project_id = 'proj-a'`).run()
       const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
       expect(harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM office_publish_freezes WHERE task_id = ?`).get(ta)).toEqual({ n: 0 })
@@ -4525,6 +4531,136 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
         }
       }
       expect(harness.sqlite.prepare(`SELECT connector_id, revoked_at FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a', revoked_at: null })
+      harness.close()
+    })
+
+    it('#2472 P1: an OAuth harness session (no seat) is refused bind AND unbind with operator_principal_required; row untouched', async () => {
+      const { harness, testEnv } = await twoCustomers()
+      await seedConnector(harness, 'conn-a-new', 'https://new-a.example.com', 'squad', 'squad-a')
+      const harnessGrant: AuthContext = { ...orgOwnerAuth(), harnessId: 'harness-1' }
+      const harnessToken: AuthContext = { ...orgOwnerAuth(), harnessCredential: true }
+      // harnessCredential sessions are additionally stopped earlier by the harness-session door; harnessId is the gap.
+      for (const who of [harnessGrant, harnessToken]) {
+        for (const [tool, args] of [
+          ['office.bind_project_site', { project_id: 'proj-a', wordpress_connector_id: 'conn-a-new' }],
+          ['office.unbind_project_site', { project_id: 'proj-a' }],
+        ] as const) {
+          const r = await invokeTool(who, testEnv, tool, args, ORIGIN)
+          expect(r.ok).toBe(false)
+          if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe(who === harnessGrant ? 'operator_principal_required' : 'harness_session_seat_required') }
+        }
+      }
+      expect(harness.sqlite.prepare(`SELECT connector_id, revoked_at FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a', revoked_at: null })
+      harness.close()
+    })
+
+    it('#2472 P2: binding a live pot-scoped non-mcpwp (ghl) connector is refused at bind time', async () => {
+      const { harness, testEnv, owner } = await twoCustomers()
+      await seedConnector(harness, 'conn-ghl', 'https://ghl.example.com', 'pot', null)
+      harness.sqlite.prepare(`UPDATE connectors SET type = 'ghl' WHERE id = 'conn-ghl'`).run()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      const r = await invokeTool(owner, testEnv, 'office.bind_project_site', { project_id: 'proj-c', wordpress_connector_id: 'conn-ghl' }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe('connector_scope_refused') }
+      expect(harness.sqlite.prepare(`SELECT 1 AS x FROM project_office_bindings WHERE project_id = 'proj-c'`).get()).toBeUndefined()
+      harness.close()
+    })
+
+    it('#2472 P2: use-time type check refuses a pre-existing non-mcpwp row with 0 fetches and no claim', async () => {
+      const { harness, testEnv, departmentId } = await twoCustomers()
+      const spy = okFetch()
+      vi.stubGlobal('fetch', spy)
+      const ta = await reviewTask(testEnv, 'squad-a', 'proj-a')
+      await approveOfficeTask(testEnv, ta)
+      harness.sqlite.prepare(`UPDATE connectors SET type = 'ghl' WHERE id = 'conn-a'`).run()
+      const r = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: ta }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.error).toBe('connector_scope_refused')
+      expect(spy).not.toHaveBeenCalled()
+      expect(harness.sqlite.prepare(`SELECT claimed_at FROM office_publish_freezes WHERE task_id = ?`).get(ta)).toEqual({ claimed_at: null })
+      harness.close()
+    })
+
+    it('#2472 P2: the DB itself refuses two ACTIVE bindings of one connector (unique partial index); revoked rows do not count', async () => {
+      const { harness } = await twoCustomers()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      const dup = () => harness.sqlite.prepare(
+        `INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by) VALUES ('proj-c', 'wordpress_site', 'conn-a', 'write', 'x')`,
+      ).run()
+      expect(dup).toThrow(/UNIQUE/)
+      harness.sqlite.prepare(`UPDATE project_office_bindings SET revoked_at = '2026-02-01T00:00:00Z' WHERE project_id = 'proj-a'`).run()
+      expect(dup).not.toThrow()
+      harness.close()
+    })
+
+    it('#2472 P2: a bind that loses the race (guard passed, index refuses) is a connector_scope_refused 403, not a throw', async () => {
+      const { harness, testEnv, owner } = await twoCustomers()
+      await seedConnector(harness, 'conn-pot-race', 'https://race.example.com', 'pot', null)
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-d', 'proj-d', 'Proj d', 'active')`).run()
+      // Every read in the bind path (project, connector, shared-connector, legacy-freeze) runs for real against the
+      // real DB and finds no live binding. The bind's only write goes through `.run()`; just before the FIRST `.run()`
+      // the competing live binding (proj-d) is committed, i.e. exactly the TOCTOU window between guard and write.
+      // No SQL is matched: the hook keys on the read/write method, not the statement text. (A SQLite trigger cannot
+      // do this: SQLite rolls back a trigger's inserts together with the statement that fails.)
+      let landed = 0
+      const landCompetitor = () => {
+        landed += 1
+        harness.sqlite.prepare(
+          `INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by) VALUES ('proj-d', 'wordpress_site', 'conn-pot-race', 'write', 'competitor')`,
+        ).run()
+      }
+      const racing: Env = {
+        ...testEnv,
+        DB: new Proxy(testEnv.DB, {
+          get(target, prop, receiver) {
+            if (prop !== 'prepare') return Reflect.get(target, prop, receiver)
+            return (sql: string) => {
+              const stmt = target.prepare(sql)
+              return {
+                bind: (...args: unknown[]) => {
+                  const bound = stmt.bind(...args)
+                  return new Proxy(bound, {
+                    get(bt, bp, br) {
+                      if (bp !== 'run') return Reflect.get(bt, bp, br)
+                      return () => { if (landed === 0) landCompetitor(); return bt.run() }
+                    },
+                  })
+                },
+              }
+            }
+          },
+        }),
+      }
+      const r = await invokeTool(owner, racing, 'office.bind_project_site', { project_id: 'proj-c', wordpress_connector_id: 'conn-pot-race' }, ORIGIN)
+      expect(r.ok).toBe(false)
+      if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe('connector_scope_refused') }
+      expect(landed).toBe(1) // the guard passed and the write was attempted
+      // The competitor is the sole live holder; the loser wrote nothing.
+      expect(harness.sqlite.prepare(`SELECT project_id, bound_by FROM project_office_bindings WHERE connector_id = 'conn-pot-race' AND revoked_at IS NULL`).all())
+        .toEqual([{ project_id: 'proj-d', bound_by: 'competitor' }])
+      expect(harness.sqlite.prepare(`SELECT 1 AS x FROM project_office_bindings WHERE project_id = 'proj-c'`).get()).toBeUndefined()
+      harness.close()
+    })
+
+    it('#2472 P3: a connector the legacy addon-level binding serves for a live NULL-project freeze cannot be bound to a project', async () => {
+      const { harness, testEnv, owner } = await twoCustomers()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      const { squadId } = readOfficeDepartmentAndSquad(harness)
+      const legacy = (await createTask(testEnv, { squad_id: squadId, title: 'legacy', done_when: 'legacy post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })).id
+      const freeze = (outcome: string | null, voided: string | null) => harness.sqlite.prepare(
+        `INSERT OR REPLACE INTO office_publish_freezes (task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, outcome, voided_at, project_id)
+         VALUES (?, '{}', 'h', 'i', 'conn-bootstrap', 'https://bootstrap.example.com', 'm', ?, ?, NULL)`,
+      ).run(legacy, outcome, voided)
+      const bind = () => invokeTool(owner, testEnv, 'office.bind_project_site', { project_id: 'proj-c', wordpress_connector_id: 'conn-bootstrap' }, ORIGIN)
+      freeze(null, null)
+      const refused = await bind()
+      expect(refused.ok).toBe(false)
+      if (!refused.ok) { expect(refused.status).toBe(403); expect(refused.error).toBe('connector_scope_refused') }
+      expect(harness.sqlite.prepare(`SELECT 1 AS x FROM project_office_bindings WHERE project_id = 'proj-c'`).get()).toBeUndefined()
+      // a finished or voided legacy freeze no longer resolves through the connector: bind is allowed
+      freeze('done', null)
+      expect((await bind()).ok).toBe(true)
       harness.close()
     })
 

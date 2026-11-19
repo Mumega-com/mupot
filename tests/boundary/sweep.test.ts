@@ -54,7 +54,17 @@ type ToolSpec = (typeof TOOLS)[number]
  * "B's connector": its real UUID, B's squad id, and B's squad slug. Every other tool has one argument set.
  */
 const CONNECTOR_FORMS = (connectorIdB: string): string[] => [connectorIdB, 'sq-b', 'cust-b']
-const takesConnector = (t: ToolSpec): boolean => 'connector_id' in (t.inputSchema.properties as Record<string, unknown>)
+// #2472: any argument whose name ENDS in connector_id (connector_id, wordpress_connector_id, ...) is a connector reference,
+// so a future tool cannot slip past the probe by prefixing the key.
+const CONNECTOR_KEY = /connector_id$/
+const connectorKeys = (t: ToolSpec): string[] => Object.keys(t.inputSchema.properties as Record<string, unknown>).filter((k) => CONNECTOR_KEY.test(k))
+const takesConnector = (t: ToolSpec): boolean => connectorKeys(t).length > 0
+/** Tools whose connector argument is an org-admin-only bind (not a supabase-style squad lookup): a non-admin persona is
+ *  refused at the admin floor (or as an agent principal) BEFORE the connector is looked at, so the persona's
+ *  supabase_connector_not_found is not the expected answer. The supabase tools keep the strict persona code. */
+const ADMIN_FLOOR_CONNECTOR_CODES: Record<string, string[]> = {
+  'office.bind_project_site': ['forbidden', 'operator_principal_required'],
+}
 
 function argsFor(t: ToolSpec, connectorIdB: string): Record<string, unknown> {
   const out: Record<string, unknown> = {}
@@ -63,7 +73,7 @@ function argsFor(t: ToolSpec, connectorIdB: string): Record<string, unknown> {
   for (const [k, p] of Object.entries(props)) {
     if (k === 'seat') continue
     if (k === 'id') { out.id = ID_BY_TOOL[t.name] ?? 'x'; continue }
-    if (k === 'connector_id') { out[k] = connectorIdB; continue }
+    if (CONNECTOR_KEY.test(k)) { out[k] = connectorIdB; continue }
     if (k in VICTIM) { out[k] = VICTIM[k]; continue }
     if (!req.has(k)) continue
     const ty = Array.isArray(p.type) ? p.type[0] : p.type
@@ -256,7 +266,7 @@ describe.each(personas)('registry sweep as $name', (persona) => {
       b.bus.length = 0
       const before = snapshotB(b)
       const args = argsFor(spec, b.connectorIdB)
-      if (form !== undefined) args.connector_id = form
+      if (form !== undefined) for (const k of connectorKeys(spec)) args[k] = form
       let out: Awaited<ReturnType<Boundary['call']>> | { threw: string }
       try {
         out = await b.call(auth, spec.name, args)
@@ -272,7 +282,10 @@ describe.each(personas)('registry sweep as $name', (persona) => {
       // The connector tools are the #2381 surface: whatever form of "B's connector" is named, the answer is the same exact code
       // (a persona with no squad standing at all is refused one step earlier, by the member floor).
       if (form !== undefined) {
-        expect((out as { error?: string }).error, `${label}: ${JSON.stringify(out)}`).toBe(persona.connectorCode)
+        const adminFloor = ADMIN_FLOOR_CONNECTOR_CODES[spec.name]
+        const code = (out as { error?: string }).error
+        if (adminFloor) expect(adminFloor, `${label}: ${JSON.stringify(out)}`).toContain(code)
+        else expect(code, `${label}: ${JSON.stringify(out)}`).toBe(persona.connectorCode)
         expect(outbound, `${label}: nothing may be sent`).toEqual([])
       }
     }
