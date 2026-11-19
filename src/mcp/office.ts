@@ -27,10 +27,11 @@ import {
   reconcileStalledOfficePublish,
   officeFailureStatus,
 } from '../addons/office/service'
+import { bindProjectOfficeSlot, revokeProjectOfficeSlot } from '../addons/office/project-binding'
+import { isOrgAdmin } from '../auth/capability'
 import '../addons/office/manifest'
 
 const STRING_SCHEMA = { type: 'string' }
-
 
 const toolOfficePublishPost: ToolSpec = {
   name: 'office.publish_post',
@@ -216,10 +217,71 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
   },
 }
 
+// B3a round 2: an operator binds / unbinds a customer project's WordPress destination without SQL.
+// Org owner/admin only AND a human principal: an agent-bound session (including an attached seat,
+// which always carries seatBinding) is refused, because the binding decides whose site a gated
+// publish reaches. Capability comes from the addon manifest (never the caller); slot is fixed to
+// wordpress_site. The connector confused-deputy guard lives in bindProjectOfficeSlot.
+function bindAuthorityRefusal(auth: AuthContext): ReturnType<typeof fail> | null {
+  if (auth.boundAgentId || auth.seatBinding) return fail(403, 'operator_principal_required')
+  if (!isOrgAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
+  return null
+}
+
+const toolOfficeBindProjectSite: ToolSpec = {
+  name: 'office.bind_project_site',
+  scope: 'org owner/admin (human principal only) — bind a project\'s office WordPress connector',
+  min: 'member',
+  args: '{ project_id: string, wordpress_connector_id: string }' +
+    ' -- binds wordpress_connector_id as THE wordpress_site destination of project_id (replaces any prior binding).' +
+    ' The connector must be squad-scoped to a squad with write access on the project, or pot-scoped and' +
+    ' used by no other project; capability is taken from the addon manifest.',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA, wordpress_connector_id: STRING_SCHEMA },
+    required: ['project_id', 'wordpress_connector_id'],
+    additionalProperties: false,
+  },
+  async run(auth: AuthContext, env, args) {
+    const refusal = bindAuthorityRefusal(auth)
+    if (refusal) return refusal
+    const projectId = str(args.project_id)
+    const connectorId = str(args.wordpress_connector_id)
+    if (!projectId || !connectorId) return fail(400, 'invalid_args', 'project_id and wordpress_connector_id required')
+    const result = await bindProjectOfficeSlot(env, auth, { projectId, slot: 'wordpress_site', connectorId })
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
+    return done({ project_id: result.value.projectId, slot: result.value.slot, connector_id: result.value.connectorId, capability: result.value.capability })
+  },
+}
+
+const toolOfficeUnbindProjectSite: ToolSpec = {
+  name: 'office.unbind_project_site',
+  scope: 'org owner/admin (human principal only) — revoke a project\'s office WordPress binding',
+  min: 'member',
+  args: '{ project_id: string } -- after this, office.publish_post for that project refuses project_not_bound.',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth: AuthContext, env, args) {
+    const refusal = bindAuthorityRefusal(auth)
+    if (refusal) return refusal
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
+    const result = await revokeProjectOfficeSlot(env, auth, { projectId, slot: 'wordpress_site' })
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
+    return done({ project_id: result.value.projectId, slot: result.value.slot, revoked: true })
+  },
+}
+
 export const OFFICE_TOOLS: ToolSpec[] = [
   toolOfficePublishPost,
   toolOfficeListPendingApprovals,
   toolOfficeHealth,
   toolOfficeReviewApproval,
   toolOfficeReconcileStalledPublish,
+  toolOfficeBindProjectSite,
+  toolOfficeUnbindProjectSite,
 ]

@@ -146,7 +146,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
     'approval_expiry_sweep', 'approval_resubmit_cap_reset', 'approve_gate_edge', 'archive_row', 'credential_request', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
     'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'host_key_register', 'loop_control', 'loop_set_status', 'mint_agent_token',
-    'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
+    'move_agent_squad', 'office.bind_project_site', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval', 'office.unbind_project_site',
     'operator_revoke', 'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
     'project_update', 'project_wiki_upsert', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',

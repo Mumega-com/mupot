@@ -843,7 +843,10 @@ tasksApp.patch('/:id', async (c) => {
   // evaluateVerdictGates FROM here), so this is cycle-free — see mupot#1602 r1
   // P0's fix for why the dynamic-import/literal-string workarounds this file
   // used to carry are gone.
-  if ((body.title !== undefined || body.body !== undefined) && (await officeTaskContentLocked(c.env, existing.id))) {
+  // B3a: the same live freeze also pins the task's project (its office destination), so a
+  // project_id change is refused while it exists. squad_id is not patchable here.
+  const retargetsProject = body.project_id !== undefined && body.project_id !== existing.project_id
+  if ((body.title !== undefined || body.body !== undefined || retargetsProject) && (await officeTaskContentLocked(c.env, existing.id))) {
     return c.json({
       error: 'office_payload_frozen',
       detail: 'title/body cannot be edited while a gate:office task is in review — an org owner/admin must reverse the verdict, or wait for office.review_approval to decide it',

@@ -106,8 +106,21 @@ async function seedActiveOffice(): Promise<void> {
   if (!a.ok) throw new Error(`activate ${JSON.stringify(a)}`)
 }
 
+/** B3a: office tasks need a project whose wordpress_site is bound. One default project, the squad holds write on it,
+ *  bound to the first live connector with 'write' capability. Idempotent. (Merge fixture adaptation for #2467 tests.) */
+function ensureDefaultOfficeProject(sqlite: SqliteD1Harness['sqlite'], squadId: string): string {
+  const projectId = 'proj-office-default'
+  sqlite.prepare(`INSERT OR IGNORE INTO projects (id, slug, name, status) VALUES (?1, ?1, 'Default', 'active')`).run(projectId)
+  sqlite.prepare(`INSERT OR IGNORE INTO project_squad_access (project_id, squad_id, access_level) VALUES (?1, ?2, 'write')`).run(projectId, squadId)
+  const connector = sqlite.prepare(`SELECT id FROM connectors WHERE revoked_at IS NULL ORDER BY created_at, id LIMIT 1`).get() as { id: string } | undefined
+  if (connector) {
+    sqlite.prepare(`INSERT OR IGNORE INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by) VALUES (?1, 'wordpress_site', ?2, 'write', 'test-setup')`).run(projectId, connector.id)
+  }
+  return projectId
+}
+
 async function makeReviewTask(env: Env, forSquad: string, title = 'Publish: Q4 recap'): Promise<string> {
-  const task = await createTask(env, { squad_id: forSquad, title, body: 'the exact words', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
+  const task = await createTask(env, { squad_id: forSquad, project_id: ensureDefaultOfficeProject(h.sqlite, forSquad), title, body: 'the exact words', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
   const owner = { userId: 'seed', email: null, role: 'owner' as const, tenant: TENANT, memberId: 'seed', capabilities: [{ member_id: 'seed', scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }], boundAgentId: null }
   for (const status of ['in_progress', 'review']) {
     const r = await invokeTool(owner as never, env, 'task_update', { task_id: task.id, status }, ORIGIN)

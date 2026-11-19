@@ -1886,7 +1886,9 @@ const toolTaskUpdate: ToolSpec = {
     // belt-and-suspenders with office.review_approval's own write-time
     // live-content re-check (src/addons/office/service.ts).
     if (
-      (args.title !== undefined || args.body !== undefined || args.note !== undefined || args.reason !== undefined) &&
+      (args.title !== undefined || args.body !== undefined || args.note !== undefined || args.reason !== undefined ||
+        // B3a: the live freeze also pins the task's project (its office destination); mirrors REST PATCH.
+        (args.project_id !== undefined && args.project_id !== existing.project_id)) &&
       (await officeTaskContentLocked(env, existing.id))
     ) {
       return fail(409, 'office_payload_frozen', {

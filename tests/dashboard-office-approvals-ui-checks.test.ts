@@ -29,6 +29,19 @@ const principal = (boundAgentId: string | null) => ({
   capabilities: [{ member_id: 'mem-lead', scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }],
 })
 
+/** B3a: office tasks need a project whose wordpress_site is bound. One default project, the squad holds write on it,
+ *  bound to the first live connector with 'write' capability. Idempotent. (Merge fixture adaptation for #2467 tests.) */
+function ensureDefaultOfficeProject(sqlite: SqliteD1Harness['sqlite'], squadId: string): string {
+  const projectId = 'proj-office-default'
+  sqlite.prepare(`INSERT OR IGNORE INTO projects (id, slug, name, status) VALUES (?1, ?1, 'Default', 'active')`).run(projectId)
+  sqlite.prepare(`INSERT OR IGNORE INTO project_squad_access (project_id, squad_id, access_level) VALUES (?1, ?2, 'write')`).run(projectId, squadId)
+  const connector = sqlite.prepare(`SELECT id FROM connectors WHERE revoked_at IS NULL ORDER BY created_at, id LIMIT 1`).get() as { id: string } | undefined
+  if (connector) {
+    sqlite.prepare(`INSERT OR IGNORE INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by) VALUES (?1, 'wordpress_site', ?2, 'write', 'test-setup')`).run(projectId, connector.id)
+  }
+  return projectId
+}
+
 beforeEach(async () => {
   h = createSqliteD1()
   applyAllMigrations(h.sqlite)
@@ -46,7 +59,7 @@ beforeEach(async () => {
     if (!r.ok) throw new Error(`fixture ${JSON.stringify(r)}`)
   }
   const squadId = (h.sqlite.prepare(`SELECT id FROM squads WHERE slug = 'site-operator'`).get() as { id: string }).id
-  const task = await createTask(env(), { squad_id: squadId, title: 'Publish: Q4 recap', body: 'the exact words', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
+  const task = await createTask(env(), { squad_id: squadId, project_id: ensureDefaultOfficeProject(h.sqlite, squadId), title: 'Publish: Q4 recap', body: 'the exact words', done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true })
   taskId = task.id
   const seed = { userId: 'seed', email: null, role: 'owner' as const, tenant: TENANT, memberId: 'seed', capabilities: [{ member_id: 'seed', scope_type: 'org' as const, scope_id: null, capability: 'owner' as const }], boundAgentId: null }
   for (const status of ['in_progress', 'review']) {
