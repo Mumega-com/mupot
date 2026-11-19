@@ -11,7 +11,8 @@ const observerPath = join(root, 'src', 'agents', 'wake-echo-observer.ts')
 describe('connection echo cut scope', () => {
   it('restores the shared inbox primitive to the approved base bytes', () => {
     const digest = createHash('sha256').update(readFileSync(messagesPath)).digest('hex')
-    expect(digest).toBe('2d7ccfd4c26d35bf97b4c66998666ed1b6082b8728c1d6339067d0d5a5026c48')
+    // Re-pinned by #2368 (task-dispatch fence in sendAgentMessage; two-lens GREEN at 8de92f3b). Any further change to messages.ts must re-pin deliberately.
+    expect(digest).toBe('5f4bb32c114d93ee1ea791aadcfd859edc3395b721133464806976d94a995bef')
   })
 
   it('removes the native inbox observer module entirely', () => {
