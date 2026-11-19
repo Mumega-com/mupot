@@ -25,55 +25,12 @@ import {
   publishOfficePost,
   reviewOfficeApproval,
   reconcileStalledOfficePublish,
-  type OfficeRefusalReason,
+  officeFailureStatus,
 } from '../addons/office/service'
 import '../addons/office/manifest'
 
 const STRING_SCHEMA = { type: 'string' }
 
-function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409 {
-  switch (reason) {
-    case 'not_authorized':
-    case 'self_verdict':
-    case 'agent_approval_forbidden':
-      return 403
-    case 'task_not_found':
-      return 404
-    case 'addon_inactive':
-    case 'connector_not_bound':
-    case 'connector_capability_mismatch':
-    case 'department_not_active':
-    case 'wrong_gate':
-    case 'not_in_review':
-    case 'not_approved':
-    case 'payload_not_frozen':
-    case 'payload_mismatch':
-    case 'payload_stale':
-    case 'unreconciled_prior_publish':
-    case 'freeze_not_found':
-    case 'already_reconciled':
-    case 'reconcile_conflict':
-    case 'publish_unreconciled':
-    case 'unsupported_site_path':
-    case 'reconcile_candidate_found':
-    case 'reconcile_check_unavailable':
-    case 'reconcile_retry_required':
-    case 'binding_changed':
-    case 'publish_claimed':
-    case 'invalid_site_config':
-    case 'invalid_site_url':
-    case 'publish_outcome_unknown':
-    case 'write_failed':
-    case 'verdict_race':
-    case 'task_archived':
-    case 'approval_expired':
-      return 409
-    case 'expected_hash_required':
-      return 400
-    default:
-      return 400
-  }
-}
 
 const toolOfficePublishPost: ToolSpec = {
   name: 'office.publish_post',

@@ -170,6 +170,28 @@ describe('decorateApprovals — bounded, memoized D1 cost (mupot#1319 gate BLOCK
     expect(count()).toBeLessThanOrEqual(6)
   })
 
+  it('gate:office rows (Codex P2): office capability is memoized and decision contexts are batch-read, so query count does NOT grow with N', async () => {
+    harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-office', 'office', 'office')`).run()
+    harness.sqlite.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-office', 'dept-office', 'squad-office', 'squad-office')`).run()
+    seedMember(harness.sqlite, 'member-office')
+    seedGrant(harness.sqlite, 'gate:office', 'member-office')
+    const auth = memberAuthWithCapabilities('member-office', [{ member_id: 'member-office', scope_type: 'department', scope_id: 'dept-office', capability: 'lead' }])
+    let total = 0
+    const measure = async (n: number, prefix: string): Promise<number> => {
+      total += n
+      for (let i = 0; i < n; i += 1) seedReviewTask(harness.sqlite, `${prefix}-${i}`, 'squad-office', 'gate:office')
+      const { env, count } = countingEnv(harness)
+      const out = await loadApprovals(env, auth)
+      expect(out.items.filter((r) => r.is_office)).toHaveLength(total)
+      return count()
+    }
+    const small = await measure(5, 'o-small')
+    const large = await measure(40, 'o-large') // table now holds 45 office rows
+    // Linear growth would add ~2 queries per extra row (~70). Allow zero growth.
+    expect(large).toBe(small)
+    expect(large).toBeLessThanOrEqual(10)
+  })
+
   it('BASE_SELECT candidate fetch is bounded at APPROVALS_FETCH_CEILING (non-admin path): seeding well past it still returns at most APPROVALS_QUEUE_LIMIT display rows, flagged as a lower bound', async () => {
     const EXTRA = 5
     for (let i = 0; i < APPROVALS_FETCH_CEILING + EXTRA; i += 1) {

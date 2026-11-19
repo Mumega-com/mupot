@@ -91,6 +91,11 @@ const NEEDS_MINT = 'an admin to mint it an agent-bound workspace token with mint
 
 /** Rendered per request; the most specific matching row wins (tool 2, kinds 1). */
 export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
+  // ── dashboard web approval (POST /approvals/.../decide) ───────────────────────────────────────
+  { error: 'agent_approval_forbidden', who_acts: 'owner', next_tool: 'needs_you_list',
+    next_step: 'A human decision is never made by an agent or a seat bound to one. The signed-in human opens the Approvals page in a browser session and approves or rejects there. An agent surfaces the item for that human with needs_you_list. {reach}' },
+  { error: 'form_submissions_only', who_acts: 'owner', next_tool: 'needs_you_list',
+    next_step: 'The web approval accepts only a browser form post (application/x-www-form-urlencoded or multipart/form-data). Submit the Approve or Reject button on the Approvals page rather than calling the endpoint with another content type. A non-browser caller cannot decide it: surface the item for the human with needs_you_list.' },
   // ── harness token with no seat ────────────────────────────────────────────────────────────────
   // update_agent from a bound chat/agent session that is not the row's own self lane (an attached chat aiming at ANOTHER agent's row).
   { error: 'operator_principal_required', tool: 'update_agent', who_acts: 'admin', next_tool: 'check_in',

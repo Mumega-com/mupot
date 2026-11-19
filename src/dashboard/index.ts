@@ -90,6 +90,7 @@ import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent
 import { authorizeOwnerMemberChange, emitAgentOwnerUpdated } from '../org/agent-owner'
 import { seatAttachDesignatedEnabled } from '../members/attach-designated'
 import { checkWebSession } from '../secure-moments/enrol-mint'
+import { reviewOfficeApproval, officeFailureStatus } from '../addons/office/service'
 import { SQUAD_ACTIVE_SQL, TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
@@ -1126,6 +1127,47 @@ dashboardApp.get('/send', async (c) => {
     loadDispatchableAgents(c.env, taskable),
   ])
   return c.html(shell(c.env, 'Send a task', sendPageBody(agents, dispatchable, pickDispatchDefault(dispatchable))))
+})
+
+// POST /approvals/office/:id/decide — a named HUMAN approves or rejects a gate:office (WordPress publish) task from
+// the web. Why a separate route: the generic POST /api/tasks/:id/verdict refuses gate:office on purpose (mupot#1592
+// NEW-2 — office approval must bind to the frozen payload hash), which is why this page used to show no buttons for
+// those rows. This route is the web door onto the SAME dedicated path (reviewOfficeApproval), never a second approval
+// path: it adds only (1) a real human web session, (2) CSRF (form content type + dashboardApp csrf() Origin check),
+// and (3) the payload_sha256 the human was shown. Agent-bound, self-approval, office-lead and squad-scope refusals
+// all live in reviewOfficeApproval and are not re-implemented here. Answers JSON for the page script.
+dashboardApp.post('/approvals/office/:id/decide', async (c) => {
+  c.header('Cache-Control', 'no-store')
+  // csrf() only inspects form content types, so anything else is refused before parseBody.
+  const ctype = (c.req.header('content-type') ?? '').toLowerCase()
+  if (!ctype.startsWith('application/x-www-form-urlencoded') && !ctype.startsWith('multipart/form-data')) {
+    return c.json({ error: 'form_submissions_only' }, 415)
+  }
+  const auth = c.get('auth')
+  // A real signed-in human in a browser: a bearer / agent / OAuth caller has no web session.
+  // An attached seat verdicts AS its bound agent; a human decision is never made by an agent.
+  const preSession = await checkWebSession(c.env, auth, { fresh: false })
+  if (!preSession.ok) return c.json({ error: preSession.error }, preSession.status)
+  if (auth.boundAgentId) return c.json({ error: 'agent_approval_forbidden' }, 403)
+  const form = await c.req.parseBody()
+  const verdict = form.verdict
+  if (verdict !== 'approved' && verdict !== 'rejected') return c.json({ error: 'invalid_verdict' }, 400)
+  // No fresh step-up on approve yet: the reauth route supports Google only, so it would lock out email-login users.
+  // It returns in a follow-up that supports every login method.
+  const note = typeof form.note === 'string' && form.note.trim() ? form.note.trim() : null
+  const shownHash = typeof form.payload_sha256 === 'string' && form.payload_sha256 ? form.payload_sha256 : null
+  const { resolveTaskEntity } = await import('../lib/entity-resolver')
+  const resolved = await resolveTaskEntity(c.env, c.req.param('id'))
+  if (!resolved.ok) return c.json({ error: 'task_not_found' }, resolved.reason === 'ambiguous' ? 409 : 404)
+  const result = await reviewOfficeApproval(c.env, auth, {
+    task: resolved.entity,
+    verdict,
+    note,
+    // Approve only binds to the hash the human saw; a missing hash is refused (expected_hash_required), a stale one 409s.
+    expectedPayloadSha256: shownHash,
+  })
+  if (!result.ok) return c.json({ error: result.reason }, officeFailureStatus(result.reason))
+  return c.json({ ok: true, task_id: result.value.task.id, verdict, status: result.value.task.status })
 })
 
 // GET /approvals — the gate queue (#6). Tasks in 'review' the caller may
@@ -5894,6 +5936,20 @@ export function opsHealthBody(data: OpsHealthData) {
 // permitted button renders; a plain note field with no buttons would leave a
 // dead control, so the note input itself only renders when at least one
 // action does.
+// gate:office rows decide through POST /approvals/office/:id/decide, binding to the frozen payload hash shown
+// on the card (data-office-sha). Empty for every other gate, so their wiring is unchanged.
+function officeShaAttr(t: ApprovalItem): string {
+  const office = t.is_office ? ' data-office="1"' : ''
+  return office + (t.office_payload_sha256 ? ` data-office-sha="${escAttr(t.office_payload_sha256)}"` : '')
+}
+
+// gate:office rows: where Approve would publish (the frozen site_origin, inside the hashed payload).
+function officeDestinationHtml(t: ApprovalItem): string {
+  return t.is_office && t.office_site_origin
+    ? `<div class="appr-dest muted">Publishes to <code>${escHtml(t.office_site_origin)}</code></div>`
+    : ''
+}
+
 function approvalCardHtml(t: ApprovalItem): string {
   const preview = resultPreview(t)
   const agentLabel = escHtml(t.agent_name ?? t.assignee_agent_id ?? 'unassigned')
@@ -5912,7 +5968,7 @@ function approvalCardHtml(t: ApprovalItem): string {
         <span class="appr-status"></span>`
     : `<span class="appr-no-action">No verdict action available for you on this task.</span>`
   return `
-    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}" style="border-left:3px solid var(--accent)">
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}"${officeShaAttr(t)} style="border-left:3px solid var(--accent)">
       <div class="appr-head">
         <div>
           <div class="appr-title">${escHtml(t.title)}</div>
@@ -5921,6 +5977,7 @@ function approvalCardHtml(t: ApprovalItem): string {
         <div class="appr-when">${when}</div>
       </div>
       <div class="appr-body">${escHtml(t.body)}</div>
+      ${officeDestinationHtml(t)}
       ${previewHtml}
       <div class="appr-actions">${actionsHtml}</div>
     </div>`
@@ -5950,11 +6007,21 @@ function obsQueueScript(): string {
             }
             card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
             status.textContent = '…';
-            fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
-              method: 'POST', credentials: 'same-origin',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
-            }).then(function (res) {
+            var officeSha = card.getAttribute('data-office-sha') || '';
+            // gate:office (every office row, frozen or not): form POST (csrf Origin check applies) to the office door;
+            // approve is bound to the hash on this card, reject needs none.
+            var req = card.getAttribute('data-office') === '1'
+              ? fetch('/approvals/office/' + encodeURIComponent(id) + '/decide', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams({ verdict: verdict, note: note.value.trim(), payload_sha256: officeSha }).toString()
+                })
+              : fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
+                });
+            req.then(function (res) {
               return res.json().then(function (data) { return { ok: res.ok, data: data }; });
             }).then(function (r) {
               if (r.ok) {
@@ -6907,7 +6974,7 @@ function approvalRowHtml(t: ApprovalItem, showGate = false): string {
           <span class="appr-status"></span>`
     : '<span class="appr-no-action muted">no action for you</span>'
   return `
-    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}">
+    <div class="card approval" data-task="${escAttr(t.id)}" data-can-approve="${t.can_approve ? '1' : '0'}" data-can-reject="${t.can_reject ? '1' : '0'}"${officeShaAttr(t)}>
       <div class="appr-head">
         <div>
           <div class="appr-title">${chip} ${escHtml(t.title)}</div>
@@ -6915,6 +6982,7 @@ function approvalRowHtml(t: ApprovalItem, showGate = false): string {
         </div>
         <div class="appr-actions">${actions}</div>
       </div>
+      ${officeDestinationHtml(t)}
       ${detail}
     </div>`
 }
@@ -7117,11 +7185,21 @@ function approvalsScript() {
             }
             card.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
             status.textContent = '…';
-            fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
-              method: 'POST', credentials: 'same-origin',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
-            }).then(function (res) {
+            var officeSha = card.getAttribute('data-office-sha') || '';
+            // gate:office (every office row, frozen or not): form POST (csrf Origin check applies) to the office door;
+            // approve is bound to the hash on this card, reject needs none.
+            var req = card.getAttribute('data-office') === '1'
+              ? fetch('/approvals/office/' + encodeURIComponent(id) + '/decide', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams({ verdict: verdict, note: note.value.trim(), payload_sha256: officeSha }).toString()
+                })
+              : fetch('/api/tasks/' + encodeURIComponent(id) + '/verdict', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ verdict: verdict, note: note.value.trim() || undefined })
+                });
+            req.then(function (res) {
               return res.json().then(function (data) { return { ok: res.ok, data: data }; });
             }).then(function (r) {
               if (r.ok) {
