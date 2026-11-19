@@ -494,11 +494,14 @@ export function landEvidenceGapSql(f: string, t: string): { noResultSubmission: 
  * `task-result-submission:*` entries (forgeable at dispatch) are dropped and replaced by the verified set; other prefixes
  * are kept; the list is capped at 200 (the meta maxItems), verified refs first. Any count of evidenced landings must
  * still join task_result_submissions rather than trust the ref strings.
+ *
+ * The scalar subquery is wrapped in json(): json_group_array's JSON subtype does not survive a scalar subquery on newer
+ * SQLite builds (3.54.x, Node 22.23), and json_set then stores the array as a quoted STRING (double-encoded receipt_refs).
  */
 export function landReceiptRefsSetSql(alias: string): string {
   assertSqlAlias(alias)
   const f = alias
-  return `meta = json_set(meta, '$.receipt_refs', (
+  return `meta = json_set(meta, '$.receipt_refs', json((
          SELECT json_group_array(ref) FROM (SELECT ref FROM (
            -- caller-supplied task-result-submission:* entries are DROPPED: only refs this land verified are written
            SELECT value AS ref FROM json_each(COALESCE(json_extract(${f}.meta, '$.receipt_refs'), json_array()))
@@ -514,7 +517,7 @@ export function landReceiptRefsSetSql(alias: string): string {
             WHERE EXISTS (SELECT 1 FROM task_result_submissions sub2
                            WHERE sub2.tenant = ${f}.tenant AND sub2.task_id = task_ref.value
                              AND sub2.submitted_by_agent_id = ${f}.agent AND ${landResultMatchSql('sub2', 't')})
-         ) ORDER BY ref LIKE 'task-result-submission:%' DESC, ref LIMIT 200))),`
+         ) ORDER BY ref LIKE 'task-result-submission:%' DESC, ref LIMIT 200)))),`
 }
 
 /** #2025: every task in meta.task_ids carries both evidence conjuncts. Vacuously true for an empty task list. */
