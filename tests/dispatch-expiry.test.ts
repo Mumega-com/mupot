@@ -141,4 +141,15 @@ describe('dispatch expiry with proven receiver death',()=>{
   for(let i=0;i<30;i++)receipt(`dead-${i}`)
   expect((await sweep()).expired).toBeLessThanOrEqual(25)
  })
+ it('advances the cursor only through inspected rows when protected receipts exhaust the attempt budget',async()=>{
+  for(let i=0;i<25;i++){receipt(`held-${i}`);h.sqlite.exec(`UPDATE task_dispatch_receipts SET attempts=1 WHERE id='held-${i}'`)}
+  receipt('r')
+  const first=await sweep();expect(first).toMatchObject({expired:0,lost:25,attempted:25})
+  expect(row()).toEqual({settled_stage:null,settled_reason:null})
+  let swept=1
+  while(swept<4&&row()?.settled_stage===null){await sweep();swept++}
+  expect(row()).toEqual({settled_stage:'failed',settled_reason:'dispatch_expired_no_receiver'})
+  expect(swept).toBeLessThanOrEqual(2);expect(audit()).toHaveLength(1)
+  expect(h.sqlite.prepare("SELECT count(*) AS n FROM task_dispatch_receipts WHERE id LIKE 'held-%' AND settled_at IS NOT NULL").get()).toEqual({n:0})
+ })
 })

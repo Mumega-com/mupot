@@ -43,8 +43,11 @@ export async function expireAbandonedDispatches(env:Env,opts:{nowMs?:number}={})
  let rows=await page(cursor);if(!rows.length&&cursor>0)rows=await page(0)
  result.scanned=rows.length
  const states=await agentLiveness(env,[...new Set(rows.map(r=>r.agent_id))],now)
+ // Cursor follows the last row actually inspected, never the last row fetched: rows past the budget break stay unvisited.
+ let inspected=0
  for(const row of rows){
   if(result.attempted>=DISPATCH_EXPIRY_LIMIT)break
+  inspected=row.seq
   const state=states.get(row.agent_id)
   if(!state||state.state!=='dead'||state.mode!=='resident'||state.operatorPaused||state.deadSinceMs===null||state.deadSinceMs>=now-DEAD_ASSIGNEE_RECLAIM_AFTER_MS||state.snapshot===null)continue
   result.attempted++
@@ -71,7 +74,7 @@ export async function expireAbandonedDispatches(env:Env,opts:{nowMs?:number}={})
  // CAS avoids a slower concurrent scanner overwriting a newer cursor. Wrap is intentional.
  try {
  await env.DB.prepare(`INSERT INTO org_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE org_settings.value IS ?3`)
-   .bind(key,String(rows.at(-1)?.seq??0),prior?.value??null).run()
+   .bind(key,String(inspected),prior?.value??null).run()
  }catch{result.cursor_failed=true}
  return result
 }
