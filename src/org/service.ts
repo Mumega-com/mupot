@@ -1091,29 +1091,44 @@ export async function getAgentProfile(env: Env, agentId: string): Promise<AgentP
   return row ? rowToProfileSummary(row) : null
 }
 
-// resolve-before-mint: find existing agents matching a name/slug query, across ALL
-// squads, so onboarding surfaces existing ROLES before minting a duplicate identity.
-// This is the anti-sprawl primitive (the 2026-07-21 3-hermes incident). Case-
-// insensitive substring match on name OR slug; excludes 'inactive' by default.
+// resolve-before-mint: find existing agents matching a name/slug query so onboarding
+// surfaces existing ROLES before minting a duplicate identity (the 2026-07-21 3-hermes
+// incident). Case-insensitive substring match on name OR slug; excludes 'inactive' by
+// default.
+//
+// `canSee` is the caller's visibility predicate (the MCP tools pass one; see
+// agentVisibility in src/mcp/provision.ts). Without it the lookup is tenant-wide, which
+// is only correct for an org admin. The predicate is applied BEFORE the limit, by
+// paging, so a hidden agent can neither consume a result slot nor change the response.
 export async function findAgentsByName(
   env: Env,
   query: string,
-  opts: { includeInactive?: boolean; limit?: number } = {},
+  opts: { includeInactive?: boolean; limit?: number; canSee?: (agent: AgentProfileSummary) => Promise<boolean> } = {},
 ): Promise<AgentProfileSummary[]> {
   const q = query.trim().toLowerCase()
   if (q === '') return []
   const like = `%${q.replace(/[%_\\]/g, (ch) => `\\${ch}`)}%`
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100)
   const statusClause = opts.includeInactive ? '' : " AND status != 'inactive'"
-  const rows = await env.DB.prepare(
-    `SELECT ${PROFILE_COLUMNS} FROM agents
-      WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(slug) LIKE ?1 ESCAPE '\\')${statusClause}
-      ORDER BY name ASC, slug ASC
-      LIMIT ?2`,
-  )
-    .bind(like, limit)
-    .all<AgentProfileRow>()
-  return (rows.results ?? []).map(rowToProfileSummary)
+  const pageSize = opts.canSee ? 200 : limit
+  const out: AgentProfileSummary[] = []
+  for (let offset = 0; out.length < limit; offset += pageSize) {
+    const rows = await env.DB.prepare(
+      `SELECT ${PROFILE_COLUMNS} FROM agents
+        WHERE (LOWER(name) LIKE ?1 ESCAPE '\\' OR LOWER(slug) LIKE ?1 ESCAPE '\\')${statusClause}
+        ORDER BY name ASC, slug ASC
+        LIMIT ?2 OFFSET ?3`,
+    )
+      .bind(like, pageSize, offset)
+      .all<AgentProfileRow>()
+    const page = (rows.results ?? []).map(rowToProfileSummary)
+    for (const agent of page) {
+      if (out.length >= limit) break
+      if (!opts.canSee || (await opts.canSee(agent))) out.push(agent)
+    }
+    if (page.length < pageSize) break
+  }
+  return out
 }
 
 // ── work-unit helpers ─────────────────────────────────────────────────────────
@@ -1389,6 +1404,9 @@ export interface AuditActor {
   type: 'agent' | 'user' | 'system'
   /** Server authorization result, never copied from request arguments. Recorded with the owner change. */
   ownerAssignmentOrgAdmin?: boolean
+  /** Set only for a write made through a human-confirmed ATTACHED chat: server-derived (never from args). The audit row's after_state
+   *  then carries `_attached_by_member_id` and `_attachment_id`, so the write is traceable to the confirming human and the attachment. */
+  attachment?: { attachmentId: string; confirmingMemberId: string }
 }
 
 // A call that supplies no actor is a system-initiated correction — migrations,
@@ -1717,9 +1735,14 @@ export async function updateAgentProfile(
   const expectBinds: (string | null)[] = expect ? [expect.attach_designated_member_id,
     ...(expect.owner_member_id !== undefined ? [expect.owner_member_id] : []),
     ...(expect.ownerAuditId !== undefined ? [expect.ownerAuditId] : [])] : []
-  const afterSnapshot = patch.owner_member_id !== undefined
+  const baseSnapshot = patch.owner_member_id !== undefined
     ? `json_set(${AGENT_SNAPSHOT_JSON}, '$._owner_assignment_org_admin', ${actor.ownerAssignmentOrgAdmin === true && actor.type === 'user' ? 1 : 0})`
     : AGENT_SNAPSHOT_JSON
+  // Both ids are server-derived; they are inlined as SQL literals (quotes doubled) because the statement's positional binds are fixed below.
+  const sqlLiteral = (v: string): string => `'${v.replace(/'/g, "''")}'`
+  const afterSnapshot = actor.attachment
+    ? `json_set(${baseSnapshot}, '$._attached_by_member_id', ${sqlLiteral(actor.attachment.confirmingMemberId)}, '$._attachment_id', ${sqlLiteral(actor.attachment.attachmentId)})`
+    : baseSnapshot
   let changes = 0
   try {
     // No updated_at column on `agents` — 0049 rebuilt the table without one and

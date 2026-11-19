@@ -1,23 +1,10 @@
 // tests/coordination.test.ts — the Control Tower (cross-project departures board).
 // Service (board/update/list + board model) + the HTTP routes. Faithful in-memory journeys fake.
 
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { boardJourney, updateJourney, listJourneys, buildDepartureBoard, type JourneyRow, type DepartureCard } from '../src/coordination/journeys'
 import { controlTowerBody } from '../src/dashboard/index'
 import type { Env } from '../src/types'
-
-vi.mock('../src/auth/member-bearer', async (importOriginal) => ({
-  // partial mock: other modules reachable from the coordination routes (e.g. flight routes) need the real exports
-  ...(await importOriginal<typeof import('../src/auth/member-bearer')>()),
-  bearerToken: (h?: string) => (h && h.startsWith('Bearer ') ? h.slice(7) : null),
-  resolveMemberByToken: async (_e: unknown, token: string | null) => {
-    if (token === 'tok-code') return { memberId: 'm-code', displayName: 'code', email: null, boundAgentId: 'ag-code' }
-    if (token === 'tok-rev') return { memberId: 'm-rev', displayName: 'rev', email: null, boundAgentId: 'ag-review' }
-    if (token === 'tok-unbound') return { memberId: 'm-h', displayName: 'h', email: null, boundAgentId: null }
-    return null
-  },
-}))
-const { coordinationApp } = await import('../src/coordination/routes')
 
 function makeDb(opts: { throwOnList?: boolean } = {}) {
   const rows: JourneyRow[] = []
@@ -45,12 +32,12 @@ function makeDb(opts: { throwOnList?: boolean } = {}) {
   function runAll(sql: string, b: unknown[]) {
     if (sql.includes('FROM journeys')) {
       if (opts.throwOnList) throw new Error('d1 unavailable')
-      const [tenant, limit] = b as [string, number]
+      const [tenant, limit, offset] = b as [string, number, number]
       const live = sql.includes("status IN ('boarding','departed','delayed')")
       return rows
         .filter((r) => r.tenant === tenant && (!live || ['boarding', 'departed', 'delayed'].includes(r.status)))
         .sort((x, y) => y.created_at - x.created_at)
-        .slice(0, limit)
+        .slice(offset, offset + limit)
         .map((r) => ({ ...r }))
     }
     throw new Error('unhandled all: ' + sql)
@@ -72,6 +59,8 @@ function makeDb(opts: { throwOnList?: boolean } = {}) {
 function env(db: ReturnType<typeof makeDb>, tenant = 't'): Env {
   return { TENANT_SLUG: tenant, DB: db } as unknown as Env
 }
+// Service-level tests: visibility is the route's concern (tests/coordination-scope.test.ts, real schema).
+const allow = async () => true
 const clock = { now: () => 1_000_000, idGen: (() => { let n = 0; return () => `j-${++n}` })() }
 
 describe('boardJourney', () => {
@@ -151,9 +140,9 @@ describe('listJourneys + buildDepartureBoard', () => {
     const arrived = await boardJourney(e, { agent: 'a3', project: 'digid' }, { now: () => 3, idGen: idgen })
     if (!arrived.ok) return
     await updateJourney(e, arrived.id, 'a3', { status: 'arrived' }, { now: () => 4 })
-    const live = await listJourneys(e, { scope: 'live' })
+    const live = await listJourneys(e, { scope: 'live', canSee: allow })
     expect(live.map((r) => r.agent)).toEqual(['a2', 'a1']) // newest first, arrived excluded
-    const all = await listJourneys(e, { scope: 'all' })
+    const all = await listJourneys(e, { scope: 'all', canSee: allow })
     expect(all.length).toBe(3)
   })
   it('board model maps phase + eta/departed display', () => {
@@ -173,59 +162,8 @@ describe('listJourneys + buildDepartureBoard', () => {
   })
 })
 
-// ── routes ──────────────────────────────────────────────────────────────────────
-function reqJson(method: string, token: string | undefined, body?: unknown, path = '/'): Request {
-  return new Request(`https://pot.test${path}`, {
-    method,
-    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-}
-
-describe('coordination routes', () => {
-  it('POST no token → 401; unbound → 403', async () => {
-    expect((await coordinationApp.fetch(reqJson('POST', undefined, { project: 'mupot' }), env(makeDb()))).status).toBe(401)
-    expect((await coordinationApp.fetch(reqJson('POST', 'tok-unbound', { project: 'mupot' }), env(makeDb()))).status).toBe(403)
-  })
-  it('POST happy → 201 + persisted with welded agent', async () => {
-    const db = makeDb()
-    const res = await coordinationApp.fetch(reqJson('POST', 'tok-code', { project: 'mupot', goal: 'x', gate: 'PR#9' }), env(db))
-    expect(res.status).toBe(201)
-    expect(db._rows[0].agent).toBe('ag-code') // from token weld, not body
-    expect(db._rows[0].project).toBe('mupot')
-  })
-  it('POST invalid project → 400', async () => {
-    expect((await coordinationApp.fetch(reqJson('POST', 'tok-code', { project: 'bad space' }), env(makeDb()))).status).toBe(400)
-  })
-  it('PATCH own flight → 200; another agent → 404', async () => {
-    const db = makeDb()
-    const e = env(db)
-    await coordinationApp.fetch(reqJson('POST', 'tok-code', { project: 'mupot' }), e)
-    const id = db._rows[0].id
-    const ok = await coordinationApp.fetch(reqJson('PATCH', 'tok-code', { status: 'departed' }, `/${id}`), e)
-    expect(ok.status).toBe(200)
-    const no = await coordinationApp.fetch(reqJson('PATCH', 'tok-rev', { status: 'arrived' }, `/${id}`), e)
-    expect(no.status).toBe(404)
-  })
-  it('GET board → 200 cards (live by default)', async () => {
-    const db = makeDb()
-    const e = env(db)
-    await coordinationApp.fetch(reqJson('POST', 'tok-code', { project: 'mupot' }), e)
-    const res = await coordinationApp.fetch(reqJson('GET', 'tok-code'), e)
-    expect(res.status).toBe(200)
-    const j = (await res.json()) as { board: Array<{ project: string }>; scope: string }
-    expect(j.scope).toBe('live')
-    expect(j.board[0].project).toBe('mupot')
-  })
-  it('GET no token → 401', async () => {
-    expect((await coordinationApp.fetch(reqJson('GET', undefined), env(makeDb()))).status).toBe(401)
-  })
-  it('GET on a DB read failure → explicit 500 db_error (never a silent empty board)', async () => {
-    const res = await coordinationApp.fetch(reqJson('GET', 'tok-code'), env(makeDb({ throwOnList: true })))
-    expect(res.status).toBe(500)
-    expect(((await res.json()) as { error: string }).error).toBe('db_error')
-  })
-})
+// Route behaviour (auth, boarding, patch, scoped read) is covered on the real schema in
+// tests/coordination-scope.test.ts.
 
 describe('controlTowerBody — XSS regression (rendered board escapes agent fields)', () => {
   it('escapes a malicious agent / project / goal / gate', () => {

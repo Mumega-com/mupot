@@ -151,6 +151,7 @@ function envFor(harness: SqliteD1Harness, extra: Record<string, unknown> = {}): 
   return {
     DB: harness.db,
     TENANT_SLUG: TENANT,
+    OPEN_SIGNUP_ENABLED: 'true',
     BUS: { send: async () => {} },
     ...extra,
   } as unknown as Env
@@ -566,6 +567,7 @@ function httpEnv(harnessRef: SqliteD1Harness, oauthProvider: ReturnType<typeof s
   const env = {
     DB: harnessRef.db,
     TENANT_SLUG: TENANT,
+    OPEN_SIGNUP_ENABLED: 'true',
     BRAND: 'mupot',
     POT_TIER: 'scale',
     GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',

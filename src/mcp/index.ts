@@ -43,7 +43,7 @@ import type {
 import { resolveCapabilities, hasCapability, displayRole, isOrgAdmin, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, shouldStampLastUsed, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
-import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { evaluateVerdictGates, canViewTaskReceipts, agentGateHolderIneligibility } from '../tasks/index'
 import { recordReviewLens } from '../tasks/lenses'
 import { resolveDyadGateDefault } from '../gates/dyad'
 import { isSubsystemReservedLane } from '../gates/lanes'
@@ -234,7 +234,8 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
 import { NAMED_INTENT_TOOLS } from './named-intent'
 import { namedIntentEnabled } from '../members/named-intent'
-import { SEAT_ATTACH_TOOLS } from './seat-attach'
+import { connectionSubject, SEAT_ATTACH_TOOLS } from './seat-attach'
+import { loadConnectionEcho } from '../members/connection-echo'
 import { pendingClaimForSeat } from '../members/claim'
 import { VIP_LANE_TOOLS } from './vip-lane'
 import { attachedOnboarding } from '../members/attached-onboarding'
@@ -311,6 +312,7 @@ import { recordNegotiation, describeRequestedVersion } from './negotiation-log'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { loadRuntimeTruth } from '../fleet/runtime-truth'
+import { attachedRuntimeSince, attachmentHasReported, type AttachedRuntimeRow, cleanAttachedRuntime, loadAttachedRuntime, recordAttachedRuntime } from './attached-runtime'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
@@ -2493,7 +2495,11 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
 export type GateWakeOutcome = {
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
+  // mupot#2450: no_eligible_holder = every agent holder is one task_verdict would refuse (assignee / self_verdict);
+  // eligibility_unknown = no holder was woken and at least one could not be judged (read failed or beyond the read cap).
+  // mupot#2461: holders_stopped = agent holders exist and were judged eligible, but every one is operator-stopped, so
+  // nobody can be woken. Not no_live_holder (the resolver found holders) and never delivered.
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'no_eligible_holder' | 'eligibility_unknown' | 'holders_stopped' | 'requires_human' | 'queued_to_owner_agent' | 'owner_agent_delivery_failed' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2501,8 +2507,72 @@ export type GateWakeOutcome = {
   grant_count: number
   notice: string
   notice_persisted: boolean
+  // mupot#2450: one status per agent holder considered (woken holders first, live ones ranked ahead). Presence is
+  // reported only as counts over the eligible holders; no per-holder presence or channel detail leaves the server.
+  holders?: readonly (GatePrincipalRef & { status: GateHolderWakeStatus })[]
+  presence?: { live: number; total: number }
+  width_cap?: { limit: number; omitted: number }
+  // Holders whose eligibility read failed. Fan-out: skipped (fail closed). Sole holder: still woken, as on base.
+  eligibility_unknown?: number
+  // mupot#2461: eligible agent holders skipped because their fleet row is operator-stopped (status stopped_skipped).
+  // No inbox row is kept for them (no store-and-forward); recovery is a re-attach plus the stall watchdog's re-wake.
+  stopped?: number
   // Decision-card path only: messages actually newly inserted (excludes duplicate / request_id_conflict).
   new_sends?: number
+}
+
+export type GateHolderWakeStatus =
+  | 'delivered' | 'partial' | 'delivery_failed'
+  | 'skipped_task_assignee' | 'skipped_self_verdict' | 'skipped_eligibility_unknown' | 'skipped_width_cap'
+  // mupot#2458: the holder's fleet row is operator-stopped; neither the bus wake nor the inbox row is sent.
+  | 'stopped_skipped'
+
+/**
+ * mupot#2450 item 6: the most holders one review wake fans out to. The cap bounds the per-holder D1 reads too:
+ * holders are walked in the resolver's stable order and walking stops once this many are eligible AND not stopped.
+ * mupot#2461: a stopped holder receives nothing, so it does not consume the width budget (otherwise 10 stopped
+ * holders sorting first would starve every live one, on every watchdog re-wake). Every holder walked costs one
+ * eligibility read and every eligible one one presence read; both are bounded by GATE_WAKE_FANOUT_MAX_READS.
+ * Hitting either bound is recorded as width_cap and makes the wake partial.
+ */
+export const GATE_WAKE_FANOUT_MAX_HOLDERS = 10
+export const GATE_WAKE_FANOUT_MAX_READS = 2 * GATE_WAKE_FANOUT_MAX_HOLDERS
+
+type HolderSkipReason = 'task_assignee' | 'self_verdict' | 'eligibility_unknown'
+
+// An eligibility read that throws is not proof of eligibility: the fan-out skips the holder (fail closed), and the
+// outcome names it eligibility_unknown, never ineligible.
+async function gateHolderSkipReason(env: Env, task: Task, agentId: string): Promise<HolderSkipReason | null> {
+  try {
+    return await agentGateHolderIneligibility(env, task, agentId)
+  } catch {
+    return 'eligibility_unknown'
+  }
+}
+
+type GateWakeRoute = { stopped: boolean; live: boolean; inboxId: string }
+
+/**
+ * mupot#2458: where (and whether) a gate wake reaches an agent holder. ONE presence read per holder.
+ * - A stopped fleet row never receives (the #1729 receiver fence): stopped = true, nothing is sent.
+ * - The inbox row goes to the fleet identity (route.agentId) ONLY when the consumer's own delivery-mode resolver
+ *   would deliver to that inbox: a live runtime or an active poll route (bus/consumer.ts resolveDispatchDeliveryMode).
+ *   Otherwise, e.g. a stale slug-keyed resident registration, it goes to agents.id: a dead address is never "delivered".
+ * - A failed read is unproven presence: not live, not stopped, inbox row to agents.id.
+ */
+async function resolveGateWakeRoute(env: Env, agentId: string): Promise<GateWakeRoute> {
+  try {
+    const route = await getFleetAgentLiveness(env, agentId)
+    if (route.stopped) return { stopped: true, live: false, inboxId: agentId }
+    const inboxId = resolveDispatchDeliveryMode(route, false) === 'inbox' ? route.agentId || agentId : agentId
+    return { stopped: false, live: route.live, inboxId }
+  } catch {
+    return { stopped: false, live: false, inboxId: agentId }
+  }
+}
+
+function channelStatus(d: { bus_delivered: boolean; inbox_delivered: boolean }): 'delivered' | 'partial' | 'delivery_failed' {
+  return d.bus_delivered && d.inbox_delivered ? 'delivered' : d.bus_delivered || d.inbox_delivered ? 'partial' : 'delivery_failed'
 }
 
 async function surfaceGateWakeOutcome(
@@ -2573,6 +2643,120 @@ export async function wakeGateOwnerOnReview(
     grant_count: resolution.grant_count,
   }
   if (resolution.status === 'ambiguous') {
+    // Wake routing only: keep the authority resolver and verdict predicates unchanged. Members retain their needs_you
+    // item. mupot#2450: every ELIGIBLE agent holder gets the durable inbox row whatever its presence (in-Worker and
+    // inbox-woken seats have no fleet_agents row). Presence only orders the deliveries (live first) and is reported as
+    // counts; holders[] and the saved notice use the resolver's stable order, so neither reveals who is live.
+    const agentHolders = resolution.active_holders.filter((holder) => holder.type === 'agent')
+    const hasMemberHolder = resolution.active_holders.some((holder) => holder.type === 'member')
+    const verdictOf = new Map<string, HolderSkipReason | null>()
+    const routeOf = new Map<string, GateWakeRoute>()
+    let reads = 0
+    let wakeableCount = 0
+    for (const holder of agentHolders) {
+      if (wakeableCount >= GATE_WAKE_FANOUT_MAX_HOLDERS || reads >= GATE_WAKE_FANOUT_MAX_READS) break
+      reads++
+      const reason = await gateHolderSkipReason(env, task, holder.id)
+      verdictOf.set(holder.id, reason)
+      if (reason) continue
+      // One presence read per eligible holder (mupot#2458): it fences stopped receivers, ranks the delivery order and
+      // picks the inbox address with the consumer's delivery-mode rule. Read during the walk (mupot#2461) so a
+      // stopped holder is known before it could take a width-cap slot.
+      const route = await resolveGateWakeRoute(env, holder.id)
+      routeOf.set(holder.id, route)
+      if (!route.stopped) wakeableCount++
+    }
+    const stoppedHolders = agentHolders.filter((holder) => routeOf.get(holder.id)?.stopped === true)
+    const targets = agentHolders.filter((holder) => routeOf.has(holder.id) && !routeOf.get(holder.id)!.stopped)
+    const unread = agentHolders.filter((holder) => !verdictOf.has(holder.id))
+    const skipped = agentHolders.flatMap((holder) => {
+      const reason = verdictOf.get(holder.id)
+      return reason ? [{ ...holder, reason }] : []
+    })
+    const unknownCount = skipped.filter((h) => h.reason === 'eligibility_unknown').length
+
+    // The read cap (not the holder cap) stopped the walk: name the bound that actually tripped.
+    const capText = unread.length
+      ? ` ${wakeableCount >= GATE_WAKE_FANOUT_MAX_HOLDERS ? `width cap ${GATE_WAKE_FANOUT_MAX_HOLDERS}` : `read cap ${GATE_WAKE_FANOUT_MAX_READS}`} reached; ${unread.length} agent holder${unread.length === 1 ? '' : 's'} not read or woken (${unread.map(h => h.id).join(', ')}).`
+      : ''
+    const stoppedText = stoppedHolders.length ? ` Stopped: ${stoppedHolders.map(h => h.id).join(', ')}.` : ''
+    const memberText = hasMemberHolder ? ' Member holders keep their needs_you item.' : ''
+    const widthCap = unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}
+    const unknownField = unknownCount ? { eligibility_unknown: unknownCount } : {}
+    const stoppedField = stoppedHolders.length ? { stopped: stoppedHolders.length } : {}
+    const skippedText = skipped.length ? ` Skipped: ${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''
+    if (targets.length === 0 && stoppedHolders.length > 0) {
+      // mupot#2461: every eligible holder READ is stopped, so nothing is sent. That is not no_live_holder (holders
+      // exist). While a holder is unread (cap) or unjudged (eligibility read failed) it might still be wakeable, so
+      // the wake is eligibility_unknown; only when every holder was judged is it holders_stopped.
+      const status = unread.length || unknownCount ? 'eligibility_unknown' : 'holders_stopped'
+      const statusById = new Map<string, GateHolderWakeStatus>([
+        ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
+        ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
+        ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
+      ])
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status,
+        holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
+        ...widthCap, ...unknownField, ...stoppedField,
+        notice: `Gate wake not delivered: every eligible agent holder of ${gateOwner} that was read is stopped.${capText}${skippedText}${stoppedText}${memberText}`,
+      })
+    }
+    if (targets.length > 0) {
+      const routes = targets.map((holder) => routeOf.get(holder.id)!)
+      const order = targets.map((_, i) => i).sort((x, y) => Number(routes[y].live) - Number(routes[x].live) || x - y)
+      const ts = new Date().toISOString()
+      const statusOf = new Map<string, 'delivered' | 'partial' | 'delivery_failed'>()
+      for (const i of order) {
+        const principal = targets[i]
+        // Sender/request_id uniqueness spans recipients: use a distinct key for each holder.
+        const requestId = `review-wake:${await sha256Hex(`${task.id}:${ts}:${principal.id}`)}`
+        statusOf.set(principal.id, channelStatus(await deliverGateAgentWake(env, task, actor, byId, principal.id, ts, requestId, routes[i].inboxId)))
+      }
+      const delivered = targets.map((principal) => ({ ...principal, status: statusOf.get(principal.id)! }))
+      // mupot#2461: presence counts the holders a wake was sent to; stopped holders are reported separately.
+      const presence = { live: routes.filter((r) => r.live).length, total: targets.length }
+      // A holder left unwoken that might be eligible (cap, unreadable eligibility) keeps the wake from being "delivered".
+      // A stopped holder does not: it is a known non-receiver, like a proven-ineligible skip (decision, mupot#2461).
+      const complete = unread.length === 0 && unknownCount === 0
+      const status = delivered.every(d => d.status === 'delivered') && complete
+        ? 'delivered'
+        : delivered.some(d => d.status !== 'delivery_failed') ? 'partial' : 'delivery_failed'
+      const statusById = new Map<string, GateHolderWakeStatus>([
+        ...delivered.map((d) => [d.id, d.status] as const),
+        ...stoppedHolders.map((h) => [h.id, 'stopped_skipped'] as const),
+        ...unread.map((h) => [h.id, 'skipped_width_cap'] as const),
+        ...skipped.map((h) => [h.id, `skipped_${h.reason}`] as const),
+      ])
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status, presence,
+        holders: agentHolders.map((h) => ({ ...h, status: statusById.get(h.id)! })),
+        ...widthCap, ...unknownField, ...stoppedField,
+        notice: `Gate wake ${status}: ${gateOwner} -> ${delivered.map(d => `agent ${d.id} (${d.status})`).join(', ')}; live ${presence.live} of ${presence.total}.${capText}${skippedText}${stoppedText}`,
+      })
+    }
+    if (agentHolders.length > 0) {
+      const holders = agentHolders.map((h) => {
+        const reason = verdictOf.get(h.id)
+        return { ...h, status: (reason ? `skipped_${reason}` : 'skipped_width_cap') as GateHolderWakeStatus }
+      })
+      const unknown = [...skipped.filter((h) => h.reason === 'eligibility_unknown'), ...unread]
+      if (unknown.length > 0) {
+        // Nobody was woken and some holder could not be judged: never report that as "ineligible".
+        const proven = skipped.filter((h) => h.reason !== 'eligibility_unknown')
+        return surfaceGateWakeOutcome(env, task.id, {
+          ...baseOutcome, status: 'eligibility_unknown', holders,
+          ...(unknownCount ? { eligibility_unknown: unknownCount } : {}),
+          ...(unread.length ? { width_cap: { limit: GATE_WAKE_FANOUT_MAX_HOLDERS, omitted: unread.length } } : {}),
+          notice: `Gate wake not delivered: eligibility of ${gateOwner} agent holders could not be read (${unknown.map(h => h.id).join(', ')}); skipped as unknown, not ineligible.${proven.length ? ` Also skipped: ${proven.map(h => `${h.id} (${h.reason})`).join(', ')}.` : ''}${memberText}`,
+        })
+      }
+      // Every agent holder is one task_verdict would refuse: say so, not "no live holder" or "multiple live holders".
+      return surfaceGateWakeOutcome(env, task.id, {
+        ...baseOutcome, status: 'no_eligible_holder', holders,
+        notice: `Gate wake not delivered: every agent holder of ${gateOwner} is ineligible (${skipped.map(h => `${h.id} (${h.reason})`).join(', ')}).${memberText}`,
+      })
+    }
     return surfaceGateWakeOutcome(env, task.id, {
       ...baseOutcome,
       status: 'ambiguous',
@@ -2618,9 +2802,60 @@ export async function wakeGateOwnerOnReview(
   }
 
   const agentId = resolution.principal.id
-
+  // mupot#2450: the sole holder is judged by the same task_verdict predicate as a fan-out target; a live but
+  // ineligible holder is no_eligible_holder, never no_live_holder. A FAILED eligibility read keeps base behaviour
+  // (the sole holder is woken) and is reported as eligibility_unknown on the outcome and in the notice.
+  const soleSkip = await gateHolderSkipReason(env, task, agentId)
+  if (soleSkip && soleSkip !== 'eligibility_unknown') {
+    return surfaceGateWakeOutcome(env, task.id, {
+      ...baseOutcome, status: 'no_eligible_holder',
+      holders: [{ ...resolution.principal, status: `skipped_${soleSkip}` }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is not an eligible decider (${soleSkip}).`,
+    })
+  }
+  // mupot#2458: a stopped receiver gets nothing; otherwise the inbox row goes to the fleet identity only for a live or
+  // active poll route (the consumer's rule), else agents.id. A failed read = agents.id (resolveGateWakeRoute).
+  const soleRoute = await resolveGateWakeRoute(env, agentId)
+  if (soleRoute.stopped) {
+    return surfaceGateWakeOutcome(env, task.id, {
+      // mupot#2461: the holder exists and is eligible but cannot be woken: holders_stopped, not no_live_holder.
+      ...baseOutcome, status: 'holders_stopped', principal: resolution.principal, stopped: 1,
+      holders: [{ ...resolution.principal, status: 'stopped_skipped' }],
+      notice: `Gate wake not delivered: ${gateOwner} holder agent ${agentId} is stopped.`,
+    })
+  }
+  const inboxId = soleRoute.inboxId
   const ts = new Date().toISOString()
+  const { bus_delivered: busDelivered, inbox_delivered: inboxDelivered } = await deliverGateAgentWake(
+    env, task, actor, byId, agentId, ts, reviewWakeRequestId(task.id, ts), inboxId,
+  )
 
+  const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
+    ? 'delivered'
+    : busDelivered || inboxDelivered
+      ? 'partial'
+      : 'delivery_failed'
+  return surfaceGateWakeOutcome(env, task.id, {
+    ...baseOutcome,
+    status,
+    principal: resolution.principal,
+    ...(soleSkip ? { eligibility_unknown: 1 } : {}),
+    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).${soleSkip ? ' Eligibility could not be read; delivered unverified.' : ''}`,
+  })
+}
+
+async function deliverGateAgentWake(
+  env: Env,
+  task: Task,
+  actor: { kind: 'member' | 'agent'; id: string },
+  byId: string,
+  agentId: string,
+  ts: string,
+  requestId: string,
+  // The inbox recipient: the fleet identity the runtime polls by (mupot#2450 item 7). The bus wake keeps agents.id,
+  // the in-Worker AgentDO key.
+  inboxAgentId: string,
+): Promise<{ bus_delivered: boolean; inbox_delivered: boolean }> {
   let busDelivered = false
   try {
     const event: BusEvent<{ task_id: string; gate_owner: string; by: string }> = {
@@ -2629,7 +2864,7 @@ export async function wakeGateOwnerOnReview(
       squad_id: task.squad_id,
       agent_id: agentId,
       actor,
-      payload: { task_id: task.id, gate_owner: gateOwner, by: byId },
+      payload: { task_id: task.id, gate_owner: task.gate_owner!, by: byId },
       ts,
     }
     await createBus(env).emit(event)
@@ -2645,14 +2880,14 @@ export async function wakeGateOwnerOnReview(
       {
         fromAgent: REVIEW_WAKE_SENDER,
         fromMember: byId,
-        toAgent: agentId,
+        toAgent: inboxAgentId,
         kind: 'request',
-        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: gateOwner, squad_id: task.squad_id }),
-        requestId: reviewWakeRequestId(task.id, ts),
+        body: JSON.stringify({ type: 'task_review', task_id: task.id, gate_owner: task.gate_owner!, squad_id: task.squad_id }),
+        requestId,
       },
       {
         system: true,
-        reason: 'target is the sole gate_grants holder resolved server-side, not attacker input',
+        reason: 'target is an independent gate_grants holder resolved server-side, not attacker input',
       },
     )
     inboxDelivered = delivery.ok
@@ -2660,17 +2895,7 @@ export async function wakeGateOwnerOnReview(
     // best-effort — the visible task notice records this failure.
   }
 
-  const status: GateWakeOutcome['status'] = busDelivered && inboxDelivered
-    ? 'delivered'
-    : busDelivered || inboxDelivered
-      ? 'partial'
-      : 'delivery_failed'
-  return surfaceGateWakeOutcome(env, task.id, {
-    ...baseOutcome,
-    status,
-    principal: resolution.principal,
-    notice: `Gate wake ${status}: ${gateOwner} -> agent ${agentId} (bus=${busDelivered ? 'sent' : 'failed'}, inbox=${inboxDelivered ? 'sent' : 'failed'}).`,
-  })
+  return { bus_delivered: busDelivered, inbox_delivered: inboxDelivered }
 }
 
 // task_verdict — approve or reject a task in 'review'. The MCP twin of
@@ -4697,8 +4922,8 @@ const toolRecall: ToolSpec = {
     }
 
     const scope = memberMemoryScope(auth.memberId as string)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done(result)
   },
 }
 
@@ -4815,8 +5040,8 @@ const toolSquadRecall: ToolSpec = {
     if (!squadRes.ok) return squadRes
 
     const scope = squadMemoryScope(squadRes.squad.id)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ squad_id: squadRes.squad.id, scope, hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done({ squad_id: squadRes.squad.id, scope, ...result })
   },
 }
 
@@ -4890,8 +5115,8 @@ const toolProjectRecall: ToolSpec = {
     if (!project) return fail(404, 'project_not_found')
 
     const scope = projectMemoryScope(projectId)
-    const hits = await createMemory(env).recall(scope, query, limit)
-    return done({ project_id: projectId, scope, hits })
+    const result = await createMemory(env).recallDetailed(scope, query, limit)
+    return done({ project_id: projectId, scope, ...result })
   },
 }
 
@@ -6137,6 +6362,8 @@ const toolPeers: ToolSpec = {
     const nowMs = Date.now()
     // fca29748: the live self-reported runtime (check_in first), beside the unchanged profile `model`.
     const truth = await loadRuntimeTruth(env, (rows.results ?? []).map((r) => ({ id: r.id, slug: r.slug, model: r.model })), nowMs)
+    // What attached chats SAY they run, per attachment and self-reported. Kept out of live_model/live_runtime on purpose: one chat's claim is not the agent's runtime.
+    const attachedReports = await loadAttachedRuntime(env, (rows.results ?? []).map((r) => r.id), attachedRuntimeSince(nowMs)).catch(() => new Map<string, AttachedRuntimeRow[]>()) // advisory read
     const peers = (rows.results ?? []).map((row) => {
       const lastSeenMs = sqliteUtcToMs(row.presence_last_seen_at)
       const live = truth.get(row.id)
@@ -6146,6 +6373,7 @@ const toolPeers: ToolSpec = {
         name: row.name,
         role: row.role,
         model: row.model, // PROFILE value, meaning unchanged
+        attached_runtime: (attachedReports.get(row.id) ?? []).map((r) => ({ trust: 'self_reported', scope: 'attachment', harness: r.harness, machine: r.machine, model: r.model, provider: r.provider, effort: r.effort, reported_at: r.reported_at })),
         live_model: live?.model && live.model.trust !== 'profile' ? live.model.value : null,
         live_runtime: live ?? null,
         status: row.status,
@@ -6382,15 +6610,32 @@ const toolCheckIn: ToolSpec = {
     // held_harness is the non-routing inventory of that server row (id, stored kind, and the
     // same display canonical used everywhere else). It is not written to `presence`, and the
     // caller's harness argument is not an input to it.
-    if (attachedAuthority(auth)) {
+    const attachedCheckIn = attachedAuthority(auth)
+    if (attachedCheckIn) {
       const binding = auth.seatBinding
       const held = binding
         ? await loadHarness(env, binding.humanMemberId, binding.harnessId).catch(() => null)
         : null
+      // What the chat SAYS it runs is recorded as its own self-reported fact (agent_reported_runtime, keyed by the server-derived
+      // attachment). It is not `presence`: no liveness, no routing, no host claim. It never touches agents.* (the profile).
+      // Validated for storage from the RAW args (an omitted field is null and keeps its earlier value; an invalid one is dropped and named).
+      const { values: said, rejected } = cleanAttachedRuntime(args)
+      const saidSomething = Object.values(said).some((v) => v !== null)
+      let runtimeRecorded = false
+      if (saidSomething) {
+        try {
+          await recordAttachedRuntime(env, { agentId: attachedCheckIn.agentId, attachmentId: attachedCheckIn.attachmentId, memberId: attachedCheckIn.humanMemberId }, said)
+          runtimeRecorded = true
+        } catch {
+          // fail-soft like the rest of check_in: the echo below says it was not recorded
+        }
+      }
       return done({
         ...echo,
         debounced: false,
         presence_recorded: false,
+        runtime_recorded: runtimeRecorded,
+        ...(rejected.length > 0 ? { runtime_rejected: rejected } : {}),
         held_harness: held
           ? { id: held.id, kind: held.kind, kind_canonical: canonicalHarness(held.kind) }
           : null,
@@ -6849,8 +7094,11 @@ const toolFleetAgentGet: ToolSpec = {
 
     // Observed facts boot recorded (migration 0235). Raw as reported; *_canonical is a hint, never a gate.
     const observed = row ? await readFleetBelief(env, row.agent_id) : null
+    const selfSubject = isSelf ? await connectionSubject(auth,env) : null
+    const echoStatus = await loadConnectionEcho(env,selfSubject?.ok ? selfSubject.context : {agentId:targetAgent.id})
     return done({
       agent_id: targetAgent.id,
+      echo_status: echoStatus,
       agent_slug: targetAgent.slug,
       squad_id: targetAgent.squad_id,
       runtime: routeInfo.runtime,
@@ -6939,7 +7187,18 @@ async function gatherWhoamiFacts(
     : undefined
   // Only read when the caller stated an expectation (one extra read-only SELECT, otherwise none).
   const directory = opts.withAgentDirectory ? await activeAgentDirectory(env) : undefined
-  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
+  // Runtime fact for the report_runtime onboarding step: ONLY for an attached chat (boot cannot record a runtime for it, and its report is keyed
+  // by its own attachment). Every other caller gets no fact, so no step. A failed read gives no step.
+  let runtime: WhoamiFacts['runtime']
+  const attachedForFacts = attachedAuthority(auth)
+  if (agentId && attachedForFacts) {
+    try {
+      runtime = { reported: await attachmentHasReported(env, attachedForFacts.agentId, attachedForFacts.attachmentId) }
+    } catch {
+      runtime = undefined
+    }
+  }
+  return { keyed, fenced, bootstrappedBefore, tenantHasAgents, actsAs: opts.actsAs ?? null, ...(runtime ? { runtime } : {}), ...(directory ? { agentDirectory: directory.rows, ...(directory.truncated ? { agentDirectoryTruncated: true } : {}) } : {}), ...(opts.report ? { report: opts.report } : {}), ...(admission ? { admission } : {}), ...(humanCanDesignate !== undefined ? { humanCanDesignate } : {}), callerIsAdmin }
 }
 
 /** Does this pot have any agent row? Fails toward TRUE (do not advertise the identity mint on an unreadable pot, #2020). */
@@ -7595,6 +7854,12 @@ const toolBootContext: ToolSpec = {
       nextStepOut = `${nextStepOut} SHOW YOUR HUMAN THIS LINK to claim ${pendingClaim.agent}: ${pendingClaim.claim_url ?? `attach code ${pendingClaim.attach_code} (on their Connections page)`} (valid until ${pendingClaim.expires_at}). After they press Confirm, call seat_attach again.`
     }
 
+    // Only the authenticated agent's own returned inbox nonce clears this step.
+    const echoSubject = !ctx?.sideEffectFree && !wrongPrincipal && (auth.seatBinding?.attached || (!auth.seatBinding && auth.boundAgentId))
+      ? await connectionSubject(auth,env).catch(()=>null) : null
+    const echoStatus = echoSubject?.ok ? await loadConnectionEcho(env,echoSubject.context) : null
+    if(echoStatus && echoStatus.state!=='echo_roundtrip') nextStepOut += ' Next: complete inbox echo with connection_check {echo:true}, then reply with the nonce from your own inbox.'
+
     // First-steps from mupot itself for a freshly ATTACHED chat (server rows only; absent once the attachment is older than the window). A failed read degrades to "no block".
     const attachedOnboardingBlock = auth.seatBinding?.attached && !ctx?.sideEffectFree
       ? await attachedOnboarding(env, { attachmentId: auth.seatBinding.attached.attachmentId, agentId: auth.seatBinding.attached.agentId }).catch(() => null)
@@ -7626,6 +7891,7 @@ const toolBootContext: ToolSpec = {
       onboarding_state: onboardingState,
       available_doors: availableDoors,
       next_step: nextStepOut,
+      ...(echoStatus ? {echo_status:echoStatus} : {}),
       ...(ctx?.sideEffectFree ? {} : await joinNextStepsField(env, auth)),
       ...(ctx?.sideEffectFree ? {} : await squadChoiceField(env, auth)),
       ...(isMinted ? {} : { enroll_url: enrollHref }),
@@ -8200,7 +8466,7 @@ export function unknownToolDetail(toolName: string, env: Pick<Env, 'SEAT_AUTO_EN
 // drift from the others.
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
 // W2: seat_attach is advertised only while SEAT_ATTACH (and SEAT_AUTO_ENROLL) is on (flag off => tools/list unchanged).
-const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.map((t) => t.name))
+const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.filter(t => t.name !== 'connection_check').map((t) => t.name))
 // NAMED_INTENT_CONNECT: connect_intent is advertised only while its own flag (and both seat flags) is on (flag off => tools/list unchanged).
 const NAMED_INTENT_FLAG_TOOLS: ReadonlySet<string> = new Set(NAMED_INTENT_TOOLS.map((t) => t.name))
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page

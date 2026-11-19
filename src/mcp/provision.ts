@@ -34,6 +34,7 @@
 import { findInFlightWork } from '../fleet/in-flight-work'
 import { installerGrantIdOf, isInstallerDelegationId } from '../operators/installer-window'
 import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
+import { agentVisibility } from '../auth/agent-visibility'
 import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, actorRankOnScopeFor, CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   createDepartment,
@@ -294,7 +295,6 @@ function agentTokenMintResponse(
       agent.id,
       agent.squad_id,
       env.TENANT_SLUG,
-      canonicalOrigin,
     ),
     note:
       'the raw token is NOT in this result. Call reveal_credential_claim '
@@ -817,23 +817,21 @@ const toolCreateAgent: ToolSpec = {
 }
 
 // ── resolve_agent ───────────────────────────────────────────────────────────────
+// Directory visibility (board a90ff195, P0 2026-11-10): see agentVisibility in ../auth/agent-visibility
+// (moved there so the coordination board shares the one rule without importing this module).
+
 // resolve-before-mint (Port 1.3): before minting a new agent, search existing agents
 // by name/slug across the whole pot so onboarding SEES the roles that already exist
 // and doesn't fork a duplicate identity. This is the anti-sprawl primitive — the
 // 2026-07-21 3-hermes incident (agent-hermes + kayhermes + hadi-hermes, distinct
 // roles, retired as "duplicates") is exactly what pot-wide resolve prevents.
 //
-// Scope: observer FLOOR (not 'authenticated'). Deliberately pot-wide (not caller-
-// squad-scoped): the sprawl this fixes spans squads, so a squad-scoped search would
-// miss the case. Agents live in a single-tenant pot (the `agents` table has no tenant
-// column — one pot = one tenant), so this discloses no cross-tenant data, only agent
-// metadata (name/role/purpose/model/capabilities/lineage). It is min:'observer', NOT
-// 'authenticated': `min:'authenticated'` would SKIP the AAGATE capability floor
-// (src/mcp/index.ts) and let a ZERO-GRANT OAuth member enumerate the whole pot's agent
-// inventory — a broadening a grantless token should not have (cursor gate,
-// 2026-07-22; the earlier "presence-roster parity" claim was wrong — a grantless
-// member never gets the roster either). 'observer' requires the caller hold observer
-// on SOME scope, enforced centrally at the dispatch chokepoint.
+// Scope: observer FLOOR (not 'authenticated') AND per-agent visibility (agentVisibility
+// above): an org admin searches the whole pot, everyone else only the squads they can
+// read. The earlier "deliberately pot-wide" reasoning predates several customers sharing
+// one pot (P0, 2026-11-10). min:'observer', NOT 'authenticated': `min:'authenticated'`
+// would SKIP the AAGATE capability floor (src/mcp/index.ts) and let a ZERO-GRANT OAuth
+// member in at all (cursor gate, 2026-07-22).
 const toolResolveAgent: ToolSpec = {
   name: 'resolve_agent',
   scope: 'org (read)',
@@ -861,14 +859,13 @@ const toolResolveAgent: ToolSpec = {
       }
       limit = args.limit
     }
-    const matches = await findAgentsByName(env, query, { includeInactive, limit })
+    const matches = await findAgentsByName(env, query, { includeInactive, limit, canSee: agentVisibility(env, auth) })
     return done({ matches })
   },
 }
 
 // ── get_agent_profile ───────────────────────────────────────────────────────────
-// Read one agent's full profile by id. Same pot-internal, metadata-only disclosure
-// rationale as resolve_agent above — and the same observer FLOOR: min:'observer' so
+// Read one agent's full profile by id. Same visibility rule as resolve_agent above, and the same observer FLOOR: min:'observer' so
 // the AAGATE capability floor rejects a zero-grant member (min:'authenticated' would
 // skip it). cursor gate, 2026-07-22.
 const toolGetAgentProfile: ToolSpec = {
@@ -887,7 +884,8 @@ const toolGetAgentProfile: ToolSpec = {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
     const profile = await getAgentProfile(env, agentId)
-    if (!profile) return fail(404, 'agent_not_found')
+    // A hidden agent answers exactly as a missing one: same status, same body.
+    if (!profile || !(await agentVisibility(env, auth)(profile))) return fail(404, 'agent_not_found')
     return done({ profile })
   },
 }
@@ -2156,6 +2154,18 @@ async function readAuditDiff(
 // the same two checks — whether hasWorkspaceAdmin is ALSO redundant there is
 // a question about the shared floor, not about this tool, and simplifying
 // the shared floor is out of scope here. Match it, don't improve on it.
+// What a human-confirmed ATTACHED seat may change on its own row. DESCRIPTIVE only. Every other update_agent field is refused:
+//   refused (routing/authority): slug (resolves identity), role (system prompt + rank), owner/owner_member_id (whose identity a
+//   verdict may carry), attach_designated_member_id, qnft_ref, capabilities, budget_cap_cents, budget_window, autonomy.
+//   refused (ambiguous, listed for the owner): skills and model_fallback (a runtime may read them to choose work or a model).
+//   refused (by design): name. It is an ADDRESS, not a description: send resolves by display name, IM and channel routing read it, and
+//   it goes raw into the agent's system prompt (PR #1289 took it out of the agent's own self lane for the same reasons). A chat could
+//   rename itself onto another agent's id, slug or name and cut that agent's mail. Renaming returns later as a designed feature (board task 8fe4aaf6).
+//   refused (by design): model. Several chats can attach to one agent on different models; one agent-row value would be overwritten
+//   by the last writer. Each attachment reports its own live runtime with check_in (agent_reported_runtime) instead.
+/** The machine reason carried in the detail of a 403 forbidden (the refusal table keys the next step on it). */
+export const ATTACHED_FIELD_REFUSAL = 'attached_seat_field_not_self_editable'
+export const ATTACHED_SELF_PATCHABLE_FIELDS = ['purpose'] as const
 export const SELF_PATCHABLE_FIELDS = ['model', 'model_fallback', 'purpose', 'skills'] as const
 export const SELF_FORBIDDEN_FIELDS = [
   'slug',
@@ -2218,6 +2228,8 @@ const toolUpdateAgent: ToolSpec = {
     ' identity a harness-attested human_origin on task_verdict may carry (a self-write would be a' +
     ' self-grant), so all three are deliberately excluded from the self lane. Every non-self call' +
     ' (a different agent-bound target, or a non-bound member) needs admin on the target agent squad or org.' +
+    ' ATTACHED SEAT LANE: a chat whose attachment a human confirmed may edit only purpose on its OWN row (the audit row names the confirming human and the attachment);' +
+    ' everything else, name included, is refused with a next step. It reports model/host/harness with check_in instead (recorded per chat).' +
     ' owner_member_id: null clears it (squad-admin suffices, same as any other admin-lane field); a' +
     ' non-null value must be an existing member id in this tenant with no leading/trailing/inner' +
     ' whitespace (invalid_args otherwise), and the caller must ALSO hold admin on the ORG scope' +
@@ -2300,13 +2312,24 @@ const toolUpdateAgent: ToolSpec = {
     // carries, unchanged from before this fix.
     // W2: an ATTACHED thread shares the agent's boundAgentId but is not the agent: it gets no self lane (it would rewrite
     // agents.model/purpose/skills, which feed routing) and falls to the structural gate like any other non-self caller.
-    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id && !attachedAuthority(auth)
-    if (auth.boundAgentId && !isSelf) {
+    const attached = attachedAuthority(auth)
+    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id && !attached
+    // Owner decision (2026-11-11): a seat whose attachment a human CONFIRMED (attachedAuthority is non-null only for a live, admitted
+    // attachment; a pending one never carries it) may correct its OWN descriptive profile, within ATTACHED_SELF_PATCHABLE_FIELDS.
+    const isAttachedSelf = attached !== null && auth.boundAgentId === agent.id && attached.agentId === agent.id
+    if (auth.boundAgentId && !isSelf && !isAttachedSelf) {
       const updateGate = await structuralGate(env, auth, 'update_agent')
       return updateGate.kind === 'refused' ? structuralFail(updateGate) : fail(403, 'operator_principal_required')
     }
 
-    if (isSelf) {
+    if (isAttachedSelf) {
+      // Everything that is not descriptive is refused with a next step, BEFORE any write, in the admin list's fixed order.
+      for (const field of ADMIN_PATCHABLE_FIELDS) {
+        if (field in args && !(ATTACHED_SELF_PATCHABLE_FIELDS as readonly string[]).includes(field)) {
+          return fail(403, 'forbidden', { reason: ATTACHED_FIELD_REFUSAL, field })
+        }
+      }
+    } else if (isSelf) {
       // Authority / identity-reference fields (including name/role — see the
       // block comment above toolUpdateAgent) stay admin-gated even on the
       // caller's own row. Checked BEFORE any write (patch isn't even built
@@ -2333,7 +2356,7 @@ const toolUpdateAgent: ToolSpec = {
       }
     }
 
-    const PATCHABLE = isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
+    const PATCHABLE = isAttachedSelf ? ATTACHED_SELF_PATCHABLE_FIELDS : isSelf ? SELF_PATCHABLE_FIELDS : ADMIN_PATCHABLE_FIELDS
 
     const patch: AgentProfilePatch = {}
     for (const key of PATCHABLE) {
@@ -2402,7 +2425,10 @@ const toolUpdateAgent: ToolSpec = {
     // emitProvisioned below) and can be lost on a bus failure while the audit
     // row still commits. self_report is a same-request convenience for a live
     // listener, not the record of truth. No schema change in this PR.
-    const actor: AuditActor = isSelf
+    const actor: AuditActor = isAttachedSelf
+      // The agent is the actor of record; the confirming human and the attachment ride in the same atomic audit row (after_state).
+      ? { id: auth.boundAgentId as string, type: 'agent', attachment: { attachmentId: attached.attachmentId, confirmingMemberId: attached.humanMemberId } }
+      : isSelf
       ? { id: auth.boundAgentId as string, type: 'agent' }
       : { id: auth.memberId as string, type: 'user', ownerAssignmentOrgAdmin: ownerGate.ownerAssignmentOrgAdmin }
 
@@ -2438,6 +2464,7 @@ const toolUpdateAgent: ToolSpec = {
       changed,
       reason: str(args.reason) || undefined,
       ...(isSelf ? { self_report: true } : {}),
+      ...(isAttachedSelf ? { attachment_id: attached.attachmentId, attached_human_member_id: attached.humanMemberId } : {}),
     })
 
     return done({ agent: result.value, changed, audit_id: result.auditId })

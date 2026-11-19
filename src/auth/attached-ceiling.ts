@@ -14,6 +14,12 @@
 //     thread may pass the task_verdict gate check AS ITS BOUND AGENT, and only for a gate_owner the agent holds a live
 //     gate_grants row for. Verdict independence is unchanged and judged for BOTH the agent and the attaching human.
 //
+// mupot#980005ac STAGE 1 — Helper/Full (agent_seat_admissions.authority_level) is a SEPARATE human choice from this
+// ceiling. Full is recorded, displayed and expiry-bound, but in this stage it MUST NOT widen any authority beyond
+// today's Helper ceiling: do NOT read authority_level here, do NOT add entries to ATTACHED_SUDO_ACTIONS for Full, and
+// do NOT treat Full as a bypass of the clamps below. The action table that decides what Full may do lands in a
+// separately gated PR. Until then Full == Helper in effect for every action.
+//
 // Capabilities are clamped at the source (resolveSeatCapabilities in seat-handle.ts takes the ceiling from here). Every
 // identity-keyed path consults THIS module:
 //   - src/gates/principal.ts            resolveGatePrincipal   -> null (no surface / approvals-queue principal)

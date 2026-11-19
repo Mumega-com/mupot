@@ -549,7 +549,7 @@ const DECK_SCRIPT = `
           if (status) status.textContent = 'Flight ' + ((r.data && r.data.flight_id) || '') + ' dispatched.';
           window.location.reload();
         } else {
-          if (status) status.textContent = (r.data && r.data.error) || 'dispatch failed';
+          if (status) status.textContent = (r.data && (r.data.next_step || r.data.error)) || 'dispatch failed';
         }
       }).catch(function () {
         if (status) status.textContent = 'network error — try again';

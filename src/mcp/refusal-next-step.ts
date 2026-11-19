@@ -92,6 +92,12 @@ const NEEDS_MINT = 'an admin to mint it an agent-bound workspace token with mint
 /** Rendered per request; the most specific matching row wins (tool 2, kinds 1). */
 export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
   // ── harness token with no seat ────────────────────────────────────────────────────────────────
+  // update_agent from a bound chat/agent session that is not the row's own self lane (an attached chat aiming at ANOTHER agent's row).
+  { error: 'operator_principal_required', tool: 'update_agent', who_acts: 'admin', next_tool: 'check_in',
+    next_step: 'update_agent from a bound session edits only that session\'s OWN agent row (pass your own agent id). Another agent\'s profile is edited by a squad admin or the owner. To say what you are running, call check_in { model, machine, harness, provider?, effort? }.' },
+  // An attached (human-confirmed) chat editing its OWN row, but a routing/authority field.
+  { error: 'forbidden', tool: 'update_agent', reasonIs: 'attached_seat_field_not_self_editable', overridesReason: true, who_acts: 'admin', next_tool: 'check_in',
+    next_step: 'an attached chat may update only its own purpose (a name is an address other agents send to, so it is not changed from a chat). Say what YOU run (model, host, harness) with check_in { model, machine, harness, provider?, effort? }: it is recorded per chat, so other chats on this agent are not overwritten. Routing and authority fields (slug, role, squad, owner, capabilities, skills, model_fallback, budget, autonomy, designation, credentials) are changed by a squad admin or the owner.' },
   { error: 'harness_session_seat_required', who_acts: 'self', next_tool: 'seat_select', next_step: SEAT_SELECT_STEP },
 
   // ── seat_select ───────────────────────────────────────────────────────────────────────────────
@@ -103,7 +109,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'This connection carries no verified harness, so it cannot get a seat. Your human re-consents the connector (remove and add it again) and picks {many} on the consent screen; then call seat_select again. {reach}' },
   { error: 'member_not_active', tool: 'seat_select', who_acts: 'org_admin',
     next_step: 'The human behind this connection is not an active member of this pot. An org admin reactivates the membership; nothing you call changes that. {reach}' },
-  { error: 'home_rank_insufficient', tool: 'seat_select', who_acts: 'org_admin',
+  { error: 'home_rank_insufficient', tool: 'seat_select', who_acts: 'org_admin', next_tool: 'seat_select',
     next_step: 'The human does not hold admin on their own home squad, so a seat agent cannot be placed there. An org admin restores that grant; then call seat_select again. {reach}' },
   { error: 'seat_cap_reached', tool: 'seat_select', who_acts: 'self', next_tool: 'seat_select',
     next_step: 'This connection holds the maximum number of seats. Reuse one: call seat_select with the same project, folder and thread labels as a seat you already have. If you need more seats than the cap, an org admin raises it.' },
@@ -131,7 +137,7 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'bootstrap_self only runs for a chat session that has no agent yet; this is an unbound member token. An admin mints it an agent: mint_agent_token { agent }. {reach}' },
   { error: 'not_unbound_directory_session', tool: 'bootstrap_self', who_acts: 'self', next_tool: 'boot_context',
     next_step: 'bootstrap_self only runs for a chat session that has no agent yet. This credential is already an agent or a seat: call boot_context to see which. Do not retry bootstrap_self.' },
-  { error: 'rate_limited', tool: 'bootstrap_self', who_acts: 'self',
+  { error: 'rate_limited', tool: 'bootstrap_self', who_acts: 'self', next_tool: 'bootstrap_self',
     next_step: 'You hit the bootstrap rate limit. Stop retrying in a loop: wait, then call bootstrap_self once more.' },
 
   // ── agent-bound credential refusals ───────────────────────────────────────────────────────────
@@ -161,8 +167,8 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'Every task is done but the flight lacks landing evidence (a result submission from its agent and an independent approved verdict), so it was not landed, and done tasks can no longer take a verdict: a held flight cannot be landed. A squad lead or admin cancels it (flight_cancel), then the task is re-dispatched with a gate owner who is not the assignee. Left alone it expires to failed (unverified_expired) 7 days after it started. {reach}' },
 
   // ── pot features off ──────────────────────────────────────────────────────────────────────────
-  { error: 'seat_attach_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
-  { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
+  { error: 'seat_attach_disabled', who_acts: 'org_admin', next_tool: 'boot_context', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
+  { error: 'seat_auto_enroll_disabled', who_acts: 'org_admin', next_tool: 'boot_context', next_step: `This pot has not enabled that feature, so retrying will not help. ${BOOT_MAP} {reach}` },
 
   // ── check_in / inbox ──────────────────────────────────────────────────────────────────────────
   { error: 'not_member_bound', tool: 'check_in', who_acts: 'org_admin',

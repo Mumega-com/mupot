@@ -189,7 +189,7 @@ describe('seat_attach and boot_context hand the agent the claim link', () => {
 })
 
 describe('GET /claim/:code', () => {
-  it('shows the agent, the app, whose sign-in and when, with ONE Confirm button and no field to type in; claims nothing', async () => {
+  it('shows the agent, the app, whose sign-in and when, with ONE Connect button and Helper default; claims nothing', async () => {
     const p = await fileAsk()
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
@@ -199,11 +199,12 @@ describe('GET /claim/:code', () => {
     expect(body).toContain('Agent One')
     expect(body).toContain('ChatGPT')
     expect(body).toContain('admin@x.test')
-    expect(body.match(/>Confirm</g)?.length).toBe(1)
+    expect(body.match(/data-claim-connect>Connect</g)?.length).toBe(1)
+    expect(body).toMatch(/name="authority_level" value="helper" checked/)
+    expect(body).not.toMatch(/name="authority_level" value="full"[^>]*checked/)
     const formHtml = /<form[^>]*data-claim-confirm[\s\S]*?<\/form>/.exec(body)?.[0] ?? ''
     expect(formHtml).not.toBe('')
-    expect([...formHtml.matchAll(/<input[^>]*>/g)].every((m) => /type="hidden"/.test(m[0]))).toBe(true) // nothing to type
-    expect(formHtml).not.toMatch(/attach_code/)
+    expect(formHtml).not.toMatch(/name="attach_code"/)
     expect(admStatus(p.admissionId)).toBe('pending')
     expect(liveAttachments()).toBe(0)
   })
@@ -231,13 +232,13 @@ describe('GET /claim/:code', () => {
     expect([...kv.store.values()].some((v) => v.includes(`"return":"/claim/${p.code}"`))).toBe(true)
   })
 
-  it('a stale session sees the identity but a "Sign in again to confirm" link instead of Confirm', async () => {
+  it('a stale session sees the identity but a "Sign in again to connect" link instead of Connect', async () => {
     const p = await fileAsk()
     const a = await login('admin@x.test')
     setReauth('mem-admin', stale())
     const body = await (await get(`/claim/${p.code}`, a)).text()
     expect(body).toContain('Agent One')
-    expect(body).not.toContain('>Confirm<')
+    expect(body).not.toContain('data-claim-connect')
     expect(body).toContain(`/auth/reauth?return=${encodeURIComponent(`/claim/${p.code}`)}`)
   })
 
@@ -271,14 +272,19 @@ describe('GET /claim/:code', () => {
   })
 })
 
-describe('POST /claim/:code (Confirm)', () => {
+/** Claim redirects now carry the read-back authority decision (`authority` + `expires`). */
+function expectClaimedRedirect(loc: string | null, agentId: string, claimed: '1' | 'partial') {
+  expect(loc).toMatch(new RegExp(`^/agents/${agentId}\\?claimed=${claimed}&authority=(helper|full)&expires=`))
+}
+
+describe('POST /claim/:code (Connect)', () => {
   it('claims the shown agent: admission live, the asking chat attached, redirect to the agent page', async () => {
     const p = await fileAsk()
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     const res = await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })
     expect(res.status, await res.clone().text()).toBe(303)
-    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=1')
+    expectClaimedRedirect(res.headers.get('location'), 'ag1', '1')
     expect(admStatus(p.admissionId)).toBe('live')
     expect(liveAttachments()).toBe(1)
     expect(one<{ agent_id: string }>('SELECT agent_id FROM agent_seat_attachments')?.agent_id).toBe('ag1')
@@ -295,9 +301,9 @@ describe('POST /claim/:code (Confirm)', () => {
     }
     expect(admStatus(p.admissionId)).toBe('pending')
     expect(liveAttachments()).toBe(0)
-    // ...and after the sign-in the same page offers the single Confirm, which now works.
+    // ...and after the sign-in the same page offers the single Connect, which now works.
     setReauth('mem-admin', fresh())
-    expect(await (await get(`/claim/${p.code}`, a)).text()).toContain('>Confirm<')
+    expect(await (await get(`/claim/${p.code}`, a)).text()).toContain('data-claim-connect')
     expect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).status).toBe(303)
     expect(admStatus(p.admissionId)).toBe('live')
   })
@@ -326,7 +332,7 @@ describe('POST /claim/:code (Confirm)', () => {
     expect(await page.text()).toContain('already used')
   })
 
-  it('EXPIRED: the link is refused (page and Confirm) and nothing is claimed', async () => {
+  it('EXPIRED: the link is refused (page and Connect) and nothing is claimed', async () => {
     const p = await fileAsk()
     h.sqlite.prepare("UPDATE agent_seat_admissions SET expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?").run(p.admissionId)
     const a = await login('admin@x.test')
@@ -335,7 +341,7 @@ describe('POST /claim/:code (Confirm)', () => {
     expect(page.status).toBe(409)
     const body = await page.text()
     expect(body).toContain('expired')
-    expect(body).not.toContain('>Confirm<')
+    expect(body).not.toContain('data-claim-connect')
     expect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).status).toBe(409)
     expect(admStatus(p.admissionId)).not.toBe('live')
     expect(liveAttachments()).toBe(0)
@@ -389,7 +395,7 @@ describe('agent page: "Own this agent" and "Issue a new claim link"', () => {
     expect(admStatus(p.admissionId)).toBe('pending')
     const res = await post('/agents/ag1/claim', a, { admission_id: p.admissionId, attach_code: p.code })
     expect(res.status, await res.clone().text()).toBe(303)
-    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=1')
+    expectClaimedRedirect(res.headers.get('location'), 'ag1', '1')
     expect(admStatus(p.admissionId)).toBe('live')
     expect(liveAttachments()).toBe(1)
   })
@@ -438,14 +444,14 @@ describe('agent page: "Own this agent" and "Issue a new claim link"', () => {
     const a = await login('admin@x.test')
     setReauth('mem-admin', stale())
     const stalePage = await (await get('/agents/ag1', a)).text()
-    expect(stalePage).toContain('Sign in again to approve')
-    expect(stalePage).not.toContain('class="btn">Approve<')
+    expect(stalePage).toContain('Sign in again to connect')
+    expect(stalePage).not.toContain('data-claim-connect')
     const res = await post('/agents/ag1/claim', a, { admission_id: p.admissionId, attach_code: p.code })
     expect(res.status).toBe(303)
     expect(res.headers.get('location')).toBe(`/auth/reauth?return=${encodeURIComponent('/agents/ag1?resume=claim')}`)
     expect(admStatus(p.admissionId)).toBe('pending')
     setReauth('mem-admin', fresh())
-    expect(await (await get('/agents/ag1?resume=claim', a)).text()).toContain('Confirm: Approve')
+    expect(await (await get('/agents/ag1?resume=claim', a)).text()).toContain('Confirm: Connect')
   })
 
   it('EXPIRED: the page offers "Issue a new claim link"; reissue makes a fresh ask for the SAME agent, app and thread; the agent\'s boot_context shows the new link; the old link is dead', async () => {
@@ -533,14 +539,14 @@ describe('Codex/gate round: honest outcome when the chat cannot be attached; res
     h.sqlite.prepare("UPDATE agent_seats SET retired_at = '2026-10-10T00:00:00.000Z' WHERE id = ?").run(seat)
   }
 
-  it('link: the thread was retired before Confirm -> admission live but the result says NOT attached (claimed=partial), never "Claimed"', async () => {
+  it('link: the thread was retired before Connect -> admission live but the result says NOT attached (claimed=partial), never "Connected" as acting', async () => {
     const p = await fileAsk()
     retireSeat(p.admissionId)
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     const res = await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })
     expect(res.status).toBe(303)
-    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+    expectClaimedRedirect(res.headers.get('location'), 'ag1', 'partial')
     expect(liveAttachments()).toBe(0)
     const page = await (await get('/agents/ag1?claimed=partial', a)).text()
     expect(page).toContain('not attached yet')
@@ -553,7 +559,7 @@ describe('Codex/gate round: honest outcome when the chat cannot be attached; res
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
     const res = await post('/agents/ag1/claim', a, { admission_id: p.admissionId, attach_code: p.code })
-    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+    expectClaimedRedirect(res.headers.get('location'), 'ag1', 'partial')
   })
 
   it('the thread already attached to ANOTHER agent via a different admission: the second claim is partial (outcome is per admission)', async () => {
@@ -563,9 +569,9 @@ describe('Codex/gate round: honest outcome when the chat cannot be attached; res
     expect((await post('/agents/ag2/designation', a, { action: 'allow' })).status).toBe(303)
     const out = await rpc(adminEnv, adminCtx, 'seat_attach', { reason: 'This chat is assigned to operate the requested agent.', agent: 'ag2' }, 'thread-1')
     const adm2 = one<{ id: string }>("SELECT id FROM agent_seat_admissions WHERE agent_id = 'ag2'")!.id
-    expect((await post(`/claim/${String(out.attach_code)}`, a, { admission_id: adm2, agent_id: 'ag2' })).headers.get('location')).toBe('/agents/ag2?claimed=1')
+    expectClaimedRedirect((await post(`/claim/${String(out.attach_code)}`, a, { admission_id: adm2, agent_id: 'ag2' })).headers.get('location'), 'ag2', '1')
     const res = await post(`/claim/${p1.code}`, a, { admission_id: p1.admissionId, agent_id: 'ag1' })
-    expect(res.headers.get('location')).toBe('/agents/ag1?claimed=partial')
+    expectClaimedRedirect(res.headers.get('location'), 'ag1', 'partial')
     expect(liveAttachments()).toBe(1)
   })
 
@@ -573,8 +579,8 @@ describe('Codex/gate round: honest outcome when the chat cannot be attached; res
     const p = await fileAsk()
     const a = await login('admin@x.test')
     setReauth('mem-admin', fresh())
-    expect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).headers.get('location')).toBe('/agents/ag1?claimed=1')
-    expect(await (await get('/agents/ag1?claimed=1', a)).text()).toContain('The chat is now acting as')
+    expectClaimedRedirect((await post(`/claim/${p.code}`, a, { admission_id: p.admissionId, agent_id: 'ag1' })).headers.get('location'), 'ag1', '1')
+    expect(await (await get('/agents/ag1?claimed=1&authority=helper&expires=2026-11-22+00%3A00%3A00', a)).text()).toContain('The chat is now acting as')
   })
 
   it('Allow for me, stale: the return path carries the DB-resolved agent id even when addressed by slug', async () => {

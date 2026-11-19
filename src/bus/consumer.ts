@@ -20,7 +20,8 @@ import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteIn
 import { processAssignmentWakes } from '../agents/assignment-wake'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DispatchBrakeRefusedError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { writebackForBusEvent } from '../projects/board-writeback'
-import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { notify, OWNER_RECIPIENT } from '../notify'
+import { dispatchAddonEvent } from '../addons/event-dispatch'
 import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { isEventsEnabled } from '../mcp/events'
@@ -620,14 +621,37 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         tenant: event.tenant,
         task_id: (event.payload as any)?.task_id,
       })
-      await notifyHadi(env, {
-        type: event.type,
-        task_id: (event.payload as any)?.task_id,
-        title: (event.payload as any)?.task_title,
-        squad_id: event.squad_id,
-        agent_id: event.agent_id,
-        project_id: (event.payload as any)?.project_id,
-      })
+      // Through the notify kernel: same Telegram message as before, plus dedupe (same task + state within
+      // 10 min sends once) and the per-recipient rate cap. A notify failure never fails the queue message.
+      const taskId: string | undefined = (event.payload as any)?.task_id
+      // execute.ts emits `title`; older producers used `task_title`.
+      const taskTitle: string | undefined = (event.payload as any)?.title ?? (event.payload as any)?.task_title
+      try {
+        await notify(env, {
+          tenant: event.tenant,
+          type: event.type,
+          severity: 'attention',
+          subject_ref: taskId ? `task:${taskId}` : `squad:${event.squad_id ?? 'none'}`,
+          recipients: [OWNER_RECIPIENT],
+          // The key names the event type, so blocked-then-review on one task both send. No task id means nothing
+          // identifies the event: a unique key keeps it un-deduped (free text never goes into the key).
+          dedupe_key: `${event.type}:${taskId ?? crypto.randomUUID()}`,
+          context: {
+            task_id: taskId,
+            title: taskTitle,
+            squad_id: event.squad_id,
+            agent_id: event.agent_id,
+            project_id: (event.payload as any)?.project_id,
+          },
+        })
+      } catch (err) {
+        safeConsole.error('bus: notify failed', String(err).slice(0, 200))
+      }
+      try {
+        await dispatchAddonEvent(env, event)
+      } catch (err) {
+        safeConsole.error('bus: addon event dispatch failed', String(err).slice(0, 200))
+      }
       // Still log for the activity feed (the agent-actor branch in handleQueue
       // surfaces task events into the squad's bound channel).
       safeConsole.log(`bus: ${event.type}`, {

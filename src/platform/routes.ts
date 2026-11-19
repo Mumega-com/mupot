@@ -28,7 +28,7 @@ async function previewHandler(c: Context<AppEnv>): Promise<Response> {
   //
   // requireAuth above proves a valid session in this pot. It does NOT prove this principal
   // may see THIS project — and new identities self-enrol as `member` with zero grants
-  // (src/auth/index.ts: role = isFirst && allowBootstrapOwner ? 'owner' : 'member'), so
+  // (src/auth/index.ts upsertUserByEmail: 'owner' only for the provisioned owner or the atomic first-owner claim, src/auth/first-owner.ts; everyone else is 'member'), so
   // "authenticated" is a much larger set than it looks.
   //
   // Before this check, `/preview/:id` resolved the project with the UNSCOPED getProject

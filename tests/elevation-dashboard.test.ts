@@ -225,6 +225,9 @@ describe('elevation dashboard screens — integration through dashboardApp (real
   it('a login with no matching members row is told WHY nothing is shown, not left with a bare empty page', async () => {
     const env = makeEnv(NOBODY_EMAIL)
     await seedFixture(env)
+    // A legacy owner: a users row with owner standing and NO members row (what this screen's copy is for). The owner role
+    // no longer comes from "first row in users" on a pot that has members (src/auth/first-owner.ts), so seed it explicitly.
+    harness.sqlite.exec(`INSERT INTO users (id, email, role) VALUES ('u-nobody', '${NOBODY_EMAIL}', 'owner')`)
     const cookie = await devLogin(env) // succeeds (KV-only), never bridges to a members row
 
     const res = await dashboardApp.request('/elevation', { headers: { cookie: `mupot_session=${cookie}` } }, env)

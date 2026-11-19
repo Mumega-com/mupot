@@ -5,6 +5,7 @@
 // Only `message.created` (the bound agent's OWN inbox) is subscribable in this PR.
 
 import { attachDesignatedClause, ADMISSION_BOUND_TO_SEAT_SQL } from '../members/attach-designated'
+import { authorityLiveSql } from '../auth/attached-authority'
 import type { AuthContext, Env } from '../types'
 import { decryptConnectorSecret, encryptConnectorSecret } from '../connectors/crypto'
 import { capabilityRank, holdsCapabilityFloor, resolveCapabilities } from '../auth/capability'
@@ -469,7 +470,7 @@ export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Prom
 async function attachmentLiveness(env: Env, tokenId: string): Promise<{ live: true } | { live: false; reason: string } | null> {
   try {
     const row = await env.DB.prepare(
-      `SELECT att.detached_at AS detached_at, adm.status AS adm_status, s.retired_at AS retired_at,
+      `SELECT att.detached_at AS detached_at, adm.status AS adm_status, CASE WHEN ${authorityLiveSql('adm','?3')} THEN 1 ELSE 0 END AS authority_live, s.retired_at AS retired_at,
               CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.id = att.agent_id ${attachDesignatedClause(env, 'a', 'att.human_member_id')}) THEN 1 ELSE 0 END AS designated,
               CASE WHEN ${ADMISSION_BOUND_TO_SEAT_SQL} THEN 1 ELSE 0 END AS bound,
               CASE WHEN adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id THEN 1 ELSE 0 END AS adm_matches,
@@ -485,10 +486,11 @@ async function attachmentLiveness(env: Env, tokenId: string): Promise<{ live: tr
          LEFT JOIN agent_seats s ON s.id = att.seat_id AND s.tenant = att.tenant
         WHERE att.tenant = ?1 AND att.seat_token_id = ?2
         LIMIT 1`,
-    ).bind(env.TENANT_SLUG, tokenId).first<{ detached_at: string | null; adm_status: string | null; retired_at: string | null; designated: number; bound: number; adm_matches: number; seat_matches: number; chain_ok: number }>()
+    ).bind(env.TENANT_SLUG, tokenId, nowSqlUtc()).first<{ authority_live: number; detached_at: string | null; adm_status: string | null; retired_at: string | null; designated: number; bound: number; adm_matches: number; seat_matches: number; chain_ok: number }>()
     if (!row) return null
     if (row.detached_at !== null) return { live: false, reason: 'attachment_detached' }
     if (row.adm_status !== 'live') return { live: false, reason: 'admission_not_live' }
+    if (row.authority_live !== 1) return { live: false, reason: 'authority_expired' }
     if (row.retired_at !== null) return { live: false, reason: 'seat_retired' }
     if (row.designated !== 1) return { live: false, reason: 'agent_not_designated' }
     if (row.bound !== 1) return { live: false, reason: 'admission_not_bound_to_seat' }

@@ -36,6 +36,7 @@ import {
 } from './proposal'
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
+import { closeRoutineControlTask, controlTaskOutcome, resolveAttemptControlTaskId } from './control-task'
 import { routineControlId } from './identity'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
@@ -1339,6 +1340,9 @@ async function loadTask(env: Env, taskId: string): Promise<Task | null> {
 }
 
 async function completeControlTask(env: Env, run: RunContext): Promise<void> {
+  // Success path = main's floor (patchToDoneBypassesGate for EVERY gate, including
+  // gate:routines). Do not route through closeRoutineControlTask — that helper is
+  // for failure/cancel/unclaimed ends only (B1 / routine-review-window).
   if (!run.task_id) throw new Error('routine control Task missing')
   let task = await loadTask(env, run.task_id)
   if (!task || task.project_id !== run.project_id) throw new Error('routine control Task ownership mismatch')
@@ -1361,6 +1365,16 @@ async function completeControlTask(env: Env, run: RunContext): Promise<void> {
     throw error
   }
   await emitTaskEvent(env, 'task.updated', task, { kind: 'agent', id: run.assigned_agent_id ?? ROUTINE_ACTOR })
+  // Board outcome text (11e2a810). persistTaskUpdate does not write `result`; fence
+  // empty-result only so an agent-written result is preserved. Archive-guarded.
+  if (existing.result == null || existing.result === '') {
+    await env.DB.prepare(
+      `UPDATE tasks SET result = ?
+        WHERE id = ? AND project_id = ? AND status = 'done' AND updated_at = ?
+          AND (result IS NULL OR result = '')
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
+    ).bind(controlTaskOutcome('succeeded'), task.id, task.project_id, task.updated_at).run()
+  }
 }
 
 async function landControlFlight(env: Env, run: RunContext): Promise<void> {
@@ -1393,6 +1407,7 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
   if (existing?.status !== 'landed' || !outbox) throw new Error('routine control Flight could not land')
 }
 
+/** Block the control task (main behaviour). Returns false when a live human gate blocks. */
 async function cancelControlTask(env: Env, run: Pick<RunContext, 'task_id' | 'project_id'>): Promise<boolean> {
   if (!run.task_id) return true
   let task = await loadTask(env, run.task_id)
@@ -1532,6 +1547,9 @@ async function classifyActionFailure(
     ),
   ])
   if (wrote(outcomes[0]) && wrote(outcomes[1]) && wrote(outcomes[2])) {
+    // Close after the guarded run transition so a failed batch cannot leave a
+    // done task beside a live run (P1-F).
+    await closeRoutineControlTask(env, run, controlTaskOutcome('failed', reason))
     return retryAt
       ? { ok: true, status: 'retry_scheduled', reason: 'execution_failed', run_id: run.id, action_key: action.action_key, duplicate: false }
       : { ok: false, error: 'action_failed' }
@@ -2205,18 +2223,15 @@ export async function cancelRoutineRun(
     return { ok: false, error: 'receipt_failed' }
   }
 
-  let taskId = live.task_id
-  let flightId = live.flight_id
-  if (!taskId) {
-    const candidate = await routineControlId('task', `${live.id}:${live.attempt}`)
-    const existing = await loadTask(env, candidate)
-    if (existing && existing.project_id === live.project_id) taskId = candidate
-  }
-  if (!flightId) {
-    const candidate = await routineControlId('flight', `${live.id}:${live.attempt}`)
-    const existing = await getFlight(env, candidate)
-    if (existing && existing.project_id === live.project_id) flightId = candidate
-  }
+  // Close/block only THIS attempt's control task — never a stale prior-attempt id.
+  const taskId = await resolveAttemptControlTaskId(env, {
+    id: live.id, attempt: live.attempt, task_id: live.task_id, project_id: live.project_id,
+  })
+  const attemptFlightId = await routineControlId('flight', `${live.id}:${live.attempt}`)
+  const attemptFlight = await getFlight(env, attemptFlightId)
+  const flightId = attemptFlight && attemptFlight.project_id === live.project_id
+    ? attemptFlightId
+    : (live.flight_id ?? null)
   const children = { project_id: live.project_id, task_id: taskId, flight_id: flightId }
 
   const runningAction = await env.DB.prepare(
@@ -2225,6 +2240,7 @@ export async function cancelRoutineRun(
   const deliveredMessage = await env.DB.prepare(
     `SELECT 1 WHERE ${routineMessageDeliveredExistsSql('?1', '?2', '?3')}`,
   ).bind(live.id, live.tenant, live.project_id).first()
+  // Main: always block the control task when present; its return feeds confirmability.
   const taskConfirmed = await cancelControlTask(env, children)
   const flightCancel = await cancelControlFlight(env, children)
   // A delivered inbox request is external work unless the runtime supplies an acknowledgement.
@@ -2271,6 +2287,15 @@ export async function cancelRoutineRun(
     ),
   ])
   if (wrote(outcomes[0]) && wrote(outcomes[2])) {
+    // Close AFTER the guarded run transition (P1-F). Confirmed only — unconfirmed
+    // keeps the task blocked as main does (external work may still be running).
+    if (outcome === 'confirmed') {
+      await closeRoutineControlTask(
+        env,
+        children,
+        controlTaskOutcome('cancelled', 'operator'),
+      )
+    }
     return { ok: true, run_id: live.id, duplicate: !wrote(requested), outcome }
   }
 

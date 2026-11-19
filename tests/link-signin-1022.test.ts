@@ -911,7 +911,7 @@ describe('#1022 linked sign-ins', () => {
         completeAuthorization: vi.fn(async () => ({ redirectTo: 'https://client.example.test/callback?code=xyz' })),
       }
       const cenv = {
-        DB: h.db, TENANT_SLUG: TENANT, BRAND: 'mupot', POT_TIER: 'scale', GOOGLE_CLIENT_ID: 'id', GOOGLE_CLIENT_SECRET: 'secret',
+        DB: h.db, TENANT_SLUG: TENANT, BRAND: 'mupot', POT_TIER: 'scale', OPEN_SIGNUP_ENABLED: 'true', GOOGLE_CLIENT_ID: 'id', GOOGLE_CLIENT_SECRET: 'secret',
         SESSIONS: memoryKv(), OAUTH_PROVIDER: provider, BUS: { send: async () => {} },
       } as unknown as Env
       const authorize = await handleOAuthAuthorize(new Request(

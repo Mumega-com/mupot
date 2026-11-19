@@ -45,6 +45,7 @@ import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
 import { ipRateLimitKey } from '../agents/seat-events'
 import { MemberAttachDeniedError, NewMemberRefusedError, type BeforeCreateGuard } from '../members/human-identity'
+import { decideSignIn, refusalText } from '../auth/invite-only'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAgentStatusFromRow, seatFloorSql } from '../auth/member-bearer'
 import { chunkForD1InList } from '../lib/d1-in-list'
@@ -1907,6 +1908,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // guard). The CF-Connecting-IP header is set by Cloudflare on every inbound Worker request; fall back to
     // 'unknown' if absent (local dev / test). The rate limiter uses SESSIONS KV (no new binding needed).
     const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
+
+    // Invite-only (the SAME decision function the web doors use, src/auth/invite-only.ts): refused BEFORE any member row, signup
+    // grant, consent nonce, rate-limit counter or token. A real owner (active member, or a legacy owner/admin) passes; so does
+    // an invitee whose invite was redeemed. The first-owner claim is web-only, so it is not offered here.
+    const signIn = await decideSignIn(env, { door: 'oauth_mcp', email: googleUser.email, provider: 'google', subject: googleUser.id })
+    if (!signIn.allowed) {
+      return new Response(refusalText(signIn.reason), { status: 403, headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } })
+    }
 
     // Find-or-create the mupot member row for this verified email.
     let memberId: string

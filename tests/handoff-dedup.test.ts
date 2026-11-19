@@ -77,7 +77,20 @@ function makeUsersDB(seed: Row[] = [], opts: { throwOnInsertEmail?: boolean } = 
           return { meta: { changes: 1 } }
         },
       }
-      return api
+      return Object.assign(api, { sql, get args() { return args } })
+    },
+    // claimFirstOwner's batch (src/auth/first-owner.ts): the real SQL is conditional on an empty pot; the mock reproduces that
+    // for the users INSERT (empty users table => owner row written) and reports changes per statement. Real-schema proof of the
+    // other emptiness conditions lives in tests/first-owner-claim.test.ts.
+    async batch(stmts: Array<{ sql: string; args: unknown[] }>) {
+      const out: Array<{ meta: { changes: number } }> = []
+      for (const st of stmts) {
+        if (st.sql.includes('INSERT INTO users')) {
+          const [, id, email] = st.args as [string, string, string | null]
+          if (byId.size === 0) { byId.set(id, { id, email, role: 'owner' }); if (email) exactEmails.add(email); out.push({ meta: { changes: 1 } }) } else out.push({ meta: { changes: 0 } })
+        } else out.push({ meta: { changes: 1 } })
+      }
+      return out
     },
   }
   return { DB: DB as unknown as Env['DB'], byId }

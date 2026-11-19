@@ -13,7 +13,7 @@
 // the human's passkey tap; nothing is attached. Once admitted, the thread attaches immediately and its NEXT request
 // acts as that agent.
 
-import type { Env } from '../types'
+import type { AuthContext, Env } from '../types'
 import type { ToolSpec, ToolOutcome } from './index'
 import { fail, done } from './index'
 import { attachSeatToAgent, type AttachResult, humanCanDesignateAtAll, listAttachableAgents, seatAttachDesignatedEnabled, seatAttachEnabled } from '../members/seat-attach'
@@ -21,7 +21,10 @@ import { connectionsLink } from '../members/vip-lane'
 import { attachedAuthority } from '../auth/attached-ceiling'
 import { claimUrl } from '../members/claim'
 import { resolveBoundSeat } from '../agents/inbox-seat'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { findLiveAttachment } from '../members/seat-attach'
 import { runConnectionCheck } from '../members/connection-check'
+import { finishConnectionEcho, loadConnectionEcho, startConnectionEcho } from '../members/connection-echo'
 import { markMessagesHandledByAttachment, MAX_MARK_HANDLED_IDS, normalizeHandledIds } from '../members/attached-handled'
 
 /** The claim link first (open it signed in, press Confirm: no typing); the code stays as the fallback for /connections. */
@@ -241,23 +244,65 @@ const toolInboxMarkHandled: ToolSpec = {
   },
 }
 
-// connection_check — the full-duplex check (SEND, RECEIVE, WAKE) an attached chat runs on request. See members/connection-check.ts.
-const toolConnectionCheck: ToolSpec = {
-  name: 'connection_check',
-  scope: 'self (an ATTACHED chat checks its own connection to mupot: send, receive, wake; writes one probe message to its own agent inbox and one audit row)',
-  min: 'authenticated',
-  args: '{ fresh?: boolean }  // fresh:true starts a new receive round after one completed',
-  inputSchema: { type: 'object', properties: { fresh: { type: 'boolean', description: 'Start a new receive round after the previous one completed.' } }, additionalProperties: false },
-  async run(auth, env, args) {
+/** Resolve only the authenticated principal. Reused by diagnostics and read-only proof views. */
+export async function connectionSubject(auth: AuthContext, env: Env) {
     const att = attachedAuthority(auth)
-    if (!att) {
-      return fail(409, 'not_attached', {
-        message: 'connection_check runs from an attached chat. This chat is not attached to an agent yet.',
-        next_step: "Call seat_attach {agent:'<slug>', reason:'why this chat should act as that agent'}, show your human the approval code you get back, and wait while they approve it. Then call boot_context and run connection_check.",
-      })
+    const agentId = att?.agentId ?? (!auth.seatBinding ? auth.boundAgentId : null) ?? null
+    const identity = { step: 0 as const, bound_agent_id: agentId, slug: null as string | null,
+      credential_kind: att ? 'attached' as const : agentId ? 'agent-bound' as const : 'person' as const }
+    const next_step = 'this connection is not an agent; stop and ask your human'
+    if (!agentId) return { ok: false as const, error: 'not_agent', identity, next_step }
+    let memberId = auth.memberId ?? null
+    let credentialId = auth.tokenId ?? null
+    if (att) {
+      const binding = auth.seatBinding!
+      const live = await findLiveAttachment(env, { memberId: att.humanMemberId, tokenId: binding.grantTokenId }, binding.seatId)
+      if (!live || live.attachment_id !== att.attachmentId || live.agent_id !== agentId) {
+        return { ok: false as const, error: 'connection_not_live', identity, next_step }
+      }
+      credentialId = live.seat_token_id
+    } else {
+      // The token/member/agent weld is re-read here; a supplied label or target cannot select a principal.
+      const live = await env.DB.prepare(`SELECT a.slug FROM agents a
+        JOIN agent_member_bindings b ON b.agent_id=a.id AND b.tenant=?1 AND b.member_id=?3
+        JOIN members m ON m.id=b.member_id AND m.tenant=?1 AND m.status='active'
+        JOIN member_tokens t ON t.id=?4 AND t.agent_id=a.id AND t.member_id=b.member_id AND t.tenant=?1
+        WHERE a.id=?2 AND a.status IN ('active','paused') AND ${TOKEN_LIVE_PREDICATE('?5')}`)
+        .bind(env.TENANT_SLUG,agentId,auth.memberId ?? '',credentialId ?? '',nowSqlUtc()).first<{slug:string}>()
+      if (!live) return { ok: false as const, error: 'connection_not_live', identity, next_step }
+      identity.slug = live.slug
     }
-    const r = await runConnectionCheck(env, { attachmentId: att.attachmentId, agentId: att.agentId, humanMemberId: att.humanMemberId, fresh: args.fresh === true })
-    return done({ ...r, tell_your_human: r.summary })
+    if (identity.slug === null) {
+      const row = await env.DB.prepare('SELECT slug FROM agents WHERE id=?1').bind(agentId).first<{slug:string}>()
+      if (!row) return { ok: false as const, error: 'connection_not_live', identity, next_step }
+      identity.slug = row.slug
+    }
+    if (!credentialId || !memberId) return {ok:false as const,error:'connection_not_live',identity,next_step}
+    return {ok:true as const, identity, context:{agentId,credentialId,memberId,
+      harnessId:auth.seatBinding?.harnessId ?? auth.harnessId ?? null,attachmentId:att?.attachmentId ?? null},
+      actorMemberId:att?.humanMemberId ?? memberId}
+}
+
+const toolConnectionCheck: ToolSpec = {
+  name:'connection_check',
+  scope:'self (identity step 0, own send/receive, and inbox echo; never selects another agent)',
+  min:'authenticated',
+  args:'{ fresh?: boolean, echo?: boolean, echo_reply?: string } // echo starts an inbox roundtrip; reply with the inbox nonce',
+  inputSchema:{type:'object',properties:{fresh:{type:'boolean'},echo:{type:'boolean'},echo_reply:{type:'string',minLength:1,maxLength:128}},additionalProperties:false},
+  async run(auth,env,args) {
+    if ((args.echo===true && args.echo_reply!==undefined) || (args.fresh===true && (args.echo===true || args.echo_reply!==undefined))) return fail(400,'invalid_args','Choose a receive check, echo start, or echo reply.')
+    const subject=await connectionSubject(auth,env)
+    if(!subject.ok) return fail(403,subject.error,{identity:subject.identity,next_step:subject.next_step})
+    const {identity,context}=subject
+    if(args.echo===true || typeof args.echo_reply==='string') {
+      const echo=args.echo===true ? await startConnectionEcho(env,context) : await finishConnectionEcho(env,context,args.echo_reply as string)
+      if(!echo.ok) return fail(409,echo.error,{identity})
+      return done({identity,echo_status:echo})
+    }
+    const echoStatus=await loadConnectionEcho(env,context)
+    const r=await runConnectionCheck(env,{attachmentId:context.attachmentId ?? undefined,credentialId:context.credentialId,
+      agentId:context.agentId,humanMemberId:subject.actorMemberId,fresh:args.fresh===true,echoStatus})
+    return done({identity,...r,echo_status:echoStatus,tell_your_human:r.summary})
   },
 }
 

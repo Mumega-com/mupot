@@ -130,15 +130,15 @@ export function mcpServerKey(slug: string): string {
  * wakeContractForAgent — build the WakeContract for an agent.
  *
  * Returns the machine-readable specification of HOW to fire an agent.wake event
- * at this specific agent via the mupot bus HTTP surface. Returned alongside
- * mcp_endpoint from mint_agent_token so the operator has everything in one flow.
+ * at this specific agent via the in-process bus (createBus().emit). Returned
+ * alongside mcp_endpoint from mint_agent_token so the operator has everything
+ * in one flow.
  *
- * PURE: no DB, no env, no secrets. Accepts the resolved agent row fields and
- * the request origin (scheme+host only; used the same way as mcpEndpoint).
+ * PURE: no DB, no env, no secrets. Accepts the resolved agent row fields.
  *
- * The emit_url is the bus emit endpoint: POST /bus/emit with the body shape
- * filled in. The caller supplies the operator bearer token as the Authorization
- * header (never embedded in this contract).
+ * There is no public HTTP emit URL (mupot#2414 / #2395 / #2402): POST /bus/emit
+ * was never mounted and /api/bus/emit was removed. The contract carries the
+ * body shape and auth header name only; emit goes through createBus().emit.
  *
  * Cross-project boundary note (#115 / S175): this contract is for callers
  * within the SAME tenant pot. Waking agents across tenant boundaries (e.g.
@@ -150,11 +150,8 @@ export function wakeContractForAgent(
   agentId: string,
   squadId: string,
   tenant: string,
-  origin: string,
 ): WakeContract {
-  const base = origin.replace(/\/+$/, '')
   return {
-    emit_url: `${base}/bus/emit`,
     auth_header: 'Authorization',
     body_shape: {
       type: 'agent.wake',
@@ -164,8 +161,8 @@ export function wakeContractForAgent(
       payload: { reason: '<caller-supplied reason>', context: '<optional context string>' },
     },
     note:
-      'POST emit_url with Authorization: Bearer <OPERATOR_TOKEN> and the body_shape JSON (fill in payload.reason). ' +
-      'The bus consumer routes agent.wake to the AgentDO.wake() cycle immediately. ' +
+      'Emit agent.wake via createBus().emit with Authorization: Bearer <OPERATOR_TOKEN> and the body_shape JSON (fill in payload.reason). ' +
+      'There is no public HTTP emit URL (#2414). The bus consumer routes agent.wake to the AgentDO.wake() cycle immediately. ' +
       'Cross-tenant wake (S175) requires additional bus-layer opt-in — see issue #115.',
   }
 }

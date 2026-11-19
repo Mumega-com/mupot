@@ -47,6 +47,7 @@ export function newWorld(): World {
     DB: h.db, TENANT_SLUG: TENANT, BRAND: 'mupot', POT_TIER: 'scale', PUBLIC_ORIGIN: 'https://pot.test',
     GOOGLE_CLIENT_ID: 'cid.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'secret',
     SESSIONS: memoryKv(), BUS: { send: async () => {} },
+    OPEN_SIGNUP_ENABLED: 'true', // these door tests sign up brand-new members; invite-only is covered by invite-only-signin.test.ts
     SEAT_AUTO_ENROLL: '1', REALTIME_SEAT_EVENTS: '1', // prod flags; SEAT_ATTACH and SECURE_MOMENTS are off/unset in prod
   } as unknown as Env
   return { h, env, agents: () => Number(h.sqlite.prepare('SELECT COUNT(*) AS n FROM agents').get()!.n), refusals: [] }

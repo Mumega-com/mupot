@@ -1,7 +1,7 @@
 // src/mcp/supabase-tools.ts — MCP tools for 1-Click Supabase Data Connector.
 
 import type { ToolSpec } from './index'
-import { fail, done, str, hasWorkspaceAdmin, memberCanOnSquad } from './index'
+import { fail, done, str, hasWorkspaceAdmin, memberCanOnSquad, memberCanOnSquadAuth } from './index'
 import type { AuthContext, Env } from '../types'
 import {
   introspectSupabaseSchema,
@@ -12,7 +12,7 @@ import {
 } from '../connectors/supabase'
 import {
   addConnector,
-  resolveConnector,
+  resolveConnectorById,
   listConnectors,
   type ConnectorScopeType,
 } from '../connectors/service'
@@ -21,34 +21,72 @@ const STRING_SCHEMA = { type: 'string' }
 const OPTIONAL_STRING_SCHEMA = { type: 'string' }
 const OBJECT_SCHEMA = { type: 'object' }
 
-async function resolveSupabaseCredentials(
+/**
+ * May this caller use a connector with this scope? Decided from the connector's REAL scope,
+ * before any secret is decrypted.
+ *   agent → only the bound agent; squad → member rank on THAT squad; pot → org admin only.
+ */
+async function callerMayUseConnector(
   env: Env,
-  _auth: AuthContext,
-  connectorId?: string,
-): Promise<SupabaseConfig | null> {
-  if (connectorId) {
-    const raw = await resolveConnector(env, connectorId, 'supabase')
-    if (!raw) return null
-    try {
-      const parsed = JSON.parse(raw)
-      if (parsed.url && parsed.apiKey) return parsed
-    } catch {
-      // If raw is just the api key and url is in meta
-    }
-  }
+  auth: AuthContext,
+  scopeType: string,
+  scopeId: string | null,
+): Promise<boolean> {
+  if (scopeType === 'agent') return !!scopeId && !!auth.boundAgentId && auth.boundAgentId === scopeId
+  if (scopeType === 'squad') return !!scopeId && memberCanOnSquadAuth(env, auth, scopeId, 'member')
+  if (scopeType === 'pot') return hasWorkspaceAdmin(auth)
+  return false
+}
 
-  // Look for any active supabase connector available in pot/squad scope
-  const connectors = await listConnectors(env)
-  const active = connectors.find((c) => c.type === 'supabase' && !c.revoked_at)
-  if (!active) return null
-
-  const raw = await resolveConnector(env, active.id, 'supabase')
+async function decryptSupabaseConfig(env: Env, connectorId: string): Promise<SupabaseConfig | null> {
+  const raw = await resolveConnectorById(env, connectorId, 'supabase')
   if (!raw) return null
   try {
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed.url === 'string' && typeof parsed.apiKey === 'string') return parsed
   } catch {
-    return null
+    // unparseable secret: treat as unavailable
   }
+  return null
+}
+
+// Every refusal here (unknown id, other scope, revoked, wrong type) returns null, which the
+// tools turn into one identical not-found result: no existence oracle across scopes.
+async function resolveSupabaseCredentials(
+  env: Env,
+  auth: AuthContext,
+  connectorId?: string,
+): Promise<SupabaseConfig | null> {
+  const connectors = (await listConnectors(env)).filter((c) => c.type === 'supabase' && !c.revoked_at)
+
+  if (connectorId) {
+    // connector_id is a connector's OWN id; strict, no fallback to another connector.
+    const target = connectors.find((c) => c.id === connectorId)
+    if (!target) return null
+    if (!(await callerMayUseConnector(env, auth, target.scope_type, target.scope_id))) return null
+    return decryptSupabaseConfig(env, target.id)
+  }
+
+  // No id: only connectors the caller is authorised for, agent first, then the caller's own
+  // squad, then (org admins only) pot-wide.
+  if (auth.boundAgentId) {
+    const own = connectors.find((c) => c.scope_type === 'agent' && c.scope_id === auth.boundAgentId)
+    if (own) return decryptSupabaseConfig(env, own.id)
+
+    const agent = await env.DB.prepare(`SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1`)
+      .bind(auth.boundAgentId)
+      .first<{ squad_id: string }>()
+    const squadId = agent?.squad_id
+    if (squadId && (await memberCanOnSquadAuth(env, auth, squadId, 'member'))) {
+      const sq = connectors.find((c) => c.scope_type === 'squad' && c.scope_id === squadId)
+      if (sq) return decryptSupabaseConfig(env, sq.id)
+    }
+  }
+  if (hasWorkspaceAdmin(auth)) {
+    const pot = connectors.find((c) => c.scope_type === 'pot')
+    if (pot) return decryptSupabaseConfig(env, pot.id)
+  }
+  return null
 }
 
 export const toolSupabaseConnect: ToolSpec = {

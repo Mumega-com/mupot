@@ -1,0 +1,12 @@
+{
+  "src/memory/index.ts": "ed5d066e6c8e3bff5ae3427af54fcf5e565805f9d3ffd9100b8f891db54772a3",
+  "src/types.ts": "1f068928a4da39216d5f452e823fa6fc5927605049dc3c49d83216a7c2d7a586",
+  "src/mcp/index.ts": "afdbc1105a9401d8dceaf4f1d56cf0f606770d56e0d899c3ea2af7220c4c3d22",
+  "tests/memory-recall-reliability.test.ts": "9aafbf7309c5d4b433331acaf20ef031dc928cc5bbb6a0e648f49d8330f1e3a2",
+  "recall-final-flag.log": "18f8ab4cbac606afbd68c78c65d828fede023e3fae6f0d320584c1a6a6d0d396",
+  "recall-callers.log": "fb3cd50b28b3786c7bc7dda837b49539cda5b751f006371281c92eda4c49cae8",
+  "recall-final-typecheck.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  ".mutation-evidence/coverage.log": "8845a3f46bf9ce9c4b2f534cf7aadfcb0c44b84cc6842f23ccaa375a8fe5dbeb",
+  ".mutation-evidence/results.json": "889c84f634177d833a352829a3916ca99094ec75dc66eb2e032f00a2b9ffcb00",
+  "recall-final-restored.log": "9b15d593014ba0368ec3e3448bc17250035f7cb81317567a95f4eaca4d5fdcc9"
+}

@@ -316,3 +316,35 @@ export async function decideIdentitylessAttach(
 
   return { kind: 'eligible', memberId: candidate.id, status: candidate.status }
 }
+
+/**
+ * Standing of a verified email in THIS tenant, for the invite-only sign-in gate (src/auth/invite-only.ts).
+ *  - 'active':   a member row exists that is active, not archived, not superseded.
+ *  - 'inactive': a member row exists but is suspended, archived or superseded (a removed person is not a member).
+ *  - 'none':     no member row.
+ * Lives here, beside decideIdentitylessAttach, because this module is the sanctioned home of raw `members` email reads
+ * (scripts/check-member-email-authority-lookup.mjs). Read-only; grants nothing: it answers "does the pot already know this
+ * person", never "which member is acting".
+ */
+export async function memberStandingForEmail(env: Env, tenant: string, normalizedEmail: string): Promise<'active' | 'inactive' | 'none'> {
+  if (!normalizedEmail) return 'none'
+  const rows = await env.DB.prepare(
+    `SELECT status, archived_at, superseded_by_member_id FROM members WHERE lower(email) = ?1 AND tenant = ?2`,
+  )
+    .bind(normalizedEmail, tenant)
+    .all<{ status: string; archived_at: string | null; superseded_by_member_id: string | null }>()
+  const found = rows.results ?? []
+  if (found.length === 0) return 'none'
+  const live = found.some((m) => m.status === 'active' && m.archived_at === null && m.superseded_by_member_id === null)
+  return live ? 'active' : 'inactive'
+}
+
+/** True when this member id is active, not archived, not superseded (tenant-scoped). */
+export async function isLiveMemberId(env: Env, tenant: string, memberId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS present FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active' AND archived_at IS NULL AND ${notSupersededSql()}`,
+  )
+    .bind(memberId, tenant)
+    .first<{ present: number }>()
+  return row !== null
+}

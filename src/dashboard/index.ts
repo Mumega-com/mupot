@@ -22,6 +22,8 @@
 // another pot. The wake action is performed by the browser POSTing to the
 // RBAC-gated /api/agents/:id/wake endpoint owned by the agents component.
 
+import { loadConnectionEcho } from '../members/connection-echo'
+import { agentEchoStatus } from './agent-echo-status'
 import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { Hono, type Context } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -327,7 +329,7 @@ import { makeWakeApp, loadAgentWakeCard } from './wake-card'
 import { makeImSettingsApp } from './im-settings'
 import { makeSecurityBarApp } from './security-bar'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
-import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
+import { getAuthContext, loadStudioData, studioPageHtml, isSafeRepoUrl } from './studio'
 import { deployProject, isDeployPolicyError } from '../projects/deploy'
 
 const DEPLOY_POLICY_HINT = 'a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool, or POST /api/projects/:id/deploy with canary_receipt and rollback (Studio dispatch is refused for such a project).'
@@ -1689,23 +1691,9 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
   return c.redirect(`/projects/${encodeURIComponent(detail.project.id)}`, 303)
 })
 
-// POST /api/studio/dispatch — create a flight + task from a Studio prompt.
-dashboardApp.post('/api/studio/dispatch', async (c) => {
-  const auth = getAuthContext(c)
-  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown }
-  try {
-    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown }
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
-  const result = await dispatchStudioFlight(c.env, auth, {
-    prompt: typeof body.prompt === 'string' ? body.prompt : '',
-    repoUrl: typeof body.repoUrl === 'string' ? body.repoUrl : undefined,
-    model: typeof body.model === 'string' ? body.model : undefined,
-  })
-  if (!result.ok) return c.json({ error: result.error }, result.status)
-  return c.json(result.result)
-})
+// POST /api/studio/dispatch lives on studioApp (mounted at /api/studio above). A second
+// handler here was registered later and never ran — Hono matches the mount first. Removed
+// so refusals keep next_step from studioApp.post('/dispatch').
 
 // GET /copilot and GET /chat — full-height Deep Chat card (session auth).
 dashboardApp.get('/copilot', async (c) => c.html(shell(c.env, 'Co-Pilot', copilotPageBody(getAuthContext(c)))))
@@ -2145,9 +2133,18 @@ dashboardApp.get('/agents/:id', async (c) => {
   // The Connect checklist lists (and approves) pending requests itself; the older single-purpose card would duplicate them.
   const claimCard = ownerView.connect && ownerView.connect.pending.length > 0 ? null : await loadAgentClaimCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
   const wakeCard = await loadAgentWakeCard(c.env, auth, agent, { resume, fresh: freshNow }).catch(() => null)
-  const onboardingCards = claimCard || wakeCard ? html`${claimCard ?? ''}${wakeCard ?? ''}` : null
+  const echoCard = agentEchoStatus(await loadConnectionEcho(c.env,{agentId:agent.id}))
+  const onboardingCards = html`${claimCard ?? ''}${wakeCard ?? ''}${echoCard}`
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, { resume, fresh: freshNow, claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null, reissued: c.req.query('reissued') === '1' })),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel, ownerView, liveRuntime, onboardingCards, {
+      resume,
+      fresh: freshNow,
+      claimed: c.req.query('claimed') === '1' ? 'attached' : c.req.query('claimed') === 'partial' ? 'partial' : null,
+      reissued: c.req.query('reissued') === '1',
+      // Read-back of the STORED authority decision (query params set after the server re-read the row).
+      authorityLevel: (() => { const a = c.req.query('authority'); return a === 'full' || a === 'helper' ? a : null })(),
+      authorityExpires: c.req.query('expires') || null,
+    })),
   )
 })
 
@@ -6206,7 +6203,14 @@ function agentConsoleBody(
   ownerView: AgentOwnerView | null = null,
   liveRuntime: FleetBelief | null = null,
   onboardingCard: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
-  flash: { resume: 'claim' | 'allow' | 'push' | null; fresh: boolean; claimed: 'attached' | 'partial' | null; reissued: boolean } = { resume: null, fresh: false, claimed: null, reissued: false },
+  flash: {
+    resume: 'claim' | 'allow' | 'push' | null
+    fresh: boolean
+    claimed: 'attached' | 'partial' | null
+    reissued: boolean
+    authorityLevel?: 'helper' | 'full' | null
+    authorityExpires?: string | null
+  } = { resume: null, fresh: false, claimed: null, reissued: false, authorityLevel: null, authorityExpires: null },
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -6276,8 +6280,8 @@ function agentConsoleBody(
       <pre style="white-space:pre-wrap"><code id="background-connect-prompt">${`You are ${agent.slug}. Connect to mupot by OAuth as ${agent.slug} (choose 'This connection is ${agent.name}'), then run connection_check.`}</code></pre>
       <button type="button" class="btn secondary" onclick="navigator.clipboard.writeText(document.getElementById('background-connect-prompt').textContent).then(() => { this.textContent = 'Copied'; })">Copy</button>
     </div>
-    ${flash.claimed === 'attached' ? html`<div class="card" role="status"><p><strong>Claimed.</strong> The chat is now acting as ${agent.name}.</p></div>` : ''}
-    ${flash.claimed === 'partial' ? html`<div class="card" role="status"><p><strong>Admitted, but the chat is not attached yet.</strong> The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
+    ${flash.claimed === 'attached' ? html`<div class="card" role="status" data-claim-authority="${flash.authorityLevel ?? ''}"><p><strong>Connected.</strong> The chat is now acting as ${agent.name}${flash.authorityLevel ? html` as <strong>${flash.authorityLevel === 'full' ? 'Full' : 'Helper'}</strong>` : ''}${flash.authorityExpires ? html` until ${flash.authorityExpires}` : ''}.</p></div>` : ''}
+    ${flash.claimed === 'partial' ? html`<div class="card" role="status" data-claim-authority="${flash.authorityLevel ?? ''}"><p><strong>Admitted, but the chat is not attached yet.</strong> Stored access: ${flash.authorityLevel === 'full' ? 'Full' : 'Helper'}${flash.authorityExpires ? html` until ${flash.authorityExpires}` : ''}. The chat that asked was closed or is acting as a different agent. Ask the agent to call seat_attach again from a live chat; no new approval is needed.</p></div>` : ''}
     ${flash.reissued ? html`<div class="card" role="status"><p>A new claim link was issued. The agent shows it on its next boot_context.</p></div>` : ''}
     ${onboardingCard ?? ''}
     ${liveRuntimeCard(liveRuntime)}

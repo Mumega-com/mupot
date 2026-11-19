@@ -5,6 +5,7 @@
 // separately owner-gated + signature-verified, so a stale/forged status row can only mislead the
 // panel, never authorize a host action. Reports are accepted ONLY from the configured consumer agent.
 
+import { writeRuntimeWithEchoFence } from './runtime-echo-fence'
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
 import { cleanReported, isNonAdoptedRuntime, MAX_REPORTED } from './reported-values'
@@ -599,7 +600,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
     // `upsertPollFleetPresence` (keyed on `auth.boundAgentId`, always a uuid) can never
     // create two rows for the same real agent. See resolveFleetWriteAgentId's doc comment.
     const writeAgentId = await resolveFleetWriteAgentId(env, v.agent_id)
-    await env.DB.prepare(
+    await writeRuntimeWithEchoFence(env,{agentId:writeAgentId,runtime:v.runtime ?? '',actorId:reportedBy,source:'report'},env.DB.prepare(
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO UPDATE SET
@@ -615,7 +616,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
             last_reported_at=excluded.last_reported_at, updated_at=excluded.updated_at`,
     )
       .bind(writeAgentId, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null, v.host ?? '')
-      .run()
+      )
     written++
   }
   return skipped > 0 ? { ok: true, count: written, skipped } : { ok: true, count: written }
@@ -819,6 +820,10 @@ export interface FleetAgentRouteInfo {
    *  what actually decides task_dispatch routing. '' means no row, or a legacy/daemon row that
    *  never declared a mode — resident semantics for that case are unchanged from pre-#1494. */
   presenceMode: string
+  /** mupot#2458: true iff the matched row is operator-stopped (status 'stopped', the same fence as
+   *  deriveReceiverLiveness). Lets a caller that already holds the route refuse a stopped receiver
+   *  without a second read. Optional so hand-built routes stay valid; absent = not stopped. */
+  stopped?: boolean
 }
 
 export interface FleetAgentIdentity {
@@ -1055,13 +1060,15 @@ export function deriveFleetAgentRoute(env: Env, row: FleetAgentRowIdentity | nul
   // regardless of `presenceMode` would have silently zeroed OUT the entire poll-mode dispatch
   // fix for every poll agent that never separately reported a runtime. Only bail when NEITHER
   // signal is present.
-  if (!runtime && presenceMode !== 'poll') return { runtime: '', live: false, agentId: '', presenceMode: '' }
+  // Present only when true, so a not-stopped route keeps its exact pre-#2458 shape.
+  const stopped = status === 'stopped' ? { stopped: true } : {}
+  if (!runtime && presenceMode !== 'poll') return { runtime: '', live: false, agentId: '', presenceMode: '', ...stopped }
   // Per-row TTL (poll-mode, mupot#1494) via resolveFleetPresenceTtlSec — THE ONE shared
   // resolution every fleet_agents presence reader now calls (round 2 P1-b).
   const ttlSec = resolveFleetPresenceTtlSec(env, row)
   const lastReportedAt = String(row?.last_reported_at ?? '')
   const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
-  return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
+  return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode, ...stopped }
 }
 
 /**
