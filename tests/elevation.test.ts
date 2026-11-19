@@ -123,6 +123,31 @@ describe('elevation ledger (D1, real migration chain)', () => {
 
   const capabilities = [{ member_id: ADMIN_MEMBER, scope_type: 'squad' as const, scope_id: SQUAD, capability: 'admin' as const }]
 
+  it('pending list hides overdue backlog and the exact deadline after a bounded sweep',async()=>{
+    const now=Date.now(),session=await seedAgentSession(now)
+    const insert=harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
+      VALUES(?,?,?,?,?,'["action:manage_access"]','squad',?,60,'list fixture','pending',?,?)`)
+    const old=new Date(now-3600000).toISOString()
+    for(let i=0;i<102;i++)insert.run(`list-old-${i}`,TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,old,old)
+    insert.run('list-boundary',TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,new Date(now-600000).toISOString(),new Date(now).toISOString())
+    insert.run('list-live',TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,old,new Date(now+60000).toISOString())
+    insert.run('list-foreign','foreign',session.id,AGENT_ID,AGENT_MEMBER,SQUAD,old,new Date(now+60000).toISOString())
+    expect((await listPendingElevationRequests(env,TENANT,now)).map(r=>r.id)).toEqual(['list-live'])
+    expect(harness.sqlite.prepare("SELECT count(*) AS n FROM elevation_requests WHERE tenant=? AND status='pending'").get(TENANT)).toEqual({n:4})
+  })
+
+  it('foreign expired backlog cannot consume the tenant-limited expiry subquery',async()=>{
+    const now=Date.now(),session=await seedAgentSession(now)
+    const insert=harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
+      VALUES(?,?,?,?,?,'["action:manage_access"]','squad',?,60,'tenant budget fixture','pending',?,?)`)
+    const older=new Date(now-86400000).toISOString(),old=new Date(now-60000).toISOString()
+    for(let i=0;i<101;i++)insert.run(`foreign-first-${i}`,'foreign',session.id,AGENT_ID,AGENT_MEMBER,SQUAD,older,older)
+    insert.run('tenant-expiry',TENANT,session.id,AGENT_ID,AGENT_MEMBER,SQUAD,old,old)
+    expect(await expireStaleElevationRequests(env,TENANT,now)).toEqual({expiredCount:1})
+    expect(harness.sqlite.prepare("SELECT status FROM elevation_requests WHERE id='tenant-expiry'").get()).toEqual({status:'expired'})
+    expect(harness.sqlite.prepare("SELECT count(*) AS n FROM elevation_requests WHERE tenant='foreign' AND status='pending'").get()).toEqual({n:101})
+  })
+
   it('expires overdue requests in bounded tenant-scoped idempotent batches', async () => {
     const now=Date.now(),session=await seedAgentSession(now)
     const insert=harness.sqlite.prepare(`INSERT INTO elevation_requests(id,tenant,agent_session_id,agent_id,member_id,requested_actions_json,requested_scope_type,requested_scope_id,requested_duration_minutes,reason,status,created_at,decision_expires_at)
