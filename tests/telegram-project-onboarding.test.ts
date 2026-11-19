@@ -1688,7 +1688,7 @@ describe('Telegram project invitation service', () => {
 
     expect(harness.sqlite.prepare(`
       SELECT status FROM tasks WHERE id = 'participant-review'
-    `).get()).toEqual({ status: 'approved' })
+    `).get()).toEqual({ status: 'done' })
     expect(harness.sqlite.prepare(`
       SELECT COUNT(*) AS count FROM task_verdicts WHERE task_id = 'participant-review'
     `).get()).toEqual({ count: 1 })

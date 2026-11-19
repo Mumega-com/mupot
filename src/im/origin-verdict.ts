@@ -586,9 +586,9 @@ async function commitOriginDecision(
        VALUES (?, ?, ?, ?, 'processing', ?)
        ON CONFLICT (tenant, update_id) DO NOTHING`,
     ).bind(env.TENANT_SLUG, updateId, origin.user_id, digest, reservedAt),
-    ...verdictBuild.statements, // [0]=tasks status UPDATE (full guard set), [1]=task_verdicts INSERT (the anchor)
+    ...verdictBuild.statements, // status UPDATE, verdict anchor, optional executor-free completion
   ]
-  const verdictInsertIndex = statements.length - 1
+  const verdictInsertIndex = 1 + verdictBuild.verdictInsertIndex
 
   const results: D1Result[] = await env.DB.batch(statements)
 
@@ -659,9 +659,12 @@ async function commitOriginDecision(
     return { replayed: false, applied: false, reason: 'origin_member_mismatch' }
   }
 
-  const updatedTask: Task = { ...task, status: verdictBuild.newStatus, updated_at: verdictBuild.now }
+  const completed = rowsChanged(results[1 + verdictBuild.completionIndex]) === 1
+  const finalStatus = completed ? 'done' : verdictBuild.newStatus
+  const updatedTask: Task = { ...task, status: finalStatus, updated_at: verdictBuild.now,
+    ...(completed ? { completed_at: verdictBuild.now } : {}) }
   const actor: TaskActor = { kind: 'member', id: owner.id }
-  await emitVerdictBusEvent(env, task, { task, verdict, note, decidedBy: owner.id }, verdictBuild.newStatus, verdictBuild.now, actor)
+  await emitVerdictBusEvent(env, task, { task, verdict, note, decidedBy: owner.id }, finalStatus, verdictBuild.now, actor)
 
   // seed B4: gate.verdict onto the receipt chain; never throws, never undoes the (already committed) verdict.
   const gate_receipt = await emitGateVerdictReceipt(env, verdictBuild.verdictRow)

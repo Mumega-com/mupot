@@ -110,6 +110,19 @@ describe('POST /:id/verdict — gate:loops surface cap, real route + real D1 (mu
     expect(body).toMatchObject({ error: 'forbidden', need: 'outreach:send-gated' })
   })
 
+  it('ordinary executor-free approval returns the committed done task and approved verdict', async () => {
+    seedReviewTask(harness.sqlite, 'task-terminal-http', 'gate:review')
+    seedGrant(harness.sqlite, 'gate:review', 'member', 'member-1')
+    harness.sqlite.prepare("UPDATE tasks SET done_when='Review decision is recorded' WHERE id='task-terminal-http'").run()
+    const res = await postVerdict('task-terminal-http', { verdict: 'approved', note: 'Reviewed' }, envFor(harness))
+    expect(res.status).toBe(201)
+    const body = await res.json() as { task: { status: string; completed_at: string }; verdict: { verdict: string; decided_at: string } }
+    expect(body.task.status).toBe('done')
+    expect(body.verdict.verdict).toBe('approved')
+    expect(body.task.completed_at).toBe(body.verdict.decided_at)
+    expect(harness.sqlite.prepare("SELECT status FROM tasks WHERE id='task-terminal-http'").get()).toEqual({ status: 'done' })
+  })
+
   it('holds gate:loops but NOT outreach:send-gated: reject is NOT gated, succeeds', async () => {
     seedReviewTask(harness.sqlite, 'task-2', 'gate:loops')
     seedGrant(harness.sqlite, 'gate:loops', 'member', 'member-1')
