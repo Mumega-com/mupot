@@ -4547,7 +4547,7 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
         ] as const) {
           const r = await invokeTool(who, testEnv, tool, args, ORIGIN)
           expect(r.ok).toBe(false)
-          if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe(who === harnessGrant ? 'operator_principal_required' : r.error) }
+          if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe(who === harnessGrant ? 'operator_principal_required' : 'harness_session_seat_required') }
         }
       }
       expect(harness.sqlite.prepare(`SELECT connector_id, revoked_at FROM project_office_bindings WHERE project_id = 'proj-a'`).get()).toEqual({ connector_id: 'conn-a', revoked_at: null })
@@ -4595,25 +4595,51 @@ describe('B3a: per-project office binding (cross-customer publish is impossible)
 
     it('#2472 P2: a bind that loses the race (guard passed, index refuses) is a connector_scope_refused 403, not a throw', async () => {
       const { harness, testEnv, owner } = await twoCustomers()
-      harness.sqlite.prepare(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-b', 'squad-a', 'write')`).run()
-      // Simulate the TOCTOU: the other project's binding lands after this bind's shared-connector read.
-      const racy: Env = {
+      await seedConnector(harness, 'conn-pot-race', 'https://race.example.com', 'pot', null)
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-c', 'proj-c', 'Proj c', 'active')`).run()
+      harness.sqlite.prepare(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-d', 'proj-d', 'Proj d', 'active')`).run()
+      // Every read in the bind path (project, connector, shared-connector, legacy-freeze) runs for real against the
+      // real DB and finds no live binding. The bind's only write goes through `.run()`; just before the FIRST `.run()`
+      // the competing live binding (proj-d) is committed, i.e. exactly the TOCTOU window between guard and write.
+      // No SQL is matched: the hook keys on the read/write method, not the statement text. (A SQLite trigger cannot
+      // do this: SQLite rolls back a trigger's inserts together with the statement that fails.)
+      let landed = 0
+      const landCompetitor = () => {
+        landed += 1
+        harness.sqlite.prepare(
+          `INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by) VALUES ('proj-d', 'wordpress_site', 'conn-pot-race', 'write', 'competitor')`,
+        ).run()
+      }
+      const racing: Env = {
         ...testEnv,
         DB: new Proxy(testEnv.DB, {
           get(target, prop, receiver) {
             if (prop !== 'prepare') return Reflect.get(target, prop, receiver)
             return (sql: string) => {
               const stmt = target.prepare(sql)
-              if (!/FROM project_office_bindings/.test(sql) || !/NOT \(project_id/.test(sql)) return stmt
-              return { bind: () => ({ first: async () => null }) }
+              return {
+                bind: (...args: unknown[]) => {
+                  const bound = stmt.bind(...args)
+                  return new Proxy(bound, {
+                    get(bt, bp, br) {
+                      if (bp !== 'run') return Reflect.get(bt, bp, br)
+                      return () => { if (landed === 0) landCompetitor(); return bt.run() }
+                    },
+                  })
+                },
+              }
             }
           },
         }),
       }
-      const r = await invokeTool(owner, racy, 'office.bind_project_site', { project_id: 'proj-b', wordpress_connector_id: 'conn-a' }, ORIGIN)
+      const r = await invokeTool(owner, racing, 'office.bind_project_site', { project_id: 'proj-c', wordpress_connector_id: 'conn-pot-race' }, ORIGIN)
       expect(r.ok).toBe(false)
       if (!r.ok) { expect(r.status).toBe(403); expect(r.error).toBe('connector_scope_refused') }
-      expect(harness.sqlite.prepare(`SELECT connector_id FROM project_office_bindings WHERE project_id = 'proj-b'`).get()).toEqual({ connector_id: 'conn-b' })
+      expect(landed).toBe(1) // the guard passed and the write was attempted
+      // The competitor is the sole live holder; the loser wrote nothing.
+      expect(harness.sqlite.prepare(`SELECT project_id, bound_by FROM project_office_bindings WHERE connector_id = 'conn-pot-race' AND revoked_at IS NULL`).all())
+        .toEqual([{ project_id: 'proj-d', bound_by: 'competitor' }])
+      expect(harness.sqlite.prepare(`SELECT 1 AS x FROM project_office_bindings WHERE project_id = 'proj-c'`).get()).toBeUndefined()
       harness.close()
     })
 
