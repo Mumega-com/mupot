@@ -71,3 +71,14 @@ export async function isTaskArchived(env: Env, taskId: string): Promise<boolean>
   const row = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind(taskId).first()
   return row !== null
 }
+
+/** Boolean SQL fragment: a done task's `result` is not one of the routine
+ *  control-task failure closes (`failed:` / `cancelled:` / `unclaimed:`
+ *  prefixes written by controlTaskOutcome). Everything else — free-text
+ *  results, NULL, `succeeded` — counts as a success. Used by the KPI
+ *  counters and the observatory done_count so ordinary done tasks stay
+ *  credited. `tasksAlias` must match the alias the query gives `tasks`. */
+export function TASK_RESULT_NOT_FAILURE_SQL(tasksAlias: string = 'tasks'): string {
+  const r = `COALESCE(${tasksAlias}.result,'')`
+  return `NOT (${r} LIKE 'failed:%' OR ${r} LIKE 'cancelled:%' OR ${r} LIKE 'unclaimed:%')`
+}

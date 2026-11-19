@@ -896,8 +896,9 @@ const STUDIO_SCRIPT = `
       });
       var data = await res.json().catch(function () { return {}; });
       if (!res.ok || !data.ok) {
-        statusEl.textContent = 'Dispatch failed' + (data.error ? ': ' + data.error : ' (' + res.status + ')');
-        appendLog('[studio] error ' + (data.error || res.status));
+        var refusal = data.next_step || data.error;
+        statusEl.textContent = 'Dispatch failed' + (refusal ? ': ' + refusal : ' (' + res.status + ')');
+        appendLog('[studio] error ' + (refusal || res.status));
         return;
       }
       lastFlightId = data.flight_id;
@@ -1056,7 +1057,7 @@ export function isSafeRepoUrl(value: string): boolean {
 const STUDIO_SQUAD_FORBIDDEN_NEXT_STEP =
   'Dispatch needs member rank on the target squad. Ask an org admin or the squad lead for a member grant on that squad, or omit squad_id to use one of your own squads.'
 const STUDIO_NO_SQUAD_NEXT_STEP =
-  'You hold member rank on no squad with an agent to take this. Ask an org admin for a member grant on a squad.'
+  'You hold member rank on no squad. Ask an org admin for a member grant on a squad.'
 
 // Resolves where a Studio dispatch lands, and refuses ('forbidden') unless the caller holds at least member rank on
 // that TARGET squad (the same resolveAccessibleSquadIds predicate the peers/fleet surfaces use). There is no pot-wide
@@ -1089,7 +1090,9 @@ async function resolveStudioHome(
       const squad = await env.DB.prepare(`SELECT id FROM squads WHERE kind != 'home' AND status = 'active' ORDER BY name LIMIT 1`).first<{ id: string }>()
       return squad ? { agentId: 'studio', squadId: squad.id } : null
     }
-    if (accessible.length === 0) return 'forbidden'
+    // No member-rank squad: a real "nowhere to land" (no_squad), not squad_forbidden's
+    // "omit squad_id" hint — omitting cannot help when the caller has no squad of their own.
+    if (accessible.length === 0) return null
     squadId = [...accessible].sort()[0] ?? ''
   }
   if (!squadId || !mayWrite(squadId)) return 'forbidden'

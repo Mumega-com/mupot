@@ -67,7 +67,7 @@ import type { EpisodeInput, Episode } from './episodic'
 import { computeKpiSignal } from './kpi-sources'
 import type { KpiSignalResult } from './kpi-sources'
 import { GATE_LOOPS } from '../gates/lanes'
-import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { TASK_NOT_ARCHIVED_SQL, TASK_RESULT_NOT_FAILURE_SQL } from '../hygiene/filters'
 
 // The gate stamped on tasks an agent's own loop creates under
 // execute_with_approval.
@@ -591,7 +591,8 @@ export async function updateKpiProgress(
   // FUTURE: replace with domain-specific signal (e.g. GitHub PRs, revenue events).
   const doneRow = await env.DB.prepare(
     `SELECT COUNT(*) AS cnt FROM tasks
-       WHERE assignee_agent_id = ? AND status = 'done' LIMIT 1`,
+       WHERE assignee_agent_id = ? AND status = 'done'
+         AND ${TASK_RESULT_NOT_FAILURE_SQL()} LIMIT 1`,
   )
     .bind(agentId)
     .first<{ cnt: number }>()

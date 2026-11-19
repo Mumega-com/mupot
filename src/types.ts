@@ -988,8 +988,8 @@ export type BusEventType =
                       // duplicate send produces no event. See MessageCreatedPayload.
   | 'member.auto_enrolled'
   // mupot#1618 PR 2: one MCP Events webhook delivery attempt (queue job produced ONLY by the
-  // message.created consumer leg and by its own retries). Internal-only: createBus().emit, the sos
-  // addon's /publish and /bridge and the /bus/emit allowlist all refuse it
+  // message.created consumer leg and by its own retries). Internal-only: createBus().emit and the sos
+  // addon's /publish and /bridge all refuse it
   // (src/bus/internal-events.ts), and the consumer rebuilds every fact of the delivery from D1.
   | 'mcp.event.delivery'
   // Signed webhook doorbell attempt (src/bus/doorbell-delivery.ts). Internal-only, same rule as
@@ -1054,20 +1054,19 @@ export interface BusEvent<T = unknown> {
 // ── Wake Contract ────────────────────────────────────────────────────────────
 //
 // Returned by mint_agent_token alongside mcp_endpoint. Describes exactly HOW
-// to fire an agent.wake event at this agent via the mupot bus HTTP surface —
-// the method, URL, required headers, and the body shape to POST.
+// to fire an agent.wake event at this agent via the in-process bus
+// (createBus().emit) — required headers and the body shape. There is no public
+// HTTP emit URL (mupot#2414 / #2395 / #2402).
 //
 // This is the self-serve equivalent of manual tmux send-keys: any caller that
 // holds the operator token + this contract can wake the agent without hand-wiring
 // or shell access. The bus consumer already routes agent.wake → AgentDO.wake();
 // this type makes the wire format explicit and machine-readable.
 //
-// Cross-project note: today the /bus/emit endpoint is tenant-scoped —
-// only tokens minted inside the same pot can emit. Cross-project wake uses
+// Cross-project note: emit is tenant-scoped via the pot's createBus().emit —
+// only code running inside the same pot can emit. Cross-project wake uses
 // project-link / multiplex on the mupot CF-native bus (not the retired SOS Redis bus).
 export interface WakeContract {
-  // POST this URL to fire the wake event.
-  emit_url: string
   // Required header: 'Authorization: Bearer <OPERATOR_TOKEN>'
   auth_header: 'Authorization'
   // The body shape to POST (JSON). agent_id and tenant are pre-filled; reason
@@ -1091,10 +1090,24 @@ export interface MemoryPort {
    *  recall's recent/lexical legs cover the gap). Without it the vector write is awaited as before. */
   remember(agentId: string, text: string, concepts?: string[], opts?: { waitUntil?: (p: Promise<unknown>) => void }): Promise<string>
   recall(agentId: string, query: string, limit?: number): Promise<MemoryHit[]>
+  /** Optional detailed read; array-only ports and callers remain compatible. */
+  recallDetailed?(agentId: string, query: string, limit?: number): Promise<MemoryRecallResult>
   /** Newest engrams in ONE scope (read-your-writes; does not depend on the vector index). */
   recent?(agentId: string, limit?: number): Promise<MemoryEngram[]>
   /** One engram by id, ONLY if it lives in `agentId`'s scope; null for missing and foreign alike. */
   get?(agentId: string, id: string): Promise<MemoryEngram | null>
+}
+
+export interface MemoryRetrieval {
+  semantic: 'available' | 'unavailable'
+  coverage: 'semantic-only' | 'semantic-and-bounded-text' | 'bounded-text-only'
+  reason?: 'embedding_failed' | 'vector_query_failed' | 'timeout'
+}
+
+export interface MemoryRecallResult {
+  hits: MemoryHit[]
+  degraded: boolean
+  retrieval: MemoryRetrieval
 }
 
 export type MemoryHitSource = 'vector' | 'recent' | 'lexical'

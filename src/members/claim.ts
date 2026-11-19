@@ -1,3 +1,4 @@
+import { authorityLiveSql } from '../auth/attached-authority'
 // mupot — claim link: the pending admission a chat filed (seat_attach), seen from the human's side as ONE link and ONE click.
 //
 // This module adds NO authority. A "claim" is the existing pending agent_seat_admissions row; claiming it is the existing
@@ -25,8 +26,11 @@ import {
   decideAdmissionDirect,
   ensureAdmission,
   loadAdmission,
+  parseAttachAuthorityDays,
+  parseAttachAuthorityLevel,
   seatAttachEnabled,
   type AdmissionRow,
+  type AttachAuthorityLevel,
   type AttachIdentity,
   type AdmissionScope,
 } from './seat-attach'
@@ -40,6 +44,10 @@ export interface ClaimView extends AttachIdentity {
   agentSlug: string
   harnessName: string
   seatLabel: string | null
+  /** Verified machine/host display: harness + seat label. Self-reported runtime.machine is never used for authority. */
+  machineLabel: string
+  /** Narrowest project-like context available today (agent squad). No verified project binding on the admission yet. */
+  projectLabel: string
   /** The human whose sign-in the chat used (always the viewing member: lookups are scoped to them). */
   signedInAs: string
   requestedAt: string
@@ -75,6 +83,10 @@ async function viewOf(env: Env, adm: AdmissionRow): Promise<ClaimView> {
   const v = await admissionView(env, adm)
   const m = await env.DB.prepare('SELECT display_name, email FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
     .bind(adm.human_member_id, env.TENANT_SLUG).first<{ display_name: string | null; email: string | null }>()
+  const squad = await env.DB.prepare(
+    `SELECT sq.name AS name FROM agents a JOIN squads sq ON sq.id = a.squad_id WHERE a.id = ?1 LIMIT 1`,
+  ).bind(adm.agent_id).first<{ name: string }>()
+  const machineLabel = [v.harnessName, v.seatLabel].filter((x): x is string => !!x && x.length > 0).join(' · ') || 'this chat'
   return {
     admissionId: adm.id,
     agentId: adm.agent_id,
@@ -83,6 +95,8 @@ async function viewOf(env: Env, adm: AdmissionRow): Promise<ClaimView> {
     agentSlug: v.agentSlug,
     harnessName: v.harnessName,
     seatLabel: v.seatLabel,
+    machineLabel,
+    projectLabel: squad?.name || 'not bound',
     signedInAs: [m?.display_name, m?.email].filter((x): x is string => !!x).join(' · ') || adm.human_member_id,
     requestedAt: adm.created_at,
     expiresAt: adm.expires_at,
@@ -96,10 +110,10 @@ export async function lookupClaim(env: Env, memberId: string, rawCode: unknown, 
   const code = normalizeClaimCode(rawCode)
   if (!code) return { state: 'not_found' }
   const ids = (await env.DB.prepare(
-    `SELECT id FROM agent_seat_admissions
+    `SELECT id, CASE WHEN ${authorityLiveSql('agent_seat_admissions','?4')} THEN 1 ELSE 0 END AS authority_live FROM agent_seat_admissions
       WHERE tenant = ?1 AND human_member_id = ?2 AND attach_code IS NOT NULL AND replace(attach_code, '-', '') = ?3
       ORDER BY created_at DESC, id DESC LIMIT 6`,
-  ).bind(env.TENANT_SLUG, memberId, code).all<{ id: string }>()).results ?? []
+  ).bind(env.TENANT_SLUG, memberId, code, new Date(nowMs).toISOString()).all<{ id: string; authority_live: number }>()).results ?? []
   const rows: AdmissionRow[] = []
   for (const r of ids) {
     const a = await loadAdmission(env, r.id)
@@ -113,7 +127,7 @@ export async function lookupClaim(env: Env, memberId: string, rawCode: unknown, 
   const state: ClaimState = admissionIsPendingLive(adm, nowMs)
     ? 'pending'
     : adm.status === 'live'
-      ? 'already_claimed'
+      ? ids.find(r => r.id === adm.id)?.authority_live === 1 ? 'already_claimed' : 'expired'
       : adm.status === 'expired' || (adm.status === 'pending' && !admissionIsPendingLive(adm, nowMs))
         ? 'expired'
         : 'closed'
@@ -130,13 +144,22 @@ async function seatIsAttachedVia(env: Env, admissionId: string): Promise<boolean
 
 export type ConfirmClaimResult =
   /** attached=false: the admission went live but the asking chat could not be attached (seat gone, or already acting as another agent). */
-  | { ok: true; agentId: string; attached: boolean }
-  | { ok: false; error: 'seat_attach_disabled' | 'claim_not_found' | 'claim_not_pending' | 'claim_changed' | 'attach_refused' | 'attach_code_mismatch' }
+  | { ok: true; agentId: string; attached: boolean; authorityLevel: AttachAuthorityLevel; authorityExpiresAt: string }
+  | { ok: false; error: 'seat_attach_disabled' | 'claim_not_found' | 'claim_not_pending' | 'claim_changed' | 'attach_refused' | 'attach_code_mismatch' | 'invalid_authority_days' }
 
 /** Claim by link: the code, and the admission + agent the page showed, must still all name one live pending ask of this member. */
 export async function confirmClaimByCode(
   env: Env,
-  p: { memberId: string; code: unknown; shownAdmissionId: unknown; shownAgentId: unknown },
+  p: {
+    memberId: string
+    code: unknown
+    shownAdmissionId: unknown
+    shownAgentId: unknown
+    /** Form field: helper|full. Missing/unknown → helper. Full is never inferred. */
+    authorityLevel?: unknown
+    /** Form field: absolute days 1..7. Default 7. */
+    authorityDays?: unknown
+  },
   nowMs: number = Date.now(),
 ): Promise<ConfirmClaimResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -144,15 +167,34 @@ export async function confirmClaimByCode(
   if (found.state === 'not_found' || found.state === 'ambiguous') return { ok: false, error: 'claim_not_found' }
   if (found.state !== 'pending') return { ok: false, error: 'claim_not_pending' }
   if (found.adm.id !== p.shownAdmissionId || found.adm.agent_id !== p.shownAgentId) return { ok: false, error: 'claim_changed' }
+  const authorityLevel = parseAttachAuthorityLevel(p.authorityLevel)
+  const daysParsed = parseAttachAuthorityDays(p.authorityDays)
+  if (!daysParsed.ok) return { ok: false, error: 'invalid_authority_days' }
   const r = await decideAdmissionDirect(env, {
-    admissionId: found.adm.id, humanMemberId: p.memberId, decision: 'approve', ceiling: 'member', attachCode: normalizeClaimCode(p.code),
+    admissionId: found.adm.id,
+    humanMemberId: p.memberId,
+    decision: 'approve',
+    ceiling: 'member',
+    attachCode: normalizeClaimCode(p.code),
+    authorityLevel,
+    authorityDays: daysParsed.days,
   }, nowMs)
   if (!r.ok) {
     if (r.error === 'not_pending') return { ok: false, error: 'claim_not_pending' }
     if (r.error === 'admission_not_found') return { ok: false, error: 'claim_not_found' }
     return { ok: false, error: r.error }
   }
-  return { ok: true, agentId: found.adm.agent_id, attached: await seatIsAttachedVia(env, found.adm.id) }
+  // Read-back already happened inside decideAdmissionDirect; prefer that, then re-load if needed.
+  const storedLevel = r.authorityLevel ?? (await loadAdmission(env, found.adm.id))?.authority_level ?? 'helper'
+  const storedExpiry = r.authorityExpiresAt ?? (await loadAdmission(env, found.adm.id))?.authority_expires_at
+  if (!storedExpiry) return { ok: false, error: 'attach_refused' }
+  return {
+    ok: true,
+    agentId: found.adm.agent_id,
+    attached: await seatIsAttachedVia(env, found.adm.id),
+    authorityLevel: storedLevel,
+    authorityExpiresAt: storedExpiry,
+  }
 }
 
 export interface AgentClaims {
@@ -200,7 +242,14 @@ async function reissueSeat(env: Env, adm: AdmissionRow): Promise<{ seatId: strin
  */
 export async function confirmClaimOnAgentPage(
   env: Env,
-  p: { memberId: string; agentId: string; shownAdmissionId: unknown; attachCode: unknown },
+  p: {
+    memberId: string
+    agentId: string
+    shownAdmissionId: unknown
+    attachCode: unknown
+    authorityLevel?: unknown
+    authorityDays?: unknown
+  },
   nowMs: number = Date.now(),
 ): Promise<ConfirmClaimResult> {
   if (!seatAttachEnabled(env)) return { ok: false, error: 'seat_attach_disabled' }
@@ -209,15 +258,33 @@ export async function confirmClaimOnAgentPage(
   if (!hit) return { ok: false, error: mine.pending.length > 0 ? 'claim_changed' : 'claim_not_found' }
   const adm = await loadAdmission(env, hit.admissionId)
   if (!adm || adm.human_member_id !== p.memberId || adm.agent_id !== p.agentId) return { ok: false, error: 'claim_changed' }
+  const authorityLevel = parseAttachAuthorityLevel(p.authorityLevel)
+  const daysParsed = parseAttachAuthorityDays(p.authorityDays)
+  if (!daysParsed.ok) return { ok: false, error: 'invalid_authority_days' }
   const r = await decideAdmissionDirect(env, {
-    admissionId: adm.id, humanMemberId: p.memberId, decision: 'approve', ceiling: 'member', attachCode: p.attachCode,
+    admissionId: adm.id,
+    humanMemberId: p.memberId,
+    decision: 'approve',
+    ceiling: 'member',
+    attachCode: p.attachCode,
+    authorityLevel,
+    authorityDays: daysParsed.days,
   }, nowMs)
   if (!r.ok) {
     if (r.error === 'not_pending') return { ok: false, error: 'claim_not_pending' }
     if (r.error === 'admission_not_found') return { ok: false, error: 'claim_not_found' }
     return { ok: false, error: r.error }
   }
-  return { ok: true, agentId: p.agentId, attached: await seatIsAttachedVia(env, adm.id) }
+  const storedLevel = r.authorityLevel ?? (await loadAdmission(env, adm.id))?.authority_level ?? 'helper'
+  const storedExpiry = r.authorityExpiresAt ?? (await loadAdmission(env, adm.id))?.authority_expires_at
+  if (!storedExpiry) return { ok: false, error: 'attach_refused' }
+  return {
+    ok: true,
+    agentId: p.agentId,
+    attached: await seatIsAttachedVia(env, adm.id),
+    authorityLevel: storedLevel,
+    authorityExpiresAt: storedExpiry,
+  }
 }
 
 /** Explicitly reissue the passkey decision link for a harness-wide request. This rotates only after the signed-in human asks. */

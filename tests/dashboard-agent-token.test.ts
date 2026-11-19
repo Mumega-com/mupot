@@ -975,7 +975,7 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
       const body = (await retry.json()) as {
         result: { structuredContent: {
           token: { label: string; capability: string }
-          wake_contract?: { emit_url?: string }
+          wake_contract?: { auth_header?: string; body_shape?: { type: string } }
           note?: string
         } }
       }
@@ -983,7 +983,9 @@ describe('mintAgentBoundToken — canonical SQLite identity', () => {
 
       expect(retry.status).toBe(200)
       expect(content.token).toMatchObject({ label: 'persisted-label', capability: 'observer' })
-      expect(content.wake_contract?.emit_url).toBe('https://mupot.mumega.com/bus/emit')
+      expect(content.wake_contract).not.toHaveProperty('emit_url')
+      expect(content.wake_contract?.auth_header).toBe('Authorization')
+      expect(content.wake_contract?.body_shape?.type).toBe('agent.wake')
       expect(content.note).toContain('reveal_credential_claim')
       expect(JSON.stringify(content)).not.toMatch(/mupot_[0-9a-f]{64}|token_hash|"raw"\s*:/)
     } finally {

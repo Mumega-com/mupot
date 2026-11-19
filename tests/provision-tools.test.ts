@@ -473,7 +473,6 @@ describe('mint_agent_token', () => {
           agent: { id: string }
           mcp_endpoint: string
           wake_contract: {
-            emit_url: string
             auth_header: string
             body_shape: { type: string; agent_id: string; tenant: string; squad_id: string }
             note: string
@@ -502,14 +501,15 @@ describe('mint_agent_token', () => {
     expect(sc.agent.id).toBe('agent-1')
     expect(sc.mcp_endpoint).toBe('https://agents.digid.ca/mcp')
 
-    // THE WAKE CONTRACT (#115): machine-readable wake spec returned alongside mcp_endpoint.
-    expect(sc.wake_contract.emit_url).toBe('https://agents.digid.ca/bus/emit')
+    // THE WAKE CONTRACT (#115 / #2414): body shape + auth header; no emit_url.
+    expect(sc.wake_contract).not.toHaveProperty('emit_url')
     expect(sc.wake_contract.auth_header).toBe('Authorization')
     expect(sc.wake_contract.body_shape.type).toBe('agent.wake')
     expect(sc.wake_contract.body_shape.agent_id).toBe('agent-1')
     expect(sc.wake_contract.body_shape.squad_id).toBe('squad-1')
     expect(sc.wake_contract.body_shape.tenant).toBe('digid')
     expect(typeof sc.wake_contract.note).toBe('string')
+    expect(sc.wake_contract.note).toContain('#2414')
 
     // THE WELD: member_tokens insert carries the agent id in agent_id.
     const tokenInsert = cap.find((c) => c.sql.includes('INSERT INTO member_tokens'))
@@ -598,11 +598,13 @@ describe('mint_agent_token', () => {
     )
     expect(res.status).toBe(200)
     const body = (await res.json()) as {
-      result: { structuredContent: { mcp_endpoint: string; wake_contract: { emit_url: string } } }
+      result: { structuredContent: { mcp_endpoint: string; wake_contract: { auth_header: string } } }
     }
     expect(body.result.structuredContent.mcp_endpoint).toBe('https://pot.example/mcp')
-    expect(body.result.structuredContent.wake_contract.emit_url).toBe('https://pot.example/bus/emit')
+    expect(body.result.structuredContent.wake_contract).not.toHaveProperty('emit_url')
+    expect(body.result.structuredContent.wake_contract.auth_header).toBe('Authorization')
     expect(JSON.stringify(body)).not.toContain('evil.example')
+    expect(JSON.stringify(body)).not.toContain('/bus/emit')
   })
 
   it('403s a squad-lead — minting a credential needs admin', async () => {

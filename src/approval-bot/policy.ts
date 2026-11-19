@@ -7,23 +7,17 @@
 import type { Env } from '../types'
 import { ELEVATION_ACTIONS } from '../auth/elevation-actions'
 import type { ElevationRequestRecord } from '../auth/elevation'
+import { REVERSIBLE_ACTIONS } from '../notify/carry'
 import { exactCallLine } from '../auth/owner-sudo-args'
 import { untrustedLine } from '../auth/untrusted-line'
 import { SETTINGS_KEYS, getSetting, isValidBotUsername } from '../dashboard/settings'
 
-/** Reversible, enforced, narrow, and not credential- or structure-minting. The broad action:manage_access is NOT here: it stays passkey / Mini App only. Adding a key here is a reviewed one-line change. */
-export const APPROVAL_BOT_ACTIONS: readonly string[] = [
-  'action:project_lifecycle',
-  'action:org_structure',
-  'action:workspace_project',
-  'action:routine_policy',
-  'action:project_status',
-  // owner sudo: ONE call of ONE owner-only tool, run as the approver (src/auth/owner-sudo.ts)
-  'action:sudo_squad_member_add',
-  'action:sudo_squad_dyad_pin',
-  'action:sudo_grant_gate_capability',
-  'action:sudo_seat_event_grant',
-]
+/**
+ * Reversible, enforced, narrow, and not credential- or structure-minting. The broad action:manage_access is NOT here:
+ * it stays passkey / Mini App only. The list lives in ONE place, REVERSIBLE_ACTIONS in src/notify/carry.ts; adding a
+ * key there is a reviewed one-line change.
+ */
+export const APPROVAL_BOT_ACTIONS: readonly string[] = REVERSIBLE_ACTIONS
 
 export function parseRequestedActions(req: Pick<ElevationRequestRecord, 'requested_actions_json'>): string[] {
   try {

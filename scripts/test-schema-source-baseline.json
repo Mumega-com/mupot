@@ -28,7 +28,6 @@
   "mockDb": [
     "tests/agency-module.test.ts",
     "tests/agent-keys.test.ts",
-    "tests/agent-messages.test.ts",
     "tests/agent-token-lifecycle.test.ts",
     "tests/auth-bootstrap-owner.test.ts",
     "tests/auth-member-bridge.test.ts",
@@ -98,7 +97,6 @@
     "tests/growth-department.test.ts",
     "tests/handoff-dedup.test.ts",
     "tests/im-hermes.test.ts",
-    "tests/inbox-routes.test.ts",
     "tests/loop-cro.test.ts",
     "tests/loop-service.test.ts",
     "tests/marketing-monitor-adapters.test.ts",
@@ -133,7 +131,6 @@
     "tests/sensorium-render.test.ts",
     "tests/sensorium.test.ts",
     "tests/seo-meta-fix-proposer.test.ts",
-    "tests/squad-seed.test.ts",
     "tests/surface-caps.test.ts",
     "tests/task-ranking.test.ts",
     "tests/tasks-completion-gate.test.ts",

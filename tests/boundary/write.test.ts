@@ -103,7 +103,8 @@ describe('tasks and projects over MCP', () => {
     await expectBoundary(b, 'task_verdict', { task_id: 't-b', verdict: 'approved', note: 'x', expected_submission_id: sub }, {
       owner: await b.agent('ag-b2', 'mem-b-agent2'), intruder: await b.attacker(), code: 'forbidden', status: 403,
     })
-    expect(count(`SELECT COUNT(*) n FROM task_verdicts WHERE task_id = 't-b'`)).toBe(1)
+    // Fixture seeds ver-b-snap on t-b (#2411); this probe adds one more.
+    expect(count(`SELECT COUNT(*) n FROM task_verdicts WHERE task_id = 't-b'`)).toBe(2)
   })
 
   it('writing memory into B\'s squad or project is refused; B\'s lead writes the same memory', async () => {
@@ -166,10 +167,12 @@ describe('Supabase connectors (fixed by #2381)', () => {
       const own = await b.agent('ag-b', 'mem-b-agent')
       for (const [tool, mk] of TOOLS_UNDER_TEST) {
         calls.length = 0
+        const before = snapshotB(b)
         const intruder = await b.call(a, tool, mk(scopeId))
         expect(intruder.ok, `${tool}: ${JSON.stringify(intruder)}`).toBe(false)
         expect(intruder.error, `${tool}: ${JSON.stringify(intruder)}`).toBe('supabase_connector_not_found')
         expect(calls, `${tool} with connector_id=${scopeId}: no outbound request`).toEqual([])
+        expect(snapshotB(b), `${tool} with connector_id=${scopeId}: refused call changed B's rows`).toBe(before)
         const control = await b.call(own, tool, mk(b.connectorIdB))
         expect(control.ok, `${tool} control: ${JSON.stringify(control)}`).toBe(true)
         expect(calls.length).toBeGreaterThan(0)
@@ -230,9 +233,12 @@ describe('Studio dispatch', () => {
   })
 
   it('control: an agent-bound token stays in its own squad', async () => {
+    const before = snapshotB(b)
     const r = await studioApp.request('/dispatch', { method: 'POST', headers: bearer(RAW.agentA), body: JSON.stringify({ prompt: 'A-AGENT-WROTE-THIS' }) }, b.env)
-    expect(r.status).toBeLessThan(500)
+    expect(r.status, await r.clone().text()).toBe(200)
+    expect(count(`SELECT COUNT(*) n FROM tasks WHERE squad_id = 'sq-a' AND title LIKE '%A-AGENT-WROTE-THIS%'`)).toBe(1)
     expect(count(`SELECT COUNT(*) n FROM tasks WHERE squad_id = 'sq-b' AND title LIKE '%A-AGENT-WROTE-THIS%'`)).toBe(0)
+    expect(snapshotB(b), 'A\'s agent dispatch changed B\'s rows').toBe(before)
     expect(leaksB(await r.clone().text())).toBe(false)
   })
 })

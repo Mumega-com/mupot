@@ -11,11 +11,13 @@
 //   5. Agent↔agent messages round-trip + request/ack correlation (Slice D proof
 //      that the existing service works for our agents).
 
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect } from 'vitest'
 import { seedSquadMembers, deterministicMemberId, buildSquadDefs } from '../src/members/squad-seed'
 import { resolveCapabilities, hasCapability, type SquadScope } from '../src/auth/capability'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // G-FP1b point 1: hasCapability's 'squad' overload requires a real SquadScope,
 // not a bare id. Every check below is an EXACT squad-scope match (the seeded
@@ -34,8 +36,13 @@ const TEST_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage pri
 
 // Canonical test squad id (all seed calls require a squadId — no org fallback).
 const SQUAD_ID = 'sq-test-0001-0001-0001-000000000001'
+const fixtures: SqliteD1Harness[] = []
 
-// ── faithful in-memory D1 ─────────────────────────────────────────────────────
+afterEach(() => {
+  while (fixtures.length > 0) fixtures.pop()!.close()
+})
+
+// ── migrated SQLite fixture ───────────────────────────────────────────────────
 
 interface MemberRow {
   id: string
@@ -54,239 +61,65 @@ interface CapabilityRow {
   created_at: string
 }
 
-interface AgentMsgRow {
-  seq: number
-  id: string
-  tenant: string
-  to_agent: string
-  from_agent: string
-  from_member: string
-  kind: string
-  body: string
-  request_id: string | null
-  in_reply_to: string | null
-  created_at: string
-  read_at: string | null
+interface SquadSeedFixture {
+  harness: SqliteD1Harness
+  env: Env
+  memberCount(): number
+  capabilityCount(): number
+  members(): MemberRow[]
+  capabilities(): CapabilityRow[]
 }
 
-/** Build a minimal faithful in-memory D1 that supports:
- *  - INSERT OR IGNORE INTO members / capabilities
- *  - SELECT from capabilities (for resolveCapabilities)
- *  - INSERT INTO / UPDATE / SELECT agent_messages (for round-trip test)
- */
-function makeDb(squadKinds: Map<string, string> = new Map()) {
-  const members: MemberRow[] = []
-  const capabilities: CapabilityRow[] = []
-  const messages: AgentMsgRow[] = []
-  let msgSeq = 0
-
-  function prepare(sql: string) {
-    const binds: unknown[] = []
-    const api = {
-      bind(...args: unknown[]) {
-        binds.push(...args)
-        return api
-      },
-      async run(): Promise<{ meta: { changes: number; last_row_id?: number } }> {
-        const s = sql.trim()
-
-        // INSERT OR IGNORE INTO members
-        if (/INSERT OR IGNORE INTO members/i.test(s)) {
-          const [id, email, display_name, status, created_at] = binds as [string, string, string, string, string]
-          const dupId = members.some((m) => m.id === id)
-          const dupEmail = members.some((m) => m.email === email)
-          if (dupId || dupEmail) return { meta: { changes: 0 } }
-          members.push({ id, email, display_name, status, created_at })
-          return { meta: { changes: 1 } }
-        }
-
-        // INSERT OR IGNORE INTO capabilities
-        if (/INSERT (?:OR IGNORE )?INTO capabilities/i.test(s)) {
-          const [id, member_id, scope_type, scope_id, capability, created_at] = binds as [
-            string, string, string, string | null, string, string,
-          ]
-          // UNIQUE(member_id, scope_type, scope_id)
-          const dup = capabilities.some(
-            (c) => c.member_id === member_id && c.scope_type === scope_type && c.scope_id === scope_id,
-          )
-          if (dup) return { meta: { changes: 0 } }
-          capabilities.push({ id, member_id, scope_type, scope_id, capability, created_at })
-          return { meta: { changes: 1 } }
-        }
-
-        // INSERT INTO agent_messages (for round-trip test)
-        if (/INSERT INTO agent_messages/i.test(s)) {
-          const [id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, maxUnread] =
-            binds as [string, string, string, string, string, string, string, string | null, string | null, string, number]
-          const unread = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
-          if (typeof maxUnread === 'number' && unread >= maxUnread) return { meta: { changes: 0 } }
-          if (
-            request_id != null &&
-            messages.some((m) => m.tenant === tenant && m.from_agent === from_agent && m.request_id === request_id)
-          ) {
-            throw new Error('UNIQUE constraint failed: idx_agent_messages_rid')
-          }
-          const seq = ++msgSeq
-          messages.push({ seq, id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, read_at: null })
-          return { meta: { changes: 1, last_row_id: seq } }
-        }
-
-        // UPDATE agent_messages SET read_at (consume)
-        if (/UPDATE agent_messages SET read_at/i.test(s)) {
-          const [readAt, tenant, to_agent, limit] = binds as [string, string, string, number]
-          const claimed = messages
-            .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
-            .sort((a, b) => a.seq - b.seq)
-            .slice(0, limit)
-          for (const m of claimed) m.read_at = readAt
-          return { meta: { changes: claimed.length } }
-        }
-
-        throw new Error(`squad-seed makeDb: unhandled run sql:\n${s}`)
-      },
-      async first<T>(): Promise<T | null> {
-        const s = sql.trim()
-
-        if (/FROM agent_inbox_fences/i.test(s)) return null
-
-        // resolveCapabilities: SELECT from capabilities UNION channel_capability_grants
-        if (/SELECT member_id, scope_type, scope_id, capability/.test(s) && /FROM capabilities/.test(s)) {
-          const [memberId] = binds as [string]
-          // return all capabilities for this member (the UNION is a single block — split on UNION ALL)
-          const rows = capabilities.filter((c) => c.member_id === memberId)
-          // .first() is used by capability.ts — but resolveCapabilities uses .all()
-          // This branch handles the subquery in requireCapability middleware (not used in tests).
-          return (rows[0] as unknown as T) ?? null
-        }
-
-        // COUNT(*) AS n FROM agent_messages (remaining)
-        if (/COUNT\(\*\) AS n FROM agent_messages/i.test(s)) {
-          const [tenant, to_agent] = binds as [string, string]
-          const n = messages.filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null).length
-          return { n } as unknown as T
-        }
-
-        // sender request_id dedup lookup
-        if (/from_agent = \?2 AND request_id = \?3/.test(s)) {
-          const [tenant, from_agent, request_id] = binds as [string, string, string]
-          const m = messages.find((x) => x.tenant === tenant && x.from_agent === from_agent && x.request_id === request_id)
-          if (!m) return null
-          return { id: m.id, seq: m.seq, to_agent: m.to_agent, kind: m.kind, body: m.body, in_reply_to: m.in_reply_to } as unknown as T
-        }
-
-        // BLOCK-1 fix: SELECT id FROM members WHERE email = ?1 LIMIT 1
-        // Used when INSERT OR IGNORE was a no-op (member already exists with different UUID).
-        if (/SELECT id FROM members WHERE email = \?1/i.test(s)) {
-          const [email] = binds as [string]
-          const m = members.find((x) => x.email === email)
-          if (!m) return null
-          return { id: m.id } as unknown as T
-        }
-
-        // Round-2 (Athena §2e-9): seedSquadMembers' home-squad guard —
-        // SELECT kind FROM squads WHERE id = ?1. Every squad id this file
-        // uses resolves as 'work' unless the test explicitly registered it
-        // as 'home' via the squadKinds map passed into makeDb().
-        if (/SELECT kind FROM squads WHERE id = \?1/i.test(s)) {
-          const [squadId] = binds as [string]
-          return { kind: squadKinds.get(squadId) ?? 'work' } as unknown as T
-        }
-
-        throw new Error(`squad-seed makeDb: unhandled first sql:\n${s}`)
-      },
-      async all<T>(): Promise<{ results: T[] }> {
-        const s = sql.trim()
-
-        // resolveCapabilities: SELECT member_id, scope_type, scope_id, capability FROM capabilities UNION ...
-        if (/SELECT member_id, scope_type, scope_id, capability/.test(s)) {
-          const [memberId] = binds as [string]
-          // Both branches of the UNION target member_id = ?1
-          const rows = capabilities
-            .filter((c) => c.member_id === memberId)
-            .map((c) => ({
-              member_id: c.member_id,
-              scope_type: c.scope_type,
-              scope_id: c.scope_id,
-              capability: c.capability,
-            }))
-          return { results: rows as unknown as T[] }
-        }
-
-        // UPDATE ... RETURNING (consume path — MUST come before peek/SELECT check because
-        // the consume SQL embeds a subquery with FROM agent_messages + read_at IS NULL +
-        // ORDER BY seq ASC, which would otherwise match the peek check below).
-        if (/^UPDATE agent_messages SET read_at/i.test(s) && /RETURNING/i.test(s)) {
-          const [readAt, tenant, to_agent, limit] = binds as [string, string, string, number]
-          const claimed = messages
-            .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null)
-            .sort((a, b) => a.seq - b.seq)
-            .slice(0, limit)
-          for (const m of claimed) m.read_at = readAt
-          // Reverse to prove the service re-sorts by seq (RETURNING order is unspecified).
-          return { results: claimed.slice().reverse() as unknown as T[] }
-        }
-
-        // SELECT ... FROM agent_messages WHERE ... ORDER BY seq ASC LIMIT (peek — checked AFTER consume).
-        if (/^SELECT/i.test(s) && /FROM agent_messages/.test(s) && /read_at IS NULL/.test(s) && /ORDER BY seq ASC/.test(s)) {
-          const [tenant, to_agent, sinceSeq, limit] = binds as [string, string, number, number]
-          const rows = messages
-            .filter((m) => m.tenant === tenant && m.to_agent === to_agent && m.read_at === null && m.seq > (sinceSeq ?? 0))
-            .sort((a, b) => a.seq - b.seq)
-            .slice(0, limit)
-          return { results: rows as unknown as T[] }
-        }
-
-        // agents table queries (for sendToRef resolver — not used in seed tests but needed by messages service)
-        if (/FROM agents WHERE id = \?1 LIMIT 1/i.test(s)) {
-          return { results: [] }
-        }
-        if (/FROM agents WHERE slug = \?1/i.test(s)) {
-          return { results: [] }
-        }
-
-        throw new Error(`squad-seed makeDb: unhandled all sql:\n${s}`)
-      },
-    }
-    return api
-  }
+/** Production-schema fixture with query-backed views for the assertions below. */
+function makeFixture(squadId = SQUAD_ID, squadKind: 'work' | 'home' = 'work'): SquadSeedFixture {
+  const harness = createSqliteD1()
+  fixtures.push(harness)
+  applyAllMigrations(harness.sqlite)
+  harness.sqlite.prepare(
+    `INSERT INTO departments (id, slug, name, kind) VALUES (?, ?, ?, 'work')`,
+  ).run('dept-squad-seed', 'squad-seed', 'Squad seed test')
+  harness.sqlite.prepare(
+    `INSERT INTO squads (id, department_id, slug, name, kind) VALUES (?, 'dept-squad-seed', ?, ?, ?)`,
+  ).run(squadId, `squad-${squadId}`, 'Squad seed test', squadKind)
 
   return {
-    _members: members,
-    _capabilities: capabilities,
-    _messages: messages,
-    prepare,
+    harness,
+    env: { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env,
+    memberCount: () => Number(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM members').get()?.n ?? 0),
+    capabilityCount: () => Number(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM capabilities').get()?.n ?? 0),
+    members: () => harness.sqlite.prepare(
+      'SELECT id, email, display_name, status, created_at FROM members ORDER BY id',
+    ).all() as unknown as MemberRow[],
+    capabilities: () => harness.sqlite.prepare(
+      'SELECT id, member_id, scope_type, scope_id, capability, created_at FROM capabilities ORDER BY id',
+    ).all() as unknown as CapabilityRow[],
   }
-}
-
-function makeEnv(db: ReturnType<typeof makeDb>, tenant = 'mumega'): Env {
-  return { DB: db, TENANT_SLUG: tenant } as unknown as Env
 }
 
 // ── Slice A: seed + capability verification ───────────────────────────────────
 
 describe('seedSquadMembers — Slice A', () => {
   it('creates all 6 member rows on first seed', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
     const result = await seedSquadMembers(env, SQUAD_ID)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.seeded.length).toBe(6)
-    expect(db._members.length).toBe(6)
+    expect(fixture.memberCount()).toBe(6)
     const slugs = result.seeded.map((s) => s.slug).sort()
     expect(slugs).toEqual(['codex', 'hadi', 'kasra', 'loom', 'mumega-brain', 'river'])
   })
 
   it('all 6 members get exactly 1 capability grant each', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
     await seedSquadMembers(env, SQUAD_ID)
-    expect(db._capabilities.length).toBe(6)
+    expect(fixture.capabilityCount()).toBe(6)
   })
 
   it('resolveCapabilities → hadi has owner at org scope', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     await seedSquadMembers(env, SQUAD_ID)
     const hadiId = await deterministicMemberId('hadi')
     const grants = await resolveCapabilities(env, hadiId)
@@ -299,8 +132,7 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('resolveCapabilities → kasra has admin @ squad (bounded — NOT org-admin)', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     await seedSquadMembers(env, SQUAD_ID)
     const kasraId = await deterministicMemberId('kasra')
     const grants = await resolveCapabilities(env, kasraId)
@@ -314,8 +146,7 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('resolveCapabilities → loom/river have lead @ squad, NOT admin', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     await seedSquadMembers(env, SQUAD_ID)
     for (const slug of ['loom', 'river']) {
       const id = await deterministicMemberId(slug)
@@ -328,8 +159,7 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('resolveCapabilities → codex/mumega-brain have member @ squad, NOT lead', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     await seedSquadMembers(env, SQUAD_ID)
     for (const slug of ['codex', 'mumega-brain']) {
       const id = await deterministicMemberId(slug)
@@ -341,8 +171,7 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('resolveCapabilities → squad-scope grants do NOT bubble to org (with squadId)', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     const squadId = 'sq-test-0001-0001-0001-000000000001'
     await seedSquadMembers(env, squadId)
     // kasra=admin@squad, codex=member@squad — each satisfies its squad check,
@@ -358,8 +187,8 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('idempotency: re-seeding returns ok with 0 inserts (no duplicates)', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
     const r1 = await seedSquadMembers(env, SQUAD_ID)
     const r2 = await seedSquadMembers(env, SQUAD_ID)
     expect(r1.ok).toBe(true)
@@ -371,8 +200,8 @@ describe('seedSquadMembers — Slice A', () => {
       expect(s.grantInserted).toBe(false)
     }
     // DB still has exactly 6 members + 6 grants (no duplicates)
-    expect(db._members.length).toBe(6)
-    expect(db._capabilities.length).toBe(6)
+    expect(fixture.memberCount()).toBe(6)
+    expect(fixture.capabilityCount()).toBe(6)
   })
 
   it('deterministicMemberId is stable across calls', async () => {
@@ -416,16 +245,16 @@ describe('seedSquadMembers — Slice A', () => {
   })
 
   it('seedSquadMembers fails closed without a squadId (no org-scope fallback)', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
     // Empty squadId exercises the runtime fail-closed guard.
     const result = await seedSquadMembers(env, '')
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.reason).toBe('squad_required')
     // Nothing written.
-    expect(db._members.length).toBe(0)
-    expect(db._capabilities.length).toBe(0)
+    expect(fixture.memberCount()).toBe(0)
+    expect(fixture.capabilityCount()).toBe(0)
   })
 
   // Athena's §2e-9 sharpening (Round 2 on #1472): squad-seed.ts is dev/
@@ -437,27 +266,25 @@ describe('seedSquadMembers — Slice A', () => {
   // never grant squad-scope capability into a home squad, reachable or not.
   it('refuses a home-kind squad: home_scope_not_grantable, zero rows written', async () => {
     const homeSquadId = 'sq-home-0001-0001-0001-000000000001'
-    const db = makeDb(new Map([[homeSquadId, 'home']]))
-    const env = makeEnv(db)
+    const fixture = makeFixture(homeSquadId, 'home')
+    const { env } = fixture
     const result = await seedSquadMembers(env, homeSquadId)
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.reason).toBe('home_scope_not_grantable')
-    expect(db._members.length).toBe(0)
-    expect(db._capabilities.length).toBe(0)
+    expect(fixture.memberCount()).toBe(0)
+    expect(fixture.capabilityCount()).toBe(0)
   })
 })
 
 // ── Slice D: agent↔agent inbox round-trip (proves Slice D works for our agents) ─
 
 /**
- * Faithful agent_messages DB for the round-trip test.
- * Reuses the same makeDb above (which includes agent_messages handling).
+ * Real agent_messages schema for the round-trip test.
  */
 describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
   it('kasra sends to loom → loom reads inbox → message delivered', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
 
     const kasraId = await deterministicMemberId('kasra')
     const loomId = await deterministicMemberId('loom')
@@ -483,8 +310,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
   })
 
   it('request/ack correlation: kasra sends [request_id:...] → loom ACKs with in_reply_to', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
 
     const kasraId = await deterministicMemberId('kasra')
     const loomId = await deterministicMemberId('loom')
@@ -528,8 +354,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
   })
 
   it('consume-once: inbox consumed on read; second read returns empty', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     const kasraId = await deterministicMemberId('kasra')
 
     await sendAgentMessage(env, {
@@ -550,8 +375,7 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
   })
 
   it('inbox isolation: each agent only sees its own messages', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const { env } = makeFixture()
     const kasraId = await deterministicMemberId('kasra')
 
     await sendAgentMessage(env, { fromAgent: 'ag-kasra', fromMember: kasraId, toAgent: 'ag-loom', body: 'for loom' }, TEST_AUTHZ)
@@ -578,19 +402,16 @@ describe('agent↔agent inbox round-trip (Slice D proof — S196)', () => {
 
 describe('BLOCK-1 regression — pre-existing member with different UUID', () => {
   it('seed with pre-existing hadi (different UUID) attaches capability to real id', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
 
     const REAL_HADI_ID = 'real-hadi-uuid-pre-existing-0001'
 
     // Pre-seed the DB: hadi already exists with a REAL id (not the synthetic one).
-    db._members.push({
-      id: REAL_HADI_ID,
-      email: 'hadi@mumega.com',
-      display_name: 'Hadi Servat (pre-existing)',
-      status: 'active',
-      created_at: '2026-01-01T00:00:00.000Z',
-    })
+    fixture.harness.sqlite.prepare(
+      `INSERT INTO members (id, email, display_name, status, created_at, tenant)
+       VALUES (?, 'hadi@mumega.com', 'Hadi Servat (pre-existing)', 'active', '2026-01-01T00:00:00.000Z', 'mumega')`,
+    ).run(REAL_HADI_ID)
 
     // Now run the squad seed.
     const result = await seedSquadMembers(env, SQUAD_ID)
@@ -610,34 +431,31 @@ describe('BLOCK-1 regression — pre-existing member with different UUID', () =>
     expect(hadiEntry.grantInserted).toBe(true)
 
     // Critical: no orphan capability row (all capability member_ids must exist in members).
-    for (const cap of db._capabilities) {
-      const memberExists = db._members.some((m) => m.id === cap.member_id)
+    for (const cap of fixture.capabilities()) {
+      const memberExists = fixture.members().some((m) => m.id === cap.member_id)
       expect(memberExists).toBe(true)
     }
 
     // The capability for hadi references REAL_HADI_ID, not any synthetic UUID.
-    const hadiCap = db._capabilities.find((c) => c.member_id === REAL_HADI_ID)
+    const hadiCap = fixture.capabilities().find((c) => c.member_id === REAL_HADI_ID)
     expect(hadiCap).toBeDefined()
     expect(hadiCap?.capability).toBe('owner')
     expect(hadiCap?.scope_type).toBe('org')
   })
 
   it('re-seed with pre-existing hadi is fully idempotent (0 inserts on second run)', async () => {
-    const db = makeDb()
-    const env = makeEnv(db)
+    const fixture = makeFixture()
+    const { env } = fixture
 
     const REAL_HADI_ID = 'real-hadi-uuid-pre-existing-0001'
-    db._members.push({
-      id: REAL_HADI_ID,
-      email: 'hadi@mumega.com',
-      display_name: 'Hadi Servat',
-      status: 'active',
-      created_at: '2026-01-01T00:00:00.000Z',
-    })
+    fixture.harness.sqlite.prepare(
+      `INSERT INTO members (id, email, display_name, status, created_at, tenant)
+       VALUES (?, 'hadi@mumega.com', 'Hadi Servat', 'active', '2026-01-01T00:00:00.000Z', 'mumega')`,
+    ).run(REAL_HADI_ID)
 
     // First seed: inserts 5 new members + 1 capability on real id + 5 synthetic caps.
     await seedSquadMembers(env, SQUAD_ID)
-    const capCountAfterFirst = db._capabilities.length
+    const capCountAfterFirst = fixture.capabilityCount()
 
     // Second seed: all INSERT OR IGNORE no-ops.
     const second = await seedSquadMembers(env, SQUAD_ID)
@@ -645,7 +463,7 @@ describe('BLOCK-1 regression — pre-existing member with different UUID', () =>
     if (!second.ok) return
 
     // No new rows on second run.
-    expect(db._capabilities.length).toBe(capCountAfterFirst)
+    expect(fixture.capabilityCount()).toBe(capCountAfterFirst)
     for (const entry of second.seeded) {
       expect(entry.inserted).toBe(false)
       expect(entry.grantInserted).toBe(false)

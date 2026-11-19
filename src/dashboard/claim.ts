@@ -50,14 +50,16 @@ const REFUSAL_TEXT: Record<Exclude<ConfirmClaimResult, { ok: true }>['error'], s
   claim_changed: 'This request changed since the page loaded. Nothing was claimed; open the link again.',
   attach_refused: 'The claim could not be completed (the agent, your standing, or the app changed). Nothing was claimed.',
   attach_code_mismatch: 'This claim link does not match. Nothing was claimed.',
+  invalid_authority_days: 'Choose how long this connection lasts (1 to 7 days). Nothing was claimed.',
 }
-const REFUSAL_STATUS: Record<keyof typeof REFUSAL_TEXT, 403 | 404 | 409> = {
+const REFUSAL_STATUS: Record<keyof typeof REFUSAL_TEXT, 400 | 403 | 404 | 409> = {
   seat_attach_disabled: 403,
   claim_not_found: 404,
   claim_not_pending: 409,
   claim_changed: 409,
   attach_refused: 409,
   attach_code_mismatch: 403,
+  invalid_authority_days: 400,
 }
 
 /** The one-redirect return path. Same-origin relative; the re-auth route validates it again (safeReturnPath). */
@@ -68,11 +70,30 @@ export function reauthRedirectUrl(returnPath: string): string {
 function identityTable(v: ClaimView): Html {
   return html`${attachIdentityCard(v)}<dl class="kv">
     <dt>Agent</dt><dd><strong>${v.agentName}</strong>${v.agentSlug ? html` <code>${v.agentSlug}</code>` : ''}</dd>
+    <dt>Machine / chat</dt><dd>${v.machineLabel}</dd>
+    <dt>Project context</dt><dd>${v.projectLabel}</dd>
     <dt>Connecting app</dt><dd>${v.harnessName || 'an app you connected'}${v.seatLabel ? html` · chat ${v.seatLabel}` : ''}</dd>
     <dt>Connected via</dt><dd>your sign-in (${v.signedInAs})</dd>
     <dt>Asked</dt><dd>${formatWhen(v.requestedAt)}</dd>
     <dt>Link valid until</dt><dd>${formatWhen(v.expiresAt)}</dd>
   </dl>`
+}
+
+/** Helper is checked by default. Full is NEVER preselected and never inferred from harness/model/label. */
+export function authorityChoiceFields(agentName: string): Html {
+  return html`<fieldset class="authority-choice" data-authority-choice>
+      <legend>How this chat may act as ${agentName}</legend>
+      <label><input type="radio" name="authority_level" value="helper" checked> Helper: can read and draft, asks before acting</label>
+      <label><input type="radio" name="authority_level" value="full"> Full ${agentName}: records your Full choice; current access stays the same as Helper</label>
+      <p class="ui-sub" data-full-warning>Full is a deliberate choice. Money, keys, deletes and publishing still ask you. In this release Full does not yet widen tools beyond Helper — it is recorded and expiry-bound only.</p>
+      <label>Lasts
+        <select name="authority_days" aria-label="How long this connection lasts">
+          <option value="1">1 day</option>
+          <option value="3">3 days</option>
+          <option value="7" selected>7 days</option>
+        </select>
+      </label>
+    </fieldset>`
 }
 
 /** What the agent page shows about this member's claims on this agent (also used by tests). */
@@ -91,13 +112,14 @@ export async function loadAgentClaimCard(
     return sectionPanel({
       title: 'Own this agent',
       body: html`${mine.pending.map((c) => html`<form method="post" action="/agents/${agent.id}/claim" class="inline-form" data-claim-own>
-        <p>A chat you connected is asking to act as <strong>${agent.name}</strong>. If that was you, one click claims it.</p>
+        <p>A chat you connected is asking to act as <strong>${agent.name}</strong>. If that was you, choose Helper or Full and connect.</p>
         ${identityTable(c)}
         <input type="hidden" name="admission_id" value="${c.admissionId}">
+        ${authorityChoiceFields(agent.name)}
         ${opts.fresh
-          ? html`<button type="submit" class="btn">${opts.resume === 'claim' ? 'Confirm: own this agent' : 'Own this agent'}</button>`
-          : html`<a class="btn" href="${reauthRedirectUrl(back)}">Sign in again to own this agent</a>
-            <p class="ui-sub">Owning an agent binds a credential, so it needs a recent sign-in. You will come straight back to this page and see one Confirm button.</p>`}
+          ? html`<button type="submit" class="btn" data-claim-connect>${opts.resume === 'claim' ? 'Confirm: connect this agent' : 'Connect'}</button>`
+          : html`<a class="btn" href="${reauthRedirectUrl(back)}">Sign in again to connect</a>
+            <p class="ui-sub">Connecting binds a credential, so it needs a recent sign-in. You will come straight back to this page and see one Connect button.</p>`}
       </form>`)}`,
     })
   }
@@ -114,7 +136,7 @@ export async function loadAgentClaimCard(
 export function makeClaimApp(shell: ShellFn) {
   const app = new Hono<AppEnv>()
 
-  const page = (c: import('hono').Context<AppEnv>, title: string, body: Html, status: 200 | 403 | 404 | 409 | 415 = 200) =>
+  const page = (c: import('hono').Context<AppEnv>, title: string, body: Html, status: 200 | 400 | 403 | 404 | 409 | 415 = 200) =>
     c.html(shell(c.env, title, body), status)
   const note = (text: string, back?: { href: string; label: string }) =>
     html`<div class="card"><p>${text}</p>${back ? html`<p><a href="${back.href}">${back.label}</a></p>` : ''}</div>`
@@ -145,17 +167,18 @@ export function makeClaimApp(shell: ShellFn) {
     }
     const fresh = (await checkWebSession(c.env, auth, { fresh: true })).ok
     return page(c, 'Claim', html`
-      ${pageHeader({ crumbs: 'Overview / Claim', title: `Claim ${v.agentName}` })}
+      ${pageHeader({ crumbs: 'Overview / Claim', title: `Connect ${v.agentName}` })}
       ${sectionPanel({
         body: html`<form method="post" action="${here}" class="inline-form" data-claim-confirm>
-          <p>This chat is asking to act as the agent below. Check that it is the one you expect.</p>
+          <p>Connect this chat as <strong>${v.agentName}</strong> · on ${v.machineLabel} · project ${v.projectLabel}</p>
           ${identityTable(v)}
           <input type="hidden" name="admission_id" value="${v.admissionId}">
           <input type="hidden" name="agent_id" value="${v.agentId}">
+          ${authorityChoiceFields(v.agentName)}
           ${fresh
-            ? html`<button type="submit" class="btn">Confirm</button>`
-            : html`<a class="btn" href="${reauthRedirectUrl(here)}">Sign in again to confirm</a>
-              <p class="ui-sub">A claim binds a credential, so it needs a recent sign-in. You will come straight back here and see one Confirm button.</p>`}
+            ? html`<button type="submit" class="btn" data-claim-connect>Connect</button>`
+            : html`<a class="btn" href="${reauthRedirectUrl(here)}">Sign in again to connect</a>
+              <p class="ui-sub">Connecting binds a credential, so it needs a recent sign-in. You will come straight back here and see one Connect button.</p>`}
         </form>`,
       })}`)
   })
@@ -174,7 +197,8 @@ export function makeClaimApp(shell: ShellFn) {
     return { ok: true as const, memberId: session.memberId }
   }
 
-  // POST /claim/:code — Confirm. Member = session member; code from the URL; the admission + agent the page showed from the form.
+  // POST /claim/:code — Connect. Member = session member; code from the URL; the admission + agent the page showed from the form.
+  // Helper/Full and expiry are deliberate form fields; GET / unfurl / forwarded link never reaches here.
   app.post('/claim/:code', async (c) => {
     const code = normalizeClaimCode(c.req.param('code'))
     if (!code) return page(c, 'Claim', note('This claim link is not valid.'), 404)
@@ -182,9 +206,22 @@ export function makeClaimApp(shell: ShellFn) {
     const s = await formSession(c, here)
     if (!s.ok) return s.res
     const form = await c.req.parseBody()
-    const r = await confirmClaimByCode(c.env, { memberId: s.memberId, code, shownAdmissionId: form.admission_id, shownAgentId: form.agent_id })
+    const r = await confirmClaimByCode(c.env, {
+      memberId: s.memberId,
+      code,
+      shownAdmissionId: form.admission_id,
+      shownAgentId: form.agent_id,
+      authorityLevel: form.authority_level,
+      authorityDays: form.authority_days,
+    })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: '/connections', label: 'Open Connections' }), REFUSAL_STATUS[r.error])
-    return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
+    // Read-back shown on the destination: the STORED level, not the form echo.
+    const q = new URLSearchParams({
+      claimed: r.attached ? '1' : 'partial',
+      authority: r.authorityLevel,
+      expires: r.authorityExpiresAt,
+    })
+    return c.redirect(`/agents/${encodeURIComponent(r.agentId)}?${q.toString()}`, 303)
   })
 
   // POST /agents/:id/claim — agent-page approval. The server finds this member's pending ask for THIS agent and checks the displayed code.
@@ -195,9 +232,21 @@ export function makeClaimApp(shell: ShellFn) {
     const s = await formSession(c, `/agents/${agentId}?resume=claim`)
     if (!s.ok) return s.res
     const form = await c.req.parseBody()
-    const r = await confirmClaimOnAgentPage(c.env, { memberId: s.memberId, agentId, shownAdmissionId: form.admission_id, attachCode: form.attach_code })
+    const r = await confirmClaimOnAgentPage(c.env, {
+      memberId: s.memberId,
+      agentId,
+      shownAdmissionId: form.admission_id,
+      attachCode: form.attach_code,
+      authorityLevel: form.authority_level,
+      authorityDays: form.authority_days,
+    })
     if (!r.ok) return page(c, 'Claim', note(REFUSAL_TEXT[r.error], { href: `/agents/${agentId}`, label: 'Back to the agent' }), REFUSAL_STATUS[r.error])
-    return c.redirect(`/agents/${encodeURIComponent(agentId)}?claimed=${r.attached ? '1' : 'partial'}`, 303)
+    const q = new URLSearchParams({
+      claimed: r.attached ? '1' : 'partial',
+      authority: r.authorityLevel,
+      expires: r.authorityExpiresAt,
+    })
+    return c.redirect(`/agents/${encodeURIComponent(agentId)}?${q.toString()}`, 303)
   })
 
   // POST /agents/:id/claim/passkey — an explicit fresh-human request may rotate a harness-wide approval link.

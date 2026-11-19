@@ -4841,9 +4841,51 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_agent_reported_runtime_agent" },
     ],
   },
+  {
+    file: "0274_attached_authority_decision.sql",
+    sha256: "14659977af7c2245109e87fbf63aee549ae899e221a92464730c7b0074fa4991",
+    statements: [
+      "ALTER TABLE agent_seat_admissions ADD COLUMN authority_level TEXT NOT NULL DEFAULT 'helper'\n  CHECK (authority_level IN ('helper', 'full'));",
+      "ALTER TABLE agent_seat_admissions ADD COLUMN authority_expires_at TEXT;",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_admissions_authority_immutable\nBEFORE UPDATE OF authority_level, authority_expires_at ON agent_seat_admissions\nFOR EACH ROW\nWHEN (NEW.authority_level IS NOT OLD.authority_level OR\n      (NEW.authority_expires_at IS NOT OLD.authority_expires_at\n       AND (NEW.authority_expires_at IS NOT NULL OR OLD.authority_expires_at IS NOT NULL)))\n  AND OLD.status <> 'pending'\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_admission_authority_immutable');\nEND;",
+      "CREATE TABLE IF NOT EXISTS agent_seat_authority_decisions (\n  id                      TEXT PRIMARY KEY,\n  tenant                  TEXT NOT NULL,\n  admission_id            TEXT NOT NULL REFERENCES agent_seat_admissions(id) ON DELETE RESTRICT,\n  attachment_id           TEXT,\n  seat_id                 TEXT,\n  agent_id                TEXT NOT NULL,\n  harness_id              TEXT NOT NULL,\n  project_id              TEXT,\n  machine_key             TEXT,\n  decided_by_member_id    TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  authority_level         TEXT NOT NULL CHECK (authority_level IN ('helper', 'full')),\n  authority_expires_at    TEXT NOT NULL,\n  decided_at              TEXT NOT NULL,\n  decided_via             TEXT NOT NULL CHECK (decided_via IN ('webauthn', 'dashboard')),\n  replaces_decision_id    TEXT REFERENCES agent_seat_authority_decisions(id) ON DELETE RESTRICT\n);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_seat_authority_decisions_admission\n  ON agent_seat_authority_decisions(tenant, admission_id, decided_at DESC);",
+      "CREATE INDEX IF NOT EXISTS idx_agent_seat_authority_decisions_member\n  ON agent_seat_authority_decisions(tenant, decided_by_member_id, decided_at DESC);",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_authority_decisions_no_update\nBEFORE UPDATE ON agent_seat_authority_decisions\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_authority_decisions is append-only: UPDATE is forbidden');\nEND;",
+      "CREATE TRIGGER IF NOT EXISTS agent_seat_authority_decisions_no_delete\nBEFORE DELETE ON agent_seat_authority_decisions\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_authority_decisions is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "agent_seat_admissions_authority_immutable" },
+      { type: "table", name: "agent_seat_authority_decisions" },
+      { type: "index", name: "idx_agent_seat_authority_decisions_admission" },
+      { type: "index", name: "idx_agent_seat_authority_decisions_member" },
+      { type: "trigger", name: "agent_seat_authority_decisions_no_update" },
+      { type: "trigger", name: "agent_seat_authority_decisions_no_delete" },
+    ],
+  },
+  {
+    file: "0275_notify_kernel.sql",
+    sha256: "af608e1aeafc6999590b25760d2cdfb70fa818caa599fc730ec206567cc54ae0",
+    statements: [
+      "CREATE TABLE IF NOT EXISTS notif_event (\n  id              TEXT NOT NULL PRIMARY KEY,\n  tenant          TEXT NOT NULL,\n  type            TEXT NOT NULL,\n  severity        TEXT NOT NULL CHECK (severity IN ('info','attention','decision','critical')),\n  subject_ref     TEXT NOT NULL,\n  recipients_json TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  action_class    TEXT CHECK (action_class IS NULL OR action_class IN ('reversible','high_risk')),\n  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_event_tenant_created ON notif_event (tenant, created_at);",
+      "CREATE TABLE IF NOT EXISTS notif_delivery (\n  id           TEXT NOT NULL PRIMARY KEY,\n  event_id     TEXT NOT NULL REFERENCES notif_event (id) ON DELETE CASCADE,\n  tenant       TEXT NOT NULL,\n  recipient    TEXT NOT NULL,\n  channel      TEXT NOT NULL,\n  status       TEXT NOT NULL CHECK (status IN ('sent','edited','acked','failed','capped')),\n  retry_after  TEXT,\n  external_ref TEXT,\n  error_code   TEXT,\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))\n);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_delivery_event ON notif_delivery (event_id);",
+      "CREATE INDEX IF NOT EXISTS idx_notif_delivery_rate ON notif_delivery (tenant, recipient, channel, created_at);",
+      "CREATE TABLE IF NOT EXISTS notif_dedupe (\n  tenant          TEXT NOT NULL,\n  recipient       TEXT NOT NULL,\n  dedupe_key      TEXT NOT NULL,\n  window_start_ms INTEGER NOT NULL,\n  PRIMARY KEY (tenant, recipient, dedupe_key)\n);",
+    ],
+    objects: [
+      { type: "table", name: "notif_event" },
+      { type: "index", name: "idx_notif_event_tenant_created" },
+      { type: "table", name: "notif_delivery" },
+      { type: "index", name: "idx_notif_delivery_event" },
+      { type: "index", name: "idx_notif_delivery_rate" },
+      { type: "table", name: "notif_dedupe" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "48974219b201b4edef2979417add119fc85ccfc4dc54f6cd93e44513aa3c1ce3"
+export const SCHEMA_CHAIN_DIGEST: string = "1d0d60d9fac0f2450073bcedbb5f9941c91187018537b15ca96dafd3cfef5785"
