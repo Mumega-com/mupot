@@ -30,6 +30,33 @@ async function tick(env: Env, label: string): Promise<void> {
 }
 
 describe('maintenance lifecycle exits',()=>{
+  it('still runs reclaim if dispatch expiry fails',async()=>{
+    const h=createSqliteD1();applyAllMigrations(h.sqlite)
+    const expiry=await import('../src/tasks/dispatch-expiry'),reclaim=await import('../src/tasks/dead-assignee-reclaim')
+    const fail=vi.spyOn(expiry,'expireAbandonedDispatches').mockRejectedValue(new Error('expiry unavailable'))
+    const kept=vi.spyOn(reclaim,'reclaimDeadAssignments').mockResolvedValue({scanned:0,reclaimed:0,lost:0,failed:0,notified:0})
+    try{await tick({DB:h.db,TENANT_SLUG:'retire-cron'} as Env,'dead-assignee-reclaim');expect(kept).toHaveBeenCalledOnce()}
+    finally{fail.mockRestore();kept.mockRestore();h.close()}
+  })
+  it('expires dispatches in the existing reclaim heartbeat without adding or halving slots',async()=>{
+    const h=createSqliteD1();applyAllMigrations(h.sqlite)
+    try{
+      const now=Date.now(),old=new Date(now-8*86400000).toISOString(),dead=new Date(now-2*86400000).toISOString()
+      h.sqlite.exec(`INSERT INTO departments(id,slug,name) VALUES('d','d','D');INSERT INTO squads(id,department_id,slug,name) VALUES('s','d','s','S');
+        INSERT INTO agents(id,squad_id,slug,name,status) VALUES('a','s','a','A','active');
+        INSERT INTO tasks(id,squad_id,title,status,done_when,assignee_agent_id) VALUES('t','s','T','blocked','reviewed','a');`)
+      h.sqlite.prepare(`INSERT INTO fleet_agents(agent_id,tenant,display,runtime,squads,lifecycle,status,reported_by,last_reported_at,updated_at,presence_mode,presence_ttl_sec,connection_kind)
+        VALUES('a','retire-cron','A','claude-code','[]','always_on','running','host',?,?,'resident',180,'fleet_attach')`).run(dead,dead)
+      h.sqlite.prepare(`INSERT INTO task_dispatch_receipts(id,tenant,task_id,squad_id,agent_id,actor_kind,actor_id,created_at) VALUES('old-dispatch','retire-cron','t','s','a','member','owner',?)`).run(old)
+      const source=readFileSync(new URL('../src/index.ts',import.meta.url),'utf8')
+      const array=source.slice(source.indexOf('const maintenance:'),source.indexOf('const heartbeat = maintenance'))
+      expect([...array.matchAll(/\['([^']+)',/g)]).toHaveLength(22)
+      await tick({DB:h.db,TENANT_SLUG:'retire-cron'} as Env,'dead-assignee-reclaim')
+      expect(h.sqlite.prepare("SELECT settled_stage FROM task_dispatch_receipts WHERE id='old-dispatch'").get()).toEqual({settled_stage:'failed'})
+      expect(h.sqlite.prepare("SELECT count(*) AS n FROM mutation_audit_entries WHERE operation='dispatch_expired_no_receiver'").get()).toEqual({n:1})
+    }finally{h.close()}
+  })
+
   it('expires elevation requests from its reachable maintenance slot without any list or decision request',async()=>{
     const h=createSqliteD1();applyAllMigrations(h.sqlite)
     const env={DB:h.db,TENANT_SLUG:'tenant'} as Env
