@@ -10,6 +10,7 @@
 
 import type { Env } from '../types'
 import { resolveSquadConnectorWithMeta } from '../connectors/service'
+import type { ConnectorType } from '../connectors/service'
 
 const TENANT_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/i
 
@@ -34,12 +35,24 @@ export function parseInkwellTenantSlug(meta: string | null): string | null {
   return TENANT_SLUG_RE.test(trimmed) ? trimmed : null
 }
 
-export async function resolveInkwellTargetForGate(env: Env, gateId: string): Promise<InkwellTarget | null> {
+/**
+ * The connector (secret + meta) of `type` in the squad of the task behind this gate. Strictly squad-scoped:
+ * no task row / no squad / no squad connector → null. Never a pot- or agent-scoped connector (operator's).
+ */
+export async function resolveSquadConnectorForGate(
+  env: Env,
+  gateId: string,
+  type: ConnectorType,
+): Promise<{ secret: string; meta: string | null } | null> {
   const task = await env.DB.prepare(`SELECT squad_id FROM tasks WHERE id = ?1`)
     .bind(gateId)
     .first<{ squad_id: string | null }>()
   if (!task || !task.squad_id) return null
-  const conn = await resolveSquadConnectorWithMeta(env, task.squad_id, 'inkwell')
+  return resolveSquadConnectorWithMeta(env, task.squad_id, type)
+}
+
+export async function resolveInkwellTargetForGate(env: Env, gateId: string): Promise<InkwellTarget | null> {
+  const conn = await resolveSquadConnectorForGate(env, gateId, 'inkwell')
   if (!conn) return null
   const tenantSlug = parseInkwellTenantSlug(conn.meta)
   if (!tenantSlug) return null

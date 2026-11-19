@@ -17,24 +17,21 @@ import { describe, it, expect, vi } from 'vitest'
 // controlled independently per test.
 vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
-  resolveConnector: vi.fn(),
-  resolveConnectorWithMeta: vi.fn(),
   resolveSquadConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta, resolveSquadConnectorWithMeta } from '../src/connectors/service'
+import { resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import { inkwellContentWrite } from '../src/departments/executors/inkwell'
 import { wpContentWrite } from '../src/departments/executors/mcpwp'
 import type { Env } from '../src/types'
 
-const mockResolve = vi.mocked(resolveConnector)
-const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
+const mockSquadConnector = vi.mocked(resolveSquadConnectorWithMeta)
 
 // Default: no mcpwp connector configured, unless a test overrides it. Declared here
 // (not per-test) so every pre-existing inkwell-focused test keeps its original,
 // single-adapter behavior without having to know mcpwp now exists.
-mockResolveWithMeta.mockResolvedValue(null)
+mockSquadConnector.mockResolvedValue(null)
 
 // ── A. SSRF guard ─────────────────────────────────────────────────────────────
 describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
@@ -133,11 +130,23 @@ function req(path: string): Request {
   })
 }
 
+// A task row behind the gate (gate id === task id): connectors resolve from the task's squad (B3c).
+function taskBackedDb(): Env['DB'] {
+  return {
+    prepare: vi.fn((sql: string) => ({
+      bind: (..._a: unknown[]) => ({
+        first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
+        all: async () => ({ results: [] }),
+        run: async () => ({ meta: { changes: 1 } }),
+      }),
+    })),
+  } as unknown as Env['DB']
+}
+
 const INKWELL = { INKWELL_API_URL: 'https://inkwell-api.mumega.com' }
 
 describe('POST /admin/departments/:dept/execute/:gateId', () => {
   it('non-admin → 403', async () => {
-    mockResolve.mockResolvedValue('tok')
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('member', INKWELL))
     expect(res.status).toBe(403)
   })
@@ -148,7 +157,7 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   })
 
   it('no INKWELL_API_URL and no mcpwp connector → 503 executor_not_configured', async () => {
-    mockResolveWithMeta.mockResolvedValue(null)
+    mockSquadConnector.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
@@ -160,8 +169,7 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   // route's header comment in src/dashboard/index.ts for why (content-bound dispatch
   // means the route can't know in advance which single adapter the record needs).
   it('inkwell connector missing AND no mcpwp connector → 503 executor_not_configured', async () => {
-    mockResolve.mockResolvedValue(null)
-    mockResolveWithMeta.mockResolvedValue(null)
+    mockSquadConnector.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner', INKWELL))
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
@@ -169,18 +177,9 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
 
   it('connector present but proposal not approved → 409 not_executable (gate holds)', async () => {
     // B3c: inkwell wires only for a task with a squad-scoped connector carrying meta.tenantSlug.
-    vi.mocked(resolveSquadConnectorWithMeta).mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
-    mockResolveWithMeta.mockResolvedValue(null)
+    mockSquadConnector.mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
     const env = envForRole('owner', INKWELL)
-    env.DB = {
-      prepare: vi.fn((sql: string) => ({
-        bind: (..._a: unknown[]) => ({
-          first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
-          all: async () => ({ results: [] }),
-          run: async () => ({ meta: { changes: 1 } }),
-        }),
-      })),
-    } as unknown as Env['DB']
+    env.DB = taskBackedDb()
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
@@ -191,11 +190,13 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   // ── #370: mcpwp resolution at the route level ──────────────────────────────
 
   it('mcpwp-only pot (no INKWELL_API_URL, valid mcpwp connector) reaches execute() — not blocked by 503', async () => {
-    mockResolveWithMeta.mockResolvedValue({
+    mockSquadConnector.mockResolvedValue({
       secret: 'app-pw-123',
       meta: JSON.stringify({ siteUrl: 'https://example.com', username: 'agent' }),
     })
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner'))
+    const env = envForRole('owner')
+    env.DB = taskBackedDb()
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     // Reaches the kernel's fail-closed not_approved check (409), NOT the route's
     // 503 executor_not_configured — proving the mcpwp connector alone satisfies the gate.
     expect(res.status).toBe(409)
@@ -204,8 +205,10 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   })
 
   it('mcpwp connector present but meta malformed, and no inkwell → 503 executor_not_configured', async () => {
-    mockResolveWithMeta.mockResolvedValue({ secret: 'app-pw-123', meta: 'not json' })
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
+    mockSquadConnector.mockResolvedValue({ secret: 'app-pw-123', meta: 'not json' })
+    const env = envForRole('owner')
+    env.DB = taskBackedDb()
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), env)
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
   })

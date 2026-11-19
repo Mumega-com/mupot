@@ -14,18 +14,13 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 
 vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
-  resolveConnector: vi.fn(),
-  resolveConnectorWithMeta: vi.fn(),
   resolveSquadConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta, resolveSquadConnectorWithMeta } from '../src/connectors/service'
+import { resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import type { Env } from '../src/types'
 
-const mockResolve = vi.mocked(resolveConnector)
-const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
-mockResolveWithMeta.mockResolvedValue(null)
 // B3c: Inkwell resolves via the task's squad-scoped connector (meta.tenantSlug), not the pot connector.
 vi.mocked(resolveSquadConnectorWithMeta).mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
 
@@ -115,7 +110,6 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
   })
 
   it('outcome.executed=true flips the matching task approved → done, stamping the artifact URL', async () => {
-    mockResolve.mockResolvedValue('tok')
     const { env, updates } = envWithApprovedProposal()
 
     const fakeFetch = vi.fn(async () =>
@@ -142,7 +136,6 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
   })
 
   it('outcome.executed=false (adapter/connector failure) never touches tasks', async () => {
-    mockResolve.mockResolvedValue('tok')
     const { env, updates } = envWithApprovedProposal()
     // Force the adapter to fail: fetch throws → inkwellContentWrite throws
     // InkwellExecutorError('inkwell_unreachable') → executed:false.
@@ -156,8 +149,6 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
   })
 
   it('not_approved (409) never touches tasks', async () => {
-    mockResolve.mockResolvedValue('tok')
-    mockResolveWithMeta.mockResolvedValue(null)
     // No approved verdict this time: first() for task_verdicts and
     // department_proposals both return null.
     // Inkwell wiring needs a task row; every other lookup (verdict/proposal) stays null → not_approved.
@@ -186,7 +177,6 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
   })
 
   it('the flip UPDATE is a harmless no-op when the gateId has no matching approved task row', async () => {
-    mockResolve.mockResolvedValue('tok')
     // taskRow status !== 'approved' models a gateId with no matching row (or an
     // already-closed one) — the UPDATE's WHERE guard matches zero rows.
     const { env, updates } = envWithApprovedProposal({ taskRow: { id: GATE_ID, status: 'done' } })
