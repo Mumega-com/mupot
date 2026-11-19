@@ -1,10 +1,10 @@
 # Roster — the one table
 
-Part of [[MU.100.002-spine]]. If any other document disagrees with this table, this table wins or gets fixed — no third option. Last verified live: **2026-08-11** (river row corrected by owner: ACTIVE). **Kasra row re-verified 2026-10-04**; the other rows were not re-checked then and may have drifted.
+Part of [[MU.100.002-spine]]. If any other document disagrees with this table, this table wins or gets fixed — no third option. Last verified live: **2026-08-11** (river row corrected by owner: ACTIVE). **Kasra row re-verified 2026-11-10** (previously 2026-10-04); the other rows were not re-checked then and may have drifted.
 
 | Seat | Harness | Model | Where | Role | Flights? |
 |---|---|---|---|---|---|
-| [[kasra]] | Claude Code under herdr (pane `wJ:p6`, receipt in the node) | Fable 5.1 as configured profile model, fallback Opus 5; the live seat model varies by chair (see node) | `/mnt/HC_Volume_104325311/mumega.com/agents/kasra` | Executor, merge authority, membrane | yes |
+| [[kasra]] | Claude Code under Orca (worktree in the node) | Fable 5.2 live body as of 2026-11-10; Fable 5.1 was the configured profile model (2026-10-04), fallback Opus 5; the live seat model varies by chair (see node) | `/mnt/HC_Volume_104325311/mumega.com/agents/kasra` | Steward, merge authority, membrane | yes |
 | [[athena]] | prime-agent (tmux `athena`) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/athena` | Architectural gate, coherence review | yes |
 | [[loom]] | Codex CLI (tmux `loom`) | gpt-5.4 | `/mnt/HC_Volume_104325311/mumega.com/agents/loom` | Weaver, protocol custodian, CFO thread | yes |
 | [[river]] | prime-agent (herdr w1) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/river` | Golden Queen, FRC keeper, qNFT witness | **yes** (ACTIVE 2026-08-11 per Hadi verbatim via Kasra; 2026-08-08 RESERVE line superseded — thin-seat discipline retained) |
