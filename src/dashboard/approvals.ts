@@ -29,6 +29,7 @@ import type { Env, Task, AuthContext, OrgKind } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache, primeVerdictIndependence } from '../tasks/index'
 import { hasDedicatedGatePredicate } from '../tasks/service'
+import { OFFICE_GATE_OWNER, hasOfficePublishCapability, loadOfficeDecisionContext } from '../addons/office/service'
 import { resolveGatePrincipal } from '../gates/principal'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { resolveVisibleTaskScope, visibleTaskClause } from '../tasks/visibility'
@@ -58,6 +59,10 @@ export interface ApprovalItem {
   priority?: 'P0' | 'P1' | 'P2' | 'P3' | null
   project_id?: string | null
   project_name?: string | null
+  /** gate:office rows only: the payload_sha256 of the FROZEN payload the human is shown (title/body above are
+   *  then the frozen bytes, not the live row). The web Approve control posts this back so the decision binds
+   *  to exactly what was displayed (mupot#1592 NEW-1). Null/absent: nothing frozen, approve is not offered. */
+  office_payload_sha256?: string | null
   // mupot#1081 — see module header. can_verdict = can_approve || can_reject;
   // kept as its own field because the card/queue UI decides whether to render
   // ANY action affordance at all (vs. the specific Approve/Reject buttons)
@@ -234,6 +239,12 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
       // outright) — mirror that here so the dashboard never renders a button
       // that always 409s. Structurally absent, not disabled, matching this
       // module's own can_verdict/can_approve/can_reject contract.
+      if (gateOwner === OFFICE_GATE_OWNER) {
+        // Web Approve/Reject for office tasks goes through POST /approvals/office/:id/decide, which calls the
+        // dedicated reviewOfficeApproval path — never the generic verdict route. The flags below only decide
+        // whether to OFFER the buttons; every guard is re-run server-side at write time.
+        return decorateOfficeRow(env, auth, row, gateCache)
+      }
       if (hasDedicatedGatePredicate(gateOwner)) {
         return { ...row, can_verdict: false, can_approve: false, can_reject: false }
       }
@@ -247,6 +258,33 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
       return { ...row, can_verdict: can_approve || can_reject, can_approve, can_reject }
     }),
   )
+}
+
+// gate:office row: show the FROZEN payload (the bytes the hash covers and the publish will send) and offer
+// Approve/Reject only to a human who could actually succeed. Mirrors, never replaces, reviewOfficeApproval's
+// own refusals (agent-bound, self-approval, office-department lead, gate verdict rules).
+async function decorateOfficeRow(
+  env: Env,
+  auth: AuthContext,
+  row: ApprovalRow,
+  gateCache: ReturnType<typeof createVerdictGateCache>,
+): Promise<ApprovalItem> {
+  const none = { ...row, can_verdict: false, can_approve: false, can_reject: false }
+  if (auth.boundAgentId) return none
+  const ctx = await loadOfficeDecisionContext(env, row.id)
+  if (!ctx) return none
+  const principalMemberId = auth.memberId ?? auth.userId
+  if (ctx.assignee_member_id && ctx.assignee_member_id === principalMemberId) return none
+  if (!(await hasOfficePublishCapability(env, auth))) return none
+  const task = { id: row.id, squad_id: row.squad_id, gate_owner: OFFICE_GATE_OWNER, assignee_agent_id: row.assignee_agent_id }
+  const [approveResult, rejectResult] = await Promise.all([
+    evaluateVerdictGates(env, auth, task, 'approved', gateCache),
+    evaluateVerdictGates(env, auth, task, 'rejected', gateCache),
+  ])
+  const shown = ctx.frozen ? { ...row, title: ctx.frozen.title, body: ctx.frozen.content } : row
+  const can_approve = approveResult.allowed && ctx.frozen !== null
+  const can_reject = rejectResult.allowed
+  return { ...shown, office_payload_sha256: ctx.frozen?.payload_sha256 ?? null, can_verdict: can_approve || can_reject, can_approve, can_reject }
 }
 
 // mupot#1319 round 2, Codex FINDING 3 + FINDING 4/2: the caller-facing result
