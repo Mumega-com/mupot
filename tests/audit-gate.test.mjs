@@ -624,17 +624,8 @@ test('withoutDevRoot drops root devDependencies so dev-only chains are not accep
   assert.ok(lock.packages[''].devDependencies, 'input lockfile is not mutated')
 })
 
-test('the real allowlists carry a valid, future expires_on and load in their modes', () => {
-  const root = loadAllowlist()
-  const po = loadAllowlist(new URL('../.github/audit-allowlist-project-office.json', import.meta.url).pathname, { prod: true })
-  for (const e of [...root, ...po]) {
-    assert.equal(e.ghsa, 'GHSA-fc5q-39xc-vjpf')
-    assert.equal(e.expires_on, '2027-01-18')
-    assert.ok(e.accepted_on)
-    assert.equal(e.isDirect, false)
-  }
-  assert.equal(root.length, 1)
-  assert.equal(po.length, 1)
+test('the real root allowlist is empty (picomatch entry deleted 2026-11-19) and loads', () => {
+  assert.equal(loadAllowlist().length, 0)
 })
 
 // ── #2455 follow-ups: expires_on rules, CLI wiring, metadata cross-check, bundle scan ──
