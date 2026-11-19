@@ -54,6 +54,7 @@ interface ConnectorScopeRow {
   scope_type: string
   scope_id: string | null
   revoked_at: string | null
+  type: string
 }
 
 /** The confused-deputy guard. Pure read; shared by bind time and use time. */
@@ -64,9 +65,17 @@ export async function assertProjectMayUseConnector(
   connectorId: string,
 ): Promise<OfficeResult<true>> {
   const connector = await env.DB.prepare(
-    `SELECT scope_type, scope_id, revoked_at FROM connectors WHERE id = ?1 AND tenant = ?2`,
+    `SELECT type, scope_type, scope_id, revoked_at FROM connectors WHERE id = ?1 AND tenant = ?2`,
   ).bind(connectorId, env.TENANT_SLUG).first<ConnectorScopeRow>()
   if (!connector || connector.revoked_at !== null) return { ok: false, reason: 'connector_not_bound' }
+
+  // #2472: the connector TYPE must be one the office manifest accepts for this slot (wordpress_site accepts
+  // only 'mcpwp'), the same check configureAddon makes (src/addons/bindings.ts adapter_not_allowed). Without it
+  // a live pot-scoped ghl/telegram connector could be bound as the publish destination. Runs at bind AND use.
+  const accepted = McpwpOfficeAddon.connectorRequirements.find((r) => r.slot === slot)?.accepts ?? []
+  if (!accepted.some((a) => a === connector.type)) {
+    return { ok: false, reason: 'connector_scope_refused', hint: 'connector type is not accepted for this slot' }
+  }
 
   if (connector.scope_type === 'squad') {
     if (!connector.scope_id) return { ok: false, reason: 'connector_scope_refused' }
@@ -85,6 +94,20 @@ export async function assertProjectMayUseConnector(
       WHERE connector_id = ?1 AND revoked_at IS NULL AND NOT (project_id = ?2 AND slot = ?3) LIMIT 1`,
   ).bind(connectorId, projectId, slot).first()
   if (shared) return { ok: false, reason: 'connector_scope_refused', hint: 'connector is bound to another project' }
+
+  // #2472: the legacy ADDON-level wordpress_site binding is also a user of the connector: a live NULL-project
+  // freeze (pre-0276, or a task without a project) still publishes through it. Refuse giving that connector
+  // to a project while such a freeze exists (unvoided and without an outcome).
+  const legacy = await env.DB.prepare(
+    `SELECT 1 FROM office_publish_freezes f
+       JOIN addon_connector_bindings b
+         ON b.connector_id = f.connector_id AND b.slot = ?2 AND b.revoked_at IS NULL AND b.tenant = ?3
+       JOIN addon_installations i
+         ON i.id = b.installation_id AND i.tenant = b.tenant AND i.addon_key = 'mcpwp-office' AND i.state = 'active'
+      WHERE f.connector_id = ?1 AND f.project_id IS NULL AND f.voided_at IS NULL AND f.outcome IS NULL
+      LIMIT 1`,
+  ).bind(connectorId, slot, env.TENANT_SLUG).first()
+  if (legacy) return { ok: false, reason: 'connector_scope_refused', hint: 'connector still serves a live project-less office approval' }
   return { ok: true, value: true }
 }
 
@@ -102,16 +125,25 @@ export async function bindProjectOfficeSlot(
   if (!project) return { ok: false, reason: 'project_not_bound', hint: 'project not found' }
   const guard = await assertProjectMayUseConnector(env, input.projectId, input.slot, input.connectorId)
   if (!guard.ok) return guard
-  await env.DB.prepare(`
-    INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by, bound_at, revoked_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-    ON CONFLICT(project_id, slot) DO UPDATE SET
-      connector_id = excluded.connector_id, capability = excluded.capability,
-      bound_by = excluded.bound_by, bound_at = excluded.bound_at, revoked_at = NULL
-  `).bind(
-    input.projectId, input.slot, input.connectorId, capability,
-    auth.memberId ?? auth.userId, new Date().toISOString(),
-  ).run()
+  try {
+    await env.DB.prepare(`
+      INSERT INTO project_office_bindings (project_id, slot, connector_id, capability, bound_by, bound_at, revoked_at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+      ON CONFLICT(project_id, slot) DO UPDATE SET
+        connector_id = excluded.connector_id, capability = excluded.capability,
+        bound_by = excluded.bound_by, bound_at = excluded.bound_at, revoked_at = NULL
+    `).bind(
+      input.projectId, input.slot, input.connectorId, capability,
+      auth.memberId ?? auth.userId, new Date().toISOString(),
+    ).run()
+  } catch (err) {
+    // #2472: migration 0277's unique partial index on (connector_id) WHERE revoked_at IS NULL is the atomic
+    // backstop for the shared-connector read above; the losing concurrent bind lands here.
+    if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
+      return { ok: false, reason: 'connector_scope_refused', hint: 'connector is bound to another project' }
+    }
+    throw err
+  }
   return { ok: true, value: { projectId: input.projectId, slot: input.slot, connectorId: input.connectorId, capability } }
 }
 

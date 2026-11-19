@@ -219,11 +219,16 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
 
 // B3a round 2: an operator binds / unbinds a customer project's WordPress destination without SQL.
 // Org owner/admin only AND a human principal: an agent-bound session (including an attached seat,
-// which always carries seatBinding) is refused, because the binding decides whose site a gated
+// which always carries seatBinding) and any harness session are refused, because the binding decides whose site a gated
 // publish reaches. Capability comes from the addon manifest (never the caller); slot is fixed to
 // wordpress_site. The connector confused-deputy guard lives in bindProjectOfficeSlot.
 function bindAuthorityRefusal(auth: AuthContext): ReturnType<typeof fail> | null {
-  if (auth.boundAgentId || auth.seatBinding) return fail(403, 'operator_principal_required')
+  // #2472: a HARNESS session (OAuth harness grant with no seat, or a harness-token session) is an agent's
+  // runtime wearing a human's grant, not the human. Same shape as canReleaseExecutionHold
+  // (src/agents/execution-release-policy.ts): refuse harnessId, harnessCredential, seatBinding and boundAgentId.
+  if (auth.harnessId || auth.harnessCredential || auth.seatBinding || auth.boundAgentId) {
+    return fail(403, 'operator_principal_required')
+  }
   if (!isOrgAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
   return null
 }

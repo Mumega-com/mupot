@@ -4898,9 +4898,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_project_office_bindings_connector" },
     ],
   },
+  {
+    file: "0277_project_office_bindings_unique_connector.sql",
+    sha256: "fa1d17a981228444db2f04b1de67bfaaafebc4c3a052d2009483342b78be5e4e",
+    statements: [
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_project_office_bindings_active_connector\n  ON project_office_bindings (connector_id) WHERE revoked_at IS NULL;",
+    ],
+    objects: [
+      { type: "index", name: "uq_project_office_bindings_active_connector" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "01017221d13021a3f9d3e3cb203c051922c8f9b7b7ccf03103a31392fec8bdce"
+export const SCHEMA_CHAIN_DIGEST: string = "e6e81f03e576d6155e06ff2458a7d242b11ea3d1fc067a1a533763d7bf30b941"
