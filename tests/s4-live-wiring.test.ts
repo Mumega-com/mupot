@@ -25,6 +25,8 @@ import { resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import { inkwellContentWrite } from '../src/departments/executors/inkwell'
 import { wpContentWrite } from '../src/departments/executors/mcpwp'
 import type { Env } from '../src/types'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const mockSquadConnector = vi.mocked(resolveSquadConnectorWithMeta)
 
@@ -166,20 +168,21 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
     // B3c: inkwell wires only for a task with a squad-scoped connector carrying meta.tenantSlug.
     mockSquadConnector.mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
     const env = envForRole('owner', INKWELL)
-    env.DB = {
-      prepare: vi.fn((sql: string) => ({
-        bind: (..._a: unknown[]) => ({
-          first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
-          all: async () => ({ results: [] }),
-          run: async () => ({ meta: { changes: 1 } }),
-        }),
-      })),
-    } as unknown as Env['DB']
+    // Real schema: a task row (no verdict/proposal) so the kernel fails closed at not_approved.
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)').run('dept-1', 'growth', 'Growth')
+    h.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name, charter) VALUES (?, ?, ?, ?, ?)').run('squad-a', 'dept-1', 'squad-a', 'squad-a', 'c')
+    h.sqlite
+      .prepare(`INSERT INTO tasks (id, squad_id, title, body, status, done_when) VALUES ('g-unapproved', 'squad-a', 't', 'b', 'approved', 'd')`)
+      .run()
+    env.DB = h.db
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
     expect(body.executed).toBe(false)
     expect(body.reason).toMatch(/not_approved/)
+    h.close()
   })
   // #370 mcpwp-only route-wiring cases: moved to tests/inkwell-customer-tenant.test.ts (real DB).
 })
