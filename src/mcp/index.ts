@@ -114,6 +114,7 @@ import {
   persistTaskUpdate,
   stampTaskUpdate,
   TaskProjectError,
+  assertOfficeTaskHasProject,
   TaskUpdateConflictError,
   TaskIntakeContractError,
   assertIntakeWithBar,
@@ -2311,6 +2312,7 @@ const toolTaskUpdate: ToolSpec = {
         projectId: existing.project_id,
         result: existing.result,
       })
+      assertOfficeTaskHasProject(existing, next) // #2471
     } catch (error) {
       if (error instanceof TaskProjectError) return taskProjectFailure(error)
       throw error

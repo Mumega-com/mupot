@@ -555,6 +555,13 @@ export async function reviewOfficeApproval(
     return { ok: false, reason: 'self_verdict' }
   }
 
+  // #2471: an office task with no project can never freeze (B3a) and hasProjectOfficeCapability is false for it, so an
+  // approval would only ever say not_authorized/payload_not_frozen. Name the real blocker, after the agent/self checks
+  // and before the capability check that cannot pass. A rejection commits to no write and keeps its prior behaviour.
+  if (verdict === 'approved' && (task.project_id === null || task.project_id === undefined)) {
+    return { ok: false, reason: 'project_required' }
+  }
+
   // B3b (spec office-per-customer §2): ONE predicate decides authority — the task's squad must hold write|admin on
   // the task's project AND the caller must hold the manifest's 'office.publish' capability (read live from the
   // registered manifest, never hardcoded) ON THAT SQUAD. This subsumes the old squad-membership guard (P2-2: never

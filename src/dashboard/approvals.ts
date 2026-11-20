@@ -67,6 +67,9 @@ export interface ApprovalItem {
   is_office?: boolean
   /** gate:office rows: the frozen site_origin (inside the hashed payload) - where Approve would publish. */
   office_site_origin?: string | null
+  /** gate:office rows only: why this row can never be approved ('project_required' = the task has no project, so
+   *  nothing can freeze or publish; #2471). The card says so instead of showing a bare "no action". */
+  office_blocker?: 'project_required'
   // mupot#1081 — see module header. can_verdict = can_approve || can_reject;
   // kept as its own field because the card/queue UI decides whether to render
   // ANY action affordance at all (vs. the specific Approve/Reject buttons)
@@ -298,7 +301,8 @@ async function decorateOfficeRow(
   gateCache: ReturnType<typeof createVerdictGateCache>,
   office: OfficeDecorationCtx,
 ): Promise<ApprovalItem> {
-  const none = { ...row, is_office: true, can_verdict: false, can_approve: false, can_reject: false }
+  const blocker = row.project_id ? {} : { office_blocker: 'project_required' as const }
+  const none = { ...row, is_office: true, ...blocker, can_verdict: false, can_approve: false, can_reject: false }
   if (auth.boundAgentId) return none
   const ctx = office.contexts.get(row.id)
   if (!ctx) return none
@@ -315,7 +319,7 @@ async function decorateOfficeRow(
   const frozenIsLive = ctx.frozen !== null && ctx.frozen.title === row.title && ctx.frozen.content === row.body
   const can_approve = approveResult.allowed && frozenIsLive
   const can_reject = rejectResult.allowed
-  return { ...shown, is_office: true, office_site_origin: ctx.frozen?.site_origin ?? null, office_payload_sha256: ctx.frozen?.payload_sha256 ?? null, can_verdict: can_approve || can_reject, can_approve, can_reject }
+  return { ...shown, is_office: true, ...blocker, office_site_origin: ctx.frozen?.site_origin ?? null, office_payload_sha256: ctx.frozen?.payload_sha256 ?? null, can_verdict: can_approve || can_reject, can_approve, can_reject }
 }
 
 // mupot#1319 round 2, Codex FINDING 3 + FINDING 4/2: the caller-facing result

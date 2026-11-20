@@ -351,7 +351,6 @@
     "processing_failed",
     "project_access_forbidden",
     "project_not_found",
-    "project_required",
     "project_squad_access_not_found",
     "prospects_must_be_array",
     "protected_agent",
