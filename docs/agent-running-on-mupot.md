@@ -26,7 +26,7 @@ memory, or capabilities.
 ## mupot = the control plane (not the CPU)
 
 A Cloudflare Worker does not run a long-lived Claude Code process. So "running on mupot"
-does **not** mean mupot executes the model. It means mupot is the **operating system**
+does **not** mean mupot runs a long-lived agent process. (AgentDO execute mode, `src/agents/execute.ts`, does make bounded model calls through `ModelPort`; Workers AI default `@cf/deepseek-ai/deepseek-v4.1-flash-1017`.) It means mupot is the **operating system**
 for agents — it owns, controls, and observes them, while the runtime does the compute:
 
 | OS concept | mupot equivalent | status |

@@ -242,6 +242,8 @@ export interface Env {
   SOS_TOKEN?: string // token for SOS event bus bridge
   TORIVERS_SECRET?: string // shared secret for ToRivers v2 deterministic automation sub-app
   AI_GATEWAY_TOKEN?: string
+  // Optional plain-text var: Workers AI chat model id override (must start with '@cf/'; else ignored)
+  WORKERS_AI_CHAT_MODEL?: string
   // Telegram bridge: Mupot bus consumer notifies Hadi of task events
   // via HMAC-signed POST to Hermes webhook deliver_only route.
   // Telegram ingress lives at POST /channels/telegram/webhook and authenticates with

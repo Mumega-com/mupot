@@ -101,3 +101,74 @@ describe('createModel Workers AI fallback — stream/response shape normalizatio
     }
   })
 })
+
+describe('Workers AI default model, OpenAI-shape parsing, env override', () => {
+  const capture = (resp: unknown) => {
+    const calls: Array<{ model: string; input: { max_tokens?: number } }> = []
+    const run = async (model: string, input: { max_tokens?: number }) => {
+      calls.push({ model, input })
+      return resp
+    }
+    return { run, calls }
+  }
+  const chatOnce = async (resp: unknown, extra: Partial<Env> = {}) => {
+    const { run, calls } = capture(resp)
+    const { harness, env } = makeEnv(run)
+    try {
+      const text = await createModel({ ...env, ...extra } as Env).chat(msgs)
+      return { text, calls }
+    } finally {
+      harness.close()
+    }
+  }
+
+  it('parses choices[0].message.content', async () => {
+    const r = await chatOnce({ choices: [{ message: { role: 'assistant', content: 'answer' } }], usage: { prompt_tokens: 3, completion_tokens: 4 } })
+    expect(r.text).toBe('answer')
+  })
+
+  it('excludes reasoning_content / reasoning from the returned text', async () => {
+    const r = await chatOnce({ choices: [{ message: { content: 'final', reasoning_content: 'SECRET-COT', reasoning: 'SECRET-COT2' } }] })
+    expect(r.text).toBe('final')
+    expect(r.text).not.toContain('SECRET-COT')
+  })
+
+  it('returns "" when only reasoning is present (no content)', async () => {
+    expect((await chatOnce({ choices: [{ message: { content: null, reasoning_content: 'thinking' } }] })).text).toBe('')
+  })
+
+  it('returns "" for empty / garbage responses', async () => {
+    expect((await chatOnce({ choices: [] })).text).toBe('')
+    expect((await chatOnce({ choices: [{ message: { content: 42 } }] })).text).toBe('')
+    expect((await chatOnce({ choices: 'x', response: 7 })).text).toBe('')
+    expect((await chatOnce(null)).text).toBe('')
+  })
+
+  it('legacy { response } still wins when no choices', async () => {
+    expect((await chatOnce({ response: 'legacy' })).text).toBe('legacy')
+  })
+
+  it('reports usage from the choices shape', async () => {
+    const { run } = capture({ choices: [{ message: { content: 'a' } }], usage: { prompt_tokens: 3, completion_tokens: 4 } })
+    const { harness, env } = makeEnv(run)
+    try {
+      const r = await createModel(env).chatWithUsage!(msgs)
+      expect(r.usage).toEqual({ input: 3, output: 4 })
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('defaults to DeepSeek V4.1 Flash with a 2048 token budget', async () => {
+    const r = await chatOnce({ response: 'x' })
+    expect(r.calls[0].model).toBe('@cf/deepseek-ai/deepseek-v4.1-flash-1017')
+    expect(r.calls[0].input.max_tokens).toBe(2048)
+  })
+
+  it('honours WORKERS_AI_CHAT_MODEL only when it starts with @cf/', async () => {
+    const ok = await chatOnce({ response: 'x' }, { WORKERS_AI_CHAT_MODEL: '@cf/meta/llama-3.3-70b-instruct-fp8-fast' })
+    expect(ok.calls[0].model).toBe('@cf/meta/llama-3.3-70b-instruct-fp8-fast')
+    const bad = await chatOnce({ response: 'x' }, { WORKERS_AI_CHAT_MODEL: 'gpt-4o' })
+    expect(bad.calls[0].model).toBe('@cf/deepseek-ai/deepseek-v4.1-flash-1017')
+  })
+})

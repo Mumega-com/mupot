@@ -36,9 +36,14 @@ function isGatewayProvider(v: string | null): v is GatewayProvider {
 
 // ── defaults ──
 // Workers AI chat model used for the fallback path and when the agent row carries
-// no usable model id. A small, always-available instruct model.
-const WORKERS_AI_CHAT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
-const DEFAULT_MAX_TOKENS = 1024
+// no usable model id. Overridable per deployment via the WORKERS_AI_CHAT_MODEL
+// env var (plain-text var; honoured only when it starts with '@cf/').
+export const WORKERS_AI_CHAT_MODEL = '@cf/deepseek-ai/deepseek-v4.1-flash-1017'
+// DeepSeek V4.1 Flash reasons by default (reasoning_effort default "high",
+// https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/)
+// and reasoning tokens count against the completion budget, so 1024 can be
+// spent before any answer text appears. 2048 is a modest bump, not a rewrite.
+const DEFAULT_MAX_TOKENS = 2048
 
 // Per-provider default model id when the org has not pinned one in org_settings
 // and the caller did not pass opts.model. Conservative, current-generation ids.
@@ -270,6 +275,11 @@ async function readGatewayResponse(res: Response, provider: GatewayProvider): Pr
  *   - `{ response: <array of {response:string}|string chunks> }` (some models
  *     assemble the stream into an array)
  *   - ReadableStream<{ response: string }> (default stream:true)
+ *   - OpenAI-compatible `{ choices: [{ message: { content } }] }` returned by
+ *     newer models (output schema: "choices[]" + "usage" on
+ *     https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/ ).
+ *     Only `message.content` is returned; any separate reasoning field
+ *     (`reasoning_content` / `reasoning`) is deliberately never read.
  * A drifted shape must NEVER leak a non-string into parseDecision/parseProposals
  * (raw2.indexOf crash) — and must not silently drop real output to ''.
  */
@@ -290,6 +300,12 @@ async function extractWorkersText(resp: unknown): Promise<string> {
       if (typeof t === 'string') out += t
     }
     return out
+  }
+
+  const choices = (resp as { choices?: unknown }).choices
+  if (Array.isArray(choices)) {
+    const content = (choices[0] as { message?: { content?: unknown } } | null | undefined)?.message?.content
+    if (typeof content === 'string') return content
   }
 
   const r = (resp as { response?: unknown }).response
@@ -376,7 +392,9 @@ export function createModel(env: Env): ModelPort {
       // a Workers AI model id (starts with '@cf/'); otherwise the module default —
       // a provider-style id (e.g. "claude-…") is meaningless to env.AI.run.
       const override = opts?.model && opts.model.startsWith('@cf/') ? opts.model : null
-      return callWorkersAI(env, override ?? WORKERS_AI_CHAT_MODEL, messages, maxTokens)
+      const envModel = env.WORKERS_AI_CHAT_MODEL
+      const envOverride = typeof envModel === 'string' && envModel.startsWith('@cf/') ? envModel : null
+      return callWorkersAI(env, override ?? envOverride ?? WORKERS_AI_CHAT_MODEL, messages, maxTokens)
     },
   }
 }
