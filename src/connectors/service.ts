@@ -535,6 +535,38 @@ export async function resolveConnectorWithMeta(
   }
 }
 
+/**
+ * Resolve ONE connector strictly in SQUAD scope (scope_type='squad', scope_id = squadId): secret + meta.
+ * Unlike resolveConnectorWithMeta there is NO agent/pot fallback — a pot-wide connector belongs to the
+ * operator, so a customer's squad must never silently receive it (B3c). Same null conditions otherwise.
+ */
+export async function resolveSquadConnectorWithMeta(
+  env: Env,
+  squadId: string,
+  type: ConnectorType,
+): Promise<{ secret: string; meta: string | null } | null> {
+  if (!isConnectorType(type) || !squadId) return null
+  const masterKey = env.CONNECTOR_MASTER_KEY
+  if (!masterKey) return null
+  const row = await env.DB.prepare(
+    `SELECT id, type, encrypted_secret, meta
+       FROM connectors
+      WHERE tenant = ?1 AND type = ?2 AND revoked_at IS NULL
+        AND scope_type = 'squad' AND scope_id = ?3
+      ORDER BY created_at DESC
+      LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, type, squadId)
+    .first<{ id: string; type: ConnectorType; encrypted_secret: string; meta: string | null }>()
+  if (!row) return null
+  try {
+    const secret = await decryptConnectorSecret(masterKey, row.id, row.type, row.encrypted_secret)
+    return { secret, meta: row.meta }
+  } catch {
+    return null
+  }
+}
+
 export interface ImmediateConnectorResult {
   readonly status: 'available' | 'unavailable' | 'failed'
   readonly observations: readonly unknown[]

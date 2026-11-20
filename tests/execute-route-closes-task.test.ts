@@ -10,24 +10,17 @@
 // approved → done; on any other outcome, or when no matching task row exists,
 // the route is unchanged / a harmless no-op.
 
-import { describe, it, expect, vi, afterEach } from 'vitest'
-
-vi.mock('../src/connectors/service', async (orig) => ({
-  ...(await orig<typeof import('../src/connectors/service')>()),
-  resolveConnector: vi.fn(),
-  resolveConnectorWithMeta: vi.fn(),
-}))
-
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta } from '../src/connectors/service'
+import { addConnector } from '../src/connectors/service'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
 
-const mockResolve = vi.mocked(resolveConnector)
-const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
-mockResolveWithMeta.mockResolvedValue(null)
-
-const INKWELL = { INKWELL_API_URL: 'https://inkwell-api.mumega.com' }
 const GATE_ID = 'task-content-1'
+
+let h: SqliteD1Harness
+let env: Env
 
 function req(path: string): Request {
   return new Request(`https://pot.test${path}`, {
@@ -36,91 +29,72 @@ function req(path: string): Request {
   })
 }
 
-// A DB stub that models an APPROVED content-publish proposal durably persisted
-// under gate_id === GATE_ID (the idGen trick), plus a `tasks` row for that same
-// id currently at status='approved'. Records every UPDATE tasks call so the
-// test can assert the exact close-the-loop write.
-function envWithApprovedProposal(opts: { taskRow?: Record<string, unknown> | null } = {}): {
-  env: Env
-  updates: { sql: string; args: unknown[] }[]
-} {
-  const updates: { sql: string; args: unknown[] }[] = []
-  const taskRow = opts.taskRow === undefined
-    ? { id: GATE_ID, status: 'approved' }
-    : opts.taskRow
+// Real schema: a task at `status` in a squad with a squad-scoped Inkwell connector (B3c), plus
+// optionally an APPROVED content-publish proposal + verdict under gate_id === the task id.
+function seed(opts: { status?: string; approved?: boolean } = {}): void {
+  const { status = 'approved', approved = true } = opts
+  h.sqlite
+    .prepare(`INSERT INTO tasks (id, squad_id, title, body, status, done_when) VALUES (?, 'squad-a', 't', 'b', ?, 'd')`)
+    .run(GATE_ID, status)
+  if (!approved) return
+  h.sqlite
+    .prepare(`INSERT INTO department_proposals (gate_id, tenant_id, department_key, action, payload_json) VALUES (?, 't', 'growth', 'content-publish', ?)`)
+    .run(GATE_ID, JSON.stringify({ executor: 'inkwell-content', title: 'mupot closes the loop', content: 'body', status: 'draft' }))
+  h.sqlite
+    .prepare(`INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at) VALUES ('v1', ?, 'approved', NULL, 'm1', '2026-07-16T12:00:00.000Z')`)
+    .run(GATE_ID)
+}
 
-  const stmt = {
-    bind: (..._a: unknown[]) => stmt,
-    first: vi.fn(async () => null),
-    all: vi.fn(async () => ({ results: [] })),
-    run: vi.fn(async () => ({ meta: { changes: 1 } })),
+const taskRow = () =>
+  h.sqlite.prepare('SELECT status, result, completed_at FROM tasks WHERE id = ?').get(GATE_ID) as {
+    status: string
+    result: string | null
+    completed_at: string | null
   }
 
-  const env = {
+beforeEach(async () => {
+  h = createSqliteD1()
+  applyAllMigrations(h.sqlite)
+  h.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)').run('dept-1', 'growth', 'Growth')
+  h.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name, charter) VALUES (?, ?, ?, ?, ?)').run('squad-a', 'dept-1', 'squad-a', 'squad-a', 'c')
+  env = {
     TENANT_SLUG: 't',
     BRAND: 'Test',
-    DB: {
-      prepare: vi.fn((sql: string) => ({
-        bind: (...args: unknown[]) => ({
-          async first<T>() {
-            if (sql.includes('FROM task_verdicts')) {
-              return { verdict: 'approved' } as unknown as T
-            }
-            if (sql.includes('FROM department_proposals')) {
-              return {
-                gate_id: GATE_ID,
-                tenant_id: 't',
-                department_key: 'growth',
-                action: 'content-publish',
-                payload_json: JSON.stringify({
-                  executor: 'inkwell-content',
-                  title: 'mupot closes the loop',
-                  content: 'body',
-                  status: 'draft',
-                }),
-              } as unknown as T
-            }
-            return null as unknown as T
-          },
-          async run() {
-            if (sql.trim().toUpperCase().startsWith('UPDATE TASKS')) {
-              updates.push({ sql, args })
-              return { meta: { changes: taskRow && taskRow.status === 'approved' ? 1 : 0 } }
-            }
-            return { meta: { changes: 1 } }
-          },
-          async all() {
-            return { results: [] }
-          },
-        }),
-      })),
-    },
+    INKWELL_API_URL: 'https://inkwell-api.mumega.com',
+    CONNECTOR_MASTER_KEY: 'a'.repeat(64),
+    DB: h.db,
     SESSIONS: {
       get: vi.fn(async () => JSON.stringify({ userId: 'u1', email: 'a@b.com', role: 'owner', createdAt: '2026-01-01T00:00:00Z' })),
     },
     OAUTH_KV: { get: vi.fn(), put: vi.fn() },
-    ...INKWELL,
   } as unknown as Env
-
-  return { env, updates }
-}
+  // B3c: Inkwell resolves via the task's squad-scoped connector (meta.tenantSlug), not the pot connector.
+  const r = await addConnector(env, {
+    type: 'inkwell',
+    label: 'inkwell-squad-a',
+    secret: 'tok',
+    meta: JSON.stringify({ tenantSlug: 'tenant-a' }),
+    scope_type: 'squad',
+    scope_id: 'squad-a',
+    created_by: 'm1',
+  })
+  if (!r.ok) throw new Error(`addConnector failed: ${r.error}`)
+})
 
 describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a real write', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
+    h.close()
   })
 
   it('outcome.executed=true flips the matching task approved → done, stamping the artifact URL', async () => {
-    mockResolve.mockResolvedValue('tok')
-    const { env, updates } = envWithApprovedProposal()
-
-    const fakeFetch = vi.fn(async () =>
+    seed()
+    vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ ok: true, slug: 's', url: '/blog/mupot-closes-the-loop' }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
       }),
-    )
-    vi.stubGlobal('fetch', fakeFetch)
+    ))
 
     const res = await dashboardApp.fetch(req(`/admin/departments/growth/execute/${GATE_ID}`), env)
     expect(res.status).toBe(200)
@@ -128,72 +102,51 @@ describe('POST /admin/departments/:dept/execute/:gateId — closes the loop on a
     expect(body.executed).toBe(true)
     expect(body.artifactUrl).toBe('/blog/mupot-closes-the-loop')
 
-    // Exactly one UPDATE tasks fired (the close-the-loop write); scoped to the
-    // gateId with an 'approved' guard, stamping status/result/completed_at.
-    expect(updates).toHaveLength(1)
-    expect(updates[0].sql).toContain("SET status = 'done'")
-    expect(updates[0].sql).toContain("WHERE id = ? AND status = 'approved'")
-    expect(updates[0].args).toContain(GATE_ID)
-    expect(updates[0].args.some((a) => typeof a === 'string' && a.includes('/blog/mupot-closes-the-loop'))).toBe(true)
+    // The close-the-loop write, observed on the real row: status/result/completed_at stamped.
+    const row = taskRow()
+    expect(row.status).toBe('done')
+    expect(row.result).toContain('/blog/mupot-closes-the-loop')
+    expect(row.completed_at).toBeTruthy()
   })
 
   it('outcome.executed=false (adapter/connector failure) never touches tasks', async () => {
-    mockResolve.mockResolvedValue('tok')
-    const { env, updates } = envWithApprovedProposal()
-    // Force the adapter to fail: fetch throws → inkwellContentWrite throws
-    // InkwellExecutorError('inkwell_unreachable') → executed:false.
+    seed()
+    // fetch throws → inkwellContentWrite throws InkwellExecutorError('inkwell_unreachable') → executed:false.
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }))
 
     const res = await dashboardApp.fetch(req(`/admin/departments/growth/execute/${GATE_ID}`), env)
     expect(res.status).toBe(422)
     const body = (await res.json()) as { executed: boolean }
     expect(body.executed).toBe(false)
-    expect(updates).toHaveLength(0) // no UPDATE tasks attempted on a non-executed outcome
+    const row = taskRow()
+    expect(row.status).toBe('approved')
+    expect(row.result).toBeNull()
+    expect(row.completed_at).toBeNull()
   })
 
   it('not_approved (409) never touches tasks', async () => {
-    mockResolve.mockResolvedValue('tok')
-    mockResolveWithMeta.mockResolvedValue(null)
-    // No approved verdict this time: first() for task_verdicts and
-    // department_proposals both return null.
-    const stmt = {
-      bind: (..._a: unknown[]) => stmt,
-      first: vi.fn(async () => null),
-      all: vi.fn(async () => ({ results: [] })),
-      run: vi.fn(async () => ({ meta: { changes: 1 } })),
-    }
-    const updates: unknown[] = []
-    const env = {
-      TENANT_SLUG: 't',
-      BRAND: 'Test',
-      DB: { prepare: vi.fn(() => stmt) },
-      SESSIONS: {
-        get: vi.fn(async () => JSON.stringify({ userId: 'u1', email: 'a@b.com', role: 'owner', createdAt: '2026-01-01T00:00:00Z' })),
-      },
-      OAUTH_KV: { get: vi.fn(), put: vi.fn() },
-      ...INKWELL,
-    } as unknown as Env
+    // A task row exists (inkwell wiring needs it) but no approved verdict/proposal → not_approved.
+    seed({ approved: false })
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
 
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
+    const res = await dashboardApp.fetch(req(`/admin/departments/growth/execute/${GATE_ID}`), env)
     expect(res.status).toBe(409)
-    expect(updates).toHaveLength(0)
+    expect(taskRow().status).toBe('approved')
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('the flip UPDATE is a harmless no-op when the gateId has no matching approved task row', async () => {
-    mockResolve.mockResolvedValue('tok')
-    // taskRow status !== 'approved' models a gateId with no matching row (or an
-    // already-closed one) — the UPDATE's WHERE guard matches zero rows.
-    const { env, updates } = envWithApprovedProposal({ taskRow: { id: GATE_ID, status: 'done' } })
+  it('the flip UPDATE is a harmless no-op when the task is not at approved (already closed)', async () => {
+    // The route does not pre-check task state — the WHERE status='approved' guard is the filter.
+    seed({ status: 'done' })
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify({ ok: true, slug: 's', url: '/blog/x' }), { status: 200, headers: { 'content-type': 'application/json' } }),
     ))
 
     const res = await dashboardApp.fetch(req(`/admin/departments/growth/execute/${GATE_ID}`), env)
     expect(res.status).toBe(200)
-    // The route still attempts the UPDATE (it does not pre-check task state —
-    // the WHERE clause is the guard), but this DB stub reports changes:0 for
-    // it, modelling the real self-scoping no-op described in the route's
-    // comment. The important assertion is that the route does not error.
-    expect(updates).toHaveLength(1)
+    const row = taskRow()
+    expect(row.status).toBe('done')
+    expect(row.result).toBeNull() // the guarded UPDATE matched zero rows: nothing re-stamped
   })
 })

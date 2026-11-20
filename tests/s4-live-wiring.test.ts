@@ -17,23 +17,23 @@ import { describe, it, expect, vi } from 'vitest'
 // controlled independently per test.
 vi.mock('../src/connectors/service', async (orig) => ({
   ...(await orig<typeof import('../src/connectors/service')>()),
-  resolveConnector: vi.fn(),
-  resolveConnectorWithMeta: vi.fn(),
+  resolveSquadConnectorWithMeta: vi.fn(),
 }))
 
 import { dashboardApp } from '../src/dashboard/index'
-import { resolveConnector, resolveConnectorWithMeta } from '../src/connectors/service'
+import { resolveSquadConnectorWithMeta } from '../src/connectors/service'
 import { inkwellContentWrite } from '../src/departments/executors/inkwell'
 import { wpContentWrite } from '../src/departments/executors/mcpwp'
 import type { Env } from '../src/types'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const mockResolve = vi.mocked(resolveConnector)
-const mockResolveWithMeta = vi.mocked(resolveConnectorWithMeta)
+const mockSquadConnector = vi.mocked(resolveSquadConnectorWithMeta)
 
 // Default: no mcpwp connector configured, unless a test overrides it. Declared here
 // (not per-test) so every pre-existing inkwell-focused test keeps its original,
 // single-adapter behavior without having to know mcpwp now exists.
-mockResolveWithMeta.mockResolvedValue(null)
+mockSquadConnector.mockResolvedValue(null)
 
 // ── A. SSRF guard ─────────────────────────────────────────────────────────────
 describe('inkwellContentWrite — SSRF guard on apiUrl', () => {
@@ -136,7 +136,6 @@ const INKWELL = { INKWELL_API_URL: 'https://inkwell-api.mumega.com' }
 
 describe('POST /admin/departments/:dept/execute/:gateId', () => {
   it('non-admin → 403', async () => {
-    mockResolve.mockResolvedValue('tok')
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('member', INKWELL))
     expect(res.status).toBe(403)
   })
@@ -147,7 +146,7 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   })
 
   it('no INKWELL_API_URL and no mcpwp connector → 503 executor_not_configured', async () => {
-    mockResolveWithMeta.mockResolvedValue(null)
+    mockSquadConnector.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
@@ -159,42 +158,31 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
   // route's header comment in src/dashboard/index.ts for why (content-bound dispatch
   // means the route can't know in advance which single adapter the record needs).
   it('inkwell connector missing AND no mcpwp connector → 503 executor_not_configured', async () => {
-    mockResolve.mockResolvedValue(null)
-    mockResolveWithMeta.mockResolvedValue(null)
+    mockSquadConnector.mockResolvedValue(null)
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner', INKWELL))
     expect(res.status).toBe(503)
     expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
   })
 
   it('connector present but proposal not approved → 409 not_executable (gate holds)', async () => {
-    mockResolve.mockResolvedValue('tok')
-    mockResolveWithMeta.mockResolvedValue(null)
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner', INKWELL))
+    // B3c: inkwell wires only for a task with a squad-scoped connector carrying meta.tenantSlug.
+    mockSquadConnector.mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
+    const env = envForRole('owner', INKWELL)
+    // Real schema: a task row (no verdict/proposal) so the kernel fails closed at not_approved.
+    const h = createSqliteD1()
+    applyAllMigrations(h.sqlite)
+    h.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)').run('dept-1', 'growth', 'Growth')
+    h.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name, charter) VALUES (?, ?, ?, ?, ?)').run('squad-a', 'dept-1', 'squad-a', 'squad-a', 'c')
+    h.sqlite
+      .prepare(`INSERT INTO tasks (id, squad_id, title, body, status, done_when) VALUES ('g-unapproved', 'squad-a', 't', 'b', 'approved', 'd')`)
+      .run()
+    env.DB = h.db
+    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
     expect(body.executed).toBe(false)
     expect(body.reason).toMatch(/not_approved/)
+    h.close()
   })
-
-  // ── #370: mcpwp resolution at the route level ──────────────────────────────
-
-  it('mcpwp-only pot (no INKWELL_API_URL, valid mcpwp connector) reaches execute() — not blocked by 503', async () => {
-    mockResolveWithMeta.mockResolvedValue({
-      secret: 'app-pw-123',
-      meta: JSON.stringify({ siteUrl: 'https://example.com', username: 'agent' }),
-    })
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), envForRole('owner'))
-    // Reaches the kernel's fail-closed not_approved check (409), NOT the route's
-    // 503 executor_not_configured — proving the mcpwp connector alone satisfies the gate.
-    expect(res.status).toBe(409)
-    const body = (await res.json()) as { executed: boolean; reason: string }
-    expect(body.reason).toMatch(/not_approved/)
-  })
-
-  it('mcpwp connector present but meta malformed, and no inkwell → 503 executor_not_configured', async () => {
-    mockResolveWithMeta.mockResolvedValue({ secret: 'app-pw-123', meta: 'not json' })
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), envForRole('owner'))
-    expect(res.status).toBe(503)
-    expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
-  })
+  // #370 mcpwp-only route-wiring cases: moved to tests/inkwell-customer-tenant.test.ts (real DB).
 })

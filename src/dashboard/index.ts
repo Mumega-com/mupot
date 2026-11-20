@@ -299,9 +299,8 @@ import {
   rotateConnector,
   revokeConnector,
   listConnectors,
-  resolveConnector,
-  resolveConnectorWithMeta,
 } from '../connectors/service'
+import { resolveInkwellTargetForGate, resolveSquadConnectorForGate } from '../departments/inkwell-target'
 import { isConnectorType, isConnectorScopeType } from '../connectors/crypto'
 import { parseWpConnectorConfig } from '../departments/executors/mcpwp'
 import { kernelMintCtx, getRegistered } from '../departments/registry'
@@ -1514,17 +1513,18 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
 
   const executorEnv: NonNullable<KernelHandle['executorEnv']> = {}
 
-  // Inkwell: pot-scoped 'inkwell' connector. resolveConnector fails closed (null)
-  // when no CONNECTOR_MASTER_KEY or no row. Additive + non-fatal here — a pot with
-  // no INKWELL_API_URL / no inkwell connector simply doesn't get inkwell wired,
-  // it is not an error unless NO adapter resolves at all (checked below).
+  // Inkwell (B3c): resolved for the TASK behind this gate, never for the operator. The connector is the
+  // task's squad-scoped 'inkwell' connector and the destination tenant is that connector's own
+  // meta.tenantSlug. Fail-closed and additive: no task / no squad / no connector / no meta.tenantSlug →
+  // inkwell is simply not wired (the kernel then cannot dispatch to it), and it NEVER falls back to the
+  // pot-scoped connector or c.env.TENANT_SLUG (that is the operator's own tenant).
   if (c.env.INKWELL_API_URL) {
-    const token = await resolveConnector(c.env, dept, 'inkwell')
-    if (token) {
+    const target = await resolveInkwellTargetForGate(c.env, gateId)
+    if (target) {
       executorEnv.inkwell = {
         apiUrl: c.env.INKWELL_API_URL,
-        token,
-        tenantSlug: c.env.TENANT_SLUG,
+        token: target.token,
+        tenantSlug: target.tenantSlug,
         // Same-zone Inkwell → route through the service binding to dodge the CF 522
         // Worker→Worker edge loopback. Absent (cross-zone tenant) → public fetch.
         fetcher: c.env.INKWELL_SVC,
@@ -1532,11 +1532,11 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
     }
   }
 
-  // WordPress (#370): pot-scoped 'mcpwp' connector. secret = the WordPress
-  // application password (the actual credential); meta = non-secret JSON
-  // { siteUrl, username } — same secret+meta split as the Telegram connector's
-  // allowed_chats (src/connectors/service.ts). Additive + non-fatal.
-  const wp = await resolveConnectorWithMeta(c.env, dept, 'mcpwp')
+  // WordPress (#370, B3c round 2): the 'mcpwp' connector of the TASK's squad, same rule as Inkwell: no
+  // task / squad / squad connector → not wired, and NEVER the pot-scoped connector (the operator's own
+  // WordPress). secret = the WordPress application password; meta = non-secret JSON { siteUrl, username }.
+  // Additive + non-fatal.
+  const wp = await resolveSquadConnectorForGate(c.env, gateId, 'mcpwp')
   if (wp) {
     const wpCfg = parseWpConnectorConfig(wp.secret, wp.meta)
     if (wpCfg) executorEnv.mcpwp = wpCfg
@@ -1544,7 +1544,7 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
 
   if (!executorEnv.inkwell && !executorEnv.mcpwp) {
     return c.json(
-      { error: 'executor_not_configured', reason: 'no inkwell or mcpwp adapter is configured for this pot' },
+      { error: 'executor_not_configured', reason: 'no inkwell (squad-scoped, with meta.tenantSlug) or mcpwp adapter is configured for this gate' },
       503,
     )
   }
@@ -1565,20 +1565,19 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
       // This route previously returned the outcome and never touched `tasks`,
       // stranding that row at 'approved' forever — invisible as a receipt.
       // Flip it to 'done' now that a real write has happened. approved → done
-      // is a legal transition (src/tasks/service.ts TRANSITIONS). Self-scoping
-      // / harmless no-op for every OTHER gate.propose() work-type this kernel
-      // serves (seo-audit-proposal, seo-meta-fix, …): their gateId is a random
-      // UUID with no matching task row, or the row isn't 'approved' — either
-      // way this UPDATE only ever touches a row that is genuinely this pot's
-      // own approved content-publish task.
+      // is a legal transition (src/tasks/service.ts TRANSITIONS).
+      // NOTE (B3c): the connector is now resolved from the gate's TASK row (gate id === task id). Gates with
+      // no task row (seo-meta-fix, seo-audit-proposal, cro-apply: random-UUID gate ids) therefore fail
+      // closed with 503 executor_not_configured on this route BY DESIGN, until a task-backed proposer
+      // exists; they no longer reach this UPDATE through here. For any gate that does execute, the UPDATE
+      // only touches the row that is genuinely this pot's own approved content-publish task.
       const now = new Date().toISOString()
       // CRO apply-bridge (S5b): when the adapter performed a fetch-then-merge write
       // (outcome.diff present — see executors/inkwell.ts ContentMergeDiff /
       // ctx.ts ExecuteDiff), fold the change-type + before/after into this SAME
-      // receipt string rather than adding a second persistence path. Today this
-      // UPDATE is a harmless no-op for cro-apply's random-UUID gateId (same as it
-      // already is for seo-meta-fix — see the comment above); this stays ready for
-      // a future flow that mints gateId === task.id for a cro-apply proposal too.
+      // receipt string rather than adding a second persistence path. Today no flow reaches this with a
+      // diff: cro-apply gates have no task row, so this route refuses them (503, see B3c note above);
+      // it stays ready for a future task-backed proposer (gateId === task.id) of cro-apply.
       const receiptResult = outcome.diff
         ? `Applied ${outcome.diff.changeType} via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''} — ${outcome.diff.field}: ${JSON.stringify(outcome.diff.before)} -> ${JSON.stringify(outcome.diff.after)}`
         : `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`
