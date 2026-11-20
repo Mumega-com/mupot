@@ -130,19 +130,6 @@ function req(path: string): Request {
   })
 }
 
-// A task row behind the gate (gate id === task id): connectors resolve from the task's squad (B3c).
-function taskBackedDb(): Env['DB'] {
-  return {
-    prepare: vi.fn((sql: string) => ({
-      bind: (..._a: unknown[]) => ({
-        first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
-        all: async () => ({ results: [] }),
-        run: async () => ({ meta: { changes: 1 } }),
-      }),
-    })),
-  } as unknown as Env['DB']
-}
-
 const INKWELL = { INKWELL_API_URL: 'https://inkwell-api.mumega.com' }
 
 describe('POST /admin/departments/:dept/execute/:gateId', () => {
@@ -179,37 +166,20 @@ describe('POST /admin/departments/:dept/execute/:gateId', () => {
     // B3c: inkwell wires only for a task with a squad-scoped connector carrying meta.tenantSlug.
     mockSquadConnector.mockResolvedValue({ secret: 'tok', meta: JSON.stringify({ tenantSlug: 'tenant-a' }) })
     const env = envForRole('owner', INKWELL)
-    env.DB = taskBackedDb()
+    env.DB = {
+      prepare: vi.fn((sql: string) => ({
+        bind: (..._a: unknown[]) => ({
+          first: async () => (sql.includes('FROM tasks WHERE id') ? { squad_id: 'squad-a' } : null),
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 1 } }),
+        }),
+      })),
+    } as unknown as Env['DB']
     const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
     expect(res.status).toBe(409)
     const body = (await res.json()) as { executed: boolean; reason: string }
     expect(body.executed).toBe(false)
     expect(body.reason).toMatch(/not_approved/)
   })
-
-  // ── #370: mcpwp resolution at the route level ──────────────────────────────
-
-  it('mcpwp-only pot (no INKWELL_API_URL, valid mcpwp connector) reaches execute() — not blocked by 503', async () => {
-    mockSquadConnector.mockResolvedValue({
-      secret: 'app-pw-123',
-      meta: JSON.stringify({ siteUrl: 'https://example.com', username: 'agent' }),
-    })
-    const env = envForRole('owner')
-    env.DB = taskBackedDb()
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g-unapproved'), env)
-    // Reaches the kernel's fail-closed not_approved check (409), NOT the route's
-    // 503 executor_not_configured — proving the mcpwp connector alone satisfies the gate.
-    expect(res.status).toBe(409)
-    const body = (await res.json()) as { executed: boolean; reason: string }
-    expect(body.reason).toMatch(/not_approved/)
-  })
-
-  it('mcpwp connector present but meta malformed, and no inkwell → 503 executor_not_configured', async () => {
-    mockSquadConnector.mockResolvedValue({ secret: 'app-pw-123', meta: 'not json' })
-    const env = envForRole('owner')
-    env.DB = taskBackedDb()
-    const res = await dashboardApp.fetch(req('/admin/departments/growth/execute/g1'), env)
-    expect(res.status).toBe(503)
-    expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
-  })
+  // #370 mcpwp-only route-wiring cases: moved to tests/inkwell-customer-tenant.test.ts (real DB).
 })

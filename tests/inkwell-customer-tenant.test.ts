@@ -33,7 +33,7 @@ async function connector(
     type,
     label: `${type}-${scope.type}-${scope.id ?? 'pot'}`,
     secret,
-    meta: meta === null ? undefined : JSON.stringify(meta),
+    meta: meta === null ? undefined : typeof meta === 'string' ? meta : JSON.stringify(meta), // a raw string is passed through (malformed-JSON case)
     scope_type: scope.type,
     scope_id: scope.id,
     created_by: 'm1',
@@ -232,6 +232,35 @@ describe('execute route: WordPress (mcpwp) destination is the customer site (rea
     const res = await run('task-none')
     expect(res.status).toBe(503)
     expect(calls).toHaveLength(0)
+  })
+
+  // Moved from s4-live-wiring (#370): route-level mcpwp wiring on the real DB, pot WITHOUT INKWELL_API_URL.
+  describe('mcpwp-only pot (no INKWELL_API_URL)', () => {
+    const seedBareTask = (id: string, squadId: string) =>
+      h.sqlite
+        .prepare(`INSERT INTO tasks (id, squad_id, title, body, status, done_when) VALUES (?, ?, 't', 'b', 'open', 'd')`)
+        .run(id, squadId)
+
+    it('valid squad mcpwp connector reaches execute() (409 not_approved), not the 503 gate', async () => {
+      delete (env as { INKWELL_API_URL?: string }).INKWELL_API_URL
+      await connector('mcpwp', { type: 'squad', id: 'squad-none' }, 'app-pw-123', { siteUrl: 'https://example.com', username: 'agent' })
+      seedBareTask('g-unapproved', 'squad-none')
+      const res = await run('g-unapproved')
+      expect(res.status).toBe(409)
+      const body = (await res.json()) as { executed: boolean; reason: string }
+      expect(body.reason).toMatch(/not_approved/)
+      expect(calls).toHaveLength(0)
+    })
+
+    it('squad mcpwp connector with malformed meta, no inkwell → 503 executor_not_configured', async () => {
+      delete (env as { INKWELL_API_URL?: string }).INKWELL_API_URL
+      await connector('mcpwp', { type: 'squad', id: 'squad-none' }, 'app-pw-123', 'not json')
+      seedBareTask('g1', 'squad-none')
+      const res = await run('g1')
+      expect(res.status).toBe(503)
+      expect(((await res.json()) as { error: string }).error).toBe('executor_not_configured')
+      expect(calls).toHaveLength(0)
+    })
   })
 })
 
