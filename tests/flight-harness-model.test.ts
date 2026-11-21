@@ -7,8 +7,8 @@
 //      they may only ride the landing receipt as claimed_* describe-only keys.
 //   3. An unknown/odd harness string is accepted as a BOUNDED string (max 64 chars,
 //      no control chars) — sanitised, not refused, never fabricated.
-//   4. An agent with no fleet_agents row lands with NULL columns and the read seam
-//      says 'unknown' — never blank, never invented.
+//   4. An agent with no fleet_agents row keeps NULL fleet-only columns; W1-3 below
+//      adds explicitly labelled executor self-reports to the receipt, never the columns.
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -20,7 +20,8 @@ import type { FlightRow } from '../src/flight/service'
 import { parseFlightMetaV1 } from '../src/flight/meta'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
+import { invokeTool } from '../src/mcp'
 import { fleetAttachApp } from '../src/fleet/attach-routes'
 import { signedAttach } from '../fleet-runtime/fleet-sign.mjs'
 
@@ -354,5 +355,129 @@ SHA256: ${'1'.repeat(64)}'
 
     const rowFull = await env.DB.prepare(`SELECT * FROM flights WHERE id=?1 AND tenant=?2`).bind(FLIGHT, TENANT).first<Record<string, unknown>>()
     expect(flightHarnessDisplay(rowFull as never)).toEqual({ harness: 'unknown', model: 'unknown' })
+  })
+})
+
+// W1-3: receipts may carry executor reports without granting them fleet provenance.
+// The DB columns remain fleet-only so legacy readers cannot mistake a report for attestation.
+describe('W1-3 honest receipt provenance', () => {
+  const executorAuth: AuthContext = {
+    userId: 'member-executor', memberId: 'member-executor', email: null,
+    role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: 'agent-1',
+    capabilities: [{ member_id: 'member-executor', scope_type: 'squad', scope_id: 'squad-core', capability: 'member' }],
+  }
+
+  it('lands through MCP without a fleet row and labels both executor reports self_reported', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      const result = await invokeTool(executorAuth, env, 'flight_land', {
+        flight_id: FLIGHT, cost_micro_usd: 1, harness: 'orca-codex', model: 'gpt-executor',
+      })
+      expect(result.ok, JSON.stringify(result)).toBe(true)
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: 'orca-codex', model: 'gpt-executor',
+        harness_source: 'self_reported', model_source: 'self_reported',
+        claimed_harness: 'orca-codex', claimed_model: 'gpt-executor',
+      })
+      expect(await landedRow(env)).toMatchObject({ status: 'landed', harness: null, model: null })
+    } finally { harnessDb.close() }
+  })
+
+  it('lands through MCP with a fleet row and labels the winning fleet values fleet', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      await insertFleetRow(env, 'agent-1', 'codex-cloud', 'gpt-fleet')
+      const result = await invokeTool(executorAuth, env, 'flight_land', {
+        flight_id: FLIGHT, cost_micro_usd: 1, harness: 'untrusted-harness', model: 'untrusted-model',
+      })
+      expect(result.ok, JSON.stringify(result)).toBe(true)
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: 'codex-cloud', model: 'gpt-fleet', harness_source: 'fleet', model_source: 'fleet',
+        claimed_harness: 'untrusted-harness', claimed_model: 'untrusted-model',
+      })
+      expect(await landedRow(env)).toMatchObject({ status: 'landed', harness: 'codex-cloud', model: 'gpt-fleet' })
+    } finally { harnessDb.close() }
+  })
+
+  it('refuses caller-supplied provenance before landing', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      const result = await invokeTool(executorAuth, env, 'flight_land', {
+        flight_id: FLIGHT, cost_micro_usd: 1, harness: 'orca', model: 'gpt-executor',
+        harness_source: 'fleet', model_source: 'fleet',
+      })
+      expect(result).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+      expect(await landedRow(env)).toMatchObject({ status: 'running', harness: null, model: null })
+      expect(await env.DB.prepare('SELECT COUNT(*) AS n FROM flight_event_outbox').first())
+        .toEqual({ n: 0 })
+    } finally { harnessDb.close() }
+  })
+
+  it('labels a missing report unknown independently of a present report', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      expect(await landGovernedFlight(env, FLIGHT, { ...LAND_OPTS_BASE, claimed_harness: 'orca' }))
+        .toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: 'orca', model: null, harness_source: 'self_reported', model_source: 'unknown',
+      })
+    } finally { harnessDb.close() }
+  })
+
+  it('does not fill an existing fleet row missing model from a caller claim', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      await insertFleetRow(env, 'agent-1', 'codex-cloud', null)
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE, claimed_harness: 'orca', claimed_model: 'untrusted-model',
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: 'codex-cloud', model: null, harness_source: 'fleet', model_source: 'unknown',
+        claimed_model: 'untrusted-model',
+      })
+    } finally { harnessDb.close() }
+  })
+
+  it.each([
+    { kind: 'member' as const, id: 'member-admin' },
+    { kind: 'agent' as const, id: 'another-agent' },
+  ])('never labels another actor $kind/$id as an executor self-report', async (actor) => {
+    const { env, harnessDb } = fixture()
+    try {
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE, actor, claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: null, model: null, harness_source: 'unknown', model_source: 'unknown',
+        claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })
+    } finally { harnessDb.close() }
+  })
+
+  it('sanitizes and bounds self-reports with the same cleaner as fleet values', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE,
+        claimed_harness: '  orca\u202e\u200b\u0007' + 'x'.repeat(80),
+        claimed_model: '  model\u0085\u2028' + 'y'.repeat(150),
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: 'orca' + 'x'.repeat(60), model: 'model' + 'y'.repeat(123),
+        harness_source: 'self_reported', model_source: 'self_reported',
+      })
+    } finally { harnessDb.close() }
+  })
+
+  it('keeps blank and non-string claims unknown instead of inventing a report', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE, claimed_harness: ' \u200b ', claimed_model: { model: 'spoof' },
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: null, model: null, harness_source: 'unknown', model_source: 'unknown',
+      })
+    } finally { harnessDb.close() }
   })
 })

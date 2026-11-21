@@ -658,8 +658,10 @@ function parseReceiptRefs(raw: string | null | undefined): string[] {
 // Source of truth is SERVER-DERIVED from the executing agent's fleet_agents row
 // (fleet runtime -> harness, fleet model), resolved through readFleetAgentRow so a
 // slug-keyed fleet row is found and an ambiguous slug refuses to guess. A caller-
-// supplied value is describe-only: it may ride the landing receipt as claimed_*,
-// but the stored columns always come from the fleet row. Every stored string is
+// supplied value may ride the landing receipt as claimed_*. When no fleet row
+// resolves, the executor's own report can also supply the receipt's harness/model,
+// labelled self_reported. The stored columns stay fleet-only so legacy readers
+// cannot mistake a self-report for fleet attestation. Every stored string is
 // exactly what the fleet's OWN scanner (cleanReported, src/fleet/reported-values.ts)
 // would have accepted of a self-report: C0/DEL AND C1 NEL, RTL/bidi controls,
 // zero-width chars and U+2028/2029 stripped, trim, truncate, never a lone
@@ -685,15 +687,16 @@ export function sanitizeBoundedFlightText(raw: unknown, maxLength = FLIGHT_HARNE
 export async function loadFlightHarness(
   env: Env,
   agentId: string,
-): Promise<{ harness: string | null; model: string | null }> {
-  if (!agentId) return { harness: null, model: null }
+): Promise<{ harness: string | null; model: string | null; source: 'fleet' | 'unknown' }> {
+  if (!agentId) return { harness: null, model: null, source: 'unknown' }
   // #1590 P2: single fleet read with readFleetAgentRow — already tenant-scoped, and the
   // slug fallback an id-keyed read misses (a daemon can key the row by the agent's SLUG).
   const row = await readFleetAgentRow(env, agentId)
-  if (!row) return { harness: null, model: null }
+  if (!row) return { harness: null, model: null, source: 'unknown' }
   return {
     harness: sanitizeBoundedFlightText(row.runtime, FLIGHT_HARNESS_MAX_LEN),
     model: sanitizeBoundedFlightText(row.model, FLIGHT_MODEL_MAX_LEN),
+    source: 'fleet',
   }
 }
 
@@ -724,10 +727,9 @@ export async function landGovernedFlight(
     actor: { kind: 'member' | 'agent'; id: string }
     /** mupot#2006: the attached thread's attribution (from auth only); omitted/null = NULL columns. */
     attribution?: { attachmentId: string; consentingMemberId: string } | null
-    // Brief P3 (0267): DESCRIBE-ONLY claims of what executed. Accepted and sanitised, then
-    // recorded on the landing receipt as claimed_harness/claimed_model — they NEVER
-    // override the stored columns, which are always derived from the executing agent's
-    // fleet_agents row (loadFlightHarness below). Authority stays server-derived.
+    // Claims never override fleet values or populate fleet-only columns. With no fleet
+    // row, an executor's own claims may populate the receipt, labelled self_reported.
+    // A member/admin landing on someone's behalf supplies describe-only claims.
     claimed_harness?: unknown
     claimed_model?: unknown
   },
@@ -897,21 +899,27 @@ export async function landGovernedFlight(
   const storedMetered = landedRow ? landedRow.cost_metered === 1 : opts.cost_metered !== false
   const storedCost = landedRow?.cost_micro_usd ?? opts.cost_micro_usd
   const storedBudget = landedRow?.budget_micro_usd ?? null
-  // Brief P3 (0267): the receipt carries the SERVER-DERIVED harness/model the row now
-  // holds (NULL stays NULL — the row's honest value), plus the caller's describe-only
-  // claim (sanitised bounded string) under claimed_* so the audit can see both.
+  // Preserve claims for audit even when fleet values win. Only the executor can
+  // self-report, and only in the absence of a fleet row (a missing field on an
+  // existing row stays unknown). Provenance is chosen here, never accepted from args.
   const claimedKeys: Record<string, unknown> = {}
   const claimedHarness = sanitizeBoundedFlightText(opts.claimed_harness)
   const claimedModel = sanitizeBoundedFlightText(opts.claimed_model, FLIGHT_MODEL_MAX_LEN)
   if (claimedHarness !== null) claimedKeys.claimed_harness = claimedHarness
   if (claimedModel !== null) claimedKeys.claimed_model = claimedModel
+  const canSelfReport = harnessIdentity.source === 'unknown'
+    && opts.actor.kind === 'agent' && opts.actor.id === opts.agent_id
+  const receiptHarness = landedRow.harness ?? (canSelfReport ? claimedHarness : null)
+  const receiptModel = landedRow.model ?? (canSelfReport ? claimedModel : null)
   const receiptPayload = JSON.stringify({
     ...JSON.parse(payload) as Record<string, unknown>,
     score: landedRow?.score ?? opts.score ?? null,
     cost_micro_usd: storedMetered ? storedCost : null,
     cost_metered: storedMetered,
-    harness: landedRow?.harness ?? harnessIdentity.harness,
-    model: landedRow?.model ?? harnessIdentity.model,
+    harness: receiptHarness,
+    model: receiptModel,
+    harness_source: receiptHarness === null ? 'unknown' : canSelfReport ? 'self_reported' : 'fleet',
+    model_source: receiptModel === null ? 'unknown' : canSelfReport ? 'self_reported' : 'fleet',
     ...claimedKeys,
     // #2025: the evidence the landing rested on (task-result-submission:<id> per task), as stored on the row.
     receipt_refs: parseReceiptRefs(landedRow?.receipt_refs),
