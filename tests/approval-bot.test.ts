@@ -165,7 +165,7 @@ describe('delivery: ONE message from the approval bot', () => {
   it('names the agent, exact action, scope, duration, reason and recommendation; Approve/Deny buttons; fallback commands; telegram "sent"', async () => {
     const f = await file({ recommendation: 'approve, it is read-only', reason: 'flip project status for the demo' })
     expect(f.telegram).toBe('sent')
-    expect(f.approve_url).toBeTruthy() // the plain link stays as the fallback
+    expect(f.approve_url).toBe('https://t.me/muapprove_test_bot')
     expect(approvalCalls()).toHaveLength(1)
     const m = approvalCalls()[0]
     expect(m.method).toBe('sendMessage')
@@ -203,10 +203,11 @@ describe('delivery: ONE message from the approval bot', () => {
     expect(count('approval_bot_deliveries')).toBe(0)
   })
   it('bot unset and Mini App off: telegram "disabled", approve_url present, nothing sent', async () => {
-    const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined })
+    const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined, SECURE_MOMENTS: '0', ACCESS_APPROVE_ENABLED: '0',
+      PUBLIC_ORIGIN: 'https://colony.example.test/t/example' })
     const f = await file({}, off)
     expect(f.telegram).toBe('disabled')
-    expect(f.approve_url).toBeTruthy()
+    expect(f.approve_url).toBe(`https://colony.example.test/t/example/elevation/${f.requestId}`)
     expect(calls).toHaveLength(0)
   })
   it('an action the bot may not carry (token mint) is never offered to the bot: the old path answers', async () => {
@@ -230,7 +231,7 @@ describe('delivery: ONE message from the approval bot', () => {
     harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
     const f = await file()
     expect(f.telegram).toBe('not_bound')
-    expect(f.approve_url).toBeTruthy()
+    expect(f.approve_url).toBe(`https://colony.example.test/elevation/${f.requestId}`)
     expect(calls).toHaveLength(0)
   })
   it('a Bot API failure is reported as failed and the request stays pending with its link', async () => {

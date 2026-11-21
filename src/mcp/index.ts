@@ -288,6 +288,8 @@ import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
+import { approvalBotStatus } from '../approval-bot/config'
+import { ARCHIVE_PROPOSE_NEXT_STEP, withArchiveProposeNextStep } from '../tasks/close-next-step'
 import { DYAD_PIN_SUDO_STEP, SUDO_CLAIM_RELEASE_REMEDY, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
@@ -2013,7 +2015,9 @@ const toolTaskUpdate: ToolSpec = {
         if (transitionErr) {
           // A flight reap/cancel parked this task as blocked: tell the executor the one legal next step.
           const flightNext = transitionErr.error === 'invalid_transition' ? await flightChildBlockedNextStep(env, existing.id, existing.status) : null
-          return fail(400, transitionErr.error, flightNext ? { ...transitionErr, ...flightNext } : transitionErr)
+          const detail = flightNext ? { ...transitionErr, ...flightNext } : transitionErr
+          const closeRefusal = transitionErr.error === 'invalid_transition' && (args.status === 'done' || args.status === 'review')
+          return fail(400, transitionErr.error, closeRefusal ? withArchiveProposeNextStep(detail) : detail)
         }
       }
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
@@ -2046,7 +2050,10 @@ const toolTaskUpdate: ToolSpec = {
         return fail(
           409,
           'assignee_cannot_self_close',
-          'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+          {
+            detail: 'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+            next_step: ARCHIVE_PROPOSE_NEXT_STEP,
+          },
         )
       }
       if (args.status === 'done') {
@@ -2095,6 +2102,7 @@ const toolTaskUpdate: ToolSpec = {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+            next_step: ARCHIVE_PROPOSE_NEXT_STEP,
             detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (operating and under_attack require exactly this), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
           })
         }
@@ -2130,7 +2138,10 @@ const toolTaskUpdate: ToolSpec = {
         return fail(
           409,
           'assignee_cannot_mutate_own_assignment',
-          'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+          {
+            detail: 'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+            next_step: ARCHIVE_PROPOSE_NEXT_STEP,
+          },
         )
       }
       // #406 fast-follow (Opus re-gate WARN-1 on #404) — mirrors the same guard
@@ -3840,6 +3851,7 @@ const toolTaskSubmitResult: ToolSpec = {
       return fail(409, 'artifact_verification_failed', {
         reason: artifactCheck.reason,
         ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+        next_step: ARCHIVE_PROPOSE_NEXT_STEP,
         detail: 'a completion result must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>", or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference — prose describing intended work is not evidence of work done',
       })
     }
@@ -6731,7 +6743,7 @@ const toolEndAgentSession: ToolSpec = {
 // fails closed with 'not_agent_session' for those).
 const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
-  scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
+  scope: 'self (exact current agent session). Every pending request has an approve_url. When telegram is "sent", the human has a card in Telegram and approve_url opens that bot chat or the card’s secure review page. Otherwise approve_url opens the web review page.',
   min: 'authenticated',
   args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant) }',
   inputSchema: {
@@ -6805,10 +6817,9 @@ const toolRequestElevation: ToolSpec = {
       kind: 'elevation', subjectId: result.request.id, requesterAgentId: sessionContext.context.agentId, subjectExpiresAtIso: result.request.decision_expires_at,
     })
     const accessLink = approveUrl(env, 'elevation', result.request.id)
-    const elevationLink = moment?.url ?? accessLink
-    // The approval bot (src/approval-bot/) takes the request first when it is on and may carry it: ONE message with Approve and
-    // Deny buttons from the bot only the worker drives. Otherwise (bot off, an action the bot may not carry, nobody reachable,
-    // a failed send) the Mini App button and the approve_url run exactly as before.
+    const webApprovalUrl = `${canonicalOrigin(env, ctx.origin)}/elevation/${encodeURIComponent(result.request.id)}`
+    // Prefer a delivered Telegram card. The ordinary web review page remains available
+    // while delivery is pending or unavailable and does not depend on Access being enabled.
     const recommendation = str(args.recommendation)
     if (recommendation) {
       await env.DB.prepare('UPDATE elevation_requests SET recommendation = ?1 WHERE id = ?2 AND tenant = ?3')
@@ -6820,12 +6831,19 @@ const toolRequestElevation: ToolSpec = {
       fallback: moment ? () => deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil }) : undefined,
     })
     let telegram: string = botDelivery
+    let telegramApprovalUrl: string | undefined
+    if (botDelivery === 'sent') {
+      const bot = approvalBotStatus(env)
+      // Telegram links to individual messages are for channels and groups, not private bot chats.
+      if (bot.state === 'on') telegramApprovalUrl = `https://t.me/${bot.username}`
+    }
     if (botDelivery !== 'sent' && botDelivery !== 'pending') {
       const viaMiniapp = moment
         ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
         : 'disabled'
       // Mini App channel off and the bot had its own answer (not_bound / failed): report that one, it is the more specific.
       telegram = viaMiniapp === 'disabled' && botDelivery !== 'unavailable' ? botDelivery : viaMiniapp
+      if (viaMiniapp === 'sent') telegramApprovalUrl = moment?.url
     }
 
     return done({
@@ -6841,12 +6859,11 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
-      // sent|not_bound|disabled|failed|rate_limited: whether the Telegram Mini App button reached the deciding human. The link below stays the fallback.
       telegram,
-      // Present only when a human-proof channel is enabled: the link a human opens to decide (secure moment
-      // first, else the Access approve page). This tool decides nothing.
-      ...(elevationLink ? { approve_url: elevationLink } : {}),
-      // Both channels on: the Access link stays available beside the secure one (same shape as seed_attach_request).
+      approve_url: telegramApprovalUrl ?? webApprovalUrl,
+      ...(telegramApprovalUrl ? { web_approve_url: webApprovalUrl } : {}),
+      ...(moment ? { secure_moment_url: moment.url } : {}),
+      // Access is optional and only advertised if its dedicated approval surface is available.
       ...(moment && accessLink ? { access_approve_url: accessLink } : {}),
     })
   },

@@ -232,7 +232,10 @@ const ask = async (w: World, o: { actions?: string[]; scope_type?: string; scope
   invokeTool(o.ctx ?? (await w.att()), w.env, 'request_elevation', {
     actions: o.actions ?? [SUDO], scope_type: o.scope_type ?? 'squad', scope_id: o.scope_id ?? 'squad-core', duration_minutes: 15, reason: 'fix the squad',
   }, POT)
-const urlOf = (o: Out): string => String((o.result as { approve_url?: string }).approve_url)
+const urlOf = (o: Out): string => {
+  const links = o.result as { approve_url: string; secure_moment_url?: string }
+  return links.secure_moment_url ?? links.approve_url
+}
 const reqIdOf = (o: Out): string => String((o.result as { request: { id: string } }).request.id)
 const text = (o: Out): string => JSON.stringify(o)
 
@@ -296,8 +299,64 @@ describe('sudo for attached chats: the request', () => {
     expect(n(`SELECT COUNT(*) AS n FROM elevation_requests`)).toBe(0)
   })
 
-  it('the allow-list is exactly the reversible org-structure act (a one-line, reviewed change to extend)', () => {
-    expect([...ATTACHED_SUDO_ACTIONS]).toEqual([SUDO])
+  it('the allow-list covers org structure and the exact own-agent seat-event grant', () => {
+    expect([...ATTACHED_SUDO_ACTIONS]).toEqual([SUDO, 'action:sudo_seat_event_grant'])
+  })
+
+  it.each(['live at claim', 'revoked at claim'])('binds an own-agent wake grant to the human-approved attachment (%s)', async (scenario) => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    h.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+        VALUES ('wake-host', 'squad-core', 'wake-host', 'Host', 'worker', 'test', 'active');
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('${TENANT}', 'wake-host', 'AAAA', 'Ed25519', '${HUMAN}', 1760000000);
+    `)
+    const action = 'action:sudo_seat_event_grant'
+    const exact = { agent_id: 'agent-rava', host_agent_id: 'wake-host' }
+    const request = async (sudo_args: Record<string, string>) =>
+      invokeTool(await w.att(), w.env, 'request_elevation', {
+        actions: [action], scope_type: 'squad', scope_id: 'squad-core',
+        duration_minutes: 15, reason: 'Route wake hints', sudo_args,
+      }, POT)
+    const use = async (args = exact) =>
+      invokeTool(await w.att(), w.env, 'seat_event_grant', { ...args, reason: 'Route wake hints' }, POT)
+
+    seedAgent({ id: 'other-wake-agent', slug: 'other-wake-agent', name: 'Other agent', squad: 'squad-core', admins: [HUMAN] })
+    expect(await request({ ...exact, agent_id: 'other-wake-agent' })).toMatchObject({
+      ok: false, error: 'invalid_elevation_request', detail: expect.stringContaining('attached_seat_sudo_target_mismatch'),
+    })
+    expect(await request({ ...exact, host_agent_id: exact.agent_id })).toMatchObject({
+      ok: false, error: 'invalid_elevation_request', detail: expect.stringContaining('cannot_grant_to_self'),
+    })
+    expect(n('SELECT COUNT(*) AS n FROM elevation_requests')).toBe(0)
+    const filed = await request(exact)
+    expect(filed).toMatchObject({ ok: true, result: { request: { status: 'pending' } } })
+    expect(await use()).toMatchObject({ ok: false })
+    expect(n('SELECT COUNT(*) AS n FROM seat_event_grants')).toBe(0)
+    expect((await decideElevationMoment(w.env, urlOf(filed), w.key, 'approve', [action])).status).toBe(200)
+    expect(await use({ ...exact, agent_id: 'other-wake-agent' })).toMatchObject({
+      ok: false, error: 'attached_seat_sudo_target_mismatch',
+    })
+    if (scenario === 'revoked at claim') {
+      const { resolveOwnerSudo, claimOwnerSudo } = await import('../src/auth/owner-sudo')
+      const auth = await w.att()
+      const resolved = await resolveOwnerSudo(w.env, auth, 'seat_event_grant', exact)
+      expect(resolved.kind).toBe('sudo')
+      if (resolved.kind !== 'sudo') throw new Error('expected a pending owner-sudo call')
+      h.sqlite.prepare("UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = ?").run(auth.seatBinding!.grantTokenId)
+      expect(one('SELECT revoked_at FROM elevation_grants')).toEqual({ revoked_at: null })
+      expect(await claimOwnerSudo(w.env, resolved.pending)).toMatchObject({ ok: false, refusal: { error: 'sudo_grant_ended' } })
+      expect(n('SELECT COUNT(*) AS n FROM elevation_usage_log')).toBe(0)
+      expect(n('SELECT COUNT(*) AS n FROM seat_event_grants')).toBe(0)
+      return
+    }
+    expect(await use()).toMatchObject({ ok: true })
+    expect(await use()).toMatchObject({ ok: false })
+    expect(one('SELECT agent_id, host_agent_id FROM seat_event_grants')).toEqual(exact)
+    expect(one('SELECT action, status, agent_session_id FROM elevation_usage_log')).toEqual({
+      action, status: 'applied', agent_session_id: w.sessionId,
+    })
   })
 })
 

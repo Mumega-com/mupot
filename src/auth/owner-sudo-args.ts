@@ -51,7 +51,7 @@ export interface CanonicalSudoArgs {
 }
 export type CanonicalResult = { ok: true; value: CanonicalSudoArgs } | { ok: false; error: string; detail: string }
 
-export interface Requester { agentId: string | null; memberId: string | null }
+export interface Requester { agentId: string | null; memberId: string | null; attachedAgentId?: string }
 
 function text(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null
@@ -149,6 +149,9 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
   // action:sudo_seat_event_grant
   const hostId = text(raw.host_agent_id), agentId = text(raw.agent_id)
   if (!hostId || !agentId) return bad('sudo_args_required', 'host_agent_id and agent_id are required')
+  if (who.attachedAgentId !== undefined && agentId !== who.attachedAgentId) {
+    return bad('attached_seat_sudo_target_mismatch', 'an attached chat may request wake hints only for its own bound agent')
+  }
   const projectId = raw.project_id === undefined || raw.project_id === null ? null : text(raw.project_id)
   if (raw.project_id !== undefined && raw.project_id !== null && !projectId) return bad('sudo_args_invalid', 'project_id must be a string')
   if (projectId) {
