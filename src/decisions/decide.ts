@@ -300,6 +300,5 @@ export async function decide(env: Env, request: DecisionRequest, config: DecideC
     latencyMs: Date.now() - started,
     receiptId,
     ...(reason === null ? {} : { reason }),
-    ...(result.provenance === undefined ? {} : { provenance: result.provenance }),
   }
 }

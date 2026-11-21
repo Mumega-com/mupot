@@ -495,6 +495,8 @@ export interface Env {
   // through a Cloudflare AI Gateway.
   DECISION_ADAPTER?: string
   DECISION_GATEWAY_ID?: string
+  // Clef adapter model: '@cf/cloudflare/clef-flash' (default) or '@cf/cloudflare/clef'. Anything else fails closed.
+  CLEF_MODEL?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──

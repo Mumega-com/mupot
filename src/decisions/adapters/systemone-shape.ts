@@ -52,20 +52,3 @@ export function parseSystemOneResponse(
     ...(inputTokens === undefined ? {} : { inputTokens }),
   }
 }
-
-/**
- * Lowest per-answer `confidence` in a provider body (Clef reports one per answer).
- * Returns 0 when any answer lacks a finite confidence in [0,1], so callers escalate rather than
- * trust a body that did not say how sure it was. Independent of parseSystemOneResponse,
- * so the Jev parse and the DecisionResult shape are untouched.
- */
-export function minAnswerConfidence(body: unknown, request: DecisionRequest): number {
-  if (!isRecord(body) || !isRecord(body.answers)) return 0
-  let min = Number.POSITIVE_INFINITY
-  for (const name of Object.keys(request.questions)) {
-    const raw = body.answers[name]
-    const c = isRecord(raw) && typeof raw.confidence === 'number' && Number.isFinite(raw.confidence) && raw.confidence >= 0 && raw.confidence <= 1 ? raw.confidence : 0
-    if (c < min) min = c
-  }
-  return Number.isFinite(min) ? min : 0
-}
