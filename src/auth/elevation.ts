@@ -50,7 +50,7 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { installerRequestRefusal, installerWindowEnabled, isInstallerAction } from '../operators/installer-tiers'
-import { attachedAuthority, ATTACHED_SEAT_EVENT_SUDO_ACTION, isAttachedSudoAction } from './attached-ceiling'
+import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
 import { canonicalizeSudoArgs, ownerSudoEnabled, type SudoActionKey } from './owner-sudo-args'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 
@@ -189,12 +189,12 @@ export async function createElevationRequest(
     if (input.durationMinutes > OWNER_SUDO_MAX_MINUTES) {
       return { ok: false, reason: 'invalid_elevation_request', detail: `an owner-sudo action lasts at most ${OWNER_SUDO_MAX_MINUTES} minutes` }
     }
-    if (uniqueActions[0] === 'action:sudo_grant_gate_capability' && input.scopeType !== 'org') {
-      return { ok: false, reason: 'invalid_elevation_request', detail: 'action:sudo_grant_gate_capability is org scope' }
+    if ((uniqueActions[0] === 'action:sudo_grant_gate_capability' || uniqueActions[0] === 'action:sudo_project_repo') && input.scopeType !== 'org') {
+      return { ok: false, reason: 'invalid_elevation_request', detail: `${uniqueActions[0]} is org scope` }
     }
     // Derive the attached requester from the stored session, not from the proposed host or agent.
     let attachedAgentId: string | undefined
-    if (uniqueActions[0] === ATTACHED_SEAT_EVENT_SUDO_ACTION) {
+    if (isAttachedSudoAction(uniqueActions[0])) {
       const session = await loadAgentSessionById(env, input.tenant, input.agentSessionId)
       if (!session || session.agent_id !== input.agentId || session.member_id !== input.memberId || !evaluateAgentSession(session, nowMs).ok) {
         return { ok: false, reason: 'invalid_elevation_request', detail: 'the requesting agent session is not live' }
@@ -1530,6 +1530,7 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   squad_member_add: 'action:sudo_squad_member_add',
   grant_gate_capability: 'action:sudo_grant_gate_capability',
   seat_event_grant: 'action:sudo_seat_event_grant',
+  archive_row: 'action:sudo_archive_row',
 })
 
 /** elevationHint — the refusal hint naming request_elevation + the action key
@@ -1551,6 +1552,7 @@ const ELEVATION_SCOPE_HINT_BY_TOOL: Readonly<Record<string, string>> = Object.fr
   squad_member_add: 'scope_type "squad" with scope_id = that squad\'s id, duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
   grant_gate_capability: 'scope_type "org", duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
   seat_event_grant: 'scope_type "squad" with scope_id = the target agent\'s squad id, duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
+  archive_row: 'scope_type "squad" with scope_id = the squad of the row (the task\'s squad, the squad itself, or the agent\'s squad), duration_minutes 15 and sudo_args = { table, id } (tasks, squads or inactive agents; it covers ONE call, run as your human)',
 })
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {

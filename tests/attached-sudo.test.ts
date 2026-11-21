@@ -32,6 +32,7 @@ import {
 import type { AuthContext, Env } from '../src/types'
 import { invokeTool } from '../src/mcp/index'
 import { ATTACHED_SUDO_ACTIONS } from '../src/auth/attached-ceiling'
+import { canonicalizeSudoArgs } from '../src/auth/owner-sudo-args'
 import {
   canDecideElevationRequest, createElevationRequest, decideElevationRequest, hasElevatedAction, loadElevationRequestById,
 } from '../src/auth/elevation'
@@ -299,7 +300,7 @@ describe('sudo for attached chats: the request', () => {
     expect(n(`SELECT COUNT(*) AS n FROM elevation_requests`)).toBe(0)
   })
 
-  it('the allow-list covers org structure and the exact own-agent seat-event grant', () => {
+  it('the allow-list covers org structure and the exact own-agent seat-event grant; no W1-2 hygiene act is on it', () => {
     expect([...ATTACHED_SUDO_ACTIONS]).toEqual([SUDO, 'action:sudo_seat_event_grant'])
   })
 
@@ -375,6 +376,102 @@ describe('sudo for attached chats: the request', () => {
     expect(one('SELECT action, status, agent_session_id FROM elevation_usage_log')).toEqual({
       action, status: 'applied', agent_session_id: w.sessionId,
     })
+  })
+})
+
+describe('sudo for attached chats: NO W1-2 hygiene act is attached-sudo-able (council-20261121-authz; Kasra gate #2488 round 2)', () => {
+  it('an attached chat can NOT ask for an archive_row: refused at request, nothing filed, and the call itself stays refused', async () => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    w.env.TASK_ARCHIVE_ENABLED = '1'
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('org-h1', '${HUMAN}', 'org', NULL, 'admin');
+      INSERT INTO tasks (id, squad_id, title, status, done_when) VALUES ('task-stale', 'squad-core', 'stale', 'open', 'never');
+    `)
+    const use = async () => invokeTool(await w.att(), w.env, 'archive_row', { table: 'tasks', id: 'task-stale', reason: 'stale' }, POT)
+    expect(await use()).toMatchObject({ ok: false })
+    const filed = await invokeTool(await w.att(), w.env, 'request_elevation', {
+      actions: ['action:sudo_archive_row'], scope_type: 'squad', scope_id: 'squad-core', duration_minutes: 15, reason: 'hygiene', sudo_args: { table: 'tasks', id: 'task-stale' },
+    }, POT)
+    expect(filed).toMatchObject({ ok: false, error: 'attached_seat_cannot_elevate' })
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_requests`)).toBe(0)
+    expect(await use()).toMatchObject({ ok: false })
+    expect(n(`SELECT COUNT(*) AS n FROM archive_receipts`)).toBe(0)
+  })
+
+  it('P-OBS: an attached chat whose agent holds only OBSERVER on a squad cannot ask to archive that squad\'s review task', async () => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    w.env.TASK_ARCHIVE_ENABLED = '1'
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('org-h1', '${HUMAN}', 'org', NULL, 'admin');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-obs', 'mem-agent-rava', 'squad', 'squad-other', 'observer');
+      INSERT INTO tasks (id, squad_id, title, status, done_when) VALUES ('task-review', 'squad-other', 'their review task', 'review', 'never');
+    `)
+    const r = await invokeTool(await w.att(), w.env, 'request_elevation', {
+      actions: ['action:sudo_archive_row'], scope_type: 'squad', scope_id: 'squad-other', duration_minutes: 15, reason: 'dup', sudo_args: { table: 'tasks', id: 'task-review' },
+    }, POT)
+    expect(r).toMatchObject({ ok: false, error: 'attached_seat_cannot_elevate' })
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_requests`)).toBe(0)
+    expect((await invokeTool(await w.att(), w.env, 'archive_row', { table: 'tasks', id: 'task-review', reason: 'dup' }, POT)).ok).toBe(false)
+    expect(n(`SELECT COUNT(*) AS n FROM archive_receipts`)).toBe(0)
+  })
+
+  it.each([
+    ['action:sudo_project_repo', 'org', { project_id: 'proj-att', op: 'add', repo: 'https://github.com/acme/widgets' }],
+    ['action:sudo_move_agent_squad', 'squad', { agent: 'hadi-admin', to_squad: 'squad-core', capability: 'member' }],
+  ] as const)('%s can NOT be requested from an attached chat (Kasra gate #2488)', async (action, scopeType, sudoArgs) => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    h.sqlite.exec(`INSERT INTO projects (id, slug, name) VALUES ('proj-att', 'p-att', 'Att Project')`)
+    const r = await invokeTool(await w.att(), w.env, 'request_elevation', {
+      actions: [action], scope_type: scopeType, ...(scopeType === 'squad' ? { scope_id: 'squad-core' } : {}), duration_minutes: 15, reason: 'hygiene', sudo_args: sudoArgs,
+    }, POT)
+    expect(r).toMatchObject({ ok: false, error: 'attached_seat_cannot_elevate' })
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_requests`)).toBe(0)
+  })
+
+  it('a forged, digest-matching archive grant bound to the attachment session changes nothing: the chat gets the tool\'s own refusal, byte for byte', async () => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    w.env.TASK_ARCHIVE_ENABLED = '1'
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('org-h1', '${HUMAN}', 'org', NULL, 'admin');
+      INSERT INTO tasks (id, squad_id, title, status, done_when) VALUES ('task-f', 'squad-core', 'forged target', 'open', 'never');
+    `)
+    const call = { table: 'tasks', id: 'task-f', reason: 'dup' }
+    const before = await invokeTool(await w.att(), w.env, 'archive_row', call, POT)
+    expect(before.ok).toBe(false)
+    const canon = await canonicalizeSudoArgs(w.env, 'action:sudo_archive_row', { table: 'tasks', id: 'task-f' }, { agentId: 'agent-rava', memberId: 'mem-agent-rava' })
+    if (!canon.ok) throw new Error(JSON.stringify(canon))
+    const ws = await liveWebSession(w, HUMAN)
+    h.sqlite.prepare(`INSERT INTO elevation_requests (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json, requested_scope_type, requested_scope_id, requested_duration_minutes, reason, status, created_at, decision_expires_at, sudo_args_json, sudo_args_sha256) VALUES ('rq-a', ?, ?, 'agent-rava', 'mem-agent-rava', '["action:sudo_archive_row"]', 'squad', 'squad-core', 15, 'x', 'approved', ?, ?, ?, ?)`).run(TENANT, w.sessionId, isoIn(0), isoIn(10), canon.value.json, canon.value.sha256)
+    h.sqlite.prepare(`INSERT INTO elevation_grants (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at) VALUES ('gr-a', ?, 'rq-a', ?, 'action:sudo_archive_row', 'squad', 'squad-core', 'reversible', ?, ?, ?, ?)`).run(TENANT, w.sessionId, HUMAN, ws, isoIn(0), isoIn(15))
+    const after = await invokeTool(await w.att(), w.env, 'archive_row', call, POT)
+    expect(after).toEqual(before)
+    expect(n(`SELECT COUNT(*) AS n FROM archive_receipts`)).toBe(0)
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_usage_log`)).toBe(0)
+  })
+
+  it('a forged, digest-matching grant for a NON-attached sudo action (the repo edit) bound to the attachment session changes nothing: the chat gets the tool\'s own refusal, byte for byte', async () => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('org-h1', '${HUMAN}', 'org', NULL, 'admin');
+      INSERT INTO projects (id, slug, name) VALUES ('proj-att', 'p-att', 'Att Project');
+    `)
+    const call = { project_id: 'proj-att', add_repo: 'https://github.com/acme/widgets' }
+    const before = await invokeTool(await w.att(), w.env, 'project_update', call, POT)
+    expect(before.ok).toBe(false)
+    const canon = await canonicalizeSudoArgs(w.env, 'action:sudo_project_repo', { project_id: 'proj-att', op: 'add', repo: call.add_repo }, { agentId: 'agent-rava', memberId: 'mem-agent-rava' })
+    if (!canon.ok) throw new Error(JSON.stringify(canon))
+    const ws = await liveWebSession(w, HUMAN)
+    h.sqlite.prepare(`INSERT INTO elevation_requests (id, tenant, agent_session_id, agent_id, member_id, requested_actions_json, requested_scope_type, requested_scope_id, requested_duration_minutes, reason, status, created_at, decision_expires_at, sudo_args_json, sudo_args_sha256) VALUES ('rq-r', ?, ?, 'agent-rava', 'mem-agent-rava', '["action:sudo_project_repo"]', 'org', '', 15, 'x', 'approved', ?, ?, ?, ?)`).run(TENANT, w.sessionId, isoIn(0), isoIn(10), canon.value.json, canon.value.sha256)
+    h.sqlite.prepare(`INSERT INTO elevation_grants (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at) VALUES ('gr-r', ?, 'rq-r', ?, 'action:sudo_project_repo', 'org', '', 'reversible', ?, ?, ?, ?)`).run(TENANT, w.sessionId, HUMAN, ws, isoIn(0), isoIn(15))
+    const after = await invokeTool(await w.att(), w.env, 'project_update', call, POT)
+    expect(after).toEqual(before)
+    expect(text(after)).not.toContain('sudo_denied')
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_usage_log`)).toBe(0)
   })
 })
 

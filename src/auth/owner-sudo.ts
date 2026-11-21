@@ -1,13 +1,17 @@
 // mupot — OWNER SUDO ("/muapprove = sudo"; SENSITIVE).
 //
-// Four owner-only tools refuse every agent (`operator_principal_required`): squad_member_add, the update_squad dyad pin,
-// grant_gate_capability and the seat-event grant. This module is the ONE way an agent gets one call of one of them, and only
+// Six owner-only acts refuse every agent (`operator_principal_required` / org admin): squad_member_add, the update_squad dyad pin,
+// grant_gate_capability, the seat-event grant, archive_row (tasks, squads, inactive agents) and the project_update repository
+// allow-list edit (add_repo / remove_repo). move_agent_squad is deliberately NOT one (it hands the agent to another squad's leads). This module is the ONE way an agent gets one call of one of them, and only
 // with a LIVE, human-approved elevation whose action names exactly that tool and covers exactly that scope:
 //
 //   action:sudo_squad_member_add      squad_member_add
 //   action:sudo_squad_dyad_pin        update_squad, only when the call is a dyad pin and changes nothing else
 //   action:sudo_grant_gate_capability grant_gate_capability
 //   action:sudo_seat_event_grant      seat_event_grant
+//   action:sudo_archive_row           archive_row, tasks / work squads / inactive agents only
+//   action:sudo_project_repo          project_update, only when the call is ONE add_repo or remove_repo and changes nothing else
+// Credentials (mint, list, reveal, revoke a token) are deliberately NOT on this list: no approval lets an agent handle them.
 //
 // WHAT HAPPENS. invokeTool asks resolveOwnerSudo before the capability floor. When it says `sudo`, the tool body runs with an
 // AuthContext built LIVE for the APPROVING human (buildAuth), so every check the tool already makes (org owner/admin, rank
@@ -17,7 +21,7 @@
 //
 // EVERY CONDITION (re-derived per call, nothing cached; each has a test that breaks it):
 //   0. OWNER_SUDO_ENABLED is on (default off: this module is then a no-op);
-//   1. the caller is a bound agent. An attached chat may only use an exact seat-event grant for its own agent;
+//   1. the caller is a bound agent. An attached chat may only use the attached-sudo actions (ATTACHED_SUDO_ACTIONS), as its own agent;
 //   2. the call's arguments canonicalise (owner-sudo-args.ts, with its fences) to EXACTLY the digest the human approved, and to a scope;
 //   3. hasElevatedAction, literal action: the agent's own live session, a live unexpired unrevoked grant covering THIS scope,
 //      the approver's CURRENT admin authority (incl. the owner's legacy role plane) and the approver's session still live;
@@ -41,13 +45,16 @@ import {
   type HasElevatedActionOptions,
 } from './elevation'
 import { finishElevationReceipt } from './elevation-receipt'
-import { attachedAuthority, ATTACHED_SEAT_EVENT_SUDO_ACTION } from './attached-ceiling'
+import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
 import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 
 /** The one call that pins a squad's review pair, for an agent that cannot: shown on every dyad refusal (hint on the floor, detail in the tool). */
 export const DYAD_PIN_SUDO_STEP = 'Ask your human to approve ONE exact call: request_elevation { actions: ["action:sudo_squad_dyad_pin"], scope_type: "squad", scope_id: <the squad id>, duration_minutes: 15, reason, sudo_args: { squad, agent_a, agent_b } }. They see those names in Telegram and tap Approve. Then call update_squad with only squad, dyad_agent_a and dyad_agent_b, exactly as approved.'
 
-export type OwnerSudoTool = 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant'
+/** The one call that edits a project's repository allow-list, for an agent that cannot: shown on the floor refusal of a repo edit. */
+export const PROJECT_REPO_SUDO_STEP = 'Ask your human to approve ONE exact call: request_elevation { actions: ["action:sudo_project_repo"], scope_type: "org", duration_minutes: 15, reason, sudo_args: { project_id, op: "add"|"remove", repo } }. They see the project and repository in Telegram and tap Approve. Then call project_update with only project_id and add_repo (or remove_repo), exactly as approved.'
+
+export type OwnerSudoTool = 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant' | 'archive_row' | 'project_update'
 
 /** tool -> the ONE action that opens it. The ratchet test pins this map against OWNER_SUDO_ACTIONS in both directions. */
 export const OWNER_SUDO_ACTION_FOR_TOOL: Readonly<Record<OwnerSudoTool, string>> = Object.freeze({
@@ -55,7 +62,16 @@ export const OWNER_SUDO_ACTION_FOR_TOOL: Readonly<Record<OwnerSudoTool, string>>
   update_squad: 'action:sudo_squad_dyad_pin',
   grant_gate_capability: 'action:sudo_grant_gate_capability',
   seat_event_grant: 'action:sudo_seat_event_grant',
+  archive_row: 'action:sudo_archive_row',
+  project_update: 'action:sudo_project_repo',
 })
+
+/** The ONE-call shape each partial tool covers, named in the refusal when the call is a different call of that tool. */
+const SUDO_CALL_SHAPE: Partial<Record<OwnerSudoTool, string>> = {
+  update_squad: 'this approval covers ONE update_squad call that sets or clears the dyad pair and changes nothing else (squad, dyad_agent_a, dyad_agent_b, reason only)',
+  project_update: 'this approval covers ONE project_update call with project_id and exactly one of add_repo / remove_repo, and nothing else',
+  archive_row: 'this approval covers ONE archive_row call (table, id, reason, expected_status only)',
+}
 
 export function isOwnerSudoTool(name: string): name is OwnerSudoTool {
   return Object.prototype.hasOwnProperty.call(OWNER_SUDO_ACTION_FOR_TOOL, name)
@@ -85,7 +101,7 @@ async function planFor(env: Env, auth: AuthContext, tool: OwnerSudoTool, args: R
   const action = OWNER_SUDO_ACTION_FOR_TOOL[tool] as SudoActionKey
   const raw = sudoRawFromToolArgs(tool, args)
   if (!raw) {
-    return refusal(403, 'sudo_covers_dyad_pin_only', { remedy: 'this approval covers ONE update_squad call that sets or clears the dyad pair and changes nothing else (squad, dyad_agent_a, dyad_agent_b, reason only)' })
+    return refusal(403, tool === 'update_squad' ? 'sudo_covers_dyad_pin_only' : 'sudo_covers_exact_call_only', { remedy: SUDO_CALL_SHAPE[tool] ?? 'this approval covers exactly the call your human approved' })
   }
   const canon = await canonicalizeSudoArgs(env, action, raw, {
     agentId: auth.boundAgentId ?? null, memberId: auth.memberId ?? null,
@@ -131,6 +147,8 @@ function checkGrant(env: Env, auth: AuthContext, tool: OwnerSudoTool, plan: Plan
   if (tool === 'squad_member_add') return hasElevatedAction(env, auth, 'action:sudo_squad_member_add', plan.scopeType, plan.scopeId, opts)
   if (tool === 'update_squad') return hasElevatedAction(env, auth, 'action:sudo_squad_dyad_pin', plan.scopeType, plan.scopeId, opts)
   if (tool === 'grant_gate_capability') return hasElevatedAction(env, auth, 'action:sudo_grant_gate_capability', plan.scopeType, plan.scopeId, opts)
+  if (tool === 'archive_row') return hasElevatedAction(env, auth, 'action:sudo_archive_row', plan.scopeType, plan.scopeId, opts)
+  if (tool === 'project_update') return hasElevatedAction(env, auth, 'action:sudo_project_repo', plan.scopeType, plan.scopeId, opts)
   return hasElevatedAction(env, auth, 'action:sudo_seat_event_grant', plan.scopeType, plan.scopeId, opts)
 }
 
@@ -174,12 +192,15 @@ export async function resolveOwnerSudo(env: Env, auth: AuthContext, toolName: st
   if (!ownerSudoEnabled(env)) return { kind: 'none' } // flag off: a total no-op
   if (!auth.boundAgentId || !isOwnerSudoTool(toolName)) return { kind: 'none' }
   const tool: OwnerSudoTool = toolName
+  // project_update has many calls; only a repository allow-list edit is a sudo situation. Every other project_update (status
+  // under action:project_status, a human's edit) proceeds exactly as before this module existed.
+  if (tool === 'project_update' && !('add_repo' in args) && !('remove_repo' in args)) return { kind: 'none' }
   const action = OWNER_SUDO_ACTION_FOR_TOOL[tool]
   const attached = attachedAuthority(auth)
   const binding = auth.seatBinding
   let attachment: OwnerSudoPending['attachment']
   if (attached) {
-    if (action !== ATTACHED_SEAT_EVENT_SUDO_ACTION || attached.agentId !== auth.boundAgentId || !binding || !auth.tokenId) {
+    if (!isAttachedSudoAction(action) || attached.agentId !== auth.boundAgentId || !binding || !auth.tokenId) {
       return { kind: 'none' }
     }
     attachment = { id: attached.attachmentId, seatId: binding.seatId, grantTokenId: binding.grantTokenId,

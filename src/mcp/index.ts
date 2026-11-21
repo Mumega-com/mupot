@@ -291,7 +291,7 @@ import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
 import { approvalBotStatus } from '../approval-bot/config'
 import { taskCloseNextStep } from '../tasks/close-next-step'
-import { DYAD_PIN_SUDO_STEP, SUDO_CLAIM_RELEASE_REMEDY, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
+import { DYAD_PIN_SUDO_STEP, PROJECT_REPO_SUDO_STEP, SUDO_CLAIM_RELEASE_REMEDY, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { PAGES_TOOLS } from './pages'
@@ -6801,7 +6801,7 @@ const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
   scope: 'self (exact current agent session). approve_url opens the secure moment when issued, otherwise web review or the passkey approval page for install_high. web_approve_url opens the dashboard. When telegram is "sent", the human also has a card in Telegram.',
   min: 'authenticated',
-  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant) }',
+  args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant; { table: "tasks"|"squads"|"agents", id } for action:sudo_archive_row; { project_id, op: "add"|"remove", repo } for action:sudo_project_repo) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -9011,7 +9011,9 @@ async function invokeToolInner(
       }
       // A dyad pin has its own one-call door (owner sudo); every other update_squad keeps the org_structure hint.
       const dyadPin = spec.name === 'update_squad' && ('dyad_agent_a' in args || 'dyad_agent_b' in args)
-      const hint = dyadPin ? DYAD_PIN_SUDO_STEP : elevationHint(spec.name)
+      // So does a project repository edit (its status-only door stays action:project_status).
+      const repoEdit = spec.name === 'project_update' && ('add_repo' in args || 'remove_repo' in args)
+      const hint = dyadPin ? DYAD_PIN_SUDO_STEP : repoEdit ? PROJECT_REPO_SUDO_STEP : elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }
   }
