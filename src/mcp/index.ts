@@ -4550,7 +4550,7 @@ const toolFlightLand: ToolSpec = {
   name: 'flight_land',
   scope: 'self (bound agent own flight)',
   min: 'member',
-  args: '{ flight_id: string, cost_micro_usd?: number (required unless cost_metered=false), cost_metered?: boolean (false = executor has no spend meter; omit cost, budget check skipped, reported as unmetered), score?: number, note?: string, reason?: string }',
+  args: '{ flight_id: string, cost_micro_usd?: number (required unless cost_metered=false), cost_metered?: boolean (false = executor has no spend meter; omit cost, budget check skipped, reported as unmetered), score?: number, note?: string, reason?: string, harness?: string, model?: string (executor reports; receipt labels self_reported only when no fleet row exists; fleet values always win) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4560,6 +4560,8 @@ const toolFlightLand: ToolSpec = {
       score: OPTIONAL_NUMBER_SCHEMA,
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
+      harness: STRING_SCHEMA,
+      model: STRING_SCHEMA,
     },
     required: ['flight_id'],
     additionalProperties: false,
@@ -4624,6 +4626,8 @@ const toolFlightLand: ToolSpec = {
       meta,
       actor: { kind: 'agent', id: auth.boundAgentId },
       attribution: attachmentAttribution(auth), // mupot#2006: from auth, never args
+      claimed_harness: args.harness,
+      claimed_model: args.model,
     })
     // Only a refused TRANSITION is a failed land (#916). A missing receipt means the
     // flight is already landed; answering 409 there tells the agent to retry something
