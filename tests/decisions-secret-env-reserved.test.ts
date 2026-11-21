@@ -8,7 +8,7 @@ import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
-const NAMES = ['DECISION_ADAPTER', 'DECISION_GATEWAY_ID', 'CLEF_MODEL', 'TYPESAFE_API_KEY']
+const NAMES = ['DECISION_ADAPTER', 'DECISION_GATEWAY_ID', 'CLEF_MODEL', 'CLEF_MODEL_VERSION', 'TYPESAFE_API_KEY']
 const harnesses: SqliteD1Harness[] = []
 afterEach(() => { while (harnesses.length) harnesses.pop()?.close() })
 
