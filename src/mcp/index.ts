@@ -4401,6 +4401,32 @@ const toolFlightDispatch: ToolSpec = {
       }
     }
 
+    // W1-1 — receiver-liveness gate, the SAME fence task_dispatch applies (mupot#1729). The
+    // flight.dispatch/v1 message lands in the EXECUTOR's inbox, so the executor (the caller, or
+    // executor_agent_id) must not be a STOPPED fleet seat: refuse BEFORE the flight row exists, so
+    // nothing is booked, nothing is sent, and no phantom `running` flight is left for the watchdog to
+    // reap. A stale-but-not-stopped poll seat is NOT refused (its inbox is a store-and-forward
+    // mailbox) — exactly task_dispatch's precedent — the dispatcher gets a `warning` instead.
+    // No fleet row = no fleet surface = ok (in-Worker executors behave as before).
+    const executorVerdict = await evaluateReceiverLiveness(env, executorAgent.id)
+    if (!executorVerdict.ok) {
+      return fail(409, 'receiver_not_live', {
+        agent_id: executorAgent.id,
+        presence_mode: executorVerdict.presence_mode,
+        status: executorVerdict.status,
+        live: executorVerdict.live,
+        reason: executorVerdict.reason,
+      })
+    }
+    const executorStaleWarning = executorVerdict.stale_poll
+      ? {
+          code: 'receiver_stale',
+          agent_id: executorAgent.id,
+          last_reported_at: executorVerdict.last_reported_at,
+          presence_ttl_sec: executorVerdict.presence_ttl_sec,
+        }
+      : null
+
     const signals = parseJsonArg(args.signals_json)
     const parsed = parseDispatchBody({
       agent: executorAgentId,
@@ -4514,10 +4540,10 @@ const toolFlightDispatch: ToolSpec = {
       }
 
       const dispatched = await getFlight(env, preflight.id)
-      return done({ flight: flightWithParsedMeta(dispatched ?? flight, meta), preflight, delivered: true, budget_uncapped: budgetUncapped })
+      return done({ flight: flightWithParsedMeta(dispatched ?? flight, meta), preflight, delivered: true, budget_uncapped: budgetUncapped, ...(executorStaleWarning ? { warning: executorStaleWarning, warnings: [executorStaleWarning] } : {}) })
     }
 
-    return done({ flight: flightWithParsedMeta(flight, meta), preflight, delivered: false, budget_uncapped: budgetUncapped })
+    return done({ flight: flightWithParsedMeta(flight, meta), preflight, delivered: false, budget_uncapped: budgetUncapped, ...(executorStaleWarning ? { warning: executorStaleWarning, warnings: [executorStaleWarning] } : {}) })
   },
 }
 
