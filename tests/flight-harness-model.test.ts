@@ -9,7 +9,8 @@
 //      no control chars) — sanitised, not refused, never fabricated.
 //   4. An agent with no fleet_agents row keeps NULL fleet-only columns; W1-3 below
 //      adds explicitly labelled executor self-reports to the receipt, never the columns.
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as fleetRegistry from '../src/fleet/registry'
 
 import {
   flightHarnessDisplay, landGovernedFlight, loadFlightHarness,
@@ -452,6 +453,44 @@ describe('W1-3 honest receipt provenance', () => {
         claimed_harness: 'claimed', claimed_model: 'claimed-model',
       })
     } finally { harnessDb.close() }
+  })
+
+  it('S2: a member whose id equals the executor id still cannot self-report', async () => {
+    const { env, harnessDb } = fixture()
+    try {
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE, actor: { kind: 'member', id: 'agent-1' },
+        claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: null, model: null, harness_source: 'unknown', model_source: 'unknown',
+        claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })
+      expect(await landedRow(env)).toMatchObject({ status: 'landed', harness: null, model: null })
+    } finally { harnessDb.close() }
+  })
+
+  it('S11: an existing fleet row with null runtime and model does not admit self-reports', async () => {
+    const { env, harnessDb } = fixture()
+    // The migrated table requires runtime NOT NULL, but FleetAgentRowIdentity permits
+    // null. Exercise that defensive read contract without changing the real schema:
+    // resolve the real fleet row, then supply null values at the registry read boundary.
+    const readFleetAgentRow = fleetRegistry.readFleetAgentRow
+    const registryRead = vi.spyOn(fleetRegistry, 'readFleetAgentRow').mockImplementation(async (...args) => {
+      const row = await readFleetAgentRow(...args)
+      return row ? { ...row, runtime: null, model: null } : null
+    })
+    try {
+      await insertFleetRow(env, 'agent-1', '', null)
+      expect(await landGovernedFlight(env, FLIGHT, {
+        ...LAND_OPTS_BASE, claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })).toEqual({ transitioned: true, receipt: true })
+      expect(await landedReceiptPayload(env)).toMatchObject({
+        harness: null, model: null, harness_source: 'unknown', model_source: 'unknown',
+        claimed_harness: 'claimed', claimed_model: 'claimed-model',
+      })
+      expect(await landedRow(env)).toMatchObject({ status: 'landed', harness: null, model: null })
+    } finally { registryRead.mockRestore(); harnessDb.close() }
   })
 
   it('sanitizes and bounds self-reports with the same cleaner as fleet values', async () => {

@@ -4,6 +4,8 @@
 > call it a flight (the aviation discipline is load-bearing); in code/API the
 > ecosystem-standard word is **session**. This doc is the organizing model.
 
+Landing receipt readers must check `harness_source` and `model_source`: `self_reported` marks an executor claim, `fleet` identifies the registry source, and `unknown` means no value.
+
 ## Why aviation, not poetry — the cache forces it
 
 The Opus prompt cache has a **~5-minute TTL**. A cold start or an expired-mid-run cache
