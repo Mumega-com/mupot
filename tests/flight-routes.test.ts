@@ -492,6 +492,25 @@ describe('REST governed flight landing parity', () => {
     expect(flight.status).toBe('landed')
   })
 
+  // W1-5: a flight dispatched for a subscription (CLI) seat is stored cost_metered=0 and lands
+  // with neither cost nor flag; a metered flight with neither is still refused (#1738 above).
+  it('W1-5 lands a subscription-seat flight (stored cost_metered=0) with no cost and no flag', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    ;(flight as { cost_metered?: number }).cost_metered = 0
+    const response = await land(env, { score: 0.9 })
+    expect(response.status).toBe(200)
+    expect(flight.status).toBe('landed')
+  })
+
+  it('W1-5 a subscription-seat flight that reports a cost is judged metered against budget 0', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    ;(flight as { cost_metered?: number }).cost_metered = 0
+    const response = await land(env, { cost_micro_usd: 1 })
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'flight_budget_exceeded', budget_micro_usd: 0 })
+    expect(flight.status).toBe('running')
+  })
+
   // mupot#1590 P1-3: the HTTP land accepts describe-only harness/model claims and they ride
   // the landing receipt as claimed_* ONLY — the stored columns stay server-derived (the
   // executor's own fleet row; this mock resolves no fleet row, so both stay null).
