@@ -2,9 +2,10 @@
 
 A dedicated Telegram bot, owned by the worker, that carries an agent's `request_elevation` to the deciding human as one
 message with **Approve** and **Deny** buttons. The bot is off unless `APPROVAL_BOT_TOKEN` is set.
-`request_elevation` always returns an `approve_url`. After the bot delivers a card, the link opens the private bot
-chat and `web_approve_url` points to browser review. A delivered Mini App card can link to its secure review page.
-If delivery is pending or unavailable, `approve_url` points to the signed-in dashboard at `/elevation/<id>`.
+`request_elevation` returns the secure moment in `approve_url` when it issues one and puts the dashboard URL in
+`web_approve_url`. Without a moment, ordinary requests use that dashboard URL as `approve_url`. A request for
+`action:install_high` needs a passkey approval link. When the bot delivers a card, the separate `telegram_url` opens
+the private bot chat. Mini App delivery uses the same secure moment as the browser.
 
 It is a **dedicated** bot. It is not the notification bot (`TELEGRAM_BOT_TOKEN`), not the Mini App bot, and not the
 Hermes / IM decision bot (KayHermes): config refuses a shared token or a shared webhook secret.

@@ -303,6 +303,24 @@ describe('sudo for attached chats: the request', () => {
     expect([...ATTACHED_SUDO_ACTIONS]).toEqual([SUDO, 'action:sudo_seat_event_grant'])
   })
 
+  it('refuses a wake grant request after the attachment has ended while its session row is still live', async () => {
+    const w = await world()
+    w.env.OWNER_SUDO_ENABLED = '1'
+    const auth = await w.att()
+    h.sqlite.exec("UPDATE agent_seats SET retired_at = '2026-10-14 00:00:00'")
+    expect(one('SELECT revoked_at FROM agent_sessions WHERE id = ?', w.sessionId)).toEqual({ revoked_at: null })
+
+    const result = await createElevationRequest(w.env, {
+      tenant: TENANT, agentSessionId: w.sessionId,
+      agentId: auth.boundAgentId!, memberId: auth.memberId!,
+      actions: ['action:sudo_seat_event_grant'], scopeType: 'squad', scopeId: 'squad-core',
+      durationMinutes: 15, reason: 'Route wake hints',
+      sudoArgs: { agent_id: auth.boundAgentId, host_agent_id: 'wake-host' },
+    })
+    expect(result).toEqual({ ok: false, reason: 'invalid_elevation_request', detail: 'the requesting attachment is not live' })
+    expect(n('SELECT COUNT(*) AS n FROM elevation_requests')).toBe(0)
+  })
+
   it.each(['live at claim', 'revoked at claim'])('binds an own-agent wake grant to the human-approved attachment (%s)', async (scenario) => {
     const w = await world()
     w.env.OWNER_SUDO_ENABLED = '1'

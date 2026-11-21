@@ -48,7 +48,17 @@ Enrolment adds no authority. It records one more way for an existing member to p
 
 ### Asking for a decision
 
-`seed_attach_request` and `request_elevation` create a moment when `SECURE_MOMENTS` is on. This is independent of `ACCESS_APPROVE_ENABLED`. The tool result carries `approve_url`, the link `https://<secure host>/m/<id>/<token>`. If both channels are on, `approve_url` is the secure link and `access_approve_url` is the Access one. With the flag off the tools return no secure link and write no moment rows.
+`seed_attach_request` and `request_elevation` put the secure moment URL (`https://<secure host>/m/<id>/<token>`)
+in `approve_url` whenever they issue a moment. `request_elevation` also returns the signed-in dashboard URL
+(`/elevation/<id>`) in `web_approve_url`. With no moment, ordinary elevations use the dashboard as `approve_url`.
+For `action:install_high`, the dashboard can show the request but approval requires a passkey. If a secure moment
+is unavailable, `approve_url` uses the dedicated Access route when it requires passkey-class sign-in. If neither
+passkey path is configured, the tool refuses the request.
+
+The optional `access_approve_url` accompanies a moment only when `ACCESS_APPROVE_ENABLED` is on and the dedicated
+Access host and login configuration are valid. For `action:install_high`, Access must also require passkey-class
+methods only. Secure Moments are independent of Access. With `SECURE_MOMENTS` off, the tools issue no secure links
+and write no moment rows.
 
 A moment is single-use and expiring: it never outlives the request behind it, and never lasts more than 24 hours. At most one moment is pending per request. Filing the same request again rotates the link, so the old link stops working. The link token is stored only as a SHA-256 hash.
 
@@ -247,7 +257,7 @@ When the flag is on, a 2026-07-28 request (`MCP-Protocol-Version` or `_meta` nam
 
 ### Which tools, which link
 
-Only `seed_attach_request` and `request_elevation`. After the tool succeeds, the layer reads the result's `approve_url` and offers it only if all hold: https, the host is exactly `SECURE_MOMENTS_HOST` (no port, no userinfo), no query or fragment, path exactly `/m/<moment id>/<token>`, and the moment row is pending, of the kind that tool mints, and filed for this caller's bound agent. Anything else leaves the plain result alone. The URL is the W1 one-time link: its token authorises nothing; the human still proves themselves with a passkey on the secure host. A future tool (W2 `credential_request`) joins by adding a row to `URL_ELICITATION_TOOLS` and a case in `readOutcome`.
+Only `seed_attach_request` and `request_elevation`. After the tool succeeds, the layer reads the result's `approve_url` and offers it only if all hold: https, the host is exactly `SECURE_MOMENTS_HOST` (no port, no userinfo), no query or fragment, path exactly `/m/<moment id>/<token>`, and the moment row is pending, of the kind that tool mints, and filed for this caller's bound agent. Dashboard and Access links stay in the plain result. The secure URL is the W1 one-time link: its token authorises nothing; the human still proves themselves with a passkey on the secure host. A future tool (W2 `credential_request`) joins by adding a row to `URL_ELICITATION_TOOLS` and a case in `readOutcome`.
 
 An elicitation answer (`accept`, `decline`, `cancel`) is consent to open the page, never a decision. No form mode is ever used, nothing secret is put in a message, and the server never sends a mid-call `elicitation/create` (the Worker is stateless).
 
@@ -283,7 +293,7 @@ The elicitation has already filed the request and minted the moment. A retry mus
 
 A headless client (Claude Code in print mode was measured) cancels a URL elicitation on its own and retries with `requestState` and `inputResponses` carrying `cancel`. The link was handed to a client that discarded it, and the token is stored only as a hash, so it cannot be shown again. The retry therefore does this, for a 2026-07-28 retry whose request and moment are both still pending and whose answer is anything but an explicit `accept` (`decline`, `cancel`, a missing or unrecognised answer):
 
-- It rotates the pending moment's link (the same `createMoment` rotation, same moment id; the old link stops working) and returns the new `approve_url` in the tool result, plus `access_approve_url` when the Access channel is on, with a note telling the agent to give the link to the human. The result still has `retry: true` and `elicitation_action`.
+- It rotates the pending moment's link (the same `createMoment` rotation, same moment id; the old link stops working) and returns the rotated secure URL as `approve_url` and, for elevations, `secure_moment_url`. It includes `access_approve_url` when the dedicated Access channel can approve the request, with a note telling the agent to give the link to the human. The result still has `retry: true` and includes `elicitation_action` when the client supplies one.
 - `accept` while pending stays read-only (no rotation, no link): the human has the link open and rotating would break the page.
 - A decided, expired or no-longer-pending request returns its outcome with no link and no rotation.
 - Rotation is bounded per moment: at most one per minute and five in total, enforced by one atomic insert into `mutation_audit_entries` (operation `moment_link_rotate`, no token in the evidence) that is both the receipt and the counter. A throttled or capped call returns the pending outcome with `link_reissue: "throttled"` or `"capped"` and no link. For 10 minutes after a human rotation through Telegram (W4.1) the machine path is suppressed: the retry returns the pending outcome with `link_reissue: "human_active"`, no link, and a note not to retry for about ten minutes, so the link the human just opened survives a slow passkey ceremony; if the receipt cannot be written (`link_reissue: "error"`) nothing is rotated.
@@ -299,7 +309,7 @@ The 2025-11-25 retry carries no answer at all, so it is read as consent and stay
 | VS Code Copilot | confirmed `url` (1.107) |
 | Claude Desktop, claude.ai, ChatGPT, Codex, Cursor | unknown: no documentation found; Codex and Cursor are documented for form mode only |
 
-Because most clients are unknown, nothing depends on the elicitation: the plain `approve_url` is always in the result for a client that did not declare support.
+A client that does not declare URL-mode support receives the plain tool result. A successful request still includes the primary approval URL.
 
 ### Not verified
 

@@ -158,8 +158,8 @@ async function fileElevation(actions = ['action:project_status', 'action:manage_
   const r = await invokeTool(agentAuth(), e, 'request_elevation',
     { actions, scope_type: 'squad', scope_id: 'squad-a', duration_minutes: minutes, reason: 'need it' }, 'https://pot.test')
   if (!r.ok) throw new Error(`elevation failed ${JSON.stringify(r)}`)
-  const res = r.result as { request: { id: string }; approve_url?: string }
-  if (!res.approve_url) throw new Error('no approve_url')
+  const res = r.result as { request: { id: string }; approve_url: string; web_approve_url: string }
+  expect(new URL(res.web_approve_url).pathname).toBe(`/elevation/${res.request.id}`)
   return { ...parseLink(res.approve_url), subject: res.request.id }
 }
 

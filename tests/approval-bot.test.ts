@@ -49,15 +49,22 @@ const agentAuth = (): AuthContext => ({
   userId: 'mem-agent', email: 'agent@x.test', role: 'member', tenant: TENANT, channel: 'workspace', memberId: 'mem-agent', tokenId: 'tok-1',
   capabilities: [{ member_id: 'mem-agent', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' } as CapabilityGrant], boundAgentId: 'agent-x',
 })
-interface Filed { telegram: string; requestId: string; shortId: string | null; approve_url?: string }
+interface Filed {
+  telegram: string
+  requestId: string
+  shortId: string | null
+  approve_url: string
+  web_approve_url: string
+  telegram_url?: string
+}
 async function file(args: Record<string, unknown> = {}, e: Env = env): Promise<Filed> {
   await invokeTool(agentAuth(), e, 'check_in', {}, 'https://pot.test')
   const r = await invokeTool(agentAuth(), e, 'request_elevation',
     { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 60, reason: 'need it', ...args }, 'https://pot.test')
   if (!r.ok) throw new Error(`elevation failed ${JSON.stringify(r)}`)
-  const res = r.result as { telegram: string; request: { id: string }; approve_url?: string }
-  const row = one<{ short_id: string | null }>('SELECT short_id FROM elevation_requests WHERE id = ?', res.request.id)
-  return { telegram: res.telegram, requestId: res.request.id, shortId: row.short_id, approve_url: res.approve_url }
+  const { request, ...links } = r.result as Omit<Filed, 'requestId' | 'shortId'> & { request: { id: string } }
+  const row = one<{ short_id: string | null }>('SELECT short_id FROM elevation_requests WHERE id = ?', request.id)
+  return { ...links, requestId: request.id, shortId: row.short_id }
 }
 
 let updateSeq = 100
@@ -165,7 +172,10 @@ describe('delivery: ONE message from the approval bot', () => {
   it('names the agent, exact action, scope, duration, reason and recommendation; Approve/Deny buttons; fallback commands; telegram "sent"', async () => {
     const f = await file({ recommendation: 'approve, it is read-only', reason: 'flip project status for the demo' })
     expect(f.telegram).toBe('sent')
-    expect(f.approve_url).toBe('https://t.me/muapprove_test_bot')
+    expect(new URL(f.approve_url).hostname).toBe(HOST)
+    expect(new URL(f.approve_url).pathname).toMatch(/^\/m\/[^/]+\/[^/]+$/)
+    expect(f.telegram_url).toBe('https://t.me/muapprove_test_bot')
+    expect(new URL(f.web_approve_url).pathname).toBe(`/elevation/${f.requestId}`)
     expect(approvalCalls()).toHaveLength(1)
     const m = approvalCalls()[0]
     expect(m.method).toBe('sendMessage')
@@ -196,7 +206,8 @@ describe('delivery: ONE message from the approval bot', () => {
     const off = baseEnv({ APPROVAL_BOT_TOKEN: undefined, TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: MINIAPP_BOT, TELEGRAM_MINIAPP_BOT_TOKEN: `${MINIAPP_BOT}:AAEhqMY-dedicated-miniapp-test-token` })
     const f = await file({}, off)
     expect(f.telegram).toBe('sent') // sent by the Mini App sender, not the approval bot
-    expect(f.approve_url).toBeTruthy()
+    expect(new URL(f.approve_url).pathname).toMatch(/^\/m\/[^/]+\/[^/]+$/)
+    expect(new URL(f.web_approve_url).pathname).toBe(`/elevation/${f.requestId}`)
     expect(approvalCalls()).toHaveLength(0)
     expect(calls).toHaveLength(1)
     expect(calls[0].url).toContain(`bot${MINIAPP_BOT}:`)
@@ -208,6 +219,7 @@ describe('delivery: ONE message from the approval bot', () => {
     const f = await file({}, off)
     expect(f.telegram).toBe('disabled')
     expect(f.approve_url).toBe(`https://colony.example.test/t/example/elevation/${f.requestId}`)
+    expect(f.web_approve_url).toBe(f.approve_url)
     expect(calls).toHaveLength(0)
   })
   it('an action the bot may not carry (token mint) is never offered to the bot: the old path answers', async () => {
@@ -231,7 +243,9 @@ describe('delivery: ONE message from the approval bot', () => {
     harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
     const f = await file()
     expect(f.telegram).toBe('not_bound')
-    expect(f.approve_url).toBe(`https://colony.example.test/elevation/${f.requestId}`)
+    expect(new URL(f.approve_url).pathname).toMatch(/^\/m\/[^/]+\/[^/]+$/)
+    expect(f.web_approve_url).toBe(`https://colony.example.test/elevation/${f.requestId}`)
+    expect(f.telegram_url).toBeUndefined()
     expect(calls).toHaveLength(0)
   })
   it('a Bot API failure is reported as failed and the request stays pending with its link', async () => {

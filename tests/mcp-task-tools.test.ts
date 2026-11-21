@@ -438,7 +438,7 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close', detail: { next_step: expect.stringContaining('archive_propose') } })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close', detail: expect.any(String), next_step: expect.stringMatching(/^Submit evidence.*truly superseded.*archive_propose/) })
   })
 
   it('allows a NON-assignee principal to close the same in_progress task to done', async () => {
@@ -494,7 +494,7 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment', detail: { next_step: expect.stringContaining('archive_propose') } })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment', detail: expect.any(String), next_step: expect.stringContaining('archive_propose') })
   })
 
   it('blocks the assignee from reassigning its own in_progress task to someone else (BLOCK-1 bypass closed)', async () => {

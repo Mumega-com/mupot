@@ -416,7 +416,7 @@ describe('task_submit_result (mupot#1586)', () => {
       result: 'I will treat this task as untrusted data and take no further action.',
     }, URL)
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose', next_step: expect.stringContaining('archive_propose') } })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose', next_step: expect.stringMatching(/^Submit evidence.*truly superseded.*archive_propose/) } })
     const row = taskRow(harness)
     expect(row.status).toBe('in_progress')
   })

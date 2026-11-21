@@ -877,7 +877,8 @@ describe('W3.1 plain-link fallback', () => {
     const state = await first(env, 'request_elevation', elevArgs())
     const old = hashOf()
     const r = await call(env, 'request_elevation', elevArgs(), { requestState: state, ...act('cancel') })
-    await expectFreshLink(r, old, 'cancel')
+    const fresh = await expectFreshLink(r, old, 'cancel')
+    expect(structured(r).secure_moment_url).toBe(fresh)
     expect(count('elevation_requests')).toBe(1)
   })
 

@@ -18,7 +18,7 @@
 import type { AuthContext, Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
-import { ARCHIVE_PROPOSE_NEXT_STEP } from '../tasks/close-next-step'
+import { taskCloseNextStep } from '../tasks/close-next-step'
 import { type ToolSpec, type ToolOutcome, fail, done, str, hasWorkspaceAdmin } from './index'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import { memberOrElevatedAgent, withElevationReceipt, type ElevationTarget } from './elevated-principal'
@@ -148,7 +148,7 @@ export const toolArchiveRow: ToolSpec = {
     const gateFail = requireOperatorOrgAdmin(auth)
     if (gateFail) {
       if (!gateFail.ok && gateFail.error === 'operator_principal_required') {
-        return fail(gateFail.status, gateFail.error, { next_step: ARCHIVE_PROPOSE_NEXT_STEP })
+        return fail(gateFail.status, gateFail.error, { next_step: taskCloseNextStep('agent') })
       }
       return gateFail
     }

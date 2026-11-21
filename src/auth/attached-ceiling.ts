@@ -94,7 +94,7 @@ export function verdictAttribution(auth: Pick<AuthContext, 'seatBinding'>): Verd
  * Everything else stays refused (attached_seat_cannot_elevate): minting, access, deploy, secrets, keys, irreversible
  * acts (org_department_create, routine_archive), home access and every gate power. Adding a key here is a reviewed
  * one-line change: it must be (a) enforced by a tool that is safe for an attached thread to call with a live grant,
- * (b) reversible, and (c) never confers rank or gate authority. Seat events are an exact, single-use exception for the
+ * (b) reversible, and (c) never mints or widens authority. Seat events are an exact, single-use exception for the
  * attached agent's own wake hints to an independently eligible host. It applies equally to Helper and Full.
  * The set is consulted at THREE points (the request,
  * the decision, every use in hasElevatedAction), so a row forged past one of them is still refused by the others.

@@ -111,7 +111,7 @@ const PASSKEY_CLASS_AMR: ReadonlySet<string> = new Set(['hwk', 'swk', 'webauthn'
 
 /** True when ACCESS_REQUIRED_AMR is non-empty and every value is passkey-class (config.ts reads the same list): one weaker value
  *  (e.g. pwd) would let any fresh Access login satisfy "passkey only". */
-function accessAmrConfigured(env: Env): boolean {
+export function accessAmrConfigured(env: Env): boolean {
   const vals = (env.ACCESS_REQUIRED_AMR ?? '').split(',').map((v) => v.trim().toLowerCase()).filter((v) => v.length > 0)
   return vals.length > 0 && vals.every((v) => PASSKEY_CLASS_AMR.has(v))
 }
