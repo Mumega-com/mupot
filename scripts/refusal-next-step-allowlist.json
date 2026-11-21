@@ -363,7 +363,6 @@
     "receipt_integrity_failure",
     "receipt_not_found",
     "receipt_unavailable",
-    "receiver_not_live",
     "relay_not_configured",
     "replacement_handoff_pending",
     "replacement_handoff_unavailable",

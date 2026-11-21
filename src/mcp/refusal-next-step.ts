@@ -96,6 +96,12 @@ export const GUIDANCE_TABLE: readonly GuidanceEntry[] = [
     next_step: 'A human decision is never made by an agent or a seat bound to one. The signed-in human opens the Approvals page in a browser session and approves or rejects there. An agent surfaces the item for that human with needs_you_list. {reach}' },
   { error: 'form_submissions_only', who_acts: 'owner', next_tool: 'needs_you_list',
     next_step: 'The web approval accepts only a browser form post (application/x-www-form-urlencoded or multipart/form-data). Submit the Approve or Reject button on the Approvals page rather than calling the endpoint with another content type. A non-browser caller cannot decide it: surface the item for the human with needs_you_list.' },
+  // ── flight_dispatch to a stopped executor seat (W1-1) ─────────────────────────────────────────
+  { error: 'receiver_not_live', tool: 'flight_dispatch', overridesReason: true, who_acts: 'self', next_tool: 'fleet_agent_get',
+    next_step: 'The executor seat is stopped (detached), so no flight was booked and nothing was sent. Check it with fleet_agent_get { agent_id }; then re-dispatch with an executor_agent_id whose seat is live, or ask whoever runs that seat to restart it and dispatch again.' },
+  // ── task_dispatch to a stopped assignee seat (mupot#1729) ─────────────────────────────────────
+  { error: 'receiver_not_live', tool: 'task_dispatch', overridesReason: true, who_acts: 'self', next_tool: 'fleet_agent_get',
+    next_step: 'The assignee seat is stopped (detached), so the task was not dispatched. Check it with fleet_agent_get { agent_id }; then reassign the task to an agent whose seat is live (task_update { task_id, assignee_agent_id }), or ask whoever runs that seat to restart it and dispatch again.' },
   // ── office task with no project (#2471) ───────────────────────────────────────────────────────
   { error: 'project_required', who_acts: 'self', next_tool: 'task_update',
     next_step: "An office (gate:office) task is frozen and published against its project's WordPress binding, so it needs a project. Set project_id to the customer's project: task_update { task_id, project_id }. An office task is refused at create or update without one; a legacy one already in review gets a project the same way, then goes back through review." },
