@@ -44,6 +44,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'BUS_TOKEN',
   'BUS_URL',
   'CC_SPEND_SECRET',
+  'CLEF_MODEL',
   'CONNECTOR_MASTER_KEY',
   'CONSOLE_SWITCH_POT_URL',
   'CURSOR_API_KEY',

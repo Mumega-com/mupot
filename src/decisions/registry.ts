@@ -3,6 +3,7 @@
 import type { Env } from '../types'
 import type { DecisionAdapter } from './port'
 import { humanDeferAdapter } from './adapters/human-defer'
+import { createClefAdapter } from './adapters/clef'
 import { createTypesafeDirectAdapter } from './adapters/typesafe-direct'
 import { createWorkersAiAdapter } from './adapters/workers-ai'
 
@@ -11,6 +12,8 @@ export function selectAdapter(env: Env): DecisionAdapter {
   switch (name) {
     case 'workers-ai':
       return createWorkersAiAdapter(env)
+    case 'clef':
+      return createClefAdapter(env)
     case 'typesafe':
       return createTypesafeDirectAdapter(env)
     default:
