@@ -291,14 +291,15 @@ describe('each assignment path enqueues exactly one doorbell', () => {
   }
 
   it('concierge work-router (routeUnassignedWork): one ledger row per routed task, none on the next tick', async () => {
+    // Match the fixed task timestamp; wall-clock age eventually makes it stale.
     seedTask('t1', { project: 'pr1' })
     await builderOnline()
-    expect((await runProjectConcierge(env, project())).decision).toEqual({ action: 'route', routed: 1 })
+    expect((await runProjectConcierge(env, project(), { now: at(0) })).decision).toEqual({ action: 'route', routed: 1 })
     expect(assignee('t1')).toBe('ag-a')
     expect(rows('t1')).toMatchObject([{ agent_id: 'ag-a', outcome: 'queued' }])
     await drain()
     expect(doorbells('ag-a')[0].body).toContain('system concierge')
-    await runProjectConcierge(env, project())
+    await runProjectConcierge(env, project(), { now: at(0) })
     expect(rows()).toHaveLength(1)
   })
 
@@ -469,7 +470,7 @@ describe('the assigning request pays one statement per assignment', () => {
     await registerModule(env, { identity: 'ag-a', kind: 'agent_system', adapter: 'cursor', projectId: null, capabilities: [BUILD_CAPABILITY] })
     for (let i = 0; i < 2; i++) seedTask(`ct${i}`, { project: 'pr1' })
     sqls = []
-    const result = await runProjectConcierge(env, { id: 'pr1', slug: 'pr1', name: 'Project One', description: '', goal: 'ship', status: 'active', parent_project_id: null, target_date: null, created_at: T0.toISOString(), updated_at: T0.toISOString() } as Project)
+    const result = await runProjectConcierge(env, { id: 'pr1', slug: 'pr1', name: 'Project One', description: '', goal: 'ship', status: 'active', parent_project_id: null, target_date: null, created_at: T0.toISOString(), updated_at: T0.toISOString() } as Project, { now: at(0) })
     expect(result.decision.action).toBe('route')
     const inline = sqls.filter(doorbellSql)
     expect(inline.length).toBeGreaterThan(0)
