@@ -4525,6 +4525,9 @@ const toolFlightDispatch: ToolSpec = {
           // guarantees the recipient's squad is one of the flight's squads. Project
           // existence and archived-status are still enforced inside the primitive.
           systemProjectAttribution: true,
+          // Atomic form of the liveness gate above (mupot#1740): a seat detached AFTER the check but
+          // before the insert makes delivery fail (receiver_not_live), so the flight is failed below.
+          receiverNotStopped: { agentId: executorAgent.id },
         },
       )
 

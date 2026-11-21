@@ -131,6 +131,8 @@ function makeEnv(
           bind(...args: unknown[]) {
             return {
               async first<T>() {
+                // The atomic receiver fence (mupot#1740, W1-1): `SELECT 1 AS ok WHERE <not-stopped>`. No fleet row = not stopped.
+                if (sql.startsWith('SELECT 1 AS ok WHERE')) return ({ ok: 1 }) as T
                 if (sql.includes('FROM agents WHERE id = ?1')) return (agents.get(args[0] as string) ?? null) as T | null
                 if (sql.includes('FROM squads WHERE id = ?1')) return (squads.get(args[0] as string) ?? null) as T | null
                 if (sql.includes('SELECT department_id FROM squads')) {
@@ -285,6 +287,11 @@ function makeEnv(
                       : []) as T[],
                     meta: ran.meta,
                   }
+                }
+                // The fenced agent_messages INSERT (receiverNotStopped) decides from RETURNING rows (W1-1).
+                if (sql.includes('INSERT INTO agent_messages')) {
+                  const ran = await this.run() as { meta: { changes: number } }
+                  return { results: (ran.meta.changes === 1 ? [{ seq: 1 }] : []) as T[], meta: ran.meta }
                 }
                 if (sql.includes('FROM flight_event_outbox')) {
                   const limit = args[1] as number

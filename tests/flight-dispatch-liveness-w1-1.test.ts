@@ -91,7 +91,7 @@ describe('flight_dispatch executor liveness (W1-1)', () => {
     expect(flights()).toHaveLength(0)
   })
 
-  it('the refusal carries a next_step through the MCP envelope (refusal-next-step rule)', async () => {
+  it('refusalGuidance (called directly, not via the MCP envelope) gives the flight_dispatch receiver_not_live refusal a next_step', async () => {
     const { refusalGuidance } = await import('../src/mcp/refusal-next-step')
     fleet(EXEC, { mode: 'poll', at: FRESH() })
     detach(EXEC)
@@ -137,5 +137,72 @@ describe('flight_dispatch executor liveness (W1-1)', () => {
     const r = await dispatch()
     expect(r.ok, JSON.stringify(r)).toBe(true)
     expect(inbox(CALLER)).toHaveLength(1)
+  })
+
+  it('refusalGuidance gives the task_dispatch receiver_not_live refusal a next_step, and the reason overrides', async () => {
+    const { refusalGuidance } = await import('../src/mcp/refusal-next-step')
+    const g = refusalGuidance('receiver_not_live', 409, { agent_id: EXEC, status: 'stopped', live: false, reason: 'stopped' }, 'task_dispatch')
+    expect(g.next_tool).toBe('fleet_agent_get')
+    expect(g.next_step).toMatch(/assignee/)
+    expect(g.next_step).not.toMatch(/executor_agent_id/)
+    const other = refusalGuidance('receiver_not_live', 409, { agent_id: EXEC, reason: 'something_else' }, 'task_dispatch')
+    expect(other.next_step).toBe(g.next_step)
+  })
+
+  it.each([
+    ['8-char prefix', (id: string) => id.slice(0, 8)],
+    ['upper-case id', (id: string) => id.toUpperCase()],
+    ['padded id', (id: string) => `  ${id}  `],
+  ])('gate evaluates the RESOLVED executor id, not the raw executor_agent_id: %s of a stopped seat -> 409', async (_n, mk) => {
+    // Use a uuid-shaped id so prefix/case forms are meaningful.
+    const ID = 'abcdef12-0000-4000-8000-000000000001'
+    h.sqlite.prepare(`INSERT INTO agents (id, squad_id, slug, name, status, created_at) VALUES (?, ?, 'exec2', 'E2', 'active', ?)`).run(ID, SQUAD, T0)
+    fleet(ID, { mode: 'poll', at: FRESH() })
+    detach(ID)
+    const r = await dispatch({ executor_agent_id: mk(ID) })
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'receiver_not_live' })
+    expect(r.ok === false && r.detail).toMatchObject({ agent_id: ID, status: 'stopped' })
+    expect(inbox(ID)).toHaveLength(0)
+    expect(flights()).toHaveLength(0)
+  })
+
+  it('preflight no_go (delivered:false) still carries the receiver_stale warning', async () => {
+    fleet(EXEC, { mode: 'poll', at: STALE })
+    const r = await dispatch({
+      executor_agent_id: EXEC,
+      signals_json: JSON.stringify({ ...signals, contextComplete: false, toolsReachable: false, budgetRemainingMicroUsd: 0 }),
+    })
+    expect(r.ok, JSON.stringify(r)).toBe(true)
+    expect(r.ok && r.result).toMatchObject({
+      delivered: false,
+      warning: { code: 'receiver_stale', agent_id: EXEC },
+      warnings: [{ code: 'receiver_stale', agent_id: EXEC }],
+    })
+    expect(inbox(EXEC)).toHaveLength(0)
+  })
+
+  it('TOCTOU: seat detached AFTER the liveness check, BEFORE the flight insert -> delivery fails, flight not left running, stopped inbox empty', async () => {
+    fleet(EXEC, { mode: 'poll', at: FRESH() })
+    const realPrepare = h.db.prepare.bind(h.db)
+    let fired = false
+    const proxied = new Proxy(h.db, {
+      get(t, p) {
+        if (p === 'prepare') {
+          return (sql: string) => {
+            if (!fired && /INSERT\s+INTO\s+flights/i.test(sql)) { fired = true; detach(EXEC) }
+            return realPrepare(sql)
+          }
+        }
+        const v: unknown = Reflect.get(t, p)
+        return typeof v === 'function' ? v.bind(t) : v
+      },
+    })
+    env = { ...env, DB: proxied } as unknown as Env
+    const r = await dispatch({ executor_agent_id: EXEC })
+    expect(fired).toBe(true)
+    expect(r).toMatchObject({ ok: false, error: 'flight_dispatch_delivery_failed' })
+    const rows = flights() as Array<{ status: string }>
+    expect(rows.filter((f) => f.status === 'running')).toHaveLength(0)
+    expect(inbox(EXEC)).toHaveLength(0)
   })
 })
