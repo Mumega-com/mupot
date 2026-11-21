@@ -407,7 +407,10 @@ flightsApp.post('/:id/land', async (c) => {
     if (b.cost_metered !== undefined && typeof b.cost_metered !== 'boolean') {
       return c.json({ error: 'invalid_flight_cost' }, 400)
     }
+    // W1-5: a flight dispatched for a subscription (CLI) seat is stored cost_metered=0; with
+    // neither flag nor cost given it lands unmetered. Any other shape is unchanged.
     const unmetered = b.cost_metered === false
+      || (b.cost_metered === undefined && b.cost_micro_usd == null && existing.cost_metered === 0)
     if (unmetered && b.cost_micro_usd != null) {
       return c.json({ error: 'invalid_flight_cost', reason: 'cost_micro_usd must be omitted when cost_metered=false' }, 400)
     }

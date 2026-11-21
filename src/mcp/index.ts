@@ -4159,6 +4159,7 @@ const toolFlightDispatch: ToolSpec = {
     + 'There is NO "unknown": go needs score>=0.5, no failed check and no live-flight collision. Set the booleans true only if verified. '
     + 'With no history 0/0/0 scores ~0.13 (no-go); a declared neutral 0.5/0.5/0.5 scores ~0.82: an assumption, not a measurement, so say so in the goal), '
     + 'budget_micro_usd?: number, '
+    + 'cost_metered?: boolean (false = subscription/CLI seat: budget must be 0, lands unmetered with no cost), '
     + 'executor_agent_id?: string (who FLIES the flight, if not the caller — requires lead on the executor\'s squad), '
     + 'client_request_id?: string (idempotency key, <=200 chars, unique per dispatching agent — a retry with the '
     + 'same key returns the ORIGINAL flight with idempotent_replay:true; the same key with a different request is '
@@ -4175,6 +4176,7 @@ const toolFlightDispatch: ToolSpec = {
       meta_json: STRING_SCHEMA,
       signals_json: STRING_SCHEMA,
       budget_micro_usd: OPTIONAL_NUMBER_SCHEMA,
+      cost_metered: { type: 'boolean' },
       executor_agent_id: STRING_SCHEMA,
       client_request_id: STRING_SCHEMA,
       redispatch_landed_reason: STRING_SCHEMA,
@@ -4193,6 +4195,15 @@ const toolFlightDispatch: ToolSpec = {
     const requestedBudget = args.budget_micro_usd == null ? 0 : args.budget_micro_usd
     if (!Number.isSafeInteger(requestedBudget) || (requestedBudget as number) < 0) {
       return fail(400, 'invalid_flight_budget')
+    }
+    // W1-5 (bd21b349 slice 1): a subscription (CLI) seat has no per-call dollar meter, so its
+    // flight carries no dollar budget. It is declared on the flight, not inferred from fleet
+    // rows (those are a self-reported display cache, never authority). Declaring it grants
+    // nothing a budget-0 metered flight lacks: that one may already land a self-reported 0.
+    // A non-boolean cost_metered is refused by the input schema before this handler runs.
+    const subscriptionSeat = args.cost_metered === false
+    if (subscriptionSeat && (requestedBudget as number) !== 0) {
+      return fail(400, 'invalid_flight_budget', { reason: 'budget_micro_usd must be 0 when cost_metered=false (subscription seat)' })
     }
 
     const squad = await loadSquad(env, squadId)
@@ -4468,6 +4479,13 @@ const toolFlightDispatch: ToolSpec = {
       if (!(error instanceof FlightProjectError)) throw error
       return flightProjectFailure(error)
     }
+    if (subscriptionSeat) {
+      // Before the envelope goes out. If this write is lost the flight stays metered, the
+      // stricter state: the seat can still land it with an explicit cost_metered:false.
+      await env.DB.prepare(
+        `UPDATE flights SET cost_metered = 0 WHERE id = ?1 AND tenant = ?2 AND budget_micro_usd = 0`,
+      ).bind(preflight.id, env.TENANT_SLUG).run()
+    }
     const flight = await getFlight(env, preflight.id)
     if (!flight) return fail(500, 'flight_record_missing')
 
@@ -4579,7 +4597,8 @@ const toolFlightLand: ToolSpec = {
   name: 'flight_land',
   scope: 'self (bound agent own flight)',
   min: 'member',
-  args: '{ flight_id: string, cost_micro_usd?: number (required unless cost_metered=false), cost_metered?: boolean (false = executor has no spend meter; omit cost, budget check skipped, reported as unmetered), score?: number, note?: string, reason?: string, harness?: string, model?: string (executor reports; receipt labels self_reported only when no fleet row exists; fleet values always win) }',
+  args: '{ flight_id: string, cost_micro_usd?: number (required unless cost_metered=false), cost_metered?: boolean (false = executor has no spend meter; omit cost, budget check skipped, reported as unmetered. '
+    + 'Default: false for a flight dispatched with cost_metered:false (subscription/CLI seat), when cost_micro_usd is also omitted; otherwise metered), score?: number, note?: string, reason?: string, harness?: string, model?: string (executor reports; receipt labels self_reported only when no fleet row exists; fleet values always win) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4604,14 +4623,17 @@ const toolFlightLand: ToolSpec = {
     const flightRef = str(args.flight_id)
     const score = args.score
     if (args.cost_metered !== undefined && typeof args.cost_metered !== 'boolean') return fail(400, 'invalid_args')
-    const unmetered = args.cost_metered === false
+    // W1-5: neither flag nor cost given = the flight decides (a subscription-seat flight is
+    // unmetered by default). Every other shape is validated here exactly as before.
+    const flightDecidesMeter = args.cost_metered === undefined && (args.cost_micro_usd === undefined || args.cost_micro_usd === null)
+    let unmetered = args.cost_metered === false
     // #1732: unmetered = cost must be absent (no mixing a fabricated number with the flag);
     // metered (default) = today's contract, cost required.
-    const costMicroUsd = unmetered ? 0 : args.cost_micro_usd
+    let costMicroUsd = unmetered ? 0 : args.cost_micro_usd
     if (unmetered && args.cost_micro_usd !== undefined && args.cost_micro_usd !== null) {
       return fail(400, 'invalid_args', { reason: 'cost_micro_usd must be omitted when cost_metered=false' })
     }
-    if (!flightRef || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
+    if (!flightRef || (!flightDecidesMeter && (!Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0))) {
       return fail(400, 'invalid_args')
     }
     if (score !== undefined && (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1)) {
@@ -4628,6 +4650,12 @@ const toolFlightLand: ToolSpec = {
     }
     const flight = flightRes.entity
     if (flight.agent !== auth.boundAgentId) return fail(404, 'flight_not_found')
+    if (flightDecidesMeter) {
+      // A metered flight with no cost is refused as it always was.
+      if (flight.cost_metered !== 0) return fail(400, 'invalid_args')
+      unmetered = true
+      costMicroUsd = 0
+    }
     const meta = parseFlightMetaV1(parseJsonArg(flight.meta))
     if (!meta) return fail(404, 'flight_not_found')
     const squads = await loadFlightSquads(env, meta.squad_ids)

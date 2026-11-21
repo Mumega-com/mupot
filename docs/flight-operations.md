@@ -132,6 +132,25 @@ The receipt payload carries `routine_outcome` (`confirmed` | `unconfirmed` | `no
 
 Known gap: `cancelRoutineRun` also requires its control TASK to be confirmed cancelled (`taskConfirmed`). That is a multi-step write with task events, not expressible in the flight_cancel batch, so a flight cancel does not check it.
 
+## Subscription (CLI) seats: no dollar budget (W1-5)
+
+Most seats run on CLI subscriptions (Claude Code, Codex, Cursor), not metered per-call
+dollars. Such a seat has no spend meter, so a dollar budget on its flight means nothing.
+
+| Seat | Dispatch | Land |
+|---|---|---|
+| Subscription (CLI) | `flight_dispatch` with `cost_metered: false`. `budget_micro_usd` must be `0` or omitted (otherwise `400 invalid_flight_budget`). The flight is stored `cost_metered: false`. | `flight_land { flight_id }`: no cost, no flag. The flight's own `cost_metered: false` is the default, so it lands unmetered: cost reads `null` (unknown, not zero), no cost check. Task, gate and evidence checks still apply. |
+| Metered (default) | As before: omit `cost_metered`. Budget `0` needs member; budget `> 0` needs lead and is bounded by the agent/squad `budget_cap_cents`. | As before: `cost_micro_usd` required unless `cost_metered: false` is passed explicitly, and a cost above `budget_micro_usd` is `409 flight_budget_exceeded`. |
+
+A subscription flight that explicitly reports `cost_micro_usd` is judged as a metered land
+against its budget of `0`. The REST land (`POST /flights/:id/land`) uses the same default.
+
+Why a flag on the flight and not a fleet field: `fleet_agents` is a display cache that the
+host daemon reports. It is not authority, so it cannot exempt a flight from a check. The
+flag grants nothing a budget-0 metered flight lacks, because that flight can already land
+a self-reported `0`; the flag only records the cost honestly as unknown. Budget by plan
+type in general (bd21b349) is a larger design, and this is its first slice.
+
 ## Vocabulary (adopted)
 
 `loop` (the think→act→observe cycle) · `routine` (a saved config + trigger that fires
